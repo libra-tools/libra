@@ -56,19 +56,50 @@ libra merge --restart
 `.gitattributes` / `.libra_attributes` 级联读取 `merge` 属性，并按 Git
 低层合并语义分派：
 
-- `merge` 或 `merge=text` 使用普通行级文本三路合并。
-- `-merge` 或 `merge=binary` 把文件视为不可拆分整体。未解决冲突时，
-  工作树保留完整 ours 内容，索引写入 stage 1/2/3，且不生成冲突标记。
-- `merge=union` 在每个重叠区域依次保留 ours、theirs，并把内容合并视为干净；
-  若 xdiff 把任一输入判为二进制（例如含 NUL），则回退整文件 binary 冲突，
-  保留 ours 且不写 marker。
-- 未知属性值回退 `text`；不报错，也不会继续查询 `merge.default`。
+- 裸 `merge` 使用普通行级文本三路合并；`-merge` 把文件视为不可拆分整体。
+  未解决的 binary 冲突在工作树保留完整 ours 内容，索引写入 stage 1/2/3，
+  且不生成冲突标记。
+- 具名值先选择同名外部配置；没有外部配置时，`merge=text` 与
+  `merge=binary` 选择对应内建 driver，`merge=union` 则在每个重叠区域依次
+  保留 ours、theirs。若 xdiff 把 union 的任一输入判为二进制（例如含
+  NUL），则回退整文件 binary 冲突，保留 ours 且不写 marker。
+- 既没有同名外部配置、也不是已知内建名称时回退 `text`；不报错，也不会
+  继续查询 `merge.default`。
 
-路径没有 `merge` 属性时，`merge.default=text|binary|union` 选择默认
-driver；未配置或配置为未知值同样回退 `text`。`merge-file`、
-`cherry-pick`、`revert` 共用该分派；`merge-file` 在 Libra 仓库外没有
-属性/配置来源，恒用 `text`。外部 `merge.<name>.driver` 命令尚未实现，
-所以自定义名称目前按上述规则回退文本合并。
+路径没有 `merge` 属性时，`merge.default=<name>` 选择默认 driver。未设置
+或未知名称回退 `text`；若存在 `merge.<name>.driver` 外部命令，则使用该
+命令。Libra 会按严格的 local → global → system 级联一次性读取这些配置。
+已配置的外部命令优先于同名内建 driver（因此 `merge=text` 也可被覆盖）；
+布尔属性 `merge` 与 `-merge` 始终直接选择内建 text 与 binary driver。
+
+`libra merge` 通过 `sh -c` 执行配置值，以保持 Git 所用的 POSIX 单引号
+语义（因此 Windows 也需要在 `PATH` 中提供兼容的 `sh`）。这是受信配置
+边界：命令不在 sandbox 中运行，也没有超时限制，因此不要从不可信来源
+导入 `merge.*.driver`。占位符如下：
+
+- `%O`、`%A`、`%B`：base、ours、theirs 的不可预测临时文件绝对路径；
+  shell 安全路径保持 Git 的无 quote 展开，若路径继承了不安全的工作树目录名，
+  则用单引号保护，避免目录名变成 shell 语法；路径使用原生编码字节，不经
+  UTF-8 lossy 转换。driver 退出后读回 `%A` 作为结果，空文件也合法。
+- `%L`：当前递归深度对应的冲突标记长度。
+- `%P`、`%S`、`%X`、`%Y`：工作树相对路径以及 ancestor、ours、theirs
+  标签；均按 Git 的单引号规则做 shell quote。`%%` 展开为字面量 `%`。
+
+退出码 0 表示干净合并；1 至 128 表示冲突，并保留 driver 写入 `%A` 的
+字节；更高退出码或 shell 无法启动是致命错误，此后 Libra 自身不再发布
+由本次合并产生的 HEAD、索引或已跟踪工作树更新。由于 driver 不受沙箱
+限制，配置命令直接修改仓库文件或元数据所产生的变化不在 Libra 的回滚
+边界内。driver 的 stdout/stderr 会被丢弃；Libra 的错误只给出 driver
+名、路径与配置键，不回显配置命令。输入文件位于工作树内 mode
+0700 的目录中（文件为私有权限），名称不可预测，并在 driver 返回或子进程
+中断后清理；若 Libra 自身在无法展开清理的状态下终止，残留目录仍以 0700
+保持私有。`-X ours` / `-X theirs` 不覆盖外部 driver 的结果。递归虚拟祖先
+仍调用同一 driver，并使用 `merged common ancestors` / `Temporary merge
+branch …` 标签；`merge.<name>.recursive` 尚未实现。
+
+`merge-file`、`cherry-pick`、`revert` 仍共用内建分派，但目前不执行外部
+merge driver；`merge-file` 在 Libra 仓库之外没有属性/配置来源，恒用
+`text`。
 
 ### 目录/文件冲突（D/F 冲突）
 

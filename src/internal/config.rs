@@ -22,7 +22,11 @@
 //!   encrypt-by-default policy in `libra config`.
 //! - [`encrypt_value`] / [`decrypt_value`]: thin wrappers over the vault module.
 
-use std::{collections::HashSet, mem::swap, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    mem::swap,
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow};
 use sea_orm::{
@@ -1420,10 +1424,176 @@ pub async fn read_cascaded_config_value_strict(
     Ok(None)
 }
 
+/// Read every `section.<subsection>.<variable>` value through the strict
+/// local → global → system cascade.
+///
+/// Subsection names remain case-sensitive, while the section and variable
+/// follow Git's case-insensitive matching rules. The highest-priority scope
+/// wins independently for each subsection. This is intentionally a snapshot:
+/// callers that dispatch per path can resolve arbitrary subsection names
+/// without rescanning config databases on the hot path.
+pub(crate) async fn read_cascaded_subsection_values_strict(
+    local_target: LocalIdentityTarget<'_>,
+    section: &str,
+    variable: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+
+    let local_path = match local_target {
+        LocalIdentityTarget::CurrentRepo => match try_get_storage_path(None) {
+            Ok(storage) => Some(storage.join(DATABASE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).context("failed to resolve current repository storage");
+            }
+        },
+        LocalIdentityTarget::ExplicitDb(path) => Some(path.to_path_buf()),
+        LocalIdentityTarget::None => None,
+    };
+    if let Some(path) = local_path {
+        for (subsection, entry) in
+            read_subsection_entries_from_db_path(&path, section, variable).await?
+        {
+            let value =
+                decrypt_strict_config_entry(entry, StrictConfigScope::Local(local_target)).await?;
+            values.entry(subsection).or_insert(value);
+        }
+    }
+
+    if let Some(path) = global_config_path() {
+        match read_subsection_entries_from_db_path(&path, section, variable).await {
+            Ok(entries) => {
+                for (subsection, entry) in entries {
+                    let value =
+                        decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?;
+                    values.entry(subsection).or_insert(value);
+                }
+            }
+            Err(error) => skip_global_scope_if_schema_future(&path, error).await?,
+        }
+    }
+
+    if let Some(path) = system_config_path() {
+        match read_subsection_entries_from_db_path(&path, section, variable).await {
+            Ok(entries) => {
+                for (subsection, entry) in entries {
+                    match decrypt_strict_config_entry(entry, StrictConfigScope::System).await {
+                        Ok(value) => {
+                            values.entry(subsection).or_insert(value);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                section,
+                                variable,
+                                path = %path.display(),
+                                error = %format!("{error:#}"),
+                                "skipping unsupported system subsection config"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    section,
+                    variable,
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping unreadable system subsection config"
+                );
+            }
+        }
+    }
+
+    Ok(values)
+}
+
 enum StrictConfigScope<'a> {
     Local(LocalIdentityTarget<'a>),
     Global,
     System,
+}
+
+async fn read_subsection_entries_from_db_path(
+    db_path: &Path,
+    section: &str,
+    variable: &str,
+) -> Result<Vec<(String, ConfigKvEntry)>> {
+    let exists = db_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+
+    let conn = get_db_conn_instance_for_path(db_path)
+        .await
+        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+    let rows = config_kv::Entity::find()
+        .order_by_desc(config_kv::Column::Id)
+        .all(&conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query {section}.*.{variable} from config database '{}'",
+                db_path.display()
+            )
+        })?;
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for row in &rows {
+        let Some((stored_section, Some(subsection), stored_variable)) =
+            split_git_config_key(&row.key)
+        else {
+            continue;
+        };
+        if stored_section.eq_ignore_ascii_case(section)
+            && stored_variable.eq_ignore_ascii_case(variable)
+            && seen.insert(subsection.to_string())
+        {
+            entries.push((subsection.to_string(), ConfigKvEntry::from_model(row)));
+        }
+    }
+
+    let has_legacy_table = crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect legacy config schema in database '{}'",
+                db_path.display()
+            )
+        })?;
+    if has_legacy_table {
+        let legacy_rows = config::Entity::find()
+            .order_by_desc(config::Column::Id)
+            .all(&conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query legacy {section}.*.{variable} config from database '{}'",
+                    db_path.display()
+                )
+            })?;
+        for row in legacy_rows {
+            let Some(subsection) = row.name else {
+                continue;
+            };
+            if row.configuration.eq_ignore_ascii_case(section)
+                && row.key.eq_ignore_ascii_case(variable)
+                && seen.insert(subsection.clone())
+            {
+                entries.push((
+                    subsection.clone(),
+                    ConfigKvEntry {
+                        key: format!("{section}.{subsection}.{variable}"),
+                        value: row.value,
+                        encrypted: false,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 async fn decrypt_strict_config_entry(
@@ -2976,6 +3146,61 @@ mod tests {
         .await
         .expect("insert config value");
         conn.close().await.expect("close config db");
+    }
+
+    async fn append_plain_config(db_path: &Path, key: &str, value: &str) {
+        let conn = crate::internal::db::open_connection_without_schema_management(
+            db_path.to_str().expect("utf8 db path"),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("open config db");
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
+            [key.into(), value.into()],
+        ))
+        .await
+        .expect("append config value");
+        conn.close().await.expect("close config db");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn strict_subsection_snapshot_cascades_each_case_sensitive_name() {
+        use crate::utils::test::ScopedEnvVar;
+
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let local_db = temp.path().join("local.db");
+        let global_db = temp.path().join("global.db");
+        let system_db = temp.path().join("system.db");
+        write_config_db(&local_db, "Merge.Shared.Driver", "local-shared", false).await;
+        append_plain_config(&local_db, "merge.Local.driver", "local-only").await;
+        write_config_db(&global_db, "merge.Shared.driver", "global-shadowed", false).await;
+        append_plain_config(&global_db, "MERGE.Global.DRIVER", "global-only").await;
+        append_plain_config(&global_db, "merge.local.driver", "lowercase-subsection").await;
+        write_config_db(&system_db, "merge.System.driver", "system-only", false).await;
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
+        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
+
+        let values = read_cascaded_subsection_values_strict(
+            LocalIdentityTarget::ExplicitDb(&local_db),
+            "merge",
+            "driver",
+        )
+        .await
+        .expect("read strict subsection snapshot");
+
+        assert_eq!(
+            values,
+            BTreeMap::from([
+                ("Global".to_string(), "global-only".to_string()),
+                ("Local".to_string(), "local-only".to_string()),
+                ("Shared".to_string(), "local-shared".to_string()),
+                ("System".to_string(), "system-only".to_string()),
+                ("local".to_string(), "lowercase-subsection".to_string()),
+            ])
+        );
     }
 
     async fn max_schema_version(db_path: &Path) -> i64 {

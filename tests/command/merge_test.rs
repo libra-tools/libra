@@ -2,6 +2,8 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use git_internal::internal::object::commit::Commit;
@@ -13,8 +15,9 @@ use libra::{
 use serial_test::serial;
 
 use super::{
-    assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
+    assert_cli_success, configure_identity_via_cli, create_committed_repo_via_cli,
+    init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
+    run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
@@ -31,11 +34,22 @@ fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
 }
 
 fn merge_driver_repo(attribute: Option<&str>, default_driver: Option<&str>) -> tempfile::TempDir {
+    merge_driver_repo_for_path("driver.txt", attribute, default_driver)
+}
+
+fn merge_driver_repo_for_path(
+    file: &str,
+    attribute: Option<&str>,
+    default_driver: Option<&str>,
+) -> tempfile::TempDir {
     let repo = create_committed_repo_via_cli();
     let root = repo.path();
-    std::fs::write(root.join("driver.txt"), "top\nbase\nbottom\n")
-        .expect("failed to write merge-driver base");
-    let mut paths = vec!["driver.txt"];
+    let file_path = root.join(file);
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create merge-driver parent");
+    }
+    std::fs::write(&file_path, "top\nbase\nbottom\n").expect("failed to write merge-driver base");
+    let mut paths = vec![file];
     if let Some(attribute) = attribute {
         std::fs::write(root.join(".gitattributes"), format!("*.txt {attribute}\n"))
             .expect("failed to write merge attributes");
@@ -69,13 +83,41 @@ fn merge_driver_repo(attribute: Option<&str>, default_driver: Option<&str>) -> t
         &run_libra_command(&["checkout", "driver-side"], root),
         "checkout side",
     );
-    commit_file(root, "driver.txt", "top\ntheirs\nbottom\n", "driver theirs");
+    commit_file(root, file, "top\ntheirs\nbottom\n", "driver theirs");
     assert_cli_success(
         &run_libra_command(&["checkout", "main"], root),
         "checkout main",
     );
-    commit_file(root, "driver.txt", "top\nours\nbottom\n", "driver ours");
+    commit_file(root, file, "top\nours\nbottom\n", "driver ours");
     repo
+}
+
+#[cfg(unix)]
+fn shell_quote_test(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn external_driver_fixture_command(root: &Path, mode: &str) -> (String, std::path::PathBuf) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/merge-driver.sh");
+    let log = root.join(format!("driver-{mode}.log"));
+    let command = format!(
+        "sh {} {} {} %O %A %B %L %P %S %X %Y",
+        shell_quote_test(&fixture.to_string_lossy()),
+        shell_quote_test(mode),
+        shell_quote_test(&log.to_string_lossy())
+    );
+    (command, log)
+}
+
+#[cfg(unix)]
+fn configure_external_driver(root: &Path, mode: &str) -> std::path::PathBuf {
+    let (command, log) = external_driver_fixture_command(root, mode);
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.custom.driver", command.as_str()], root),
+        "configure external merge driver",
+    );
+    log
 }
 
 #[test]
@@ -251,6 +293,465 @@ fn merge_driver_union_binary_input_keeps_ours_without_markers() {
     assert_eq!(
         std::fs::read(root.join("driver.bin")).unwrap(),
         b"ours\0bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_clean_result_is_read_from_percent_a() {
+    let repo = merge_driver_repo(Some("merge=custom"), None);
+    let root = repo.path();
+    let log = configure_external_driver(root, "clean");
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+    assert_cli_success(&output, "external driver clean merge");
+    assert_eq!(
+        std::fs::read(root.join("driver.txt")).expect("read external merge result"),
+        b"external result\n"
+    );
+    let invocation = std::fs::read_to_string(log).expect("read driver invocation");
+    for expected in [
+        "base=top\nbase\nbottom",
+        "ours=top\nours\nbottom",
+        "theirs=top\ntheirs\nbottom",
+        "marker=7",
+        "path=driver.txt",
+        "ancestor=base",
+        "ours-label=HEAD",
+        "theirs-label=driver-side",
+    ] {
+        assert!(
+            invocation.contains(expected),
+            "missing {expected:?} in {invocation:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_conflict_result_survives_strategy_options_and_exit_128() {
+    for (mode, option, expected) in [
+        ("conflict", Some("ours"), b"external conflict\n".as_slice()),
+        (
+            "conflict128",
+            Some("theirs"),
+            b"external conflict 128\n".as_slice(),
+        ),
+    ] {
+        let repo = merge_driver_repo(Some("merge=custom"), None);
+        let root = repo.path();
+        configure_external_driver(root, mode);
+        let mut args = vec!["merge", "driver-side", "--no-verify"];
+        if let Some(option) = option {
+            args.extend(["-X", option]);
+        }
+
+        let output = run_libra_command(&args, root);
+        assert_eq!(
+            output.status.code(),
+            Some(128),
+            "external status {mode} remains a content conflict: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.join("driver.txt")).expect("read external conflict"),
+            expected,
+            "-X must not replace an external driver's %A result"
+        );
+        let stages = run_libra_command(&["ls-files", "-s", "driver.txt"], root);
+        assert_cli_success(&stages, "inspect conflict stages");
+        let listing = String::from_utf8_lossy(&stages.stdout);
+        for stage in [" 1\t", " 2\t", " 3\t"] {
+            assert!(
+                listing.contains(stage),
+                "missing stage {stage:?}: {listing}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_accepts_an_empty_percent_a_result() {
+    let repo = merge_driver_repo(Some("merge=custom"), None);
+    let root = repo.path();
+    configure_external_driver(root, "empty");
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+    assert_cli_success(&output, "empty external result is a clean merge");
+    assert_eq!(
+        std::fs::metadata(root.join("driver.txt"))
+            .expect("empty merged file")
+            .len(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_result_survives_an_independent_add_add_mode_conflict() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    std::fs::write(root.join(".gitattributes"), "*.txt merge=custom\n")
+        .expect("write external-driver attributes");
+    assert_cli_success(
+        &run_libra_command(&["add", ".gitattributes"], root),
+        "add external-driver attributes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver attributes", "--no-verify"], root),
+        "commit external-driver attributes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "driver-side"], root),
+        "create driver side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "driver-side"], root),
+        "checkout driver side",
+    );
+    std::fs::write(root.join("driver.txt"), "theirs\n").expect("write executable side");
+    std::fs::set_permissions(
+        root.join("driver.txt"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make side executable");
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add executable side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add executable", "--no-verify"], root),
+        "commit executable side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    commit_file(root, "driver.txt", "ours\n", "add regular");
+    configure_external_driver(root, "clean");
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "the independent mode conflict must remain unmerged: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(root.join("driver.txt")).expect("read mode-conflict result"),
+        b"external result\n",
+        "the external driver's clean content must survive the mode conflict"
+    );
+    let stages = run_libra_command(&["ls-files", "-s", "driver.txt"], root);
+    assert_cli_success(&stages, "inspect mode-conflict stages");
+    let listing = String::from_utf8_lossy(&stages.stdout);
+    assert!(
+        listing.contains("100644 ") && listing.contains(" 2\t"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("100755 ") && listing.contains(" 3\t"),
+        "{listing}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_sq_quotes_a_hostile_path_without_executing_it() {
+    let file = "odd '$(touch PWNED)'.txt";
+    let repo = merge_driver_repo_for_path(file, Some("merge=custom"), None);
+    let root = repo.path();
+    let log = configure_external_driver(root, "clean");
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+    assert_cli_success(&output, "hostile-looking path is data, not shell code");
+    assert_eq!(
+        std::fs::read(root.join(file)).expect("merged hostile-looking path"),
+        b"external result\n"
+    );
+    assert!(
+        !root.join("PWNED").exists(),
+        "path command substitution ran"
+    );
+    let invocation = std::fs::read_to_string(log).expect("driver path log");
+    assert!(invocation.contains(&format!("path={file}")), "{invocation}");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_protects_temporary_paths_under_a_hostile_worktree_name() {
+    let parent = tempfile::tempdir().expect("hostile worktree parent");
+    let root = parent.path().join("repo $(touch PWNED)");
+    std::fs::create_dir(&root).expect("create hostile worktree path");
+    init_repo_via_cli(&root);
+    configure_identity_via_cli(&root);
+    std::fs::write(root.join("seed.txt"), "seed\n").expect("write initial file");
+    assert_cli_success(&run_libra_command(&["add", "seed.txt"], &root), "add seed");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "seed", "--no-verify"], &root),
+        "commit seed",
+    );
+    std::fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").expect("write driver base");
+    std::fs::write(root.join(".gitattributes"), "*.txt merge=custom\n")
+        .expect("write driver attribute");
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], &root),
+        "add driver base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], &root),
+        "commit driver base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "driver-side"], &root),
+        "create side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "driver-side"], &root),
+        "checkout side",
+    );
+    commit_file(&root, "driver.txt", "top\ntheirs\nbottom\n", "theirs");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], &root),
+        "checkout main",
+    );
+    commit_file(&root, "driver.txt", "top\nours\nbottom\n", "ours");
+    configure_external_driver(&root, "clean");
+
+    let output = run_libra_command(&["merge", "driver-side", "--no-verify"], &root);
+    assert_cli_success(&output, "external merge in hostile worktree path");
+    assert_eq!(
+        std::fs::read(root.join("driver.txt")).expect("read external result"),
+        b"external result\n"
+    );
+    assert!(
+        !root.join("PWNED").exists(),
+        "temporary path executed shell code"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_reads_a_global_driver_for_the_configured_default() {
+    let repo = merge_driver_repo(None, Some("custom"));
+    let root = repo.path();
+    let global = tempfile::tempdir().expect("isolated global config");
+    let global_db = global.path().join("config.db");
+    let (command, _) = external_driver_fixture_command(root, "clean");
+    let global_db_value = global_db.to_string_lossy().into_owned();
+    let configured = run_libra_command_with_stdin_and_env(
+        &[
+            "config",
+            "--global",
+            "Merge.custom.Driver",
+            command.as_str(),
+        ],
+        root,
+        "",
+        &[("LIBRA_CONFIG_GLOBAL_DB", global_db_value.as_str())],
+    );
+    assert_cli_success(&configured, "configure global external driver");
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["merge", "driver-side", "--no-verify"],
+        root,
+        "",
+        &[("LIBRA_CONFIG_GLOBAL_DB", global_db_value.as_str())],
+    );
+    assert_cli_success(&output, "global default external driver");
+    assert_eq!(
+        std::fs::read(root.join("driver.txt")).expect("global driver result"),
+        b"external result\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_errors_leave_head_index_and_worktree_unchanged() {
+    for mode in ["error129", "signal"] {
+        let repo = merge_driver_repo(Some("merge=custom"), None);
+        let root = repo.path();
+        let log = configure_external_driver(root, mode);
+        let head_before = head_commit(root);
+        let index_before = std::fs::read(root.join(".libra/index")).expect("read index");
+        let worktree_before = std::fs::read(root.join("driver.txt")).expect("read worktree");
+
+        let output = run_libra_command(&["merge", "driver-side", "--no-verify"], root);
+        assert!(!output.status.success(), "{mode} must be fatal");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("external merge driver 'custom'"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("tests/fixtures/merge-driver.sh"),
+            "the configured command leaked: {stderr}"
+        );
+        assert_eq!(head_commit(root), head_before);
+        assert_eq!(
+            std::fs::read(root.join(".libra/index")).expect("read unchanged index"),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read(root.join("driver.txt")).expect("read unchanged worktree"),
+            worktree_before
+        );
+        if mode == "signal" {
+            let temp_root = std::fs::read_to_string(log.with_extension("log.temp-root"))
+                .expect("signal fixture records its protected temp root");
+            assert!(
+                !Path::new(temp_root.trim()).exists(),
+                "parent RAII must remove the interrupted driver's temporary directory"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_reports_an_unavailable_shell_without_leaking_the_command() {
+    let repo = merge_driver_repo(Some("merge=custom"), None);
+    let root = repo.path();
+    configure_external_driver(root, "clean");
+    let head_before = head_commit(root);
+    let index_before = std::fs::read(root.join(".libra/index")).expect("read index");
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["merge", "driver-side", "--no-verify"],
+        root,
+        "",
+        &[("PATH", "/definitely-missing")],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("could not start"), "{stderr}");
+    assert!(stderr.contains("merge.custom.driver"), "{stderr}");
+    assert!(
+        !stderr.contains("merge-driver.sh"),
+        "command leaked: {stderr}"
+    );
+    assert_eq!(head_commit(root), head_before);
+    assert_eq!(
+        std::fs::read(root.join(".libra/index")).expect("unchanged index"),
+        index_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_uses_recursive_and_top_level_labels_without_strategy_override() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    std::fs::write(root.join("p.txt"), "0\n").expect("write root");
+    assert_cli_success(&run_libra_command(&["add", "p.txt"], root), "add root");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], root),
+        "commit root",
+    );
+
+    for (branch, content) in [("a", "a\n"), ("b", "b\n")] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], root),
+            "checkout main",
+        );
+        assert_cli_success(
+            &run_libra_command(&["branch", branch], root),
+            "create branch",
+        );
+        assert_cli_success(
+            &run_libra_command(&["checkout", branch], root),
+            "checkout branch",
+        );
+        commit_file(root, "p.txt", content, "side edit");
+    }
+    for (from, tip, other, resolution) in [("a", "x", "b", "x\n"), ("b", "y", "a", "y\n")] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", from], root),
+            "checkout side",
+        );
+        assert_cli_success(&run_libra_command(&["branch", tip], root), "create tip");
+        assert_cli_success(&run_libra_command(&["checkout", tip], root), "checkout tip");
+        assert_eq!(
+            run_libra_command(&["merge", other], root).status.code(),
+            Some(128)
+        );
+        std::fs::write(root.join("p.txt"), resolution).expect("resolve side merge");
+        assert_cli_success(&run_libra_command(&["add", "p.txt"], root), "stage side");
+        assert_cli_success(
+            &run_libra_command(&["merge", "--continue", "--no-verify"], root),
+            "finish side merge",
+        );
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "x"], root),
+        "checkout final ours",
+    );
+    std::fs::write(root.join(".gitattributes"), "*.txt merge=custom\n")
+        .expect("write external attribute");
+    assert_cli_success(
+        &run_libra_command(&["add", ".gitattributes"], root),
+        "add external attribute",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "external attribute", "--no-verify"], root),
+        "commit external attribute",
+    );
+    let log = configure_external_driver(root, "conflict");
+
+    let output = run_libra_command(&["merge", "y", "-X", "ours", "--no-verify"], root);
+    assert_eq!(output.status.code(), Some(128));
+    assert_eq!(
+        std::fs::read(root.join("p.txt")).expect("external recursive result"),
+        b"external conflict\n"
+    );
+    let invocations = std::fs::read_to_string(log).expect("recursive driver log");
+    for expected in [
+        "ancestor=merged common ancestors",
+        "ours-label=Temporary merge branch 1",
+        "theirs-label=Temporary merge branch 2",
+        "ancestor=base",
+        "ours-label=HEAD",
+        "theirs-label=y",
+    ] {
+        assert!(
+            invocations.contains(expected),
+            "missing {expected:?}: {invocations}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_ext_driver_caches_the_rename_conflict_replay() {
+    let ours = "line1\nours\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let theirs = "line1\ntheirs\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(Some(ours), theirs);
+    let root = repo.path();
+    std::fs::write(root.join(".gitattributes"), "*.txt merge=custom\n")
+        .expect("write external attribute");
+    assert_cli_success(
+        &run_libra_command(&["add", ".gitattributes"], root),
+        "add external attribute",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "external attribute", "--no-verify"], root),
+        "commit external attribute",
+    );
+    let log = configure_external_driver(root, "conflict");
+
+    let output = run_libra_command(&["merge", "feature", "--no-verify"], root);
+    assert_eq!(output.status.code(), Some(128));
+    let invocations = std::fs::read_to_string(log).expect("rename driver log");
+    assert_eq!(
+        invocations.matches("mode=conflict").count(),
+        1,
+        "incremental conflict-state replay must reuse the external result: {invocations}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("new.txt")).expect("external rename result"),
+        b"external conflict\n"
     );
 }
 

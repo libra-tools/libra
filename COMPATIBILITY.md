@@ -282,19 +282,36 @@ Myers-minimal, Patience, and Histogram backends through `--algorithm` plus
 Git-compatible anchored Patience: qualifying lines must be unique on both sides
 and start with a supplied prefix; selector retention/clearing follows Git.
 
-### Built-in merge-driver dispatch (MG-08)
+### Merge-driver dispatch (MG-08 / MG-09)
 
 `merge`, `merge-file`, `cherry-pick`, and `revert` share the path-level
-`merge` gitattribute dispatch. `merge`/`merge=text` selects the existing text
-three-way merge; `-merge`/`merge=binary` selects whole-file conflict handling
-without markers; `merge=union` retains ours then theirs in each overlapping
-region; xdiff-classified binary input makes union fall back to the marker-free
-whole-file binary conflict. A named-but-unknown attribute value falls back directly to text. Only
+`merge` gitattribute dispatch. Bare `merge` and `-merge` directly select text
+and whole-file binary handling. Named `text`/`binary`/`union` values select the
+matching built-in only when no external driver of that name is configured;
+union retains ours then theirs in each overlapping region, with binary input
+falling back to a marker-free whole-file conflict. Any other unconfigured name
+falls back directly to text. Only
 an absent attribute consults `merge.default`, whose unset or unknown value also
 falls back to text. `merge-file` outside a Libra repository deliberately has no
-attributes/config source and always selects text. External
-`merge.<name>.driver` commands remain deferred, so custom names currently take
-the Git-compatible built-in text fallback.
+attributes/config source and always selects text.
+
+`libra merge` additionally executes `merge.<name>.driver` from the strict local
+→ global → system cascade when a named attribute or `merge.default` selects it;
+external configuration overrides a same-named built-in, while boolean
+`merge`/`-merge` remains direct built-in dispatch. Git-compatible placeholders,
+shell quoting for `%P/%S/%X/%Y`, `%A` readback (including empty output), and the
+0 / 1..128 / >128 result split are supported. Inputs are private unpredictable
+files in a mode-0700 worktree-local directory and are cleaned by RAII; errors
+do not echo the trusted shell command. Native path bytes are preserved without
+lossy UTF-8 conversion. As a security hardening, `%O/%A/%B`
+remain raw only for shell-safe absolute paths and are single-quoted when an
+unsafe worktree directory would otherwise become shell syntax. Commands run via `sh -c`, including on
+Windows (where a compatible `sh` must be available). Recursive folds reuse the driver with
+temporary-branch labels, but `merge.<name>.recursive`, sandboxing, timeouts, and
+external-driver execution from `merge-file`/`cherry-pick`/`revert` remain
+unsupported. A fatal result stops Libra from publishing merge-driven repository
+state, but direct mutations made by the trusted unsandboxed command are outside
+Libra's rollback boundary.
 
 ## Git commands intentionally absent from `src/cli.rs`
 

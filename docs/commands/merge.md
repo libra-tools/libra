@@ -68,23 +68,59 @@ For a path whose contents changed on both sides, Libra reads the existing
 `.gitattributes` / `.libra_attributes` cascade and dispatches the `merge`
 attribute like Git's low-level merge layer:
 
-- `merge` or `merge=text` uses the normal line-level text merge.
-- `-merge` or `merge=binary` treats the file as indivisible. An unresolved
-  conflict keeps the complete ours version in the working tree, writes stages
-  1/2/3 to the index, and emits no conflict markers.
-- `merge=union` resolves each overlapping region by retaining ours followed by
-  theirs, and reports the content merge as clean. If xdiff classifies any input
-  as binary (for example, a NUL byte), union falls back to a whole-file binary
-  conflict and keeps ours without markers.
-- An unknown attribute value falls back to `text`; it is not an error and does
-  not consult `merge.default`.
+- Bare `merge` uses the normal line-level text merge; `-merge` treats the file
+  as indivisible. An unresolved binary conflict keeps the complete ours version
+  in the working tree, writes stages 1/2/3 to the index, and emits no markers.
+- A named value first selects a matching external configuration. Without one,
+  `merge=text` and `merge=binary` select those built-ins, while `merge=union`
+  resolves each overlapping region by retaining ours followed by theirs. If
+  xdiff classifies any union input as binary (for example, a NUL byte), union
+  falls back to a whole-file binary conflict and keeps ours without markers.
+- A named value with no configured external or known built-in falls back to
+  `text`; it is not an error and does not consult `merge.default`.
 
-When a path has no `merge` attribute, `merge.default=text|binary|union` selects
-the fallback driver. An unset or unknown `merge.default` also falls back to
-`text`. The same dispatch is used by `merge-file`, `cherry-pick`, and `revert`;
-`merge-file` outside a Libra repository has no attribute/config source and
-always uses `text`. External `merge.<name>.driver` commands are not yet
-implemented, so custom names currently take the documented text fallback.
+When a path has no `merge` attribute, `merge.default=<name>` selects the
+fallback driver. An unset or unknown name falls back to `text`, unless the name
+has an external command configured as `merge.<name>.driver`. External commands
+are read once through the strict local → global → system config cascade. A
+configured command wins over a same-named built-in (`merge=text` can therefore
+be overridden); the boolean attributes `merge` and `-merge` always select the
+built-in text and binary drivers directly.
+
+`libra merge` runs the configured value through `sh -c`, preserving the POSIX
+single-quote semantics used by Git (Windows therefore also needs a compatible
+`sh` on `PATH`). This is a trusted-config boundary: the command is not
+sandboxed or timed out, so do not import `merge.*.driver` values from an
+untrusted source. Its placeholders are:
+
+- `%O`, `%A`, `%B`: absolute paths to unpredictable temporary base, ours, and
+  theirs files; shell-safe paths retain Git's unquoted expansion, while paths
+  inherited from an unsafe worktree name are single-quoted to prevent that
+  directory name from becoming shell syntax. Native path bytes are preserved
+  rather than lossily converted through UTF-8. `%A` is read back as the result,
+  including when it is empty.
+- `%L`: the conflict-marker length for this merge depth.
+- `%P`, `%S`, `%X`, `%Y`: the worktree-relative path and the ancestor, ours,
+  and theirs labels, each shell-quoted with Git's single-quote rules. `%%`
+  expands to a literal percent sign.
+
+Exit status 0 reports a clean merge; 1 through 128 reports a conflict and keeps
+the bytes the driver left in `%A`; a higher status or failure to start the shell
+is fatal, after which Libra performs no merge-driven HEAD, index, or tracked
+working-tree update. Because the driver is unsandboxed, changes that the
+configured command makes directly to repository files or metadata are outside
+Libra's rollback boundary. Driver stdout/stderr is discarded; Libra's error
+names the driver, path, and config key without echoing the configured command. The input files live in a
+mode-0700 worktree-local directory (files are private), are removed when the
+driver returns or the child is interrupted, and do not use predictable names.
+If Libra itself is terminated before it can unwind, a residual directory stays
+private under mode 0700. A driver also owns its result under `-X ours` / `-X theirs`. Recursive virtual-ancestor
+merges invoke the same driver with `merged common ancestors` / `Temporary merge
+branch …` labels; `merge.<name>.recursive` is not implemented.
+
+The built-in dispatch is also used by `merge-file`, `cherry-pick`, and `revert`;
+those commands do not execute external merge drivers yet. `merge-file` outside
+a Libra repository has no attribute/config source and always uses `text`.
 
 ### Directory/file collisions (D/F conflicts)
 

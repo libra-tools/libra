@@ -3,9 +3,13 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use clap::{Parser, ValueEnum};
@@ -661,10 +665,10 @@ pub(crate) enum PullMergeError {
     /// fall-back that would ignore a configured `diff3`.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
-    /// The default low-level merge driver could not be read. Unknown VALUES
+    /// Low-level merge-driver configuration could not be read. Unknown names
     /// are valid and fall back to text; only an actual config-store failure is
     /// an error.
-    #[error("failed to read merge.default config: {0}")]
+    #[error("failed to read merge driver config: {0}")]
     MergeDriverConfigRead(String),
     /// A rename-detection config value Libra rejects (`merge.renames`,
     /// `merge.renameLimit`, `merge.directoryRenames`, and the applicable
@@ -1579,6 +1583,13 @@ pub(crate) async fn run_merge_for_pull_with_options(
     } else {
         None
     };
+    let preflighted_external_drivers = if reaches_three_way {
+        read_external_merge_runtime()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?
+    } else {
+        Arc::new(ExternalMergeRuntime::default())
+    };
 
     // ── autostash (lore.md §1.8) ──
     // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
@@ -1682,6 +1693,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
         options,
         preflighted_rename_config,
         preflighted_default_driver,
+        preflighted_external_drivers,
     )
     .await;
     // Uniform finalize: applies when no merge state persists (clean success,
@@ -1985,6 +1997,7 @@ async fn run_merge_for_pull_inner(
     // autostash had already saved and reset the tree (Codex R9).
     preflighted_rename_config: Option<MergeRenameConfig>,
     preflighted_default_driver: Option<String>,
+    preflighted_external_drivers: SharedExternalMergeRuntime,
 ) -> Result<PullMergeSummary, PullMergeError> {
     let Some(current_commit_id) = Head::current_commit().await else {
         let files_changed = count_changed_files(None, &target_commit)?;
@@ -2090,6 +2103,7 @@ async fn run_merge_for_pull_inner(
         fast_forwardable: merge_head_is_sole_base(&bases, &current_commit) && !options.no_ff,
         rename_config: preflighted_rename_config,
         merge_default_driver: preflighted_default_driver,
+        external_merge_runtime: preflighted_external_drivers,
         output,
     };
     match options.strategy {
@@ -2152,6 +2166,7 @@ struct ThreeWayMergeOptions<'a> {
     /// the engine would reopen the window those refusals exist to close.
     rename_config: Option<MergeRenameConfig>,
     merge_default_driver: Option<String>,
+    external_merge_runtime: SharedExternalMergeRuntime,
     output: &'a OutputConfig,
 }
 
@@ -2392,6 +2407,7 @@ async fn perform_three_way_merge(
                 conflict_style,
                 &rename_config,
                 options.merge_default_driver.as_deref(),
+                options.external_merge_runtime.clone(),
             )?;
             (ancestor.items, ancestor.blobs)
         }
@@ -2410,10 +2426,12 @@ async fn perform_three_way_merge(
             df_branch_label(MergeSide::Ours, upstream).as_str(),
             upstream,
         ),
-        &mut TreeMergeContext::top_level(
+        &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
             options.merge_default_driver.as_deref(),
+            upstream,
+            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
     )?;
@@ -2427,10 +2445,12 @@ async fn perform_three_way_merge(
         &base_items,
         &our_items,
         &their_items,
-        &mut TreeMergeContext::top_level(
+        &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
             options.merge_default_driver.as_deref(),
+            upstream,
+            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
     )?;
@@ -3937,6 +3957,9 @@ enum ConflictKind {
         ours: ObjectHash,
         theirs: ObjectHash,
         driver: BuiltinMergeDriver,
+        /// External drivers own their conflict presentation and write it to
+        /// `%A`; built-in drivers render later with the final branch labels.
+        rendered: Option<MergeTreeEntry>,
     },
     OursModifiedTheirsDeleted {
         ours: ObjectHash,
@@ -4001,6 +4024,15 @@ enum RelativeState {
     Missing,
 }
 
+enum BlobMergeAttempt {
+    NotApplicable,
+    Clean(MergeTreeEntry),
+    Conflict {
+        driver: BuiltinMergeDriver,
+        rendered: Option<MergeTreeEntry>,
+    },
+}
+
 fn classify_relative_to_base(
     base: Option<&MergeTreeEntry>,
     side: Option<&MergeTreeEntry>,
@@ -4037,20 +4069,41 @@ fn resolve_three_way(
                 MergeResolution::Use(theirs)
             } else {
                 let driver = context.driver_for_path(path);
-                if driver != BuiltinMergeDriver::Text
-                    && let Some(merged) =
-                        try_merge_blob_contents(None, ours, theirs, driver, context)?
+                if driver.is_builtin(BuiltinMergeDriver::Text)
+                    && let Some(favor) = favor
                 {
-                    MergeResolution::Use(merged)
-                } else if let Some(favor) = favor {
+                    // Preserve the long-standing add/add `-X` shortcut for
+                    // the built-in text driver: it chooses one complete side
+                    // without loading either blob. External drivers still run
+                    // and own `%A`, regardless of the strategy option.
                     favored_resolution(favor, Some(ours), Some(theirs))
                 } else {
-                    MergeResolution::Conflict(ConflictKind::BothChanged {
-                        base: None,
-                        ours: ours.hash,
-                        theirs: theirs.hash,
-                        driver,
-                    })
+                    match try_merge_blob_contents(path, None, ours, theirs, driver, context)? {
+                        BlobMergeAttempt::Clean(merged) => MergeResolution::Use(merged),
+                        BlobMergeAttempt::Conflict { driver, rendered } => {
+                            MergeResolution::Conflict(ConflictKind::BothChanged {
+                                base: None,
+                                ours: ours.hash,
+                                theirs: theirs.hash,
+                                driver,
+                                rendered,
+                            })
+                        }
+                        BlobMergeAttempt::NotApplicable if favor.is_some() => favored_resolution(
+                            favor.unwrap_or(MergeFavor::Ours),
+                            Some(ours),
+                            Some(theirs),
+                        ),
+                        BlobMergeAttempt::NotApplicable => {
+                            MergeResolution::Conflict(ConflictKind::BothChanged {
+                                base: None,
+                                ours: ours.hash,
+                                theirs: theirs.hash,
+                                driver: BuiltinMergeDriver::Text,
+                                rendered: None,
+                            })
+                        }
+                    }
                 }
             }
         }
@@ -4064,18 +4117,31 @@ fn resolve_three_way(
                 MergeResolution::Use(theirs)
             } else {
                 let driver = context.driver_for_path(path);
-                if let Some(merged) = try_merge_blob_contents(base, ours, theirs, driver, context)?
-                {
-                    MergeResolution::Use(merged)
-                } else if let Some(favor) = favor {
-                    favored_resolution(favor, Some(ours), Some(theirs))
-                } else {
-                    MergeResolution::Conflict(ConflictKind::BothChanged {
-                        base: base.map(|b| b.hash),
-                        ours: ours.hash,
-                        theirs: theirs.hash,
-                        driver,
-                    })
+                match try_merge_blob_contents(path, base, ours, theirs, driver, context)? {
+                    BlobMergeAttempt::Clean(merged) => MergeResolution::Use(merged),
+                    BlobMergeAttempt::Conflict { driver, rendered } => {
+                        MergeResolution::Conflict(ConflictKind::BothChanged {
+                            base: base.map(|b| b.hash),
+                            ours: ours.hash,
+                            theirs: theirs.hash,
+                            driver,
+                            rendered,
+                        })
+                    }
+                    BlobMergeAttempt::NotApplicable if favor.is_some() => favored_resolution(
+                        favor.unwrap_or(MergeFavor::Ours),
+                        Some(ours),
+                        Some(theirs),
+                    ),
+                    BlobMergeAttempt::NotApplicable => {
+                        MergeResolution::Conflict(ConflictKind::BothChanged {
+                            base: base.map(|b| b.hash),
+                            ours: ours.hash,
+                            theirs: theirs.hash,
+                            driver: BuiltinMergeDriver::Text,
+                            rendered: None,
+                        })
+                    }
                 }
             }
         }
@@ -4120,12 +4186,13 @@ fn favored_resolution(
 }
 
 fn try_merge_blob_contents(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: MergeTreeEntry,
     theirs: MergeTreeEntry,
-    driver: BuiltinMergeDriver,
+    driver: SelectedMergeDriver,
     context: &mut TreeMergeContext<'_>,
-) -> Result<Option<MergeTreeEntry>, PullMergeError> {
+) -> Result<BlobMergeAttempt, PullMergeError> {
     // Git merges the CONTENT and the MODE independently
     // (`merge-ort.c` `handle_content_merge`): a side that only chmod'ed does
     // not stop the line-level merge, and the mode that differs from the base
@@ -4137,17 +4204,20 @@ fn try_merge_blob_contents(
         || !is_regular_file_mode(ours.mode)
         || !is_regular_file_mode(theirs.mode)
     {
-        return Ok(None);
+        return Ok(BlobMergeAttempt::NotApplicable);
     }
-    let merged_mode = if ours.mode == theirs.mode {
-        ours.mode
+    let (merged_mode, mode_clean) = if ours.mode == theirs.mode {
+        (ours.mode, true)
     } else if base.is_some_and(|base| ours.mode == base.mode) {
-        theirs.mode
+        (theirs.mode, true)
     } else if base.is_some_and(|base| theirs.mode == base.mode) {
-        ours.mode
+        (ours.mode, true)
     } else {
-        // Both sides changed the mode, differently.
-        return Ok(None);
+        // There is no common mode answer, but Git still runs the low-level
+        // driver for the content and leaves the path unmerged. Keeping ours'
+        // mode here lets an external driver's `%A` result survive that
+        // independent mode conflict.
+        (ours.mode, false)
     };
 
     let base_blob = match base {
@@ -4159,21 +4229,54 @@ fn try_merge_blob_contents(
     let base_data = base_blob
         .as_ref()
         .map_or(&[][..], |blob| blob.data.as_slice());
-    let merged_bytes = match merge_bytes_with_driver(
-        driver,
-        base_data,
-        &ours_blob.data,
-        &theirs_blob.data,
-        context.favor,
-        diffy::ConflictStyle::Diff3,
-        2 * context.depth,
-    )
-    .map_err(PullMergeError::TreeCreate)?
-    {
-        BuiltinMergeOutcome::Clean(bytes) => bytes,
-        BuiltinMergeOutcome::Conflict(_) => return Ok(None),
+    let marker_length = conflict_marker_length_at_depth(
+        &[base_data, &ours_blob.data, &theirs_blob.data],
+        context.depth,
+    );
+    let outcome = match &driver {
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_driver(
+            *driver,
+            base_data,
+            &ours_blob.data,
+            &theirs_blob.data,
+            context.favor,
+            diffy::ConflictStyle::Diff3,
+            2 * context.depth,
+        )
+        .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => run_external_merge_driver(
+            &context.external_merge_runtime,
+            driver,
+            ExternalMergeInput {
+                path,
+                base_id: base.map_or_else(
+                    || Blob::from_content_bytes(Vec::new()).id,
+                    |entry| entry.hash,
+                ),
+                ours_id: ours.hash,
+                theirs_id: theirs.hash,
+                base: base_data,
+                ours: &ours_blob.data,
+                theirs: &theirs_blob.data,
+                marker_length,
+                labels: context.external_labels(),
+            },
+        )
+        .map_err(PullMergeError::TreeCreate)?,
     };
 
+    let (merged_bytes, content_clean) = match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
+        BuiltinMergeOutcome::Conflict(bytes) => (bytes, false),
+    };
+    let clean = content_clean && mode_clean;
+    let rendered = matches!(driver, SelectedMergeDriver::External(_));
+    if !clean && !rendered {
+        return Ok(BlobMergeAttempt::Conflict {
+            driver: driver.fallback_builtin(),
+            rendered: None,
+        });
+    }
     let merged_blob = Blob::from_content_bytes(merged_bytes);
     // `--dry-run` (persist=false): the merged OID is computed in memory only —
     // persisting here would write the object store (and, under tiered storage,
@@ -4182,10 +4285,18 @@ fn try_merge_blob_contents(
     // virtual ancestor's content and the outer merge loads it by id.
     context.record_merged_blob(&merged_blob)?;
 
-    Ok(Some(MergeTreeEntry {
+    let entry = MergeTreeEntry {
         hash: merged_blob.id,
         mode: merged_mode,
-    }))
+    };
+    if clean {
+        Ok(BlobMergeAttempt::Clean(entry))
+    } else {
+        Ok(BlobMergeAttempt::Conflict {
+            driver: driver.fallback_builtin(),
+            rendered: Some(entry),
+        })
+    }
 }
 
 /// Choose the requested side only inside `diffy` conflict regions while
@@ -4272,9 +4383,9 @@ fn resolve_conflicted_content(
     Ok(output)
 }
 
-/// Git's built-in low-level merge drivers. External drivers are deliberately
-/// deferred to MG-09; an unknown driver name therefore resolves to `Text`, the
-/// same fallback used by `find_ll_merge_driver`.
+/// Git's built-in low-level merge drivers. A named driver without an external
+/// configuration resolves to `Text`, the same fallback used by
+/// `find_ll_merge_driver`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinMergeDriver {
     Text,
@@ -4291,12 +4402,344 @@ pub(crate) enum BuiltinMergeOutcome {
     Conflict(Vec<u8>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalMergeDriver {
+    name: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectedMergeDriver {
+    Builtin(BuiltinMergeDriver),
+    External(ExternalMergeDriver),
+}
+
+impl SelectedMergeDriver {
+    fn fallback_builtin(&self) -> BuiltinMergeDriver {
+        match self {
+            Self::Builtin(driver) => *driver,
+            Self::External(_) => BuiltinMergeDriver::Text,
+        }
+    }
+
+    fn is_builtin(&self, expected: BuiltinMergeDriver) -> bool {
+        matches!(self, Self::Builtin(driver) if *driver == expected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExternalMergeCacheKey {
+    driver: String,
+    path: PathBuf,
+    base: ObjectHash,
+    ours: ObjectHash,
+    theirs: ObjectHash,
+    marker_length: usize,
+    ancestor_label: String,
+    ours_label: String,
+    theirs_label: String,
+}
+
+#[derive(Default)]
+struct ExternalMergeRuntime {
+    drivers: HashMap<String, ExternalMergeDriver>,
+    cache: Mutex<HashMap<ExternalMergeCacheKey, BuiltinMergeOutcome>>,
+}
+
+type SharedExternalMergeRuntime = Arc<ExternalMergeRuntime>;
+
+struct ExternalMergeLabels<'a> {
+    ancestor: &'a str,
+    ours: &'a str,
+    theirs: &'a str,
+}
+
+struct ExternalMergeInput<'a> {
+    path: &'a Path,
+    base_id: ObjectHash,
+    ours_id: ObjectHash,
+    theirs_id: ObjectHash,
+    base: &'a [u8],
+    ours: &'a [u8],
+    theirs: &'a [u8],
+    marker_length: usize,
+    labels: ExternalMergeLabels<'a>,
+}
+
+struct ExternalMergeTempFiles {
+    _directory: tempfile::TempDir,
+    base: tempfile::NamedTempFile,
+    ours: tempfile::NamedTempFile,
+    theirs: tempfile::NamedTempFile,
+}
+
+impl ExternalMergeTempFiles {
+    fn create(input: &ExternalMergeInput<'_>) -> Result<Self, String> {
+        let worktree = util::try_working_dir()
+            .map_err(|error| format!("failed to resolve the worktree: {error}"))?;
+        Self::create_in(&worktree, input)
+    }
+
+    fn create_in(worktree: &Path, input: &ExternalMergeInput<'_>) -> Result<Self, String> {
+        let directory = tempfile::Builder::new()
+            .prefix(".libra-merge-driver-")
+            .tempdir_in(worktree)
+            .map_err(|error| {
+                format!("failed to create a worktree-local merge-driver directory: {error}")
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).map_err(
+                |error| format!("failed to protect the merge-driver directory: {error}"),
+            )?;
+        }
+
+        let create_file = |prefix: &str, content: &[u8]| {
+            let mut file = tempfile::Builder::new()
+                .prefix(prefix)
+                .tempfile_in(directory.path())
+                .map_err(|error| format!("failed to create merge-driver input: {error}"))?;
+            file.write_all(content)
+                .map_err(|error| format!("failed to write merge-driver input: {error}"))?;
+            file.flush()
+                .map_err(|error| format!("failed to flush merge-driver input: {error}"))?;
+            Ok::<_, String>(file)
+        };
+        let base = create_file("base-", input.base)?;
+        let ours = create_file("ours-", input.ours)?;
+        let theirs = create_file("theirs-", input.theirs)?;
+        Ok(Self {
+            _directory: directory,
+            base,
+            ours,
+            theirs,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut quoted = Vec::with_capacity(value.as_bytes().len() + 2);
+    quoted.push(b'\'');
+    for byte in value.as_bytes() {
+        if *byte == b'\'' {
+            quoted.extend_from_slice(b"'\\''");
+        } else {
+            quoted.push(*byte);
+        }
+    }
+    quoted.push(b'\'');
+    OsString::from_vec(quoted)
+}
+
+#[cfg(windows)]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut quoted = Vec::new();
+    quoted.push(b'\'' as u16);
+    for unit in value.encode_wide() {
+        if unit == b'\'' as u16 {
+            quoted.extend("'\\''".encode_utf16());
+        } else {
+            quoted.push(unit);
+        }
+    }
+    quoted.push(b'\'' as u16);
+    OsString::from_wide(&quoted)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    OsString::from(format!(
+        "'{}'",
+        value.to_string_lossy().replace('\'', "'\\''")
+    ))
+}
+
+fn expand_external_merge_path(path: &Path) -> OsString {
+    let value = path.as_os_str();
+    if value.to_str().is_some_and(|value| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    }) {
+        value.to_os_string()
+    } else {
+        // Git can insert `%O/%A/%B` verbatim because its temporary basename is
+        // shell-safe. Libra's files are worktree-local absolute paths, so an
+        // unsafe worktree directory would otherwise turn trusted global driver
+        // config into code injection merely by checking out a repository under
+        // a hostile name. Safe paths retain Git's unquoted expansion.
+        sq_quote_external_merge_value(value)
+    }
+}
+
+fn expand_external_merge_command(
+    command: &str,
+    files: &ExternalMergeTempFiles,
+    input: &ExternalMergeInput<'_>,
+) -> OsString {
+    let replacements = |token| match token {
+        'O' => Some(expand_external_merge_path(files.base.path())),
+        'A' => Some(expand_external_merge_path(files.ours.path())),
+        'B' => Some(expand_external_merge_path(files.theirs.path())),
+        'L' => Some(OsString::from(input.marker_length.to_string())),
+        'P' => Some(sq_quote_external_merge_value(input.path.as_os_str())),
+        'S' => Some(sq_quote_external_merge_value(OsStr::new(
+            input.labels.ancestor,
+        ))),
+        'X' => Some(sq_quote_external_merge_value(OsStr::new(input.labels.ours))),
+        'Y' => Some(sq_quote_external_merge_value(OsStr::new(
+            input.labels.theirs,
+        ))),
+        '%' => Some(OsString::from("%")),
+        _ => None,
+    };
+    let mut expanded = OsString::new();
+    let mut literal = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    while let Some(current) = chars.next() {
+        if current != '%' {
+            literal.push(current);
+            continue;
+        }
+        expanded.push(&literal);
+        literal.clear();
+        let Some(token) = chars.next() else {
+            literal.push('%');
+            break;
+        };
+        match replacements(token) {
+            Some(value) => expanded.push(value),
+            None => {
+                literal.push('%');
+                literal.push(token);
+            }
+        }
+    }
+    expanded.push(literal);
+    expanded
+}
+
+fn external_driver_shell(command: &OsStr) -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command);
+    process
+}
+
+fn run_external_merge_driver(
+    runtime: &ExternalMergeRuntime,
+    driver: &ExternalMergeDriver,
+    input: ExternalMergeInput<'_>,
+) -> Result<BuiltinMergeOutcome, String> {
+    let key = ExternalMergeCacheKey {
+        driver: driver.name.clone(),
+        path: input.path.to_path_buf(),
+        base: input.base_id,
+        ours: input.ours_id,
+        theirs: input.theirs_id,
+        marker_length: input.marker_length,
+        ancestor_label: input.labels.ancestor.to_string(),
+        ours_label: input.labels.ours.to_string(),
+        theirs_label: input.labels.theirs.to_string(),
+    };
+    if let Some(cached) = runtime
+        .cache
+        .lock()
+        .map_err(|_| "external merge-driver result cache is unavailable".to_string())?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let files = ExternalMergeTempFiles::create(&input)?;
+    let expanded = expand_external_merge_command(&driver.command, &files, &input);
+    // The driver protocol communicates only through `%A`. Discarding the
+    // child's streams prevents an untrusted amount of output from being held
+    // in memory and keeps command/output details out of Libra diagnostics.
+    let status = external_driver_shell(&expanded)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            format!(
+                "external merge driver '{}' could not start for '{}': {error}; check merge.{}.driver and its executable",
+                driver.name,
+                input.path.display(),
+                driver.name
+            )
+        })?;
+    let code = status.code().ok_or_else(|| {
+        format!(
+            "external merge driver '{}' was interrupted for '{}'; its temporary files were protected and cleaned",
+            driver.name,
+            input.path.display()
+        )
+    })?;
+    if !(0..=128).contains(&code) {
+        return Err(format!(
+            "external merge driver '{}' exited with status {code} for '{}'; inspect merge.{}.driver without exposing it in logs",
+            driver.name,
+            input.path.display(),
+            driver.name
+        ));
+    }
+    let merged = fs::read(files.ours.path()).map_err(|error| {
+        format!(
+            "external merge driver '{}' did not leave a readable %A result for '{}': {error}",
+            driver.name,
+            input.path.display()
+        )
+    })?;
+    let outcome = if code == 0 {
+        BuiltinMergeOutcome::Clean(merged)
+    } else {
+        BuiltinMergeOutcome::Conflict(merged)
+    };
+    runtime
+        .cache
+        .lock()
+        .map_err(|_| "external merge-driver result cache is unavailable".to_string())?
+        .insert(key, outcome.clone());
+    Ok(outcome)
+}
+
 fn builtin_driver_named(name: &str) -> BuiltinMergeDriver {
     match name {
         "binary" => BuiltinMergeDriver::Binary,
         "union" => BuiltinMergeDriver::Union,
         "text" => BuiltinMergeDriver::Text,
         _ => BuiltinMergeDriver::Text,
+    }
+}
+
+fn selected_driver_named(name: &str, runtime: &ExternalMergeRuntime) -> SelectedMergeDriver {
+    if let Some(driver) = runtime.drivers.get(name) {
+        SelectedMergeDriver::External(driver.clone())
+    } else {
+        SelectedMergeDriver::Builtin(builtin_driver_named(name))
+    }
+}
+
+fn select_merge_driver(
+    attribute: Option<AttributeState>,
+    default_driver: Option<&str>,
+    runtime: &ExternalMergeRuntime,
+) -> SelectedMergeDriver {
+    match attribute {
+        Some(AttributeState::Set) => SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text),
+        Some(AttributeState::Unset) => SelectedMergeDriver::Builtin(BuiltinMergeDriver::Binary),
+        Some(AttributeState::Value(name)) => selected_driver_named(&name, runtime),
+        Some(AttributeState::Unspecified) | None => default_driver.map_or(
+            SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text),
+            |name| selected_driver_named(name, runtime),
+        ),
     }
 }
 
@@ -4336,6 +4779,33 @@ pub(crate) async fn read_merge_default_driver() -> Result<Option<String>, String
     read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "merge.default")
         .await
         .map_err(|error| format!("{error:#}"))
+}
+
+async fn read_external_merge_runtime() -> Result<SharedExternalMergeRuntime, String> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_subsection_values_strict};
+
+    let configured =
+        read_cascaded_subsection_values_strict(LocalIdentityTarget::CurrentRepo, "merge", "driver")
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+    let mut drivers = HashMap::with_capacity(configured.len());
+    for (name, command) in configured {
+        if command.is_empty() {
+            return Err(format!(
+                "merge.{name}.driver is empty; set a shell command or remove the configuration"
+            ));
+        }
+        if command.contains('\0') {
+            return Err(format!(
+                "merge.{name}.driver contains a NUL byte; replace it with a valid shell command"
+            ));
+        }
+        drivers.insert(name.clone(), ExternalMergeDriver { name, command });
+    }
+    Ok(Arc::new(ExternalMergeRuntime {
+        drivers,
+        cache: Mutex::new(HashMap::new()),
+    }))
 }
 
 /// Apply one built-in low-level driver. The text and union drivers use a diff3
@@ -4530,6 +5000,12 @@ struct TreeMergeContext<'a> {
     depth: usize,
     /// Configured fallback used only when the path has no `merge` attribute.
     default_driver: Option<String>,
+    /// One config snapshot and result cache shared by the incremental walk,
+    /// flat fallback, rename replay, and recursive virtual-ancestor fold.
+    external_merge_runtime: SharedExternalMergeRuntime,
+    ancestor_label: String,
+    ours_label: String,
+    theirs_label: String,
     /// Blobs this merge (and, inside the recursive fold, every level below it)
     /// synthesized WITHOUT writing them, consulted by [`load_merge_blob`] ahead
     /// of the object store.
@@ -4544,6 +5020,7 @@ struct TreeMergeContext<'a> {
 
 impl TreeMergeContext<'_> {
     /// The context for a real (depth 0) merge.
+    #[cfg(test)]
     fn top_level<'a>(
         persist_merged_blobs: bool,
         favor: Option<MergeFavor>,
@@ -4555,6 +5032,31 @@ impl TreeMergeContext<'_> {
             favor,
             depth: 0,
             default_driver: default_driver.map(str::to_owned),
+            external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
+            ancestor_label: "base".to_string(),
+            ours_label: "HEAD".to_string(),
+            theirs_label: "theirs".to_string(),
+            virtual_blobs,
+        }
+    }
+
+    fn top_level_with_external<'a>(
+        persist_merged_blobs: bool,
+        favor: Option<MergeFavor>,
+        default_driver: Option<&str>,
+        theirs_label: &str,
+        external_merge_runtime: SharedExternalMergeRuntime,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
+        TreeMergeContext {
+            persist_merged_blobs,
+            favor,
+            depth: 0,
+            default_driver: default_driver.map(str::to_owned),
+            external_merge_runtime,
+            ancestor_label: "base".to_string(),
+            ours_label: "HEAD".to_string(),
+            theirs_label: theirs_label.to_string(),
             virtual_blobs,
         }
     }
@@ -4563,10 +5065,27 @@ impl TreeMergeContext<'_> {
     /// always `None` there: Git disables `-X ours`/`-X theirs` whenever
     /// `call_depth` is non-zero, because a virtual ancestor is an input the
     /// user never asked to bias.
+    #[cfg(test)]
     fn nested<'a>(
         persist_merged_blobs: bool,
         depth: usize,
         default_driver: Option<&str>,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
+        Self::nested_with_external(
+            persist_merged_blobs,
+            depth,
+            default_driver,
+            Arc::new(ExternalMergeRuntime::default()),
+            virtual_blobs,
+        )
+    }
+
+    fn nested_with_external<'a>(
+        persist_merged_blobs: bool,
+        depth: usize,
+        default_driver: Option<&str>,
+        external_merge_runtime: SharedExternalMergeRuntime,
         virtual_blobs: &'a mut VirtualBlobs,
     ) -> TreeMergeContext<'a> {
         TreeMergeContext {
@@ -4574,6 +5093,10 @@ impl TreeMergeContext<'_> {
             favor: None,
             depth,
             default_driver: default_driver.map(str::to_owned),
+            external_merge_runtime,
+            ancestor_label: "merged common ancestors".to_string(),
+            ours_label: VIRTUAL_OURS_LABEL.to_string(),
+            theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
             virtual_blobs,
         }
     }
@@ -4594,8 +5117,20 @@ impl TreeMergeContext<'_> {
         Ok(())
     }
 
-    fn driver_for_path(&self, path: &Path) -> BuiltinMergeDriver {
-        builtin_merge_driver_for_path(path, self.default_driver.as_deref())
+    fn driver_for_path(&self, path: &Path) -> SelectedMergeDriver {
+        select_merge_driver(
+            attributes::attribute_state_for_path("merge", path),
+            self.default_driver.as_deref(),
+            &self.external_merge_runtime,
+        )
+    }
+
+    fn external_labels(&self) -> ExternalMergeLabels<'_> {
+        ExternalMergeLabels {
+            ancestor: &self.ancestor_label,
+            ours: &self.ours_label,
+            theirs: &self.theirs_label,
+        }
     }
 }
 
@@ -4742,7 +5277,7 @@ fn merge_bases_of_folded_with(
 }
 
 /// The knobs every level of the virtual-ancestor fold shares.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VirtualFold<'a> {
     /// `false` under `--dry-run`: the fold keeps its blobs in memory.
     persist: bool,
@@ -4750,6 +5285,7 @@ struct VirtualFold<'a> {
     /// The fold is a merge, so it detects renames like any other (FIX-MG05-02).
     rename_config: &'a MergeRenameConfig,
     default_driver: Option<&'a str>,
+    external_merge_runtime: SharedExternalMergeRuntime,
 }
 
 /// Fold every merge base of a criss-cross history into ONE virtual ancestor
@@ -4764,6 +5300,7 @@ fn virtual_merge_base(
     conflict_style: diffy::ConflictStyle,
     rename_config: &MergeRenameConfig,
     default_driver: Option<&str>,
+    external_merge_runtime: SharedExternalMergeRuntime,
 ) -> Result<VirtualAncestor, PullMergeError> {
     let mut blobs = VirtualBlobs::new();
     let fold = VirtualFold {
@@ -4771,6 +5308,7 @@ fn virtual_merge_base(
         conflict_style,
         rename_config,
         default_driver,
+        external_merge_runtime,
     };
     let items = fold_merge_bases(bases, gitlinks, 1, &mut blobs, fold)?;
     Ok(VirtualAncestor { items, blobs })
@@ -4803,8 +5341,8 @@ fn fold_merge_bases(
         let next_commit = load_merge_commit(next)?;
         let next_items = commit_tree_split_for_merge(&next_commit)?.0;
         let sub_bases = merge_bases_of_folded(&folded_ids, next)?;
-        let sub_items = fold_merge_bases(&sub_bases, gitlinks, depth + 1, blobs, fold)?;
-        items = merge_virtual_items(&sub_items, &items, &next_items, depth, blobs, fold)?;
+        let sub_items = fold_merge_bases(&sub_bases, gitlinks, depth + 1, blobs, fold.clone())?;
+        items = merge_virtual_items(&sub_items, &items, &next_items, depth, blobs, fold.clone())?;
         folded_ids.push(*next);
         timestamp = timestamp.max(next_commit.committer.timestamp);
         if fold.persist {
@@ -4857,7 +5395,13 @@ fn merge_virtual_items(
         fold.rename_config,
         fold.conflict_style,
         (VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL),
-        &mut TreeMergeContext::nested(fold.persist, depth, fold.default_driver, blobs),
+        &mut TreeMergeContext::nested_with_external(
+            fold.persist,
+            depth,
+            fold.default_driver,
+            fold.external_merge_runtime.clone(),
+            blobs,
+        ),
     )?;
     let (base_items, our_items, their_items) = (&base_items, &our_items, &their_items);
 
@@ -4878,6 +5422,10 @@ fn merge_virtual_items(
                 favor: None,
                 depth,
                 default_driver: fold.default_driver.map(str::to_owned),
+                external_merge_runtime: fold.external_merge_runtime.clone(),
+                ancestor_label: "merged common ancestors".to_string(),
+                ours_label: VIRTUAL_OURS_LABEL.to_string(),
+                theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
                 virtual_blobs: blobs,
             };
             resolve_three_way(&path, base, ours, theirs, &mut context)?
@@ -4886,11 +5434,19 @@ fn merge_virtual_items(
             MergeResolution::Use(entry) => Some(entry),
             MergeResolution::Delete => None,
             MergeResolution::Conflict(kind) => {
+                if let ConflictKind::BothChanged {
+                    rendered: Some(entry),
+                    ..
+                } = kind
+                {
+                    merged.insert(path, entry);
+                    continue;
+                }
                 let driver = match kind {
                     ConflictKind::BothChanged { driver, .. } => driver,
                     _ => BuiltinMergeDriver::Text,
                 };
-                virtual_conflict_resolution(base, ours, theirs, driver, depth, blobs, fold)?
+                virtual_conflict_resolution(base, ours, theirs, driver, depth, blobs, fold.clone())?
             }
         };
         if let Some(entry) = entry {
@@ -5035,6 +5591,10 @@ fn virtual_conflict_resolution(
             favor: None,
             depth,
             default_driver: None,
+            external_merge_runtime: fold.external_merge_runtime.clone(),
+            ancestor_label: "merged common ancestors".to_string(),
+            ours_label: VIRTUAL_OURS_LABEL.to_string(),
+            theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
             virtual_blobs: blobs,
         }
         .record_merged_blob(blob)
@@ -7365,10 +7925,11 @@ fn merge_rename_content(
         None => &[],
     };
     let driver = context.driver_for_path(path);
-    if driver == BuiltinMergeDriver::Binary
-        || merge_input_is_binary(base_data)
-        || merge_input_is_binary(&ours_blob.data)
-        || merge_input_is_binary(&theirs_blob.data)
+    if matches!(driver, SelectedMergeDriver::Builtin(_))
+        && (driver.is_builtin(BuiltinMergeDriver::Binary)
+            || merge_input_is_binary(base_data)
+            || merge_input_is_binary(&ours_blob.data)
+            || merge_input_is_binary(&theirs_blob.data))
     {
         if context.depth > 0 {
             // ll_binary_merge(virtual_ancestor) returns orig with LL_MERGE_OK.
@@ -7392,7 +7953,7 @@ fn merge_rename_content(
         }
         // ll_binary_merge selects bytes only; handle_content_merge retains
         // the mode result even when the selected side has a different mode.
-        let (hash, content_clean) = match (driver, favor) {
+        let (hash, content_clean) = match (driver.fallback_builtin(), favor) {
             (BuiltinMergeDriver::Union, _) | (_, None) => (ours.hash, false),
             (_, Some(MergeFavor::Ours)) => (ours.hash, true),
             (_, Some(MergeFavor::Theirs)) => (theirs.hash, true),
@@ -7410,18 +7971,45 @@ fn merge_rename_content(
         context.depth,
     )
     .saturating_add(1);
-    let (bytes, clean) = match merge_bytes_with_driver(
-        driver,
-        base_data,
-        &ours_blob.data,
-        &theirs_blob.data,
-        favor,
-        conflict_style,
-        1 + 2 * context.depth,
-    )
-    .map_err(PullMergeError::TreeCreate)?
-    {
+    let outcome = match &driver {
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_driver(
+            *driver,
+            base_data,
+            &ours_blob.data,
+            &theirs_blob.data,
+            favor,
+            conflict_style,
+            1 + 2 * context.depth,
+        )
+        .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => run_external_merge_driver(
+            &context.external_merge_runtime,
+            driver,
+            ExternalMergeInput {
+                path,
+                base_id: base.map_or_else(
+                    || Blob::from_content_bytes(Vec::new()).id,
+                    |entry| entry.hash,
+                ),
+                ours_id: ours.hash,
+                theirs_id: theirs.hash,
+                base: base_data,
+                ours: &ours_blob.data,
+                theirs: &theirs_blob.data,
+                marker_length: marker_len,
+                labels: ExternalMergeLabels {
+                    ancestor: base_label,
+                    ours: ours_label,
+                    theirs: theirs_label,
+                },
+            },
+        )
+        .map_err(PullMergeError::TreeCreate)?,
+    };
+    let external = matches!(driver, SelectedMergeDriver::External(_));
+    let (bytes, clean) = match outcome {
         BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
+        BuiltinMergeOutcome::Conflict(bytes) if external => (bytes, false),
         BuiltinMergeOutcome::Conflict(bytes) => (
             relabel_conflict_markers(bytes, marker_len, ours_label, theirs_label, base_label),
             false,
@@ -7456,13 +8044,14 @@ fn rename_destination_conflict(
         *ours
     } else if !is_regular_file_mode(ours.mode)
         || !is_regular_file_mode(theirs.mode)
-        || driver == BuiltinMergeDriver::Binary
-        || merge_input_is_binary(&ours_blob.data)
-        || merge_input_is_binary(&theirs_blob.data)
+        || (matches!(driver, SelectedMergeDriver::Builtin(_))
+            && (driver.is_builtin(BuiltinMergeDriver::Binary)
+                || merge_input_is_binary(&ours_blob.data)
+                || merge_input_is_binary(&theirs_blob.data)))
     {
         // Git's binary fallback selects one complete input. Even a favored
         // result still carries the path conflict and both original stages.
-        match (driver, context.favor) {
+        match (driver.fallback_builtin(), context.favor) {
             (BuiltinMergeDriver::Union, _) | (_, Some(MergeFavor::Ours) | None) => *ours,
             (_, Some(MergeFavor::Theirs)) => *theirs,
         }
@@ -7470,13 +8059,17 @@ fn rename_destination_conflict(
         // A base-less add/add still merges against the empty blob. In
         // particular, an empty added file has no conflicting hunk for -X to
         // choose, so it must not erase the other side's nonempty content.
-        match try_merge_blob_contents(None, *ours, *theirs, driver, context)? {
-            Some(merged) => MergeTreeEntry {
+        match try_merge_blob_contents(path, None, *ours, *theirs, driver.clone(), context)? {
+            BlobMergeAttempt::Clean(merged)
+            | BlobMergeAttempt::Conflict {
+                rendered: Some(merged),
+                ..
+            } => MergeTreeEntry {
                 hash: merged.hash,
                 mode: ours.mode,
             },
-            None => {
-                let bytes = if driver == BuiltinMergeDriver::Binary {
+            BlobMergeAttempt::Conflict { .. } | BlobMergeAttempt::NotApplicable => {
+                let bytes = if driver.is_builtin(BuiltinMergeDriver::Binary) {
                     ours_blob.data
                 } else {
                     both_changed_conflict_content(
@@ -9443,10 +10036,12 @@ async fn perform_incremental_three_way_merge(
         base_tree,
         ours_tree,
         theirs_tree,
-        &mut TreeMergeContext::top_level(
+        &mut TreeMergeContext::top_level_with_external(
             !options.dry_run,
             options.favor,
             options.merge_default_driver.as_deref(),
+            upstream,
+            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
         rename_config.enabled,
@@ -9481,10 +10076,12 @@ async fn perform_incremental_three_way_merge(
         ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
         ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
     })?;
-    let mut rename_context = TreeMergeContext::top_level(
+    let mut rename_context = TreeMergeContext::top_level_with_external(
         !options.dry_run,
         options.favor,
         options.merge_default_driver.as_deref(),
+        upstream,
+        options.external_merge_runtime.clone(),
         &mut virtual_blobs,
     );
     let rename_decisions = apply_incremental_renames(
@@ -9645,10 +10242,12 @@ async fn perform_incremental_three_way_merge(
                 df_branch_label(MergeSide::Ours, upstream).as_str(),
                 upstream,
             ),
-            &mut TreeMergeContext::top_level(
+            &mut TreeMergeContext::top_level_with_external(
                 !options.dry_run,
                 options.favor,
                 options.merge_default_driver.as_deref(),
+                upstream,
+                options.external_merge_runtime.clone(),
                 &mut virtual_blobs,
             ),
         )?;
@@ -10409,7 +11008,14 @@ fn write_conflict_markers(
             ours,
             theirs,
             driver,
+            rendered,
         } => {
+            if let Some(rendered) = rendered {
+                return load_object::<Blob>(&rendered.hash)
+                    .map(|blob| blob.data)
+                    .map_err(|error| error.to_string())
+                    .and_then(|content| write_workdir_file(workdir, path, &content));
+            }
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
             match driver {
@@ -11000,11 +11606,180 @@ mod driver {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &rename_config,
                 default_driver: Some("binary"),
+                external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
             },
         )
         .expect("recursive binary-driver merge");
 
         assert_eq!(merged.get(&path), Some(&base));
+    }
+}
+
+#[cfg(test)]
+mod ext_driver {
+    #[cfg(unix)]
+    use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+
+    use super::*;
+
+    fn input<'a>(path: &'a Path, labels: ExternalMergeLabels<'a>) -> ExternalMergeInput<'a> {
+        ExternalMergeInput {
+            path,
+            base_id: ObjectHash::new(&[1; 20]),
+            ours_id: ObjectHash::new(&[2; 20]),
+            theirs_id: ObjectHash::new(&[3; 20]),
+            base: b"base\n",
+            ours: b"ours\n",
+            theirs: b"theirs\n",
+            marker_length: 9,
+            labels,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholders_quote_only_path_and_revision_labels() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let path = Path::new("dir/odd ' $(touch PWNED).txt");
+        let merge_input = input(
+            path,
+            ExternalMergeLabels {
+                ancestor: "merged common ancestors",
+                ours: "Temporary merge branch 1's side",
+                theirs: "Temporary merge branch 2 $(false)",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let expanded = expand_external_merge_command(
+            "driver %O %A %B %L %P %S %X %Y %% %Q",
+            &files,
+            &merge_input,
+        );
+        let expanded = expanded.to_string_lossy();
+
+        assert!(expanded.contains(files.base.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(files.ours.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(files.theirs.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(" 9 "));
+        assert!(expanded.contains("'dir/odd '\\'' $(touch PWNED).txt'"));
+        assert!(expanded.contains("'merged common ancestors'"));
+        assert!(expanded.contains("'Temporary merge branch 1'\\''s side'"));
+        assert!(expanded.contains("'Temporary merge branch 2 $(false)'"));
+        assert!(expanded.ends_with(" % %Q"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_expansion_preserves_non_utf8_path_bytes() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let raw_path = b"dir/non-utf8-\xff.txt";
+        let path = Path::new(OsStr::from_bytes(raw_path));
+        let merge_input = input(
+            path,
+            ExternalMergeLabels {
+                ancestor: "base",
+                ours: "HEAD",
+                theirs: "feature",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let expanded = expand_external_merge_command("driver %P", &files, &merge_input);
+        let expanded = expanded.as_os_str().as_bytes();
+
+        assert!(
+            expanded
+                .windows(raw_path.len())
+                .any(|window| window == raw_path),
+            "%P must preserve platform-native path bytes"
+        );
+
+        let raw_temp_path = b"/tmp/worktree-\xff/ours-file";
+        let quoted_temp = expand_external_merge_path(Path::new(OsStr::from_bytes(raw_temp_path)));
+        assert!(
+            quoted_temp
+                .as_os_str()
+                .as_bytes()
+                .windows(raw_temp_path.len())
+                .any(|window| window == raw_temp_path),
+            "%O/%A/%B path expansion must preserve platform-native bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_inputs_are_private_unpredictable_and_removed_on_drop() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let merge_input = input(
+            Path::new("driver.txt"),
+            ExternalMergeLabels {
+                ancestor: "base",
+                ours: "HEAD",
+                theirs: "feature",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let directory = files._directory.path().to_path_buf();
+        assert_eq!(
+            fs::metadata(&directory)
+                .expect("temp metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let names: HashSet<_> = [&files.base, &files.ours, &files.theirs]
+            .into_iter()
+            .map(|file| {
+                file.path()
+                    .file_name()
+                    .expect("random file name")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 3);
+        for file in [&files.base, &files.ours, &files.theirs] {
+            assert!(file.path().is_absolute());
+            assert_eq!(
+                fs::metadata(file.path())
+                    .expect("input metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "merge inputs are not readable by group/other"
+            );
+        }
+        drop(files);
+        assert!(!directory.exists(), "RAII removes the temporary directory");
+    }
+
+    #[test]
+    fn configured_driver_overrides_a_builtin_name_but_boolean_attributes_do_not() {
+        let runtime = ExternalMergeRuntime {
+            drivers: HashMap::from([(
+                "text".to_string(),
+                ExternalMergeDriver {
+                    name: "text".to_string(),
+                    command: "custom".to_string(),
+                },
+            )]),
+            cache: Mutex::new(HashMap::new()),
+        };
+        assert!(matches!(
+            select_merge_driver(
+                Some(AttributeState::Value("text".to_string())),
+                None,
+                &runtime
+            ),
+            SelectedMergeDriver::External(_)
+        ));
+        assert_eq!(
+            select_merge_driver(Some(AttributeState::Set), Some("text"), &runtime),
+            SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text)
+        );
     }
 }
 
@@ -11613,6 +12388,7 @@ mod recursive {
     use std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
+        sync::Arc,
     };
 
     use git_internal::{
@@ -11701,6 +12477,7 @@ mod recursive {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
             },
         )
         .expect("folding two ancestors never fails")
@@ -11737,6 +12514,7 @@ mod recursive {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
             },
         )
         .expect_err("one level past the ceiling is refused");
@@ -11752,6 +12530,7 @@ mod recursive {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
             },
         )
         .expect_err("these ids name no object");
@@ -11781,6 +12560,7 @@ mod recursive {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
             },
         )
         .expect_err("one base past the width ceiling is refused");
@@ -11799,6 +12579,7 @@ mod recursive {
                 conflict_style: diffy::ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
             },
         )
         .expect_err("these ids name no object");
