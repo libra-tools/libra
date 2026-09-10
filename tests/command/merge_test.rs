@@ -9305,6 +9305,96 @@ fn merge_a_blocked_rename_keeps_its_source_occupied() {
     );
 }
 
+/// MG-05 fixed-point complement to R16: re-taking a blocked rename source must
+/// also re-check destinations BELOW that source. Here `a -> x` is blocked by
+/// the other side's independent `x`, so file `a` stays and must in turn block
+/// the optimistically released `b -> a/child`. Missing that descendant edge
+/// leaves a file and one of its children in the same index/tree.
+#[test]
+fn merge_a_reoccupied_rename_source_blocks_descendant_destinations() {
+    let mut results = Vec::new();
+    for env in [
+        &[][..],
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "other.txt", "o\n", "root");
+        assert_cli_success(&run_libra_command(&["branch", "root"], p), "root hub");
+        let a_body: String = (1..=8).map(|n| format!("a{n}\n")).collect();
+        let b_body: String = (1..=8).map(|n| format!("b{n}\n")).collect();
+        std::fs::write(p.join("a"), &a_body).expect("a");
+        std::fs::write(p.join("b"), &b_body).expect("b");
+        assert_cli_success(&run_libra_command(&["add", "a", "b"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+            "base",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
+
+        assert_cli_success(&run_libra_command(&["rm", "a", "b"], p), "drop");
+        std::fs::create_dir(p.join("a")).expect("a directory");
+        std::fs::write(p.join("a/child"), &b_body).expect("a/child");
+        std::fs::write(p.join("x"), &a_body).expect("x");
+        assert_cli_success(&run_libra_command(&["add", "a/child", "x"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "ours renames a to x and b to a/child",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "ours",
+        );
+
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
+        std::fs::write(p.join("a"), a_body.replace("a2\n", "a2 EDIT\n")).expect("edit a");
+        std::fs::write(p.join("b"), b_body.replace("b2\n", "b2 EDIT\n")).expect("edit b");
+        // This blocks `a -> x`; re-taking source `a` must then block the
+        // descendant destination `a/child` as well.
+        std::fs::write(p.join("x"), "theirs own x\n").expect("x");
+        assert_cli_success(&run_libra_command(&["add", "a", "b", "x"], p), "stage");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "commit",
+                    "-m",
+                    "theirs edits both and adds x",
+                    "--no-verify",
+                ],
+                p,
+            ),
+            "theirs",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "root"], p), "via root");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+
+        let _ = merge_expecting_conflict(p, &["merge", "feature"], env);
+        let listing = run_libra_command(&["ls-files", "-s"], p);
+        assert_cli_success(&listing, "ls-files still works");
+        let mut stages: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| !line.contains("libraignore"))
+            .map(|line| line.to_string())
+            .collect();
+        stages.sort();
+        let b_stages = index_stage_lines(p, "b");
+        assert!(
+            b_stages.iter().any(|line| line.contains(" 3\t")),
+            "walk {env:?}: theirs' edit to blocked source `b` survives: {stages:?}"
+        );
+        results.push(stages);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "the two walks agree on the descendant dependency"
+    );
+}
+
 /// Codex R15: two renames can free each other's destination. Ours renames both
 /// `old` to `new` and `new/child` to `z`, so nothing is left under `new` for
 /// the first rename to collide with. Measured on git 2.50.1 with theirs editing

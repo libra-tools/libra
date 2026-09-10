@@ -6043,6 +6043,62 @@ struct RenameDecision {
     declined: Option<RenameDeclined>,
 }
 
+/// Rename candidates whose destinations can be blocked by one path becoming
+/// occupied. A file at `a/b` blocks a destination at `a`, while a file at `a`
+/// blocks a destination at `a/b`; both directions matter when a declined
+/// rename puts its source back into the occupancy index.
+struct DestinationDependents<'a> {
+    exact: HashMap<&'a Path, Vec<usize>>,
+    strict_descendants: HashMap<&'a Path, Vec<usize>>,
+}
+
+impl<'a> DestinationDependents<'a> {
+    fn from_pairs(
+        pairs: &[(usize, &'a rename_detect::RenameMatch)],
+        declined: &[Option<RenameDeclined>],
+    ) -> Self {
+        let mut exact: HashMap<&Path, Vec<usize>> = HashMap::new();
+        let mut strict_descendants: HashMap<&Path, Vec<usize>> = HashMap::new();
+        for (slot, (_, pair)) in pairs.iter().enumerate() {
+            if declined[slot].is_some() {
+                continue;
+            }
+            exact.entry(pair.new.as_path()).or_default().push(slot);
+            for ancestor in pair
+                .new
+                .ancestors()
+                .skip(1)
+                .take_while(|path| !path.as_os_str().is_empty())
+            {
+                strict_descendants.entry(ancestor).or_default().push(slot);
+            }
+        }
+        Self {
+            exact,
+            strict_descendants,
+        }
+    }
+
+    fn requeue_blocked_by(&self, occupied: &Path, queue: &mut Vec<usize>) {
+        // Destinations equal to or above the occupied path are blocked by an
+        // entry beneath them.
+        for path in occupied
+            .ancestors()
+            .take_while(|path| !path.as_os_str().is_empty())
+        {
+            if let Some(affected) = self.exact.get(path) {
+                queue.extend(affected.iter().copied());
+            }
+        }
+        // Destinations below the occupied path are blocked when that occupant
+        // is a file. Requeueing directory destinations is harmless; the
+        // occupancy check below remains the source of truth for entry kind.
+        if let Some(affected) = self.strict_descendants.get(occupied) {
+            queue.extend(affected.iter().copied());
+        }
+    }
+}
+
 /// Decide which detected renames the three-way match can use. One place, so
 /// the two engines and the tests see the same rules.
 fn decide_renames(
@@ -6138,17 +6194,7 @@ fn decide_renames(
             occupancy[other].apply(&pair.old, marker, true, -1);
         }
     }
-    // Which renames could a path becoming occupied again affect? Only those
-    // whose destination is that path or a directory above it.
-    let mut by_destination: HashMap<&Path, Vec<usize>> = HashMap::new();
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
-        if declined[slot].is_none() {
-            by_destination
-                .entry(pair.new.as_path())
-                .or_default()
-                .push(slot);
-        }
-    }
+    let destination_dependents = DestinationDependents::from_pairs(&pairs, &declined);
     let mut queue: Vec<usize> = (0..pairs.len())
         .filter(|slot| declined[*slot].is_none())
         .collect();
@@ -6165,11 +6211,7 @@ fn decide_renames(
         // The source stays where it is, so it occupies its path again.
         if let Some(marker) = counted_at(other, &pair.old) {
             occupancy[other].apply(&pair.old, marker, true, 1);
-            for path in paths_and_ancestors(std::iter::once(pair.old.as_path())) {
-                if let Some(affected) = by_destination.get(path.as_path()) {
-                    queue.extend(affected.iter().copied());
-                }
-            }
+            destination_dependents.requeue_blocked_by(&pair.old, &mut queue);
         }
     }
 
@@ -6288,6 +6330,10 @@ fn base_holds_anything_at(
 struct DestinationOccupancy {
     /// Files — anything that is not a directory marker — at or under a path.
     files: HashMap<PathBuf, usize>,
+    /// Non-directory entries at their exact paths. `files` answers whether
+    /// anything is at or below a destination; this companion index answers
+    /// whether a FILE sits on the way to a descendant destination.
+    files_at_path: HashMap<PathBuf, usize>,
     /// Empty-directory markers under a path. A marker never counts at its OWN
     /// path, only the directories above it, and blocks a destination only where
     /// the merge base had nothing there (MG-04's base-presence rule).
@@ -6302,6 +6348,10 @@ impl DestinationOccupancy {
     /// the rename that creates it — and for an empty-directory marker, which
     /// only ever occupies the directories above it.
     fn apply(&mut self, path: &Path, marker: bool, at_own_path: bool, delta: i64) {
+        if !marker && at_own_path {
+            let slot = self.files_at_path.entry(path.to_path_buf()).or_insert(0);
+            *slot = slot.saturating_add_signed(delta as isize);
+        }
         let counts = if marker {
             &mut self.markers
         } else {
@@ -6322,6 +6372,19 @@ impl DestinationOccupancy {
         }
     }
 
+    fn file_occupied(&self, path: &Path) -> bool {
+        self.files.get(path).is_some_and(|count| *count > 0)
+            || path
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| {
+                    self.files_at_path
+                        .get(ancestor)
+                        .is_some_and(|count| *count > 0)
+                })
+    }
+
     /// Is anything left at or under `path` once the accepted renames have taken
     /// their sources away?
     fn occupied(
@@ -6330,7 +6393,7 @@ impl DestinationOccupancy {
         base: &HashMap<PathBuf, MergeTreeEntry>,
         base_names: &HashSet<PathBuf>,
     ) -> bool {
-        if self.files.get(path).is_some_and(|count| *count > 0) {
+        if self.file_occupied(path) {
             return true;
         }
         self.markers.get(path).is_some_and(|count| *count > 0)
@@ -6390,20 +6453,6 @@ fn side_occupancy(
         occupancy.apply(path, entry.mode == TreeItemMode::Tree, true, 1);
     }
     occupancy
-}
-
-/// Every directory on the way to one of `paths`, `paths` themselves included.
-fn paths_and_ancestors<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for path in paths {
-        for ancestor in path.ancestors() {
-            if ancestor.as_os_str().is_empty() {
-                break;
-            }
-            out.push(ancestor.to_path_buf());
-        }
-    }
-    out
 }
 
 /// How many accepted renames the given side made — the moves the merge
@@ -6726,12 +6775,23 @@ fn apply_incremental_renames(
             && occupancy.markers.get(path).is_some_and(|count| *count > 0)
     };
     let conflicted_paths: HashSet<&PathBuf> = conflicts.iter().map(|(path, _)| path).collect();
-    // `(marker, at_own_path)` — the same two facts the entry was counted with.
-    let held_at = |path: &PathBuf| -> Option<(bool, bool)> {
+    // `(marker, at_own_path, already_counted)` — the facts needed to release
+    // and, when a rename is blocked, restore the other side's source. A D/F
+    // candidate is deliberately not yet in `merged` or `conflicts`; the input
+    // source tuple is still authoritative there and must be indexed before it
+    // can participate in the optimistic release.
+    let held_at = |index: usize, path: &PathBuf| -> Option<(bool, bool, bool)> {
         merged
             .get(path)
-            .map(|entry| (entry.mode == TreeItemMode::Tree, false))
-            .or_else(|| conflicted_paths.contains(path).then_some((false, true)))
+            .map(|entry| (entry.mode == TreeItemMode::Tree, false, true))
+            .or_else(|| {
+                conflicted_paths
+                    .contains(path)
+                    .then_some((false, true, true))
+            })
+            .or_else(|| {
+                other_at(index, path).map(|entry| (entry.mode == TreeItemMode::Tree, true, false))
+            })
     };
     // PASS 1 — the declines that do not depend on occupancy.
     let pairs: Vec<(usize, &rename_detect::RenameMatch)> = per_side[0]
@@ -6768,23 +6828,18 @@ fn apply_incremental_renames(
     // PASS 2 — occupancy, as the same fixed point the flattening engine runs:
     // release every eligible source, then re-take the ones whose destination
     // turns out to be occupied and re-check only what that could affect.
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
+    for (slot, (index, pair)) in pairs.iter().enumerate() {
         if declined[slot].is_some() {
             continue;
         }
-        if let Some((marker, at_own_path)) = held_at(&pair.old) {
+        if let Some((marker, at_own_path, already_counted)) = held_at(*index, &pair.old) {
+            if !already_counted {
+                occupancy.apply(&pair.old, marker, at_own_path, 1);
+            }
             occupancy.apply(&pair.old, marker, at_own_path, -1);
         }
     }
-    let mut by_destination: HashMap<&Path, Vec<usize>> = HashMap::new();
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
-        if declined[slot].is_none() {
-            by_destination
-                .entry(pair.new.as_path())
-                .or_default()
-                .push(slot);
-        }
-    }
+    let destination_dependents = DestinationDependents::from_pairs(&pairs, &declined);
     let mut base_presence = BasePresence::default();
     let mut queue: Vec<usize> = (0..pairs.len())
         .filter(|slot| declined[*slot].is_none())
@@ -6795,7 +6850,7 @@ fn apply_incremental_renames(
         }
         let (index, pair) = pairs[slot];
         let taken = other_adds[1 - index].contains(&pair.new)
-            || occupancy.files.get(&pair.new).is_some_and(|count| *count > 0)
+            || occupancy.file_occupied(&pair.new)
             || (occupies_marker_only(&pair.new, &occupancy)
                 && !base_holds_anything_at(source, base_tree, &pair.new, &mut base_presence)?)
             // A subtree the walk carries whole IS a directory there — but only
@@ -6806,13 +6861,9 @@ fn apply_incremental_renames(
             continue;
         }
         declined[slot] = Some(RenameDeclined::DestinationTaken);
-        if let Some((marker, at_own_path)) = held_at(&pair.old) {
+        if let Some((marker, at_own_path, _)) = held_at(index, &pair.old) {
             occupancy.apply(&pair.old, marker, at_own_path, 1);
-            for path in paths_and_ancestors(std::iter::once(pair.old.as_path())) {
-                if let Some(affected) = by_destination.get(path.as_path()) {
-                    queue.extend(affected.iter().copied());
-                }
-            }
+            destination_dependents.requeue_blocked_by(&pair.old, &mut queue);
         }
     }
     for ((index, pair), declined) in pairs.into_iter().zip(declined) {
