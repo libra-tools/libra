@@ -172,7 +172,30 @@ source path too; Libra writes it as `base:<path>`, keeping the `base` label its
 diff3 output has always used, where Git uses the abbreviated ancestor commit
 id instead (an intentional output difference).
 
-Directory renames are still not inferred.
+Directory renames are inferred at the outer merge. When every tracked path has
+left an old directory and one destination directory has the unique highest
+number of file-renames, an addition made by the other side below the old name
+follows that directory rename. A modification to an existing base path already
+follows its ordinary per-file rename. A destination tie is a directory-rename
+split: the additions stay at their old names as resolved stage-0 entries, but
+the merge stops so the user can confirm the layout; `merge --continue` can
+commit that layout immediately, or `merge --abort` can restore the old HEAD.
+
+`merge.directoryRenames=false` disables this inference. `true` moves an
+affected addition automatically and reports `Path updated: ...`; `conflict`
+(the default) moves it to the suggested destination but leaves that path
+unmerged and reports `CONFLICT (file location): ...`. If the suggested target
+is independently occupied, normal add/add conflict handling retains both
+sides. Disabling `merge.renames` disables directory inference too.
+
+Libra accepts `conflict` plus Git-compatible boolean spellings for `true` and
+`false` (including `yes`/`no`, `on`/`off`, and numeric booleans), and rejects
+any value outside those three logical modes before repository writes with
+`LBR-REPO-003`. This fail-closed parsing is an intentional safety difference
+from Git, which currently ignores unknown `merge.directoryRenames` values and
+retains its default. Human directory messages are suppressed in JSON/machine
+mode; a suggested-location or split preview uses conflict kind
+`directory-rename`.
 
 ### History-changing merge defaults
 
@@ -182,7 +205,7 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. For a non-squash merge, the resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog. Squash records no merge state; its ordinary `libra commit` supplies the commit message.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
 
-Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames` and `merge.renameLimit`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
+Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames`, `merge.renameLimit`, and `merge.directoryRenames`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
 
 ### Submodules (`160000` gitlink entries)
 
@@ -292,7 +315,7 @@ Outcomes and exit codes:
 | Clean three-way/ours merge | `Would merge cleanly by the '<strategy>' strategy.` | 0 |
 | Would conflict | `Would conflict in: <paths>` (a directory/file collision is listed under the `~`-suffixed name the file would be moved to) | 1 |
 
-The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths` and `conflict_kinds` — one `{"path", "kind", "original_path"?}` object per conflicted path, `kind` being `content`, `modify-delete`, `file-directory` or `rename-rename` (both halves of a rename/rename(1to2)), with `original_path` present only for a directory/file move (the path the file held before; `path` is then the `~`-suffixed name it would be written to, and `conflicted_paths` lists that same name). All of these keys are absent from every real merge's output (frozen schema).
+The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths` and `conflict_kinds` — one `{"path", "kind", "original_path"?}` object per conflicted path, `kind` being `content`, `modify-delete`, `file-directory`, `rename-rename` or `directory-rename`; `rename-rename` reports both destinations of a rename/rename(1to2), while `directory-rename` reports a suggested location or directory split. `original_path` is present only for a directory/file move (the path the file held before; `path` is then the `~`-suffixed name it would be written to, and `conflicted_paths` lists that same name). All of these keys are absent from every real merge's output (frozen schema).
 
 ## Human Output
 

@@ -11906,6 +11906,7 @@ fn rename_shape_table() -> Vec<(&'static str, Box<dyn Fn() -> tempfile::TempDir>
     ]
 }
 
+mod dir_rename;
 mod rename_binary;
 mod rename_fold;
 mod rename_fold_binary;

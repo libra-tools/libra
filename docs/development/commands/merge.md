@@ -138,6 +138,15 @@ flowchart TD
 - **嵌在原路径之下的目标（Codex R6，实测判定不修改）**：`old` 改名为 `old/new`、对侧修改 `old` 时，R6 主张 git 必报 `CONFLICT (file/directory)` 并把修改留在 `old~HEAD`。git 2.50.1 双路实测（`git merge-tree --write-tree --messages` 与工作区里真跑 `git merge`）均**干净合并**：无冲突消息，退出 0，结果为 `100644 679f60f4… old/new`，即 git 采纳改名并让修改跟随。改名本身移除了 `old`，占用检查看到的祖先因此不再是文件，与实现一致，故不作修改；双 walk 用例 `merge_rename_into_a_subdirectory_of_its_own_path_merges_cleanly` 钉住该口径，证据存档 `libra-plan-review/mg05-r6-git-ground-truth.log`。
 - **用例**：`command::merge_test::merge_rename_*`（改名+对侧修改干净落新路径、改名+冲突在新路径且 stage 1 为原路径 base 内容 + `--abort`、双侧改名 notice、`--json` 静默、`merge.renames=false` 退化、采纳子树内的改名、`--dry-run`、`--squash`、`--no-commit`+`--continue` 组合）与 `--lib merge::rename`（快照只含删除/新增且排除 gitlink、接受时的重映射、四种拒绝形态、超限退化仍保留精确配对）。
 
+### 目录级 rename 推断（plan-20260903 MG-07）
+
+- **事实基线与推断规则**：`infer_provisional_directory_renames` 从 MG-05 已检测的逐文件 rename pair 聚合每个旧目录的目标票数；唯一最高票获胜，平票为 split。这里不是严格多数：2/1/1 仍选择 2 票的唯一目标。推断只在最外层（`TreeMergeContext.depth == 0`）运行，且改名侧仍有任何路径留在旧目录时不成立。普通 base 路径的修改仍由 MG-05 的逐文件 remap 携带；目录推断只迁移对侧新增路径与对侧普通 rename 的 destination。
+- **配置与故障边界**：`MergeRenameConfig.directory_renames` 默认 `conflict`；接受 `conflict` 及共享 Git 布尔 parser 能解析出的 true/false 拼写（含 yes/no、on/off 和数值布尔），严格拒绝三种逻辑模式以外的值。`false` 不推断，`true` 自动迁移并打印 Git 的 `Path updated` 行，`conflict` 迁移到建议路径后保留单侧 unmerged stage 并打印 `CONFLICT (file location)`。未知值在真正进入三路合并、且早于 autostash/虚拟祖先/索引等写入时复用 `InvalidRenameConfig` fail-closed。Git 源码会忽略未知值、继续使用默认 `conflict`；Libra 的拒绝是有意安全差异，不宣称逐字节兼容。`merge.renames=false` 关闭逐文件检测，因此也关闭目录推断。
+- **平局的 stage-0 冲突**：Git 的 split-directory 判定会让整体 merge 不干净，但受影响新增路径仍是 stage 0。`ConflictKind::DirectorySplit` 表达这个「合并冲突、路径已解决」的形态：冲突写入器把一个确定性的受影响新增路径登记为 stage 0（没有新增路径时只保留目录级状态），非 squash 合并写 `MergeState`，因此可直接 `merge --continue` 接受布局，也可 `--abort`；绝不伪造 stage 1/2/3 或冲突标记。
+- **两条 tree-walk 的一致性**：增量 walk 继续在 walk/pruned diff 中收集 MG-05 候选。只有这些候选可能产生目录票时，`incremental_may_need_flat_directory_renames` 返回 read-only fallback，让同一次合并由拍平路径完成目录迁移、冲突 stage 与输出；没有目录候选的普通 merge 保持 MG-03 的剪枝路径。这样目录行为只有一个生产实现，默认与强制 `LIBRA_TEST_MERGE_TREE_WALK=flat` 的端到端结果逐项对拍。
+- **冲突组合**：迁移目标已由改名侧独立新增时，`true` 交给普通 base-less add/add，保留 stage 2/3 与两侧内容；默认 `conflict` 用同一 rename-destination 内容合并器保留路径冲突。JSON/machine 不打印人读 notice；`--dry-run` 用 `directory-rename` 作为建议落位或 split 的 `conflict_kinds.kind`，仍保持零写入。
+- **用例**：`command::merge_test::dir_rename::merge_dir_rename_*` 覆盖双向迁移、base 路径修改、部分目录不推断、`true|false|conflict` 与默认值、非法值零写入、目标 add/add、split 的 stage-0 continue/abort、JSON dry-run 及默认/flat 入口；`--lib command::merge::dir_rename` 钉住唯一最高票、平局排序、嵌套祖先票与同目录文件改名零票。
+
 ### 路径级 rename 冲突（plan-20260903 MG-06）
 
 MG-05 把「无法直接吸收的改名」一律退化成「未检测到改名」并打 notice——**这会丢掉 merge base**，冲突随之消失。MG-06 按 git `process_renames`（`merge-ort.c:2913-3232`）把它们升级为 Git 的路径级冲突。全部形态经 git 2.50.1 实测（证据目录 `/Volumes/Data/tmp/mg06-git/`）。

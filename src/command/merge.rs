@@ -660,9 +660,9 @@ pub(crate) enum PullMergeError {
     /// fall-back that would ignore a configured `diff3`.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
-    /// A rename-detection config value Git would reject (`merge.renames`,
-    /// `merge.renameLimit` and their `diff.*` fall-backs). A typo must not
-    /// silently turn detection on or off.
+    /// A rename-detection config value Libra rejects (`merge.renames`,
+    /// `merge.renameLimit`, `merge.directoryRenames`, and the applicable
+    /// `diff.*` fall-backs). A typo must not silently change merge behavior.
     #[error("bad config value '{value}' for '{key}' (expected {expected})")]
     InvalidRenameConfig {
         key: String,
@@ -2107,6 +2107,7 @@ impl MergeTreeEntry {
     }
 }
 
+#[derive(Clone)]
 struct ThreeWayMergeOptions<'a> {
     message_override: Option<String>,
     merge_log: usize,
@@ -2316,16 +2317,19 @@ async fn perform_three_way_merge(
     // incrementally, opening only the directories the sides disagree about.
     // The recursive fold of several bases (MG-02) has already read every input
     // to build its virtual ancestor, so that shape keeps the flattening path.
-    if base_commits.len() <= 1 && incremental_tree_walk_enabled() {
-        return perform_incremental_three_way_merge(
-            current_commit,
-            target_commit,
+    if base_commits.len() <= 1
+        && incremental_tree_walk_enabled()
+        && let Some(summary) = perform_incremental_three_way_merge(
+            current_commit.clone(),
+            target_commit.clone(),
             base_commits.first(),
-            head_name,
+            head_name.clone(),
             upstream,
-            options,
+            options.clone(),
         )
-        .await;
+        .await?
+    {
+        return Ok(summary);
     }
     // MG-05: the rename config is STRICT, so it is read before anything is
     // persisted — a multi-base fold materializes its virtual ancestor, and an
@@ -2813,6 +2817,12 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         // A moved modify/delete conflict is still looked up where the sides
         // HAD the file; its stages are written at the moved path.
         let source = original.as_ref().unwrap_or(path);
+        if let ConflictKind::DirectorySplit { content } = kind {
+            // Git records the addition as fully resolved (stage 0) while the
+            // directory-level decision keeps the merge itself unclean.
+            add_blob_index_entry(&mut index, path, *content, 0)?;
+            continue;
+        }
         if let ConflictKind::FileDirectory {
             file,
             file_side,
@@ -2967,6 +2977,9 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
         // `None` for every rename-driven conflict) — the 1to2 destinations get
         // their already-merged content from `write_conflict_markers`.
         ConflictKind::RenameMerged { .. } => None,
+        // A split-directory conflict is not relocated either; its optional
+        // resolved stage-0 entry is handled directly by the writer.
+        ConflictKind::DirectorySplit { .. } => None,
     }
 }
 
@@ -3925,6 +3938,11 @@ enum ConflictKind {
         content: MergeTreeEntry,
         kind: RenameConflictKind,
     },
+    /// Git marks a split directory rename unclean even though affected paths
+    /// stay resolved at stage 0. A split with no affected addition is clean.
+    DirectorySplit {
+        content: MergeTreeEntry,
+    },
 }
 
 /// A path conflict retains its stages even when its content is already settled.
@@ -3932,6 +3950,7 @@ enum ConflictKind {
 enum RenameConflictKind {
     RenameRename,
     Content,
+    DirectoryRename,
 }
 
 /// Which merge input a D/F file came from.
@@ -5799,6 +5818,17 @@ struct MergeRenameConfig {
     enabled: bool,
     threshold: u32,
     rename_limit: usize,
+    directory_renames: DirectoryRenameMode,
+}
+
+/// Git's three directory-rename modes (`merge.directoryRenames`). `conflict`
+/// is the default: infer the destination, but leave every relocated path
+/// unmerged so the user explicitly confirms it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryRenameMode {
+    False,
+    Conflict,
+    True,
 }
 
 /// Git's effective `merge.renameLimit` when the value is unset or <= 0
@@ -5818,6 +5848,7 @@ impl Default for MergeRenameConfig {
             // `git -c merge.renameLimit=0` detects renames a 30-path merge
             // needs, so `0` is the default and not "no cap".
             rename_limit: GIT_MERGE_RENAME_LIMIT_DEFAULT,
+            directory_renames: DirectoryRenameMode::Conflict,
         }
     }
 }
@@ -5886,6 +5917,23 @@ async fn merge_rename_config() -> Result<MergeRenameConfig, PullMergeError> {
             .ok()
             .filter(|limit| *limit > 0)
             .unwrap_or(GIT_MERGE_RENAME_LIMIT_DEFAULT);
+    }
+    if let Some(value) = read("merge.directoryRenames").await? {
+        let trimmed = value.trim();
+        config.directory_renames = match trimmed.to_ascii_lowercase().as_str() {
+            "conflict" => DirectoryRenameMode::Conflict,
+            _ => match parse_git_config_bool(trimmed) {
+                Some(true) => DirectoryRenameMode::True,
+                Some(false) => DirectoryRenameMode::False,
+                None => {
+                    return Err(PullMergeError::InvalidRenameConfig {
+                        key: "merge.directoryRenames".to_string(),
+                        value,
+                        expected: "true, false or conflict",
+                    });
+                }
+            },
+        };
     }
     Ok(config)
 }
@@ -6072,6 +6120,108 @@ fn rename_snapshot(
 struct SideRenames {
     matches: Vec<rename_detect::RenameMatch>,
     skipped_by_limit: bool,
+}
+
+/// One provisional directory rename selected by Git's plurality rule: the
+/// unique destination with the largest number of file renames wins. A tie is
+/// kept separately because it is a split-directory conflict, not a rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRename {
+    old: PathBuf,
+    new: PathBuf,
+    side: MergeSide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRenameSplit {
+    old: PathBuf,
+    destinations: Vec<PathBuf>,
+    side: MergeSide,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DirectoryRenamePlan {
+    renames: Vec<DirectoryRename>,
+    splits: Vec<DirectoryRenameSplit>,
+}
+
+/// Aggregate per-file rename pairs into provisional directory renames.
+///
+/// Each pair votes for its immediate parent and every non-root ancestor whose
+/// relative suffix can be removed from the destination. The unique highest
+/// count wins; a tied highest count is a split. This is Git's
+/// `get_provisional_directory_renames` rule — it is deliberately a plurality,
+/// not a strict-majority test.
+fn infer_provisional_directory_renames(
+    matches: &[rename_detect::RenameMatch],
+    side: MergeSide,
+) -> DirectoryRenamePlan {
+    let mut votes: BTreeMap<PathBuf, BTreeMap<PathBuf, usize>> = BTreeMap::new();
+    for pair in matches {
+        for old_dir in pair
+            .old
+            .ancestors()
+            .skip(1)
+            .take_while(|path| !path.as_os_str().is_empty())
+        {
+            let Ok(relative) = pair.old.strip_prefix(old_dir) else {
+                continue;
+            };
+            let mut new_dir = pair.new.as_path();
+            let mut valid = true;
+            for _ in relative.components() {
+                let Some(parent) = new_dir.parent() else {
+                    valid = false;
+                    break;
+                };
+                new_dir = parent;
+            }
+            if !valid || new_dir.as_os_str().is_empty() || new_dir == old_dir {
+                continue;
+            }
+            *votes
+                .entry(old_dir.to_path_buf())
+                .or_default()
+                .entry(new_dir.to_path_buf())
+                .or_default() += 1;
+        }
+    }
+
+    let mut plan = DirectoryRenamePlan::default();
+    for (old, destinations) in votes {
+        let Some(highest) = destinations.values().copied().max() else {
+            continue;
+        };
+        let winners: Vec<PathBuf> = destinations
+            .into_iter()
+            .filter_map(|(path, count)| (count == highest).then_some(path))
+            .collect();
+        match winners.as_slice() {
+            [new] => plan.renames.push(DirectoryRename {
+                old,
+                new: new.clone(),
+                side,
+            }),
+            [] => {}
+            _ => plan.splits.push(DirectoryRenameSplit {
+                old,
+                destinations: winners,
+                side,
+            }),
+        }
+    }
+    // Apply the most specific mapping first. This keeps a nested rename from
+    // being consumed by an ancestor mapping and is deterministic across map
+    // iteration order.
+    plan.renames.sort_by(|left, right| {
+        right
+            .old
+            .components()
+            .count()
+            .cmp(&left.old.components().count())
+            .then_with(|| left.old.cmp(&right.old))
+    });
+    plan
 }
 
 fn detect_side_renames(
@@ -6708,6 +6858,189 @@ enum RenameConflictNote {
     /// nested conflict markers.` — `merge-ort.c:3169-3178`, printed ONLY when
     /// the rename's OWN content merge came out unclean.
     Collision { old: PathBuf, new: PathBuf },
+    /// A path added by the non-renaming side follows an inferred directory
+    /// rename. `conflict` distinguishes `merge.directoryRenames=conflict`
+    /// from the automatic `true` mode.
+    DirectoryMove {
+        old: PathBuf,
+        new: PathBuf,
+        added_side: MergeSide,
+        rename_side: MergeSide,
+        conflict: bool,
+    },
+    /// No unique directory destination won. Kept deterministic and visible;
+    /// the affected paths remain at their original names.
+    DirectorySplit { old: PathBuf },
+}
+
+/// Relocate additions (including ordinary rename destinations) made by the
+/// opposite side through the inferred directory rename. Base paths themselves
+/// are left alone: the regular rename pass below already carries those to
+/// their per-file destinations.
+#[allow(clippy::too_many_arguments)]
+fn apply_directory_renames(
+    base: &HashMap<PathBuf, MergeTreeEntry>,
+    ours: &mut HashMap<PathBuf, MergeTreeEntry>,
+    theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
+    our_matches: &mut [rename_detect::RenameMatch],
+    their_matches: &mut [rename_detect::RenameMatch],
+    config: &MergeRenameConfig,
+    conflict_style: diffy::ConflictStyle,
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
+    forced: &mut Vec<(PathBuf, ConflictKind)>,
+) -> Result<Vec<RenameConflictNote>, PullMergeError> {
+    if config.directory_renames == DirectoryRenameMode::False || context.depth != 0 {
+        return Ok(Vec::new());
+    }
+
+    let ours_plan = infer_provisional_directory_renames(our_matches, MergeSide::Ours);
+    let theirs_plan = infer_provisional_directory_renames(their_matches, MergeSide::Theirs);
+    let mut notes = Vec::new();
+
+    // A split is actionable only when the renaming side actually removed the
+    // old directory. Otherwise it is just a set of unrelated file renames.
+    for split in ours_plan.splits.iter().chain(theirs_plan.splits.iter()) {
+        let (renaming, other): (
+            &HashMap<PathBuf, MergeTreeEntry>,
+            &HashMap<PathBuf, MergeTreeEntry>,
+        ) = match split.side {
+            MergeSide::Ours => (&*ours, &*theirs),
+            MergeSide::Theirs => (&*theirs, &*ours),
+        };
+        if !renaming.keys().any(|path| path.starts_with(&split.old)) {
+            let mut affected: Vec<(PathBuf, MergeTreeEntry)> = other
+                .iter()
+                .filter(|(path, entry)| {
+                    entry.mode != TreeItemMode::Tree
+                        && path.starts_with(&split.old)
+                        && base
+                            .get(*path)
+                            .is_none_or(|base_entry| base_entry.mode == TreeItemMode::Tree)
+                })
+                .map(|(path, entry)| (path.clone(), *entry))
+                .collect();
+            affected.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let Some((conflict_path, content)) = affected.into_iter().next() else {
+                continue;
+            };
+            if !forced.iter().any(|(path, _)| path == &conflict_path) {
+                forced.push((conflict_path, ConflictKind::DirectorySplit { content }));
+            }
+            notes.push(RenameConflictNote::DirectorySplit {
+                old: split.old.clone(),
+            });
+        }
+    }
+
+    for rename in ours_plan.renames.into_iter().chain(theirs_plan.renames) {
+        let (renaming, other, other_matches, added_side): (
+            &HashMap<PathBuf, MergeTreeEntry>,
+            &mut HashMap<PathBuf, MergeTreeEntry>,
+            &mut [rename_detect::RenameMatch],
+            MergeSide,
+        ) = match rename.side {
+            MergeSide::Ours => (&*ours, &mut *theirs, their_matches, MergeSide::Theirs),
+            MergeSide::Theirs => (&*theirs, &mut *ours, our_matches, MergeSide::Ours),
+        };
+        // Git's directory rename rule applies only when the old directory is
+        // gone on the side that supplied the file renames.
+        if renaming.keys().any(|path| path.starts_with(&rename.old)) {
+            continue;
+        }
+
+        let mut additions: Vec<PathBuf> = other
+            .iter()
+            .filter(|(path, entry)| {
+                entry.mode != TreeItemMode::Tree
+                    && path.starts_with(&rename.old)
+                    && base
+                        .get(*path)
+                        .is_none_or(|base_entry| base_entry.mode == TreeItemMode::Tree)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        additions.sort();
+        for old_path in additions {
+            let Ok(relative) = old_path.strip_prefix(&rename.old) else {
+                continue;
+            };
+            let new_path = rename.new.join(relative);
+            if new_path == old_path {
+                continue;
+            }
+            let Some(moved) = other.get(&old_path).copied() else {
+                continue;
+            };
+
+            // Never overwrite a second path from the SAME side. Leave the
+            // source addressable and make the ambiguity explicit instead.
+            if other.contains_key(&new_path) {
+                forced.push((
+                    old_path.clone(),
+                    ConflictKind::RenameMerged {
+                        content: moved,
+                        kind: RenameConflictKind::DirectoryRename,
+                    },
+                ));
+                notes.push(RenameConflictNote::DirectoryMove {
+                    old: old_path,
+                    new: new_path,
+                    added_side,
+                    rename_side: rename.side,
+                    conflict: true,
+                });
+                continue;
+            }
+
+            other.remove(&old_path);
+            other.insert(new_path.clone(), moved);
+            // If this addition was itself a regular rename destination, the
+            // later per-file pass must use its relocated name too.
+            for pair in other_matches.iter_mut() {
+                if pair.new == old_path {
+                    pair.new = new_path.clone();
+                }
+            }
+
+            let conflict = config.directory_renames == DirectoryRenameMode::Conflict;
+            if conflict {
+                let counterpart = renaming
+                    .get(&new_path)
+                    .copied()
+                    .filter(|entry| entry.mode != TreeItemMode::Tree);
+                let kind = match (rename.side, counterpart) {
+                    (MergeSide::Ours, Some(ours_entry)) => rename_destination_conflict(
+                        &ours_entry,
+                        &moved,
+                        branches.1,
+                        conflict_style,
+                        context,
+                    )?,
+                    (MergeSide::Theirs, Some(theirs_entry)) => rename_destination_conflict(
+                        &moved,
+                        &theirs_entry,
+                        branches.1,
+                        conflict_style,
+                        context,
+                    )?,
+                    (_, None) => ConflictKind::RenameMerged {
+                        content: moved,
+                        kind: RenameConflictKind::DirectoryRename,
+                    },
+                };
+                forced.push((new_path.clone(), kind));
+            }
+            notes.push(RenameConflictNote::DirectoryMove {
+                old: old_path,
+                new: new_path,
+                added_side,
+                rename_side: rename.side,
+                conflict,
+            });
+        }
+    }
+    Ok(notes)
 }
 
 /// MG-06: the content merge Git runs for a rename before it settles the
@@ -7377,6 +7710,39 @@ fn announce_rename_notices(
                 old.display(),
                 new.display()
             ),
+            RenameConflictNote::DirectoryMove {
+                old,
+                new,
+                added_side,
+                rename_side,
+                conflict: false,
+            } => info_println!(
+                output,
+                "Path updated: {} added in {} inside a directory that was renamed in {}; moving it to {}.",
+                old.display(),
+                df_branch_label(*added_side, upstream),
+                df_branch_label(*rename_side, upstream),
+                new.display()
+            ),
+            RenameConflictNote::DirectoryMove {
+                old,
+                new,
+                added_side,
+                rename_side,
+                conflict: true,
+            } => info_println!(
+                output,
+                "CONFLICT (file location): {} added in {} inside a directory that was renamed in {}, suggesting it should perhaps be moved to {}.",
+                old.display(),
+                df_branch_label(*added_side, upstream),
+                df_branch_label(*rename_side, upstream),
+                new.display()
+            ),
+            RenameConflictNote::DirectorySplit { old } => info_println!(
+                output,
+                "CONFLICT (directory rename split): Unclear where to rename {} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
+                old.display()
+            ),
         }
     }
 }
@@ -7405,7 +7771,7 @@ fn detect_and_apply_renames(
     // ONE reader for both sides: a blob shared by the two detections (the
     // base's, above all) is then read once.
     let mut reader = MergeRenameReader::new();
-    let (our_side, their_side) = {
+    let (mut our_side, mut their_side) = {
         let virtual_blobs = &*context.virtual_blobs;
         (
             detect_side_renames(base, ours, config, virtual_blobs, &mut reader),
@@ -7424,9 +7790,21 @@ fn detect_and_apply_renames(
             forced: Vec::new(),
         });
     }
-    let decisions = decide_renames(base, ours, theirs, &our_side.matches, &their_side.matches);
     let mut forced = Vec::new();
-    let notes = apply_renames(
+    let mut notes = apply_directory_renames(
+        base,
+        ours,
+        theirs,
+        &mut our_side.matches,
+        &mut their_side.matches,
+        config,
+        conflict_style,
+        branches,
+        context,
+        &mut forced,
+    )?;
+    let decisions = decide_renames(base, ours, theirs, &our_side.matches, &their_side.matches);
+    notes.extend(apply_renames(
         base,
         ours,
         theirs,
@@ -7435,7 +7813,7 @@ fn detect_and_apply_renames(
         conflict_style,
         branches,
         context,
-    )?;
+    )?);
     let mut limited = Vec::new();
     if our_side.skipped_by_limit {
         limited.push(MergeSide::Ours);
@@ -7449,6 +7827,40 @@ fn detect_and_apply_renames(
         notes,
         forced,
     })
+}
+
+/// The incremental walk keeps its pruning contract for ordinary merges. When
+/// its already-collected rename candidates can imply a directory rename, the
+/// caller reuses the flattening engine: directory relocation changes paths
+/// before the ordinary three-way resolution, and one implementation remains
+/// the source of truth for the resulting index stages and conflicts.
+fn incremental_may_need_flat_directory_renames(
+    sources: &[Vec<(PathBuf, MergeTreeEntry, Option<MergeTreeEntry>)>; 2],
+    dests: &[Vec<(PathBuf, MergeTreeEntry)>; 2],
+    config: &MergeRenameConfig,
+    virtual_blobs: &VirtualBlobs,
+) -> bool {
+    if !config.enabled || config.directory_renames == DirectoryRenameMode::False {
+        return false;
+    }
+    let mut reader = MergeRenameReader::new();
+    for (index, side) in [MergeSide::Ours, MergeSide::Theirs].into_iter().enumerate() {
+        if sources[index].is_empty() || dests[index].is_empty() {
+            continue;
+        }
+        let base_map: HashMap<PathBuf, MergeTreeEntry> = sources[index]
+            .iter()
+            .map(|(path, base, _)| (path.clone(), *base))
+            .collect();
+        let side_map: HashMap<PathBuf, MergeTreeEntry> = dests[index].iter().cloned().collect();
+        let detected =
+            detect_side_renames(&base_map, &side_map, config, virtual_blobs, &mut reader);
+        let plan = infer_provisional_directory_renames(&detected.matches, side);
+        if !plan.renames.is_empty() || !plan.splits.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// MG-05 for the pruned walk: the walk resolved the rename's source and
@@ -8633,7 +9045,9 @@ fn conflict_kind_name(kind: &ConflictKind) -> &'static str {
         ConflictKind::RenameMerged { kind, .. } => match kind {
             RenameConflictKind::RenameRename => "rename-rename",
             RenameConflictKind::Content => "content",
+            RenameConflictKind::DirectoryRename => "directory-rename",
         },
+        ConflictKind::DirectorySplit { .. } => "directory-rename",
     }
 }
 
@@ -8793,7 +9207,7 @@ async fn perform_incremental_three_way_merge(
     head_name: String,
     upstream: &str,
     options: ThreeWayMergeOptions<'_>,
-) -> Result<PullMergeSummary, PullMergeError> {
+) -> Result<Option<PullMergeSummary>, PullMergeError> {
     // ROOT trees go through `refs/replace` exactly as the flattening path's
     // `load_object(&commit.tree_id)` does; nested trees are read raw on both
     // paths (`Tree::load` there, `load_object_raw` here). Same view, same ids.
@@ -8819,6 +9233,14 @@ async fn perform_incremental_three_way_merge(
         &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
         rename_config.enabled,
     )?;
+    if incremental_may_need_flat_directory_renames(
+        &walk.rename_sources,
+        &walk.rename_dests,
+        &rename_config,
+        &virtual_blobs,
+    ) {
+        return Ok(None);
+    }
     let mut files_changed = walk.changed_paths;
     let df_candidates = walk.df_candidates;
     let introduced: HashSet<PathBuf> = walk
@@ -8939,7 +9361,7 @@ async fn perform_incremental_three_way_merge(
             .collect();
         let conflict_kinds = conflict_reports(&placements);
         let would_conflict = !conflicted_paths.is_empty();
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "three-way".to_string(),
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
@@ -8953,7 +9375,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict,
             conflict_kinds,
             autostash: None,
-        });
+        }));
     }
 
     let resolved_message = resolve_merge_message(
@@ -9089,7 +9511,7 @@ async fn perform_incremental_three_way_merge(
     if options.squash {
         report_incremental_walk_stats();
         reset_index_and_workdir_to_tree(&tree_id)?;
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "squash".to_string(),
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
@@ -9103,7 +9525,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict: false,
             conflict_kinds: Vec::new(),
             autostash: None,
-        });
+        }));
     }
 
     if options.no_commit {
@@ -9122,7 +9544,7 @@ async fn perform_incremental_three_way_merge(
             message: Some(resolved_message.clone()),
         }
         .save()?;
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "no-commit".to_string(),
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
@@ -9136,7 +9558,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict: false,
             conflict_kinds: Vec::new(),
             autostash: None,
-        });
+        }));
     }
 
     let message = if !options.skip_hooks {
@@ -9191,7 +9613,7 @@ async fn perform_incremental_three_way_merge(
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
     }
 
-    Ok(PullMergeSummary {
+    Ok(Some(PullMergeSummary {
         strategy: "three-way".to_string(),
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
@@ -9205,7 +9627,7 @@ async fn perform_incremental_three_way_merge(
         would_conflict: false,
         conflict_kinds: Vec::new(),
         autostash: None,
-    })
+    }))
 }
 
 /// Read-only availability probe for `--dry-run`: load every tree the result
@@ -9797,6 +10219,10 @@ fn write_conflict_markers(
         // content merge was not clean — written verbatim, never marked up
         // twice.
         ConflictKind::RenameMerged { content, .. } => {
+            let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
+            return write_workdir_entry(workdir, path, content.mode, &blob.data);
+        }
+        ConflictKind::DirectorySplit { content } => {
             let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
             return write_workdir_entry(workdir, path, content.mode, &blob.data);
         }
@@ -12487,6 +12913,82 @@ mod tree {
             collecting, graph.reads,
             "with no destination to pair, detection opens nothing extra"
         );
+    }
+}
+
+#[cfg(test)]
+mod dir_rename {
+    use super::*;
+
+    fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
+        rename_detect::RenameMatch {
+            old: PathBuf::from(old),
+            new: PathBuf::from(new),
+            exact: true,
+            internal_score: 60_000,
+        }
+    }
+
+    #[test]
+    fn unique_highest_destination_wins_without_a_strict_majority() {
+        let plan = infer_provisional_directory_renames(
+            &[
+                pair("old/a", "winner/a"),
+                pair("old/b", "winner/b"),
+                pair("old/c", "second/c"),
+                pair("old/d", "third/d"),
+            ],
+            MergeSide::Ours,
+        );
+        assert_eq!(
+            plan.renames,
+            [DirectoryRename {
+                old: PathBuf::from("old"),
+                new: PathBuf::from("winner"),
+                side: MergeSide::Ours,
+            }]
+        );
+        assert!(plan.splits.is_empty());
+    }
+
+    #[test]
+    fn tied_highest_destinations_are_sorted_and_not_inferred() {
+        let plan = infer_provisional_directory_renames(
+            &[pair("old/a", "z/a"), pair("old/b", "a/b")],
+            MergeSide::Theirs,
+        );
+        assert!(plan.renames.is_empty());
+        assert_eq!(
+            plan.splits,
+            [DirectoryRenameSplit {
+                old: PathBuf::from("old"),
+                destinations: vec![PathBuf::from("a"), PathBuf::from("z")],
+                side: MergeSide::Theirs,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_pairs_vote_for_their_parent_and_ancestor_directories() {
+        let plan =
+            infer_provisional_directory_renames(&[pair("old/sub/a", "new/sub/a")], MergeSide::Ours);
+        assert!(plan.renames.contains(&DirectoryRename {
+            old: PathBuf::from("old/sub"),
+            new: PathBuf::from("new/sub"),
+            side: MergeSide::Ours,
+        }));
+        assert!(plan.renames.contains(&DirectoryRename {
+            old: PathBuf::from("old"),
+            new: PathBuf::from("new"),
+            side: MergeSide::Ours,
+        }));
+    }
+
+    #[test]
+    fn a_file_rename_within_one_directory_casts_no_directory_vote() {
+        let plan =
+            infer_provisional_directory_renames(&[pair("same/old", "same/new")], MergeSide::Ours);
+        assert_eq!(plan, DirectoryRenamePlan::default());
     }
 }
 

@@ -106,15 +106,19 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 
 改名相关合并写出的冲突标记比普通内容冲突**长一个字符**，且每一侧的标签为 `<分支>:<路径>` 而非仅分支名——只有真正做了改名的那一侧用目标路径，另一侧仍用源路径。两者均与 Git 一致。`merge.conflictStyle=diff3` 下共同祖先的标记同样带源路径限定；Libra 写作 `base:<路径>`，沿用其 diff3 输出一贯的 `base` 标签，而 Git 在该位置写的是祖先提交的缩写，这是有意保留的输出差异。
 
-目录级改名仍然完全不推断。
+最外层合并会推断目录级改名：旧目录下所有已跟踪路径都已移走，且某个目标目录获得唯一最高的文件改名票数时，对侧在旧目录下的**新增**路径会跟随目录改名落到新目录；对 merge base 已有路径的修改，本来就由普通逐文件改名带到新路径。最高票平局属于目录改名分裂：新增路径以已解决的 stage 0 留在旧名，但合并停下让用户确认布局；可直接 `merge --continue` 提交该布局，也可 `merge --abort` 恢复旧 HEAD。
+
+`merge.directoryRenames=false` 关闭推断；`true` 自动移动受影响的新增路径并报告 `Path updated: ...`；默认值 `conflict` 会把路径移到建议位置、保留为未合并路径，并报告 `CONFLICT (file location): ...`。建议目标另有独立内容时，普通 add/add 冲突会保住两侧。关闭 `merge.renames` 也会一并关闭目录推断。
+
+Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包括 `yes`/`no`、`on`/`off` 与数值布尔）；不属于这三种逻辑模式的值会在仓库写入前以 `LBR-REPO-003` 拒绝。这是有意的 fail-closed 安全差异：Git 当前会忽略未知的 `merge.directoryRenames` 值并保留默认行为。JSON/machine 模式不打印上述人读消息；建议落位或分裂的预演以 `directory-rename` 作为冲突种类。
 
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
 
 ### `--dry-run`（Libra 扩展）
 
-`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，只要没有进行中的 merge 状态且索引没有未解决条目，脏工作树也可预演。入口检查仍适用于 `--dry-run`，包括未解决的 squash 冲突；除此之外，预演不校验工作树干净度，真实合并仍可能拒绝。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory` / `rename-rename`（后者是 rename/rename(1to2) 的两个目标），`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
+`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，只要没有进行中的 merge 状态且索引没有未解决条目，脏工作树也可预演。入口检查仍适用于 `--dry-run`，包括未解决的 squash 冲突；除此之外，预演不校验工作树干净度，真实合并仍可能拒绝。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory` / `rename-rename` / `directory-rename`；`rename-rename` 报告 rename/rename(1to2) 的两个目标，`directory-rename` 报告建议落位或目录分裂。`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
 
 ### `--restart`（Libra 扩展，移植 Lore `branch merge restart`）
 
@@ -256,7 +260,7 @@ Merge aborted.
 
 `-s ours` 使用 `strategy: "ours"`、`files_changed: 0` 并报告两个 parent。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
 
-`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete`、`file-directory` 或 `rename-rename`（后者是 rename/rename(1to2) 的两个目标）；`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
+`--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete`、`file-directory`、`rename-rename` 或 `directory-rename`；`rename-rename` 报告 rename/rename(1to2) 的两个目标，`directory-rename` 报告建议落位或目录分裂。`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
 
 ## 参数对比：Libra vs Git vs jj
 
