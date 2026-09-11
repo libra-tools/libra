@@ -86,6 +86,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "checkout",
     "tag",
     "merge",
+    "mergetool",
     "rebase",
     "reset",
     "cherry-pick",

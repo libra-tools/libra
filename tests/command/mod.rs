@@ -384,6 +384,7 @@ mod maintenance_test;
 mod merge_base_test;
 mod merge_file_test;
 mod merge_test;
+mod mergetool_test;
 mod metadata_test;
 mod mv_test;
 mod notes_test;

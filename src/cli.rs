@@ -60,7 +60,7 @@ Command Groups:
     media_group_entry!(),
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
-  Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
+  Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
   AI And Automation       code, automation, usage, graph, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
@@ -611,6 +611,11 @@ enum Commands {
     Tag(command::tag::TagArgs),
     #[command(about = "Merge changes")]
     Merge(command::merge::MergeArgs),
+    #[command(
+        about = "Run a merge-resolution tool for conflicted paths",
+        after_help = command::mergetool::MERGETOOL_EXAMPLES
+    )]
+    Mergetool(command::mergetool::MergetoolArgs),
     #[command(
         about = "Three-way merge files (git merge-file)",
         after_help = command::merge_file::MERGE_FILE_EXAMPLES
@@ -1707,6 +1712,7 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::Dirty(_)
         | Commands::Checkout(_)
         | Commands::Switch(_)
+        | Commands::Mergetool(_)
         | Commands::MergeFile(_)
         | Commands::Apply(_)
         // rerere's MERGE_RR is worktree-local (the rr-cache stays shared).
@@ -3032,6 +3038,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::Switch(cmd_args) => command::switch::execute_safe(cmd_args, &output).await?,
             Commands::Rebase(cmd_args) => command::rebase::execute_safe(cmd_args, &output).await?,
             Commands::Merge(cmd_args) => command::merge::execute_safe(cmd_args, &output).await?,
+            Commands::Mergetool(cmd_args) => {
+                command::mergetool::execute_safe(cmd_args, &output).await?
+            }
             Commands::MergeFile(cmd_args) => {
                 command::merge_file::execute_safe(cmd_args, &output).await?
             }

@@ -98,6 +98,7 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra reset` | | Move HEAD and optionally reset index or working directory | [reset.md](reset.md) |
 | `libra merge` | | Fast-forward merge a branch into the current branch | [merge.md](merge.md) |
+| `libra mergetool` | | Resolve ordinary content conflicts using a configured external tool | [mergetool.md](mergetool.md) |
 | `libra merge-file` | | Three-way merge of three files (git merge-file) | [merge-file.md](merge-file.md) |
 | `libra merge-base` | | Find the best common ancestor(s) of two commits | [merge-base.md](merge-base.md) |
 | `libra rebase` | `rb` | Reapply commits on top of another base tip with conflict resolution | [rebase.md](rebase.md) |

@@ -23,7 +23,7 @@
 //! - [`encrypt_value`] / [`decrypt_value`]: thin wrappers over the vault module.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem::swap,
     path::Path,
 };
@@ -1422,6 +1422,113 @@ pub async fn read_cascaded_config_value_strict(
     }
 
     Ok(None)
+}
+
+/// Read the names of all configuration keys under `prefix` through the strict
+/// local → global → system cascade, without exposing their values.
+///
+/// This is for feature gates that must reject an unsupported configuration
+/// namespace rather than silently ignore a setting. Section and variable names
+/// are compared case-insensitively, as in Git configuration; subsection text
+/// remains part of the returned key so the caller can apply its own policy.
+pub(crate) async fn read_cascaded_config_keys_by_prefix_strict(
+    local_target: LocalIdentityTarget<'_>,
+    prefix: &str,
+) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    let local_path = match local_target {
+        LocalIdentityTarget::CurrentRepo => match try_get_storage_path(None) {
+            Ok(storage) => Some(storage.join(DATABASE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).context("failed to resolve current repository storage");
+            }
+        },
+        LocalIdentityTarget::ExplicitDb(path) => Some(path.to_path_buf()),
+        LocalIdentityTarget::None => None,
+    };
+    if let Some(path) = local_path {
+        keys.extend(read_config_keys_by_prefix_from_db_path(&path, prefix).await?);
+    }
+
+    if let Some(path) = global_config_path() {
+        match read_config_keys_by_prefix_from_db_path(&path, prefix).await {
+            Ok(scope_keys) => keys.extend(scope_keys),
+            Err(error) => skip_global_scope_if_schema_future(&path, error).await?,
+        }
+    }
+
+    if let Some(path) = system_config_path() {
+        match read_config_keys_by_prefix_from_db_path(&path, prefix).await {
+            Ok(scope_keys) => keys.extend(scope_keys),
+            Err(error) => {
+                tracing::debug!(
+                    prefix,
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping unreadable system config namespace"
+                );
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
+async fn read_config_keys_by_prefix_from_db_path(
+    db_path: &Path,
+    prefix: &str,
+) -> Result<BTreeSet<String>> {
+    let exists = db_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
+    if !exists {
+        return Ok(BTreeSet::new());
+    }
+
+    let conn = get_db_conn_instance_for_path(db_path)
+        .await
+        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+    let mut keys = BTreeSet::new();
+    for row in config_kv::Entity::find()
+        .order_by_asc(config_kv::Column::Key)
+        .all(&conn)
+        .await
+        .with_context(|| format!("failed to query config keys in '{}'", db_path.display()))?
+    {
+        if config_key_has_prefix(&row.key, prefix) {
+            keys.insert(row.key);
+        }
+    }
+
+    if crate::internal::db::sqlite_schema_contains(&conn, "table", "config").await? {
+        for row in config::Entity::find()
+            .order_by_asc(config::Column::Id)
+            .all(&conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query legacy config keys in '{}'",
+                    db_path.display()
+                )
+            })?
+        {
+            let key = match row.name {
+                Some(name) => format!("{}.{}.{}", row.configuration, name, row.key),
+                None => format!("{}.{}", row.configuration, row.key),
+            };
+            if config_key_has_prefix(&key, prefix) {
+                keys.insert(key);
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
+fn config_key_has_prefix(key: &str, prefix: &str) -> bool {
+    key.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 /// Read every `section.<subsection>.<variable>` value through the strict
@@ -3199,6 +3306,59 @@ mod tests {
                 ("Shared".to_string(), "local-shared".to_string()),
                 ("System".to_string(), "system-only".to_string()),
                 ("local".to_string(), "lowercase-subsection".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn strict_prefix_key_snapshot_includes_all_scopes_and_legacy_rows() {
+        use crate::utils::test::ScopedEnvVar;
+
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let local_db = temp.path().join("local.db");
+        let global_db = temp.path().join("global.db");
+        let system_db = temp.path().join("system.db");
+        write_config_db(&local_db, "MERGETOOL.local.cmd", "local-tool", false).await;
+        write_config_db(
+            &global_db,
+            "mergetool.global.futurePreference",
+            "true",
+            false,
+        )
+        .await;
+        write_config_db(&system_db, "unrelated.key", "ignored", false).await;
+        {
+            let conn = crate::internal::db::open_connection_without_schema_management(
+                system_db.to_str().expect("utf8 system db path"),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("open system db");
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "INSERT INTO `config` (`configuration`, `name`, `key`, `value`) VALUES ('mergetool', 'legacy', 'path', '/usr/bin/legacy-tool')",
+            ))
+            .await
+            .expect("insert legacy mergetool key");
+            conn.close().await.expect("close system db");
+        }
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
+        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
+
+        let keys = read_cascaded_config_keys_by_prefix_strict(
+            LocalIdentityTarget::ExplicitDb(&local_db),
+            "mergetool.",
+        )
+        .await
+        .expect("read prefix key snapshot");
+
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "MERGETOOL.local.cmd".to_string(),
+                "mergetool.global.futurePreference".to_string(),
+                "mergetool.legacy.path".to_string(),
             ])
         );
     }
