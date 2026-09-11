@@ -508,6 +508,7 @@ pub(crate) async fn run_pull(
                 // is resolved inside the merge — matching `git pull`.
                 autostash: if args.autostash { Some(true) } else { None },
                 preserve_held_autostash: false,
+                strategy_evaluation: None,
             },
         )
         .await
@@ -1059,6 +1060,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
                 "merge the branches' common ancestors together first, so the history has a single merge base",
             )
             .with_hint("or pull with --rebase, which replays commits one at a time"),
+        merge::PullMergeError::OctopusStrategyUnsupported { .. } => {
+            CliError::failure(error.to_string()).with_stable_code(StableErrorCode::Unsupported)
+        }
         merge::PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::Unsupported)
             .with_hint(

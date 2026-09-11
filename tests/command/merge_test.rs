@@ -1113,8 +1113,8 @@ async fn test_merge_diverged_branch_creates_two_parent_commit() {
     assert_cli_success(&merge_output, "three-way merge");
     let stdout = String::from_utf8_lossy(&merge_output.stdout);
     assert!(
-        stdout.contains("Merge made by the 'three-way' strategy."),
-        "merge should report three-way strategy, stdout: {stdout}"
+        stdout.contains("Merge made by the 'ort' strategy."),
+        "merge should report its selected backend, stdout: {stdout}"
     );
     assert_eq!(
         std::fs::read_to_string(temp_path.join("branch1.txt")).expect("read branch1"),
@@ -3741,6 +3741,229 @@ fn create_diverged_repo_clean() -> tempfile::TempDir {
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
     commit_file(p, "main.txt", "main\n", "main edit");
     temp_repo
+}
+
+/// MG-13 G1/G2/G12/G14: explicit ort/recursive use the existing three-way
+/// result category while the selected backend is exposed through an additive
+/// JSON field. The implicit single-head default is ort as well.
+#[test]
+fn merge_strategy_ort_recursive_and_default_report_the_selected_backend() {
+    for (strategy_args, expected) in [
+        (&[][..], "ort"),
+        (&["-s", "ort"][..], "ort"),
+        (&["-s", "recursive"][..], "recursive"),
+    ] {
+        let repo = create_diverged_repo_clean();
+        let mut args = vec!["--json", "merge"];
+        args.extend_from_slice(strategy_args);
+        args.push("feature");
+        args.push("--no-verify");
+        let output = run_libra_command(&args, repo.path());
+        assert_cli_success(&output, expected);
+        let json = parse_json_stdout(&output);
+        assert_eq!(
+            json["data"]["strategy"], "three-way",
+            "the existing outcome field remains backward compatible: {json}"
+        );
+        assert_eq!(json["data"]["selected_strategy"], expected, "{json}");
+        assert!(repo.path().join("feature.txt").is_file());
+        assert!(repo.path().join("main.txt").is_file());
+    }
+}
+
+/// MG-13 G3/G6/G7: resolve deliberately ignores rename detection. A rename
+/// plus an edit therefore becomes one clean add and one modify/delete conflict,
+/// with an explicit human notice explaining the degraded result.
+#[test]
+fn merge_strategy_resolve_degrades_a_rename_to_delete_add_with_notice() {
+    let theirs = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(None, theirs);
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renames", "not-a-bool"], root),
+        "install a value resolve must not consume",
+    );
+    let output = run_libra_command(&["merge", "-s", "resolve", "feature"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolve strategy disables rename detection")
+            && stdout.contains("old.txt")
+            && stdout.contains("new.txt")
+            && stdout.contains("delete/add"),
+        "the degraded rename must be actionable: {stdout}"
+    );
+    assert_eq!(
+        index_stage_lines(root, "old.txt").len(),
+        2,
+        "base + theirs remain unresolved at the deleted source"
+    );
+    assert_eq!(
+        index_stage_lines(root, "new.txt").len(),
+        1,
+        "the renamed destination is a clean stage-0 add"
+    );
+    assert_eq!(read_merge_state(root)["strategy"], "resolve");
+}
+
+/// MG-13 G9/G10/G14: failed strategies are evaluated without mutation, the
+/// first clean strategy is replayed once, and human-only progress never leaks
+/// into the JSON envelope.
+#[test]
+fn merge_strategy_repeated_values_stop_at_the_first_clean_strategy() {
+    let theirs = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(None, theirs);
+    let root = repo.path();
+    let output = run_libra_command(
+        &[
+            "merge",
+            "-s",
+            "resolve",
+            "-s",
+            "ort",
+            "-s",
+            "ours",
+            "feature",
+            "--no-verify",
+        ],
+        root,
+    );
+    assert_cli_success(&output, "resolve-to-ort fallback");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let resolve = stdout.find("Trying merge strategy resolve...");
+    let ort = stdout.find("Trying merge strategy ort...");
+    assert!(
+        resolve.is_some() && ort.is_some() && resolve < ort,
+        "strategies must be tried in command-line order: {stdout}"
+    );
+    assert!(
+        stdout.contains("Merge made by the 'ort' strategy."),
+        "the success message must name the selected backend: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Trying merge strategy ours..."),
+        "no strategy after the first clean result may run: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("new.txt")).expect("merged rename destination"),
+        theirs
+    );
+    assert!(!root.join("old.txt").exists());
+
+    let repo = create_rename_repo(None, theirs);
+    let output = run_libra_command(
+        &[
+            "--json",
+            "merge",
+            "-s",
+            "resolve",
+            "-s",
+            "recursive",
+            "feature",
+            "--no-verify",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "machine-clean strategy fallback");
+    let stdout = String::from_utf8(output.stdout).expect("JSON is UTF-8");
+    assert!(!stdout.contains("Trying merge strategy"), "{stdout}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON envelope");
+    assert_eq!(json["data"]["strategy"], "three-way");
+    assert_eq!(json["data"]["selected_strategy"], "recursive");
+}
+
+/// MG-13 G11: when every strategy conflicts, replay the result with the
+/// smallest Git-style score (conflicted paths + unresolved stage entries).
+/// Here ort leaves three stages at the renamed destination (score 4), while
+/// resolve leaves two at the source (score 3), so resolve must win.
+#[test]
+fn merge_strategy_all_conflicts_replays_the_lowest_score() {
+    let ours = "line1\nours\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let theirs = "line1\ntheirs\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(Some(ours), theirs);
+    let root = repo.path();
+    let output = run_libra_command(&["merge", "-s", "ort", "-s", "resolve", "feature"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Trying merge strategy ort..."), "{stdout}");
+    assert!(
+        stdout.contains("Trying merge strategy resolve..."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Using the resolve strategy to prepare resolving by hand."),
+        "{stdout}"
+    );
+    assert_eq!(read_merge_state(root)["strategy"], "resolve");
+    assert_eq!(index_stage_lines(root, "old.txt").len(), 2);
+    assert_eq!(index_stage_lines(root, "new.txt").len(), 1);
+}
+
+/// A restart must replay the backend persisted with the conflict. In this
+/// fixture resolve conflicts while ort would merge cleanly, so silently
+/// falling back to the default would complete a different merge.
+#[test]
+fn merge_strategy_restart_preserves_the_selected_backend() {
+    let theirs = "line1\nline2 edited\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let repo = create_rename_repo(None, theirs);
+    let root = repo.path();
+    let initial = run_libra_command(&["merge", "-s", "resolve", "feature"], root);
+    assert_eq!(initial.status.code(), Some(128), "{initial:?}");
+    assert_eq!(read_merge_state(root)["strategy"], "resolve");
+
+    let restarted = run_libra_command(&["merge", "--restart"], root);
+    assert_eq!(
+        restarted.status.code(),
+        Some(128),
+        "restart must reproduce the resolve conflict: {restarted:?}"
+    );
+    assert_eq!(read_merge_state(root)["strategy"], "resolve");
+    assert_eq!(index_stage_lines(root, "old.txt").len(), 2);
+    assert_eq!(index_stage_lines(root, "new.txt").len(), 1);
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], root), "abort");
+}
+
+/// MG-13 G8: clap rejects an unknown backend before repository mutation and
+/// names the supported replacements in the actionable usage error.
+#[test]
+fn merge_strategy_unknown_name_lists_supported_values() {
+    let repo = create_diverged_repo_clean();
+    let before = head_commit(repo.path());
+    let output = run_libra_command(&["merge", "-s", "mystery", "feature"], repo.path());
+    assert_eq!(output.status.code(), Some(129), "{output:?}");
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{stderr}");
+    for supported in ["ort", "recursive", "resolve", "ours"] {
+        assert!(stderr.contains(supported), "missing {supported}: {stderr}");
+    }
+    assert_eq!(head_commit(repo.path()), before);
+}
+
+/// MG-13 G13/G14: a strategy-free multi-head invocation continues to select
+/// octopus, and reports that backend additively without changing `strategy`.
+#[test]
+fn merge_strategy_default_multi_head_remains_octopus() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let output = run_libra_command(&["--json", "merge", "alpha", "beta", "--no-verify"], root);
+    assert_cli_success(&output, "default octopus strategy");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["strategy"], "octopus");
+    assert_eq!(json["data"]["selected_strategy"], "octopus");
+
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let before = head_commit(root);
+    let output = run_libra_command(&["merge", "-s", "ort", "alpha", "beta"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001", "{stderr}");
+    assert!(stderr.contains("handles one target only"), "{stderr}");
+    assert_eq!(head_commit(root), before, "rejection must precede mutation");
 }
 
 fn stash_list_len(p: &Path) -> usize {

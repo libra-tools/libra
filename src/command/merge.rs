@@ -65,6 +65,7 @@ EXAMPLES:
     libra merge feature-x --no-edit  Accept the default merge message (no editor)
     libra merge --verify-signatures feature-x  Require a valid PGP signature on the merged tip
     libra merge -X ours feature-x  Favor HEAD only where content conflicts
+    libra merge -s resolve -s ort feature-x  Try resolve, then fall back to ort
     libra merge -s ours archive   Record archive as merged while retaining the HEAD tree
     libra merge topic-a topic-b topic-c  Create an octopus merge when every head merges cleanly
     libra merge --allow-unrelated-histories imported-root
@@ -83,14 +84,40 @@ NOTES:
     conflict leaves HEAD, index, and worktree unchanged; merge those heads
     one at a time to resolve conflicts. --dry-run exits 1 when the merge
     would conflict (0 for ff/up-to-date/clean); --restart discards
-    resolution work done so far, exactly like --abort, before re-running.";
+    resolution work done so far, exactly like --abort, before re-running
+    the recorded strategy.";
 
 /// Merge strategies currently implemented by Libra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergeStrategy {
+    /// The default merge-ort-compatible three-way implementation.
+    Ort,
+    /// Compatibility alias for `ort`; it uses the same implementation.
+    Recursive,
+    /// Conservative two-head merge: one base, no virtual ancestor, no renames.
+    Resolve,
     /// Record the merge relationship while retaining the current HEAD tree.
     Ours,
+}
+
+impl MergeStrategy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ort => "ort",
+            Self::Recursive => "recursive",
+            Self::Resolve => "resolve",
+            Self::Ours => "ours",
+        }
+    }
+
+    fn folds_merge_bases(self) -> bool {
+        matches!(self, Self::Ort | Self::Recursive)
+    }
+
+    fn detects_renames(self) -> bool {
+        matches!(self, Self::Ort | Self::Recursive)
+    }
 }
 
 /// Conflict-side preference accepted by the default three-way strategy.
@@ -243,10 +270,10 @@ pub struct MergeArgs {
     #[arg(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "continue_merge", "abort"])]
     pub no_ff: bool,
 
-    /// Select the merge strategy. Libra currently supports only `ours`, which
-    /// records every parent while retaining the current HEAD tree.
-    #[arg(short = 's', long = "strategy", value_enum, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
-    pub strategy: Option<MergeStrategy>,
+    /// Select one or more merge strategies in fallback order. `recursive` is
+    /// an alias for `ort`; `resolve` disables recursive bases and renames.
+    #[arg(short = 's', long = "strategy", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
+    pub strategy: Vec<MergeStrategy>,
 
     /// Pass an option to the default three-way merge. Favor and renormalize
     /// toggles use their last value; whitespace comparison flags compose.
@@ -367,6 +394,11 @@ pub struct MergeArgs {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PullMergeSummary {
     pub strategy: String,
+    /// Concrete backend selected for a public `libra merge`. This is additive:
+    /// `strategy` retains its established outcome-category values for existing
+    /// JSON consumers. Internal pull integrations leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_strategy: Option<String>,
     /// The previous HEAD commit before merge (None for root commits).
     pub old_commit: Option<String>,
     pub commit: Option<String>,
@@ -419,6 +451,55 @@ pub(crate) type MergeOutput = PullMergeSummary;
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Git's `evaluate_result()` score: worktree/index differences plus unmerged
+/// index entries. Lower is better; a later strategy wins a tie, matching
+/// `builtin/merge.c` at git@3cb9185f6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrategyEvaluationScore {
+    differing_files: usize,
+    unmerged_entries: usize,
+}
+
+impl StrategyEvaluationScore {
+    fn total(self) -> usize {
+        self.differing_files.saturating_add(self.unmerged_entries)
+    }
+
+    fn replaces(self, current: Self) -> bool {
+        self.total() <= current.total()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StrategyEvaluationSink(Arc<Mutex<Option<StrategyEvaluationScore>>>);
+
+impl StrategyEvaluationSink {
+    fn record(&self, score: StrategyEvaluationScore) -> Result<(), PullMergeError> {
+        let mut slot = self.0.lock().map_err(|_| {
+            PullMergeError::History("merge-strategy evaluation state is unavailable".to_string())
+        })?;
+        *slot = Some(score);
+        Ok(())
+    }
+
+    fn score(&self) -> Result<StrategyEvaluationScore, PullMergeError> {
+        self.0
+            .lock()
+            .map_err(|_| {
+                PullMergeError::History(
+                    "merge-strategy evaluation state is unavailable".to_string(),
+                )
+            })?
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                PullMergeError::History(
+                    "a conflicting strategy did not report its evaluation score".to_string(),
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -477,6 +558,9 @@ pub(crate) struct PullMergeOptions {
     /// autostash of the restarted merge is preserved (not demoted to the
     /// stash list as stale).
     pub preserve_held_autostash: bool,
+    /// Read-only sink used only while comparing repeated public `merge -s`
+    /// strategies. Pull and ordinary one-strategy merges leave it absent.
+    pub strategy_evaluation: Option<StrategyEvaluationSink>,
 }
 
 /// This worktree's merge sidecar, for the §C.5 pseudo-ref projection
@@ -825,6 +909,10 @@ pub(crate) enum PullMergeError {
         "Automated merge with '{target}' did not work in {paths}. Should not be doing an octopus"
     )]
     OctopusConflict { target: String, paths: String },
+    #[error(
+        "merge strategy '{strategy}' handles one target only; omit '-s' to use the automatic octopus strategy, or use '-s ours'"
+    )]
+    OctopusStrategyUnsupported { strategy: String },
     /// A three-way merge input carries a gitlink the merge would have to
     /// arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
     /// than silently dropped from the merge result the way it used to be.
@@ -941,6 +1029,10 @@ impl From<PullMergeError> for CliError {
                 .with_hint(
                     "merge the branches one at a time so each conflict can be resolved and committed",
                 ),
+            PullMergeError::OctopusStrategyUnsupported { .. } => {
+                CliError::failure(error.to_string())
+                    .with_stable_code(StableErrorCode::Unsupported)
+            }
             PullMergeError::VirtualAncestorTooDeep | PullMergeError::VirtualAncestorTooWide { .. } => {
                 CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::Unsupported)
@@ -1144,6 +1236,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     }
     match (args.branch.as_slice(), args.continue_merge, args.abort) {
         (branches, false, false) if !branches.is_empty() => {
+            let requested_strategies = args.strategy.clone();
             let strategy_options = parse_merge_strategy_options(&args.strategy_option);
             let (ff_only, no_ff) = if args.ff_only {
                 (true, false)
@@ -1181,7 +1274,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             let options = PullMergeOptions {
                 ff_only,
                 no_ff,
-                strategy: args.strategy,
+                strategy: requested_strategies.first().copied(),
                 favor: strategy_options.favor,
                 whitespace: strategy_options.whitespace,
                 renormalize: strategy_options.renormalize,
@@ -1203,11 +1296,46 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                     None
                 },
                 preserve_held_autostash: false,
+                strategy_evaluation: None,
             };
             if let [branch] = branches {
-                run_merge_for_pull_with_options(branch, branch, output, options).await
+                if requested_strategies.len() > 1 {
+                    run_merge_with_strategy_fallback(
+                        branch,
+                        branch,
+                        output,
+                        options,
+                        &requested_strategies,
+                    )
+                    .await
+                } else {
+                    let selected = requested_strategies
+                        .first()
+                        .copied()
+                        .unwrap_or(MergeStrategy::Ort);
+                    run_merge_for_pull_with_options(branch, branch, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, selected.name()))
+                }
             } else {
-                run_octopus_merge(branches, output, options).await
+                match requested_strategies.as_slice() {
+                    [] => run_octopus_merge(branches, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, "octopus")),
+                    [MergeStrategy::Ours] => run_octopus_merge(branches, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, "ours")),
+                    [strategy] => Err(PullMergeError::OctopusStrategyUnsupported {
+                        strategy: strategy.name().to_string(),
+                    }),
+                    _ => Err(PullMergeError::OctopusStrategyUnsupported {
+                        strategy: requested_strategies
+                            .iter()
+                            .map(|strategy| strategy.name())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }),
+                }
             }
         }
         ([], true, false) => run_merge_continue(output, args.no_verify, args.message.clone()).await,
@@ -1215,6 +1343,74 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
         ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
+}
+
+fn attach_selected_strategy(mut summary: PullMergeSummary, selected: &str) -> PullMergeSummary {
+    if !matches!(
+        summary.strategy.as_str(),
+        "fast-forward" | "already-up-to-date" | "abort"
+    ) {
+        summary.selected_strategy = Some(selected.to_string());
+    }
+    summary
+}
+
+/// Try repeated `-s` values without letting a failed candidate touch the
+/// repository. Each probe is the existing zero-write dry-run path; the first
+/// clean strategy is then executed once for real. If every strategy conflicts,
+/// the lowest Git `evaluate_result()` score is replayed, with the later
+/// strategy winning a tie (`builtin/merge.c`, git@3cb9185f6).
+async fn run_merge_with_strategy_fallback(
+    target_ref: &str,
+    upstream: &str,
+    output: &OutputConfig,
+    options: PullMergeOptions,
+    strategies: &[MergeStrategy],
+) -> Result<PullMergeSummary, PullMergeError> {
+    let mut best: Option<(MergeStrategy, StrategyEvaluationScore)> = None;
+    let mut probe_output = output.clone();
+    probe_output.quiet = true;
+
+    for strategy in strategies {
+        if !output.is_json() && !output.quiet {
+            println!("Trying merge strategy {}...", strategy.name());
+        }
+        let sink = StrategyEvaluationSink::default();
+        let mut probe = options.clone();
+        probe.strategy = Some(*strategy);
+        probe.dry_run = true;
+        probe.autostash = Some(false);
+        probe.strategy_evaluation = Some(sink.clone());
+        let summary =
+            run_merge_for_pull_with_options(target_ref, upstream, &probe_output, probe).await?;
+        if !summary.would_conflict {
+            let mut selected = options.clone();
+            selected.strategy = Some(*strategy);
+            return run_merge_for_pull_with_options(target_ref, upstream, output, selected)
+                .await
+                .map(|summary| attach_selected_strategy(summary, strategy.name()));
+        }
+
+        let score = sink.score()?;
+        if best.is_none_or(|(_, current)| score.replaces(current)) {
+            best = Some((*strategy, score));
+        }
+    }
+
+    let (strategy, _) = best.ok_or_else(|| {
+        PullMergeError::History("no merge strategy produced an outcome".to_string())
+    })?;
+    if !output.is_json() && !output.quiet {
+        println!(
+            "Using the {} strategy to prepare resolving by hand.",
+            strategy.name()
+        );
+    }
+    let mut selected = options;
+    selected.strategy = Some(strategy);
+    run_merge_for_pull_with_options(target_ref, upstream, output, selected)
+        .await
+        .map(|summary| attach_selected_strategy(summary, strategy.name()))
 }
 
 /// Build a merge commit that carries the repository's configured identity.
@@ -1379,6 +1575,10 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
     if output.quiet {
         return Ok(());
     }
+    let selected_strategy = result
+        .selected_strategy
+        .as_deref()
+        .unwrap_or(result.strategy.as_str());
 
     if result.dry_run {
         // `--dry-run`: preview phrasing — nothing was written, so the normal
@@ -1398,7 +1598,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
             info_println!(
                 output,
                 "Would merge cleanly by the '{}' strategy.\n(dry run: nothing was written)",
-                result.strategy
+                selected_strategy
             );
         }
         return Ok(());
@@ -1417,7 +1617,11 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
         );
     } else {
         match result.strategy.as_str() {
-            "three-way" => info_println!(output, "Merge made by the 'three-way' strategy."),
+            "three-way" => info_println!(
+                output,
+                "Merge made by the '{}' strategy.",
+                selected_strategy
+            ),
             "octopus" => info_println!(output, "Merge made by the 'octopus' strategy."),
             "ours" => info_println!(output, "Merge made by the 'ours' strategy."),
             "squash" => info_println!(output, "Squash commit -- not updating HEAD"),
@@ -1810,6 +2014,7 @@ async fn run_octopus_merge(
     if targets.is_empty() {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
+            selected_strategy: None,
             old_commit: Some(current.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -1895,6 +2100,7 @@ async fn run_octopus_merge(
                 .collect();
             return Ok(PullMergeSummary {
                 strategy: "octopus".to_string(),
+                selected_strategy: None,
                 old_commit: Some(current.id.to_string()),
                 commit: None,
                 files_changed: 0,
@@ -1934,6 +2140,7 @@ async fn run_octopus_merge(
                 "octopus"
             }
             .to_string(),
+            selected_strategy: None,
             old_commit: Some(current.id.to_string()),
             commit: None,
             files_changed,
@@ -1984,6 +2191,7 @@ async fn run_octopus_merge(
             reset_index_and_workdir_to_tree(&tree_id)?;
             let summary = PullMergeSummary {
                 strategy: "squash".to_string(),
+                selected_strategy: None,
                 old_commit: Some(current.id.to_string()),
                 commit: None,
                 files_changed,
@@ -2026,6 +2234,7 @@ async fn run_octopus_merge(
             .save()?;
             let summary = PullMergeSummary {
                 strategy: "no-commit".to_string(),
+                selected_strategy: None,
                 old_commit: Some(current.id.to_string()),
                 commit: None,
                 files_changed,
@@ -2086,6 +2295,7 @@ async fn run_octopus_merge(
 
         Ok(PullMergeSummary {
             strategy: strategy.to_string(),
+            selected_strategy: None,
             old_commit: Some(current.id.to_string()),
             commit: Some(merge_commit.id.to_string()),
             files_changed,
@@ -2204,6 +2414,8 @@ async fn prepare_octopus_tree(
         skip_hooks: options.skip_hooks,
         // Every blob remains in `VirtualBlobs` until all heads are clean.
         dry_run: true,
+        strategy: None,
+        strategy_evaluation: None,
         favor: options.favor,
         allow_unrelated_histories: options.allow_unrelated_histories,
         fast_forwardable: false,
@@ -2386,7 +2598,19 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // Git parses the value at all.
     let reaches_three_way = merge_reaches_three_way_engine(&target_commit, &options).await;
     let preflighted_rename_config = if reaches_three_way {
-        Some(merge_rename_config().await?)
+        Some(
+            if options
+                .strategy
+                .is_some_and(|strategy| !strategy.detects_renames())
+            {
+                MergeRenameConfig {
+                    enabled: false,
+                    ..MergeRenameConfig::default()
+                }
+            } else {
+                merge_rename_config().await?
+            },
+        )
     } else {
         None
     };
@@ -2503,7 +2727,7 @@ async fn merge_reaches_three_way_engine(
     target_commit: &Commit,
     options: &PullMergeOptions,
 ) -> bool {
-    if options.strategy.is_some() {
+    if options.strategy == Some(MergeStrategy::Ours) {
         return false;
     }
     let Some(current_commit_id) = Head::current_commit().await else {
@@ -2512,11 +2736,7 @@ async fn merge_reaches_three_way_engine(
     let Ok(current_commit) = load_object::<Commit>(&current_commit_id) else {
         return false;
     };
-    let Ok(bases) = merge_base_commits(
-        &current_commit,
-        target_commit,
-        merge_options_will_fold(options),
-    ) else {
+    let Ok(bases) = merge_base_commits_for_strategy(&current_commit, target_commit, options) else {
         return false;
     };
     if bases.is_empty() && !options.allow_unrelated_histories {
@@ -2557,7 +2777,11 @@ fn merge_is_up_to_date(bases: &[Commit], target_commit: &Commit) -> bool {
 /// virtual ancestor at all. Shared by the preflight and the engine so the width
 /// ceiling can never fire for a merge that decides the shape some other way.
 fn merge_options_will_fold(options: &PullMergeOptions) -> bool {
-    options.strategy.is_none() && !options.ff_only
+    options
+        .strategy
+        .unwrap_or(MergeStrategy::Ort)
+        .folds_merge_bases()
+        && !options.ff_only
 }
 
 /// Whether HEAD is the sole merge base — the shape a fast-forward (and
@@ -2591,7 +2815,7 @@ fn merge_is_fast_forward(
     options: &PullMergeOptions,
 ) -> bool {
     merge_head_is_sole_base(bases, current_commit)
-        && options.strategy.is_none()
+        && options.strategy != Some(MergeStrategy::Ours)
         && !options.no_ff
         && !options.squash
         && !options.no_commit
@@ -2610,7 +2834,7 @@ async fn preflight_merge_gitlinks(
     target_commit: &Commit,
     options: &PullMergeOptions,
 ) -> Result<(), PullMergeError> {
-    if options.strategy.is_some() {
+    if options.strategy == Some(MergeStrategy::Ours) {
         return Ok(());
     }
     let Some(current_commit_id) = Head::current_commit().await else {
@@ -2621,11 +2845,7 @@ async fn preflight_merge_gitlinks(
             commit_id: current_commit_id.to_string(),
             detail: error.to_string(),
         })?;
-    let bases = merge_base_commits(
-        &current_commit,
-        target_commit,
-        merge_options_will_fold(options),
-    )?;
+    let bases = merge_base_commits_for_strategy(&current_commit, target_commit, options)?;
     // Every shape the engine settles WITHOUT arbitrating is skipped here, so a
     // gitlink refusal can never pre-empt the engine's own verdict:
     //   * unrelated histories the user did not opt into are rejected outright;
@@ -2749,6 +2969,7 @@ async fn run_merge_for_pull_inner(
         }
         return Ok(PullMergeSummary {
             strategy: "fast-forward".to_string(),
+            selected_strategy: None,
             old_commit: None,
             commit: Some(target_commit.id.to_string()),
             files_changed,
@@ -2769,11 +2990,7 @@ async fn run_merge_for_pull_inner(
             detail: error.to_string(),
         })?;
 
-    let bases = merge_base_commits(
-        &current_commit,
-        &target_commit,
-        merge_options_will_fold(&options),
-    )?;
+    let bases = merge_base_commits_for_strategy(&current_commit, &target_commit, &options)?;
 
     if bases.is_empty() && !options.allow_unrelated_histories {
         return Err(PullMergeError::UnrelatedHistories);
@@ -2782,6 +2999,7 @@ async fn run_merge_for_pull_inner(
     if merge_is_up_to_date(&bases, &target_commit) {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit_id.to_string()),
             commit: None,
             files_changed: 0,
@@ -2805,6 +3023,7 @@ async fn run_merge_for_pull_inner(
         }
         return Ok(PullMergeSummary {
             strategy: "fast-forward".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit_id.to_string()),
             commit: Some(target_commit.id.to_string()),
             files_changed,
@@ -2839,6 +3058,8 @@ async fn run_merge_for_pull_inner(
         no_commit: options.no_commit,
         skip_hooks: options.skip_hooks,
         dry_run: options.dry_run,
+        strategy: options.strategy,
+        strategy_evaluation: options.strategy_evaluation,
         favor: options.favor,
         allow_unrelated_histories: options.allow_unrelated_histories,
         fast_forwardable: merge_head_is_sole_base(&bases, &current_commit) && !options.no_ff,
@@ -2852,7 +3073,7 @@ async fn run_merge_for_pull_inner(
         Some(MergeStrategy::Ours) => {
             perform_ours_merge(current_commit, target_commit, upstream, merge_options).await
         }
-        None => {
+        None | Some(MergeStrategy::Ort | MergeStrategy::Recursive | MergeStrategy::Resolve) => {
             perform_three_way_merge(
                 current_commit,
                 target_commit,
@@ -2891,6 +3112,11 @@ struct ThreeWayMergeOptions<'a> {
     skip_hooks: bool,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
+    /// Explicit backend name. `None` is the historical default ort path and
+    /// keeps legacy summary/reflog/state values backward compatible.
+    strategy: Option<MergeStrategy>,
+    /// Present only for the read-only probes used by repeated `merge -s`.
+    strategy_evaluation: Option<StrategyEvaluationSink>,
     /// Resolve otherwise-conflicting paths in favor of one side.
     favor: Option<MergeFavor>,
     /// Persisted in recovery state for unrelated-history restart.
@@ -2966,6 +3192,7 @@ async fn perform_ours_merge(
     if options.dry_run {
         return Ok(PullMergeSummary {
             strategy: "ours".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -2984,6 +3211,7 @@ async fn perform_ours_merge(
     if options.squash {
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -3017,6 +3245,7 @@ async fn perform_ours_merge(
         .save()?;
         return Ok(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -3061,6 +3290,7 @@ async fn perform_ours_merge(
 
     Ok(PullMergeSummary {
         strategy: "ours".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed: 0,
@@ -3098,6 +3328,8 @@ async fn perform_three_way_merge(
     // The recursive fold of several bases (MG-02) has already read every input
     // to build its virtual ancestor, so that shape keeps the flattening path.
     if base_commits.len() <= 1
+        && options.strategy != Some(MergeStrategy::Resolve)
+        && options.strategy_evaluation.is_none()
         && incremental_tree_walk_enabled()
         && let Some(summary) = perform_incremental_three_way_merge(
             current_commit.clone(),
@@ -3170,6 +3402,11 @@ async fn perform_three_way_merge(
     // side onto the new path, so the ordinary three-way match below sees one
     // triple there (Git's `detect_regular_renames` + `process_renames`).
     let mut base_items = base_items;
+    let resolve_rename_notices = if options.strategy == Some(MergeStrategy::Resolve) {
+        detect_resolve_rename_notices(&base_items, &our_items, &their_items, &virtual_blobs)
+    } else {
+        Vec::new()
+    };
     let rename_report = detect_and_apply_renames(
         &mut base_items,
         &mut our_items,
@@ -3268,12 +3505,23 @@ async fn perform_three_way_merge(
         // — and it must still report the rename decisions the real merge would
         // make, or a declined rename would be invisible until the merge itself
         // (Codex R13 P2). `--json`/`--machine` stay silent, as always.
+        announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
         announce_rename_notices(
             &rename_report.notes,
             &rename_report.limited,
             upstream,
             options.output,
         );
+        if !placements.is_empty()
+            && let Some(sink) = &options.strategy_evaluation
+        {
+            sink.record(strategy_evaluation_score(
+                &placements,
+                &base_items,
+                &our_items,
+                &their_items,
+            ))?;
+        }
         let conflicted_paths: Vec<String> = placements
             .iter()
             .map(|(path, _, _)| path.display().to_string())
@@ -3282,6 +3530,7 @@ async fn perform_three_way_merge(
         let would_conflict = !conflicted_paths.is_empty();
         return Ok(PullMergeSummary {
             strategy: "three-way".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -3323,6 +3572,7 @@ async fn perform_three_way_merge(
             base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items: merge_result.merged_items,
@@ -3337,6 +3587,7 @@ async fn perform_three_way_merge(
         // and Git prints nothing when it does. The rename notices wait for the
         // same moment and print first, so the decision that shaped the conflict
         // is read before the conflict itself.
+        announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
         announce_rename_notices(
             &rename_report.notes,
             &rename_report.limited,
@@ -3382,6 +3633,7 @@ async fn perform_three_way_merge(
     refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
     // The preflight passed, so the merge will happen: the rename notices can be
     // printed now (Codex R12 P2 — a refused merge prints no rename decision).
+    announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
     announce_rename_notices(
         &rename_report.notes,
         &rename_report.limited,
@@ -3399,6 +3651,7 @@ async fn perform_three_way_merge(
         reset_index_and_workdir_to_tree(&tree_id)?;
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -3429,7 +3682,7 @@ async fn perform_three_way_merge(
             targets: Vec::new(),
             target_refs: Vec::new(),
             base: recorded_merge_base(&base_commits).map(|base| base.to_string()),
-            strategy: None,
+            strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
             conflicted_paths: Vec::new(),
@@ -3438,6 +3691,7 @@ async fn perform_three_way_merge(
         .save()?;
         return Ok(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -3484,7 +3738,13 @@ async fn perform_three_way_merge(
     .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
-    update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
+    update_head_with_reflog(
+        &head_name,
+        merge_commit.id,
+        upstream,
+        options.strategy.map_or("three-way", MergeStrategy::name),
+    )
+    .await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
     if !options.skip_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
@@ -3492,6 +3752,7 @@ async fn perform_three_way_merge(
 
     Ok(PullMergeSummary {
         strategy: "three-way".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -3589,6 +3850,9 @@ struct MergeConflictInput {
     base: Option<ObjectHash>,
     allow_unrelated_histories: bool,
     skip_hooks: bool,
+    /// Explicit backend selected for this conflict. `None` retains the
+    /// historical implicit-ort state schema.
+    strategy: Option<MergeStrategy>,
     ours: ObjectHash,
     theirs: ObjectHash,
     merged_items: HashMap<PathBuf, MergeTreeEntry>,
@@ -3602,6 +3866,48 @@ struct MergeConflictInput {
     their_items: HashMap<PathBuf, MergeTreeEntry>,
     /// Marker style for conflicted paths, resolved from `merge.conflictStyle`.
     conflict_style: ConflictStyle,
+}
+
+fn strategy_evaluation_score(
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+    base_items: &HashMap<PathBuf, MergeTreeEntry>,
+    our_items: &HashMap<PathBuf, MergeTreeEntry>,
+    their_items: &HashMap<PathBuf, MergeTreeEntry>,
+) -> StrategyEvaluationScore {
+    // Every unmerged placement is one `diff-files` path. A directory-split
+    // notice is the exception: the writer records the resolved content at
+    // stage 0 and writes those same bytes to the worktree, so Git's
+    // `run_diff_files()` contributes zero for it.
+    let differing_files = placements
+        .iter()
+        .filter(|(_, kind, _)| !matches!(kind, ConflictKind::DirectorySplit { .. }))
+        .count();
+    let unmerged_entries = placements
+        .iter()
+        .map(|(path, kind, original)| {
+            let source = original.as_ref().unwrap_or(path);
+            match kind {
+                // This path-level conflict is represented by a resolved
+                // stage-0 entry rather than by unmerged stages.
+                ConflictKind::DirectorySplit { .. } => 0,
+                ConflictKind::FileDirectory { base_file, .. } => {
+                    usize::from(base_file.is_some()) + 1
+                }
+                _ => [base_items, our_items, their_items]
+                    .into_iter()
+                    .filter(|items| {
+                        items
+                            .get(source)
+                            .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+                    })
+                    .count(),
+            }
+        })
+        .sum();
+    StrategyEvaluationScore {
+        differing_files,
+        unmerged_entries,
+    }
 }
 
 fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMergeError> {
@@ -3702,7 +4008,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         targets: Vec::new(),
         target_refs: Vec::new(),
         base: input.base.map(|base| base.to_string()),
-        strategy: None,
+        strategy: input.strategy,
         allow_unrelated_histories: input.allow_unrelated_histories,
         skip_hooks: input.skip_hooks,
         conflicted_paths: conflict_paths
@@ -4030,19 +4336,20 @@ async fn run_merge_continue(
     .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
-    let strategy = match state.strategy {
-        Some(MergeStrategy::Ours) => "ours",
+    let (strategy, reflog_strategy, selected_strategy) = match state.strategy {
+        Some(MergeStrategy::Ours) => ("ours", "ours", Some("ours")),
+        Some(strategy) => ("three-way", strategy.name(), Some(strategy.name())),
         // Single-head states leave `targets` empty. An octopus invocation
         // records the reduced target set here even when every head but one was
         // redundant, so non-empty is the durable strategy discriminator.
-        None if !state.targets.is_empty() => "octopus",
-        None => "three-way",
+        None if !state.targets.is_empty() => ("octopus", "octopus", Some("octopus")),
+        None => ("three-way", "three-way", Some("ort")),
     };
     update_head_with_reflog(
         &state.head_name,
         merge_commit.id,
         &state.target_ref,
-        strategy,
+        reflog_strategy,
     )
     .await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
@@ -4060,6 +4367,7 @@ async fn run_merge_continue(
 
     let summary = PullMergeSummary {
         strategy: strategy.to_string(),
+        selected_strategy: selected_strategy.map(str::to_string),
         old_commit: Some(orig_head.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -4141,10 +4449,10 @@ async fn restore_pre_merge_state(
 /// resolution done so far — then immediately re-run the same merge against the
 /// RECORDED target commit (`state.target`, not the ref name, which may have
 /// moved since the original merge), regenerating fresh conflict markers and
-/// merge state. The re-run uses default merge options: the original
+/// merge state. The selected strategy and recovery-critical unrelated-history
+/// permission are persisted and replayed. Other original options such as
 /// `-m`/`--no-ff`/`--squash`/`--no-commit` are not persisted in [`MergeState`]
-/// and are not replayed (documented limitation). The recovery-critical
-/// unrelated-history permission is persisted and replayed below.
+/// and are not replayed (documented limitation).
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
     let _held_autostash = preflight_held_autostash()?;
@@ -4157,6 +4465,8 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     }
     let target = state.target.clone();
     let target_ref = state.target_ref.clone();
+    let persisted_strategy = state.strategy;
+    let selected_strategy = persisted_strategy.unwrap_or(MergeStrategy::Ort);
     restore_pre_merge_state(&state, "restart").await?;
     // Deterministic replay: merge the recorded commit; keep the original ref
     // name as the upstream label so the merge message/state read naturally.
@@ -4165,13 +4475,16 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     // uniform finalize applies it on eventual clean completion or keeps
     // holding across a re-conflict.
     let options = PullMergeOptions {
+        strategy: persisted_strategy,
         autostash: Some(false),
         preserve_held_autostash: true,
         allow_unrelated_histories: state.allow_unrelated_histories,
         skip_hooks: state.skip_hooks,
         ..PullMergeOptions::default()
     };
-    run_merge_for_pull_with_options(&target, &target_ref, output, options).await
+    run_merge_for_pull_with_options(&target, &target_ref, output, options)
+        .await
+        .map(|summary| attach_selected_strategy(summary, selected_strategy.name()))
 }
 
 /// Refuse a control action on a COMMON-storage merge sidecar whose owner cannot
@@ -4227,6 +4540,7 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
 
     Ok(PullMergeSummary {
         strategy: "abort".to_string(),
+        selected_strategy: None,
         old_commit: Some(orig_head.to_string()),
         commit: Some(orig_head.to_string()),
         files_changed: 0,
@@ -4289,6 +4603,27 @@ fn merge_base_commits(
             })
         })
         .collect()
+}
+
+/// Resolve the base set exactly once for the selected backend. `resolve`
+/// deliberately takes the first deterministic base from the object-id-sorted
+/// set and never builds a recursive virtual ancestor; ort/recursive retain the
+/// complete set. The same helper feeds preflight and execution so their graph
+/// shape cannot diverge.
+fn merge_base_commits_for_strategy(
+    lhs: &Commit,
+    rhs: &Commit,
+    options: &PullMergeOptions,
+) -> Result<Vec<Commit>, PullMergeError> {
+    let bases = merge_base_commits(lhs, rhs, merge_options_will_fold(options))?;
+    Ok(select_strategy_bases(bases, options.strategy))
+}
+
+fn select_strategy_bases<T>(mut bases: Vec<T>, strategy: Option<MergeStrategy>) -> Vec<T> {
+    if strategy == Some(MergeStrategy::Resolve) {
+        bases.truncate(1);
+    }
+    bases
 }
 
 async fn apply_fast_forward_merge(
@@ -8613,6 +8948,66 @@ struct SideRenames {
     skipped_by_limit: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolveRenameNotice {
+    old: PathBuf,
+    new: PathBuf,
+    side: MergeSide,
+}
+
+fn detect_resolve_rename_notices(
+    base: &HashMap<PathBuf, MergeTreeEntry>,
+    ours: &HashMap<PathBuf, MergeTreeEntry>,
+    theirs: &HashMap<PathBuf, MergeTreeEntry>,
+    virtual_blobs: &VirtualBlobs,
+) -> Vec<ResolveRenameNotice> {
+    let config = MergeRenameConfig::default();
+    let mut reader = MergeRenameReader::new();
+    let mut notices = Vec::new();
+    for (side, items) in [(MergeSide::Ours, ours), (MergeSide::Theirs, theirs)] {
+        notices.extend(
+            detect_side_renames(base, items, &config, virtual_blobs, &mut reader)
+                .matches
+                .into_iter()
+                .map(|pair| ResolveRenameNotice {
+                    old: pair.old,
+                    new: pair.new,
+                    side,
+                }),
+        );
+    }
+    notices.sort_by(|left, right| {
+        left.old
+            .cmp(&right.old)
+            .then_with(|| left.new.cmp(&right.new))
+            .then_with(|| match (left.side, right.side) {
+                (MergeSide::Ours, MergeSide::Theirs) => std::cmp::Ordering::Less,
+                (MergeSide::Theirs, MergeSide::Ours) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+    });
+    notices
+}
+
+fn announce_resolve_rename_notices(
+    notices: &[ResolveRenameNotice],
+    upstream: &str,
+    output: &OutputConfig,
+) {
+    if output.is_json() {
+        return;
+    }
+    for notice in notices {
+        info_println!(
+            output,
+            "notice: resolve strategy disables rename detection; treating {} -> {} in {} as delete/add",
+            notice.old.display(),
+            notice.new.display(),
+            df_branch_label(notice.side, upstream)
+        );
+    }
+}
+
 /// One provisional directory rename selected by Git's plurality rule: the
 /// unique destination with the largest number of file renames wins. A tie is
 /// kept separately because it is a split-directory conflict, not a rename.
@@ -11911,6 +12306,7 @@ async fn perform_incremental_three_way_merge(
         let would_conflict = !conflicted_paths.is_empty();
         return Ok(Some(PullMergeSummary {
             strategy: "three-way".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -11998,6 +12394,7 @@ async fn perform_incremental_three_way_merge(
             base: recorded_base,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items,
@@ -12066,6 +12463,7 @@ async fn perform_incremental_three_way_merge(
         reset_index_and_workdir_to_tree(&tree_id)?;
         return Ok(Some(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -12092,7 +12490,7 @@ async fn perform_incremental_three_way_merge(
             targets: Vec::new(),
             target_refs: Vec::new(),
             base: recorded_base.map(|base| base.to_string()),
-            strategy: None,
+            strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
             conflicted_paths: Vec::new(),
@@ -12101,6 +12499,7 @@ async fn perform_incremental_three_way_merge(
         .save()?;
         return Ok(Some(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -12163,13 +12562,20 @@ async fn perform_incremental_three_way_merge(
     reset_index_and_workdir_to_tree(&tree_id)?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
-    update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
+    update_head_with_reflog(
+        &head_name,
+        merge_commit.id,
+        upstream,
+        options.strategy.map_or("three-way", MergeStrategy::name),
+    )
+    .await?;
     if !options.skip_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
     }
 
     Ok(Some(PullMergeSummary {
         strategy: "three-way".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -13954,12 +14360,15 @@ mod tests {
             MergeArgs::try_parse_from(["merge", "--log", "feature"]).expect("parse bare --log");
         assert_eq!(bare_log.log, Some(20));
 
-        let ours = MergeArgs::try_parse_from(["merge", "-s", "ours", "feature"])
-            .expect("parse ours strategy");
-        assert_eq!(ours.strategy, Some(MergeStrategy::Ours));
+        for strategy in ["ort", "recursive", "resolve", "ours"] {
+            assert!(
+                MergeArgs::try_parse_from(["merge", "-s", strategy, "feature"]).is_ok(),
+                "the documented {strategy} strategy must parse"
+            );
+        }
         assert!(
-            MergeArgs::try_parse_from(["merge", "-s", "recursive", "feature"]).is_err(),
-            "unsupported strategies fail during argument parsing"
+            MergeArgs::try_parse_from(["merge", "-s", "resolve", "-s", "ort", "feature",]).is_ok(),
+            "-s is repeatable"
         );
     }
 
@@ -14281,6 +14690,63 @@ mod tests {
             .expect_err("both submodules diverged");
 
         assert_eq!(refusal.path, PathBuf::from("a/sub"));
+    }
+}
+
+/// MG-13: pure strategy selection rules. These stay independent of repository
+/// I/O so the resolve boundary and Git score ordering are pinned directly.
+#[cfg(test)]
+mod strategy {
+    use super::{
+        MergeStrategy, PullMergeOptions, StrategyEvaluationScore, merge_options_will_fold,
+        select_strategy_bases,
+    };
+
+    #[test]
+    fn resolve_selects_one_base_and_disables_recursive_folding() {
+        assert_eq!(
+            select_strategy_bases(vec![1, 2, 3], Some(MergeStrategy::Resolve)),
+            vec![1]
+        );
+        let resolve = PullMergeOptions {
+            strategy: Some(MergeStrategy::Resolve),
+            ..PullMergeOptions::default()
+        };
+        assert!(!merge_options_will_fold(&resolve));
+
+        for strategy in [
+            None,
+            Some(MergeStrategy::Ort),
+            Some(MergeStrategy::Recursive),
+        ] {
+            let options = PullMergeOptions {
+                strategy,
+                ..PullMergeOptions::default()
+            };
+            assert!(merge_options_will_fold(&options), "{strategy:?}");
+            assert_eq!(
+                select_strategy_bases(vec![1, 2, 3], strategy),
+                vec![1, 2, 3]
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_result_prefers_lower_scores_and_the_later_tie() {
+        let ort = StrategyEvaluationScore {
+            differing_files: 1,
+            unmerged_entries: 3,
+        };
+        let resolve = StrategyEvaluationScore {
+            differing_files: 1,
+            unmerged_entries: 2,
+        };
+        assert!(resolve.replaces(ort));
+        assert!(!ort.replaces(resolve));
+        assert!(
+            resolve.replaces(resolve),
+            "Git's <= comparison makes the later strategy win a tie"
+        );
     }
 }
 

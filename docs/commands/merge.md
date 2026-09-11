@@ -5,7 +5,7 @@ Merge one or more targets into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>...
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>...
 libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
@@ -19,7 +19,24 @@ Before starting a merge, Libra checks both merge state and the index. Existing m
 
 If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
-The default three-way strategy accepts conflict-side, whitespace-comparison, and renormalization `-X` options. `-X ours` / `-X theirs` choose a side only for conflicting hunks/paths while retaining clean changes from both sides. This is different from `-s ours`, which creates a merge commit with `HEAD` and every surviving target as parents (unless every target is already reachable) while retaining the entire current HEAD tree. See “Input normalization” below for the other supported values. Other strategies and strategy options are rejected during argument parsing.
+The default single-head strategy is `ort`. The default for two or more targets remains the automatic `octopus` path. The selected backend is named in human success output and, for JSON consumers, in the additive `selected_strategy` field; the historical `strategy` field remains an outcome category such as `three-way`, `ours`, or `octopus`.
+
+### Strategy selection
+
+`-s` / `--strategy` accepts these built-in names:
+
+| Strategy | Behavior |
+|----------|----------|
+| `ort` | The default single-head three-way backend: all merge bases are recursively folded when needed, and rename detection is enabled. |
+| `recursive` | A compatibility alias for `ort`; behavior is identical, while output records the requested name. |
+| `resolve` | A conservative single-head three-way backend: it takes the first object-id-ordered merge base, never builds a recursive virtual ancestor, and disables rename handling. A rename therefore degrades deterministically to delete/add (and can leave a modify/delete conflict); human output prints a notice naming the old and new paths. |
+| `ours` | Records `HEAD` and every surviving target as parents while retaining the complete current `HEAD` tree. This is distinct from `-X ours`. |
+
+For a single target, `-s` is repeatable. Libra probes the names in command-line order without repository writes, prints `Trying merge strategy <name>...` in human mode, and executes the first clean result. If every strategy conflicts, it replays the best result using Git's `evaluate_result` score (worktree/index differences plus unmerged index entries); the later strategy wins a tie. The selected backend is persisted in non-squash merge state, so `--continue` reports it and `--restart` reproduces it instead of silently returning to the default.
+
+With several targets, omit `-s` for automatic `octopus`, or use one `-s ours`. The explicit name `-s octopus`, single-head strategies on several targets, external `git-merge-<name>` programs, and `subtree` are not implemented. An unknown or incompatible name fails before mutation with an actionable error. `-s` cannot be combined with `-X`.
+
+The `ort`/`recursive` three-way backend accepts conflict-side, whitespace-comparison, and renormalization `-X` options. `-X ours` / `-X theirs` choose a side only for conflicting hunks/paths while retaining clean changes from both sides. See “Input normalization” below for the other supported values.
 
 ### Octopus merges (several targets)
 
@@ -44,7 +61,7 @@ Inside the fold, decisions differ from a real merge, matching Git:
 - Binary content (Git's rule: a NUL byte in the first 8000, or an input larger than 1023 MiB) is not line-merged; the ancestor keeps the base's content, or the empty blob when there is no base.
 - Symlinks — and any two sides that are different *kinds* of entry — keep the base version, which means the path is simply absent from the ancestor when there is no base.
 - The resulting file mode follows Git's rule: the other side's mode when the two agree or ours is unchanged, otherwise ours.
-- Nesting deeper than 20 levels, or more than 32 merge bases at one level — counted on the bare ids before any base is loaded, and again on the candidate ancestors collected while folding — is refused with `LBR-UNSUPPORTED-001` rather than recursed (the fold's work grows with the square of the width; a criss-cross has two). `-s ours` and `--ff-only` never fold and are never refused for width (a diverged `--ff-only` merge is refused as non-fast-forward, as always).
+- Nesting deeper than 20 levels, or more than 32 merge bases at one level — counted on the bare ids before any base is loaded, and again on the candidate ancestors collected while folding — is refused with `LBR-UNSUPPORTED-001` rather than recursed (the fold's work grows with the square of the width; a criss-cross has two). `-s resolve`, `-s ours`, and `--ff-only` never fold and are never refused for width (resolve selects one deterministic real base; a diverged `--ff-only` merge is refused as non-fast-forward, as always).
 
 The synthetic commit's parents are **all** the real merge bases folded so far (Git chains one two-parent virtual commit per fold step); the reachable history is the same, the object ids are not. The virtual ancestor's tree and its synthetic commit are written as ordinary loose objects, but they are **one-shot**: they are deliberately *not* recorded in the merge state, so they are not garbage-collection roots. `libra maintenance run --task gc` may reclaim them at any time, including while a conflicted merge is still in progress — nothing depends on them surviving, and `libra merge --restart` recomputes the same ancestor from the real merge bases. Consequently `merge-state.json` records a `base` only when the merge base is a single real commit.
 
@@ -201,9 +218,10 @@ detecting in some shapes where Libra stops.
 Both keys are read strictly: a value neither can parse fails the merge before
 anything is written, including before `--autostash` saves your changes. That
 check runs exactly where Git parses these keys, so a fast-forward, an
-already-up-to-date merge, `-s ours`, and `--squash` or `--no-commit` over a
-fast-forwardable history all succeed regardless of the value, while `--no-ff`
-on that same history is a real merge and fails.
+already-up-to-date merge, `-s resolve`, `-s ours`, and `--squash` or
+`--no-commit` over a fast-forwardable history all succeed regardless of the
+value. Resolve deliberately does not consume rename configuration; `--no-ff`
+with ort/recursive on that same history is a real rename-aware merge and fails.
 
 A rename is a move of one thing into another name, so both ends must be the
 same kind of entry. If the other side replaced the file at the old path with a
@@ -322,7 +340,7 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement merge strategies other than `ours`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
+Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
 ## Options
 
@@ -333,8 +351,8 @@ Libra still does not implement merge strategies other than `ours`, strategy opti
 | `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
 | `--ff-only` | Refuse unless a single-head merge can fast-forward. A non-up-to-date octopus merge is never a fast-forward and is refused. |
 | `--no-ff` | Always create a merge commit even when a single-head fast-forward is possible. Octopus already always creates one. |
-| `-s ours`, `--strategy=ours` | Record the merge relationship with `HEAD` plus every surviving target as parents while retaining the complete current HEAD tree. Distinct from `-X ours`. Other strategies are rejected. |
-| `-X <option>`, `--strategy-option=<option>` | Accepts `ours`, `theirs`, `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, or `no-renormalize`. Repeatable; favor and renormalize toggles are last-one-wins, while whitespace modes select the strongest requested comparison. Cannot be combined with `-s ours`. |
+| `-s <strategy>`, `--strategy=<strategy>` | Select `ort` (single-head default), its `recursive` alias, conservative `resolve`, or `ours`. Repeatable for a single target: try in order, first clean result wins, otherwise replay the lowest Git `evaluate_result` score (later tie wins). With several targets only automatic octopus (no `-s`) or one `-s ours` is supported. Cannot be combined with `-X`. |
+| `-X <option>`, `--strategy-option=<option>` | Accepts `ours`, `theirs`, `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, or `no-renormalize`. Repeatable; favor and renormalize toggles are last-one-wins, while whitespace modes select the strongest requested comparison. Cannot be combined with `-s`. |
 | `--allow-unrelated-histories` | Permit histories with no common ancestor by using a virtual empty merge base. The permission is persisted for non-squash conflict `--restart`. |
 | `--log[=<N>]` | Append up to N target-side subjects to the merge message; bare `--log` uses 20. Overrides `merge.log`, and also appends to an explicit `-m` message. Last-one-wins with `--no-log`. |
 | `--no-log` | Disable the merge-message shortlog, overriding `merge.log` and an earlier `--log`. |
@@ -352,9 +370,9 @@ Libra still does not implement merge strategies other than `ours`, strategy opti
 | `--continue` | Finish an in-progress non-squash merge after conflicts have been resolved and staged, using the parent set recorded in merge state. A squash has no merge state to continue. |
 | `--abort` | Restore the pre-merge HEAD, index, and working tree of an in-progress non-squash merge (re-applies a held autostash). Unavailable after `--squash`. |
 | `--autostash` / `--no-autostash` | Stash local tracked changes before the merge and restore staged index and unstaged worktree layers separately when it concludes — held (outside `stash list`) across a non-squash conflict until `--continue`/`--abort`. A clean squash attempts restoration when the merge command returns. A conflicted squash saves the autostash directly in `stash list` without applying it, preserving the unresolved index and working tree; resolve and commit those conflicts, then run `libra stash pop`. If saving fails, a warning is emitted and the held autostash remains referenced by its sidecar. A conflicting re-apply is saved to the stash list with a notice, never lost. Config: `merge.autostash` (boolean; invalid value = hard error). Untracked files are not stashed (Git parity). `--json` adds `autostash: applied\|stashed\|kept`. |
-| `--dry-run` | Libra extension: preview the merge outcome writing **nothing** — reports fast-forward / already-up-to-date / clean three-way / would-conflict (with the paths). Exits 0 for a clean preview, 1 when the merge would conflict. Mutually exclusive with `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit`. |
-| `--restart` | Libra extension (ports Lore's `branch merge restart`): abort the in-progress conflicted merge — discarding any resolution work, exactly like `--abort` — then immediately re-run the same merge against the recorded target commit, regenerating fresh conflict markers and state. Takes no branch and no merge options. Recovery-critical `--allow-unrelated-histories` is replayed; presentation/policy options such as the original `-m`/`--no-ff` are not. Requires a **conflicted non-squash** merge: squash has no merge state to restart, and a staged `--no-commit` merge is refused (finish it with `--continue` or discard with `--abort`). |
-| `--json` | Emit a structured success envelope. |
+| `--dry-run` | Libra extension: preview the merge outcome writing **nothing** — reports fast-forward / already-up-to-date / clean selected strategy / would-conflict (with the paths). Exits 0 for a clean preview, 1 when the merge would conflict. Mutually exclusive with `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit`. |
+| `--restart` | Libra extension (ports Lore's `branch merge restart`): abort the in-progress conflicted merge — discarding any resolution work, exactly like `--abort` — then immediately re-run the same merge against the recorded target commit and selected strategy, regenerating fresh conflict markers and state. Takes no branch and no merge options. Recovery-critical `--allow-unrelated-histories` is also replayed; presentation/policy options such as the original `-m`/`--no-ff` are not. Requires a **conflicted non-squash** merge: squash has no merge state to restart, and a staged `--no-commit` merge is refused (finish it with `--continue` or discard with `--abort`). |
+| `--json` | Emit a structured success envelope. `selected_strategy` names the concrete backend when one ran; the existing `strategy` field remains the outcome category. |
 | `--machine` | Emit the same structured envelope as one compact JSON line. |
 | `--quiet` | Suppress human success output. |
 
@@ -375,6 +393,7 @@ argument `1`; it does not run for already-up-to-date or conflicted outcomes.
 ```bash
 libra merge feature-x
 libra merge topic-a topic-b topic-c
+libra merge -s resolve -s ort feature-x
 libra merge -X ours feature-x
 libra merge -s ours obsolete-history
 libra merge --allow-unrelated-histories imported-root
@@ -427,10 +446,10 @@ Fast-forward:
 Fast-forward
 ```
 
-Clean three-way merge:
+Clean default single-head merge:
 
 ```text
-Merge made by the 'three-way' strategy.
+Merge made by the 'ort' strategy.
 ```
 
 Ours strategy:
@@ -469,6 +488,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
   "command": "merge",
   "data": {
     "strategy": "three-way",
+    "selected_strategy": "ort",
     "old_commit": "abc1234...",
     "commit": "def5678...",
     "files_changed": 2,
@@ -478,7 +498,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 }
 ```
 
-`-s ours` uses `strategy: "ours"` and `files_changed: 0`. A default multi-target merge uses `strategy: "octopus"`; `parents` contains `HEAD` followed by every non-redundant target in command-line order. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
+`selected_strategy` is additive: existing consumers can continue switching on `strategy`, whose outcome-category values do not change. Default and explicit single-head three-way merges name `ort`, `recursive`, or `resolve`; `-s ours` uses both `strategy: "ours"` and `selected_strategy: "ours"`; and a default multi-target merge uses `strategy: "octopus"` plus `selected_strategy: "octopus"`. The field is omitted when no backend runs (fast-forward, already-up-to-date, or abort). `parents` contains `HEAD` followed by every non-redundant target in command-line order. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
 
 `--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`. `--dry-run` adds `dry_run`, `would_conflict`, `conflicted_paths` and `conflict_kinds` (see Dry Run).
 
@@ -504,6 +524,9 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Disable signature verification | `--no-verify-signatures` (default; disables `--verify-signatures`) | `--no-verify-signatures` | N/A |
 | No rerere autoupdate | `--no-rerere-autoupdate` (accepted; staging follows `rerere.autoUpdate`) | `--no-rerere-autoupdate` | N/A |
 | No GPG sign | `--no-gpg-sign` (no-op; never signs) | `--no-gpg-sign` | N/A |
+| Default / recursive strategy | `-s ort` (default), `-s recursive` alias | `-s ort` (default), `-s recursive` | N/A |
+| Resolve strategy | `-s resolve` (one base, no virtual ancestor or rename handling) | `-s resolve` | N/A |
+| Repeated strategy fallback | Supported for one target; first clean, otherwise lowest `evaluate_result` score | Supported | N/A |
 | Ours strategy | `-s ours` | `-s ours` | N/A |
 | Conflict-side preference | `-X ours/theirs` | `-X ours/theirs` | N/A |
 | Whitespace-aware content merge | `-X ignore-space-change` / `ignore-all-space` / `ignore-space-at-eol` / `ignore-cr-at-eol` | Same | N/A |
@@ -524,7 +547,8 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Unrelated histories without `--allow-unrelated-histories` | `LBR-REPO-003` | 128 |
 | Three-way merge would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 |
 | Recursive virtual ancestor would nest deeper than 20 levels or fold more than 32 bases at one level | `LBR-UNSUPPORTED-001` | 128 |
-| Unsupported `-s` / `-X` value or incompatible strategy combination | `LBR-CLI-002` | 129 |
+| Unknown `-s` / `-X` value or mutually exclusive strategy options | `LBR-CLI-002` | 129 |
+| A single-head strategy (or repeated strategies) is requested for several targets | `LBR-UNSUPPORTED-001` | 128 |
 | `--verify-signatures`: any target tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
 | Merge conflicts | `LBR-CONFLICT-002` | 128 |
 | Octopus conflict (atomic; no merge state) | `LBR-CONFLICT-002` | 128 |
