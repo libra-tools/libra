@@ -1148,7 +1148,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         // match must stay exhaustive.
         merge::PullMergeError::UnsignedMergeCommit { .. }
         | merge::PullMergeError::BadMergeSignature { .. }
-        | merge::PullMergeError::SignatureCheck(..) => {
+        | merge::PullMergeError::SignatureCheck(..)
+        | merge::PullMergeError::OctopusUnbornHead
+        | merge::PullMergeError::OctopusConflict { .. } => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
         merge::PullMergeError::RepositoryHook { .. } => CliError::failure(error.to_string())

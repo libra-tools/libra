@@ -66,6 +66,7 @@ EXAMPLES:
     libra merge --verify-signatures feature-x  Require a valid PGP signature on the merged tip
     libra merge -X ours feature-x  Favor HEAD only where content conflicts
     libra merge -s ours archive   Record archive as merged while retaining the HEAD tree
+    libra merge topic-a topic-b topic-c  Create an octopus merge when every head merges cleanly
     libra merge --allow-unrelated-histories imported-root
                                      Merge a root with no common ancestor
     libra merge --log=10 feature-x  Include target subjects in the merge message
@@ -78,11 +79,13 @@ EXAMPLES:
 NOTES:
     Divergent single-head merges create a merge commit when paths do not
     conflict. Conflicts write markers and can be finished with --continue
-    or restored with --abort. --dry-run exits 1 when the merge would
-    conflict (0 for ff/up-to-date/clean); --restart discards resolution
-    work done so far, exactly like --abort, before re-running.";
+    or restored with --abort. Multi-head octopus merges are atomic: any
+    conflict leaves HEAD, index, and worktree unchanged; merge those heads
+    one at a time to resolve conflicts. --dry-run exits 1 when the merge
+    would conflict (0 for ff/up-to-date/clean); --restart discards
+    resolution work done so far, exactly like --abort, before re-running.";
 
-/// Single-head merge strategies currently implemented by Libra.
+/// Merge strategies currently implemented by Libra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergeStrategy {
@@ -193,8 +196,10 @@ fn select_whitespace_mode(current: &mut Option<MergeWhitespace>, candidate: Merg
 #[derive(Parser, Debug)]
 #[command(after_help = MERGE_EXAMPLES)]
 pub struct MergeArgs {
-    /// The branch to merge into the current branch, could be remote branch
-    pub branch: Option<String>,
+    /// One or more branches to merge into the current branch; each may be a
+    /// remote-tracking branch. Multiple branches select the octopus path.
+    #[arg(value_name = "BRANCH", num_args = 0..)]
+    pub branch: Vec<String>,
 
     /// Continue an in-progress merge after resolving conflicts
     #[arg(long = "continue", conflicts_with = "abort")]
@@ -225,7 +230,8 @@ pub struct MergeArgs {
     #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
     pub restart: bool,
 
-    /// Refuse to merge unless the current branch can fast-forward to the target.
+    /// Refuse to merge unless the current branch can fast-forward to the
+    /// target. A multi-branch octopus merge never fast-forwards.
     #[arg(long = "ff-only", conflicts_with_all = ["ff", "no_ff", "continue_merge", "abort"])]
     pub ff_only: bool,
 
@@ -238,7 +244,7 @@ pub struct MergeArgs {
     pub no_ff: bool,
 
     /// Select the merge strategy. Libra currently supports only `ours`, which
-    /// records both parents while retaining the current HEAD tree.
+    /// records every parent while retaining the current HEAD tree.
     #[arg(short = 's', long = "strategy", value_enum, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
     pub strategy: Option<MergeStrategy>,
 
@@ -247,7 +253,7 @@ pub struct MergeArgs {
     #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy"])]
     pub strategy_option: Vec<MergeStrategyOption>,
 
-    /// Permit a two-parent merge when the histories have no common ancestor.
+    /// Permit a merge when the histories have no common ancestor.
     #[arg(long = "allow-unrelated-histories", conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub allow_unrelated_histories: bool,
 
@@ -328,8 +334,8 @@ pub struct MergeArgs {
     #[arg(long = "no-progress")]
     pub no_progress: bool,
 
-    /// Verify that the tip commit of the branch being merged carries a valid PGP
-    /// signature, aborting the merge if it is unsigned or the signature is bad.
+    /// Verify that every tip commit being merged carries a valid PGP signature,
+    /// aborting the merge if any tip is unsigned or has a bad signature.
     /// Like `tag -v`, only signatures made by this repository's vault PGP key can
     /// be validated (Libra has no external GPG keyring), so a commit signed
     /// elsewhere — or with an SSH signature — is treated as not verifiable.
@@ -489,7 +495,12 @@ pub(crate) fn merge_state_gc_oids(
     let Some(state) = merge_state_for_pseudo_refs(gitdir)? else {
         return Ok(None);
     };
-    let mut oids = vec![("orig_head", state.orig_head), ("target", state.target)];
+    let mut oids = vec![("orig_head", state.orig_head)];
+    if state.targets.is_empty() {
+        oids.push(("target", state.target));
+    } else {
+        oids.extend(state.targets.into_iter().map(|target| ("target", target)));
+    }
     if let Some(base) = state.base {
         oids.push(("base", base));
     }
@@ -516,6 +527,14 @@ pub(crate) struct MergeState {
     pub orig_head: String,
     pub target: String,
     pub target_ref: String,
+    /// Every octopus target in parent order. Empty for legacy and single-head
+    /// states, where `target` remains authoritative.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Display refs corresponding to `targets`; status and reflog continue to
+    /// use the backward-compatible joined `target_ref` field.
+    #[serde(default)]
+    pub target_refs: Vec<String>,
     /// Common ancestor used by the three-way merge, when it is a real commit.
     /// `None` represents the virtual empty base used by
     /// `--allow-unrelated-histories` AND the recursive virtual ancestor of a
@@ -800,6 +819,12 @@ pub(crate) enum PullMergeError {
     History(String),
     #[error("refusing to merge unrelated histories")]
     UnrelatedHistories,
+    #[error("cannot merge multiple branches into an unborn HEAD; create the first commit first")]
+    OctopusUnbornHead,
+    #[error(
+        "Automated merge with '{target}' did not work in {paths}. Should not be doing an octopus"
+    )]
+    OctopusConflict { target: String, paths: String },
     /// A three-way merge input carries a gitlink the merge would have to
     /// arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
     /// than silently dropped from the merge result the way it used to be.
@@ -908,6 +933,14 @@ impl From<PullMergeError> for CliError {
             }
             PullMergeError::UnrelatedHistories => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
+            PullMergeError::OctopusUnbornHead => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("create an initial commit, then retry the multi-branch merge"),
+            PullMergeError::OctopusConflict { .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint(
+                    "merge the branches one at a time so each conflict can be resolved and committed",
+                ),
             PullMergeError::VirtualAncestorTooDeep | PullMergeError::VirtualAncestorTooWide { .. } => {
                 CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::Unsupported)
@@ -1109,8 +1142,8 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     if args.restart {
         return run_merge_restart(output).await;
     }
-    match (args.branch.as_deref(), args.continue_merge, args.abort) {
-        (Some(branch), false, false) => {
+    match (args.branch.as_slice(), args.continue_merge, args.abort) {
+        (branches, false, false) if !branches.is_empty() => {
             let strategy_options = parse_merge_strategy_options(&args.strategy_option);
             let (ff_only, no_ff) = if args.ff_only {
                 (true, false)
@@ -1171,13 +1204,15 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 },
                 preserve_held_autostash: false,
             };
-            run_merge_for_pull_with_options(branch, branch, output, options).await
+            if let [branch] = branches {
+                run_merge_for_pull_with_options(branch, branch, output, options).await
+            } else {
+                run_octopus_merge(branches, output, options).await
+            }
         }
-        (None, true, false) => {
-            run_merge_continue(output, args.no_verify, args.message.clone()).await
-        }
-        (None, false, true) => run_merge_abort(output).await,
-        (None, false, false) => Err(MergeError::MissingAction),
+        ([], true, false) => run_merge_continue(output, args.no_verify, args.message.clone()).await,
+        ([], false, true) => run_merge_abort(output).await,
+        ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
 }
@@ -1383,6 +1418,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
     } else {
         match result.strategy.as_str() {
             "three-way" => info_println!(output, "Merge made by the 'three-way' strategy."),
+            "octopus" => info_println!(output, "Merge made by the 'octopus' strategy."),
             "ours" => info_println!(output, "Merge made by the 'ours' strategy."),
             "squash" => info_println!(output, "Squash commit -- not updating HEAD"),
             "no-commit" => info_println!(
@@ -1624,6 +1660,675 @@ async fn store_pending_autostash(
     }
 }
 
+/// Start the shared merge autostash lifecycle after every semantic preflight
+/// has passed. The durable ordering is objects -> sidecar -> worktree reset;
+/// callers must later invoke [`resolve_pending_autostash`] on every outcome.
+async fn prepare_merge_autostash(
+    options: &PullMergeOptions,
+    output: &OutputConfig,
+) -> Result<(), PullMergeError> {
+    let held_snapshot = if options.preserve_held_autostash || options.dry_run {
+        None
+    } else {
+        snapshot_held_autostash().map_err(PullMergeError::Autostash)?
+    };
+    if let Some(snapshot) = held_snapshot {
+        let sidecar = &snapshot.sidecar;
+        verify_autostash_ownership(snapshot.recorded_owner.as_deref())
+            .map_err(PullMergeError::Autostash)?;
+        if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
+            crate::command::stash::store_stash_commit(&oid, "autostash")
+                .await
+                .map_err(|error| {
+                    PullMergeError::Autostash(format!(
+                        "cannot recover the leftover autostash: {error}"
+                    ))
+                })?;
+            match cleanup_autostash_if_matches(&snapshot) {
+                Ok(true) => {}
+                Ok(false) => crate::utils::error::emit_warning(
+                    "the autostash sidecar changed while it was being recovered; the newer file was left in place",
+                ),
+                Err(error) => {
+                    return Err(PullMergeError::Autostash(format!(
+                        "the recovered autostash's sidecar could not be removed: {error}"
+                    )));
+                }
+            }
+            crate::utils::error::emit_warning(
+                "recovered a leftover autostash into the stash list (it may duplicate already-restored changes — inspect with 'libra stash show')",
+            );
+        } else {
+            return Err(PullMergeError::Autostash(
+                "merge-autostash.json holds an invalid OID; inspect and remove it".to_string(),
+            ));
+        }
+    }
+
+    if autostash_enabled(options).await? && Head::current_commit().await.is_some() {
+        match crate::command::stash::create_held_stash_commit("autostash").await {
+            Ok(Some(stash_commit)) => {
+                MergeAutostash {
+                    stash_commit: stash_commit.to_string(),
+                }
+                .save()?;
+                if let Err(error) = crate::command::stash::reset_to_head_for_held_stash().await {
+                    return Err(PullMergeError::Autostash(format!(
+                        "created the autostash but failed to reset the tree: {error} \
+                         (merge-autostash.json references stash commit {stash_commit})"
+                    )));
+                }
+                if !output.quiet {
+                    eprintln!("Created autostash: {stash_commit}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(PullMergeError::Autostash(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+struct OctopusTree {
+    items: HashMap<PathBuf, MergeTreeEntry>,
+    blobs: VirtualBlobs,
+    rename_outcomes: Vec<(String, RenameOutcome)>,
+}
+
+enum OctopusTreeOutcome {
+    Clean(OctopusTree),
+    Conflict {
+        target: String,
+        conflicts: Vec<(PathBuf, ConflictKind)>,
+    },
+}
+
+async fn run_octopus_merge(
+    branches: &[String],
+    output: &OutputConfig,
+    options: PullMergeOptions,
+) -> Result<PullMergeSummary, PullMergeError> {
+    if MergeState::load_optional_sync()
+        .map_err(PullMergeError::StateLoad)?
+        .is_some()
+    {
+        return Err(PullMergeError::MergeInProgress);
+    }
+    let initial_index =
+        Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+    let unresolved = unresolved_conflicted_paths(&initial_index, &[]);
+    if !unresolved.is_empty() {
+        return Err(PullMergeError::Conflicts {
+            paths: unresolved.join(", "),
+            squash: true,
+        });
+    }
+
+    let current_id = Head::current_commit()
+        .await
+        .ok_or(PullMergeError::OctopusUnbornHead)?;
+    let current: Commit =
+        load_object(&current_id).map_err(|error| PullMergeError::CurrentLoad {
+            commit_id: current_id.to_string(),
+            detail: error.to_string(),
+        })?;
+    let mut requested = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let id = resolve_merge_target(branch)
+            .await
+            .map_err(|_| PullMergeError::InvalidTarget(branch.clone()))?;
+        let commit: Commit = load_object(&id).map_err(|error| PullMergeError::TargetLoad {
+            commit_id: id.to_string(),
+            detail: error.to_string(),
+        })?;
+        if options.verify_signatures {
+            verify_merge_commit_signature(&commit).await?;
+        }
+        requested.push((branch.clone(), commit));
+    }
+
+    // Git's `reduce_parents`: reduce HEAD and every requested tip together,
+    // then retain the surviving remote tips in their original command-line
+    // order. Octopus is NO_FAST_FORWARD, so HEAD is reinserted as the first
+    // parent even when a target subsumes it.
+    let mut all_heads = Vec::with_capacity(requested.len() + 1);
+    all_heads.push(current.id);
+    all_heads.extend(requested.iter().map(|(_, commit)| commit.id));
+    let reduced = merge_base::reduce_heads(&all_heads)
+        .map_err(|error| PullMergeError::History(error.to_string()))?;
+    let reduced_set: HashSet<ObjectHash> = reduced.into_iter().collect();
+    let mut selected_ids = HashSet::new();
+    let targets: Vec<(String, Commit)> = requested
+        .into_iter()
+        .filter(|(_, commit)| {
+            commit.id != current.id
+                && reduced_set.contains(&commit.id)
+                && selected_ids.insert(commit.id)
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(PullMergeSummary {
+            strategy: "already-up-to-date".to_string(),
+            old_commit: Some(current.id.to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: true,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: options.dry_run,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        });
+    }
+    if !options.allow_unrelated_histories {
+        let mut tips = Vec::with_capacity(targets.len() + 1);
+        tips.push(current.id);
+        tips.extend(targets.iter().map(|(_, commit)| commit.id));
+        let global_bases = merge_base::octopus_merge_bases(&tips)
+            .map_err(|error| PullMergeError::History(error.to_string()))?;
+        if global_bases.is_empty() {
+            return Err(PullMergeError::UnrelatedHistories);
+        }
+    }
+    if options.ff_only {
+        return Err(PullMergeError::NonFastForward {
+            current: current.id.to_string(),
+            target: targets
+                .iter()
+                .map(|(_, commit)| commit.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        });
+    }
+
+    let head_name = current_head_name().await?;
+    let target_refs: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    let upstream = target_refs.join(", ");
+    let resolved_message = resolve_octopus_message(
+        &current,
+        &targets,
+        &head_name,
+        options.message.as_ref(),
+        options.merge_log,
+    )?;
+
+    let tree_outcome = if options.strategy == Some(MergeStrategy::Ours) {
+        let (mut items, gitlinks) = commit_tree_split_for_merge(&current)?;
+        for (path, hash) in gitlinks {
+            items.insert(
+                path,
+                MergeTreeEntry {
+                    hash,
+                    mode: TreeItemMode::Commit,
+                },
+            );
+        }
+        OctopusTreeOutcome::Clean(OctopusTree {
+            items,
+            blobs: VirtualBlobs::new(),
+            rename_outcomes: Vec::new(),
+        })
+    } else {
+        prepare_octopus_tree(&current, &targets, output, &options).await?
+    };
+    let tree = match tree_outcome {
+        OctopusTreeOutcome::Clean(tree) => tree,
+        OctopusTreeOutcome::Conflict {
+            target: _,
+            conflicts,
+        } if options.dry_run => {
+            let conflicted_paths = conflicts
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect();
+            let conflict_kinds = conflicts
+                .iter()
+                .map(|(path, kind)| ConflictReport {
+                    path: path.display().to_string(),
+                    kind: conflict_kind_name(kind).to_string(),
+                    original_path: None,
+                })
+                .collect();
+            return Ok(PullMergeSummary {
+                strategy: "octopus".to_string(),
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed: 0,
+                up_to_date: false,
+                parents: Vec::new(),
+                conflicted_paths,
+                aborted: false,
+                continued: false,
+                dry_run: true,
+                would_conflict: true,
+                conflict_kinds,
+                autostash: None,
+            });
+        }
+        OctopusTreeOutcome::Conflict { target, conflicts } => {
+            return Err(PullMergeError::OctopusConflict {
+                target,
+                paths: conflicts
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+    };
+    let files_changed =
+        count_item_map_changes(&commit_tree_items_with_gitlinks(&current)?, &tree.items);
+
+    if options.dry_run {
+        for (branch, outcome) in &tree.rename_outcomes {
+            announce_rename_notices(&outcome.notes, &outcome.limited, branch, output);
+        }
+        return Ok(PullMergeSummary {
+            strategy: if options.strategy == Some(MergeStrategy::Ours) {
+                "ours"
+            } else {
+                "octopus"
+            }
+            .to_string(),
+            old_commit: Some(current.id.to_string()),
+            commit: None,
+            files_changed,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: true,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        });
+    }
+
+    // No target has touched the repository yet. Only now, after every round is
+    // known to be clean, may autostash reset the worktree for the real apply.
+    prepare_merge_autostash(&options, output).await?;
+    let result: Result<PullMergeSummary, PullMergeError> = async {
+        switch::ensure_clean_status(output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        let current_index = Index::load(path::index())
+            .map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+        let paths_to_write = worktree_paths_to_write(&tree.items);
+        let gitlink_paths: Vec<PathBuf> = tree
+            .items
+            .iter()
+            .filter(|(_, entry)| entry.mode == TreeItemMode::Commit)
+            .map(|(path, _)| path.clone())
+            .collect();
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+        let removals: Vec<PathBuf> = current_index
+            .tracked_files()
+            .into_iter()
+            .filter(|path| !tree.items.contains_key(path))
+            .filter(|path| !is_gitlink_index_path(&current_index, path).unwrap_or(false))
+            .collect();
+        refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+        for (branch, outcome) in &tree.rename_outcomes {
+            announce_rename_notices(&outcome.notes, &outcome.limited, branch, output);
+        }
+        persist_virtual_blobs(&tree.blobs)?;
+        let tree_id =
+            create_tree_from_items_map(&tree.items).map_err(PullMergeError::TreeCreate)?;
+
+        if options.squash {
+            reset_index_and_workdir_to_tree(&tree_id)?;
+            let summary = PullMergeSummary {
+                strategy: "squash".to_string(),
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed,
+                up_to_date: false,
+                parents: Vec::new(),
+                conflicted_paths: Vec::new(),
+                aborted: false,
+                continued: false,
+                dry_run: false,
+                would_conflict: false,
+                conflict_kinds: Vec::new(),
+                autostash: None,
+            };
+            return Ok(summary);
+        }
+
+        let target_ids: Vec<ObjectHash> = targets.iter().map(|(_, commit)| commit.id).collect();
+        let primary_target = target_ids.first().copied().ok_or_else(|| {
+            PullMergeError::History("octopus target reduction produced no target".to_string())
+        })?;
+        let mut parent_ids = Vec::with_capacity(target_ids.len() + 1);
+        parent_ids.push(current.id);
+        parent_ids.extend(target_ids.iter().copied());
+        if options.no_commit {
+            reset_index_and_workdir_to_tree(&tree_id)?;
+            MergeState {
+                head_name: head_name.clone(),
+                orig_head: current.id.to_string(),
+                target: primary_target.to_string(),
+                target_ref: upstream,
+                targets: target_ids.iter().map(ToString::to_string).collect(),
+                target_refs,
+                base: None,
+                strategy: options.strategy,
+                allow_unrelated_histories: options.allow_unrelated_histories,
+                skip_hooks: options.skip_hooks,
+                conflicted_paths: Vec::new(),
+                message: Some(resolved_message),
+            }
+            .save()?;
+            let summary = PullMergeSummary {
+                strategy: "no-commit".to_string(),
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed,
+                up_to_date: false,
+                parents: parent_ids.iter().map(ToString::to_string).collect(),
+                conflicted_paths: Vec::new(),
+                aborted: false,
+                continued: false,
+                dry_run: false,
+                would_conflict: false,
+                conflict_kinds: Vec::new(),
+                autostash: None,
+            };
+            return Ok(summary);
+        }
+
+        let message = if !options.skip_hooks {
+            run_pre_merge_commit_hook(output).await?;
+            switch::ensure_clean_status(output)
+                .await
+                .map_err(|_| PullMergeError::DirtyWorktree)?;
+            ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+            refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+            let message = run_merge_message_hooks(&resolved_message, output).await?;
+            switch::ensure_clean_status(output)
+                .await
+                .map_err(|_| PullMergeError::DirtyWorktree)?;
+            ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+            refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+            message
+        } else {
+            resolved_message
+        };
+        let merge_commit = build_merge_commit(
+            tree_id,
+            parent_ids.clone(),
+            &format_commit_msg(&message, None),
+        )
+        .await?;
+        save_object(&merge_commit, &merge_commit.id)
+            .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
+        let strategy = if options.strategy == Some(MergeStrategy::Ours) {
+            "ours"
+        } else {
+            "octopus"
+        };
+        update_head_with_reflog(
+            &head_name,
+            merge_commit.id,
+            &target_refs.join(", "),
+            strategy,
+        )
+        .await?;
+        reset_index_and_workdir_to_tree(&tree_id)?;
+        if !options.skip_hooks {
+            run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
+        }
+
+        Ok(PullMergeSummary {
+            strategy: strategy.to_string(),
+            old_commit: Some(current.id.to_string()),
+            commit: Some(merge_commit.id.to_string()),
+            files_changed,
+            up_to_date: false,
+            parents: parent_ids.iter().map(ToString::to_string).collect(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        })
+    }
+    .await;
+    let autostash = resolve_pending_autostash(output, false).await;
+    match result {
+        Ok(mut summary) => {
+            summary.autostash = autostash;
+            if !options.skip_hooks && merge_completed_for_post_hook(&summary) {
+                let squash = if summary.strategy == "squash" {
+                    "1"
+                } else {
+                    "0"
+                };
+                run_advisory_repo_hook(RepoHook::PostMerge, &[squash.to_string()], None, output)
+                    .await;
+            }
+            Ok(summary)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_octopus_message(
+    current: &Commit,
+    targets: &[(String, Commit)],
+    head_name: &str,
+    message_override: Option<&String>,
+    merge_log: usize,
+) -> Result<String, PullMergeError> {
+    let names = targets
+        .iter()
+        .map(|(name, _)| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = message_override
+        .cloned()
+        .unwrap_or_else(|| format!("Merge branches {names} into {head_name}"));
+    for (name, target) in targets {
+        message = crate::command::merge_message::append_shortlog(
+            message, current.id, target.id, name, merge_log,
+        )
+        .map_err(PullMergeError::History)?;
+    }
+    Ok(message)
+}
+
+fn commit_tree_items_with_gitlinks(
+    commit: &Commit,
+) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+    let (mut items, gitlinks) = commit_tree_split_for_merge(commit)?;
+    for (path, hash) in gitlinks {
+        items.insert(
+            path,
+            MergeTreeEntry {
+                hash,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    Ok(items)
+}
+
+fn persist_virtual_blobs(blobs: &VirtualBlobs) -> Result<(), PullMergeError> {
+    for (expected, content) in blobs {
+        let blob = Blob::from_content_bytes(content.clone());
+        if blob.id != *expected {
+            return Err(PullMergeError::TreeCreate(format!(
+                "in-memory merged blob id changed from {expected} to {}",
+                blob.id
+            )));
+        }
+        save_object(&blob, &blob.id)
+            .map_err(|error| PullMergeError::TreeCreate(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn prepare_octopus_tree(
+    current: &Commit,
+    targets: &[(String, Commit)],
+    output: &OutputConfig,
+    options: &PullMergeOptions,
+) -> Result<OctopusTreeOutcome, PullMergeError> {
+    let rename_config = merge_rename_config().await?;
+    let default_driver = read_merge_default_driver()
+        .await
+        .map_err(PullMergeError::MergeDriverConfigRead)?;
+    let external_runtime = read_external_merge_runtime()
+        .await
+        .map_err(PullMergeError::MergeDriverConfigRead)?;
+    let input_normalization = MergeInputNormalization {
+        whitespace: options.whitespace,
+        renormalize: resolve_merge_renormalize(options.renormalize).await?,
+    };
+    let (conflict_style, mut deferred_style_error) = match conflict_style_from_config().await {
+        Ok(style) => (style, None),
+        Err(error) => (ConflictStyle::Merge, Some(error)),
+    };
+    let compute_options = ThreeWayMergeOptions {
+        message_override: None,
+        merge_log: 0,
+        squash: false,
+        no_commit: false,
+        skip_hooks: options.skip_hooks,
+        // Every blob remains in `VirtualBlobs` until all heads are clean.
+        dry_run: true,
+        favor: options.favor,
+        allow_unrelated_histories: options.allow_unrelated_histories,
+        fast_forwardable: false,
+        rename_config: Some(rename_config.clone()),
+        merge_default_driver: default_driver.clone(),
+        external_merge_runtime: external_runtime.clone(),
+        input_normalization,
+        output,
+    };
+    let (mut ours, mut our_gitlinks) = commit_tree_split_for_merge(current)?;
+    let mut processed = vec![current.id];
+    let mut non_ff = false;
+    let mut blobs = VirtualBlobs::new();
+    let mut rename_outcomes = Vec::new();
+
+    for (branch, target) in targets {
+        let base_ids = merge_base::merge_bases_many(&target.id, &processed)
+            .map_err(|error| PullMergeError::History(error.to_string()))?;
+        if base_ids.contains(&target.id) {
+            continue;
+        }
+        if !non_ff && processed.as_slice() == base_ids.as_slice() {
+            (ours, our_gitlinks) = commit_tree_split_for_merge(target)?;
+            processed.clear();
+            processed.push(target.id);
+            continue;
+        }
+        non_ff = true;
+        if base_ids.is_empty() && !options.allow_unrelated_histories {
+            return Err(PullMergeError::UnrelatedHistories);
+        }
+        let base_commits: Vec<Commit> = base_ids
+            .iter()
+            .map(load_merge_commit)
+            .collect::<Result<_, _>>()?;
+        let (mut theirs, their_gitlinks) = commit_tree_split_for_merge(target)?;
+        let passthrough =
+            ensure_merge_gitlinks_uniform(&base_commits, &our_gitlinks, &their_gitlinks)?;
+        let mut base = match base_commits.as_slice() {
+            [] => HashMap::new(),
+            [base] => commit_tree_split_for_merge(base)?.0,
+            _ => {
+                if let Some(error) = deferred_style_error.take() {
+                    return Err(pull_conflict_style_error(error));
+                }
+                fold_merge_bases(
+                    &base_ids,
+                    &passthrough,
+                    1,
+                    &mut blobs,
+                    VirtualFold {
+                        persist: false,
+                        conflict_style,
+                        rename_config: &rename_config,
+                        default_driver: default_driver.as_deref(),
+                        external_merge_runtime: external_runtime.clone(),
+                        input_normalization,
+                    },
+                )?
+            }
+        };
+        let outcome = detect_and_apply_renames(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &rename_config,
+            conflict_style,
+            ("HEAD", branch),
+            &mut TreeMergeContext::top_level_with_options(
+                &compute_options,
+                conflict_style,
+                branch,
+                &mut blobs,
+            ),
+        )?;
+        let mut merged = merge_tree_items(
+            &base,
+            &ours,
+            &theirs,
+            &mut TreeMergeContext::top_level_with_options(
+                &compute_options,
+                conflict_style,
+                branch,
+                &mut blobs,
+            ),
+        )?;
+        for (path, kind) in &outcome.forced {
+            merged.merged_items.remove(path);
+            merged.conflicts.retain(|(other, _)| other != path);
+            merged.conflicts.push((path.clone(), *kind));
+        }
+        if !merged.conflicts.is_empty() {
+            if let Some(error) = deferred_style_error.take() {
+                return Err(pull_conflict_style_error(error));
+            }
+            merged
+                .conflicts
+                .sort_by(|(left, _), (right, _)| left.cmp(right));
+            return Ok(OctopusTreeOutcome::Conflict {
+                target: branch.clone(),
+                conflicts: merged.conflicts,
+            });
+        }
+        ours = merged.merged_items;
+        our_gitlinks = passthrough;
+        processed.push(target.id);
+        rename_outcomes.push((branch.clone(), outcome));
+    }
+
+    for (path, hash) in our_gitlinks {
+        ours.insert(
+            path,
+            MergeTreeEntry {
+                hash,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    Ok(OctopusTreeOutcome::Clean(OctopusTree {
+        items: ours,
+        blobs,
+        rename_outcomes,
+    }))
+}
+
 pub(crate) async fn run_merge_for_pull_with_options(
     target_ref: &str,
     upstream: &str,
@@ -1714,99 +2419,9 @@ pub(crate) async fn run_merge_for_pull_with_options(
         input_normalization: preflighted_input_normalization,
     };
 
-    // ── autostash (lore.md §1.8) ──
-    // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
-    // (crash after a finalize apply, or an interrupted start) is promoted to
-    // the stash list — never overwritten or lost. Skipped on --restart
-    // re-entry, where the HELD sidecar legitimately exists without state.
-    // A sidecar that EXISTS but cannot be read is a hard stop, not a skip:
-    // proceeding would let the later `--autostash` save OVERWRITE the corrupt
-    // file — destroying the only durable reference to a held commit, which GC
-    // may then collect.
-    // §C.10 lock order: the snapshot is taken under the LOCAL autostash lock
-    // and the lock is RELEASED before `store_stash_commit` takes the
-    // repository-wide stash-stack lock — a repository lock never nests inside
-    // a local one. The cleanup afterwards is identity-checked, so a sidecar
-    // replaced in the unlocked window is preserved, never deleted.
-    // `--dry-run` writes nothing, and promoting a stale sidecar into the stash
-    // list (then deleting it) is a write — so a preview leaves a leftover
-    // sidecar exactly where it found it, for the next REAL merge to recover.
-    let held_snapshot = if options.preserve_held_autostash || options.dry_run {
-        None
-    } else {
-        snapshot_held_autostash().map_err(PullMergeError::Autostash)?
-    };
-    if let Some(snapshot) = held_snapshot {
-        let sidecar = &snapshot.sidecar;
-        // ADR-0714-08: promoting adopts the file into the SHARED stash list
-        // and deletes the evidence — only a file this scope can PROVE its own
-        // may be adopted, in any worktree (a foreign-marked file inside a
-        // linked gitdir is a manual copy, not that worktree's autostash).
-        verify_autostash_ownership(snapshot.recorded_owner.as_deref())
-            .map_err(PullMergeError::Autostash)?;
-        if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
-            match crate::command::stash::store_stash_commit(&oid, "autostash").await {
-                Ok(()) => {
-                    match cleanup_autostash_if_matches(&snapshot) {
-                        Ok(true) => {}
-                        Ok(false) => crate::utils::error::emit_warning(
-                            "the autostash sidecar changed while it was being recovered; \
-                             the newer file was left in place",
-                        ),
-                        Err(error) => {
-                            return Err(PullMergeError::Autostash(format!(
-                                "the recovered autostash's sidecar could not be removed: \
-                                 {error}"
-                            )));
-                        }
-                    }
-                    crate::utils::error::emit_warning(
-                        "recovered a leftover autostash into the stash list (it may \
-                         duplicate already-restored changes — inspect with 'libra stash show')",
-                    );
-                }
-                Err(error) => {
-                    return Err(PullMergeError::Autostash(format!(
-                        "cannot recover the leftover autostash: {error}"
-                    )));
-                }
-            }
-        } else {
-            return Err(PullMergeError::Autostash(
-                "merge-autostash.json holds an invalid OID; inspect and remove it".to_string(),
-            ));
-        }
-    }
-    let autostash_on = autostash_enabled(&options).await?;
-    if autostash_on && Head::current_commit().await.is_some() {
-        match crate::command::stash::create_held_stash_commit("autostash").await {
-            Ok(Some(stash_commit)) => {
-                // ORDER IS LOAD-BEARING: objects → sidecar (durable
-                // reference) → reset. A crash after the sidecar but before
-                // the reset leaves a dirty tree + sidecar, which the stale
-                // recovery promotes (may-duplicate warning); a crash before
-                // the sidecar leaves the tree untouched. At no point are the
-                // changes gone from the tree while unreferenced.
-                MergeAutostash {
-                    stash_commit: stash_commit.to_string(),
-                }
-                .save()?;
-                if let Err(error) = crate::command::stash::reset_to_head_for_held_stash().await {
-                    return Err(PullMergeError::Autostash(format!(
-                        "created the autostash but failed to reset the tree: {error} \
-                         (merge-autostash.json references stash commit {stash_commit})"
-                    )));
-                }
-                if !output.quiet {
-                    eprintln!("Created autostash: {stash_commit}");
-                }
-            }
-            Ok(None) => {} // clean tree: strict no-op
-            Err(error) => {
-                return Err(PullMergeError::Autostash(error.to_string()));
-            }
-        }
-    }
+    // Shared with octopus: all strict semantic preflights complete before the
+    // durable objects -> sidecar -> worktree-reset autostash sequence begins.
+    prepare_merge_autostash(&options, output).await?;
 
     let dry_run = options.dry_run;
     let result = run_merge_for_pull_inner(
@@ -2390,6 +3005,8 @@ async fn perform_ours_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: None,
             strategy: Some(MergeStrategy::Ours),
             allow_unrelated_histories: options.allow_unrelated_histories,
@@ -2809,6 +3426,8 @@ async fn perform_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: recorded_merge_base(&base_commits).map(|base| base.to_string()),
             strategy: None,
             allow_unrelated_histories: options.allow_unrelated_histories,
@@ -3080,6 +3699,8 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         orig_head: input.ours.to_string(),
         target: input.theirs.to_string(),
         target_ref: input.upstream,
+        targets: Vec::new(),
+        target_refs: Vec::new(),
         base: input.base.map(|base| base.to_string()),
         strategy: None,
         allow_unrelated_histories: input.allow_unrelated_histories,
@@ -3350,7 +3971,15 @@ async fn run_merge_continue(
     }
 
     let orig_head = object_hash_from_state("orig_head", &state.orig_head)?;
-    let target = object_hash_from_state("target", &state.target)?;
+    let target_values: Vec<&str> = if state.targets.is_empty() {
+        vec![state.target.as_str()]
+    } else {
+        state.targets.iter().map(String::as_str).collect()
+    };
+    let targets: Vec<ObjectHash> = target_values
+        .into_iter()
+        .map(|target| object_hash_from_state("target", target))
+        .collect::<Result<_, _>>()?;
     let original_commit: Commit =
         load_object(&orig_head).map_err(|error| MergeError::CurrentLoad {
             commit_id: orig_head.to_string(),
@@ -3390,9 +4019,12 @@ async fn run_merge_continue(
     } else {
         message
     };
+    let mut parent_ids = Vec::with_capacity(targets.len() + 1);
+    parent_ids.push(orig_head);
+    parent_ids.extend(targets.iter().copied());
     let merge_commit = build_merge_commit(
         tree_id,
-        vec![orig_head, target],
+        parent_ids.clone(),
         &format_commit_msg(&message, None),
     )
     .await?;
@@ -3400,6 +4032,10 @@ async fn run_merge_continue(
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
     let strategy = match state.strategy {
         Some(MergeStrategy::Ours) => "ours",
+        // Single-head states leave `targets` empty. An octopus invocation
+        // records the reduced target set here even when every head but one was
+        // redundant, so non-empty is the durable strategy discriminator.
+        None if !state.targets.is_empty() => "octopus",
         None => "three-way",
     };
     update_head_with_reflog(
@@ -3428,7 +4064,7 @@ async fn run_merge_continue(
         commit: Some(merge_commit.id.to_string()),
         files_changed,
         up_to_date: false,
-        parents: vec![orig_head.to_string(), target.to_string()],
+        parents: parent_ids.iter().map(ToString::to_string).collect(),
         conflicted_paths: Vec::new(),
         aborted: false,
         continued: true,
@@ -11453,6 +12089,8 @@ async fn perform_incremental_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: recorded_base.map(|base| base.to_string()),
             strategy: None,
             allow_unrelated_histories: options.allow_unrelated_histories,
@@ -13263,7 +13901,11 @@ mod tests {
         let no_ff = MergeArgs::try_parse_from(["merge", "--no-ff", "feature"]).unwrap();
         assert!(no_ff.no_ff);
         assert!(!no_ff.ff_only);
-        assert_eq!(no_ff.branch.as_deref(), Some("feature"));
+        assert_eq!(no_ff.branch, vec!["feature"]);
+
+        let octopus = MergeArgs::try_parse_from(["merge", "alpha", "beta", "gamma"])
+            .expect("parse several merge targets");
+        assert_eq!(octopus.branch, vec!["alpha", "beta", "gamma"]);
 
         let ff_only = MergeArgs::try_parse_from(["merge", "--ff-only", "feature"]).unwrap();
         assert!(ff_only.ff_only);
@@ -13339,6 +13981,52 @@ mod tests {
         assert_eq!(state.base.as_deref(), Some("base"));
         assert_eq!(state.strategy, None);
         assert!(!state.allow_unrelated_histories);
+        assert!(state.targets.is_empty());
+        assert!(state.target_refs.is_empty());
+    }
+
+    #[test]
+    fn merge_state_gc_roots_include_every_octopus_target() {
+        let gitdir = tempfile::tempdir().expect("create test gitdir");
+        std::fs::write(
+            gitdir.path().join("merge-state.json"),
+            r#"{
+                "head_name":"main",
+                "orig_head":"0000000000000000000000000000000000000001",
+                "target":"0000000000000000000000000000000000000002",
+                "target_ref":"alpha, beta",
+                "targets":[
+                    "0000000000000000000000000000000000000002",
+                    "0000000000000000000000000000000000000003"
+                ],
+                "target_refs":["alpha","beta"],
+                "base":null,
+                "conflicted_paths":[],
+                "message":"Merge branches 'alpha', 'beta' into main"
+            }"#,
+        )
+        .expect("write octopus merge state");
+
+        let roots = merge_state_gc_oids(gitdir.path())
+            .expect("read merge GC roots")
+            .expect("merge state exists");
+        assert_eq!(
+            roots,
+            vec![
+                (
+                    "orig_head",
+                    "0000000000000000000000000000000000000001".to_string()
+                ),
+                (
+                    "target",
+                    "0000000000000000000000000000000000000002".to_string()
+                ),
+                (
+                    "target",
+                    "0000000000000000000000000000000000000003".to_string()
+                ),
+            ]
+        );
     }
 
     /// Pin the `Display` format for every variant of [`PullMergeError`]
@@ -13395,6 +14083,18 @@ mod tests {
         assert_eq!(
             PullMergeError::UnrelatedHistories.to_string(),
             "refusing to merge unrelated histories",
+        );
+        assert_eq!(
+            PullMergeError::OctopusUnbornHead.to_string(),
+            "cannot merge multiple branches into an unborn HEAD; create the first commit first",
+        );
+        assert_eq!(
+            PullMergeError::OctopusConflict {
+                target: "beta".to_string(),
+                paths: "shared.txt".to_string(),
+            }
+            .to_string(),
+            "Automated merge with 'beta' did not work in shared.txt. Should not be doing an octopus",
         );
         assert_eq!(
             PullMergeError::UnsignedMergeCommit {

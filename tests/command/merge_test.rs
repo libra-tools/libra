@@ -33,6 +33,34 @@ fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
     );
 }
 
+fn commit_parents(repo: &Path) -> Vec<String> {
+    let output = run_libra_command(&["cat-file", "-p", "HEAD"], repo);
+    assert_cli_success(&output, "read HEAD commit");
+    String::from_utf8(output.stdout)
+        .expect("commit object is utf-8")
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent ").map(str::to_string))
+        .collect()
+}
+
+fn create_branch_commit(repo: &Path, branch: &str, file: &str, content: &str) -> String {
+    assert_cli_success(
+        &run_libra_command(&["branch", branch], repo),
+        "create octopus branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", branch], repo),
+        "checkout octopus branch",
+    );
+    commit_file(repo, file, content, &format!("commit {branch}"));
+    let tip = head_commit(repo);
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], repo),
+        "return to octopus main",
+    );
+    tip
+}
+
 fn merge_driver_repo(attribute: Option<&str>, default_driver: Option<&str>) -> tempfile::TempDir {
     merge_driver_repo_for_path("driver.txt", attribute, default_driver)
 }
@@ -1111,6 +1139,551 @@ async fn test_merge_diverged_branch_creates_two_parent_commit() {
         commit.message.starts_with('\n'),
         "merge commit body must retain Git's blank-line separator before the message"
     );
+}
+
+#[test]
+fn merge_octopus_creates_a_multi_parent_commit_in_command_line_order() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+    let alpha = create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    let beta = create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let gamma = create_branch_commit(root, "gamma", "gamma.txt", "gamma\n");
+
+    let output = run_libra_command(&["merge", "alpha", "beta", "gamma", "--no-verify"], root);
+    assert_cli_success(&output, "octopus merge");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("octopus"),
+        "the successful strategy should be visible: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(commit_parents(root), vec![original, alpha, beta, gamma]);
+    for file in ["alpha.txt", "beta.txt", "gamma.txt"] {
+        assert!(root.join(file).is_file(), "{file} should be merged");
+    }
+}
+
+#[test]
+fn merge_octopus_verifies_every_target_before_mutation() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "true"], root),
+        "enable signing for the first octopus target",
+    );
+    let alpha = create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "false"], root),
+        "disable signing for the later octopus target",
+    );
+    let beta = create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let head_before = head_commit(root);
+    let index_before = run_libra_command(&["ls-files", "-s"], root).stdout;
+
+    let output = run_libra_command(
+        &[
+            "merge",
+            "--verify-signatures",
+            "alpha",
+            "beta",
+            "--no-verify",
+        ],
+        root,
+    );
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "{stderr}");
+    assert!(
+        stderr.contains(&format!("commit {beta} does not have a GPG signature")),
+        "the signed first target {alpha} must not hide the unsigned later target: {stderr}"
+    );
+    assert_eq!(head_commit(root), head_before, "HEAD must not move");
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], root).stdout,
+        index_before,
+        "index must not move"
+    );
+    assert!(!root.join("alpha.txt").exists());
+    assert!(!root.join("beta.txt").exists());
+    assert!(!root.join(".libra/merge-state.json").exists());
+    assert!(!root.join(".libra/merge-autostash.json").exists());
+}
+
+#[test]
+fn merge_octopus_uses_the_hypothetical_merged_heads_as_each_rounds_base() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "shared"], root),
+        "create shared ancestor branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "shared"], root),
+        "checkout shared ancestor branch",
+    );
+    commit_file(root, "f", "one\n", "add shared f");
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "first"], root),
+        "create first branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "first"], root),
+        "checkout first branch",
+    );
+    commit_file(root, "first.txt", "first\n", "advance first");
+    let first = head_commit(root);
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "shared"], root),
+        "return to shared ancestor",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "target"], root),
+        "create target branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "target"], root),
+        "checkout target branch",
+    );
+    commit_file(root, "f", "two\n", "update shared f");
+    let target = head_commit(root);
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "return to main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "independent"], root),
+        "create independent branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "independent"], root),
+        "checkout independent branch",
+    );
+    commit_file(root, "f", "one\n", "independently add the same f");
+    let independent = head_commit(root);
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "return to main for octopus",
+    );
+
+    // Git computes the final round's base between `target` and a
+    // hypothetical merge of `first` + `independent`. That base is `shared`,
+    // so `f=two` is a clean one-sided update. Treating the base as the common
+    // ancestor of all three heads would incorrectly use `main` and report an
+    // add/add conflict.
+    let output = run_libra_command(
+        &["merge", "first", "independent", "target", "--no-verify"],
+        root,
+    );
+    assert_cli_success(&output, "octopus hypothetical-merge-base merge");
+    assert_eq!(
+        std::fs::read_to_string(root.join("f")).expect("read merged f"),
+        "two\n"
+    );
+    assert_eq!(
+        commit_parents(root),
+        vec![original, first, independent, target]
+    );
+}
+
+#[test]
+fn merge_octopus_rejects_heads_without_one_global_common_ancestor() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+    let index_before = run_libra_command(&["ls-files", "-s"], root).stdout;
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--orphan", "second-root"], root),
+        "create second root",
+    );
+    commit_file(root, "second.txt", "second\n", "second root");
+    assert_cli_success(
+        &run_libra_command(&["branch", "connected"], root),
+        "create connected branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "connected"], root),
+        "checkout connected branch",
+    );
+    commit_file(root, "connected.txt", "connected\n", "advance second root");
+    let connected = head_commit(root);
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "return to main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "bridge"], root),
+        "create bridge branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "bridge"], root),
+        "checkout bridge branch",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "merge",
+                "--allow-unrelated-histories",
+                "second-root",
+                "--no-verify",
+            ],
+            root,
+        ),
+        "create a bridge commit between the roots",
+    );
+    let bridge = head_commit(root);
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "return to original root",
+    );
+
+    // `bridge` shares the original root with HEAD and the second root with
+    // `connected`, so a merely sequential base check can merge both. Git's
+    // octopus entry gate instead requires one common ancestor across HEAD and
+    // every target, which this graph deliberately lacks.
+    let output = run_libra_command(&["merge", "bridge", "connected", "--no-verify"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing to merge unrelated histories"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(head_commit(root), original);
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], root).stdout,
+        index_before
+    );
+    assert!(!root.join("second.txt").exists());
+    assert!(!root.join("connected.txt").exists());
+    assert!(!root.join(".libra/merge-state.json").exists());
+
+    let allowed = run_libra_command(
+        &[
+            "merge",
+            "--allow-unrelated-histories",
+            "bridge",
+            "connected",
+            "--no-verify",
+        ],
+        root,
+    );
+    assert_cli_success(&allowed, "explicitly allowed chain-connected octopus");
+    assert_eq!(commit_parents(root), vec![original, bridge, connected]);
+    assert!(root.join("second.txt").is_file());
+    assert!(root.join("connected.txt").is_file());
+}
+
+#[test]
+fn merge_octopus_ours_strategy_records_all_parents_and_keeps_head_tree() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+    let alpha = create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    let beta = create_branch_commit(root, "beta", "beta.txt", "beta\n");
+
+    let output = run_libra_command(
+        &["merge", "-s", "ours", "alpha", "beta", "--no-verify"],
+        root,
+    );
+    assert_cli_success(&output, "octopus ours merge");
+    assert_eq!(commit_parents(root), vec![original, alpha, beta]);
+    assert!(!root.join("alpha.txt").exists());
+    assert!(!root.join("beta.txt").exists());
+}
+
+#[test]
+fn merge_octopus_conflict_is_atomic() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    commit_file(root, "shared.txt", "base\n", "octopus base");
+    create_branch_commit(root, "alpha", "shared.txt", "alpha\n");
+    create_branch_commit(root, "beta", "shared.txt", "beta\n");
+    let head_before = head_commit(root);
+    let index_before = run_libra_command(&["ls-files", "-s"], root).stdout;
+    let worktree_before = std::fs::read(root.join("shared.txt")).expect("read base worktree");
+
+    let output = run_libra_command(&["merge", "alpha", "beta", "--no-verify"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-002", "{stderr}");
+    assert!(
+        stderr.contains("Should not be doing an octopus"),
+        "{stderr}"
+    );
+    assert_eq!(head_commit(root), head_before, "HEAD must not move");
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], root).stdout,
+        index_before,
+        "index must stay byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(root.join("shared.txt")).expect("read worktree after refusal"),
+        worktree_before,
+        "worktree must stay byte-identical"
+    );
+    assert!(
+        !root.join(".libra/merge-state.json").exists(),
+        "an octopus conflict is not hand-resolvable state"
+    );
+}
+
+#[test]
+fn merge_octopus_dry_run_reports_conflict_without_writes() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    commit_file(root, "shared.txt", "base\n", "octopus base");
+    create_branch_commit(root, "alpha", "shared.txt", "alpha\n");
+    create_branch_commit(root, "beta", "shared.txt", "beta\n");
+    let head_before = head_commit(root);
+    let index_before = run_libra_command(&["ls-files", "-s"], root).stdout;
+
+    let output = run_libra_command(&["merge", "--dry-run", "alpha", "beta"], root);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Would conflict in: shared.txt"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(head_commit(root), head_before);
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], root).stdout,
+        index_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared.txt")).expect("read dry-run worktree"),
+        "base\n"
+    );
+}
+
+#[test]
+fn merge_octopus_autostash_restores_local_changes_after_success() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    commit_file(root, "local.txt", "base\n", "local base");
+    create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    std::fs::write(root.join("local.txt"), "dirty\n").expect("write dirty tracked file");
+
+    let output = run_libra_command(
+        &["merge", "--autostash", "alpha", "beta", "--no-verify"],
+        root,
+    );
+    assert_cli_success(&output, "octopus --autostash");
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).expect("read restored local file"),
+        "dirty\n"
+    );
+    assert!(root.join("alpha.txt").is_file());
+    assert!(root.join("beta.txt").is_file());
+    assert!(!root.join(".libra/merge-autostash.json").exists());
+}
+
+#[test]
+fn merge_octopus_autostash_restores_local_changes_after_preflight_failure() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    commit_file(root, "local.txt", "base\n", "local base");
+    create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    create_branch_commit(root, "beta", "collision.txt", "target\n");
+    let head_before = head_commit(root);
+    let index_before = run_libra_command(&["ls-files", "-s"], root).stdout;
+    std::fs::write(root.join("local.txt"), "dirty\n").expect("write dirty tracked file");
+    std::fs::write(root.join("collision.txt"), "untracked\n").expect("write untracked collision");
+
+    let output = run_libra_command(
+        &["merge", "--autostash", "alpha", "beta", "--no-verify"],
+        root,
+    );
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("untracked working tree file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(head_commit(root), head_before, "HEAD must not move");
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], root).stdout,
+        index_before,
+        "index must not move"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("local.txt")).expect("read restored dirty file"),
+        "dirty\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("collision.txt")).expect("read untracked file"),
+        "untracked\n"
+    );
+    assert!(!root.join("alpha.txt").exists());
+    assert!(!root.join(".libra/merge-autostash.json").exists());
+}
+
+#[test]
+fn merge_octopus_drops_redundant_heads_but_never_fast_forwards() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+    assert_cli_success(
+        &run_libra_command(&["branch", "ancestor"], root),
+        "create ancestor",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "ancestor"], root),
+        "checkout ancestor",
+    );
+    commit_file(root, "first.txt", "first\n", "first");
+    let redundant = head_commit(root);
+    assert_cli_success(
+        &run_libra_command(&["branch", "descendant"], root),
+        "create descendant",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "descendant"], root),
+        "checkout descendant",
+    );
+    commit_file(root, "second.txt", "second\n", "second");
+    let descendant = head_commit(root);
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "return to main",
+    );
+
+    let output = run_libra_command(
+        &[
+            "merge",
+            "--no-commit",
+            "ancestor",
+            "descendant",
+            "--no-verify",
+        ],
+        root,
+    );
+    assert_cli_success(&output, "octopus redundant head no-commit merge");
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join(".libra/merge-state.json")).expect("read reduced octopus state"),
+    )
+    .expect("parse reduced octopus state");
+    assert_eq!(state["targets"], serde_json::json!([descendant]));
+    assert_eq!(state["target_refs"], serde_json::json!(["descendant"]));
+    assert_eq!(state["target"], descendant);
+    assert_eq!(state["target_ref"], "descendant");
+    let continued = run_libra_command(&["--json", "merge", "--continue", "--no-verify"], root);
+    assert_cli_success(&continued, "continue reduced octopus merge");
+    assert_eq!(
+        parse_json_stdout(&continued)["data"]["strategy"],
+        "octopus",
+        "continued multi-head state must retain its strategy"
+    );
+    assert_ne!(
+        head_commit(root),
+        descendant,
+        "octopus must not fast-forward"
+    );
+    assert_eq!(
+        commit_parents(root),
+        vec![original, descendant],
+        "the ancestor target {redundant} is redundant"
+    );
+}
+
+#[test]
+fn merge_octopus_reports_already_up_to_date_when_every_head_is_reachable() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "old-a"], root), "old-a");
+    assert_cli_success(&run_libra_command(&["branch", "old-b"], root), "old-b");
+    commit_file(root, "new.txt", "new\n", "advance main");
+    let before = head_commit(root);
+
+    let output = run_libra_command(&["merge", "old-a", "old-b"], root);
+    assert_cli_success(&output, "up-to-date octopus");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Already up to date."),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(head_commit(root), before);
+}
+
+#[test]
+fn merge_octopus_ff_only_refuses_without_mutation() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let before = head_commit(root);
+
+    let output = run_libra_command(&["merge", "--ff-only", "alpha", "beta"], root);
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("non-fast-forward merge refused"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(head_commit(root), before);
+    assert!(!root.join("alpha.txt").exists());
+    assert!(!root.join("beta.txt").exists());
+}
+
+#[test]
+fn merge_octopus_no_commit_records_all_targets_and_abort_restores() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let alpha = create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    let beta = create_branch_commit(root, "beta", "beta.txt", "beta\n");
+    let before = head_commit(root);
+
+    let output = run_libra_command(
+        &["merge", "--no-commit", "alpha", "beta", "--no-verify"],
+        root,
+    );
+    assert_cli_success(&output, "octopus --no-commit");
+    assert_eq!(head_commit(root), before);
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join(".libra/merge-state.json")).expect("read octopus state"),
+    )
+    .expect("parse octopus state");
+    assert_eq!(state["targets"], serde_json::json!([alpha, beta]));
+    assert_eq!(state["target_refs"], serde_json::json!(["alpha", "beta"]));
+    assert_eq!(state["target"], alpha);
+    assert_eq!(state["target_ref"], "alpha, beta");
+
+    assert_cli_success(
+        &run_libra_command(&["merge", "--abort"], root),
+        "abort octopus --no-commit",
+    );
+    assert_eq!(head_commit(root), before);
+    assert!(!root.join("alpha.txt").exists());
+    assert!(!root.join("beta.txt").exists());
+    assert!(!root.join(".libra/merge-state.json").exists());
+}
+
+#[test]
+fn merge_octopus_no_commit_continues_with_every_parent() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let original = head_commit(root);
+    let alpha = create_branch_commit(root, "alpha", "alpha.txt", "alpha\n");
+    let beta = create_branch_commit(root, "beta", "beta.txt", "beta\n");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["merge", "--no-commit", "alpha", "beta", "--no-verify"],
+            root,
+        ),
+        "octopus --no-commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue", "--no-verify"], root),
+        "continue octopus",
+    );
+    assert_eq!(commit_parents(root), vec![original, alpha, beta]);
 }
 
 #[test]
@@ -5120,8 +5693,9 @@ fn merge_crisscross_gc_reclaims_the_virtual_ancestor_and_restart_recovers() {
     );
 }
 
-/// G10: a recursive merge adds no field to `merge-state.json`, so a state file
-/// in the pre-existing schema still drives `--abort` to completion.
+/// MG-02 G10 + MG-12 G13: the additive octopus fields stay empty for a
+/// single-head recursive merge, and a state file from before either extension
+/// still drives `--abort` to completion.
 #[test]
 fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
     let repo = create_crisscross_repo();
@@ -5140,6 +5714,8 @@ fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
         "orig_head",
         "target",
         "target_ref",
+        "targets",
+        "target_refs",
         "base",
         "strategy",
         "allow_unrelated_histories",
@@ -5153,9 +5729,11 @@ fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
     for key in state.as_object().expect("state object").keys() {
         assert!(
             known.contains(&key.as_str()),
-            "a recursive merge must not grow the state schema; found '{key}'"
+            "the state contains an unknown field; found '{key}'"
         );
     }
+    assert_eq!(state["targets"], serde_json::json!([]));
+    assert_eq!(state["target_refs"], serde_json::json!([]));
 
     // Rewrite it in the pre-P1-07b shape (no strategy / unrelated / hook flags,
     // no base) and confirm it is still a state this binary can finish.

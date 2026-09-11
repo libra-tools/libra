@@ -169,7 +169,7 @@ gitlink（`0o160000`）在 tree/index 中仍可识别；`ls-tree` / `show` / `fs
 
 ### 未覆盖的已知缺口（有意排除出本计划）
 
-以下 `partial` 命令在 `docs/development/commands/README.md` 有记录的缺口，但**不在本 Grit 差距补全计划内**。它们由各自命令开发文档维护，不进入本文件的阶段路线；若 Grit 测试重写（`GGT-00A`）覆盖到这些命令，相关断言按 `direct`/`adapted`/`declined`/`blocked` 分类处理，`blocked` 不指向本计划的任务编号。**2026-08-27 逐行复核**：下表 6 行已被实现推翻（`cat-file`/`shortlog`/`commit`/`reset`+`restore`/`fsck` 缺口清空，`tag`/`format-patch`/`log` 缺口收窄），条目按治理规则保留并改标注；以下 7 行经实测**仍成立**——`config` includeIf（`grep -rn "includeIf\|include_if" src/` 零命中）、`blame` reverse/incremental（`blame.rs` 零命中）、`stash create`/`store`（D8/D9，`COMPATIBILITY.md:131` 明写 deferred）、`symbolic-ref` 仅 HEAD（`symbolic_ref.rs:1,23` 明写）、`merge` octopus/custom strategies（`merge.rs:144-147` 注释「supports only `ours`」）、`bisect replay`（`bisect.rs` 零命中）、`clean -i`（`clean.rs` 零命中）。
+以下 `partial` 命令在 `docs/development/commands/README.md` 有记录的缺口，但**不在本 Grit 差距补全计划内**。它们由各自命令开发文档维护，不进入本文件的阶段路线；若 Grit 测试重写（`GGT-00A`）覆盖到这些命令，相关断言按 `direct`/`adapted`/`declined`/`blocked` 分类处理，`blocked` 不指向本计划的任务编号。**2026-08-27 逐行复核，2026-09-11 merge 状态修正**：下表 6 行已被实现推翻（`cat-file`/`shortlog`/`commit`/`reset`+`restore`/`fsck` 缺口清空，`tag`/`format-patch`/`log` 缺口收窄），条目按治理规则保留并改标注；以下 7 行经实测**仍成立**——`config` includeIf（`grep -rn "includeIf\|include_if" src/` 零命中）、`blame` reverse/incremental（`blame.rs` 零命中）、`stash create`/`store`（D8/D9，`COMPATIBILITY.md:131` 明写 deferred）、`symbolic-ref` 仅 HEAD（`symbolic_ref.rs:1,23` 明写）、`merge` 的 `ours` 之外自定义策略（octopus 多目标已由 MG-12 实现）、`bisect replay`（`bisect.rs` 零命中）、`clean -i`（`clean.rs` 零命中）。
 
 | 命令 | README 记录的缺口 | 排除理由 |
 |------|-------------------|----------|
@@ -189,7 +189,7 @@ gitlink（`0o160000`）在 tree/index 中仍可识别；`ls-tree` / `show` / `fs
 | `symbolic-ref` | 仅支持 HEAD | SQLite refs 架构限制，非 Grit 差距 |
 | `tag` | Git GPG interop（editor `-e` ✅ **已实现**：`tag.rs:68` `#[clap(short='e', long="edit")]`，`_compatibility.md:100` 亦确认） | 独立于本计划 |
 | `cherry-pick` / `revert` | `--edit`、strategy flags、multi-commit todo | sequencer 增强，部分由 D 编号治理 |
-| `merge` | octopus/custom strategies | 策略引擎增强，独立于本计划（`--stat`、`--verify-signatures`(vault-key PGP) 已实现） |
+| `merge` | `ours` 之外的自定义策略 | 策略引擎增强，独立于本计划（octopus 多目标、`--stat`、`--verify-signatures`(vault-key PGP) 已实现） |
 | `commit` | ~~`-t --template`~~ | ✅ **已实现**（`commit.rs:107` `#[arg(short='t', long="template", value_name="FILE")]`，含 `commit.template` config 回退）；`--status` 亦已实现，本行缺口已清空 |
 | `describe` | （`--contains` 已实现，git name-rev） | 独立于本计划 |
 | `reset` / `restore` | ~~reset merge/keep mode、restore conflict re-render（`--merge`/`--conflict`）variants~~ | ✅ **均已实现**（`reset.rs:78` `pub merge` / `reset.rs:83` `pub keep`；`restore.rs:296` `pub conflict: Option<String>`；`_compatibility.md:95` 亦确认）；restore `--overlay`/`--no-overlay`/`--ours`/`--theirs`/`--ignore-unmerged` 亦已实现，本行缺口已清空 |

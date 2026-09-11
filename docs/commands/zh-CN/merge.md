@@ -1,11 +1,11 @@
 # `libra merge`
 
-将一个目标合并到当前分支。
+将一个或多个目标合并到当前分支。
 
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>...
 libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
@@ -13,13 +13,21 @@ libra merge --restart
 
 ## 说明
 
-`libra merge <branch>` 会解析本地分支、提交哈希，或 `refs/remotes/origin/main` 这样的远程跟踪引用。
+`libra merge <branch>...` 会解析一个或多个本地分支、提交哈希，或 `refs/remotes/origin/main` 这样的远程跟踪引用。一个目标保持下述单头行为；两个及以上目标进入 octopus 合并路径。
 
 如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
 开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue` 或 `--abort`；没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
 
-默认三方策略支持冲突侧、空白比较和 renormalize 三类 `-X` 选项。`-X ours` / `-X theirs` 只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它支持值见下文“输入归一化”；未列出的 strategy/strategy option 会在参数解析阶段拒绝。
+默认三方策略支持冲突侧、空白比较和 renormalize 三类 `-X` 选项。`-X ours` / `-X theirs` 只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者以 HEAD 和所有仍有效的目标作为 parents 创建 merge commit（所有目标均已可达时除外），但完整保留当前 HEAD tree。其它支持值见下文“输入归一化”；未列出的 strategy/strategy option 会在参数解析阶段拒绝。
+
+### Octopus 合并（多个目标）
+
+传入两个及以上目标时，Libra 会剔除重复目标以及能从其它目标到达的冗余目标，同时保持独立 tip 的命令行顺序。若所有剩余目标都已能从 `HEAD` 到达，结果是 `Already up to date.`；否则 octopus 路径永不 fast-forward：成功提交的第一个 parent 是 `HEAD`，后续 parents 是按命令行顺序排列的剩余目标。因此 `--ff-only` 会拒绝任何非 already-up-to-date 的 octopus 合并。
+
+策略启动前，除非给出 `--allow-unrelated-histories`，Libra 要求 `HEAD` 与全部目标共享一段历史，与 Git 的 all-tip octopus 入口门一致。随后各目标的 tree 在内存中依次合并；每一轮都针对该目标与“已纳入的 merge-reference commits 的假想合并”计算共同祖先，包括 criss-cross 的全部 LCA，特意不采用全体 tip 的交集。只有所有轮次都干净后，Libra 才写 merge object、索引、tracked 工作树、merge 状态、ref 或 reflog。任一轮冲突时，命令以 `LBR-CONFLICT-002` 失败，指出目标与路径并包含 “Should not be doing an octopus”；`HEAD`、索引和工作树保持不变。此时不会创建可解决的冲突状态；需要逐个合并目标来解决冲突。
+
+干净的 octopus 合并支持 `--no-commit`：状态会把每个目标保存为 GC root，`--continue` 创建同样 parent 顺序的多父提交，`--abort` 恢复合并前状态。`--squash`、`--dry-run`、`--autostash`、`-s ours`、`-X` 选项、无关历史许可、merge 消息 shortlog、hooks 与签名验证也适用；`--verify-signatures` 会在任何变更前验证每个已解析的目标。octopus 预演会报告干净的 `octopus` 结果，或只读的 would-conflict 结果。与单头 external merge driver 相同，受信任但未沙箱化的 driver 直接修改仓库时超出 Libra 的原子回滚边界。
 
 ### 交叉合并历史（多个 merge base）
 
@@ -156,7 +164,7 @@ Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并�
 
 `libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
 
-Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、上述列表之外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
+Libra 仍未实现 `ours` 以外的 merge strategy、上述列表之外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
 ### 重命名
 
@@ -190,11 +198,11 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames`、`merge.renormalize` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。`merge.renormalize` 的阶段性读取时机见上文。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只允许单头可快进历史，非 already-up-to-date 的 octopus 永不快进）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在每个已解析目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames`、`merge.renormalize` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。`merge.renormalize` 的阶段性读取时机见上文。
 
 ### `--dry-run`（Libra 扩展）
 
-`libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，只要没有进行中的 merge 状态且索引没有未解决条目，脏工作树也可预演。入口检查仍适用于 `--dry-run`，包括未解决的 squash 冲突；除此之外，预演不校验工作树干净度，真实合并仍可能拒绝。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory` / `rename-rename` / `directory-rename`；`rename-rename` 报告 rename/rename(1to2) 的两个目标，`directory-rename` 报告建议落位或目录分裂。`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
+`libra merge --dry-run <branch>...` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，只要没有进行中的 merge 状态且索引没有未解决条目，脏工作树也可预演。入口检查仍适用于 `--dry-run`，包括未解决的 squash 冲突；除此之外，预演不校验工作树干净度，真实合并仍可能拒绝。结果：fast-forward / 已最新 / 干净三方或 octopus 合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`、`conflicted_paths` 与 `conflict_kinds`——每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content` / `modify-delete` / `file-directory` / `rename-rename` / `directory-rename`；`rename-rename` 报告 rename/rename(1to2) 的两个目标，`directory-rename` 报告建议落位或目录分裂。`original_path` 仅目录/文件移位时出现并记录原路径，此时 `path` 是文件将被写到的带 `~` 后缀的名字），真实合并的输出不含这些键（schema 冻结）。
 
 ### `--restart`（Libra 扩展，移植 Lore `branch merge restart`）
 
@@ -204,28 +212,28 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 
 | 选项 | 说明 |
 |--------|-------------|
-| `<branch>` | 要合并的目标分支、提交或远程跟踪引用。 |
+| `<branch>...` | 一个或多个目标分支、提交或远程跟踪引用；两个及以上进入原子 octopus 路径。 |
 | `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。也可与 `--continue` 同用，覆盖冲突合并开始时记录的消息——这是 Libra 扩展：Git 的 `--continue` 不接受参数，而 Libra 的 merge 从不打开编辑器。 |
 | `--ff` | 允许可行的快进，覆盖 `merge.ff=false|only`。 |
-| `--ff-only` | 仅当当前分支可快进时才合并，否则失败。 |
-| `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
-| `-s ours`, `--strategy=ours` | 以双父提交记录合并关系，但完整保留当前 HEAD tree；不同于 `-X ours`。其它 strategy 被拒绝。 |
+| `--ff-only` | 仅当单头合并可快进时才合并；非 already-up-to-date 的 octopus 永不快进，因此会被拒绝。 |
+| `--no-ff` | 单头可快进时仍强制生成 merge commit；octopus 本来就总会生成。 |
+| `-s ours`, `--strategy=ours` | 以 HEAD 和每个非冗余目标作为 parents 记录合并关系，但完整保留当前 HEAD tree；不同于 `-X ours`。其它 strategy 被拒绝。 |
 | `-X <option>`, `--strategy-option=<option>` | 接受 `ours`、`theirs`、`ignore-space-change`、`ignore-all-space`、`ignore-space-at-eol`、`ignore-cr-at-eol`、`renormalize` 或 `no-renormalize`。可重复；favor 与 renormalize toggle 各自 last-one-wins，空白模式选择最强规则；不能与 `-s ours` 组合。 |
 | `--allow-unrelated-histories` | 以虚拟空 merge base 允许没有共同祖先的历史；非 squash 冲突的 `--restart` 会保留此许可。 |
 | `--log[=<N>]` | 向 merge 消息追加最多 N 条目标侧 subject；bare `--log` 为 20。覆盖 `merge.log`，并可追加到显式 `-m`；与 `--no-log` last-one-wins。 |
 | `--no-log` | 禁用 merge 消息 shortlog，覆盖 `merge.log` 和更早的 `--log`。 |
 | `--squash` | 生成合并后的索引/工作树，但不创建提交、不移动 HEAD、不记录 merge 状态，即使发生冲突也如此。解决并暂存冲突后，用普通 `libra commit` 创建单亲提交；`--continue`、`--abort`、`--restart` 均报 `no merge in progress`。 |
-| `--no-commit` | 执行合并但停在提交之前，即使冲突也保留 merge 状态。解决并暂存冲突后，用 `libra merge --continue` 创建双父合并提交。 |
+| `--no-commit` | 执行合并但停在提交之前。干净 octopus 状态保留全部目标供 `--continue`/`--abort`；octopus 冲突原子拒绝且不创建状态。单头冲突仍保留可解决状态。 |
 | `--no-verify` | 本次 merge 跳过全部 `.libra/hooks`；与 `--continue` 一起使用时绕过待执行的 commit/消息/post hooks。 |
 | `--no-edit` | 接受自动生成的合并消息而不启动编辑器。Libra 从不为 merge 打开编辑器，故此为对齐 Git 而接受的 no-op。 |
 | `--stat` | 合并完成后显示 diffstat（合并前 HEAD 与新提交之间的变更）。Git 默认显示；Libra 默认不显示，故用 `--stat` 主动开启。与 `--no-stat`/`-n` 构成 last-wins 切换。仅人类输出。 |
 | `-n`, `--no-stat` | 合并结束时不显示 diffstat（Libra 默认）。与 `--stat` 构成 last-wins 切换。 |
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
-| `--verify-signatures` | 验证被合并分支 tip 的 PGP 签名，未签名或签名无效则中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
+| `--verify-signatures` | 验证每个目标 tip 的 PGP 签名，任一未签名或签名无效都在变更前中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
 | `--no-rerere-autoupdate` | 为对齐 Git 而接受。rerere 已集成：`rerere.enabled` 开启时，冲突合并会记录每个冲突的 preimage 并在有匹配记录时回放已保存的解法；回放文件是否自动暂存跟随 `rerere.autoUpdate` 配置。逐次调用的覆盖未实现——暂存始终跟随配置。（Git 的正向 `--rerere-autoupdate` 未公开。） |
 | `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
-| `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，创建双父提交。squash 没有可继续的 merge 状态。 |
+| `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，使用 merge 状态记录的 parent 集合。squash 没有可继续的 merge 状态。 |
 | `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
 | `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
 | `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit` 互斥。 |
@@ -250,6 +258,7 @@ merge 生命周期；需要
 
 ```bash
 libra merge feature-x
+libra merge topic-a topic-b topic-c
 libra merge -X ours feature-x
 libra merge -s ours obsolete-history
 libra merge --allow-unrelated-histories imported-root
@@ -269,9 +278,11 @@ libra merge --json feature-x
 
 1. 编辑包含冲突标记的文件。
 2. 使用 `libra add <path>` 暂存每个已解决路径。
-3. 运行 `libra merge --continue` 创建双父合并提交。
+3. 运行 `libra merge --continue` 创建合并提交。
 
 在继续之前运行 `libra merge --abort` 可将分支、索引和工作树恢复到合并前提交。当存在 merge 状态时，`libra status` 会显示进行中的合并目标，以及 continue/abort 命令。
+
+上述冲突解决流程只适用于单头合并。octopus 内容冲突会被原子拒绝且不创建 merge 状态，因此不能使用 `--continue`、`--abort` 或 `--restart`；请逐个合并这些目标。以 `--no-commit` 停下的干净 octopus 会创建状态，可正常继续或中止。
 
 `--squash` 冲突会留下未解决的索引 stage 和工作树结果，保持 HEAD 不变，但不创建 merge 状态。解决文件、用 `libra add <path>` 暂存每个已解决路径后，运行普通 `libra commit` 创建单亲提交。`libra merge --continue`、`--abort`、`--restart` 均以 `no merge in progress` 拒绝（`LBR-REPO-003`，退出 128），上面的非 squash 恢复步骤不适用。若启用了 `--autostash`，本地改动直接保存进 `stash list`，未解决的索引和工作树保持原样；解决并提交 squash 后，再用 `libra stash pop` 恢复本地改动。
 
@@ -334,7 +345,7 @@ Merge aborted.
 }
 ```
 
-`-s ours` 使用 `strategy: "ours"`、`files_changed: 0` 并报告两个 parent。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
+`-s ours` 使用 `strategy: "ours"` 和 `files_changed: 0`。默认多目标合并使用 `strategy: "octopus"`；`parents` 依次包含 `HEAD` 与命令行顺序下的每个非冗余目标。已经最新的合并使用 `strategy: "already-up-to-date"`、`commit: null`、`files_changed: 0` 和 `up_to_date: true`。
 
 `--abort` 设置 `aborted: true`；`--continue` 设置 `continued: true`。冲突失败会在 stderr 上返回带有 `LBR-CONFLICT-002` 的错误信封。 `--dry-run` 额外带 `dry_run`、`would_conflict`、`conflicted_paths` 与 `conflict_kinds`（每个冲突路径一个 `{"path", "kind", "original_path"?}` 对象，`kind` 为 `content`、`modify-delete`、`file-directory`、`rename-rename` 或 `directory-rename`；`rename-rename` 报告 rename/rename(1to2) 的两个目标，`directory-rename` 报告建议落位或目录分裂。`original_path` 仅在目录/文件移位时出现，记录文件原来的路径，此时 `path` 与 `conflicted_paths` 里都是带 `~` 后缀的目标名）。
 
@@ -342,12 +353,12 @@ Merge aborted.
 
 | 参数 | Libra | Git | jj |
 |-----------|-------|-----|----|
-| 分支目标 | `<branch>`（单个目标） | `<commit>...`（一个或多个） | N/A（使用 `jj new`） |
+| 分支目标 | `<branch>...`（一个或多个） | `<commit>...`（一个或多个） | N/A（使用 `jj new`） |
 | 快进 | 支持 | 支持 | N/A |
 | 单头三方合并 | 支持 | 支持 | N/A |
 | 交叉合并（多个 merge base） | 递归虚拟祖先（折叠顺序：object id 升序；最大深度 20，每层最多 32 个 base） | 递归虚拟祖先（`-s recursive`/`ort`，深度无上限） | N/A |
 | Continue / abort | `--continue`, `--abort`（需要非 squash merge 状态） | `--continue`, `--abort`（需要非 squash merge 状态） | N/A |
-| Octopus merge | 不支持 | 支持 | N/A |
+| Octopus merge | 支持；冲突原子拒绝，parents 经归约并保持顺序 | 支持 | N/A |
 | 仅快进 | `--ff-only` | `--ff-only` | N/A |
 | 强制合并提交 | `--no-ff` | `--no-ff` | N/A |
 | Squash | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | N/A |
@@ -384,6 +395,7 @@ Merge aborted.
 | 真正三路合并读取到无效 `merge.renormalize` 值 | `LBR-REPO-003` | 128 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |
+| Octopus 冲突（原子拒绝，不创建 merge 状态） | `LBR-CONFLICT-002` | 128 |
 | 无 merge 状态但索引有未解决条目，包括目标已最新或 `--dry-run` | `LBR-CONFLICT-002` | 128 |
 | 脏工作树或暂存更改 | `LBR-CONFLICT-002` | 128 |
 | 未跟踪文件会被覆盖 | `LBR-CONFLICT-002` | 128 |

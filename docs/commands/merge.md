@@ -1,11 +1,11 @@
 # `libra merge`
 
-Merge one target into the current branch.
+Merge one or more targets into the current branch.
 
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>...
 libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
@@ -13,13 +13,21 @@ libra merge --restart
 
 ## Description
 
-`libra merge <branch>` resolves a local branch, commit hash, or remote-tracking ref such as `refs/remotes/origin/main`.
+`libra merge <branch>...` resolves one or more local branches, commit hashes, or remote-tracking refs such as `refs/remotes/origin/main`. One target keeps the single-head behavior described below; two or more targets select an octopus merge.
 
 Before starting a merge, Libra checks both merge state and the index. Existing merge state still directs you to `merge --continue` or `--abort`. If there is no merge state but unresolved index entries remain (for example after a conflicted squash), even an already-up-to-date merge or `--dry-run` fails with `LBR-CONFLICT-002` (exit 128), preserving HEAD, the index and working tree. Resolve the conflicts, stage the paths with `libra add`, and run a plain `libra commit` before starting another merge.
 
 If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
-The default three-way strategy accepts conflict-side, whitespace-comparison, and renormalization `-X` options. `-X ours` / `-X theirs` choose a side only for conflicting hunks/paths while retaining clean changes from both sides. This is different from `-s ours`, which always creates a two-parent merge commit (unless the target is already an ancestor) while retaining the entire current HEAD tree. See “Input normalization” below for the other supported values. Other strategies and strategy options are rejected during argument parsing.
+The default three-way strategy accepts conflict-side, whitespace-comparison, and renormalization `-X` options. `-X ours` / `-X theirs` choose a side only for conflicting hunks/paths while retaining clean changes from both sides. This is different from `-s ours`, which creates a merge commit with `HEAD` and every surviving target as parents (unless every target is already reachable) while retaining the entire current HEAD tree. See “Input normalization” below for the other supported values. Other strategies and strategy options are rejected during argument parsing.
+
+### Octopus merges (several targets)
+
+With two or more targets, Libra reduces duplicate targets and targets reachable from another supplied target, retaining the command-line order of the independent tips. If every surviving target is already reachable from `HEAD`, the result is `Already up to date.` Otherwise the octopus path never fast-forwards: a successful merge commit has `HEAD` first, followed by the surviving targets in command-line order. `--ff-only` therefore refuses a non-up-to-date octopus merge.
+
+Before the strategy starts, Libra requires one common history across `HEAD` and every target unless `--allow-unrelated-histories` is present, matching Git's all-tip octopus entry gate. The trees are then merged one target at a time in memory. Each round computes the common ancestors between that target and a hypothetical merge of the merge-reference commits already incorporated, including every criss-cross LCA; this is intentionally not the all-tip intersection. Libra writes no merge object, index entry, tracked working-tree path, merge state, ref, or reflog until every round is clean. If any round conflicts, the command fails with `LBR-CONFLICT-002`, names the target and paths, includes “Should not be doing an octopus”, and leaves `HEAD`, index, and working tree unchanged. No conflict state is created; merge the targets one at a time if conflicts need resolution.
+
+Clean octopus merges support `--no-commit`: the state records every target as a GC root, `--continue` creates the same ordered multi-parent commit, and `--abort` restores the pre-merge state. `--squash`, `--dry-run`, `--autostash`, `-s ours`, `-X` options, unrelated-history permission, merge-message shortlogs, hooks, and signature verification also apply; `--verify-signatures` verifies every resolved target before mutation. An octopus dry-run reports a clean `octopus` result or a read-only would-conflict result. As with single-head external merge drivers, a trusted unsandboxed driver can directly mutate the repository outside Libra's atomic rollback boundary.
 
 ### Criss-cross histories (several merge bases)
 
@@ -292,9 +300,9 @@ mode; a suggested-location or split preview uses conflict kind
 
 When the corresponding CLI flag is absent, Libra reads these Git-compatible defaults through the local → global → system cascade:
 
-- `merge.ff=true|false|only` allows fast-forwarding, forces a two-parent merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it. `only` (like `--ff-only`) rejects only a genuinely diverged history: a fast-forwardable `--squash` or `--no-commit` is still allowed, matching Git.
+- `merge.ff=true|false|only` allows fast-forwarding, forces a merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it. `only` (like `--ff-only`) rejects only a genuinely diverged single-head history; a non-up-to-date octopus never fast-forwards.
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. For a non-squash merge, the resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog. Squash records no merge state; its ordinary `libra commit` supplies the commit message.
-- `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
+- `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on every resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
 
 Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames`, `merge.renameLimit`, `merge.directoryRenames`, and `merge.renormalize`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`). `merge.renormalize` follows the phase-local timing described above.
 
@@ -314,34 +322,34 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement octopus merges, merge strategies other than `ours`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
+Libra still does not implement merge strategies other than `ours`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `<branch>` | Target branch, commit, or remote-tracking ref to merge. |
+| `<branch>...` | One or more target branches, commits, or remote-tracking refs. Two or more select the atomic octopus path. |
 | `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). Also accepted with `--continue`, where it overrides the message recorded when the conflicted merge started — a Libra extension, since Git's `--continue` takes no arguments and Libra never opens an editor for merge. |
 | `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
-| `--ff-only` | Refuse to merge unless the current branch can be fast-forwarded. |
-| `--no-ff` | Always create a two-parent merge commit, even when a fast-forward is possible. |
-| `-s ours`, `--strategy=ours` | Record the merge relationship with two parents while retaining the complete current HEAD tree. Distinct from `-X ours`. Other strategies are rejected. |
+| `--ff-only` | Refuse unless a single-head merge can fast-forward. A non-up-to-date octopus merge is never a fast-forward and is refused. |
+| `--no-ff` | Always create a merge commit even when a single-head fast-forward is possible. Octopus already always creates one. |
+| `-s ours`, `--strategy=ours` | Record the merge relationship with `HEAD` plus every surviving target as parents while retaining the complete current HEAD tree. Distinct from `-X ours`. Other strategies are rejected. |
 | `-X <option>`, `--strategy-option=<option>` | Accepts `ours`, `theirs`, `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, or `no-renormalize`. Repeatable; favor and renormalize toggles are last-one-wins, while whitespace modes select the strongest requested comparison. Cannot be combined with `-s ours`. |
 | `--allow-unrelated-histories` | Permit histories with no common ancestor by using a virtual empty merge base. The permission is persisted for non-squash conflict `--restart`. |
 | `--log[=<N>]` | Append up to N target-side subjects to the merge message; bare `--log` uses 20. Overrides `merge.log`, and also appends to an explicit `-m` message. Last-one-wins with `--no-log`. |
 | `--no-log` | Disable the merge-message shortlog, overriding `merge.log` and an earlier `--log`. |
 | `--squash` | Produce the merged index/working tree but create no commit, do not move HEAD, and record no merge state, including on conflict. Resolve and stage any conflicts, then finish with a plain `libra commit` (one parent). `--continue`, `--abort`, and `--restart` report `no merge in progress`. |
-| `--no-commit` | Perform the merge but stop before committing, retaining merge state even when conflicts occur. Resolve and stage any conflicts, then finish with `libra merge --continue` to create the two-parent merge commit. |
+| `--no-commit` | Perform the merge but stop before committing. A clean octopus state retains every target for `--continue`/`--abort`; an octopus conflict is atomic and creates no state. Single-head conflicts retain their normal resolvable state. |
 | `--no-verify` | Skip all `.libra/hooks` for this merge. With `--continue`, bypass the pending commit/message/post hooks. |
 | `--no-edit` | Accept the auto-generated merge message without launching an editor. Libra never opens an editor for merge, so this is a no-op accepted for Git parity. |
 | `--stat` | Show a diffstat of the merge result (the changes between the pre-merge HEAD and the new commit) after the merge completes. Git shows this by default; Libra defaults to no diffstat, so `--stat` opts in. Last-one-wins toggle with `--no-stat`/`-n`. Human output only. |
 | `-n`, `--no-stat` | Do not show a diffstat at the end of the merge (Libra's default). Last-one-wins toggle with `--stat`. |
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
-| `--verify-signatures` | Verify the PGP signature on the tip commit and abort if it is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
+| `--verify-signatures` | Verify the PGP signature on every target tip and abort before mutation if any is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
 | `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
 | `--no-rerere-autoupdate` | Accepted for Git parity. Rerere IS integrated: with `rerere.enabled`, a conflicted merge records each conflict's preimage and replays a recorded resolution when one matches; auto-staging of replayed files follows the `rerere.autoUpdate` config. The per-invocation override is not implemented — staging follows the config either way. (Git's positive `--rerere-autoupdate` is not exposed.) |
 | `--no-gpg-sign` | Do not GPG-sign the merge commit. No-op accepted for Git parity: Libra's merge never signs. (Git's `-S`/`--gpg-sign` is not implemented.) |
-| `--continue` | Finish an in-progress non-squash merge after conflicts have been resolved and staged, creating a two-parent commit. A squash has no merge state to continue. |
+| `--continue` | Finish an in-progress non-squash merge after conflicts have been resolved and staged, using the parent set recorded in merge state. A squash has no merge state to continue. |
 | `--abort` | Restore the pre-merge HEAD, index, and working tree of an in-progress non-squash merge (re-applies a held autostash). Unavailable after `--squash`. |
 | `--autostash` / `--no-autostash` | Stash local tracked changes before the merge and restore staged index and unstaged worktree layers separately when it concludes — held (outside `stash list`) across a non-squash conflict until `--continue`/`--abort`. A clean squash attempts restoration when the merge command returns. A conflicted squash saves the autostash directly in `stash list` without applying it, preserving the unresolved index and working tree; resolve and commit those conflicts, then run `libra stash pop`. If saving fails, a warning is emitted and the held autostash remains referenced by its sidecar. A conflicting re-apply is saved to the stash list with a notice, never lost. Config: `merge.autostash` (boolean; invalid value = hard error). Untracked files are not stashed (Git parity). `--json` adds `autostash: applied\|stashed\|kept`. |
 | `--dry-run` | Libra extension: preview the merge outcome writing **nothing** — reports fast-forward / already-up-to-date / clean three-way / would-conflict (with the paths). Exits 0 for a clean preview, 1 when the merge would conflict. Mutually exclusive with `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit`. |
@@ -366,6 +374,7 @@ argument `1`; it does not run for already-up-to-date or conflicted outcomes.
 
 ```bash
 libra merge feature-x
+libra merge topic-a topic-b topic-c
 libra merge -X ours feature-x
 libra merge -s ours obsolete-history
 libra merge --allow-unrelated-histories imported-root
@@ -385,9 +394,11 @@ For a merge started without `--squash` (including `--no-commit`), resolve confli
 
 1. Edit files containing conflict markers.
 2. Stage each resolved path with `libra add <path>`.
-3. Run `libra merge --continue` to create the two-parent merge commit.
+3. Run `libra merge --continue` to create the merge commit.
 
 Run `libra merge --abort` before continuing to restore the branch, index, and working tree to the pre-merge commit. `libra status` shows the in-progress merge target and the continue/abort commands while merge state exists.
+
+This conflict-resolution flow applies to single-head merges. An octopus content conflict is rejected atomically and creates no merge state, so `--continue`, `--abort`, and `--restart` do not apply; merge the heads one at a time instead. A clean octopus stopped with `--no-commit` does create state and may be continued or aborted normally.
 
 To throw away a botched resolution attempt and start over in one step, run `libra merge --restart`: it restores the pre-merge state exactly like `--abort` (any edits to conflicted files are **discarded**) and immediately re-runs the same merge against the recorded target commit — deterministic even if the branch has moved since — leaving fresh conflict markers and a fresh merge state. The re-run uses default merge options.
 
@@ -395,7 +406,7 @@ A `--squash` conflict keeps the unresolved index stages and working-tree result 
 
 ## Dry Run
 
-`libra merge --dry-run <branch>` (a Libra extension — Git has no true merge dry-run) reports what the merge *would* do without writing anything: no HEAD, index, working-tree, reflog, merge-state, or object-store mutation (auto-merged blobs are computed in memory only). Because it is read-only it also works on a dirty working tree, provided the index has no unresolved entries and no merge is already in progress. The entry checks still apply to `--dry-run`, including unresolved squash conflicts; apart from those checks, the preview does not validate cleanliness, so a real merge may still refuse where the preview succeeded.
+`libra merge --dry-run <branch>...` (a Libra extension — Git has no true merge dry-run) reports what the merge *would* do without writing anything: no HEAD, index, working-tree, reflog, merge-state, or object-store mutation (auto-merged blobs are computed in memory only). Because it is read-only it also works on a dirty working tree, provided the index has no unresolved entries and no merge is already in progress. The entry checks still apply to `--dry-run`, including unresolved squash conflicts; apart from those checks, the preview does not validate cleanliness, so a real merge may still refuse where the preview succeeded.
 
 Outcomes and exit codes:
 
@@ -403,7 +414,7 @@ Outcomes and exit codes:
 |-----------------|--------------|------|
 | Fast-forward possible | `Would fast-forward` | 0 |
 | Already up to date | `Already up to date.` | 0 |
-| Clean three-way/ours merge | `Would merge cleanly by the '<strategy>' strategy.` | 0 |
+| Clean three-way/ours/octopus merge | `Would merge cleanly by the '<strategy>' strategy.` | 0 |
 | Would conflict | `Would conflict in: <paths>` (a directory/file collision is listed under the `~`-suffixed name the file would be moved to) | 1 |
 
 The would-conflict exit of 1 is an outcome signal (like `merge-file` and `diff --exit-code`), deliberately distinct from the 128 a *real* conflicting merge exits with — the preview itself succeeded. With `--json`/`--machine` the summary carries `"dry_run": true` and, when conflicting, `"would_conflict": true` plus `conflicted_paths` and `conflict_kinds` — one `{"path", "kind", "original_path"?}` object per conflicted path, `kind` being `content`, `modify-delete`, `file-directory`, `rename-rename` or `directory-rename`; `rename-rename` reports both destinations of a rename/rename(1to2), while `directory-rename` reports a suggested location or directory split. `original_path` is present only for a directory/file move (the path the file held before; `path` is then the `~`-suffixed name it would be written to, and `conflicted_paths` lists that same name). All of these keys are absent from every real merge's output (frozen schema).
@@ -467,7 +478,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 }
 ```
 
-`-s ours` uses `strategy: "ours"`, `files_changed: 0`, and reports both parents. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
+`-s ours` uses `strategy: "ours"` and `files_changed: 0`. A default multi-target merge uses `strategy: "octopus"`; `parents` contains `HEAD` followed by every non-redundant target in command-line order. Already-up-to-date merges use `strategy: "already-up-to-date"`, `commit: null`, `files_changed: 0`, and `up_to_date: true`.
 
 `--abort` sets `aborted: true`; `--continue` sets `continued: true`. Conflict failures return an error envelope on stderr with `LBR-CONFLICT-002`. `--dry-run` adds `dry_run`, `would_conflict`, `conflicted_paths` and `conflict_kinds` (see Dry Run).
 
@@ -475,12 +486,12 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 
 | Parameter | Libra | Git | jj |
 |-----------|-------|-----|----|
-| Branch target | `<branch>` (single target) | `<commit>...` (one or more) | N/A (use `jj new`) |
+| Branch target | `<branch>...` (one or more) | `<commit>...` (one or more) | N/A (use `jj new`) |
 | Fast-forward | Supported | Supported | N/A |
 | Single-head three-way | Supported | Supported | N/A |
 | Criss-cross (several merge bases) | Recursive virtual ancestor (fold order: ascending object id; max depth 20, max 32 bases per level) | Recursive virtual ancestor (`-s recursive`/`ort`, unbounded depth) | N/A |
 | Continue / abort | `--continue`, `--abort` (non-squash merge state required) | `--continue`, `--abort` (non-squash merge state required) | N/A |
-| Octopus merge | Not supported | Supported | N/A |
+| Octopus merge | Supported; atomic conflict refusal, ordered reduced parents | Supported | N/A |
 | Fast-forward only | `--ff-only` | `--ff-only` | N/A |
 | Force merge commit | `--no-ff` | `--no-ff` | N/A |
 | Squash | `--squash`; resolve/stage conflicts, then plain `commit` (one parent) | `--squash`; resolve/stage conflicts, then plain `commit` (one parent) | N/A |
@@ -514,8 +525,9 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Three-way merge would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 |
 | Recursive virtual ancestor would nest deeper than 20 levels or fold more than 32 bases at one level | `LBR-UNSUPPORTED-001` | 128 |
 | Unsupported `-s` / `-X` value or incompatible strategy combination | `LBR-CLI-002` | 129 |
-| `--verify-signatures`: tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
+| `--verify-signatures`: any target tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
 | Merge conflicts | `LBR-CONFLICT-002` | 128 |
+| Octopus conflict (atomic; no merge state) | `LBR-CONFLICT-002` | 128 |
 | Unresolved index entries without merge state, even for an up-to-date merge or `--dry-run` | `LBR-CONFLICT-002` | 128 |
 | Dirty worktree or staged changes | `LBR-CONFLICT-002` | 128 |
 | Untracked file would be overwritten | `LBR-CONFLICT-002` | 128 |
