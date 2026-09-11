@@ -79,6 +79,7 @@ pub mod merge;
 pub mod merge_base;
 pub mod merge_file;
 pub(crate) mod merge_message;
+pub mod mergetool;
 pub mod metadata;
 pub mod mv;
 pub mod notes;

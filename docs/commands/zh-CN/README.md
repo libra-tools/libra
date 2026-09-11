@@ -94,6 +94,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|------|------|------|
 | `libra reset` | | 移动 HEAD，并可选择重置索引或工作目录 | [reset.md](reset.md) |
 | `libra merge` | | 将分支快进合并到当前分支 | [merge.md](merge.md) |
+| `libra mergetool` | | 使用已配置的外部工具解决普通内容冲突 | [mergetool.md](mergetool.md) |
 | `libra merge-file` | | 对三个文件做三路合并（git merge-file） | [merge-file.md](merge-file.md) |
 | `libra merge-base` | | 查找两个提交的最佳共同祖先 | [merge-base.md](merge-base.md) |
 | `libra rebase` | `rb` | 在另一个基底 tip 上重新应用提交，并支持冲突解决 | [rebase.md](rebase.md) |
