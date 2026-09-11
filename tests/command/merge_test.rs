@@ -22,6 +22,7 @@ use super::{
 };
 
 mod gpg_sign;
+mod signoff;
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
     let path = repo.join(file);
@@ -5948,6 +5949,7 @@ fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
         "allow_unrelated_histories",
         "skip_hooks",
         "signing_policy",
+        "signoff",
         "conflicted_paths",
         "message",
         // Injected at the JSON layer by `MergeState::save` (W2 worktree

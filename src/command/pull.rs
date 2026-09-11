@@ -502,6 +502,8 @@ pub(crate) async fn run_pull(
                 merge_log: 0,
                 // `pull` does not expose `--dry-run`.
                 dry_run: false,
+                // `pull` has no `--signoff` surface.
+                signoff: false,
                 // `pull` exposes no merge-commit signing controls. Keep its
                 // established unsigned merge behavior rather than inheriting
                 // the public `merge` command's new signing default.

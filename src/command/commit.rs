@@ -1978,7 +1978,7 @@ fn trim_empty_lines(lines: &[String]) -> Vec<String> {
 /// Git-parseable block); otherwise open a new final paragraph (blank line).
 /// The old single-newline branch for newline-terminated messages glued
 /// trailers onto the last body line, invisible to a Git-strict parser.
-fn append_trailers(message: &str, trailers: &[String]) -> String {
+pub(crate) fn append_trailers(message: &str, trailers: &[String]) -> String {
     let trailers_block = trailers.join("\n");
     let trimmed = message.trim_end();
     if trimmed.is_empty() {
