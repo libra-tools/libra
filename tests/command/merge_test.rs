@@ -22,6 +22,7 @@ use super::{
 };
 
 mod gpg_sign;
+mod quit;
 mod signoff;
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {

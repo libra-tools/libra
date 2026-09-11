@@ -8,6 +8,7 @@
 libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] <branch>...
 libra merge --continue [-m <msg>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
+libra merge --quit
 libra merge --restart
 ```
 
@@ -17,7 +18,7 @@ libra merge --restart
 
 如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
-开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue` 或 `--abort`；没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
+开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue`、`--abort` 或 `--quit`；`--quit` 只清除 merge bookkeeping，HEAD、索引 stage 和带冲突标记的文件均保持不动；若有 held autostash，则转存到可见的 stash list 而不回贴。没有进行中的 merge 时，`--quit` 返回 `LBR-REPO-003`（退出 128）并提示启动 merge；这有意不同于 Git 的静默 no-op。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
 
 单目标的默认策略是 `ort`；两个及以上目标仍自动选择 `octopus`。人读成功输出会指出最终选中的后端；JSON 则新增 additive 的 `selected_strategy` 字段。历史 `strategy` 字段仍保留 `three-way`、`ours`、`octopus` 等结果类别，不改变既有消费者的判断。
 
@@ -254,8 +255,9 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--no-gpg-sign` | 不用 vault 签名 merge commit。它覆盖 `commit.gpgSign` 与 `vault.signing`；和 `-S` 组成 last-one-wins toggle。 |
 | `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，使用 merge 状态记录的 parent 集合。squash 没有可继续的 merge 状态。 |
 | `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
-| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
-| `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--restart`/`--squash`/`--no-commit` 互斥。 |
+| `--quit` | 忘记进行中的非 squash merge，但不重置 HEAD、索引或工作树。它只删除 merge state，故冲突 stage 与 marker 文件保持原样。held autostash 会转存为可见 stash，不会回贴；`--quit` 不接受分支或其它 merge 选项。 |
+| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`，或由 `--quit` 转存进可见 stash list。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
+| `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit` 互斥。 |
 | `--restart` | Libra 扩展：对有冲突的非 squash 合并，像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交与所选策略重跑同一合并（见上文）。不接受分支与合并选项。 |
 | `--json` | 输出结构化成功信封。实际运行了后端时，`selected_strategy` 指明具体后端；既有 `strategy` 仍是结果类别。 |
 | `--machine` | 以一行紧凑 JSON 输出同一结构化信封。 |

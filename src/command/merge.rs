@@ -75,14 +75,15 @@ EXAMPLES:
     libra merge --log=10 feature-x  Include target subjects in the merge message
     libra merge --continue         Finish an in-progress merge after resolving conflicts
     libra merge --abort            Restore the pre-merge HEAD, index, and worktree
+    libra merge --quit             Clear merge state and leave the current checkout unchanged
     libra merge --dry-run feature-x  Preview the outcome (ff/clean/conflict) writing nothing
     libra merge --restart          Abort the conflicted merge and re-run it fresh
     libra merge --json feature-x   Structured JSON output for agents
 
 NOTES:
     Divergent single-head merges create a merge commit when paths do not
-    conflict. Conflicts write markers and can be finished with --continue
-    or restored with --abort. Multi-head octopus merges are atomic: any
+    conflict. Conflicts write markers and can be finished with --continue,
+    restored with --abort, or left in place with --quit. Multi-head octopus merges are atomic: any
     conflict leaves HEAD, index, and worktree unchanged; merge those heads
     one at a time to resolve conflicts. --dry-run exits 1 when the merge
     would conflict (0 for ff/up-to-date/clean); --restart discards
@@ -238,6 +239,18 @@ pub struct MergeArgs {
     #[arg(long, conflicts_with = "continue_merge")]
     pub abort: bool,
 
+    /// Forget an in-progress merge while preserving the index and working
+    /// tree exactly as they are.
+    #[arg(long, conflicts_with_all = [
+        "branch", "continue_merge", "abort", "restart", "ff", "ff_only", "no_ff",
+        "strategy", "strategy_option", "allow_unrelated_histories", "log", "no_log",
+        "message", "squash", "no_commit", "no_verify", "autostash", "no_autostash",
+        "no_edit", "stat", "no_stat", "no_progress", "verify_signatures",
+        "no_verify_signatures", "no_rerere_autoupdate", "gpg_sign", "no_gpg_sign",
+        "signoff", "dry_run",
+    ])]
+    pub quit: bool,
+
     /// Preview the merge outcome without writing anything (Libra extension —
     /// Git has no true merge dry-run): reports whether merging `<branch>` would
     /// fast-forward, already be up to date, merge cleanly, or conflict (and on
@@ -329,8 +342,9 @@ pub struct MergeArgs {
     /// Automatically stash local changes before the merge and re-apply them
     /// when it concludes (also on failure to start). On a merge conflict the
     /// stash is HELD (not in `stash list`) and re-applied by `--continue` or
-    /// `--abort`; if the re-apply itself conflicts, the stash is saved to the
-    /// stash list and a notice is printed — changes are never lost. Config:
+    /// `--abort`; `--quit` saves it to the stash list without re-applying it.
+    /// If the re-apply itself conflicts, the stash is saved to the stash list
+    /// and a notice is printed — changes are never lost. Config:
     /// `merge.autostash` (this flag and `--no-autostash` override it).
     #[arg(long = "autostash", overrides_with = "no_autostash", conflicts_with_all = ["continue_merge", "abort", "restart", "dry_run"])]
     pub autostash: bool,
@@ -876,9 +890,9 @@ fn acquire_autostash_lock() -> Result<AutostashLockGuard, String> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PullMergeError {
-    #[error("merge requires a branch argument, --continue, or --abort")]
+    #[error("merge requires a branch argument, --continue, --abort, or --quit")]
     MissingAction,
-    #[error("merge accepts either a branch argument, --continue, or --abort")]
+    #[error("merge accepts either a branch argument, --continue, --abort, or --quit")]
     ConflictingAction,
     /// The repository configures an unsupported `merge.conflictStyle` value.
     /// Surfaced only when a conflict actually needs rendering, and a hard error
@@ -1114,7 +1128,8 @@ impl From<PullMergeError> for CliError {
                 .with_hint("resolve conflicts, then run 'libra merge --continue'")
                 .with_hint("or run 'libra merge --abort' to restore the pre-merge state"),
             PullMergeError::NoMergeInProgress => CliError::failure(error.to_string())
-                .with_stable_code(StableErrorCode::RepoStateInvalid),
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("start a merge with 'libra merge <branch>'"),
             PullMergeError::RestartWithoutConflicts => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("finish the staged merge with 'libra merge --continue'")
@@ -1267,6 +1282,12 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     // branch positional or option flags accompany it (conflicts_with_all).
     if args.restart {
         return run_merge_restart(output).await;
+    }
+    // `--quit` deliberately touches only merge bookkeeping. In particular it
+    // does not call the abort/reset path, because its contract is to retain
+    // the current index stages and conflict-marked working tree.
+    if args.quit {
+        return run_merge_quit(output).await;
     }
     // An explicit CLI request applies to an initial merge and may also replace
     // the saved decision while finalizing `--continue`. A plain continuation
@@ -1724,6 +1745,11 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
         info_println!(output, "Already up to date.");
     } else if result.aborted {
         info_println!(output, "Merge aborted.");
+    } else if result.strategy == "quit" {
+        info_println!(
+            output,
+            "Merge state cleared; index and working tree were left unchanged."
+        );
     } else if result.continued {
         info_println!(output, "Merge completed.");
     } else if !result.conflicted_paths.is_empty() {
@@ -4709,6 +4735,59 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
         parents: Vec::new(),
         conflicted_paths: Vec::new(),
         aborted: true,
+        continued: false,
+        dry_run: false,
+        would_conflict: false,
+        conflict_kinds: Vec::new(),
+        autostash,
+    })
+}
+
+/// Clear the in-progress merge state without touching the conflict checkout.
+///
+/// Git's `remove_merge_branch_state()` also makes a held `MERGE_AUTOSTASH`
+/// visible in the ordinary stash list. Do the same before returning success:
+/// the sidecar is the only reachability root for the held commit, and leaving
+/// it invisible after `--quit` would make the next merge recover surprising
+/// state. The promotion never re-applies the stash, so index stages and the
+/// working tree remain byte-for-byte intact.
+async fn run_merge_quit(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+    refuse_ambiguous_common_merge_state()?;
+    let held_autostash = preflight_held_autostash()?;
+    MergeState::load_required()?;
+
+    // Validate the held sidecar before removing merge state. A foreign or
+    // malformed sidecar must remain recoverable in place rather than being
+    // promoted into this worktree's stash list.
+    let held_autostash = held_autostash
+        .map(|snapshot| {
+            verify_autostash_ownership(snapshot.recorded_owner.as_deref())
+                .map_err(PullMergeError::Autostash)?;
+            let oid = ObjectHash::from_str(&snapshot.sidecar.stash_commit).map_err(|error| {
+                PullMergeError::Autostash(format!(
+                    "merge-autostash.json holds an invalid OID: {error}"
+                ))
+            })?;
+            Ok::<_, PullMergeError>((snapshot, oid))
+        })
+        .transpose()?;
+
+    MergeState::cleanup()?;
+    let autostash = match held_autostash {
+        Some((snapshot, oid)) => store_pending_autostash(output, &snapshot, &oid).await,
+        None => None,
+    };
+
+    Ok(PullMergeSummary {
+        strategy: "quit".to_string(),
+        selected_strategy: None,
+        old_commit: None,
+        commit: None,
+        files_changed: 0,
+        up_to_date: false,
+        parents: Vec::new(),
+        conflicted_paths: Vec::new(),
+        aborted: false,
         continued: false,
         dry_run: false,
         would_conflict: false,

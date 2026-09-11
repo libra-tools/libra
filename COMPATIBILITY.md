@@ -350,6 +350,10 @@ The older `merge` row's statement that `--no-gpg-sign` was a no-op and that `-S`
 
 `libra merge --signoff` appends `Signed-off-by: <committer name> <committer email>` after final message processing. The initial request is persisted across a conflicted or `--no-commit` `--continue`; an already-present matching Git-qualifying final trailer is not duplicated. `-s` remains reserved for strategy selection, so merge has no signoff short flag. `--signoff` is rejected with `--abort`, `--restart`, `--squash`, or `--dry-run`, which cannot produce a merge commit.
 
+### MG-17 merge quit clarification
+
+`libra merge --quit` adopts Git's checkout-preserving state-only merge exit: it removes merge state while preserving HEAD, index conflict stages, and conflict-marked working-tree files. A held autostash is saved into the visible stash list instead of being re-applied, so its only reachability root is not left hidden after the merge is forgotten. The action takes no branch or other merge option. Unlike Git's silent no-state no-op, Libra returns `LBR-REPO-003` when no merge is in progress and tells the user how to start one.
+
 ## Sub-face compatibility grading (P0/P1-touched commands)
 
 The single `Tier` column above is deliberately coarse: a command marked
