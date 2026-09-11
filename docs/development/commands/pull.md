@@ -46,6 +46,7 @@ flowchart TD
 - 2026-06-09 `17d26c76`（`fix(pull): avoid fast-forward hang from whole-worktree restore`）：实现修正：avoid fast-forward hang from whole-worktree restore；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-06-01 `17be24e0`（`test(compat): pin pull --ff-only/--rebase surface and fix matrix row (v0.17.1215)`）：测试契约：pin pull --ff-only/--rebase surface and fix matrix row (v0.17.1215)；相关行为已有回归守卫，后续变更需要继续满足。
 - 2026-07-10（plan-20260708 P1-05a）：`run_pull` 先解析当前分支，再合成 `EffectivePullOptions`。CLI 标志优先；未传 rebase 标志时按 local → global → system 读取的 `branch.<name>.rebase` 覆盖 `pull.rebase`；未传 ff 标志时 `pull.ff=true|false|only` 分别映射默认快进、强制 merge commit、仅快进。变量名大小写不敏感，本地/全局加密值会解密；`merges`/`interactive`（及短写）返回明确 unsupported 诊断。`--commit` 仅与 `--rebase`/`--squash` 冲突，和 `--no-commit` 按最后出现者生效；它可与三种 ff 策略组合且不自行覆盖快进策略。空值/无效配置返回 `LBR-CLI-002`，本地/全局读取失败返回 `LBR-IO-001`，system scope 读取失败或不支持时跳过，均在 fetch / merge / rebase 前完成。回归测试 `compat_config_defaults_semantics`、`compat_config_defaults_edge_cases` 覆盖真实 rebase、JSON 配置选中路径、CLI 覆盖、加密值、legacy fallback、system skip、转换分支和副作用边界。
+- 2026-09-11（plan-20260903 MG-11）：merge 路径的 `PullMergeOptions` 不设置 CLI normalization override，因此真正三路合并继承 strict-cascade `merge.renormalize`，并贯穿 flat/incremental/recursive/rename/external-driver 内容路径；fast-forward/up-to-date 不读取。pull 不公开 `-X`。阶段性配置拒绝前 fetch 已可能更新对象与 remote-tracking ref；HEAD/index/worktree/merge state 仍未变。回归测试 `command::pull_test::test_pull_inherits_merge_renormalize_config`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

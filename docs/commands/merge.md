@@ -5,7 +5,7 @@ Merge one target into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
 libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
@@ -19,7 +19,7 @@ Before starting a merge, Libra checks both merge state and the index. Existing m
 
 If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
-The default three-way strategy accepts `-X ours` or `-X theirs`: only conflicting hunks/paths choose that side, while clean changes from both sides remain. This is different from `-s ours`, which always creates a two-parent merge commit (unless the target is already an ancestor) while retaining the entire current HEAD tree. Other strategies and strategy options are rejected during argument parsing.
+The default three-way strategy accepts conflict-side, whitespace-comparison, and renormalization `-X` options. `-X ours` / `-X theirs` choose a side only for conflicting hunks/paths while retaining clean changes from both sides. This is different from `-s ours`, which always creates a two-parent merge commit (unless the target is already an ancestor) while retaining the entire current HEAD tree. See “Input normalization” below for the other supported values. Other strategies and strategy options are rejected during argument parsing.
 
 ### Criss-cross histories (several merge bases)
 
@@ -122,6 +122,36 @@ branch …` labels; `merge.<name>.recursive` is not implemented.
 The built-in dispatch is also used by `merge-file`, `cherry-pick`, and `revert`;
 those commands do not execute external merge drivers yet. `merge-file` outside
 a Libra repository has no attribute/config source and always uses `text`.
+
+### Input normalization
+
+The default three-way strategy accepts four comparison-only whitespace options:
+`-X ignore-space-change`, `-X ignore-all-space`,
+`-X ignore-space-at-eol`, and `-X ignore-cr-at-eol`. They use the same line
+normalizers as `libra diff`. The built-in text/union merge compares canonical
+lines, then writes the original text back; lines newly selected from the merge
+use ours-side line endings. Binary inputs and the explicit binary driver are not
+rewritten. These xdiff-style flags do not alter the files passed to an external
+merge driver.
+
+`merge.renormalize=true` or `-X renormalize` canonicalizes all three content
+inputs according to each path's `text` / `eol` attributes before either a
+built-in or external low-level driver runs. `-text` disables conversion,
+`text=auto` converts non-binary input, and a set/value `text` attribute or
+`eol=lf|crlf` enables text conversion. Libra currently implements only this
+built-in line-ending conversion; arbitrary clean/smudge filter programs remain
+unsupported. The merged result is backfilled to original text and ours-side
+line endings. `-X no-renormalize` disables the configured default.
+
+`-X` is repeatable. The final ours/theirs choice and final
+renormalize/no-renormalize toggle win independently; multiple whitespace modes
+select the strongest comparison (`ignore-all-space`, `ignore-space-change`,
+`ignore-space-at-eol`, then `ignore-cr-at-eol`). An explicit renormalize toggle
+overrides even an invalid configured value. Otherwise `merge.renormalize` is
+read strictly only when a real three-way merge is required: invalid values fail
+before HEAD/index/worktree/merge-state mutation, while fast-forward and
+already-up-to-date merges do not consume the setting. `libra pull` inherits the
+configured default on its merge path but exposes no `-X` option.
 
 ### Directory/file collisions (D/F conflicts)
 
@@ -266,7 +296,7 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. For a non-squash merge, the resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog. Squash records no merge state; its ordinary `libra commit` supplies the commit message.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
 
-Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames`, `merge.renameLimit`, and `merge.directoryRenames`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
+Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames`, `merge.renameLimit`, `merge.directoryRenames`, and `merge.renormalize`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`). `merge.renormalize` follows the phase-local timing described above.
 
 ### Submodules (`160000` gitlink entries)
 
@@ -284,7 +314,7 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement octopus merges, merge strategies other than `ours`, strategy options other than `ours`/`theirs`, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
+Libra still does not implement octopus merges, merge strategies other than `ours`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
 ## Options
 
@@ -296,7 +326,7 @@ Libra still does not implement octopus merges, merge strategies other than `ours
 | `--ff-only` | Refuse to merge unless the current branch can be fast-forwarded. |
 | `--no-ff` | Always create a two-parent merge commit, even when a fast-forward is possible. |
 | `-s ours`, `--strategy=ours` | Record the merge relationship with two parents while retaining the complete current HEAD tree. Distinct from `-X ours`. Other strategies are rejected. |
-| `-X ours`, `-X theirs`, `--strategy-option=<ours\|theirs>` | Resolve only conflicting hunks/paths in favor of that side; clean changes from both sides are retained. Repeatable; the last value wins. Cannot be combined with `-s ours`. |
+| `-X <option>`, `--strategy-option=<option>` | Accepts `ours`, `theirs`, `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, or `no-renormalize`. Repeatable; favor and renormalize toggles are last-one-wins, while whitespace modes select the strongest requested comparison. Cannot be combined with `-s ours`. |
 | `--allow-unrelated-histories` | Permit histories with no common ancestor by using a virtual empty merge base. The permission is persisted for non-squash conflict `--restart`. |
 | `--log[=<N>]` | Append up to N target-side subjects to the merge message; bare `--log` uses 20. Overrides `merge.log`, and also appends to an explicit `-m` message. Last-one-wins with `--no-log`. |
 | `--no-log` | Disable the merge-message shortlog, overriding `merge.log` and an earlier `--log`. |
@@ -465,6 +495,8 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | No GPG sign | `--no-gpg-sign` (no-op; never signs) | `--no-gpg-sign` | N/A |
 | Ours strategy | `-s ours` | `-s ours` | N/A |
 | Conflict-side preference | `-X ours/theirs` | `-X ours/theirs` | N/A |
+| Whitespace-aware content merge | `-X ignore-space-change` / `ignore-all-space` / `ignore-space-at-eol` / `ignore-cr-at-eol` | Same | N/A |
+| Renormalized content merge | `merge.renormalize` / `-X renormalize` / `-X no-renormalize` | Same | Libra does not run arbitrary clean/smudge filters |
 | Unrelated histories | `--allow-unrelated-histories` | Supported | N/A |
 | Merge-message shortlog | `--log[=<n>]` / `--no-log` | Supported | N/A |
 | Other custom strategies/options | Not supported | Supported | N/A |
@@ -490,6 +522,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Merge already in progress | `LBR-CONFLICT-002` | 128 |
 | No merge in progress for `--continue` / `--abort` / `--restart` (including after `--squash`) | `LBR-REPO-003` | 128 |
 | Unsupported `merge.conflictStyle` value (e.g. `zdiff3`) when rendering a conflict | `LBR-REPO-003` | 128 |
+| Invalid `merge.renormalize` value when a real three-way merge consumes it | `LBR-REPO-003` | 128 |
 | Unresolved conflict stages remain for `--continue` | `LBR-CONFLICT-002` | 128 |
 | Failed to read merge state or index | `LBR-IO-001` | 128 |
 | Failed to save state, index, tree, commit, HEAD, or worktree | `LBR-IO-002` | 128 |

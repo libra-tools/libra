@@ -5927,7 +5927,7 @@ fn compute_unified_hunks(
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character
 /// so two lines compare equal iff they match after all whitespace is removed.
-fn normalize_ignore_all_space(line: &str) -> String {
+pub(crate) fn normalize_ignore_all_space(line: &str) -> String {
     line.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
@@ -5936,7 +5936,7 @@ fn normalize_ignore_all_space(line: &str) -> String {
 /// and trailing whitespace is dropped. The PRESENCE of whitespace still matters,
 /// so `"a  b"` ≡ `"a b"` and `"\ta"` ≡ `"  a"` (both `" a"`), but `"a b"` ≠ `"ab"`
 /// and `"a"` ≠ `"  a"`. Matches `git diff -b` (verified empirically).
-fn normalize_ignore_space_change(line: &str) -> String {
+pub(crate) fn normalize_ignore_space_change(line: &str) -> String {
     let trimmed = line.trim_end();
     let mut out = String::with_capacity(trimmed.len());
     let mut in_ws = false;
@@ -5957,7 +5957,7 @@ fn normalize_ignore_space_change(line: &str) -> String {
 /// Normalizer for `--ignore-space-at-eol`: ignore only trailing whitespace;
 /// leading and internal whitespace compare exactly. Matches `git diff
 /// --ignore-space-at-eol` (verified empirically).
-fn normalize_ignore_space_at_eol(line: &str) -> String {
+pub(crate) fn normalize_ignore_space_at_eol(line: &str) -> String {
     line.trim_end().to_string()
 }
 
@@ -5970,7 +5970,7 @@ fn normalize_ignore_space_at_eol(line: &str) -> String {
 /// raw-splits on `\n` keeping `\r` bytes; with strip-all both paths equate
 /// exactly the same line pairs. See the flag's doc for the documented
 /// approximation vs Git's non-transitive allow-one-remaining-CR comparison.
-fn normalize_ignore_cr_at_eol(line: &str) -> String {
+pub(crate) fn normalize_ignore_cr_at_eol(line: &str) -> String {
     line.trim_end_matches('\r').to_string()
 }
 

@@ -2502,6 +2502,361 @@ fn merge_conflict_refine_crlf_markers_follow_input() {
     );
 }
 
+/// Build one same-path divergent merge for the MG-11 input-normalization
+/// matrix. `ours` is committed on main and `theirs` on feature.
+fn create_diverged_whitespace_repo(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    attribute: Option<&str>,
+) -> tempfile::TempDir {
+    let temp_repo = create_committed_repo_via_cli();
+    let p = temp_repo.path();
+    std::fs::write(p.join("shared.txt"), base).expect("write whitespace base");
+    let mut paths = vec!["shared.txt"];
+    if let Some(attribute) = attribute {
+        std::fs::write(p.join(".gitattributes"), format!("*.txt {attribute}\n"))
+            .expect("write text attributes");
+        paths.push(".gitattributes");
+    }
+    assert_cli_success(&run_libra_command(&["add", paths[0]], p), "add base");
+    if paths.len() == 2 {
+        assert_cli_success(&run_libra_command(&["add", paths[1]], p), "add attributes");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "whitespace base", "--no-verify"], p),
+        "commit whitespace base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(p, "shared.txt", theirs, "theirs substantive edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(p, "shared.txt", ours, "ours normalization-only edit");
+    temp_repo
+}
+
+/// MG-11 G1-G4/G8: each whitespace strategy option makes an ours-side
+/// comparison-only edit equal to base, so the substantive theirs edit merges
+/// cleanly. Original text is backfilled and new lines use ours' CRLF.
+#[test]
+fn merge_x_whitespace_options_merge_original_text_and_keep_ours_eol() {
+    struct Case {
+        option: &'static str,
+        base: &'static str,
+        ours: &'static str,
+        theirs: &'static str,
+        expected: &'static [u8],
+    }
+    for case in [
+        Case {
+            option: "ignore-space-change",
+            base: "top\nvalue = base\nbottom\n",
+            ours: "top\r\nvalue   =   base\r\nbottom\r\n",
+            theirs: "top\nvalue = theirs\nbottom\n",
+            expected: b"top\r\nvalue = theirs\r\nbottom\r\n",
+        },
+        Case {
+            option: "ignore-all-space",
+            base: "top\nalpha beta\nbottom\n",
+            ours: "top\r\nalphabeta\r\nbottom\r\n",
+            theirs: "top\nalpha gamma\nbottom\n",
+            expected: b"top\r\nalpha gamma\r\nbottom\r\n",
+        },
+        Case {
+            option: "ignore-space-at-eol",
+            base: "top\nvalue\nbottom\n",
+            ours: "top\r\nvalue   \r\nbottom\r\n",
+            theirs: "top\nchanged\nbottom\n",
+            expected: b"top\r\nchanged\r\nbottom\r\n",
+        },
+        Case {
+            option: "ignore-cr-at-eol",
+            base: "top\nvalue\nbottom\n",
+            ours: "top\r\nvalue\r\nbottom\r\n",
+            theirs: "top\nchanged\nbottom\n",
+            expected: b"top\r\nchanged\r\nbottom\r\n",
+        },
+    ] {
+        let temp_repo = create_diverged_whitespace_repo(case.base, case.ours, case.theirs, None);
+        let p = temp_repo.path();
+        let out = run_libra_command(&["merge", "-X", case.option, "feature"], p);
+        assert_cli_success(&out, case.option);
+        assert_eq!(
+            std::fs::read(p.join("shared.txt")).expect("read normalized merge"),
+            case.expected,
+            "{} must compare normalized lines but emit original text",
+            case.option,
+        );
+    }
+}
+
+/// MG-11 G5/G6/G8: config and explicit `-X renormalize` both canonicalize
+/// text/eol-attributed inputs for comparison and restore ours-side CRLF.
+#[test]
+fn merge_x_whitespace_renormalize_config_and_option_are_equivalent() {
+    for explicit in [false, true] {
+        let temp_repo = create_diverged_whitespace_repo(
+            "top\nbase\nbottom\n",
+            "top\r\nbase\r\nbottom\r\n",
+            "top\nfeature\nbottom\n",
+            Some("eol=lf"),
+        );
+        let p = temp_repo.path();
+        let out = if explicit {
+            run_libra_command(&["merge", "-X", "renormalize", "feature"], p)
+        } else {
+            assert_cli_success(
+                &run_libra_command(&["config", "merge.renormalize", "true"], p),
+                "configure renormalize",
+            );
+            run_libra_command(&["merge", "feature"], p)
+        };
+        assert_cli_success(&out, "renormalized merge");
+        assert_eq!(
+            std::fs::read(p.join("shared.txt")).expect("read renormalized merge"),
+            b"top\r\nfeature\r\nbottom\r\n",
+            "explicit={explicit}",
+        );
+    }
+}
+
+/// MG-11: the scoped attribute bridge follows the text/eol decisions without
+/// claiming unsupported clean/smudge filters. `eol` implies text, `text=auto`
+/// converts text only, and an explicit `-text` or binary input stays untouched.
+#[test]
+fn merge_x_whitespace_renormalize_honors_text_attribute_modes() {
+    let auto_text = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nbase\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("text=auto"),
+    );
+    let p = auto_text.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "-X", "renormalize", "feature"], p),
+        "text=auto normalizes textual input",
+    );
+    assert_eq!(
+        std::fs::read(p.join("shared.txt")).expect("read auto-text result"),
+        b"top\r\nfeature\r\nbottom\r\n"
+    );
+
+    let unset = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nbase\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("-text eol=lf"),
+    );
+    let p = unset.path();
+    let out = run_libra_command(&["merge", "-X", "renormalize", "feature"], p);
+    assert_eq!(out.status.code(), Some(128), "-text disables conversion");
+
+    let binary = create_diverged_whitespace_repo(
+        "top\0\nbase\nbottom\n",
+        "top\0\r\nbase\r\nbottom\r\n",
+        "top\0\nfeature\nbottom\n",
+        Some("text=auto"),
+    );
+    let p = binary.path();
+    let out = run_libra_command(&["merge", "-X", "renormalize", "feature"], p);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "text=auto does not rewrite binary input"
+    );
+    let rendered = std::fs::read(p.join("shared.txt")).expect("read binary result");
+    assert!(
+        rendered
+            .windows(b"top\0\r\nbase\r\nbottom\r\n".len())
+            .any(|window| window == b"top\0\r\nbase\r\nbottom\r\n"),
+        "text=auto leaves the ours binary bytes untouched inside the text driver's whole-file conflict: {rendered:?}"
+    );
+}
+
+/// MG-11 G7: the last explicit renormalize toggle overrides configuration.
+/// Turning it off restores the original unresolved CRLF-vs-LF merge.
+#[test]
+fn merge_x_whitespace_no_renormalize_overrides_config() {
+    let temp_repo = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nbase\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("text eol=lf"),
+    );
+    let p = temp_repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renormalize", "true"], p),
+        "configure renormalize",
+    );
+    let out = run_libra_command(
+        &[
+            "merge",
+            "-X",
+            "renormalize",
+            "-X",
+            "no-renormalize",
+            "feature",
+        ],
+        p,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "last no-renormalize restores the conflict"
+    );
+    assert!(
+        std::fs::read(p.join("shared.txt"))
+            .expect("read conflict")
+            .windows(b"<<<<<<<".len())
+            .any(|window| window == b"<<<<<<<"),
+        "the unnormalized merge leaves conflict markers"
+    );
+}
+
+/// MG-11 G10 and option composition: whitespace comparison remains
+/// independent from `-X ours`, and the stronger requested whitespace mode is
+/// selected regardless of ordering.
+#[test]
+fn merge_x_whitespace_composes_with_favor_and_repeated_options() {
+    let temp_repo = create_diverged_whitespace_repo(
+        "top\nalpha beta\nbottom\n",
+        "top\nalphabeta\nbottom\n",
+        "top\nalpha gamma\nbottom\n",
+        None,
+    );
+    let p = temp_repo.path();
+    let out = run_libra_command(
+        &[
+            "merge",
+            "-X",
+            "ignore-space-at-eol",
+            "-X",
+            "ours",
+            "-X",
+            "ignore-all-space",
+            "feature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "composed whitespace/favor options");
+    assert_eq!(
+        std::fs::read(p.join("shared.txt")).expect("read composed merge"),
+        b"top\nalpha gamma\nbottom\n",
+        "ignore-all-space resolves before the otherwise-unused favor"
+    );
+}
+
+/// MG-11: `ll_merge()` renormalizes before selecting the low-level driver, so
+/// an external driver must receive canonical LF inputs too. Its `%A` result is
+/// backfilled to ours-side CRLF under Libra's documented output contract.
+#[cfg(unix)]
+#[test]
+fn merge_x_whitespace_renormalizes_external_driver_inputs() {
+    let temp_repo = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nours\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("text eol=lf merge=custom"),
+    );
+    let p = temp_repo.path();
+    configure_external_driver(p, "copy-theirs-lf");
+
+    let out = run_libra_command(&["merge", "-X", "renormalize", "feature"], p);
+    assert_cli_success(&out, "renormalized external-driver merge");
+    assert_eq!(
+        std::fs::read(p.join("shared.txt")).expect("read external merge result"),
+        b"top\r\nfeature\r\nbottom\r\n"
+    );
+
+    let raw = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nours\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("text eol=lf merge=custom"),
+    );
+    let p = raw.path();
+    configure_external_driver(p, "copy-theirs-lf");
+    let out = run_libra_command(&["merge", "-X", "ignore-all-space", "feature"], p);
+    assert!(
+        !out.status.success(),
+        "whitespace-only options must not canonicalize external-driver inputs"
+    );
+    let (stderr, _report) = parse_cli_error_stderr(&out.stderr);
+    assert!(
+        stderr.contains("external merge driver 'custom'"),
+        "{stderr}"
+    );
+}
+
+/// MG-11: strict config validation belongs to the real three-way engine. It
+/// must happen before mutation there, while fast-forward/up-to-date operations
+/// and an explicit option override bypass an invalid configured default.
+#[test]
+fn merge_x_whitespace_validates_renormalize_only_when_consumed() {
+    let diverged = create_diverged_whitespace_repo(
+        "top\nbase\nbottom\n",
+        "top\r\nbase\r\nbottom\r\n",
+        "top\nfeature\nbottom\n",
+        Some("text eol=lf"),
+    );
+    let p = diverged.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renormalize", "sometimes"], p),
+        "configure invalid renormalize value",
+    );
+    let head_before = head_commit(p);
+    let index_before = std::fs::read(p.join(".libra/index")).expect("read index");
+    let worktree_before = std::fs::read(p.join("shared.txt")).expect("read worktree");
+    let invalid = run_libra_command(&["merge", "feature"], p);
+    assert!(!invalid.status.success());
+    let (stderr, _report) = parse_cli_error_stderr(&invalid.stderr);
+    assert!(stderr.contains("merge.renormalize"), "{stderr}");
+    assert_eq!(head_commit(p), head_before);
+    assert_eq!(
+        std::fs::read(p.join(".libra/index")).expect("read unchanged index"),
+        index_before
+    );
+    assert_eq!(
+        std::fs::read(p.join("shared.txt")).expect("read unchanged worktree"),
+        worktree_before
+    );
+
+    let explicit = run_libra_command(&["merge", "-X", "renormalize", "feature"], p);
+    assert_cli_success(&explicit, "explicit option overrides invalid config");
+
+    let fast_forward = create_committed_repo_via_cli();
+    let p = fast_forward.path();
+    commit_file(p, "f.txt", "base\n", "base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "checkout feature",
+    );
+    commit_file(p, "f.txt", "ahead\n", "ahead");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renormalize", "sometimes"], p),
+        "configure invalid renormalize value",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "fast-forward does not consume renormalize config",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "up-to-date does not consume renormalize config",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `merge --dry-run` (Libra extension, lore.md §1.3): preview the outcome
 // writing NOTHING — no HEAD/index/worktree/merge-state/object-store mutation.

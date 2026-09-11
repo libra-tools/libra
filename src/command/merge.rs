@@ -100,6 +100,96 @@ pub enum MergeFavor {
     Theirs,
 }
 
+/// Git-compatible options accepted by the default three-way strategy.
+///
+/// Favor, whitespace comparison, and renormalization are independent axes:
+/// repeating `-X` may set one of each. The last favor and renormalize toggle
+/// win, while whitespace flags compose by selecting the strongest requested
+/// comparison rule (the same precedence `libra diff` uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MergeStrategyOption {
+    Ours,
+    Theirs,
+    IgnoreSpaceChange,
+    IgnoreAllSpace,
+    IgnoreSpaceAtEol,
+    IgnoreCrAtEol,
+    Renormalize,
+    NoRenormalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeWhitespace {
+    SpaceChange,
+    AllSpace,
+    SpaceAtEol,
+    CrAtEol,
+}
+
+impl MergeWhitespace {
+    fn priority(self) -> u8 {
+        match self {
+            Self::AllSpace => 4,
+            Self::SpaceChange => 3,
+            Self::SpaceAtEol => 2,
+            Self::CrAtEol => 1,
+        }
+    }
+
+    fn normalizer(self) -> fn(&str) -> String {
+        match self {
+            Self::AllSpace => crate::command::diff::normalize_ignore_all_space,
+            Self::SpaceChange => crate::command::diff::normalize_ignore_space_change,
+            Self::SpaceAtEol => crate::command::diff::normalize_ignore_space_at_eol,
+            Self::CrAtEol => crate::command::diff::normalize_ignore_cr_at_eol,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MergeInputNormalization {
+    whitespace: Option<MergeWhitespace>,
+    renormalize: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ParsedMergeStrategyOptions {
+    favor: Option<MergeFavor>,
+    whitespace: Option<MergeWhitespace>,
+    renormalize: Option<bool>,
+}
+
+fn parse_merge_strategy_options(options: &[MergeStrategyOption]) -> ParsedMergeStrategyOptions {
+    let mut parsed = ParsedMergeStrategyOptions::default();
+    for option in options {
+        match option {
+            MergeStrategyOption::Ours => parsed.favor = Some(MergeFavor::Ours),
+            MergeStrategyOption::Theirs => parsed.favor = Some(MergeFavor::Theirs),
+            MergeStrategyOption::IgnoreSpaceChange => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::SpaceChange)
+            }
+            MergeStrategyOption::IgnoreAllSpace => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::AllSpace)
+            }
+            MergeStrategyOption::IgnoreSpaceAtEol => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::SpaceAtEol)
+            }
+            MergeStrategyOption::IgnoreCrAtEol => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::CrAtEol)
+            }
+            MergeStrategyOption::Renormalize => parsed.renormalize = Some(true),
+            MergeStrategyOption::NoRenormalize => parsed.renormalize = Some(false),
+        }
+    }
+    parsed
+}
+
+fn select_whitespace_mode(current: &mut Option<MergeWhitespace>, candidate: MergeWhitespace) {
+    if current.is_none_or(|selected| candidate.priority() > selected.priority()) {
+        *current = Some(candidate);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = MERGE_EXAMPLES)]
 pub struct MergeArgs {
@@ -152,12 +242,10 @@ pub struct MergeArgs {
     #[arg(short = 's', long = "strategy", value_enum, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
     pub strategy: Option<MergeStrategy>,
 
-    /// Pass a strategy option to the default three-way merge. `ours` and
-    /// `theirs` resolve conflicting paths/hunks in favor of that side while
-    /// retaining all non-conflicting changes. May be repeated; the last value
-    /// wins.
+    /// Pass an option to the default three-way merge. Favor and renormalize
+    /// toggles use their last value; whitespace comparison flags compose.
     #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy"])]
-    pub strategy_option: Vec<MergeFavor>,
+    pub strategy_option: Vec<MergeStrategyOption>,
 
     /// Permit a two-parent merge when the histories have no common ancestor.
     #[arg(long = "allow-unrelated-histories", conflicts_with_all = ["continue_merge", "abort", "restart"])]
@@ -338,6 +426,12 @@ pub(crate) struct PullMergeOptions {
     pub strategy: Option<MergeStrategy>,
     /// Conflict-side preference for the default three-way strategy.
     pub favor: Option<MergeFavor>,
+    /// Strongest whitespace comparison option selected by public `merge -X`.
+    /// `pull` has no strategy-option surface and leaves this unset.
+    pub whitespace: Option<MergeWhitespace>,
+    /// Explicit `-X renormalize|no-renormalize`; `None` reads
+    /// `merge.renormalize` only if the operation reaches the three-way engine.
+    pub renormalize: Option<bool>,
     /// Permit an empty merge base when histories are unrelated.
     pub allow_unrelated_histories: bool,
     /// Override the merge-commit message (`libra merge -m <msg>`). `None` uses
@@ -682,6 +776,12 @@ pub(crate) enum PullMergeError {
     /// The rename-detection config could not be read (config-store I/O).
     #[error("failed to read rename config '{key}': {detail}")]
     RenameConfigRead { key: String, detail: String },
+    /// `merge.renormalize` must be a Git boolean. It is read only for a real
+    /// three-way merge, before autostash or any other repository mutation.
+    #[error("unsupported merge.renormalize '{0}' (expected a boolean)")]
+    InvalidRenormalizeConfig(String),
+    #[error("failed to read merge.renormalize config: {0}")]
+    RenormalizeConfigRead(String),
     /// Autostash creation/apply/bookkeeping failure. The stash commit (when
     /// one exists) is referenced by merge-autostash.json — never lost.
     #[error("merge --autostash failed: {0}")]
@@ -884,6 +984,12 @@ impl From<PullMergeError> for CliError {
             PullMergeError::RenameConfigRead { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            PullMergeError::InvalidRenormalizeConfig(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set merge.renormalize to true/false (or remove it)"),
+            PullMergeError::RenormalizeConfigRead(..) => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
             PullMergeError::HistoryConfig(
                 crate::command::history_config::HistoryConfigError::Read { .. },
             ) => CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed),
@@ -1005,6 +1111,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     }
     match (args.branch.as_deref(), args.continue_merge, args.abort) {
         (Some(branch), false, false) => {
+            let strategy_options = parse_merge_strategy_options(&args.strategy_option);
             let (ff_only, no_ff) = if args.ff_only {
                 (true, false)
             } else if args.no_ff {
@@ -1042,7 +1149,9 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 ff_only,
                 no_ff,
                 strategy: args.strategy,
-                favor: args.strategy_option.last().copied(),
+                favor: strategy_options.favor,
+                whitespace: strategy_options.whitespace,
+                renormalize: strategy_options.renormalize,
                 allow_unrelated_histories: args.allow_unrelated_histories,
                 message: args.message.clone(),
                 squash: args.squash,
@@ -1590,6 +1699,20 @@ pub(crate) async fn run_merge_for_pull_with_options(
     } else {
         Arc::new(ExternalMergeRuntime::default())
     };
+    let preflighted_input_normalization = if reaches_three_way {
+        MergeInputNormalization {
+            whitespace: options.whitespace,
+            renormalize: resolve_merge_renormalize(options.renormalize).await?,
+        }
+    } else {
+        MergeInputNormalization::default()
+    };
+    let preflighted_three_way = PreflightedThreeWayInputs {
+        rename_config: preflighted_rename_config,
+        default_driver: preflighted_default_driver,
+        external_drivers: preflighted_external_drivers,
+        input_normalization: preflighted_input_normalization,
+    };
 
     // ── autostash (lore.md §1.8) ──
     // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
@@ -1691,9 +1814,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
         upstream,
         output,
         options,
-        preflighted_rename_config,
-        preflighted_default_driver,
-        preflighted_external_drivers,
+        preflighted_three_way,
     )
     .await;
     // Uniform finalize: applies when no merge state persists (clean success,
@@ -1983,6 +2104,13 @@ fn merge_completed_for_post_hook(summary: &PullMergeSummary) -> bool {
         && (summary.commit.is_some() || summary.strategy == "squash")
 }
 
+struct PreflightedThreeWayInputs {
+    rename_config: Option<MergeRenameConfig>,
+    default_driver: Option<String>,
+    external_drivers: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
+}
+
 async fn run_merge_for_pull_inner(
     // Pre-resolved and (when requested) signature-verified by
     // `run_merge_for_pull_with_options` BEFORE autostash/recovery mutations;
@@ -1992,12 +2120,10 @@ async fn run_merge_for_pull_inner(
     output: &OutputConfig,
     options: PullMergeOptions,
     // Validated by the caller BEFORE it mutated anything (MG-05, Codex R7/R8);
-    // carried here so the engines never read the key a second time, where a
+    // carried here so the engines never read the keys a second time, where a
     // transient failure or a concurrent edit could refuse the merge after the
     // autostash had already saved and reset the tree (Codex R9).
-    preflighted_rename_config: Option<MergeRenameConfig>,
-    preflighted_default_driver: Option<String>,
-    preflighted_external_drivers: SharedExternalMergeRuntime,
+    preflighted: PreflightedThreeWayInputs,
 ) -> Result<PullMergeSummary, PullMergeError> {
     let Some(current_commit_id) = Head::current_commit().await else {
         let files_changed = count_changed_files(None, &target_commit)?;
@@ -2101,9 +2227,10 @@ async fn run_merge_for_pull_inner(
         favor: options.favor,
         allow_unrelated_histories: options.allow_unrelated_histories,
         fast_forwardable: merge_head_is_sole_base(&bases, &current_commit) && !options.no_ff,
-        rename_config: preflighted_rename_config,
-        merge_default_driver: preflighted_default_driver,
-        external_merge_runtime: preflighted_external_drivers,
+        rename_config: preflighted.rename_config,
+        merge_default_driver: preflighted.default_driver,
+        external_merge_runtime: preflighted.external_drivers,
+        input_normalization: preflighted.input_normalization,
         output,
     };
     match options.strategy {
@@ -2167,6 +2294,7 @@ struct ThreeWayMergeOptions<'a> {
     rename_config: Option<MergeRenameConfig>,
     merge_default_driver: Option<String>,
     external_merge_runtime: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
     output: &'a OutputConfig,
 }
 
@@ -2409,11 +2537,14 @@ async fn perform_three_way_merge(
             let ancestor = virtual_merge_base(
                 &base_ids,
                 &passthrough_gitlinks,
-                !options.dry_run,
-                conflict_style,
-                &rename_config,
-                options.merge_default_driver.as_deref(),
-                options.external_merge_runtime.clone(),
+                VirtualFold {
+                    persist: !options.dry_run,
+                    conflict_style,
+                    rename_config: &rename_config,
+                    default_driver: options.merge_default_driver.as_deref(),
+                    external_merge_runtime: options.external_merge_runtime.clone(),
+                    input_normalization: options.input_normalization,
+                },
             )?;
             (ancestor.items, ancestor.blobs)
         }
@@ -2432,13 +2563,10 @@ async fn perform_three_way_merge(
             df_branch_label(MergeSide::Ours, upstream).as_str(),
             upstream,
         ),
-        &mut TreeMergeContext::top_level_with_external(
-            !options.dry_run,
-            options.favor,
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
             conflict_style,
-            options.merge_default_driver.as_deref(),
             upstream,
-            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
     )?;
@@ -2452,13 +2580,10 @@ async fn perform_three_way_merge(
         &base_items,
         &our_items,
         &their_items,
-        &mut TreeMergeContext::top_level_with_external(
-            !options.dry_run,
-            options.favor,
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
             conflict_style,
-            options.merge_default_driver.as_deref(),
             upstream,
-            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
     )?;
@@ -4263,35 +4388,42 @@ fn try_merge_blob_contents(
         context.depth,
     );
     let outcome = match &driver {
-        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_refined_driver(
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_input_normalization(
             *driver,
+            path,
             base_data,
             &ours_blob.data,
             &theirs_blob.data,
-            context.favor,
-            context.conflict_style,
-            2 * context.depth,
-        )
-        .map_err(PullMergeError::TreeCreate)?,
-        SelectedMergeDriver::External(driver) => run_external_merge_driver(
-            &context.external_merge_runtime,
-            driver,
-            ExternalMergeInput {
-                path,
-                base_id: base.map_or_else(
-                    || Blob::from_content_bytes(Vec::new()).id,
-                    |entry| entry.hash,
-                ),
-                ours_id: ours.hash,
-                theirs_id: theirs.hash,
-                base: base_data,
-                ours: &ours_blob.data,
-                theirs: &theirs_blob.data,
-                marker_length,
-                labels: context.external_labels(),
+            MergeContentOptions {
+                favor: context.favor,
+                conflict_style: context.conflict_style,
+                extra_marker_size: 2 * context.depth,
+                normalization: context.input_normalization,
             },
         )
         .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => {
+            run_external_merge_driver_with_input_normalization(
+                &context.external_merge_runtime,
+                driver,
+                ExternalMergeInput {
+                    path,
+                    base_id: base.map_or_else(
+                        || Blob::from_content_bytes(Vec::new()).id,
+                        |entry| entry.hash,
+                    ),
+                    ours_id: ours.hash,
+                    theirs_id: theirs.hash,
+                    base: base_data,
+                    ours: &ours_blob.data,
+                    theirs: &theirs_blob.data,
+                    marker_length,
+                    labels: context.external_labels(),
+                },
+                context.input_normalization,
+            )
+            .map_err(PullMergeError::TreeCreate)?
+        }
     };
 
     let (merged_bytes, content_clean) = match outcome {
@@ -4299,7 +4431,10 @@ fn try_merge_blob_contents(
         BuiltinMergeOutcome::Conflict(bytes) => (bytes, false),
     };
     let clean = content_clean && mode_clean;
-    let rendered = matches!(driver, SelectedMergeDriver::External(_));
+    let rendered = matches!(driver, SelectedMergeDriver::External(_))
+        || context.input_normalization.whitespace.is_some()
+        || (context.input_normalization.renormalize
+            && text_renormalization_for_path(path) != TextRenormalization::Never);
     if !clean && !rendered {
         return Ok(BlobMergeAttempt::Conflict {
             driver: driver.fallback_builtin(),
@@ -4739,6 +4874,62 @@ fn run_external_merge_driver(
     Ok(outcome)
 }
 
+/// Git renormalizes `%O`, `%A`, and `%B` before dispatching either a built-in
+/// or external low-level merge driver (`merge-ll.c` `ll_merge()`). Whitespace
+/// strategy flags are xdiff-only, so they intentionally do not alter external
+/// driver inputs. The result still goes through Libra's original-text backfill
+/// contract so normalized paths retain ours-side line endings on disk.
+fn run_external_merge_driver_with_input_normalization(
+    runtime: &ExternalMergeRuntime,
+    driver: &ExternalMergeDriver,
+    input: ExternalMergeInput<'_>,
+    normalization: MergeInputNormalization,
+) -> Result<BuiltinMergeOutcome, String> {
+    let text_mode = if normalization.renormalize {
+        text_renormalization_for_path(input.path)
+    } else {
+        TextRenormalization::Never
+    };
+    let renormalize_base = renormalize_text_input(text_mode, input.base);
+    let renormalize_ours = renormalize_text_input(text_mode, input.ours);
+    let renormalize_theirs = renormalize_text_input(text_mode, input.theirs);
+    if !renormalize_base && !renormalize_ours && !renormalize_theirs {
+        return run_external_merge_driver(runtime, driver, input);
+    }
+
+    let normalized_base = normalize_merge_input(input.base, None, renormalize_base);
+    let normalized_ours = normalize_merge_input(input.ours, None, renormalize_ours);
+    let normalized_theirs = normalize_merge_input(input.theirs, None, renormalize_theirs);
+    let normalized_input = ExternalMergeInput {
+        path: input.path,
+        // The cache must distinguish raw and normalized driver inputs even
+        // when their source object IDs are identical.
+        base_id: Blob::from_content_bytes(normalized_base.canonical.clone()).id,
+        ours_id: Blob::from_content_bytes(normalized_ours.canonical.clone()).id,
+        theirs_id: Blob::from_content_bytes(normalized_theirs.canonical.clone()).id,
+        base: &normalized_base.canonical,
+        ours: &normalized_ours.canonical,
+        theirs: &normalized_theirs.canonical,
+        marker_length: input.marker_length,
+        labels: input.labels,
+    };
+    let outcome = run_external_merge_driver(runtime, driver, normalized_input)?;
+    let backfill = |bytes: Vec<u8>| {
+        backfill_normalized_merge(
+            &bytes,
+            input.marker_length,
+            &normalized_base,
+            &normalized_ours,
+            &normalized_theirs,
+            input.ours,
+        )
+    };
+    Ok(match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => BuiltinMergeOutcome::Clean(backfill(bytes)),
+        BuiltinMergeOutcome::Conflict(bytes) => BuiltinMergeOutcome::Conflict(backfill(bytes)),
+    })
+}
+
 fn builtin_driver_named(name: &str) -> BuiltinMergeDriver {
     match name {
         "binary" => BuiltinMergeDriver::Binary,
@@ -4810,6 +5001,29 @@ pub(crate) async fn read_merge_default_driver() -> Result<Option<String>, String
         .map_err(|error| format!("{error:#}"))
 }
 
+/// Resolve the per-invocation renormalize toggle. The caller invokes this only
+/// after proving the operation reaches the three-way engine, preserving Git's
+/// behavior that an irrelevant bad value cannot break fast-forward or
+/// already-up-to-date merges. An explicit `-X renormalize|no-renormalize`
+/// bypasses configuration and the last toggle wins during CLI parsing.
+async fn resolve_merge_renormalize(explicit: Option<bool>) -> Result<bool, PullMergeError> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    if let Some(enabled) = explicit {
+        return Ok(enabled);
+    }
+    let Some(value) =
+        read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "merge.renormalize")
+            .await
+            .map_err(|error| PullMergeError::RenormalizeConfigRead(format!("{error:#}")))?
+    else {
+        return Ok(false);
+    };
+    parse_git_config_bool(&value).ok_or(PullMergeError::InvalidRenormalizeConfig(value))
+}
+
 async fn read_external_merge_runtime() -> Result<SharedExternalMergeRuntime, String> {
     use crate::internal::config::{LocalIdentityTarget, read_cascaded_subsection_values_strict};
 
@@ -4835,6 +5049,353 @@ async fn read_external_merge_runtime() -> Result<SharedExternalMergeRuntime, Str
         drivers,
         cache: Mutex::new(HashMap::new()),
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextRenormalization {
+    Never,
+    Always,
+    Auto,
+}
+
+/// Git's `ll_merge()` renormalizes all three low-level inputs before driver
+/// selection (`merge-ll.c:423-425`). Libra intentionally does not implement
+/// arbitrary smudge/clean filter programs (D5); this scoped bridge handles the
+/// built-in text/eol conversion that makes repository text canonical.
+fn text_renormalization_for_path(path: &Path) -> TextRenormalization {
+    let text = attributes::attribute_state_for_path("text", path);
+    let eol_implies_text = matches!(
+        attributes::attribute_state_for_path("eol", path),
+        Some(AttributeState::Value(value)) if value.eq_ignore_ascii_case("lf")
+            || value.eq_ignore_ascii_case("crlf")
+    );
+    match text {
+        Some(AttributeState::Unset) => TextRenormalization::Never,
+        Some(AttributeState::Value(value)) if value.eq_ignore_ascii_case("auto") => {
+            TextRenormalization::Auto
+        }
+        Some(AttributeState::Set | AttributeState::Value(_)) => TextRenormalization::Always,
+        Some(AttributeState::Unspecified) | None if eol_implies_text => TextRenormalization::Always,
+        Some(AttributeState::Unspecified) | None => TextRenormalization::Never,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedMergeLine {
+    key: Vec<u8>,
+    original_body: Vec<u8>,
+    original_eol: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedMergeInput {
+    canonical: Vec<u8>,
+    lines: Vec<NormalizedMergeLine>,
+}
+
+fn renormalize_text_input(mode: TextRenormalization, content: &[u8]) -> bool {
+    match mode {
+        TextRenormalization::Never => false,
+        TextRenormalization::Always => true,
+        TextRenormalization::Auto => !text_auto_is_binary(content),
+    }
+}
+
+/// Match Git's `convert.c::convert_is_binary` decision for `text=auto`.
+/// Merge's xdiff binary probe is intentionally different (NUL in the first
+/// 8000 bytes plus a size ceiling), while conversion scans the whole input and
+/// also rejects lone CR and control-heavy data.
+fn text_auto_is_binary(content: &[u8]) -> bool {
+    let mut printable = 0usize;
+    let mut nonprintable = 0usize;
+    let mut has_nul = false;
+    let mut has_lone_cr = false;
+    let mut index = 0usize;
+    while index < content.len() {
+        let byte = content[index];
+        if byte == b'\r' {
+            if content.get(index + 1) == Some(&b'\n') {
+                index += 2;
+                continue;
+            }
+            has_lone_cr = true;
+        } else if byte == b'\n' {
+            index += 1;
+            continue;
+        } else if byte == 127 {
+            nonprintable += 1;
+        } else if byte < 32 {
+            if matches!(byte, b'\x08' | b'\t' | b'\x1b' | b'\x0c') {
+                printable += 1;
+            } else {
+                has_nul |= byte == 0;
+                nonprintable += 1;
+            }
+        } else {
+            printable += 1;
+        }
+        index += 1;
+    }
+    if content.last() == Some(&b'\x1a') {
+        nonprintable = nonprintable.saturating_sub(1);
+    }
+    has_lone_cr || has_nul || (printable >> 7) < nonprintable
+}
+
+fn split_original_line(record: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(body) = record.strip_suffix(b"\r\n") {
+        (body, b"\r\n")
+    } else if let Some(body) = record.strip_suffix(b"\n") {
+        (body, b"\n")
+    } else {
+        (record, b"")
+    }
+}
+
+fn normalize_merge_input(
+    content: &[u8],
+    whitespace: Option<MergeWhitespace>,
+    renormalize: bool,
+) -> NormalizedMergeInput {
+    let mut canonical = Vec::with_capacity(content.len());
+    let mut lines = Vec::new();
+    for record in split_lines_preserving_eol(content) {
+        let (original_body, original_eol) = split_original_line(record);
+        // Every diff whitespace normalizer consumes logical lines (without the
+        // CRLF terminator). Without a whitespace option, only renormalization
+        // strips the CR from CRLF for comparison.
+        let comparison_body = if (whitespace.is_some() || renormalize) && original_eol == b"\r\n" {
+            original_body
+        } else if original_eol == b"\r\n" {
+            // Preserve the CR when neither comparison mode is active. This
+            // branch is kept for the unit-level identity contract.
+            &record[..record.len() - 1]
+        } else {
+            original_body
+        };
+        let key = match (whitespace, std::str::from_utf8(comparison_body)) {
+            (Some(mode), Ok(text)) => mode.normalizer()(text).into_bytes(),
+            // Whitespace comparison must never collapse distinct invalid
+            // UTF-8 sequences through the replacement character. Keep those
+            // bytes exact; the ordinary byte merge can still handle them.
+            (Some(_), Err(_)) => comparison_body.to_vec(),
+            (None, _) => comparison_body.to_vec(),
+        };
+        canonical.extend_from_slice(&key);
+        if !original_eol.is_empty() {
+            canonical.push(b'\n');
+        }
+        lines.push(NormalizedMergeLine {
+            key,
+            original_body: original_body.to_vec(),
+            original_eol: original_eol.to_vec(),
+        });
+    }
+    NormalizedMergeInput { canonical, lines }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalizedOutputSection {
+    Merged,
+    Ours,
+    Base,
+    Theirs,
+}
+
+fn normalized_marker(body: &[u8], marker: u8, marker_len: usize, label: Option<&[u8]>) -> bool {
+    if body.len() < marker_len || body[..marker_len].iter().any(|byte| *byte != marker) {
+        return false;
+    }
+    match label {
+        Some(label) => {
+            body.len() == marker_len + 1 + label.len()
+                && body[marker_len] == b' '
+                && body[marker_len + 1..] == *label
+        }
+        None => body.len() == marker_len,
+    }
+}
+
+fn find_normalized_line(input: &NormalizedMergeInput, cursor: usize, key: &[u8]) -> Option<usize> {
+    input.lines[cursor..]
+        .iter()
+        .position(|line| line.key == key)
+        .map(|offset| cursor + offset)
+}
+
+fn backfill_normalized_merge(
+    rendered: &[u8],
+    marker_len: usize,
+    base: &NormalizedMergeInput,
+    ours: &NormalizedMergeInput,
+    theirs: &NormalizedMergeInput,
+    original_ours: &[u8],
+) -> Vec<u8> {
+    let inputs = [base, ours, theirs];
+    let mut cursors = [0usize; 3];
+    let mut section = NormalizedOutputSection::Merged;
+    let preferred_eol = conflict_marker_eol_for_inputs(&[original_ours]);
+    let mut output = Vec::with_capacity(rendered.len());
+    for record in split_lines_preserving_eol(rendered) {
+        let (body, output_eol) = split_original_line(record);
+        let marker = if normalized_marker(body, b'<', marker_len, Some(b"ours")) {
+            section = NormalizedOutputSection::Ours;
+            true
+        } else if normalized_marker(body, b'|', marker_len, Some(b"original")) {
+            section = NormalizedOutputSection::Base;
+            true
+        } else if normalized_marker(body, b'=', marker_len, None) {
+            section = NormalizedOutputSection::Theirs;
+            true
+        } else if normalized_marker(body, b'>', marker_len, Some(b"theirs")) {
+            section = NormalizedOutputSection::Merged;
+            true
+        } else {
+            false
+        };
+        if marker {
+            output.extend_from_slice(body);
+            if !output_eol.is_empty() {
+                output.extend_from_slice(preferred_eol);
+            }
+            continue;
+        }
+
+        let candidates: &[usize] = match section {
+            NormalizedOutputSection::Merged => &[1, 2, 0],
+            NormalizedOutputSection::Ours => &[1],
+            NormalizedOutputSection::Base => &[0],
+            NormalizedOutputSection::Theirs => &[2],
+        };
+        let selected = candidates
+            .iter()
+            .filter_map(|side| {
+                find_normalized_line(inputs[*side], cursors[*side], body)
+                    .map(|index| (*side, index, index - cursors[*side]))
+            })
+            .min_by_key(|(side, _, distance)| {
+                (*distance, candidates.iter().position(|s| s == side))
+            });
+        if let Some((side, index, _)) = selected {
+            let line = &inputs[side].lines[index];
+            output.extend_from_slice(&line.original_body);
+            cursors[side] = index + 1;
+            if section == NormalizedOutputSection::Merged {
+                // A merged/context line is normally present in every input.
+                // Advancing matching cursors keeps repeated normalized lines
+                // aligned without consuming side-specific conflict bodies.
+                for other in 0..inputs.len() {
+                    if other == side {
+                        continue;
+                    }
+                    if let Some(other_index) =
+                        find_normalized_line(inputs[other], cursors[other], body)
+                    {
+                        cursors[other] = other_index + 1;
+                    }
+                }
+            }
+            if !output_eol.is_empty() {
+                if side == 1 && !line.original_eol.is_empty() {
+                    output.extend_from_slice(&line.original_eol);
+                } else {
+                    output.extend_from_slice(preferred_eol);
+                }
+            }
+        } else {
+            output.extend_from_slice(body);
+            if !output_eol.is_empty() {
+                output.extend_from_slice(preferred_eol);
+            }
+        }
+    }
+    output
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MergeContentOptions {
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+    normalization: MergeInputNormalization,
+}
+
+fn merge_bytes_with_input_normalization(
+    driver: BuiltinMergeDriver,
+    path: &Path,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    options: MergeContentOptions,
+) -> Result<BuiltinMergeOutcome, String> {
+    let MergeContentOptions {
+        favor,
+        conflict_style,
+        extra_marker_size,
+        normalization,
+    } = options;
+    let text_mode = if normalization.renormalize {
+        text_renormalization_for_path(path)
+    } else {
+        TextRenormalization::Never
+    };
+    let renormalize_base = renormalize_text_input(text_mode, base);
+    let renormalize_ours = renormalize_text_input(text_mode, ours);
+    let renormalize_theirs = renormalize_text_input(text_mode, theirs);
+    let active = normalization.whitespace.is_some()
+        || renormalize_base
+        || renormalize_ours
+        || renormalize_theirs;
+    if !active
+        || driver == BuiltinMergeDriver::Binary
+        || [base, ours, theirs]
+            .iter()
+            .any(|input| merge_input_is_binary(input))
+    {
+        return merge_bytes_with_refined_driver(
+            driver,
+            base,
+            ours,
+            theirs,
+            favor,
+            conflict_style,
+            extra_marker_size,
+        );
+    }
+
+    let normalized_base = normalize_merge_input(base, normalization.whitespace, renormalize_base);
+    let normalized_ours = normalize_merge_input(ours, normalization.whitespace, renormalize_ours);
+    let normalized_theirs =
+        normalize_merge_input(theirs, normalization.whitespace, renormalize_theirs);
+    let marker_len = unambiguous_conflict_marker_length(&[
+        &normalized_base.canonical,
+        &normalized_ours.canonical,
+        &normalized_theirs.canonical,
+    ])
+    .saturating_add(extra_marker_size);
+    let outcome = merge_bytes_with_refined_driver(
+        driver,
+        &normalized_base.canonical,
+        &normalized_ours.canonical,
+        &normalized_theirs.canonical,
+        favor,
+        conflict_style,
+        extra_marker_size,
+    )?;
+    let backfill = |bytes: Vec<u8>| {
+        backfill_normalized_merge(
+            &bytes,
+            marker_len,
+            &normalized_base,
+            &normalized_ours,
+            &normalized_theirs,
+            ours,
+        )
+    };
+    Ok(match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => BuiltinMergeOutcome::Clean(backfill(bytes)),
+        BuiltinMergeOutcome::Conflict(bytes) => BuiltinMergeOutcome::Conflict(backfill(bytes)),
+    })
 }
 
 /// Apply one built-in low-level driver without MG-10 presentation refinement.
@@ -5484,6 +6045,10 @@ struct TreeMergeContext<'a> {
     /// One config snapshot and result cache shared by the incremental walk,
     /// flat fallback, rename replay, and recursive virtual-ancestor fold.
     external_merge_runtime: SharedExternalMergeRuntime,
+    /// Comparison-only whitespace rules plus path-attribute renormalization.
+    /// Every content path, including rename replay and virtual ancestors, sees
+    /// the same immutable invocation snapshot.
+    input_normalization: MergeInputNormalization,
     ancestor_label: String,
     ours_label: String,
     theirs_label: String,
@@ -5515,6 +6080,7 @@ impl TreeMergeContext<'_> {
             depth: 0,
             default_driver: default_driver.map(str::to_owned),
             external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
+            input_normalization: MergeInputNormalization::default(),
             ancestor_label: "base".to_string(),
             ours_label: "HEAD".to_string(),
             theirs_label: "theirs".to_string(),
@@ -5522,22 +6088,20 @@ impl TreeMergeContext<'_> {
         }
     }
 
-    fn top_level_with_external<'a>(
-        persist_merged_blobs: bool,
-        favor: Option<MergeFavor>,
+    fn top_level_with_options<'a>(
+        options: &ThreeWayMergeOptions<'_>,
         conflict_style: ConflictStyle,
-        default_driver: Option<&str>,
         theirs_label: &str,
-        external_merge_runtime: SharedExternalMergeRuntime,
         virtual_blobs: &'a mut VirtualBlobs,
     ) -> TreeMergeContext<'a> {
         TreeMergeContext {
-            persist_merged_blobs,
-            favor,
+            persist_merged_blobs: !options.dry_run,
+            favor: options.favor,
             conflict_style,
             depth: 0,
-            default_driver: default_driver.map(str::to_owned),
-            external_merge_runtime,
+            default_driver: options.merge_default_driver.clone(),
+            external_merge_runtime: options.external_merge_runtime.clone(),
+            input_normalization: options.input_normalization,
             ancestor_label: "base".to_string(),
             ours_label: "HEAD".to_string(),
             theirs_label: theirs_label.to_string(),
@@ -5562,6 +6126,7 @@ impl TreeMergeContext<'_> {
             ConflictStyle::Merge,
             default_driver,
             Arc::new(ExternalMergeRuntime::default()),
+            MergeInputNormalization::default(),
             virtual_blobs,
         )
     }
@@ -5572,6 +6137,7 @@ impl TreeMergeContext<'_> {
         conflict_style: ConflictStyle,
         default_driver: Option<&str>,
         external_merge_runtime: SharedExternalMergeRuntime,
+        input_normalization: MergeInputNormalization,
         virtual_blobs: &'a mut VirtualBlobs,
     ) -> TreeMergeContext<'a> {
         TreeMergeContext {
@@ -5581,6 +6147,7 @@ impl TreeMergeContext<'_> {
             depth,
             default_driver: default_driver.map(str::to_owned),
             external_merge_runtime,
+            input_normalization,
             ancestor_label: "merged common ancestors".to_string(),
             ours_label: VIRTUAL_OURS_LABEL.to_string(),
             theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
@@ -5773,6 +6340,7 @@ struct VirtualFold<'a> {
     rename_config: &'a MergeRenameConfig,
     default_driver: Option<&'a str>,
     external_merge_runtime: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
 }
 
 /// Fold every merge base of a criss-cross history into ONE virtual ancestor
@@ -5783,20 +6351,9 @@ struct VirtualFold<'a> {
 fn virtual_merge_base(
     bases: &[ObjectHash],
     gitlinks: &GitlinkEntries,
-    persist: bool,
-    conflict_style: ConflictStyle,
-    rename_config: &MergeRenameConfig,
-    default_driver: Option<&str>,
-    external_merge_runtime: SharedExternalMergeRuntime,
+    fold: VirtualFold<'_>,
 ) -> Result<VirtualAncestor, PullMergeError> {
     let mut blobs = VirtualBlobs::new();
-    let fold = VirtualFold {
-        persist,
-        conflict_style,
-        rename_config,
-        default_driver,
-        external_merge_runtime,
-    };
     let items = fold_merge_bases(bases, gitlinks, 1, &mut blobs, fold)?;
     Ok(VirtualAncestor { items, blobs })
 }
@@ -5888,6 +6445,7 @@ fn merge_virtual_items(
             fold.conflict_style,
             fold.default_driver,
             fold.external_merge_runtime.clone(),
+            fold.input_normalization,
             blobs,
         ),
     )?;
@@ -5912,6 +6470,7 @@ fn merge_virtual_items(
                 depth,
                 default_driver: fold.default_driver.map(str::to_owned),
                 external_merge_runtime: fold.external_merge_runtime.clone(),
+                input_normalization: fold.input_normalization,
                 ancestor_label: "merged common ancestors".to_string(),
                 ours_label: VIRTUAL_OURS_LABEL.to_string(),
                 theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
@@ -5935,7 +6494,18 @@ fn merge_virtual_items(
                     ConflictKind::BothChanged { driver, .. } => driver,
                     _ => BuiltinMergeDriver::Text,
                 };
-                virtual_conflict_resolution(base, ours, theirs, driver, depth, blobs, fold.clone())?
+                virtual_conflict_resolution(
+                    &path,
+                    base,
+                    ours,
+                    theirs,
+                    blobs,
+                    VirtualConflictContext {
+                        driver,
+                        depth,
+                        fold: fold.clone(),
+                    },
+                )?
             }
         };
         if let Some(entry) = entry {
@@ -6045,15 +6615,25 @@ fn relocate_virtual_df_files(
 ///   there is no original (`merge-ll.c` `ll_binary_merge` steals `orig` for a
 ///   virtual ancestor, and `read_mmblob` of a null oid is empty);
 /// * otherwise merge the text and record it with its markers.
+struct VirtualConflictContext<'a> {
+    driver: BuiltinMergeDriver,
+    depth: usize,
+    fold: VirtualFold<'a>,
+}
+
 fn virtual_conflict_resolution(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
-    driver: BuiltinMergeDriver,
-    depth: usize,
     blobs: &mut VirtualBlobs,
-    fold: VirtualFold<'_>,
+    context: VirtualConflictContext<'_>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
+    let VirtualConflictContext {
+        driver,
+        depth,
+        fold,
+    } = context;
     let (Some(ours), Some(theirs)) = (ours, theirs) else {
         return Ok(base.copied());
     };
@@ -6082,6 +6662,7 @@ fn virtual_conflict_resolution(
             depth,
             default_driver: None,
             external_merge_runtime: fold.external_merge_runtime.clone(),
+            input_normalization: fold.input_normalization,
             ancestor_label: "merged common ancestors".to_string(),
             ours_label: VIRTUAL_OURS_LABEL.to_string(),
             theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
@@ -6114,11 +6695,12 @@ fn virtual_conflict_resolution(
 
     let content = merge_virtual_content(
         driver,
+        path,
         base_bytes,
         &ours_blob.data,
         &theirs_blob.data,
         depth,
-        fold.conflict_style,
+        &fold,
     )
     .map_err(PullMergeError::TreeCreate)?;
     let blob = Blob::from_content_bytes(content);
@@ -6186,21 +6768,26 @@ fn virtual_merged_mode(
 /// `depth` and labelled the way Git labels a virtual-ancestor merge.
 fn merge_virtual_content(
     driver: BuiltinMergeDriver,
+    path: &Path,
     base: &[u8],
     ours: &[u8],
     theirs: &[u8],
     depth: usize,
-    conflict_style: ConflictStyle,
+    fold: &VirtualFold<'_>,
 ) -> Result<Vec<u8>, String> {
     let marker_len = conflict_marker_length_at_depth(&[base, ours, theirs], depth);
-    match merge_bytes_with_refined_driver(
+    match merge_bytes_with_input_normalization(
         driver,
+        path,
         base,
         ours,
         theirs,
-        None,
-        conflict_style,
-        2 * depth,
+        MergeContentOptions {
+            favor: None,
+            conflict_style: fold.conflict_style,
+            extra_marker_size: 2 * depth,
+            normalization: fold.input_normalization,
+        },
     )? {
         BuiltinMergeOutcome::Clean(merged) => Ok(merged),
         BuiltinMergeOutcome::Conflict(conflicted) => Ok(relabel_conflict_markers(
@@ -8470,39 +9057,46 @@ fn merge_rename_content(
     )
     .saturating_add(1);
     let outcome = match &driver {
-        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_refined_driver(
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_input_normalization(
             *driver,
+            path,
             base_data,
             &ours_blob.data,
             &theirs_blob.data,
-            favor,
-            conflict_style,
-            1 + 2 * context.depth,
-        )
-        .map_err(PullMergeError::TreeCreate)?,
-        SelectedMergeDriver::External(driver) => run_external_merge_driver(
-            &context.external_merge_runtime,
-            driver,
-            ExternalMergeInput {
-                path,
-                base_id: base.map_or_else(
-                    || Blob::from_content_bytes(Vec::new()).id,
-                    |entry| entry.hash,
-                ),
-                ours_id: ours.hash,
-                theirs_id: theirs.hash,
-                base: base_data,
-                ours: &ours_blob.data,
-                theirs: &theirs_blob.data,
-                marker_length: marker_len,
-                labels: ExternalMergeLabels {
-                    ancestor: base_label,
-                    ours: ours_label,
-                    theirs: theirs_label,
-                },
+            MergeContentOptions {
+                favor,
+                conflict_style,
+                extra_marker_size: 1 + 2 * context.depth,
+                normalization: context.input_normalization,
             },
         )
         .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => {
+            run_external_merge_driver_with_input_normalization(
+                &context.external_merge_runtime,
+                driver,
+                ExternalMergeInput {
+                    path,
+                    base_id: base.map_or_else(
+                        || Blob::from_content_bytes(Vec::new()).id,
+                        |entry| entry.hash,
+                    ),
+                    ours_id: ours.hash,
+                    theirs_id: theirs.hash,
+                    base: base_data,
+                    ours: &ours_blob.data,
+                    theirs: &theirs_blob.data,
+                    marker_length: marker_len,
+                    labels: ExternalMergeLabels {
+                        ancestor: base_label,
+                        ours: ours_label,
+                        theirs: theirs_label,
+                    },
+                },
+                context.input_normalization,
+            )
+            .map_err(PullMergeError::TreeCreate)?
+        }
     };
     let external = matches!(driver, SelectedMergeDriver::External(_));
     let (bytes, clean) = match outcome {
@@ -10542,13 +11136,10 @@ async fn perform_incremental_three_way_merge(
         base_tree,
         ours_tree,
         theirs_tree,
-        &mut TreeMergeContext::top_level_with_external(
-            !options.dry_run,
-            options.favor,
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
             conflict_style,
-            options.merge_default_driver.as_deref(),
             upstream,
-            options.external_merge_runtime.clone(),
             &mut virtual_blobs,
         ),
         rename_config.enabled,
@@ -10574,13 +11165,10 @@ async fn perform_incremental_three_way_merge(
     // them, so the pair is re-resolved at the new path (Git's
     // `process_renames` does the same to its already-collected entries).
     //
-    let mut rename_context = TreeMergeContext::top_level_with_external(
-        !options.dry_run,
-        options.favor,
+    let mut rename_context = TreeMergeContext::top_level_with_options(
+        &options,
         conflict_style,
-        options.merge_default_driver.as_deref(),
         upstream,
-        options.external_merge_runtime.clone(),
         &mut virtual_blobs,
     );
     let rename_decisions = apply_incremental_renames(
@@ -10747,13 +11335,10 @@ async fn perform_incremental_three_way_merge(
                 df_branch_label(MergeSide::Ours, upstream).as_str(),
                 upstream,
             ),
-            &mut TreeMergeContext::top_level_with_external(
-                !options.dry_run,
-                options.favor,
+            &mut TreeMergeContext::top_level_with_options(
+                &options,
                 conflict_style,
-                options.merge_default_driver.as_deref(),
                 upstream,
-                options.external_merge_runtime.clone(),
                 &mut virtual_blobs,
             ),
         )?;
@@ -12114,6 +12699,7 @@ mod driver {
                 rename_config: &rename_config,
                 default_driver: Some("binary"),
                 external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
+                input_normalization: MergeInputNormalization::default(),
             },
         )
         .expect("recursive binary-driver merge");
@@ -12717,7 +13303,7 @@ mod tests {
         .expect("parse strategy options");
         assert_eq!(
             args.strategy_option,
-            vec![MergeFavor::Ours, MergeFavor::Theirs]
+            vec![MergeStrategyOption::Ours, MergeStrategyOption::Theirs]
         );
         assert!(args.allow_unrelated_histories);
         assert_eq!(args.log, Some(7));
@@ -12773,6 +13359,14 @@ mod tests {
         assert_eq!(
             PullMergeError::ConflictStyleRead("db locked".to_string()).to_string(),
             "failed to read merge.conflictStyle config: db locked",
+        );
+        assert_eq!(
+            PullMergeError::InvalidRenormalizeConfig("sometimes".to_string()).to_string(),
+            "unsupported merge.renormalize 'sometimes' (expected a boolean)",
+        );
+        assert_eq!(
+            PullMergeError::RenormalizeConfigRead("db locked".to_string()).to_string(),
+            "failed to read merge.renormalize config: db locked",
         );
         assert_eq!(
             PullMergeError::RestartWithoutConflicts.to_string(),
@@ -13093,6 +13687,7 @@ mod recursive {
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect("folding two ancestors never fails")
@@ -13130,6 +13725,7 @@ mod recursive {
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("one level past the ceiling is refused");
@@ -13146,6 +13742,7 @@ mod recursive {
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("these ids name no object");
@@ -13176,6 +13773,7 @@ mod recursive {
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("one base past the width ceiling is refused");
@@ -13195,6 +13793,7 @@ mod recursive {
                 rename_config: &super::MergeRenameConfig::default(),
                 default_driver: None,
                 external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("these ids name no object");
@@ -13706,6 +14305,157 @@ mod recursive {
             None,
             "a criss-cross merge's base is virtual and must not be rooted"
         );
+    }
+}
+
+/// MG-11: comparison-only whitespace normalization and original-byte
+/// backfill. These tests pin the shared diff predicate rather than a second
+/// merge-specific whitespace implementation.
+#[cfg(test)]
+mod whitespace {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn merge_normalizers_use_the_diff_engine() {
+        let input = b"a  b \r\n";
+        for mode in [
+            MergeWhitespace::SpaceChange,
+            MergeWhitespace::AllSpace,
+            MergeWhitespace::SpaceAtEol,
+            MergeWhitespace::CrAtEol,
+        ] {
+            let normalized = normalize_merge_input(input, Some(mode), false);
+            let expected = mode.normalizer()("a  b ");
+            assert_eq!(
+                normalized.lines[0].key,
+                expected.as_bytes(),
+                "merge and diff must classify the same logical line under {mode:?}"
+            );
+            assert_eq!(
+                normalized.lines[0].original_body, b"a  b ",
+                "comparison normalization must not discard emitted bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_normalization_keeps_invalid_utf8_distinct() {
+        let left = normalize_merge_input(b"\x80  value\n", Some(MergeWhitespace::AllSpace), false);
+        let right = normalize_merge_input(b"\x81  value\n", Some(MergeWhitespace::AllSpace), false);
+        assert_ne!(
+            left.canonical, right.canonical,
+            "lossy decoding must not make distinct repository bytes compare equal"
+        );
+        assert_eq!(left.canonical, b"\x80  value\n");
+        assert_eq!(right.canonical, b"\x81  value\n");
+    }
+
+    #[test]
+    fn text_auto_uses_git_conversion_binary_heuristic() {
+        assert!(!text_auto_is_binary(b"plain\r\ntext\n"));
+        assert!(text_auto_is_binary(b"bare\rreturn"));
+        assert!(text_auto_is_binary(b"nul\0byte"));
+        assert!(text_auto_is_binary(b"\x01\x02\x03"));
+        assert!(renormalize_text_input(
+            TextRenormalization::Auto,
+            b"plain\r\ntext\r\n"
+        ));
+        assert!(!renormalize_text_input(
+            TextRenormalization::Auto,
+            b"bare\rreturn"
+        ));
+    }
+
+    #[test]
+    fn normalized_clean_merge_backfills_text_and_ours_eol() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"top\nvalue = base\nbottom\n",
+            b"top\r\nvalue   =   base\r\nbottom\r\n",
+            b"top\nvalue = theirs\nbottom\n",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceChange),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("normalized merge");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Clean(b"top\r\nvalue = theirs\r\nbottom\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn normalized_conflict_backfills_both_sides_and_ours_eol() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"top\nvalue = base\nbottom\n",
+            b"top\r\nvalue   = ours\r\nbottom\r\n",
+            b"top\nvalue = theirs\nbottom\n",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceChange),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("normalized conflict");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("INVARIANT: two substantive postimages must remain conflicted")
+        };
+        assert_eq!(
+            bytes,
+            b"top\r\n<<<<<<< ours\r\nvalue   = ours\r\n=======\r\nvalue = theirs\r\n>>>>>>> theirs\r\nbottom\r\n"
+        );
+    }
+
+    #[test]
+    fn normalized_merge_preserves_an_unterminated_last_line() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"base",
+            b"base   ",
+            b"theirs",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceAtEol),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("unterminated normalized merge");
+        assert_eq!(outcome, BuiltinMergeOutcome::Clean(b"theirs".to_vec()));
+    }
+
+    #[test]
+    fn repeated_strategy_options_keep_independent_axes() {
+        let parsed = parse_merge_strategy_options(&[
+            MergeStrategyOption::IgnoreSpaceAtEol,
+            MergeStrategyOption::Theirs,
+            MergeStrategyOption::Renormalize,
+            MergeStrategyOption::Ours,
+            MergeStrategyOption::IgnoreAllSpace,
+            MergeStrategyOption::NoRenormalize,
+        ]);
+        assert_eq!(parsed.favor, Some(MergeFavor::Ours));
+        assert_eq!(parsed.whitespace, Some(MergeWhitespace::AllSpace));
+        assert_eq!(parsed.renormalize, Some(false));
     }
 }
 

@@ -28,6 +28,14 @@ case "$mode" in
         printf 'external result\n' >"$ours_file"
         exit 0
         ;;
+    copy-theirs-lf)
+        cr=$(printf '\r')
+        if grep -q "$cr" "$base_file" || grep -q "$cr" "$ours_file" || grep -q "$cr" "$theirs_file"; then
+            exit 129
+        fi
+        cp "$theirs_file" "$ours_file"
+        exit 0
+        ;;
     empty)
         : >"$ours_file"
         exit 0

@@ -30,6 +30,14 @@ Pull 支持 already-up-to-date、fast-forward 和 single-head three-way merge �
 
 pull 的 merge 阶段也继承 `libra merge` 的目录改名推断和 `merge.directoryRenames=true|false|conflict`。默认 `conflict` 会建议并暂存迁移后的未解决路径；`true` 自动迁移；`false` 把新增路径留在旧目录名下。目标分裂会让合并停下，但受影响新增路径仍是 stage 0。未知值在 merge 阶段以 `LBR-REPO-003` fail-closed；在这次阶段性拒绝前，fetch 可能已经更新远程跟踪引用。
 
+merge 路径也继承 `merge.renormalize=true|false`。启用时，共享三路引擎先根据
+`text` / `eol` 属性 canonicalize base、本地和远端输入，再执行内容合并，
+结果保留本地（ours 侧）行尾。pull 不公开 `-X renormalize|no-renormalize`
+覆盖；请使用仓库配置。无效值只在 pull 真正进入三路合并时以
+`LBR-REPO-003` 失败；此前 fetch 可能已更新对象与远程跟踪引用。
+fast-forward 与 already-up-to-date 不读取该配置。任意 clean/smudge filter
+仍不支持。
+
 `pull` 已支持 `--ff-only`、`--ff`、`--no-ff`、`--squash`、`--no-commit`、`--commit`、`--autostash`、`--no-progress`、`--rebase`、`--no-rebase` 与 fetch `--depth`；尚不支持 octopus merge 与自定义合并策略（`--strategy`/`-X`）。`--commit` 只与 `--squash`、`--rebase` 冲突，并与 `--no-commit` 按命令行最后出现者生效；它不会自行强制 merge commit 或覆盖快进策略。`--depth` 要求 upstream 能协商 shallow boundary；本地 Libra upstream 以 `LBR-REPO-002` fail-closed（已决终态，见开发兼容登记 D20）。`--no-progress` 把进度抑制转发给 fetch，抑制其 “Receiving objects” 进度条。`--autostash` 在集成前 stash 已跟踪改动、集成结束时再应用回来，让 `pull` 能在脏工作树上运行——「结束」因路径而异：**rebase** 路径即使失败也会恢复；**merge** 路径沿用 `libra merge` 自己的 autostash，干净结果或前置失败时立即应用，非 squash 冲突合并进行中则**持有**（JSON `autostash: "kept"`），由 `libra merge --continue` / `--abort` 应用回来，绝不丢失；冲突 squash 则直接把 autostash 保存进 stash list，不执行回贴，保留未解决的索引和工作树，解决、提交后再用 `libra stash pop` 恢复；保存失败时警告并保留 held sidecar 引用。未跟踪/忽略文件保持原样，应用冲突时提升入 stash list 并报错（用 `libra stash pop` 恢复）。
 
 ## 全局配置 Schema 保护
@@ -245,7 +253,7 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | `pull.rebase`、`branch.<name>.rebase` 或 `pull.ff` 配置值无效 | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
 | 不支持的 `pull.rebase=merges|interactive` 模式 | `LBR-CLI-002` | 129 | 使用布尔 rebase 或显式的受支持 pull 标志 |
-| `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | "set merge.directoryRenames to true, false or conflict" |
+| `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | 把对应 merge 配置设为支持值或删除 |
 | Fetch：网络不可达 / 超时 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch：认证失败 | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
 | Fetch：协议错误 | `LBR-NET-002` | 128 | "the remote did not respond correctly" |

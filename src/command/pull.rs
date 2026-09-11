@@ -489,6 +489,8 @@ pub(crate) async fn run_pull(
                 // or unrelated-history override controls.
                 strategy: None,
                 favor: None,
+                whitespace: None,
+                renormalize: None,
                 allow_unrelated_histories: false,
                 message: None,
                 squash: args.squash,
@@ -1088,7 +1090,7 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         }
         merge::PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+            .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
         merge::PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("set merge.renames to true/false and merge.renameLimit to an integer"),
@@ -1096,8 +1098,14 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
         merge::PullMergeError::ConflictStyleRead(..)
-        | merge::PullMergeError::MergeDriverConfigRead(..) => {
+        | merge::PullMergeError::MergeDriverConfigRead(..)
+        | merge::PullMergeError::RenormalizeConfigRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        merge::PullMergeError::InvalidRenormalizeConfig(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set merge.renormalize to true/false (or remove it)")
         }
         merge::PullMergeError::HistoryConfig(
             crate::command::history_config::HistoryConfigError::Read { .. },

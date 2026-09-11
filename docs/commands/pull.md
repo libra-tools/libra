@@ -48,6 +48,16 @@ additions at stage 0. Unknown values fail closed in the merge phase with
 `LBR-REPO-003`; fetch may already have updated remote-tracking refs before
 that phase-local refusal.
 
+The merge path also inherits `merge.renormalize=true|false`. When enabled, the
+shared three-way engine canonicalizes `text` / `eol`-attributed base, local, and
+remote inputs before content merge, then preserves the local (ours-side) line
+endings in the result. Pull exposes no `-X renormalize|no-renormalize` override;
+use repository configuration. An invalid value fails with `LBR-REPO-003` only
+if pull reaches a real three-way merge. Fetch may already have updated its
+objects and remote-tracking refs; fast-forward and already-up-to-date
+integration do not consume the setting. Arbitrary clean/smudge filters remain
+unsupported.
+
 With `--squash`, pull fetches and computes the merge but stages the merged tree without creating a commit or moving `HEAD`, leaving the result ready for a single-parent plain `libra commit` (mirroring `git pull --squash`). Even on conflict, no merge state is recorded and HEAD stays unchanged; resolve and stage the files before that ordinary commit. `merge --continue`, `--abort` and `--restart` report `no merge in progress`. With `--no-commit`, pull performs the merge and stages the result but stops before committing, recording merge state so the two-parent commit can be finalized with `libra merge --continue`. `--squash` and `--no-commit` conflict with each other and with `--rebase`. `--commit` requests that the merge be committed and is last-one-wins with `--no-commit` (the final flag decides); it does not itself force a merge commit or override the selected fast-forward policy, and conflicts only with `--squash` and `--rebase`.
 
 With `--autostash`, pull stashes your tracked working-tree changes before integrating (so a dirty tree does not block the merge/rebase) and re-applies them when the integration concludes. What "concludes" means depends on the path: the **rebase** path restores them even when the rebase fails; the **merge** path uses `libra merge`'s own autostash, which re-applies on a clean result or an up-front failure but **holds** the stash (JSON `autostash: "kept"`) while a conflicted non-squash merge is in progress — it is re-applied by `libra merge --continue` or `libra merge --abort`, never lost. A conflicted squash instead saves its autostash directly in `stash list` without applying it, preserving the unresolved index and working tree; resolve and commit the squash, then run `libra stash pop`. Saving failure warns and preserves the held sidecar reference. Untracked and ignored files are left in place. If re-applying the stash conflicts, the stash is promoted to the stash list and the failure is reported; recover it with `libra stash pop`.
@@ -276,7 +286,7 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | Invalid `pull.rebase`, `branch.<name>.rebase`, or `pull.ff` config value | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
 | Unsupported `pull.rebase=merges|interactive` mode | `LBR-CLI-002` | 129 | Use boolean rebase or an explicit supported pull flag |
-| Invalid `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` (inherited from `libra merge`) | `LBR-REPO-003` | 128 | "set merge.directoryRenames to true, false or conflict" |
+| Invalid `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` (inherited from `libra merge`) | `LBR-REPO-003` | 128 | Set the named merge key to a supported value or remove it |
 | Fetch: network unreachable / timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
 | Fetch: protocol error | `LBR-NET-002` | 128 | "the remote did not respond correctly" |

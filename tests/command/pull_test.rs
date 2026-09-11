@@ -385,6 +385,66 @@ async fn test_pull_diverged_remote_creates_three_way_merge() {
     assert!(local_repo.path().join("local.txt").exists());
 }
 
+/// MG-11: pull is a consumer of the shared three-way engine and inherits
+/// `merge.renormalize` even though pull does not expose merge's `-X` surface.
+#[test]
+fn test_pull_inherits_merge_renormalize_config() {
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    fs::write(work_dir.join("shared.txt"), "top\nbase\nbottom\n").expect("write base");
+    fs::write(work_dir.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
+    git(&["add", "shared.txt", ".gitattributes"], &work_dir);
+    git(&["commit", "-m", "add shared text"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    fs::write(work_dir.join("shared.txt"), "top\nfeature\nbottom\n").expect("write remote edit");
+    git(&["add", "shared.txt"], &work_dir);
+    git(&["commit", "-m", "remote text edit"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    fs::write(
+        local_repo.path().join("shared.txt"),
+        b"top\r\nbase\r\nbottom\r\n",
+    )
+    .expect("write local CRLF edit");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], local_repo.path()),
+        "stage local CRLF edit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "local line endings", "--no-verify"],
+            local_repo.path(),
+        ),
+        "commit local CRLF edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.renormalize", "true"], local_repo.path()),
+        "configure merge.renormalize",
+    );
+
+    let output = run_libra_command(&["pull"], local_repo.path());
+    assert_cli_success(&output, "pull with merge.renormalize");
+    assert_eq!(
+        fs::read(local_repo.path().join("shared.txt")).expect("read pulled text"),
+        b"top\r\nfeature\r\nbottom\r\n"
+    );
+}
+
 /// MG-04 (Codex R1): pull inherits merge's directory/file handling; under
 /// `--json` the human announcement stays off stdout, the conflict is the
 /// `LBR-CONFLICT-002` envelope on stderr, and the moved file is in place.

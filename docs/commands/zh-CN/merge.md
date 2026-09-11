@@ -5,7 +5,7 @@
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
+libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
 libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
@@ -19,7 +19,7 @@ libra merge --restart
 
 开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue` 或 `--abort`；没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
 
-默认三方策略支持 `-X ours` / `-X theirs`：只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它 strategy/strategy option 会在参数解析阶段拒绝。
+默认三方策略支持冲突侧、空白比较和 renormalize 三类 `-X` 选项。`-X ours` / `-X theirs` 只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它支持值见下文“输入归一化”；未列出的 strategy/strategy option 会在参数解析阶段拒绝。
 
 ### 交叉合并历史（多个 merge base）
 
@@ -101,6 +101,31 @@ branch …` 标签；`merge.<name>.recursive` 尚未实现。
 merge driver；`merge-file` 在 Libra 仓库之外没有属性/配置来源，恒用
 `text`。
 
+### 输入归一化
+
+默认三方策略支持四个只影响比较的空白选项：`-X ignore-space-change`、
+`-X ignore-all-space`、`-X ignore-space-at-eol`、
+`-X ignore-cr-at-eol`。它们复用 `libra diff` 的行归一化器。内建
+text/union merge 用 canonical 行比较，再回填原文；合并中新选出的行使用
+ours 侧行尾。binary 输入和显式 binary driver 不会被改写。这些 xdiff
+风格 flag 不改变传给外部 merge driver 的文件。
+
+`merge.renormalize=true` 或 `-X renormalize` 会在内建或外部低层 driver
+运行前，根据各路径的 `text` / `eol` 属性 canonicalize 三份内容输入。
+`-text` 禁止转换，`text=auto` 转换非 binary 输入，已设置/有值的 `text`
+或 `eol=lf|crlf` 启用文本转换。Libra 当前只实现内建行尾转换，不执行任意
+clean/smudge filter 程序。合并结果回填原文并使用 ours 侧行尾；
+`-X no-renormalize` 显式关闭配置默认值。
+
+`-X` 可重复。最后一个 ours/theirs 选择与最后一个
+renormalize/no-renormalize toggle 分别生效；多个空白模式选择最强比较规则
+（依次为 `ignore-all-space`、`ignore-space-change`、
+`ignore-space-at-eol`、`ignore-cr-at-eol`）。显式 renormalize toggle
+会覆盖配置，即使配置值无效。否则只有真正需要三路合并时才严格读取
+`merge.renormalize`：无效值会在修改 HEAD/索引/工作树/merge state 前
+失败，fast-forward 与 already-up-to-date 不读取它。`libra pull` 的 merge
+路径继承该配置，但不公开 `-X`。
+
 ### 目录/文件冲突（D/F 冲突）
 
 一侧保留（或修改）**文件** `foo`、另一侧把 `foo` 变成**目录**（删除文件并在 `foo/` 下新增路径）时，两者无法共用一个路径。Libra 遵循 Git recursive 策略（`merge-ort.c` 的 `unique_path`）：目录保留 `foo`，文件按持有它的分支写到唯一名字下——文件在我方时为 `foo~HEAD`，在对方时为 `foo~<branch>`（分支名中的 `/` 替换为 `_`）；该名字已被本次合并的任一输入或其结果占用——无论占用者是文件还是目录，仅 merge base 有过的路径也算，与 Git `unique_path` 检查的集合一致——时追加 `_0`、`_1`……。合并以冲突停止（`LBR-CONFLICT-002`），并先打印 Git 的提示行：
@@ -131,7 +156,7 @@ Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并�
 
 `libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
 
-Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`theirs` 以外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
+Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、上述列表之外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
 ### 重命名
 
@@ -165,7 +190,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames`、`merge.renormalize` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。`merge.renormalize` 的阶段性读取时机见上文。
 
 ### `--dry-run`（Libra 扩展）
 
@@ -185,7 +210,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--ff-only` | 仅当当前分支可快进时才合并，否则失败。 |
 | `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
 | `-s ours`, `--strategy=ours` | 以双父提交记录合并关系，但完整保留当前 HEAD tree；不同于 `-X ours`。其它 strategy 被拒绝。 |
-| `-X ours`, `-X theirs`, `--strategy-option=<ours\|theirs>` | 只在冲突 hunk/路径偏向指定一侧；双方无冲突变更仍保留。可重复，最后一个值生效；不能与 `-s ours` 组合。 |
+| `-X <option>`, `--strategy-option=<option>` | 接受 `ours`、`theirs`、`ignore-space-change`、`ignore-all-space`、`ignore-space-at-eol`、`ignore-cr-at-eol`、`renormalize` 或 `no-renormalize`。可重复；favor 与 renormalize toggle 各自 last-one-wins，空白模式选择最强规则；不能与 `-s ours` 组合。 |
 | `--allow-unrelated-histories` | 以虚拟空 merge base 允许没有共同祖先的历史；非 squash 冲突的 `--restart` 会保留此许可。 |
 | `--log[=<N>]` | 向 merge 消息追加最多 N 条目标侧 subject；bare `--log` 为 20。覆盖 `merge.log`，并可追加到显式 `-m`；与 `--no-log` last-one-wins。 |
 | `--no-log` | 禁用 merge 消息 shortlog，覆盖 `merge.log` 和更早的 `--log`。 |
@@ -337,6 +362,8 @@ Merge aborted.
 | 不 GPG 签名 | `--no-gpg-sign`（no-op；从不签名） | `--no-gpg-sign` | N/A |
 | Ours strategy | `-s ours` | `-s ours` | N/A |
 | 冲突侧偏好 | `-X ours/theirs` | `-X ours/theirs` | N/A |
+| 空白感知内容合并 | `-X ignore-space-change` / `ignore-all-space` / `ignore-space-at-eol` / `ignore-cr-at-eol` | 相同 | N/A |
+| 归一化内容合并 | `merge.renormalize` / `-X renormalize` / `-X no-renormalize` | 相同 | Libra 不运行任意 clean/smudge filter |
 | 无关历史 | `--allow-unrelated-histories` | 支持 | N/A |
 | Merge 消息 shortlog | `--log[=<n>]` / `--no-log` | 支持 | N/A |
 | 其它自定义 strategy/option | 不支持 | 支持 | N/A |
@@ -354,6 +381,7 @@ Merge aborted.
 | 三路合并需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 |
 | 递归虚拟祖先嵌套超过 20 层或同层超过 32 个 base | `LBR-UNSUPPORTED-001` | 128 |
 | 不支持的 `-s` / `-X` 值或不兼容的 strategy 组合 | `LBR-CLI-002` | 129 |
+| 真正三路合并读取到无效 `merge.renormalize` 值 | `LBR-REPO-003` | 128 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |
 | 无 merge 状态但索引有未解决条目，包括目标已最新或 `--dry-run` | `LBR-CONFLICT-002` | 128 |
