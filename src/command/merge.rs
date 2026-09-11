@@ -56,6 +56,8 @@ use crate::{
     },
 };
 
+mod signing;
+
 /// `--help` examples shown in `libra merge --help` output.
 ///
 pub const MERGE_EXAMPLES: &str = "\
@@ -384,10 +386,13 @@ pub struct MergeArgs {
     #[arg(long = "no-rerere-autoupdate")]
     pub no_rerere_autoupdate: bool,
 
-    /// Do not GPG-sign the merge commit. Accepted for Git parity and is a no-op:
-    /// Libra's merge never signs, so this already matches the default. (Git's
-    /// opposite `-S`/`--gpg-sign` is not implemented.)
-    #[arg(long = "no-gpg-sign")]
+    /// Force vault-signing of the merge commit.
+    #[arg(short = 'S', long = "gpg-sign", overrides_with = "no_gpg_sign", conflicts_with_all = ["abort", "restart", "squash", "dry_run"])]
+    pub gpg_sign: bool,
+
+    /// Do not vault-sign the merge commit. This takes precedence over
+    /// `commit.gpgSign` and the `vault.signing` default.
+    #[arg(long = "no-gpg-sign", overrides_with = "gpg_sign", conflicts_with_all = ["abort", "restart", "squash", "dry_run"])]
     pub no_gpg_sign: bool,
 }
 
@@ -549,6 +554,12 @@ pub(crate) struct PullMergeOptions {
     /// writes (auto-merged blobs are computed in memory only). Always `false`
     /// for `pull`.
     pub dry_run: bool,
+    /// The signing decision resolved before the merge begins. It is saved in
+    /// `MergeState` so a later `--continue` and `--restart` preserve explicit
+    /// `-S` / `--no-gpg-sign` choices. `None` is only accepted at the public
+    /// pull boundary, where the shared runner resolves configuration before a
+    /// merge can mutate state.
+    pub signing_policy: Option<crate::command::history_config::CommitSigningPolicy>,
     /// `merge --autostash` (lore.md §1.8): `Some(true)` = --autostash,
     /// `Some(false)` = --no-autostash, `None` = resolve `merge.autostash`
     /// config (git-bool; an invalid value is a hard error). Under --dry-run a
@@ -639,6 +650,11 @@ pub(crate) struct MergeState {
     /// Whether the starting invocation used `--no-verify`.
     #[serde(default)]
     pub skip_hooks: bool,
+    /// Resolved signing decision from the invocation that wrote this state.
+    /// Older sidecars omit it and are resolved through current configuration
+    /// when they are continued.
+    #[serde(default)]
+    pub signing_policy: Option<crate::command::history_config::CommitSigningPolicy>,
     pub conflicted_paths: Vec<String>,
     /// Merge message resolved at merge start (`-m` override or the generated
     /// default including the `merge.log` shortlog), replayed verbatim by
@@ -971,6 +987,8 @@ pub(crate) enum PullMergeError {
     TreeCreate(String),
     #[error("failed to save merge commit: {0}")]
     CommitSave(String),
+    #[error("failed to sign merge commit: {0}")]
+    CommitSigning(String),
     #[error("failed to resolve the identity for the merge commit: {0}")]
     IdentityMissing(String),
     #[error("failed to reset working tree after merge: {0}")]
@@ -1134,6 +1152,9 @@ impl From<PullMergeError> for CliError {
             | PullMergeError::WorkdirReset(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            PullMergeError::CommitSigning(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthMissingCredentials)
+                .with_hint("check vault configuration with 'libra config --list'"),
             // Mirrors `CommitError::IdentityMissing`: a merge commit needs the same
             // identity as any other commit, so it fails the same way and offers the
             // same fix.
@@ -1234,6 +1255,15 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     if args.restart {
         return run_merge_restart(output).await;
     }
+    // An explicit CLI request applies to an initial merge and may also replace
+    // the saved decision while finalizing `--continue`. A plain continuation
+    // deliberately uses its saved policy so a later config edit cannot erase
+    // the original `-S` / `--no-gpg-sign` intent.
+    let explicit_signing_policy = if args.gpg_sign || args.no_gpg_sign {
+        Some(signing::resolve_signing_policy(args.gpg_sign, args.no_gpg_sign).await?)
+    } else {
+        None
+    };
     match (args.branch.as_slice(), args.continue_merge, args.abort) {
         (branches, false, false) if !branches.is_empty() => {
             let requested_strategies = args.strategy.clone();
@@ -1288,6 +1318,10 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 verify_signatures,
                 merge_log,
                 dry_run: args.dry_run,
+                signing_policy: Some(match explicit_signing_policy {
+                    Some(policy) => policy,
+                    None => signing::resolve_signing_policy(false, false).await?,
+                }),
                 autostash: if args.autostash {
                     Some(true)
                 } else if args.no_autostash {
@@ -1338,7 +1372,15 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 }
             }
         }
-        ([], true, false) => run_merge_continue(output, args.no_verify, args.message.clone()).await,
+        ([], true, false) => {
+            run_merge_continue(
+                output,
+                args.no_verify,
+                args.message.clone(),
+                explicit_signing_policy,
+            )
+            .await
+        }
         ([], false, true) => run_merge_abort(output).await,
         ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
@@ -1424,17 +1466,55 @@ async fn build_merge_commit(
     tree_id: ObjectHash,
     parent_commit_ids: Vec<ObjectHash>,
     message: &str,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
 ) -> Result<Commit, PullMergeError> {
     let (author, committer, _) = crate::command::commit::create_commit_signatures(None, None)
         .await
         .map_err(|error| PullMergeError::IdentityMissing(error.to_string()))?;
+    let gpg_signature = match signing_policy {
+        crate::command::history_config::CommitSigningPolicy::Disable => None,
+        crate::command::history_config::CommitSigningPolicy::Force => {
+            crate::command::commit::vault_sign_commit(
+                &tree_id,
+                &parent_commit_ids,
+                &author,
+                &committer,
+                message,
+                true,
+            )
+            .await
+            .map_err(|error| PullMergeError::CommitSigning(error.to_string()))?
+        }
+        crate::command::history_config::CommitSigningPolicy::InheritVault => {
+            crate::command::commit::vault_sign_commit(
+                &tree_id,
+                &parent_commit_ids,
+                &author,
+                &committer,
+                message,
+                false,
+            )
+            .await
+            .map_err(|error| PullMergeError::CommitSigning(error.to_string()))?
+        }
+    };
     Ok(Commit::new(
         author,
         committer,
         tree_id,
         parent_commit_ids,
-        message,
+        &format_commit_msg(message, gpg_signature.as_deref()),
     ))
+}
+
+fn signing_policy_from_options(
+    options: &PullMergeOptions,
+) -> Result<crate::command::history_config::CommitSigningPolicy, PullMergeError> {
+    options.signing_policy.ok_or_else(|| {
+        PullMergeError::History(
+            "merge signing policy was not resolved before commit construction".to_string(),
+        )
+    })
 }
 
 async fn run_pre_merge_commit_hook(output: &OutputConfig) -> Result<(), PullMergeError> {
@@ -2228,6 +2308,7 @@ async fn run_octopus_merge(
                 strategy: options.strategy,
                 allow_unrelated_histories: options.allow_unrelated_histories,
                 skip_hooks: options.skip_hooks,
+                signing_policy: options.signing_policy,
                 conflicted_paths: Vec::new(),
                 message: Some(resolved_message),
             }
@@ -2271,7 +2352,8 @@ async fn run_octopus_merge(
         let merge_commit = build_merge_commit(
             tree_id,
             parent_ids.clone(),
-            &format_commit_msg(&message, None),
+            &message,
+            signing_policy_from_options(&options)?,
         )
         .await?;
         save_object(&merge_commit, &merge_commit.id)
@@ -2412,6 +2494,7 @@ async fn prepare_octopus_tree(
         squash: false,
         no_commit: false,
         skip_hooks: options.skip_hooks,
+        signing_policy: signing_policy_from_options(options)?,
         // Every blob remains in `VirtualBlobs` until all heads are clean.
         dry_run: true,
         strategy: None,
@@ -2547,6 +2630,16 @@ pub(crate) async fn run_merge_for_pull_with_options(
     output: &OutputConfig,
     options: PullMergeOptions,
 ) -> Result<PullMergeSummary, PullMergeError> {
+    // Pull has no positive signing flag, so its unset policy is resolved at
+    // the same pre-mutation boundary as public merge. Callers that replay a
+    // saved state provide `Some` and keep that durable decision instead.
+    let options = PullMergeOptions {
+        signing_policy: Some(match options.signing_policy {
+            Some(policy) => policy,
+            None => signing::resolve_signing_policy(false, false).await?,
+        }),
+        ..options
+    };
     let skip_hooks = options.skip_hooks;
     if MergeState::load_optional_sync()
         .map_err(PullMergeError::StateLoad)?
@@ -3057,6 +3150,7 @@ async fn run_merge_for_pull_inner(
         squash: options.squash,
         no_commit: options.no_commit,
         skip_hooks: options.skip_hooks,
+        signing_policy: signing_policy_from_options(&options)?,
         dry_run: options.dry_run,
         strategy: options.strategy,
         strategy_evaluation: options.strategy_evaluation,
@@ -3110,6 +3204,7 @@ struct ThreeWayMergeOptions<'a> {
     squash: bool,
     no_commit: bool,
     skip_hooks: bool,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
     /// Explicit backend name. `None` is the historical default ort path and
@@ -3239,6 +3334,7 @@ async fn perform_ours_merge(
             strategy: Some(MergeStrategy::Ours),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
             conflicted_paths: Vec::new(),
             message: Some(resolved_message),
         }
@@ -3277,7 +3373,8 @@ async fn perform_ours_merge(
     let merge_commit = build_merge_commit(
         current_commit.tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
     )
     .await?;
     save_object(&merge_commit, &merge_commit.id)
@@ -3572,6 +3669,7 @@ async fn perform_three_way_merge(
             base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: options.signing_policy,
             strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
@@ -3685,6 +3783,7 @@ async fn perform_three_way_merge(
             strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
@@ -3733,7 +3832,8 @@ async fn perform_three_way_merge(
     let merge_commit = build_merge_commit(
         tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
     )
     .await?;
     save_object(&merge_commit, &merge_commit.id)
@@ -3850,6 +3950,7 @@ struct MergeConflictInput {
     base: Option<ObjectHash>,
     allow_unrelated_histories: bool,
     skip_hooks: bool,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
     /// Explicit backend selected for this conflict. `None` retains the
     /// historical implicit-ort state schema.
     strategy: Option<MergeStrategy>,
@@ -4011,6 +4112,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         strategy: input.strategy,
         allow_unrelated_histories: input.allow_unrelated_histories,
         skip_hooks: input.skip_hooks,
+        signing_policy: Some(input.signing_policy),
         conflicted_paths: conflict_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -4256,10 +4358,15 @@ async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
     message_override: Option<String>,
+    signing_policy_override: Option<crate::command::history_config::CommitSigningPolicy>,
 ) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
     let held_autostash = preflight_held_autostash()?;
     let state = MergeState::load_required()?;
+    let signing_policy = match signing_policy_override.or(state.signing_policy) {
+        Some(policy) => policy,
+        None => signing::resolve_signing_policy(false, false).await?,
+    };
     ensure_no_unstaged_changes_for_continue()?;
     let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
     let index =
@@ -4328,12 +4435,8 @@ async fn run_merge_continue(
     let mut parent_ids = Vec::with_capacity(targets.len() + 1);
     parent_ids.push(orig_head);
     parent_ids.extend(targets.iter().copied());
-    let merge_commit = build_merge_commit(
-        tree_id,
-        parent_ids.clone(),
-        &format_commit_msg(&message, None),
-    )
-    .await?;
+    let merge_commit =
+        build_merge_commit(tree_id, parent_ids.clone(), &message, signing_policy).await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
     let (strategy, reflog_strategy, selected_strategy) = match state.strategy {
@@ -4480,6 +4583,7 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
         preserve_held_autostash: true,
         allow_unrelated_histories: state.allow_unrelated_histories,
         skip_hooks: state.skip_hooks,
+        signing_policy: state.signing_policy,
         ..PullMergeOptions::default()
     };
     run_merge_for_pull_with_options(&target, &target_ref, output, options)
@@ -12394,6 +12498,7 @@ async fn perform_incremental_three_way_merge(
             base: recorded_base,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: options.signing_policy,
             strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
@@ -12493,6 +12598,7 @@ async fn perform_incremental_three_way_merge(
             strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
@@ -12543,7 +12649,8 @@ async fn perform_incremental_three_way_merge(
     let merge_commit = build_merge_commit(
         tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
     )
     .await?;
     report_incremental_walk_stats();
@@ -14328,6 +14435,30 @@ mod tests {
         assert!(
             MergeArgs::try_parse_from(["merge", "--squash", "--no-commit", "feature"]).is_err()
         );
+
+        let force_sign = MergeArgs::try_parse_from(["merge", "-S", "feature"])
+            .expect("-S must parse for a merge commit");
+        assert!(force_sign.gpg_sign);
+        assert!(!force_sign.no_gpg_sign);
+        let disable_sign = MergeArgs::try_parse_from(["merge", "--no-gpg-sign", "feature"])
+            .expect("--no-gpg-sign must parse for a merge commit");
+        assert!(disable_sign.no_gpg_sign);
+        assert!(!disable_sign.gpg_sign);
+        let last_toggle = MergeArgs::try_parse_from(["merge", "-S", "--no-gpg-sign", "feature"])
+            .expect("the last signing toggle must win");
+        assert!(last_toggle.no_gpg_sign);
+        assert!(!last_toggle.gpg_sign);
+        for argv in [
+            ["merge", "--restart", "-S"].as_slice(),
+            ["merge", "--abort", "--no-gpg-sign"].as_slice(),
+            ["merge", "--squash", "-S", "feature"].as_slice(),
+            ["merge", "--dry-run", "--no-gpg-sign", "feature"].as_slice(),
+        ] {
+            assert!(
+                MergeArgs::try_parse_from(argv).is_err(),
+                "signing controls must not be silently ignored for {argv:?}"
+            );
+        }
     }
 
     #[test]

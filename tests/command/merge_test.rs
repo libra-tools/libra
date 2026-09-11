@@ -9,6 +9,7 @@ use std::path::Path;
 use git_internal::internal::object::commit::Commit;
 use libra::{
     command::load_object,
+    common_utils::parse_commit_msg,
     internal::{branch::Branch, head::Head},
     utils::test::ChangeDirGuard,
 };
@@ -19,6 +20,8 @@ use super::{
     init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
     run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
+
+mod gpg_sign;
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
     let path = repo.join(file);
@@ -1135,9 +1138,11 @@ async fn test_merge_diverged_branch_creates_two_parent_commit() {
         2,
         "diverged merge should create a two-parent commit"
     );
+    let (message, _) = parse_commit_msg(&commit.message);
     assert!(
-        commit.message.starts_with('\n'),
-        "merge commit body must retain Git's blank-line separator before the message"
+        message.starts_with("Merge branch2 into branch1"),
+        "merge commit must retain its generated message, got: {}",
+        commit.message
     );
 }
 
@@ -2092,9 +2097,11 @@ async fn test_merge_continue_after_resolving_conflict_creates_two_parent_commit(
         .expect("merge continue should create HEAD");
     let commit: Commit = load_object(&head).expect("load continued merge commit");
     assert_eq!(commit.parent_commit_ids.len(), 2);
+    let (message, _) = parse_commit_msg(&commit.message);
     assert!(
-        commit.message.starts_with('\n'),
-        "merge --continue commit body must retain Git's blank-line separator before the message"
+        message.starts_with("Merge feature into main"),
+        "merge --continue must retain its generated message, got: {}",
+        commit.message
     );
     assert_eq!(
         std::fs::read_to_string(temp_path.join("tracked.txt")).expect("read resolved file"),
@@ -2433,8 +2440,8 @@ fn test_merge_no_rerere_autoupdate_is_accepted_noop() {
 
 #[test]
 fn test_merge_no_gpg_sign_is_accepted_noop() {
-    // `--no-gpg-sign` skips signing the merge commit. Libra's merge never signs,
-    // so it is an accepted no-op that produces a normal merge.
+    // `--no-gpg-sign` skips signing the merge commit. It still produces a normal
+    // merge when no signing policy would otherwise apply.
     let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
     assert_cli_success(
@@ -4301,17 +4308,14 @@ async fn test_merge_continue_accepts_message_override_and_configured_identity() 
     let head = Head::current_commit().await.expect("continue moved HEAD");
     let commit: Commit = load_object(&head).expect("load continued merge commit");
     assert_eq!(commit.parent_commit_ids.len(), 2);
-    // Commit messages are stored with a leading newline (`format_commit_msg`).
+    let (message, _) = parse_commit_msg(&commit.message);
     assert!(
-        commit
-            .message
-            .trim_start()
-            .starts_with("custom merge subject"),
+        message.starts_with("custom merge subject"),
         "-m must override the message stored at merge start, got: {}",
         commit.message
     );
     assert!(
-        !commit.message.contains("Merge feature into main"),
+        !message.contains("Merge feature into main"),
         "the stored default must not survive the override, got: {}",
         commit.message
     );
@@ -5943,6 +5947,7 @@ fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
         "strategy",
         "allow_unrelated_histories",
         "skip_hooks",
+        "signing_policy",
         "conflicted_paths",
         "message",
         // Injected at the JSON layer by `MergeState::save` (W2 worktree

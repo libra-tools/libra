@@ -342,6 +342,10 @@ Libra's rollback boundary.
 
 The command rows above additionally honor history-changing Git defaults through the strict local → global → system cascade: `merge.ff=true|false|only`, `merge.log=true|false|<n>`, `merge.verifySignatures=true|false`, and `commit.gpgSign=true|false`. Merge CLI overrides (`--ff`/`--no-ff`/`--ff-only`, `--verify-signatures`/`--no-verify-signatures`) win; `--no-gpg-sign` wins over `commit.gpgSign`, which in turn wins over Libra's `vault.signing` default. Invalid local/global values fail before history mutation. This clarification supersedes the older commit-row wording that described signing as driven only by `vault.signing`.
 
+### MG-15 merge-commit signing clarification
+
+The older `merge` row's statement that `--no-gpg-sign` was a no-op and that `-S`/`--gpg-sign` was deferred is superseded. `libra merge -S` / `--gpg-sign` force-signs every merge-commit path with the repository vault key; `--no-gpg-sign` disables signing and wins over `commit.gpgSign`, which wins over `vault.signing`. The resolved decision is persisted for `--continue` and `--restart`; a vault signing failure leaves HEAD unchanged and creates no merge commit. External GPG keyring and SSH signing remain deferred.
+
 ## Sub-face compatibility grading (P0/P1-touched commands)
 
 The single `Tier` column above is deliberately coarse: a command marked

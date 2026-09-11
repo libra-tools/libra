@@ -5,8 +5,8 @@ Merge one or more targets into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>...
-libra merge --continue [-m <msg>] [--no-verify]
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>...
+libra merge --continue [-m <msg>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign]
 libra merge --abort
 libra merge --restart
 ```
@@ -321,6 +321,7 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 - `merge.ff=true|false|only` allows fast-forwarding, forces a merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it. `only` (like `--ff-only`) rejects only a genuinely diverged single-head history; a non-up-to-date octopus never fast-forwards.
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. For a non-squash merge, the resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog. Squash records no merge state; its ordinary `libra commit` supplies the commit message.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on every resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
+- `commit.gpgSign=true|false` controls merge-commit signing. `-S`/`--gpg-sign` force vault signing, and `--no-gpg-sign` disables it. Without either flag, `commit.gpgSign` wins over the `vault.signing` fallback. The resolved choice is persisted for `--continue` and `--restart`; old merge state without it reuses the current default. A vault-signing failure leaves HEAD unmoved and writes no merge commit.
 
 Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation: an unusable value is `LBR-CLI-002` for `merge.ff` and `merge.verifySignatures` and `LBR-REPO-003` for `merge.autostash`, `merge.conflictStyle`, `merge.renames`, `merge.renameLimit`, `merge.directoryRenames`, and `merge.renormalize`, while a value that cannot be read at all is `LBR-IO-001`. Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`). `merge.renormalize` follows the phase-local timing described above.
 
@@ -340,7 +341,7 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
+Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported.
 
 ## Options
 
@@ -366,7 +367,8 @@ Libra still does not implement external merge strategies, `subtree`, explicit `-
 | `--verify-signatures` | Verify the PGP signature on every target tip and abort before mutation if any is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
 | `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
 | `--no-rerere-autoupdate` | Accepted for Git parity. Rerere IS integrated: with `rerere.enabled`, a conflicted merge records each conflict's preimage and replays a recorded resolution when one matches; auto-staging of replayed files follows the `rerere.autoUpdate` config. The per-invocation override is not implemented — staging follows the config either way. (Git's positive `--rerere-autoupdate` is not exposed.) |
-| `--no-gpg-sign` | Do not GPG-sign the merge commit. No-op accepted for Git parity: Libra's merge never signs. (Git's `-S`/`--gpg-sign` is not implemented.) |
+| `-S`, `--gpg-sign` | Force vault-signing of the merge commit. This applies to automatic, `-s ours`, octopus, and `--continue` commit paths. |
+| `--no-gpg-sign` | Do not vault-sign the merge commit. This overrides `commit.gpgSign` and `vault.signing`; together with `-S` it is a last-one-wins toggle. |
 | `--continue` | Finish an in-progress non-squash merge after conflicts have been resolved and staged, using the parent set recorded in merge state. A squash has no merge state to continue. |
 | `--abort` | Restore the pre-merge HEAD, index, and working tree of an in-progress non-squash merge (re-applies a held autostash). Unavailable after `--squash`. |
 | `--autostash` / `--no-autostash` | Stash local tracked changes before the merge and restore staged index and unstaged worktree layers separately when it concludes — held (outside `stash list`) across a non-squash conflict until `--continue`/`--abort`. A clean squash attempts restoration when the merge command returns. A conflicted squash saves the autostash directly in `stash list` without applying it, preserving the unresolved index and working tree; resolve and commit those conflicts, then run `libra stash pop`. If saving fails, a warning is emitted and the held autostash remains referenced by its sidecar. A conflicting re-apply is saved to the stash list with a notice, never lost. Config: `merge.autostash` (boolean; invalid value = hard error). Untracked files are not stashed (Git parity). `--json` adds `autostash: applied\|stashed\|kept`. |
@@ -523,7 +525,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | No progress meter | `--no-progress` (no-op; never renders one) | `--no-progress` | N/A |
 | Disable signature verification | `--no-verify-signatures` (default; disables `--verify-signatures`) | `--no-verify-signatures` | N/A |
 | No rerere autoupdate | `--no-rerere-autoupdate` (accepted; staging follows `rerere.autoUpdate`) | `--no-rerere-autoupdate` | N/A |
-| No GPG sign | `--no-gpg-sign` (no-op; never signs) | `--no-gpg-sign` | N/A |
+| Merge commit signing | `-S` / `--gpg-sign` forces vault signing; `--no-gpg-sign` disables it | Same toggle surface | Vault-only; no external GPG/SSH signing |
 | Default / recursive strategy | `-s ort` (default), `-s recursive` alias | `-s ort` (default), `-s recursive` | N/A |
 | Resolve strategy | `-s resolve` (one base, no virtual ancestor or rename handling) | `-s resolve` | N/A |
 | Repeated strategy fallback | Supported for one target; first clean, otherwise lowest `evaluate_result` score | Supported | N/A |

@@ -502,6 +502,10 @@ pub(crate) async fn run_pull(
                 merge_log: 0,
                 // `pull` does not expose `--dry-run`.
                 dry_run: false,
+                // `pull` exposes no merge-commit signing controls. Keep its
+                // established unsigned merge behavior rather than inheriting
+                // the public `merge` command's new signing default.
+                signing_policy: Some(crate::command::history_config::CommitSigningPolicy::Disable),
                 // `pull --autostash` on the merge path rides the Git-faithful
                 // merge-owned autostash (held on conflict, applied by
                 // --continue/--abort); with no flag, `merge.autostash` config
@@ -1135,6 +1139,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::WorkdirReset(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        merge::PullMergeError::CommitSigning(..) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::AuthMissingCredentials)
+            .with_hint("check vault configuration with 'libra config --list'"),
         // Mirrors `CommitError::IdentityMissing`: the merge commit `pull` creates
         // needs the same identity as any other commit, and fails the same way.
         merge::PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
@@ -1188,6 +1195,17 @@ mod tests {
             assert_eq!(rendered.contains("libra merge --abort"), !squash);
             assert_eq!(rendered.contains("'libra commit'"), squash);
         }
+    }
+
+    #[test]
+    fn merge_vault_signing_error_maps_to_actionable_auth_failure() {
+        let error = merge::PullMergeError::CommitSigning("no unseal key".to_string());
+        let cli = map_merge_error_to_cli(&error);
+        assert_eq!(cli.stable_code(), StableErrorCode::AuthMissingCredentials);
+        assert!(
+            cli.render().contains("check vault configuration"),
+            "merge signing failures must retain an actionable vault hint"
+        );
     }
 
     #[test]

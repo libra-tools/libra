@@ -1,5 +1,7 @@
 //! Typed readers for Git config defaults that can change commit history.
 
+use serde::{Deserialize, Serialize};
+
 use crate::internal::config::{
     LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
 };
@@ -25,8 +27,10 @@ pub(crate) enum MergeFastForward {
     Only,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CommitSigningPolicy {
+    #[default]
     InheritVault,
     Force,
     Disable,

@@ -5,8 +5,8 @@
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>...
-libra merge --continue [-m <msg>] [--no-verify]
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--dry-run] <branch>...
+libra merge --continue [-m <msg>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign]
 libra merge --abort
 libra merge --restart
 ```
@@ -215,7 +215,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 
 ### 会改变历史的 merge 默认值
 
-未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只允许单头可快进历史，非 already-up-to-date 的 octopus 永不快进）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在每个已解析目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames`、`merge.renormalize` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。`merge.renormalize` 的阶段性读取时机见上文。
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只允许单头可快进历史，非 already-up-to-date 的 octopus 永不快进）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject。`--log[=<n>]` / `--no-log` 覆盖配置并 last-one-wins，bare `--log` 为 20；显式 `-m` 会抑制仅来自配置的 `merge.log`，但显式 `--log` 仍会把 shortlog 追加到自定义消息。非 squash 合并将解析后的消息记录进 merge state，冲突或 `--no-commit` 后用 `merge --continue` 收尾时原样提交；squash 不记录 merge state，提交消息由随后普通 `libra commit` 提供；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在每个已解析目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。`commit.gpgSign=true|false` 控制 merge commit 签名：`-S`/`--gpg-sign` 强制使用 vault，`--no-gpg-sign` 关闭；未给 flag 时 `commit.gpgSign` 优先于 `vault.signing`。解析结果会持久化给 `--continue`/`--restart`；旧 state 缺少该字段时回退读取当前默认值。vault 签名失败不会移动 HEAD，也不会写 merge commit。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前失败：无法解析的值，`merge.ff` 与 `merge.verifySignatures` 报 `LBR-CLI-002`，`merge.autostash`、`merge.conflictStyle`、`merge.renames`、`merge.renameLimit`、`merge.directoryRenames`、`merge.renormalize` 报 `LBR-REPO-003`；完全读不出来的值报 `LBR-IO-001`；local/global 加密值先解密，不可读或不支持的 system scope 跳过。例外：schema 比当前 Libra 二进制更新的全局配置库会在一次性去重警告后被跳过而不失败（见 `LBR-CONFIG-001`）。`merge.renormalize` 的阶段性读取时机见上文。
 
 ### `--dry-run`（Libra 扩展）
 
@@ -249,7 +249,8 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--verify-signatures` | 验证每个目标 tip 的 PGP 签名，任一未签名或签名无效都在变更前中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
 | `--no-rerere-autoupdate` | 为对齐 Git 而接受。rerere 已集成：`rerere.enabled` 开启时，冲突合并会记录每个冲突的 preimage 并在有匹配记录时回放已保存的解法；回放文件是否自动暂存跟随 `rerere.autoUpdate` 配置。逐次调用的覆盖未实现——暂存始终跟随配置。（Git 的正向 `--rerere-autoupdate` 未公开。） |
-| `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
+| `-S`, `--gpg-sign` | 强制用 vault 签名 merge commit；自动、`-s ours`、octopus 和 `--continue` 提交路径都适用。 |
+| `--no-gpg-sign` | 不用 vault 签名 merge commit。它覆盖 `commit.gpgSign` 与 `vault.signing`；和 `-S` 组成 last-one-wins toggle。 |
 | `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，使用 merge 状态记录的 parent 集合。squash 没有可继续的 merge 状态。 |
 | `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
 | `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
@@ -389,7 +390,7 @@ Merge aborted.
 | 不显示进度条 | `--no-progress`（no-op；从不渲染） | `--no-progress` | N/A |
 | 禁用签名验证 | `--no-verify-signatures`（默认；关闭 `--verify-signatures`） | `--no-verify-signatures` | N/A |
 | 不更新 rerere | `--no-rerere-autoupdate`（已接受；暂存跟随 `rerere.autoUpdate`） | `--no-rerere-autoupdate` | N/A |
-| 不 GPG 签名 | `--no-gpg-sign`（no-op；从不签名） | `--no-gpg-sign` | N/A |
+| merge commit 签名 | `-S` / `--gpg-sign` 强制 vault 签名；`--no-gpg-sign` 关闭 | 同一 toggle 表面 | 仅 vault；不支持外部 GPG/SSH 签名 |
 | 默认 / recursive 策略 | `-s ort`（默认）、`-s recursive` 别名 | `-s ort`（默认）、`-s recursive` | N/A |
 | Resolve 策略 | `-s resolve`（单 base，不做虚拟祖先或 rename 处理） | `-s resolve` | N/A |
 | 重复策略回退 | 单目标支持；第一个干净结果胜出，否则取 `evaluate_result` 最低分 | 支持 | N/A |
