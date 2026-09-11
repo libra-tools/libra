@@ -5,8 +5,8 @@ Merge one or more targets into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
-libra merge --continue [-m <msg>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
+libra merge --continue [-m <msg> | -F <file>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
 libra merge --quit
 libra merge --restart
@@ -343,14 +343,18 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, strategy options outside the values listed above, or interactive message editing (`--edit`/launching an editor). Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported.
+Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported.
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
 | `<branch>...` | One or more target branches, commits, or remote-tracking refs. Two or more select the atomic octopus path. |
-| `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). Also accepted with `--continue`, where it overrides the message recorded when the conflicted merge started — a Libra extension, since Git's `--continue` takes no arguments and Libra never opens an editor for merge. |
+| `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). Also accepted with `--continue`, where it overrides the message recorded when the conflicted merge started — a Libra extension, since Git's `--continue` takes no arguments. |
+| `-F, --file <FILE>` | Read the merge message from a file. It is mutually exclusive with `-m`, and may also override the saved message during `--continue`. |
+| `--into-name <NAME>` | Use `NAME` as the destination in an automatically generated message (`Merge <branch> into <NAME>`). It does not alter an explicit `-m`/`-F` message and is unavailable with `--continue`. |
+| `-e, --edit` | Open `$GIT_EDITOR`, `core.editor`, `$VISUAL`, or `$EDITOR` on the resolved message. Libra does not edit by default; an empty edited result aborts before merge state or a commit is written. Available with `--continue`. |
+| `--cleanup=<MODE>` | Use `strip`, `whitespace`, `verbatim`, `scissors`, or `default` message cleanup. Without editing, `default` and `scissors` use the shared `whitespace` behavior; cleanup occurs before `--signoff`. |
 | `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
 | `--ff-only` | Refuse unless a single-head merge can fast-forward. A non-up-to-date octopus merge is never a fast-forward and is refused. |
 | `--no-ff` | Always create a merge commit even when a single-head fast-forward is possible. Octopus already always creates one. |
@@ -362,7 +366,7 @@ Libra still does not implement external merge strategies, `subtree`, explicit `-
 | `--squash` | Produce the merged index/working tree but create no commit, do not move HEAD, and record no merge state, including on conflict. Resolve and stage any conflicts, then finish with a plain `libra commit` (one parent). `--continue`, `--abort`, and `--restart` report `no merge in progress`. |
 | `--no-commit` | Perform the merge but stop before committing. A clean octopus state retains every target for `--continue`/`--abort`; an octopus conflict is atomic and creates no state. Single-head conflicts retain their normal resolvable state. |
 | `--no-verify` | Skip all `.libra/hooks` for this merge. With `--continue`, bypass the pending commit/message/post hooks. |
-| `--no-edit` | Accept the auto-generated merge message without launching an editor. Libra never opens an editor for merge, so this is a no-op accepted for Git parity. |
+| `--no-edit` | Accept the resolved merge message without launching an editor (the default). Mutually exclusive with `--edit`. |
 | `--stat` | Show a diffstat of the merge result (the changes between the pre-merge HEAD and the new commit) after the merge completes. Git shows this by default; Libra defaults to no diffstat, so `--stat` opts in. Last-one-wins toggle with `--no-stat`/`-n`. Human output only. |
 | `-n`, `--no-stat` | Do not show a diffstat at the end of the merge (Libra's default). Last-one-wins toggle with `--stat`. |
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
@@ -376,7 +380,7 @@ Libra still does not implement external merge strategies, `subtree`, explicit `-
 | `--abort` | Restore the pre-merge HEAD, index, and working tree of an in-progress non-squash merge (re-applies a held autostash). Unavailable after `--squash`. |
 | `--quit` | Forget an in-progress non-squash merge without resetting HEAD, the index, or the working tree. It removes merge state only, so conflict stages and markers remain. A held autostash is promoted to the visible stash list, not re-applied; `--quit` takes no branch or other merge option. |
 | `--autostash` / `--no-autostash` | Stash local tracked changes before the merge and restore staged index and unstaged worktree layers separately when it concludes — held (outside `stash list`) across a non-squash conflict until `--continue`/`--abort`, or promoted to the visible stash list by `--quit`. A clean squash attempts restoration when the merge command returns. A conflicted squash saves the autostash directly in `stash list` without applying it, preserving the unresolved index and working tree; resolve and commit those conflicts, then run `libra stash pop`. If saving fails, a warning is emitted and the held autostash remains referenced by its sidecar. A conflicting re-apply is saved to the stash list with a notice, never lost. Config: `merge.autostash` (boolean; invalid value = hard error). Untracked files are not stashed (Git parity). `--json` adds `autostash: applied\|stashed\|kept`. |
-| `--dry-run` | Libra extension: preview the merge outcome writing **nothing** — reports fast-forward / already-up-to-date / clean selected strategy / would-conflict (with the paths). Exits 0 for a clean preview, 1 when the merge would conflict. Mutually exclusive with `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit`. |
+| `--dry-run` | Libra extension: preview the merge outcome writing **nothing** — reports fast-forward / already-up-to-date / clean selected strategy / would-conflict (with the paths). Exits 0 for a clean preview, 1 when the merge would conflict. Mutually exclusive with `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit`/`--edit`. |
 | `--restart` | Libra extension (ports Lore's `branch merge restart`): abort the in-progress conflicted merge — discarding any resolution work, exactly like `--abort` — then immediately re-run the same merge against the recorded target commit and selected strategy, regenerating fresh conflict markers and state. Takes no branch and no merge options. Recovery-critical `--allow-unrelated-histories` is also replayed; presentation/policy options such as the original `-m`/`--no-ff` are not. Requires a **conflicted non-squash** merge: squash has no merge state to restart, and a staged `--no-commit` merge is refused (finish it with `--continue` or discard with `--abort`). |
 | `--json` | Emit a structured success envelope. `selected_strategy` names the concrete backend when one ran; the existing `strategy` field remains the outcome category. |
 | `--machine` | Emit the same structured envelope as one compact JSON line. |
@@ -523,8 +527,9 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Squash | `--squash`; resolve/stage conflicts, then plain `commit` (one parent) | `--squash`; resolve/stage conflicts, then plain `commit` (one parent) | N/A |
 | No-commit | `--no-commit` | `--no-commit` | N/A |
 | Skip all merge-lifecycle hooks | `--no-verify` | `--no-verify` | N/A |
-| Commit message | `-m <msg>` | `-m <msg>` | N/A |
-| No editor | `--no-edit` (no-op; never edits) | `--no-edit` | N/A |
+| Commit message | `-m <msg>`, `-F <file>`, `--into-name <name>` | Same message-source surface | N/A |
+| Edit / cleanup message | `-e`/`--edit`, `--cleanup=<mode>`; edit is opt-in | Same surface | N/A |
+| No editor | `--no-edit` (default; conflicts with `--edit`) | `--no-edit` | N/A |
 | Post-merge diffstat | `--stat` (prints it); `-n` / `--no-stat` (default: omit) | `--stat` (default) / `-n` / `--no-stat` | N/A |
 | No progress meter | `--no-progress` (no-op; never renders one) | `--no-progress` | N/A |
 | Disable signature verification | `--no-verify-signatures` (default; disables `--verify-signatures`) | `--no-verify-signatures` | N/A |

@@ -5,8 +5,8 @@
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] <branch>...
-libra merge --continue [-m <msg>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--autostash | --no-autostash] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] <branch>...
+libra merge --continue [-m <msg> | -F <file>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
 libra merge --quit
 libra merge --restart
@@ -182,7 +182,7 @@ Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并�
 
 `libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
 
-Libra 仍未实现外部 merge strategy、`subtree`、显式 `-s octopus`、上述列表之外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
+Libra 仍未实现外部 merge strategy、`subtree`、显式 `-s octopus` 或上述列表之外的 strategy option。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
 ### 重命名
 
@@ -231,7 +231,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | 选项 | 说明 |
 |--------|-------------|
 | `<branch>...` | 一个或多个目标分支、提交或远程跟踪引用；两个及以上进入原子 octopus 路径。 |
-| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。也可与 `--continue` 同用，覆盖冲突合并开始时记录的消息——这是 Libra 扩展：Git 的 `--continue` 不接受参数，而 Libra 的 merge 从不打开编辑器。 |
+| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。也可与 `--continue` 同用，覆盖冲突合并开始时记录的消息——这是 Libra 扩展：Git 的 `--continue` 不接受参数。 |
 | `--ff` | 允许可行的快进，覆盖 `merge.ff=false|only`。 |
 | `--ff-only` | 仅当单头合并可快进时才合并；非 already-up-to-date 的 octopus 永不快进，因此会被拒绝。 |
 | `--no-ff` | 单头可快进时仍强制生成 merge commit；octopus 本来就总会生成。 |
@@ -243,7 +243,11 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--squash` | 生成合并后的索引/工作树，但不创建提交、不移动 HEAD、不记录 merge 状态，即使发生冲突也如此。解决并暂存冲突后，用普通 `libra commit` 创建单亲提交；`--continue`、`--abort`、`--restart` 均报 `no merge in progress`。 |
 | `--no-commit` | 执行合并但停在提交之前。干净 octopus 状态保留全部目标供 `--continue`/`--abort`；octopus 冲突原子拒绝且不创建状态。单头冲突仍保留可解决状态。 |
 | `--no-verify` | 本次 merge 跳过全部 `.libra/hooks`；与 `--continue` 一起使用时绕过待执行的 commit/消息/post hooks。 |
-| `--no-edit` | 接受自动生成的合并消息而不启动编辑器。Libra 从不为 merge 打开编辑器，故此为对齐 Git 而接受的 no-op。 |
+| `-F`, `--file <FILE>` | 从文件读取合并消息；与 `-m` 互斥，也可在 `--continue` 时覆盖已保存的消息。 |
+| `--into-name <NAME>` | 自动消息中以 `NAME` 替代当前分支名（`Merge <branch> into <NAME>`）；不改变显式 `-m`/`-F` 消息，且不能与 `--continue` 共用。 |
+| `-e`, `--edit` | 在已解析消息上打开 `$GIT_EDITOR`、`core.editor`、`$VISUAL` 或 `$EDITOR`。Libra 默认不编辑；编辑后为空会在写入 merge state 或提交前中止。可与 `--continue` 使用。 |
+| `--cleanup=<MODE>` | 使用 `strip`、`whitespace`、`verbatim`、`scissors` 或 `default` 清理消息。未编辑时 `default` 和 `scissors` 使用共享的 `whitespace` 行为；清理发生在 `--signoff` 前。 |
+| `--no-edit` | 不打开编辑器并接受已解析消息（默认行为）；与 `--edit` 互斥。 |
 | `--stat` | 合并完成后显示 diffstat（合并前 HEAD 与新提交之间的变更）。Git 默认显示；Libra 默认不显示，故用 `--stat` 主动开启。与 `--no-stat`/`-n` 构成 last-wins 切换。仅人类输出。 |
 | `-n`, `--no-stat` | 合并结束时不显示 diffstat（Libra 默认）。与 `--stat` 构成 last-wins 切换。 |
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
@@ -257,7 +261,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
 | `--quit` | 忘记进行中的非 squash merge，但不重置 HEAD、索引或工作树。它只删除 merge state，故冲突 stage 与 marker 文件保持原样。held autostash 会转存为可见 stash，不会回贴；`--quit` 不接受分支或其它 merge 选项。 |
 | `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`，或由 `--quit` 转存进可见 stash list。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
-| `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit` 互斥。 |
+| `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit`/`--edit` 互斥。 |
 | `--restart` | Libra 扩展：对有冲突的非 squash 合并，像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交与所选策略重跑同一合并（见上文）。不接受分支与合并选项。 |
 | `--json` | 输出结构化成功信封。实际运行了后端时，`selected_strategy` 指明具体后端；既有 `strategy` 仍是结果类别。 |
 | `--machine` | 以一行紧凑 JSON 输出同一结构化信封。 |
@@ -387,8 +391,9 @@ Merge aborted.
 | Squash | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | `--squash`；解决/暂存冲突后普通 `commit`（单亲） | N/A |
 | 不提交 | `--no-commit` | `--no-commit` | N/A |
 | 跳过全部 merge lifecycle hooks | `--no-verify` | `--no-verify` | N/A |
-| 提交消息 | `-m <msg>` | `-m <msg>` | N/A |
-| 不编辑 | `--no-edit`（no-op；从不编辑） | `--no-edit` | N/A |
+| 提交消息 | `-m <msg>`、`-F <file>`、`--into-name <name>` | 同等消息来源表面 | N/A |
+| 编辑 / 清理消息 | `-e`/`--edit`、`--cleanup=<mode>`；编辑为显式选择 | 同等表面 | N/A |
+| 不编辑 | `--no-edit`（默认；与 `--edit` 互斥） | `--no-edit` | N/A |
 | 合并后 diffstat | `--stat`（打印）；`-n` / `--no-stat`（默认：不打印） | `--stat`（默认） / `-n` / `--no-stat` | N/A |
 | 不显示进度条 | `--no-progress`（no-op；从不渲染） | `--no-progress` | N/A |
 | 禁用签名验证 | `--no-verify-signatures`（默认；关闭 `--verify-signatures`） | `--no-verify-signatures` | N/A |

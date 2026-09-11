@@ -493,6 +493,9 @@ pub(crate) async fn run_pull(
                 renormalize: None,
                 allow_unrelated_histories: false,
                 message: None,
+                into_name: None,
+                cleanup: None,
+                edit: false,
                 squash: args.squash,
                 no_commit: args.no_commit,
                 skip_hooks: false,
@@ -1174,6 +1177,15 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         }
         merge::PullMergeError::MessageFileRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        // `pull` never enables merge message sources, cleanup, or editing,
+        // but retain a stable, actionable mapping if an internal caller does.
+        merge::PullMergeError::InvalidCleanup(..) => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("choose strip, whitespace, verbatim, scissors, or default"),
+        merge::PullMergeError::EmptyMessage | merge::PullMergeError::Editor(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
         }
     }
 }

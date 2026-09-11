@@ -22,6 +22,7 @@ use super::{
 };
 
 mod gpg_sign;
+mod message_options;
 mod quit;
 mod signoff;
 
@@ -2289,8 +2290,8 @@ fn test_merge_no_edit_accepts_default_message() {
     );
     commit_file(temp_path, "main.txt", "main\n", "main change");
 
-    // `--no-edit` accepts the auto-generated merge message without an editor
-    // (Libra never opens one, so this behaves like a plain three-way merge).
+    // `--no-edit` accepts the auto-generated merge message without an editor;
+    // that is Libra's default unless the user explicitly passes `--edit`.
     let output = run_libra_command(&["merge", "feature", "--no-edit"], temp_path);
     assert_cli_success(&output, "merge feature --no-edit");
     let log = run_libra_command(&["log", "--oneline", "-n", "1"], temp_path);
@@ -4262,8 +4263,8 @@ async fn test_merge_commit_carries_configured_identity() {
     }
 }
 
-/// `--continue` finalizes without an editor, so `-m` is the only way to set the
-/// message of a conflicted merge. It must also carry the configured identity.
+/// `-m` overrides the message of a conflicted merge; it must also carry the
+/// configured identity. `--edit` is covered separately in message_options.
 #[tokio::test]
 #[serial(cwd)]
 async fn test_merge_continue_accepts_message_override_and_configured_identity() {

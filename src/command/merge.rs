@@ -33,6 +33,10 @@ use super::{
     save_object, status, switch,
 };
 use crate::{
+    command::{
+        commit::{CleanupMode, cleanup_commit_message, parse_cleanup_mode},
+        editor,
+    },
     common_utils::format_commit_msg,
     info_println,
     internal::{
@@ -64,7 +68,8 @@ pub const MERGE_EXAMPLES: &str = "\
 EXAMPLES:
     libra merge feature-x          Fast-forward current branch onto feature-x if possible
     libra merge origin/main        Fast-forward onto a remote-tracking branch
-    libra merge feature-x --no-edit  Accept the default merge message (no editor)
+    libra merge -e feature-x         Edit the generated merge message before committing
+    libra merge -F message.txt feature-x  Read the merge message from a file
     libra merge --verify-signatures feature-x  Require a valid PGP signature on the merged tip
     libra merge -X ours feature-x  Favor HEAD only where content conflicts
     libra merge -s resolve -s ort feature-x  Try resolve, then fall back to ort
@@ -244,8 +249,9 @@ pub struct MergeArgs {
     #[arg(long, conflicts_with_all = [
         "branch", "continue_merge", "abort", "restart", "ff", "ff_only", "no_ff",
         "strategy", "strategy_option", "allow_unrelated_histories", "log", "no_log",
-        "message", "squash", "no_commit", "no_verify", "autostash", "no_autostash",
-        "no_edit", "stat", "no_stat", "no_progress", "verify_signatures",
+        "message", "file", "into_name", "cleanup", "edit", "squash", "no_commit",
+        "no_verify", "autostash", "no_autostash", "no_edit", "stat", "no_stat",
+        "no_progress", "verify_signatures",
         "no_verify_signatures", "no_rerere_autoupdate", "gpg_sign", "no_gpg_sign",
         "signoff", "dry_run",
     ])]
@@ -269,7 +275,7 @@ pub struct MergeArgs {
     /// `--allow-unrelated-histories` permission but otherwise uses default
     /// merge options (an original `-m`/`--no-ff`/`--squash`/`--no-commit` is
     /// not replayed).
-    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
+    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "file", "into_name", "cleanup", "edit", "squash", "no_commit", "verify_signatures"])]
     pub restart: bool,
 
     /// Refuse to merge unless the current branch can fast-forward to the
@@ -324,6 +330,26 @@ pub struct MergeArgs {
     )]
     pub message: Option<String>,
 
+    /// Read the merge-commit message from a file. May be combined with
+    /// `--edit`, but is mutually exclusive with `-m`/`--message`.
+    #[arg(short = 'F', long = "file", value_name = "FILE", conflicts_with_all = ["message", "abort", "restart"])]
+    pub file: Option<String>,
+
+    /// Use NAME instead of the current branch name in an automatically
+    /// generated merge message. Explicit `-m`/`-F` messages are unchanged.
+    #[arg(long = "into-name", value_name = "NAME", conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    pub into_name: Option<String>,
+
+    /// Clean the message using Git-compatible `strip`, `whitespace`,
+    /// `verbatim`, `scissors`, or `default` behavior.
+    #[arg(long = "cleanup", value_name = "MODE", conflicts_with_all = ["abort", "restart"])]
+    pub cleanup: Option<String>,
+
+    /// Open the configured editor on the resolved merge message before it is
+    /// committed. Unlike Git, Libra does not open an editor by default.
+    #[arg(short = 'e', long, conflicts_with_all = ["no_edit", "dry_run"])]
+    pub edit: bool,
+
     /// Merge changes but stage the result without committing or moving HEAD
     /// (no merge info recorded); finalize with a normal `commit`.
     #[arg(long, conflicts_with_all = ["continue_merge", "abort"])]
@@ -353,10 +379,9 @@ pub struct MergeArgs {
     #[arg(long = "no-autostash", overrides_with = "autostash", conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub no_autostash: bool,
 
-    /// Accept the auto-generated merge message without launching an editor.
-    /// Libra never opens an editor for merge (it uses `-m` or the default
-    /// message), so this is accepted for Git parity and is a no-op.
-    #[arg(long = "no-edit")]
+    /// Accept the resolved merge message without launching an editor.
+    /// This is the default behavior; it is mutually exclusive with `--edit`.
+    #[arg(long = "no-edit", conflicts_with = "edit")]
     pub no_edit: bool,
 
     /// Show a diffstat of the merge result at the end (what the merge changed,
@@ -549,6 +574,14 @@ pub(crate) struct PullMergeOptions {
     /// Override the merge-commit message (`libra merge -m <msg>`). `None` uses
     /// the default `Merge <upstream> into <head>` message.
     pub message: Option<String>,
+    /// Override the branch name in an auto-generated merge message. This is
+    /// public-merge-only; pull leaves it unset.
+    pub into_name: Option<String>,
+    /// Optional Git-compatible cleanup mode for the resolved message.
+    pub cleanup: Option<String>,
+    /// Whether to open the configured editor on the resolved message. Public
+    /// merge defaults to false and pull always leaves it false.
+    pub edit: bool,
     /// `libra merge --squash`: produce the merged index/worktree but do NOT
     /// create a commit or move HEAD (and never fast-forward), leaving the result
     /// staged for a subsequent normal `commit`.
@@ -1042,6 +1075,14 @@ pub(crate) enum PullMergeError {
     MessageFileWrite { path: String, detail: String },
     #[error("failed to read merge commit message file '{path}': {detail}")]
     MessageFileRead { path: String, detail: String },
+    #[error("merge commit message is empty")]
+    EmptyMessage,
+    #[error(
+        "invalid merge message cleanup mode '{0}' (expected strip/whitespace/verbatim/scissors/default)"
+    )]
+    InvalidCleanup(String),
+    #[error("failed to edit merge commit message: {0}")]
+    Editor(String),
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
@@ -1112,6 +1153,16 @@ impl From<PullMergeError> for CliError {
                 .with_stable_code(StableErrorCode::IoWriteFailed),
             PullMergeError::MessageFileRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
+            PullMergeError::InvalidCleanup(..) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("choose strip, whitespace, verbatim, scissors, or default"),
+            PullMergeError::EmptyMessage => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("write a non-empty message in the editor, or pass -m/--message or -F/--file"),
+            PullMergeError::Editor(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set GIT_EDITOR, core.editor, VISUAL, or EDITOR")
+                .with_hint("or omit --edit to accept the resolved merge message"),
             PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
@@ -1289,6 +1340,18 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     if args.quit {
         return run_merge_quit(output).await;
     }
+    if let Some(cleanup) = &args.cleanup
+        && parse_cleanup_mode(cleanup).is_none()
+    {
+        return Err(MergeError::InvalidCleanup(cleanup.clone()));
+    }
+    // Read `-F` before any merge mutation. Clap already rejects `-F` with
+    // `-m`; retaining a single resolved source lets an edited continuation
+    // override the persisted message by either spelling.
+    let message_override = match &args.file {
+        Some(path) => Some(read_merge_message(Path::new(path))?),
+        None => args.message.clone(),
+    };
     // An explicit CLI request applies to an initial merge and may also replace
     // the saved decision while finalizing `--continue`. A plain continuation
     // deliberately uses its saved policy so a later config edit cannot erase
@@ -1330,7 +1393,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             };
             let merge_log = if let Some(limit) = args.log {
                 limit
-            } else if args.no_log || args.message.is_some() {
+            } else if args.no_log || message_override.is_some() {
                 0
             } else {
                 crate::command::history_config::merge_log_limit().await?
@@ -1343,7 +1406,10 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 whitespace: strategy_options.whitespace,
                 renormalize: strategy_options.renormalize,
                 allow_unrelated_histories: args.allow_unrelated_histories,
-                message: args.message.clone(),
+                message: message_override.clone(),
+                into_name: args.into_name.clone(),
+                cleanup: args.cleanup.clone(),
+                edit: args.edit,
                 squash: args.squash,
                 no_commit: args.no_commit,
                 skip_hooks: args.no_verify,
@@ -1411,7 +1477,9 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             run_merge_continue(
                 output,
                 args.no_verify,
-                args.message.clone(),
+                message_override,
+                args.cleanup,
+                args.edit,
                 explicit_signing_policy,
                 args.signoff,
             )
@@ -2199,9 +2267,9 @@ async fn run_octopus_merge(
         &current,
         &targets,
         &head_name,
-        options.message.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_pull_options(&options),
+    )
+    .await?;
 
     let tree_outcome = if options.strategy == Some(MergeStrategy::Ours) {
         let (mut items, gitlinks) = commit_tree_split_for_merge(&current)?;
@@ -2476,28 +2544,39 @@ async fn run_octopus_merge(
     }
 }
 
-fn resolve_octopus_message(
+async fn resolve_octopus_message(
     current: &Commit,
     targets: &[(String, Commit)],
     head_name: &str,
-    message_override: Option<&String>,
-    merge_log: usize,
+    settings: MergeMessageSettings<'_>,
 ) -> Result<String, PullMergeError> {
     let names = targets
         .iter()
         .map(|(name, _)| format!("'{name}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut message = message_override
-        .cloned()
-        .unwrap_or_else(|| format!("Merge branches {names} into {head_name}"));
+    let mut message = settings.message_override.cloned().unwrap_or_else(|| {
+        format!(
+            "Merge branches {names} into {}",
+            settings.into_name.unwrap_or(head_name)
+        )
+    });
     for (name, target) in targets {
         message = crate::command::merge_message::append_shortlog(
-            message, current.id, target.id, name, merge_log,
+            message,
+            current.id,
+            target.id,
+            name,
+            settings.merge_log,
         )
         .map_err(PullMergeError::History)?;
     }
-    Ok(message)
+    let message = if settings.edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    finalize_merge_message(&message, settings.cleanup, settings.edit)
 }
 
 fn commit_tree_items_with_gitlinks(
@@ -2555,6 +2634,9 @@ async fn prepare_octopus_tree(
     let compute_options = ThreeWayMergeOptions {
         message_override: None,
         merge_log: 0,
+        into_name: None,
+        cleanup: None,
+        edit: false,
         squash: false,
         no_commit: false,
         skip_hooks: options.skip_hooks,
@@ -3212,6 +3294,9 @@ async fn run_merge_for_pull_inner(
     let merge_options = ThreeWayMergeOptions {
         message_override: options.message.clone(),
         merge_log: options.merge_log,
+        into_name: options.into_name.clone(),
+        cleanup: options.cleanup.clone(),
+        edit: options.edit,
         squash: options.squash,
         no_commit: options.no_commit,
         skip_hooks: options.skip_hooks,
@@ -3267,6 +3352,9 @@ impl MergeTreeEntry {
 struct ThreeWayMergeOptions<'a> {
     message_override: Option<String>,
     merge_log: usize,
+    into_name: Option<String>,
+    cleanup: Option<String>,
+    edit: bool,
     squash: bool,
     no_commit: bool,
     skip_hooks: bool,
@@ -3301,28 +3389,118 @@ struct ThreeWayMergeOptions<'a> {
     output: &'a OutputConfig,
 }
 
-fn resolve_merge_message(
+/// Open the configured editor on a per-worktree merge message buffer.
+async fn edit_merge_message(initial: &str) -> Result<String, MergeError> {
+    let Some(editor_cmd) = editor::resolve_editor().await else {
+        return Err(MergeError::Editor(
+            "no editor configured for --edit; set $GIT_EDITOR, core.editor, $VISUAL, or $EDITOR"
+                .to_string(),
+        ));
+    };
+    let path = util::request_worktree_gitdir_strict().join("MERGE_MSG");
+    editor::edit_message(&path, initial, &editor_cmd, true)
+        .await
+        .map_err(|error| MergeError::Editor(error.to_string()))
+}
+
+/// The message-related knobs shared by every merge backend. Keeping them
+/// together prevents message compatibility from making strategy APIs brittle.
+#[derive(Clone, Copy)]
+struct MergeMessageSettings<'a> {
+    message_override: Option<&'a String>,
+    merge_log: usize,
+    into_name: Option<&'a str>,
+    cleanup: Option<&'a str>,
+    edit: bool,
+}
+
+impl<'a> MergeMessageSettings<'a> {
+    fn from_pull_options(options: &'a PullMergeOptions) -> Self {
+        Self {
+            message_override: options.message.as_ref(),
+            merge_log: options.merge_log,
+            into_name: options.into_name.as_deref(),
+            cleanup: options.cleanup.as_deref(),
+            edit: options.edit,
+        }
+    }
+
+    fn from_three_way_options(options: &'a ThreeWayMergeOptions<'_>) -> Self {
+        Self {
+            message_override: options.message_override.as_ref(),
+            merge_log: options.merge_log,
+            into_name: options.into_name.as_deref(),
+            cleanup: options.cleanup.as_deref(),
+            edit: options.edit,
+        }
+    }
+}
+
+/// Apply an explicitly requested cleanup mode, or the normal edited-message
+/// comment removal. The result is validated before merge state is written so a
+/// later `--continue` never inherits an empty message.
+fn finalize_merge_message(
+    message: &str,
+    cleanup: Option<&str>,
+    edited: bool,
+) -> Result<String, MergeError> {
+    let cleaned = match cleanup {
+        Some(raw) => {
+            let mode = parse_cleanup_mode(raw)
+                .ok_or_else(|| MergeError::InvalidCleanup(raw.to_string()))?;
+            let mode = if !edited && matches!(mode, CleanupMode::Default | CleanupMode::Scissors) {
+                CleanupMode::Whitespace
+            } else {
+                mode
+            };
+            cleanup_commit_message(message, mode)
+        }
+        None if edited => message
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        None => message.to_string(),
+    };
+    if cleaned.trim().is_empty() {
+        return Err(MergeError::EmptyMessage);
+    }
+    Ok(cleaned)
+}
+
+async fn resolve_merge_message(
     current: ObjectHash,
     target: ObjectHash,
     upstream: &str,
     head_name: &str,
-    message_override: Option<&String>,
-    merge_log: usize,
+    settings: MergeMessageSettings<'_>,
 ) -> Result<String, PullMergeError> {
-    match message_override {
+    let message = match settings.message_override {
         Some(message) => crate::command::merge_message::append_shortlog(
             message.clone(),
             current,
             target,
             upstream,
-            merge_log,
+            settings.merge_log,
         )
         .map_err(PullMergeError::History),
         None => crate::command::merge_message::default_message(
-            current, target, upstream, head_name, merge_log,
+            current,
+            target,
+            upstream,
+            settings.into_name.unwrap_or(head_name),
+            settings.merge_log,
         )
         .map_err(PullMergeError::History),
-    }
+    }?;
+    let message = if settings.edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    finalize_merge_message(&message, settings.cleanup, settings.edit)
 }
 
 /// Git's `ours` merge strategy records the target as a second parent while
@@ -3347,9 +3525,9 @@ async fn perform_ours_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if options.dry_run {
         return Ok(PullMergeSummary {
@@ -3722,9 +3900,9 @@ async fn perform_three_way_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if !merge_result.conflicts.is_empty() {
         if let Some(error) = deferred_conflict_style_error.take() {
@@ -4432,6 +4610,8 @@ async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
     message_override: Option<String>,
+    cleanup: Option<String>,
+    edit: bool,
     signing_policy_override: Option<crate::command::history_config::CommitSigningPolicy>,
     signoff_for_continue: bool,
 ) -> Result<MergeOutput, MergeError> {
@@ -4491,14 +4671,19 @@ async fn run_merge_continue(
     let index_items = index_tree_items(&index)?;
     let files_changed = count_changes_following_renames(&original_items, &index_items).await?;
     let tree_id = create_tree_from_items_map(&index_items).map_err(MergeError::TreeCreate)?;
-    // A `-m` given to `--continue` wins: it is the only way to set the message
-    // of a conflicted merge, since Libra finalizes without opening an editor.
-    // Otherwise replay the message resolved at merge start (`-m` or the
-    // generated default with the `merge.log` shortlog); states written by older
-    // binaries carry no message and keep the plain form.
+    // An explicit `-m`/`-F` given to `--continue` wins. Otherwise replay the
+    // message resolved at merge start (including its source/cleanup result);
+    // states written by older binaries carry no message and keep the plain
+    // form. `--edit` may then replace either starting point.
     let message = message_override
         .or_else(|| state.message.clone())
         .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name));
+    let message = if edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    let message = finalize_merge_message(&message, cleanup.as_deref(), edit)?;
     let message = if !skip_hooks {
         run_pre_merge_commit_hook(output).await?;
         ensure_no_unstaged_changes_for_continue()?;
@@ -12567,9 +12752,9 @@ async fn perform_incremental_three_way_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if !conflicts.is_empty() {
         // The conflict path writes per-file index entries and worktree files,
@@ -14565,6 +14750,34 @@ mod tests {
 
         let with_msg = MergeArgs::try_parse_from(["merge", "-m", "custom", "feature"]).unwrap();
         assert_eq!(with_msg.message.as_deref(), Some("custom"));
+
+        let with_file = MergeArgs::try_parse_from(["merge", "-F", "message.txt", "feature"])
+            .expect("-F must parse for a merge commit");
+        assert_eq!(with_file.file.as_deref(), Some("message.txt"));
+        let edit = MergeArgs::try_parse_from(["merge", "--edit", "feature"])
+            .expect("--edit must parse for a merge commit");
+        assert!(edit.edit);
+        let into_name = MergeArgs::try_parse_from([
+            "merge",
+            "--into-name",
+            "release",
+            "--cleanup=strip",
+            "feature",
+        ])
+        .expect("message options must parse for a merge commit");
+        assert_eq!(into_name.into_name.as_deref(), Some("release"));
+        assert_eq!(into_name.cleanup.as_deref(), Some("strip"));
+        for argv in [
+            ["merge", "-m", "inline", "-F", "message.txt", "feature"].as_slice(),
+            ["merge", "--edit", "--no-edit", "feature"].as_slice(),
+            ["merge", "--continue", "--into-name", "release"].as_slice(),
+            ["merge", "--edit", "--dry-run", "feature"].as_slice(),
+        ] {
+            assert!(
+                MergeArgs::try_parse_from(argv).is_err(),
+                "message options must not be silently ignored for {argv:?}"
+            );
+        }
 
         let squash = MergeArgs::try_parse_from(["merge", "--squash", "feature"]).unwrap();
         assert!(squash.squash);
