@@ -1,22 +1,26 @@
 //! plan-20260714 §C.5 (W2): the pseudo-ref surface is DECLARED, not implied.
 //!
-//! §C.5 requires that when `WorktreePseudoRefs` ships, `COMPATIBILITY.md`'s
-//! `rev-parse` row states that the pseudo-ref names are not resolvable — so a
-//! Git user who reaches for `rev-parse MERGE_HEAD` mid-conflict finds a
-//! contract instead of a silent failure. This guard fails if the service and
-//! the declaration ever drift apart in either direction. (A W2-review
-//! attempt to wire the names into `rev-parse` was ROLLED BACK against this
-//! very contract — §C.5 keeps public resolution deferred and says that if it
-//! ever lands, it lands only through the service; the per-worktree isolation
-//! itself is pinned by `linked_pseudo_refs_resolve_per_worktree` at the
-//! service level.)
+//! The pseudo-ref surface is DECLARED, not implied. `AUTO_MERGE` is the one
+//! exception: while a conflicted merge state exists, the public opt-in
+//! consumers may resolve its automatic result tree; the six historical names
+//! remain unavailable to public object resolution.
 
 use std::process::Command;
 
 /// Every name the service declares, from `src/internal/pseudo_ref.rs`'s own
 /// table. Kept here as a literal on purpose: a guard that imported the list
 /// from the code under test could not notice the list changing.
-const DECLARED: [&str; 6] = [
+const DECLARED: [&str; 7] = [
+    "ORIG_HEAD",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "FETCH_HEAD",
+    "AUTO_MERGE",
+];
+
+const REJECTED: [&str; 6] = [
     "ORIG_HEAD",
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -25,18 +29,33 @@ const DECLARED: [&str; 6] = [
     "FETCH_HEAD",
 ];
 
-fn rev_parse_row() -> String {
+fn rev_parse_rows() -> String {
     let compat = include_str!("../../COMPATIBILITY.md");
     compat
         .lines()
-        .find(|line| line.starts_with("| rev-parse | "))
-        .expect("COMPATIBILITY.md has a rev-parse row")
-        .to_string()
+        .filter(|line| line.starts_with("| rev-parse "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn documented_pseudo_ref_set() -> Vec<String> {
+    let row = rev_parse_rows();
+    let (_, listed) = row
+        .split_once("The complete pseudo-ref set is ")
+        .expect("COMPATIBILITY.md declares the complete pseudo-ref set");
+    let (listed, _) = listed
+        .split_once(". `AUTO_MERGE` alone")
+        .expect("pseudo-ref set ends before the AUTO_MERGE contract");
+    listed
+        .split('`')
+        .enumerate()
+        .filter_map(|(index, token)| (index % 2 == 1).then_some(token.to_string()))
+        .collect()
 }
 
 #[test]
 fn the_rev_parse_row_declares_every_pseudo_ref_name() {
-    let row = rev_parse_row();
+    let row = rev_parse_rows();
     for name in DECLARED {
         assert!(
             row.contains(name),
@@ -44,10 +63,8 @@ fn the_rev_parse_row_declares_every_pseudo_ref_name() {
              (§C.5): a user who tries it gets no contract otherwise"
         );
     }
-    assert!(
-        row.contains("not resolvable") || row.contains("NOT accepted"),
-        "and it must say they are not resolvable, not merely mention them: {row}"
-    );
+    assert!(row.contains("not resolvable") || row.contains("NOT accepted"));
+    assert!(row.contains("AUTO_MERGE"));
 }
 
 /// EXACTLY the same set, in both directions.
@@ -103,20 +120,11 @@ fn the_service_declares_exactly_the_same_names() {
         );
     }
 
-    // And the ROW's declared set, parsed rather than sampled: rejecting two
-    // hand-picked names could not see a third being added.
-    let row = rev_parse_row();
-    let mut declared_in_row: Vec<String> = Vec::new();
-    for token in row.split(|c: char| !(c.is_ascii_uppercase() || c == '_')) {
-        // A pseudo-ref name is SCREAMING_SNAKE and ends in `_HEAD`; nothing
-        // else in this row has that shape.
-        if token.ends_with("_HEAD") && token.len() > "_HEAD".len() {
-            let token = token.to_string();
-            if !declared_in_row.contains(&token) {
-                declared_in_row.push(token);
-            }
-        }
-    }
+    // And the documented set, parsed from the explicit public list rather
+    // than inferred from the historical `_HEAD` suffix (which AUTO_MERGE does
+    // not carry). This catches both an undocumented service addition and a
+    // stale name left in the compatibility contract.
+    let mut declared_in_row = documented_pseudo_ref_set();
     let mut expected: Vec<String> = DECLARED.iter().map(|name| name.to_string()).collect();
     expected.sort();
     declared_in_row.sort();
@@ -142,7 +150,7 @@ fn rev_parse_refuses_the_declared_names() {
         .expect("init runs");
     assert!(init.status.success(), "init: {init:?}");
 
-    for name in DECLARED {
+    for name in REJECTED {
         let out = Command::new(libra)
             .args(["rev-parse", name])
             .current_dir(temp.path())

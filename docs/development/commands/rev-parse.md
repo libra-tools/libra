@@ -7,6 +7,7 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。共享严格对象解析器支持 branch/tag/remote/full ref、`@`、`^N`/`~N`、`^{commit|tree|blob|tag|object}`、递归 `^{}`、数字 reflog selector（`HEAD@{N}`/`@{N}`/`branch@{N}`）和 `REV:path`，并在 SHA-1/SHA-256 仓库按当前 hash kind 校验对象 ID；plain、`--verify`/`--short`、symbolic 模式与输出过滤共用该语义。`--abbrev-ref`、`--symbolic-full-name`、`--symbolic`、`--show-toplevel`、`--default`、`--sq`、仓库状态查询及 `--flags`/`--no-flags`/`--revs-only`/`--no-revs` 已支持；日期 reflog selector、`@{-N}`、`@{upstream}`/`@{push}`、相对 tree path、`--abbrev=<n>` 与 parseopt 子模式尚未公开。
+- MG-21 仅为本命令接入 `resolve_object_spec_with_auto_merge_typed`：`AUTO_MERGE` 在非 squash 冲突 merge state 存在时解析为 automatic-result tree（含 markers），state cleanup 后立即拒绝。其余六个历史伪引用仍拒绝；默认 resolver 不变，因此不把该例外扩散给写引用或其它消费者。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -15,7 +16,7 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/rev_parse.rs`。参数/子命令类型包括：`RevParseArgs`；输出、错误或状态类型包括：模块私有的输出结构体 `RevParseOutput`（`mode` / `input` / `value`），错误通过 `CliError` / `CliResult` 统一传播；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径委托 `utils::util::resolve_object_spec_typed`，严格消费整个 spec、读取 refs/HEAD/数字 reflog、递归 peel tag/commit/tree 并遍历 `REV:path`；`--verify`/`--short` 额外验证最终对象存在。命令只读对象库、SQLite refs/HEAD/reflog 与配置，不写对象或引用。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径委托 `utils::util::resolve_object_spec_with_auto_merge_typed`，严格消费整个 spec、读取 refs/HEAD/数字 reflog、递归 peel tag/commit/tree 并遍历 `REV:path`；该 wrapper 仅为精确的 `AUTO_MERGE` 加入状态受限投影，其余输入仍走默认严格 resolver；`--verify`/`--short` 额外验证最终对象存在。命令只读对象库、SQLite refs/HEAD/reflog 与配置，不写对象或引用。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

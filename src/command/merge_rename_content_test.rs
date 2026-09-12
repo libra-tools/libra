@@ -20,6 +20,9 @@ fn merge(
     ours: &MergeTreeEntry,
     theirs: &MergeTreeEntry,
 ) -> (MergeTreeEntry, bool) {
+    // The synthetic merge still resolves path attributes from the ambient
+    // worktree. Use the same process-wide CWD lock as ChangeDirGuard tests.
+    let _cwd_lock = crate::utils::test::cwd_lock_guard();
     merge_rename_content(
         Path::new("renamed.txt"),
         base,
@@ -106,6 +109,7 @@ fn symlink_fold_restores_the_complete_original_and_remains_unclean() {
 
 #[test]
 fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
+    let _cwd_lock = crate::utils::test::cwd_lock_guard();
     // Given: callers normally supply an original; absence needs an optional
     // path result and belongs to virtual_conflict_resolution instead.
     let mut blobs = VirtualBlobs::new();
@@ -149,6 +153,7 @@ fn binary_fold_resolves_trivial_oids_before_the_virtual_original_fallback() {
 
 #[test]
 fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
+    let _cwd_lock = crate::utils::test::cwd_lock_guard();
     // Given: nontrivial binary versions with different modes, with or without
     // an original that can explain the executable-bit change.
     let mut blobs = VirtualBlobs::new();

@@ -2181,9 +2181,46 @@ pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitB
     resolve_revision_expression_typed(name).await
 }
 
+/// Resolve the sole public pseudo-ref that is deliberately opt-in. Keeping
+/// this separate from [`resolve_object_spec_typed`] preserves the rejection
+/// contract for every other consumer, including `update-ref` CAS arguments.
+pub async fn resolve_object_spec_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let auto_merge = crate::internal::pseudo_ref::PseudoRef::AutoMerge.name();
+    let suffix = name.strip_prefix(auto_merge);
+    if let Some(suffix) = suffix.filter(|suffix| {
+        suffix.is_empty() || matches!(suffix.as_bytes().first(), Some(b'^' | b'~' | b':'))
+    }) {
+        let refs = crate::internal::pseudo_ref::WorktreePseudoRefs::for_request();
+        return match refs
+            .resolve(crate::internal::pseudo_ref::PseudoRef::AutoMerge)
+            .await
+        {
+            Ok(Some(value)) => {
+                let projected_spec = format!("{}{suffix}", value.oid);
+                resolve_object_spec_typed(&projected_spec).await
+            }
+            Ok(None) => Err(invalid_reference(name)),
+            Err(detail) => Err(CommitBaseError::ReadFailure(format!(
+                "failed to resolve {name}: {detail}"
+            ))),
+        };
+    }
+    resolve_object_spec_typed(name).await
+}
+
 /// Resolve a tree-ish expression and peel commits or annotated tags to a tree.
 pub async fn resolve_tree_ish_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
     let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
+}
+
+/// Tree-ish counterpart for consumers that explicitly support `AUTO_MERGE`.
+pub async fn resolve_tree_ish_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_with_auto_merge_typed(name).await?;
     peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
 }
 
@@ -3263,6 +3300,7 @@ mod test {
     #[test]
     ///Test get current directory success.
     fn cur_dir_returns_current_directory() {
+        let _cwd_lock = test::cwd_lock_guard();
         match env::current_dir() {
             Ok(expected) => {
                 let actual = cur_dir();

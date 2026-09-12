@@ -15,6 +15,7 @@
 - MG-13 策略框架：`MergeStrategy` 支持 `ort`（默认）、等价的 `recursive`、`resolve` 与既有 `ours`。resolve 只取 object-id 顺序的第一个真实 base、禁用 recursive fold 与 rename 配置/处理；诊断性检测只用于输出 rename 退化为 delete/add 的 notice。单目标重复 `-s` 用零写入 dry-run 依次探测，第一个干净结果胜出；全冲突时按 Git `evaluate_result` 的 worktree/index 差异数 + unmerged stage 数评分，同分取后者，再只重放一次胜者。`StrategyEvaluationSink` 仅存在于探测路径并强制 flat engine，保证评分与最终 stage writer 同源。人读输出使用具体后端名；JSON 以 additive `selected_strategy` 暴露它而不改变旧 `strategy` 类别。
 - `--restart` 继续对记录的 `state.target` 确定性重跑；MG-13 起同时重放 `state.strategy`，recovery-critical 的 `allow_unrelated_histories` 也从 fsynced state 重放，其它原始展示/策略 option 仍使用默认。`--no-commit` 的干净 state 继续由 `RestartWithoutConflicts` 拒绝。`--squash` 即使冲突也不写 `MergeState`，因此 `--continue`、`--abort`、`--restart` 都由 `NoMergeInProgress` 拒绝。
 - P1-07b 实现边界：`MergeStrategy::Ours` 记录双父并复用当前 tree；`MergeFavor::{Ours,Theirs}` 对 add/add、modify/delete 和内容冲突统一选侧，内容冲突使用不可与输入碰撞的动态 marker 只抽取冲突区段。LCA 缺失且显式允许时使用空 item map，`MergeState.base: Option<String>` 的 `None` 表达虚拟 base，不写伪对象。
+- MG-21 `AUTO_MERGE`：非 squash 冲突在写出 merge state 前，依据已决定的结果条目与同一份冲突 marker 渲染创建 automatic-result tree，并将 tree OID 作为 `MergeState.auto_merge`（serde default 保持旧 sidecar 可读）及 merge GC root。状态不存在、干净 `--no-commit` 或 squash 时为 `None`；`--continue`、`--abort`、`--quit` 通过既有 state cleanup 自动撤销投影。全局 object resolver 保持不变，只有 `rev-parse`、`cat-file` 与 `diff` 显式调用 opt-in resolver；`update-ref` 等写路径因而不会接受伪引用。
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 

@@ -20,6 +20,8 @@ libra merge --restart
 
 开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue`、`--abort` 或 `--quit`；`--quit` 只清除 merge bookkeeping，HEAD、索引 stage 和带冲突标记的文件均保持不动；若有 held autostash，则转存到可见的 stash list 而不回贴。没有进行中的 merge 时，`--quit` 返回 `LBR-REPO-003`（退出 128）并提示启动 merge；这有意不同于 Git 的静默 no-op。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
 
+非 squash 合并因冲突停下时，Libra 会记录包含自动合并结果（含冲突标记）的 `AUTO_MERGE` tree。它是投影出的伪引用，而非落盘的 loose ref：仅在该 merge state 存在期间，`libra rev-parse AUTO_MERGE`、`libra cat-file` 和 `libra diff` 可以消费它。`merge --continue`、`--abort` 与 `--quit` 删除 state 后它会自动消失；干净合并和 squash 合并不会创建它。其它伪引用以及 `update-ref` 等全部写入路径仍会拒绝。
+
 单目标的默认策略是 `ort`；两个及以上目标仍自动选择 `octopus`。人读成功输出会指出最终选中的后端；JSON 则新增 additive 的 `selected_strategy` 字段。历史 `strategy` 字段仍保留 `three-way`、`ours`、`octopus` 等结果类别，不改变既有消费者的判断。
 
 ### 策略选择

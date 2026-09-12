@@ -655,6 +655,9 @@ pub(crate) fn merge_state_gc_oids(
     if let Some(base) = state.base {
         oids.push(("base", base));
     }
+    if let Some(auto_merge) = state.auto_merge {
+        oids.push(("auto_merge", auto_merge));
+    }
     Ok(Some(oids))
 }
 
@@ -722,6 +725,10 @@ pub(crate) struct MergeState {
     /// fall back to the plain `Merge <target> into <head>` form.
     #[serde(default)]
     pub message: Option<String>,
+    /// The automatic merge-result tree projected as `AUTO_MERGE` while this
+    /// non-squash conflict state exists. Older sidecars omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<String>,
 }
 
 impl MergeState {
@@ -2442,6 +2449,7 @@ async fn run_octopus_merge(
                 signoff: options.signoff,
                 conflicted_paths: Vec::new(),
                 message: Some(resolved_message),
+                auto_merge: None,
             }
             .save()?;
             let summary = PullMergeSummary {
@@ -3583,6 +3591,7 @@ async fn perform_ours_merge(
             signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message),
+            auto_merge: None,
         }
         .save()?;
         return Ok(PullMergeSummary {
@@ -4035,6 +4044,7 @@ async fn perform_three_way_merge(
             signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
+            auto_merge: None,
         }
         .save()?;
         return Ok(PullMergeSummary {
@@ -4297,6 +4307,19 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
 
     let workdir = util::working_dir();
     let theirs_abbrev = short_object_id(&input.theirs);
+    // Create the automatic conflict-result tree before publishing the state
+    // that roots it. This tree deliberately contains the same marker content
+    // written below, rather than reading the worktree after a write.
+    let auto_merge = if input.squash {
+        None
+    } else {
+        Some(automatic_merge_tree(
+            &input.merged_items,
+            &placements,
+            &theirs_abbrev,
+            input.conflict_style,
+        )?)
+    };
 
     let mut index = Index::new();
     for (path, entry) in &input.merged_items {
@@ -4370,6 +4393,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
             .map(|path| path.display().to_string())
             .collect(),
         message: Some(input.message),
+        auto_merge: auto_merge.map(|tree| tree.to_string()),
     };
     // Git builtin/merge.c writes merge state only for a non-squash result.
     // A squash's staged resolution must be committed with one parent.
@@ -4467,6 +4491,130 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
         // resolved stage-0 entry is handled directly by the writer.
         ConflictKind::DirectorySplit { .. } => None,
     }
+}
+
+/// Construct Git's `AUTO_MERGE` tree from the already-decided result plus the
+/// exact conflict presentation. This avoids re-reading mutable worktree files
+/// after they have been written.
+fn automatic_merge_tree(
+    merged_items: &HashMap<PathBuf, MergeTreeEntry>,
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+    commit_abbrev: &str,
+    conflict_style: ConflictStyle,
+) -> Result<ObjectHash, PullMergeError> {
+    let mut items = merged_items.clone();
+    for (path, kind, original) in placements {
+        let entry = if original.is_some() {
+            match moved_file_content(kind) {
+                Some(entry) => entry,
+                None => automatic_conflict_entry(kind, commit_abbrev, conflict_style)?,
+            }
+        } else {
+            automatic_conflict_entry(kind, commit_abbrev, conflict_style)?
+        };
+        items.insert(path.clone(), entry);
+    }
+    create_tree_from_items_map(&items).map_err(PullMergeError::TreeCreate)
+}
+
+fn automatic_conflict_entry(
+    kind: &ConflictKind,
+    commit_abbrev: &str,
+    conflict_style: ConflictStyle,
+) -> Result<MergeTreeEntry, PullMergeError> {
+    let content = match *kind {
+        ConflictKind::BothChanged {
+            rendered: Some(entry),
+            ..
+        } => return Ok(entry),
+        ConflictKind::BothChanged {
+            base,
+            ours,
+            theirs,
+            driver,
+            rendered: None,
+        } => {
+            let ours_blob: Blob = load_object(&ours).map_err(|error| PullMergeError::TreeLoad {
+                tree_id: ours.to_string(),
+                detail: error.to_string(),
+            })?;
+            let theirs_blob: Blob =
+                load_object(&theirs).map_err(|error| PullMergeError::TreeLoad {
+                    tree_id: theirs.to_string(),
+                    detail: error.to_string(),
+                })?;
+            match driver {
+                BuiltinMergeDriver::Binary => ours_blob.data,
+                BuiltinMergeDriver::Union => {
+                    let base_data = match base {
+                        Some(base) => {
+                            load_object::<Blob>(&base)
+                                .map_err(|error| PullMergeError::TreeLoad {
+                                    tree_id: base.to_string(),
+                                    detail: error.to_string(),
+                                })?
+                                .data
+                        }
+                        None => Vec::new(),
+                    };
+                    match merge_bytes_with_refined_driver(
+                        driver,
+                        &base_data,
+                        &ours_blob.data,
+                        &theirs_blob.data,
+                        None,
+                        conflict_style,
+                        0,
+                    )
+                    .map_err(PullMergeError::TreeCreate)?
+                    {
+                        BuiltinMergeOutcome::Clean(bytes)
+                        | BuiltinMergeOutcome::Conflict(bytes) => bytes,
+                    }
+                }
+                BuiltinMergeDriver::Text => both_changed_conflict_content(
+                    base,
+                    &ours_blob.data,
+                    &theirs_blob.data,
+                    commit_abbrev,
+                    conflict_style,
+                )
+                .map_err(PullMergeError::TreeCreate)?,
+            }
+        }
+        ConflictKind::OursModifiedTheirsDeleted { ours } => {
+            let ours_blob: Blob = load_object(&ours).map_err(|error| PullMergeError::TreeLoad {
+                tree_id: ours.to_string(),
+                detail: error.to_string(),
+            })?;
+            let ours = conflict_payload(&ours_blob.data);
+            render_whole_file_conflict(
+                ours.as_bytes(),
+                &[],
+                "HEAD",
+                &format!("{commit_abbrev} (deleted)"),
+            )
+        }
+        ConflictKind::TheirsModifiedOursDeleted { theirs } => {
+            let theirs_blob: Blob =
+                load_object(&theirs).map_err(|error| PullMergeError::TreeLoad {
+                    tree_id: theirs.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let theirs = conflict_payload(&theirs_blob.data);
+            render_whole_file_conflict(&[], theirs.as_bytes(), "HEAD (deleted)", commit_abbrev)
+        }
+        ConflictKind::FileDirectory { file, .. } => return Ok(file),
+        ConflictKind::RenameMerged { content, .. } | ConflictKind::DirectorySplit { content } => {
+            return Ok(content);
+        }
+    };
+    let blob = Blob::from_content_bytes(content);
+    save_object(&blob, &blob.id).map_err(|error| PullMergeError::TreeCreate(error.to_string()))?;
+    Ok(MergeTreeEntry {
+        hash: blob.id,
+        mode: TreeItemMode::Blob,
+    })
 }
 
 /// Write a tracked entry into the working tree with its TYPE and MODE: a
@@ -12924,6 +13072,7 @@ async fn perform_incremental_three_way_merge(
             signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
+            auto_merge: None,
         }
         .save()?;
         return Ok(Some(PullMergeSummary {
@@ -14044,6 +14193,7 @@ mod merge_rename_content_test;
 #[cfg(test)]
 mod driver {
     use super::*;
+    use crate::utils::test;
 
     #[test]
     fn builtins_follow_attribute_precedence_and_text_fallbacks() {
@@ -14144,6 +14294,10 @@ mod driver {
 
     #[test]
     fn recursive_binary_driver_uses_the_original_for_the_virtual_ancestor() {
+        // `merge_virtual_items` obtains the attribute source from the ambient
+        // worktree. Hold the process-wide CWD lock while parallel tests may
+        // otherwise switch to their own temporary repositories.
+        let _cwd_lock = test::cwd_lock_guard();
         let mut blobs = VirtualBlobs::new();
         let mut entry = |data: &[u8]| {
             let blob = Blob::from_content_bytes(data.to_vec());
@@ -14893,6 +15047,7 @@ mod tests {
         assert!(!state.allow_unrelated_histories);
         assert!(state.targets.is_empty());
         assert!(state.target_refs.is_empty());
+        assert_eq!(state.auto_merge, None);
     }
 
     #[test]
@@ -14911,6 +15066,7 @@ mod tests {
                 ],
                 "target_refs":["alpha","beta"],
                 "base":null,
+                "auto_merge":"0000000000000000000000000000000000000004",
                 "conflicted_paths":[],
                 "message":"Merge branches 'alpha', 'beta' into main"
             }"#,
@@ -14934,6 +15090,10 @@ mod tests {
                 (
                     "target",
                     "0000000000000000000000000000000000000003".to_string()
+                ),
+                (
+                    "auto_merge",
+                    "0000000000000000000000000000000000000004".to_string()
                 ),
             ]
         );
@@ -15342,6 +15502,9 @@ mod recursive {
         depth: usize,
         blobs: &mut VirtualBlobs,
     ) -> HashMap<PathBuf, MergeTreeEntry> {
+        // Virtual content resolution still consults attributes from the
+        // ambient worktree. Share ChangeDirGuard's process-wide CWD lock.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         merge_virtual_items(
             base,
             ours,
@@ -16289,6 +16452,10 @@ mod tree {
         ours: ObjectHash,
         theirs: ObjectHash,
     ) -> Result<FlatOutcome, PullMergeError> {
+        // Content resolution consults the ambient worktree's attributes. Share
+        // the process-wide CWD lock with ChangeDirGuard-based tests so that
+        // lookup cannot race a temporary worktree being removed.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let (base_items, base_gl) = match base {
             Some(id) => split_gitlink_entries(leaves(graph, id)),
             None => (HashMap::new(), GitlinkEntries::new()),
@@ -16316,6 +16483,9 @@ mod tree {
         ours: ObjectHash,
         theirs: ObjectHash,
     ) -> Result<(IncrementalMergeResult, GitlinkEntries), PullMergeError> {
+        // See flat_merge: the synthetic tree still uses the real attribute
+        // resolver for content drivers.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let mut blobs = fixture_blobs();
         let (mut out, passthrough) = incremental_merge_trees(
             graph,
@@ -16348,6 +16518,9 @@ mod tree {
         ours: ObjectHash,
         theirs: ObjectHash,
     ) -> Result<IncrementalMergeResult, PullMergeError> {
+        // See flat_merge: the synthetic tree still uses the real attribute
+        // resolver for content drivers.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let mut blobs = fixture_blobs();
         let (out, _) = incremental_merge_trees(
             graph,
@@ -17242,6 +17415,9 @@ mod rename {
         decisions: &[RenameDecision],
         contents: &[&str],
     ) -> (Vec<(PathBuf, ConflictKind)>, Vec<RenameConflictNote>) {
+        // Content resolution still consults attributes through the ambient
+        // worktree. Share ChangeDirGuard's process-wide lock with command tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let mut blobs = VirtualBlobs::new();
         for content in contents {
             let blob = Blob::from_content(content);
