@@ -255,7 +255,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
 | `--verify-signatures` | 验证每个目标 tip 的 PGP 签名，任一未签名或签名无效都在变更前中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
-| `--rerere-autoupdate`, `--no-rerere-autoupdate` | 覆盖本次 merge 的 rerere 回放暂存：正向标志会暂存回放解法，负向标志保持未暂存；最后出现的标志生效。两者均省略时继承 `rerere.autoUpdate`。显式选择会写入 merge state，因此后续 `merge --continue` 仍保持它。rerere 禁用时二者均为 no-op。 |
+| `--rerere-autoupdate`, `--no-rerere-autoupdate` | 覆盖本次 merge 的 rerere 回放暂存：正向标志会暂存回放解法，负向标志保持未暂存；最后出现的标志生效。两者均省略时继承 `rerere.autoUpdate`。rerere 按规范化 hunk 两侧识别冲突，且只会在三方回放干净时写入。显式选择会写入 merge state，因此后续 `merge --continue` 仍保持它。rerere 禁用时二者均为 no-op。 |
 | `--signoff` | 在最终 merge 消息后追加 `Signed-off-by: <committer name> <committer email>`。初始请求会由 merge state 保留给 `--continue`；已存在相同的末尾 trailer 时不重复追加。`-s` 已用于策略，因此没有 `-s` 短选项。 |
 | `-S`, `--gpg-sign` | 强制用 vault 签名 merge commit；自动、`-s ours`、octopus 和 `--continue` 提交路径都适用。 |
 | `--no-gpg-sign` | 不用 vault 签名 merge commit。它覆盖 `commit.gpgSign` 与 `vault.signing`；和 `-S` 组成 last-one-wins toggle。 |

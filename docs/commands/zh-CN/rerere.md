@@ -13,10 +13,10 @@ libra rerere [status | diff | forget <path>... | clear | gc]
 不带子命令时，`rerere` 扫描已跟踪文件中的冲突标记并：
 
 - 为每个新冲突记录 **preimage**（带标记的冲突文件），并在本 worktree 的 `MERGE_RR`（位于该 worktree 的 local gitdir——自 W2 起每个 worktree 各自跟踪当前冲突，而下述已记录的 resolution 仍跨 worktree 共享）中跟踪；
-- 若已记录的 **postimage**（解决方案）匹配某冲突，则**复用**——把解决后的内容写回文件；
+- 若已记录的 **postimage**（解决方案）匹配某冲突，则通过三方合并**复用**；只有合并干净时才把结果写回文件；
 - 一旦被跟踪的冲突被手工解决，记录其 postimage，使下一次相同冲突自动解决。
 
-冲突以冲突文件字节的 SHA-256 匹配，因此整个冲突文件与之前所见逐字节相同时复用解决方案。
+完整冲突以其规范化 hunk 两侧的 SHA-256 匹配：rerere 丢弃 diff3 的 base 段、按字典序排列两侧并哈希所得 side pair。因此标签、两侧顺序和无关的文件上下文不会阻止命中。没有完整冲突标记的文件回退到历史的整文件哈希。既有的整文件键缓存保留；未命中时会按规范化键重新记录。
 
 | 子命令 | 说明 |
 |--------|------|
@@ -55,4 +55,4 @@ libra rerere status
 | 检查 | `libra rerere status` / `diff` | `git rerere status` / `diff` |
 | 删除 / 重置 | `libra rerere forget <p>` / `clear` / `gc` | `git rerere forget <p>` / `clear` / `gc` |
 
-差异与延后项：匹配为整文件逐字节相同（Git 对每个冲突 hunk 归一化、与 ours/theirs 顺序无关）。`rerere.enabled=true` 时，`merge` / `rebase` / `cherry-pick` 会自动记录 preimage、回放匹配解法并在完成时记录 postimage；默认关闭时行为不变。三个命令都支持 `--rerere-autoupdate`（暂存回放解法）与 `--no-rerere-autoupdate`（保持未暂存），last-wins；省略时继承 `rerere.autoUpdate`，显式选择跨 `--continue` 保持。
+Rerere 把完整规范化 preimage 作为三方合并 base、把已记录解决作为另一侧，并与当前规范化冲突合并后才替换文件；若回放本身冲突，工作树文件保持不变。`rerere.enabled=true` 时，`merge` / `rebase` / `cherry-pick` 会自动记录 preimage、回放匹配解法并在完成时记录 postimage；默认关闭时行为不变。三个命令都支持 `--rerere-autoupdate`（暂存回放解法）与 `--no-rerere-autoupdate`（保持未暂存），last-wins；省略时继承 `rerere.autoUpdate`，显式选择跨 `--continue` 保持。

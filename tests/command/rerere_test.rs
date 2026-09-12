@@ -4,12 +4,14 @@
 
 use std::{fs, process::Output};
 
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
 
 const CONFLICT: &str = "line1\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\nline3\n";
 const RESOLVED: &str = "line1\nRESOLVED\nline3\n";
+const SWAPPED_CONFLICT: &str = "line1\n<<<<<<< other\ntheirs\n=======\nours\n>>>>>>> HEAD\nline3\n";
 
 fn out(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -52,6 +54,93 @@ fn rerere_records_resolves_and_replays() {
         RESOLVED,
         "rerere should have replayed the recorded resolution"
     );
+}
+
+#[test]
+fn rerere_replays_a_conflict_when_its_sides_are_swapped() {
+    // Given: a recorded resolution for one ordering of the same conflict hunk.
+    let repo = repo_with_conflict();
+    let file = repo.path().join("tracked.txt");
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "record");
+    fs::write(&file, RESOLVED).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["rerere"], repo.path()),
+        "record resolution",
+    );
+
+    // When: the same sides recur in the reverse order.
+    fs::write(&file, SWAPPED_CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "replay");
+
+    // Then: normalizing the hunk identifies and replays the existing resolution.
+    assert_eq!(fs::read_to_string(&file).unwrap(), RESOLVED);
+}
+
+#[test]
+fn rerere_three_way_replay_preserves_current_non_conflicting_edits() {
+    const FIRST_CONFLICT: &str = "header\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\nshared one\nshared two\nshared three\noriginal tail\n";
+    const RESOLUTION: &str =
+        "header\nresolved\nshared one\nshared two\nshared three\noriginal tail\n";
+    const RECURRING_CONFLICT: &str = "header\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\nshared one\nshared two\nshared three\ncurrent tail\n";
+    const EXPECTED: &str = "header\nresolved\nshared one\nshared two\nshared three\ncurrent tail\n";
+
+    // Given: an earlier conflict and its recorded resolution.
+    let repo = create_committed_repo_via_cli();
+    let file = repo.path().join("tracked.txt");
+    fs::write(&file, FIRST_CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "record");
+    fs::write(&file, RESOLUTION).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["rerere"], repo.path()),
+        "record resolution",
+    );
+
+    // When: the same conflict recurs alongside an independent current edit.
+    fs::write(&file, RECURRING_CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "replay");
+
+    // Then: rerere applies the resolution by a clean three-way merge.
+    assert_eq!(fs::read_to_string(&file).unwrap(), EXPECTED);
+}
+
+#[test]
+fn rerere_keeps_the_current_file_when_three_way_replay_conflicts() {
+    const CONFLICTING_POSTIMAGE: &str = "resolution header\nresolved\nline3\n";
+    const CURRENT_CONFLICT: &str =
+        "current header\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\nline3\n";
+
+    // Given: a recorded conflict whose stored postimage changes a context line.
+    let repo = repo_with_conflict();
+    let file = repo.path().join("tracked.txt");
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "record");
+    fs::write(&file, RESOLVED).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["rerere"], repo.path()),
+        "record resolution",
+    );
+    let mut entries = fs::read_dir(repo.path().join(".libra/rerere"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir());
+    let entry = entries.next().expect("rerere cache entry");
+    assert!(entries.next().is_none(), "one cache entry expected");
+    fs::write(entry.join("postimage"), CONFLICTING_POSTIMAGE).unwrap();
+    // Keep a legacy whole-file-keyed entry too: the old implementation would
+    // select it and overwrite the current file, whereas the normalized key
+    // selects `entry` above and must reject the non-clean three-way replay.
+    let legacy_id = hex::encode(Sha256::digest(CURRENT_CONFLICT.as_bytes()));
+    let legacy_entry = repo.path().join(".libra/rerere").join(legacy_id);
+    fs::create_dir(&legacy_entry).unwrap();
+    fs::copy(entry.join("preimage"), legacy_entry.join("preimage")).unwrap();
+    fs::write(legacy_entry.join("postimage"), CONFLICTING_POSTIMAGE).unwrap();
+
+    // When: the current conflict changes that same context line differently.
+    fs::write(&file, CURRENT_CONFLICT).unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], repo.path()), "replay");
+
+    // Then: a non-clean replay leaves the working tree byte-for-byte untouched.
+    assert_eq!(fs::read_to_string(&file).unwrap(), CURRENT_CONFLICT);
 }
 
 #[test]

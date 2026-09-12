@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、空提交策略、`--cleanup=<mode>`，以及可重复且 last-wins 的 `-X/--strategy-option ours|theirs` 与 `--rerere-autoupdate`/`--no-rerere-autoupdate`。`-X` 复用 merge 的 hunk resolver，只偏向真正冲突 region，保留同文件 clean hunk；add/add 与 modify/delete 选择整侧。有效值经 `CherryPickOpts` 随统一 `sequence_state` 持久化。自动提交保留源 author metadata，committer 取当前身份；消息先去签名。未解决冲突写 index stage 1/2/3 与工作树标记，并支持 `--continue`/`--skip`/`--abort`/`--quit` 及跨操作对称 mutex。自定义 `--strategy` 仍显式拒绝；rerere disabled 时两个 rerere flag 均为 no-op。
+`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、空提交策略、`--cleanup=<mode>`，以及可重复且 last-wins 的 `-X/--strategy-option ours|theirs` 与 `--rerere-autoupdate`/`--no-rerere-autoupdate`。`-X` 复用 merge 的 hunk resolver，只偏向真正冲突 region，保留同文件 clean hunk；add/add 与 modify/delete 选择整侧。有效值经 `CherryPickOpts` 随统一 `sequence_state` 持久化。自动提交保留源 author metadata，committer 取当前身份；消息先去签名。未解决冲突写 index stage 1/2/3 与工作树标记，并支持 `--continue`/`--skip`/`--abort`/`--quit` 及跨操作对称 mutex。rerere 以规范化 hunk sides 命中，并仅把干净的 preimage/current/postimage 三方回放写入工作树；rerere disabled 时两个 rerere flag 均为 no-op。自定义 `--strategy` 仍显式拒绝。
 
 ## 对比 Git 与兼容性
 

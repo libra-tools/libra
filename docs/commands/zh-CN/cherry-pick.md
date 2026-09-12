@@ -256,7 +256,7 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 
 ### 自定义策略仍保持显式边界
 
-内置三方应用已支持 `-X ours/theirs`，且只偏向冲突 region。`--rerere-autoupdate` 会暂存回放解法，`--no-rerere-autoupdate` 保持未暂存；最后出现的标志生效，两个均省略时继承 `rerere.autoUpdate`。所选值会保留在 SQLite sequencer state 中，故 `--continue` 仍保持它。rerere 禁用时两个标志都是 no-op。外部/自定义 `--strategy <name>` 仍以 `LBR-UNSUPPORTED-001`（退出 128）显式拒绝。
+内置三方应用已支持 `-X ours/theirs`，且只偏向冲突 region。`--rerere-autoupdate` 会暂存回放解法，`--no-rerere-autoupdate` 保持未暂存；最后出现的标志生效，两个均省略时继承 `rerere.autoUpdate`。rerere 按规范化 hunk 两侧匹配，并且只写入干净的三方回放。所选值会保留在 SQLite sequencer state 中，故 `--continue` 仍保持它。rerere 禁用时两个标志都是 no-op。外部/自定义 `--strategy <name>` 仍以 `LBR-UNSUPPORTED-001`（退出 128）显式拒绝。
 
 ## 参数对比：Libra vs Git vs jj
 

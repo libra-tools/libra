@@ -14,10 +14,13 @@
 //!   only while no linked worktree exists; with linked evidence it is left
 //!   untouched for the worktree doctor (W3) and a one-line notice is printed.
 //!
-//! `<id>` is the SHA-256 of the conflicted file's bytes. This version matches a
-//! conflict only when the whole conflicted file is byte-identical to a recorded
-//! preimage (Git's per-hunk normalisation / ours-theirs-swap independence remain
-//! a documented follow-up).
+//! `<id>` is the SHA-256 of Git-style normalized conflict hunks. The normalizer
+//! discards diff3 base sections and orders each hunk's two sides
+//! lexicographically, so swapping ours and theirs reaches the same cache entry.
+//! It retains ordinary file content in the stored preimage, allowing replay to
+//! three-way merge an earlier resolution with the current conflict. Existing
+//! whole-file-keyed entries deliberately coexist: an old key simply misses and
+//! is re-recorded under the normalized key.
 //!
 //! When `rerere.enabled` is set, [`auto_update`] is invoked automatically by the
 //! merge / rebase / cherry-pick sequencers (at both conflict and resolution
@@ -44,6 +47,7 @@ use crate::{
 };
 
 const CONFLICT_START: &str = "<<<<<<<";
+const CONFLICT_BASE: &str = "|||||||";
 const CONFLICT_SEP: &str = "=======";
 const CONFLICT_END: &str = ">>>>>>>";
 
@@ -218,17 +222,27 @@ async fn apply(scope: &WorktreeScope, rr_dir: &Path, stage_replayed: bool) -> Cl
         }
         let id = conflict_id(&content);
         let postimage = entry_path(rr_dir, &id, "postimage");
+        let preimage = entry_path(rr_dir, &id, "preimage");
         // Replay only when BOTH the recorded preimage and postimage exist — a
-        // defensive guard so a stray postimage can never overwrite a file.
-        if postimage.exists() && entry_path(rr_dir, &id, "preimage").exists() {
+        // defensive guard so a stray postimage can never overwrite a file. The
+        // recorded preimage is the three-way base, the current normalized
+        // conflict is ours, and the postimage is theirs. A conflict from that
+        // replay deliberately leaves the worktree unchanged.
+        if postimage.exists() && preimage.exists() {
+            let recorded_preimage = fs::read(&preimage).map_err(read_err)?;
             let resolution = fs::read(&postimage).map_err(read_err)?;
-            fs::write(&absolute, &resolution).map_err(write_err)?;
-            println!("Resolved '{path}' using a previously recorded resolution.");
-            if stage_replayed {
-                stage_path(path).await?;
+            if let Some(replayed) =
+                replay_recorded_resolution(&recorded_preimage, &content, &resolution)
+            {
+                fs::write(&absolute, &replayed).map_err(write_err)?;
+                println!("Resolved '{path}' using a previously recorded resolution.");
+                if stage_replayed {
+                    stage_path(path).await?;
+                }
             }
         } else {
-            write_entry(rr_dir, &id, "preimage", &content)?;
+            let normalized = normalized_preimage(&content);
+            write_entry(rr_dir, &id, "preimage", &normalized)?;
             if !merge_rr.iter().any(|(p, _)| p == path) {
                 merge_rr.push((path.to_string(), id));
             }
@@ -410,25 +424,161 @@ fn gc(rr_dir: &Path) -> CliResult<()> {
 
 // ── helpers ──
 
-/// Whether `content` contains a conflict marker.
+/// Whether `content` contains a complete conflict that rerere can normalize.
 fn is_conflicted(content: &[u8]) -> bool {
-    content
-        .split(|&b| b == b'\n')
-        .any(|line| starts_with(line, CONFLICT_START))
-        && content
-            .split(|&b| b == b'\n')
-            .any(|line| starts_with(line, CONFLICT_SEP) || starts_with(line, CONFLICT_END))
+    normalize_conflicts(content).is_some()
 }
 
 fn starts_with(line: &[u8], prefix: &str) -> bool {
     line.starts_with(prefix.as_bytes())
 }
 
-/// The cache id for a conflicted file: the SHA-256 of its bytes.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConflictSide {
+    Ours,
+    Base,
+    Theirs,
+}
+
+struct NormalizedConflicts {
+    preimage: Vec<u8>,
+    fingerprint: Vec<u8>,
+}
+
+/// Canonicalize every complete conflict hunk in `content` following Git's
+/// rerere rules. The stable form retains non-conflict text, discards a diff3
+/// base, and makes each hunk independent of which side happened to be ours.
+///
+/// `None` means there are no complete conflict hunks (or a marker sequence was
+/// malformed), which preserves the historical whole-file key fallback.
+fn normalize_conflicts(content: &[u8]) -> Option<NormalizedConflicts> {
+    let lines: Vec<&[u8]> = content.split_inclusive(|byte| *byte == b'\n').collect();
+    let mut preimage = Vec::with_capacity(content.len());
+    let mut fingerprint = Vec::new();
+    let mut cursor = 0;
+    let mut found = false;
+
+    while cursor < lines.len() {
+        if starts_with(lines[cursor], CONFLICT_START) {
+            let (hunk, next) = normalize_conflict_hunk(&lines, cursor)?;
+            preimage.extend_from_slice(&hunk.preimage);
+            fingerprint.extend_from_slice(&hunk.fingerprint);
+            cursor = next;
+            found = true;
+        } else {
+            preimage.extend_from_slice(lines[cursor]);
+            cursor += 1;
+        }
+    }
+
+    found.then_some(NormalizedConflicts {
+        preimage,
+        fingerprint,
+    })
+}
+
+/// Normalize one conflict hunk, recursively preserving nested hunks in the
+/// active side. The cursor returned points immediately after the closing marker.
+fn normalize_conflict_hunk(lines: &[&[u8]], start: usize) -> Option<(NormalizedConflicts, usize)> {
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    let mut side = ConflictSide::Ours;
+    let mut cursor = start.checked_add(1)?;
+
+    while let Some(line) = lines.get(cursor) {
+        if starts_with(line, CONFLICT_START) {
+            let (nested, next) = normalize_conflict_hunk(lines, cursor)?;
+            if side == ConflictSide::Ours {
+                ours.extend_from_slice(&nested.preimage);
+            } else {
+                // Git's recursive normalizer attaches a nested hunk to the
+                // second side whenever the enclosing hunk is not on ours.
+                theirs.extend_from_slice(&nested.preimage);
+            }
+            cursor = next;
+            continue;
+        }
+        if starts_with(line, CONFLICT_BASE) {
+            if side != ConflictSide::Ours {
+                return None;
+            }
+            side = ConflictSide::Base;
+        } else if starts_with(line, CONFLICT_SEP) {
+            if side != ConflictSide::Ours && side != ConflictSide::Base {
+                return None;
+            }
+            side = ConflictSide::Theirs;
+        } else if starts_with(line, CONFLICT_END) {
+            if side != ConflictSide::Theirs {
+                return None;
+            }
+            if ours > theirs {
+                std::mem::swap(&mut ours, &mut theirs);
+            }
+            let mut preimage = Vec::with_capacity(ours.len() + theirs.len() + 24);
+            preimage.extend_from_slice(CONFLICT_START.as_bytes());
+            preimage.push(b'\n');
+            preimage.extend_from_slice(&ours);
+            preimage.extend_from_slice(CONFLICT_SEP.as_bytes());
+            preimage.push(b'\n');
+            preimage.extend_from_slice(&theirs);
+            preimage.extend_from_slice(CONFLICT_END.as_bytes());
+            preimage.push(b'\n');
+
+            // The cache key intentionally excludes ordinary surrounding text:
+            // Git hashes only each canonical hunk's two sides, separated by
+            // NULs, so the same conflict can recur in a changed file context.
+            let mut fingerprint = Vec::with_capacity(ours.len() + theirs.len() + 2);
+            fingerprint.extend_from_slice(&ours);
+            fingerprint.push(0);
+            fingerprint.extend_from_slice(&theirs);
+            fingerprint.push(0);
+            return Some((
+                NormalizedConflicts {
+                    preimage,
+                    fingerprint,
+                },
+                cursor + 1,
+            ));
+        } else {
+            match side {
+                ConflictSide::Ours => ours.extend_from_slice(line),
+                ConflictSide::Base => {}
+                ConflictSide::Theirs => theirs.extend_from_slice(line),
+            }
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+fn normalized_preimage(content: &[u8]) -> Vec<u8> {
+    normalize_conflicts(content)
+        .map(|normalized| normalized.preimage)
+        .unwrap_or_else(|| content.to_vec())
+}
+
+/// The cache id for a conflicted file: the SHA-256 of the normalized hunk
+/// content, or the whole file when no complete conflict markers are present.
 fn conflict_id(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content);
+    let fingerprint = normalize_conflicts(content)
+        .map(|normalized| normalized.fingerprint)
+        .unwrap_or_else(|| content.to_vec());
+    hasher.update(fingerprint);
     hex::encode(hasher.finalize())
+}
+
+/// Apply a recorded resolution through a three-way merge. Returning `None` on
+/// a conflict is intentional: callers must not replace a user's current
+/// conflict markers with a partial or unrelated resolution.
+fn replay_recorded_resolution(
+    recorded_preimage: &[u8],
+    current: &[u8],
+    postimage: &[u8],
+) -> Option<Vec<u8>> {
+    diffy::merge_bytes(recorded_preimage, &normalized_preimage(current), postimage).ok()
 }
 
 fn entry_path(rr_dir: &Path, id: &str, name: &str) -> PathBuf {
@@ -639,7 +789,7 @@ fn write_err(error: std::io::Error) -> CliError {
 }
 
 #[cfg(test)]
-mod tests {
+mod normalize {
     use super::*;
 
     #[test]
@@ -652,13 +802,35 @@ mod tests {
     }
 
     #[test]
-    fn conflict_id_is_stable_and_content_addressed() {
-        let a = conflict_id(b"<<<<<<<\nx\n=======\ny\n>>>>>>>\n");
-        let b = conflict_id(b"<<<<<<<\nx\n=======\ny\n>>>>>>>\n");
-        let c = conflict_id(b"<<<<<<<\nx\n=======\nz\n>>>>>>>\n");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.len(), 64);
+    fn normalize_conflicts_discards_base_and_orders_each_hunk() {
+        // Given: a diff3 hunk with labels and an opposite-side equivalent.
+        let diff3 = b"prefix\n<<<<<<< ours\nzeta\n||||||| base\ncommon\n=======\nalpha\n>>>>>>> theirs\nsuffix\n";
+        let swapped = b"prefix\n<<<<<<< theirs\nalpha\n=======\nzeta\n>>>>>>> ours\nsuffix\n";
+        let expected = b"prefix\n<<<<<<<\nalpha\n=======\nzeta\n>>>>>>>\nsuffix\n";
+
+        // When: rerere normalizes each conflict hunk.
+        let normalized = normalize_conflicts(diff3);
+
+        // Then: base and labels are removed, sides sort, and swapping matches.
+        assert_eq!(
+            normalized
+                .as_ref()
+                .map(|normalized| normalized.preimage.as_slice()),
+            Some(expected.as_slice())
+        );
+        assert_eq!(conflict_id(diff3), conflict_id(swapped));
+    }
+
+    #[test]
+    fn normalize_conflicts_falls_back_to_the_whole_file_without_markers() {
+        // Given: ordinary content with no conflict markers.
+        let content = b"plain\ncontent\n";
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+
+        // When / Then: the legacy whole-file SHA-256 remains the cache key.
+        assert_eq!(conflict_id(content), hex::encode(hasher.finalize()));
+        assert!(normalize_conflicts(content).is_none());
     }
 
     #[test]

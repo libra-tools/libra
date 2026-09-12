@@ -25,7 +25,7 @@ fn merge_rename_conflict_rerere_replays_after_abort_with_configured_staging() {
             (false, &["--rerere-autoupdate"][..], true),
         ] {
             // Given: the same labelled 1to2 content conflict occurs twice, so
-            // Libra's current whole-file rerere key is identical on replay.
+            // rerere's normalized hunk key identifies the recorded resolution.
             let repo = rename_1to2_repo(2, 2);
             let p = repo.path();
             let original_head = head_commit(p);

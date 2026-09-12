@@ -259,7 +259,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 
 ### Custom strategies remain explicit
 
-`-X ours/theirs` is supported by Libra's built-in three-way apply and resolves only conflict regions. `--rerere-autoupdate` stages a replayed resolution, while `--no-rerere-autoupdate` leaves it unstaged; the last supplied flag wins and omitting both inherits `rerere.autoUpdate`. The selected value is retained in the SQLite sequencer state so `--continue` preserves it. Both flags are no-ops while rerere is disabled. `--strategy <name>` remains explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128), because external/custom merge strategies are still out of scope.
+`-X ours/theirs` is supported by Libra's built-in three-way apply and resolves only conflict regions. `--rerere-autoupdate` stages a replayed resolution, while `--no-rerere-autoupdate` leaves it unstaged; the last supplied flag wins and omitting both inherits `rerere.autoUpdate`. Rerere matches normalized hunk sides and only writes a clean three-way replay. The selected value is retained in the SQLite sequencer state so `--continue` preserves it. Both flags are no-ops while rerere is disabled. `--strategy <name>` remains explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128), because external/custom merge strategies are still out of scope.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
