@@ -507,6 +507,8 @@ pub(crate) async fn run_pull(
                 dry_run: false,
                 // `pull` has no `--signoff` surface.
                 signoff: false,
+                // `pull` has no rerere per-invocation override; inherit config.
+                rerere_autoupdate: None,
                 // `pull` exposes no merge-commit signing controls. Keep its
                 // established unsigned merge behavior rather than inheriting
                 // the public `merge` command's new signing default.

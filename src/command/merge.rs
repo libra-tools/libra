@@ -252,7 +252,7 @@ pub struct MergeArgs {
         "message", "file", "into_name", "cleanup", "edit", "squash", "no_commit",
         "no_verify", "autostash", "no_autostash", "no_edit", "stat", "no_stat",
         "no_progress", "verify_signatures",
-        "no_verify_signatures", "no_rerere_autoupdate", "gpg_sign", "no_gpg_sign",
+        "no_verify_signatures", "rerere_autoupdate", "no_rerere_autoupdate", "gpg_sign", "no_gpg_sign",
         "signoff", "dry_run",
     ])]
     pub quit: bool,
@@ -415,14 +415,14 @@ pub struct MergeArgs {
     #[arg(long = "no-verify-signatures", overrides_with = "verify_signatures")]
     pub no_verify_signatures: bool,
 
-    /// Do not auto-stage rerere-replayed resolutions for this merge. Rerere IS
-    /// integrated: with `rerere.enabled`, a conflicted merge records each
-    /// conflict's preimage and replays a recorded resolution when one matches;
-    /// whether a replayed file is auto-STAGED follows the `rerere.autoUpdate`
-    /// config. This flag is accepted for Git parity but the per-invocation
-    /// override is not implemented — staging follows the config either way.
-    /// (Git's positive `--rerere-autoupdate` is not exposed.)
-    #[arg(long = "no-rerere-autoupdate")]
+    /// Auto-stage rerere-replayed resolutions for this merge, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[arg(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
+    pub rerere_autoupdate: bool,
+
+    /// Do not auto-stage rerere-replayed resolutions for this merge, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[arg(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
     pub no_rerere_autoupdate: bool,
 
     /// Force vault-signing of the merge commit.
@@ -610,6 +610,9 @@ pub(crate) struct PullMergeOptions {
     /// Append a `Signed-off-by` trailer to the merge commit after the final
     /// message-processing hooks have run. `pull` always leaves this false.
     pub signoff: bool,
+    /// Per-invocation rerere staging policy. `None` inherits
+    /// `rerere.autoUpdate`; explicit values are persisted for conflict recovery.
+    pub rerere_autoupdate: Option<bool>,
     /// The signing decision resolved before the merge begins. It is saved in
     /// `MergeState` so a later `--continue` and `--restart` preserve explicit
     /// `-S` / `--no-gpg-sign` choices. `None` is only accepted at the public
@@ -718,6 +721,10 @@ pub(crate) struct MergeState {
     /// `--no-commit` continuations retain the original trailer decision.
     #[serde(default)]
     pub signoff: bool,
+    /// Explicit rerere staging choice from the invocation that wrote this state.
+    /// Older sidecars omit it and therefore inherit `rerere.autoUpdate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerere_autoupdate: Option<bool>,
     pub conflicted_paths: Vec<String>,
     /// Merge message resolved at merge start (`-m` override or the generated
     /// default including the `merge.log` shortlog), replayed verbatim by
@@ -1426,6 +1433,10 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 merge_log,
                 dry_run: args.dry_run,
                 signoff: args.signoff,
+                rerere_autoupdate: rerere_autoupdate_override(
+                    args.rerere_autoupdate,
+                    args.no_rerere_autoupdate,
+                ),
                 signing_policy: Some(match explicit_signing_policy {
                     Some(policy) => policy,
                     None => signing::resolve_signing_policy(false, false).await?,
@@ -1495,6 +1506,16 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
         ([], false, true) => run_merge_abort(output).await,
         ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
+    }
+}
+
+const fn rerere_autoupdate_override(enabled: bool, disabled: bool) -> Option<bool> {
+    if enabled {
+        Some(true)
+    } else if disabled {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -2447,6 +2468,7 @@ async fn run_octopus_merge(
                 skip_hooks: options.skip_hooks,
                 signing_policy: options.signing_policy,
                 signoff: options.signoff,
+                rerere_autoupdate: options.rerere_autoupdate,
                 conflicted_paths: Vec::new(),
                 message: Some(resolved_message),
                 auto_merge: None,
@@ -2650,6 +2672,7 @@ async fn prepare_octopus_tree(
         skip_hooks: options.skip_hooks,
         signing_policy: signing_policy_from_options(options)?,
         signoff: false,
+        rerere_autoupdate: options.rerere_autoupdate,
         // Every blob remains in `VirtualBlobs` until all heads are clean.
         dry_run: true,
         strategy: None,
@@ -3310,6 +3333,7 @@ async fn run_merge_for_pull_inner(
         skip_hooks: options.skip_hooks,
         signing_policy: signing_policy_from_options(&options)?,
         signoff: options.signoff,
+        rerere_autoupdate: options.rerere_autoupdate,
         dry_run: options.dry_run,
         strategy: options.strategy,
         strategy_evaluation: options.strategy_evaluation,
@@ -3368,6 +3392,7 @@ struct ThreeWayMergeOptions<'a> {
     skip_hooks: bool,
     signing_policy: crate::command::history_config::CommitSigningPolicy,
     signoff: bool,
+    rerere_autoupdate: Option<bool>,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
     /// Explicit backend name. `None` is the historical default ort path and
@@ -3589,6 +3614,7 @@ async fn perform_ours_merge(
             skip_hooks: options.skip_hooks,
             signing_policy: Some(options.signing_policy),
             signoff: options.signoff,
+            rerere_autoupdate: options.rerere_autoupdate,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message),
             auto_merge: None,
@@ -3927,6 +3953,7 @@ async fn perform_three_way_merge(
             skip_hooks: options.skip_hooks,
             signing_policy: options.signing_policy,
             signoff: options.signoff,
+            rerere_autoupdate: options.rerere_autoupdate,
             strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
@@ -3952,9 +3979,8 @@ async fn perform_three_way_merge(
         announce_df_conflicts(&placements, upstream, options.output);
         // rerere: record the preimage of each merge conflict just written and
         // replay a recorded resolution if one matches. A no-op unless
-        // `rerere.enabled`; staging of a replayed file follows `rerere.autoUpdate`
-        // (merge does not expose a per-invocation `--rerere-autoupdate`).
-        if let Err(error) = crate::command::rerere::auto_update(false).await {
+        // `rerere.enabled`; an explicit per-invocation choice overrides config.
+        if let Err(error) = crate::command::rerere::auto_update(options.rerere_autoupdate).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
         let paths = placements
@@ -4042,6 +4068,7 @@ async fn perform_three_way_merge(
             skip_hooks: options.skip_hooks,
             signing_policy: Some(options.signing_policy),
             signoff: options.signoff,
+            rerere_autoupdate: options.rerere_autoupdate,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
             auto_merge: None,
@@ -4212,6 +4239,7 @@ struct MergeConflictInput {
     skip_hooks: bool,
     signing_policy: crate::command::history_config::CommitSigningPolicy,
     signoff: bool,
+    rerere_autoupdate: Option<bool>,
     /// Explicit backend selected for this conflict. `None` retains the
     /// historical implicit-ort state schema.
     strategy: Option<MergeStrategy>,
@@ -4388,6 +4416,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         skip_hooks: input.skip_hooks,
         signing_policy: Some(input.signing_policy),
         signoff: input.signoff,
+        rerere_autoupdate: input.rerere_autoupdate,
         conflicted_paths: conflict_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -4783,7 +4812,7 @@ async fn run_merge_continue(
     // identical conflict is auto-resolved next time. A no-op unless
     // `rerere.enabled`. (`libra merge --continue` finalizes the merge here
     // without going through `commit`, so it needs its own hook.)
-    if let Err(error) = crate::command::rerere::auto_update(false).await {
+    if let Err(error) = crate::command::rerere::auto_update(state.rerere_autoupdate).await {
         tracing::warn!("rerere auto-update on merge --continue failed: {error}");
     }
 
@@ -5000,6 +5029,7 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
         skip_hooks: state.skip_hooks,
         signing_policy: state.signing_policy,
         signoff: state.signoff,
+        rerere_autoupdate: state.rerere_autoupdate,
         ..PullMergeOptions::default()
     };
     run_merge_for_pull_with_options(&target, &target_ref, output, options)
@@ -12969,6 +12999,7 @@ async fn perform_incremental_three_way_merge(
             skip_hooks: options.skip_hooks,
             signing_policy: options.signing_policy,
             signoff: options.signoff,
+            rerere_autoupdate: options.rerere_autoupdate,
             strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
@@ -12989,7 +13020,7 @@ async fn perform_incremental_three_way_merge(
             options.output,
         );
         announce_df_conflicts(&placements, upstream, options.output);
-        if let Err(error) = crate::command::rerere::auto_update(false).await {
+        if let Err(error) = crate::command::rerere::auto_update(options.rerere_autoupdate).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
         let paths = placements
@@ -13070,6 +13101,7 @@ async fn perform_incremental_three_way_merge(
             skip_hooks: options.skip_hooks,
             signing_policy: Some(options.signing_policy),
             signoff: options.signoff,
+            rerere_autoupdate: options.rerere_autoupdate,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
             auto_merge: None,
@@ -14954,6 +14986,30 @@ mod tests {
             .expect("the last signing toggle must win");
         assert!(last_toggle.no_gpg_sign);
         assert!(!last_toggle.gpg_sign);
+
+        let enable_rerere = MergeArgs::try_parse_from(["merge", "--rerere-autoupdate", "feature"])
+            .expect("positive rerere toggle must parse");
+        assert_eq!(
+            rerere_autoupdate_override(
+                enable_rerere.rerere_autoupdate,
+                enable_rerere.no_rerere_autoupdate,
+            ),
+            Some(true)
+        );
+        let last_rerere_toggle = MergeArgs::try_parse_from([
+            "merge",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "feature",
+        ])
+        .expect("the last rerere toggle must win");
+        assert_eq!(
+            rerere_autoupdate_override(
+                last_rerere_toggle.rerere_autoupdate,
+                last_rerere_toggle.no_rerere_autoupdate,
+            ),
+            Some(false)
+        );
         let signoff = MergeArgs::try_parse_from(["merge", "--signoff", "feature"])
             .expect("--signoff must parse for a merge commit");
         assert!(signoff.signoff);
@@ -14983,6 +15039,36 @@ mod tests {
                 "signoff must not be silently ignored for {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_state_without_rerere_override_inherits_configuration() {
+        let state = MergeState {
+            head_name: "main".to_string(),
+            orig_head: "a".repeat(64),
+            target: "b".repeat(64),
+            target_ref: "feature".to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
+            base: None,
+            strategy: None,
+            allow_unrelated_histories: false,
+            skip_hooks: false,
+            signing_policy: None,
+            signoff: false,
+            rerere_autoupdate: Some(false),
+            conflicted_paths: Vec::new(),
+            message: None,
+            auto_merge: None,
+        };
+        let mut value = serde_json::to_value(state).expect("serialize merge state");
+        value
+            .as_object_mut()
+            .expect("merge state serializes as an object")
+            .remove("rerere_autoupdate");
+        let old: MergeState = serde_json::from_value(value)
+            .expect("state written before rerere override remains readable");
+        assert_eq!(old.rerere_autoupdate, None);
     }
 
     #[test]

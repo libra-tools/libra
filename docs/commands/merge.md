@@ -5,7 +5,7 @@ Merge one or more targets into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--rerere-autoupdate | --no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
 libra merge --continue [-m <msg> | -F <file>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
 libra merge --quit
@@ -374,7 +374,7 @@ Libra still does not implement external merge strategies, `subtree`, explicit `-
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
 | `--verify-signatures` | Verify the PGP signature on every target tip and abort before mutation if any is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
 | `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
-| `--no-rerere-autoupdate` | Accepted for Git parity. Rerere IS integrated: with `rerere.enabled`, a conflicted merge records each conflict's preimage and replays a recorded resolution when one matches; auto-staging of replayed files follows the `rerere.autoUpdate` config. The per-invocation override is not implemented — staging follows the config either way. (Git's positive `--rerere-autoupdate` is not exposed.) |
+| `--rerere-autoupdate`, `--no-rerere-autoupdate` | Override replay staging for this merge: positive stages a replayed resolution, negative leaves it unstaged; the last supplied flag wins. Omit both to inherit `rerere.autoUpdate`. The explicit choice is retained in merge state so a later `merge --continue` preserves it. Both are no-ops while rerere is disabled. |
 | `--signoff` | Append `Signed-off-by: <committer name> <committer email>` after the final merge message. The initial request is retained by merge state for `--continue`; a matching final trailer is not duplicated. There is no `-s` alias because `-s` selects a strategy. |
 | `-S`, `--gpg-sign` | Force vault-signing of the merge commit. This applies to automatic, `-s ours`, octopus, and `--continue` commit paths. |
 | `--no-gpg-sign` | Do not vault-sign the merge commit. This overrides `commit.gpgSign` and `vault.signing`; together with `-S` it is a last-one-wins toggle. |
@@ -535,7 +535,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Post-merge diffstat | `--stat` (prints it); `-n` / `--no-stat` (default: omit) | `--stat` (default) / `-n` / `--no-stat` | N/A |
 | No progress meter | `--no-progress` (no-op; never renders one) | `--no-progress` | N/A |
 | Disable signature verification | `--no-verify-signatures` (default; disables `--verify-signatures`) | `--no-verify-signatures` | N/A |
-| No rerere autoupdate | `--no-rerere-autoupdate` (accepted; staging follows `rerere.autoUpdate`) | `--no-rerere-autoupdate` | N/A |
+| Rerere autoupdate | `--rerere-autoupdate` / `--no-rerere-autoupdate` override replay staging (last wins); omit to inherit `rerere.autoUpdate` | Same toggle surface | Choice persists across `--continue` |
 | Signoff trailer | `--signoff` (no short form; `-s` selects a strategy) | `--signoff` (no short form; `-s` selects a strategy) | Matching final trailer is not duplicated |
 | Merge commit signing | `-S` / `--gpg-sign` forces vault signing; `--no-gpg-sign` disables it | Same toggle surface | Vault-only; no external GPG/SSH signing |
 | Default / recursive strategy | `-s ort` (default), `-s recursive` alias | `-s ort` (default), `-s recursive` | N/A |

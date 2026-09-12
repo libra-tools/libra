@@ -18,7 +18,12 @@ fn merge_rename_conflict_rerere_replays_after_abort_with_configured_staging() {
         &[][..],
         &[("LIBRA_TEST", "1"), ("LIBRA_TEST_MERGE_TREE_WALK", "flat")][..],
     ] {
-        for auto_update in [false, true] {
+        for (auto_update, rerere_flags, expected_auto_stage) in [
+            (false, &[][..], false),
+            (true, &[][..], true),
+            (true, &["--no-rerere-autoupdate"][..], false),
+            (false, &["--rerere-autoupdate"][..], true),
+        ] {
             // Given: the same labelled 1to2 content conflict occurs twice, so
             // Libra's current whole-file rerere key is identical on replay.
             let repo = rename_1to2_repo(2, 2);
@@ -37,7 +42,9 @@ fn merge_rename_conflict_rerere_replays_after_abort_with_configured_staging() {
                     "rerere config",
                 );
             }
-            merge_expecting_conflict(p, &["merge", "feature"], env);
+            let mut merge_args = vec!["merge", "feature"];
+            merge_args.extend_from_slice(rerere_flags);
+            merge_expecting_conflict(p, &merge_args, env);
             let conflict = std::fs::read_to_string(p.join("a")).expect("rename markers");
             assert!(conflict.contains("<<<<<<<< HEAD:a"));
             assert!(conflict.contains(">>>>>>>> feature:b"));
@@ -73,7 +80,7 @@ fn merge_rename_conflict_rerere_replays_after_abort_with_configured_staging() {
             assert!(!p.join("b").exists());
 
             // When: the real merge recreates exactly the recorded conflict.
-            let replay = merge_expecting_conflict(p, &["merge", "feature"], env);
+            let replay = merge_expecting_conflict(p, &merge_args, env);
 
             // Then: both resolutions return; only configured autoUpdate stages
             // them, while the merge remains explicitly resumable.
@@ -88,14 +95,18 @@ fn merge_rename_conflict_rerere_replays_after_abort_with_configured_staging() {
                 );
                 let stages = index_stage_lines(p, path);
                 assert_eq!(stages.len(), 1, "{path}: {stages:?}");
-                let expected = if auto_update { 0 } else { unmerged_stage };
+                let expected = if expected_auto_stage {
+                    0
+                } else {
+                    unmerged_stage
+                };
                 assert!(
                     stages[0].contains(&format!(" {expected}\t")),
                     "{path}: {stages:?}"
                 );
             }
             assert_eq!(head_commit(p), original_head);
-            if !auto_update {
+            if !expected_auto_stage {
                 assert_cli_success(
                     &run_libra_command(&["add", "a", "b"], p),
                     "stage reused resolution",

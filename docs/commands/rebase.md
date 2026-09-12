@@ -8,7 +8,7 @@ Reapply commits on top of another base tip.
 
 ```
 libra rebase <upstream>
-libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--rerere-autoupdate | --no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
 libra rebase --onto <newbase> <upstream> [<branch>]
 libra rebase --continue
 libra rebase --abort
@@ -46,7 +46,7 @@ Rebase state (the list of remaining and completed commits, the original HEAD, an
 | | `--exec <cmd>` | Run a repeatable shell command after each replayed commit in a required workspace-write, network-denied sandbox. Non-zero exit or timeout stops the rebase; `--continue` retries it. |
 | | `--update-refs` / `--no-update-refs` | Atomically move other local branches that point into the rewritten range. Branches checked out in any worktree are excluded. The last toggle wins. |
 | | `--fork-point` / `--no-fork-point` | Select the replay boundary from the upstream reflog when possible, otherwise use the ordinary merge base. The last toggle wins. |
-| | `--no-rerere-autoupdate` | Accepted no-op for Git parity: rerere recording is integrated when enabled, but rebase does not expose positive `--rerere-autoupdate`; staging follows `rerere.autoUpdate`. |
+| | `--rerere-autoupdate` / `--no-rerere-autoupdate` | Override replay staging for this rebase: positive stages a replayed resolution, negative leaves it unstaged; the last supplied flag wins. Omit both to inherit `rerere.autoUpdate`. The choice is persisted in rebase auxiliary state, so `--continue` uses the original decision. Both are no-ops while rerere is disabled. |
 | | `--keep-empty` | Keep commits that begin empty (already empty before replay) rather than dropping them. Accepted no-op for Git parity: Libra's rebase already keeps empty commits by default. Toggle pair with `--no-keep-empty`; the last one wins. |
 | | `--no-keep-empty` | Drop commits that begin empty (their tree equals their parent's — they introduce no change) instead of replaying them. Toggle pair with `--keep-empty`. (This controls commits that *begin* empty; `--empty=<mode>` controls commits that *become* empty after replay.) |
 | | `--empty=<mode>` | How to handle a commit that *becomes* empty after replay (its change is already on the new base): `drop` skips it (HEAD does not advance; a `dropping <sha> <subject> -- patch contents already upstream` notice is printed), `keep` records the empty commit. Omitted, Libra **keeps** it — an intentional divergence from Git, which drops by default; pass `--empty=drop` for Git's behavior. The mode survives a conflict into `--continue`/`--skip`. Git's `stop`/`ask` (halt for you to decide) are not supported (Libra's non-interactive rebase has no halt-on-empty resume flow); they and any unknown value are usage errors (`LBR-CLI-002`, exit 129). |
@@ -411,7 +411,7 @@ Libra provides a middle ground: a linear rebase with conflict-stop semantics (fa
 | Autostash | `--autostash` / `--no-autostash` supported; tracked changes held through sequencer stops | `--autostash` / `--no-autostash` | N/A |
 | Update refs | Supported; checked-out branches excluded and captured tips compared atomically | `--update-refs` / `--no-update-refs` | N/A |
 | Fork point | Supported with upstream-reflog selection and merge-base fallback | `--fork-point` / `--no-fork-point` | N/A |
-| Rerere autoupdate | `--no-rerere-autoupdate` accepted no-op; positive flag not exposed, staging follows `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
+| Rerere autoupdate | Both flags override replay staging (last wins); omit to inherit `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | Choice persists across `--continue` |
 | Reapply cherry-picks | Supported; Libra replays by default | `--reapply-cherry-picks` | N/A |
 | Rebase merges | Not supported | `--rebase-merges` | Default behavior |
 | Keep empty | `--keep-empty` (no-op; already keeps empty) / `--no-keep-empty` (drop start-empty commits) | `--keep-empty` / `--no-keep-empty` | Default keeps empty |

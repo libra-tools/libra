@@ -124,7 +124,7 @@ pub(crate) async fn is_enabled() -> bool {
 }
 
 /// Whether replayed resolutions should also be staged (`rerere.autoUpdate`,
-/// default off). The per-command `--rerere-autoupdate` flag ORs with this.
+/// default off).
 async fn autoupdate_configured() -> bool {
     matches!(
         ConfigKv::get("rerere.autoUpdate")
@@ -137,23 +137,36 @@ async fn autoupdate_configured() -> bool {
     )
 }
 
+/// Resolve a per-command rerere choice against the repository default.
+///
+/// `None` deliberately means inherit: an absent flag must keep honoring
+/// `rerere.autoUpdate`, while `Some(false)` must be able to countermand a true
+/// configuration value.
+const fn resolve_auto_update(override_value: Option<bool>, configured: bool) -> bool {
+    match override_value {
+        Some(value) => value,
+        None => configured,
+    }
+}
+
 /// Automatic hook for the merge/rebase/cherry-pick sequencers.
 ///
 /// A no-op unless `rerere.enabled` is set. When enabled it runs the same
 /// record/replay pass as `libra rerere`, so calling it at both the moment a
 /// conflict is written and the moment it is resolved (or `--continue`d)
 /// records preimages, replays known resolutions, and records postimages —
-/// whichever applies to the current working-tree state. `auto_update` (the
-/// command's `--rerere-autoupdate` flag) ORed with `rerere.autoUpdate` decides
-/// whether a replayed file is also staged. Errors are surfaced to the caller,
-/// which should treat them as non-fatal to the underlying operation.
-pub(crate) async fn auto_update(auto_update: bool) -> CliResult<()> {
+/// whichever applies to the current working-tree state. `override_value`
+/// carries a command's `--rerere-autoupdate`/`--no-rerere-autoupdate` choice:
+/// `None` inherits `rerere.autoUpdate`; either explicit value overrides it.
+/// Errors are surfaced to the caller, which should treat them as non-fatal to
+/// the underlying operation.
+pub(crate) async fn auto_update(override_value: Option<bool>) -> CliResult<()> {
     if !is_enabled().await {
         return Ok(());
     }
     let rr_dir = rerere_dir()?;
     let scope = WorktreeScope::for_request();
-    let stage_replayed = auto_update || autoupdate_configured().await;
+    let stage_replayed = resolve_auto_update(override_value, autoupdate_configured().await);
     apply(&scope, &rr_dir, stage_replayed).await
 }
 
@@ -646,5 +659,13 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn explicit_autoupdate_choice_overrides_repository_config() {
+        assert!(resolve_auto_update(None, true));
+        assert!(!resolve_auto_update(None, false));
+        assert!(resolve_auto_update(Some(true), false));
+        assert!(!resolve_auto_update(Some(false), true));
     }
 }

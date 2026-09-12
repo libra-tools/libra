@@ -9,7 +9,7 @@ Apply the changes introduced by some existing commits.
 ```
 libra cherry-pick [-n|--no-commit] [-x] [-s|--signoff] [-e|--edit]
                   [-m <n>|--mainline <n>] [--ff] [-S|--gpg-sign]
-                  [-X <ours|theirs>]
+                  [-X <ours|theirs>] [--rerere-autoupdate | --no-rerere-autoupdate]
                   [--allow-empty] [--allow-empty-message] [--keep-redundant-commits]
                   [--empty=<mode>] [--cleanup=<mode>] [--json] [--quiet] <commit>...
 libra cherry-pick (--continue | --skip | --abort | --quit)
@@ -259,7 +259,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 
 ### Custom strategies remain explicit
 
-`-X ours/theirs` is supported by Libra's built-in three-way apply and resolves only conflict regions. `--rerere-autoupdate` is honored when rerere is enabled. `--strategy <name>` remains explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128), because external/custom merge strategies are still out of scope.
+`-X ours/theirs` is supported by Libra's built-in three-way apply and resolves only conflict regions. `--rerere-autoupdate` stages a replayed resolution, while `--no-rerere-autoupdate` leaves it unstaged; the last supplied flag wins and omitting both inherits `rerere.autoUpdate`. The selected value is retained in the SQLite sequencer state so `--continue` preserves it. Both flags are no-ops while rerere is disabled. `--strategy <name>` remains explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128), because external/custom merge strategies are still out of scope.
 
 ## Parameter Comparison: Libra vs Git vs jj
 

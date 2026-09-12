@@ -104,6 +104,10 @@ struct RebaseAuxState {
     /// completes or aborts.
     #[serde(default)]
     autostash: Option<String>,
+    /// Explicit rerere staging choice for this rebase. Missing fields from
+    /// older sidecars inherit the current `rerere.autoUpdate` configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerere_autoupdate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,11 +1076,14 @@ pub struct RebaseArgs {
     #[clap(long = "no-fork-point", overrides_with = "fork_point", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
     pub no_fork_point: bool,
 
-    /// Do not update the rerere (reuse recorded resolution) index. Accepted for
-    /// Git parity and is a no-op: `libra rerere` exists as a standalone command
-    /// but is not yet auto-integrated into rebase, so there is nothing to update
-    /// here. (Git's `--rerere-autoupdate` is not exposed.)
-    #[clap(long = "no-rerere-autoupdate")]
+    /// Auto-stage rerere-replayed resolutions for this rebase, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
+    pub rerere_autoupdate: bool,
+
+    /// Do not auto-stage rerere-replayed resolutions for this rebase, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
     pub no_rerere_autoupdate: bool,
 
     /// Keep commits that begin empty (already empty before replay) rather than
@@ -2098,6 +2105,7 @@ async fn prepare_rebase_aux(args: &RebaseArgs) -> Result<(), RebaseError> {
     let mut aux = RebaseAuxState {
         exec_commands: args.exec.clone(),
         update_refs: args.update_refs,
+        rerere_autoupdate: rerere_autoupdate_override(args),
         ..Default::default()
     };
     if args.autostash {
@@ -2124,6 +2132,20 @@ async fn prepare_rebase_aux(args: &RebaseArgs) -> Result<(), RebaseError> {
     // for every rebase, not only exec/update-refs/autostash runs.
     aux.save()?;
     Ok(())
+}
+
+const fn rerere_autoupdate_override(args: &RebaseArgs) -> Option<bool> {
+    if args.rerere_autoupdate {
+        Some(true)
+    } else if args.no_rerere_autoupdate {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn persisted_rerere_autoupdate() -> Result<Option<bool>, RebaseError> {
+    Ok(RebaseAuxState::load_optional()?.and_then(|aux| aux.rerere_autoupdate))
 }
 
 async fn resolve_rebase_autostash() -> Result<(), RebaseError> {
@@ -3050,6 +3072,7 @@ async fn continue_replay(
     let db = crate::internal::sequencer::request_db_checked()
         .await
         .map_err(RebaseError::StateSave)?;
+    let rerere_autoupdate = persisted_rerere_autoupdate()?;
     let mut summary = RebaseReplaySummary::default();
 
     if emit_human {
@@ -3072,6 +3095,7 @@ async fn continue_replay(
             &state.current_head,
             action,
             state.empty_mode,
+            rerere_autoupdate,
         )
         .await
         {
@@ -3485,7 +3509,9 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
 
         // rerere: the conflict is resolved — record its postimage so an identical
         // conflict is auto-resolved next time. A no-op unless `rerere.enabled`.
-        if let Err(error) = crate::command::rerere::auto_update(false).await {
+        if let Err(error) =
+            crate::command::rerere::auto_update(persisted_rerere_autoupdate()?).await
+        {
             tracing::warn!("rerere auto-update on rebase --continue failed: {error}");
         }
 
@@ -4054,6 +4080,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use clap::Parser;
     use git_internal::{
         hash::ObjectHash,
         internal::object::tree::{Tree, TreeItem, TreeItemMode},
@@ -4063,9 +4090,10 @@ mod tests {
     #[cfg(unix)]
     use super::path_to_index_key;
     use super::{
-        RebaseError, RebaseTreeEntry, ReplayErrorKind, classify_relative_to_base,
-        collect_tree_items_and_paths, create_tree_from_items_map, index_mode_to_tree_item_mode,
-        resolve_three_way, tree_item_mode_to_index_mode, tree_item_name, write_workdir_blob,
+        RebaseArgs, RebaseAuxState, RebaseError, RebaseTreeEntry, ReplayErrorKind,
+        classify_relative_to_base, collect_tree_items_and_paths, create_tree_from_items_map,
+        index_mode_to_tree_item_mode, rerere_autoupdate_override, resolve_three_way,
+        tree_item_mode_to_index_mode, tree_item_name, write_workdir_blob,
     };
     use crate::{
         command::load_object,
@@ -4080,6 +4108,26 @@ mod tests {
             hash: ObjectHash::new(&[byte; 20]),
             mode,
         }
+    }
+
+    #[test]
+    fn rerere_autoupdate_flags_are_last_wins_and_old_aux_state_inherits() {
+        let enabled = RebaseArgs::try_parse_from(["rebase", "--rerere-autoupdate", "main"])
+            .expect("positive rerere toggle must parse");
+        assert_eq!(rerere_autoupdate_override(&enabled), Some(true));
+
+        let disabled = RebaseArgs::try_parse_from([
+            "rebase",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "main",
+        ])
+        .expect("the last rerere toggle must win");
+        assert_eq!(rerere_autoupdate_override(&disabled), Some(false));
+
+        let old: RebaseAuxState = serde_json::from_str("{}")
+            .expect("sidecars written before rerere override remain readable");
+        assert_eq!(old.rerere_autoupdate, None);
     }
 
     #[test]
@@ -4983,6 +5031,7 @@ async fn replay_commit_with_conflict_detection(
     new_parent_id: &ObjectHash,
     action: RebaseTodoAction,
     empty_mode: RebaseEmptyMode,
+    rerere_autoupdate: Option<bool>,
 ) -> ReplayResult {
     let index_file = path::index();
     let current_index = match git_internal::internal::index::Index::load(&index_file) {
@@ -5212,9 +5261,8 @@ async fn replay_commit_with_conflict_detection(
 
         // rerere: record the preimage of each just-written conflict and replay a
         // recorded resolution if one matches. A no-op unless `rerere.enabled`;
-        // staging of a replayed file follows `rerere.autoUpdate` (rebase does not
-        // expose a per-invocation `--rerere-autoupdate`).
-        if let Err(error) = crate::command::rerere::auto_update(false).await {
+        // an explicit sequencer choice overrides `rerere.autoUpdate`.
+        if let Err(error) = crate::command::rerere::auto_update(rerere_autoupdate).await {
             tracing::warn!("rerere auto-update after rebase conflict failed: {error}");
         }
         return ReplayResult::conflict(conflicts);

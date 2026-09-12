@@ -5,7 +5,7 @@
 ## 概要
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--autostash | --no-autostash] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] <branch>...
+libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [--autostash | --no-autostash] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--rerere-autoupdate | --no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] <branch>...
 libra merge --continue [-m <msg> | -F <file>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
 libra merge --quit
@@ -255,7 +255,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
 | `--verify-signatures` | 验证每个目标 tip 的 PGP 签名，任一未签名或签名无效都在变更前中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
 | `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
-| `--no-rerere-autoupdate` | 为对齐 Git 而接受。rerere 已集成：`rerere.enabled` 开启时，冲突合并会记录每个冲突的 preimage 并在有匹配记录时回放已保存的解法；回放文件是否自动暂存跟随 `rerere.autoUpdate` 配置。逐次调用的覆盖未实现——暂存始终跟随配置。（Git 的正向 `--rerere-autoupdate` 未公开。） |
+| `--rerere-autoupdate`, `--no-rerere-autoupdate` | 覆盖本次 merge 的 rerere 回放暂存：正向标志会暂存回放解法，负向标志保持未暂存；最后出现的标志生效。两者均省略时继承 `rerere.autoUpdate`。显式选择会写入 merge state，因此后续 `merge --continue` 仍保持它。rerere 禁用时二者均为 no-op。 |
 | `--signoff` | 在最终 merge 消息后追加 `Signed-off-by: <committer name> <committer email>`。初始请求会由 merge state 保留给 `--continue`；已存在相同的末尾 trailer 时不重复追加。`-s` 已用于策略，因此没有 `-s` 短选项。 |
 | `-S`, `--gpg-sign` | 强制用 vault 签名 merge commit；自动、`-s ours`、octopus 和 `--continue` 提交路径都适用。 |
 | `--no-gpg-sign` | 不用 vault 签名 merge commit。它覆盖 `commit.gpgSign` 与 `vault.signing`；和 `-S` 组成 last-one-wins toggle。 |
@@ -399,7 +399,7 @@ Merge aborted.
 | 合并后 diffstat | `--stat`（打印）；`-n` / `--no-stat`（默认：不打印） | `--stat`（默认） / `-n` / `--no-stat` | N/A |
 | 不显示进度条 | `--no-progress`（no-op；从不渲染） | `--no-progress` | N/A |
 | 禁用签名验证 | `--no-verify-signatures`（默认；关闭 `--verify-signatures`） | `--no-verify-signatures` | N/A |
-| 不更新 rerere | `--no-rerere-autoupdate`（已接受；暂存跟随 `rerere.autoUpdate`） | `--no-rerere-autoupdate` | N/A |
+| Rerere 自动暂存 | `--rerere-autoupdate` / `--no-rerere-autoupdate` 覆盖回放暂存（last-wins）；省略时继承 `rerere.autoUpdate` | 同一 toggle 表面 | 选择跨 `--continue` 保持 |
 | merge commit 签名 | `-S` / `--gpg-sign` 强制 vault 签名；`--no-gpg-sign` 关闭 | 同一 toggle 表面 | 仅 vault；不支持外部 GPG/SSH 签名 |
 | 默认 / recursive 策略 | `-s ort`（默认）、`-s recursive` 别名 | `-s ort`（默认）、`-s recursive` | N/A |
 | Resolve 策略 | `-s resolve`（单 base，不做虚拟祖先或 rename 处理） | `-s resolve` | N/A |

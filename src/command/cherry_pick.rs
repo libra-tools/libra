@@ -316,10 +316,10 @@ struct CherryPickOpts {
     keep_redundant_commits: bool,
     #[serde(default)]
     gpg_sign: bool,
-    /// `--rerere-autoupdate`: stage a rerere-replayed resolution. Persisted so a
-    /// later pick in a resumed sequence keeps auto-staging replayed conflicts.
-    #[serde(default)]
-    rerere_autoupdate: bool,
+    /// Explicit rerere staging policy. `None` inherits `rerere.autoUpdate`;
+    /// either value must survive a conflict + resumed sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerere_autoupdate: Option<bool>,
     /// Mainline parent for merge-commit picks; applies to every commit in the
     /// `-m <n>` invocation, so it must survive a conflict + resume.
     #[serde(default)]
@@ -349,7 +349,7 @@ impl CherryPickOpts {
             allow_empty_message: args.allow_empty_message,
             keep_redundant_commits: args.keep_redundant_commits,
             gpg_sign: args.gpg_sign,
-            rerere_autoupdate: args.rerere_autoupdate,
+            rerere_autoupdate: rerere_autoupdate_override(args),
             mainline: args.mainline,
             cleanup: args.cleanup.clone(),
             empty: args.empty.clone(),
@@ -371,13 +371,24 @@ impl CherryPickOpts {
             allow_empty_message: self.allow_empty_message,
             keep_redundant_commits: self.keep_redundant_commits,
             gpg_sign: self.gpg_sign,
-            rerere_autoupdate: self.rerere_autoupdate,
+            rerere_autoupdate: self.rerere_autoupdate == Some(true),
+            no_rerere_autoupdate: self.rerere_autoupdate == Some(false),
             mainline: self.mainline,
             cleanup: self.cleanup,
             empty: self.empty,
             strategy_option: self.strategy_option.into_iter().collect(),
             ..Default::default()
         }
+    }
+}
+
+const fn rerere_autoupdate_override(args: &CherryPickArgs) -> Option<bool> {
+    if args.rerere_autoupdate {
+        Some(true)
+    } else if args.no_rerere_autoupdate {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -608,17 +619,13 @@ pub struct CherryPickArgs {
     // ── Unsupported Git options captured for explicit rejection ──
     #[clap(long = "strategy", value_name = "name", hide = true)]
     pub strategy: Option<String>,
-    #[clap(
-        long = "rerere-autoupdate",
-        overrides_with = "no_rerere_autoupdate",
-        hide = true
-    )]
+    /// Auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
     pub rerere_autoupdate: bool,
-    #[clap(
-        long = "no-rerere-autoupdate",
-        overrides_with = "rerere_autoupdate",
-        hide = true
-    )]
+    /// Do not auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
     pub no_rerere_autoupdate: bool,
     #[clap(long = "commit", hide = true)]
     pub commit: bool,
@@ -1137,7 +1144,9 @@ async fn run_cherry_pick_continue(
 
     // rerere: the conflict is resolved — record its postimage so an identical
     // conflict is auto-resolved next time. A no-op unless `rerere.enabled`.
-    if let Err(error) = crate::command::rerere::auto_update(opts_args.rerere_autoupdate).await {
+    if let Err(error) =
+        crate::command::rerere::auto_update(rerere_autoupdate_override(&opts_args)).await
+    {
         tracing::warn!("rerere auto-update on cherry-pick --continue failed: {error}");
     }
 
@@ -1580,7 +1589,9 @@ async fn cherry_pick_single_commit(
         // rerere: record the preimage of each just-written conflict and replay a
         // previously recorded resolution if one matches. A no-op unless
         // `rerere.enabled` is set, so default cherry-pick behaviour is unchanged.
-        if let Err(error) = crate::command::rerere::auto_update(args.rerere_autoupdate).await {
+        if let Err(error) =
+            crate::command::rerere::auto_update(rerere_autoupdate_override(args)).await
+        {
             tracing::warn!("rerere auto-update after cherry-pick conflict failed: {error}");
         }
         let mut paths: Vec<String> = conflicts
@@ -2488,6 +2499,7 @@ mod tests {
             allow_empty_message: true,
             keep_redundant_commits: true,
             gpg_sign: true,
+            rerere_autoupdate: true,
             mainline: Some(2),
             cleanup: Some("strip".to_string()),
             empty: Some("drop".to_string()),
@@ -2505,10 +2517,16 @@ mod tests {
         assert!(rebuilt.allow_empty_message);
         assert!(rebuilt.keep_redundant_commits);
         assert!(rebuilt.gpg_sign);
+        assert!(rebuilt.rerere_autoupdate);
+        assert!(!rebuilt.no_rerere_autoupdate);
         assert_eq!(rebuilt.mainline, Some(2));
         assert_eq!(rebuilt.cleanup.as_deref(), Some("strip"));
         assert_eq!(rebuilt.empty.as_deref(), Some("drop"));
         assert_eq!(rebuilt.strategy_option, vec![MergeFavor::Ours]);
+
+        let old: CherryPickOpts = serde_json::from_str("{}")
+            .expect("options written before rerere override remain readable");
+        assert_eq!(old.rerere_autoupdate, None);
     }
 
     #[test]
@@ -2517,5 +2535,21 @@ mod tests {
             .expect("valid cherry-pick arguments should parse");
         assert!(args.gpg_sign);
         assert!(!args.no_gpg_sign);
+    }
+
+    #[test]
+    fn rerere_autoupdate_flags_are_last_wins_and_round_trip() {
+        let args = CherryPickArgs::try_parse_from([
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "deadbeef",
+        ])
+        .expect("the last rerere toggle must win");
+        assert_eq!(rerere_autoupdate_override(&args), Some(false));
+
+        let rebuilt = CherryPickOpts::from_args(&args).into_args();
+        assert!(!rebuilt.rerere_autoupdate);
+        assert!(rebuilt.no_rerere_autoupdate);
     }
 }

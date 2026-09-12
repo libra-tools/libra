@@ -84,9 +84,11 @@ With `rerere.enabled` unset (the default) these hooks are complete no-ops, so
 those commands behave exactly as before.
 
 Staging of a replayed file follows `rerere.autoUpdate` (`libra config
-rerere.autoUpdate true`). `cherry-pick --rerere-autoupdate` turns the same
-staging on for a single invocation; `merge` and `rebase` do not expose the
-positive flag, so they rely on `rerere.autoUpdate`.
+rerere.autoUpdate true`). `merge`, `rebase`, and `cherry-pick` all accept
+`--rerere-autoupdate` to stage a replayed resolution and
+`--no-rerere-autoupdate` to leave it unstaged; the last supplied flag wins and
+omitting both inherits the configuration. The explicit choice survives an
+interrupted operation's `--continue`.
 
 Differences and deferred features: matching is whole-file byte-identical (Git
 normalises each conflict hunk and is independent of ours/theirs order).

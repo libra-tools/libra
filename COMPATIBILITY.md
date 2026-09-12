@@ -469,3 +469,13 @@ strategy winning a tie. JSON adds `selected_strategy` without changing the
 historical `strategy` outcome field. Multi-head merge still uses automatic
 octopus or one explicit `-s ours`; external strategies, `subtree`, and explicit
 `-s octopus` remain unsupported.
+
+## Rerere autoupdate overrides (MG-22)
+
+This section supersedes older per-command text that described the flags as
+no-ops or unimplemented. `merge`, `rebase`, and `cherry-pick` each accept both
+`--rerere-autoupdate` and `--no-rerere-autoupdate`; the last occurrence wins,
+and omitting both inherits `rerere.autoUpdate`. An explicit choice is persisted
+for an interrupted operation: merge state, rebase auxiliary state, and the
+SQLite cherry-pick sequencer state respectively, so `--continue` preserves the
+decision. Both flags are no-ops while `rerere.enabled` is false.

@@ -1749,6 +1749,52 @@ fn conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
     (repo, f1, f2)
 }
 
+/// Two commits that each conflict with `main` on a distinct file. This lets a
+/// resumed cherry-pick prove that its persisted options reach the later pick.
+fn rerere_conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for path in ["first.txt", "second.txt"] {
+        std::fs::write(p.join(path), "base\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", path], p), "add base");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base rerere files", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch feature",
+    );
+    std::fs::write(p.join("first.txt"), "feature first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "first.txt"], p), "add f1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f1", "--no-verify"], p),
+        "commit f1",
+    );
+    let f1 = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("second.txt"), "feature second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f2", "--no-verify"], p),
+        "commit f2",
+    );
+    let f2 = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    for (path, contents) in [
+        ("first.txt", "main first\n"),
+        ("second.txt", "main second\n"),
+    ] {
+        std::fs::write(p.join(path), contents).unwrap();
+        assert_cli_success(&run_libra_command(&["add", path], p), "add main change");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main rerere changes", "--no-verify"], p),
+        "commit main changes",
+    );
+    (repo, f1, f2)
+}
+
 /// `merge.conflictStyle = diff3` is honored by cherry-pick's line-level markers
 /// (parity with `libra merge` — Git honors the config for both): the base block
 /// appears as `||||||| base` with the common-ancestor content (lore.md §1.3).
@@ -1901,6 +1947,146 @@ fn cherry_pick_conflict_persists_state() {
     let blocked = run_libra_command(&["cherry-pick", &feat], p);
     let (_h2, report2) = parse_cli_error_stderr(&blocked.stderr);
     assert_eq!(report2.error_code, "LBR-CONFLICT-002");
+}
+
+#[test]
+fn cherry_pick_rerere_autoupdate_flags_override_configured_staging() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed the reusable resolution cache, then abandon the first sequence.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &feat], p).status.code(),
+        Some(128),
+        "first pick conflicts"
+    );
+    fs::write(p.join("shared.txt"), "resolved\n").expect("write resolution");
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record resolution");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort seed pick",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--no-rerere-autoupdate", &feat], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit off still stops on the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("shared.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit off must leave replayed content unstaged despite true config"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort explicit-off pick",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "false"], p),
+        "configure no auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--rerere-autoupdate", &feat], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit on still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("shared.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit on must stage replayed content despite false config"
+    );
+}
+
+#[test]
+fn cherry_pick_rerere_autoupdate_off_survives_conflict_resume() {
+    let (repo, f1, f2) = rerere_conflict_sequence_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed both independent conflict resolutions before starting the sequence
+    // under test. The second cache entry is only encountered after --continue.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "f1 seed conflict"
+    );
+    fs::write(p.join("first.txt"), "resolved first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f1 resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "stage f1 seed",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 seed conflict"
+    );
+    fs::write(p.join("second.txt"), "resolved second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f2 resolution");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort seed sequence",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--no-rerere-autoupdate", &f1, &f2], p,)
+            .status
+            .code(),
+        Some(128),
+        "f1 replay stops unstaged"
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "manually stage f1 before the new-process continue",
+    );
+
+    // No flag is supplied to this fresh process. It must retain the original
+    // explicit off choice when it reaches f2, despite config being true.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 replay stops after continue"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("second.txt")).unwrap(),
+        "resolved second\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "persisted explicit off must leave f2's replayed resolution unstaged"
+    );
 }
 
 /// An in-progress cherry-pick blocks a new `merge`.

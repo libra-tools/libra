@@ -55,4 +55,4 @@ libra rerere status
 | 检查 | `libra rerere status` / `diff` | `git rerere status` / `diff` |
 | 删除 / 重置 | `libra rerere forget <p>` / `clear` / `gc` | `git rerere forget <p>` / `clear` / `gc` |
 
-差异与延后项：匹配为整文件逐字节相同（Git 对每个冲突 hunk 归一化、与 ours/theirs 顺序无关）；与 `merge` / `rebase` / `cherry-pick` 的**自动**集成（`rerere.enabled` 与 `--rerere-autoupdate`）为已记录的后续项 —— 目前请显式运行 `libra rerere`。那些命令上的 `--rerere-autoupdate` 仍按 no-op 接受。
+差异与延后项：匹配为整文件逐字节相同（Git 对每个冲突 hunk 归一化、与 ours/theirs 顺序无关）。`rerere.enabled=true` 时，`merge` / `rebase` / `cherry-pick` 会自动记录 preimage、回放匹配解法并在完成时记录 postimage；默认关闭时行为不变。三个命令都支持 `--rerere-autoupdate`（暂存回放解法）与 `--no-rerere-autoupdate`（保持未暂存），last-wins；省略时继承 `rerere.autoUpdate`，显式选择跨 `--continue` 保持。

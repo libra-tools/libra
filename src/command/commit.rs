@@ -2283,7 +2283,7 @@ pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<
     // postimage of any tracked conflict now resolved so an identical conflict is
     // auto-resolved next time. A no-op unless `rerere.enabled` and there is a
     // tracked conflict to record (so ordinary commits are unaffected).
-    if !preview && let Err(error) = crate::command::rerere::auto_update(false).await {
+    if !preview && let Err(error) = crate::command::rerere::auto_update(None).await {
         tracing::warn!("rerere auto-update after commit failed: {error}");
     }
     // `--porcelain` replaces the human commit summary with `status --porcelain`

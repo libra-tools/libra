@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、空提交策略、`--cleanup=<mode>`，以及可重复且 last-wins 的 `-X/--strategy-option ours|theirs`。`-X` 复用 merge 的 hunk resolver，只偏向真正冲突 region，保留同文件 clean hunk；add/add 与 modify/delete 选择整侧。有效值经 `CherryPickOpts.strategy_option` 随统一 `sequence_state` 持久化。自动提交保留源 author metadata，committer 取当前身份；消息先去签名。未解决冲突写 index stage 1/2/3 与工作树标记，并支持 `--continue`/`--skip`/`--abort`/`--quit` 及跨操作对称 mutex。自定义 `--strategy` 仍显式拒绝；`--rerere-autoupdate` 在 rerere 启用时生效。
+`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、空提交策略、`--cleanup=<mode>`，以及可重复且 last-wins 的 `-X/--strategy-option ours|theirs` 与 `--rerere-autoupdate`/`--no-rerere-autoupdate`。`-X` 复用 merge 的 hunk resolver，只偏向真正冲突 region，保留同文件 clean hunk；add/add 与 modify/delete 选择整侧。有效值经 `CherryPickOpts` 随统一 `sequence_state` 持久化。自动提交保留源 author metadata，committer 取当前身份；消息先去签名。未解决冲突写 index stage 1/2/3 与工作树标记，并支持 `--continue`/`--skip`/`--abort`/`--quit` 及跨操作对称 mutex。自定义 `--strategy` 仍显式拒绝；rerere disabled 时两个 rerere flag 均为 no-op。
 
 ## 对比 Git 与兼容性
 
@@ -50,8 +50,8 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/cherry-pick.md`。
-- Synopsis：`libra cherry-pick ... [-X <ours|theirs>] [--cleanup=<mode>] <commit>...` 或 `libra cherry-pick (--continue|--skip|--abort|--quit)`。
-- 公开参数在既有 surface 上新增 `-X/--strategy-option <ours|theirs>`（可重复，last-wins）；其余包括消息/空提交控制、sequencer 控制、JSON 与 quiet。
+- Synopsis：`libra cherry-pick ... [-X <ours|theirs>] [--rerere-autoupdate | --no-rerere-autoupdate] [--cleanup=<mode>] <commit>...` 或 `libra cherry-pick (--continue|--skip|--abort|--quit)`。
+- 公开参数在既有 surface 上新增 `-X/--strategy-option <ours|theirs>` 与 `--rerere-autoupdate`/`--no-rerere-autoupdate`（均可重复，last-wins）；后者省略时继承 `rerere.autoUpdate`，且作为 `CherryPickOpts` 写入 sequencer state 供 `--continue` 使用；其余包括消息/空提交控制、sequencer 控制、JSON 与 quiet。
 
 
 ## 还未实现的功能
@@ -63,7 +63,7 @@ flowchart TD
 | ✅ 已实现 | 策略选项 | `-X/--strategy-option ours|theirs` 可重复且 last-wins；共享 `merge::merge_bytes_with_favor` 仅选择冲突 hunk，clean hunk 保留；整路径冲突选择对应侧；`CherryPickOpts` round-trip；`compat_noninteractive_history_controls::cherry_pick_strategy_option_is_hunk_level_and_last_wins` 固定 tree 与 parent。 |
 | ✅ 已实现 | 空提交模式 | 原始对照：`--empty=<how>`；当前说明：`--empty=stop`（默认，halt）/`drop`（跳过冗余提交，HEAD 不前进，打印 `dropping <sha> <subject> -- patch contents already upstream`）/`keep`（保留空提交，等价 `--keep-redundant-commits`）已支持。`effective_empty_mode`：`--empty` 优先，否则 `--keep-redundant-commits`→keep，缺省→stop。在任何 sequencer 分发之前校验（非法 mode → `invalid value for '--empty'`，`LBR-CLI-002`/退出 129，与 `--cleanup` 同样早校验），随 `CherryPickOpts.empty` round-trip 到 `--continue`/`--skip`。`PickOutcome{Committed,Staged,Dropped}` + `PickAccumulator{picked,dropped}` 驱动主循环与 `resume_picks`；`drop` 的 subject 经 `parse_commit_msg` 去签名取首行。带集成测试 `test_cherry_pick_empty_modes`。 |
 | ✅ 已实现 | 消息清理 `--cleanup=<mode>` | 已公开：`strip`/`whitespace`/`verbatim`/`scissors`/`default`，复用 commit 的 `parse_cleanup_mode` + `cleanup_commit_message`（已改为 `pub(crate)`）。`build_cherry_pick_message` 先清理被 pick 的正文（`-e` 时再清理编辑后的缓冲），再追加 `-x`/`Signed-off-by` trailer，从而不会塌陷 trailer 分隔空行；仅在显式给出时生效（默认仍为 trim，行为不变）。无 editor 时 `default`/`scissors` 回退为 `whitespace`（同 commit / git 的“若消息将被编辑”语义）。mode 在 sequencer 控制分发之前即校验，非法值报 `InvalidCleanup` → `LBR-CLI-002`/退出 129（`--continue --cleanup=bogus` 亦快速失败）。通过 `CherryPickOpts.cleanup`（原始字符串）round-trip 到 `--continue`/`--skip`。带集成测试 `cherry_pick_cleanup_strip_then_verbatim`、`cherry_pick_cleanup_survives_conflict_resume`、`cherry_pick_invalid_cleanup_mode_rejected` 与单元 round-trip 守卫。 |
-| 兼容差异项 | rerere 自动更新 | 原始对照：--rerere-autoupdate；相关参数/替代：不适用；当前说明：显式拒绝（LBR-UNSUPPORTED-001 / 128）。后续实现时需要补对应回归测试并同步兼容矩阵。 |
+| ✅ 已实现 | rerere 自动更新 | `--rerere-autoupdate` 暂存回放解法，`--no-rerere-autoupdate` 保持未暂存；last-wins，省略时继承 `rerere.autoUpdate`，选择随 `CherryPickOpts` 到 `--continue`。rerere 禁用时 no-op。证据：`cherry_pick_rerere_autoupdate_flags_override_configured_staging`。 |
 | ✅ 已实现 | 行级冲突 hunk + merge driver | 原始对照：Git 行级三方合并；modify/modify 先经共享 `merge_bytes_with_refined_driver`（path attribute/default 分派），text 冲突再由 `merge::render_line_level_conflict` 重写为 `HEAD`/被 pick 提交缩写；binary driver 写完整存活侧原文（ours 存在时优先）且无 marker；union clean。被 pick 与当前同时新增同一路径时，binary/union 同样以空 base 进入共享 driver；隐式 text 保留既有 add/add 冲突行为。删除/修改仍保持 path conflict。`merge.conflictStyle=merge|diff3|zdiff3` 对 text 同样生效，未知值在真实冲突的索引/工作树写入前拒绝，统一 CRLF 输入生成 CRLF marker。证据：`cherry_pick_conflict_is_line_level`、`cherry_pick_conflict_honors_diff3_style`、`cherry_pick_conflict_honors_zdiff3_style`、`cherry_pick_driver_union_resolves_overlapping_change`、`cherry_pick_driver_default_union_resolves_add_add`、`cherry_pick_driver_binary_preserves_surviving_modify_delete_side`。 |
 | ✅ 已实现 | P0-08 author/message 保真 | `create_cherry_pick_commit` 使用 `original_commit.author.clone()` 作为新提交 author，committer 走 `commit::create_committer_signature`（含 `GIT_COMMITTER_DATE`）；`build_cherry_pick_message` 对源消息调用 `parse_commit_msg` 后再 cleanup/trailer。带 compat 测试 `compat_sequencer_message_author::cherry_pick_preserves_original_author_and_uses_current_committer`。 |
 
