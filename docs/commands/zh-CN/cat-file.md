@@ -20,6 +20,8 @@ Git 对象模式与 batch 输入复用 `rev-parse` 的严格 resolver：支持 r
 
 Batch 模式仅把不可解析或不存在的名称输出为 `<input> missing`。ref 数据库读取失败或对象损坏/不可读会让命令以结构化错误失败，避免把存储损坏静默伪装成缺失对象。
 
+非 squash 合并因冲突暂停时，`AUTO_MERGE` 也可作为对象 spec，表示含冲突标记的自动结果 tree。它只在该 merge state 的生命周期内存在；干净合并和 squash 合并不会创建它。历史伪引用（`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`REVERT_HEAD`、`REBASE_HEAD`、`FETCH_HEAD`）仍不参与对象解析。
+
 ## 选项
 
 | 标志 | 短选项 | 说明 |

@@ -21,6 +21,7 @@ use super::{
     run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
+mod auto_merge;
 mod gpg_sign;
 mod message_options;
 mod quit;
@@ -5925,7 +5926,7 @@ fn merge_crisscross_gc_reclaims_the_virtual_ancestor_and_restart_recovers() {
 
 /// MG-02 G10 + MG-12 G13: the additive octopus fields stay empty for a
 /// single-head recursive merge, and a state file from before either extension
-/// still drives `--abort` to completion.
+/// or `AUTO_MERGE` still drives `--abort` to completion.
 #[test]
 fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
     let repo = create_crisscross_repo();
@@ -5954,6 +5955,7 @@ fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
         "signoff",
         "conflicted_paths",
         "message",
+        "auto_merge",
         // Injected at the JSON layer by `MergeState::save` (W2 worktree
         // ownership), not part of the merge's own schema.
         "owner_scope",

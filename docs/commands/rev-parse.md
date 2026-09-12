@@ -26,6 +26,13 @@ suffixes cannot silently degrade to a different object. Reflog date selectors,
 `@{-N}`, `@{upstream}`/`@{push}`, and relative `./`/`../` tree paths remain
 unsupported and fail explicitly.
 
+`AUTO_MERGE` is the sole pseudo-ref accepted by this command: during a
+non-squash merge paused on conflicts, it resolves to the automatic result
+tree, including conflict markers. It disappears after `merge --continue`,
+`--abort`, or `--quit`; it is unavailable for clean and squash merges. The
+six historical pseudo-refs (`ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+`REVERT_HEAD`, `REBASE_HEAD`, and `FETCH_HEAD`) remain rejected as revisions.
+
 ## Options
 
 | Flag | Description |

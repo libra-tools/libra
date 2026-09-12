@@ -7,6 +7,7 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。`-t` / `-s` / `-p` / `-e` / `--batch-check` / `--batch`（带内容输出）/ `--batch-command`（info/contents）/ `--batch-all-objects`（配合 --batch/--batch-check，遍历 loose+packed，按 id 排序）/ batch 格式串（`=<format>`）/ `--buffer`（缓冲 batch 输出，使 `--batch-command` 的 `flush` 命令生效；需配合 batch 模式）已支持。对象参数共用严格 resolver，支持 `@`、数字 reflog、parent/ancestor、typed/recursive peel、完整 tag ref 和 `REV:path`；`-e --json`/`--machine` 输出 `{ exists: bool }` 信封（保留退出码：存在 0 / 缺失 1 / 非法名 129）已支持（`--follow-symlinks` 未公开）。
+- MG-21 仅在对象读取路径调用 `resolve_object_spec_with_auto_merge_typed`，因此非 squash 冲突 merge state 存在时 `AUTO_MERGE` 可被单对象和 batch 表面读取为 tree；sidecar 清理后恢复明确拒绝。其余六个历史伪引用与所有非 opt-in consumer 均保持默认拒绝。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -15,7 +16,7 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/cat_file.rs`。参数/子命令类型包括：`CatFileArgs`；输出、错误或状态类型包括：源码未暴露独立输出/错误类型，错误通过 `CliResult` 或上层命令错误统一传播；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；Git 对象路径委托 `utils::util::resolve_object_spec_typed`，严格解析 revision、peel 与 tree path 后只读 blob/tree/commit/tag。Batch 仅把不可解析或不存在对象输出为 `<spec> missing`；ref/对象库读取失败或损坏必须作为结构化错误返回，不能静默降级为 missing。AI 路径另行读取 session、checkpoint、thread graph 或 agent profile 状态。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；Git 对象路径委托 `utils::util::resolve_object_spec_with_auto_merge_typed`，严格解析 revision、peel 与 tree path 后只读 blob/tree/commit/tag；该 wrapper 仅显式投影冲突 state 内的 `AUTO_MERGE`，其它输入保持默认 resolver 语义。Batch 仅把不可解析或不存在对象输出为 `<spec> missing`；ref/对象库读取失败或损坏必须作为结构化错误返回，不能静默降级为 missing。AI 路径另行读取 session、checkpoint、thread graph 或 agent profile 状态。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

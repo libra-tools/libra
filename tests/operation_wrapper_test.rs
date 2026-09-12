@@ -452,6 +452,10 @@ async fn persist_failure_rolls_back_business_writes() {
 #[tokio::test]
 /// Verifies that serial duplicate submissions are rejected inside the dedup window.
 async fn serial_duplicate_submission_is_rejected_within_window() {
+    // `Head::current_result_with_conn` intentionally resolves the ambient
+    // worktree scope. Keep that scope stable from fixture setup through the
+    // wrapper's final snapshot while parallel command tests may change CWD.
+    let _cwd_guard = libra::utils::test::ChangeDirGuard::new(env!("CARGO_MANIFEST_DIR"));
     let db = Database::connect("sqlite::memory:").await.unwrap();
     create_operation_schema(&db).await;
     create_reference_table_with_head(&db).await;
@@ -516,6 +520,10 @@ async fn concurrent_duplicate_submission_allows_only_one_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 /// Verifies that concurrent successful writes never create orphan parent links.
 async fn concurrent_writes_keep_parent_links_non_orphaned() {
+    // Each concurrent transaction captures a final view through the ambient
+    // worktree scope. Hold that scope stable for every spawned task while
+    // command tests may otherwise switch the process CWD.
+    let _cwd_guard = libra::utils::test::ChangeDirGuard::new(env!("CARGO_MANIFEST_DIR"));
     let db = Database::connect("sqlite::memory:").await.unwrap();
     create_operation_schema(&db).await;
     create_reference_table_with_head(&db).await;
@@ -665,6 +673,9 @@ async fn cross_scope_interference_cannot_hide_a_duplicate() {
 async fn the_same_action_in_another_worktree_is_not_a_duplicate() {
     use sea_orm::{ConnectionTrait, Statement};
 
+    // The final operation view resolves the ambient worktree after async
+    // database work. Keep it stable while command tests may change process CWD.
+    let _cwd_guard = libra::utils::test::ChangeDirGuard::new(env!("CARGO_MANIFEST_DIR"));
     let db = Database::connect("sqlite::memory:").await.unwrap();
     create_operation_schema(&db).await;
     create_reference_table_with_head(&db).await;
@@ -770,6 +781,10 @@ async fn op_restore_dedup_key_is_scope_aware() {
 async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     use sea_orm::{ConnectionTrait, Statement};
 
+    // The scope is resolved from the ambient worktree more than once while
+    // this async test awaits SQLite. Keep it stable while parallel command
+    // tests may otherwise switch the process CWD.
+    let _cwd_guard = libra::utils::test::ChangeDirGuard::new(env!("CARGO_MANIFEST_DIR"));
     let db = Database::connect("sqlite::memory:").await.unwrap();
     create_operation_schema(&db).await;
     create_reference_table_with_head(&db).await;
@@ -889,6 +904,9 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
 /// NEXT identical submission matches it.
 #[tokio::test]
 async fn a_padded_digest_is_stored_canonically() {
+    // The operation view resolves the ambient worktree after async database
+    // work. Keep it stable while parallel command tests may change process CWD.
+    let _cwd_guard = libra::utils::test::ChangeDirGuard::new(env!("CARGO_MANIFEST_DIR"));
     let db = Database::connect("sqlite::memory:").await.unwrap();
     create_operation_schema(&db).await;
     create_reference_table_with_head(&db).await;

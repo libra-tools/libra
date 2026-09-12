@@ -26,6 +26,8 @@ libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
 
 `libra diff` 显示仓库不同状态之间的更改。默认情况下，它比较索引和已跟踪工作树路径（未暂存更改）。未跟踪文件不属于默认 diff，因此不会影响 `--quiet`、`--exit-code`、`--name-status`、`--numstat` 或 `--shortstat`；请用 `libra status`、`libra ls-files --others` 或 `libra add` 检查或纳入未跟踪文件。使用 `--staged` 时，它比较 HEAD 和索引（已暂存更改）。使用 `--old` 和 `--new` 时，它比较两个任意提交。
 
+非 squash 合并因冲突暂停时，位置参数 `AUTO_MERGE` 可作为包含冲突标记的自动结果 tree-ish。它只在 `merge --continue`、`--abort` 或 `--quit` 前可用；干净合并和 squash 合并不会创建它。六个历史伪引用仍会作为 diff revision 被拒绝。
+
 Diff 引擎默认使用 Myers，与 Git 及底层内建引擎一致。`--minimal`/`--algorithm=myersMinimal` 选择同一无 deadline 的最短编辑 Myers 实现；`--patience` 与 `--histogram`（或对应 `--algorithm` 值）选择真实的可读性后端。可重复的 `--anchored=<text>` 选择 anchored Patience，并尝试让符合条件的唯一行保持为上下文。输出可通过 `--output` 写入文件，并提供代码评审与摘要格式（`--raw`、`--name-only`、`--name-status`、`--numstat`、`--stat`、`--compact-summary`、`--shortstat`、`--summary`）。Pickaxe 过滤 `-S <STRING>` / `-G <REGEX>` 分别按出现次数变化或匹配的增删行筛选 file pair。可用 `-s`/`--no-patch` 配合 `--exit-code` 做仅状态检查；`-z`/`--null` 让 raw/name/numstat 输出以 NUL 终止，便于安全脚本解析。`--word-diff[=<mode>]` 以单词粒度重绘补丁；`--word-diff-regex=<regex>` 定义比较词，`--color-words[=<regex>]` 是颜色模式简写。
 
 当工作树存在未合并冲突条目时，默认工作区 diff 会输出冲突感知的 `diff --cc <path>` 记录，而不是把冲突文件误报为从 `/dev/null` 新增。

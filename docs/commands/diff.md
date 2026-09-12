@@ -26,6 +26,12 @@ libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
+During a non-squash merge paused on conflicts, a positional `AUTO_MERGE` is a
+tree-ish for the automatic result, including conflict markers. It is available
+only until `merge --continue`, `--abort`, or `--quit`; clean and squash merges
+do not create it. The six historical pseudo-refs remain rejected as diff
+revisions.
+
 The diff engine defaults to Myers, matching Git and the underlying built-in engine. `--minimal`/`--algorithm=myersMinimal` select the same no-deadline shortest-edit Myers implementation; `--patience` and `--histogram` (or their `--algorithm` values) select real readability-oriented backends. Repeatable `--anchored=<text>` selects an anchored Patience diff and tries to keep qualifying unique lines as context. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity; `--word-diff-regex=<regex>` defines comparison words, and `--color-words[=<regex>]` is the color shorthand (matching Git's structure; like all Libra diffs, ambiguous word alignments can differ, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.

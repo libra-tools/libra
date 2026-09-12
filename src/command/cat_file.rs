@@ -887,7 +887,7 @@ fn format_batch_line(format: &str, hash: &ObjectHash, obj_type: &str, size: usiz
 }
 
 async fn resolve_object_safe(object_ref: &str, _storage: &ClientStorage) -> CliResult<ObjectHash> {
-    util::resolve_object_spec_typed(object_ref)
+    util::resolve_object_spec_with_auto_merge_typed(object_ref)
         .await
         .map_err(|error| match error {
             util::CommitBaseError::InvalidReference(detail)

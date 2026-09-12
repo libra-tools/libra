@@ -42,7 +42,7 @@ use self::options::parse_rename_score;
 use self::options::{DiffPrefixes, ResolvedDiffConfig, resolve_diff_config};
 use crate::{
     command::{
-        get_target_commit, load_object, read_worktree_blob_bytes,
+        load_object, read_worktree_blob_bytes,
         unmerged::{self, UnmergedEntry},
     },
     internal::{config::ConfigKv, head::Head},
@@ -1803,7 +1803,10 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
             remaining.push(tok);
             continue;
         }
-        let resolves = crate::command::get_target_commit(&tok).await.is_ok();
+        let resolves = crate::command::get_target_commit(&tok).await.is_ok()
+            || crate::utils::util::resolve_tree_ish_with_auto_merge_typed(&tok)
+                .await
+                .is_ok();
         let is_path = exists_as_path(&tok);
         if resolves && is_path && !dashdash {
             return Err(DiffError::AmbiguousArgument(tok));
@@ -3452,10 +3455,7 @@ async fn resolve_diff_side(
     index: &Index,
 ) -> Result<DiffSide, DiffError> {
     if let Some(source) = source {
-        let commit_hash = get_target_commit(source)
-            .await
-            .map_err(|_| DiffError::InvalidRevision(source.clone()))?;
-        let (blobs, modes) = get_commit_entries(&commit_hash).await?;
+        let (blobs, modes) = get_treeish_entries(source).await?;
         return Ok(DiffSide {
             label: source.clone(),
             blobs,
@@ -3510,6 +3510,8 @@ async fn resolve_diff_side(
     }
 }
 
+type DiffTreeEntries = (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>);
+
 async fn get_commit_blobs(
     commit_hash: &ObjectHash,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
@@ -3518,17 +3520,26 @@ async fn get_commit_blobs(
         .map(|(blobs, _)| blobs)
 }
 
-async fn get_commit_entries(
-    commit_hash: &ObjectHash,
-) -> Result<(Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>), DiffError> {
+async fn get_commit_entries(commit_hash: &ObjectHash) -> Result<DiffTreeEntries, DiffError> {
     let commit = load_object::<Commit>(commit_hash).map_err(|e| DiffError::ObjectLoad {
         kind: "commit",
         object_id: commit_hash.to_string(),
         detail: e.to_string(),
     })?;
-    let tree = load_object::<Tree>(&commit.tree_id).map_err(|e| DiffError::ObjectLoad {
+    get_tree_entries(&commit.tree_id)
+}
+
+async fn get_treeish_entries(source: &str) -> Result<DiffTreeEntries, DiffError> {
+    let tree_id = util::resolve_tree_ish_with_auto_merge_typed(source)
+        .await
+        .map_err(|_| DiffError::InvalidRevision(source.to_string()))?;
+    get_tree_entries(&tree_id)
+}
+
+fn get_tree_entries(tree_id: &ObjectHash) -> Result<DiffTreeEntries, DiffError> {
+    let tree = load_object::<Tree>(tree_id).map_err(|e| DiffError::ObjectLoad {
         kind: "tree",
-        object_id: commit.tree_id.to_string(),
+        object_id: tree_id.to_string(),
         detail: e.to_string(),
     })?;
     let mut blobs = Vec::new();

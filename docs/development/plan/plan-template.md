@@ -2,7 +2,7 @@
 
 本文是 `docs/development/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。
 
-**模板版本:** `v2.5`（2026-09-12 起生效；相对 v2.4 的规范性变更：**全量测试统一为** `source .env.test && cargo nextest run --all --no-fail-fast --retries 2`。`cargo test --all` 仅可用于诊断或与 nextest 结果的差异调查，不能作为计划任务卡或计划收口的通过证据。）
+**模板版本:** `v2.5`（2026-09-12 起生效；相对 v2.4 的规范性变更：**全量测试统一使用 `source .env.test && cargo nextest run --all --no-fail-fast --retries 2`**。该多进程执行器是 ER-13 的唯一全量证据入口，保留失败集合并按受控策略重试；`cargo test --all` 仅可用于诊断，不构成全量通过证据。）
 
 **历史版本 — v2.4**（2026-09-10 起生效；相对 v2.3 的规范性变更：新增 **GC-13 数据库迁移作用域与全局配置隔离** —— 任何触及数据库 schema、连接建构、bootstrap、schema top-up、schema 兼容检查或迁移 fixture 的计划，必须声明数据库角色与每类 schema writer 的适用范围；仓库 writer 不得推进全局/系统配置库版本或创建 Repository 表，测试不得触及真实用户/系统配置库；显式 confirmed repair 必须采用一致性备份与原子前滚。）
 
@@ -15,11 +15,11 @@
 ### 模板版本与迁移政策
 
 - 生效日期之后**新建**的计划必须整份符合本版模板。
-- v2.5 的测试迁移适用于尚未执行的计划：其所有未执行任务卡、命中 ER-13 的全量门及计划级收口门，统一运行 `source .env.test && cargo nextest run --all --no-fail-fast --retries 2`。既有 focused 命令不变；旧计划中的 `cargo test --all` 文字在上述范围内由本条替代，历史运行记录不改写。
 - 生效日期之前成稿的计划按**增量迁移**：只有本次被新增或做规范性修改的任务卡需要满足本版 `G-*` 与新增字段；未触碰的卡保持原样，不构成违规，也不要求整份回填。
 - 存量计划若仍按「批量发布组收口时一次 bump」执行，必须在修订历史登记一行例外，并在下次触碰该 `REL-*` 时迁到本版 ER-08（每卡 `patch + 1` + `gh` 发布）。
 - 存量计划整份迁移是一次独立的计划工作，必须单独立卡；不得作为其它任务的附带产物。
 - ER-13 的测试分层是**放宽**而不是收紧：存量计划继续每卡跑全量不构成违规，无需回填。一旦某份计划改按 ER-13 只跑 focused，就必须同时具备两件事——每张会推送的卡有 `Full-suite trigger` 字段，且「完成判据」里的全量收口门（含修复全量暴露 Bug 的要求）已写入；缺任一项不得降级。
+- v2.5 的全量执行器迁移适用于尚未开工的任务卡：其 ER-13 触发门、计划完成门与重跑要求一律使用 `source .env.test && cargo nextest run --all --no-fail-fast --retries 2`。已执行卡的历史命令与结果保留为事实记录，不倒改为 nextest 结果；`cargo test --all` 不得再作为新卡或收口卡的通过替代。
 - 若某份存量计划因迁移成本暂时保留与本版冲突的口径（例如旧的 clippy 命令行、L/XL 卡），在该计划的「修订历史」登记一行例外与预期迁移时机即可。
 
 ## 使用规则
@@ -61,7 +61,7 @@
 - **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，版本面五处 + `Cargo.lock` + artifact；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
 - **发布切片**：一次独立的 review + 验收 + **本卡版本 bump（默认 `patch + 1`）** + 提交 + 推送 + **`gh` 触发 release（Cloudflare）**。
 - **focused 测试**：只覆盖本卡行为的测试集合 —— ER-04 A 组按本卡实际改动表面选出的命令，加上本卡 `Verification` 登记的指定用例。
-- **全量测试**：`source .env.test && cargo nextest run --all --no-fail-fast --retries 2`（L1 全量，L2/L3 未配置 env 时打印 skipped；固定 `--no-fail-fast --retries 2` 以取得完整失败面与可复现的重试策略）。改动 `web/` / `worker/` 时并入各自 `package.json` scripts 的 lint / test / build。fmt 与 clippy 是独立的静态门，不计入「测试」，任何会推送的卡都必须跑（ER-13）。
+- **全量测试**：`source .env.test && cargo nextest run --all --no-fail-fast --retries 2`（L1 全量，L2/L3 未配置 env 时打印 skipped；`--no-fail-fast` 确保保留完整失败集合，`--retries 2` 只按 nextest 报告的 retry/flake 语义记录，不得掩盖最终失败）。`cargo test --all` 仅用于诊断 nextest 自身问题，不能构成通过证据。改动 `web/` / `worker/` 时并入各自 `package.json` scripts 的 lint / test / build。fmt 与 clippy 是独立的静态门，不计入「测试」，任何会推送的卡都必须跑（ER-13）。
 - **家族卡**：共用唯一发布点的一组子卡（G-08）。
 - **恢复模式（字段名 `Rollback mode`）**：`revert` / `forward-only` / `compensating` / `immutable-release` 四种之一（G-01）。不可逆变更用后三种表达，不要求「一次 revert 撤销」。
 
@@ -188,7 +188,7 @@
 1. **ER-01 开工前安全检查:** 运行 `libra status --short --branch`（`--branch` 才会输出 `## <branch>...<upstream>` 行；不带它只有文件状态），确认当前分支与计划指定分支一致、工作区脏状态、目标文件是否已有无关改动。若目标文件已有未确认用户改动，先报告并避免覆盖。
 2. **ER-02 先核对后实现:** 刷新本任务相关源码锚点、文档锚点、测试 target 和外部参照 revision，再决定实现、补测、补文档、关闭或降级。
 3. **ER-03 粒度门禁:** 开工前按粒度规则 `G-*` 逐条复核本任务卡，并逐字段核对该卡的 `Granularity` 摘要行。若核对后发现范围已扩大（新增行为轴、AC/Verification 超限、scope 升到 L、写集与其它在跑任务重叠），先修改计划拆卡再开工，不得在实现中静默扩张任务范围。
-4. **ER-04 每卡验收门:** 门由 **A 表面 focused 门**（按实际改动的表面）+ **B 类型门**（按 `Task type`）+ **C 发布收口门**（覆盖要求对所有非延后卡生效，执行归属见下）+ **D 远端后置门**（有不可本地复现的 CI 语义时）四组组成，**所有适用行累加**，全部通过才算验收。权威口径分层：`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 两门是**任何会推送的改动**的完成契约，模板不得削弱、任何卡不得跳过；第三门为 `source .env.test && cargo nextest run --all --no-fail-fast --retries 2`，在**计划驱动的多任务卡工作**中按 **ER-13** 分层执行 —— 执行阶段默认由本卡 A 组 focused 用例承担，只有命中 ER-13 全量触发条件的卡才在 C 组第 ④ 步跑全量，全部任务卡完成后由「完成判据」的全量收口门统一兜底并修复其暴露的 Bug。任务卡指定的 focused 用例用来证明本卡行为；在需要跑全量的卡上它是**附加**门，不是全量的替代品。`web/`、`worker/` 的命令以各自 `package.json` 的 `scripts` 为权威（本表按当前 scripts 列出，scripts 变更时以 `package.json` 为准并同批更新本表）。本模板当前版本的全量测试口径以此处为准；存量计划按「模板版本与迁移政策」处理，不因本条被追认为违规。
+4. **ER-04 每卡验收门:** 门由 **A 表面 focused 门**（按实际改动的表面）+ **B 类型门**（按 `Task type`）+ **C 发布收口门**（覆盖要求对所有非延后卡生效，执行归属见下）+ **D 远端后置门**（有不可本地复现的 CI 语义时）四组组成，**所有适用行累加**，全部通过才算验收。权威口径分层：`CLAUDE.md`「Quality Acceptance Criteria」中的 `cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 两门是**任何会推送的改动**的完成契约，模板不得削弱、任何卡不得跳过；第三门 `source .env.test && cargo nextest run --all --no-fail-fast --retries 2` 在**计划驱动的多任务卡工作**中按 **ER-13** 分层执行 —— 执行阶段默认由本卡 A 组 focused 用例承担，只有命中 ER-13 全量触发条件的卡才在 C 组第 ④ 步跑全量，全部任务卡完成后由「完成判据」的全量收口门统一兜底并修复其暴露的 Bug。计划之外的独立改动仍按 `CLAUDE.md` 三门执行。任务卡指定的 focused 用例用来证明本卡行为；在需要跑全量的卡上它是**附加**门，不是全量的替代品。`web/`、`worker/` 的命令以各自 `package.json` 的 `scripts` 为权威（本表按当前 scripts 列出，scripts 变更时以 `package.json` 为准并同批更新本表）。权威口径变更时必须同批同步 `CLAUDE.md`、`AGENTS.md`，以及**采用本模板当前版本的计划**（存量计划按「模板版本与迁移政策」处理，不因本条被追认为违规）。
 
    **门不计入条目上限：** 本条列出的门是全局强制门，**不计入**任务卡 `Verification` 的 G-03 条目计数；`Verification` 只登记本卡特有的判据（指定用例、新增守卫、手工证据）。
 
@@ -478,7 +478,7 @@
 | 多轴伪装 | 把多条 AC 合成一条长句、塞进表格或写「等等」以压到 8 条以内 | 按独立谓词还原计数后重新判定（G-03） |
 | 落点注水 | 把 `src/` 或仓库根算作「一个落点」以保住 S/M | 按目录级落点重新计数（G-04） |
 | 隐式依赖 | Description 写「按 X 卡的约定」而 X 卡未交付该约定 | 写进本卡，或提升为全局约束 / ADR（G-05） |
-| 幽灵验收 | `Verification` 只写全量命令（包括 `cargo nextest run --all`），或零命中守卫不区分 `rg` 退出码 `1` 与 `>1` | 指定 target 与 test fn；按「Verification 判定口径」的退出码模板重写（G-05） |
+| 幽灵验收 | `Verification` 只写全量 nextest，或零命中守卫不区分 `rg` 退出码 `1` 与 `>1` | 指定 target 与 test fn；按「Verification 判定口径」的退出码模板重写（G-05） |
 | 悬空依赖 | `Dependencies` 写「Phase N 完成」或自由描述外部前置 | 收敛到具体前置卡 ID / `DEP-*`（G-06） |
 | 假回滚 | 已发布或已迁移数据的卡仍写「一次 revert 撤销」 | 按实际选 `forward-only` / `compensating` / `immutable-release`（G-01） |
 | 并发冲撞 | 两张无依赖的卡实现写集相交 | 只有两条出路：补顺序边，或合并到唯一集成卡（G-10 不可豁免）。版本面争用不算并发冲突，由 ER-12 的串行发布窗口处理 |
@@ -541,8 +541,8 @@
 - 「只允许 allowlist 命中」类守卫必须逐条比对固定 allowlist，并在任务记录中附命中 diff。
 - 仅用于定位符号的 `rg` 必须注明「锚点定位用，非判据」。
 - 本任务新增的 test fn / 场景过滤必须标 `(new)`，并确保其所属 `--test` target 已存在，或在同卡内注册（`tests/compat/*` 还需 `Cargo.toml` `[[test]]`）并同步 `tests/INDEX.md`。
-- `source .env.test && cargo nextest run --all --no-fail-fast --retries 2` 不能替代任务指定用例（ER-04）；反过来，指定用例也不能替代计划完成前的全量 L1 门（见「完成判据」）。
-- 本卡执行阶段是否需要跑全量，按 ER-13 判定并写在 `Full-suite trigger` 字段；`Verification` 只登记本卡特有判据，**不要**把全量 nextest 命令当作本卡判据行登记（它要么由 ER-13 的触发条件带出，要么由收口阶段的全量门覆盖）。
+- 全量 nextest 不能替代任务指定用例（ER-04）；反过来，指定用例也不能替代计划完成前的全量 L1 门（见「完成判据」）。
+- 本卡执行阶段是否需要跑全量，按 ER-13 判定并写在 `Full-suite trigger` 字段；`Verification` 只登记本卡特有判据，**不要**把 `cargo nextest run --all --no-fail-fast --retries 2` 当作本卡判据行登记（它要么由 ER-13 的触发条件带出，要么由收口阶段的全量门覆盖）。
 
 ### Task <ID>: <任务标题>
 

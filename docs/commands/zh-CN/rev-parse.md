@@ -20,6 +20,8 @@ libra rev-parse [OPTIONS] [SPEC]...
 
 共享的严格对象 spec 解析器支持：`@` 作为 `HEAD`、完整 tag ref、`^N`/`~N`、`^{commit|tree|blob|tag|object}` 与递归 `^{}` peel、数字 reflog selector（`main@{1}`、`HEAD@{0}`，以及表示当前分支的 `@{1}`）和 `<tree-ish>:<path>`。解析必须消费完整输入，非法后缀不会静默退化到另一个对象。reflog 日期 selector、`@{-N}`、`@{upstream}`/`@{push}` 与相对 `./`/`../` tree path 仍不支持，并会明确失败。
 
+`AUTO_MERGE` 是本命令唯一接受的伪引用：非 squash 合并因冲突暂停时，它解析为包含冲突标记的自动结果 tree。`merge --continue`、`--abort` 或 `--quit` 后会消失；干净合并和 squash 合并时不可用。六个历史伪引用（`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`REVERT_HEAD`、`REBASE_HEAD`、`FETCH_HEAD`）仍会作为 revision 被拒绝。
+
 ## 选项
 
 | 标志 | 说明 |

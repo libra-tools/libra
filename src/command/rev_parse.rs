@@ -636,7 +636,7 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
         });
     }
 
-    let object_id = util::resolve_object_spec_typed(spec)
+    let object_id = util::resolve_object_spec_with_auto_merge_typed(spec)
         .await
         .map_err(|err| rev_parse_target_error(spec, err))?;
     let object_id = if args.verify || args.short.is_some() {

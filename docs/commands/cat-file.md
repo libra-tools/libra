@@ -35,6 +35,13 @@ In batch modes, only an unresolvable or nonexistent name is rendered as
 `<input> missing`. A ref-database read failure or corrupt/unreadable object
 fails the command with a structured error so storage damage is not hidden.
 
+During a non-squash merge paused on conflicts, `AUTO_MERGE` is also accepted
+as an object spec and names the automatic result tree with its conflict
+markers. It exists only for that merge state's lifetime; clean and squash
+merges do not create it. The historical pseudo-refs (`ORIG_HEAD`,
+`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, and
+`FETCH_HEAD`) remain unavailable to object resolution.
+
 ## Options
 
 | Flag | Short | Description |

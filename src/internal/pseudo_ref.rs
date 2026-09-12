@@ -26,6 +26,7 @@
 //! | `REVERT_HEAD`      | `revert-state.json` `reverted_commit`, or `sequence_state.current_oid` for a revert sequence |
 //! | `REBASE_HEAD`      | `rebase_state.stopped_sha`                          |
 //! | `FETCH_HEAD`       | `<local gitdir>/FETCH_HEAD` (the one pseudo-ref that IS a file, because it holds many rows) |
+//! | `AUTO_MERGE`       | `merge-state.json` `auto_merge` result-tree oid, only for a non-squash conflicted merge |
 //!
 //! Duplicating any of these into a second store is exactly what §C.5 forbids:
 //! two worktrees would then have two ways to disagree about the same sequence.
@@ -35,9 +36,11 @@
 //!
 //! 1. `ORIG_HEAD` here means "the commit this worktree's sequence/bisect
 //!    started from". Git also writes it from `reset`, `am` and others.
-//! 2. None of these names is resolvable by `rev-parse`. `rev-parse` recognises
-//!    `HEAD`/`@` only, and this wave does not widen it — a script that asks for
-//!    `rev-parse MERGE_HEAD` must get a clear refusal, not a silent miss.
+//! 2. The six historical names are not resolvable by `rev-parse`. `AUTO_MERGE`
+//!    is deliberately different: only the opt-in `rev-parse`, `cat-file`, and
+//!    `diff` paths may resolve it, and only while its conflict sidecar lives.
+//!    All other object resolution (including `update-ref`) keeps refusing every
+//!    pseudo-ref name.
 
 use crate::internal::worktree_scope::WorktreeScope;
 
@@ -50,6 +53,7 @@ pub enum PseudoRef {
     RevertHead,
     RebaseHead,
     FetchHead,
+    AutoMerge,
 }
 
 impl PseudoRef {
@@ -62,18 +66,20 @@ impl PseudoRef {
             Self::RevertHead => "REVERT_HEAD",
             Self::RebaseHead => "REBASE_HEAD",
             Self::FetchHead => "FETCH_HEAD",
+            Self::AutoMerge => "AUTO_MERGE",
         }
     }
 
     /// Every name this service answers for — the contract `rev-parse`'s
     /// refusal and the compatibility row are both derived from.
-    pub const ALL: [PseudoRef; 6] = [
+    pub const ALL: [PseudoRef; 7] = [
         PseudoRef::OrigHead,
         PseudoRef::MergeHead,
         PseudoRef::CherryPickHead,
         PseudoRef::RevertHead,
         PseudoRef::RebaseHead,
         PseudoRef::FetchHead,
+        PseudoRef::AutoMerge,
     ];
 
     /// Resolve a Git-spelled name, case-sensitively as Git does.
@@ -167,6 +173,7 @@ impl WorktreePseudoRefs {
             PseudoRef::RevertHead => self.revert_head().await,
             PseudoRef::RebaseHead => self.rebase_stopped().await,
             PseudoRef::FetchHead => Ok(self.fetch_head()?),
+            PseudoRef::AutoMerge => Ok(self.auto_merge()?),
         }
     }
 
@@ -247,6 +254,20 @@ impl WorktreePseudoRefs {
                     oid: state.target,
                     source: "merge-state.json",
                 }
+            }),
+        )
+    }
+
+    /// `AUTO_MERGE` — the automatic result tree of a non-squash conflicted
+    /// merge, available only for the lifetime of its merge sidecar.
+    fn auto_merge(&self) -> Result<Option<ResolvedPseudoRef>, String> {
+        Ok(
+            crate::command::merge::merge_state_for_pseudo_refs(self.gitdir()?)?.and_then(|state| {
+                state.auto_merge.map(|oid| ResolvedPseudoRef {
+                    name: PseudoRef::AutoMerge.name(),
+                    oid,
+                    source: "merge-state.json",
+                })
             }),
         )
     }
@@ -1012,9 +1033,9 @@ mod tests {
         }
     }
 
-    /// §C.5 names exactly these six. The list is the contract `rev-parse`'s
-    /// refusal message and the compatibility row are both derived from, so a
-    /// silent addition here would leave both stale.
+    /// §C.5's six historical names plus MG-21's deliberately constrained
+    /// `AUTO_MERGE` projection. The list is the compatibility contract, so a
+    /// silent addition here would leave it stale.
     #[test]
     fn the_declared_set_is_the_c5_table() {
         let names: Vec<&str> = PseudoRef::ALL.iter().map(|which| which.name()).collect();
@@ -1026,7 +1047,8 @@ mod tests {
                 "CHERRY_PICK_HEAD",
                 "REVERT_HEAD",
                 "REBASE_HEAD",
-                "FETCH_HEAD"
+                "FETCH_HEAD",
+                "AUTO_MERGE"
             ]
         );
     }
@@ -1036,7 +1058,7 @@ mod tests {
         // Git writes these too; §C.5 does not define them here, and pretending
         // otherwise would make `rev-parse` promise a value nothing produces.
         assert_eq!(PseudoRef::parse("BISECT_HEAD"), None);
-        assert_eq!(PseudoRef::parse("AUTO_MERGE"), None);
+        assert_eq!(PseudoRef::parse("AUTO_MERGE"), Some(PseudoRef::AutoMerge));
         // Case-sensitive, as Git is.
         assert_eq!(PseudoRef::parse("merge_head"), None);
     }
