@@ -3,7 +3,7 @@
 ## 命令实现目标
 
 保留默认关闭的 `fastcdc = []` 功能，复用既有确定性分块器、manifest 和本地 chunk store，
-把 FastCDC 接到 Libra 的真实 LFS 上传/下载路径，并与 Mega 的可选服务端实现联动。
+把 FastCDC 接到 Libra 的真实 LFS 上传/下载路径，并与 monoengine 的可选服务端实现联动。
 不增加客户端依赖，不修改 Git 对象图或标准 LFS pointer 的 SHA-256 标识。
 
 ## 对比 Git 与兼容性
@@ -11,7 +11,7 @@
 `intentionally-different`：`media chunk/inspect/verify/probe` 是 Libra 扩展。
 默认构建仍使用标准 LFS；启用功能后，远端没有兼容能力或 manifest 时回退完整对象。
 `lfs.fastcdc=false` 可按仓库关闭传输扩展。所有远端现在都保留仓库路径，
-例如 `/project/demo.git/info/lfs`，不再把 Mega 的地址截断到主机根路径。
+例如 `/project/demo.git/info/lfs`。这不是标准 Git FastCDC 互通。
 
 ## 设计方案
 
@@ -31,7 +31,7 @@
 - `LFSClient::upload_object/download_object` 的新调用严格在 feature gate 内。
   标准 LFS batch 保持 basic，不向普通服务端发送扩展上传请求。
 
-## Mega 协议与权限边界
+## 协议与权限边界
 
 端点位于 `<repo>.git/info/lfs/libra/media/v1`：
 
@@ -48,20 +48,23 @@ prepare 返回 manifest_id 和 missing_chunks。manifest_id 是紧凑 JSON 数�
 `[version,algorithm,hash_algorithm,media_oid,media_size,chunks]` 的 SHA-256，
 不包含客户端 provenance。冻结边界保证同一内容的合法 manifest ID 一致。
 
-Mega 新端点要求 Mono access token，并保留 URI 改写前的仓库路径。
-由于现有 Mega LFS 尚无完整仓库 ACL，本版按「认证用户＋仓库」隔离存储，
-再由 manifest ID / media OID 限定对象范围。不同用户/仓库不能查询或读到彼此的块；
-另一用户的下载回退既有完整 LFS 对象。没有公开的裸 chunk-hash GET。
-服务端必须以 `--features fastcdc` 显式构建，默认不暴露扩展端点。
+monoengine 新端点要求 Mono access token，并保留 URI 改写前的仓库路径。
+本版按「认证用户＋仓库」隔离存储，再由 manifest ID / media OID 限定对象范围。
+不同用户/仓库不能查询或读到彼此的块；另一用户的下载回退既有完整 LFS 对象。
+没有公开的裸 chunk-hash GET。服务端必须以 `--features fastcdc` 显式构建，
+默认不暴露扩展端点。
 
 ## 测试
 
 既有分块/manifest/cache 单测；`media_fastcdc_test` 的 CLI 测试；
 坏块不覆盖目标、普通服务端完整 LFS 回退测试；
-手动 `mega_fastcdc_http_interop` 连接 Mega 的真实 HTTP 路由和令牌验证，
+忽略的 `monoengine_fastcdc_http_interop` 连接真实 HTTP 路由和令牌验证，
 覆盖实际变长分块上传/下载、只补缺块、缓存恢复/修复、跨用户拒绝和空文件。
-两进程命令见 Mega 的 `docs/lfs-api.md`，共享 `MEGA_FASTCDC_READY_FILE`。
-测试结果以本次实际运行记录为准；不把编译失败或 skipped/ignored 计为通过。
+两进程由 monoengine FC-15 启动 feature-on HTTP service 并写入
+`MONOENGINE_FASTCDC_READY_FILE`（JSON 仅含 `lfs_url` 与一次性 `token`）。
+`lfs_url` 必须是 `<repo>.git/info/lfs/`。默认 `cargo test` 的 feature-gate
+guard 不依赖该文件。测试结果以本次实际运行记录为准；不把编译失败或
+skipped/ignored 计为通过。这不是标准 Git FastCDC 互通。
 
 ## 未完成项
 
