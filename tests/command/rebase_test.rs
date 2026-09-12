@@ -314,6 +314,225 @@ fn create_cli_rebase_success_repo() -> tempfile::TempDir {
     repo
 }
 
+/// A rename on the new base must carry the replayed commit's edit to the new
+/// path. This exercises rebase through merge's rename arbitration instead of
+/// treating the change as a delete plus an unrelated add.
+#[test]
+fn test_rebase_rename_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let feature_edit = "line1\nfeature edit\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    commit_file_via_cli(root, "old.txt", base, "base tracks old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(root, "old.txt", feature_edit, "feature edits old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename base path");
+    assert_cli_success(
+        &run_libra_command(&["add", "-A", "."], root),
+        "stage base rename",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main renames path", "--no-verify"], root),
+        "commit base rename",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase edit across renamed path",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("new.txt")).expect("read replayed rename result"),
+        feature_edit
+    );
+    assert!(
+        !root.join("old.txt").exists(),
+        "the old path must not return after the replay"
+    );
+}
+
+/// Attribute-selected drivers are part of the shared tree engine. The union
+/// driver makes an otherwise overlapping replay clean and preserves both sides.
+#[test]
+fn test_rebase_driver_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").expect("write driver base");
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").expect("write driver attributes");
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "stage driver base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver base",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\ntheirs\nbottom\n",
+        "feature driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\nours\nbottom\n",
+        "main driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase through union driver",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).expect("read union result"),
+        "top\nours\ntheirs\nbottom\n"
+    );
+}
+
+/// A flattened replay of a merge commit still has every original parent as a
+/// tree-merge base. Here the merge resolution differs from its first parent:
+/// using that parent alone would replay cleanly, while the shared engine's
+/// recursive virtual ancestor correctly exposes a conflict.
+#[test]
+fn test_rebase_recursive_uses_all_merge_parents() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    commit_file_via_cli(root, "shared.txt", "base\n", "root");
+    assert_cli_success(
+        &run_libra_command(&["branch", "target"], root),
+        "create target branch",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], root),
+        "create topic branch",
+    );
+    commit_file_via_cli(root, "shared.txt", "topic\n", "topic change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(root, "shared.txt", "main\n", "main change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "switch to topic",
+    );
+    let merge = run_libra_command(&["merge", "main"], root);
+    assert_eq!(merge.status.code(), Some(128), "topic/main merge conflicts");
+    fs::write(root.join("shared.txt"), "resolution\n").expect("write merge resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "stage merge resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue"], root),
+        "complete merge commit",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "target"], root),
+        "switch to target",
+    );
+    commit_file_via_cli(root, "target.txt", "target\n", "target-only change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "return to topic",
+    );
+    let output = run_libra_command(&["rebase", "target"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "recursive virtual base must expose the merge-resolution conflict"
+    );
+    let markers = fs::read_to_string(root.join("shared.txt")).expect("read recursive markers");
+    assert!(
+        markers.contains("topic") && markers.contains("resolution"),
+        "the virtual-base replay must compare the rewritten topic with the merge resolution: {markers:?}"
+    );
+}
+
+/// Rebase conflict presentation and index stages are written by the same
+/// materializer as merge. `diff3` exposes the ancestor block while the index
+/// retains the base/ours/theirs roles required by `rebase --continue`.
+#[test]
+fn test_rebase_refine_uses_shared_tree_engine() {
+    let repo = create_cli_rebase_conflict_ready_repo();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], root),
+        "configure diff3 markers",
+    );
+
+    let output = run_libra_command(&["rebase", "main"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "rebase must stop on conflict"
+    );
+    let marker_file = fs::read_to_string(root.join("conflict.txt")).expect("read markers");
+    assert!(
+        marker_file.contains("||||||| base\nbase\n=======\n"),
+        "diff3 ancestor section comes from the shared renderer: {marker_file:?}"
+    );
+
+    let stages = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&stages, "inspect conflicted index stages");
+    let stage_stdout = String::from_utf8_lossy(&stages.stdout);
+    let stage_lines: Vec<_> = stage_stdout
+        .lines()
+        .filter(|line| line.ends_with("\tconflict.txt"))
+        .collect();
+    assert_eq!(
+        stage_lines.len(),
+        3,
+        "expected three conflict stages: {stage_lines:?}"
+    );
+    for stage in [" 1\t", " 2\t", " 3\t"] {
+        assert!(
+            stage_lines.iter().any(|line| line.contains(stage)),
+            "missing stage {stage:?}: {stage_lines:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_rebase_preserves_executable_mode_in_rewritten_commit() {

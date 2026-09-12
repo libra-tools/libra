@@ -3436,6 +3436,186 @@ async fn edit_merge_message(initial: &str) -> Result<String, MergeError> {
         .map_err(|error| MergeError::Editor(error.to_string()))
 }
 
+/// The outcome of applying the shared three-way tree engine to one rebase
+/// replay step.  The caller owns the rebase sequencer and rewritten commit;
+/// this module owns every tree-level decision and conflict materialization.
+pub(crate) enum RebaseTreeMergeOutcome {
+    Clean { tree_id: ObjectHash },
+    Conflicted { paths: Vec<PathBuf> },
+}
+
+/// Apply the merge command's tree engine to a rebase replay step.
+///
+/// Rebase supplies the original parent(s) as `base_commits`, its rewritten tip
+/// as `ours`, and the commit being replayed as `theirs`.  Keeping this adapter
+/// in `merge` prevents rebase from growing a second tree walker: rename
+/// arbitration, driver dispatch, recursive virtual ancestors, conflict
+/// refinement, D/F placement, index stages, and worktree conflict files all
+/// use the same implementation as `libra merge`.
+pub(crate) async fn merge_rebase_trees(
+    base_commits: &[Commit],
+    ours: &Commit,
+    theirs: &Commit,
+) -> Result<RebaseTreeMergeOutcome, PullMergeError> {
+    let output = OutputConfig::default();
+    let rename_config = merge_rename_config().await?;
+    let options = ThreeWayMergeOptions {
+        message_override: None,
+        merge_log: 0,
+        into_name: None,
+        cleanup: None,
+        edit: false,
+        squash: true,
+        no_commit: false,
+        skip_hooks: false,
+        signing_policy: crate::command::history_config::CommitSigningPolicy::Disable,
+        signoff: false,
+        rerere_autoupdate: None,
+        dry_run: false,
+        strategy: None,
+        strategy_evaluation: None,
+        favor: None,
+        allow_unrelated_histories: false,
+        fast_forwardable: false,
+        rename_config: Some(rename_config.clone()),
+        merge_default_driver: read_merge_default_driver()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?,
+        external_merge_runtime: read_external_merge_runtime()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?,
+        input_normalization: MergeInputNormalization {
+            whitespace: None,
+            renormalize: resolve_merge_renormalize(None).await?,
+        },
+        output: &output,
+    };
+    let replay_label = short_object_id(&theirs.id);
+    let (mut our_items, our_gitlinks) = commit_tree_split_for_merge(ours)?;
+    let (mut their_items, their_gitlinks) = commit_tree_split_for_merge(theirs)?;
+    let passthrough_gitlinks =
+        ensure_merge_gitlinks_uniform(base_commits, &our_gitlinks, &their_gitlinks)?;
+
+    let (conflict_style, mut deferred_conflict_style_error) =
+        match conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (ConflictStyle::Merge, Some(error)),
+        };
+    if base_commits.len() > 1
+        && let Some(error) = deferred_conflict_style_error.take()
+    {
+        return Err(pull_conflict_style_error(error));
+    }
+
+    let (mut base_items, mut virtual_blobs) = match base_commits {
+        [] => (HashMap::new(), VirtualBlobs::new()),
+        [base] => (commit_tree_split_for_merge(base)?.0, VirtualBlobs::new()),
+        bases => {
+            let base_ids: Vec<ObjectHash> = bases.iter().map(|base| base.id).collect();
+            let ancestor = virtual_merge_base(
+                &base_ids,
+                &passthrough_gitlinks,
+                VirtualFold {
+                    persist: true,
+                    conflict_style,
+                    rename_config: &rename_config,
+                    default_driver: options.merge_default_driver.as_deref(),
+                    external_merge_runtime: options.external_merge_runtime.clone(),
+                    input_normalization: options.input_normalization,
+                },
+            )?;
+            (ancestor.items, ancestor.blobs)
+        }
+    };
+    let rename_report = detect_and_apply_renames(
+        &mut base_items,
+        &mut our_items,
+        &mut their_items,
+        &rename_config,
+        conflict_style,
+        ("HEAD", replay_label.as_str()),
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
+            conflict_style,
+            &replay_label,
+            &mut virtual_blobs,
+        ),
+    )?;
+    let mut merge_result = merge_tree_items(
+        &base_items,
+        &our_items,
+        &their_items,
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
+            conflict_style,
+            &replay_label,
+            &mut virtual_blobs,
+        ),
+    )?;
+    for (path, kind) in &rename_report.forced {
+        merge_result.merged_items.remove(path);
+        merge_result.conflicts.retain(|(other, _)| other != path);
+        merge_result.conflicts.push((path.clone(), *kind));
+    }
+    for (path, gitlink) in &passthrough_gitlinks {
+        merge_result.merged_items.insert(
+            path.clone(),
+            MergeTreeEntry {
+                hash: *gitlink,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    merge_result
+        .conflicts
+        .sort_by(|(left, _), (right, _)| left.cmp(right));
+    let placements = conflict_placements(
+        &merge_result.conflicts,
+        &df_occupied_names_if_needed(
+            &[&base_items, &our_items, &their_items],
+            &merge_result.merged_items,
+            &merge_result.conflicts,
+        ),
+        &replay_label,
+    );
+
+    if !merge_result.conflicts.is_empty() {
+        if let Some(error) = deferred_conflict_style_error.take() {
+            return Err(pull_conflict_style_error(error));
+        }
+        let paths = placements.iter().map(|(path, _, _)| path.clone()).collect();
+        // `squash` deliberately reuses merge's materializer without creating a
+        // MergeState. Rebase persists its own state immediately after this
+        // function reports the conflict.
+        write_conflicted_merge_state(MergeConflictInput {
+            head_name: String::new(),
+            message: String::new(),
+            squash: true,
+            upstream: replay_label,
+            base: recorded_merge_base(base_commits),
+            allow_unrelated_histories: false,
+            skip_hooks: false,
+            signing_policy: crate::command::history_config::CommitSigningPolicy::Disable,
+            signoff: false,
+            rerere_autoupdate: None,
+            strategy: None,
+            ours: ours.id,
+            theirs: theirs.id,
+            merged_items: merge_result.merged_items,
+            placements,
+            base_items,
+            our_items,
+            their_items,
+            conflict_style,
+        })?;
+        return Ok(RebaseTreeMergeOutcome::Conflicted { paths });
+    }
+
+    let tree_id = create_tree_from_items_map(&merge_result.merged_items)
+        .map_err(PullMergeError::TreeCreate)?;
+    Ok(RebaseTreeMergeOutcome::Clean { tree_id })
+}
+
 /// The message-related knobs shared by every merge backend. Keeping them
 /// together prevents message compatibility from making strategy APIs brittle.
 #[derive(Clone, Copy)]

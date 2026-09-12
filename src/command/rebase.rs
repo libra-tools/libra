@@ -1,7 +1,6 @@
 //! Rebase implementation that parses onto/branch arguments, replays commits onto a new base, handles conflicts, and updates branch refs.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
@@ -15,7 +14,7 @@ use git_internal::{
     internal::object::{
         blob::Blob,
         commit::Commit,
-        tree::{Tree, TreeItem, TreeItemMode},
+        tree::{Tree, TreeItemMode},
     },
 };
 use sea_orm::{
@@ -38,7 +37,6 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         ignore::IgnorePolicy,
-        object_ext::{BlobExt, TreeExt},
         output::{OutputConfig, emit_json_data},
         path, util, worktree,
     },
@@ -883,7 +881,7 @@ fn resolve_rebase_empty_mode(args: &RebaseArgs) -> CliResult<RebaseEmptyMode> {
 }
 
 /// Categorizes the cause of a non-conflict failure inside
-/// [`replay_commit_with_conflict_detection`].
+/// [`replay_commit_with_unified_merge`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayErrorKind {
@@ -906,6 +904,9 @@ pub enum ReplayErrorKind {
     /// A replayed commit's three-way inputs carry a gitlink the rebase would
     /// have to arbitrate — refused fail-closed (ADR-MG-01).
     GitlinkUnsupported,
+    /// The shared merge tree engine could not prepare or materialize the
+    /// replay. The original error detail remains user-visible.
+    MergeEngine,
 }
 
 impl ReplayErrorKind {
@@ -928,6 +929,7 @@ impl ReplayErrorKind {
             ReplayErrorKind::WorkdirReset => "workdir_reset",
             ReplayErrorKind::IdentityMissing => "identity_missing",
             ReplayErrorKind::GitlinkUnsupported => "gitlink_unsupported",
+            ReplayErrorKind::MergeEngine => "merge_engine",
         }
     }
 
@@ -951,6 +953,7 @@ impl ReplayErrorKind {
             | ReplayErrorKind::WorkdirReset => StableErrorCode::IoWriteFailed,
             ReplayErrorKind::IdentityMissing => StableErrorCode::AuthMissingCredentials,
             ReplayErrorKind::GitlinkUnsupported => StableErrorCode::Unsupported,
+            ReplayErrorKind::MergeEngine => StableErrorCode::RepoStateInvalid,
         }
     }
 }
@@ -2540,7 +2543,7 @@ async fn reflog_fork_point(
 /// the `--autostash` stash commit + worktree reset, the aux sidecar, the branch
 /// switch, the HEAD detach, and the state claim.
 ///
-/// The per-replay guard in `replay_commit_with_conflict_detection` cannot serve
+/// The per-replay guard in the unified tree engine cannot serve
 /// here: a step's "ours" side only exists once the previous steps have been
 /// applied, so a refusal there arrives after HEAD has already moved. This asks
 /// the conservative whole-sequence question instead — every input tree of the
@@ -2625,11 +2628,9 @@ async fn preflight_rebase_gitlinks(
     }
 
     // The inputs of the actual replay: the landing tree the first step merges
-    // onto, and — for each replayed commit — its own tree plus its FIRST
-    // parent's tree, which is the base
-    // `replay_commit_with_conflict_detection` diffs against. Any other parent
-    // of a merge commit is never a three-way input, so including it would
-    // refuse rebases that arbitrate nothing.
+    // onto, and — for each replayed commit — its own tree plus every original
+    // parent. The shared tree engine folds multiple parent bases into its
+    // recursive virtual ancestor before applying the flattened replay.
     let mut inputs = Vec::with_capacity(1 + commits.len() * 2);
     match commit_gitlinks(&newbase_id) {
         Ok(gitlinks) => inputs.push(gitlinks),
@@ -2643,14 +2644,16 @@ async fn preflight_rebase_gitlinks(
             Ok(gitlinks) => inputs.push(gitlinks),
             Err(_) => return Ok(()),
         }
-        let Some(parent_id) = commit.parent_commit_ids.first() else {
+        if commit.parent_commit_ids.is_empty() {
             // A root commit has no base tree to diff against; the replay
             // refuses it separately (`ReplayErrorKind::MissingParent`).
             return Ok(());
-        };
-        match commit_gitlinks(parent_id) {
-            Ok(gitlinks) => inputs.push(gitlinks),
-            Err(_) => return Ok(()),
+        }
+        for parent_id in &commit.parent_commit_ids {
+            match commit_gitlinks(parent_id) {
+                Ok(gitlinks) => inputs.push(gitlinks),
+                Err(_) => return Ok(()),
+            }
         }
     }
     merge::ensure_gitlinks_uniform_across_inputs("rebase", &inputs)
@@ -3090,7 +3093,7 @@ async fn continue_replay(
             .front()
             .copied()
             .unwrap_or(RebaseTodoAction::Pick);
-        match replay_commit_with_conflict_detection(
+        match replay_commit_with_unified_merge(
             &commit_id,
             &state.current_head,
             action,
@@ -3899,20 +3902,20 @@ fn has_unmerged_entries(index: &git_internal::internal::index::Index) -> bool {
 fn create_tree_from_index(
     index: &git_internal::internal::index::Index,
 ) -> Result<ObjectHash, String> {
-    let mut items: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
+    let mut items: HashMap<PathBuf, merge::MergeTreeEntry> = HashMap::new();
     for path in index.tracked_files() {
         let path_str = path_to_index_key(&path)?;
         if let Some(entry) = index.get(path_str, 0) {
             items.insert(
                 path.clone(),
-                RebaseTreeEntry {
+                merge::MergeTreeEntry {
                     hash: entry.hash,
                     mode: index_mode_to_tree_item_mode(entry.mode)?,
                 },
             );
         }
     }
-    create_tree_from_items_map(&items)
+    merge::create_tree_from_items_map(&items)
 }
 
 fn write_workdir_file(workdir: &Path, path: &Path, content: &[u8]) -> Result<(), String> {
@@ -3934,7 +3937,7 @@ fn write_workdir_file(workdir: &Path, path: &Path, content: &[u8]) -> Result<(),
 fn write_rebase_workdir_entry(
     workdir: &Path,
     path: &Path,
-    entry: RebaseTreeEntry,
+    entry: merge::MergeTreeEntry,
 ) -> Result<(), String> {
     // Submodule pointers never reach the working tree (ADR-MG-01): the commit
     // object belongs to the submodule, so loading it as a blob would fail.
@@ -4017,98 +4020,22 @@ fn write_workdir_symlink(workdir: &Path, path: &Path, target: &[u8]) -> Result<(
     write_workdir_file(workdir, path, target)
 }
 
-fn write_conflict_file(workdir: &Path, path: &Path, content: &str) -> Result<(), String> {
-    write_workdir_file(workdir, path, content.as_bytes())
-        .map_err(|e| format!("conflict file: {}", e))
-}
-
-fn conflict_marker_eol() -> &'static str {
-    if cfg!(windows) { "\r\n" } else { "\n" }
-}
-
-fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
-    match std::str::from_utf8(content) {
-        Ok(text) => Cow::Borrowed(text),
-        Err(_) => Cow::Owned(format!("[binary content, {} bytes]", content.len())),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RebaseTreeEntry {
-    hash: ObjectHash,
-    mode: TreeItemMode,
-}
-
-/// Flatten each tree into its mergeable entries, the gitlinks it carries, and
-/// the union of the mergeable paths.
-///
-/// Gitlinks are split out rather than dropped: submodule content is never
-/// merged (ADR-MG-01), but the pointers still have to reach
-/// [`merge::ensure_gitlinks_not_arbitrated`] so a diverged one is refused and
-/// an agreed-on one survives into the replayed tree.
-fn collect_tree_items_and_paths<'a>(
-    trees: impl IntoIterator<Item = &'a Tree>,
-) -> (
-    Vec<HashMap<PathBuf, RebaseTreeEntry>>,
-    Vec<merge::GitlinkEntries>,
-    HashSet<PathBuf>,
-) {
-    let mut items = Vec::new();
-    let mut gitlinks = Vec::new();
-    let mut all_paths = HashSet::new();
-    for tree in trees {
-        let mut map: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
-        let mut links = merge::GitlinkEntries::new();
-        for (path, hash, mode) in tree.get_plain_items_with_mode() {
-            if mode == TreeItemMode::Commit {
-                links.insert(path, hash);
-            } else {
-                map.insert(path, RebaseTreeEntry { hash, mode });
-            }
-        }
-        all_paths.extend(map.keys().cloned());
-        items.push(map);
-        gitlinks.push(links);
-    }
-    (items, gitlinks, all_paths)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, HashSet},
-        path::{Path, PathBuf},
-    };
+    #[cfg(unix)]
+    use std::path::Path;
 
     use clap::Parser;
-    use git_internal::{
-        hash::ObjectHash,
-        internal::object::tree::{Tree, TreeItem, TreeItemMode},
-    };
+    use git_internal::internal::object::tree::TreeItemMode;
     use tempfile::tempdir;
 
     #[cfg(unix)]
     use super::path_to_index_key;
     use super::{
-        RebaseArgs, RebaseAuxState, RebaseError, RebaseTreeEntry, ReplayErrorKind,
-        classify_relative_to_base, collect_tree_items_and_paths, create_tree_from_items_map,
-        index_mode_to_tree_item_mode, rerere_autoupdate_override, resolve_three_way,
-        tree_item_mode_to_index_mode, tree_item_name, write_workdir_blob,
+        RebaseArgs, RebaseAuxState, RebaseError, ReplayErrorKind, index_mode_to_tree_item_mode,
+        rerere_autoupdate_override, write_workdir_blob,
     };
-    use crate::{
-        command::load_object,
-        utils::{
-            error::{CliError, StableErrorCode},
-            test::{ChangeDirGuard, setup_with_new_libra_in},
-        },
-    };
-
-    fn rebase_entry(byte: u8, mode: TreeItemMode) -> RebaseTreeEntry {
-        RebaseTreeEntry {
-            hash: ObjectHash::new(&[byte; 20]),
-            mode,
-        }
-    }
+    use crate::utils::error::{CliError, StableErrorCode};
 
     #[test]
     fn rerere_autoupdate_flags_are_last_wins_and_old_aux_state_inherits() {
@@ -4167,6 +4094,11 @@ mod tests {
             StableErrorCode::Unsupported
         );
 
+        assert_eq!(
+            ReplayErrorKind::MergeEngine.stable_code(),
+            StableErrorCode::RepoStateInvalid
+        );
+
         // Write/save side failures all surface as IO write failed.
         for kind in [
             ReplayErrorKind::ConflictMarker,
@@ -4207,6 +4139,7 @@ mod tests {
             ReplayErrorKind::GitlinkUnsupported.as_str(),
             "gitlink_unsupported"
         );
+        assert_eq!(ReplayErrorKind::MergeEngine.as_str(), "merge_engine");
     }
 
     /// Pin the `Display` format for the static-message `RebaseError`
@@ -4506,26 +4439,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tree_item_name_rejects_paths_without_file_name() {
-        let err = tree_item_name(Path::new("")).expect_err("empty path should fail");
-        assert!(err.contains("path has no file name"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tree_item_name_rejects_non_utf8_paths() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-
-        let path = PathBuf::from(OsString::from_vec(vec![0x66, 0x80]));
-        let err = tree_item_name(&path).expect_err("non-UTF-8 path should fail");
-        assert!(err.contains("path is not valid UTF-8"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn path_to_index_key_rejects_non_utf8_paths() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
 
         let path = PathBuf::from(OsString::from_vec(vec![0x66, 0x80]));
         let err = path_to_index_key(&path).expect_err("non-UTF-8 path should fail");
@@ -4533,185 +4450,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_tree_items_and_paths_unions_paths_and_preserves_items() {
-        let a_hash = ObjectHash::new(&[1; 20]);
-        let b_hash = ObjectHash::new(&[2; 20]);
-        let b2_hash = ObjectHash::new(&[3; 20]);
-        let c_hash = ObjectHash::new(&[4; 20]);
-
-        let tree1 = Tree::from_tree_items(vec![
-            TreeItem::new(TreeItemMode::Blob, a_hash, "a.txt".to_string()),
-            TreeItem::new(TreeItemMode::BlobExecutable, b_hash, "b.txt".to_string()),
-        ])
-        .expect("tree1");
-
-        let tree2 = Tree::from_tree_items(vec![
-            TreeItem::new(TreeItemMode::Blob, b2_hash, "b.txt".to_string()),
-            TreeItem::new(TreeItemMode::Link, c_hash, "c.txt".to_string()),
-        ])
-        .expect("tree2");
-
-        let (items, gitlinks, all_paths) = collect_tree_items_and_paths([&tree1, &tree2]);
-        assert_eq!(items.len(), 2);
-        assert!(
-            gitlinks.iter().all(|links| links.is_empty()),
-            "trees without gitlinks must produce empty gitlink maps"
-        );
-
-        let expected_first: HashMap<PathBuf, RebaseTreeEntry> = HashMap::from([
-            (
-                PathBuf::from("a.txt"),
-                RebaseTreeEntry {
-                    hash: a_hash,
-                    mode: TreeItemMode::Blob,
-                },
-            ),
-            (
-                PathBuf::from("b.txt"),
-                RebaseTreeEntry {
-                    hash: b_hash,
-                    mode: TreeItemMode::BlobExecutable,
-                },
-            ),
-        ]);
-        let expected_second: HashMap<PathBuf, RebaseTreeEntry> = HashMap::from([
-            (
-                PathBuf::from("b.txt"),
-                RebaseTreeEntry {
-                    hash: b2_hash,
-                    mode: TreeItemMode::Blob,
-                },
-            ),
-            (
-                PathBuf::from("c.txt"),
-                RebaseTreeEntry {
-                    hash: c_hash,
-                    mode: TreeItemMode::Link,
-                },
-            ),
-        ]);
-        assert_eq!(items[0], expected_first);
-        assert_eq!(items[1], expected_second);
-
-        let expected_paths: HashSet<PathBuf> = HashSet::from([
-            PathBuf::from("a.txt"),
-            PathBuf::from("b.txt"),
-            PathBuf::from("c.txt"),
-        ]);
-        assert_eq!(all_paths, expected_paths);
-    }
-
-    #[test]
-    fn classify_relative_to_base_tracks_state() {
-        let base = rebase_entry(1, TreeItemMode::Blob);
-        let same = base;
-        let modified = rebase_entry(2, TreeItemMode::BlobExecutable);
-
-        match classify_relative_to_base(Some(&base), Some(&same)) {
-            super::RelativeState::Same(entry) => assert_eq!(entry, base),
-            other => panic!("expected Same, got {:?}", other),
-        }
-
-        match classify_relative_to_base(Some(&base), Some(&modified)) {
-            super::RelativeState::Modified(entry) => assert_eq!(entry, modified),
-            other => panic!("expected Modified, got {:?}", other),
-        }
-
-        match classify_relative_to_base(Some(&base), None) {
-            super::RelativeState::Deleted => {}
-            other => panic!("expected Deleted, got {:?}", other),
-        }
-
-        match classify_relative_to_base(None, Some(&modified)) {
-            super::RelativeState::Added(entry) => assert_eq!(entry, modified),
-            other => panic!("expected Added, got {:?}", other),
-        }
-
-        match classify_relative_to_base(None, None) {
-            super::RelativeState::Missing => {}
-            other => panic!("expected Missing, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn resolve_three_way_merges_and_conflicts() {
-        let base = rebase_entry(1, TreeItemMode::Blob);
-        let ours = rebase_entry(2, TreeItemMode::BlobExecutable);
-        let theirs = rebase_entry(3, TreeItemMode::Link);
-
-        match resolve_three_way(Some(&base), Some(&base), Some(&base)) {
-            super::MergeResolution::Use(entry) => assert_eq!(entry, base),
-            other => panic!("expected Use(base), got {:?}", other),
-        }
-
-        match resolve_three_way(Some(&base), Some(&base), Some(&ours)) {
-            super::MergeResolution::Use(entry) => assert_eq!(entry, ours),
-            other => panic!("expected Use(ours), got {:?}", other),
-        }
-
-        match resolve_three_way(Some(&base), Some(&theirs), Some(&base)) {
-            super::MergeResolution::Use(entry) => assert_eq!(entry, theirs),
-            other => panic!("expected Use(theirs), got {:?}", other),
-        }
-
-        match resolve_three_way(Some(&base), Some(&theirs), Some(&ours)) {
-            super::MergeResolution::Conflict(super::ConflictKind::BothChanged {
-                ours: o,
-                theirs: t,
-            }) => {
-                assert_eq!(o, ours.hash);
-                assert_eq!(t, theirs.hash);
-            }
-            other => panic!("expected BothChanged conflict, got {:?}", other),
-        }
-
-        match resolve_three_way(None, Some(&theirs), Some(&ours)) {
-            super::MergeResolution::Conflict(super::ConflictKind::BothChanged {
-                ours: o,
-                theirs: t,
-            }) => {
-                assert_eq!(o, ours.hash);
-                assert_eq!(t, theirs.hash);
-            }
-            other => panic!("expected BothChanged conflict (add/add), got {:?}", other),
-        }
-
-        match resolve_three_way(Some(&base), None, Some(&ours)) {
-            super::MergeResolution::Conflict(super::ConflictKind::OursModifiedTheirsDeleted {
-                ours: o,
-            }) => assert_eq!(o, ours.hash),
-            other => panic!(
-                "expected ours-modified/theirs-deleted conflict, got {:?}",
-                other
-            ),
-        }
-
-        match resolve_three_way(Some(&base), Some(&theirs), None) {
-            super::MergeResolution::Conflict(super::ConflictKind::TheirsModifiedOursDeleted {
-                theirs: t,
-            }) => assert_eq!(t, theirs.hash),
-            other => panic!(
-                "expected theirs-modified/ours-deleted conflict, got {:?}",
-                other
-            ),
-        }
-    }
-
-    #[test]
     fn rebase_index_tree_mode_conversions_pin_supported_modes() {
-        assert_eq!(
-            tree_item_mode_to_index_mode(TreeItemMode::Blob).expect("regular blob"),
-            0o100644
-        );
-        assert_eq!(
-            tree_item_mode_to_index_mode(TreeItemMode::BlobExecutable).expect("executable blob"),
-            0o100755
-        );
-        assert_eq!(
-            tree_item_mode_to_index_mode(TreeItemMode::Link).expect("symlink"),
-            0o120000
-        );
-
         assert_eq!(
             index_mode_to_tree_item_mode(0o100644).expect("regular blob"),
             TreeItemMode::Blob
@@ -4724,48 +4463,10 @@ mod tests {
             index_mode_to_tree_item_mode(0o120000).expect("symlink"),
             TreeItemMode::Link
         );
-        // ADR-MG-01: gitlinks round-trip as `160000` instead of failing. Only a
-        // pass-through pointer (identical on all three sides) ever reaches these
-        // conversions — an arbitrated one is refused by
-        // `merge::ensure_gitlinks_not_arbitrated` before the replay writes
-        // anything — so the mapping preserves the submodule the tree declares.
-        assert_eq!(
-            tree_item_mode_to_index_mode(TreeItemMode::Commit).expect("gitlink"),
-            0o160000
-        );
         assert_eq!(
             index_mode_to_tree_item_mode(0o160000).expect("gitlink"),
             TreeItemMode::Commit
         );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn create_tree_from_items_map_preserves_blob_modes() {
-        let repo = tempdir().expect("temp repo");
-        setup_with_new_libra_in(repo.path()).await;
-        let _guard = ChangeDirGuard::new(repo.path());
-
-        let executable = rebase_entry(1, TreeItemMode::BlobExecutable);
-        let symlink = rebase_entry(2, TreeItemMode::Link);
-        let regular = rebase_entry(3, TreeItemMode::Blob);
-        let items = HashMap::from([
-            (PathBuf::from("run.sh"), executable),
-            (PathBuf::from("link"), symlink),
-            (PathBuf::from("plain.txt"), regular),
-        ]);
-
-        let tree_id = create_tree_from_items_map(&items).expect("create tree");
-        let tree: Tree = load_object(&tree_id).expect("load created tree");
-        let modes: HashMap<_, _> = tree
-            .tree_items
-            .iter()
-            .map(|item| (item.name.as_str(), item.mode))
-            .collect();
-
-        assert_eq!(modes.get("run.sh"), Some(&TreeItemMode::BlobExecutable));
-        assert_eq!(modes.get("link"), Some(&TreeItemMode::Link));
-        assert_eq!(modes.get("plain.txt"), Some(&TreeItemMode::Blob));
     }
 
     #[cfg(unix)]
@@ -4832,6 +4533,7 @@ mod tests {
             ReplayErrorKind::GitlinkUnsupported.to_string(),
             "gitlink_unsupported"
         );
+        assert_eq!(ReplayErrorKind::MergeEngine.to_string(), "merge_engine");
     }
 }
 
@@ -4876,142 +4578,6 @@ async fn resolve_branch_or_commit(reference: &str) -> Result<ObjectHash, String>
     util::get_commit_base(reference).await
 }
 
-#[derive(Debug, Copy, Clone)]
-enum MergeResolution {
-    Use(RebaseTreeEntry),
-    Delete,
-    Conflict(ConflictKind),
-}
-
-#[derive(Debug, Copy, Clone)]
-enum ConflictKind {
-    BothChanged {
-        ours: ObjectHash,
-        theirs: ObjectHash,
-    },
-    OursModifiedTheirsDeleted {
-        ours: ObjectHash,
-    },
-    TheirsModifiedOursDeleted {
-        theirs: ObjectHash,
-    },
-}
-
-#[derive(Debug, Copy, Clone)]
-enum RelativeState {
-    Same(RebaseTreeEntry),
-    Modified(RebaseTreeEntry),
-    Deleted,
-    Added(RebaseTreeEntry),
-    Missing,
-}
-
-fn classify_relative_to_base(
-    base: Option<&RebaseTreeEntry>,
-    side: Option<&RebaseTreeEntry>,
-) -> RelativeState {
-    match (base, side) {
-        (Some(b), Some(s)) if b == s => RelativeState::Same(*s),
-        (Some(_), Some(s)) => RelativeState::Modified(*s),
-        (Some(_), None) => RelativeState::Deleted,
-        (None, Some(s)) => RelativeState::Added(*s),
-        (None, None) => RelativeState::Missing,
-    }
-}
-
-fn resolve_three_way(
-    base: Option<&RebaseTreeEntry>,
-    theirs: Option<&RebaseTreeEntry>,
-    ours: Option<&RebaseTreeEntry>,
-) -> MergeResolution {
-    let base_present = base.is_some();
-    let theirs_state = classify_relative_to_base(base, theirs);
-    let ours_state = classify_relative_to_base(base, ours);
-
-    match (base_present, ours_state, theirs_state) {
-        (false, RelativeState::Missing, RelativeState::Missing) => MergeResolution::Delete,
-        (false, RelativeState::Added(o), RelativeState::Missing) => MergeResolution::Use(o),
-        (false, RelativeState::Missing, RelativeState::Added(t)) => MergeResolution::Use(t),
-        (false, RelativeState::Added(o), RelativeState::Added(t)) => {
-            if o == t {
-                MergeResolution::Use(t)
-            } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    ours: o.hash,
-                    theirs: t.hash,
-                })
-            }
-        }
-        (true, RelativeState::Same(o), RelativeState::Same(_)) => MergeResolution::Use(o),
-        (true, RelativeState::Same(_), RelativeState::Modified(t)) => MergeResolution::Use(t),
-        (true, RelativeState::Modified(o), RelativeState::Same(_)) => MergeResolution::Use(o),
-        (true, RelativeState::Modified(o), RelativeState::Modified(t)) => {
-            if o == t {
-                MergeResolution::Use(t)
-            } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    ours: o.hash,
-                    theirs: t.hash,
-                })
-            }
-        }
-        (true, RelativeState::Deleted, RelativeState::Same(_)) => MergeResolution::Delete,
-        (true, RelativeState::Same(_), RelativeState::Deleted) => MergeResolution::Delete,
-        (true, RelativeState::Deleted, RelativeState::Deleted) => MergeResolution::Delete,
-        (true, RelativeState::Deleted, RelativeState::Modified(t)) => {
-            MergeResolution::Conflict(ConflictKind::TheirsModifiedOursDeleted { theirs: t.hash })
-        }
-        (true, RelativeState::Modified(o), RelativeState::Deleted) => {
-            MergeResolution::Conflict(ConflictKind::OursModifiedTheirsDeleted { ours: o.hash })
-        }
-        _ => {
-            debug_assert!(false, "unexpected three-way merge state");
-            MergeResolution::Delete
-        }
-    }
-}
-
-fn write_conflict_markers(
-    workdir: &Path,
-    path: &Path,
-    marker_eol: &str,
-    commit_abbrev: &str,
-    kind: ConflictKind,
-) -> Result<(), String> {
-    match kind {
-        ConflictKind::BothChanged { ours, theirs } => {
-            let our_content = Blob::load(&ours).data;
-            let their_content = Blob::load(&theirs).data;
-            let our_text = conflict_payload(&our_content);
-            let their_text = conflict_payload(&their_content);
-            let conflict_content = format!(
-                "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-                our_text, their_text, commit_abbrev
-            );
-            write_conflict_file(workdir, path, &conflict_content)?;
-        }
-        ConflictKind::OursModifiedTheirsDeleted { ours } => {
-            let our_content = Blob::load(&ours).data;
-            let our_text = conflict_payload(&our_content);
-            let conflict_content = format!(
-                "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}>>>>>>> {} (deleted){marker_eol}",
-                our_text, commit_abbrev
-            );
-            write_conflict_file(workdir, path, &conflict_content)?;
-        }
-        ConflictKind::TheirsModifiedOursDeleted { theirs } => {
-            let their_content = Blob::load(&theirs).data;
-            let their_text = conflict_payload(&their_content);
-            let conflict_content = format!(
-                "<<<<<<< HEAD (deleted){marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-                their_text, commit_abbrev
-            );
-            write_conflict_file(workdir, path, &conflict_content)?;
-        }
-    }
-    Ok(())
-}
-
 /// Replay a single commit with conflict detection
 ///
 /// This function performs a three-way merge to apply the changes from one commit
@@ -5026,7 +4592,7 @@ fn write_conflict_markers(
 /// a merged tree. If both `ours` and `theirs` modify the same path in
 /// incompatible ways relative to `base`, the function reports a conflict
 /// and leaves resolution to the caller.
-async fn replay_commit_with_conflict_detection(
+async fn replay_commit_with_unified_merge(
     commit_to_replay_id: &ObjectHash,
     new_parent_id: &ObjectHash,
     action: RebaseTodoAction,
@@ -5046,244 +4612,54 @@ async fn replay_commit_with_conflict_detection(
         Err(e) => return ReplayResult::internal(ReplayErrorKind::CommitLoad, e.to_string()),
     };
 
-    let original_parent_id = match commit_to_replay.parent_commit_ids.first() {
-        Some(id) => id,
-        None => {
-            return ReplayResult::internal(ReplayErrorKind::MissingParent, "commit has no parents");
-        }
-    };
-
-    // Load the three trees needed for the three-way merge
-    let base_tree: Tree =
-        match load_object::<Commit>(original_parent_id).and_then(|c| load_object(&c.tree_id)) {
-            Ok(t) => t,
-            Err(e) => return ReplayResult::internal(ReplayErrorKind::BaseTreeLoad, e.to_string()),
-        };
-
-    let their_tree: Tree = match load_object(&commit_to_replay.tree_id) {
-        Ok(t) => t,
-        Err(e) => return ReplayResult::internal(ReplayErrorKind::TheirTreeLoad, e.to_string()),
-    };
-
-    let our_tree: Tree =
-        match load_object::<Commit>(new_parent_id).and_then(|c| load_object(&c.tree_id)) {
-            Ok(t) => t,
-            Err(e) => return ReplayResult::internal(ReplayErrorKind::OurTreeLoad, e.to_string()),
-        };
-
-    // Get all items from each tree and a union of their paths.
-    let (tree_items, tree_gitlinks, all_paths) =
-        collect_tree_items_and_paths([&base_tree, &their_tree, &our_tree]);
-    let base_items = &tree_items[0];
-    let their_items = &tree_items[1];
-    let our_items = &tree_items[2];
-    // ADR-MG-01 fail-closed gate, shared with `merge` and `cherry-pick`: a
-    // gitlink the replay would have to arbitrate stops the rebase before any
-    // index/worktree write; one all three sides agree on passes through into
-    // the replayed tree instead of being silently dropped.
-    let passthrough_gitlinks = match merge::ensure_gitlinks_not_arbitrated(
-        "rebase",
-        &tree_gitlinks[0],
-        &tree_gitlinks[2],
-        &tree_gitlinks[1],
-    ) {
-        Ok(passthrough) => passthrough,
-        Err(refusal) => {
-            return ReplayResult::internal(
-                ReplayErrorKind::GitlinkUnsupported,
-                refusal.to_string(),
-            );
-        }
-    };
-
-    let mut merged_items: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
-    let mut conflict_items: Vec<(PathBuf, ConflictKind)> = Vec::new();
-    let workdir = util::request_working_dir();
-    let commit_abbrev = commit_to_replay_id.to_string();
-    let commit_short = &commit_abbrev[..7];
-    let marker_eol = conflict_marker_eol();
-    let untracked_paths = match worktree::untracked_workdir_paths(&current_index) {
-        Ok(paths) => paths,
-        Err(e) => return ReplayResult::internal(ReplayErrorKind::IndexLoad, e.to_string()),
-    };
-
-    for path in all_paths {
-        let base_entry = base_items.get(&path);
-        let their_entry = their_items.get(&path);
-        let our_entry = our_items.get(&path);
-
-        match resolve_three_way(base_entry, their_entry, our_entry) {
-            MergeResolution::Use(entry) => {
-                merged_items.insert(path, entry);
-            }
-            MergeResolution::Delete => {}
-            MergeResolution::Conflict(kind) => {
-                conflict_items.push((path, kind));
-            }
-        }
+    if commit_to_replay.parent_commit_ids.is_empty() {
+        return ReplayResult::internal(ReplayErrorKind::MissingParent, "commit has no parents");
     }
-
-    // Pass-through gitlinks: identical on all three sides, so they are copied
-    // into the replayed tree without ever entering a merge decision.
-    for (path, gitlink) in &passthrough_gitlinks {
-        merged_items.insert(
-            path.clone(),
-            RebaseTreeEntry {
-                hash: *gitlink,
-                mode: TreeItemMode::Commit,
-            },
-        );
+    let mut base_commits = Vec::with_capacity(commit_to_replay.parent_commit_ids.len());
+    for parent_id in &commit_to_replay.parent_commit_ids {
+        let base_commit: Commit = match load_object(parent_id) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return ReplayResult::internal(ReplayErrorKind::BaseTreeLoad, error.to_string());
+            }
+        };
+        base_commits.push(base_commit);
     }
+    // A flattened rebase still uses the first-parent comparison for its
+    // historical `--empty=drop` decision. The tree merge itself receives all
+    // parents and therefore uses a recursive virtual base for merge commits.
+    let first_base_commit = &base_commits[0];
+    let our_commit: Commit = match load_object(new_parent_id) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return ReplayResult::internal(ReplayErrorKind::OurTreeLoad, error.to_string());
+        }
+    };
 
-    let conflicts: Vec<PathBuf> = conflict_items
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect();
-
-    if !conflicts.is_empty() {
-        let mut untracked_conflict = None;
-        // Pass-through gitlinks are excluded: Libra never writes a submodule
-        // working tree, so an existing submodule directory must not be mistaken
-        // for an untracked path the replay is about to overwrite.
-        let materialized: Vec<&PathBuf> = merged_items
-            .iter()
-            .filter(|(_, entry)| entry.mode != TreeItemMode::Commit)
-            .map(|(path, _)| path)
-            .collect();
-        for untracked in &untracked_paths {
-            for path in conflicts.iter().chain(materialized.iter().copied()) {
-                if worktree::paths_conflict(untracked, path) {
-                    untracked_conflict = Some(untracked.clone());
-                    break;
+    let new_tree_id =
+        match merge::merge_rebase_trees(&base_commits, &our_commit, &commit_to_replay).await {
+            Ok(merge::RebaseTreeMergeOutcome::Clean { tree_id }) => tree_id,
+            Ok(merge::RebaseTreeMergeOutcome::Conflicted { paths }) => {
+                if let Err(error) = crate::command::rerere::auto_update(rerere_autoupdate).await {
+                    tracing::warn!("rerere auto-update after rebase conflict failed: {error}");
                 }
+                return ReplayResult::conflict(paths);
             }
-            if untracked_conflict.is_some() {
-                break;
+            Err(error) => {
+                return ReplayResult::internal(ReplayErrorKind::MergeEngine, error.to_string());
             }
-        }
-        if let Some(conflict) = untracked_conflict {
-            return ReplayResult::internal(
-                ReplayErrorKind::UntrackedOverwrite,
-                format!(
-                    "untracked working tree file would be overwritten by rebase: {}",
-                    conflict.display()
-                ),
-            );
-        }
-
-        for (path, kind) in &conflict_items {
-            if let Err(e) = write_conflict_markers(&workdir, path, marker_eol, commit_short, *kind)
-            {
-                return ReplayResult::internal(ReplayErrorKind::ConflictMarker, e);
-            }
-        }
-
-        // Update index with conflict entries
-        let index_file = path::index();
-        let mut index = git_internal::internal::index::Index::new();
-
-        // Add non-conflicting files at stage 0
-        for (path, entry) in &merged_items {
-            if let Err(e) = add_rebase_index_entry(&mut index, path, *entry, 0) {
-                return ReplayResult::internal(ReplayErrorKind::IndexSave, e);
-            }
-        }
-
-        // Add conflicting files at stages 1, 2, 3
-        for path in &conflicts {
-            // Stage 1: base version
-            if let Some(base_entry) = base_items.get(path)
-                && let Err(e) = add_rebase_index_entry(&mut index, path, *base_entry, 1)
-            {
-                return ReplayResult::internal(ReplayErrorKind::IndexSave, e);
-            }
-
-            // Stage 2: ours version
-            if let Some(our_entry) = our_items.get(path)
-                && let Err(e) = add_rebase_index_entry(&mut index, path, *our_entry, 2)
-            {
-                return ReplayResult::internal(ReplayErrorKind::IndexSave, e);
-            }
-
-            // Stage 3: theirs version
-            if let Some(their_entry) = their_items.get(path)
-                && let Err(e) = add_rebase_index_entry(&mut index, path, *their_entry, 3)
-            {
-                return ReplayResult::internal(ReplayErrorKind::IndexSave, e);
-            }
-        }
-
-        if let Err(e) = index.save(&index_file) {
-            return ReplayResult::Conflict {
-                paths: conflicts,
-                message: Some(format!("index save: {}", e)),
-            };
-        }
-
-        // Update working directory for non-conflicting paths so users can see clean changes.
-        let mut tracked_paths: HashSet<PathBuf> = HashSet::new();
-        tracked_paths.extend(current_index.tracked_files());
-        tracked_paths.extend(base_items.keys().cloned());
-        tracked_paths.extend(their_items.keys().cloned());
-        tracked_paths.extend(our_items.keys().cloned());
-
-        let conflict_set: HashSet<PathBuf> = conflicts.iter().cloned().collect();
-
-        for (path, entry) in &merged_items {
-            // Pass-through gitlink: a submodule has no blob to write and Libra
-            // materializes no submodule working tree (ADR-MG-01).
-            if entry.mode == TreeItemMode::Commit {
-                continue;
-            }
-            if let Err(e) = write_rebase_workdir_entry(&workdir, path, *entry) {
-                return ReplayResult::Conflict {
-                    paths: conflicts,
-                    message: Some(e),
-                };
-            }
-        }
-
-        for path in tracked_paths {
-            if conflict_set.contains(&path) || merged_items.contains_key(&path) {
-                continue;
-            }
-            let full_path = workdir.join(&path);
-            if !full_path.exists() {
-                continue;
-            }
-            if let Err(e) = fs::remove_file(&full_path) {
-                return ReplayResult::Conflict {
-                    paths: conflicts,
-                    message: Some(format!("failed to remove {}: {}", full_path.display(), e)),
-                };
-            }
-        }
-
-        // rerere: record the preimage of each just-written conflict and replay a
-        // recorded resolution if one matches. A no-op unless `rerere.enabled`;
-        // an explicit sequencer choice overrides `rerere.autoUpdate`.
-        if let Err(error) = crate::command::rerere::auto_update(rerere_autoupdate).await {
-            tracing::warn!("rerere auto-update after rebase conflict failed: {error}");
-        }
-        return ReplayResult::conflict(conflicts);
-    }
-
-    // No conflicts - create the merged tree and commit
-    let new_tree_id = match create_tree_from_items_map(&merged_items) {
-        Ok(id) => id,
-        Err(e) => return ReplayResult::internal(ReplayErrorKind::TreeCreate, e.to_string()),
-    };
+        };
 
     // `--empty=drop`: a commit that BECOMES empty after replay (the merged tree
     // equals the new parent's tree — its changes are already on the new base) is
     // skipped. This is distinct from a commit that BEGINS empty (handled by
-    // `--no-keep-empty` up front): `their_tree != base_tree` confirms the original
-    // commit DID introduce a change, so emptiness arose from the replay. The
-    // index/worktree already equal the new parent (new_tree == our_tree), so no
+    // `--no-keep-empty` up front): the replayed commit's tree differs from its
+    // original parent, confirming it introduced a change. The index/worktree
+    // already equal the new parent when the result tree matches it, so no
     // mutation is needed before skipping.
     if empty_mode == RebaseEmptyMode::Drop
-        && new_tree_id == our_tree.id
-        && their_tree.id != base_tree.id
+        && new_tree_id == our_commit.tree_id
+        && commit_to_replay.tree_id != first_base_commit.tree_id
     {
         let subject = commit_subject_from_message(&commit_to_replay.message);
         return ReplayResult::BecameEmptyDropped { subject };
@@ -5497,77 +4873,6 @@ async fn collect_commits_to_replay(
     Ok(commits)
 }
 
-/// Create a tree object from a flat map of file paths to content hashes
-///
-/// This function takes a HashMap of file paths and their content hashes,
-/// and builds a proper Git tree structure. It handles:
-/// - Grouping files by their parent directories
-/// - Creating tree objects for each directory
-/// - Recursively building the tree structure from root to leaves
-///
-/// Returns the ObjectHash hash of the root tree object.
-fn create_tree_from_items_map(
-    items: &HashMap<PathBuf, RebaseTreeEntry>,
-) -> Result<ObjectHash, String> {
-    // Group files by their parent directories
-    let mut entries_map: HashMap<PathBuf, Vec<TreeItem>> = HashMap::new();
-    for (path, entry) in items {
-        let item = TreeItem {
-            mode: entry.mode,
-            name: tree_item_name(path)?,
-            id: entry.hash,
-        };
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-        entries_map.entry(parent_dir).or_default().push(item);
-    }
-    build_tree_recursively(Path::new(""), &mut entries_map)
-}
-
-/// Recursively build tree objects from a directory structure
-///
-/// This helper function processes a directory and all its subdirectories:
-/// 1. Creates tree items for all files in the current directory
-/// 2. Recursively processes subdirectories to create subtree objects  
-/// 3. Combines files and subdirectories into a single tree object
-/// 4. Saves the tree object and returns its hash
-///
-/// The algorithm works bottom-up, creating leaf trees first and then
-/// combining them into parent trees.
-fn build_tree_recursively(
-    current_path: &Path,
-    entries_map: &mut HashMap<PathBuf, Vec<TreeItem>>,
-) -> Result<ObjectHash, String> {
-    // Get all files/items in the current directory
-    let mut current_items = entries_map.remove(current_path).unwrap_or_default();
-
-    // Find all subdirectories that are children of current directory
-    let subdirs: Vec<_> = entries_map
-        .keys()
-        .filter(|p| p.parent() == Some(current_path))
-        .cloned()
-        .collect();
-
-    // Recursively process each subdirectory
-    for subdir_path in subdirs {
-        let subdir_name = tree_item_name(&subdir_path)?;
-
-        let subtree_hash = build_tree_recursively(&subdir_path, entries_map)?;
-
-        // Add the subdirectory as a tree item
-        current_items.push(TreeItem {
-            mode: TreeItemMode::Tree,
-            name: subdir_name,
-            id: subtree_hash,
-        });
-    }
-
-    crate::utils::tree::sort_tree_items_for_git(&mut current_items);
-    // Create and save the tree object for this directory
-    let tree = Tree::from_tree_items(current_items).map_err(|e| e.to_string())?;
-    save_object(&tree, &tree.id).map_err(|e| e.to_string())?;
-    Ok(tree.id)
-}
-
 /// `ORIG_HEAD` for an explicitly resolved scope — the pseudo-ref projection
 /// (§C.5). `None` when that worktree has no rebase in progress; an unreadable
 /// row is an ERROR, never "nothing in progress".
@@ -5634,7 +4939,7 @@ fn reset_workdir_tracked_only(
             write_rebase_workdir_entry(
                 &workdir,
                 &path_buf,
-                RebaseTreeEntry {
+                merge::MergeTreeEntry {
                     hash: entry.hash,
                     mode,
                 },
@@ -5645,65 +4950,9 @@ fn reset_workdir_tracked_only(
     Ok(())
 }
 
-fn tree_item_name(path: &Path) -> Result<String, String> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("path has no file name: {}", path.display()))?;
-    name.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
-}
-
 fn path_to_index_key(path: &Path) -> Result<&str, String> {
     path.to_str()
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
-}
-
-fn add_rebase_index_entry(
-    index: &mut git_internal::internal::index::Index,
-    path: &Path,
-    item: RebaseTreeEntry,
-    stage: u8,
-) -> Result<(), String> {
-    // A gitlink records a SUBMODULE's commit id, which is not an object of this
-    // repository — asking for it as a blob would fail. Only a pass-through
-    // gitlink (identical on all three sides, ADR-MG-01) reaches here, so the
-    // pointer is registered verbatim with a zero size.
-    let size = if item.mode == TreeItemMode::Commit {
-        0
-    } else {
-        let blob: Blob = load_object(&item.hash).map_err(|error| {
-            format!(
-                "failed to load blob {} for index entry '{}': {error}",
-                item.hash,
-                path.display()
-            )
-        })?;
-        blob.data.len() as u32
-    };
-    let mut entry = git_internal::internal::index::IndexEntry::new_from_blob(
-        path_to_index_key(path)?.to_string(),
-        item.hash,
-        size,
-    );
-    entry.mode = tree_item_mode_to_index_mode(item.mode)?;
-    entry.flags.stage = stage;
-    index.add(entry);
-    Ok(())
-}
-
-fn tree_item_mode_to_index_mode(mode: TreeItemMode) -> Result<u32, String> {
-    match mode {
-        TreeItemMode::Blob => Ok(0o100644),
-        TreeItemMode::BlobExecutable => Ok(0o100755),
-        TreeItemMode::Link => Ok(0o120000),
-        TreeItemMode::Tree => {
-            Err("tree entry cannot be represented as a file index entry".to_string())
-        }
-        // Pass-through gitlink (ADR-MG-01): an arbitrated one never gets this
-        // far, so the unchanged pointer is recorded instead of rejected.
-        TreeItemMode::Commit => Ok(0o160000),
-    }
 }
 
 fn index_mode_to_tree_item_mode(mode: u32) -> Result<TreeItemMode, String> {
