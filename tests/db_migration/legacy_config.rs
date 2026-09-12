@@ -4,16 +4,32 @@ use sea_orm::EntityTrait;
 
 use super::*;
 
+// #472 shipped independently of operation v2. Its down/up contract belongs
+// to that historical registry, before either forward-only operation barrier.
+fn legacy_config_runner() -> Result<MigrationRunner, MigrationError> {
+    let mut runner = MigrationRunner::new();
+    runner.extend(
+        builtin_migrations()
+            .into_iter()
+            .filter(|migration| migration.version < 2026090101 || migration.version == 2026090601),
+    )?;
+    Ok(runner)
+}
+
 #[tokio::test]
 async fn opening_old_database_repairs_missing_legacy_config_and_preserves_values() {
     // Given a previously migrated database missing only its legacy table.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("libra.db");
-    let conn = libra::internal::db::create_database(path.to_str().unwrap())
+    let (_dir, url, path) = fresh_db_url();
+    let conn = connect(&url).await;
+    historical_bootstrap::initialize(&conn).await;
+    super::builtin_runner()
+        .unwrap()
+        .run_pending(&conn)
         .await
         .unwrap();
+    historical_bootstrap::assert_pre_v2_history(&conn).await;
     conn.execute_unprepared(
-        "DROP TABLE config; DELETE FROM schema_versions WHERE version = 2026090601; \
+        "DROP TABLE config; \
          INSERT INTO config_kv (key, value, encrypted) VALUES ('init.defaultBranch', 'trunk', 0)",
     )
     .await
@@ -40,12 +56,12 @@ async fn opening_old_database_repairs_missing_legacy_config_and_preserves_values
             .is_empty()
     );
     assert_eq!(
-        builtin_runner()
+        all_builtin_runner()
             .unwrap()
             .current_version(&conn)
             .await
             .unwrap(),
-        Some(2026090601)
+        all_builtin_runner().unwrap().max_registered_version()
     );
 }
 
@@ -65,7 +81,7 @@ async fn legacy_config_migration_preserves_preexisting_rows_through_rollback() {
     )
     .await
     .unwrap();
-    let runner = builtin_runner().unwrap();
+    let runner = legacy_config_runner().unwrap();
 
     // When the repair runs and a downgrade is subsequently requested.
     runner.run_pending(&conn).await.unwrap();
@@ -100,7 +116,7 @@ async fn empty_legacy_config_can_roll_back_and_reapply() {
     // Given a migrated database with no legacy values to lose.
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
-    let runner = builtin_runner().unwrap();
+    let runner = legacy_config_runner().unwrap();
     runner.run_pending(&conn).await.unwrap();
 
     // When rolling back the repair and reapplying it.

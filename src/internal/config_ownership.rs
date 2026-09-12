@@ -366,6 +366,9 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
     ("ai_final_decision", ConfigOwner::Repository),
     ("ai_risk_score_breakdown", ConfigOwner::Repository),
     ("ai_validation_report", ConfigOwner::Repository),
+    // V2 operation records carry optional AI/session provenance but remain
+    // repository-owned; the operation store is not a configuration surface.
+    ("ai_operation_link", ConfigOwner::Repository),
 ];
 
 /// §C.4.1.1 process-cache inventory: every `static` synchronization/cache

@@ -19,6 +19,11 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod entry_identity;
+pub(crate) use entry_identity::{
+    EntryIdentity, EntryIdentityKey, EntryKind, entry_identity_beneath,
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RootIdentity {
     #[cfg(unix)]
@@ -270,6 +275,30 @@ pub fn read_file_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Replace a regular file beneath an already-pinned root without following a
+/// symlink at any path component.
+///
+/// The parent directory is held by descriptor while the leaf is opened. The
+/// leaf is verified to be regular before it is truncated, so a concurrent
+/// replacement cannot redirect the write through a symlink or special file.
+/// When `create` is true, a missing regular leaf is created with owner-only
+/// permissions on Unix.
+pub fn write_regular_file_beneath(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    write_regular_file_beneath_platform(root, rel, bytes, create)
+}
+
 /// Read a symlink's target bytes relative to a pinned root and parent
 /// descriptor. This never follows the symlink or reopens it by pathname.
 pub fn read_symlink_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
@@ -350,6 +379,60 @@ fn open_file_in_dir(
             "beneath file open unsupported on this platform",
         ))
     }
+}
+
+#[cfg(unix)]
+fn write_regular_file_beneath_platform(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path contains an interior NUL",
+        )
+    })?;
+    let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let flags = if create { flags | libc::O_CREAT } else { flags };
+    // SAFETY: `directory` and the NUL-terminated leaf name remain live for
+    // the syscall. O_NOFOLLOW protects the final component while the parent
+    // descriptor, opened through `open_beneath`, pins every ancestor.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a newly owned descriptor above.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path is not a regular file",
+        ));
+    }
+    file.set_len(0)?;
+    io::Write::write_all(&mut file, bytes)?;
+    io::Write::flush(&mut file)
 }
 
 fn read_symlink_in_dir(
@@ -1340,6 +1423,77 @@ fn open_windows_nofollow(
 }
 
 #[cfg(windows)]
+fn write_regular_file_beneath_platform(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+            GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+        },
+    };
+
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+    let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
+    let wide = wide_path(&directory_path.join(name))?;
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(owned.as_raw_handle() as HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & 0x10 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path is not a regular file",
+        ));
+    }
+    let mut file = fs::File::from(owned);
+    assert_handle_beneath(&file, &root_path)?;
+    file.set_len(0)?;
+    io::Write::write_all(&mut file, bytes)?;
+    io::Write::flush(&mut file)
+}
+
+#[cfg(windows)]
 fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
     use std::os::windows::io::AsRawHandle;
 
@@ -1543,9 +1697,18 @@ fn fstatat_nofollow(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLst
 
 #[cfg(unix)]
 fn fstatat_raw(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
+    fstatat_value(dir, name).map(|stat| RawLstat::from_libc_stat(&stat))
+}
+
+#[cfg(unix)]
+fn fstatat_value(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
     use std::os::fd::AsRawFd;
     let c_name = component_cstring(name)?;
+    // SAFETY: libc::stat contains only integer fields on the supported Unix
+    // targets; zero initialization produces a valid writable output buffer.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the borrowed directory descriptor and NUL-terminated name remain
+    // live during the call; stat is an aligned, exclusively borrowed buffer.
     let rc = unsafe {
         libc::fstatat(
             dir.as_raw_fd(),
@@ -1557,7 +1720,7 @@ fn fstatat_raw(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(RawLstat::from_libc_stat(&stat))
+    Ok(stat)
 }
 
 /// Test harness seam: when `LIBRA_TEST=1` and the swap env vars are set,

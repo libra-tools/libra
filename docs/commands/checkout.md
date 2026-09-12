@@ -18,6 +18,8 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 `libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, returning to the previous checkout target with `-`, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, creating an unborn orphan branch with `--orphan`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
 
+For local-branch or detached checkout, including explicit branch creation/reset (`-b` / `-B`), Libra does not manage submodule contents. If the target would remove or replace a tracked gitlink (mode `160000`) whose directory is nonempty, it refuses with `LBR-CONFLICT-002` before changing HEAD, branch refs, reflogs, the index, or the working tree. This check cannot be bypassed with `--force`. Move the nested files safely aside before retrying. An empty Libra-owned directory placeholder can be removed successfully. This is Libra's protection boundary; Git's default checkout can instead leave a nonempty submodule directory in place. Remote auto-tracking is a separate composite operation: its subsequent `pull` has its own failure behavior and is not covered by this preflight guarantee.
+
 `libra checkout -` shares the worktree-scoped HEAD navigation history used by `switch -`. A branch source follows the current tip of that local branch, while a detached source returns to the full stored commit ID. Repeating the shortcut toggles between targets. Missing, deleted, or corrupt latest navigation targets fail closed without moving HEAD or changing the index/worktree.
 
 This command exists so that developers migrating from Git can use familiar muscle memory. For new workflows, prefer `libra switch` (for branch operations) and `libra restore` (for file operations), which provide richer error messages, structured JSON output, and clearer semantics.
@@ -292,6 +294,7 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 |----------|-------------|---------|------|
 | Dirty worktree (unstaged or staged changes) | `LBR-REPO-003` | "local changes would be overwritten by checkout" | 128 |
 | Untracked file would be overwritten | `LBR-CONFLICT-002` | "local changes would be overwritten by checkout" | 128 |
+| Nonempty tracked gitlink directory would be removed or replaced during local-branch/detached navigation, including explicit branch creation/reset with `-b` / `-B` | `LBR-CONFLICT-002` | "refusing to replace non-empty worktree directory '{path}'"; move nested files safely aside before retrying. | 128 |
 | Internal branch blocked | `LBR-CLI-003` | "checking out '{name}' branch is not allowed" | 128 |
 | Create internal branch blocked | `LBR-CLI-003` | "creating/switching to '{name}' branch is not allowed" | 128 |
 | Branch or start-point not found (no remote match) | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 129 |

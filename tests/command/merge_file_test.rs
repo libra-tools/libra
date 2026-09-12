@@ -29,6 +29,77 @@ fn merge_file(dir: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn merge_file_driver_uses_attributes_in_repo_and_text_outside() {
+    let repo = init_repo();
+    write_inputs(
+        repo.path(),
+        "top\nours\nbottom\n",
+        "top\nbase\nbottom\n",
+        "top\ntheirs\nbottom\n",
+    );
+    fs::write(repo.path().join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    let union = merge_file(repo.path(), &["-p"]);
+    assert_eq!(
+        union.status.code(),
+        Some(0),
+        "repository union driver should merge cleanly: {}",
+        String::from_utf8_lossy(&union.stderr)
+    );
+    assert_eq!(stdout_str(&union), "top\nours\ntheirs\nbottom\n");
+
+    let default_repo = init_repo();
+    write_inputs(
+        default_repo.path(),
+        "top\nours\nbottom\n",
+        "top\nbase\nbottom\n",
+        "top\ntheirs\nbottom\n",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.default", "union"], default_repo.path()),
+        "configure merge-file default driver",
+    );
+    let default_union = merge_file(default_repo.path(), &["-p"]);
+    assert_eq!(
+        default_union.status.code(),
+        Some(0),
+        "repository default union driver should merge cleanly: {}",
+        String::from_utf8_lossy(&default_union.stderr)
+    );
+    assert_eq!(stdout_str(&default_union), "top\nours\ntheirs\nbottom\n");
+
+    let outside = tempdir().unwrap();
+    write_inputs(
+        outside.path(),
+        "top\nours\nbottom\n",
+        "top\nbase\nbottom\n",
+        "top\ntheirs\nbottom\n",
+    );
+    fs::write(outside.path().join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    let text = merge_file(outside.path(), &["-p"]);
+    assert_eq!(
+        text.status.code(),
+        Some(1),
+        "outside-repo merge-file stays text"
+    );
+    assert!(stdout_str(&text).contains("<<<<<<< ours"));
+}
+
+#[test]
+fn merge_file_driver_binary_keeps_current_without_markers() {
+    let repo = init_repo();
+    write_inputs(
+        repo.path(),
+        "top\nours\nbottom\n",
+        "top\nbase\nbottom\n",
+        "top\ntheirs\nbottom\n",
+    );
+    fs::write(repo.path().join(".gitattributes"), "*.txt -merge\n").unwrap();
+    let output = merge_file(repo.path(), &["-p"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_str(&output), "top\nours\nbottom\n");
+}
+
+#[test]
 fn clean_merge_combines_non_overlapping_changes() {
     let dir = tempdir().unwrap();
     write_inputs(dir.path(), "X\nb\nc\n", "a\nb\nc\n", "a\nb\nZ\n");
@@ -57,6 +128,10 @@ fn conflict_emits_markers_and_exits_1() {
     assert!(
         merged.contains(">>>>>>> theirs"),
         "missing theirs marker: {merged}"
+    );
+    assert!(
+        !merged.contains("||||||| original"),
+        "the default style must remain distinct from --diff3: {merged}"
     );
 }
 

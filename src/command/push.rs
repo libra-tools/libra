@@ -26,6 +26,8 @@ use git_internal::{
 };
 use sea_orm::TransactionError;
 use serde::Serialize;
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha256Digest, Sha256};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -1062,7 +1064,8 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         }
     }
 
-    let obj_result = collect_push_objects(&plans).await?;
+    let advertised_haves = collect_advertised_haves(&discovery.refs).await;
+    let obj_result = collect_push_objects(&plans, &advertised_haves).await?;
     let objs = obj_result.objs;
     warnings.extend(obj_result.warnings);
     let obj_count = objs.len();
@@ -1191,6 +1194,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     }
 
     let mut pack_data = Vec::new();
+    let needs_pack = plans.iter().any(|plan| plan.new_oid.is_some());
     if !objs.is_empty() && args.thin {
         // `--thin` (lore.md 2.10): REF_DELTA entries against SERVER-KNOWN
         // bases. Base harvesting is deliberately conservative: only blobs
@@ -1246,7 +1250,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                 "thin pack: {delta_count} delta object(s) against server-known bases"
             );
         }
-    } else if !objs.is_empty() {
+    } else if objs.is_empty() && needs_pack {
+        // receive-pack expects a valid pack stream for every non-delete
+        // update, even when all wanted objects are already advertised.
+        pack_data = encode_empty_pack(discovery.hash_kind);
+    } else if needs_pack {
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000_000);
         let (stream_tx, mut stream_rx) = mpsc::channel(1_000_000);
 
@@ -2099,7 +2107,42 @@ fn tag_object_hash(object: &tag::TagObject) -> ObjectHash {
     }
 }
 
-async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjsResult, PushError> {
+#[derive(Debug, Default)]
+struct AdvertisedHaves {
+    objects: HashSet<ObjectHash>,
+    commits: HashSet<ObjectHash>,
+}
+
+/// Build the pack exclusion boundary from every object the server advertised
+/// and the local repository can load. Git send-pack follows the same
+/// conservative rule: an advertised OID missing locally cannot be used as a
+/// negative have because its type and reachable graph are unknown.
+async fn collect_advertised_haves(refs: &[crate::internal::protocol::DiscRef]) -> AdvertisedHaves {
+    let mut haves = AdvertisedHaves::default();
+    let mut commit_tips = HashSet::new();
+
+    for reference in refs {
+        let Ok(oid) = ObjectHash::from_str(reference.hash()) else {
+            continue;
+        };
+        let Ok(object) = tag::load_object_trait(&oid).await else {
+            continue;
+        };
+
+        haves.objects.insert(oid);
+        if let tag::TagObject::Commit(commit) = object {
+            commit_tips.insert(commit.id);
+        }
+    }
+
+    haves.commits = collect_history_commits_from_tips(commit_tips.iter());
+    haves
+}
+
+async fn collect_push_objects(
+    plans: &[RefUpdatePlan],
+    advertised_haves: &AdvertisedHaves,
+) -> Result<IncrementalObjsResult, PushError> {
     let mut combined = IncrementalObjsResult {
         objs: HashSet::new(),
         warnings: Vec::new(),
@@ -2108,7 +2151,7 @@ async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjs
         let Some(new_oid) = plan.new_oid else {
             continue;
         };
-        let result = collect_objects_for_ref(new_oid, plan.old_oid, plan.local_kind).await?;
+        let result = collect_objects_for_ref(new_oid, advertised_haves).await?;
         combined.objs.extend(result.objs);
         combined.warnings.extend(result.warnings);
     }
@@ -2117,38 +2160,43 @@ async fn collect_push_objects(plans: &[RefUpdatePlan]) -> Result<IncrementalObjs
 
 async fn collect_objects_for_ref(
     new_oid: ObjectHash,
-    old_oid: ObjectHash,
-    kind: Option<LocalRefKind>,
+    advertised_haves: &AdvertisedHaves,
 ) -> Result<IncrementalObjsResult, PushError> {
-    match tag::load_object_trait(&new_oid)
+    if advertised_haves.objects.contains(&new_oid) {
+        return Ok(IncrementalObjsResult::default());
+    }
+
+    let mut result = match tag::load_object_trait(&new_oid)
         .await
         .map_err(|error| PushError::ObjectCollection(error.to_string()))?
     {
         tag::TagObject::Commit(commit) => {
-            let remote_base = if kind == Some(LocalRefKind::Tag) {
-                zero_object_hash()
-            } else {
-                old_oid
-            };
-            Ok(incremental_objs(commit.id, remote_base))
+            incremental_objs_from_haves(commit.id, &advertised_haves.commits)
         }
-        tag::TagObject::Tag(tag_object) => collect_tag_object_chain(tag_object).await,
+        tag::TagObject::Tag(tag_object) => {
+            collect_tag_object_chain(tag_object, advertised_haves).await?
+        }
         tag::TagObject::Tree(tree) => {
             let mut warnings = Vec::new();
-            Ok(IncrementalObjsResult {
+            IncrementalObjsResult {
                 objs: diff_tree_objs(None, &tree.id, &mut warnings),
                 warnings,
-            })
+            }
         }
-        tag::TagObject::Blob(blob) => Ok(IncrementalObjsResult {
+        tag::TagObject::Blob(blob) => IncrementalObjsResult {
             objs: HashSet::from([blob.into()]),
             warnings: Vec::new(),
-        }),
-    }
+        },
+    };
+    result
+        .objs
+        .retain(|entry| !advertised_haves.objects.contains(&entry.hash));
+    Ok(result)
 }
 
 async fn collect_tag_object_chain(
     mut tag_object: GitTagObject,
+    advertised_haves: &AdvertisedHaves,
 ) -> Result<IncrementalObjsResult, PushError> {
     let mut result = IncrementalObjsResult {
         objs: HashSet::new(),
@@ -2166,13 +2214,17 @@ async fn collect_tag_object_chain(
 
         let target_oid = tag_object.object_hash;
         result.objs.insert(tag_object.into());
+        if advertised_haves.objects.contains(&target_oid) {
+            return Ok(result);
+        }
 
         match tag::load_object_trait(&target_oid)
             .await
             .map_err(|error| PushError::ObjectCollection(error.to_string()))?
         {
             tag::TagObject::Commit(commit) => {
-                let commit_result = incremental_objs(commit.id, zero_object_hash());
+                let commit_result =
+                    incremental_objs_from_haves(commit.id, &advertised_haves.commits);
                 result.objs.extend(commit_result.objs);
                 result.warnings.extend(commit_result.warnings);
                 return Ok(result);
@@ -2687,16 +2739,24 @@ fn is_local_file_remote(spec: &str) -> bool {
 }
 
 /// collect all commits from `commit_id` to root commit
+#[cfg(test)]
 fn collect_history_commits(commit_id: &ObjectHash) -> HashSet<ObjectHash> {
-    let zero_oid = zero_object_hash();
-    if commit_id == &zero_oid {
-        return HashSet::new();
-    }
+    collect_history_commits_from_tips(std::iter::once(commit_id))
+}
 
+fn collect_history_commits_from_tips<'a>(
+    commit_ids: impl IntoIterator<Item = &'a ObjectHash>,
+) -> HashSet<ObjectHash> {
     let mut commits = HashSet::new();
     let mut queue = VecDeque::new();
-    commits.insert(*commit_id);
-    queue.push_back(*commit_id);
+    for commit_id in commit_ids {
+        if commit_id.as_ref().iter().any(|byte| *byte != 0)
+            && Commit::try_load(commit_id).is_some()
+            && commits.insert(*commit_id)
+        {
+            queue.push_back(*commit_id);
+        }
+    }
     while let Some(commit) = queue.pop_front() {
         let commit = match Commit::try_load(&commit) {
             Some(c) => c,
@@ -2772,11 +2832,27 @@ fn load_object_data(hash: &ObjectHash) -> Result<Vec<u8>, GitError> {
     storage.get(hash)
 }
 
+fn encode_empty_pack(hash_kind: HashKind) -> Vec<u8> {
+    let mut pack = Vec::with_capacity(12 + hash_kind.size());
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&0_u32.to_be_bytes());
+
+    let checksum = match hash_kind {
+        HashKind::Sha1 => <Sha1 as Sha1Digest>::digest(&pack).to_vec(),
+        HashKind::Sha256 => <Sha256 as Sha256Digest>::digest(&pack).to_vec(),
+    };
+    pack.extend_from_slice(&checksum);
+    pack
+}
+
+#[derive(Default)]
 struct IncrementalObjsResult {
     objs: HashSet<Entry>,
     warnings: Vec<String>,
 }
 
+#[cfg(test)]
 fn incremental_objs(local_ref: ObjectHash, remote_ref: ObjectHash) -> IncrementalObjsResult {
     tracing::debug!("local_ref: {}, remote_ref: {}", local_ref, remote_ref);
 
@@ -2847,9 +2923,17 @@ fn incremental_objs(local_ref: ObjectHash, remote_ref: ObjectHash) -> Incrementa
         }
     }
 
-    let mut objs = HashSet::new();
-    let mut visit = HashSet::new();
     let exist_commits = collect_history_commits(&remote_ref);
+    incremental_objs_from_haves(local_ref, &exist_commits)
+}
+
+fn incremental_objs_from_haves(
+    local_ref: ObjectHash,
+    exist_commits: &HashSet<ObjectHash>,
+) -> IncrementalObjsResult {
+    let mut objs = HashSet::new();
+    let mut warnings = Vec::new();
+    let mut visit = HashSet::new();
     let mut queue = VecDeque::new();
     if !exist_commits.contains(&local_ref) {
         queue.push_back(local_ref);
@@ -3010,7 +3094,10 @@ mod test {
         internal::object::{
             blob::Blob,
             commit::Commit,
+            signature::{Signature, SignatureType},
+            tag::Tag as GitTag,
             tree::{Tree, TreeItem, TreeItemMode},
+            types::ObjectType,
         },
     };
 
@@ -3032,6 +3119,13 @@ mod test {
         let commit = Commit::from_tree_id(tree_id, parents, message);
         crate::command::save_object(&commit, &commit.id).expect("test commit should save");
         commit
+    }
+
+    fn advertised_ref(name: &str, oid: &str) -> crate::internal::protocol::DiscRef {
+        crate::internal::protocol::DiscRef {
+            _hash: oid.to_string(),
+            _ref: name.to_string(),
+        }
     }
 
     fn test_ref_update_plan(remote_ref: &str) -> RefUpdatePlan {
@@ -3268,6 +3362,217 @@ mod test {
             "fast-forward push must not repack unchanged blobs inside changed subtrees"
         );
         assert_eq!(hashes.len(), 4);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn advertised_haves_same_tip_commit_sends_nothing() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("already remote");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "already remote");
+        let refs = vec![advertised_ref("refs/heads/main", &commit.id.to_string())];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(commit.id, &haves)
+            .await
+            .expect("advertised commit should be reusable");
+
+        assert!(haves.objects.contains(&commit.id));
+        assert!(haves.commits.contains(&commit.id));
+        assert!(result.objs.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn advertised_haves_empty_pack_tracks_explicit_hash_kind() {
+        let header = b"PACK\0\0\0\x02\0\0\0\0";
+
+        let sha1_pack = encode_empty_pack(HashKind::Sha1);
+        assert_eq!(&sha1_pack[..12], header);
+        assert_eq!(sha1_pack.len(), 32);
+        assert_eq!(
+            sha1_pack[12..],
+            <Sha1 as Sha1Digest>::digest(&sha1_pack[..12])[..]
+        );
+
+        let sha256_pack = encode_empty_pack(HashKind::Sha256);
+        assert_eq!(&sha256_pack[..12], header);
+        assert_eq!(sha256_pack.len(), 44);
+        assert_eq!(
+            sha256_pack[12..],
+            <Sha256 as Sha256Digest>::digest(&sha256_pack[..12])[..]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn advertised_haves_direct_tree_and_blob_refs_send_nothing() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("already advertised");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let refs = vec![
+            advertised_ref("refs/tags/tree", &tree.id.to_string()),
+            advertised_ref("refs/tags/blob", &blob.id.to_string()),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let tree_result = collect_objects_for_ref(tree.id, &haves)
+            .await
+            .expect("advertised tree should be reusable");
+        let blob_result = collect_objects_for_ref(blob.id, &haves)
+            .await
+            .expect("advertised blob should be reusable");
+
+        assert!(haves.objects.contains(&tree.id));
+        assert!(haves.objects.contains(&blob.id));
+        assert!(haves.commits.is_empty());
+        assert!(tree_result.objs.is_empty());
+        assert!(tree_result.warnings.is_empty());
+        assert!(blob_result.objs.is_empty());
+        assert!(blob_result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn advertised_haves_descendant_sends_only_new_delta() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let old_blob = save_test_blob("old content");
+        let old_tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            old_blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let old_commit = save_test_commit(old_tree.id, vec![], "old");
+        let new_blob = save_test_blob("new content");
+        let new_tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            new_blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let new_commit = save_test_commit(new_tree.id, vec![old_commit.id], "new");
+        let refs = vec![advertised_ref(
+            "refs/heads/main",
+            &old_commit.id.to_string(),
+        )];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(new_commit.id, &haves)
+            .await
+            .expect("descendant objects should collect");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            hashes,
+            HashSet::from([new_commit.id, new_tree.id, new_blob.id])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn advertised_haves_annotated_tag_sends_only_tag_object() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("release content");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "release");
+        let tag = GitTag::new(
+            commit.id,
+            ObjectType::Commit,
+            "v1.0".to_string(),
+            Signature {
+                signature_type: SignatureType::Tagger,
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+                timestamp: 1,
+                timezone: "+0000".to_string(),
+            },
+            "release v1.0".to_string(),
+        );
+        crate::command::save_object(&tag, &tag.id).expect("test tag should save");
+        let refs = vec![
+            advertised_ref("refs/heads/main", &commit.id.to_string()),
+            advertised_ref("refs/tags/existing^{}", &commit.id.to_string()),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(tag.id, &haves)
+            .await
+            .expect("annotated tag objects should collect");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(hashes, HashSet::from([tag.id]));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn advertised_haves_invalid_or_unavailable_oids_are_ignored() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("must be sent");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "tracked.txt".to_string(),
+        )]);
+        let commit = save_test_commit(tree.id, vec![], "must be sent");
+        let refs = vec![
+            advertised_ref("refs/heads/invalid", "not-an-object-id"),
+            advertised_ref(
+                "refs/heads/unavailable",
+                "1111111111111111111111111111111111111111",
+            ),
+        ];
+
+        let haves = collect_advertised_haves(&refs).await;
+        let result = collect_objects_for_ref(commit.id, &haves)
+            .await
+            .expect("unknown advertised objects must not block collection");
+        let hashes = result
+            .objs
+            .iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
+
+        assert!(haves.objects.is_empty());
+        assert!(haves.commits.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(hashes, HashSet::from([commit.id, tree.id, blob.id]));
     }
 
     /// Regression (#464 follow-up): `collect_lease_tracking_oids` must prefer

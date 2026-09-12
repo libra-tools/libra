@@ -53,15 +53,15 @@ fn sample_record(op_id: &str, status: OperationStatus, end_ts: i64) -> Operation
 /// Create the full operation-layer schema required by wrapper tests.
 async fn create_operation_schema(db: &DatabaseConnection) {
     let ddl = [
-        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
-        "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+        "CREATE TABLE legacy_operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
+        "CREATE TABLE legacy_operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
         // Present in every real repository (bootstrap schema); the write-lock
         // primitive in `db::begin_write_transaction` writes a no-op row filter
         // against it, and a fixture without it is not a repository database.
         "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
-        "CREATE TABLE operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
-        "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
-        "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
+        "CREATE TABLE legacy_operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
+        "CREATE TABLE legacy_operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
+        "CREATE TABLE legacy_operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
         db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
@@ -70,17 +70,17 @@ async fn create_operation_schema(db: &DatabaseConnection) {
     }
 }
 
-/// Create a schema that is missing `operation_view` so persist failure paths can be exercised.
+/// Create a schema that is missing `legacy_operation_view` so persist failure paths can be exercised.
 async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
     let ddl = [
-        "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
-        "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+        "CREATE TABLE legacy_operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
+        "CREATE TABLE legacy_operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
         // Present in every real repository (bootstrap schema); the write-lock
         // primitive in `db::begin_write_transaction` writes a no-op row filter
         // against it, and a fixture without it is not a repository database.
         "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
-        "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
-        "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
+        "CREATE TABLE legacy_operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
+        "CREATE TABLE legacy_operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
         db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
@@ -92,11 +92,11 @@ async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
 /// Create the reference table with both HEAD and main branch rows.
 async fn create_reference_table_with_head(db: &DatabaseConnection) {
     db.execute_raw(Statement::from_string(
-        DbBackend::Sqlite,
-        "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
-    ))
-    .await
-    .unwrap();
+         DbBackend::Sqlite,
+         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
+     ))
+     .await
+     .unwrap();
     // HEAD resolution is scoped to `WorktreeScope::current()` (cwd-derived):
     // seed the row for the scope this process actually runs in, so the suite
     // also passes when invoked from inside a linked worktree (where main's
@@ -105,28 +105,28 @@ async fn create_reference_table_with_head(db: &DatabaseConnection) {
         .worktree_id()
         .map(str::to_string);
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO reference(name, kind, \"commit\", remote, worktree_id) VALUES('main', 'Head', NULL, NULL, ?)",
-        [scope_worktree_id.into()],
-    ))
-    .await
-    .unwrap();
+         DbBackend::Sqlite,
+         "INSERT INTO reference(name, kind, \"commit\", remote, worktree_id) VALUES('main', 'Head', NULL, NULL, ?)",
+         [scope_worktree_id.into()],
+     ))
+     .await
+     .unwrap();
     db.execute_raw(Statement::from_string(
-        DbBackend::Sqlite,
-        "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Branch', '1111111111111111111111111111111111111111', NULL)".to_string(),
-    ))
-    .await
-    .unwrap();
+         DbBackend::Sqlite,
+         "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Branch', '1111111111111111111111111111111111111111', NULL)".to_string(),
+     ))
+     .await
+     .unwrap();
 }
 
 /// Create the reference table without a HEAD row to force snapshot failure.
 async fn create_reference_table_without_head(db: &DatabaseConnection) {
     db.execute_raw(Statement::from_string(
-        DbBackend::Sqlite,
-        "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
-    ))
-    .await
-    .unwrap();
+         DbBackend::Sqlite,
+         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
+     ))
+     .await
+     .unwrap();
 }
 
 /// Create a probe table used to assert rollback behavior.
@@ -341,7 +341,7 @@ async fn business_failure_rolls_back_all_writes() {
     let op_count = db
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT COUNT(*) FROM operation".to_string(),
+            "SELECT COUNT(*) FROM legacy_operation".to_string(),
         ))
         .await
         .unwrap()
@@ -388,7 +388,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
     let op_count = db
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT COUNT(*) FROM operation".to_string(),
+            "SELECT COUNT(*) FROM legacy_operation".to_string(),
         ))
         .await
         .unwrap()
@@ -438,7 +438,7 @@ async fn persist_failure_rolls_back_business_writes() {
     let op_count = db
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT COUNT(*) FROM operation".to_string(),
+            "SELECT COUNT(*) FROM legacy_operation".to_string(),
         ))
         .await
         .unwrap()
@@ -632,10 +632,10 @@ async fn cross_scope_interference_cannot_hide_a_duplicate() {
     for i in 0..50 {
         db.execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
-             args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-             VALUES (?, 'repo_1', ?, 'commit', 'other worktree', 'bob', 'sha256:other', ?, ?, \
-             'succeeded', ?, 'declared')",
+            "INSERT INTO legacy_operation (op_id, repo_id, view_id, command_name, description, actor, \
+              args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+              VALUES (?, 'repo_1', ?, 'commit', 'other worktree', 'bob', 'sha256:other', ?, ?, \
+              'succeeded', ?, 'declared')",
             [
                 format!("op-other-{i}").into(),
                 format!("view-other-{i}").into(),
@@ -673,10 +673,10 @@ async fn the_same_action_in_another_worktree_is_not_a_duplicate() {
     let now = chrono::Utc::now().timestamp();
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
-        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
-         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-         VALUES ('op-linked', 'repo_1', 'view-linked', 'commit', 'linked worktree', 'bob', \
-         'sha256:same-action', ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
+        "INSERT INTO legacy_operation (op_id, repo_id, view_id, command_name, description, actor, \
+          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+          VALUES ('op-linked', 'repo_1', 'view-linked', 'commit', 'linked worktree', 'bob', \
+          'sha256:same-action', ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
         [(now - 1).into(), (now - 1).into()],
     ))
     .await
@@ -726,10 +726,10 @@ async fn op_restore_dedup_key_is_scope_aware() {
     let now = chrono::Utc::now().timestamp();
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
-        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
-         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-         VALUES ('op-linked-restore', 'repo_1', 'view-linked-restore', 'op restore', \
-         'restore to 0191f0de', 'bob', ?, ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
+        "INSERT INTO legacy_operation (op_id, repo_id, view_id, command_name, description, actor, \
+          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+          VALUES ('op-linked-restore', 'repo_1', 'view-linked-restore', 'op restore', \
+          'restore to 0191f0de', 'bob', ?, ?, ?, 'succeeded', 'wt-linked-1', 'declared')",
         [target_op_id.into(), (now - 1).into(), (now - 1).into()],
     ))
     .await
@@ -784,10 +784,10 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     let now = chrono::Utc::now().timestamp();
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
-        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
-         args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-         VALUES ('op-legacy', 'repo_1', 'view-legacy', 'commit', 'legacy row', 'alice', \
-         '  sha256:legacy-pad  ', ?, ?, 'succeeded', ?, 'declared')",
+        "INSERT INTO legacy_operation (op_id, repo_id, view_id, command_name, description, actor, \
+          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+          VALUES ('op-legacy', 'repo_1', 'view-legacy', 'commit', 'legacy row', 'alice', \
+          '  sha256:legacy-pad  ', ?, ?, 'succeeded', ?, 'declared')",
         [
             (now - 1).into(),
             (now - 1).into(),
@@ -802,10 +802,10 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     for (op_id, digest) in [("op-tab", "\tsha256:legacy-tab\n"), ("op-ws", "   ")] {
         db.execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
-             args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-             VALUES (?, 'repo_1', ?, 'commit', 'legacy row', 'alice', ?, ?, ?, 'succeeded', ?, \
-             'declared')",
+            "INSERT INTO legacy_operation (op_id, repo_id, view_id, command_name, description, actor, \
+              args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
+              VALUES (?, 'repo_1', ?, 'commit', 'legacy row', 'alice', ?, ?, ?, 'succeeded', ?, \
+              'declared')",
             [
                 op_id.into(),
                 format!("view-{op_id}").into(),
@@ -819,23 +819,24 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
         .expect("seed a legacy row");
     }
 
-    // Run the SHIPPED migration SQL, not a hand-written approximation: the
-    // point is that THAT predicate and THAT trim set canonicalize these rows.
-    db.execute_raw(Statement::from_string(
-        db.get_database_backend(),
-        include_str!("../sql/migrations/2026073001_operation_args_digest_canonical.sql")
-            .to_string(),
-    ))
-    .await
-    .expect("canonicalize");
+    // Run the shipped migration body against the retained legacy table, not a
+    // hand-written approximation: the predicate and trim set must remain the
+    // same while the active v1 service is pointed at `legacy_operation`.
+    let canonical_sql = include_str!(
+        "../sql/migrations/2026073001_operation_args_digest_canonical.sql"
+    )
+    .replacen("`operation`", "`legacy_operation`", 1);
+    db.execute_unprepared(&canonical_sql)
+        .await
+        .expect("canonicalize");
 
     // Whitespace-only becomes NULL (no digest), and the tab/newline row is
     // trimmed to its token.
     let rows = db
         .query_all_raw(Statement::from_string(
             db.get_database_backend(),
-            "SELECT op_id, args_digest FROM operation WHERE op_id IN ('op-tab', 'op-ws') \
-             ORDER BY op_id"
+            "SELECT op_id, args_digest FROM legacy_operation WHERE op_id IN ('op-tab', 'op-ws') \
+              ORDER BY op_id"
                 .to_string(),
         ))
         .await

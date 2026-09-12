@@ -14,7 +14,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 使用 `--rebase`（`-r`）时，集成步骤会改为在获取到的 upstream tip 之上重放仅本地提交。这等价于 `libra fetch` 后跟 `libra rebase <upstream>`。
 
-使用 `--ff-only` 时，pull 会获取 upstream，但在本地和远程历史已经分叉时拒绝创建合并提交。快进和已经最新的 pull 仍会成功。`--ff-only` 与 `--rebase`、`--ff` 和 `--no-ff` 冲突；与 Git 一样，它可以和 `--squash`、`--no-commit` 或 `--commit` 组合。
+使用 `--ff-only` 时，pull 会获取 upstream，但在本地和远程历史已经分叉时拒绝创建合并提交。快进和已经最新的 pull 在集成预检允许时仍可成功；未解决的索引仍会阻塞 merge 阶段。`--ff-only` 与 `--rebase`、`--ff` 和 `--no-ff` 冲突；与 Git 一样，它可以和 `--squash`、`--no-commit` 或 `--commit` 组合。
 
 使用 `--no-ff` 时，即使 upstream 可以快进，pull 也会记录一个真实的 merge commit，对齐 `git pull --no-ff`。`--ff` 显式允许快进，并覆盖本次调用中的 `pull.ff`。`--ff`、`--no-ff` 和 `--ff-only` 互斥且都与 `--rebase` 冲突，但都可以和 `--commit` 组合。
 
@@ -24,9 +24,21 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 不带参数调用时，命令读取当前分支 tracking 配置（`branch.<name>.remote` 和 `branch.<name>.merge`）。只给出 `<repository>` 时，当前分支名会被用作远程分支。同时给出 `<repository>` 和 `<refspec>` 时，会获取并合并指定远程分支。
 
-Pull 支持 already-up-to-date、fast-forward 和 single-head three-way merge 结果——包括拥有多个 merge base 的交叉合并历史：共享的 merge 引擎会像 `libra merge` 一样通过递归虚拟祖先解决（见其「交叉合并历史」一节；嵌套超过 20 层、或同一层超过 32 个 merge base 的历史以 `LBR-UNSUPPORTED-001` 拒绝）。如果本地和远程分支冲突，pull 会返回由 merge 拥有的 `LBR-CONFLICT-002` 错误，带有 `phase: "merge"`，并留下与 `libra merge` 相同的 merge 状态。使用 `libra add <path>` 解决冲突并运行 `libra merge --continue`，或运行 `libra merge --abort`。 重命名同样按 `libra merge` 的方式逐侧检测（见其「重命名」一节）：远端改名而本地修改过的文件会在新路径上合并，`merge.renames` 与 `merge.renameLimit` 在此同样生效。目录/文件冲突按 `libra merge` 的方式处理（见其「目录/文件冲突」一节）：目录保留路径，文件移到 `<path>~HEAD` / `<path>~<branch>`，人读输出会在冲突错误之前打印 Git 的 `CONFLICT (file/directory)` 提示行（`--json`/`--machine` 下 stdout 保持机器可读，冲突只由错误信封承载）。
+pull 的 merge 阶段开始前继承 `libra merge` 的索引检查。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使获取到的目标已最新，也会以 `LBR-CONFLICT-002` 拒绝（退出 128，`phase: "merge"`）。该阶段保持 HEAD、索引和工作树原样，提示先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`。已有 merge 状态仍使用 `merge --continue` / `--abort` 提示。拒绝发生前 fetch 可能已经下载对象并更新远程跟踪引用，因此这不是整个 pull 的零写入保证。
 
-`pull` 已支持 `--ff-only`、`--ff`、`--no-ff`、`--squash`、`--no-commit`、`--commit`、`--autostash`、`--no-progress`、`--rebase`、`--no-rebase` 与 fetch `--depth`；尚不支持 octopus merge 与自定义合并策略（`--strategy`/`-X`）。`--commit` 只与 `--squash`、`--rebase` 冲突，并与 `--no-commit` 按命令行最后出现者生效；它不会自行强制 merge commit 或覆盖快进策略。`--depth` 要求 upstream 能协商 shallow boundary；本地 Libra upstream 以 `LBR-REPO-002` fail-closed（已决终态，见开发兼容登记 D20）。`--no-progress` 把进度抑制转发给 fetch，抑制其 “Receiving objects” 进度条。`--autostash` 在集成前 stash 已跟踪改动、集成结束时再应用回来，让 `pull` 能在脏工作树上运行——「结束」因路径而异：**rebase** 路径即使失败也会恢复；**merge** 路径沿用 `libra merge` 自己的 autostash，干净结果或前置失败时立即应用，冲突合并进行中则**持有**（JSON `autostash: "kept"`），由 `libra merge --continue` / `--abort` 应用回来，绝不丢失；未跟踪/忽略文件保持原样，应用冲突时提升入 stash list 并报错（用 `libra stash pop` 恢复）。
+Pull 支持 already-up-to-date、fast-forward 和 single-head three-way merge 结果——包括拥有多个 merge base 的交叉合并历史：共享的 merge 引擎会像 `libra merge` 一样通过递归虚拟祖先解决（见其「交叉合并历史」一节；嵌套超过 20 层、或同一层超过 32 个 merge base 的历史以 `LBR-UNSUPPORTED-001` 拒绝）。如果本地和远程分支冲突，pull 会返回由 merge 拥有的 `LBR-CONFLICT-002` 错误，带有 `phase: "merge"`，除 `--squash` 外留下与 `libra merge` 相同的 merge 状态。非 squash 冲突在解决文件、用 `libra add <path>` 暂存后运行 `libra merge --continue`，或运行 `libra merge --abort`。squash 冲突则只留下未解决的索引条目而不记录 merge 状态，解决、暂存后用普通 `libra commit` 创建单亲提交；`merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。 重命名同样按 `libra merge` 的方式逐侧检测（见其「重命名」一节）：远端改名而本地修改过的文件会在新路径上合并，`merge.renames` 与 `merge.renameLimit` 在此同样生效。路径级改名冲突也原样继承——`CONFLICT (rename/rename)`、`CONFLICT (rename/delete)` 与 `CONFLICT (rename involved in collision)` 会在冲突错误之前打印于人读输出（`--json`/`--machine` 下 stdout 保持机器可读），而两侧把同一文件改名到同一路径则是干净合并而非冲突。目录/文件冲突按 `libra merge` 的方式处理（见其「目录/文件冲突」一节）：目录保留路径，文件移到 `<path>~HEAD` / `<path>~<branch>`，人读输出会在冲突错误之前打印 Git 的 `CONFLICT (file/directory)` 提示行（`--json`/`--machine` 下 stdout 保持机器可读，冲突只由错误信封承载）。
+
+pull 的 merge 阶段也继承 `libra merge` 的目录改名推断和 `merge.directoryRenames=true|false|conflict`。默认 `conflict` 会建议并暂存迁移后的未解决路径；`true` 自动迁移；`false` 把新增路径留在旧目录名下。目标分裂会让合并停下，但受影响新增路径仍是 stage 0。未知值在 merge 阶段以 `LBR-REPO-003` fail-closed；在这次阶段性拒绝前，fetch 可能已经更新远程跟踪引用。
+
+merge 路径也继承 `merge.renormalize=true|false`。启用时，共享三路引擎先根据
+`text` / `eol` 属性 canonicalize base、本地和远端输入，再执行内容合并，
+结果保留本地（ours 侧）行尾。pull 不公开 `-X renormalize|no-renormalize`
+覆盖；请使用仓库配置。无效值只在 pull 真正进入三路合并时以
+`LBR-REPO-003` 失败；此前 fetch 可能已更新对象与远程跟踪引用。
+fast-forward 与 already-up-to-date 不读取该配置。任意 clean/smudge filter
+仍不支持。
+
+`pull` 已支持 `--ff-only`、`--ff`、`--no-ff`、`--squash`、`--no-commit`、`--commit`、`--autostash`、`--no-progress`、`--rebase`、`--no-rebase` 与 fetch `--depth`；尚不支持 octopus merge 与自定义合并策略（`--strategy`/`-X`）。`--commit` 只与 `--squash`、`--rebase` 冲突，并与 `--no-commit` 按命令行最后出现者生效；它不会自行强制 merge commit 或覆盖快进策略。`--depth` 要求 upstream 能协商 shallow boundary；本地 Libra upstream 以 `LBR-REPO-002` fail-closed（已决终态，见开发兼容登记 D20）。`--no-progress` 把进度抑制转发给 fetch，抑制其 “Receiving objects” 进度条。`--autostash` 在集成前 stash 已跟踪改动、集成结束时再应用回来，让 `pull` 能在脏工作树上运行——「结束」因路径而异：**rebase** 路径即使失败也会恢复；**merge** 路径沿用 `libra merge` 自己的 autostash，干净结果或前置失败时立即应用，非 squash 冲突合并进行中则**持有**（JSON `autostash: "kept"`），由 `libra merge --continue` / `--abort` 应用回来，绝不丢失；冲突 squash 则直接把 autostash 保存进 stash list，不执行回贴，保留未解决的索引和工作树，解决、提交后再用 `libra stash pop` 恢复；保存失败时警告并保留 held sidecar 引用。未跟踪/忽略文件保持原样，应用冲突时提升入 stash list 并报错（用 `libra stash pop` 恢复）。
 
 ## 全局配置 Schema 保护
 
@@ -41,13 +53,13 @@ Pull 支持 already-up-to-date、fast-forward 和 single-head three-way merge �
 |-----------------|-------------|---------|
 | `<repository>` | 要从中 pull 的远程名称。省略时使用当前分支已配置的 upstream。 | `libra pull origin` |
 | `<refspec>` | 远程上的分支名。需要 `<repository>`。省略时使用当前分支名。 | `libra pull origin main` |
-| `--ff-only` | 拒绝创建合并提交；仅 fast-forward 或 already-up-to-date pull 会成功。与 `--rebase`、`--ff` 和 `--no-ff` 冲突。 | `libra pull --ff-only` |
+| `--ff-only` | 拒绝创建合并提交；仅允许 fast-forward 或 already-up-to-date 集成；未解决的索引仍会拒绝 merge 阶段。与 `--rebase`、`--ff` 和 `--no-ff` 冲突。 | `libra pull --ff-only` |
 | `--ff` | 显式允许快进合并，覆盖 `pull.ff=false|only`。与 `--no-ff`、`--ff-only` 和 `--rebase` 冲突。 | `libra pull --ff` |
 | `--no-ff` | 即使可以快进也总是创建 merge commit。与 `--ff`、`--ff-only` 和 `--rebase` 冲突。 | `libra pull --no-ff` |
-| `--squash` | 暂存合并后的树，但不提交也不移动 `HEAD`，结果留给普通 `libra commit`。与 `--no-commit`、`--rebase` 冲突。 | `libra pull --squash` |
+| `--squash` | 暂存合并后的树，但不提交、不移动 `HEAD`、不记录 merge 状态，即使冲突也如此。解决并暂存冲突后用普通 `libra commit` 创建单亲提交，merge 控制动作不可用。与 `--no-commit`、`--rebase` 冲突。 | `libra pull --squash` |
 | `--no-commit` | 合并并暂存，但提交前停止，记录 merge state 以便用 `libra merge --continue` 完成。与 `--squash`、`--rebase` 冲突。 | `libra pull --no-commit` |
 | `--commit` | 提交 merge 结果；与 `--no-commit` 最后出现者生效，且不覆盖快进策略。与 `--squash`、`--rebase` 冲突。 | `libra pull --commit` |
-| `--autostash` | 集成前 stash 已跟踪工作树改动，集成结束时再应用回来（rebase：即使失败也恢复；merge：冲突时持有，直到 `merge --continue`/`--abort`），让脏工作树也能 pull。未跟踪/忽略文件保持原样。 | `libra pull --autostash` |
+| `--autostash` | 集成前 stash 已跟踪工作树改动，集成结束时再应用回来（rebase：即使失败也恢复；merge：非 squash 冲突时持有，直到 `merge --continue`/`--abort`；冲突 squash：直接保存进 stash list，解决并提交后 `stash pop`），让脏工作树也能 pull。未跟踪/忽略文件保持原样。 | `libra pull --autostash` |
 | `--no-progress` | 抑制 fetch 进度条（“Receiving objects” spinner），对齐 `git pull --no-progress`。 | `libra pull --no-progress` |
 | `--notes` | 转发给 fetch：从本地 Libra upstream 额外导入文件依赖图（`refs/notes/deps`，lore.md 3.2）。默认关闭；网络或普通 Git upstream 会告警且不导入。见 `libra fetch --notes`。 | `libra pull --notes` |
 | `--depth <n>` | 将 fetch 阶段限制为每个 tip 的 `n` 个提交。与 `--rebase` 冲突；本地 Libra upstream 因不能声明 shallow boundary 以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra pull --depth 1` |
@@ -241,11 +253,12 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | `pull.rebase`、`branch.<name>.rebase` 或 `pull.ff` 配置值无效 | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
 | 不支持的 `pull.rebase=merges|interactive` 模式 | `LBR-CLI-002` | 129 | 使用布尔 rebase 或显式的受支持 pull 标志 |
-| `merge.renames` / `merge.renameLimit` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | "set merge.renames to true/false and merge.renameLimit to an integer" |
+| `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | 把对应 merge 配置设为支持值或删除 |
 | Fetch：网络不可达 / 超时 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch：认证失败 | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
 | Fetch：协议错误 | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
-| Merge：冲突、脏工作树或未跟踪覆盖 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
+| Merge：非 squash 冲突、脏工作树或未跟踪覆盖 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
+| Merge：无 merge 状态的未解决索引，或新发生的 squash 冲突 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'" |
 | Merge：`--ff-only` 拒绝非快进 | `LBR-CONFLICT-002` | 128 | "run 'libra pull' without --ff-only to allow a merge commit" |
 | Merge 或 rebase 需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 | 在 Libra 之外解决 submodule 指针，或移除该 gitlink 条目——拒绝发生在 autostash 与任何索引/工作树写入之前（见 `docs/commands/zh-CN/merge.md`） |
 | Merge：递归虚拟祖先嵌套超过 20 层或同层超过 32 个 base | `LBR-UNSUPPORTED-001` | 128 | 先把两条分支的共同祖先合并到一起，或改用 `--rebase` pull（见 `docs/commands/zh-CN/merge.md`） |

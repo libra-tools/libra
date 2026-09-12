@@ -76,6 +76,7 @@ const COMMANDS: &[&str] = &[
     "checkout",
     "tag",
     "merge",
+    "mergetool",
     "rebase",
     "reset",
     "cherry-pick",

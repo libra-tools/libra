@@ -18,6 +18,7 @@ use git_internal::internal::index::Index;
 
 use crate::{
     command::status_untracked_paths::TrackedPaths,
+    internal::worktree_scope::{WorktreeScope, with_request_scope_sync},
     utils::{pathspec::PathspecSet, util},
 };
 
@@ -218,11 +219,12 @@ where
     // is supposed to match — the exact stage would silently degrade to
     // inexact and read objects it did not need. Carry it across.
     let hash_kind = git_internal::hash::get_hash_kind();
+    let request_scope = WorktreeScope::request_scope();
     let job: IoJob = Box::new(move || {
         git_internal::hash::set_hash_kind(hash_kind);
         // A closed receiver (timed-out caller) is expected; drop the value,
         // then release the slot so the pool accounting stays accurate.
-        let _ = tx.send(op());
+        let _ = tx.send(with_request_scope_sync(request_scope, op));
         IO_BUSY.fetch_sub(1, Ordering::SeqCst);
     });
     {
@@ -343,9 +345,10 @@ where
         }
     }
     let hash_kind = git_internal::hash::get_hash_kind();
+    let request_scope = WorktreeScope::request_scope();
     let job: IoJob = Box::new(move || {
         git_internal::hash::set_hash_kind(hash_kind);
-        op();
+        with_request_scope_sync(request_scope, op);
         IO_BUSY.fetch_sub(1, Ordering::SeqCst);
     });
     {
@@ -379,6 +382,9 @@ fn run_io_worker(pool: &IoWorkerPool) {
         job();
     }
 }
+
+#[cfg(test)]
+mod scope_context_tests;
 
 #[cfg(test)]
 mod pool_smoke_tests {

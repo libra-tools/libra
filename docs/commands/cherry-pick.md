@@ -32,6 +32,13 @@ Submodules are never merged (see `docs/commands/merge.md`): if the pick's three-
 
 When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any unresolved divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). `-X ours/theirs` can resolve only the overlapping hunks while retaining clean changes. The in-progress sequence is persisted in the unified SQLite `sequence_state` table, so you can resolve a remaining conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, other sequencer operations are blocked (`LBR-CONFLICT-002`).
 
+That content merge honors the path's `merge` gitattribute and the
+`merge.default` fallback exactly as `libra merge` does: `text`, `binary`, and
+`union` are built in, while unknown names fall back to `text`. A union driver
+can therefore resolve an overlapping pick by keeping current content followed
+by picked content; a binary-driver conflict keeps the complete surviving side
+(current when present) without adding text markers.
+
 ## Options
 
 ### `-n`, `--no-commit`
@@ -248,7 +255,7 @@ Git maintains `.git/CHERRY_PICK_HEAD` and sequencer state files. Libra persists 
 
 A divergent path is surfaced with line-level conflict markers, matching Git: a three-way merge (base = parent tree, ours = current index, theirs = picked tree) encloses only the diverging hunks between `<<<<<<< HEAD` / `=======` / `>>>>>>> <short-source>`, leaving lines that both sides share outside the markers. A delete/modify conflict (one side absent) or binary content falls back to a whole-file presentation, where a line-level merge would be meaningless. The `>>>>>>>` label is the picked commit's abbreviation (Libra omits the commit subject Git appends).
 
-The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `diff3` additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator; an unsupported value (e.g. `zdiff3`) is a hard error when a conflict must be rendered. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
+The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `merge` re-diffs the two postimages to expose common edges and longer common runs, `diff3` adds the complete ancestor block, and `zdiff3` keeps that ancestor block while trimming common postimage prefixes and suffixes. An unknown value is a hard error before index or working-tree writes whenever a divergent content merge needs the renderer. Marker lines follow uniformly CRLF input; otherwise they use LF. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
 
 ### Custom strategies remain explicit
 

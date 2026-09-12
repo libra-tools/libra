@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.22.16"
+version = "0.22.18"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -600,3 +600,32 @@ path = "tests/commit_change_id_header_spike.rs"
 # debug_assertions are independent of opt-level, so behavior is unchanged.
 [profile.dev.package."*"]
 opt-level = 2
+# OL-02..04: v2 persistence foundation targets.
+[[test]]
+name = "operation_schema_v2"
+path = "tests/operation_schema_v2.rs"
+
+[[test]]
+name = "operation_dag"
+path = "tests/operation_dag.rs"
+
+# plan-20260822 OL-05..09: operation-log v2 snapshot and mutation-boundary targets.
+[[test]]
+name = "workspace_snapshot_roundtrip"
+path = "tests/workspace_snapshot_roundtrip.rs"
+
+[[test]]
+name = "index_snapshot_roundtrip"
+path = "tests/index_snapshot_roundtrip.rs"
+
+[[test]]
+name = "sequencer_snapshot_roundtrip"
+path = "tests/sequencer_snapshot_roundtrip.rs"
+
+[[test]]
+name = "operation_command_coverage"
+path = "tests/operation_command_coverage.rs"
+
+[[test]]
+name = "agent_shell_operation"
+path = "tests/agent_shell_operation.rs"

@@ -31,8 +31,8 @@ fn bridge_migrations_remain_registered_after_later_migrations() {
         "2026082401_agent_bridge_link_relations must stay registered"
     );
     assert!(
-        runner.max_registered_version() >= Some(BRIDGE_LINK_RELATIONS_VERSION),
-        "no migration may regress below the bridge link-relations version"
+        runner.max_registered_version() > Some(BRIDGE_LINK_RELATIONS_VERSION),
+        "newer foundation migrations may follow the bridge migration"
     );
 }
 

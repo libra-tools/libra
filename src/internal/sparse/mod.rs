@@ -157,6 +157,115 @@ impl SparseViewStore {
     }
 }
 
+/// Capture sparse state from an explicit repository connection. Snapshot
+/// facets run synchronously behind a trait boundary, so a fresh connection in
+/// their helper runtime avoids borrowing the caller's cached async pool while
+/// the caller is blocked waiting for the facet result.
+pub(crate) async fn snapshot_for_storage(
+    storage: &std::path::Path,
+    scope: &WorktreeScope,
+) -> Result<(Vec<String>, bool), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT pattern FROM sparse_view WHERE worktree_id = ? ORDER BY ordinal ASC, id ASC",
+            [scope.storage_key().into()],
+        ))
+        .await
+        .map_err(|error| format!("failed to list the sparse view: {error}"))?;
+    let mut patterns = Vec::with_capacity(rows.len());
+    for row in rows {
+        patterns.push(row.try_get_by_index(0).map_err(|error| error.to_string())?);
+    }
+    let enabled = match db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
+            [scope.storage_key().into()],
+        ))
+        .await
+    {
+        Ok(Some(row)) => {
+            row.try_get_by_index::<i32>(0)
+                .map_err(|error| error.to_string())?
+                != 0
+        }
+        Ok(None) => false,
+        Err(error) => return Err(format!("failed to read the sparse view toggle: {error}")),
+    };
+    Ok((patterns, enabled))
+}
+
+/// Restore sparse state through an explicitly opened connection for the
+/// already-resolved worktree. This mirrors the facet capture helper and keeps
+/// synchronous StateFacet restoration from borrowing the caller's cached pool.
+pub(crate) async fn restore_for_storage(
+    storage: &std::path::Path,
+    scope: &WorktreeScope,
+    patterns: &[String],
+    enabled: bool,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin sparse view restore transaction: {error}"))?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sparse_view WHERE worktree_id = ?",
+        [scope.storage_key().into()],
+    ))
+    .await
+    .map_err(|error| format!("failed to clear the sparse view: {error}"))?;
+    for (ordinal, pattern) in patterns.iter().enumerate() {
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+            [
+                scope.storage_key().into(),
+                pattern.as_str().into(),
+                (ordinal as i64).into(),
+            ],
+        ))
+        .await
+        .map_err(|error| format!("failed to restore a sparse pattern: {error}"))?;
+    }
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
+         ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
+        [
+            scope.storage_key().into(),
+            (if enabled { 1 } else { 0 }).into(),
+        ],
+    ))
+    .await
+    .map_err(|error| format!("failed to restore the sparse view toggle: {error}"))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("failed to commit sparse view restore: {error}"))?;
+    Ok(())
+}
+
 /// A compiled sparse view ready for per-path verdicts. `None` when the view is
 /// disabled or has no patterns — in which case EVERYTHING is in view (a
 /// deliberate anti-footgun: an enabled-but-empty view degrades to a no-op

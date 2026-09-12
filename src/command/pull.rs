@@ -489,8 +489,13 @@ pub(crate) async fn run_pull(
                 // or unrelated-history override controls.
                 strategy: None,
                 favor: None,
+                whitespace: None,
+                renormalize: None,
                 allow_unrelated_histories: false,
                 message: None,
+                into_name: None,
+                cleanup: None,
+                edit: false,
                 squash: args.squash,
                 no_commit: args.no_commit,
                 skip_hooks: false,
@@ -500,12 +505,19 @@ pub(crate) async fn run_pull(
                 merge_log: 0,
                 // `pull` does not expose `--dry-run`.
                 dry_run: false,
+                // `pull` has no `--signoff` surface.
+                signoff: false,
+                // `pull` exposes no merge-commit signing controls. Keep its
+                // established unsigned merge behavior rather than inheriting
+                // the public `merge` command's new signing default.
+                signing_policy: Some(crate::command::history_config::CommitSigningPolicy::Disable),
                 // `pull --autostash` on the merge path rides the Git-faithful
                 // merge-owned autostash (held on conflict, applied by
                 // --continue/--abort); with no flag, `merge.autostash` config
                 // is resolved inside the merge — matching `git pull`.
                 autostash: if args.autostash { Some(true) } else { None },
                 preserve_held_autostash: false,
+                strategy_evaluation: None,
             },
         )
         .await
@@ -1057,6 +1069,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
                 "merge the branches' common ancestors together first, so the history has a single merge base",
             )
             .with_hint("or pull with --rebase, which replays commits one at a time"),
+        merge::PullMergeError::OctopusStrategyUnsupported { .. } => {
+            CliError::failure(error.to_string()).with_stable_code(StableErrorCode::Unsupported)
+        }
         merge::PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::Unsupported)
             .with_hint(
@@ -1069,7 +1084,10 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
             .with_hint("or run 'libra pull --rebase' to replay local commits"),
-        merge::PullMergeError::Conflicts { .. }
+        merge::PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
+        merge::PullMergeError::Conflicts { squash: false, .. }
         | merge::PullMergeError::DirtyWorktree
         | merge::PullMergeError::UntrackedOverwrite { .. }
         | merge::PullMergeError::MergeInProgress
@@ -1085,15 +1103,22 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         }
         merge::PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+            .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
         merge::PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("set merge.renames to true/false and merge.renameLimit to an integer"),
         merge::PullMergeError::RenameConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
-        merge::PullMergeError::ConflictStyleRead(..) => {
+        merge::PullMergeError::ConflictStyleRead(..)
+        | merge::PullMergeError::MergeDriverConfigRead(..)
+        | merge::PullMergeError::RenormalizeConfigRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        merge::PullMergeError::InvalidRenormalizeConfig(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set merge.renormalize to true/false (or remove it)")
         }
         merge::PullMergeError::HistoryConfig(
             crate::command::history_config::HistoryConfigError::Read { .. },
@@ -1119,6 +1144,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::WorkdirReset(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        merge::PullMergeError::CommitSigning(..) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::AuthMissingCredentials)
+            .with_hint("check vault configuration with 'libra config --list'"),
         // Mirrors `CommitError::IdentityMissing`: the merge commit `pull` creates
         // needs the same identity as any other commit, and fails the same way.
         merge::PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
@@ -1136,7 +1164,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         // match must stay exhaustive.
         merge::PullMergeError::UnsignedMergeCommit { .. }
         | merge::PullMergeError::BadMergeSignature { .. }
-        | merge::PullMergeError::SignatureCheck(..) => {
+        | merge::PullMergeError::SignatureCheck(..)
+        | merge::PullMergeError::OctopusUnbornHead
+        | merge::PullMergeError::OctopusConflict { .. } => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
         merge::PullMergeError::RepositoryHook { .. } => CliError::failure(error.to_string())
@@ -1148,12 +1178,49 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::MessageFileRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
+        // `pull` never enables merge message sources, cleanup, or editing,
+        // but retain a stable, actionable mapping if an internal caller does.
+        merge::PullMergeError::InvalidCleanup(..) => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("choose strip, whitespace, verbatim, scissors, or default"),
+        merge::PullMergeError::EmptyMessage | merge::PullMergeError::Editor(..) => {
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_conflict_hints_follow_the_pending_merge_state() {
+        for squash in [false, true] {
+            let error = merge::PullMergeError::Conflicts {
+                paths: "renamed.txt".to_string(),
+                squash,
+            };
+            let cli = map_merge_error_to_cli(&error);
+            assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
+            let rendered = cli.render();
+            assert!(rendered.contains("renamed.txt"));
+            assert_eq!(rendered.contains("libra merge --continue"), !squash);
+            assert_eq!(rendered.contains("libra merge --abort"), !squash);
+            assert_eq!(rendered.contains("'libra commit'"), squash);
+        }
+    }
+
+    #[test]
+    fn merge_vault_signing_error_maps_to_actionable_auth_failure() {
+        let error = merge::PullMergeError::CommitSigning("no unseal key".to_string());
+        let cli = map_merge_error_to_cli(&error);
+        assert_eq!(cli.stable_code(), StableErrorCode::AuthMissingCredentials);
+        assert!(
+            cli.render().contains("check vault configuration"),
+            "merge signing failures must retain an actionable vault hint"
+        );
+    }
 
     #[test]
     fn depth_and_no_ff_flags_parse() {

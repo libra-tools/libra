@@ -169,6 +169,11 @@ struct WalkStats {
     /// this replaced held two full ancestor sets plus a `common` set plus a
     /// fresh visited set per candidate.
     peak_painted: usize,
+    /// Largest combined number of logical entries resident in the paint map
+    /// and priority queue at one time. Queue entries are counted separately
+    /// because the same painted commit can be queued more than once while its
+    /// flags converge.
+    peak_resident_entries: usize,
     /// Committer date of each commit as it was popped, in order. TEST-ONLY: it
     /// grows with the number of pops, so it must never exist in a production
     /// walk — the whole point of the residency claim is that nothing here
@@ -187,7 +192,8 @@ struct WalkStats {
     priority_respected: bool,
 }
 
-/// Paint down from both tips and return every commit reached from both sides.
+/// Paint down from one tip and one or more opposite tips, returning every
+/// commit reached from both sides.
 ///
 /// The result is the merge-base CANDIDATE set: it always contains the true
 /// LCAs, and may additionally contain commits shadowed by them, which
@@ -197,6 +203,14 @@ fn paint_down_to_common<S: CommitSource>(
     lhs: &ObjectHash,
     rhs: &ObjectHash,
 ) -> Result<(Vec<ObjectHash>, WalkStats), MergeBaseError> {
+    paint_down_to_common_many(source, lhs, std::slice::from_ref(rhs))
+}
+
+fn paint_down_to_common_many<S: CommitSource>(
+    source: &mut S,
+    lhs: &ObjectHash,
+    rhs: &[ObjectHash],
+) -> Result<(Vec<ObjectHash>, WalkStats), MergeBaseError> {
     let mut painted: HashMap<ObjectHash, Paint> = HashMap::new();
     let mut queue: BinaryHeap<Queued> = BinaryHeap::new();
     let mut result = Vec::new();
@@ -204,47 +218,39 @@ fn paint_down_to_common<S: CommitSource>(
         priority_respected: true,
         ..WalkStats::default()
     };
-
-    // Identical tips are seeded ONCE carrying both marks. Seeding twice would
-    // queue the same commit twice for no gain, and would put the read count
-    // over the `3 * (commits + edges)` bound on the degenerate one-commit
-    // graph.
-    let seeds: &[(&ObjectHash, Paint)] = if lhs == rhs {
-        &[(
-            lhs,
-            Paint {
-                lhs: true,
-                rhs: true,
-                stale: false,
-            },
-        )]
-    } else {
-        &[
-            (
-                lhs,
-                Paint {
-                    lhs: true,
-                    ..Paint::default()
-                },
-            ),
-            (
-                rhs,
-                Paint {
-                    rhs: true,
-                    ..Paint::default()
-                },
-            ),
-        ]
-    };
-    for (tip, paint) in seeds {
-        let date = source.node(tip)?.date;
-        painted.entry(**tip).or_default().merge(*paint);
-        queue.push(Queued { date, id: **tip });
+    if rhs.is_empty() {
+        return Ok((result, stats));
     }
+
+    // Deduplicate seeds before queueing them. In particular, `lhs` may also be
+    // one of the opposite tips; it must be queued ONCE carrying both marks to
+    // preserve the `3 * (commits + edges)` read bound.
+    let mut seed_order = vec![*lhs];
+    painted.insert(
+        *lhs,
+        Paint {
+            lhs: true,
+            ..Paint::default()
+        },
+    );
+    for tip in rhs {
+        if !painted.contains_key(tip) {
+            seed_order.push(*tip);
+        }
+        painted.entry(*tip).or_default().rhs = true;
+    }
+    for tip in seed_order {
+        let date = source.node(&tip)?.date;
+        queue.push(Queued { date, id: tip });
+    }
+    stats.peak_resident_entries = painted.len() + queue.len();
 
     while let Some(Queued { date, id }) = queue.pop() {
         stats.peak_frontier = stats.peak_frontier.max(queue.len() + 1);
         stats.peak_painted = stats.peak_painted.max(painted.len());
+        stats.peak_resident_entries = stats
+            .peak_resident_entries
+            .max(painted.len() + queue.len() + 1);
         #[cfg(test)]
         stats.pop_dates.push(date);
         stats.priority_respected &= queue.peek().is_none_or(|next| next.date <= date);
@@ -272,6 +278,7 @@ fn paint_down_to_common<S: CommitSource>(
             painted.insert(*parent, next);
             queue.push(Queued { date, id: *parent });
         }
+        stats.peak_resident_entries = stats.peak_resident_entries.max(painted.len() + queue.len());
     }
 
     Ok((result, stats))
@@ -342,6 +349,94 @@ pub fn merge_base(a: &ObjectHash, b: &ObjectHash) -> Result<Option<ObjectHash>, 
     Ok(merge_bases(a, b)?.into_iter().next())
 }
 
+/// Remove duplicate or reachable heads while retaining the command-line order
+/// of the independent tips. This is Git's `reduce_heads`: a head that is an
+/// ancestor of another supplied head does not need to become a parent of the
+/// resulting merge commit.
+pub fn reduce_heads(heads: &[ObjectHash]) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let mut source = ObjectStoreCommits::new();
+    reduce_heads_with(&mut source, heads)
+}
+
+fn reduce_heads_with<S: CommitSource>(
+    source: &mut S,
+    heads: &[ObjectHash],
+) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for head in heads {
+        if seen.insert(*head) {
+            unique.push(*head);
+        }
+    }
+
+    // Reuse the single multi-source ancestry walk used for merge-base
+    // candidates. A pairwise reachability query per head would turn a wide
+    // octopus invocation into O(heads^2 * history) work.
+    remove_redundant(source, &unique)
+}
+
+/// Best common ancestors shared by every tip in an octopus merge.
+///
+/// This follows Git's `get_octopus_merge_bases`: repeatedly union the pairwise
+/// LCA sets against the next tip, reducing duplicates and dominated candidates
+/// between rounds. It is used for the octopus entry gate that rejects a set of
+/// heads with no single shared history unless unrelated histories are allowed.
+pub fn octopus_merge_bases(tips: &[ObjectHash]) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let mut source = ObjectStoreCommits::new();
+    octopus_merge_bases_with(&mut source, tips)
+}
+
+fn octopus_merge_bases_with<S: CommitSource>(
+    source: &mut S,
+    tips: &[ObjectHash],
+) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let Some(first) = tips.first() else {
+        return Ok(Vec::new());
+    };
+    let mut result = vec![*first];
+    for tip in &tips[1..] {
+        let mut next = Vec::new();
+        for candidate in &result {
+            next.extend(merge_bases_with(source, tip, candidate)?);
+        }
+        result = reduce_heads_with(source, &next)?;
+        if result.is_empty() {
+            break;
+        }
+    }
+    result.sort_by_key(|id| id.to_string());
+    Ok(result)
+}
+
+/// Best common ancestors between `one` and a hypothetical merge of `others`.
+///
+/// This is the multi-commit form of `git merge-base one other...`, used by
+/// `git-merge-octopus.sh` for each target after the first. It is deliberately
+/// different from `git merge-base --octopus`: a base only needs to be
+/// reachable from `one` and one of the already-merged heads, not from every
+/// head. One multi-source paint computes the union of the pairwise candidate
+/// sets, which is then reduced so an older base cannot mask a more specific
+/// base shared with one member of the hypothetical merge.
+pub fn merge_bases_many(
+    one: &ObjectHash,
+    others: &[ObjectHash],
+) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let mut source = ObjectStoreCommits::new();
+    merge_bases_many_with(&mut source, one, others)
+}
+
+fn merge_bases_many_with<S: CommitSource>(
+    source: &mut S,
+    one: &ObjectHash,
+    others: &[ObjectHash],
+) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    let (candidates, _stats) = paint_down_to_common_many(source, one, others)?;
+    let mut result = reduce_heads_with(source, &candidates)?;
+    result.sort_by_key(|id| id.to_string());
+    Ok(result)
+}
+
 /// Whether `ancestor` is an ancestor of `descendant`. Reflexive: a commit is its
 /// own ancestor, matching `git merge-base --is-ancestor X X` (exit 0).
 pub fn is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> Result<bool, MergeBaseError> {
@@ -384,6 +479,8 @@ mod tests {
         /// How many `node()` lookups the algorithm asked for, and the largest
         /// number of commits it held painted at once — the frontier bound.
         reads: usize,
+        /// Distinct commit ids requested by the algorithm under test.
+        unique_reads: HashSet<ObjectHash>,
     }
 
     impl TestGraph {
@@ -391,6 +488,7 @@ mod tests {
             Self {
                 nodes: HashMap::new(),
                 reads: 0,
+                unique_reads: HashSet::new(),
             }
         }
 
@@ -430,6 +528,7 @@ mod tests {
     impl CommitSource for TestGraph {
         fn node(&mut self, id: &ObjectHash) -> Result<CommitNode, MergeBaseError> {
             self.reads += 1;
+            self.unique_reads.insert(*id);
             self.nodes
                 .get(id)
                 .cloned()
@@ -441,17 +540,29 @@ mod tests {
     /// intersection, then a full walk from EVERY common ancestor to drop the
     /// non-maximal ones. Kept as the oracle the new painting is checked
     /// against, and as the baseline the scaling assertion measures.
+    #[derive(Debug, Default)]
+    struct ReferenceStats {
+        /// Peak logical entries simultaneously retained by the replaced walk's
+        /// ancestor sets, intersection, per-candidate visited set and queues.
+        peak_resident_entries: usize,
+    }
+
     fn reference_merge_bases(
         graph: &mut TestGraph,
         a: &ObjectHash,
         b: &ObjectHash,
-    ) -> Result<Vec<ObjectHash>, MergeBaseError> {
+    ) -> Result<(Vec<ObjectHash>, ReferenceStats), MergeBaseError> {
         fn ancestors(
             graph: &mut TestGraph,
             start: &ObjectHash,
+            already_resident: usize,
+            stats: &mut ReferenceStats,
         ) -> Result<HashSet<ObjectHash>, MergeBaseError> {
             let mut seen = HashSet::new();
             let mut queue = VecDeque::from([*start]);
+            stats.peak_resident_entries = stats
+                .peak_resident_entries
+                .max(already_resident + seen.len() + queue.len());
             while let Some(id) = queue.pop_front() {
                 if !seen.insert(id) {
                     continue;
@@ -459,21 +570,36 @@ mod tests {
                 for parent in graph.node(&id)?.parents {
                     queue.push_back(parent);
                 }
+                stats.peak_resident_entries = stats
+                    .peak_resident_entries
+                    .max(already_resident + seen.len() + queue.len());
             }
             Ok(seen)
         }
 
-        let common: HashSet<ObjectHash> = ancestors(graph, a)?
-            .intersection(&ancestors(graph, b)?)
+        let mut stats = ReferenceStats::default();
+        let lhs_ancestors = ancestors(graph, a, 0, &mut stats)?;
+        let rhs_ancestors = ancestors(graph, b, lhs_ancestors.len(), &mut stats)?;
+        let common: HashSet<ObjectHash> = lhs_ancestors
+            .intersection(&rhs_ancestors)
             .copied()
             .collect();
+        stats.peak_resident_entries = stats
+            .peak_resident_entries
+            .max(lhs_ancestors.len() + rhs_ancestors.len() + common.len());
         if common.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), stats));
         }
+        drop(lhs_ancestors);
+        drop(rhs_ancestors);
+
         let mut dominated: HashSet<ObjectHash> = HashSet::new();
         for start in &common {
             let mut seen = HashSet::new();
             let mut queue: VecDeque<ObjectHash> = graph.node(start)?.parents.into_iter().collect();
+            stats.peak_resident_entries = stats
+                .peak_resident_entries
+                .max(common.len() + dominated.len() + seen.len() + queue.len());
             while let Some(id) = queue.pop_front() {
                 if !seen.insert(id) {
                     continue;
@@ -484,6 +610,9 @@ mod tests {
                 for parent in graph.node(&id)?.parents {
                     queue.push_back(parent);
                 }
+                stats.peak_resident_entries = stats
+                    .peak_resident_entries
+                    .max(common.len() + dominated.len() + seen.len() + queue.len());
             }
         }
         let mut lcas: Vec<ObjectHash> = common
@@ -491,14 +620,14 @@ mod tests {
             .filter(|id| !dominated.contains(id))
             .collect();
         lcas.sort_by_key(|id| id.to_string());
-        Ok(lcas)
+        Ok((lcas, stats))
     }
 
     /// Assert the painting agrees with the reference implementation, and return
     /// what both produced.
     fn agree(graph: &mut TestGraph, a: ObjectHash, b: ObjectHash) -> Vec<ObjectHash> {
         let painted = merge_bases_with(graph, &a, &b).expect("paint down");
-        let reference = reference_merge_bases(graph, &a, &b).expect("reference walk");
+        let (reference, _) = reference_merge_bases(graph, &a, &b).expect("reference walk");
         assert_eq!(
             painted, reference,
             "the painting must agree with the BFS-intersection oracle"
@@ -534,6 +663,119 @@ mod tests {
         let mut expected = vec![TestGraph::id(1), TestGraph::id(2)];
         expected.sort_by_key(|id| id.to_string());
         assert_eq!(bases, expected);
+    }
+
+    #[test]
+    fn octopus_reduce_heads_preserves_independent_input_order() {
+        let mut graph = TestGraph::new();
+        graph.add(0, &[], 0);
+        graph.add(1, &[0], 1);
+        graph.add(2, &[1], 2);
+        graph.add(3, &[0], 3);
+
+        let reduced = reduce_heads_with(
+            &mut graph,
+            &[
+                TestGraph::id(1),
+                TestGraph::id(3),
+                TestGraph::id(2),
+                TestGraph::id(1),
+            ],
+        )
+        .expect("reduce octopus heads");
+        assert_eq!(
+            reduced,
+            vec![TestGraph::id(3), TestGraph::id(2)],
+            "the ancestor and duplicate are removed without sorting the survivors"
+        );
+    }
+
+    #[test]
+    fn octopus_merge_bases_many_keep_every_criss_cross_lca() {
+        let mut graph = TestGraph::new();
+        graph.add(0, &[], 0);
+        graph.add(1, &[0], 1);
+        graph.add(2, &[0], 2);
+        graph.add(3, &[1, 2], 3);
+        graph.add(4, &[2, 1], 4);
+        graph.add(5, &[1, 2], 5);
+
+        let bases = merge_bases_many_with(
+            &mut graph,
+            &TestGraph::id(3),
+            &[TestGraph::id(4), TestGraph::id(5)],
+        )
+        .expect("compute octopus bases");
+        let mut expected = vec![TestGraph::id(1), TestGraph::id(2)];
+        expected.sort_by_key(|id| id.to_string());
+        assert_eq!(bases, expected);
+        assert_eq!(
+            octopus_merge_bases_with(
+                &mut graph,
+                &[TestGraph::id(3), TestGraph::id(4), TestGraph::id(5)]
+            )
+            .expect("compute all-tip octopus bases"),
+            expected
+        );
+    }
+
+    #[test]
+    fn octopus_merge_bases_many_use_the_hypothetical_merge_not_all_tip_intersection() {
+        let mut graph = TestGraph::new();
+        graph.add(0, &[], 0);
+        graph.add(1, &[0], 1);
+        graph.add(2, &[1], 2);
+        graph.add(3, &[0], 3);
+        graph.add(4, &[1], 4);
+
+        let bases = merge_bases_many_with(
+            &mut graph,
+            &TestGraph::id(4),
+            &[TestGraph::id(2), TestGraph::id(3)],
+        )
+        .expect("compute merge base against hypothetical merged heads");
+        assert_eq!(bases, vec![TestGraph::id(1)]);
+    }
+
+    #[test]
+    fn octopus_merge_bases_many_use_one_multi_source_history_walk() {
+        const TRUNK: u32 = 128;
+        const OPPOSITE_TIPS: u32 = 32;
+
+        let mut graph = TestGraph::new();
+        let trunk = graph.chain(0, TRUNK, None);
+        let one = graph.add(1_000, &[trunk], 1_000);
+        let others: Vec<ObjectHash> = (0..OPPOSITE_TIPS)
+            .map(|offset| graph.add(2_000 + offset, &[trunk], u64::from(2_000 + offset)))
+            .collect();
+        graph.reads = 0;
+
+        let bases = merge_bases_many_with(&mut graph, &one, &others)
+            .expect("compute bases with one multi-source walk");
+        assert_eq!(bases, vec![TestGraph::id(trunk)]);
+        let commits = usize::try_from(TRUNK + 1 + OPPOSITE_TIPS).expect("small fixture");
+        let edges = usize::try_from((TRUNK - 1) + 1 + OPPOSITE_TIPS).expect("small fixture");
+        assert!(
+            graph.reads <= 3 * (commits + edges),
+            "one-vs-many painting must stay linear in the graph, not repeat the trunk per tip: {} reads",
+            graph.reads
+        );
+    }
+
+    #[test]
+    fn octopus_all_tip_bases_reject_only_chain_connected_histories() {
+        let mut graph = TestGraph::new();
+        graph.add(0, &[], 0);
+        graph.add(10, &[], 10);
+        graph.add(1, &[0, 10], 11);
+        graph.add(11, &[10], 12);
+
+        let bases = octopus_merge_bases_with(
+            &mut graph,
+            &[TestGraph::id(0), TestGraph::id(1), TestGraph::id(11)],
+        )
+        .expect("compute all-tip octopus bases");
+        assert!(bases.is_empty());
     }
 
     #[test]
@@ -670,24 +912,26 @@ mod tests {
         let left = TestGraph::id(TRUNK + 1);
         let right = TestGraph::id(TRUNK + 2);
 
+        graph.unique_reads.clear();
         let (_, stats) = paint_down_to_common(&mut graph, &left, &right).expect("paint down");
-        let commits = usize::try_from(TRUNK).expect("trunk fits") + 2;
+        let painted_unique_reads = graph.unique_reads.len();
 
-        // One entry per visited commit, and no more.
-        assert!(
-            stats.peak_painted <= commits,
-            "the paint map must not exceed one entry per commit: {} over {commits}",
-            stats.peak_painted
+        // Every commit loaded by the walk has exactly one paint-map entry,
+        // even if changing flags enqueue it more than once.
+        assert_eq!(
+            stats.peak_painted, painted_unique_reads,
+            "the paint map must contain exactly one entry per visited commit"
         );
-        // The replaced implementation's residency on the same history: two full
-        // ancestor sets (each the whole trunk) plus their intersection, before
-        // its per-candidate visited sets are counted at all.
-        let replaced_residency = 3 * commits;
+
+        graph.unique_reads.clear();
+        let (_, reference_stats) =
+            reference_merge_bases(&mut graph, &left, &right).expect("reference walk");
         assert!(
-            stats.peak_painted * 2 < replaced_residency,
-            "the paint must hold materially less than the two ancestor sets \
-             plus intersection it replaced: {} vs {replaced_residency}",
-            stats.peak_painted
+            stats.peak_resident_entries * 2 < reference_stats.peak_resident_entries,
+            "the paint must hold materially fewer logical entries than the \
+             measured reference walk: {} vs {}",
+            stats.peak_resident_entries,
+            reference_stats.peak_resident_entries
         );
         // And the queue is the frontier, not the history.
         assert!(
@@ -874,7 +1118,7 @@ mod tests {
             graph.chain(trunk + 1, 5, Some(tip));
             graph.chain(trunk + 100, 5, Some(tip));
             graph.reads = 0;
-            reference_merge_bases(
+            let _ = reference_merge_bases(
                 &mut graph,
                 &TestGraph::id(trunk + 5),
                 &TestGraph::id(trunk + 104),

@@ -255,6 +255,9 @@ pub enum CommitError {
     #[error("failed to save index: {0}")]
     IndexSave(String),
 
+    #[error("cannot commit with unresolved conflicts: {0}")]
+    UnresolvedConflicts(String),
+
     #[error("nothing to commit, working tree clean")]
     NothingToCommit,
 
@@ -369,6 +372,10 @@ impl From<CommitError> for CliError {
             CommitError::IndexSave(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            CommitError::UnresolvedConflicts(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictUnresolved)
+                .with_hint("stage resolved files with 'libra add <path>'; for gitlinks, select the resolved commit with 'libra update-index --cacheinfo 160000,<commit>,<path>'")
+                .with_hint("to stage deleted conflicts, use 'libra commit -a' only when all tracked changes are intended for this commit"),
             CommitError::NothingToCommit => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("use 'libra add' to stage changes")
@@ -1036,6 +1043,12 @@ async fn run_commit_with_index(
     let prepared = async {
         let original_index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        let unresolved = crate::command::merge::unresolved_conflicted_paths(&original_index, &[]);
+        // Git's as-is commit rejects before hooks or tree construction. `-a`
+        // first stages the worktree, so its conflict check uses the final index.
+        if !dry_run && !args.all && !unresolved.is_empty() {
+            return Err(CommitError::UnresolvedConflicts(unresolved.join(", ")));
+        }
         tree_plumbing::validate_index_objects(&original_index)
             .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
@@ -1047,6 +1060,10 @@ async fn run_commit_with_index(
 
         let index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        let unresolved = crate::command::merge::unresolved_conflicted_paths(&index, &[]);
+        if !dry_run && !unresolved.is_empty() {
+            return Err(CommitError::UnresolvedConflicts(unresolved.join(", ")));
+        }
         // lore.md 2.4 / §C.11 W1: the LAST gate before a commit is published.
         // `add` has its own guard, but plumbing does not — `update-index --add`
         // stages a path directly — so a materialized layer overlay could reach
@@ -1961,7 +1978,7 @@ fn trim_empty_lines(lines: &[String]) -> Vec<String> {
 /// Git-parseable block); otherwise open a new final paragraph (blank line).
 /// The old single-newline branch for newline-terminated messages glued
 /// trailers onto the last body line, invisible to a Git-strict parser.
-fn append_trailers(message: &str, trailers: &[String]) -> String {
+pub(crate) fn append_trailers(message: &str, trailers: &[String]) -> String {
     let trailers_block = trailers.join("\n");
     let trimmed = message.trim_end();
     if trimmed.is_empty() {
@@ -2498,6 +2515,12 @@ async fn create_tree_with_persistence(
     current_root: PathBuf,
     persist: bool,
 ) -> Result<Tree, CommitError> {
+    if persist && current_root.as_os_str().is_empty() {
+        let unresolved = crate::command::merge::unresolved_conflicted_paths(index, &[]);
+        if !unresolved.is_empty() {
+            return Err(CommitError::UnresolvedConflicts(unresolved.join(", ")));
+        }
+    }
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
         let name = util::path_to_string(path);
@@ -2597,17 +2620,125 @@ fn auto_stage_tracked_changes(
     persist_objects: bool,
     cache_preview_objects: bool,
 ) -> Result<bool, CommitError> {
-    let pending = status::changes_to_be_staged().map_err(|e| {
+    let mut pending = status::changes_to_be_staged().map_err(|e| {
         CommitError::AutoStage(format!("failed to determine working tree status: {e}"))
     })?;
-    if pending.modified.is_empty() && pending.deleted.is_empty() {
-        return Ok(false);
-    }
-
     let index_path = path::index();
     let mut index = Index::load(&index_path)
         .map_err(|e| CommitError::IndexLoad(format!("failed to load index: {}", e)))?;
     let workdir = util::working_dir();
+    let unresolved = crate::command::merge::unresolved_conflicted_paths(&index, &[]);
+    let unresolved_gitlinks: Vec<_> = unresolved
+        .iter()
+        .filter(|path| {
+            (1..=3).any(|stage| {
+                index
+                    .get(path, stage)
+                    .is_some_and(|entry| entry.mode & 0o170000 == 0o160000)
+            })
+        })
+        .cloned()
+        .collect();
+    // Libra does not materialize submodules (ADR-MG-01). Their absence is not
+    // a deletion resolution, and their checked-out directory is not a blob.
+    if persist_objects && !unresolved_gitlinks.is_empty() {
+        return Err(CommitError::UnresolvedConflicts(
+            unresolved_gitlinks.join(", "),
+        ));
+    }
+    // Git add_files_to_cache treats unmerged regular paths as modifications or
+    // deletions. Status's stage-0 comparison alone cannot discover these paths.
+    for file in unresolved {
+        if unresolved_gitlinks.contains(&file) {
+            continue;
+        }
+        // Like Git's has_symlink_leading_path, a replaced parent means the
+        // tracked child was removed. Never read an external symlink target.
+        let relative = PathBuf::from(&file);
+        let mut ancestor = workdir.clone();
+        let mut parent_replaced = false;
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                ancestor.push(component);
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => {
+                        parent_replaced = true;
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        parent_replaced = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(CommitError::AutoStageRead {
+                            path: ancestor.display().to_string(),
+                            detail: format!("failed to inspect conflicted path's parent: {error}"),
+                        });
+                    }
+                }
+            }
+        }
+        if parent_replaced {
+            pending.deleted.push(relative);
+            continue;
+        }
+        match std::fs::symlink_metadata(workdir.join(&file)) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                pending.modified.push(PathBuf::from(file));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                for marker in [".git", ".libra"] {
+                    let marker_path = workdir.join(&file).join(marker);
+                    match std::fs::symlink_metadata(&marker_path) {
+                        Ok(_) => return Err(CommitError::UnresolvedConflicts(file)),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) => {}
+                        Err(error) => {
+                            return Err(CommitError::AutoStageRead {
+                                path: marker_path.display().to_string(),
+                                detail: format!(
+                                    "failed to inspect possible nested repository: {error}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                pending.deleted.push(PathBuf::from(file));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                pending.deleted.push(PathBuf::from(file));
+            }
+            Ok(_) => {
+                return Err(CommitError::AutoStageRead {
+                    path: workdir.join(&file).display().to_string(),
+                    detail: "expected a regular file or symlink; resolve this conflict and stage it explicitly".to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(CommitError::AutoStageRead {
+                    path: workdir.join(&file).display().to_string(),
+                    detail: format!("failed to inspect conflicted path: {error}"),
+                });
+            }
+        }
+    }
+    if pending.modified.is_empty() && pending.deleted.is_empty() {
+        return Ok(false);
+    }
     let mut touched = false;
 
     for file in pending.modified {
@@ -2646,13 +2777,20 @@ fn auto_stage_tracked_changes(
                     CommitError::AutoStage(format!("failed to create index entry: {}", e))
                 })?,
         );
+        if let Some(path) = file.to_str() {
+            for stage in 1..=3 {
+                index.remove(path, stage);
+            }
+        }
         touched = true;
     }
 
     for file in pending.deleted {
         if let Some(path) = file.to_str() {
             // Drop entries that disappeared from the working tree
-            index.remove(path, 0);
+            for stage in 0..=3 {
+                index.remove(path, stage);
+            }
             touched = true;
         }
     }

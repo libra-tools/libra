@@ -17,6 +17,7 @@
 - 源码分层：主要实现文件为 `src/command/push.rs`。参数/子命令类型包括：`PushArgs`；输出、错误或状态类型包括：`PushError`、`PushRefUpdateKind`、`PushRefUpdate`、`PushOutput`；主要执行函数包括：`execute`、`execute_safe`、`run_push`。
 - 源码意图：源码模块注释说明该命令读取 remote 配置、与服务器协商，并发送本地 refs 与 pack 数据完成远端更新。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；核心领域逻辑集中在 `run_push`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
+- 对象裁剪：`collect_advertised_haves` 读取 discovery 的全部 refs，仅把本地能解析并加载的 OID 作为共享 negative haves；commit tips（包括 annotated tag 的 peeled `^{}` ref）以一次多源遍历形成可达历史边界，direct advertised object 也可复用。未知/本地缺失的 OID 被忽略以保持保守发送。新 ref 指向已通告 commit 时对象数为零，但真实 receive-pack 仍收到 hash-kind 正确的 pack v2 空包（SHA-1 32 字节、SHA-256 44 字节）；`test_push_multi_refspec_delete_tags_and_mirror_dry_run` 钉住真实服务端往返，`advertised_haves_*` 单测覆盖同 tip、后代 delta、annotated tag、未知 have 与两种空包 checksum。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

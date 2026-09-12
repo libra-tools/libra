@@ -1181,6 +1181,7 @@ async fn takeover_reports_its_own_fence_even_if_another_lands_immediately_after(
     let _failpoints = FailpointGuard;
     let db = open_db().await;
     let path = workspace_dir(db.path.parent().expect("db parent"), "linked-a");
+    let noise_path = workspace_dir(db.path.parent().expect("db parent"), "linked-noise");
     let second = connect(&db.path).await;
 
     let stale = WorkspaceStore::acquire(
@@ -1190,29 +1191,50 @@ async fn takeover_reports_its_own_fence_even_if_another_lands_immediately_after(
     )
     .await
     .expect("acquire");
+    let noise = WorkspaceStore::acquire(
+        &db.conn,
+        &AcquireRequest::linked("wt-noise", noise_path, "noise-agent", TTL),
+        NOW,
+    )
+    .await
+    .expect("acquire noise workspace");
 
     let late = NOW + TTL + 1;
     let later = late + TTL + 1;
 
     // doctor-1 parks AFTER its takeover statement, before it returns.
-    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (parked_tx, mut parked_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
     let parked_tx = StdArc::new(tokio::sync::Mutex::new(Some(parked_tx)));
     let resume_rx = StdArc::new(tokio::sync::Mutex::new(Some(resume_rx)));
-    test_hooks::set_after_write(Some(StdArc::new(move || {
+    let target_workspace_id = stale.workspace_id.clone();
+    test_hooks::set_after_write(Some(StdArc::new(move |workspace_id, lease_owner| {
+        let is_target = workspace_id == target_workspace_id && lease_owner == "doctor-1";
         let parked_tx = parked_tx.clone();
         let resume_rx = resume_rx.clone();
         Box::pin(async move {
-            let signal = parked_tx.lock().await.take();
-            if let Some(tx) = signal {
-                let _ = tx.send(());
-                let wait = resume_rx.lock().await.take();
-                if let Some(rx) = wait {
-                    let _ = rx.await;
+            if is_target {
+                let signal = parked_tx.lock().await.take();
+                if let Some(tx) = signal {
+                    let _ = tx.send(());
+                    let wait = resume_rx.lock().await.take();
+                    if let Some(rx) = wait {
+                        let _ = rx.await;
+                    }
                 }
             }
         })
     })));
+
+    let noise_lease =
+        WorkspaceStore::reclaim_expired(&second, &noise.workspace_id, "noise-doctor", TTL, late)
+            .await
+            .expect("unrelated takeover succeeds without consuming the target hook");
+    assert_eq!(noise_lease.fence, 2);
+    assert!(matches!(
+        parked_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
 
     // Deliberately the bare-connection form: the statement autocommits, so
     // doctor-1 holds NO lock while it is parked and doctor-2 can really land.

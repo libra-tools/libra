@@ -60,7 +60,7 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容矩阵说明 | `run` / `register` / `unregister` / `status` / `start` / `stop` exposed; `commit-graph` 与 `prefetch` 已有实际任务实现，但仍保留 Git 语义差异 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
-| ✅ 已实现 | commit-graph octopus merge | `build_commit_graph` 对 >2 父提交写出 EDGE chunk：CDAT 第二父槽置 `GRAPH_EXTRA_EDGES_NEEDED`(0x80000000) 按位或 EDGE 索引，EDGE chunk 列出第 2..N 个父的位置、末项按位或 `GRAPH_LAST_EDGE`(0x80000000)；有 octopus 时 chunk 数 3→4、TOC 增 `EDGE` 项、偏移顺延。非 octopus 输出逐字节不变。带单元测试 `commit_graph_build_writes_octopus_edge_chunk`（构造 3 父 merge，解析 EDGE/EXTRA 位/LAST 位）。注：libra `merge` 不支持 >2 分支，故 octopus 提交来自导入历史，不可经 CLI 复现。 |
+| ✅ 已实现 | commit-graph octopus merge | `build_commit_graph` 对 >2 父提交写出 EDGE chunk：CDAT 第二父槽置 `GRAPH_EXTRA_EDGES_NEEDED`(0x80000000) 按位或 EDGE 索引，EDGE chunk 列出第 2..N 个父的位置、末项按位或 `GRAPH_LAST_EDGE`(0x80000000)；有 octopus 时 chunk 数 3→4、TOC 增 `EDGE` 项、偏移顺延。非 octopus 输出逐字节不变。带单元测试 `commit_graph_build_writes_octopus_edge_chunk`（构造 3 父 merge，解析 EDGE/EXTRA 位/LAST 位）。`libra merge <branch>...` 现可从两个及以上目标生成这种多父提交，导入历史与 CLI 生成历史均受该编码覆盖。 |
 | ✅ 已实现 | commit-graph SHA-256 | `build_commit_graph` 按 `oids[0].kind()` 选择 header hash version（1=SHA-1/2=SHA-256）与 trailer 摘要（`sha1::Sha1` / `sha2::Sha256`，新增 `sha2` 直接依赖，复用既有 transitive 0.10）；OIDL/CDAT 的 OID 宽度本就由 `hash_len = oids[0].size()` 自适应（20/32）。trailer 由 OID kind 决定（不依赖全局 hash kind），故对导入的 SHA-256 历史也自洽。带单元测试 `commit_graph_build_handles_sha256_repository`（直接构造 32 字节 OID，断言 header version 2 + 32 字节 OIDL 条目 + SHA-256 trailer）。 |
 | 兼容差异项 | prefetch | 当前复用普通 fetch 路径刷新标准 remote-tracking refs；不同于 Git 的 `refs/prefetch/` namespace。无 remote 时跳过；后续若改为 Git namespace 语义，需要同步兼容矩阵和测试。 |
 

@@ -44,7 +44,10 @@ pub trait ToolHandler: Send + Sync {
     /// Returns `true` if the tool invocation *might* mutate the environment.
     /// This function should be defensive and return `true` if there's any doubt.
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
-        false
+        // The operation boundary is fail-closed: a handler that has not
+        // opted into a narrower read-only classification is treated as
+        // potentially mutating.
+        true
     }
 
     /// Returns `true` if the invocation requires direct network access.
@@ -70,6 +73,12 @@ pub trait ToolHandler: Send + Sync {
 /// handler here changes what an AI can do in `libra code`, so new tools should
 /// document the task they enable, whether they mutate state, and what evidence
 /// they return to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepositoryOperationBoundary {
+    PerTool,
+    TaskSyncBack,
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     /// Map of tool name to handler implementation.
@@ -80,6 +89,8 @@ pub struct ToolRegistry {
     path_aliases: Vec<(PathBuf, PathBuf)>,
     /// Optional runtime boundary policy and audit pipeline.
     hardening: Option<ToolBoundaryRuntime>,
+    /// Where repository operation history is published for mutations.
+    operation_boundary: RepositoryOperationBoundary,
 }
 
 impl ToolRegistry {
@@ -97,6 +108,7 @@ impl ToolRegistry {
             working_dir: std::env::current_dir()?,
             path_aliases: Vec::new(),
             hardening: None,
+            operation_boundary: RepositoryOperationBoundary::PerTool,
         })
     }
 
@@ -107,6 +119,7 @@ impl ToolRegistry {
             working_dir,
             path_aliases: Vec::new(),
             hardening: None,
+            operation_boundary: RepositoryOperationBoundary::PerTool,
         }
     }
 
@@ -117,6 +130,7 @@ impl ToolRegistry {
             working_dir,
             path_aliases: self.path_aliases.clone(),
             hardening: self.hardening.clone(),
+            operation_boundary: self.operation_boundary,
         }
     }
 
@@ -136,7 +150,20 @@ impl ToolRegistry {
             working_dir,
             path_aliases,
             hardening: self.hardening.clone(),
+            operation_boundary: self.operation_boundary,
         }
+    }
+
+    /// Clone the registry for an ephemeral task workspace whose file changes
+    /// are published into the real repository only by the sync-back boundary.
+    pub(crate) fn clone_for_task_worktree(
+        &self,
+        working_dir: PathBuf,
+        alias_from: PathBuf,
+    ) -> Self {
+        let mut cloned = self.clone_with_working_dir_and_alias(working_dir, alias_from);
+        cloned.operation_boundary = RepositoryOperationBoundary::TaskSyncBack;
+        cloned
     }
 
     /// Attach runtime tool-boundary policy, audit, and redaction.
@@ -288,6 +315,129 @@ impl ToolRegistry {
 
         let mutates_state = handler.is_mutating(&invocation).await;
         let requires_network = handler.requires_network(&invocation).await;
+        let operation_class = operation_class_for_tool(&tool_name, mutates_state);
+        tracing::debug!(?operation_class, tool = %tool_name, "classified Agent tool operation surface");
+
+        // Repository-backed Agent mutations use the same durable v2 boundary
+        // as the CLI. Read-only tools remain direct, while a tool invoked from
+        // a repository that cannot resolve a pinned scope keeps the existing
+        // non-repository behavior (external tools are still subject to the
+        // hardening policy below).
+        if self.operation_boundary == RepositoryOperationBoundary::PerTool
+            && mutates_state
+            && let Some(scope) =
+                crate::internal::worktree_scope::RequestScope::resolve(self.working_dir.clone())
+        {
+            let operation_handler = handler.clone();
+            let operation_hardening = self.hardening.clone();
+            let operation_working_dir = self.working_dir.clone();
+            let operation_aliases = self.path_aliases.clone();
+            let operation_tool_name = tool_name.clone();
+            let operation_meta = crate::internal::operation::OperationMetaV2 {
+                command_name: Some(format!("agent.tool.{operation_tool_name}")),
+                description: Some("Agent tool mutation".to_string()),
+                ..Default::default()
+            };
+            let outcome = crate::internal::operation::run_with_operation(
+                &scope,
+                operation_meta,
+                operation_class,
+                move |_txn| async move {
+                    let result = if let Some(hardening) = operation_hardening {
+                        let operation = ToolOperation::tool(
+                            operation_tool_name.clone(),
+                            mutates_state,
+                            requires_network,
+                        );
+                        let decision = hardening.decide(&operation);
+                        hardening
+                            .append_audit(
+                                format!("tool_boundary.{}", operation_tool_name),
+                                format!(
+                                    "decision={} approval_required={} reason={} payload={}",
+                                    if decision.allowed { "allow" } else { "deny" },
+                                    decision.approval_required,
+                                    decision.reason,
+                                    invocation.log_payload()
+                                ),
+                            )
+                            .await
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(format!(
+                                    "failed to persist tool boundary audit event: {error}"
+                                ))
+                            })?;
+                        if !decision.allowed {
+                            return Err(crate::internal::operation::OperationError::Mutation(
+                                decision.reason,
+                            ));
+                        }
+                        let result = operation_handler.handle(invocation).await.map(|output| {
+                            redact_workspace_paths_in_output(
+                                output,
+                                &operation_working_dir,
+                                &operation_aliases,
+                            )
+                        });
+                        let summary = match &result {
+                            Ok(output) => format!(
+                                "success={} output={}",
+                                output.is_success(),
+                                output.log_preview()
+                            ),
+                            Err(error) => format!("error={error}"),
+                        };
+                        hardening
+                            .append_audit(format!("tool_result.{}", operation_tool_name), summary)
+                            .await
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(format!(
+                                    "failed to persist tool result audit event: {error}"
+                                ))
+                            })?;
+                        hardening.flush_audit().await.map_err(|error| {
+                            crate::internal::operation::OperationError::Mutation(format!(
+                                "failed to flush tool audit sink: {error}"
+                            ))
+                        })?;
+                        result.map_err(|error| {
+                            crate::internal::operation::OperationError::Mutation(error.to_string())
+                        })?
+                    } else {
+                        operation_handler
+                            .handle(invocation)
+                            .await
+                            .map(|output| {
+                                redact_workspace_paths_in_output(
+                                    output,
+                                    &operation_working_dir,
+                                    &operation_aliases,
+                                )
+                            })
+                            .map_err(|error| {
+                                crate::internal::operation::OperationError::Mutation(
+                                    error.to_string(),
+                                )
+                            })?
+                    };
+                    Ok(result)
+                },
+            )
+            .await;
+            return match outcome {
+                Ok(result) => Ok(result.value),
+                Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
+            };
+        }
+
+        if operation_class == crate::internal::operation::MutationClass::ExternalOrUnknown
+            && self.hardening.is_none()
+        {
+            return Err(ToolError::ExecutionFailed(
+                "external or unknown mutation requires a repository scope and post-snapshot verification"
+                    .to_string(),
+            ));
+        }
 
         if let Some(hardening) = &self.hardening {
             let operation = ToolOperation::tool(tool_name.clone(), mutates_state, requires_network);
@@ -432,6 +582,25 @@ fn is_read_only_or_semantic_tool(tool_name: &str) -> bool {
             | "list_tool_invocations"
             | "list_provenances"
     )
+}
+
+/// Central Agent-tool census used by the gateway before handler dispatch.
+/// Read-only tools are never recorded; shell and external VCS calls require
+/// before/after verification; every other mutating tool is conservatively a
+/// Libra-state mutation until it is assigned a narrower owner.
+pub fn operation_class_for_tool(
+    tool_name: &str,
+    mutates_state: bool,
+) -> crate::internal::operation::MutationClass {
+    use crate::internal::operation::MutationClass;
+    if !mutates_state || is_read_only_or_semantic_tool(tool_name) {
+        return MutationClass::ReadOnly;
+    }
+    match tool_name {
+        "shell" | "run_libra_vcs" | "exec" => MutationClass::ExternalOrUnknown,
+        "apply_patch" | "write_file" | "edit_file" => MutationClass::WorkspaceMutation,
+        _ => MutationClass::LibraStateMutation,
+    }
 }
 
 fn rebase_payload_path_aliases(
@@ -747,6 +916,86 @@ mod tests {
 
         assert!(cloned.contains_tool("mock"));
         assert_eq!(cloned.working_dir(), std::path::Path::new("/tmp/cloned"));
+        assert_eq!(
+            cloned.operation_boundary,
+            RepositoryOperationBoundary::PerTool
+        );
+    }
+
+    #[tokio::test]
+    async fn task_worktree_clone_defers_operations_but_preserves_hardening() {
+        let original = TempDir::new().unwrap();
+        let task_worktree = TempDir::new().unwrap();
+        let sink = Arc::new(crate::internal::ai::runtime::InMemoryAuditSink::default());
+        let hardening = ToolBoundaryRuntime::new(
+            uuid::Uuid::new_v4(),
+            crate::internal::ai::runtime::PrincipalContext {
+                principal_id: "observer".to_string(),
+                role: crate::internal::ai::runtime::PrincipalRole::Observer,
+            },
+            crate::internal::ai::runtime::ToolBoundaryPolicy::default_runtime(),
+            crate::internal::ai::runtime::SecretRedactor::default_runtime(),
+            sink.clone(),
+        );
+        let mut registry =
+            ToolRegistry::with_working_dir(original.path().to_path_buf()).with_hardening(hardening);
+        registry.register("apply_patch", Arc::new(MutatingMockHandler));
+
+        let task_registry = registry.clone_for_task_worktree(
+            task_worktree.path().to_path_buf(),
+            original.path().to_path_buf(),
+        );
+        assert_eq!(
+            task_registry.operation_boundary,
+            RepositoryOperationBoundary::TaskSyncBack
+        );
+
+        let result = task_registry
+            .dispatch(ToolInvocation::new(
+                "call-task",
+                "apply_patch",
+                ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+                original.path().to_path_buf(),
+            ))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].redacted_summary.contains("decision=deny"));
+    }
+
+    #[tokio::test]
+    async fn task_worktree_clone_without_hardening_still_rejects_external_mutation() {
+        let original = TempDir::new().unwrap();
+        let task_worktree = TempDir::new().unwrap();
+        let mut registry = ToolRegistry::with_working_dir(original.path().to_path_buf());
+        registry.register("shell", Arc::new(MutatingMockHandler));
+        let task_registry = registry.clone_for_task_worktree(
+            task_worktree.path().to_path_buf(),
+            original.path().to_path_buf(),
+        );
+
+        let result = task_registry
+            .dispatch(ToolInvocation::new(
+                "call-task-shell",
+                "shell",
+                ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+                original.path().to_path_buf(),
+            ))
+            .await;
+
+        let error = result.expect_err("external task mutation needs a hardening boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a repository scope and post-snapshot verification"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

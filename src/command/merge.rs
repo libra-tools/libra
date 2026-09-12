@@ -3,9 +3,13 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fs,
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use clap::{Parser, ValueEnum};
@@ -29,6 +33,10 @@ use super::{
     save_object, status, switch,
 };
 use crate::{
+    command::{
+        commit::{CleanupMode, cleanup_commit_message, parse_cleanup_mode},
+        editor,
+    },
     common_utils::format_commit_msg,
     info_println,
     internal::{
@@ -44,6 +52,7 @@ use crate::{
         tree_plumbing,
     },
     utils::{
+        attributes::{self, AttributeState},
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
@@ -51,38 +60,72 @@ use crate::{
     },
 };
 
+mod signing;
+
 /// `--help` examples shown in `libra merge --help` output.
 ///
 pub const MERGE_EXAMPLES: &str = "\
 EXAMPLES:
     libra merge feature-x          Fast-forward current branch onto feature-x if possible
     libra merge origin/main        Fast-forward onto a remote-tracking branch
-    libra merge feature-x --no-edit  Accept the default merge message (no editor)
+    libra merge -e feature-x         Edit the generated merge message before committing
+    libra merge -F message.txt feature-x  Read the merge message from a file
     libra merge --verify-signatures feature-x  Require a valid PGP signature on the merged tip
     libra merge -X ours feature-x  Favor HEAD only where content conflicts
+    libra merge -s resolve -s ort feature-x  Try resolve, then fall back to ort
     libra merge -s ours archive   Record archive as merged while retaining the HEAD tree
+    libra merge topic-a topic-b topic-c  Create an octopus merge when every head merges cleanly
     libra merge --allow-unrelated-histories imported-root
                                      Merge a root with no common ancestor
     libra merge --log=10 feature-x  Include target subjects in the merge message
     libra merge --continue         Finish an in-progress merge after resolving conflicts
     libra merge --abort            Restore the pre-merge HEAD, index, and worktree
+    libra merge --quit             Clear merge state and leave the current checkout unchanged
     libra merge --dry-run feature-x  Preview the outcome (ff/clean/conflict) writing nothing
     libra merge --restart          Abort the conflicted merge and re-run it fresh
     libra merge --json feature-x   Structured JSON output for agents
 
 NOTES:
     Divergent single-head merges create a merge commit when paths do not
-    conflict. Conflicts write markers and can be finished with --continue
-    or restored with --abort. --dry-run exits 1 when the merge would
-    conflict (0 for ff/up-to-date/clean); --restart discards resolution
-    work done so far, exactly like --abort, before re-running.";
+    conflict. Conflicts write markers and can be finished with --continue,
+    restored with --abort, or left in place with --quit. Multi-head octopus merges are atomic: any
+    conflict leaves HEAD, index, and worktree unchanged; merge those heads
+    one at a time to resolve conflicts. --dry-run exits 1 when the merge
+    would conflict (0 for ff/up-to-date/clean); --restart discards
+    resolution work done so far, exactly like --abort, before re-running
+    the recorded strategy.";
 
-/// Single-head merge strategies currently implemented by Libra.
+/// Merge strategies currently implemented by Libra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergeStrategy {
+    /// The default merge-ort-compatible three-way implementation.
+    Ort,
+    /// Compatibility alias for `ort`; it uses the same implementation.
+    Recursive,
+    /// Conservative two-head merge: one base, no virtual ancestor, no renames.
+    Resolve,
     /// Record the merge relationship while retaining the current HEAD tree.
     Ours,
+}
+
+impl MergeStrategy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ort => "ort",
+            Self::Recursive => "recursive",
+            Self::Resolve => "resolve",
+            Self::Ours => "ours",
+        }
+    }
+
+    fn folds_merge_bases(self) -> bool {
+        matches!(self, Self::Ort | Self::Recursive)
+    }
+
+    fn detects_renames(self) -> bool {
+        matches!(self, Self::Ort | Self::Recursive)
+    }
 }
 
 /// Conflict-side preference accepted by the default three-way strategy.
@@ -95,11 +138,103 @@ pub enum MergeFavor {
     Theirs,
 }
 
+/// Git-compatible options accepted by the default three-way strategy.
+///
+/// Favor, whitespace comparison, and renormalization are independent axes:
+/// repeating `-X` may set one of each. The last favor and renormalize toggle
+/// win, while whitespace flags compose by selecting the strongest requested
+/// comparison rule (the same precedence `libra diff` uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MergeStrategyOption {
+    Ours,
+    Theirs,
+    IgnoreSpaceChange,
+    IgnoreAllSpace,
+    IgnoreSpaceAtEol,
+    IgnoreCrAtEol,
+    Renormalize,
+    NoRenormalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeWhitespace {
+    SpaceChange,
+    AllSpace,
+    SpaceAtEol,
+    CrAtEol,
+}
+
+impl MergeWhitespace {
+    fn priority(self) -> u8 {
+        match self {
+            Self::AllSpace => 4,
+            Self::SpaceChange => 3,
+            Self::SpaceAtEol => 2,
+            Self::CrAtEol => 1,
+        }
+    }
+
+    fn normalizer(self) -> fn(&str) -> String {
+        match self {
+            Self::AllSpace => crate::command::diff::normalize_ignore_all_space,
+            Self::SpaceChange => crate::command::diff::normalize_ignore_space_change,
+            Self::SpaceAtEol => crate::command::diff::normalize_ignore_space_at_eol,
+            Self::CrAtEol => crate::command::diff::normalize_ignore_cr_at_eol,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MergeInputNormalization {
+    whitespace: Option<MergeWhitespace>,
+    renormalize: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ParsedMergeStrategyOptions {
+    favor: Option<MergeFavor>,
+    whitespace: Option<MergeWhitespace>,
+    renormalize: Option<bool>,
+}
+
+fn parse_merge_strategy_options(options: &[MergeStrategyOption]) -> ParsedMergeStrategyOptions {
+    let mut parsed = ParsedMergeStrategyOptions::default();
+    for option in options {
+        match option {
+            MergeStrategyOption::Ours => parsed.favor = Some(MergeFavor::Ours),
+            MergeStrategyOption::Theirs => parsed.favor = Some(MergeFavor::Theirs),
+            MergeStrategyOption::IgnoreSpaceChange => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::SpaceChange)
+            }
+            MergeStrategyOption::IgnoreAllSpace => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::AllSpace)
+            }
+            MergeStrategyOption::IgnoreSpaceAtEol => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::SpaceAtEol)
+            }
+            MergeStrategyOption::IgnoreCrAtEol => {
+                select_whitespace_mode(&mut parsed.whitespace, MergeWhitespace::CrAtEol)
+            }
+            MergeStrategyOption::Renormalize => parsed.renormalize = Some(true),
+            MergeStrategyOption::NoRenormalize => parsed.renormalize = Some(false),
+        }
+    }
+    parsed
+}
+
+fn select_whitespace_mode(current: &mut Option<MergeWhitespace>, candidate: MergeWhitespace) {
+    if current.is_none_or(|selected| candidate.priority() > selected.priority()) {
+        *current = Some(candidate);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = MERGE_EXAMPLES)]
 pub struct MergeArgs {
-    /// The branch to merge into the current branch, could be remote branch
-    pub branch: Option<String>,
+    /// One or more branches to merge into the current branch; each may be a
+    /// remote-tracking branch. Multiple branches select the octopus path.
+    #[arg(value_name = "BRANCH", num_args = 0..)]
+    pub branch: Vec<String>,
 
     /// Continue an in-progress merge after resolving conflicts
     #[arg(long = "continue", conflicts_with = "abort")]
@@ -108,6 +243,19 @@ pub struct MergeArgs {
     /// Abort an in-progress merge and restore the pre-merge state
     #[arg(long, conflicts_with = "continue_merge")]
     pub abort: bool,
+
+    /// Forget an in-progress merge while preserving the index and working
+    /// tree exactly as they are.
+    #[arg(long, conflicts_with_all = [
+        "branch", "continue_merge", "abort", "restart", "ff", "ff_only", "no_ff",
+        "strategy", "strategy_option", "allow_unrelated_histories", "log", "no_log",
+        "message", "file", "into_name", "cleanup", "edit", "squash", "no_commit",
+        "no_verify", "autostash", "no_autostash", "no_edit", "stat", "no_stat",
+        "no_progress", "verify_signatures",
+        "no_verify_signatures", "no_rerere_autoupdate", "gpg_sign", "no_gpg_sign",
+        "signoff", "dry_run",
+    ])]
+    pub quit: bool,
 
     /// Preview the merge outcome without writing anything (Libra extension —
     /// Git has no true merge dry-run): reports whether merging `<branch>` would
@@ -127,10 +275,11 @@ pub struct MergeArgs {
     /// `--allow-unrelated-histories` permission but otherwise uses default
     /// merge options (an original `-m`/`--no-ff`/`--squash`/`--no-commit` is
     /// not replayed).
-    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
+    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "file", "into_name", "cleanup", "edit", "squash", "no_commit", "verify_signatures"])]
     pub restart: bool,
 
-    /// Refuse to merge unless the current branch can fast-forward to the target.
+    /// Refuse to merge unless the current branch can fast-forward to the
+    /// target. A multi-branch octopus merge never fast-forwards.
     #[arg(long = "ff-only", conflicts_with_all = ["ff", "no_ff", "continue_merge", "abort"])]
     pub ff_only: bool,
 
@@ -142,19 +291,17 @@ pub struct MergeArgs {
     #[arg(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "continue_merge", "abort"])]
     pub no_ff: bool,
 
-    /// Select the merge strategy. Libra currently supports only `ours`, which
-    /// records both parents while retaining the current HEAD tree.
-    #[arg(short = 's', long = "strategy", value_enum, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
-    pub strategy: Option<MergeStrategy>,
+    /// Select one or more merge strategies in fallback order. `recursive` is
+    /// an alias for `ort`; `resolve` disables recursive bases and renames.
+    #[arg(short = 's', long = "strategy", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
+    pub strategy: Vec<MergeStrategy>,
 
-    /// Pass a strategy option to the default three-way merge. `ours` and
-    /// `theirs` resolve conflicting paths/hunks in favor of that side while
-    /// retaining all non-conflicting changes. May be repeated; the last value
-    /// wins.
+    /// Pass an option to the default three-way merge. Favor and renormalize
+    /// toggles use their last value; whitespace comparison flags compose.
     #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy"])]
-    pub strategy_option: Vec<MergeFavor>,
+    pub strategy_option: Vec<MergeStrategyOption>,
 
-    /// Permit a two-parent merge when the histories have no common ancestor.
+    /// Permit a merge when the histories have no common ancestor.
     #[arg(long = "allow-unrelated-histories", conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub allow_unrelated_histories: bool,
 
@@ -183,6 +330,26 @@ pub struct MergeArgs {
     )]
     pub message: Option<String>,
 
+    /// Read the merge-commit message from a file. May be combined with
+    /// `--edit`, but is mutually exclusive with `-m`/`--message`.
+    #[arg(short = 'F', long = "file", value_name = "FILE", conflicts_with_all = ["message", "abort", "restart"])]
+    pub file: Option<String>,
+
+    /// Use NAME instead of the current branch name in an automatically
+    /// generated merge message. Explicit `-m`/`-F` messages are unchanged.
+    #[arg(long = "into-name", value_name = "NAME", conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    pub into_name: Option<String>,
+
+    /// Clean the message using Git-compatible `strip`, `whitespace`,
+    /// `verbatim`, `scissors`, or `default` behavior.
+    #[arg(long = "cleanup", value_name = "MODE", conflicts_with_all = ["abort", "restart"])]
+    pub cleanup: Option<String>,
+
+    /// Open the configured editor on the resolved merge message before it is
+    /// committed. Unlike Git, Libra does not open an editor by default.
+    #[arg(short = 'e', long, conflicts_with_all = ["no_edit", "dry_run"])]
+    pub edit: bool,
+
     /// Merge changes but stage the result without committing or moving HEAD
     /// (no merge info recorded); finalize with a normal `commit`.
     #[arg(long, conflicts_with_all = ["continue_merge", "abort"])]
@@ -201,8 +368,9 @@ pub struct MergeArgs {
     /// Automatically stash local changes before the merge and re-apply them
     /// when it concludes (also on failure to start). On a merge conflict the
     /// stash is HELD (not in `stash list`) and re-applied by `--continue` or
-    /// `--abort`; if the re-apply itself conflicts, the stash is saved to the
-    /// stash list and a notice is printed — changes are never lost. Config:
+    /// `--abort`; `--quit` saves it to the stash list without re-applying it.
+    /// If the re-apply itself conflicts, the stash is saved to the stash list
+    /// and a notice is printed — changes are never lost. Config:
     /// `merge.autostash` (this flag and `--no-autostash` override it).
     #[arg(long = "autostash", overrides_with = "no_autostash", conflicts_with_all = ["continue_merge", "abort", "restart", "dry_run"])]
     pub autostash: bool,
@@ -211,10 +379,9 @@ pub struct MergeArgs {
     #[arg(long = "no-autostash", overrides_with = "autostash", conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub no_autostash: bool,
 
-    /// Accept the auto-generated merge message without launching an editor.
-    /// Libra never opens an editor for merge (it uses `-m` or the default
-    /// message), so this is accepted for Git parity and is a no-op.
-    #[arg(long = "no-edit")]
+    /// Accept the resolved merge message without launching an editor.
+    /// This is the default behavior; it is mutually exclusive with `--edit`.
+    #[arg(long = "no-edit", conflicts_with = "edit")]
     pub no_edit: bool,
 
     /// Show a diffstat of the merge result at the end (what the merge changed,
@@ -235,8 +402,8 @@ pub struct MergeArgs {
     #[arg(long = "no-progress")]
     pub no_progress: bool,
 
-    /// Verify that the tip commit of the branch being merged carries a valid PGP
-    /// signature, aborting the merge if it is unsigned or the signature is bad.
+    /// Verify that every tip commit being merged carries a valid PGP signature,
+    /// aborting the merge if any tip is unsigned or has a bad signature.
     /// Like `tag -v`, only signatures made by this repository's vault PGP key can
     /// be validated (Libra has no external GPG keyring), so a commit signed
     /// elsewhere — or with an SSH signature — is treated as not verifiable.
@@ -258,16 +425,30 @@ pub struct MergeArgs {
     #[arg(long = "no-rerere-autoupdate")]
     pub no_rerere_autoupdate: bool,
 
-    /// Do not GPG-sign the merge commit. Accepted for Git parity and is a no-op:
-    /// Libra's merge never signs, so this already matches the default. (Git's
-    /// opposite `-S`/`--gpg-sign` is not implemented.)
-    #[arg(long = "no-gpg-sign")]
+    /// Force vault-signing of the merge commit.
+    #[arg(short = 'S', long = "gpg-sign", overrides_with = "no_gpg_sign", conflicts_with_all = ["abort", "restart", "squash", "dry_run"])]
+    pub gpg_sign: bool,
+
+    /// Do not vault-sign the merge commit. This takes precedence over
+    /// `commit.gpgSign` and the `vault.signing` default.
+    #[arg(long = "no-gpg-sign", overrides_with = "gpg_sign", conflicts_with_all = ["abort", "restart", "squash", "dry_run"])]
     pub no_gpg_sign: bool,
+
+    /// Append a `Signed-off-by` trailer, using the resolved committer identity.
+    /// Git reserves `-s` for selecting a merge strategy, so merge exposes no
+    /// short spelling for this option.
+    #[arg(long, conflicts_with_all = ["abort", "restart", "squash", "dry_run"])]
+    pub signoff: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PullMergeSummary {
     pub strategy: String,
+    /// Concrete backend selected for a public `libra merge`. This is additive:
+    /// `strategy` retains its established outcome-category values for existing
+    /// JSON consumers. Internal pull integrations leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_strategy: Option<String>,
     /// The previous HEAD commit before merge (None for root commits).
     pub old_commit: Option<String>,
     pub commit: Option<String>,
@@ -322,6 +503,55 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Git's `evaluate_result()` score: worktree/index differences plus unmerged
+/// index entries. Lower is better; a later strategy wins a tie, matching
+/// `builtin/merge.c` at git@3cb9185f6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrategyEvaluationScore {
+    differing_files: usize,
+    unmerged_entries: usize,
+}
+
+impl StrategyEvaluationScore {
+    fn total(self) -> usize {
+        self.differing_files.saturating_add(self.unmerged_entries)
+    }
+
+    fn replaces(self, current: Self) -> bool {
+        self.total() <= current.total()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StrategyEvaluationSink(Arc<Mutex<Option<StrategyEvaluationScore>>>);
+
+impl StrategyEvaluationSink {
+    fn record(&self, score: StrategyEvaluationScore) -> Result<(), PullMergeError> {
+        let mut slot = self.0.lock().map_err(|_| {
+            PullMergeError::History("merge-strategy evaluation state is unavailable".to_string())
+        })?;
+        *slot = Some(score);
+        Ok(())
+    }
+
+    fn score(&self) -> Result<StrategyEvaluationScore, PullMergeError> {
+        self.0
+            .lock()
+            .map_err(|_| {
+                PullMergeError::History(
+                    "merge-strategy evaluation state is unavailable".to_string(),
+                )
+            })?
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                PullMergeError::History(
+                    "a conflicting strategy did not report its evaluation score".to_string(),
+                )
+            })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PullMergeOptions {
     pub ff_only: bool,
@@ -333,11 +563,25 @@ pub(crate) struct PullMergeOptions {
     pub strategy: Option<MergeStrategy>,
     /// Conflict-side preference for the default three-way strategy.
     pub favor: Option<MergeFavor>,
+    /// Strongest whitespace comparison option selected by public `merge -X`.
+    /// `pull` has no strategy-option surface and leaves this unset.
+    pub whitespace: Option<MergeWhitespace>,
+    /// Explicit `-X renormalize|no-renormalize`; `None` reads
+    /// `merge.renormalize` only if the operation reaches the three-way engine.
+    pub renormalize: Option<bool>,
     /// Permit an empty merge base when histories are unrelated.
     pub allow_unrelated_histories: bool,
     /// Override the merge-commit message (`libra merge -m <msg>`). `None` uses
     /// the default `Merge <upstream> into <head>` message.
     pub message: Option<String>,
+    /// Override the branch name in an auto-generated merge message. This is
+    /// public-merge-only; pull leaves it unset.
+    pub into_name: Option<String>,
+    /// Optional Git-compatible cleanup mode for the resolved message.
+    pub cleanup: Option<String>,
+    /// Whether to open the configured editor on the resolved message. Public
+    /// merge defaults to false and pull always leaves it false.
+    pub edit: bool,
     /// `libra merge --squash`: produce the merged index/worktree but do NOT
     /// create a commit or move HEAD (and never fast-forward), leaving the result
     /// staged for a subsequent normal `commit`.
@@ -363,6 +607,15 @@ pub(crate) struct PullMergeOptions {
     /// writes (auto-merged blobs are computed in memory only). Always `false`
     /// for `pull`.
     pub dry_run: bool,
+    /// Append a `Signed-off-by` trailer to the merge commit after the final
+    /// message-processing hooks have run. `pull` always leaves this false.
+    pub signoff: bool,
+    /// The signing decision resolved before the merge begins. It is saved in
+    /// `MergeState` so a later `--continue` and `--restart` preserve explicit
+    /// `-S` / `--no-gpg-sign` choices. `None` is only accepted at the public
+    /// pull boundary, where the shared runner resolves configuration before a
+    /// merge can mutate state.
+    pub signing_policy: Option<crate::command::history_config::CommitSigningPolicy>,
     /// `merge --autostash` (lore.md §1.8): `Some(true)` = --autostash,
     /// `Some(false)` = --no-autostash, `None` = resolve `merge.autostash`
     /// config (git-bool; an invalid value is a hard error). Under --dry-run a
@@ -372,6 +625,9 @@ pub(crate) struct PullMergeOptions {
     /// autostash of the restarted merge is preserved (not demoted to the
     /// stash list as stale).
     pub preserve_held_autostash: bool,
+    /// Read-only sink used only while comparing repeated public `merge -s`
+    /// strategies. Pull and ordinary one-strategy merges leave it absent.
+    pub strategy_evaluation: Option<StrategyEvaluationSink>,
 }
 
 /// This worktree's merge sidecar, for the §C.5 pseudo-ref projection
@@ -390,7 +646,12 @@ pub(crate) fn merge_state_gc_oids(
     let Some(state) = merge_state_for_pseudo_refs(gitdir)? else {
         return Ok(None);
     };
-    let mut oids = vec![("orig_head", state.orig_head), ("target", state.target)];
+    let mut oids = vec![("orig_head", state.orig_head)];
+    if state.targets.is_empty() {
+        oids.push(("target", state.target));
+    } else {
+        oids.extend(state.targets.into_iter().map(|target| ("target", target)));
+    }
     if let Some(base) = state.base {
         oids.push(("base", base));
     }
@@ -417,6 +678,14 @@ pub(crate) struct MergeState {
     pub orig_head: String,
     pub target: String,
     pub target_ref: String,
+    /// Every octopus target in parent order. Empty for legacy and single-head
+    /// states, where `target` remains authoritative.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Display refs corresponding to `targets`; status and reflog continue to
+    /// use the backward-compatible joined `target_ref` field.
+    #[serde(default)]
+    pub target_refs: Vec<String>,
     /// Common ancestor used by the three-way merge, when it is a real commit.
     /// `None` represents the virtual empty base used by
     /// `--allow-unrelated-histories` AND the recursive virtual ancestor of a
@@ -437,6 +706,15 @@ pub(crate) struct MergeState {
     /// Whether the starting invocation used `--no-verify`.
     #[serde(default)]
     pub skip_hooks: bool,
+    /// Resolved signing decision from the invocation that wrote this state.
+    /// Older sidecars omit it and are resolved through current configuration
+    /// when they are continued.
+    #[serde(default)]
+    pub signing_policy: Option<crate::command::history_config::CommitSigningPolicy>,
+    /// Whether the invocation requested `--signoff`. Persisted so conflict and
+    /// `--no-commit` continuations retain the original trailer decision.
+    #[serde(default)]
+    pub signoff: bool,
     pub conflicted_paths: Vec<String>,
     /// Merge message resolved at merge start (`-m` override or the generated
     /// default including the `merge.log` shortlog), replayed verbatim by
@@ -645,24 +923,29 @@ fn acquire_autostash_lock() -> Result<AutostashLockGuard, String> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PullMergeError {
-    #[error("merge requires a branch argument, --continue, or --abort")]
+    #[error("merge requires a branch argument, --continue, --abort, or --quit")]
     MissingAction,
-    #[error("merge accepts either a branch argument, --continue, or --abort")]
+    #[error("merge accepts either a branch argument, --continue, --abort, or --quit")]
     ConflictingAction,
     /// The repository configures an unsupported `merge.conflictStyle` value.
     /// Surfaced only when a conflict actually needs rendering, and a hard error
     /// rather than a silent fall-back to the default style — a typo must not
-    /// quietly change the conflict-marker format (`zdiff3` is not implemented).
-    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge' or 'diff3')")]
+    /// quietly change the conflict-marker format.
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
     InvalidConflictStyle(String),
     /// The `merge.conflictStyle` config could not be read (config-store I/O
     /// failure) — surfaced as an I/O error, never a silent default-style
     /// fall-back that would ignore a configured `diff3`.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
-    /// A rename-detection config value Git would reject (`merge.renames`,
-    /// `merge.renameLimit` and their `diff.*` fall-backs). A typo must not
-    /// silently turn detection on or off.
+    /// Low-level merge-driver configuration could not be read. Unknown names
+    /// are valid and fall back to text; only an actual config-store failure is
+    /// an error.
+    #[error("failed to read merge driver config: {0}")]
+    MergeDriverConfigRead(String),
+    /// A rename-detection config value Libra rejects (`merge.renames`,
+    /// `merge.renameLimit`, `merge.directoryRenames`, and the applicable
+    /// `diff.*` fall-backs). A typo must not silently change merge behavior.
     #[error("bad config value '{value}' for '{key}' (expected {expected})")]
     InvalidRenameConfig {
         key: String,
@@ -672,6 +955,12 @@ pub(crate) enum PullMergeError {
     /// The rename-detection config could not be read (config-store I/O).
     #[error("failed to read rename config '{key}': {detail}")]
     RenameConfigRead { key: String, detail: String },
+    /// `merge.renormalize` must be a Git boolean. It is read only for a real
+    /// three-way merge, before autostash or any other repository mutation.
+    #[error("unsupported merge.renormalize '{0}' (expected a boolean)")]
+    InvalidRenormalizeConfig(String),
+    #[error("failed to read merge.renormalize config: {0}")]
+    RenormalizeConfigRead(String),
     /// Autostash creation/apply/bookkeeping failure. The stash commit (when
     /// one exists) is referenced by merge-autostash.json — never lost.
     #[error("merge --autostash failed: {0}")]
@@ -690,6 +979,16 @@ pub(crate) enum PullMergeError {
     History(String),
     #[error("refusing to merge unrelated histories")]
     UnrelatedHistories,
+    #[error("cannot merge multiple branches into an unborn HEAD; create the first commit first")]
+    OctopusUnbornHead,
+    #[error(
+        "Automated merge with '{target}' did not work in {paths}. Should not be doing an octopus"
+    )]
+    OctopusConflict { target: String, paths: String },
+    #[error(
+        "merge strategy '{strategy}' handles one target only; omit '-s' to use the automatic octopus strategy, or use '-s ours'"
+    )]
+    OctopusStrategyUnsupported { strategy: String },
     /// A three-way merge input carries a gitlink the merge would have to
     /// arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
     /// than silently dropped from the merge result the way it used to be.
@@ -715,7 +1014,7 @@ pub(crate) enum PullMergeError {
     )]
     VirtualAncestorTooWide { bases: usize },
     #[error("merge has conflicts in {paths}")]
-    Conflicts { paths: String },
+    Conflicts { paths: String, squash: bool },
     #[error("no merge in progress")]
     NoMergeInProgress,
     /// `--restart` on an in-progress merge that has NO conflicts (a staged
@@ -748,6 +1047,8 @@ pub(crate) enum PullMergeError {
     TreeCreate(String),
     #[error("failed to save merge commit: {0}")]
     CommitSave(String),
+    #[error("failed to sign merge commit: {0}")]
+    CommitSigning(String),
     #[error("failed to resolve the identity for the merge commit: {0}")]
     IdentityMissing(String),
     #[error("failed to reset working tree after merge: {0}")]
@@ -774,6 +1075,14 @@ pub(crate) enum PullMergeError {
     MessageFileWrite { path: String, detail: String },
     #[error("failed to read merge commit message file '{path}': {detail}")]
     MessageFileRead { path: String, detail: String },
+    #[error("merge commit message is empty")]
+    EmptyMessage,
+    #[error(
+        "invalid merge message cleanup mode '{0}' (expected strip/whitespace/verbatim/scissors/default)"
+    )]
+    InvalidCleanup(String),
+    #[error("failed to edit merge commit message: {0}")]
+    Editor(String),
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
@@ -798,6 +1107,18 @@ impl From<PullMergeError> for CliError {
             }
             PullMergeError::UnrelatedHistories => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
+            PullMergeError::OctopusUnbornHead => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("create an initial commit, then retry the multi-branch merge"),
+            PullMergeError::OctopusConflict { .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint(
+                    "merge the branches one at a time so each conflict can be resolved and committed",
+                ),
+            PullMergeError::OctopusStrategyUnsupported { .. } => {
+                CliError::failure(error.to_string())
+                    .with_stable_code(StableErrorCode::Unsupported)
+            }
             PullMergeError::VirtualAncestorTooDeep | PullMergeError::VirtualAncestorTooWide { .. } => {
                 CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::Unsupported)
@@ -832,11 +1153,24 @@ impl From<PullMergeError> for CliError {
                 .with_stable_code(StableErrorCode::IoWriteFailed),
             PullMergeError::MessageFileRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
+            PullMergeError::InvalidCleanup(..) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("choose strip, whitespace, verbatim, scissors, or default"),
+            PullMergeError::EmptyMessage => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("write a non-empty message in the editor, or pass -m/--message or -F/--file"),
+            PullMergeError::Editor(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set GIT_EDITOR, core.editor, VISUAL, or EDITOR")
+                .with_hint("or omit --edit to accept the resolved merge message"),
             PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
                 .with_hint("or run 'libra pull --rebase' to replay local commits"),
-            PullMergeError::Conflicts { .. }
+            PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
+            PullMergeError::Conflicts { squash: false, .. }
             | PullMergeError::DirtyWorktree
             | PullMergeError::UntrackedOverwrite { .. }
             | PullMergeError::MergeInProgress
@@ -845,7 +1179,8 @@ impl From<PullMergeError> for CliError {
                 .with_hint("resolve conflicts, then run 'libra merge --continue'")
                 .with_hint("or run 'libra merge --abort' to restore the pre-merge state"),
             PullMergeError::NoMergeInProgress => CliError::failure(error.to_string())
-                .with_stable_code(StableErrorCode::RepoStateInvalid),
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("start a merge with 'libra merge <branch>'"),
             PullMergeError::RestartWithoutConflicts => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("finish the staged merge with 'libra merge --continue'")
@@ -858,14 +1193,23 @@ impl From<PullMergeError> for CliError {
                 .with_hint("set merge.autostash to true/false (or remove it)"),
             PullMergeError::InvalidConflictStyle(..) => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
-                .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
             PullMergeError::ConflictStyleRead(..) => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            PullMergeError::MergeDriverConfigRead(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
             PullMergeError::InvalidRenameConfig { .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("set merge.renames to true/false and merge.renameLimit to an integer"),
             PullMergeError::RenameConfigRead { .. } => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            PullMergeError::InvalidRenormalizeConfig(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set merge.renormalize to true/false (or remove it)"),
+            PullMergeError::RenormalizeConfigRead(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
             PullMergeError::HistoryConfig(
@@ -887,6 +1231,9 @@ impl From<PullMergeError> for CliError {
             | PullMergeError::WorkdirReset(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            PullMergeError::CommitSigning(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthMissingCredentials)
+                .with_hint("check vault configuration with 'libra config --list'"),
             // Mirrors `CommitError::IdentityMissing`: a merge commit needs the same
             // identity as any other commit, so it fails the same way and offers the
             // same fix.
@@ -987,8 +1334,37 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     if args.restart {
         return run_merge_restart(output).await;
     }
-    match (args.branch.as_deref(), args.continue_merge, args.abort) {
-        (Some(branch), false, false) => {
+    // `--quit` deliberately touches only merge bookkeeping. In particular it
+    // does not call the abort/reset path, because its contract is to retain
+    // the current index stages and conflict-marked working tree.
+    if args.quit {
+        return run_merge_quit(output).await;
+    }
+    if let Some(cleanup) = &args.cleanup
+        && parse_cleanup_mode(cleanup).is_none()
+    {
+        return Err(MergeError::InvalidCleanup(cleanup.clone()));
+    }
+    // Read `-F` before any merge mutation. Clap already rejects `-F` with
+    // `-m`; retaining a single resolved source lets an edited continuation
+    // override the persisted message by either spelling.
+    let message_override = match &args.file {
+        Some(path) => Some(read_merge_message(Path::new(path))?),
+        None => args.message.clone(),
+    };
+    // An explicit CLI request applies to an initial merge and may also replace
+    // the saved decision while finalizing `--continue`. A plain continuation
+    // deliberately uses its saved policy so a later config edit cannot erase
+    // the original `-S` / `--no-gpg-sign` intent.
+    let explicit_signing_policy = if args.gpg_sign || args.no_gpg_sign {
+        Some(signing::resolve_signing_policy(args.gpg_sign, args.no_gpg_sign).await?)
+    } else {
+        None
+    };
+    match (args.branch.as_slice(), args.continue_merge, args.abort) {
+        (branches, false, false) if !branches.is_empty() => {
+            let requested_strategies = args.strategy.clone();
+            let strategy_options = parse_merge_strategy_options(&args.strategy_option);
             let (ff_only, no_ff) = if args.ff_only {
                 (true, false)
             } else if args.no_ff {
@@ -1017,7 +1393,7 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             };
             let merge_log = if let Some(limit) = args.log {
                 limit
-            } else if args.no_log || args.message.is_some() {
+            } else if args.no_log || message_override.is_some() {
                 0
             } else {
                 crate::command::history_config::merge_log_limit().await?
@@ -1025,10 +1401,15 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             let options = PullMergeOptions {
                 ff_only,
                 no_ff,
-                strategy: args.strategy,
-                favor: args.strategy_option.last().copied(),
+                strategy: requested_strategies.first().copied(),
+                favor: strategy_options.favor,
+                whitespace: strategy_options.whitespace,
+                renormalize: strategy_options.renormalize,
                 allow_unrelated_histories: args.allow_unrelated_histories,
-                message: args.message.clone(),
+                message: message_override.clone(),
+                into_name: args.into_name.clone(),
+                cleanup: args.cleanup.clone(),
+                edit: args.edit,
                 squash: args.squash,
                 no_commit: args.no_commit,
                 skip_hooks: args.no_verify,
@@ -1037,6 +1418,11 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                 verify_signatures,
                 merge_log,
                 dry_run: args.dry_run,
+                signoff: args.signoff,
+                signing_policy: Some(match explicit_signing_policy {
+                    Some(policy) => policy,
+                    None => signing::resolve_signing_policy(false, false).await?,
+                }),
                 autostash: if args.autostash {
                     Some(true)
                 } else if args.no_autostash {
@@ -1045,16 +1431,132 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                     None
                 },
                 preserve_held_autostash: false,
+                strategy_evaluation: None,
             };
-            run_merge_for_pull_with_options(branch, branch, output, options).await
+            if let [branch] = branches {
+                if requested_strategies.len() > 1 {
+                    run_merge_with_strategy_fallback(
+                        branch,
+                        branch,
+                        output,
+                        options,
+                        &requested_strategies,
+                    )
+                    .await
+                } else {
+                    let selected = requested_strategies
+                        .first()
+                        .copied()
+                        .unwrap_or(MergeStrategy::Ort);
+                    run_merge_for_pull_with_options(branch, branch, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, selected.name()))
+                }
+            } else {
+                match requested_strategies.as_slice() {
+                    [] => run_octopus_merge(branches, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, "octopus")),
+                    [MergeStrategy::Ours] => run_octopus_merge(branches, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, "ours")),
+                    [strategy] => Err(PullMergeError::OctopusStrategyUnsupported {
+                        strategy: strategy.name().to_string(),
+                    }),
+                    _ => Err(PullMergeError::OctopusStrategyUnsupported {
+                        strategy: requested_strategies
+                            .iter()
+                            .map(|strategy| strategy.name())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }),
+                }
+            }
         }
-        (None, true, false) => {
-            run_merge_continue(output, args.no_verify, args.message.clone()).await
+        ([], true, false) => {
+            run_merge_continue(
+                output,
+                args.no_verify,
+                message_override,
+                args.cleanup,
+                args.edit,
+                explicit_signing_policy,
+                args.signoff,
+            )
+            .await
         }
-        (None, false, true) => run_merge_abort(output).await,
-        (None, false, false) => Err(MergeError::MissingAction),
+        ([], false, true) => run_merge_abort(output).await,
+        ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
+}
+
+fn attach_selected_strategy(mut summary: PullMergeSummary, selected: &str) -> PullMergeSummary {
+    if !matches!(
+        summary.strategy.as_str(),
+        "fast-forward" | "already-up-to-date" | "abort"
+    ) {
+        summary.selected_strategy = Some(selected.to_string());
+    }
+    summary
+}
+
+/// Try repeated `-s` values without letting a failed candidate touch the
+/// repository. Each probe is the existing zero-write dry-run path; the first
+/// clean strategy is then executed once for real. If every strategy conflicts,
+/// the lowest Git `evaluate_result()` score is replayed, with the later
+/// strategy winning a tie (`builtin/merge.c`, git@3cb9185f6).
+async fn run_merge_with_strategy_fallback(
+    target_ref: &str,
+    upstream: &str,
+    output: &OutputConfig,
+    options: PullMergeOptions,
+    strategies: &[MergeStrategy],
+) -> Result<PullMergeSummary, PullMergeError> {
+    let mut best: Option<(MergeStrategy, StrategyEvaluationScore)> = None;
+    let mut probe_output = output.clone();
+    probe_output.quiet = true;
+
+    for strategy in strategies {
+        if !output.is_json() && !output.quiet {
+            println!("Trying merge strategy {}...", strategy.name());
+        }
+        let sink = StrategyEvaluationSink::default();
+        let mut probe = options.clone();
+        probe.strategy = Some(*strategy);
+        probe.dry_run = true;
+        probe.autostash = Some(false);
+        probe.strategy_evaluation = Some(sink.clone());
+        let summary =
+            run_merge_for_pull_with_options(target_ref, upstream, &probe_output, probe).await?;
+        if !summary.would_conflict {
+            let mut selected = options.clone();
+            selected.strategy = Some(*strategy);
+            return run_merge_for_pull_with_options(target_ref, upstream, output, selected)
+                .await
+                .map(|summary| attach_selected_strategy(summary, strategy.name()));
+        }
+
+        let score = sink.score()?;
+        if best.is_none_or(|(_, current)| score.replaces(current)) {
+            best = Some((*strategy, score));
+        }
+    }
+
+    let (strategy, _) = best.ok_or_else(|| {
+        PullMergeError::History("no merge strategy produced an outcome".to_string())
+    })?;
+    if !output.is_json() && !output.quiet {
+        println!(
+            "Using the {} strategy to prepare resolving by hand.",
+            strategy.name()
+        );
+    }
+    let mut selected = options;
+    selected.strategy = Some(strategy);
+    run_merge_for_pull_with_options(target_ref, upstream, output, selected)
+        .await
+        .map(|summary| attach_selected_strategy(summary, strategy.name()))
 }
 
 /// Build a merge commit that carries the repository's configured identity.
@@ -1068,17 +1570,76 @@ async fn build_merge_commit(
     tree_id: ObjectHash,
     parent_commit_ids: Vec<ObjectHash>,
     message: &str,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
+    signoff: bool,
 ) -> Result<Commit, PullMergeError> {
     let (author, committer, _) = crate::command::commit::create_commit_signatures(None, None)
         .await
         .map_err(|error| PullMergeError::IdentityMissing(error.to_string()))?;
+    // The common commit trailer engine owns blank-line and existing-trailer
+    // block handling. Do this after every merge-message hook has finished so
+    // a cleanup/editing step cannot separate the generated signoff from its
+    // final trailer block.
+    let message = if signoff {
+        let trailer_value = format!("{} <{}>", committer.name, committer.email);
+        let trailer = format!("Signed-off-by: {trailer_value}");
+        if crate::internal::log::trailer::parse_trailers(message)
+            .iter()
+            .any(|existing| {
+                existing.key_matches("Signed-off-by") && existing.value == trailer_value
+            })
+        {
+            message.to_string()
+        } else {
+            crate::command::commit::append_trailers(message, &[trailer])
+        }
+    } else {
+        message.to_string()
+    };
+    let gpg_signature = match signing_policy {
+        crate::command::history_config::CommitSigningPolicy::Disable => None,
+        crate::command::history_config::CommitSigningPolicy::Force => {
+            crate::command::commit::vault_sign_commit(
+                &tree_id,
+                &parent_commit_ids,
+                &author,
+                &committer,
+                &message,
+                true,
+            )
+            .await
+            .map_err(|error| PullMergeError::CommitSigning(error.to_string()))?
+        }
+        crate::command::history_config::CommitSigningPolicy::InheritVault => {
+            crate::command::commit::vault_sign_commit(
+                &tree_id,
+                &parent_commit_ids,
+                &author,
+                &committer,
+                &message,
+                false,
+            )
+            .await
+            .map_err(|error| PullMergeError::CommitSigning(error.to_string()))?
+        }
+    };
     Ok(Commit::new(
         author,
         committer,
         tree_id,
         parent_commit_ids,
-        message,
+        &format_commit_msg(&message, gpg_signature.as_deref()),
     ))
+}
+
+fn signing_policy_from_options(
+    options: &PullMergeOptions,
+) -> Result<crate::command::history_config::CommitSigningPolicy, PullMergeError> {
+    options.signing_policy.ok_or_else(|| {
+        PullMergeError::History(
+            "merge signing policy was not resolved before commit construction".to_string(),
+        )
+    })
 }
 
 async fn run_pre_merge_commit_hook(output: &OutputConfig) -> Result<(), PullMergeError> {
@@ -1219,6 +1780,10 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
     if output.quiet {
         return Ok(());
     }
+    let selected_strategy = result
+        .selected_strategy
+        .as_deref()
+        .unwrap_or(result.strategy.as_str());
 
     if result.dry_run {
         // `--dry-run`: preview phrasing — nothing was written, so the normal
@@ -1238,7 +1803,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
             info_println!(
                 output,
                 "Would merge cleanly by the '{}' strategy.\n(dry run: nothing was written)",
-                result.strategy
+                selected_strategy
             );
         }
         return Ok(());
@@ -1248,6 +1813,11 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
         info_println!(output, "Already up to date.");
     } else if result.aborted {
         info_println!(output, "Merge aborted.");
+    } else if result.strategy == "quit" {
+        info_println!(
+            output,
+            "Merge state cleared; index and working tree were left unchanged."
+        );
     } else if result.continued {
         info_println!(output, "Merge completed.");
     } else if !result.conflicted_paths.is_empty() {
@@ -1257,7 +1827,12 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
         );
     } else {
         match result.strategy.as_str() {
-            "three-way" => info_println!(output, "Merge made by the 'three-way' strategy."),
+            "three-way" => info_println!(
+                output,
+                "Merge made by the '{}' strategy.",
+                selected_strategy
+            ),
+            "octopus" => info_println!(output, "Merge made by the 'octopus' strategy."),
             "ours" => info_println!(output, "Merge made by the 'ours' strategy."),
             "squash" => info_println!(output, "Squash commit -- not updating HEAD"),
             "no-commit" => info_println!(
@@ -1272,12 +1847,7 @@ fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -> CliResult
 }
 
 fn merge_error_to_cli(error: MergeError) -> CliError {
-    match error {
-        MergeError::Conflicts { .. } => CliError::from(error)
-            .with_priority_hint("resolve conflicts, then run 'libra merge --continue'")
-            .with_hint("or run 'libra merge --abort' to restore the pre-merge state"),
-        error => CliError::from(error),
-    }
+    CliError::from(error)
 }
 
 /// Resolve whether autostash is enabled: explicit flag wins; otherwise the
@@ -1377,7 +1947,10 @@ fn snapshot_held_autostash() -> Result<Option<AutostashSnapshot>, String> {
     MergeAutostash::load_snapshot()
 }
 
-async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
+async fn resolve_pending_autostash(
+    output: &OutputConfig,
+    preserve_conflicts: bool,
+) -> Option<String> {
     let snapshot = match snapshot_held_autostash() {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
@@ -1388,7 +1961,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return None;
         }
     };
-    resolve_pending_autostash_with(output, snapshot).await
+    resolve_pending_autostash_with(output, snapshot, preserve_conflicts).await
 }
 
 /// The consumer half, taking a snapshot the CALLER loaded — the merge
@@ -1397,6 +1970,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
 async fn resolve_pending_autostash_with(
     output: &OutputConfig,
     snapshot: AutostashSnapshot,
+    preserve_conflicts: bool,
 ) -> Option<String> {
     let sidecar = &snapshot.sidecar;
     match MergeState::load_optional_sync() {
@@ -1423,6 +1997,11 @@ async fn resolve_pending_autostash_with(
             return None;
         }
     };
+    // A conflicted squash has no merge sidecar, but its unmerged stages must
+    // survive. Git leaves its autostash for a later stash pop in this case.
+    if preserve_conflicts {
+        return store_pending_autostash(output, &snapshot, &oid).await;
+    }
     match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {
             match cleanup_autostash_if_matches(&snapshot) {
@@ -1444,35 +2023,10 @@ async fn resolve_pending_autostash_with(
         Err(crate::command::stash::StashError::MergeConflict(_)) => {
             // All-or-nothing apply: the merge result is intact. Promote the
             // stash into the visible list so nothing is lost.
-            match crate::command::stash::store_stash_commit(&oid, "autostash").await {
-                Ok(()) => {
-                    match cleanup_autostash_if_matches(&snapshot) {
-                        Ok(true) => {}
-                        Ok(false) => crate::utils::error::emit_warning(
-                            "the autostash sidecar changed while it was being promoted; \
-                             the newer file was left in place",
-                        ),
-                        Err(error) => crate::utils::error::emit_warning(format!(
-                            "the promoted autostash's sidecar could not be removed \
-                             ({error}); a later merge would re-promote it — remove it \
-                             manually"
-                        )),
-                    }
-                    if !output.quiet {
-                        eprintln!(
-                            "Applying autostash resulted in conflicts.\nYour changes are safe in the stash (stash@{{0}}).\nYou can run \"libra stash pop\" or \"libra stash drop\" at any time."
-                        );
-                    }
-                    Some("stashed".to_string())
-                }
-                Err(error) => {
-                    crate::utils::error::emit_warning(format!(
-                        "failed to store the autostash into the stash list ({error}); \
-                         merge-autostash.json still references stash commit {oid}"
-                    ));
-                    None
-                }
+            if !output.quiet {
+                eprintln!("Applying autostash resulted in conflicts.");
             }
+            store_pending_autostash(output, &snapshot, &oid).await
         }
         Err(error) => {
             crate::utils::error::emit_warning(format!(
@@ -1484,18 +2038,774 @@ async fn resolve_pending_autostash_with(
     }
 }
 
+async fn store_pending_autostash(
+    output: &OutputConfig,
+    snapshot: &AutostashSnapshot,
+    oid: &ObjectHash,
+) -> Option<String> {
+    match crate::command::stash::store_stash_commit(oid, "autostash").await {
+        Ok(()) => {
+            match cleanup_autostash_if_matches(snapshot) {
+                Ok(true) => {}
+                Ok(false) => crate::utils::error::emit_warning(
+                    "the autostash sidecar changed while it was being promoted; \
+                             the newer file was left in place",
+                ),
+                Err(error) => crate::utils::error::emit_warning(format!(
+                    "the promoted autostash's sidecar could not be removed \
+                             ({error}); a later merge would re-promote it — remove it \
+                             manually"
+                )),
+            }
+            if !output.quiet {
+                eprintln!(
+                    "Your changes are safe in the stash (stash@{{0}}).\nAfter resolving any conflicts, run \"libra stash pop\" to restore your local changes."
+                );
+            }
+            Some("stashed".to_string())
+        }
+        Err(error) => {
+            crate::utils::error::emit_warning(format!(
+                "failed to store the autostash into the stash list ({error}); \
+                         merge-autostash.json still references stash commit {oid}"
+            ));
+            None
+        }
+    }
+}
+
+/// Start the shared merge autostash lifecycle after every semantic preflight
+/// has passed. The durable ordering is objects -> sidecar -> worktree reset;
+/// callers must later invoke [`resolve_pending_autostash`] on every outcome.
+async fn prepare_merge_autostash(
+    options: &PullMergeOptions,
+    output: &OutputConfig,
+) -> Result<(), PullMergeError> {
+    let held_snapshot = if options.preserve_held_autostash || options.dry_run {
+        None
+    } else {
+        snapshot_held_autostash().map_err(PullMergeError::Autostash)?
+    };
+    if let Some(snapshot) = held_snapshot {
+        let sidecar = &snapshot.sidecar;
+        verify_autostash_ownership(snapshot.recorded_owner.as_deref())
+            .map_err(PullMergeError::Autostash)?;
+        if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
+            crate::command::stash::store_stash_commit(&oid, "autostash")
+                .await
+                .map_err(|error| {
+                    PullMergeError::Autostash(format!(
+                        "cannot recover the leftover autostash: {error}"
+                    ))
+                })?;
+            match cleanup_autostash_if_matches(&snapshot) {
+                Ok(true) => {}
+                Ok(false) => crate::utils::error::emit_warning(
+                    "the autostash sidecar changed while it was being recovered; the newer file was left in place",
+                ),
+                Err(error) => {
+                    return Err(PullMergeError::Autostash(format!(
+                        "the recovered autostash's sidecar could not be removed: {error}"
+                    )));
+                }
+            }
+            crate::utils::error::emit_warning(
+                "recovered a leftover autostash into the stash list (it may duplicate already-restored changes — inspect with 'libra stash show')",
+            );
+        } else {
+            return Err(PullMergeError::Autostash(
+                "merge-autostash.json holds an invalid OID; inspect and remove it".to_string(),
+            ));
+        }
+    }
+
+    if autostash_enabled(options).await? && Head::current_commit().await.is_some() {
+        match crate::command::stash::create_held_stash_commit("autostash").await {
+            Ok(Some(stash_commit)) => {
+                MergeAutostash {
+                    stash_commit: stash_commit.to_string(),
+                }
+                .save()?;
+                if let Err(error) = crate::command::stash::reset_to_head_for_held_stash().await {
+                    return Err(PullMergeError::Autostash(format!(
+                        "created the autostash but failed to reset the tree: {error} \
+                         (merge-autostash.json references stash commit {stash_commit})"
+                    )));
+                }
+                if !output.quiet {
+                    eprintln!("Created autostash: {stash_commit}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(PullMergeError::Autostash(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+struct OctopusTree {
+    items: HashMap<PathBuf, MergeTreeEntry>,
+    blobs: VirtualBlobs,
+    rename_outcomes: Vec<(String, RenameOutcome)>,
+}
+
+enum OctopusTreeOutcome {
+    Clean(OctopusTree),
+    Conflict {
+        target: String,
+        conflicts: Vec<(PathBuf, ConflictKind)>,
+    },
+}
+
+async fn run_octopus_merge(
+    branches: &[String],
+    output: &OutputConfig,
+    options: PullMergeOptions,
+) -> Result<PullMergeSummary, PullMergeError> {
+    if MergeState::load_optional_sync()
+        .map_err(PullMergeError::StateLoad)?
+        .is_some()
+    {
+        return Err(PullMergeError::MergeInProgress);
+    }
+    let initial_index =
+        Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+    let unresolved = unresolved_conflicted_paths(&initial_index, &[]);
+    if !unresolved.is_empty() {
+        return Err(PullMergeError::Conflicts {
+            paths: unresolved.join(", "),
+            squash: true,
+        });
+    }
+
+    let current_id = Head::current_commit()
+        .await
+        .ok_or(PullMergeError::OctopusUnbornHead)?;
+    let current: Commit =
+        load_object(&current_id).map_err(|error| PullMergeError::CurrentLoad {
+            commit_id: current_id.to_string(),
+            detail: error.to_string(),
+        })?;
+    let mut requested = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let id = resolve_merge_target(branch)
+            .await
+            .map_err(|_| PullMergeError::InvalidTarget(branch.clone()))?;
+        let commit: Commit = load_object(&id).map_err(|error| PullMergeError::TargetLoad {
+            commit_id: id.to_string(),
+            detail: error.to_string(),
+        })?;
+        if options.verify_signatures {
+            verify_merge_commit_signature(&commit).await?;
+        }
+        requested.push((branch.clone(), commit));
+    }
+
+    // Git's `reduce_parents`: reduce HEAD and every requested tip together,
+    // then retain the surviving remote tips in their original command-line
+    // order. Octopus is NO_FAST_FORWARD, so HEAD is reinserted as the first
+    // parent even when a target subsumes it.
+    let mut all_heads = Vec::with_capacity(requested.len() + 1);
+    all_heads.push(current.id);
+    all_heads.extend(requested.iter().map(|(_, commit)| commit.id));
+    let reduced = merge_base::reduce_heads(&all_heads)
+        .map_err(|error| PullMergeError::History(error.to_string()))?;
+    let reduced_set: HashSet<ObjectHash> = reduced.into_iter().collect();
+    let mut selected_ids = HashSet::new();
+    let targets: Vec<(String, Commit)> = requested
+        .into_iter()
+        .filter(|(_, commit)| {
+            commit.id != current.id
+                && reduced_set.contains(&commit.id)
+                && selected_ids.insert(commit.id)
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(PullMergeSummary {
+            strategy: "already-up-to-date".to_string(),
+            selected_strategy: None,
+            old_commit: Some(current.id.to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: true,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: options.dry_run,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        });
+    }
+    if !options.allow_unrelated_histories {
+        let mut tips = Vec::with_capacity(targets.len() + 1);
+        tips.push(current.id);
+        tips.extend(targets.iter().map(|(_, commit)| commit.id));
+        let global_bases = merge_base::octopus_merge_bases(&tips)
+            .map_err(|error| PullMergeError::History(error.to_string()))?;
+        if global_bases.is_empty() {
+            return Err(PullMergeError::UnrelatedHistories);
+        }
+    }
+    if options.ff_only {
+        return Err(PullMergeError::NonFastForward {
+            current: current.id.to_string(),
+            target: targets
+                .iter()
+                .map(|(_, commit)| commit.id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        });
+    }
+
+    let head_name = current_head_name().await?;
+    let target_refs: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    let upstream = target_refs.join(", ");
+    let resolved_message = resolve_octopus_message(
+        &current,
+        &targets,
+        &head_name,
+        MergeMessageSettings::from_pull_options(&options),
+    )
+    .await?;
+
+    let tree_outcome = if options.strategy == Some(MergeStrategy::Ours) {
+        let (mut items, gitlinks) = commit_tree_split_for_merge(&current)?;
+        for (path, hash) in gitlinks {
+            items.insert(
+                path,
+                MergeTreeEntry {
+                    hash,
+                    mode: TreeItemMode::Commit,
+                },
+            );
+        }
+        OctopusTreeOutcome::Clean(OctopusTree {
+            items,
+            blobs: VirtualBlobs::new(),
+            rename_outcomes: Vec::new(),
+        })
+    } else {
+        prepare_octopus_tree(&current, &targets, output, &options).await?
+    };
+    let tree = match tree_outcome {
+        OctopusTreeOutcome::Clean(tree) => tree,
+        OctopusTreeOutcome::Conflict {
+            target: _,
+            conflicts,
+        } if options.dry_run => {
+            let conflicted_paths = conflicts
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect();
+            let conflict_kinds = conflicts
+                .iter()
+                .map(|(path, kind)| ConflictReport {
+                    path: path.display().to_string(),
+                    kind: conflict_kind_name(kind).to_string(),
+                    original_path: None,
+                })
+                .collect();
+            return Ok(PullMergeSummary {
+                strategy: "octopus".to_string(),
+                selected_strategy: None,
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed: 0,
+                up_to_date: false,
+                parents: Vec::new(),
+                conflicted_paths,
+                aborted: false,
+                continued: false,
+                dry_run: true,
+                would_conflict: true,
+                conflict_kinds,
+                autostash: None,
+            });
+        }
+        OctopusTreeOutcome::Conflict { target, conflicts } => {
+            return Err(PullMergeError::OctopusConflict {
+                target,
+                paths: conflicts
+                    .iter()
+                    .map(|(path, _)| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+    };
+    let files_changed =
+        count_item_map_changes(&commit_tree_items_with_gitlinks(&current)?, &tree.items);
+
+    if options.dry_run {
+        for (branch, outcome) in &tree.rename_outcomes {
+            announce_rename_notices(&outcome.notes, &outcome.limited, branch, output);
+        }
+        return Ok(PullMergeSummary {
+            strategy: if options.strategy == Some(MergeStrategy::Ours) {
+                "ours"
+            } else {
+                "octopus"
+            }
+            .to_string(),
+            selected_strategy: None,
+            old_commit: Some(current.id.to_string()),
+            commit: None,
+            files_changed,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: true,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        });
+    }
+
+    // No target has touched the repository yet. Only now, after every round is
+    // known to be clean, may autostash reset the worktree for the real apply.
+    prepare_merge_autostash(&options, output).await?;
+    let result: Result<PullMergeSummary, PullMergeError> = async {
+        switch::ensure_clean_status(output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        let current_index = Index::load(path::index())
+            .map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+        let paths_to_write = worktree_paths_to_write(&tree.items);
+        let gitlink_paths: Vec<PathBuf> = tree
+            .items
+            .iter()
+            .filter(|(_, entry)| entry.mode == TreeItemMode::Commit)
+            .map(|(path, _)| path.clone())
+            .collect();
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+        let removals: Vec<PathBuf> = current_index
+            .tracked_files()
+            .into_iter()
+            .filter(|path| !tree.items.contains_key(path))
+            .filter(|path| !is_gitlink_index_path(&current_index, path).unwrap_or(false))
+            .collect();
+        refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+        for (branch, outcome) in &tree.rename_outcomes {
+            announce_rename_notices(&outcome.notes, &outcome.limited, branch, output);
+        }
+        persist_virtual_blobs(&tree.blobs)?;
+        let tree_id =
+            create_tree_from_items_map(&tree.items).map_err(PullMergeError::TreeCreate)?;
+
+        if options.squash {
+            reset_index_and_workdir_to_tree(&tree_id)?;
+            let summary = PullMergeSummary {
+                strategy: "squash".to_string(),
+                selected_strategy: None,
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed,
+                up_to_date: false,
+                parents: Vec::new(),
+                conflicted_paths: Vec::new(),
+                aborted: false,
+                continued: false,
+                dry_run: false,
+                would_conflict: false,
+                conflict_kinds: Vec::new(),
+                autostash: None,
+            };
+            return Ok(summary);
+        }
+
+        let target_ids: Vec<ObjectHash> = targets.iter().map(|(_, commit)| commit.id).collect();
+        let primary_target = target_ids.first().copied().ok_or_else(|| {
+            PullMergeError::History("octopus target reduction produced no target".to_string())
+        })?;
+        let mut parent_ids = Vec::with_capacity(target_ids.len() + 1);
+        parent_ids.push(current.id);
+        parent_ids.extend(target_ids.iter().copied());
+        if options.no_commit {
+            reset_index_and_workdir_to_tree(&tree_id)?;
+            MergeState {
+                head_name: head_name.clone(),
+                orig_head: current.id.to_string(),
+                target: primary_target.to_string(),
+                target_ref: upstream,
+                targets: target_ids.iter().map(ToString::to_string).collect(),
+                target_refs,
+                base: None,
+                strategy: options.strategy,
+                allow_unrelated_histories: options.allow_unrelated_histories,
+                skip_hooks: options.skip_hooks,
+                signing_policy: options.signing_policy,
+                signoff: options.signoff,
+                conflicted_paths: Vec::new(),
+                message: Some(resolved_message),
+            }
+            .save()?;
+            let summary = PullMergeSummary {
+                strategy: "no-commit".to_string(),
+                selected_strategy: None,
+                old_commit: Some(current.id.to_string()),
+                commit: None,
+                files_changed,
+                up_to_date: false,
+                parents: parent_ids.iter().map(ToString::to_string).collect(),
+                conflicted_paths: Vec::new(),
+                aborted: false,
+                continued: false,
+                dry_run: false,
+                would_conflict: false,
+                conflict_kinds: Vec::new(),
+                autostash: None,
+            };
+            return Ok(summary);
+        }
+
+        let message = if !options.skip_hooks {
+            run_pre_merge_commit_hook(output).await?;
+            switch::ensure_clean_status(output)
+                .await
+                .map_err(|_| PullMergeError::DirtyWorktree)?;
+            ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+            refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+            let message = run_merge_message_hooks(&resolved_message, output).await?;
+            switch::ensure_clean_status(output)
+                .await
+                .map_err(|_| PullMergeError::DirtyWorktree)?;
+            ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
+            refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
+            message
+        } else {
+            resolved_message
+        };
+        let merge_commit = build_merge_commit(
+            tree_id,
+            parent_ids.clone(),
+            &message,
+            signing_policy_from_options(&options)?,
+            options.signoff,
+        )
+        .await?;
+        save_object(&merge_commit, &merge_commit.id)
+            .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
+        let strategy = if options.strategy == Some(MergeStrategy::Ours) {
+            "ours"
+        } else {
+            "octopus"
+        };
+        update_head_with_reflog(
+            &head_name,
+            merge_commit.id,
+            &target_refs.join(", "),
+            strategy,
+        )
+        .await?;
+        reset_index_and_workdir_to_tree(&tree_id)?;
+        if !options.skip_hooks {
+            run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
+        }
+
+        Ok(PullMergeSummary {
+            strategy: strategy.to_string(),
+            selected_strategy: None,
+            old_commit: Some(current.id.to_string()),
+            commit: Some(merge_commit.id.to_string()),
+            files_changed,
+            up_to_date: false,
+            parents: parent_ids.iter().map(ToString::to_string).collect(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        })
+    }
+    .await;
+    let autostash = resolve_pending_autostash(output, false).await;
+    match result {
+        Ok(mut summary) => {
+            summary.autostash = autostash;
+            if !options.skip_hooks && merge_completed_for_post_hook(&summary) {
+                let squash = if summary.strategy == "squash" {
+                    "1"
+                } else {
+                    "0"
+                };
+                run_advisory_repo_hook(RepoHook::PostMerge, &[squash.to_string()], None, output)
+                    .await;
+            }
+            Ok(summary)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn resolve_octopus_message(
+    current: &Commit,
+    targets: &[(String, Commit)],
+    head_name: &str,
+    settings: MergeMessageSettings<'_>,
+) -> Result<String, PullMergeError> {
+    let names = targets
+        .iter()
+        .map(|(name, _)| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = settings.message_override.cloned().unwrap_or_else(|| {
+        format!(
+            "Merge branches {names} into {}",
+            settings.into_name.unwrap_or(head_name)
+        )
+    });
+    for (name, target) in targets {
+        message = crate::command::merge_message::append_shortlog(
+            message,
+            current.id,
+            target.id,
+            name,
+            settings.merge_log,
+        )
+        .map_err(PullMergeError::History)?;
+    }
+    let message = if settings.edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    finalize_merge_message(&message, settings.cleanup, settings.edit)
+}
+
+fn commit_tree_items_with_gitlinks(
+    commit: &Commit,
+) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+    let (mut items, gitlinks) = commit_tree_split_for_merge(commit)?;
+    for (path, hash) in gitlinks {
+        items.insert(
+            path,
+            MergeTreeEntry {
+                hash,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    Ok(items)
+}
+
+fn persist_virtual_blobs(blobs: &VirtualBlobs) -> Result<(), PullMergeError> {
+    for (expected, content) in blobs {
+        let blob = Blob::from_content_bytes(content.clone());
+        if blob.id != *expected {
+            return Err(PullMergeError::TreeCreate(format!(
+                "in-memory merged blob id changed from {expected} to {}",
+                blob.id
+            )));
+        }
+        save_object(&blob, &blob.id)
+            .map_err(|error| PullMergeError::TreeCreate(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn prepare_octopus_tree(
+    current: &Commit,
+    targets: &[(String, Commit)],
+    output: &OutputConfig,
+    options: &PullMergeOptions,
+) -> Result<OctopusTreeOutcome, PullMergeError> {
+    let rename_config = merge_rename_config().await?;
+    let default_driver = read_merge_default_driver()
+        .await
+        .map_err(PullMergeError::MergeDriverConfigRead)?;
+    let external_runtime = read_external_merge_runtime()
+        .await
+        .map_err(PullMergeError::MergeDriverConfigRead)?;
+    let input_normalization = MergeInputNormalization {
+        whitespace: options.whitespace,
+        renormalize: resolve_merge_renormalize(options.renormalize).await?,
+    };
+    let (conflict_style, mut deferred_style_error) = match conflict_style_from_config().await {
+        Ok(style) => (style, None),
+        Err(error) => (ConflictStyle::Merge, Some(error)),
+    };
+    let compute_options = ThreeWayMergeOptions {
+        message_override: None,
+        merge_log: 0,
+        into_name: None,
+        cleanup: None,
+        edit: false,
+        squash: false,
+        no_commit: false,
+        skip_hooks: options.skip_hooks,
+        signing_policy: signing_policy_from_options(options)?,
+        signoff: false,
+        // Every blob remains in `VirtualBlobs` until all heads are clean.
+        dry_run: true,
+        strategy: None,
+        strategy_evaluation: None,
+        favor: options.favor,
+        allow_unrelated_histories: options.allow_unrelated_histories,
+        fast_forwardable: false,
+        rename_config: Some(rename_config.clone()),
+        merge_default_driver: default_driver.clone(),
+        external_merge_runtime: external_runtime.clone(),
+        input_normalization,
+        output,
+    };
+    let (mut ours, mut our_gitlinks) = commit_tree_split_for_merge(current)?;
+    let mut processed = vec![current.id];
+    let mut non_ff = false;
+    let mut blobs = VirtualBlobs::new();
+    let mut rename_outcomes = Vec::new();
+
+    for (branch, target) in targets {
+        let base_ids = merge_base::merge_bases_many(&target.id, &processed)
+            .map_err(|error| PullMergeError::History(error.to_string()))?;
+        if base_ids.contains(&target.id) {
+            continue;
+        }
+        if !non_ff && processed.as_slice() == base_ids.as_slice() {
+            (ours, our_gitlinks) = commit_tree_split_for_merge(target)?;
+            processed.clear();
+            processed.push(target.id);
+            continue;
+        }
+        non_ff = true;
+        if base_ids.is_empty() && !options.allow_unrelated_histories {
+            return Err(PullMergeError::UnrelatedHistories);
+        }
+        let base_commits: Vec<Commit> = base_ids
+            .iter()
+            .map(load_merge_commit)
+            .collect::<Result<_, _>>()?;
+        let (mut theirs, their_gitlinks) = commit_tree_split_for_merge(target)?;
+        let passthrough =
+            ensure_merge_gitlinks_uniform(&base_commits, &our_gitlinks, &their_gitlinks)?;
+        let mut base = match base_commits.as_slice() {
+            [] => HashMap::new(),
+            [base] => commit_tree_split_for_merge(base)?.0,
+            _ => {
+                if let Some(error) = deferred_style_error.take() {
+                    return Err(pull_conflict_style_error(error));
+                }
+                fold_merge_bases(
+                    &base_ids,
+                    &passthrough,
+                    1,
+                    &mut blobs,
+                    VirtualFold {
+                        persist: false,
+                        conflict_style,
+                        rename_config: &rename_config,
+                        default_driver: default_driver.as_deref(),
+                        external_merge_runtime: external_runtime.clone(),
+                        input_normalization,
+                    },
+                )?
+            }
+        };
+        let outcome = detect_and_apply_renames(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &rename_config,
+            conflict_style,
+            ("HEAD", branch),
+            &mut TreeMergeContext::top_level_with_options(
+                &compute_options,
+                conflict_style,
+                branch,
+                &mut blobs,
+            ),
+        )?;
+        let mut merged = merge_tree_items(
+            &base,
+            &ours,
+            &theirs,
+            &mut TreeMergeContext::top_level_with_options(
+                &compute_options,
+                conflict_style,
+                branch,
+                &mut blobs,
+            ),
+        )?;
+        for (path, kind) in &outcome.forced {
+            merged.merged_items.remove(path);
+            merged.conflicts.retain(|(other, _)| other != path);
+            merged.conflicts.push((path.clone(), *kind));
+        }
+        if !merged.conflicts.is_empty() {
+            if let Some(error) = deferred_style_error.take() {
+                return Err(pull_conflict_style_error(error));
+            }
+            merged
+                .conflicts
+                .sort_by(|(left, _), (right, _)| left.cmp(right));
+            return Ok(OctopusTreeOutcome::Conflict {
+                target: branch.clone(),
+                conflicts: merged.conflicts,
+            });
+        }
+        ours = merged.merged_items;
+        our_gitlinks = passthrough;
+        processed.push(target.id);
+        rename_outcomes.push((branch.clone(), outcome));
+    }
+
+    for (path, hash) in our_gitlinks {
+        ours.insert(
+            path,
+            MergeTreeEntry {
+                hash,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    Ok(OctopusTreeOutcome::Clean(OctopusTree {
+        items: ours,
+        blobs,
+        rename_outcomes,
+    }))
+}
+
 pub(crate) async fn run_merge_for_pull_with_options(
     target_ref: &str,
     upstream: &str,
     output: &OutputConfig,
     options: PullMergeOptions,
 ) -> Result<PullMergeSummary, PullMergeError> {
+    // Pull has no positive signing flag, so its unset policy is resolved at
+    // the same pre-mutation boundary as public merge. Callers that replay a
+    // saved state provide `Some` and keep that durable decision instead.
+    let options = PullMergeOptions {
+        signing_policy: Some(match options.signing_policy {
+            Some(policy) => policy,
+            None => signing::resolve_signing_policy(false, false).await?,
+        }),
+        ..options
+    };
     let skip_hooks = options.skip_hooks;
     if MergeState::load_optional_sync()
         .map_err(PullMergeError::StateLoad)?
         .is_some()
     {
         return Err(PullMergeError::MergeInProgress);
+    }
+
+    // A squash leaves conflict stages but deliberately no merge sidecar.
+    // Git checks the index even for an otherwise up-to-date merge, before
+    // autostash or any other operation can replace the unresolved entries.
+    let index =
+        Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+    let unresolved = unresolved_conflicted_paths(&index, &[]);
+    if !unresolved.is_empty() {
+        return Err(PullMergeError::Conflicts {
+            paths: unresolved.join(", "),
+            squash: true,
+        });
     }
 
     // Resolve and load the merge target up front so `--verify-signatures` /
@@ -1526,106 +2836,56 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // follows it, which writes a stash commit, a durable sidecar and resets the
     // worktree. Only the three-way path is preflighted, matching exactly where
     // Git parses the value at all.
-    let preflighted_rename_config =
-        if merge_reaches_three_way_engine(&target_commit, &options).await {
-            Some(merge_rename_config().await?)
-        } else {
-            None
-        };
-
-    // ── autostash (lore.md §1.8) ──
-    // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
-    // (crash after a finalize apply, or an interrupted start) is promoted to
-    // the stash list — never overwritten or lost. Skipped on --restart
-    // re-entry, where the HELD sidecar legitimately exists without state.
-    // A sidecar that EXISTS but cannot be read is a hard stop, not a skip:
-    // proceeding would let the later `--autostash` save OVERWRITE the corrupt
-    // file — destroying the only durable reference to a held commit, which GC
-    // may then collect.
-    // §C.10 lock order: the snapshot is taken under the LOCAL autostash lock
-    // and the lock is RELEASED before `store_stash_commit` takes the
-    // repository-wide stash-stack lock — a repository lock never nests inside
-    // a local one. The cleanup afterwards is identity-checked, so a sidecar
-    // replaced in the unlocked window is preserved, never deleted.
-    // `--dry-run` writes nothing, and promoting a stale sidecar into the stash
-    // list (then deleting it) is a write — so a preview leaves a leftover
-    // sidecar exactly where it found it, for the next REAL merge to recover.
-    let held_snapshot = if options.preserve_held_autostash || options.dry_run {
-        None
+    let reaches_three_way = merge_reaches_three_way_engine(&target_commit, &options).await;
+    let preflighted_rename_config = if reaches_three_way {
+        Some(
+            if options
+                .strategy
+                .is_some_and(|strategy| !strategy.detects_renames())
+            {
+                MergeRenameConfig {
+                    enabled: false,
+                    ..MergeRenameConfig::default()
+                }
+            } else {
+                merge_rename_config().await?
+            },
+        )
     } else {
-        snapshot_held_autostash().map_err(PullMergeError::Autostash)?
+        None
     };
-    if let Some(snapshot) = held_snapshot {
-        let sidecar = &snapshot.sidecar;
-        // ADR-0714-08: promoting adopts the file into the SHARED stash list
-        // and deletes the evidence — only a file this scope can PROVE its own
-        // may be adopted, in any worktree (a foreign-marked file inside a
-        // linked gitdir is a manual copy, not that worktree's autostash).
-        verify_autostash_ownership(snapshot.recorded_owner.as_deref())
-            .map_err(PullMergeError::Autostash)?;
-        if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
-            match crate::command::stash::store_stash_commit(&oid, "autostash").await {
-                Ok(()) => {
-                    match cleanup_autostash_if_matches(&snapshot) {
-                        Ok(true) => {}
-                        Ok(false) => crate::utils::error::emit_warning(
-                            "the autostash sidecar changed while it was being recovered; \
-                             the newer file was left in place",
-                        ),
-                        Err(error) => {
-                            return Err(PullMergeError::Autostash(format!(
-                                "the recovered autostash's sidecar could not be removed: \
-                                 {error}"
-                            )));
-                        }
-                    }
-                    crate::utils::error::emit_warning(
-                        "recovered a leftover autostash into the stash list (it may \
-                         duplicate already-restored changes — inspect with 'libra stash show')",
-                    );
-                }
-                Err(error) => {
-                    return Err(PullMergeError::Autostash(format!(
-                        "cannot recover the leftover autostash: {error}"
-                    )));
-                }
-            }
-        } else {
-            return Err(PullMergeError::Autostash(
-                "merge-autostash.json holds an invalid OID; inspect and remove it".to_string(),
-            ));
+    let preflighted_default_driver = if reaches_three_way {
+        read_merge_default_driver()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+    let preflighted_external_drivers = if reaches_three_way {
+        read_external_merge_runtime()
+            .await
+            .map_err(PullMergeError::MergeDriverConfigRead)?
+    } else {
+        Arc::new(ExternalMergeRuntime::default())
+    };
+    let preflighted_input_normalization = if reaches_three_way {
+        MergeInputNormalization {
+            whitespace: options.whitespace,
+            renormalize: resolve_merge_renormalize(options.renormalize).await?,
         }
-    }
-    let autostash_on = autostash_enabled(&options).await?;
-    if autostash_on && Head::current_commit().await.is_some() {
-        match crate::command::stash::create_held_stash_commit("autostash").await {
-            Ok(Some(stash_commit)) => {
-                // ORDER IS LOAD-BEARING: objects → sidecar (durable
-                // reference) → reset. A crash after the sidecar but before
-                // the reset leaves a dirty tree + sidecar, which the stale
-                // recovery promotes (may-duplicate warning); a crash before
-                // the sidecar leaves the tree untouched. At no point are the
-                // changes gone from the tree while unreferenced.
-                MergeAutostash {
-                    stash_commit: stash_commit.to_string(),
-                }
-                .save()?;
-                if let Err(error) = crate::command::stash::reset_to_head_for_held_stash().await {
-                    return Err(PullMergeError::Autostash(format!(
-                        "created the autostash but failed to reset the tree: {error} \
-                         (merge-autostash.json references stash commit {stash_commit})"
-                    )));
-                }
-                if !output.quiet {
-                    eprintln!("Created autostash: {stash_commit}");
-                }
-            }
-            Ok(None) => {} // clean tree: strict no-op
-            Err(error) => {
-                return Err(PullMergeError::Autostash(error.to_string()));
-            }
-        }
-    }
+    } else {
+        MergeInputNormalization::default()
+    };
+    let preflighted_three_way = PreflightedThreeWayInputs {
+        rename_config: preflighted_rename_config,
+        default_driver: preflighted_default_driver,
+        external_drivers: preflighted_external_drivers,
+        input_normalization: preflighted_input_normalization,
+    };
+
+    // Shared with octopus: all strict semantic preflights complete before the
+    // durable objects -> sidecar -> worktree-reset autostash sequence begins.
+    prepare_merge_autostash(&options, output).await?;
 
     let dry_run = options.dry_run;
     let result = run_merge_for_pull_inner(
@@ -1633,7 +2893,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
         upstream,
         output,
         options,
-        preflighted_rename_config,
+        preflighted_three_way,
     )
     .await;
     // Uniform finalize: applies when no merge state persists (clean success,
@@ -1644,7 +2904,11 @@ pub(crate) async fn run_merge_for_pull_with_options(
     let autostash_outcome = if dry_run {
         None
     } else {
-        resolve_pending_autostash(output).await
+        resolve_pending_autostash(
+            output,
+            matches!(&result, Err(PullMergeError::Conflicts { squash: true, .. })),
+        )
+        .await
     };
     match result {
         Ok(mut summary) => {
@@ -1664,14 +2928,6 @@ pub(crate) async fn run_merge_for_pull_with_options(
     }
 }
 
-/// Whether the target is already reachable from HEAD — nothing to merge.
-/// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
-/// never disagree about which merges arbitrate anything (GC-02).
-///
-/// Phrased over the merge-base SET (MG-02): a commit that is an ancestor of the
-/// other dominates every other common ancestor, so "already merged" is exactly
-/// the shape where the target is the ONE merge base. A criss-cross history with
-/// several bases is never up to date and never fast-forwardable.
 /// The rename configuration for a three-way merge — read strictly, EXCEPT on a
 /// merge that is only here because `--squash` or `--no-commit` skipped the
 /// fast-forward branch. There the result is the target tree whatever rename
@@ -1711,7 +2967,7 @@ async fn merge_reaches_three_way_engine(
     target_commit: &Commit,
     options: &PullMergeOptions,
 ) -> bool {
-    if options.strategy.is_some() {
+    if options.strategy == Some(MergeStrategy::Ours) {
         return false;
     }
     let Some(current_commit_id) = Head::current_commit().await else {
@@ -1720,11 +2976,7 @@ async fn merge_reaches_three_way_engine(
     let Ok(current_commit) = load_object::<Commit>(&current_commit_id) else {
         return false;
     };
-    let Ok(bases) = merge_base_commits(
-        &current_commit,
-        target_commit,
-        merge_options_will_fold(options),
-    ) else {
+    let Ok(bases) = merge_base_commits_for_strategy(&current_commit, target_commit, options) else {
         return false;
     };
     if bases.is_empty() && !options.allow_unrelated_histories {
@@ -1749,6 +3001,14 @@ async fn merge_reaches_three_way_engine(
     true
 }
 
+/// Whether the target is already reachable from HEAD — nothing to merge.
+/// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
+/// never disagree about which merges arbitrate anything (GC-02).
+///
+/// Phrased over the merge-base SET (MG-02): a commit that is an ancestor of the
+/// other dominates every other common ancestor, so "already merged" is exactly
+/// the shape where the target is the ONE merge base. A criss-cross history with
+/// several bases is never up to date and never fast-forwardable.
 fn merge_is_up_to_date(bases: &[Commit], target_commit: &Commit) -> bool {
     matches!(bases, [base] if base.id == target_commit.id)
 }
@@ -1757,7 +3017,11 @@ fn merge_is_up_to_date(bases: &[Commit], target_commit: &Commit) -> bool {
 /// virtual ancestor at all. Shared by the preflight and the engine so the width
 /// ceiling can never fire for a merge that decides the shape some other way.
 fn merge_options_will_fold(options: &PullMergeOptions) -> bool {
-    options.strategy.is_none() && !options.ff_only
+    options
+        .strategy
+        .unwrap_or(MergeStrategy::Ort)
+        .folds_merge_bases()
+        && !options.ff_only
 }
 
 /// Whether HEAD is the sole merge base — the shape a fast-forward (and
@@ -1791,7 +3055,7 @@ fn merge_is_fast_forward(
     options: &PullMergeOptions,
 ) -> bool {
     merge_head_is_sole_base(bases, current_commit)
-        && options.strategy.is_none()
+        && options.strategy != Some(MergeStrategy::Ours)
         && !options.no_ff
         && !options.squash
         && !options.no_commit
@@ -1810,7 +3074,7 @@ async fn preflight_merge_gitlinks(
     target_commit: &Commit,
     options: &PullMergeOptions,
 ) -> Result<(), PullMergeError> {
-    if options.strategy.is_some() {
+    if options.strategy == Some(MergeStrategy::Ours) {
         return Ok(());
     }
     let Some(current_commit_id) = Head::current_commit().await else {
@@ -1821,11 +3085,7 @@ async fn preflight_merge_gitlinks(
             commit_id: current_commit_id.to_string(),
             detail: error.to_string(),
         })?;
-    let bases = merge_base_commits(
-        &current_commit,
-        target_commit,
-        merge_options_will_fold(options),
-    )?;
+    let bases = merge_base_commits_for_strategy(&current_commit, target_commit, options)?;
     // Every shape the engine settles WITHOUT arbitrating is skipped here, so a
     // gitlink refusal can never pre-empt the engine's own verdict:
     //   * unrelated histories the user did not opt into are rejected outright;
@@ -1919,6 +3179,13 @@ fn merge_completed_for_post_hook(summary: &PullMergeSummary) -> bool {
         && (summary.commit.is_some() || summary.strategy == "squash")
 }
 
+struct PreflightedThreeWayInputs {
+    rename_config: Option<MergeRenameConfig>,
+    default_driver: Option<String>,
+    external_drivers: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
+}
+
 async fn run_merge_for_pull_inner(
     // Pre-resolved and (when requested) signature-verified by
     // `run_merge_for_pull_with_options` BEFORE autostash/recovery mutations;
@@ -1928,10 +3195,10 @@ async fn run_merge_for_pull_inner(
     output: &OutputConfig,
     options: PullMergeOptions,
     // Validated by the caller BEFORE it mutated anything (MG-05, Codex R7/R8);
-    // carried here so the engines never read the key a second time, where a
+    // carried here so the engines never read the keys a second time, where a
     // transient failure or a concurrent edit could refuse the merge after the
     // autostash had already saved and reset the tree (Codex R9).
-    preflighted_rename_config: Option<MergeRenameConfig>,
+    preflighted: PreflightedThreeWayInputs,
 ) -> Result<PullMergeSummary, PullMergeError> {
     let Some(current_commit_id) = Head::current_commit().await else {
         let files_changed = count_changed_files(None, &target_commit)?;
@@ -1942,6 +3209,7 @@ async fn run_merge_for_pull_inner(
         }
         return Ok(PullMergeSummary {
             strategy: "fast-forward".to_string(),
+            selected_strategy: None,
             old_commit: None,
             commit: Some(target_commit.id.to_string()),
             files_changed,
@@ -1962,11 +3230,7 @@ async fn run_merge_for_pull_inner(
             detail: error.to_string(),
         })?;
 
-    let bases = merge_base_commits(
-        &current_commit,
-        &target_commit,
-        merge_options_will_fold(&options),
-    )?;
+    let bases = merge_base_commits_for_strategy(&current_commit, &target_commit, &options)?;
 
     if bases.is_empty() && !options.allow_unrelated_histories {
         return Err(PullMergeError::UnrelatedHistories);
@@ -1975,6 +3239,7 @@ async fn run_merge_for_pull_inner(
     if merge_is_up_to_date(&bases, &target_commit) {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit_id.to_string()),
             commit: None,
             files_changed: 0,
@@ -1998,6 +3263,7 @@ async fn run_merge_for_pull_inner(
         }
         return Ok(PullMergeSummary {
             strategy: "fast-forward".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit_id.to_string()),
             commit: Some(target_commit.id.to_string()),
             files_changed,
@@ -2028,21 +3294,31 @@ async fn run_merge_for_pull_inner(
     let merge_options = ThreeWayMergeOptions {
         message_override: options.message.clone(),
         merge_log: options.merge_log,
+        into_name: options.into_name.clone(),
+        cleanup: options.cleanup.clone(),
+        edit: options.edit,
         squash: options.squash,
         no_commit: options.no_commit,
         skip_hooks: options.skip_hooks,
+        signing_policy: signing_policy_from_options(&options)?,
+        signoff: options.signoff,
         dry_run: options.dry_run,
+        strategy: options.strategy,
+        strategy_evaluation: options.strategy_evaluation,
         favor: options.favor,
         allow_unrelated_histories: options.allow_unrelated_histories,
         fast_forwardable: merge_head_is_sole_base(&bases, &current_commit) && !options.no_ff,
-        rename_config: preflighted_rename_config,
+        rename_config: preflighted.rename_config,
+        merge_default_driver: preflighted.default_driver,
+        external_merge_runtime: preflighted.external_drivers,
+        input_normalization: preflighted.input_normalization,
         output,
     };
     match options.strategy {
         Some(MergeStrategy::Ours) => {
             perform_ours_merge(current_commit, target_commit, upstream, merge_options).await
         }
-        None => {
+        None | Some(MergeStrategy::Ort | MergeStrategy::Recursive | MergeStrategy::Resolve) => {
             perform_three_way_merge(
                 current_commit,
                 target_commit,
@@ -2072,14 +3348,25 @@ impl MergeTreeEntry {
     }
 }
 
+#[derive(Clone)]
 struct ThreeWayMergeOptions<'a> {
     message_override: Option<String>,
     merge_log: usize,
+    into_name: Option<String>,
+    cleanup: Option<String>,
+    edit: bool,
     squash: bool,
     no_commit: bool,
     skip_hooks: bool,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
+    signoff: bool,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
     dry_run: bool,
+    /// Explicit backend name. `None` is the historical default ort path and
+    /// keeps legacy summary/reflog/state values backward compatible.
+    strategy: Option<MergeStrategy>,
+    /// Present only for the read-only probes used by repeated `merge -s`.
+    strategy_evaluation: Option<StrategyEvaluationSink>,
     /// Resolve otherwise-conflicting paths in favor of one side.
     favor: Option<MergeFavor>,
     /// Persisted in recovery state for unrelated-history restart.
@@ -2096,31 +3383,124 @@ struct ThreeWayMergeOptions<'a> {
     /// stale-sidecar recovery and the autostash it guards. Reading it again in
     /// the engine would reopen the window those refusals exist to close.
     rename_config: Option<MergeRenameConfig>,
+    merge_default_driver: Option<String>,
+    external_merge_runtime: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
     output: &'a OutputConfig,
 }
 
-fn resolve_merge_message(
+/// Open the configured editor on a per-worktree merge message buffer.
+async fn edit_merge_message(initial: &str) -> Result<String, MergeError> {
+    let Some(editor_cmd) = editor::resolve_editor().await else {
+        return Err(MergeError::Editor(
+            "no editor configured for --edit; set $GIT_EDITOR, core.editor, $VISUAL, or $EDITOR"
+                .to_string(),
+        ));
+    };
+    let path = util::request_worktree_gitdir_strict().join("MERGE_MSG");
+    editor::edit_message(&path, initial, &editor_cmd, true)
+        .await
+        .map_err(|error| MergeError::Editor(error.to_string()))
+}
+
+/// The message-related knobs shared by every merge backend. Keeping them
+/// together prevents message compatibility from making strategy APIs brittle.
+#[derive(Clone, Copy)]
+struct MergeMessageSettings<'a> {
+    message_override: Option<&'a String>,
+    merge_log: usize,
+    into_name: Option<&'a str>,
+    cleanup: Option<&'a str>,
+    edit: bool,
+}
+
+impl<'a> MergeMessageSettings<'a> {
+    fn from_pull_options(options: &'a PullMergeOptions) -> Self {
+        Self {
+            message_override: options.message.as_ref(),
+            merge_log: options.merge_log,
+            into_name: options.into_name.as_deref(),
+            cleanup: options.cleanup.as_deref(),
+            edit: options.edit,
+        }
+    }
+
+    fn from_three_way_options(options: &'a ThreeWayMergeOptions<'_>) -> Self {
+        Self {
+            message_override: options.message_override.as_ref(),
+            merge_log: options.merge_log,
+            into_name: options.into_name.as_deref(),
+            cleanup: options.cleanup.as_deref(),
+            edit: options.edit,
+        }
+    }
+}
+
+/// Apply an explicitly requested cleanup mode, or the normal edited-message
+/// comment removal. The result is validated before merge state is written so a
+/// later `--continue` never inherits an empty message.
+fn finalize_merge_message(
+    message: &str,
+    cleanup: Option<&str>,
+    edited: bool,
+) -> Result<String, MergeError> {
+    let cleaned = match cleanup {
+        Some(raw) => {
+            let mode = parse_cleanup_mode(raw)
+                .ok_or_else(|| MergeError::InvalidCleanup(raw.to_string()))?;
+            let mode = if !edited && matches!(mode, CleanupMode::Default | CleanupMode::Scissors) {
+                CleanupMode::Whitespace
+            } else {
+                mode
+            };
+            cleanup_commit_message(message, mode)
+        }
+        None if edited => message
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        None => message.to_string(),
+    };
+    if cleaned.trim().is_empty() {
+        return Err(MergeError::EmptyMessage);
+    }
+    Ok(cleaned)
+}
+
+async fn resolve_merge_message(
     current: ObjectHash,
     target: ObjectHash,
     upstream: &str,
     head_name: &str,
-    message_override: Option<&String>,
-    merge_log: usize,
+    settings: MergeMessageSettings<'_>,
 ) -> Result<String, PullMergeError> {
-    match message_override {
+    let message = match settings.message_override {
         Some(message) => crate::command::merge_message::append_shortlog(
             message.clone(),
             current,
             target,
             upstream,
-            merge_log,
+            settings.merge_log,
         )
         .map_err(PullMergeError::History),
         None => crate::command::merge_message::default_message(
-            current, target, upstream, head_name, merge_log,
+            current,
+            target,
+            upstream,
+            settings.into_name.unwrap_or(head_name),
+            settings.merge_log,
         )
         .map_err(PullMergeError::History),
-    }
+    }?;
+    let message = if settings.edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    finalize_merge_message(&message, settings.cleanup, settings.edit)
 }
 
 /// Git's `ours` merge strategy records the target as a second parent while
@@ -2145,13 +3525,14 @@ async fn perform_ours_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if options.dry_run {
         return Ok(PullMergeSummary {
             strategy: "ours".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -2170,6 +3551,7 @@ async fn perform_ours_merge(
     if options.squash {
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -2191,16 +3573,21 @@ async fn perform_ours_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: None,
             strategy: Some(MergeStrategy::Ours),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
+            signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message),
         }
         .save()?;
         return Ok(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed: 0,
@@ -2232,7 +3619,9 @@ async fn perform_ours_merge(
     let merge_commit = build_merge_commit(
         current_commit.tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
+        options.signoff,
     )
     .await?;
     save_object(&merge_commit, &merge_commit.id)
@@ -2245,6 +3634,7 @@ async fn perform_ours_merge(
 
     Ok(PullMergeSummary {
         strategy: "ours".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed: 0,
@@ -2281,16 +3671,21 @@ async fn perform_three_way_merge(
     // incrementally, opening only the directories the sides disagree about.
     // The recursive fold of several bases (MG-02) has already read every input
     // to build its virtual ancestor, so that shape keeps the flattening path.
-    if base_commits.len() <= 1 && incremental_tree_walk_enabled() {
-        return perform_incremental_three_way_merge(
-            current_commit,
-            target_commit,
+    if base_commits.len() <= 1
+        && options.strategy != Some(MergeStrategy::Resolve)
+        && options.strategy_evaluation.is_none()
+        && incremental_tree_walk_enabled()
+        && let Some(summary) = perform_incremental_three_way_merge(
+            current_commit.clone(),
+            target_commit.clone(),
             base_commits.first(),
-            head_name,
+            head_name.clone(),
             upstream,
-            options,
+            options.clone(),
         )
-        .await;
+        .await?
+    {
+        return Ok(summary);
     }
     // MG-05: the rename config is STRICT, so it is read before anything is
     // persisted — a multi-base fold materializes its virtual ancestor, and an
@@ -2312,27 +3707,37 @@ async fn perform_three_way_merge(
     // better than the others. Fold them into one virtual ancestor (Git's
     // recursive strategy, `merge-ort.c:5313`) instead of arbitrarily picking
     // one, which reports conflicts the recursion resolves.
+    // A valid style must reach the first content merge so refinement and rename
+    // replay agree. Preserve the existing single-base failure boundary,
+    // though: a bad presentation setting is reported only if a conflict needs
+    // rendering. The recursive fold is the documented exception because its
+    // synthetic ancestor may itself contain conflict markers.
+    let (conflict_style, mut deferred_conflict_style_error) =
+        match conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (ConflictStyle::Merge, Some(error)),
+        };
+    if base_commits.len() > 1
+        && let Some(error) = deferred_conflict_style_error.take()
+    {
+        return Err(pull_conflict_style_error(error));
+    }
     let (base_items, mut virtual_blobs) = match base_commits.as_slice() {
         [] => (HashMap::new(), VirtualBlobs::new()),
         [base] => (commit_tree_split_for_merge(base)?.0, VirtualBlobs::new()),
         bases => {
-            // A conflict INSIDE the virtual ancestor is rendered with the
-            // configured style, exactly as Git renders one at any call depth.
-            // Resolving the style here rather than only on the outer conflict
-            // path is what a multi-base merge costs: an invalid
-            // `merge.conflictStyle` stops a criss-cross merge even when the
-            // merge itself would come out clean.
-            let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-                ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-                ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-            })?;
             let base_ids: Vec<ObjectHash> = bases.iter().map(|base| base.id).collect();
             let ancestor = virtual_merge_base(
                 &base_ids,
                 &passthrough_gitlinks,
-                !options.dry_run,
-                conflict_style,
-                &rename_config,
+                VirtualFold {
+                    persist: !options.dry_run,
+                    conflict_style,
+                    rename_config: &rename_config,
+                    default_driver: options.merge_default_driver.as_deref(),
+                    external_merge_runtime: options.external_merge_runtime.clone(),
+                    input_normalization: options.input_normalization,
+                },
             )?;
             (ancestor.items, ancestor.blobs)
         }
@@ -2341,12 +3746,27 @@ async fn perform_three_way_merge(
     // side onto the new path, so the ordinary three-way match below sees one
     // triple there (Git's `detect_regular_renames` + `process_renames`).
     let mut base_items = base_items;
+    let resolve_rename_notices = if options.strategy == Some(MergeStrategy::Resolve) {
+        detect_resolve_rename_notices(&base_items, &our_items, &their_items, &virtual_blobs)
+    } else {
+        Vec::new()
+    };
     let rename_report = detect_and_apply_renames(
         &mut base_items,
         &mut our_items,
         &mut their_items,
-        &virtual_blobs,
         &rename_config,
+        conflict_style,
+        (
+            df_branch_label(MergeSide::Ours, upstream).as_str(),
+            upstream,
+        ),
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
+            conflict_style,
+            upstream,
+            &mut virtual_blobs,
+        ),
     )?;
 
     // Under `--dry-run`, auto-merged blobs are computed in memory only
@@ -2354,12 +3774,29 @@ async fn perform_three_way_merge(
     // under tiered storage a `save_object` would even upload to the remote.
     // The virtual ancestor obeys the same rule: its blobs stay in
     // `virtual_blobs` and its one-shot tree/commit are not materialized.
-    let merge_result = merge_tree_items(
+    let mut merge_result = merge_tree_items(
         &base_items,
         &our_items,
         &their_items,
-        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
+            conflict_style,
+            upstream,
+            &mut virtual_blobs,
+        ),
     )?;
+    // MG-06: conflicts the ordinary match must not decide for itself. A
+    // rename/rename(1to2)'s destinations look like one-sided adds to it, its
+    // source like a clean delete, and a rename/delete whose content never
+    // changed like a clean delete too — all three are PATH-level conflicts for
+    // Git. Applied after the match so the paths carry the rename pass's
+    // verdict, exactly as the pruned walk's `settle` does.
+    for (path, kind) in &rename_report.forced {
+        merge_result.merged_items.remove(path);
+        merge_result.conflicts.retain(|(other, _)| other != path);
+        merge_result.conflicts.push((path.clone(), *kind));
+    }
+    let merge_result = merge_result;
     // A rename THEIRS made moves a file ours still had at the old path: the
     // remapped comparison sees the same entry on both sides, so the move
     // itself has to be counted here (Git's diffstat shows it as one changed
@@ -2412,12 +3849,23 @@ async fn perform_three_way_merge(
         // — and it must still report the rename decisions the real merge would
         // make, or a declined rename would be invisible until the merge itself
         // (Codex R13 P2). `--json`/`--machine` stay silent, as always.
+        announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
         announce_rename_notices(
-            &rename_report.decisions,
+            &rename_report.notes,
             &rename_report.limited,
             upstream,
             options.output,
         );
+        if !placements.is_empty()
+            && let Some(sink) = &options.strategy_evaluation
+        {
+            sink.record(strategy_evaluation_score(
+                &placements,
+                &base_items,
+                &our_items,
+                &their_items,
+            ))?;
+        }
         let conflicted_paths: Vec<String> = placements
             .iter()
             .map(|(path, _, _)| path.display().to_string())
@@ -2426,6 +3874,7 @@ async fn perform_three_way_merge(
         let would_conflict = !conflicted_paths.is_empty();
         return Ok(PullMergeSummary {
             strategy: "three-way".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -2451,26 +3900,25 @@ async fn perform_three_way_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if !merge_result.conflicts.is_empty() {
-        // For a single-base merge the style is resolved only here, on the
-        // conflict path, so an invalid value cannot block a clean merge. A
-        // multi-base merge already resolved it above (the fold's content
-        // depends on it) — this second read then simply agrees with the first.
-        let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-            ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-            ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-        })?;
+        if let Some(error) = deferred_conflict_style_error.take() {
+            return Err(pull_conflict_style_error(error));
+        }
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
             message: resolved_message,
+            squash: options.squash,
             upstream: upstream.to_string(),
             base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: options.signing_policy,
+            signoff: options.signoff,
+            strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items: merge_result.merged_items,
@@ -2485,8 +3933,9 @@ async fn perform_three_way_merge(
         // and Git prints nothing when it does. The rename notices wait for the
         // same moment and print first, so the decision that shaped the conflict
         // is read before the conflict itself.
+        announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
         announce_rename_notices(
-            &rename_report.decisions,
+            &rename_report.notes,
             &rename_report.limited,
             upstream,
             options.output,
@@ -2499,8 +3948,15 @@ async fn perform_three_way_merge(
         if let Err(error) = crate::command::rerere::auto_update(false).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
-        let paths = MergeState::load_required()?.conflicted_paths.join(", ");
-        return Err(PullMergeError::Conflicts { paths });
+        let paths = placements
+            .iter()
+            .map(|(path, _, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PullMergeError::Conflicts {
+            paths,
+            squash: options.squash,
+        });
     }
 
     let current_index =
@@ -2523,8 +3979,9 @@ async fn perform_three_way_merge(
     refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
     // The preflight passed, so the merge will happen: the rename notices can be
     // printed now (Codex R12 P2 — a refused merge prints no rename decision).
+    announce_resolve_rename_notices(&resolve_rename_notices, upstream, options.output);
     announce_rename_notices(
-        &rename_report.decisions,
+        &rename_report.notes,
         &rename_report.limited,
         upstream,
         options.output,
@@ -2540,6 +3997,7 @@ async fn perform_three_way_merge(
         reset_index_and_workdir_to_tree(&tree_id)?;
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -2567,16 +4025,21 @@ async fn perform_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: recorded_merge_base(&base_commits).map(|base| base.to_string()),
-            strategy: None,
+            strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
+            signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
         .save()?;
         return Ok(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -2618,12 +4081,20 @@ async fn perform_three_way_merge(
     let merge_commit = build_merge_commit(
         tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
+        options.signoff,
     )
     .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
-    update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
+    update_head_with_reflog(
+        &head_name,
+        merge_commit.id,
+        upstream,
+        options.strategy.map_or("three-way", MergeStrategy::name),
+    )
+    .await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
     if !options.skip_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
@@ -2631,6 +4102,7 @@ async fn perform_three_way_merge(
 
     Ok(PullMergeSummary {
         strategy: "three-way".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -2648,12 +4120,14 @@ async fn perform_three_way_merge(
 
 /// Resolve the conflict-marker style from the Git-compatible
 /// `merge.conflictStyle` config key (lore.md §1.3): unset/`merge` → the default
-/// two-marker style, `diff3` → additionally emit the `||||||| base` block.
+/// two-marker style, `diff3` → additionally emit the `||||||| base` block, and
+/// `zdiff3` → retain that base block while moving common postimage edges out
+/// of the conflict region.
 /// Matching Git, this is config-only — `git merge` has no CLI style flag. An
-/// unrecognized value (including the unimplemented `zdiff3`) is a hard error so
+/// unrecognized value is a hard error so
 /// a typo never silently changes the marker format. Consulted only when a
-/// conflict actually needs rendering; shared by `merge`/`pull` and
-/// `cherry-pick`, which use the same line-level renderer.
+/// conflict actually needs rendering; shared by `merge`/`pull`,
+/// `cherry-pick`, and `revert`, which use the same content renderer.
 /// Why [`conflict_style_from_config`] could not produce a style: the configured
 /// value is unsupported, or the config store itself could not be read. The two
 /// are distinct on purpose — a read failure must surface as an I/O problem, not
@@ -2664,8 +4138,32 @@ pub(crate) enum ConflictStyleError {
     Read(String),
 }
 
-pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle, ConflictStyleError>
-{
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictStyle {
+    Merge,
+    Diff3,
+    ZDiff3,
+}
+
+impl ConflictStyle {
+    fn diffy_style(self) -> diffy::ConflictStyle {
+        match self {
+            Self::Merge => diffy::ConflictStyle::Merge,
+            Self::Diff3 | Self::ZDiff3 => diffy::ConflictStyle::Diff3,
+        }
+    }
+}
+
+impl From<diffy::ConflictStyle> for ConflictStyle {
+    fn from(style: diffy::ConflictStyle) -> Self {
+        match style {
+            diffy::ConflictStyle::Merge => Self::Merge,
+            diffy::ConflictStyle::Diff3 => Self::Diff3,
+        }
+    }
+}
+
+pub(crate) async fn conflict_style_from_config() -> Result<ConflictStyle, ConflictStyleError> {
     // Case-insensitive variable lookup: Git config variable names are
     // case-insensitive, and Libra stores keys verbatim, so both
     // `merge.conflictStyle` and `merge.conflictstyle` spellings must match.
@@ -2676,14 +4174,24 @@ pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle,
         .map(|entry| entry.value.trim().to_ascii_lowercase())
         .as_deref()
     {
-        None | Some("") | Some("merge") => Ok(diffy::ConflictStyle::Merge),
-        Some("diff3") => Ok(diffy::ConflictStyle::Diff3),
+        None | Some("") | Some("merge") => Ok(ConflictStyle::Merge),
+        Some("diff3") => Ok(ConflictStyle::Diff3),
+        Some("zdiff3") => Ok(ConflictStyle::ZDiff3),
         Some(other) => Err(ConflictStyleError::Invalid(other.to_string())),
+    }
+}
+
+fn pull_conflict_style_error(error: ConflictStyleError) -> PullMergeError {
+    match error {
+        ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+        ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
     }
 }
 
 struct MergeConflictInput {
     head_name: String,
+    /// Git skips MERGE_HEAD even when a squash has unresolved conflicts.
+    squash: bool,
     /// Resolved merge message (see [`MergeState::message`]).
     message: String,
     upstream: String,
@@ -2692,6 +4200,11 @@ struct MergeConflictInput {
     base: Option<ObjectHash>,
     allow_unrelated_histories: bool,
     skip_hooks: bool,
+    signing_policy: crate::command::history_config::CommitSigningPolicy,
+    signoff: bool,
+    /// Explicit backend selected for this conflict. `None` retains the
+    /// historical implicit-ort state schema.
+    strategy: Option<MergeStrategy>,
     ours: ObjectHash,
     theirs: ObjectHash,
     merged_items: HashMap<PathBuf, MergeTreeEntry>,
@@ -2704,7 +4217,49 @@ struct MergeConflictInput {
     our_items: HashMap<PathBuf, MergeTreeEntry>,
     their_items: HashMap<PathBuf, MergeTreeEntry>,
     /// Marker style for conflicted paths, resolved from `merge.conflictStyle`.
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
+}
+
+fn strategy_evaluation_score(
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+    base_items: &HashMap<PathBuf, MergeTreeEntry>,
+    our_items: &HashMap<PathBuf, MergeTreeEntry>,
+    their_items: &HashMap<PathBuf, MergeTreeEntry>,
+) -> StrategyEvaluationScore {
+    // Every unmerged placement is one `diff-files` path. A directory-split
+    // notice is the exception: the writer records the resolved content at
+    // stage 0 and writes those same bytes to the worktree, so Git's
+    // `run_diff_files()` contributes zero for it.
+    let differing_files = placements
+        .iter()
+        .filter(|(_, kind, _)| !matches!(kind, ConflictKind::DirectorySplit { .. }))
+        .count();
+    let unmerged_entries = placements
+        .iter()
+        .map(|(path, kind, original)| {
+            let source = original.as_ref().unwrap_or(path);
+            match kind {
+                // This path-level conflict is represented by a resolved
+                // stage-0 entry rather than by unmerged stages.
+                ConflictKind::DirectorySplit { .. } => 0,
+                ConflictKind::FileDirectory { base_file, .. } => {
+                    usize::from(base_file.is_some()) + 1
+                }
+                _ => [base_items, our_items, their_items]
+                    .into_iter()
+                    .filter(|items| {
+                        items
+                            .get(source)
+                            .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+                    })
+                    .count(),
+            }
+        })
+        .sum();
+    StrategyEvaluationScore {
+        differing_files,
+        unmerged_entries,
+    }
 }
 
 fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMergeError> {
@@ -2741,7 +4296,6 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
 
     let workdir = util::working_dir();
-    let marker_eol = conflict_marker_eol();
     let theirs_abbrev = short_object_id(&input.theirs);
 
     let mut index = Index::new();
@@ -2752,6 +4306,12 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         // A moved modify/delete conflict is still looked up where the sides
         // HAD the file; its stages are written at the moved path.
         let source = original.as_ref().unwrap_or(path);
+        if let ConflictKind::DirectorySplit { content } = kind {
+            // Git records the addition as fully resolved (stage 0) while the
+            // directory-level decision keeps the merge itself unclean.
+            add_blob_index_entry(&mut index, path, *content, 0)?;
+            continue;
+        }
         if let ConflictKind::FileDirectory {
             file,
             file_side,
@@ -2797,20 +4357,30 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         orig_head: input.ours.to_string(),
         target: input.theirs.to_string(),
         target_ref: input.upstream,
+        targets: Vec::new(),
+        target_refs: Vec::new(),
         base: input.base.map(|base| base.to_string()),
-        strategy: None,
+        strategy: input.strategy,
         allow_unrelated_histories: input.allow_unrelated_histories,
         skip_hooks: input.skip_hooks,
+        signing_policy: Some(input.signing_policy),
+        signoff: input.signoff,
         conflicted_paths: conflict_paths
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
         message: Some(input.message),
     };
-    state.save()?;
+    // Git builtin/merge.c writes merge state only for a non-squash result.
+    // A squash's staged resolution must be committed with one parent.
+    if !input.squash {
+        state.save()?;
+    }
 
     if let Err(error) = index.save(path::index()) {
-        let _ = MergeState::cleanup();
+        if !input.squash {
+            let _ = MergeState::cleanup();
+        }
         return Err(PullMergeError::IndexSave(error.to_string()));
     }
 
@@ -2867,15 +4437,8 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
                 .map_err(PullMergeError::WorkdirReset)?;
             continue;
         }
-        write_conflict_markers(
-            &workdir,
-            path,
-            marker_eol,
-            &theirs_abbrev,
-            *kind,
-            input.conflict_style,
-        )
-        .map_err(PullMergeError::WorkdirReset)?;
+        write_conflict_markers(&workdir, path, &theirs_abbrev, *kind, input.conflict_style)
+            .map_err(PullMergeError::WorkdirReset)?;
     }
 
     Ok(())
@@ -2896,6 +4459,13 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
             mode: TreeItemMode::Blob,
         }),
         ConflictKind::BothChanged { .. } => None,
+        // MG-06: not a D/F relocation, so never consulted here (`original` is
+        // `None` for every rename-driven conflict) — the 1to2 destinations get
+        // their already-merged content from `write_conflict_markers`.
+        ConflictKind::RenameMerged { .. } => None,
+        // A split-directory conflict is not relocated either; its optional
+        // resolved stage-0 entry is handled directly by the writer.
+        ConflictKind::DirectorySplit { .. } => None,
     }
 }
 
@@ -3040,10 +4610,19 @@ async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
     message_override: Option<String>,
+    cleanup: Option<String>,
+    edit: bool,
+    signing_policy_override: Option<crate::command::history_config::CommitSigningPolicy>,
+    signoff_for_continue: bool,
 ) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
     let held_autostash = preflight_held_autostash()?;
     let state = MergeState::load_required()?;
+    let signing_policy = match signing_policy_override.or(state.signing_policy) {
+        Some(policy) => policy,
+        None => signing::resolve_signing_policy(false, false).await?,
+    };
+    let signoff = state.signoff || signoff_for_continue;
     ensure_no_unstaged_changes_for_continue()?;
     let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
     let index =
@@ -3061,7 +4640,15 @@ async fn run_merge_continue(
     }
 
     let orig_head = object_hash_from_state("orig_head", &state.orig_head)?;
-    let target = object_hash_from_state("target", &state.target)?;
+    let target_values: Vec<&str> = if state.targets.is_empty() {
+        vec![state.target.as_str()]
+    } else {
+        state.targets.iter().map(String::as_str).collect()
+    };
+    let targets: Vec<ObjectHash> = target_values
+        .into_iter()
+        .map(|target| object_hash_from_state("target", target))
+        .collect::<Result<_, _>>()?;
     let original_commit: Commit =
         load_object(&orig_head).map_err(|error| MergeError::CurrentLoad {
             commit_id: orig_head.to_string(),
@@ -3084,14 +4671,19 @@ async fn run_merge_continue(
     let index_items = index_tree_items(&index)?;
     let files_changed = count_changes_following_renames(&original_items, &index_items).await?;
     let tree_id = create_tree_from_items_map(&index_items).map_err(MergeError::TreeCreate)?;
-    // A `-m` given to `--continue` wins: it is the only way to set the message
-    // of a conflicted merge, since Libra finalizes without opening an editor.
-    // Otherwise replay the message resolved at merge start (`-m` or the
-    // generated default with the `merge.log` shortlog); states written by older
-    // binaries carry no message and keep the plain form.
+    // An explicit `-m`/`-F` given to `--continue` wins. Otherwise replay the
+    // message resolved at merge start (including its source/cleanup result);
+    // states written by older binaries carry no message and keep the plain
+    // form. `--edit` may then replace either starting point.
     let message = message_override
         .or_else(|| state.message.clone())
         .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name));
+    let message = if edit {
+        edit_merge_message(&message).await?
+    } else {
+        message
+    };
+    let message = finalize_merge_message(&message, cleanup.as_deref(), edit)?;
     let message = if !skip_hooks {
         run_pre_merge_commit_hook(output).await?;
         ensure_no_unstaged_changes_for_continue()?;
@@ -3101,23 +4693,33 @@ async fn run_merge_continue(
     } else {
         message
     };
+    let mut parent_ids = Vec::with_capacity(targets.len() + 1);
+    parent_ids.push(orig_head);
+    parent_ids.extend(targets.iter().copied());
     let merge_commit = build_merge_commit(
         tree_id,
-        vec![orig_head, target],
-        &format_commit_msg(&message, None),
+        parent_ids.clone(),
+        &message,
+        signing_policy,
+        signoff,
     )
     .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
-    let strategy = match state.strategy {
-        Some(MergeStrategy::Ours) => "ours",
-        None => "three-way",
+    let (strategy, reflog_strategy, selected_strategy) = match state.strategy {
+        Some(MergeStrategy::Ours) => ("ours", "ours", Some("ours")),
+        Some(strategy) => ("three-way", strategy.name(), Some(strategy.name())),
+        // Single-head states leave `targets` empty. An octopus invocation
+        // records the reduced target set here even when every head but one was
+        // redundant, so non-empty is the durable strategy discriminator.
+        None if !state.targets.is_empty() => ("octopus", "octopus", Some("octopus")),
+        None => ("three-way", "three-way", Some("ort")),
     };
     update_head_with_reflog(
         &state.head_name,
         merge_commit.id,
         &state.target_ref,
-        strategy,
+        reflog_strategy,
     )
     .await?;
     reset_index_and_workdir_to_tree(&tree_id)?;
@@ -3126,7 +4728,7 @@ async fn run_merge_continue(
     // (clean → dropped; conflict → promoted to the stash list with a notice).
     // The control's pre-mutation snapshot is what is consumed (W2 r6 #4).
     let autostash = match held_autostash {
-        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot, false).await,
         None => None,
     };
     if !skip_hooks {
@@ -3135,11 +4737,12 @@ async fn run_merge_continue(
 
     let summary = PullMergeSummary {
         strategy: strategy.to_string(),
+        selected_strategy: selected_strategy.map(str::to_string),
         old_commit: Some(orig_head.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
         up_to_date: false,
-        parents: vec![orig_head.to_string(), target.to_string()],
+        parents: parent_ids.iter().map(ToString::to_string).collect(),
         conflicted_paths: Vec::new(),
         aborted: false,
         continued: true,
@@ -3216,10 +4819,10 @@ async fn restore_pre_merge_state(
 /// resolution done so far — then immediately re-run the same merge against the
 /// RECORDED target commit (`state.target`, not the ref name, which may have
 /// moved since the original merge), regenerating fresh conflict markers and
-/// merge state. The re-run uses default merge options: the original
+/// merge state. The selected strategy and recovery-critical unrelated-history
+/// permission are persisted and replayed. Other original options such as
 /// `-m`/`--no-ff`/`--squash`/`--no-commit` are not persisted in [`MergeState`]
-/// and are not replayed (documented limitation). The recovery-critical
-/// unrelated-history permission is persisted and replayed below.
+/// and are not replayed (documented limitation).
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
     let _held_autostash = preflight_held_autostash()?;
@@ -3232,6 +4835,8 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     }
     let target = state.target.clone();
     let target_ref = state.target_ref.clone();
+    let persisted_strategy = state.strategy;
+    let selected_strategy = persisted_strategy.unwrap_or(MergeStrategy::Ort);
     restore_pre_merge_state(&state, "restart").await?;
     // Deterministic replay: merge the recorded commit; keep the original ref
     // name as the upstream label so the merge message/state read naturally.
@@ -3240,13 +4845,18 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     // uniform finalize applies it on eventual clean completion or keeps
     // holding across a re-conflict.
     let options = PullMergeOptions {
+        strategy: persisted_strategy,
         autostash: Some(false),
         preserve_held_autostash: true,
         allow_unrelated_histories: state.allow_unrelated_histories,
         skip_hooks: state.skip_hooks,
+        signing_policy: state.signing_policy,
+        signoff: state.signoff,
         ..PullMergeOptions::default()
     };
-    run_merge_for_pull_with_options(&target, &target_ref, output, options).await
+    run_merge_for_pull_with_options(&target, &target_ref, output, options)
+        .await
+        .map(|summary| attach_selected_strategy(summary, selected_strategy.name()))
 }
 
 /// Refuse a control action on a COMMON-storage merge sidecar whose owner cannot
@@ -3296,12 +4906,13 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
     // is consumed (W2 r6 #4): a sidecar replaced in between is preserved by
     // the identity-checked cleanup, never adopted by this control.
     let autostash = match held_autostash {
-        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot, false).await,
         None => None,
     };
 
     Ok(PullMergeSummary {
         strategy: "abort".to_string(),
+        selected_strategy: None,
         old_commit: Some(orig_head.to_string()),
         commit: Some(orig_head.to_string()),
         files_changed: 0,
@@ -3309,6 +4920,59 @@ async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeErro
         parents: Vec::new(),
         conflicted_paths: Vec::new(),
         aborted: true,
+        continued: false,
+        dry_run: false,
+        would_conflict: false,
+        conflict_kinds: Vec::new(),
+        autostash,
+    })
+}
+
+/// Clear the in-progress merge state without touching the conflict checkout.
+///
+/// Git's `remove_merge_branch_state()` also makes a held `MERGE_AUTOSTASH`
+/// visible in the ordinary stash list. Do the same before returning success:
+/// the sidecar is the only reachability root for the held commit, and leaving
+/// it invisible after `--quit` would make the next merge recover surprising
+/// state. The promotion never re-applies the stash, so index stages and the
+/// working tree remain byte-for-byte intact.
+async fn run_merge_quit(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+    refuse_ambiguous_common_merge_state()?;
+    let held_autostash = preflight_held_autostash()?;
+    MergeState::load_required()?;
+
+    // Validate the held sidecar before removing merge state. A foreign or
+    // malformed sidecar must remain recoverable in place rather than being
+    // promoted into this worktree's stash list.
+    let held_autostash = held_autostash
+        .map(|snapshot| {
+            verify_autostash_ownership(snapshot.recorded_owner.as_deref())
+                .map_err(PullMergeError::Autostash)?;
+            let oid = ObjectHash::from_str(&snapshot.sidecar.stash_commit).map_err(|error| {
+                PullMergeError::Autostash(format!(
+                    "merge-autostash.json holds an invalid OID: {error}"
+                ))
+            })?;
+            Ok::<_, PullMergeError>((snapshot, oid))
+        })
+        .transpose()?;
+
+    MergeState::cleanup()?;
+    let autostash = match held_autostash {
+        Some((snapshot, oid)) => store_pending_autostash(output, &snapshot, &oid).await,
+        None => None,
+    };
+
+    Ok(PullMergeSummary {
+        strategy: "quit".to_string(),
+        selected_strategy: None,
+        old_commit: None,
+        commit: None,
+        files_changed: 0,
+        up_to_date: false,
+        parents: Vec::new(),
+        conflicted_paths: Vec::new(),
+        aborted: false,
         continued: false,
         dry_run: false,
         would_conflict: false,
@@ -3364,6 +5028,27 @@ fn merge_base_commits(
             })
         })
         .collect()
+}
+
+/// Resolve the base set exactly once for the selected backend. `resolve`
+/// deliberately takes the first deterministic base from the object-id-sorted
+/// set and never builds a recursive virtual ancestor; ort/recursive retain the
+/// complete set. The same helper feeds preflight and execution so their graph
+/// shape cannot diverge.
+fn merge_base_commits_for_strategy(
+    lhs: &Commit,
+    rhs: &Commit,
+    options: &PullMergeOptions,
+) -> Result<Vec<Commit>, PullMergeError> {
+    let bases = merge_base_commits(lhs, rhs, merge_options_will_fold(options))?;
+    Ok(select_strategy_bases(bases, options.strategy))
+}
+
+fn select_strategy_bases<T>(mut bases: Vec<T>, strategy: Option<MergeStrategy>) -> Vec<T> {
+    if strategy == Some(MergeStrategy::Resolve) {
+        bases.truncate(1);
+    }
+    bases
 }
 
 async fn apply_fast_forward_merge(
@@ -3821,6 +5506,10 @@ enum ConflictKind {
         base: Option<ObjectHash>,
         ours: ObjectHash,
         theirs: ObjectHash,
+        driver: BuiltinMergeDriver,
+        /// External drivers own their conflict presentation and write it to
+        /// `%A`; built-in drivers render later with the final branch labels.
+        rendered: Option<MergeTreeEntry>,
     },
     OursModifiedTheirsDeleted {
         ours: ObjectHash,
@@ -3847,6 +5536,26 @@ enum ConflictKind {
         /// conflict even under `-X ours/theirs`, as Git does (verified).
         modify_delete: bool,
     },
+    /// MG-06: a rename path conflict with its final worktree content already
+    /// rendered. Stage entries remain in the remapped input maps: a colliding
+    /// add must stay independently addressable even when -X settles the text.
+    RenameMerged {
+        content: MergeTreeEntry,
+        kind: RenameConflictKind,
+    },
+    /// Git marks a split directory rename unclean even though affected paths
+    /// stay resolved at stage 0. A split with no affected addition is clean.
+    DirectorySplit {
+        content: MergeTreeEntry,
+    },
+}
+
+/// A path conflict retains its stages even when its content is already settled.
+#[derive(Debug, Copy, Clone)]
+enum RenameConflictKind {
+    RenameRename,
+    Content,
+    DirectoryRename,
 }
 
 /// Which merge input a D/F file came from.
@@ -3865,6 +5574,15 @@ enum RelativeState {
     Missing,
 }
 
+enum BlobMergeAttempt {
+    NotApplicable,
+    Clean(MergeTreeEntry),
+    Conflict {
+        driver: BuiltinMergeDriver,
+        rendered: Option<MergeTreeEntry>,
+    },
+}
+
 fn classify_relative_to_base(
     base: Option<&MergeTreeEntry>,
     side: Option<&MergeTreeEntry>,
@@ -3879,6 +5597,7 @@ fn classify_relative_to_base(
 }
 
 fn resolve_three_way(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
@@ -3898,14 +5617,44 @@ fn resolve_three_way(
         (false, RelativeState::Added(ours), RelativeState::Added(theirs)) => {
             if ours == theirs {
                 MergeResolution::Use(theirs)
-            } else if let Some(favor) = favor {
-                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    base: None,
-                    ours: ours.hash,
-                    theirs: theirs.hash,
-                })
+                let driver = context.driver_for_path(path);
+                if driver.is_builtin(BuiltinMergeDriver::Text)
+                    && let Some(favor) = favor
+                {
+                    // Preserve the long-standing add/add `-X` shortcut for
+                    // the built-in text driver: it chooses one complete side
+                    // without loading either blob. External drivers still run
+                    // and own `%A`, regardless of the strategy option.
+                    favored_resolution(favor, Some(ours), Some(theirs))
+                } else {
+                    match try_merge_blob_contents(path, None, ours, theirs, driver, context)? {
+                        BlobMergeAttempt::Clean(merged) => MergeResolution::Use(merged),
+                        BlobMergeAttempt::Conflict { driver, rendered } => {
+                            MergeResolution::Conflict(ConflictKind::BothChanged {
+                                base: None,
+                                ours: ours.hash,
+                                theirs: theirs.hash,
+                                driver,
+                                rendered,
+                            })
+                        }
+                        BlobMergeAttempt::NotApplicable if favor.is_some() => favored_resolution(
+                            favor.unwrap_or(MergeFavor::Ours),
+                            Some(ours),
+                            Some(theirs),
+                        ),
+                        BlobMergeAttempt::NotApplicable => {
+                            MergeResolution::Conflict(ConflictKind::BothChanged {
+                                base: None,
+                                ours: ours.hash,
+                                theirs: theirs.hash,
+                                driver: BuiltinMergeDriver::Text,
+                                rendered: None,
+                            })
+                        }
+                    }
+                }
             }
         }
         (true, RelativeState::Same(ours), RelativeState::Same(_)) => MergeResolution::Use(ours),
@@ -3916,18 +5665,34 @@ fn resolve_three_way(
         (true, RelativeState::Modified(ours), RelativeState::Modified(theirs)) => {
             if ours == theirs {
                 MergeResolution::Use(theirs)
-            } else if let Some(base) = base
-                && let Some(merged) = try_merge_blob_contents(base, ours, theirs, context)?
-            {
-                MergeResolution::Use(merged)
-            } else if let Some(favor) = favor {
-                favored_resolution(favor, Some(ours), Some(theirs))
             } else {
-                MergeResolution::Conflict(ConflictKind::BothChanged {
-                    base: base.map(|b| b.hash),
-                    ours: ours.hash,
-                    theirs: theirs.hash,
-                })
+                let driver = context.driver_for_path(path);
+                match try_merge_blob_contents(path, base, ours, theirs, driver, context)? {
+                    BlobMergeAttempt::Clean(merged) => MergeResolution::Use(merged),
+                    BlobMergeAttempt::Conflict { driver, rendered } => {
+                        MergeResolution::Conflict(ConflictKind::BothChanged {
+                            base: base.map(|b| b.hash),
+                            ours: ours.hash,
+                            theirs: theirs.hash,
+                            driver,
+                            rendered,
+                        })
+                    }
+                    BlobMergeAttempt::NotApplicable if favor.is_some() => favored_resolution(
+                        favor.unwrap_or(MergeFavor::Ours),
+                        Some(ours),
+                        Some(theirs),
+                    ),
+                    BlobMergeAttempt::NotApplicable => {
+                        MergeResolution::Conflict(ConflictKind::BothChanged {
+                            base: base.map(|b| b.hash),
+                            ours: ours.hash,
+                            theirs: theirs.hash,
+                            driver: BuiltinMergeDriver::Text,
+                            rendered: None,
+                        })
+                    }
+                }
             }
         }
         (true, RelativeState::Deleted, RelativeState::Same(_)) => MergeResolution::Delete,
@@ -3971,11 +5736,13 @@ fn favored_resolution(
 }
 
 fn try_merge_blob_contents(
-    base: &MergeTreeEntry,
+    path: &Path,
+    base: Option<&MergeTreeEntry>,
     ours: MergeTreeEntry,
     theirs: MergeTreeEntry,
+    driver: SelectedMergeDriver,
     context: &mut TreeMergeContext<'_>,
-) -> Result<Option<MergeTreeEntry>, PullMergeError> {
+) -> Result<BlobMergeAttempt, PullMergeError> {
     // Git merges the CONTENT and the MODE independently
     // (`merge-ort.c` `handle_content_merge`): a side that only chmod'ed does
     // not stop the line-level merge, and the mode that differs from the base
@@ -3983,59 +5750,93 @@ fn try_merge_blob_contents(
     // answer — that stays a conflict. Verified against `git merge`:
     // rename + `chmod +x` on one side and an edit on the other merges cleanly
     // and keeps `100755`.
-    if !is_regular_file_mode(base.mode)
+    if base.is_some_and(|base| !is_regular_file_mode(base.mode))
         || !is_regular_file_mode(ours.mode)
         || !is_regular_file_mode(theirs.mode)
     {
-        return Ok(None);
+        return Ok(BlobMergeAttempt::NotApplicable);
     }
-    let merged_mode = if ours.mode == theirs.mode {
-        ours.mode
-    } else if ours.mode == base.mode {
-        theirs.mode
-    } else if theirs.mode == base.mode {
-        ours.mode
+    let (merged_mode, mode_clean) = if ours.mode == theirs.mode {
+        (ours.mode, true)
+    } else if base.is_some_and(|base| ours.mode == base.mode) {
+        (theirs.mode, true)
+    } else if base.is_some_and(|base| theirs.mode == base.mode) {
+        (ours.mode, true)
     } else {
-        // Both sides changed the mode, differently.
-        return Ok(None);
+        // There is no common mode answer, but Git still runs the low-level
+        // driver for the content and leaves the path unmerged. Keeping ours'
+        // mode here lets an external driver's `%A` result survive that
+        // independent mode conflict.
+        (ours.mode, false)
     };
 
-    let base_blob = load_merge_blob(base.hash, context.virtual_blobs)?;
+    let base_blob = match base {
+        Some(base) => Some(load_merge_blob(base.hash, context.virtual_blobs)?),
+        None => None,
+    };
     let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
     let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
-
-    // Git routes ANY binary input to `ll_binary_merge` instead of the
-    // line-level merge (`merge-ll.c` `ll_xdl_merge`), and inside a virtual
-    // ancestor that is what decides the content — so the line-level path has to
-    // decline here and let [`virtual_conflict_resolution`] apply the rule. The
-    // depth-0 behaviour is deliberately left exactly as it was: binary content
-    // merging for the user's own merge is a different axis, untouched by MG-02.
-    if context.depth > 0
-        && (merge_input_is_binary(&base_blob.data)
-            || merge_input_is_binary(&ours_blob.data)
-            || merge_input_is_binary(&theirs_blob.data))
-    {
-        return Ok(None);
-    }
-
-    let marker_len = conflict_marker_length_at_depth(
-        &[&base_blob.data, &ours_blob.data, &theirs_blob.data],
+    let base_data = base_blob
+        .as_ref()
+        .map_or(&[][..], |blob| blob.data.as_slice());
+    let marker_length = conflict_marker_length_at_depth(
+        &[base_data, &ours_blob.data, &theirs_blob.data],
         context.depth,
     );
-    let mut merge_options = diffy::MergeOptions::new();
-    merge_options
-        .set_conflict_style(diffy::ConflictStyle::Diff3)
-        .set_conflict_marker_length(marker_len);
-    let merged_bytes =
-        match merge_options.merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data) {
-            Ok(merged) => merged,
-            Err(conflicted) => match context.favor {
-                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
-                    .map_err(PullMergeError::TreeCreate)?,
-                None => return Ok(None),
+    let outcome = match &driver {
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_input_normalization(
+            *driver,
+            path,
+            base_data,
+            &ours_blob.data,
+            &theirs_blob.data,
+            MergeContentOptions {
+                favor: context.favor,
+                conflict_style: context.conflict_style,
+                extra_marker_size: 2 * context.depth,
+                normalization: context.input_normalization,
             },
-        };
+        )
+        .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => {
+            run_external_merge_driver_with_input_normalization(
+                &context.external_merge_runtime,
+                driver,
+                ExternalMergeInput {
+                    path,
+                    base_id: base.map_or_else(
+                        || Blob::from_content_bytes(Vec::new()).id,
+                        |entry| entry.hash,
+                    ),
+                    ours_id: ours.hash,
+                    theirs_id: theirs.hash,
+                    base: base_data,
+                    ours: &ours_blob.data,
+                    theirs: &theirs_blob.data,
+                    marker_length,
+                    labels: context.external_labels(),
+                },
+                context.input_normalization,
+            )
+            .map_err(PullMergeError::TreeCreate)?
+        }
+    };
 
+    let (merged_bytes, content_clean) = match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
+        BuiltinMergeOutcome::Conflict(bytes) => (bytes, false),
+    };
+    let clean = content_clean && mode_clean;
+    let rendered = matches!(driver, SelectedMergeDriver::External(_))
+        || context.input_normalization.whitespace.is_some()
+        || (context.input_normalization.renormalize
+            && text_renormalization_for_path(path) != TextRenormalization::Never);
+    if !clean && !rendered {
+        return Ok(BlobMergeAttempt::Conflict {
+            driver: driver.fallback_builtin(),
+            rendered: None,
+        });
+    }
     let merged_blob = Blob::from_content_bytes(merged_bytes);
     // `--dry-run` (persist=false): the merged OID is computed in memory only —
     // persisting here would write the object store (and, under tiered storage,
@@ -4044,10 +5845,18 @@ fn try_merge_blob_contents(
     // virtual ancestor's content and the outer merge loads it by id.
     context.record_merged_blob(&merged_blob)?;
 
-    Ok(Some(MergeTreeEntry {
+    let entry = MergeTreeEntry {
         hash: merged_blob.id,
         mode: merged_mode,
-    }))
+    };
+    if clean {
+        Ok(BlobMergeAttempt::Clean(entry))
+    } else {
+        Ok(BlobMergeAttempt::Conflict {
+            driver: driver.fallback_builtin(),
+            rendered: Some(entry),
+        })
+    }
 }
 
 /// Choose the requested side only inside `diffy` conflict regions while
@@ -4059,6 +5868,20 @@ fn resolve_favored_content(
     conflicted: Vec<u8>,
     marker_len: usize,
     favor: MergeFavor,
+) -> Result<Vec<u8>, String> {
+    resolve_conflicted_content(conflicted, marker_len, ConflictResolution::Favor(favor))
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ConflictResolution {
+    Favor(MergeFavor),
+    Union,
+}
+
+fn resolve_conflicted_content(
+    conflicted: Vec<u8>,
+    marker_len: usize,
+    resolution: ConflictResolution,
 ) -> Result<Vec<u8>, String> {
     let marker = |byte: u8, label: Option<&[u8]>| {
         let mut line = vec![byte; marker_len];
@@ -4098,9 +5921,17 @@ fn resolve_favored_content(
             find_after(&conflicted, base_start, &separator).ok_or_else(malformed)?;
         let theirs_start = separator_start + separator.len();
         let close_start = find_after(&conflicted, theirs_start, &close).ok_or_else(malformed)?;
-        match favor {
-            MergeFavor::Ours => output.extend_from_slice(&conflicted[ours_start..original_start]),
-            MergeFavor::Theirs => output.extend_from_slice(&conflicted[theirs_start..close_start]),
+        match resolution {
+            ConflictResolution::Favor(MergeFavor::Ours) => {
+                output.extend_from_slice(&conflicted[ours_start..original_start]);
+            }
+            ConflictResolution::Favor(MergeFavor::Theirs) => {
+                output.extend_from_slice(&conflicted[theirs_start..close_start]);
+            }
+            ConflictResolution::Union => {
+                output.extend_from_slice(&conflicted[ours_start..original_start]);
+                output.extend_from_slice(&conflicted[theirs_start..close_start]);
+            }
         }
         cursor = close_start + close.len();
         resolved += 1;
@@ -4110,6 +5941,1379 @@ fn resolve_favored_content(
     }
     output.extend_from_slice(&conflicted[cursor..]);
     Ok(output)
+}
+
+/// Git's built-in low-level merge drivers. A named driver without an external
+/// configuration resolves to `Text`, the same fallback used by
+/// `find_ll_merge_driver`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinMergeDriver {
+    Text,
+    Binary,
+    Union,
+}
+
+/// The bytes a low-level driver produced, and whether the path remains
+/// unmerged. A binary conflict intentionally carries ours verbatim rather than
+/// manufacturing text markers in arbitrary bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinMergeOutcome {
+    Clean(Vec<u8>),
+    Conflict(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalMergeDriver {
+    name: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectedMergeDriver {
+    Builtin(BuiltinMergeDriver),
+    External(ExternalMergeDriver),
+}
+
+impl SelectedMergeDriver {
+    fn fallback_builtin(&self) -> BuiltinMergeDriver {
+        match self {
+            Self::Builtin(driver) => *driver,
+            Self::External(_) => BuiltinMergeDriver::Text,
+        }
+    }
+
+    fn is_builtin(&self, expected: BuiltinMergeDriver) -> bool {
+        matches!(self, Self::Builtin(driver) if *driver == expected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExternalMergeCacheKey {
+    driver: String,
+    path: PathBuf,
+    base: ObjectHash,
+    ours: ObjectHash,
+    theirs: ObjectHash,
+    marker_length: usize,
+    ancestor_label: String,
+    ours_label: String,
+    theirs_label: String,
+}
+
+#[derive(Default)]
+struct ExternalMergeRuntime {
+    drivers: HashMap<String, ExternalMergeDriver>,
+    cache: Mutex<HashMap<ExternalMergeCacheKey, BuiltinMergeOutcome>>,
+}
+
+type SharedExternalMergeRuntime = Arc<ExternalMergeRuntime>;
+
+struct ExternalMergeLabels<'a> {
+    ancestor: &'a str,
+    ours: &'a str,
+    theirs: &'a str,
+}
+
+struct ExternalMergeInput<'a> {
+    path: &'a Path,
+    base_id: ObjectHash,
+    ours_id: ObjectHash,
+    theirs_id: ObjectHash,
+    base: &'a [u8],
+    ours: &'a [u8],
+    theirs: &'a [u8],
+    marker_length: usize,
+    labels: ExternalMergeLabels<'a>,
+}
+
+struct ExternalMergeTempFiles {
+    _directory: tempfile::TempDir,
+    base: tempfile::NamedTempFile,
+    ours: tempfile::NamedTempFile,
+    theirs: tempfile::NamedTempFile,
+}
+
+impl ExternalMergeTempFiles {
+    fn create(input: &ExternalMergeInput<'_>) -> Result<Self, String> {
+        let worktree = util::try_working_dir()
+            .map_err(|error| format!("failed to resolve the worktree: {error}"))?;
+        Self::create_in(&worktree, input)
+    }
+
+    fn create_in(worktree: &Path, input: &ExternalMergeInput<'_>) -> Result<Self, String> {
+        let directory = tempfile::Builder::new()
+            .prefix(".libra-merge-driver-")
+            .tempdir_in(worktree)
+            .map_err(|error| {
+                format!("failed to create a worktree-local merge-driver directory: {error}")
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).map_err(
+                |error| format!("failed to protect the merge-driver directory: {error}"),
+            )?;
+        }
+
+        let create_file = |prefix: &str, content: &[u8]| {
+            let mut file = tempfile::Builder::new()
+                .prefix(prefix)
+                .tempfile_in(directory.path())
+                .map_err(|error| format!("failed to create merge-driver input: {error}"))?;
+            file.write_all(content)
+                .map_err(|error| format!("failed to write merge-driver input: {error}"))?;
+            file.flush()
+                .map_err(|error| format!("failed to flush merge-driver input: {error}"))?;
+            Ok::<_, String>(file)
+        };
+        let base = create_file("base-", input.base)?;
+        let ours = create_file("ours-", input.ours)?;
+        let theirs = create_file("theirs-", input.theirs)?;
+        Ok(Self {
+            _directory: directory,
+            base,
+            ours,
+            theirs,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut quoted = Vec::with_capacity(value.as_bytes().len() + 2);
+    quoted.push(b'\'');
+    for byte in value.as_bytes() {
+        if *byte == b'\'' {
+            quoted.extend_from_slice(b"'\\''");
+        } else {
+            quoted.push(*byte);
+        }
+    }
+    quoted.push(b'\'');
+    OsString::from_vec(quoted)
+}
+
+#[cfg(windows)]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut quoted = Vec::new();
+    quoted.push(b'\'' as u16);
+    for unit in value.encode_wide() {
+        if unit == b'\'' as u16 {
+            quoted.extend("'\\''".encode_utf16());
+        } else {
+            quoted.push(unit);
+        }
+    }
+    quoted.push(b'\'' as u16);
+    OsString::from_wide(&quoted)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sq_quote_external_merge_value(value: &OsStr) -> OsString {
+    OsString::from(format!(
+        "'{}'",
+        value.to_string_lossy().replace('\'', "'\\''")
+    ))
+}
+
+fn expand_external_merge_path(path: &Path) -> OsString {
+    let value = path.as_os_str();
+    if value.to_str().is_some_and(|value| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    }) {
+        value.to_os_string()
+    } else {
+        // Git can insert `%O/%A/%B` verbatim because its temporary basename is
+        // shell-safe. Libra's files are worktree-local absolute paths, so an
+        // unsafe worktree directory would otherwise turn trusted global driver
+        // config into code injection merely by checking out a repository under
+        // a hostile name. Safe paths retain Git's unquoted expansion.
+        sq_quote_external_merge_value(value)
+    }
+}
+
+fn expand_external_merge_command(
+    command: &str,
+    files: &ExternalMergeTempFiles,
+    input: &ExternalMergeInput<'_>,
+) -> OsString {
+    let replacements = |token| match token {
+        'O' => Some(expand_external_merge_path(files.base.path())),
+        'A' => Some(expand_external_merge_path(files.ours.path())),
+        'B' => Some(expand_external_merge_path(files.theirs.path())),
+        'L' => Some(OsString::from(input.marker_length.to_string())),
+        'P' => Some(sq_quote_external_merge_value(input.path.as_os_str())),
+        'S' => Some(sq_quote_external_merge_value(OsStr::new(
+            input.labels.ancestor,
+        ))),
+        'X' => Some(sq_quote_external_merge_value(OsStr::new(input.labels.ours))),
+        'Y' => Some(sq_quote_external_merge_value(OsStr::new(
+            input.labels.theirs,
+        ))),
+        '%' => Some(OsString::from("%")),
+        _ => None,
+    };
+    let mut expanded = OsString::new();
+    let mut literal = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    while let Some(current) = chars.next() {
+        if current != '%' {
+            literal.push(current);
+            continue;
+        }
+        expanded.push(&literal);
+        literal.clear();
+        let Some(token) = chars.next() else {
+            literal.push('%');
+            break;
+        };
+        match replacements(token) {
+            Some(value) => expanded.push(value),
+            None => {
+                literal.push('%');
+                literal.push(token);
+            }
+        }
+    }
+    expanded.push(literal);
+    expanded
+}
+
+fn external_driver_shell(command: &OsStr) -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command);
+    process
+}
+
+fn run_external_merge_driver(
+    runtime: &ExternalMergeRuntime,
+    driver: &ExternalMergeDriver,
+    input: ExternalMergeInput<'_>,
+) -> Result<BuiltinMergeOutcome, String> {
+    let key = ExternalMergeCacheKey {
+        driver: driver.name.clone(),
+        path: input.path.to_path_buf(),
+        base: input.base_id,
+        ours: input.ours_id,
+        theirs: input.theirs_id,
+        marker_length: input.marker_length,
+        ancestor_label: input.labels.ancestor.to_string(),
+        ours_label: input.labels.ours.to_string(),
+        theirs_label: input.labels.theirs.to_string(),
+    };
+    if let Some(cached) = runtime
+        .cache
+        .lock()
+        .map_err(|_| "external merge-driver result cache is unavailable".to_string())?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let files = ExternalMergeTempFiles::create(&input)?;
+    let expanded = expand_external_merge_command(&driver.command, &files, &input);
+    // The driver protocol communicates only through `%A`. Discarding the
+    // child's streams prevents an untrusted amount of output from being held
+    // in memory and keeps command/output details out of Libra diagnostics.
+    let status = external_driver_shell(&expanded)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            format!(
+                "external merge driver '{}' could not start for '{}': {error}; check merge.{}.driver and its executable",
+                driver.name,
+                input.path.display(),
+                driver.name
+            )
+        })?;
+    let code = status.code().ok_or_else(|| {
+        format!(
+            "external merge driver '{}' was interrupted for '{}'; its temporary files were protected and cleaned",
+            driver.name,
+            input.path.display()
+        )
+    })?;
+    if !(0..=128).contains(&code) {
+        return Err(format!(
+            "external merge driver '{}' exited with status {code} for '{}'; inspect merge.{}.driver without exposing it in logs",
+            driver.name,
+            input.path.display(),
+            driver.name
+        ));
+    }
+    let merged = fs::read(files.ours.path()).map_err(|error| {
+        format!(
+            "external merge driver '{}' did not leave a readable %A result for '{}': {error}",
+            driver.name,
+            input.path.display()
+        )
+    })?;
+    let outcome = if code == 0 {
+        BuiltinMergeOutcome::Clean(merged)
+    } else {
+        BuiltinMergeOutcome::Conflict(merged)
+    };
+    runtime
+        .cache
+        .lock()
+        .map_err(|_| "external merge-driver result cache is unavailable".to_string())?
+        .insert(key, outcome.clone());
+    Ok(outcome)
+}
+
+/// Git renormalizes `%O`, `%A`, and `%B` before dispatching either a built-in
+/// or external low-level merge driver (`merge-ll.c` `ll_merge()`). Whitespace
+/// strategy flags are xdiff-only, so they intentionally do not alter external
+/// driver inputs. The result still goes through Libra's original-text backfill
+/// contract so normalized paths retain ours-side line endings on disk.
+fn run_external_merge_driver_with_input_normalization(
+    runtime: &ExternalMergeRuntime,
+    driver: &ExternalMergeDriver,
+    input: ExternalMergeInput<'_>,
+    normalization: MergeInputNormalization,
+) -> Result<BuiltinMergeOutcome, String> {
+    let text_mode = if normalization.renormalize {
+        text_renormalization_for_path(input.path)
+    } else {
+        TextRenormalization::Never
+    };
+    let renormalize_base = renormalize_text_input(text_mode, input.base);
+    let renormalize_ours = renormalize_text_input(text_mode, input.ours);
+    let renormalize_theirs = renormalize_text_input(text_mode, input.theirs);
+    if !renormalize_base && !renormalize_ours && !renormalize_theirs {
+        return run_external_merge_driver(runtime, driver, input);
+    }
+
+    let normalized_base = normalize_merge_input(input.base, None, renormalize_base);
+    let normalized_ours = normalize_merge_input(input.ours, None, renormalize_ours);
+    let normalized_theirs = normalize_merge_input(input.theirs, None, renormalize_theirs);
+    let normalized_input = ExternalMergeInput {
+        path: input.path,
+        // The cache must distinguish raw and normalized driver inputs even
+        // when their source object IDs are identical.
+        base_id: Blob::from_content_bytes(normalized_base.canonical.clone()).id,
+        ours_id: Blob::from_content_bytes(normalized_ours.canonical.clone()).id,
+        theirs_id: Blob::from_content_bytes(normalized_theirs.canonical.clone()).id,
+        base: &normalized_base.canonical,
+        ours: &normalized_ours.canonical,
+        theirs: &normalized_theirs.canonical,
+        marker_length: input.marker_length,
+        labels: input.labels,
+    };
+    let outcome = run_external_merge_driver(runtime, driver, normalized_input)?;
+    let backfill = |bytes: Vec<u8>| {
+        backfill_normalized_merge(
+            &bytes,
+            input.marker_length,
+            &normalized_base,
+            &normalized_ours,
+            &normalized_theirs,
+            input.ours,
+        )
+    };
+    Ok(match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => BuiltinMergeOutcome::Clean(backfill(bytes)),
+        BuiltinMergeOutcome::Conflict(bytes) => BuiltinMergeOutcome::Conflict(backfill(bytes)),
+    })
+}
+
+fn builtin_driver_named(name: &str) -> BuiltinMergeDriver {
+    match name {
+        "binary" => BuiltinMergeDriver::Binary,
+        "union" => BuiltinMergeDriver::Union,
+        "text" => BuiltinMergeDriver::Text,
+        _ => BuiltinMergeDriver::Text,
+    }
+}
+
+fn selected_driver_named(name: &str, runtime: &ExternalMergeRuntime) -> SelectedMergeDriver {
+    if let Some(driver) = runtime.drivers.get(name) {
+        SelectedMergeDriver::External(driver.clone())
+    } else {
+        SelectedMergeDriver::Builtin(builtin_driver_named(name))
+    }
+}
+
+fn select_merge_driver(
+    attribute: Option<AttributeState>,
+    default_driver: Option<&str>,
+    runtime: &ExternalMergeRuntime,
+) -> SelectedMergeDriver {
+    match attribute {
+        Some(AttributeState::Set) => SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text),
+        Some(AttributeState::Unset) => SelectedMergeDriver::Builtin(BuiltinMergeDriver::Binary),
+        Some(AttributeState::Value(name)) => selected_driver_named(&name, runtime),
+        Some(AttributeState::Unspecified) | None => default_driver.map_or(
+            SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text),
+            |name| selected_driver_named(name, runtime),
+        ),
+    }
+}
+
+fn select_builtin_merge_driver(
+    attribute: Option<AttributeState>,
+    default_driver: Option<&str>,
+) -> BuiltinMergeDriver {
+    match attribute {
+        Some(AttributeState::Set) => BuiltinMergeDriver::Text,
+        Some(AttributeState::Unset) => BuiltinMergeDriver::Binary,
+        Some(AttributeState::Value(name)) => builtin_driver_named(&name),
+        Some(AttributeState::Unspecified) | None => {
+            default_driver.map_or(BuiltinMergeDriver::Text, builtin_driver_named)
+        }
+    }
+}
+
+/// Resolve the effective built-in driver for a worktree-relative path through
+/// the existing gitattributes engine. A named-but-unknown attribute never
+/// consults `merge.default`; it falls straight back to text, matching Git.
+pub(crate) fn builtin_merge_driver_for_path(
+    path: &Path,
+    default_driver: Option<&str>,
+) -> BuiltinMergeDriver {
+    select_builtin_merge_driver(
+        attributes::attribute_state_for_path("merge", path),
+        default_driver,
+    )
+}
+
+/// Read `merge.default` through the same strict local-to-system cascade used
+/// by the other merge configuration. The caller decides whether it is inside
+/// a repository; merge-file outside a repository must not consult config.
+pub(crate) async fn read_merge_default_driver() -> Result<Option<String>, String> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value_strict};
+
+    read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "merge.default")
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Resolve the per-invocation renormalize toggle. The caller invokes this only
+/// after proving the operation reaches the three-way engine, preserving Git's
+/// behavior that an irrelevant bad value cannot break fast-forward or
+/// already-up-to-date merges. An explicit `-X renormalize|no-renormalize`
+/// bypasses configuration and the last toggle wins during CLI parsing.
+async fn resolve_merge_renormalize(explicit: Option<bool>) -> Result<bool, PullMergeError> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    if let Some(enabled) = explicit {
+        return Ok(enabled);
+    }
+    let Some(value) =
+        read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "merge.renormalize")
+            .await
+            .map_err(|error| PullMergeError::RenormalizeConfigRead(format!("{error:#}")))?
+    else {
+        return Ok(false);
+    };
+    parse_git_config_bool(&value).ok_or(PullMergeError::InvalidRenormalizeConfig(value))
+}
+
+async fn read_external_merge_runtime() -> Result<SharedExternalMergeRuntime, String> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_subsection_values_strict};
+
+    let configured =
+        read_cascaded_subsection_values_strict(LocalIdentityTarget::CurrentRepo, "merge", "driver")
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+    let mut drivers = HashMap::with_capacity(configured.len());
+    for (name, command) in configured {
+        if command.is_empty() {
+            return Err(format!(
+                "merge.{name}.driver is empty; set a shell command or remove the configuration"
+            ));
+        }
+        if command.contains('\0') {
+            return Err(format!(
+                "merge.{name}.driver contains a NUL byte; replace it with a valid shell command"
+            ));
+        }
+        drivers.insert(name.clone(), ExternalMergeDriver { name, command });
+    }
+    Ok(Arc::new(ExternalMergeRuntime {
+        drivers,
+        cache: Mutex::new(HashMap::new()),
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextRenormalization {
+    Never,
+    Always,
+    Auto,
+}
+
+/// Git's `ll_merge()` renormalizes all three low-level inputs before driver
+/// selection (`merge-ll.c:423-425`). Libra intentionally does not implement
+/// arbitrary smudge/clean filter programs (D5); this scoped bridge handles the
+/// built-in text/eol conversion that makes repository text canonical.
+fn text_renormalization_for_path(path: &Path) -> TextRenormalization {
+    let text = attributes::attribute_state_for_path("text", path);
+    let eol_implies_text = matches!(
+        attributes::attribute_state_for_path("eol", path),
+        Some(AttributeState::Value(value)) if value.eq_ignore_ascii_case("lf")
+            || value.eq_ignore_ascii_case("crlf")
+    );
+    match text {
+        Some(AttributeState::Unset) => TextRenormalization::Never,
+        Some(AttributeState::Value(value)) if value.eq_ignore_ascii_case("auto") => {
+            TextRenormalization::Auto
+        }
+        Some(AttributeState::Set | AttributeState::Value(_)) => TextRenormalization::Always,
+        Some(AttributeState::Unspecified) | None if eol_implies_text => TextRenormalization::Always,
+        Some(AttributeState::Unspecified) | None => TextRenormalization::Never,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedMergeLine {
+    key: Vec<u8>,
+    original_body: Vec<u8>,
+    original_eol: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedMergeInput {
+    canonical: Vec<u8>,
+    lines: Vec<NormalizedMergeLine>,
+}
+
+fn renormalize_text_input(mode: TextRenormalization, content: &[u8]) -> bool {
+    match mode {
+        TextRenormalization::Never => false,
+        TextRenormalization::Always => true,
+        TextRenormalization::Auto => !text_auto_is_binary(content),
+    }
+}
+
+/// Match Git's `convert.c::convert_is_binary` decision for `text=auto`.
+/// Merge's xdiff binary probe is intentionally different (NUL in the first
+/// 8000 bytes plus a size ceiling), while conversion scans the whole input and
+/// also rejects lone CR and control-heavy data.
+fn text_auto_is_binary(content: &[u8]) -> bool {
+    let mut printable = 0usize;
+    let mut nonprintable = 0usize;
+    let mut has_nul = false;
+    let mut has_lone_cr = false;
+    let mut index = 0usize;
+    while index < content.len() {
+        let byte = content[index];
+        if byte == b'\r' {
+            if content.get(index + 1) == Some(&b'\n') {
+                index += 2;
+                continue;
+            }
+            has_lone_cr = true;
+        } else if byte == b'\n' {
+            index += 1;
+            continue;
+        } else if byte == 127 {
+            nonprintable += 1;
+        } else if byte < 32 {
+            if matches!(byte, b'\x08' | b'\t' | b'\x1b' | b'\x0c') {
+                printable += 1;
+            } else {
+                has_nul |= byte == 0;
+                nonprintable += 1;
+            }
+        } else {
+            printable += 1;
+        }
+        index += 1;
+    }
+    if content.last() == Some(&b'\x1a') {
+        nonprintable = nonprintable.saturating_sub(1);
+    }
+    has_lone_cr || has_nul || (printable >> 7) < nonprintable
+}
+
+fn split_original_line(record: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(body) = record.strip_suffix(b"\r\n") {
+        (body, b"\r\n")
+    } else if let Some(body) = record.strip_suffix(b"\n") {
+        (body, b"\n")
+    } else {
+        (record, b"")
+    }
+}
+
+fn normalize_merge_input(
+    content: &[u8],
+    whitespace: Option<MergeWhitespace>,
+    renormalize: bool,
+) -> NormalizedMergeInput {
+    let mut canonical = Vec::with_capacity(content.len());
+    let mut lines = Vec::new();
+    for record in split_lines_preserving_eol(content) {
+        let (original_body, original_eol) = split_original_line(record);
+        // Every diff whitespace normalizer consumes logical lines (without the
+        // CRLF terminator). Without a whitespace option, only renormalization
+        // strips the CR from CRLF for comparison.
+        let comparison_body = if (whitespace.is_some() || renormalize) && original_eol == b"\r\n" {
+            original_body
+        } else if original_eol == b"\r\n" {
+            // Preserve the CR when neither comparison mode is active. This
+            // branch is kept for the unit-level identity contract.
+            &record[..record.len() - 1]
+        } else {
+            original_body
+        };
+        let key = match (whitespace, std::str::from_utf8(comparison_body)) {
+            (Some(mode), Ok(text)) => mode.normalizer()(text).into_bytes(),
+            // Whitespace comparison must never collapse distinct invalid
+            // UTF-8 sequences through the replacement character. Keep those
+            // bytes exact; the ordinary byte merge can still handle them.
+            (Some(_), Err(_)) => comparison_body.to_vec(),
+            (None, _) => comparison_body.to_vec(),
+        };
+        canonical.extend_from_slice(&key);
+        if !original_eol.is_empty() {
+            canonical.push(b'\n');
+        }
+        lines.push(NormalizedMergeLine {
+            key,
+            original_body: original_body.to_vec(),
+            original_eol: original_eol.to_vec(),
+        });
+    }
+    NormalizedMergeInput { canonical, lines }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalizedOutputSection {
+    Merged,
+    Ours,
+    Base,
+    Theirs,
+}
+
+fn normalized_marker(body: &[u8], marker: u8, marker_len: usize, label: Option<&[u8]>) -> bool {
+    if body.len() < marker_len || body[..marker_len].iter().any(|byte| *byte != marker) {
+        return false;
+    }
+    match label {
+        Some(label) => {
+            body.len() == marker_len + 1 + label.len()
+                && body[marker_len] == b' '
+                && body[marker_len + 1..] == *label
+        }
+        None => body.len() == marker_len,
+    }
+}
+
+fn find_normalized_line(input: &NormalizedMergeInput, cursor: usize, key: &[u8]) -> Option<usize> {
+    input.lines[cursor..]
+        .iter()
+        .position(|line| line.key == key)
+        .map(|offset| cursor + offset)
+}
+
+fn backfill_normalized_merge(
+    rendered: &[u8],
+    marker_len: usize,
+    base: &NormalizedMergeInput,
+    ours: &NormalizedMergeInput,
+    theirs: &NormalizedMergeInput,
+    original_ours: &[u8],
+) -> Vec<u8> {
+    let inputs = [base, ours, theirs];
+    let mut cursors = [0usize; 3];
+    let mut section = NormalizedOutputSection::Merged;
+    let preferred_eol = conflict_marker_eol_for_inputs(&[original_ours]);
+    let mut output = Vec::with_capacity(rendered.len());
+    for record in split_lines_preserving_eol(rendered) {
+        let (body, output_eol) = split_original_line(record);
+        let marker = if normalized_marker(body, b'<', marker_len, Some(b"ours")) {
+            section = NormalizedOutputSection::Ours;
+            true
+        } else if normalized_marker(body, b'|', marker_len, Some(b"original")) {
+            section = NormalizedOutputSection::Base;
+            true
+        } else if normalized_marker(body, b'=', marker_len, None) {
+            section = NormalizedOutputSection::Theirs;
+            true
+        } else if normalized_marker(body, b'>', marker_len, Some(b"theirs")) {
+            section = NormalizedOutputSection::Merged;
+            true
+        } else {
+            false
+        };
+        if marker {
+            output.extend_from_slice(body);
+            if !output_eol.is_empty() {
+                output.extend_from_slice(preferred_eol);
+            }
+            continue;
+        }
+
+        let candidates: &[usize] = match section {
+            NormalizedOutputSection::Merged => &[1, 2, 0],
+            NormalizedOutputSection::Ours => &[1],
+            NormalizedOutputSection::Base => &[0],
+            NormalizedOutputSection::Theirs => &[2],
+        };
+        let selected = candidates
+            .iter()
+            .filter_map(|side| {
+                find_normalized_line(inputs[*side], cursors[*side], body)
+                    .map(|index| (*side, index, index - cursors[*side]))
+            })
+            .min_by_key(|(side, _, distance)| {
+                (*distance, candidates.iter().position(|s| s == side))
+            });
+        if let Some((side, index, _)) = selected {
+            let line = &inputs[side].lines[index];
+            output.extend_from_slice(&line.original_body);
+            cursors[side] = index + 1;
+            if section == NormalizedOutputSection::Merged {
+                // A merged/context line is normally present in every input.
+                // Advancing matching cursors keeps repeated normalized lines
+                // aligned without consuming side-specific conflict bodies.
+                for other in 0..inputs.len() {
+                    if other == side {
+                        continue;
+                    }
+                    if let Some(other_index) =
+                        find_normalized_line(inputs[other], cursors[other], body)
+                    {
+                        cursors[other] = other_index + 1;
+                    }
+                }
+            }
+            if !output_eol.is_empty() {
+                if side == 1 && !line.original_eol.is_empty() {
+                    output.extend_from_slice(&line.original_eol);
+                } else {
+                    output.extend_from_slice(preferred_eol);
+                }
+            }
+        } else {
+            output.extend_from_slice(body);
+            if !output_eol.is_empty() {
+                output.extend_from_slice(preferred_eol);
+            }
+        }
+    }
+    output
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MergeContentOptions {
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+    normalization: MergeInputNormalization,
+}
+
+fn merge_bytes_with_input_normalization(
+    driver: BuiltinMergeDriver,
+    path: &Path,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    options: MergeContentOptions,
+) -> Result<BuiltinMergeOutcome, String> {
+    let MergeContentOptions {
+        favor,
+        conflict_style,
+        extra_marker_size,
+        normalization,
+    } = options;
+    let text_mode = if normalization.renormalize {
+        text_renormalization_for_path(path)
+    } else {
+        TextRenormalization::Never
+    };
+    let renormalize_base = renormalize_text_input(text_mode, base);
+    let renormalize_ours = renormalize_text_input(text_mode, ours);
+    let renormalize_theirs = renormalize_text_input(text_mode, theirs);
+    let active = normalization.whitespace.is_some()
+        || renormalize_base
+        || renormalize_ours
+        || renormalize_theirs;
+    if !active
+        || driver == BuiltinMergeDriver::Binary
+        || [base, ours, theirs]
+            .iter()
+            .any(|input| merge_input_is_binary(input))
+    {
+        return merge_bytes_with_refined_driver(
+            driver,
+            base,
+            ours,
+            theirs,
+            favor,
+            conflict_style,
+            extra_marker_size,
+        );
+    }
+
+    let normalized_base = normalize_merge_input(base, normalization.whitespace, renormalize_base);
+    let normalized_ours = normalize_merge_input(ours, normalization.whitespace, renormalize_ours);
+    let normalized_theirs =
+        normalize_merge_input(theirs, normalization.whitespace, renormalize_theirs);
+    let marker_len = unambiguous_conflict_marker_length(&[
+        &normalized_base.canonical,
+        &normalized_ours.canonical,
+        &normalized_theirs.canonical,
+    ])
+    .saturating_add(extra_marker_size);
+    let outcome = merge_bytes_with_refined_driver(
+        driver,
+        &normalized_base.canonical,
+        &normalized_ours.canonical,
+        &normalized_theirs.canonical,
+        favor,
+        conflict_style,
+        extra_marker_size,
+    )?;
+    let backfill = |bytes: Vec<u8>| {
+        backfill_normalized_merge(
+            &bytes,
+            marker_len,
+            &normalized_base,
+            &normalized_ours,
+            &normalized_theirs,
+            ours,
+        )
+    };
+    Ok(match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => BuiltinMergeOutcome::Clean(backfill(bytes)),
+        BuiltinMergeOutcome::Conflict(bytes) => BuiltinMergeOutcome::Conflict(backfill(bytes)),
+    })
+}
+
+/// Apply one built-in low-level driver without MG-10 presentation refinement.
+/// `merge-file` retains this compatibility wrapper because its independent CLI
+/// surface is outside the card; merge/cherry-pick/revert use the refined entry.
+pub(crate) fn merge_bytes_with_driver(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: diffy::ConflictStyle,
+    extra_marker_size: usize,
+) -> Result<BuiltinMergeOutcome, String> {
+    merge_bytes_with_driver_impl(
+        driver,
+        base,
+        ours,
+        theirs,
+        favor,
+        conflict_style.into(),
+        extra_marker_size,
+        false,
+    )
+}
+
+/// Apply the shared merge/cherry-pick/revert built-in content driver. Text and
+/// union use a diff3 rendering internally where needed for unambiguous hunk
+/// selection; an unresolved text result is rendered in the configured style.
+pub(crate) fn merge_bytes_with_refined_driver(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+) -> Result<BuiltinMergeOutcome, String> {
+    merge_bytes_with_driver_impl(
+        driver,
+        base,
+        ours,
+        theirs,
+        favor,
+        conflict_style,
+        extra_marker_size,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_bytes_with_driver_impl(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+    refine: bool,
+) -> Result<BuiltinMergeOutcome, String> {
+    // High-level merge consumers normally settle these OID-equality cases
+    // before low-level dispatch. Keep the shared helper equally safe for
+    // byte-oriented consumers such as merge-file.
+    if ours == theirs {
+        return Ok(BuiltinMergeOutcome::Clean(ours.to_vec()));
+    }
+    if ours == base {
+        return Ok(BuiltinMergeOutcome::Clean(theirs.to_vec()));
+    }
+    if theirs == base {
+        return Ok(BuiltinMergeOutcome::Clean(ours.to_vec()));
+    }
+    let binary_fallback = driver == BuiltinMergeDriver::Binary
+        || (driver == BuiltinMergeDriver::Union
+            && (merge_input_is_binary(base)
+                || merge_input_is_binary(ours)
+                || merge_input_is_binary(theirs)));
+    if binary_fallback {
+        // Git's union driver sets the union variant itself; if xdiff rejects
+        // binary input, that variant is not ours/theirs and the binary fallback
+        // therefore reports a conflict with ours.
+        let effective_favor = if driver == BuiltinMergeDriver::Union {
+            None
+        } else {
+            favor
+        };
+        return Ok(match effective_favor {
+            None => BuiltinMergeOutcome::Conflict(ours.to_vec()),
+            Some(MergeFavor::Ours) => BuiltinMergeOutcome::Clean(ours.to_vec()),
+            Some(MergeFavor::Theirs) => BuiltinMergeOutcome::Clean(theirs.to_vec()),
+        });
+    }
+
+    let marker_len =
+        unambiguous_conflict_marker_length(&[base, ours, theirs]).saturating_add(extra_marker_size);
+    let mut options = diffy::MergeOptions::new();
+    options
+        .set_conflict_style(if favor.is_some() || driver == BuiltinMergeDriver::Union {
+            diffy::ConflictStyle::Diff3
+        } else {
+            conflict_style.diffy_style()
+        })
+        .set_conflict_marker_length(marker_len);
+    match options.merge_bytes(base, ours, theirs) {
+        Ok(bytes) => Ok(BuiltinMergeOutcome::Clean(bytes)),
+        Err(conflicted) => match driver {
+            BuiltinMergeDriver::Union => {
+                resolve_conflicted_content(conflicted, marker_len, ConflictResolution::Union)
+                    .map(BuiltinMergeOutcome::Clean)
+            }
+            BuiltinMergeDriver::Text => match favor {
+                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
+                    .map(BuiltinMergeOutcome::Clean),
+                None if refine => {
+                    let (rendered, has_conflicts) = refine_diffy_conflicts(
+                        &conflicted,
+                        marker_len,
+                        conflict_style,
+                        base,
+                        ours,
+                        theirs,
+                        ConflictMarkerLabels {
+                            ours: "ours",
+                            base: "original",
+                            theirs: "theirs",
+                        },
+                    )?;
+                    Ok(if has_conflicts {
+                        BuiltinMergeOutcome::Conflict(rendered)
+                    } else {
+                        BuiltinMergeOutcome::Clean(rendered)
+                    })
+                }
+                None => Ok(BuiltinMergeOutcome::Conflict(conflicted)),
+            },
+            BuiltinMergeDriver::Binary => {
+                Err("internal binary merge driver unexpectedly reached the text merger".to_string())
+            }
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConflictMarkerLabels<'a> {
+    ours: &'a str,
+    base: &'a str,
+    theirs: &'a str,
+}
+
+fn marker_bytes(byte: u8, marker_len: usize, label: Option<&str>, eol: &[u8]) -> Vec<u8> {
+    let mut marker = vec![byte; marker_len];
+    if let Some(label) = label {
+        marker.push(b' ');
+        marker.extend_from_slice(label.as_bytes());
+    }
+    marker.extend_from_slice(eol);
+    marker
+}
+
+fn input_uses_crlf_only(content: &[u8]) -> Option<bool> {
+    let mut saw_crlf = false;
+    for (index, byte) in content.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if index == 0 || content[index - 1] != b'\r' {
+            return Some(false);
+        }
+        saw_crlf = true;
+    }
+    saw_crlf.then_some(true)
+}
+
+/// Match xdiff's conservative marker-EOL rule for uniformly styled inputs:
+/// emit CRLF only when every input with a detectable line ending uses CRLF.
+/// An empty or one-line unterminated side is neutral; an LF side wins.
+fn conflict_marker_eol_for_inputs(inputs: &[&[u8]]) -> &'static [u8] {
+    let mut saw_crlf = false;
+    for input in inputs {
+        match input_uses_crlf_only(input) {
+            Some(true) => saw_crlf = true,
+            Some(false) => return b"\n",
+            None => {}
+        }
+    }
+    if saw_crlf { b"\r\n" } else { b"\n" }
+}
+
+fn split_lines_preserving_eol(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in content.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push(&content[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
+}
+
+fn append_lines(output: &mut Vec<u8>, lines: &[&[u8]]) {
+    for line in lines {
+        output.extend_from_slice(line);
+    }
+}
+
+fn append_marker(
+    output: &mut Vec<u8>,
+    byte: u8,
+    marker_len: usize,
+    label: Option<&str>,
+    eol: &[u8],
+) {
+    output.extend_from_slice(&marker_bytes(byte, marker_len, label, eol));
+}
+
+fn ensure_conflict_side_ends_with_eol(output: &mut Vec<u8>, side: &[&[u8]], eol: &[u8]) {
+    if side.last().is_some_and(|line| !line.ends_with(b"\n")) {
+        output.extend_from_slice(eol);
+    }
+}
+
+fn append_conflict_block(
+    output: &mut Vec<u8>,
+    ours: &[&[u8]],
+    base: Option<&[&[u8]]>,
+    theirs: &[&[u8]],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) {
+    append_marker(output, b'<', marker_len, Some(labels.ours), eol);
+    append_lines(output, ours);
+    ensure_conflict_side_ends_with_eol(output, ours, eol);
+    if let Some(base) = base {
+        append_marker(output, b'|', marker_len, Some(labels.base), eol);
+        append_lines(output, base);
+        ensure_conflict_side_ends_with_eol(output, base, eol);
+    }
+    append_marker(output, b'=', marker_len, None, eol);
+    append_lines(output, theirs);
+    ensure_conflict_side_ends_with_eol(output, theirs, eol);
+    append_marker(output, b'>', marker_len, Some(labels.theirs), eol);
+}
+
+pub(crate) fn render_whole_file_conflict(
+    ours: &[u8],
+    theirs: &[u8],
+    ours_label: &str,
+    theirs_label: &str,
+) -> Vec<u8> {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    let eol = conflict_marker_eol_for_inputs(&[ours, theirs]);
+    let marker_len = conflict_marker_length(&[ours, theirs]);
+    let mut output = Vec::with_capacity(ours.len() + theirs.len() + 64);
+    append_conflict_block(
+        &mut output,
+        &ours_lines,
+        None,
+        &theirs_lines,
+        marker_len,
+        eol,
+        ConflictMarkerLabels {
+            ours: ours_label,
+            base: "base",
+            theirs: theirs_label,
+        },
+    );
+    output
+}
+
+fn append_refined_merge_block(
+    output: &mut Vec<u8>,
+    ours: &[u8],
+    theirs: &[u8],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> bool {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    if ours_lines.is_empty() || theirs_lines.is_empty() {
+        append_conflict_block(
+            output,
+            &ours_lines,
+            None,
+            &theirs_lines,
+            marker_len,
+            eol,
+            labels,
+        );
+        return true;
+    }
+
+    let operations =
+        similar::capture_diff_slices(similar::Algorithm::Myers, &ours_lines, &theirs_lines);
+    let first_change = operations
+        .iter()
+        .position(|operation| operation.tag() != similar::DiffTag::Equal);
+    let Some(first_change) = first_change else {
+        append_lines(output, &ours_lines);
+        return false;
+    };
+    let last_change = operations
+        .iter()
+        .rposition(|operation| operation.tag() != similar::DiffTag::Equal)
+        .unwrap_or(first_change);
+
+    let first_old = operations[first_change].old_range();
+    let first_new = operations[first_change].new_range();
+    append_lines(output, &ours_lines[..first_old.start]);
+    let mut group_old_start = first_old.start;
+    let mut group_new_start = first_new.start;
+
+    // XDL_MERGE_ZEALOUS re-diffs the two postimages, then folds equal runs of
+    // at most three lines back into the surrounding conflict. Longer runs stay
+    // visible as non-conflicting context between smaller conflict blocks.
+    if first_change < last_change {
+        for operation in &operations[(first_change + 1)..last_change] {
+            if operation.tag() != similar::DiffTag::Equal {
+                continue;
+            }
+            let old = operation.old_range();
+            let new = operation.new_range();
+            if old.len() <= 3 {
+                continue;
+            }
+            append_conflict_block(
+                output,
+                &ours_lines[group_old_start..old.start],
+                None,
+                &theirs_lines[group_new_start..new.start],
+                marker_len,
+                eol,
+                labels,
+            );
+            append_lines(output, &ours_lines[old.clone()]);
+            group_old_start = old.end;
+            group_new_start = new.end;
+        }
+    }
+
+    let last_old = operations[last_change].old_range();
+    let last_new = operations[last_change].new_range();
+    append_conflict_block(
+        output,
+        &ours_lines[group_old_start..last_old.end],
+        None,
+        &theirs_lines[group_new_start..last_new.end],
+        marker_len,
+        eol,
+        labels,
+    );
+    append_lines(output, &ours_lines[last_old.end..]);
+    true
+}
+
+fn append_zdiff3_block(
+    output: &mut Vec<u8>,
+    ours: &[u8],
+    base: &[u8],
+    theirs: &[u8],
+    marker_len: usize,
+    eol: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> bool {
+    let ours_lines = split_lines_preserving_eol(ours);
+    let base_lines = split_lines_preserving_eol(base);
+    let theirs_lines = split_lines_preserving_eol(theirs);
+    let mut prefix = 0usize;
+    while prefix < ours_lines.len()
+        && prefix < theirs_lines.len()
+        && ours_lines[prefix] == theirs_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < ours_lines.len().saturating_sub(prefix)
+        && suffix < theirs_lines.len().saturating_sub(prefix)
+        && ours_lines[ours_lines.len() - 1 - suffix]
+            == theirs_lines[theirs_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    append_lines(output, &ours_lines[..prefix]);
+    let ours_end = ours_lines.len() - suffix;
+    let theirs_end = theirs_lines.len() - suffix;
+    let remains_conflicted = prefix < ours_end || prefix < theirs_end;
+    if remains_conflicted {
+        append_conflict_block(
+            output,
+            &ours_lines[prefix..ours_end],
+            Some(&base_lines),
+            &theirs_lines[prefix..theirs_end],
+            marker_len,
+            eol,
+            labels,
+        );
+    }
+    append_lines(output, &ours_lines[ours_end..]);
+    remains_conflicted
+}
+
+fn find_generated_marker(haystack: &[u8], start: usize, marker: &[u8]) -> Option<usize> {
+    let tail = haystack.get(start..)?;
+    let mut fallback = None;
+    for relative in tail
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == marker).then_some(index))
+    {
+        let position = start + relative;
+        fallback.get_or_insert(position);
+        if position == 0 || haystack[position - 1] == b'\n' {
+            return Some(position);
+        }
+    }
+    // diffy does not insert a missing newline before the next marker. Retain a
+    // fallback for an unterminated conflict side after preferring line-start
+    // markers, which cannot collide with input because marker size is bumped.
+    fallback
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_diffy_conflicts(
+    conflicted: &[u8],
+    marker_len: usize,
+    style: ConflictStyle,
+    base_input: &[u8],
+    ours_input: &[u8],
+    theirs_input: &[u8],
+    labels: ConflictMarkerLabels<'_>,
+) -> Result<(Vec<u8>, bool), String> {
+    let raw_eol = b"\n";
+    let open = marker_bytes(b'<', marker_len, Some("ours"), raw_eol);
+    let original = marker_bytes(b'|', marker_len, Some("original"), raw_eol);
+    let separator = marker_bytes(b'=', marker_len, None, raw_eol);
+    let close = marker_bytes(b'>', marker_len, Some("theirs"), raw_eol);
+    let eol = conflict_marker_eol_for_inputs(&[ours_input, theirs_input, base_input]);
+    let malformed = || "internal three-way merge produced malformed conflict markers".to_string();
+
+    let mut output = Vec::with_capacity(conflicted.len());
+    let mut cursor = 0usize;
+    let mut parsed = 0usize;
+    let mut has_conflicts = false;
+    while let Some(open_start) = find_generated_marker(conflicted, cursor, &open) {
+        output.extend_from_slice(&conflicted[cursor..open_start]);
+        let ours_start = open_start + open.len();
+        let (ours_end, base_range, separator_start) = match style {
+            ConflictStyle::Merge => {
+                let separator_start = find_generated_marker(conflicted, ours_start, &separator)
+                    .ok_or_else(malformed)?;
+                (separator_start, None, separator_start)
+            }
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3 => {
+                let original_start = find_generated_marker(conflicted, ours_start, &original)
+                    .ok_or_else(malformed)?;
+                let base_start = original_start + original.len();
+                let separator_start = find_generated_marker(conflicted, base_start, &separator)
+                    .ok_or_else(malformed)?;
+                (
+                    original_start,
+                    Some(base_start..separator_start),
+                    separator_start,
+                )
+            }
+        };
+        let theirs_start = separator_start + separator.len();
+        let close_start =
+            find_generated_marker(conflicted, theirs_start, &close).ok_or_else(malformed)?;
+        let ours = &conflicted[ours_start..ours_end];
+        let theirs = &conflicted[theirs_start..close_start];
+        has_conflicts |= match style {
+            ConflictStyle::Merge => {
+                append_refined_merge_block(&mut output, ours, theirs, marker_len, eol, labels)
+            }
+            ConflictStyle::Diff3 => {
+                let base_range = base_range.ok_or_else(malformed)?;
+                let ours_lines = split_lines_preserving_eol(ours);
+                let base_lines = split_lines_preserving_eol(&conflicted[base_range]);
+                let theirs_lines = split_lines_preserving_eol(theirs);
+                append_conflict_block(
+                    &mut output,
+                    &ours_lines,
+                    Some(&base_lines),
+                    &theirs_lines,
+                    marker_len,
+                    eol,
+                    labels,
+                );
+                true
+            }
+            ConflictStyle::ZDiff3 => {
+                let base_range = base_range.ok_or_else(malformed)?;
+                append_zdiff3_block(
+                    &mut output,
+                    ours,
+                    &conflicted[base_range],
+                    theirs,
+                    marker_len,
+                    eol,
+                    labels,
+                )
+            }
+        };
+        cursor = close_start + close.len();
+        parsed += 1;
+    }
+    if parsed == 0 {
+        return Err(malformed());
+    }
+    output.extend_from_slice(&conflicted[cursor..]);
+    Ok((output, has_conflicts))
 }
 
 /// Merge three blob payloads and resolve only overlapping regions in favor of
@@ -4191,7 +7395,8 @@ pub(crate) const MAX_VIRTUAL_ANCESTOR_DEPTH: usize = 20;
 pub(crate) const MAX_VIRTUAL_ANCESTOR_BASES: usize = 32;
 
 /// The two side labels Git renders inside a virtual-ancestor merge
-/// (`merge-ort.c:5429` swaps `opt->branch1`/`branch2` for these while it folds).
+/// (`merge-ort.c` `merge_ort_internal`, lines 5371-5372 at git@`3cb9185f6`,
+/// swaps `opt->branch1`/`branch2` for these inside the fold loop).
 const VIRTUAL_OURS_LABEL: &str = "Temporary merge branch 1";
 const VIRTUAL_THEIRS_LABEL: &str = "Temporary merge branch 2";
 
@@ -4223,10 +7428,26 @@ struct TreeMergeContext<'a> {
     /// `call_depth` is non-zero), because a virtual ancestor is an input the
     /// user never asked to bias.
     favor: Option<MergeFavor>,
+    /// User-selected presentation for built-in text conflicts. Keeping it in
+    /// the context makes the first content merge and every rename replay use
+    /// the same refinement decision as the eventual worktree renderer.
+    conflict_style: ConflictStyle,
     /// Recursion depth: 0 for the merge the user asked for, 1 for the merges
     /// that fold its merge bases, 2 for the merges that fold *those* bases, and
     /// so on — Git's `call_depth`.
     depth: usize,
+    /// Configured fallback used only when the path has no `merge` attribute.
+    default_driver: Option<String>,
+    /// One config snapshot and result cache shared by the incremental walk,
+    /// flat fallback, rename replay, and recursive virtual-ancestor fold.
+    external_merge_runtime: SharedExternalMergeRuntime,
+    /// Comparison-only whitespace rules plus path-attribute renormalization.
+    /// Every content path, including rename replay and virtual ancestors, sees
+    /// the same immutable invocation snapshot.
+    input_normalization: MergeInputNormalization,
+    ancestor_label: String,
+    ours_label: String,
+    theirs_label: String,
     /// Blobs this merge (and, inside the recursive fold, every level below it)
     /// synthesized WITHOUT writing them, consulted by [`load_merge_blob`] ahead
     /// of the object store.
@@ -4241,15 +7462,91 @@ struct TreeMergeContext<'a> {
 
 impl TreeMergeContext<'_> {
     /// The context for a real (depth 0) merge.
-    fn top_level(
+    #[cfg(test)]
+    fn top_level<'a>(
         persist_merged_blobs: bool,
         favor: Option<MergeFavor>,
-        virtual_blobs: &mut VirtualBlobs,
-    ) -> TreeMergeContext<'_> {
+        default_driver: Option<&str>,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
         TreeMergeContext {
             persist_merged_blobs,
             favor,
+            conflict_style: ConflictStyle::Merge,
             depth: 0,
+            default_driver: default_driver.map(str::to_owned),
+            external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
+            input_normalization: MergeInputNormalization::default(),
+            ancestor_label: "base".to_string(),
+            ours_label: "HEAD".to_string(),
+            theirs_label: "theirs".to_string(),
+            virtual_blobs,
+        }
+    }
+
+    fn top_level_with_options<'a>(
+        options: &ThreeWayMergeOptions<'_>,
+        conflict_style: ConflictStyle,
+        theirs_label: &str,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
+        TreeMergeContext {
+            persist_merged_blobs: !options.dry_run,
+            favor: options.favor,
+            conflict_style,
+            depth: 0,
+            default_driver: options.merge_default_driver.clone(),
+            external_merge_runtime: options.external_merge_runtime.clone(),
+            input_normalization: options.input_normalization,
+            ancestor_label: "base".to_string(),
+            ours_label: "HEAD".to_string(),
+            theirs_label: theirs_label.to_string(),
+            virtual_blobs,
+        }
+    }
+
+    /// The context for a merge INSIDE the virtual-ancestor fold. `favor` is
+    /// always `None` there: Git disables `-X ours`/`-X theirs` whenever
+    /// `call_depth` is non-zero, because a virtual ancestor is an input the
+    /// user never asked to bias.
+    #[cfg(test)]
+    fn nested<'a>(
+        persist_merged_blobs: bool,
+        depth: usize,
+        default_driver: Option<&str>,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
+        Self::nested_with_external(
+            persist_merged_blobs,
+            depth,
+            ConflictStyle::Merge,
+            default_driver,
+            Arc::new(ExternalMergeRuntime::default()),
+            MergeInputNormalization::default(),
+            virtual_blobs,
+        )
+    }
+
+    fn nested_with_external<'a>(
+        persist_merged_blobs: bool,
+        depth: usize,
+        conflict_style: ConflictStyle,
+        default_driver: Option<&str>,
+        external_merge_runtime: SharedExternalMergeRuntime,
+        input_normalization: MergeInputNormalization,
+        virtual_blobs: &'a mut VirtualBlobs,
+    ) -> TreeMergeContext<'a> {
+        TreeMergeContext {
+            persist_merged_blobs,
+            favor: None,
+            conflict_style,
+            depth,
+            default_driver: default_driver.map(str::to_owned),
+            external_merge_runtime,
+            input_normalization,
+            ancestor_label: "merged common ancestors".to_string(),
+            ours_label: VIRTUAL_OURS_LABEL.to_string(),
+            theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
             virtual_blobs,
         }
     }
@@ -4268,6 +7565,22 @@ impl TreeMergeContext<'_> {
             self.virtual_blobs.insert(blob.id, blob.data.clone());
         }
         Ok(())
+    }
+
+    fn driver_for_path(&self, path: &Path) -> SelectedMergeDriver {
+        select_merge_driver(
+            attributes::attribute_state_for_path("merge", path),
+            self.default_driver.as_deref(),
+            &self.external_merge_runtime,
+        )
+    }
+
+    fn external_labels(&self) -> ExternalMergeLabels<'_> {
+        ExternalMergeLabels {
+            ancestor: &self.ancestor_label,
+            ours: &self.ours_label,
+            theirs: &self.theirs_label,
+        }
     }
 }
 
@@ -4326,11 +7639,13 @@ fn load_merge_commit(id: &ObjectHash) -> Result<Commit, PullMergeError> {
 
 /// The merge bases of the ancestor folded from `folded` with `next`.
 ///
-/// Git asks this of the synthetic commit it just built (`merge-ort.c:5429`
-/// chains `make_virtual_commit` so the next round can call `get_merge_bases()`
-/// on it). The same set falls out of the REAL bases folded so far: the virtual
-/// commit's ancestry is exactly the union of theirs, so the common ancestors of
-/// it and `next` are `⋃ᵢ (anc(folded[i]) ∩ anc(next))`, and the maximal elements
+/// Git asks this of the synthetic commit it just built (`merge-ort.c`
+/// `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`, chains
+/// `make_virtual_commit` at line 5380 so the next round can call
+/// `get_merge_bases()` on it). The same set falls out of the REAL bases folded
+/// so far: the virtual commit's ancestry is exactly the union of theirs, so the
+/// common ancestors of it and `next` are
+/// `⋃ᵢ (anc(folded[i]) ∩ anc(next))`, and the maximal elements
 /// of a union are always among the maximal elements of its parts — i.e. among
 /// `⋃ᵢ merge_bases(folded[i], next)`, filtered for domination across the parts.
 ///
@@ -4355,13 +7670,35 @@ fn merge_bases_of_folded(
     folded: &[ObjectHash],
     next: &ObjectHash,
 ) -> Result<Vec<ObjectHash>, PullMergeError> {
-    let history = |error: merge_base::MergeBaseError| PullMergeError::History(error.to_string());
+    merge_bases_of_folded_with(
+        folded,
+        next,
+        |base, tip| {
+            merge_base::merge_bases(base, tip)
+                .map_err(|error| PullMergeError::History(error.to_string()))
+        },
+        |ancestor, descendant| {
+            merge_base::is_ancestor(ancestor, descendant)
+                .map_err(|error| PullMergeError::History(error.to_string()))
+        },
+    )
+}
+
+/// Candidate collection and cross-part domination for
+/// [`merge_bases_of_folded`], parameterized by graph reads so the otherwise
+/// rare dominated-candidate branch can be exercised on a small in-memory DAG.
+fn merge_bases_of_folded_with(
+    folded: &[ObjectHash],
+    next: &ObjectHash,
+    mut merge_bases: impl FnMut(&ObjectHash, &ObjectHash) -> Result<Vec<ObjectHash>, PullMergeError>,
+    mut is_ancestor: impl FnMut(&ObjectHash, &ObjectHash) -> Result<bool, PullMergeError>,
+) -> Result<Vec<ObjectHash>, PullMergeError> {
     ensure_virtual_ancestor_width(folded.len())?;
     let [single] = folded else {
         // Candidates tagged with the part (folded base) that produced them.
         let mut candidates: Vec<(usize, ObjectHash)> = Vec::new();
         for (part, base) in folded.iter().enumerate() {
-            for candidate in merge_base::merge_bases(base, next).map_err(history)? {
+            for candidate in merge_bases(base, next)? {
                 if !candidates.iter().any(|(_, known)| *known == candidate) {
                     candidates.push((part, candidate));
                     ensure_virtual_ancestor_width(candidates.len())?;
@@ -4375,7 +7712,7 @@ fn merge_bases_of_folded(
                 if other_part == part {
                     continue;
                 }
-                if merge_base::is_ancestor(candidate, other).map_err(history)? {
+                if is_ancestor(candidate, other)? {
                     dominated = true;
                     break;
                 }
@@ -4386,17 +7723,20 @@ fn merge_bases_of_folded(
         }
         return Ok(virtual_base_fold_order(&maximal));
     };
-    merge_base::merge_bases(single, next).map_err(history)
+    merge_bases(single, next)
 }
 
 /// The knobs every level of the virtual-ancestor fold shares.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VirtualFold<'a> {
     /// `false` under `--dry-run`: the fold keeps its blobs in memory.
     persist: bool,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
     /// The fold is a merge, so it detects renames like any other (FIX-MG05-02).
     rename_config: &'a MergeRenameConfig,
+    default_driver: Option<&'a str>,
+    external_merge_runtime: SharedExternalMergeRuntime,
+    input_normalization: MergeInputNormalization,
 }
 
 /// Fold every merge base of a criss-cross history into ONE virtual ancestor
@@ -4407,16 +7747,9 @@ struct VirtualFold<'a> {
 fn virtual_merge_base(
     bases: &[ObjectHash],
     gitlinks: &GitlinkEntries,
-    persist: bool,
-    conflict_style: diffy::ConflictStyle,
-    rename_config: &MergeRenameConfig,
+    fold: VirtualFold<'_>,
 ) -> Result<VirtualAncestor, PullMergeError> {
     let mut blobs = VirtualBlobs::new();
-    let fold = VirtualFold {
-        persist,
-        conflict_style,
-        rename_config,
-    };
     let items = fold_merge_bases(bases, gitlinks, 1, &mut blobs, fold)?;
     Ok(VirtualAncestor { items, blobs })
 }
@@ -4448,8 +7781,8 @@ fn fold_merge_bases(
         let next_commit = load_merge_commit(next)?;
         let next_items = commit_tree_split_for_merge(&next_commit)?.0;
         let sub_bases = merge_bases_of_folded(&folded_ids, next)?;
-        let sub_items = fold_merge_bases(&sub_bases, gitlinks, depth + 1, blobs, fold)?;
-        items = merge_virtual_items(&sub_items, &items, &next_items, depth, blobs, fold)?;
+        let sub_items = fold_merge_bases(&sub_bases, gitlinks, depth + 1, blobs, fold.clone())?;
+        items = merge_virtual_items(&sub_items, &items, &next_items, depth, blobs, fold.clone())?;
         folded_ids.push(*next);
         timestamp = timestamp.max(next_commit.committer.timestamp);
         if fold.persist {
@@ -4464,8 +7797,9 @@ fn fold_merge_bases(
 /// The difference from the user's merge is that this one can never fail: a
 /// virtual ancestor is a synthetic input, so every path has to end up with
 /// SOME content. Git resolves the same way — a content conflict is recorded
-/// with its markers, and a modify/delete "simply reuse[s] the base version for
-/// [the] virtual merge base" (`merge-recursive.c`, `handle_change_delete`).
+/// with its markers, and a modify/delete selects the original entry while
+/// `call_depth` is non-zero (`merge-ort.c` `process_entry`, lines 4374-4381 at
+/// git@`3cb9185f6`).
 fn merge_virtual_items(
     base_items: &HashMap<PathBuf, MergeTreeEntry>,
     our_items: &HashMap<PathBuf, MergeTreeEntry>,
@@ -4487,12 +7821,29 @@ fn merge_virtual_items(
     let mut base_items = base_items.clone();
     let mut our_items = our_items.clone();
     let mut their_items = their_items.clone();
+    // MG-06: the fold raises the same path-level rename shapes the user's own
+    // merge does. It needs no `forced` conflicts, though: a virtual ancestor
+    // can never fail, so every shape settles as CONTENT here — a 1to2 leaves
+    // the one merged blob at both destinations and drops the source, a
+    // collision leaves the rename's merge to be resolved against the occupant,
+    // and a rename/delete reuses the base version — which is exactly what the
+    // path-by-path resolution below produces from the maps this rewrites.
     detect_and_apply_renames(
         &mut base_items,
         &mut our_items,
         &mut their_items,
-        blobs,
         fold.rename_config,
+        fold.conflict_style,
+        (VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL),
+        &mut TreeMergeContext::nested_with_external(
+            fold.persist,
+            depth,
+            fold.conflict_style,
+            fold.default_driver,
+            fold.external_merge_runtime.clone(),
+            fold.input_normalization,
+            blobs,
+        ),
     )?;
     let (base_items, our_items, their_items) = (&base_items, &our_items, &their_items);
 
@@ -4511,23 +7862,47 @@ fn merge_virtual_items(
             let mut context = TreeMergeContext {
                 persist_merged_blobs: fold.persist,
                 favor: None,
+                conflict_style: fold.conflict_style,
                 depth,
+                default_driver: fold.default_driver.map(str::to_owned),
+                external_merge_runtime: fold.external_merge_runtime.clone(),
+                input_normalization: fold.input_normalization,
+                ancestor_label: "merged common ancestors".to_string(),
+                ours_label: VIRTUAL_OURS_LABEL.to_string(),
+                theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
                 virtual_blobs: blobs,
             };
-            resolve_three_way(base, ours, theirs, &mut context)?
+            resolve_three_way(&path, base, ours, theirs, &mut context)?
         };
         let entry = match resolution {
             MergeResolution::Use(entry) => Some(entry),
             MergeResolution::Delete => None,
-            MergeResolution::Conflict(_) => virtual_conflict_resolution(
-                base,
-                ours,
-                theirs,
-                depth,
-                fold.persist,
-                fold.conflict_style,
-                blobs,
-            )?,
+            MergeResolution::Conflict(kind) => {
+                if let ConflictKind::BothChanged {
+                    rendered: Some(entry),
+                    ..
+                } = kind
+                {
+                    merged.insert(path, entry);
+                    continue;
+                }
+                let driver = match kind {
+                    ConflictKind::BothChanged { driver, .. } => driver,
+                    _ => BuiltinMergeDriver::Text,
+                };
+                virtual_conflict_resolution(
+                    &path,
+                    base,
+                    ours,
+                    theirs,
+                    blobs,
+                    VirtualConflictContext {
+                        driver,
+                        depth,
+                        fold: fold.clone(),
+                    },
+                )?
+            }
         };
         if let Some(entry) = entry {
             merged.insert(path, entry);
@@ -4626,8 +8001,8 @@ fn relocate_virtual_df_files(
 /// "ask the user":
 ///
 /// * only one side survives (modify/delete) — keep the original, because there
-///   is no midpoint between "changed" and "gone"
-///   (`merge-recursive.c` `handle_change_delete`);
+///   is no midpoint between "changed" and "gone" (`merge-ort.c`
+///   `process_entry`, lines 4374-4381 at git@`3cb9185f6`);
 /// * the two sides are different KINDS of entry, or are not regular files
 ///   (symlinks) — keep the original, which is *nothing* when there is none
 ///   (`merge-ort.c` `handle_content_merge`: `result->mode = o->mode;
@@ -4636,15 +8011,25 @@ fn relocate_virtual_df_files(
 ///   there is no original (`merge-ll.c` `ll_binary_merge` steals `orig` for a
 ///   virtual ancestor, and `read_mmblob` of a null oid is empty);
 /// * otherwise merge the text and record it with its markers.
+struct VirtualConflictContext<'a> {
+    driver: BuiltinMergeDriver,
+    depth: usize,
+    fold: VirtualFold<'a>,
+}
+
 fn virtual_conflict_resolution(
+    path: &Path,
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
-    depth: usize,
-    persist: bool,
-    conflict_style: diffy::ConflictStyle,
     blobs: &mut VirtualBlobs,
+    context: VirtualConflictContext<'_>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
+    let VirtualConflictContext {
+        driver,
+        depth,
+        fold,
+    } = context;
     let (Some(ours), Some(theirs)) = (ours, theirs) else {
         return Ok(base.copied());
     };
@@ -4667,15 +8052,23 @@ fn virtual_conflict_resolution(
 
     let mut record = |blob: &Blob| {
         TreeMergeContext {
-            persist_merged_blobs: persist,
+            persist_merged_blobs: fold.persist,
             favor: None,
+            conflict_style: fold.conflict_style,
             depth,
+            default_driver: None,
+            external_merge_runtime: fold.external_merge_runtime.clone(),
+            input_normalization: fold.input_normalization,
+            ancestor_label: "merged common ancestors".to_string(),
+            ours_label: VIRTUAL_OURS_LABEL.to_string(),
+            theirs_label: VIRTUAL_THEIRS_LABEL.to_string(),
             virtual_blobs: blobs,
         }
         .record_merged_blob(blob)
     };
 
-    if merge_input_is_binary(base_bytes)
+    if driver == BuiltinMergeDriver::Binary
+        || merge_input_is_binary(base_bytes)
         || merge_input_is_binary(&ours_blob.data)
         || merge_input_is_binary(&theirs_blob.data)
     {
@@ -4697,12 +8090,15 @@ fn virtual_conflict_resolution(
     }
 
     let content = merge_virtual_content(
+        driver,
+        path,
         base_bytes,
         &ours_blob.data,
         &theirs_blob.data,
         depth,
-        conflict_style,
-    );
+        &fold,
+    )
+    .map_err(PullMergeError::TreeCreate)?;
     let blob = Blob::from_content_bytes(content);
     record(&blob)?;
     Ok(Some(MergeTreeEntry {
@@ -4722,7 +8118,7 @@ const MAX_XDIFF_SIZE: usize = 1024 * 1024 * 1023;
 /// than shared with `grep`'s private copy of the same rule — promoting it would
 /// move a helper into `src/utils/`, a cross-cutting surface this card has no
 /// reason to touch.
-fn merge_input_is_binary(content: &[u8]) -> bool {
+pub(crate) fn merge_input_is_binary(content: &[u8]) -> bool {
     merge_input_exceeds_xdiff_size(content.len())
         || content.iter().take(8000).any(|&byte| byte == 0)
 }
@@ -4748,9 +8144,9 @@ fn is_regular_file_mode(mode: TreeItemMode) -> bool {
     matches!(mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
 }
 
-/// Git's mode rule for a conflicted content merge (`merge-recursive.c`,
-/// `merge_mode_and_contents`): take theirs when the two sides agree or when
-/// ours is unchanged, otherwise keep ours.
+/// Git's mode rule for a conflicted content merge (`merge-ort.c`
+/// `handle_content_merge`, lines 2211-2217 at git@`3cb9185f6`): take theirs
+/// when the two sides agree or when ours is unchanged, otherwise keep ours.
 fn virtual_merged_mode(
     base: Option<&MergeTreeEntry>,
     ours: &MergeTreeEntry,
@@ -4767,25 +8163,36 @@ fn virtual_merged_mode(
 /// when there is one, otherwise the conflicted text with markers widened for
 /// `depth` and labelled the way Git labels a virtual-ancestor merge.
 fn merge_virtual_content(
+    driver: BuiltinMergeDriver,
+    path: &Path,
     base: &[u8],
     ours: &[u8],
     theirs: &[u8],
     depth: usize,
-    conflict_style: diffy::ConflictStyle,
-) -> Vec<u8> {
+    fold: &VirtualFold<'_>,
+) -> Result<Vec<u8>, String> {
     let marker_len = conflict_marker_length_at_depth(&[base, ours, theirs], depth);
-    let mut options = diffy::MergeOptions::new();
-    options
-        .set_conflict_style(conflict_style)
-        .set_conflict_marker_length(marker_len);
-    match options.merge_bytes(base, ours, theirs) {
-        Ok(merged) => merged,
-        Err(conflicted) => relabel_conflict_markers(
+    match merge_bytes_with_input_normalization(
+        driver,
+        path,
+        base,
+        ours,
+        theirs,
+        MergeContentOptions {
+            favor: None,
+            conflict_style: fold.conflict_style,
+            extra_marker_size: 2 * depth,
+            normalization: fold.input_normalization,
+        },
+    )? {
+        BuiltinMergeOutcome::Clean(merged) => Ok(merged),
+        BuiltinMergeOutcome::Conflict(conflicted) => Ok(relabel_conflict_markers(
             conflicted,
             marker_len,
             VIRTUAL_OURS_LABEL,
             VIRTUAL_THEIRS_LABEL,
-        ),
+            "base",
+        )),
     }
 }
 
@@ -5099,8 +8506,9 @@ fn incremental_merge_walk(
                     out.merged.insert(path, o.leaf());
                 }
                 // Both sides made the SAME change: take it, verbatim. Both
-                // sides could have made the same rename in there, which the
-                // flattening engine reports as a `SameDestination` notice.
+                // sides could have made the same rename in there; recording
+                // both candidates lets the rename pass move their base to the
+                // shared destination and run a normal three-way merge there.
                 (base_entry, Some(o), Some(t)) if o == t => {
                     for side in [MergeSide::Ours, MergeSide::Theirs] {
                         // `left` is the BASE: the other side equals this one,
@@ -5315,7 +8723,8 @@ fn resolve_walk_leaf(
         return Ok(());
     }
     out.note_rename_candidates(path, [base, ours, theirs]);
-    let resolution = resolve_three_way(base.as_ref(), ours.as_ref(), theirs.as_ref(), context)?;
+    let resolution =
+        resolve_three_way(path, base.as_ref(), ours.as_ref(), theirs.as_ref(), context)?;
     match resolution {
         MergeResolution::Use(entry) => {
             if ours != Some(entry) {
@@ -5660,6 +9069,17 @@ struct MergeRenameConfig {
     enabled: bool,
     threshold: u32,
     rename_limit: usize,
+    directory_renames: DirectoryRenameMode,
+}
+
+/// Git's three directory-rename modes (`merge.directoryRenames`). `conflict`
+/// is the default: infer the destination, but leave every relocated path
+/// unmerged so the user explicitly confirms it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryRenameMode {
+    False,
+    Conflict,
+    True,
 }
 
 /// Git's effective `merge.renameLimit` when the value is unset or <= 0
@@ -5679,6 +9099,7 @@ impl Default for MergeRenameConfig {
             // `git -c merge.renameLimit=0` detects renames a 30-path merge
             // needs, so `0` is the default and not "no cap".
             rename_limit: GIT_MERGE_RENAME_LIMIT_DEFAULT,
+            directory_renames: DirectoryRenameMode::Conflict,
         }
     }
 }
@@ -5747,6 +9168,23 @@ async fn merge_rename_config() -> Result<MergeRenameConfig, PullMergeError> {
             .ok()
             .filter(|limit| *limit > 0)
             .unwrap_or(GIT_MERGE_RENAME_LIMIT_DEFAULT);
+    }
+    if let Some(value) = read("merge.directoryRenames").await? {
+        let trimmed = value.trim();
+        config.directory_renames = match trimmed.to_ascii_lowercase().as_str() {
+            "conflict" => DirectoryRenameMode::Conflict,
+            _ => match parse_git_config_bool(trimmed) {
+                Some(true) => DirectoryRenameMode::True,
+                Some(false) => DirectoryRenameMode::False,
+                None => {
+                    return Err(PullMergeError::InvalidRenameConfig {
+                        key: "merge.directoryRenames".to_string(),
+                        value,
+                        expected: "true, false or conflict",
+                    });
+                }
+            },
+        };
     }
     Ok(config)
 }
@@ -5935,6 +9373,168 @@ struct SideRenames {
     skipped_by_limit: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolveRenameNotice {
+    old: PathBuf,
+    new: PathBuf,
+    side: MergeSide,
+}
+
+fn detect_resolve_rename_notices(
+    base: &HashMap<PathBuf, MergeTreeEntry>,
+    ours: &HashMap<PathBuf, MergeTreeEntry>,
+    theirs: &HashMap<PathBuf, MergeTreeEntry>,
+    virtual_blobs: &VirtualBlobs,
+) -> Vec<ResolveRenameNotice> {
+    let config = MergeRenameConfig::default();
+    let mut reader = MergeRenameReader::new();
+    let mut notices = Vec::new();
+    for (side, items) in [(MergeSide::Ours, ours), (MergeSide::Theirs, theirs)] {
+        notices.extend(
+            detect_side_renames(base, items, &config, virtual_blobs, &mut reader)
+                .matches
+                .into_iter()
+                .map(|pair| ResolveRenameNotice {
+                    old: pair.old,
+                    new: pair.new,
+                    side,
+                }),
+        );
+    }
+    notices.sort_by(|left, right| {
+        left.old
+            .cmp(&right.old)
+            .then_with(|| left.new.cmp(&right.new))
+            .then_with(|| match (left.side, right.side) {
+                (MergeSide::Ours, MergeSide::Theirs) => std::cmp::Ordering::Less,
+                (MergeSide::Theirs, MergeSide::Ours) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+    });
+    notices
+}
+
+fn announce_resolve_rename_notices(
+    notices: &[ResolveRenameNotice],
+    upstream: &str,
+    output: &OutputConfig,
+) {
+    if output.is_json() {
+        return;
+    }
+    for notice in notices {
+        info_println!(
+            output,
+            "notice: resolve strategy disables rename detection; treating {} -> {} in {} as delete/add",
+            notice.old.display(),
+            notice.new.display(),
+            df_branch_label(notice.side, upstream)
+        );
+    }
+}
+
+/// One provisional directory rename selected by Git's plurality rule: the
+/// unique destination with the largest number of file renames wins. A tie is
+/// kept separately because it is a split-directory conflict, not a rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRename {
+    old: PathBuf,
+    new: PathBuf,
+    side: MergeSide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRenameSplit {
+    old: PathBuf,
+    destinations: Vec<PathBuf>,
+    side: MergeSide,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DirectoryRenamePlan {
+    renames: Vec<DirectoryRename>,
+    splits: Vec<DirectoryRenameSplit>,
+}
+
+/// Aggregate per-file rename pairs into provisional directory renames.
+///
+/// Each pair votes for its immediate parent and every non-root ancestor whose
+/// relative suffix can be removed from the destination. The unique highest
+/// count wins; a tied highest count is a split. This is Git's
+/// `get_provisional_directory_renames` rule — it is deliberately a plurality,
+/// not a strict-majority test.
+fn infer_provisional_directory_renames(
+    matches: &[rename_detect::RenameMatch],
+    side: MergeSide,
+) -> DirectoryRenamePlan {
+    let mut votes: BTreeMap<PathBuf, BTreeMap<PathBuf, usize>> = BTreeMap::new();
+    for pair in matches {
+        for old_dir in pair
+            .old
+            .ancestors()
+            .skip(1)
+            .take_while(|path| !path.as_os_str().is_empty())
+        {
+            let Ok(relative) = pair.old.strip_prefix(old_dir) else {
+                continue;
+            };
+            let mut new_dir = pair.new.as_path();
+            let mut valid = true;
+            for _ in relative.components() {
+                let Some(parent) = new_dir.parent() else {
+                    valid = false;
+                    break;
+                };
+                new_dir = parent;
+            }
+            if !valid || new_dir.as_os_str().is_empty() || new_dir == old_dir {
+                continue;
+            }
+            *votes
+                .entry(old_dir.to_path_buf())
+                .or_default()
+                .entry(new_dir.to_path_buf())
+                .or_default() += 1;
+        }
+    }
+
+    let mut plan = DirectoryRenamePlan::default();
+    for (old, destinations) in votes {
+        let Some(highest) = destinations.values().copied().max() else {
+            continue;
+        };
+        let winners: Vec<PathBuf> = destinations
+            .into_iter()
+            .filter_map(|(path, count)| (count == highest).then_some(path))
+            .collect();
+        match winners.as_slice() {
+            [new] => plan.renames.push(DirectoryRename {
+                old,
+                new: new.clone(),
+                side,
+            }),
+            [] => {}
+            _ => plan.splits.push(DirectoryRenameSplit {
+                old,
+                destinations: winners,
+                side,
+            }),
+        }
+    }
+    // Apply the most specific mapping first. This keeps a nested rename from
+    // being consumed by an ancestor mapping and is deterministic across map
+    // iteration order.
+    plan.renames.sort_by(|left, right| {
+        right
+            .old
+            .components()
+            .count()
+            .cmp(&left.old.components().count())
+            .then_with(|| left.old.cmp(&right.old))
+    });
+    plan
+}
+
 fn detect_side_renames(
     base: &HashMap<PathBuf, MergeTreeEntry>,
     side: &HashMap<PathBuf, MergeTreeEntry>,
@@ -5993,20 +9593,38 @@ fn detect_side_renames_inner(
     }
 }
 
-/// Why a detected rename was not used — every reason is reported to the user,
-/// because the merge then behaves as if the file had simply been deleted and
-/// another added (which is what Libra did before MG-05).
+/// How a detected rename must be handled when it cannot use the ordinary
+/// one-sided remap. These are path-level classifications, not all failures:
+/// some are resolved by specialized rename handling and only real conflicts
+/// produce a user-visible line.
 #[derive(Debug, PartialEq, Eq)]
 enum RenameDeclined {
-    /// Both sides renamed the same file to different paths (MG-06 turns this
-    /// into a proper rename/rename conflict).
+    /// Both sides renamed the same file to different paths: handled as a
+    /// rename/rename conflict.
     DivergentRenames { theirs: PathBuf },
-    /// Both sides renamed it to the SAME path (also MG-06).
+    /// Both sides renamed it to the SAME path: move the base there and merge.
     SameDestination,
-    /// The other side deleted the source (rename/delete, MG-06).
+    /// The other side DELETED the source — Git's rename/delete
+    /// (`merge-ort.c:3213-3221`).
     SourceDeleted,
-    /// Something already occupies the destination (rename/add, MG-06).
-    DestinationTaken,
+    /// The other side replaced the source with something of a different kind —
+    /// a symbolic link, a directory, a gitlink. Git takes its own
+    /// `type_changed` branch (`merge-ort.c:3205-3212`): the base still follows
+    /// the rename to the new path, but the source is NOT reported as deleted
+    /// and the type-changed entry SURVIVES under the old name. Measured on
+    /// git 2.50.1 (`/Volumes/Data/tmp/mg06-git/ktype`): the result holds
+    /// `120000 old` beside a `new` conflicted at stages 1 and 2, and the only
+    /// message is `CONFLICT (modify/delete): new deleted in <them> and
+    /// modified in <us>.` — never `rename/delete`.
+    SourceTypeChanged,
+    /// The other side has a file at the exact destination (rename/add,
+    /// MG-06). The collision consumes the source even though the rename does
+    /// not take the ordinary accepted path through the fix-up.
+    DestinationCollision,
+    /// A file ancestor, descendant, or directory marker structurally blocks
+    /// the destination. Unlike an exact collision, the rename does not happen
+    /// and its source continues to occupy its old path.
+    DestinationBlocked,
 }
 
 /// A rename accepted into the three-way match, or the reason it was not.
@@ -6015,6 +9633,62 @@ struct RenameDecision {
     new: PathBuf,
     side: MergeSide,
     declined: Option<RenameDeclined>,
+}
+
+/// Rename candidates whose destinations can be blocked by one path becoming
+/// occupied. A file at `a/b` blocks a destination at `a`, while a file at `a`
+/// blocks a destination at `a/b`; both directions matter when a declined
+/// rename puts its source back into the occupancy index.
+struct DestinationDependents<'a> {
+    exact: HashMap<&'a Path, Vec<usize>>,
+    strict_descendants: HashMap<&'a Path, Vec<usize>>,
+}
+
+impl<'a> DestinationDependents<'a> {
+    fn from_pairs(
+        pairs: &[(usize, &'a rename_detect::RenameMatch)],
+        declined: &[Option<RenameDeclined>],
+    ) -> Self {
+        let mut exact: HashMap<&Path, Vec<usize>> = HashMap::new();
+        let mut strict_descendants: HashMap<&Path, Vec<usize>> = HashMap::new();
+        for (slot, (_, pair)) in pairs.iter().enumerate() {
+            if declined[slot].is_some() {
+                continue;
+            }
+            exact.entry(pair.new.as_path()).or_default().push(slot);
+            for ancestor in pair
+                .new
+                .ancestors()
+                .skip(1)
+                .take_while(|path| !path.as_os_str().is_empty())
+            {
+                strict_descendants.entry(ancestor).or_default().push(slot);
+            }
+        }
+        Self {
+            exact,
+            strict_descendants,
+        }
+    }
+
+    fn requeue_blocked_by(&self, occupied: &Path, queue: &mut Vec<usize>) {
+        // Destinations equal to or above the occupied path are blocked by an
+        // entry beneath them.
+        for path in occupied
+            .ancestors()
+            .take_while(|path| !path.as_os_str().is_empty())
+        {
+            if let Some(affected) = self.exact.get(path) {
+                queue.extend(affected.iter().copied());
+            }
+        }
+        // Destinations below the occupied path are blocked when that occupant
+        // is a file. Requeueing directory destinations is harmless; the
+        // occupancy check below remains the source of truth for entry kind.
+        if let Some(affected) = self.strict_descendants.get(occupied) {
+            queue.extend(affected.iter().copied());
+        }
+    }
 }
 
 /// Decide which detected renames the three-way match can use. One place, so
@@ -6057,8 +9731,10 @@ fn decide_renames(
             }),
             // The other side must still hold the source AS A FILE, and as the
             // same KIND the rename moved, for a three-way match at the new
-            // path. Nothing there — a directory, an empty marker, or a type
-            // change — is Git's rename/delete, which MG-06 will arbitrate.
+            // path. Nothing there at all is Git's rename/delete; something of
+            // a DIFFERENT kind (a directory, an empty marker, a symlink) is its
+            // `type_changed` branch instead — the two are split below because
+            // Git reports and resolves them differently.
             None if !other.get(&pair.old).is_some_and(|entry| {
                 entry.mode != TreeItemMode::Tree
                     && this
@@ -6066,7 +9742,11 @@ fn decide_renames(
                         .is_some_and(|moved| same_entry_kind(entry.mode, moved.mode))
             }) =>
             {
-                Some(RenameDeclined::SourceDeleted)
+                Some(if other.contains_key(&pair.old) {
+                    RenameDeclined::SourceTypeChanged
+                } else {
+                    RenameDeclined::SourceDeleted
+                })
             }
             None => None,
         });
@@ -6076,14 +9756,16 @@ fn decide_renames(
     //
     // A rename takes its source away, so that source stops occupying its own
     // path and the directories above it, and two renames can free each other's
-    // destination. But a rename BLOCKED at its destination never happens, so
-    // its source stays — and that can block a further rename in turn. Releasing
-    // once and deciding once gets both wrong (Codex R15 gave the first, R16 the
-    // second, which left conflicting index entries for `new` and `new/child`).
-    // So: release every eligible source, then re-take the ones whose
-    // destination turns out to be occupied, re-checking only the renames that
-    // re-taking could affect. Each rename is blocked at most once, so the walk
-    // terminates and costs the paths' depth, not the square of the rename
+    // destination. But a rename structurally BLOCKED by an ancestor,
+    // descendant, or marker never happens, so its source stays — and that can
+    // block a further rename in turn. An exact file collision is different:
+    // MG-06 resolves it at the destination and consumes the source, as Git
+    // does. Releasing once and deciding once gets the structural case wrong
+    // (Codex R15 gave the first, R16 the second, which left conflicting index
+    // entries for `new` and `new/child`). So: release every eligible source,
+    // then re-take only the structurally blocked ones, re-checking the renames
+    // that re-taking could affect. Each rename is blocked at most once, so the
+    // walk terminates and costs the paths' depth, not the square of the rename
     // count.
     let base_names: HashSet<PathBuf> = occupied_names(base.keys());
     let mut occupancy = [
@@ -6112,17 +9794,7 @@ fn decide_renames(
             occupancy[other].apply(&pair.old, marker, true, -1);
         }
     }
-    // Which renames could a path becoming occupied again affect? Only those
-    // whose destination is that path or a directory above it.
-    let mut by_destination: HashMap<&Path, Vec<usize>> = HashMap::new();
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
-        if declined[slot].is_none() {
-            by_destination
-                .entry(pair.new.as_path())
-                .or_default()
-                .push(slot);
-        }
-    }
+    let destination_dependents = DestinationDependents::from_pairs(&pairs, &declined);
     let mut queue: Vec<usize> = (0..pairs.len())
         .filter(|slot| declined[*slot].is_none())
         .collect();
@@ -6135,15 +9807,19 @@ fn decide_renames(
         if !occupancy[other].occupied(&pair.new, base, &base_names) {
             continue;
         }
-        declined[slot] = Some(RenameDeclined::DestinationTaken);
+        let exact_collision = occupancy[other].file_at_path(&pair.new);
+        declined[slot] = Some(if exact_collision {
+            RenameDeclined::DestinationCollision
+        } else {
+            RenameDeclined::DestinationBlocked
+        });
+        if exact_collision {
+            continue;
+        }
         // The source stays where it is, so it occupies its path again.
         if let Some(marker) = counted_at(other, &pair.old) {
             occupancy[other].apply(&pair.old, marker, true, 1);
-            for path in paths_and_ancestors(std::iter::once(pair.old.as_path())) {
-                if let Some(affected) = by_destination.get(path.as_path()) {
-                    queue.extend(affected.iter().copied());
-                }
-            }
+            destination_dependents.requeue_blocked_by(&pair.old, &mut queue);
         }
     }
 
@@ -6166,15 +9842,23 @@ fn decide_renames(
 /// Do two tree entries hold the same KIND of thing — a regular file (either
 /// mode), a symbolic link, a directory, a gitlink?
 ///
-/// A rename pairs like with like. Git treats a source the other side turned
-/// into a symlink as DELETED and reports rename/delete: measured on git 2.50.1
-/// with base `old` (a regular file), ours renaming it to `new` and theirs
-/// replacing `old` with a symlink, `git merge` prints
-/// `CONFLICT (modify/delete): new deleted in th and modified in HEAD` and
-/// leaves ours' content at `new` (stages 1 and 2) with the symlink at `old`.
-/// Accepting the pair instead lets the type-changed entry be remapped onto the
-/// new path, where the ordinary three-way match takes it as the only change —
-/// and the renamed file's content disappears from a merge that exits 0.
+/// A rename pairs like with like: the source the other side turned into a
+/// symlink cannot be carried onto the new path. Git takes its own
+/// `type_changed` branch for this (`merge-ort.c:3205-3212`) — NOT rename/delete
+/// — and Libra classifies it as [`RenameDeclined::SourceTypeChanged`]. Measured
+/// on git 2.50.1 with base `old` (a regular file), ours renaming it to `new`
+/// and theirs replacing `old` with a symlink: the only message is
+/// `CONFLICT (modify/delete): new deleted in <them> and modified in <us>.`,
+/// `new` carries stages 1 and 2, and the SYMLINK SURVIVES at `old` in the
+/// result tree (`/Volumes/Data/tmp/mg06-git/ktype`).
+///
+/// Accepting the pair instead would let the type-changed entry be remapped onto
+/// the new path, where the ordinary three-way match takes it as the only change
+/// — and the renamed file's content disappears from a merge that exits 0.
+///
+/// (An earlier revision of this note said Git "reports rename/delete" here,
+/// which contradicted the measurement quoted in the same paragraph — Codex R1
+/// P2-6.)
 fn same_entry_kind(left: TreeItemMode, right: TreeItemMode) -> bool {
     fn kind(mode: TreeItemMode) -> u8 {
         match mode {
@@ -6262,6 +9946,10 @@ fn base_holds_anything_at(
 struct DestinationOccupancy {
     /// Files — anything that is not a directory marker — at or under a path.
     files: HashMap<PathBuf, usize>,
+    /// Non-directory entries at their exact paths. `files` answers whether
+    /// anything is at or below a destination; this companion index answers
+    /// whether a FILE sits on the way to a descendant destination.
+    files_at_path: HashMap<PathBuf, usize>,
     /// Empty-directory markers under a path. A marker never counts at its OWN
     /// path, only the directories above it, and blocks a destination only where
     /// the merge base had nothing there (MG-04's base-presence rule).
@@ -6276,6 +9964,10 @@ impl DestinationOccupancy {
     /// the rename that creates it — and for an empty-directory marker, which
     /// only ever occupies the directories above it.
     fn apply(&mut self, path: &Path, marker: bool, at_own_path: bool, delta: i64) {
+        if !marker && at_own_path {
+            let slot = self.files_at_path.entry(path.to_path_buf()).or_insert(0);
+            *slot = slot.saturating_add_signed(delta as isize);
+        }
         let counts = if marker {
             &mut self.markers
         } else {
@@ -6296,6 +9988,23 @@ impl DestinationOccupancy {
         }
     }
 
+    fn file_at_path(&self, path: &Path) -> bool {
+        self.files_at_path.get(path).is_some_and(|count| *count > 0)
+    }
+
+    fn file_occupied(&self, path: &Path) -> bool {
+        self.files.get(path).is_some_and(|count| *count > 0)
+            || path
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| {
+                    self.files_at_path
+                        .get(ancestor)
+                        .is_some_and(|count| *count > 0)
+                })
+    }
+
     /// Is anything left at or under `path` once the accepted renames have taken
     /// their sources away?
     fn occupied(
@@ -6304,7 +10013,7 @@ impl DestinationOccupancy {
         base: &HashMap<PathBuf, MergeTreeEntry>,
         base_names: &HashSet<PathBuf>,
     ) -> bool {
-        if self.files.get(path).is_some_and(|count| *count > 0) {
+        if self.file_occupied(path) {
             return true;
         }
         self.markers.get(path).is_some_and(|count| *count > 0)
@@ -6364,20 +10073,6 @@ fn side_occupancy(
         occupancy.apply(path, entry.mode == TreeItemMode::Tree, true, 1);
     }
     occupancy
-}
-
-/// Every directory on the way to one of `paths`, `paths` themselves included.
-fn paths_and_ancestors<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for path in paths {
-        for ancestor in path.ancestors() {
-            if ancestor.as_os_str().is_empty() {
-                break;
-            }
-            out.push(ancestor.to_path_buf());
-        }
-    }
-    out
 }
 
 /// How many accepted renames the given side made — the moves the merge
@@ -6448,34 +10143,838 @@ fn unseen_renames_by(
         .count()
 }
 
+/// MG-06: a path-level rename conflict, in the words Git reports it with.
+///
+/// The paths live here rather than inside [`ConflictKind`], which stays `Copy`
+/// because it travels through the whole conflict pipeline by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenameConflictNote {
+    /// `CONFLICT (rename/rename): <old> renamed to <a> in <ours> and to <b> in
+    /// <theirs>.` — `merge-ort.c:3069-3076`. One note per PAIR: Git handles
+    /// both sides' entries in a single step (`merge-ort.c:3078`, `i++`).
+    RenameRename {
+        old: PathBuf,
+        ours_path: PathBuf,
+        theirs_path: PathBuf,
+    },
+    /// `CONFLICT (rename/delete): <old> renamed to <new> in <X>, but deleted in
+    /// <Y>.` — `merge-ort.c:3215-3221`.
+    RenameDelete {
+        old: PathBuf,
+        new: PathBuf,
+        rename_side: MergeSide,
+    },
+    /// `CONFLICT (rename involved in collision): rename of <old> -> <new> has
+    /// content conflicts AND collides with another path; this may result in
+    /// nested conflict markers.` — `merge-ort.c:3169-3178`, printed ONLY when
+    /// the rename's OWN content merge came out unclean.
+    Collision { old: PathBuf, new: PathBuf },
+    /// A path added by the non-renaming side follows an inferred directory
+    /// rename. `conflict` distinguishes `merge.directoryRenames=conflict`
+    /// from the automatic `true` mode.
+    DirectoryMove {
+        old: PathBuf,
+        new: PathBuf,
+        added_side: MergeSide,
+        rename_side: MergeSide,
+        conflict: bool,
+    },
+    /// No unique directory destination won. Kept deterministic and visible;
+    /// the affected paths remain at their original names.
+    DirectorySplit { old: PathBuf },
+}
+
+/// Relocate additions (including ordinary rename destinations) made by the
+/// opposite side through the inferred directory rename. Base paths themselves
+/// are left alone: the regular rename pass below already carries those to
+/// their per-file destinations.
+#[allow(clippy::too_many_arguments)]
+fn apply_directory_renames(
+    base: &HashMap<PathBuf, MergeTreeEntry>,
+    ours: &mut HashMap<PathBuf, MergeTreeEntry>,
+    theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
+    our_matches: &mut [rename_detect::RenameMatch],
+    their_matches: &mut [rename_detect::RenameMatch],
+    config: &MergeRenameConfig,
+    conflict_style: ConflictStyle,
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
+    forced: &mut Vec<(PathBuf, ConflictKind)>,
+) -> Result<Vec<RenameConflictNote>, PullMergeError> {
+    if config.directory_renames == DirectoryRenameMode::False || context.depth != 0 {
+        return Ok(Vec::new());
+    }
+
+    let ours_plan = infer_provisional_directory_renames(our_matches, MergeSide::Ours);
+    let theirs_plan = infer_provisional_directory_renames(their_matches, MergeSide::Theirs);
+    let mut notes = Vec::new();
+
+    // A split is actionable only when the renaming side actually removed the
+    // old directory. Otherwise it is just a set of unrelated file renames.
+    for split in ours_plan.splits.iter().chain(theirs_plan.splits.iter()) {
+        let (renaming, other): (
+            &HashMap<PathBuf, MergeTreeEntry>,
+            &HashMap<PathBuf, MergeTreeEntry>,
+        ) = match split.side {
+            MergeSide::Ours => (&*ours, &*theirs),
+            MergeSide::Theirs => (&*theirs, &*ours),
+        };
+        if !renaming.keys().any(|path| path.starts_with(&split.old)) {
+            let mut affected: Vec<(PathBuf, MergeTreeEntry)> = other
+                .iter()
+                .filter(|(path, entry)| {
+                    entry.mode != TreeItemMode::Tree
+                        && path.starts_with(&split.old)
+                        && base
+                            .get(*path)
+                            .is_none_or(|base_entry| base_entry.mode == TreeItemMode::Tree)
+                })
+                .map(|(path, entry)| (path.clone(), *entry))
+                .collect();
+            affected.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let Some((conflict_path, content)) = affected.into_iter().next() else {
+                continue;
+            };
+            if !forced.iter().any(|(path, _)| path == &conflict_path) {
+                forced.push((conflict_path, ConflictKind::DirectorySplit { content }));
+            }
+            notes.push(RenameConflictNote::DirectorySplit {
+                old: split.old.clone(),
+            });
+        }
+    }
+
+    for rename in ours_plan.renames.into_iter().chain(theirs_plan.renames) {
+        let (renaming, other, other_matches, added_side): (
+            &HashMap<PathBuf, MergeTreeEntry>,
+            &mut HashMap<PathBuf, MergeTreeEntry>,
+            &mut [rename_detect::RenameMatch],
+            MergeSide,
+        ) = match rename.side {
+            MergeSide::Ours => (&*ours, &mut *theirs, their_matches, MergeSide::Theirs),
+            MergeSide::Theirs => (&*theirs, &mut *ours, our_matches, MergeSide::Ours),
+        };
+        // Git's directory rename rule applies only when the old directory is
+        // gone on the side that supplied the file renames.
+        if renaming.keys().any(|path| path.starts_with(&rename.old)) {
+            continue;
+        }
+
+        let mut additions: Vec<PathBuf> = other
+            .iter()
+            .filter(|(path, entry)| {
+                entry.mode != TreeItemMode::Tree
+                    && path.starts_with(&rename.old)
+                    && base
+                        .get(*path)
+                        .is_none_or(|base_entry| base_entry.mode == TreeItemMode::Tree)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        additions.sort();
+        for old_path in additions {
+            let Ok(relative) = old_path.strip_prefix(&rename.old) else {
+                continue;
+            };
+            let new_path = rename.new.join(relative);
+            if new_path == old_path {
+                continue;
+            }
+            let Some(moved) = other.get(&old_path).copied() else {
+                continue;
+            };
+
+            // Never overwrite a second path from the SAME side. Leave the
+            // source addressable and make the ambiguity explicit instead.
+            if other.contains_key(&new_path) {
+                forced.push((
+                    old_path.clone(),
+                    ConflictKind::RenameMerged {
+                        content: moved,
+                        kind: RenameConflictKind::DirectoryRename,
+                    },
+                ));
+                notes.push(RenameConflictNote::DirectoryMove {
+                    old: old_path,
+                    new: new_path,
+                    added_side,
+                    rename_side: rename.side,
+                    conflict: true,
+                });
+                continue;
+            }
+
+            other.remove(&old_path);
+            other.insert(new_path.clone(), moved);
+            // If this addition was itself a regular rename destination, the
+            // later per-file pass must use its relocated name too.
+            for pair in other_matches.iter_mut() {
+                if pair.new == old_path {
+                    pair.new = new_path.clone();
+                }
+            }
+
+            let conflict = config.directory_renames == DirectoryRenameMode::Conflict;
+            if conflict {
+                let counterpart = renaming
+                    .get(&new_path)
+                    .copied()
+                    .filter(|entry| entry.mode != TreeItemMode::Tree);
+                let kind = match (rename.side, counterpart) {
+                    (MergeSide::Ours, Some(ours_entry)) => rename_destination_conflict(
+                        &new_path,
+                        &ours_entry,
+                        &moved,
+                        branches.1,
+                        conflict_style,
+                        context,
+                    )?,
+                    (MergeSide::Theirs, Some(theirs_entry)) => rename_destination_conflict(
+                        &new_path,
+                        &moved,
+                        &theirs_entry,
+                        branches.1,
+                        conflict_style,
+                        context,
+                    )?,
+                    (_, None) => ConflictKind::RenameMerged {
+                        content: moved,
+                        kind: RenameConflictKind::DirectoryRename,
+                    },
+                };
+                forced.push((new_path.clone(), kind));
+            }
+            notes.push(RenameConflictNote::DirectoryMove {
+                old: old_path,
+                new: new_path,
+                added_side,
+                rename_side: rename.side,
+                conflict,
+            });
+        }
+    }
+    Ok(notes)
+}
+
+/// MG-06: the content merge Git runs for a rename before it settles the
+/// path-level conflict.
+///
+/// `handle_content_merge` is called with `extra_marker_size = 1 + 2 *
+/// call_depth` (`merge-ort.c:3027` for rename/rename(1to2), `:3161` for a
+/// collision), so a rename-involved conflict's markers are ONE character
+/// longer than an ordinary content conflict's, and the labels are
+/// `<branch>:<path>` rather than the bare branch name. Measured on git 2.50.1
+/// (`/Volumes/Data/tmp/mg06-git/r1to2c`): `<<<<<<<< HEAD:a` / `========` /
+/// `>>>>>>>> theirs:b`.
+///
+/// Unlike [`try_merge_blob_contents`] this returns a blob even on a conflict —
+/// Git passes `record_object = true` and stores a new result when needed, which
+/// lets both destinations of a 1to2 point at the same object. Trivial merges
+/// reuse an input object. Returns the entry and whether the merge was clean.
+#[allow(clippy::too_many_arguments)]
+fn merge_rename_content(
+    path: &Path,
+    base: Option<&MergeTreeEntry>,
+    ours: &MergeTreeEntry,
+    theirs: &MergeTreeEntry,
+    ours_label: &str,
+    theirs_label: &str,
+    base_label: &str,
+    conflict_style: ConflictStyle,
+    context: &mut TreeMergeContext<'_>,
+) -> Result<(MergeTreeEntry, bool), PullMergeError> {
+    // Git merges the mode independently of the content: the side that differs
+    // from the base wins, and when BOTH differ from it there is no answer —
+    // `handle_content_merge` keeps ours' and reports the merge UNCLEAN
+    // (`merge-ort.c:2211-2218`), which is what makes a collision print Git's
+    // `rename involved in collision` line even for a mode-only divergence
+    // (Codex R1 P2-3).
+    let (merged_mode, mode_clean) = match base {
+        Some(base) if ours.mode != theirs.mode => {
+            if ours.mode == base.mode {
+                (theirs.mode, true)
+            } else if theirs.mode == base.mode {
+                (ours.mode, true)
+            } else {
+                (ours.mode, false)
+            }
+        }
+        None if ours.mode != theirs.mode => (ours.mode, false),
+        _ => (ours.mode, true),
+    };
+    // Git handles trivial OID merges before the file-type-specific rules
+    // (`merge-ort.c:2243-2246`). A binary pure rename must carry the other
+    // side's source edit, just as a text rename does, without invoking the
+    // unmergeable-binary fallback or losing the independently merged mode.
+    let trivial_hash =
+        if ours.hash == theirs.hash || base.is_some_and(|base| ours.hash == base.hash) {
+            Some(theirs.hash)
+        } else if base.is_some_and(|base| theirs.hash == base.hash) {
+            Some(ours.hash)
+        } else {
+            None
+        };
+    if let Some(hash) = trivial_hash {
+        return Ok((
+            MergeTreeEntry {
+                hash,
+                mode: merged_mode,
+            },
+            mode_clean,
+        ));
+    }
+    // `-X ours` / `-X theirs` reach the rename's own content merge too: Git
+    // maps `MERGE_VARIANT_OURS`/`THEIRS` onto `ll_opts.variant`
+    // (`merge-ort.c:2129-2143`), so the favoured side settles the hunks and the
+    // merge comes out clean. `context.favor` is always `None` inside the
+    // virtual-ancestor fold, exactly as Git disables the variant at
+    // `call_depth > 0` (Codex R1 P1-1).
+    let favor = context.favor;
+    // A symlink, a gitlink, or binary content has no line-level merge:
+    // `ll_binary_merge` takes one whole side. Without `-X` this path keeps
+    // ours and reports UNCLEAN; with `-X` it takes the favoured side and is clean.
+    if !is_regular_file_mode(ours.mode) || !is_regular_file_mode(theirs.mode) {
+        if context.depth > 0 {
+            // Git restores the full original entry for recursive symlink
+            // conflicts, but keeps clean=false (merge-ort.c:2301-2305).
+            // Every rename caller supplies an original; an absent entry needs
+            // the optional-path result of virtual_conflict_resolution instead.
+            let original = base.copied().ok_or_else(|| {
+                PullMergeError::TreeCreate(format!(
+                    "cannot construct the virtual ancestor for {base_label}: \
+                     the renamed non-file entry has no original version"
+                ))
+            })?;
+            return Ok((original, false));
+        }
+        return Ok(match favor {
+            Some(MergeFavor::Ours) => (*ours, true),
+            Some(MergeFavor::Theirs) => (*theirs, true),
+            None => (*ours, false),
+        });
+    }
+    // A different original kind is a two-way content merge in Git; its mode
+    // still participates independently above (merge-ort.c:2254-2263).
+    let base_blob = match base.filter(|entry| is_regular_file_mode(entry.mode)) {
+        Some(base) => Some(load_merge_blob(base.hash, context.virtual_blobs)?),
+        None => None,
+    };
+    let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+    let base_data: &[u8] = match &base_blob {
+        Some(blob) => &blob.data,
+        None => &[],
+    };
+    let driver = context.driver_for_path(path);
+    if matches!(driver, SelectedMergeDriver::Builtin(_))
+        && (driver.is_builtin(BuiltinMergeDriver::Binary)
+            || merge_input_is_binary(base_data)
+            || merge_input_is_binary(&ours_blob.data)
+            || merge_input_is_binary(&theirs_blob.data))
+    {
+        if context.depth > 0 {
+            // ll_binary_merge(virtual_ancestor) returns orig with LL_MERGE_OK.
+            // Preserve the merged mode; no regular original means an empty
+            // blob, not either side's bytes or a missing ancestor path.
+            let hash = match &base_blob {
+                Some(original) => original.id,
+                None => {
+                    let empty = Blob::from_content_bytes(Vec::new());
+                    context.record_merged_blob(&empty)?;
+                    empty.id
+                }
+            };
+            return Ok((
+                MergeTreeEntry {
+                    hash,
+                    mode: merged_mode,
+                },
+                mode_clean,
+            ));
+        }
+        // ll_binary_merge selects bytes only; handle_content_merge retains
+        // the mode result even when the selected side has a different mode.
+        let (hash, content_clean) = match (driver.fallback_builtin(), favor) {
+            (BuiltinMergeDriver::Union, _) | (_, None) => (ours.hash, false),
+            (_, Some(MergeFavor::Ours)) => (ours.hash, true),
+            (_, Some(MergeFavor::Theirs)) => (theirs.hash, true),
+        };
+        return Ok((
+            MergeTreeEntry {
+                hash,
+                mode: merged_mode,
+            },
+            content_clean && mode_clean,
+        ));
+    }
+    let marker_len = conflict_marker_length_at_depth(
+        &[base_data, &ours_blob.data, &theirs_blob.data],
+        context.depth,
+    )
+    .saturating_add(1);
+    let outcome = match &driver {
+        SelectedMergeDriver::Builtin(driver) => merge_bytes_with_input_normalization(
+            *driver,
+            path,
+            base_data,
+            &ours_blob.data,
+            &theirs_blob.data,
+            MergeContentOptions {
+                favor,
+                conflict_style,
+                extra_marker_size: 1 + 2 * context.depth,
+                normalization: context.input_normalization,
+            },
+        )
+        .map_err(PullMergeError::TreeCreate)?,
+        SelectedMergeDriver::External(driver) => {
+            run_external_merge_driver_with_input_normalization(
+                &context.external_merge_runtime,
+                driver,
+                ExternalMergeInput {
+                    path,
+                    base_id: base.map_or_else(
+                        || Blob::from_content_bytes(Vec::new()).id,
+                        |entry| entry.hash,
+                    ),
+                    ours_id: ours.hash,
+                    theirs_id: theirs.hash,
+                    base: base_data,
+                    ours: &ours_blob.data,
+                    theirs: &theirs_blob.data,
+                    marker_length: marker_len,
+                    labels: ExternalMergeLabels {
+                        ancestor: base_label,
+                        ours: ours_label,
+                        theirs: theirs_label,
+                    },
+                },
+                context.input_normalization,
+            )
+            .map_err(PullMergeError::TreeCreate)?
+        }
+    };
+    let external = matches!(driver, SelectedMergeDriver::External(_));
+    let (bytes, clean) = match outcome {
+        BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
+        BuiltinMergeOutcome::Conflict(bytes) if external => (bytes, false),
+        BuiltinMergeOutcome::Conflict(bytes) => (
+            relabel_conflict_markers(bytes, marker_len, ours_label, theirs_label, base_label),
+            false,
+        ),
+    };
+    let blob = Blob::from_content_bytes(bytes);
+    context.record_merged_blob(&blob)?;
+    Ok((
+        MergeTreeEntry {
+            hash: blob.id,
+            mode: merged_mode,
+        },
+        // A mode divergence with no answer keeps the merge unclean even when
+        // the CONTENT merged cleanly.
+        clean && mode_clean,
+    ))
+}
+
+/// Merge a colliding destination's content without clearing its path conflict.
+fn rename_destination_conflict(
+    path: &Path,
+    ours: &MergeTreeEntry,
+    theirs: &MergeTreeEntry,
+    upstream: &str,
+    conflict_style: ConflictStyle,
+    context: &mut TreeMergeContext<'_>,
+) -> Result<ConflictKind, PullMergeError> {
+    let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+    let driver = context.driver_for_path(path);
+    let content = if ours.hash == theirs.hash {
+        *ours
+    } else if !is_regular_file_mode(ours.mode)
+        || !is_regular_file_mode(theirs.mode)
+        || (matches!(driver, SelectedMergeDriver::Builtin(_))
+            && (driver.is_builtin(BuiltinMergeDriver::Binary)
+                || merge_input_is_binary(&ours_blob.data)
+                || merge_input_is_binary(&theirs_blob.data)))
+    {
+        // Git's binary fallback selects one complete input. Even a favored
+        // result still carries the path conflict and both original stages.
+        match (driver.fallback_builtin(), context.favor) {
+            (BuiltinMergeDriver::Union, _) | (_, Some(MergeFavor::Ours) | None) => *ours,
+            (_, Some(MergeFavor::Theirs)) => *theirs,
+        }
+    } else {
+        // A base-less add/add still merges against the empty blob. In
+        // particular, an empty added file has no conflicting hunk for -X to
+        // choose, so it must not erase the other side's nonempty content.
+        match try_merge_blob_contents(path, None, *ours, *theirs, driver.clone(), context)? {
+            BlobMergeAttempt::Clean(merged)
+            | BlobMergeAttempt::Conflict {
+                rendered: Some(merged),
+                ..
+            } => MergeTreeEntry {
+                hash: merged.hash,
+                mode: ours.mode,
+            },
+            BlobMergeAttempt::Conflict { .. } | BlobMergeAttempt::NotApplicable => {
+                let bytes = if driver.is_builtin(BuiltinMergeDriver::Binary) {
+                    ours_blob.data
+                } else {
+                    both_changed_conflict_content(
+                        None,
+                        &ours_blob.data,
+                        &theirs_blob.data,
+                        upstream,
+                        conflict_style,
+                    )
+                    .map_err(PullMergeError::TreeCreate)?
+                };
+                let blob = Blob::from_content_bytes(bytes);
+                context.record_merged_blob(&blob)?;
+                MergeTreeEntry {
+                    hash: blob.id,
+                    mode: ours.mode,
+                }
+            }
+        }
+    };
+    Ok(ConflictKind::RenameMerged {
+        content,
+        kind: RenameConflictKind::Content,
+    })
+}
+
 /// Rewrite the base and the non-renaming side onto the new path so the
 /// ordinary three-way match sees one triple there (Git's `process_renames`).
 /// The source path disappears from all three maps: it is the same file.
+#[allow(clippy::too_many_arguments)]
 fn apply_renames(
     base: &mut HashMap<PathBuf, MergeTreeEntry>,
     ours: &mut HashMap<PathBuf, MergeTreeEntry>,
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
     decisions: &[RenameDecision],
-) {
+    forced: &mut Vec<(PathBuf, ConflictKind)>,
+    conflict_style: ConflictStyle,
+    // How each side is named in a conflict marker. `HEAD` / the upstream ref
+    // for the merge the user asked for, and Git's virtual-ancestor labels
+    // inside the fold — Git labels a rename-involved merge `<branch>:<path>`
+    // at every call depth.
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
+) -> Result<Vec<RenameConflictNote>, PullMergeError> {
+    let label = |side: MergeSide, path: &Path| {
+        let branch = match side {
+            MergeSide::Ours => branches.0,
+            MergeSide::Theirs => branches.1,
+        };
+        format!("{branch}:{}", path.display())
+    };
+    let mut notes = Vec::new();
+    // A rename/rename(1to2) arrives as one decision per side; Git reports and
+    // resolves the PAIR once (`merge-ort.c:3078` consumes `i+1` as well).
+    let mut folded: HashSet<PathBuf> = HashSet::new();
     for decision in decisions {
-        if decision.declined.is_some() {
-            continue;
-        }
-        let Some(base_entry) = base.remove(&decision.old) else {
-            continue;
-        };
-        base.insert(decision.new.clone(), base_entry);
-        let other: &mut HashMap<PathBuf, MergeTreeEntry> = match decision.side {
-            MergeSide::Ours => &mut *theirs,
-            MergeSide::Theirs => &mut *ours,
-        };
-        if let Some(entry) = other.remove(&decision.old) {
-            other.insert(decision.new.clone(), entry);
+        match &decision.declined {
+            // A plain rename, and rename/rename(1to1): Git carries the base to
+            // the new path for both. For 1to1 (`merge-ort.c:2991-3018`) BOTH
+            // sides already hold the destination, so moving the base is the
+            // whole of it and the ordinary content merge decides the rest —
+            // which is why 1to1 is a CLEAN merge in Git whenever the contents
+            // agree, not the base-less add/add Libra degraded it to before.
+            None | Some(RenameDeclined::SameDestination) => {
+                let Some(base_entry) = base.remove(&decision.old) else {
+                    continue;
+                };
+                base.insert(decision.new.clone(), base_entry);
+                let other: &mut HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &mut *theirs,
+                    MergeSide::Theirs => &mut *ours,
+                };
+                if let Some(entry) = other.remove(&decision.old) {
+                    other.insert(decision.new.clone(), entry);
+                }
+            }
+            Some(RenameDeclined::DivergentRenames { theirs: other_path }) => {
+                if !folded.insert(decision.old.clone()) {
+                    continue;
+                }
+                let (ours_path, theirs_path) = match decision.side {
+                    MergeSide::Ours => (decision.new.clone(), other_path.clone()),
+                    MergeSide::Theirs => (other_path.clone(), decision.new.clone()),
+                };
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base.get(&decision.old).copied(),
+                    ours.get(&ours_path).copied(),
+                    theirs.get(&theirs_path).copied(),
+                ) else {
+                    continue;
+                };
+                let (merged, clean) = merge_rename_content(
+                    &ours_path,
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    &label(MergeSide::Ours, &ours_path),
+                    &label(MergeSide::Theirs, &theirs_path),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git's `was_binary_blob` fallback (`merge-ort.c:3032-3053`):
+                // when the content merge could not actually be performed it
+                // just TOOK one whole side, so copying that side's blob to both
+                // destinations would overwrite the other side's data. Git
+                // detects exactly that shape — an unclean merge whose result IS
+                // ours' input — and hands the second destination theirs'
+                // original object instead. Git's own regression
+                // `t/t6422-merge-rename-corner-cases.sh:1423-1438` requires the
+                // two destinations to equal the two sides' originals
+                // (Codex R1 P1-2).
+                let theirs_content = if !clean && merged == ours_entry {
+                    theirs_entry
+                } else {
+                    merged
+                };
+                // Git copies ONE merge result into both sides' stages and
+                // leaves the base under the OLD name — `merge-ort.c:3036-3068`
+                // documents keeping the source at stage 1 as deliberate.
+                ours.insert(ours_path.clone(), merged);
+                theirs.insert(theirs_path.clone(), theirs_content);
+                forced.push((
+                    ours_path.clone(),
+                    match theirs.get(&ours_path) {
+                        Some(added) if context.depth == 0 => rename_destination_conflict(
+                            &ours_path,
+                            &merged,
+                            added,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                        // The fold discards forced conflicts and resolves the
+                        // remapped stages with virtual_conflict_resolution.
+                        Some(_) | None => ConflictKind::RenameMerged {
+                            content: merged,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    },
+                ));
+                forced.push((
+                    theirs_path.clone(),
+                    match ours.get(&theirs_path) {
+                        Some(added) if context.depth == 0 => rename_destination_conflict(
+                            &theirs_path,
+                            added,
+                            &theirs_content,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                        Some(_) | None => ConflictKind::RenameMerged {
+                            content: theirs_content,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    },
+                ));
+                // INTENTIONAL DEVIATION from Git: the source is resolved by
+                // REMOVAL rather than left unmerged at stage 1.
+                //
+                // Git's own comment at `merge-ort.c:3057-3068` calls keeping it
+                // legacy — "For renames we normally remove the path at the old
+                // name. It would thus seem consistent to do the same for
+                // rename/rename(1to2) cases, but we haven't done so
+                // traditionally and a number of the regression tests now encode
+                // an expectation that the file is left there at stage 1" — and
+                // spells out the two lines that would change it.
+                //
+                // Libra takes the consistent branch. The primary reason is
+                // Git's own verdict above; the secondary one is that keeping
+                // the stage would put the conflict out of reach of the ordinary
+                // staging flow. The source has no working-tree file, and
+                // `libra add` / `libra rm` / `libra restore --staged` all match
+                // paths through the staged entry, so none of them can address
+                // it (`LBR-CLI-003: pathspec did not match any files`, or
+                // `path is unmerged`); `add -A` silently no-ops on it.
+                //
+                // It is NOT unresolvable, and an earlier version of this note
+                // wrongly said so (Codex R1 P1-4): `libra read-tree HEAD`
+                // followed by `add -A .` does clear it, as does
+                // `update-index --cacheinfo`. Both are blunt — `read-tree`
+                // replaces the whole index and so discards every resolution
+                // staged so far, and `update-index` is plumbing — so the shape
+                // would still be a trap for anyone following the documented
+                // `add <path>` + `merge --continue` workflow.
+                //
+                // Both destinations carry the merged result, which already
+                // incorporates the base, so nothing is lost by dropping it.
+                base.remove(&decision.old);
+                notes.push(RenameConflictNote::RenameRename {
+                    old: decision.old.clone(),
+                    ours_path,
+                    theirs_path,
+                });
+            }
+            Some(reason @ (RenameDeclined::SourceDeleted | RenameDeclined::SourceTypeChanged)) => {
+                let type_changed = *reason == RenameDeclined::SourceTypeChanged;
+                let other: &HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &*theirs,
+                    MergeSide::Theirs => &*ours,
+                };
+                // rename/add/delete: the destination is ALSO taken by the other
+                // side. Git reports rename/delete but leaves the destination
+                // "as-is so they look like an add/add conflict"
+                // (`merge-ort.c:3180-3188`) — so the base is NOT carried over.
+                let destination_taken = other.contains_key(&decision.new);
+                let Some(base_entry) = base.remove(&decision.old) else {
+                    continue;
+                };
+                let side: &HashMap<PathBuf, MergeTreeEntry> = match decision.side {
+                    MergeSide::Ours => &*ours,
+                    MergeSide::Theirs => &*theirs,
+                };
+                let Some(entry) = side.get(&decision.new).copied() else {
+                    continue;
+                };
+                // A type-changed source SURVIVES under the old name (Git keeps
+                // the two side stages and only clears the base's,
+                // `merge-ort.c:3209-3211`); a deleted one is already gone from
+                // both sides.
+                if !type_changed {
+                    ours.remove(&decision.old);
+                    theirs.remove(&decision.old);
+                }
+                // Git copies the base to the NEW path's stage 1 whenever it
+                // reaches the rename branch (`merge-ort.c:3202-3204`, before
+                // the `type_changed` / `source_deleted` split). A COLLISION is
+                // what suppresses that — and for a type change Git clears the
+                // collision first (`:3090-3120`), so the base still travels.
+                // Only rename/add/delete (`collision && source_deleted`) leaves
+                // the destination base-less, "so they look like an add/add
+                // conflict" (`:3180-3188`). Codex R1 P1-3.
+                if type_changed || !destination_taken {
+                    base.insert(decision.new.clone(), base_entry);
+                }
+                if !destination_taken {
+                    // A PURE rename plus a delete is still a conflict for Git
+                    // even though the content never changed (measured: stages
+                    // 1 and 2 hold the same blob), so it is forced here — the
+                    // ordinary match would call it a clean delete.
+                    forced.push((
+                        decision.new.clone(),
+                        match decision.side {
+                            MergeSide::Ours => {
+                                ConflictKind::OursModifiedTheirsDeleted { ours: entry.hash }
+                            }
+                            MergeSide::Theirs => {
+                                ConflictKind::TheirsModifiedOursDeleted { theirs: entry.hash }
+                            }
+                        },
+                    ));
+                } else if !type_changed && context.depth == 0 {
+                    let (Some(ours_entry), Some(theirs_entry)) =
+                        (ours.get(&decision.new), theirs.get(&decision.new))
+                    else {
+                        continue;
+                    };
+                    // Git keeps path_conflict after the add/add content merge,
+                    // including when -X settles every hunk (merge-ort.c:3190).
+                    forced.push((
+                        decision.new.clone(),
+                        rename_destination_conflict(
+                            &decision.new,
+                            ours_entry,
+                            theirs_entry,
+                            branches.1,
+                            conflict_style,
+                            context,
+                        )?,
+                    ));
+                }
+                // Git prints NOTHING extra for a type change: the destination's
+                // own modify/delete line is the whole report.
+                if !type_changed {
+                    notes.push(RenameConflictNote::RenameDelete {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                        rename_side: decision.side,
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationCollision) => {
+                let Some(base_entry) = base.get(&decision.old).copied() else {
+                    continue;
+                };
+                let (side_entry, other_entry) = match decision.side {
+                    MergeSide::Ours => (
+                        ours.get(&decision.new).copied(),
+                        theirs.get(&decision.old).copied(),
+                    ),
+                    MergeSide::Theirs => (
+                        theirs.get(&decision.new).copied(),
+                        ours.get(&decision.old).copied(),
+                    ),
+                };
+                let (Some(side_entry), Some(other_entry)) = (side_entry, other_entry) else {
+                    continue;
+                };
+                let (ours_entry, theirs_entry) = match decision.side {
+                    MergeSide::Ours => (side_entry, other_entry),
+                    MergeSide::Theirs => (other_entry, side_entry),
+                };
+                let (merged, clean) = merge_rename_content(
+                    &decision.new,
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    // Codex R1 P2-1: Git's collision branch sets
+                    // `pathnames[other_source_index] = oldpath` and
+                    // `pathnames[target_index] = newpath`
+                    // (`merge-ort.c:3144-3146`) — only the side that DID the
+                    // rename is labelled with the destination.
+                    &label(
+                        MergeSide::Ours,
+                        match decision.side {
+                            MergeSide::Ours => &decision.new,
+                            MergeSide::Theirs => &decision.old,
+                        },
+                    ),
+                    &label(
+                        MergeSide::Theirs,
+                        match decision.side {
+                            MergeSide::Theirs => &decision.new,
+                            MergeSide::Ours => &decision.old,
+                        },
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git stores the rename's own merge at the renaming side's
+                // stage of the destination, leaves the other side's entry at
+                // its stage, records NO base there, and resolves the source by
+                // removal (`merge-ort.c:3137-3179`) — so the destination comes
+                // out as the add/add that was measured, for rename/add and
+                // rename/rename(2to1) alike.
+                match decision.side {
+                    MergeSide::Ours => ours.insert(decision.new.clone(), merged),
+                    MergeSide::Theirs => theirs.insert(decision.new.clone(), merged),
+                };
+                base.remove(&decision.old);
+                ours.remove(&decision.old);
+                theirs.remove(&decision.old);
+                if !clean {
+                    notes.push(RenameConflictNote::Collision {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationBlocked) => {}
         }
     }
+    Ok(notes)
 }
 
-/// What the user is told about renames the merge could not use.
 /// What the rename pass decided, held until the merge is known to proceed.
 ///
 /// The notices are NOT printed where the decision is made: the writer's
@@ -6485,10 +10984,17 @@ fn apply_renames(
 struct RenameOutcome {
     decisions: Vec<RenameDecision>,
     limited: Vec<MergeSide>,
+    /// MG-06: the path-level conflicts the renames produced, in Git's words.
+    notes: Vec<RenameConflictNote>,
+    /// MG-06: conflicts the ordinary three-way match must NOT decide for
+    /// itself — a rename/rename(1to2)'s two destinations and a rename/delete
+    /// whose content never changed (which the plain match would call a clean
+    /// delete).
+    forced: Vec<(PathBuf, ConflictKind)>,
 }
 
 fn announce_rename_notices(
-    decisions: &[RenameDecision],
+    notes: &[RenameConflictNote],
     limited_sides: &[MergeSide],
     upstream: &str,
     output: &OutputConfig,
@@ -6503,65 +11009,116 @@ fn announce_rename_notices(
             df_branch_label(*side, upstream)
         );
     }
-    for decision in decisions {
-        let Some(reason) = &decision.declined else {
-            continue;
-        };
-        let label = df_branch_label(decision.side, upstream);
-        match reason {
-            RenameDeclined::DivergentRenames { theirs } => info_println!(
+    // MG-06: Git's own wording, verbatim. Each line is a CONFLICT, not a
+    // notice: before this card these shapes degraded to "merging without
+    // rename detection", which lost the merge base and with it the conflict.
+    for note in notes {
+        match note {
+            RenameConflictNote::RenameRename {
+                old,
+                ours_path,
+                theirs_path,
+            } => info_println!(
                 output,
-                "notice: {} was renamed to {} on {} and to {} on the other side; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label,
-                theirs.display()
+                "CONFLICT (rename/rename): {} renamed to {} in {} and to {} in {}.",
+                old.display(),
+                ours_path.display(),
+                df_branch_label(MergeSide::Ours, upstream),
+                theirs_path.display(),
+                df_branch_label(MergeSide::Theirs, upstream)
             ),
-            RenameDeclined::SameDestination => info_println!(
+            RenameConflictNote::RenameDelete {
+                old,
+                new,
+                rename_side,
+            } => info_println!(
                 output,
-                "notice: both sides renamed {} to {}; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display()
+                "CONFLICT (rename/delete): {} renamed to {} in {}, but deleted in {}.",
+                old.display(),
+                new.display(),
+                df_branch_label(*rename_side, upstream),
+                df_branch_label(
+                    match rename_side {
+                        MergeSide::Ours => MergeSide::Theirs,
+                        MergeSide::Theirs => MergeSide::Ours,
+                    },
+                    upstream
+                )
             ),
-            RenameDeclined::SourceDeleted => info_println!(
+            RenameConflictNote::Collision { old, new } => info_println!(
                 output,
-                "notice: {} was renamed to {} on {} and deleted on the other side; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label
+                "CONFLICT (rename involved in collision): rename of {} -> {} has content conflicts AND collides with another path; this may result in nested conflict markers.",
+                old.display(),
+                new.display()
             ),
-            RenameDeclined::DestinationTaken => info_println!(
+            RenameConflictNote::DirectoryMove {
+                old,
+                new,
+                added_side,
+                rename_side,
+                conflict: false,
+            } => info_println!(
                 output,
-                "notice: {} was renamed to {} on {}, which another side already occupies; merging without rename detection for that path",
-                decision.old.display(),
-                decision.new.display(),
-                label
+                "Path updated: {} added in {} inside a directory that was renamed in {}; moving it to {}.",
+                old.display(),
+                df_branch_label(*added_side, upstream),
+                df_branch_label(*rename_side, upstream),
+                new.display()
+            ),
+            RenameConflictNote::DirectoryMove {
+                old,
+                new,
+                added_side,
+                rename_side,
+                conflict: true,
+            } => info_println!(
+                output,
+                "CONFLICT (file location): {} added in {} inside a directory that was renamed in {}, suggesting it should perhaps be moved to {}.",
+                old.display(),
+                df_branch_label(*added_side, upstream),
+                df_branch_label(*rename_side, upstream),
+                new.display()
+            ),
+            RenameConflictNote::DirectorySplit { old } => info_println!(
+                output,
+                "CONFLICT (directory rename split): Unclear where to rename {} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
+                old.display()
             ),
         }
     }
 }
 
-/// Detect renames on both sides and rewrite the maps in place. Returns what
-/// was detected so the caller can report it; the notices are printed here (a
-/// preview says the same thing a real merge would).
+/// Detect renames on both sides and rewrite the maps in place. Returns the
+/// decisions and deferred notices so the caller can announce them only after
+/// the merge's write preflight succeeds (or while producing a dry-run).
+#[allow(clippy::too_many_arguments)]
 fn detect_and_apply_renames(
     base: &mut HashMap<PathBuf, MergeTreeEntry>,
     ours: &mut HashMap<PathBuf, MergeTreeEntry>,
     theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
-    virtual_blobs: &VirtualBlobs,
     config: &MergeRenameConfig,
+    conflict_style: ConflictStyle,
+    branches: (&str, &str),
+    context: &mut TreeMergeContext<'_>,
 ) -> Result<RenameOutcome, PullMergeError> {
     if !config.enabled {
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
     // ONE reader for both sides: a blob shared by the two detections (the
     // base's, above all) is then read once.
     let mut reader = MergeRenameReader::new();
-    let our_side = detect_side_renames(base, ours, config, virtual_blobs, &mut reader);
-    let their_side = detect_side_renames(base, theirs, config, virtual_blobs, &mut reader);
+    let (mut our_side, mut their_side) = {
+        let virtual_blobs = &*context.virtual_blobs;
+        (
+            detect_side_renames(base, ours, config, virtual_blobs, &mut reader),
+            detect_side_renames(base, theirs, config, virtual_blobs, &mut reader),
+        )
+    };
     if our_side.matches.is_empty()
         && their_side.matches.is_empty()
         && !our_side.skipped_by_limit
@@ -6570,10 +11127,34 @@ fn detect_and_apply_renames(
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
+    let mut forced = Vec::new();
+    let mut notes = apply_directory_renames(
+        base,
+        ours,
+        theirs,
+        &mut our_side.matches,
+        &mut their_side.matches,
+        config,
+        conflict_style,
+        branches,
+        context,
+        &mut forced,
+    )?;
     let decisions = decide_renames(base, ours, theirs, &our_side.matches, &their_side.matches);
-    apply_renames(base, ours, theirs, &decisions);
+    notes.extend(apply_renames(
+        base,
+        ours,
+        theirs,
+        &decisions,
+        &mut forced,
+        conflict_style,
+        branches,
+        context,
+    )?);
     let mut limited = Vec::new();
     if our_side.skipped_by_limit {
         limited.push(MergeSide::Ours);
@@ -6581,7 +11162,46 @@ fn detect_and_apply_renames(
     if their_side.skipped_by_limit {
         limited.push(MergeSide::Theirs);
     }
-    Ok(RenameOutcome { decisions, limited })
+    Ok(RenameOutcome {
+        decisions,
+        limited,
+        notes,
+        forced,
+    })
+}
+
+/// The incremental walk keeps its pruning contract for ordinary merges. When
+/// its already-collected rename candidates can imply a directory rename, the
+/// caller reuses the flattening engine: directory relocation changes paths
+/// before the ordinary three-way resolution, and one implementation remains
+/// the source of truth for the resulting index stages and conflicts.
+fn incremental_may_need_flat_directory_renames(
+    sources: &[Vec<(PathBuf, MergeTreeEntry, Option<MergeTreeEntry>)>; 2],
+    dests: &[Vec<(PathBuf, MergeTreeEntry)>; 2],
+    config: &MergeRenameConfig,
+    virtual_blobs: &VirtualBlobs,
+) -> bool {
+    if !config.enabled || config.directory_renames == DirectoryRenameMode::False {
+        return false;
+    }
+    let mut reader = MergeRenameReader::new();
+    for (index, side) in [MergeSide::Ours, MergeSide::Theirs].into_iter().enumerate() {
+        if sources[index].is_empty() || dests[index].is_empty() {
+            continue;
+        }
+        let base_map: HashMap<PathBuf, MergeTreeEntry> = sources[index]
+            .iter()
+            .map(|(path, base, _)| (path.clone(), *base))
+            .collect();
+        let side_map: HashMap<PathBuf, MergeTreeEntry> = dests[index].iter().cloned().collect();
+        let detected =
+            detect_side_renames(&base_map, &side_map, config, virtual_blobs, &mut reader);
+        let plan = infer_provisional_directory_renames(&detected.matches, side);
+        if !plan.renames.is_empty() || !plan.splits.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// MG-05 for the pruned walk: the walk resolved the rename's source and
@@ -6598,6 +11218,10 @@ fn apply_incremental_renames(
     conflicts: &mut Vec<(PathBuf, ConflictKind)>,
     files_changed: &mut usize,
     context: &mut TreeMergeContext<'_>,
+    // MG-06: the style the rename-driven content merges are rendered with, and
+    // the label the other side's paths carry in their conflict markers.
+    conflict_style: ConflictStyle,
+    upstream: &str,
     // The merge base's root, for MG-04's base-presence rule: a destination
     // directory holding nothing but empty trees is in the way only when the
     // base had NOTHING there (Codex R15). Probed per destination, and only for
@@ -6609,6 +11233,8 @@ fn apply_incremental_renames(
         return Ok(RenameOutcome {
             decisions: Vec::new(),
             limited: Vec::new(),
+            notes: Vec::new(),
+            forced: Vec::new(),
         });
     }
     let mut decisions = Vec::new();
@@ -6700,12 +11326,23 @@ fn apply_incremental_renames(
             && occupancy.markers.get(path).is_some_and(|count| *count > 0)
     };
     let conflicted_paths: HashSet<&PathBuf> = conflicts.iter().map(|(path, _)| path).collect();
-    // `(marker, at_own_path)` — the same two facts the entry was counted with.
-    let held_at = |path: &PathBuf| -> Option<(bool, bool)> {
+    // `(marker, at_own_path, already_counted)` — the facts needed to release
+    // and, when a rename is blocked, restore the other side's source. A D/F
+    // candidate is deliberately not yet in `merged` or `conflicts`; the input
+    // source tuple is still authoritative there and must be indexed before it
+    // can participate in the optimistic release.
+    let held_at = |index: usize, path: &PathBuf| -> Option<(bool, bool, bool)> {
         merged
             .get(path)
-            .map(|entry| (entry.mode == TreeItemMode::Tree, false))
-            .or_else(|| conflicted_paths.contains(path).then_some((false, true)))
+            .map(|entry| (entry.mode == TreeItemMode::Tree, false, true))
+            .or_else(|| {
+                conflicted_paths
+                    .contains(path)
+                    .then_some((false, true, true))
+            })
+            .or_else(|| {
+                other_at(index, path).map(|entry| (entry.mode == TreeItemMode::Tree, true, false))
+            })
     };
     // PASS 1 — the declines that do not depend on occupancy.
     let pairs: Vec<(usize, &rename_detect::RenameMatch)> = per_side[0]
@@ -6733,32 +11370,32 @@ fn apply_incremental_renames(
                     .is_some_and(|moved| same_entry_kind(entry.mode, moved.mode))
             }) =>
             {
-                Some(RenameDeclined::SourceDeleted)
+                Some(if other_at(*index, &pair.old).is_some() {
+                    RenameDeclined::SourceTypeChanged
+                } else {
+                    RenameDeclined::SourceDeleted
+                })
             }
             None => None,
         });
     }
 
     // PASS 2 — occupancy, as the same fixed point the flattening engine runs:
-    // release every eligible source, then re-take the ones whose destination
-    // turns out to be occupied and re-check only what that could affect.
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
+    // release every eligible source, then re-take only the ones structurally
+    // blocked at their destination and re-check what that could affect. An
+    // exact file collision consumes its source in the MG-06 collision pass.
+    for (slot, (index, pair)) in pairs.iter().enumerate() {
         if declined[slot].is_some() {
             continue;
         }
-        if let Some((marker, at_own_path)) = held_at(&pair.old) {
+        if let Some((marker, at_own_path, already_counted)) = held_at(*index, &pair.old) {
+            if !already_counted {
+                occupancy.apply(&pair.old, marker, at_own_path, 1);
+            }
             occupancy.apply(&pair.old, marker, at_own_path, -1);
         }
     }
-    let mut by_destination: HashMap<&Path, Vec<usize>> = HashMap::new();
-    for (slot, (_, pair)) in pairs.iter().enumerate() {
-        if declined[slot].is_none() {
-            by_destination
-                .entry(pair.new.as_path())
-                .or_default()
-                .push(slot);
-        }
-    }
+    let destination_dependents = DestinationDependents::from_pairs(&pairs, &declined);
     let mut base_presence = BasePresence::default();
     let mut queue: Vec<usize> = (0..pairs.len())
         .filter(|slot| declined[*slot].is_none())
@@ -6769,7 +11406,7 @@ fn apply_incremental_renames(
         }
         let (index, pair) = pairs[slot];
         let taken = other_adds[1 - index].contains(&pair.new)
-            || occupancy.files.get(&pair.new).is_some_and(|count| *count > 0)
+            || occupancy.file_occupied(&pair.new)
             || (occupies_marker_only(&pair.new, &occupancy)
                 && !base_holds_anything_at(source, base_tree, &pair.new, &mut base_presence)?)
             // A subtree the walk carries whole IS a directory there — but only
@@ -6779,14 +11416,19 @@ fn apply_incremental_renames(
         if !taken {
             continue;
         }
-        declined[slot] = Some(RenameDeclined::DestinationTaken);
-        if let Some((marker, at_own_path)) = held_at(&pair.old) {
+        let exact_collision =
+            dest_at(1 - index, &pair.new).is_some_and(|entry| entry.mode != TreeItemMode::Tree);
+        declined[slot] = Some(if exact_collision {
+            RenameDeclined::DestinationCollision
+        } else {
+            RenameDeclined::DestinationBlocked
+        });
+        if exact_collision {
+            continue;
+        }
+        if let Some((marker, at_own_path, _)) = held_at(index, &pair.old) {
             occupancy.apply(&pair.old, marker, at_own_path, 1);
-            for path in paths_and_ancestors(std::iter::once(pair.old.as_path())) {
-                if let Some(affected) = by_destination.get(path.as_path()) {
-                    queue.extend(affected.iter().copied());
-                }
-            }
+            destination_dependents.requeue_blocked_by(&pair.old, &mut queue);
         }
     }
     for ((index, pair), declined) in pairs.into_iter().zip(declined) {
@@ -6816,7 +11458,7 @@ fn apply_incremental_renames(
     // ONE prune of the conflict list. Conflicts the resolution below pushes are
     // added afterwards, so they survive; two accepted renames never share a
     // path (a shared destination is declined as `SameDestination` or
-    // `DestinationTaken`), so the order within the pass does not matter.
+    // `DestinationCollision`), so the order within the pass does not matter.
     let mut renamed_paths: HashSet<PathBuf> = HashSet::new();
     for decision in &decisions {
         if decision.declined.is_some() {
@@ -6862,6 +11504,7 @@ fn apply_incremental_renames(
             MergeSide::Theirs => (other_entry, side_entry),
         };
         let resolved = match resolve_three_way(
+            &decision.new,
             Some(&base_entry),
             Some(&ours_entry),
             Some(&theirs_entry),
@@ -6917,7 +11560,385 @@ fn apply_incremental_renames(
         };
         *files_changed = (*files_changed + truth).saturating_sub(counted_by_walk);
     }
-    Ok(RenameOutcome { decisions, limited })
+    // MG-06: the declines the walk left as "no rename" become Git's PATH-LEVEL
+    // conflicts here, over the walk's own output. The flattening engine does
+    // the same surgery on its maps before it resolves anything
+    // ([`apply_renames`]); both engines must land on the same result, which is
+    // what the double-walk cases assert.
+    let mut notes = Vec::new();
+    let mut folded: HashSet<PathBuf> = HashSet::new();
+    // A 2to1 collision updates each destination stage separately. Keep the
+    // first source's merged content when processing the second source.
+    let mut collision_inputs: HashMap<PathBuf, [Option<MergeTreeEntry>; 2]> = HashMap::new();
+    // Whatever the walk decided for a path the rename pass takes over is
+    // replaced wholesale: its merged entry and any conflict it recorded go,
+    // and the rename's own verdict (if any) takes their place.
+    let settle = |path: &PathBuf,
+                  kind: Option<ConflictKind>,
+                  merged: &mut HashMap<PathBuf, MergeTreeEntry>,
+                  conflicts: &mut Vec<(PathBuf, ConflictKind)>| {
+        merged.remove(path);
+        conflicts.retain(|(other, _)| other != path);
+        if let Some(kind) = kind {
+            conflicts.push((path.clone(), kind));
+        }
+    };
+    for decision in &decisions {
+        let index = match decision.side {
+            MergeSide::Ours => 0,
+            MergeSide::Theirs => 1,
+        };
+        match &decision.declined {
+            None => {}
+            Some(RenameDeclined::SameDestination) => {
+                // rename/rename(1to1): Git carries the base to the shared
+                // destination and merges normally there
+                // (`merge-ort.c:2991-3018`), so the add/add the walk saw
+                // becomes a three-way merge that can come out CLEAN.
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(0, &decision.new),
+                    dest_at(1, &decision.new),
+                ) else {
+                    continue;
+                };
+                if !folded.insert(decision.new.clone()) {
+                    continue;
+                }
+                let resolved = resolve_three_way(
+                    &decision.new,
+                    Some(&base_entry),
+                    Some(&ours_entry),
+                    Some(&theirs_entry),
+                    context,
+                )?;
+                let before_counted = merged
+                    .get(&decision.new)
+                    .is_none_or(|entry| *entry != ours_entry)
+                    || conflicts.iter().any(|(path, _)| *path == decision.new);
+                settle(
+                    &decision.new,
+                    match resolved {
+                        MergeResolution::Conflict(kind) => Some(kind),
+                        _ => None,
+                    },
+                    merged,
+                    conflicts,
+                );
+                let after = match resolved {
+                    MergeResolution::Use(entry) => {
+                        merged.insert(decision.new.clone(), entry);
+                        Some(entry)
+                    }
+                    MergeResolution::Delete => None,
+                    MergeResolution::Conflict(_) => None,
+                };
+                let after_counted = after != Some(ours_entry);
+                *files_changed = (*files_changed + usize::from(after_counted))
+                    .saturating_sub(usize::from(before_counted));
+                // The old path is gone from both sides already; the walk
+                // resolved it as a clean delete, which is what Git does.
+            }
+            Some(RenameDeclined::DivergentRenames { theirs: other_path }) => {
+                if !folded.insert(decision.old.clone()) {
+                    continue;
+                }
+                let (ours_path, theirs_path) = match decision.side {
+                    MergeSide::Ours => (decision.new.clone(), other_path.clone()),
+                    MergeSide::Theirs => (other_path.clone(), decision.new.clone()),
+                };
+                let (Some(base_entry), Some(ours_entry), Some(theirs_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(0, &ours_path),
+                    dest_at(1, &theirs_path),
+                ) else {
+                    continue;
+                };
+                let (merged_entry, merged_clean) = merge_rename_content(
+                    &ours_path,
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Ours, upstream),
+                        ours_path.display()
+                    ),
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Theirs, upstream),
+                        theirs_path.display()
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // Git's `was_binary_blob` fallback (`merge-ort.c:3032-3053`):
+                // when the content merge could not actually be performed it
+                // just TOOK one whole side, so copying that side's blob to both
+                // destinations would overwrite the other side's data. Git
+                // detects exactly that shape — an unclean merge whose result IS
+                // ours' input — and hands the second destination theirs'
+                // original object instead. Git's own regression
+                // `t/t6422-merge-rename-corner-cases.sh:1423-1438` requires the
+                // two destinations to equal the two sides' originals
+                // (Codex R1 P1-2).
+                let theirs_content = if !merged_clean && merged_entry == ours_entry {
+                    theirs_entry
+                } else {
+                    merged_entry
+                };
+                for (path, content, rename_side) in [
+                    (&ours_path, merged_entry, 0),
+                    (&theirs_path, theirs_content, 1),
+                ] {
+                    let original_ours = dest_at(0, path);
+                    let before_counted = merged.get(path).copied() != original_ours;
+                    let kind = match dest_at(1 - rename_side, path) {
+                        Some(added) => {
+                            let (ours_side, theirs_side) = if rename_side == 0 {
+                                (content, added)
+                            } else {
+                                (added, content)
+                            };
+                            rename_destination_conflict(
+                                path,
+                                &ours_side,
+                                &theirs_side,
+                                upstream,
+                                conflict_style,
+                                context,
+                            )?
+                        }
+                        None => ConflictKind::RenameMerged {
+                            content,
+                            kind: RenameConflictKind::RenameRename,
+                        },
+                    };
+                    settle(path, Some(kind), merged, conflicts);
+                    let ours_after_remap = if rename_side == 0 {
+                        Some(content)
+                    } else {
+                        original_ours
+                    };
+                    *files_changed = (*files_changed + usize::from(ours_after_remap.is_some()))
+                        .saturating_sub(usize::from(before_counted));
+                }
+                // The source is resolved by removal, not left unmerged — see
+                // the deviation note in `apply_renames`.
+                settle(&decision.old, None, merged, conflicts);
+                notes.push(RenameConflictNote::RenameRename {
+                    old: decision.old.clone(),
+                    ours_path,
+                    theirs_path,
+                });
+            }
+            Some(reason @ (RenameDeclined::SourceDeleted | RenameDeclined::SourceTypeChanged)) => {
+                let type_changed = *reason == RenameDeclined::SourceTypeChanged;
+                let Some(side_entry) = dest_at(index, &decision.new) else {
+                    continue;
+                };
+                // rename/add/delete: the destination is ALSO taken, and Git
+                // leaves it looking like an add/add (`merge-ort.c:3180-3188`).
+                let destination_taken = dest_at(1 - index, &decision.new).is_some();
+                if !destination_taken {
+                    settle(
+                        &decision.new,
+                        Some(match decision.side {
+                            MergeSide::Ours => ConflictKind::OursModifiedTheirsDeleted {
+                                ours: side_entry.hash,
+                            },
+                            MergeSide::Theirs => ConflictKind::TheirsModifiedOursDeleted {
+                                theirs: side_entry.hash,
+                            },
+                        }),
+                        merged,
+                        conflicts,
+                    );
+                    // Codex R1 P1-6. The walk decided the destination on its
+                    // own: when OURS renamed, it saw ours' own entry there and
+                    // counted nothing; when THEIRS renamed, it saw an add that
+                    // differs from ours' absence and counted one. Forcing the
+                    // conflict takes the path out of the result, so the truth —
+                    // what `count_item_map_changes(ours_after_remap, merged)`
+                    // sees — is one when ours holds a file there after the
+                    // remap (i.e. ours did the rename) and zero otherwise.
+                    let truth = usize::from(decision.side == MergeSide::Ours);
+                    let counted_by_walk = usize::from(decision.side == MergeSide::Theirs);
+                    *files_changed = (*files_changed + truth).saturating_sub(counted_by_walk);
+                } else if !type_changed {
+                    let (Some(ours_entry), Some(theirs_entry)) =
+                        (dest_at(0, &decision.new), dest_at(1, &decision.new))
+                    else {
+                        continue;
+                    };
+                    let before_counted = merged.get(&decision.new).copied() != Some(ours_entry);
+                    settle(
+                        &decision.new,
+                        Some(rename_destination_conflict(
+                            &decision.new,
+                            &ours_entry,
+                            &theirs_entry,
+                            upstream,
+                            conflict_style,
+                            context,
+                        )?),
+                        merged,
+                        conflicts,
+                    );
+                    *files_changed =
+                        (*files_changed + 1).saturating_sub(usize::from(before_counted));
+                }
+                if type_changed && destination_taken {
+                    // The base travels to the destination even though something
+                    // occupies it (Codex R1 P1-3), so the walk's base-less
+                    // add/add verdict has to be replaced by the three-way the
+                    // flattening engine forms there.
+                    if let (Some(base_entry), Some(other_entry)) = (
+                        base_at(index, &decision.old),
+                        dest_at(1 - index, &decision.new),
+                    ) {
+                        let (ours_side, theirs_side) = match decision.side {
+                            MergeSide::Ours => (side_entry, other_entry),
+                            MergeSide::Theirs => (other_entry, side_entry),
+                        };
+                        let resolved = resolve_three_way(
+                            &decision.new,
+                            Some(&base_entry),
+                            Some(&ours_side),
+                            Some(&theirs_side),
+                            context,
+                        )?;
+                        settle(
+                            &decision.new,
+                            match resolved {
+                                MergeResolution::Conflict(kind) => Some(kind),
+                                _ => None,
+                            },
+                            merged,
+                            conflicts,
+                        );
+                        if let MergeResolution::Use(entry) = resolved {
+                            merged.insert(decision.new.clone(), entry);
+                        }
+                    }
+                }
+                if type_changed {
+                    // Git clears only the BASE bit at the source
+                    // (`oldinfo->filemask &= 0x06`, `merge-ort.c:3211`), which
+                    // leaves the type-changed entry as a plain one-sided add —
+                    // the walk saw base + one side and called it modify/delete,
+                    // so its verdict has to be replaced. Measured on git 2.50.1
+                    // (`/Volumes/Data/tmp/mg06-git/ktype`): the result tree
+                    // holds `120000 old` beside the conflicted `new`.
+                    if let Some(surviving) = other_at(index, &decision.old) {
+                        settle(&decision.old, None, merged, conflicts);
+                        merged.insert(decision.old.clone(), surviving);
+                    }
+                } else {
+                    settle(&decision.old, None, merged, conflicts);
+                    notes.push(RenameConflictNote::RenameDelete {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                        rename_side: decision.side,
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationCollision) => {
+                let (Some(base_entry), Some(side_entry), Some(other_entry)) = (
+                    base_at(index, &decision.old),
+                    dest_at(index, &decision.new),
+                    other_at(index, &decision.old),
+                ) else {
+                    continue;
+                };
+                let (ours_entry, theirs_entry) = match decision.side {
+                    MergeSide::Ours => (side_entry, other_entry),
+                    MergeSide::Theirs => (other_entry, side_entry),
+                };
+                let (rename_merged, clean) = merge_rename_content(
+                    &decision.new,
+                    Some(&base_entry),
+                    &ours_entry,
+                    &theirs_entry,
+                    // Codex R1 P2-1: only the renaming side carries the
+                    // destination path; the other side keeps the source.
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Ours, upstream),
+                        match decision.side {
+                            MergeSide::Ours => decision.new.display(),
+                            MergeSide::Theirs => decision.old.display(),
+                        }
+                    ),
+                    &format!(
+                        "{}:{}",
+                        df_branch_label(MergeSide::Theirs, upstream),
+                        match decision.side {
+                            MergeSide::Theirs => decision.new.display(),
+                            MergeSide::Ours => decision.old.display(),
+                        }
+                    ),
+                    &format!("base:{}", decision.old.display()),
+                    conflict_style,
+                    context,
+                )?;
+                // The destination becomes an add/add between the rename's own
+                // merge and whatever the other side put there — no base stage,
+                // exactly as measured for rename/add and rename/rename(2to1).
+                let destination = collision_inputs
+                    .entry(decision.new.clone())
+                    .or_insert_with(|| [dest_at(0, &decision.new), dest_at(1, &decision.new)]);
+                let counted_destination = merged.get(&decision.new).copied() != destination[0];
+                let original_source = match decision.side {
+                    MergeSide::Ours => None,
+                    MergeSide::Theirs => Some(other_entry),
+                };
+                let counted_source = merged.get(&decision.old).copied() != original_source;
+                destination[index] = Some(rename_merged);
+                let [ours_side, theirs_side] = *destination;
+                let resolved = resolve_three_way(
+                    &decision.new,
+                    None,
+                    ours_side.as_ref(),
+                    theirs_side.as_ref(),
+                    context,
+                )?;
+                settle(
+                    &decision.new,
+                    match resolved {
+                        MergeResolution::Conflict(kind) => Some(kind),
+                        _ => None,
+                    },
+                    merged,
+                    conflicts,
+                );
+                if let MergeResolution::Use(entry) = resolved {
+                    merged.insert(decision.new.clone(), entry);
+                }
+                settle(&decision.old, None, merged, conflicts);
+                // Compare against the same remapped ours that the flat path
+                // uses. Consuming a source removes its earlier walk count;
+                // a destination shared by two renames is counted only once.
+                let changed_destination = merged.get(&decision.new).copied() != ours_side;
+                *files_changed = (*files_changed + usize::from(changed_destination))
+                    .saturating_sub(usize::from(counted_destination) + usize::from(counted_source));
+                if !clean {
+                    notes.push(RenameConflictNote::Collision {
+                        old: decision.old.clone(),
+                        new: decision.new.clone(),
+                    });
+                }
+            }
+            Some(RenameDeclined::DestinationBlocked) => {}
+        }
+    }
+    Ok(RenameOutcome {
+        decisions,
+        limited,
+        notes,
+        forced: Vec::new(),
+    })
 }
 
 /// A path that is a FILE on one side and a DIRECTORY on the other — recorded
@@ -7372,6 +12393,14 @@ fn conflict_kind_name(kind: &ConflictKind) -> &'static str {
             ..
         } => "modify-delete",
         ConflictKind::FileDirectory { .. } => "file-directory",
+        // A 1to2 destination with another add is a content collision as well
+        // as a path conflict; pre-rendering must not hide that public kind.
+        ConflictKind::RenameMerged { kind, .. } => match kind {
+            RenameConflictKind::RenameRename => "rename-rename",
+            RenameConflictKind::Content => "content",
+            RenameConflictKind::DirectoryRename => "directory-rename",
+        },
+        ConflictKind::DirectorySplit { .. } => "directory-rename",
     }
 }
 
@@ -7531,7 +12560,7 @@ async fn perform_incremental_three_way_merge(
     head_name: String,
     upstream: &str,
     options: ThreeWayMergeOptions<'_>,
-) -> Result<PullMergeSummary, PullMergeError> {
+) -> Result<Option<PullMergeSummary>, PullMergeError> {
     // ROOT trees go through `refs/replace` exactly as the flattening path's
     // `load_object(&commit.tree_id)` does; nested trees are read raw on both
     // paths (`Tree::load` there, `load_object_raw` here). Same view, same ids.
@@ -7549,14 +12578,36 @@ async fn perform_incremental_three_way_merge(
     // the deferred enumeration can read more, and only the subtrees that
     // differ on a side offering both a source and a destination.
     let rename_config = three_way_rename_config(&options).await?;
+    // The walk itself performs content merges, so a valid style must reach it
+    // and the later rename replay. A bad presentation setting is deferred until
+    // the result actually needs conflict rendering; clean single-base merges
+    // retain the established behavior of ignoring an irrelevant bad value.
+    let (conflict_style, mut deferred_conflict_style_error) =
+        match conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (ConflictStyle::Merge, Some(error)),
+        };
     let (walk, passthrough_gitlinks) = incremental_merge_trees(
         &mut source,
         base_tree,
         ours_tree,
         theirs_tree,
-        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+        &mut TreeMergeContext::top_level_with_options(
+            &options,
+            conflict_style,
+            upstream,
+            &mut virtual_blobs,
+        ),
         rename_config.enabled,
     )?;
+    if incremental_may_need_flat_directory_renames(
+        &walk.rename_sources,
+        &walk.rename_dests,
+        &rename_config,
+        &virtual_blobs,
+    ) {
+        return Ok(None);
+    }
     let mut files_changed = walk.changed_paths;
     let df_candidates = walk.df_candidates;
     let introduced: HashSet<PathBuf> = walk
@@ -7569,8 +12620,13 @@ async fn perform_incremental_three_way_merge(
     // The walk resolved each path on its own; a detected rename joins two of
     // them, so the pair is re-resolved at the new path (Git's
     // `process_renames` does the same to its already-collected entries).
-    let mut rename_context =
-        TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs);
+    //
+    let mut rename_context = TreeMergeContext::top_level_with_options(
+        &options,
+        conflict_style,
+        upstream,
+        &mut virtual_blobs,
+    );
     let rename_decisions = apply_incremental_renames(
         &mut source,
         &walk.rename_sources,
@@ -7580,6 +12636,8 @@ async fn perform_incremental_three_way_merge(
         &mut conflicts,
         &mut files_changed,
         &mut rename_context,
+        conflict_style,
+        upstream,
         base_tree,
     )?;
     // Now the result is complete, so the collisions are settled last: an
@@ -7597,8 +12655,12 @@ async fn perform_incremental_three_way_merge(
     let renamed_paths: HashSet<&Path> = rename_decisions
         .decisions
         .iter()
-        .filter(|decision| decision.declined.is_none())
-        .flat_map(|decision| [decision.old.as_path(), decision.new.as_path()])
+        .flat_map(|decision| match &decision.declined {
+            None => [Some(decision.old.as_path()), Some(decision.new.as_path())],
+            Some(RenameDeclined::DestinationCollision) => [Some(decision.old.as_path()), None],
+            _ => [None, None],
+        })
+        .flatten()
         .collect();
     let df_candidates: Vec<DfCandidate> = df_candidates
         .into_iter()
@@ -7612,12 +12674,18 @@ async fn perform_incremental_three_way_merge(
         &mut files_changed,
     )?;
 
+    if !conflicts.is_empty()
+        && let Some(error) = deferred_conflict_style_error.take()
+    {
+        return Err(pull_conflict_style_error(error));
+    }
+
     if options.dry_run {
         // A preview writes nothing, so there is no write preflight to wait for
         // — and it must still report the rename decisions the real merge would
         // make (Codex R13 P2). `--json`/`--machine` stay silent, as always.
         announce_rename_notices(
-            &rename_decisions.decisions,
+            &rename_decisions.notes,
             &rename_decisions.limited,
             upstream,
             options.output,
@@ -7661,8 +12729,9 @@ async fn perform_incremental_three_way_merge(
             .collect();
         let conflict_kinds = conflict_reports(&placements);
         let would_conflict = !conflicted_paths.is_empty();
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "three-way".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -7675,7 +12744,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict,
             conflict_kinds,
             autostash: None,
-        });
+        }));
     }
 
     let resolved_message = resolve_merge_message(
@@ -7683,9 +12752,9 @@ async fn perform_incremental_three_way_merge(
         target_commit.id,
         upstream,
         &head_name,
-        options.message_override.as_ref(),
-        options.merge_log,
-    )?;
+        MergeMessageSettings::from_three_way_options(&options),
+    )
+    .await?;
 
     if !conflicts.is_empty() {
         // The conflict path writes per-file index entries and worktree files,
@@ -7693,10 +12762,6 @@ async fn perform_incremental_three_way_merge(
         // lists every file. Reads here are O(tree), as the flattening path's
         // were; the pruning pays off on the decision and on the clean path.
         expand_adopted_subtrees(&mut source, &mut merged_items)?;
-        let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
-            ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
-            ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
-        })?;
         let (mut base_items, _) = match base_tree {
             Some(id) => split_gitlink_entries(tree_leaves(&mut source, id)?),
             None => (HashMap::new(), GitlinkEntries::new()),
@@ -7708,12 +12773,32 @@ async fn perform_incremental_three_way_merge(
         // MG-05: a conflict the rename moved is unmerged at the NEW path, so
         // its stages must be looked up there — the same remap the flattening
         // engine applies to its maps before it resolves anything.
+        // MG-06: replaying the SAME surgery the walk's rename pass performed
+        // is what makes the stages agree with it — a rename/rename(1to2) puts
+        // the one merged blob on both destinations and keeps the base under
+        // the old name, a collision drops the source entirely. The content
+        // merges are deterministic, so replaying them re-derives the identical
+        // object ids; the forced conflicts are already in `conflicts` and the
+        // replay's copy is discarded.
+        let mut replayed_forced = Vec::new();
         apply_renames(
             &mut base_items,
             &mut our_items,
             &mut their_items,
             &rename_decisions.decisions,
-        );
+            &mut replayed_forced,
+            conflict_style,
+            (
+                df_branch_label(MergeSide::Ours, upstream).as_str(),
+                upstream,
+            ),
+            &mut TreeMergeContext::top_level_with_options(
+                &options,
+                conflict_style,
+                upstream,
+                &mut virtual_blobs,
+            ),
+        )?;
         conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
         let placements = conflict_placements(
             &conflicts,
@@ -7729,10 +12814,14 @@ async fn perform_incremental_three_way_merge(
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
             message: resolved_message,
+            squash: options.squash,
             upstream: upstream.to_string(),
             base: recorded_base,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: options.signing_policy,
+            signoff: options.signoff,
+            strategy: options.strategy,
             ours: current_commit.id,
             theirs: target_commit.id,
             merged_items,
@@ -7746,7 +12835,7 @@ async fn perform_incremental_three_way_merge(
         // symlink traversal, directory takeover) may still refuse the merge,
         // and Git prints nothing when it does. Same for the rename notices.
         announce_rename_notices(
-            &rename_decisions.decisions,
+            &rename_decisions.notes,
             &rename_decisions.limited,
             upstream,
             options.output,
@@ -7755,8 +12844,15 @@ async fn perform_incremental_three_way_merge(
         if let Err(error) = crate::command::rerere::auto_update(false).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }
-        let paths = MergeState::load_required()?.conflicted_paths.join(", ");
-        return Err(PullMergeError::Conflicts { paths });
+        let paths = placements
+            .iter()
+            .map(|(path, _, _)| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(PullMergeError::Conflicts {
+            paths,
+            squash: options.squash,
+        });
     }
 
     let current_index =
@@ -7776,7 +12872,7 @@ async fn perform_incremental_three_way_merge(
     // The preflight passed, so the merge will happen: the rename notices can be
     // printed now (Codex R12 P2 — a refused merge prints no rename decision).
     announce_rename_notices(
-        &rename_decisions.decisions,
+        &rename_decisions.notes,
         &rename_decisions.limited,
         upstream,
         options.output,
@@ -7792,8 +12888,9 @@ async fn perform_incremental_three_way_merge(
     if options.squash {
         report_incremental_walk_stats();
         reset_index_and_workdir_to_tree(&tree_id)?;
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "squash".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -7806,7 +12903,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict: false,
             conflict_kinds: Vec::new(),
             autostash: None,
-        });
+        }));
     }
 
     if options.no_commit {
@@ -7817,16 +12914,21 @@ async fn perform_incremental_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
             base: recorded_base.map(|base| base.to_string()),
-            strategy: None,
+            strategy: options.strategy,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
+            signing_policy: Some(options.signing_policy),
+            signoff: options.signoff,
             conflicted_paths: Vec::new(),
             message: Some(resolved_message.clone()),
         }
         .save()?;
-        return Ok(PullMergeSummary {
+        return Ok(Some(PullMergeSummary {
             strategy: "no-commit".to_string(),
+            selected_strategy: None,
             old_commit: Some(current_commit.id.to_string()),
             commit: None,
             files_changed,
@@ -7839,7 +12941,7 @@ async fn perform_incremental_three_way_merge(
             would_conflict: false,
             conflict_kinds: Vec::new(),
             autostash: None,
-        });
+        }));
     }
 
     let message = if !options.skip_hooks {
@@ -7870,7 +12972,9 @@ async fn perform_incremental_three_way_merge(
     let merge_commit = build_merge_commit(
         tree_id,
         vec![current_commit.id, target_commit.id],
-        &format_commit_msg(&message, None),
+        &message,
+        options.signing_policy,
+        options.signoff,
     )
     .await?;
     report_incremental_walk_stats();
@@ -7889,13 +12993,20 @@ async fn perform_incremental_three_way_merge(
     reset_index_and_workdir_to_tree(&tree_id)?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
-    update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
+    update_head_with_reflog(
+        &head_name,
+        merge_commit.id,
+        upstream,
+        options.strategy.map_or("three-way", MergeStrategy::name),
+    )
+    .await?;
     if !options.skip_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
     }
 
-    Ok(PullMergeSummary {
+    Ok(Some(PullMergeSummary {
         strategy: "three-way".to_string(),
+        selected_strategy: None,
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -7908,7 +13019,7 @@ async fn perform_incremental_three_way_merge(
         would_conflict: false,
         conflict_kinds: Vec::new(),
         autostash: None,
-    })
+    }))
 }
 
 /// Read-only availability probe for `--dry-run`: load every tree the result
@@ -8022,7 +13133,7 @@ fn merge_tree_items(
             our_items.get(&path),
             their_items.get(&path),
         );
-        match resolve_three_way(base, ours, theirs, context)? {
+        match resolve_three_way(&path, base, ours, theirs, context)? {
             MergeResolution::Use(hash) => {
                 merged_items.insert(path, hash);
             }
@@ -8438,10 +13549,6 @@ fn prune_empty_parents(workdir: &Path, relative: &Path) {
     }
 }
 
-fn conflict_marker_eol() -> &'static str {
-    if cfg!(windows) { "\r\n" } else { "\n" }
-}
-
 fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
     match std::str::from_utf8(content) {
         Ok(text) => Cow::Borrowed(text),
@@ -8452,41 +13559,73 @@ fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
 fn write_conflict_markers(
     workdir: &Path,
     path: &Path,
-    marker_eol: &str,
     commit_abbrev: &str,
     kind: ConflictKind,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 ) -> Result<(), String> {
     let content: Vec<u8> = match kind {
-        ConflictKind::BothChanged { base, ours, theirs } => {
+        ConflictKind::BothChanged {
+            base,
+            ours,
+            theirs,
+            driver,
+            rendered,
+        } => {
+            if let Some(rendered) = rendered {
+                return load_object::<Blob>(&rendered.hash)
+                    .map(|blob| blob.data)
+                    .map_err(|error| error.to_string())
+                    .and_then(|content| write_workdir_file(workdir, path, &content));
+            }
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
-            both_changed_conflict_content(
-                base,
-                &ours_blob.data,
-                &theirs_blob.data,
-                marker_eol,
-                commit_abbrev,
-                conflict_style,
-            )?
+            match driver {
+                BuiltinMergeDriver::Binary => ours_blob.data,
+                BuiltinMergeDriver::Union => {
+                    let base_data = match base {
+                        Some(base) => {
+                            load_object::<Blob>(&base)
+                                .map_err(|error| error.to_string())?
+                                .data
+                        }
+                        None => Vec::new(),
+                    };
+                    match merge_bytes_with_refined_driver(
+                        driver,
+                        &base_data,
+                        &ours_blob.data,
+                        &theirs_blob.data,
+                        None,
+                        conflict_style,
+                        0,
+                    )? {
+                        BuiltinMergeOutcome::Clean(bytes)
+                        | BuiltinMergeOutcome::Conflict(bytes) => bytes,
+                    }
+                }
+                BuiltinMergeDriver::Text => both_changed_conflict_content(
+                    base,
+                    &ours_blob.data,
+                    &theirs_blob.data,
+                    commit_abbrev,
+                    conflict_style,
+                )?,
+            }
         }
         ConflictKind::OursModifiedTheirsDeleted { ours } => {
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
-            format!(
-                "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}>>>>>>> {} (deleted){marker_eol}",
-                conflict_payload(&ours_blob.data),
-                commit_abbrev
+            let ours = conflict_payload(&ours_blob.data);
+            render_whole_file_conflict(
+                ours.as_bytes(),
+                &[],
+                "HEAD",
+                &format!("{commit_abbrev} (deleted)"),
             )
-            .into_bytes()
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
-            format!(
-                "<<<<<<< HEAD (deleted){marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-                conflict_payload(&theirs_blob.data),
-                commit_abbrev
-            )
-            .into_bytes()
+            let theirs = conflict_payload(&theirs_blob.data);
+            render_whole_file_conflict(&[], theirs.as_bytes(), "HEAD (deleted)", commit_abbrev)
         }
         // The directory kept the original path; `path` here is already the
         // file's `unique_path`, and its content is written verbatim — Git
@@ -8494,6 +13633,18 @@ fn write_conflict_markers(
         ConflictKind::FileDirectory { file, .. } => {
             let blob: Blob = load_object(&file.hash).map_err(|error| error.to_string())?;
             blob.data
+        }
+        // MG-06: already the merged result Git recorded for the rename
+        // (`merge-ort.c:3021-3053`), including its conflict markers when the
+        // content merge was not clean — written verbatim, never marked up
+        // twice.
+        ConflictKind::RenameMerged { content, .. } => {
+            let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
+            return write_workdir_entry(workdir, path, content.mode, &blob.data);
+        }
+        ConflictKind::DirectorySplit { content } => {
+            let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
+            return write_workdir_entry(workdir, path, content.mode, &blob.data);
         }
     };
     write_workdir_file(workdir, path, &content)
@@ -8513,18 +13664,13 @@ fn both_changed_conflict_content(
     base: Option<ObjectHash>,
     ours: &[u8],
     theirs: &[u8],
-    marker_eol: &str,
     commit_abbrev: &str,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: ConflictStyle,
 ) -> Result<Vec<u8>, String> {
     let whole_file = || {
-        format!(
-            "<<<<<<< HEAD{marker_eol}{}{marker_eol}======={marker_eol}{}{marker_eol}>>>>>>> {}{marker_eol}",
-            conflict_payload(ours),
-            conflict_payload(theirs),
-            commit_abbrev
-        )
-        .into_bytes()
+        let ours = conflict_payload(ours);
+        let theirs = conflict_payload(theirs);
+        render_whole_file_conflict(ours.as_bytes(), theirs.as_bytes(), "HEAD", commit_abbrev)
     };
 
     // Load the common-ancestor content (if any) and defer to the shared
@@ -8542,7 +13688,7 @@ fn both_changed_conflict_content(
         theirs,
         commit_abbrev,
         conflict_style,
-    )
+    )?
     .unwrap_or_else(whole_file))
 }
 
@@ -8562,13 +13708,13 @@ pub(crate) fn render_line_level_conflict(
     ours: &[u8],
     theirs: &[u8],
     commit_label: &str,
-    conflict_style: diffy::ConflictStyle,
-) -> Option<Vec<u8>> {
+    conflict_style: ConflictStyle,
+) -> Result<Option<Vec<u8>>, String> {
     if std::str::from_utf8(ours).is_err()
         || std::str::from_utf8(theirs).is_err()
         || base.is_some_and(|b| std::str::from_utf8(b).is_err())
     {
-        return None;
+        return Ok(None);
     }
 
     // Choose a marker length long enough that no line in the inputs can be
@@ -8577,21 +13723,30 @@ pub(crate) fn render_line_level_conflict(
     // only `diffy`'s emitted markers.
     let marker_len = conflict_marker_length(&[base.unwrap_or(&[]), ours, theirs]);
     let mut options = diffy::MergeOptions::new();
-    options.set_conflict_style(conflict_style);
+    options.set_conflict_style(conflict_style.diffy_style());
     options.set_conflict_marker_length(marker_len);
     match options.merge_bytes(base.unwrap_or(&[]), ours, theirs) {
-        // A genuine conflict: `diffy` returns the file with line-level markers
-        // labelled `ours`/`theirs`; relabel them to Git's `HEAD`/<commit>.
-        Err(conflicted) => Some(relabel_conflict_markers(
-            conflicted,
+        // A genuine conflict: refine diffy's block and relabel it in one
+        // byte-preserving pass so the shared merge/cherry-pick/revert renderer
+        // also controls zdiff3 and marker line endings.
+        Err(conflicted) => refine_diffy_conflicts(
+            &conflicted,
             marker_len,
-            "HEAD",
-            commit_label,
-        )),
+            conflict_style,
+            base.unwrap_or(&[]),
+            ours,
+            theirs,
+            ConflictMarkerLabels {
+                ours: "HEAD",
+                base: "base",
+                theirs: commit_label,
+            },
+        )
+        .map(|(rendered, has_conflicts)| has_conflicts.then_some(rendered)),
         // Content merged cleanly with no markers (no real text conflict — e.g. a
         // mode-only divergence): let the caller surface it as a whole-file
         // conflict rather than writing the silently-merged text.
-        Ok(_) => None,
+        Ok(_) => Ok(None),
     }
 }
 
@@ -8633,18 +13788,23 @@ fn relabel_conflict_markers(
     marker_len: usize,
     ours_label: &str,
     theirs_label: &str,
+    // The `|||||||` label under `diff3`. Git names the merge base
+    // `<ancestor>` when all three paths are the same and `<ancestor>:<path>`
+    // when they are not (`merge-ort.c:2147-2155`), so a rename-driven merge
+    // labels it with the SOURCE path (Codex R1 P2-2).
+    base_label: &str,
 ) -> Vec<u8> {
     let open = "<".repeat(marker_len);
     let close = ">".repeat(marker_len);
     let bars = "|".repeat(marker_len);
     let ours_marker = format!("{open} ours");
     let theirs_marker = format!("{close} theirs");
-    // `diffy`'s diff3 base marker; only emitted under ConflictStyle::Diff3.
+    // `diffy`'s base marker; emitted for Diff3 and ZDiff3 raw blocks.
     let original_marker = format!("{bars} original");
     let head_marker = format!("{open} {ours_label}");
     let label_marker = format!("{close} {theirs_label}");
     // Match the `||||||| base` label convention `restore --conflict=diff3` uses.
-    let base_marker = format!("{bars} base");
+    let base_marker = format!("{bars} {base_label}");
 
     // Byte-wise, never through `String::from_utf8_lossy`: the recursive
     // virtual-ancestor fold relabels content that Git's binary rule considers
@@ -8658,16 +13818,23 @@ fn relabel_conflict_markers(
         if index > 0 {
             relabelled.push(b'\n');
         }
-        let replacement = if line == ours_marker.as_bytes() {
+        let (body, had_cr) = match line.strip_suffix(b"\r") {
+            Some(body) => (body, true),
+            None => (line, false),
+        };
+        let replacement = if body == ours_marker.as_bytes() {
             head_marker.as_bytes()
-        } else if line == theirs_marker.as_bytes() {
+        } else if body == theirs_marker.as_bytes() {
             label_marker.as_bytes()
-        } else if line == original_marker.as_bytes() {
+        } else if body == original_marker.as_bytes() {
             base_marker.as_bytes()
         } else {
-            line
+            body
         };
         relabelled.extend_from_slice(replacement);
+        if had_cr {
+            relabelled.push(b'\r');
+        }
     }
     relabelled
 }
@@ -8871,8 +14038,471 @@ fn short_object_id(object_id: &ObjectHash) -> String {
 }
 
 #[cfg(test)]
+#[path = "merge_rename_content_test.rs"]
+mod merge_rename_content_test;
+
+#[cfg(test)]
+mod driver {
+    use super::*;
+
+    #[test]
+    fn builtins_follow_attribute_precedence_and_text_fallbacks() {
+        for (attribute, default, expected) in [
+            (Some(AttributeState::Set), None, BuiltinMergeDriver::Text),
+            (
+                Some(AttributeState::Unset),
+                Some("union"),
+                BuiltinMergeDriver::Binary,
+            ),
+            (
+                Some(AttributeState::Value("union".to_string())),
+                None,
+                BuiltinMergeDriver::Union,
+            ),
+            (
+                Some(AttributeState::Value("unknown".to_string())),
+                Some("union"),
+                BuiltinMergeDriver::Text,
+            ),
+            (None, Some("binary"), BuiltinMergeDriver::Binary),
+            (None, Some("unknown"), BuiltinMergeDriver::Text),
+            (None, None, BuiltinMergeDriver::Text),
+        ] {
+            assert_eq!(select_builtin_merge_driver(attribute, default), expected);
+        }
+    }
+
+    #[test]
+    fn union_retains_only_both_conflicting_sides_in_order() {
+        let result = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Union,
+            b"top\nbase\nbottom\n",
+            b"top\nours\nbottom\n",
+            b"top\ntheirs\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("union driver");
+        assert_eq!(
+            result,
+            BuiltinMergeOutcome::Clean(b"top\nours\ntheirs\nbottom\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn binary_driver_keeps_trivial_three_way_resolutions_clean() {
+        for (base, ours, theirs, expected) in [
+            (
+                &b"base\n"[..],
+                &b"base\n"[..],
+                &b"theirs\n"[..],
+                &b"theirs\n"[..],
+            ),
+            (
+                &b"base\n"[..],
+                &b"ours\n"[..],
+                &b"base\n"[..],
+                &b"ours\n"[..],
+            ),
+            (
+                &b"base\n"[..],
+                &b"same\n"[..],
+                &b"same\n"[..],
+                &b"same\n"[..],
+            ),
+        ] {
+            let outcome = merge_bytes_with_refined_driver(
+                BuiltinMergeDriver::Binary,
+                base,
+                ours,
+                theirs,
+                None,
+                ConflictStyle::Merge,
+                0,
+            )
+            .expect("binary driver");
+            assert_eq!(outcome, BuiltinMergeOutcome::Clean(expected.to_vec()));
+        }
+    }
+
+    #[test]
+    fn union_driver_falls_back_to_binary_for_nul_content() {
+        let ours = b"ours\0bytes";
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Union,
+            b"base\0bytes",
+            ours,
+            b"theirs\0bytes",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("union binary fallback");
+        assert_eq!(outcome, BuiltinMergeOutcome::Conflict(ours.to_vec()));
+    }
+
+    #[test]
+    fn recursive_binary_driver_uses_the_original_for_the_virtual_ancestor() {
+        let mut blobs = VirtualBlobs::new();
+        let mut entry = |data: &[u8]| {
+            let blob = Blob::from_content_bytes(data.to_vec());
+            blobs.insert(blob.id, blob.data);
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base = entry(b"base\n");
+        let ours = entry(b"ours\n");
+        let theirs = entry(b"theirs\n");
+        let path = PathBuf::from("driver.txt");
+        let base_items = HashMap::from([(path.clone(), base)]);
+        let our_items = HashMap::from([(path.clone(), ours)]);
+        let their_items = HashMap::from([(path.clone(), theirs)]);
+        let rename_config = MergeRenameConfig::default();
+
+        let merged = merge_virtual_items(
+            &base_items,
+            &our_items,
+            &their_items,
+            1,
+            &mut blobs,
+            VirtualFold {
+                persist: false,
+                conflict_style: ConflictStyle::Merge,
+                rename_config: &rename_config,
+                default_driver: Some("binary"),
+                external_merge_runtime: Arc::new(ExternalMergeRuntime::default()),
+                input_normalization: MergeInputNormalization::default(),
+            },
+        )
+        .expect("recursive binary-driver merge");
+
+        assert_eq!(merged.get(&path), Some(&base));
+    }
+}
+
+#[cfg(test)]
+mod ext_driver {
+    #[cfg(unix)]
+    use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _};
+
+    use super::*;
+
+    fn input<'a>(path: &'a Path, labels: ExternalMergeLabels<'a>) -> ExternalMergeInput<'a> {
+        ExternalMergeInput {
+            path,
+            base_id: ObjectHash::new(&[1; 20]),
+            ours_id: ObjectHash::new(&[2; 20]),
+            theirs_id: ObjectHash::new(&[3; 20]),
+            base: b"base\n",
+            ours: b"ours\n",
+            theirs: b"theirs\n",
+            marker_length: 9,
+            labels,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholders_quote_only_path_and_revision_labels() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let path = Path::new("dir/odd ' $(touch PWNED).txt");
+        let merge_input = input(
+            path,
+            ExternalMergeLabels {
+                ancestor: "merged common ancestors",
+                ours: "Temporary merge branch 1's side",
+                theirs: "Temporary merge branch 2 $(false)",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let expanded = expand_external_merge_command(
+            "driver %O %A %B %L %P %S %X %Y %% %Q",
+            &files,
+            &merge_input,
+        );
+        let expanded = expanded.to_string_lossy();
+
+        assert!(expanded.contains(files.base.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(files.ours.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(files.theirs.path().to_string_lossy().as_ref()));
+        assert!(expanded.contains(" 9 "));
+        assert!(expanded.contains("'dir/odd '\\'' $(touch PWNED).txt'"));
+        assert!(expanded.contains("'merged common ancestors'"));
+        assert!(expanded.contains("'Temporary merge branch 1'\\''s side'"));
+        assert!(expanded.contains("'Temporary merge branch 2 $(false)'"));
+        assert!(expanded.ends_with(" % %Q"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_expansion_preserves_non_utf8_path_bytes() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let raw_path = b"dir/non-utf8-\xff.txt";
+        let path = Path::new(OsStr::from_bytes(raw_path));
+        let merge_input = input(
+            path,
+            ExternalMergeLabels {
+                ancestor: "base",
+                ours: "HEAD",
+                theirs: "feature",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let expanded = expand_external_merge_command("driver %P", &files, &merge_input);
+        let expanded = expanded.as_os_str().as_bytes();
+
+        assert!(
+            expanded
+                .windows(raw_path.len())
+                .any(|window| window == raw_path),
+            "%P must preserve platform-native path bytes"
+        );
+
+        let raw_temp_path = b"/tmp/worktree-\xff/ours-file";
+        let quoted_temp = expand_external_merge_path(Path::new(OsStr::from_bytes(raw_temp_path)));
+        assert!(
+            quoted_temp
+                .as_os_str()
+                .as_bytes()
+                .windows(raw_temp_path.len())
+                .any(|window| window == raw_temp_path),
+            "%O/%A/%B path expansion must preserve platform-native bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_inputs_are_private_unpredictable_and_removed_on_drop() {
+        let worktree = tempfile::tempdir().expect("create worktree");
+        let merge_input = input(
+            Path::new("driver.txt"),
+            ExternalMergeLabels {
+                ancestor: "base",
+                ours: "HEAD",
+                theirs: "feature",
+            },
+        );
+        let files = ExternalMergeTempFiles::create_in(worktree.path(), &merge_input)
+            .expect("create protected inputs");
+        let directory = files._directory.path().to_path_buf();
+        assert_eq!(
+            fs::metadata(&directory)
+                .expect("temp metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let names: HashSet<_> = [&files.base, &files.ours, &files.theirs]
+            .into_iter()
+            .map(|file| {
+                file.path()
+                    .file_name()
+                    .expect("random file name")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 3);
+        for file in [&files.base, &files.ours, &files.theirs] {
+            assert!(file.path().is_absolute());
+            assert_eq!(
+                fs::metadata(file.path())
+                    .expect("input metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "merge inputs are not readable by group/other"
+            );
+        }
+        drop(files);
+        assert!(!directory.exists(), "RAII removes the temporary directory");
+    }
+
+    #[test]
+    fn configured_driver_overrides_a_builtin_name_but_boolean_attributes_do_not() {
+        let runtime = ExternalMergeRuntime {
+            drivers: HashMap::from([(
+                "text".to_string(),
+                ExternalMergeDriver {
+                    name: "text".to_string(),
+                    command: "custom".to_string(),
+                },
+            )]),
+            cache: Mutex::new(HashMap::new()),
+        };
+        assert!(matches!(
+            select_merge_driver(
+                Some(AttributeState::Value("text".to_string())),
+                None,
+                &runtime
+            ),
+            SelectedMergeDriver::External(_)
+        ));
+        assert_eq!(
+            select_merge_driver(Some(AttributeState::Set), Some("text"), &runtime),
+            SelectedMergeDriver::Builtin(BuiltinMergeDriver::Text)
+        );
+    }
+}
+
+#[cfg(test)]
+mod refine {
+    use super::*;
+
+    #[test]
+    fn adopts_equal_postimage_suffix() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS\nSAME\nbottom\n",
+            b"top\nTHEIRS\nSAME\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"top\n<<<<<<< ours\nOURS\n=======\nTHEIRS\n>>>>>>> theirs\nSAME\nbottom\n"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn simplifies_short_equal_gap_into_one_block() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS-A\nc1\nc2\nc3\nOURS-B\nbottom\n",
+            b"top\nTHEIRS-A\nc1\nc2\nc3\nTHEIRS-B\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("genuine differences must remain conflicted");
+        };
+        assert_eq!(
+            bytes
+                .windows(b"=======\n".len())
+                .filter(|window| *window == b"=======\n")
+                .count(),
+            1,
+            "three common lines stay inside one simpler conflict block"
+        );
+    }
+
+    #[test]
+    fn splits_around_long_equal_gap_without_changing_status() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"top\nbase-a\nbase-b\nbottom\n",
+            b"top\nOURS-A\nc1\nc2\nc3\nc4\nOURS-B\nbottom\n",
+            b"top\nTHEIRS-A\nc1\nc2\nc3\nc4\nTHEIRS-B\nbottom\n",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("text merge succeeds");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("genuine differences must remain conflicted");
+        };
+        assert_eq!(
+            bytes
+                .windows(b"=======\n".len())
+                .filter(|window| *window == b"=======\n")
+                .count(),
+            2,
+            "four common lines separate two refined conflict blocks"
+        );
+        assert!(
+            bytes
+                .windows(b"c1\nc2\nc3\nc4\n".len())
+                .any(|window| window == b"c1\nc2\nc3\nc4\n"),
+            "long shared context is retained byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn zdiff3_keeps_base_but_trims_postimage_edges() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+            b"1\n2\n3\n4\nA\nB\nC\nD\nE\n7\n8\n9\n",
+            b"1\n2\n3\n4\nA\nX\nC\nY\nE\n7\n8\n9\n",
+            None,
+            ConflictStyle::ZDiff3,
+            0,
+        )
+        .expect("text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"1\n2\n3\n4\nA\n<<<<<<< ours\nB\nC\nD\n||||||| original\n5\n6\n=======\nX\nC\nY\n>>>>>>> theirs\nE\n7\n8\n9\n"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn refines_unterminated_conflict_sides_without_malformed_markers() {
+        let outcome = merge_bytes_with_refined_driver(
+            BuiltinMergeDriver::Text,
+            b"base",
+            b"ours",
+            b"theirs",
+            None,
+            ConflictStyle::Merge,
+            0,
+        )
+        .expect("unterminated text merge succeeds");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Conflict(
+                b"<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n".to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn whole_file_markers_follow_uniform_crlf_input() {
+        assert_eq!(
+            render_whole_file_conflict(b"OURS\r\n", b"THEIRS\r\n", "HEAD", "topic"),
+            b"<<<<<<< HEAD\r\nOURS\r\n=======\r\nTHEIRS\r\n>>>>>>> topic\r\n"
+        );
+    }
+
+    #[test]
+    fn mixed_input_line_endings_conservatively_use_lf_markers() {
+        let rendered = render_whole_file_conflict(b"one\r\ntwo\n", b"other\r\n", "HEAD", "topic");
+        assert!(rendered.starts_with(b"<<<<<<< HEAD\n"));
+        assert!(rendered.ends_with(b">>>>>>> topic\n"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_cli_hints_preserve_both_resolution_and_abort_choices() {
+        let cli = merge_error_to_cli(PullMergeError::Conflicts {
+            paths: "renamed.txt".to_string(),
+            squash: false,
+        });
+        let rendered = cli.render();
+        assert_eq!(rendered.matches("libra merge --continue").count(), 1);
+        assert_eq!(rendered.matches("libra merge --abort").count(), 1);
+    }
 
     fn merge_entry(byte: u8, mode: TreeItemMode) -> MergeTreeEntry {
         MergeTreeEntry {
@@ -8886,14 +14516,10 @@ mod tests {
         let base = b"top\nl1\nl2\nl3\nbottom\n";
         let ours = b"top\nl1\nMAIN\nl3\nbottom\n";
         let theirs = b"top\nl1\nOTHER\nl3\nbottom\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .expect("a real text conflict renders line-level markers");
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "top\nl1\n<<<<<<< HEAD\nMAIN\n=======\nOTHER\n>>>>>>> abc1234\nl3\nbottom\n",
@@ -8909,14 +14535,10 @@ mod tests {
         let base = b"<<<<<<< ours\nl2\n";
         let ours = b"<<<<<<< ours\nMAIN\n";
         let theirs = b"<<<<<<< ours\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("<<<<<<< ours\n"),
@@ -8942,14 +14564,10 @@ mod tests {
         let base = b"prefix <<<<<<< ours\nl2\n";
         let ours = b"prefix <<<<<<< ours\nMAIN\n";
         let theirs = b"prefix <<<<<<< ours\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Merge,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("prefix <<<<<<< ours\n"),
@@ -8969,25 +14587,15 @@ mod tests {
     fn render_line_level_conflict_skips_binary_and_clean_merges() {
         // Binary side -> None (caller falls back to whole-file markers).
         assert!(
-            render_line_level_conflict(
-                None,
-                b"a\n",
-                &[0xff, 0xfe],
-                "x",
-                diffy::ConflictStyle::Merge
-            )
-            .is_none()
+            render_line_level_conflict(None, b"a\n", &[0xff, 0xfe], "x", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .is_none()
         );
         // No real text conflict (only one side changed) -> None.
         assert!(
-            render_line_level_conflict(
-                Some(b"a\n"),
-                b"a\n",
-                b"b\n",
-                "x",
-                diffy::ConflictStyle::Merge
-            )
-            .is_none()
+            render_line_level_conflict(Some(b"a\n"), b"a\n", b"b\n", "x", ConflictStyle::Merge)
+                .expect("conflict renderer succeeds")
+                .is_none()
         );
     }
 
@@ -8998,14 +14606,10 @@ mod tests {
         let base = b"top\nl1\nORIG\nl3\nbottom\n";
         let ours = b"top\nl1\nMAIN\nl3\nbottom\n";
         let theirs = b"top\nl1\nOTHER\nl3\nbottom\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Diff3,
-        )
-        .expect("a real text conflict renders line-level markers");
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Diff3)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "top\nl1\n<<<<<<< HEAD\nMAIN\n||||||| base\nORIG\n=======\nOTHER\n>>>>>>> abc1234\nl3\nbottom\n",
@@ -9021,14 +14625,10 @@ mod tests {
         let base = b"||||||| original\nORIG\n";
         let ours = b"||||||| original\nMAIN\n";
         let theirs = b"||||||| original\nOTHER\n";
-        let out = render_line_level_conflict(
-            Some(base),
-            ours,
-            theirs,
-            "abc1234",
-            diffy::ConflictStyle::Diff3,
-        )
-        .unwrap();
+        let out =
+            render_line_level_conflict(Some(base), ours, theirs, "abc1234", ConflictStyle::Diff3)
+                .expect("conflict renderer succeeds")
+                .expect("a real text conflict renders line-level markers");
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("||||||| original\n"),
@@ -9098,8 +14698,9 @@ mod tests {
         let mut no_virtual_blobs = VirtualBlobs::new();
         let mut favored = |base, ours, theirs, favor| {
             let mut context =
-                TreeMergeContext::top_level(false, Some(favor), &mut no_virtual_blobs);
-            resolve_three_way(base, ours, theirs, &mut context).expect("favored resolution")
+                TreeMergeContext::top_level(false, Some(favor), None, &mut no_virtual_blobs);
+            resolve_three_way(Path::new("f"), base, ours, theirs, &mut context)
+                .expect("favored resolution")
         };
 
         assert!(matches!(
@@ -9137,7 +14738,11 @@ mod tests {
         let no_ff = MergeArgs::try_parse_from(["merge", "--no-ff", "feature"]).unwrap();
         assert!(no_ff.no_ff);
         assert!(!no_ff.ff_only);
-        assert_eq!(no_ff.branch.as_deref(), Some("feature"));
+        assert_eq!(no_ff.branch, vec!["feature"]);
+
+        let octopus = MergeArgs::try_parse_from(["merge", "alpha", "beta", "gamma"])
+            .expect("parse several merge targets");
+        assert_eq!(octopus.branch, vec!["alpha", "beta", "gamma"]);
 
         let ff_only = MergeArgs::try_parse_from(["merge", "--ff-only", "feature"]).unwrap();
         assert!(ff_only.ff_only);
@@ -9145,6 +14750,34 @@ mod tests {
 
         let with_msg = MergeArgs::try_parse_from(["merge", "-m", "custom", "feature"]).unwrap();
         assert_eq!(with_msg.message.as_deref(), Some("custom"));
+
+        let with_file = MergeArgs::try_parse_from(["merge", "-F", "message.txt", "feature"])
+            .expect("-F must parse for a merge commit");
+        assert_eq!(with_file.file.as_deref(), Some("message.txt"));
+        let edit = MergeArgs::try_parse_from(["merge", "--edit", "feature"])
+            .expect("--edit must parse for a merge commit");
+        assert!(edit.edit);
+        let into_name = MergeArgs::try_parse_from([
+            "merge",
+            "--into-name",
+            "release",
+            "--cleanup=strip",
+            "feature",
+        ])
+        .expect("message options must parse for a merge commit");
+        assert_eq!(into_name.into_name.as_deref(), Some("release"));
+        assert_eq!(into_name.cleanup.as_deref(), Some("strip"));
+        for argv in [
+            ["merge", "-m", "inline", "-F", "message.txt", "feature"].as_slice(),
+            ["merge", "--edit", "--no-edit", "feature"].as_slice(),
+            ["merge", "--continue", "--into-name", "release"].as_slice(),
+            ["merge", "--edit", "--dry-run", "feature"].as_slice(),
+        ] {
+            assert!(
+                MergeArgs::try_parse_from(argv).is_err(),
+                "message options must not be silently ignored for {argv:?}"
+            );
+        }
 
         let squash = MergeArgs::try_parse_from(["merge", "--squash", "feature"]).unwrap();
         assert!(squash.squash);
@@ -9154,6 +14787,48 @@ mod tests {
         assert!(
             MergeArgs::try_parse_from(["merge", "--squash", "--no-commit", "feature"]).is_err()
         );
+
+        let force_sign = MergeArgs::try_parse_from(["merge", "-S", "feature"])
+            .expect("-S must parse for a merge commit");
+        assert!(force_sign.gpg_sign);
+        assert!(!force_sign.no_gpg_sign);
+        let disable_sign = MergeArgs::try_parse_from(["merge", "--no-gpg-sign", "feature"])
+            .expect("--no-gpg-sign must parse for a merge commit");
+        assert!(disable_sign.no_gpg_sign);
+        assert!(!disable_sign.gpg_sign);
+        let last_toggle = MergeArgs::try_parse_from(["merge", "-S", "--no-gpg-sign", "feature"])
+            .expect("the last signing toggle must win");
+        assert!(last_toggle.no_gpg_sign);
+        assert!(!last_toggle.gpg_sign);
+        let signoff = MergeArgs::try_parse_from(["merge", "--signoff", "feature"])
+            .expect("--signoff must parse for a merge commit");
+        assert!(signoff.signoff);
+        let continue_signoff = MergeArgs::try_parse_from(["merge", "--continue", "--signoff"])
+            .expect("--signoff must be accepted while finalizing a merge");
+        assert!(continue_signoff.continue_merge);
+        assert!(continue_signoff.signoff);
+        for argv in [
+            ["merge", "--restart", "-S"].as_slice(),
+            ["merge", "--abort", "--no-gpg-sign"].as_slice(),
+            ["merge", "--squash", "-S", "feature"].as_slice(),
+            ["merge", "--dry-run", "--no-gpg-sign", "feature"].as_slice(),
+        ] {
+            assert!(
+                MergeArgs::try_parse_from(argv).is_err(),
+                "signing controls must not be silently ignored for {argv:?}"
+            );
+        }
+        for argv in [
+            ["merge", "--restart", "--signoff"].as_slice(),
+            ["merge", "--abort", "--signoff"].as_slice(),
+            ["merge", "--squash", "--signoff", "feature"].as_slice(),
+            ["merge", "--dry-run", "--signoff", "feature"].as_slice(),
+        ] {
+            assert!(
+                MergeArgs::try_parse_from(argv).is_err(),
+                "signoff must not be silently ignored for {argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -9177,7 +14852,7 @@ mod tests {
         .expect("parse strategy options");
         assert_eq!(
             args.strategy_option,
-            vec![MergeFavor::Ours, MergeFavor::Theirs]
+            vec![MergeStrategyOption::Ours, MergeStrategyOption::Theirs]
         );
         assert!(args.allow_unrelated_histories);
         assert_eq!(args.log, Some(7));
@@ -9186,12 +14861,15 @@ mod tests {
             MergeArgs::try_parse_from(["merge", "--log", "feature"]).expect("parse bare --log");
         assert_eq!(bare_log.log, Some(20));
 
-        let ours = MergeArgs::try_parse_from(["merge", "-s", "ours", "feature"])
-            .expect("parse ours strategy");
-        assert_eq!(ours.strategy, Some(MergeStrategy::Ours));
+        for strategy in ["ort", "recursive", "resolve", "ours"] {
+            assert!(
+                MergeArgs::try_parse_from(["merge", "-s", strategy, "feature"]).is_ok(),
+                "the documented {strategy} strategy must parse"
+            );
+        }
         assert!(
-            MergeArgs::try_parse_from(["merge", "-s", "recursive", "feature"]).is_err(),
-            "unsupported strategies fail during argument parsing"
+            MergeArgs::try_parse_from(["merge", "-s", "resolve", "-s", "ort", "feature",]).is_ok(),
+            "-s is repeatable"
         );
     }
 
@@ -9213,6 +14891,52 @@ mod tests {
         assert_eq!(state.base.as_deref(), Some("base"));
         assert_eq!(state.strategy, None);
         assert!(!state.allow_unrelated_histories);
+        assert!(state.targets.is_empty());
+        assert!(state.target_refs.is_empty());
+    }
+
+    #[test]
+    fn merge_state_gc_roots_include_every_octopus_target() {
+        let gitdir = tempfile::tempdir().expect("create test gitdir");
+        std::fs::write(
+            gitdir.path().join("merge-state.json"),
+            r#"{
+                "head_name":"main",
+                "orig_head":"0000000000000000000000000000000000000001",
+                "target":"0000000000000000000000000000000000000002",
+                "target_ref":"alpha, beta",
+                "targets":[
+                    "0000000000000000000000000000000000000002",
+                    "0000000000000000000000000000000000000003"
+                ],
+                "target_refs":["alpha","beta"],
+                "base":null,
+                "conflicted_paths":[],
+                "message":"Merge branches 'alpha', 'beta' into main"
+            }"#,
+        )
+        .expect("write octopus merge state");
+
+        let roots = merge_state_gc_oids(gitdir.path())
+            .expect("read merge GC roots")
+            .expect("merge state exists");
+        assert_eq!(
+            roots,
+            vec![
+                (
+                    "orig_head",
+                    "0000000000000000000000000000000000000001".to_string()
+                ),
+                (
+                    "target",
+                    "0000000000000000000000000000000000000002".to_string()
+                ),
+                (
+                    "target",
+                    "0000000000000000000000000000000000000003".to_string()
+                ),
+            ]
+        );
     }
 
     /// Pin the `Display` format for every variant of [`PullMergeError`]
@@ -9227,12 +14951,20 @@ mod tests {
             "a/b - not something we can merge",
         );
         assert_eq!(
-            PullMergeError::InvalidConflictStyle("zdiff3".to_string()).to_string(),
-            "unsupported merge.conflictStyle 'zdiff3' (expected 'merge' or 'diff3')",
+            PullMergeError::InvalidConflictStyle("bogus".to_string()).to_string(),
+            "unsupported merge.conflictStyle 'bogus' (expected 'merge', 'diff3', or 'zdiff3')",
         );
         assert_eq!(
             PullMergeError::ConflictStyleRead("db locked".to_string()).to_string(),
             "failed to read merge.conflictStyle config: db locked",
+        );
+        assert_eq!(
+            PullMergeError::InvalidRenormalizeConfig("sometimes".to_string()).to_string(),
+            "unsupported merge.renormalize 'sometimes' (expected a boolean)",
+        );
+        assert_eq!(
+            PullMergeError::RenormalizeConfigRead("db locked".to_string()).to_string(),
+            "failed to read merge.renormalize config: db locked",
         );
         assert_eq!(
             PullMergeError::RestartWithoutConflicts.to_string(),
@@ -9261,6 +14993,18 @@ mod tests {
         assert_eq!(
             PullMergeError::UnrelatedHistories.to_string(),
             "refusing to merge unrelated histories",
+        );
+        assert_eq!(
+            PullMergeError::OctopusUnbornHead.to_string(),
+            "cannot merge multiple branches into an unborn HEAD; create the first commit first",
+        );
+        assert_eq!(
+            PullMergeError::OctopusConflict {
+                target: "beta".to_string(),
+                paths: "shared.txt".to_string(),
+            }
+            .to_string(),
+            "Automated merge with 'beta' did not work in shared.txt. Should not be doing an octopus",
         );
         assert_eq!(
             PullMergeError::UnsignedMergeCommit {
@@ -9353,7 +15097,7 @@ mod tests {
             &base_items,
             &our_items,
             &their_items,
-            &mut TreeMergeContext::top_level(true, None, &mut no_virtual_blobs),
+            &mut TreeMergeContext::top_level(true, None, None, &mut no_virtual_blobs),
         )
         .expect("merge tree items");
 
@@ -9450,6 +15194,63 @@ mod tests {
     }
 }
 
+/// MG-13: pure strategy selection rules. These stay independent of repository
+/// I/O so the resolve boundary and Git score ordering are pinned directly.
+#[cfg(test)]
+mod strategy {
+    use super::{
+        MergeStrategy, PullMergeOptions, StrategyEvaluationScore, merge_options_will_fold,
+        select_strategy_bases,
+    };
+
+    #[test]
+    fn resolve_selects_one_base_and_disables_recursive_folding() {
+        assert_eq!(
+            select_strategy_bases(vec![1, 2, 3], Some(MergeStrategy::Resolve)),
+            vec![1]
+        );
+        let resolve = PullMergeOptions {
+            strategy: Some(MergeStrategy::Resolve),
+            ..PullMergeOptions::default()
+        };
+        assert!(!merge_options_will_fold(&resolve));
+
+        for strategy in [
+            None,
+            Some(MergeStrategy::Ort),
+            Some(MergeStrategy::Recursive),
+        ] {
+            let options = PullMergeOptions {
+                strategy,
+                ..PullMergeOptions::default()
+            };
+            assert!(merge_options_will_fold(&options), "{strategy:?}");
+            assert_eq!(
+                select_strategy_bases(vec![1, 2, 3], strategy),
+                vec![1, 2, 3]
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_result_prefers_lower_scores_and_the_later_tie() {
+        let ort = StrategyEvaluationScore {
+            differing_files: 1,
+            unmerged_entries: 3,
+        };
+        let resolve = StrategyEvaluationScore {
+            differing_files: 1,
+            unmerged_entries: 2,
+        };
+        assert!(resolve.replaces(ort));
+        assert!(!ort.replaces(resolve));
+        assert!(
+            resolve.replaces(resolve),
+            "Git's <= comparison makes the later strategy win a tie"
+        );
+    }
+}
+
 /// MG-02: the recursive virtual ancestor that a criss-cross history's several
 /// merge bases are folded into.
 ///
@@ -9460,7 +15261,11 @@ mod tests {
 /// through [`VirtualBlobs`] exactly as a `--dry-run` supplies them).
 #[cfg(test)]
 mod recursive {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        sync::Arc,
+    };
 
     use git_internal::{
         hash::ObjectHash,
@@ -9473,11 +15278,12 @@ mod recursive {
     };
 
     use super::{
-        GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH, MAX_XDIFF_SIZE,
-        MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL, VirtualBlobs,
-        conflict_marker_length_at_depth, ensure_virtual_ancestor_depth, fold_merge_bases,
-        merge_bases_of_folded, merge_input_exceeds_xdiff_size, merge_input_is_binary,
-        merge_virtual_items, recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
+        ConflictStyle, GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH,
+        MAX_XDIFF_SIZE, MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL,
+        VirtualBlobs, conflict_marker_length_at_depth, ensure_virtual_ancestor_depth,
+        fold_merge_bases, merge_bases_of_folded, merge_bases_of_folded_with,
+        merge_input_exceeds_xdiff_size, merge_input_is_binary, merge_virtual_items,
+        recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
     };
 
     fn oid(byte: u8) -> ObjectHash {
@@ -9544,8 +15350,11 @@ mod recursive {
             blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect("folding two ancestors never fails")
@@ -9579,8 +15388,11 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("one level past the ceiling is refused");
@@ -9593,8 +15405,11 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("these ids name no object");
@@ -9621,8 +15436,11 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("one base past the width ceiling is refused");
@@ -9638,8 +15456,11 @@ mod recursive {
             &mut blobs,
             super::VirtualFold {
                 persist: false,
-                conflict_style: diffy::ConflictStyle::Merge,
+                conflict_style: ConflictStyle::Merge,
                 rename_config: &super::MergeRenameConfig::default(),
+                default_driver: None,
+                external_merge_runtime: Arc::new(super::ExternalMergeRuntime::default()),
+                input_normalization: super::MergeInputNormalization::default(),
             },
         )
         .expect_err("these ids name no object");
@@ -9662,6 +15483,96 @@ mod recursive {
             .expect_err("refused before any graph walk");
         assert!(
             matches!(refused, PullMergeError::VirtualAncestorTooWide { bases } if bases == MAX_VIRTUAL_ANCESTOR_BASES + 1)
+        );
+    }
+
+    /// The maximal filter must compare candidates contributed by different
+    /// folded bases. Here `x` is a strict ancestor of `y`, so the virtual
+    /// commit whose parents are `left` and `right` has exactly `y` as its merge
+    /// base with `next`; retaining `x` would add redundant work to the next
+    /// recursive fold.
+    #[test]
+    fn cross_part_domination_drops_the_strict_ancestor_candidate() {
+        fn ancestors(
+            parents: &HashMap<ObjectHash, Vec<ObjectHash>>,
+            tip: ObjectHash,
+        ) -> HashSet<ObjectHash> {
+            let mut seen = HashSet::new();
+            let mut stack = vec![tip];
+            while let Some(commit) = stack.pop() {
+                if seen.insert(commit) {
+                    stack.extend(parents.get(&commit).into_iter().flatten().copied());
+                }
+            }
+            seen
+        }
+
+        fn graph_merge_bases(
+            parents: &HashMap<ObjectHash, Vec<ObjectHash>>,
+            left: ObjectHash,
+            right: ObjectHash,
+        ) -> Vec<ObjectHash> {
+            let left_ancestors = ancestors(parents, left);
+            let right_ancestors = ancestors(parents, right);
+            let common: Vec<ObjectHash> = left_ancestors
+                .intersection(&right_ancestors)
+                .copied()
+                .collect();
+            let mut maximal: Vec<ObjectHash> = common
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !common.iter().any(|other| {
+                        candidate != other && ancestors(parents, *other).contains(candidate)
+                    })
+                })
+                .collect();
+            maximal.sort_by_key(|id| id.to_string());
+            maximal
+        }
+
+        // root <- x <- y; left descends only from x, while right and next
+        // descend from y. Therefore mb(left,next)={x}, mb(right,next)={y}, and
+        // the synthetic commit with parents left+right has mb(virtual,next)={y}.
+        let root = oid(0x10);
+        let x = oid(0x20);
+        let y = oid(0x30);
+        let left = oid(0x40);
+        let right = oid(0x50);
+        let next = oid(0x60);
+        let virtual_commit = oid(0x70);
+        let parents = HashMap::from([
+            (root, vec![]),
+            (x, vec![root]),
+            (y, vec![x]),
+            (left, vec![x]),
+            (right, vec![y]),
+            (next, vec![y]),
+            (virtual_commit, vec![left, right]),
+        ]);
+        let mut ancestry_checks = Vec::new();
+
+        let maximal = merge_bases_of_folded_with(
+            &[left, right],
+            &next,
+            |base, tip| Ok(graph_merge_bases(&parents, *base, *tip)),
+            |ancestor, descendant| {
+                ancestry_checks.push((*ancestor, *descendant));
+                Ok(ancestors(&parents, *descendant).contains(ancestor))
+            },
+        )
+        .expect("the in-memory ancestry graph is valid");
+
+        assert_eq!(
+            maximal,
+            graph_merge_bases(&parents, virtual_commit, next),
+            "filtering the union of per-parent bases matches the equivalent virtual commit"
+        );
+        assert_eq!(maximal, vec![y]);
+        assert_eq!(
+            ancestry_checks,
+            vec![(x, y), (y, x)],
+            "both cross-part directions are considered; only the strict ancestor is dropped"
         );
     }
 
@@ -9709,7 +15620,7 @@ mod recursive {
 
     /// G1: several ancestors fold pairwise, left to right, into ONE tree —
     /// Git's `merged_merge_bases = merge(merged_merge_bases, next)` loop
-    /// (`merge-ort.c:5429`).
+    /// (`merge-ort.c` `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`).
     #[test]
     fn folds_three_ancestors_pairwise_into_one_tree() {
         let mut blobs = VirtualBlobs::new();
@@ -9795,7 +15706,8 @@ mod recursive {
 
     /// Git's rule for a change/delete inside a virtual ancestor: there is no
     /// midpoint between "changed" and "gone", so the ancestor keeps the base
-    /// version (`merge-recursive.c`, `handle_change_delete`).
+    /// version (`merge-ort.c` `process_entry`, lines 4374-4381 at
+    /// git@`3cb9185f6`).
     #[test]
     fn change_delete_inside_an_ancestor_keeps_the_base_version() {
         let mut blobs = VirtualBlobs::new();
@@ -9986,8 +15898,8 @@ mod recursive {
         assert_eq!(folded.get(&PathBuf::from("p")), Some(&base_entry));
     }
 
-    /// Git's mode rule for a conflicted content merge
-    /// (`merge-recursive.c`, `merge_mode_and_contents`).
+    /// Git's mode rule for a conflicted content merge (`merge-ort.c`
+    /// `handle_content_merge`, lines 2211-2217 at git@`3cb9185f6`).
     #[test]
     fn conflicted_ancestor_mode_follows_gits_rule() {
         let base = MergeTreeEntry {
@@ -10060,6 +15972,157 @@ mod recursive {
             None,
             "a criss-cross merge's base is virtual and must not be rooted"
         );
+    }
+}
+
+/// MG-11: comparison-only whitespace normalization and original-byte
+/// backfill. These tests pin the shared diff predicate rather than a second
+/// merge-specific whitespace implementation.
+#[cfg(test)]
+mod whitespace {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn merge_normalizers_use_the_diff_engine() {
+        let input = b"a  b \r\n";
+        for mode in [
+            MergeWhitespace::SpaceChange,
+            MergeWhitespace::AllSpace,
+            MergeWhitespace::SpaceAtEol,
+            MergeWhitespace::CrAtEol,
+        ] {
+            let normalized = normalize_merge_input(input, Some(mode), false);
+            let expected = mode.normalizer()("a  b ");
+            assert_eq!(
+                normalized.lines[0].key,
+                expected.as_bytes(),
+                "merge and diff must classify the same logical line under {mode:?}"
+            );
+            assert_eq!(
+                normalized.lines[0].original_body, b"a  b ",
+                "comparison normalization must not discard emitted bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_normalization_keeps_invalid_utf8_distinct() {
+        let left = normalize_merge_input(b"\x80  value\n", Some(MergeWhitespace::AllSpace), false);
+        let right = normalize_merge_input(b"\x81  value\n", Some(MergeWhitespace::AllSpace), false);
+        assert_ne!(
+            left.canonical, right.canonical,
+            "lossy decoding must not make distinct repository bytes compare equal"
+        );
+        assert_eq!(left.canonical, b"\x80  value\n");
+        assert_eq!(right.canonical, b"\x81  value\n");
+    }
+
+    #[test]
+    fn text_auto_uses_git_conversion_binary_heuristic() {
+        assert!(!text_auto_is_binary(b"plain\r\ntext\n"));
+        assert!(text_auto_is_binary(b"bare\rreturn"));
+        assert!(text_auto_is_binary(b"nul\0byte"));
+        assert!(text_auto_is_binary(b"\x01\x02\x03"));
+        assert!(renormalize_text_input(
+            TextRenormalization::Auto,
+            b"plain\r\ntext\r\n"
+        ));
+        assert!(!renormalize_text_input(
+            TextRenormalization::Auto,
+            b"bare\rreturn"
+        ));
+    }
+
+    #[test]
+    fn normalized_clean_merge_backfills_text_and_ours_eol() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"top\nvalue = base\nbottom\n",
+            b"top\r\nvalue   =   base\r\nbottom\r\n",
+            b"top\nvalue = theirs\nbottom\n",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceChange),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("normalized merge");
+        assert_eq!(
+            outcome,
+            BuiltinMergeOutcome::Clean(b"top\r\nvalue = theirs\r\nbottom\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn normalized_conflict_backfills_both_sides_and_ours_eol() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"top\nvalue = base\nbottom\n",
+            b"top\r\nvalue   = ours\r\nbottom\r\n",
+            b"top\nvalue = theirs\nbottom\n",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceChange),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("normalized conflict");
+        let BuiltinMergeOutcome::Conflict(bytes) = outcome else {
+            panic!("INVARIANT: two substantive postimages must remain conflicted")
+        };
+        assert_eq!(
+            bytes,
+            b"top\r\n<<<<<<< ours\r\nvalue   = ours\r\n=======\r\nvalue = theirs\r\n>>>>>>> theirs\r\nbottom\r\n"
+        );
+    }
+
+    #[test]
+    fn normalized_merge_preserves_an_unterminated_last_line() {
+        let outcome = merge_bytes_with_input_normalization(
+            BuiltinMergeDriver::Text,
+            Path::new("shared.txt"),
+            b"base",
+            b"base   ",
+            b"theirs",
+            MergeContentOptions {
+                favor: None,
+                conflict_style: ConflictStyle::Merge,
+                extra_marker_size: 0,
+                normalization: MergeInputNormalization {
+                    whitespace: Some(MergeWhitespace::SpaceAtEol),
+                    renormalize: false,
+                },
+            },
+        )
+        .expect("unterminated normalized merge");
+        assert_eq!(outcome, BuiltinMergeOutcome::Clean(b"theirs".to_vec()));
+    }
+
+    #[test]
+    fn repeated_strategy_options_keep_independent_axes() {
+        let parsed = parse_merge_strategy_options(&[
+            MergeStrategyOption::IgnoreSpaceAtEol,
+            MergeStrategyOption::Theirs,
+            MergeStrategyOption::Renormalize,
+            MergeStrategyOption::Ours,
+            MergeStrategyOption::IgnoreAllSpace,
+            MergeStrategyOption::NoRenormalize,
+        ]);
+        assert_eq!(parsed.favor, Some(MergeFavor::Ours));
+        assert_eq!(parsed.whitespace, Some(MergeWhitespace::AllSpace));
+        assert_eq!(parsed.renormalize, Some(false));
     }
 }
 
@@ -10240,7 +16303,7 @@ mod tree {
             &base_items,
             &our_items,
             &their_items,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
         )?;
         let mut conflicts: Vec<PathBuf> = result.conflicts.into_iter().map(|(p, _)| p).collect();
         conflicts.sort();
@@ -10259,7 +16322,7 @@ mod tree {
             base,
             ours,
             theirs,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
             false,
         )?;
         // Production settles the collisions after the rename fix-up; this
@@ -10291,7 +16354,7 @@ mod tree {
             base,
             ours,
             theirs,
-            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
             true,
         )?;
         Ok(out)
@@ -11070,6 +17133,82 @@ mod tree {
 }
 
 #[cfg(test)]
+mod dir_rename {
+    use super::*;
+
+    fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
+        rename_detect::RenameMatch {
+            old: PathBuf::from(old),
+            new: PathBuf::from(new),
+            exact: true,
+            internal_score: 60_000,
+        }
+    }
+
+    #[test]
+    fn unique_highest_destination_wins_without_a_strict_majority() {
+        let plan = infer_provisional_directory_renames(
+            &[
+                pair("old/a", "winner/a"),
+                pair("old/b", "winner/b"),
+                pair("old/c", "second/c"),
+                pair("old/d", "third/d"),
+            ],
+            MergeSide::Ours,
+        );
+        assert_eq!(
+            plan.renames,
+            [DirectoryRename {
+                old: PathBuf::from("old"),
+                new: PathBuf::from("winner"),
+                side: MergeSide::Ours,
+            }]
+        );
+        assert!(plan.splits.is_empty());
+    }
+
+    #[test]
+    fn tied_highest_destinations_are_sorted_and_not_inferred() {
+        let plan = infer_provisional_directory_renames(
+            &[pair("old/a", "z/a"), pair("old/b", "a/b")],
+            MergeSide::Theirs,
+        );
+        assert!(plan.renames.is_empty());
+        assert_eq!(
+            plan.splits,
+            [DirectoryRenameSplit {
+                old: PathBuf::from("old"),
+                destinations: vec![PathBuf::from("a"), PathBuf::from("z")],
+                side: MergeSide::Theirs,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_pairs_vote_for_their_parent_and_ancestor_directories() {
+        let plan =
+            infer_provisional_directory_renames(&[pair("old/sub/a", "new/sub/a")], MergeSide::Ours);
+        assert!(plan.renames.contains(&DirectoryRename {
+            old: PathBuf::from("old/sub"),
+            new: PathBuf::from("new/sub"),
+            side: MergeSide::Ours,
+        }));
+        assert!(plan.renames.contains(&DirectoryRename {
+            old: PathBuf::from("old"),
+            new: PathBuf::from("new"),
+            side: MergeSide::Ours,
+        }));
+    }
+
+    #[test]
+    fn a_file_rename_within_one_directory_casts_no_directory_vote() {
+        let plan =
+            infer_provisional_directory_renames(&[pair("same/old", "same/new")], MergeSide::Ours);
+        assert_eq!(plan, DirectoryRenamePlan::default());
+    }
+}
+
+#[cfg(test)]
 mod rename {
     //! MG-05: per-side rename detection feeding the three-way match.
     use std::collections::HashMap;
@@ -11078,21 +17217,52 @@ mod rename {
 
     use super::*;
 
-    fn file(content: &str) -> MergeTreeEntry {
+    pub(super) fn file(content: &str) -> MergeTreeEntry {
         MergeTreeEntry {
             hash: Blob::from_content(content).id,
             mode: TreeItemMode::Blob,
         }
     }
 
-    fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
+    pub(super) fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
         entries
             .iter()
             .map(|(path, entry)| (PathBuf::from(path), *entry))
             .collect()
     }
 
-    fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
+    /// MG-06: [`apply_renames`] now merges content for the collision and 1to2
+    /// shapes, so the unit tests hand it a blob store already holding the
+    /// fixtures' contents. `persist` is false, so nothing reaches the object
+    /// store and every merged blob stays addressable in memory.
+    pub(super) fn apply_for_test(
+        base: &mut HashMap<PathBuf, MergeTreeEntry>,
+        ours: &mut HashMap<PathBuf, MergeTreeEntry>,
+        theirs: &mut HashMap<PathBuf, MergeTreeEntry>,
+        decisions: &[RenameDecision],
+        contents: &[&str],
+    ) -> (Vec<(PathBuf, ConflictKind)>, Vec<RenameConflictNote>) {
+        let mut blobs = VirtualBlobs::new();
+        for content in contents {
+            let blob = Blob::from_content(content);
+            blobs.insert(blob.id, blob.data.clone());
+        }
+        let mut forced = Vec::new();
+        let notes = apply_renames(
+            base,
+            ours,
+            theirs,
+            decisions,
+            &mut forced,
+            ConflictStyle::Merge,
+            ("HEAD", "feature"),
+            &mut TreeMergeContext::top_level(false, None, None, &mut blobs),
+        )
+        .expect("the rename pass succeeds");
+        (forced, notes)
+    }
+
+    pub(super) fn pair(old: &str, new: &str) -> rename_detect::RenameMatch {
         rename_detect::RenameMatch {
             old: PathBuf::from(old),
             new: PathBuf::from(new),
@@ -11150,7 +17320,13 @@ mod rename {
         let mut theirs = items(&[("old.txt", theirs_entry)]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "new.txt")], &[]);
         assert!(decisions[0].declined.is_none());
-        apply_renames(&mut base, &mut ours, &mut theirs, &decisions);
+        apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["base\n", "theirs\n"],
+        );
         assert_eq!(base.get(Path::new("new.txt")), Some(&base_entry));
         assert_eq!(theirs.get(Path::new("new.txt")), Some(&theirs_entry));
         assert!(!base.contains_key(Path::new("old.txt")));
@@ -11160,7 +17336,7 @@ mod rename {
     /// Every shape MG-05 leaves to MG-06 is declined with a reason, and
     /// declining changes nothing about the maps.
     #[test]
-    fn the_shapes_left_to_mg06_are_declined_with_a_reason() {
+    fn path_level_rename_shapes_are_classified_and_the_collision_is_settled() {
         let base_entry = file("base\n");
         // Both sides renamed the source, to different paths and to the same.
         let base = items(&[("old.txt", base_entry)]);
@@ -11190,20 +17366,90 @@ mod rename {
         let theirs = items(&[("unrelated.txt", file("u\n"))]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
         assert_eq!(decisions[0].declined, Some(RenameDeclined::SourceDeleted));
-        // Something already occupies the destination: rename/add.
-        let theirs = items(&[("old.txt", base_entry), ("ours.txt", file("theirs add\n"))]);
+        // The other side replaced the source with a different KIND of entry:
+        // Git's `type_changed` branch, NOT a rename/delete (`merge-ort.c:3205`).
+        let link = MergeTreeEntry {
+            hash: Blob::from_content("target").id,
+            mode: TreeItemMode::Link,
+        };
+        let theirs = items(&[("old.txt", link)]);
         let decisions = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
         assert_eq!(
             decisions[0].declined,
-            Some(RenameDeclined::DestinationTaken)
+            Some(RenameDeclined::SourceTypeChanged)
+        );
+        // A file at the exact destination is rename/add, and the collision
+        // consumes the source. Structural occupancy is classified separately
+        // because it leaves the source in place.
+        let collision_theirs =
+            items(&[("old.txt", base_entry), ("ours.txt", file("theirs add\n"))]);
+        let decisions = decide_renames(
+            &base,
+            &ours,
+            &collision_theirs,
+            &[pair("old.txt", "ours.txt")],
+            &[],
+        );
+        assert_eq!(
+            decisions[0].declined,
+            Some(RenameDeclined::DestinationCollision)
+        );
+        let theirs = items(&[
+            ("old.txt", base_entry),
+            ("ours.txt/child", file("theirs child\n")),
+        ]);
+        let blocked = decide_renames(&base, &ours, &theirs, &[pair("old.txt", "ours.txt")], &[]);
+        assert_eq!(
+            blocked[0].declined,
+            Some(RenameDeclined::DestinationBlocked)
         );
 
+        // MG-06: a collision no longer degrades to "no rename". Git merges the
+        // rename itself first — base source, the renaming side's landing spot,
+        // the other side's source — parks that result at the renaming side's
+        // stage of the destination, and resolves the SOURCE by removal
+        // (`merge-ort.c:3137-3179`), leaving the destination an add/add with no
+        // base stage.
         let mut base_copy = base.clone();
         let mut ours_copy = ours.clone();
-        let mut theirs_copy = theirs.clone();
-        apply_renames(&mut base_copy, &mut ours_copy, &mut theirs_copy, &decisions);
-        assert_eq!(base_copy, base, "a declined rename rewrites nothing");
-        assert_eq!(theirs_copy, theirs);
+        let mut theirs_copy = collision_theirs.clone();
+        let (forced, notes) = apply_for_test(
+            &mut base_copy,
+            &mut ours_copy,
+            &mut theirs_copy,
+            &decisions,
+            &["base\n", "ours\n", "theirs add\n"],
+        );
+        assert!(
+            !base_copy.contains_key(Path::new("old.txt"))
+                && !ours_copy.contains_key(Path::new("old.txt"))
+                && !theirs_copy.contains_key(Path::new("old.txt")),
+            "the source is resolved by removal on every side"
+        );
+        assert!(
+            !base_copy.contains_key(Path::new("ours.txt")),
+            "the destination records no merge base, so it is an add/add"
+        );
+        assert_eq!(
+            ours_copy.get(Path::new("ours.txt")).map(|entry| entry.hash),
+            Some(base_entry.hash),
+            "the destination holds the rename's OWN merge — base, ours' landing \
+             spot and theirs' source are all the base content here, so that \
+             merge is the base content"
+        );
+        assert_eq!(
+            theirs_copy.get(Path::new("ours.txt")),
+            collision_theirs.get(Path::new("ours.txt")),
+            "the other side's entry stays where it is"
+        );
+        assert!(
+            forced.is_empty(),
+            "a collision needs no forced conflict: the add/add is the ordinary match's own verdict"
+        );
+        assert!(
+            notes.is_empty(),
+            "the rename's own merge is clean here, so Git prints nothing extra"
+        );
     }
 
     /// G6: past `merge.renameLimit` the engine drops the inexact stage —
@@ -11671,5 +17917,166 @@ mod df {
         relocate_virtual_df_files(&mut merged, &base, &theirs, &ours);
         assert!(merged.contains_key(Path::new("foo~Temporary merge branch 2_0")));
         assert!(merged.contains_key(Path::new("foo/bar.txt")));
+    }
+}
+
+/// MG-06 G9: the index stage combination each path-level rename shape leaves,
+/// asserted where it is decided — on the three maps a conflict's stages are
+/// read from (`merge.rs` builds stage 1/2/3 from base/ours/theirs at the
+/// conflict path) plus the conflicts the rename pass forces. Every expectation
+/// is the shape measured on git 2.50.1; the CLI cases in
+/// `command::merge_test::merge_rename_conflict*` pin the same combinations end
+/// to end, on both walks.
+#[cfg(test)]
+mod rename_conflict {
+    use git_internal::internal::object::blob::Blob;
+
+    use super::{
+        rename::{apply_for_test, file, items, pair},
+        *,
+    };
+
+    /// Which stages a path would get, in the order the index writer reads them.
+    fn stages_at(
+        base: &HashMap<PathBuf, MergeTreeEntry>,
+        ours: &HashMap<PathBuf, MergeTreeEntry>,
+        theirs: &HashMap<PathBuf, MergeTreeEntry>,
+        path: &str,
+    ) -> Vec<u8> {
+        let path = PathBuf::from(path);
+        let mut stages = Vec::new();
+        for (stage, map) in [(1u8, base), (2, ours), (3, theirs)] {
+            if map
+                .get(&path)
+                .is_some_and(|entry| entry.mode != TreeItemMode::Tree)
+            {
+                stages.push(stage);
+            }
+        }
+        stages
+    }
+
+    /// rename/rename(1to2): stage 1 stays under the OLD name, each destination
+    /// carries only its own side, and both destinations hold the SAME merged
+    /// object (`merge-ort.c:3021-3068`). Measured: `1 old`, `2 a`, `3 b`.
+    #[test]
+    fn one_to_two_records_both_destinations_and_drops_the_source() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let ours_entry = file("l1\nOURS\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let theirs_entry = file("l1\nl2\nTHEIRS\nl4\nl5\nl6\nl7\nl8\n");
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("a", ours_entry)]);
+        let mut theirs = items(&[("b", theirs_entry)]);
+        let decisions = decide_renames(
+            &base,
+            &ours,
+            &theirs,
+            &[pair("old", "a")],
+            &[pair("old", "b")],
+        );
+        let (forced, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &[
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
+                "l1\nOURS\nl3\nl4\nl5\nl6\nl7\nl8\n",
+                "l1\nl2\nTHEIRS\nl4\nl5\nl6\nl7\nl8\n",
+            ],
+        );
+        // Deviation from Git, documented in `apply_renames`: the source is
+        // resolved by removal so the conflict stays resolvable.
+        assert!(stages_at(&base, &ours, &theirs, "old").is_empty());
+        assert_eq!(stages_at(&base, &ours, &theirs, "a"), vec![2]);
+        assert_eq!(stages_at(&base, &ours, &theirs, "b"), vec![3]);
+        assert_eq!(
+            ours.get(Path::new("a")),
+            theirs.get(Path::new("b")),
+            "ONE content merge is recorded at both destinations"
+        );
+        let forced_paths: Vec<&Path> = forced.iter().map(|(path, _)| path.as_path()).collect();
+        assert!(
+            forced_paths.contains(&Path::new("a")) && forced_paths.contains(&Path::new("b")),
+            "both destinations are conflicts the ordinary match must not decide: {forced_paths:?}"
+        );
+        assert!(
+            !forced_paths.contains(&Path::new("old")),
+            "the source is not a conflict: {forced_paths:?}"
+        );
+        assert!(matches!(
+            notes.as_slice(),
+            [RenameConflictNote::RenameRename { .. }]
+        ));
+    }
+
+    /// rename/delete: the base moves to the NEW path's stage 1, the renaming
+    /// side keeps its stage, the deleting side has none, and the conflict is
+    /// forced even for a PURE rename (`merge-ort.c:3202-3221`).
+    #[test]
+    fn rename_delete_moves_the_base_to_the_new_path() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("new", base_entry)]);
+        let mut theirs = items(&[("unrelated", file("u\n"))]);
+        let decisions = decide_renames(&base, &ours, &theirs, &[pair("old", "new")], &[]);
+        assert_eq!(decisions[0].declined, Some(RenameDeclined::SourceDeleted));
+        let (forced, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"],
+        );
+        assert_eq!(stages_at(&base, &ours, &theirs, "new"), vec![1, 2]);
+        assert!(stages_at(&base, &ours, &theirs, "old").is_empty());
+        assert!(
+            matches!(
+                forced.as_slice(),
+                [(path, ConflictKind::OursModifiedTheirsDeleted { .. })] if path == Path::new("new")
+            ),
+            "a pure rename plus a delete is still forced to conflict: {forced:?}"
+        );
+        assert!(matches!(
+            notes.as_slice(),
+            [RenameConflictNote::RenameDelete { .. }]
+        ));
+    }
+
+    /// A source the other side TYPE-changed is not a rename/delete: the base
+    /// still follows the rename, but the type-changed entry SURVIVES under the
+    /// old name and Git says nothing about a rename (`merge-ort.c:3205-3212`).
+    #[test]
+    fn a_type_changed_source_survives_and_is_not_announced() {
+        let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+        let link = MergeTreeEntry {
+            hash: Blob::from_content("target").id,
+            mode: TreeItemMode::Link,
+        };
+        let mut base = items(&[("old", base_entry)]);
+        let mut ours = items(&[("new", base_entry)]);
+        let mut theirs = items(&[("old", link)]);
+        let decisions = decide_renames(&base, &ours, &theirs, &[pair("old", "new")], &[]);
+        assert_eq!(
+            decisions[0].declined,
+            Some(RenameDeclined::SourceTypeChanged)
+        );
+        let (_, notes) = apply_for_test(
+            &mut base,
+            &mut ours,
+            &mut theirs,
+            &decisions,
+            &["l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"],
+        );
+        assert_eq!(stages_at(&base, &ours, &theirs, "new"), vec![1, 2]);
+        assert_eq!(
+            theirs.get(Path::new("old")),
+            Some(&link),
+            "the type-changed entry keeps the old name"
+        );
+        assert!(
+            notes.is_empty(),
+            "Git prints no rename line for a type change: {notes:?}"
+        );
     }
 }

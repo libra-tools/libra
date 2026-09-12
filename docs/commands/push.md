@@ -24,6 +24,13 @@ The command negotiates with the remote to determine which objects are missing, p
 into a single pack file, and sends the pack along with a ref-update request. If the remote
 ref has diverged (non-fast-forward), the push is rejected unless `--force` is used.
 
+Object selection reuses every advertised remote ref whose object is available locally, not
+only the old value of the ref being updated. Consequently, a new branch or tag that points
+at an already-advertised commit sends zero objects instead of repacking that commit's history.
+Invalid or locally unavailable advertised OIDs are ignored conservatively. A real zero-object
+ref update still sends the protocol-required empty pack: 32 bytes for SHA-1 repositories or
+44 bytes for SHA-256 repositories.
+
 `--force-with-lease` is the safe alternative to `--force`: it allows a non-fast-forward
 update only if the remote ref still matches the OID you expected. By default the expected
 OID is your local remote-tracking ref (`refs/remotes/<remote>/<branch>`), so a force that
@@ -317,7 +324,8 @@ Set upstream:
 - delete updates use an empty `local_ref` and the all-zero object id as `new_oid`
 - `old_oid` is `null` for new branches (no previous remote ref)
 - `forced` is `true` when the update required `--force` (non-fast-forward)
-- `bytes_pushed` is the pack data size in bytes; `0` for dry-run
+- `objects_pushed` counts objects in the generated pack; it can be `0` for a new ref whose target the remote already advertised
+- `bytes_pushed` is the pack data size in bytes; it is `0` for dry-run, while a real zero-object update reports the 32-byte SHA-1 or 44-byte SHA-256 empty pack
 - `lfs_files_uploaded` counts LFS objects transferred (HTTP transport only)
 - `upstream_set` is non-null when `-u` / `--set-upstream` was used
 - `warnings` contains force push warnings or other advisory messages

@@ -26,7 +26,9 @@
 //!    any *new* one with `LBR-CONFLICT-002` — never blocking the in-progress
 //!    op's own continue/abort/skip (those paths do not call the guard).
 
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use std::{path::Path, time::Duration};
+
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
@@ -236,6 +238,140 @@ pub async fn load_for_scope(
         todo: stored.todo,
         payload: stored.payload,
     }))
+}
+
+/// Capture a sequencer row from an explicit storage path. Facet capture runs
+/// synchronously behind a snapshot trait, so it must not borrow the parent's
+/// cached async pool from a newly-created runtime thread; doing so can wait
+/// forever when the parent runtime is blocked in that trait call.
+pub(crate) async fn load_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<serde_json::Value>, String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(stored) = load_stored_with_conn(&db, scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "present": true,
+        "kind": stored.kind,
+        "head_name": stored.head_name,
+        "head_orig": stored.head_orig,
+        "current_oid": stored.current_oid,
+        "todo": stored.todo,
+        "payload": stored.payload,
+    })))
+}
+
+/// Restore a facet against an explicitly resolved storage path. StateFacet's
+/// synchronous API runs its helper future on a short-lived runtime, so using
+/// the ambient cached pool here can deadlock when the caller is already
+/// blocking that pool's parent runtime.
+pub(crate) async fn restore_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin sequence_state transaction: {error}"))?;
+    let (kind, state) = parse_snapshot_state(value)?;
+    save_fields_for_scope(
+        &txn,
+        scope.storage_key(),
+        SequenceStateFields {
+            kind: &kind,
+            head_name: &state.head_name,
+            head_orig: &state.head_orig,
+            current_oid: &state.current_oid,
+            todo: &state.todo,
+            payload: &state.payload,
+        },
+    )
+    .await
+    .map_err(|error| format!("failed to restore sequence_state: {error}"))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("failed to commit sequence_state transaction: {error}"))?;
+    Ok(())
+}
+
+pub(crate) async fn clear_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope.storage_key().into()],
+    ))
+    .await
+    .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
+    Ok(())
+}
+
+fn parse_snapshot_state(value: &serde_json::Value) -> Result<(String, AmSequenceState), String> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("sequencer kind missing")?
+        .to_string();
+    let state = AmSequenceState {
+        head_name: string_value(value, "head_name")?,
+        head_orig: string_value(value, "head_orig")?,
+        current_oid: string_value(value, "current_oid")?,
+        todo: value
+            .get("todo")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("sequencer todo missing")?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        payload: string_value(value, "payload")?,
+    };
+    if kind != "am" && SequenceKind::from_token(&kind).is_none() {
+        return Err(format!("unknown sequencer kind '{kind}'"));
+    }
+    Ok((kind, state))
+}
+
+fn string_value(value: &serde_json::Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("sequencer field '{key}' missing"))
 }
 
 pub(crate) async fn load_am() -> Result<Option<AmSequenceState>, String> {
@@ -625,17 +761,49 @@ async fn save_fields<C>(
 where
     C: ConnectionTrait,
 {
+    let scope_key = current_scope_key();
+    save_fields_for_scope(
+        db,
+        &scope_key,
+        SequenceStateFields {
+            kind,
+            head_name,
+            head_orig,
+            current_oid,
+            todo,
+            payload,
+        },
+    )
+    .await
+}
+
+struct SequenceStateFields<'a> {
+    kind: &'a str,
+    head_name: &'a str,
+    head_orig: &'a str,
+    current_oid: &'a str,
+    todo: &'a [String],
+    payload: &'a str,
+}
+
+async fn save_fields_for_scope<C>(
+    db: &C,
+    scope_key: &str,
+    fields: SequenceStateFields<'_>,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
     // Part C W1 (§C.4.2): replace only THIS worktree's row. An unscoped
     // `DELETE FROM sequence_state` would wipe every other worktree's
     // in-progress sequence.
-    let scope_key = current_scope_key();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE worktree_id = ?",
-        [scope_key.clone().into()],
+        [scope_key.to_string().into()],
     ))
     .await?;
-    let todo = todo.join("\n");
+    let todo = fields.todo.join("\n");
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO sequence_state \
@@ -643,12 +811,12 @@ where
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
             scope_key.into(),
-            kind.to_string().into(),
-            head_name.to_string().into(),
-            head_orig.to_string().into(),
-            current_oid.to_string().into(),
+            fields.kind.to_string().into(),
+            fields.head_name.to_string().into(),
+            fields.head_orig.to_string().into(),
+            fields.current_oid.to_string().into(),
             todo.into(),
-            payload.to_string().into(),
+            fields.payload.to_string().into(),
         ],
     ))
     .await?;

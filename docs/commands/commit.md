@@ -34,6 +34,25 @@ Before computing staged changes or writing tree/commit objects, `commit` validat
 index entries for missing or mistyped blob/tree objects. A corrupt index entry fails closed
 with `LBR-REPO-002` and leaves `HEAD` unchanged.
 
+An unresolved index (stage 1/2/3 without a stage-0 resolution) blocks a real
+commit with `LBR-CONFLICT-001`, including `--amend`, `--allow-empty`, and
+`--no-verify`. This also applies after a conflicted `merge --squash`, which has
+no merge lifecycle state. Resolve the named paths and stage them with
+`libra add <path>` before committing. Rejection happens
+before hooks and tree/commit writes and preserves `HEAD`, index, and worktree.
+Like Git, `-a` first stages the current contents or deletion of conflicted
+regular files and symlinks, then checks the resulting index; it does not inspect
+file contents for conflict markers. Unresolved gitlinks require an explicit
+resolution (for example `libra update-index --cacheinfo 160000,<commit>,<path>`):
+Libra does not materialize submodules, so `-a` cannot infer deletion from an
+absent submodule directory. Dry-run and porcelain previews preserve the live
+index, `HEAD`, and worktree, including when `-a` previews a resolution.
+For a deleted conflict, use `commit -a` only when all tracked changes belong in
+the commit. A parent replaced by a file or symlink makes its tracked children
+deletions; `-a` never reads through that symlink. Replacing a conflicted file with
+a directory containing `.git` or `.libra` metadata also requires an explicit
+gitlink resolution, rather than being automatically staged as a deletion.
+
 Author identity comes from `--author`, then `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`, then
 configured `user.name`/`user.email`; committer identity comes from
 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, then config. Git environment variables
@@ -666,6 +685,7 @@ candidate OIDs while holding that fence through the prune transaction. With
 
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
+| Unresolved index conflicts | `LBR-CONFLICT-001` | 128 | Resolve and stage files with `libra add`; stage deleted conflicts with `commit -a` only when all tracked changes are intended |
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
 | Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |

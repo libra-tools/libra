@@ -102,6 +102,15 @@ enum RevertError {
     #[error("failed to load object: {0}")]
     LoadObject(String),
 
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
+
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
+    InvalidConflictStyle(String),
+
+    #[error("failed to read merge.conflictStyle config: {0}")]
+    ConflictStyleRead(String),
+
     #[error("failed to save object: {0}")]
     SaveObject(String),
 
@@ -213,6 +222,10 @@ impl RevertError {
             | Self::MainlineForNonMerge(_)
             | Self::InvalidMainline { .. } => StableErrorCode::CliInvalidArguments,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) | Self::ConflictStyleRead(_) => {
+                StableErrorCode::IoReadFailed
+            }
+            Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::SaveObject(_) => StableErrorCode::IoWriteFailed,
             Self::WriteWorktree(_) => StableErrorCode::IoWriteFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
@@ -267,6 +280,12 @@ impl From<RevertError> for CliError {
             RevertError::InvalidCleanup(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("valid modes: strip, whitespace, verbatim, scissors, default"),
+            RevertError::InvalidConflictStyle(_) => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
+            RevertError::ConflictStyleRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository integrity and retry"),
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -930,17 +949,26 @@ enum SingleRevertOutcome {
 }
 
 /// Content-level 3-way merge for a path that diverged since the reverted commit:
-/// base = the reverted commit's blob, ours = the current blob, theirs = the
-/// parent's blob (the revert target). Returns the resulting blob hash and whether
-/// it carries conflict markers.
+/// base = the reverted commit's blob (or empty when that commit deleted the
+/// path), ours = the current blob, and theirs = the parent's blob (the revert
+/// target). Returns the resulting blob hash and whether it remains conflicted.
 fn three_way_revert_blob(
-    reverted_hash: ObjectHash,
+    path: &Path,
+    reverted_hash: Option<ObjectHash>,
     current_hash: ObjectHash,
     parent_hash: Option<ObjectHash>,
     favor: Option<MergeFavor>,
+    default_driver: Option<&str>,
+    conflict_style: merge::ConflictStyle,
 ) -> Result<(ObjectHash, bool), RevertError> {
-    let reverted: Blob =
-        load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let reverted_data = match reverted_hash {
+        Some(reverted_hash) => {
+            let reverted: Blob =
+                load_object(&reverted_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+            reverted.data
+        }
+        None => Vec::new(),
+    };
     let current: Blob =
         load_object(&current_hash).map_err(|e| RevertError::LoadObject(e.to_string()))?;
     let parent_data = match parent_hash {
@@ -951,16 +979,20 @@ fn three_way_revert_blob(
         }
         None => Vec::new(),
     };
-    let (bytes, conflicted) = match favor {
-        Some(favor) => (
-            merge::merge_bytes_with_favor(&reverted.data, &current.data, &parent_data, favor)
-                .map_err(RevertError::SaveObject)?,
-            false,
-        ),
-        None => match diffy::merge_bytes(&reverted.data, &current.data, &parent_data) {
-            Ok(merged) => (merged, false),
-            Err(conflicted) => (conflicted, true),
-        },
+    let driver = merge::builtin_merge_driver_for_path(path, default_driver);
+    let (bytes, conflicted) = match merge::merge_bytes_with_refined_driver(
+        driver,
+        &reverted_data,
+        &current.data,
+        &parent_data,
+        favor,
+        conflict_style,
+        0,
+    )
+    .map_err(RevertError::SaveObject)?
+    {
+        merge::BuiltinMergeOutcome::Clean(bytes) => (bytes, false),
+        merge::BuiltinMergeOutcome::Conflict(bytes) => (bytes, true),
     };
     let blob = Blob::from_content_bytes(bytes);
     save_object(&blob, &blob.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
@@ -1056,6 +1088,35 @@ async fn revert_single_commit(
     let parent_files: std::collections::HashMap<_, _> =
         parent_tree.get_plain_items().into_iter().collect();
 
+    let modifies_existing_path = reverted_files.iter().any(|(path, reverted_hash)| {
+        let parent_hash = parent_files.get(path);
+        Some(*reverted_hash) != parent_hash.copied()
+            && current_files.get(path) != Some(reverted_hash)
+            && current_files.contains_key(path)
+    });
+    let restores_divergent_deleted_path = parent_files.iter().any(|(path, parent_hash)| {
+        !reverted_files.contains_key(path)
+            && current_files
+                .get(path)
+                .is_some_and(|current_hash| current_hash != parent_hash)
+    });
+    let needs_content_driver = modifies_existing_path || restores_divergent_deleted_path;
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(RevertError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+    let (conflict_style, deferred_conflict_style_error) = if needs_content_driver {
+        match merge::conflict_style_from_config().await {
+            Ok(style) => (style, None),
+            Err(error) => (merge::ConflictStyle::Merge, Some(error)),
+        }
+    } else {
+        (merge::ConflictStyle::Merge, None)
+    };
+
     let mut files_changed: usize = 0;
     let mut conflicted_paths: Vec<String> = Vec::new();
 
@@ -1091,10 +1152,13 @@ async fn revert_single_commit(
         if current_files.get(path) != Some(&reverted_hash) && current_files.contains_key(path) {
             let current_hash = current_files[path];
             let (merged_hash, conflicted) = three_way_revert_blob(
-                reverted_hash,
+                path,
+                Some(reverted_hash),
                 current_hash,
                 parent_hash.copied(),
                 params.strategy_option,
+                default_driver.as_deref(),
+                conflict_style,
             )?;
             current_files.insert(path.clone(), merged_hash);
             files_changed += 1;
@@ -1116,21 +1180,52 @@ async fn revert_single_commit(
     for (path, &parent_hash) in &parent_files {
         if !reverted_files.contains_key(path) {
             let current_hash = current_files.get(path).copied();
-            if current_hash.is_some()
-                && current_hash != Some(parent_hash)
-                && let Some(favor) = params.strategy_option
+            if let Some(current_hash) = current_hash
+                && current_hash != parent_hash
             {
-                if favor == MergeFavor::Theirs
-                    && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
-                {
+                let driver = merge::builtin_merge_driver_for_path(path, default_driver.as_deref());
+                if driver != merge::BuiltinMergeDriver::Text {
+                    let (merged_hash, conflicted) = three_way_revert_blob(
+                        path,
+                        None,
+                        current_hash,
+                        Some(parent_hash),
+                        params.strategy_option,
+                        default_driver.as_deref(),
+                        conflict_style,
+                    )?;
+                    current_files.insert(path.clone(), merged_hash);
                     files_changed += 1;
+                    if conflicted {
+                        conflicted_paths.push(path.display().to_string());
+                    }
+                    continue;
                 }
-                continue;
+                // The implicit text fallback keeps the pre-MG-08 add/add
+                // inverse behavior: -X ours retains current, otherwise the
+                // deleted path is restored from the selected parent.
+                if let Some(favor) = params.strategy_option {
+                    if favor == MergeFavor::Theirs
+                        && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
+                    {
+                        files_changed += 1;
+                    }
+                    continue;
+                }
             }
             if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
                 files_changed += 1;
             }
         }
+    }
+
+    if !conflicted_paths.is_empty()
+        && let Some(error) = deferred_conflict_style_error
+    {
+        return Err(match error {
+            merge::ConflictStyleError::Invalid(value) => RevertError::InvalidConflictStyle(value),
+            merge::ConflictStyleError::Read(detail) => RevertError::ConflictStyleRead(detail),
+        });
     }
 
     let final_tree_id = build_tree_from_map(current_files).await?;
@@ -1542,6 +1637,14 @@ mod tests {
             "failed to load object: ignored",
         );
         assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).to_string(),
+            "unsupported merge.conflictStyle 'bogus' (expected 'merge', 'diff3', or 'zdiff3')",
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).to_string(),
+            "failed to read merge.conflictStyle config: db locked",
+        );
+        assert_eq!(
             RevertError::SaveObject("ignored".to_string()).to_string(),
             "failed to save object: ignored",
         );
@@ -1611,6 +1714,14 @@ mod tests {
         );
         assert_eq!(
             RevertError::LoadObject("ignored".to_string()).stable_code(),
+            StableErrorCode::IoReadFailed,
+        );
+        assert_eq!(
+            RevertError::InvalidConflictStyle("bogus".to_string()).stable_code(),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            RevertError::ConflictStyleRead("db locked".to_string()).stable_code(),
             StableErrorCode::IoReadFailed,
         );
         assert_eq!(

@@ -2,6 +2,68 @@
 
 ## [Unreleased]
 
+### Changed: isolated agent tasks publish one main-workspace sync-back operation
+
+An isolated `libra code` DAG task no longer publishes an `agent.tool.*`
+operation for every mutating tool call inside its temporary copy/FUSE
+workspace. Tool permission, hardening, audit, redaction, and sandbox checks still
+run there. When the completed task is replayed into the main workspace, a
+successful view-changing replay instead publishes one
+`agent.task.sync-back` `WorkspaceMutation`; its `causal_context_id` is the task
+UUID. A replay that leaves the view unchanged does not create an operation.
+
+Transient scope-lease contention first gets a short bounded retry of sync-back
+from the same completed task workspace, without rerunning the task or consuming
+its fresh-baseline retry budget. Persistent contention can then use the normal
+task retry policy; stale-pointer and pre-replay CAS conflicts continue to use a
+fresh baseline. If replay has already completed but the operation record cannot
+be finalized, Libra fails without automatic retry and warns that the main
+workspace may already contain the task changes; inspect `libra status` and
+`libra op log` before recovering. Persistent scope-lock files now honor the existing
+`core.sharedRepository` group/all/numeric permissions, following Git's shared
+file-mode rules.
+
+### Fixed: authoritative HEAD for new operation-v2 captures
+
+New captures use the pinned scope's SQLite HEAD, with no sidecar/default-`main`
+fallback:
+missing, duplicate or corrupt rows and query errors reject capture, valid
+detached commits remain snapshot roots, and HEAD-only changes affect content
+identity. Existing immutable manifests are not rewritten. Full integration,
+implementation review and release acceptance remain pending. This is not a
+claim of reproduced GC data loss, full restore, or concurrent mixed-hash
+snapshot support.
+
+
+### Fixed: operation-v2 request isolation and conservative snapshot capture
+
+- V2 operations retain their own pinned request context across asynchronous work;
+  independent linked worktree gitdirs use separate scope leases. The lease makes
+  one zero-wait acquisition attempt and reports a busy scope/path before the
+  business callback or journal starts. Wait for the other operation to finish
+  and retry; do not delete the persistent lock file to resolve contention.
+  Closing its owning file releases the lock.
+- Snapshot ignore checks share the original scan deadline. Unknown ignore
+  decisions, ignore-file read failures (including invalid UTF-8), or deadline
+  expiry discard the visible-file listing and mark capture `Partial`, without
+  hashing or persisting files from that rejected listing. Ignore-file I/O/parsing
+  no longer holds the shared raw-source cache lock.
+- These unreleased changes do not add CLI flags or configuration settings,
+  promise an atomic filesystem snapshot or arbitrary-filesystem hard deadline,
+  or establish Windows runtime, full integration or release acceptance.
+
+### Fixed: operation-v2 convergence for repositories already upgraded by #472
+
+The forward-only `2026090801` migration handles repositories that already
+applied `2026090601` while missing operation-v2 migration `2026090101`.
+Original migration receipts and timestamps, legacy operation data, and
+`config`/`config_kv` values are preserved. Older binaries that do not support
+the new schema refuse access instead of using incompatible operation tables.
+
+Keep a verified consistent pre-upgrade backup: replacing the binary alone
+cannot downgrade the database. Controlled old-binary upgrade fixtures have
+passed focused validation; full integration and release acceptance remain open.
+
 ### Changed: `diff` scan progress is deferred, TTY-gated, and self-erasing (#466)
 
 `libra diff` no longer prints `Scanning working tree ...` on every invocation.

@@ -1273,8 +1273,9 @@ mod tests {
     use sea_orm::{ConnectOptions, Database, DatabaseConnection, ExecResult};
     use tempfile::TempDir;
 
-    use crate::internal::db::{
-        ensure_ai_runtime_contract_schema, migration::run_builtin_migrations,
+    use crate::internal::{
+        db::{ensure_ai_runtime_contract_schema, migration::run_builtin_migrations},
+        worktree_scope::{RequestScope, with_request_scope},
     };
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../sql/sqlite_20260309_init.sql");
@@ -1324,24 +1325,29 @@ mod tests {
         stopped_at: Option<i64>,
         metadata_json: &str,
     ) {
+        let worktree_id = crate::internal::worktree_scope::WorktreeScope::for_request()
+            .storage_key()
+            .to_string();
         let backend = conn.get_database_backend();
         conn.execute_raw(Statement::from_sql_and_values(
             backend,
-            // scope_state='scoped' + main worktree ('') models a MODERN
+            // scope_state='scoped' + the ambient worktree models a MODERN
             // capture: the lifecycle gate excludes legacy_unknown rows from
-            // every new write (its own test covers that refusal).
+            // every new write (its own test covers that refusal), and this
+            // fixture stays valid when the suite runs from a linked worktree.
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
                 metadata_json, redaction_report, started_at, last_event_at, stopped_at,
                 scope_state, repo_id, worktree_id, workspace_id, workspace_fence
              ) VALUES (?, 'claude_code', ?, ?, '/tmp/repo', ?, '{}', 1700000000, \
-                       1700000100, ?, 'scoped', 'test-repo', '', 'ws-test', 1)",
+                       1700000100, ?, 'scoped', 'test-repo', ?, 'ws-test', 1)",
             vec![
                 session_id.to_string().into(),
                 format!("{session_id}-provider").into(),
                 state.to_string().into(),
                 metadata_json.to_string().into(),
                 stopped_at.into(),
+                worktree_id.into(),
             ],
         ))
         .await
@@ -1372,73 +1378,93 @@ mod tests {
 
     #[tokio::test]
     async fn agent_session_stop_marks_active_session_stopped() {
-        let (_dir, conn, _repo_path) = fresh_repo().await;
-        insert_agent_session_fixture(&conn, "claude__stop-active", "active", None).await;
+        let (dir, conn, _repo_path) = fresh_repo().await;
+        let request_scope = RequestScope::resolve(dir.path().to_path_buf())
+            .expect("fresh repository should resolve its request scope");
 
-        let result = mutate_session_state(&conn, "claude__stop-active", SessionMutationKind::Stop)
-            .await
-            .unwrap();
+        with_request_scope(Some(request_scope), async {
+            insert_agent_session_fixture(&conn, "claude__stop-active", "active", None).await;
 
-        assert_eq!(result.action, "stop");
-        assert!(result.updated);
-        assert_eq!(result.previous_state, "active");
-        assert_eq!(result.state, "stopped");
-        assert_eq!(result.stopped_at, Some(result.last_event_at));
+            let result =
+                mutate_session_state(&conn, "claude__stop-active", SessionMutationKind::Stop)
+                    .await
+                    .unwrap();
 
-        let (state, stopped_at, last_event_at) =
-            read_agent_session_state(&conn, "claude__stop-active").await;
-        assert_eq!(state, "stopped");
-        assert_eq!(stopped_at, result.stopped_at);
-        assert_eq!(last_event_at, result.last_event_at);
+            assert_eq!(result.action, "stop");
+            assert!(result.updated);
+            assert_eq!(result.previous_state, "active");
+            assert_eq!(result.state, "stopped");
+            assert_eq!(result.stopped_at, Some(result.last_event_at));
+
+            let (state, stopped_at, last_event_at) =
+                read_agent_session_state(&conn, "claude__stop-active").await;
+            assert_eq!(state, "stopped");
+            assert_eq!(stopped_at, result.stopped_at);
+            assert_eq!(last_event_at, result.last_event_at);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn agent_session_resume_marks_stopped_session_active() {
-        let (_dir, conn, _repo_path) = fresh_repo().await;
-        insert_agent_session_fixture(
-            &conn,
-            "claude__resume-stopped",
-            "stopped",
-            Some(1_700_000_100),
-        )
+        let (dir, conn, _repo_path) = fresh_repo().await;
+        let request_scope = RequestScope::resolve(dir.path().to_path_buf())
+            .expect("fresh repository should resolve its request scope");
+
+        with_request_scope(Some(request_scope), async {
+            insert_agent_session_fixture(
+                &conn,
+                "claude__resume-stopped",
+                "stopped",
+                Some(1_700_000_100),
+            )
+            .await;
+
+            let result =
+                mutate_session_state(&conn, "claude__resume-stopped", SessionMutationKind::Resume)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result.action, "resume");
+            assert!(result.updated);
+            assert_eq!(result.previous_state, "stopped");
+            assert_eq!(result.state, "active");
+            assert_eq!(result.stopped_at, None);
+
+            let (state, stopped_at, last_event_at) =
+                read_agent_session_state(&conn, "claude__resume-stopped").await;
+            assert_eq!(state, "active");
+            assert_eq!(stopped_at, None);
+            assert_eq!(last_event_at, result.last_event_at);
+        })
         .await;
-
-        let result =
-            mutate_session_state(&conn, "claude__resume-stopped", SessionMutationKind::Resume)
-                .await
-                .unwrap();
-
-        assert_eq!(result.action, "resume");
-        assert!(result.updated);
-        assert_eq!(result.previous_state, "stopped");
-        assert_eq!(result.state, "active");
-        assert_eq!(result.stopped_at, None);
-
-        let (state, stopped_at, last_event_at) =
-            read_agent_session_state(&conn, "claude__resume-stopped").await;
-        assert_eq!(state, "active");
-        assert_eq!(stopped_at, None);
-        assert_eq!(last_event_at, result.last_event_at);
     }
 
     #[tokio::test]
     async fn agent_session_resume_rejects_non_stopped_session_states() {
-        let (_dir, conn, _repo_path) = fresh_repo().await;
-        insert_agent_session_fixture(&conn, "claude__resume-condensed", "condensed", None).await;
+        let (dir, conn, _repo_path) = fresh_repo().await;
+        let request_scope = RequestScope::resolve(dir.path().to_path_buf())
+            .expect("fresh repository should resolve its request scope");
 
-        let err = mutate_session_state(
-            &conn,
-            "claude__resume-condensed",
-            SessionMutationKind::Resume,
-        )
-        .await
-        .unwrap_err();
+        with_request_scope(Some(request_scope), async {
+            insert_agent_session_fixture(&conn, "claude__resume-condensed", "condensed", None)
+                .await;
 
-        assert!(
-            err.to_string()
-                .contains("only stopped sessions can be resumed"),
-            "{err}"
-        );
+            let err = mutate_session_state(
+                &conn,
+                "claude__resume-condensed",
+                SessionMutationKind::Resume,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("only stopped sessions can be resumed"),
+                "{err}"
+            );
+        })
+        .await;
     }
 
     #[test]

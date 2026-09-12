@@ -109,7 +109,7 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         table: "agent_session",
         owner: StateOwner::Composite,
         rationale: "captured sessions are repository-owned and record the worktree they were \
-                    observed in (W4 adds the workspace scope key)",
+                     observed in (W4 adds the workspace scope key)",
     },
     MutableStateSurface {
         table: "agent_export_job",
@@ -130,19 +130,59 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         table: "operation",
         owner: StateOwner::Composite,
         rationale: "the operation log is repository-wide, but its worktree_id is a real \
-                    routing key: dedup windows and `op restore` are scope-fenced (§C.9)",
+                     routing key: dedup windows and `op restore` are scope-fenced (§C.9)",
+    },
+    MutableStateSurface {
+        table: "legacy_operation",
+        owner: StateOwner::Composite,
+        rationale: "the active v1 operation logger remains scope-routed during the OL-02 staging window",
+    },
+    MutableStateSurface {
+        table: "ai_operation_link",
+        owner: StateOwner::Composite,
+        rationale: "AI provenance links are repository-owned and optionally carry worktree/workspace scope",
+    },
+    MutableStateSurface {
+        table: "operation_parent",
+        owner: StateOwner::Repository,
+        rationale: "v2 operation genealogy edges are repository-wide and keyed by operation ids",
+    },
+    MutableStateSurface {
+        table: "operation_head",
+        owner: StateOwner::Repository,
+        rationale: "v2 scope heads are repository records keyed by an opaque scope key",
+    },
+    MutableStateSurface {
+        table: "operation_journal",
+        owner: StateOwner::Repository,
+        rationale: "v2 recovery journal entries are repository-wide and keyed by operation ids",
+    },
+    MutableStateSurface {
+        table: "change_identity",
+        owner: StateOwner::Repository,
+        rationale: "change identities are repository-wide causal projections",
+    },
+    MutableStateSurface {
+        table: "change_revision",
+        owner: StateOwner::Repository,
+        rationale: "change revisions are repository-wide commit projections",
+    },
+    MutableStateSurface {
+        table: "change_predecessor",
+        owner: StateOwner::Repository,
+        rationale: "change genealogy edges are repository-wide and keyed by commit ids",
     },
     MutableStateSurface {
         table: "reference",
         owner: StateOwner::Composite,
         rationale: "branches/tags/remotes are repository-shared; HEAD rows are per-worktree \
-                    via worktree_id (partial unique index per scope, W0)",
+                     via worktree_id (partial unique index per scope, W0)",
     },
     MutableStateSurface {
         table: "reflog",
         owner: StateOwner::Composite,
         rationale: "branch reflogs are repository-shared; HEAD reflog is per-worktree, so \
-                    enumeration and expire are keyed by (ref_name, worktree_id)",
+                     enumeration and expire are keyed by (ref_name, worktree_id)",
     },
     // ── Repository-owned mutable state ──────────────────────────────────
     MutableStateSurface {
@@ -337,7 +377,7 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         table: "approved_permission",
         owner: StateOwner::Composite,
         rationale: "Always-approvals are repository-wide by trust design (§C.4.1.1); W4-07 \
-                    added the worktree_id provenance scope key (audit-only)",
+                     added the worktree_id provenance scope key (audit-only)",
     },
     MutableStateSurface {
         table: "automation_log",
@@ -363,7 +403,7 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         table: "schema_versions",
         owner: StateOwner::Repository,
         rationale: "migration bookkeeping for this repository's database (created by the \
-                    migration runner in Rust, not by a .sql file)",
+                     migration runner in Rust, not by a .sql file)",
     },
     MutableStateSurface {
         table: "config",
@@ -411,22 +451,22 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         rationale: "object-graph side tables (repository-wide by definition)",
     },
     MutableStateSurface {
-        table: "operation_parent",
+        table: "legacy_operation_parent",
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "operation_view",
+        table: "legacy_operation_view",
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "operation_view_ref",
+        table: "legacy_operation_view_ref",
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "operation_view_workspace",
+        table: "legacy_operation_view_workspace",
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
@@ -492,6 +532,14 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "layer__legacy_rows_need_explicit_adopt_2026072303",
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
+    "legacy_operation__staging",
+    "legacy_operation_parent__staging",
+    "legacy_operation_view__staging",
+    "legacy_operation_view_ref__staging",
+    "legacy_operation_view_workspace__staging",
+    "operation_view",
+    "operation_view_ref",
+    "operation_view_workspace",
     "operation_scope_provenance_down_guard",
     "rebase_state__down_guard_2026072101",
     "sequence_state__down_guard_2026071901",
@@ -711,7 +759,7 @@ mod tests {
             .join("\n")
     }
 
-    /// Every `CREATE TABLE` in the SQL corpus whose body declares a
+    /// Every `CREATE TABLE` in the SQL/Rust DDL corpus whose body declares a
     /// `worktree_id` column, paired with the table name.
     fn tables_with_scope_column() -> BTreeSet<String> {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -728,7 +776,6 @@ mod tests {
             }
         }
         collect(&manifest_dir.join("sql"), &mut corpus);
-
         // Strip `--` line comments BEFORE parsing: this corpus documents
         // itself heavily, and a comment containing `;` or an unbalanced
         // paren would otherwise cut a column list short (one such comment —
@@ -742,6 +789,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut scoped = BTreeSet::new();
+        // `legacy_operation` is created by the copy-first Rust migration
+        // helper, whose final table name is assembled outside a standalone
+        // SQL file. Keep that known production shape in the scope inventory;
+        // the broader Rust corpus contains remote D1 schemas that are not
+        // part of the local repository database.
+        scoped.insert("legacy_operation".to_string());
         for chunk in lowered.split("create table").skip(1) {
             let after = body_after_create_table(chunk);
             let name = table_name_after(chunk);
@@ -784,6 +837,12 @@ mod tests {
                 .chars()
                 .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
                 .collect();
+            // Rust doc literals are included in the DDL corpus so generated
+            // SQL is visible, but prose such as `ALTER TABLE ADD COLUMN`
+            // does not name a table. Do not classify that keyword as one.
+            if matches!(name.as_str(), "add" | "drop" | "rename" | "if") {
+                continue;
+            }
             let statement = after.split(';').next().unwrap_or("");
             if !name.is_empty()
                 && statement.contains("add column")
@@ -805,93 +864,93 @@ mod tests {
     #[test]
     fn rust_ddl_scanner_ignores_only_real_test_items() {
         const FIXTURE: &str = r##"
-            // A doc/line comment that merely MENTIONS #[cfg(test)] — the
-            // text stripper skipped to the next brace and ate this file.
-            fn commented_marker() {
-                let _ = "CREATE TABLE IF NOT EXISTS `after_comment` (id TEXT)";
-            }
+             // A doc/line comment that merely MENTIONS #[cfg(test)] — the
+             // text stripper skipped to the next brace and ate this file.
+             fn commented_marker() {
+                 let _ = "CREATE TABLE IF NOT EXISTS `after_comment` (id TEXT)";
+             }
 
-            struct Mixed {
-                real: u8,
-                #[cfg(test)]
-                only_for_tests: u8,
-                also_real: u8,
-            }
+             struct Mixed {
+                 real: u8,
+                 #[cfg(test)]
+                 only_for_tests: u8,
+                 also_real: u8,
+             }
 
-            #[cfg(test)]
-            use std::collections::{BTreeMap, BTreeSet};
+             #[cfg(test)]
+             use std::collections::{BTreeMap, BTreeSet};
 
-            fn after_braced_use() {
-                let _ = "CREATE TABLE `after_use` (id TEXT)";
-            }
+             fn after_braced_use() {
+                 let _ = "CREATE TABLE `after_use` (id TEXT)";
+             }
 
-            #[cfg(feature = "test-provider")]
-            fn feature_gated_is_production() {
-                let _ = "CREATE TABLE `after_feature_gate` (id TEXT)";
-            }
+             #[cfg(feature = "test-provider")]
+             fn feature_gated_is_production() {
+                 let _ = "CREATE TABLE `after_feature_gate` (id TEXT)";
+             }
 
-            // MENTIONING `test` is not being test-only: this one is compiled
-            // in production and nowhere else.
-            #[cfg(not(test))]
-            fn production_only() {
-                let _ = "CREATE TABLE `not_test` (id TEXT)";
-            }
+             // MENTIONING `test` is not being test-only: this one is compiled
+             // in production and nowhere else.
+             #[cfg(not(test))]
+             fn production_only() {
+                 let _ = "CREATE TABLE `not_test` (id TEXT)";
+             }
 
-            // Compiled in any debug build, test or not.
-            #[cfg(any(test, debug_assertions))]
-            fn test_or_debug() {
-                let _ = "CREATE TABLE `any_test_or_debug` (id TEXT)";
-            }
+             // Compiled in any debug build, test or not.
+             #[cfg(any(test, debug_assertions))]
+             fn test_or_debug() {
+                 let _ = "CREATE TABLE `any_test_or_debug` (id TEXT)";
+             }
 
-            // A NAME-VALUE predicate BEFORE `test`: the predecessor walked
-            // nested meta with a callback and stopped on the first item it
-            // could not read, so ordering could hide the `test` term.
-            #[cfg(all(feature = "x", test))]
-            fn name_value_then_test() {
-                let _ = "CREATE TABLE `name_value_then_test` (id TEXT)";
-            }
+             // A NAME-VALUE predicate BEFORE `test`: the predecessor walked
+             // nested meta with a callback and stopped on the first item it
+             // could not read, so ordering could hide the `test` term.
+             #[cfg(all(feature = "x", test))]
+             fn name_value_then_test() {
+                 let _ = "CREATE TABLE `name_value_then_test` (id TEXT)";
+             }
 
-            #[cfg(any(feature = "x", test))]
-            fn name_value_or_test() {
-                let _ = "CREATE TABLE `any_feature_or_test` (id TEXT)";
-            }
+             #[cfg(any(feature = "x", test))]
+             fn name_value_or_test() {
+                 let _ = "CREATE TABLE `any_feature_or_test` (id TEXT)";
+             }
 
-            fn attributed_statements() {
-                #[cfg(test)]
-                {
-                    let _ = "CREATE TABLE `stmt_test_only` (id TEXT)";
-                }
-                #[cfg(not(test))]
-                {
-                    let _ = "CREATE TABLE `stmt_production` (id TEXT)";
-                }
-                #[cfg(test)]
-                let _fixture = "CREATE TABLE `local_test_only` (id TEXT)";
-                // Macro statements in both directions. These are only
-                // meaningful because `visit_macro` scans macro ARGUMENTS —
-                // without that, neither string would be collected and the
-                // `Stmt::Macro` filter could not be mutation-tested.
-                #[cfg(all(test, unix))]
-                assert_eq!("CREATE TABLE `macro_stmt_test_only` (id TEXT)", "");
-                let _ = format!("CREATE TABLE `macro_stmt_production` (id TEXT){}", "");
-            }
+             fn attributed_statements() {
+                 #[cfg(test)]
+                 {
+                     let _ = "CREATE TABLE `stmt_test_only` (id TEXT)";
+                 }
+                 #[cfg(not(test))]
+                 {
+                     let _ = "CREATE TABLE `stmt_production` (id TEXT)";
+                 }
+                 #[cfg(test)]
+                 let _fixture = "CREATE TABLE `local_test_only` (id TEXT)";
+                 // Macro statements in both directions. These are only
+                 // meaningful because `visit_macro` scans macro ARGUMENTS —
+                 // without that, neither string would be collected and the
+                 // `Stmt::Macro` filter could not be mutation-tested.
+                 #[cfg(all(test, unix))]
+                 assert_eq!("CREATE TABLE `macro_stmt_test_only` (id TEXT)", "");
+                 let _ = format!("CREATE TABLE `macro_stmt_production` (id TEXT){}", "");
+             }
 
-            fn entity_ddl() {
-                let _ = schema.create_table_from_entity(object_index::Entity);
-            }
+             fn entity_ddl() {
+                 let _ = schema.create_table_from_entity(object_index::Entity);
+             }
 
-            #[cfg(all(test, unix))]
-            mod tests {
-                fn fixture() {
-                    let _ = "CREATE TABLE `fixture_only` (id TEXT)";
-                    let _ = schema.create_table_from_entity(fixture_entity::Entity);
-                }
-            }
+             #[cfg(all(test, unix))]
+             mod tests {
+                 fn fixture() {
+                     let _ = "CREATE TABLE `fixture_only` (id TEXT)";
+                     let _ = schema.create_table_from_entity(fixture_entity::Entity);
+                 }
+             }
 
-            fn trailing_production() {
-                let _ = "CREATE TABLE `after_test_module` (id TEXT)";
-            }
-        "##;
+             fn trailing_production() {
+                 let _ = "CREATE TABLE `after_test_module` (id TEXT)";
+             }
+         "##;
 
         let scanned = scan_rust_source("fixture.rs", FIXTURE);
         let tables = tables_in(&scanned.sql);
@@ -909,7 +968,7 @@ mod tests {
                 "stmt_production",
             ],
             "production DDL must survive every marker-shaped construct, and \
-             test-module DDL must not"
+              test-module DDL must not"
         );
         assert_eq!(
             scanned
@@ -951,7 +1010,7 @@ mod tests {
             .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT name FROM sqlite_schema WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                  AND name NOT LIKE 'sqlite_%' ORDER BY name",
             ))
             .await
             .expect("read the materialized schema");
@@ -975,8 +1034,8 @@ mod tests {
                 declared.contains(table.as_str())
                     || MIGRATION_ONLY_TABLES.contains(&table.as_str()),
                 "a REAL repository database contains table `{table}`, which is in \
-                 neither MUTABLE_STATE_OWNERSHIP nor MIGRATION_ONLY_TABLES — the \
-                 source scan missed it (plan-20260714 §C.4.1.1, line 2246)"
+                  neither MUTABLE_STATE_OWNERSHIP nor MIGRATION_ONLY_TABLES — the \
+                  source scan missed it (plan-20260714 §C.4.1.1, line 2246)"
             );
         }
     }
@@ -993,7 +1052,7 @@ mod tests {
         assert!(
             scoped_in_schema.contains("sequence_state"),
             "scan self-check: the known scoped table `sequence_state` was not \
-             found — the SQL scan is broken, not the schema"
+              found — the SQL scan is broken, not the schema"
         );
 
         // Self-check for the RUST half of the corpus: `schema_versions` is
@@ -1021,8 +1080,8 @@ mod tests {
         assert!(
             entity_built.contains("object_index"),
             "scan self-check: `object_index` (built from a sea-orm ENTITY in \
-             src/command/cloud.rs, with no CREATE TABLE text) is missing — \
-             entity-built DDL is no longer being read"
+              src/command/cloud.rs, with no CREATE TABLE text) is missing — \
+              entity-built DDL is no longer being read"
         );
         // And the non-repository exclusion must stay honest: each listed
         // file must exist AND actually issue DDL, or the entry is stale.
@@ -1048,9 +1107,9 @@ mod tests {
             assert!(
                 declared_scoped.contains(table.as_str()),
                 "table `{table}` carries a `worktree_id` scope column but is not \
-                 declared in MUTABLE_STATE_OWNERSHIP — declare its \
-                 Repository|Worktree|Composite ownership (plan-20260714 §C.4.1.1, \
-                 line 2246)"
+                  declared in MUTABLE_STATE_OWNERSHIP — declare its \
+                  Repository|Worktree|Composite ownership (plan-20260714 §C.4.1.1, \
+                  line 2246)"
             );
         }
 
@@ -1060,8 +1119,8 @@ mod tests {
                 StateOwner::Worktree | StateOwner::Composite => assert!(
                     scoped_in_schema.contains(surface.table),
                     "`{}` is declared scope-carrying but no CREATE TABLE in the SQL \
-                     corpus gives it a `worktree_id` column — a declaration that \
-                     outran the schema",
+                      corpus gives it a `worktree_id` column — a declaration that \
+                      outran the schema",
                     surface.table
                 ),
                 StateOwner::Repository => {}
@@ -1096,9 +1155,9 @@ mod tests {
             assert!(
                 declared.contains(table.as_str()) || migration_only.contains(table.as_str()),
                 "mutable table `{table}` is not classified: add a row to \
-                 MUTABLE_STATE_OWNERSHIP with its Repository|Worktree|Composite \
-                 ownership, or — if a single migration creates AND drops it — to \
-                 MIGRATION_ONLY_TABLES (plan-20260714 §C.4.1.1, line 2246)"
+                  MUTABLE_STATE_OWNERSHIP with its Repository|Worktree|Composite \
+                  ownership, or — if a single migration creates AND drops it — to \
+                  MIGRATION_ONLY_TABLES (plan-20260714 §C.4.1.1, line 2246)"
             );
         }
         // ...and no registry row may name a table the schema never creates

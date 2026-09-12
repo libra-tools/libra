@@ -29,6 +29,11 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 当某提交无法干净应用时，Libra 执行三方 apply（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树），并把未解决的发散路径写入索引（stage 1/2/3）与工作树（行级冲突标记，与 Git 一致）。`-X ours/theirs` 可只解决重叠 hunk 而保留 clean 变更。进行中的序列持久化到统一 SQLite `sequence_state` 表，因此你可以解决剩余冲突后用 `--continue` 续作、用 `--skip` 丢弃冲突提交，或用 `--abort`/`--quit` 撤销整个序列。cherry-pick 序列进行期间，其他 sequencer 操作被阻止（`LBR-CONFLICT-002`）。
 
+该内容合并与 `libra merge` 完全共用路径上的 `merge` gitattribute 及
+`merge.default` 回退：内建 `text`、`binary`、`union`，未知名称回退
+`text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
+内容；binary driver 冲突则保留完整的存活侧（current 存在时优先），不插入文本标记。
+
 ## 选项
 
 ### `-n`, `--no-commit`
@@ -247,7 +252,7 @@ Git 维护 `.git/CHERRY_PICK_HEAD` 与 sequencer 状态文件。Libra 把进行�
 
 发散路径以行级冲突标记呈现，与 Git 一致：三方合并（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树）仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>> <short-source>` 之间，两侧共享的行留在标记之外。删除/修改冲突（某一侧缺失）或二进制内容回退为整文件呈现（此时行级合并无意义）。`>>>>>>>` 标签为被 pick 提交的缩写（Libra 省略了 Git 追加的提交主题）。
 
-Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一致）：`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；不支持的值（如 `zdiff3`）在需要渲染冲突时直接报错。详见 [merge 文档](merge.md)。
+Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一致）：`merge` 重新 diff 双方 postimage 以移出共同边缘和较长共同片段；`diff3` 加入完整 ancestor 块；`zdiff3` 保留该 ancestor 块并移出共同前后缀。遇到未知值且确实需要内容合并时，会在索引或工作树写入前直接报错。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。详见 [merge 文档](merge.md)。
 
 ### 自定义策略仍保持显式边界
 
