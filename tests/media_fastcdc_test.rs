@@ -281,6 +281,9 @@ fn parse_ready_json(bytes: &[u8]) -> Result<ReadyFile, String> {
         .ok_or_else(|| "ready-file is missing token".to_string())?;
     let lfs_url =
         url::Url::parse(lfs_url).map_err(|e| format!("ready-file lfs_url is not a URL: {e}"))?;
+    if !lfs_url.username().is_empty() || lfs_url.password().is_some() {
+        return Err("ready-file lfs_url must not include credentials".to_owned());
+    }
     if !lfs_url.path().contains("/info/lfs") {
         return Err(format!(
             "ready-file lfs_url must keep the repository LFS URL (.../<repo>.git/info/lfs/), got {lfs_url}"
@@ -332,6 +335,13 @@ fn ready_file_rejects_malformed_payloads() {
         parse_ready_json(br#"{"lfs_url":"http://127.0.0.1:9/","token":"t"}"#)
             .unwrap_err()
             .contains("repository LFS URL")
+    );
+    assert!(
+        parse_ready_json(
+            br#"{"lfs_url":"http://user:password@127.0.0.1:9/acme/app.git/info/lfs/","token":"once"}"#,
+        )
+        .unwrap_err()
+        .contains("credentials")
     );
     let ok = parse_ready_json(
         br#"{"lfs_url":"http://127.0.0.1:9/acme/app.git/info/lfs/","token":"once"}"#,
