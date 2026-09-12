@@ -37,24 +37,25 @@ enabled in this repository.
 
 Actual LFS transfers also apply `lfs.fastcdc` and require the server to retain a
 complete standard-LFS fallback and accept manifests. Chunk-only advertisements
-use basic LFS instead. Mega built with `--features fastcdc` implements the
-authenticated extension; other remotes retain the standard Git LFS fallback.
+use basic LFS instead. A monoengine server built with `--features fastcdc`
+implements the authenticated extension; other remotes retain the standard Git LFS
+fallback. This is not standard Git FastCDC interoperability.
 
-## Live LFS transfers with Mega
+## Live LFS transfers with monoengine
 
-Build Libra with `cargo build --features fastcdc` and, in the Mega repository,
-build/start the HTTP server with
-`cargo run -p mono --features fastcdc -- service http` using its normal server
-configuration. Both builds default to feature OFF. The `libra` commands below
-must use the feature-built binary (`target/debug/libra`, or `libra.exe` on
-Windows); compiling does not replace a separately installed binary on PATH.
+Build Libra with `cargo build --features fastcdc` and start a monoengine HTTP
+service built with `--features fastcdc` (`cargo run -p monoengine --features
+fastcdc -- --config config/config.toml service http`). Both builds default to
+feature OFF. The `libra` commands below must use the feature-built binary
+(`target/debug/libra`, or `libra.exe` on Windows); compiling does not replace a
+separately installed binary on PATH.
 
-Obtain a **Mono-issued access token** through Mega's existing authenticated
+Obtain a **Mono-issued access token** through monoengine's existing authenticated
 token-creation flow (`POST /api/v1/user/token/generate`). `libra auth login`
-only stores that token locally; it does not issue a Mega token. A GitHub PAT or
+only stores that token locally; it does not issue a token. A GitHub PAT or
 browser session cookie is not a substitute for the Mono access token.
 
-For a local Mega HTTP server on port 8000, run in the Libra repository:
+For a local monoengine HTTP server on port 8000, run in the Libra repository:
 
 ```bash
 libra config remote.origin.url http://localhost:8000/project/demo.git
@@ -68,7 +69,7 @@ libra media probe --remote origin
 After compiling the feature, an unset `lfs.fastcdc` permits automatic negotiation;
 `true` explicitly enables it and `false` disables it in that repository. The
 stored token must match the remote's **host and port**. Use HTTPS for non-loopback
-servers (for example `--host https://mega.example.com:8443`); HTTP token attachment
+servers (for example `--host https://git.example.com:8443`); HTTP token attachment
 is allowed only for loopback. Pass only the origin to `--host`, without the
 repository path, and do not put tokens in URLs. For scripts, feed the token on
 stdin with `--with-token`; see [`libra auth`](auth.md).
@@ -78,22 +79,36 @@ Keep the repository URL in `origin`. The LFS client preserves
 to that LFS URL. The Bearer header is attached automatically from the stored token.
 
 Normal LFS push/upload now prepares a versioned manifest, uploads only missing
-chunks, and finalizes. Mega verifies chunk hashes, full SHA-256 and the frozen
-FastCDC boundaries, writes the complete standard-LFS object, then publishes the
-manifest. Repeating push resumes from missing chunks. Downloads use finalized
-manifests, reuse verified local chunks, and atomically publish only verified full
-content. Invalid manifests or corrupted remote chunks are errors and preserve the
-existing destination. No manifest, unsupported capabilities or disabled feature
-means standard full-object LFS. Objects exceeding the negotiated manifest/chunk
-count limits also use basic upload before any manifest is sent. Chunk-only uploads
-are not supported. Outside a Libra repository, the public LFS download client uses
-basic LFS instead of creating a repository cache.
+chunks, and finalizes. The FastCDC-capable server verifies chunk hashes, full
+SHA-256 and the frozen FastCDC boundaries, writes the complete standard-LFS
+object, then publishes the manifest. Repeating push resumes from missing chunks.
+Downloads use finalized manifests, reuse verified local chunks, and atomically
+publish only verified full content. Invalid manifests or corrupted remote chunks
+are errors and preserve the existing destination. No manifest, unsupported
+capabilities or disabled feature means standard full-object LFS. Objects exceeding
+the negotiated manifest/chunk count limits also use basic upload before any
+manifest is sent. Chunk-only uploads are not supported. Outside a Libra
+repository, the public LFS download client uses basic LFS instead of creating a
+repository cache.
 
-Mega's initial extension isolates chunks by authenticated user and repository;
+The initial extension isolates chunks by authenticated user and repository;
 another user's data is fetched through the standard full-object fallback. It
 requires Bearer access tokens and does not introduce a public chunk-hash API.
 Manifests are limited to 10 MiB / 8192 chunks and chunks to 8 MiB. This is an
 opt-in transport; deployments need explicit retention and quota planning.
+
+The ignored live test `monoengine_fastcdc_http_interop` is not Mega-only. Run it
+only with `--features fastcdc` and a ready-file:
+
+```bash
+export MONOENGINE_FASTCDC_READY_FILE=/path/to/ready.json
+# ready.json: {"lfs_url":"http://127.0.0.1:9000/acme/app.git/info/lfs/","token":"<one-time>"}
+cargo test --features fastcdc --test media_fastcdc_test -- --ignored --exact monoengine_fastcdc_http_interop
+```
+
+`lfs_url` must stay a repository LFS URL (`<repo>.git/info/lfs/`). Do not commit
+tokens. The default `cargo test` feature-gate guard still passes without this
+file; the live test is executed by the monoengine FC-15 harness.
 
 ## Deferred
 
