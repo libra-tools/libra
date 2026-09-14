@@ -1,136 +1,38 @@
-name: Live compatibility gates
-
-# L3 gates that require real provider/cloud credentials. These jobs are
-# intentionally separate from base.yml so they never become required PR checks.
-# Missing secrets produce an explicit skip instead of a false failure, which
-# keeps forks and local mirrors usable.
+# Verification-only branch: do not merge this replacement into main.
+# Retained with its exact run/commit as MIG-06 performance evidence.
+name: MIG-06 released-binary benchmark (verification branch only)
 
 on:
-  schedule:
-    # Daily at 04:30 UTC, staggered after model-generation-nightly.
-    - cron: "30 4 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: mig06-released-binary-benchmark-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  live-ai:
-    name: compat-live-ai
-    runs-on: [self-hosted]
-    timeout-minutes: 60
-
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
-
+  benchmark:
+    if: github.ref == 'refs/heads/codex/mig06-ci-benchmark'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Checkout verification script without persisted credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          submodules: recursive
-
-      - name: Check live AI secrets
-        id: gate
+          persist-credentials: false
+      - name: Validate harness safety checks
+        run: python3 tests/ci/mig06_released_binary_benchmark.py --self-test
+      - name: Measure verified release binaries against an isolated 100 MiB fixture
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          if [ -z "${DEEPSEEK_API_KEY}" ]; then
-            echo "::warning::DEEPSEEK_API_KEY secret is not configured; skipping compat-live-ai."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "skip=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Install stable toolchain
-        if: steps.gate.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Run live AI tests
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          cargo test --features test-live-ai \
-            --test ai_agent_test \
-            --test ai_chat_agent_test \
-            -- --test-threads=1 --nocapture
-
-  live-cloud:
-    name: compat-live-cloud
-    runs-on: [self-hosted]
-    timeout-minutes: 120
-
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+          BENCHMARK_OUTPUT: ${{ runner.temp }}/mig06-metrics.json
+        run: python3 tests/ci/mig06_released_binary_benchmark.py --metrics "$BENCHMARK_OUTPUT"
+      - name: Retain small metrics only (never databases or configuration)
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          submodules: recursive
-
-      - name: Check live cloud secrets
-        id: gate
-        env:
-          LIBRA_D1_ACCOUNT_ID: ${{ secrets.LIBRA_D1_ACCOUNT_ID }}
-          LIBRA_D1_API_TOKEN: ${{ secrets.LIBRA_D1_API_TOKEN }}
-          LIBRA_D1_DATABASE_ID: ${{ secrets.LIBRA_D1_DATABASE_ID }}
-          LIBRA_STORAGE_ENDPOINT: ${{ secrets.LIBRA_STORAGE_ENDPOINT }}
-          LIBRA_STORAGE_BUCKET: ${{ secrets.LIBRA_STORAGE_BUCKET }}
-          LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
-          LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
-        run: |
-          missing=0
-          for name in \
-            LIBRA_D1_ACCOUNT_ID \
-            LIBRA_D1_API_TOKEN \
-            LIBRA_D1_DATABASE_ID \
-            LIBRA_STORAGE_ENDPOINT \
-            LIBRA_STORAGE_BUCKET \
-            LIBRA_STORAGE_ACCESS_KEY \
-            LIBRA_STORAGE_SECRET_KEY
-          do
-            if [ -z "${!name}" ]; then
-              echo "::warning::${name} secret is not configured."
-              missing=1
-            fi
-          done
-
-          if [ "${missing}" -ne 0 ]; then
-            echo "::warning::Skipping compat-live-cloud because one or more required secrets are missing."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "skip=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Install stable toolchain
-        if: steps.gate.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Run live cloud tests
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          LIBRA_ENABLE_TEST_LIVE_CLOUD: "1"
-          LIBRA_D1_ACCOUNT_ID: ${{ secrets.LIBRA_D1_ACCOUNT_ID }}
-          LIBRA_D1_API_TOKEN: ${{ secrets.LIBRA_D1_API_TOKEN }}
-          LIBRA_D1_DATABASE_ID: ${{ secrets.LIBRA_D1_DATABASE_ID }}
-          LIBRA_STORAGE_ENDPOINT: ${{ secrets.LIBRA_STORAGE_ENDPOINT }}
-          LIBRA_STORAGE_BUCKET: ${{ secrets.LIBRA_STORAGE_BUCKET }}
-          LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
-          LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
-          LIBRA_PUBLISH_LIVE_WORKER_ORIGIN: ${{ secrets.LIBRA_PUBLISH_LIVE_WORKER_ORIGIN }}
-          LIBRA_PUBLISH_LIVE_CLONE_DOMAIN: ${{ secrets.LIBRA_PUBLISH_LIVE_CLONE_DOMAIN }}
-        run: |
-          cargo test --features test-live-cloud \
-            --test cloud_storage_backup_test \
-            --test publish_live_test \
-            --test storage_r2_test \
-            -- --test-threads=1 --nocapture
+          name: mig06-released-binary-metrics
+          path: ${{ runner.temp }}/mig06-metrics.json
+          if-no-files-found: error
+          retention-days: 30
