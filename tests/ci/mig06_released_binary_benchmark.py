@@ -19,7 +19,6 @@ import sys
 import tempfile
 import time
 import unittest
-import urllib.request
 
 
 PINS = {
@@ -78,24 +77,18 @@ def verify_binary(path, pin):
     require(actual == digest, "release binary SHA-256 differs from its pinned artifact")
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise RuntimeError("release download unexpectedly redirected; refuse an unpinned host")
-
-
 def get_binary(directory, version):
     path = directory / f"libra-v{version}-linux-amd64"
     if not path.exists():
         url = f"https://download.libra.tools/libra/releases/v{version}/libra-linux-amd64"
-        deadline = time.monotonic() + 180
-        opener = urllib.request.build_opener(NoRedirect())
-        with opener.open(url, timeout=30) as response, path.open("xb") as output:
-            downloaded = 0
-            while chunk := response.read(1024 * 1024):
-                downloaded += len(chunk)
-                require(downloaded <= PINS[version][1], "release download exceeded its pinned size")
-                require(time.monotonic() < deadline, "release download exceeded 180 seconds")
-                output.write(chunk)
+        # Use the release installer's supported curl client. Do not spoof a
+        # user agent, follow redirects, load curlrc/netrc, or inherit credentials.
+        run_child([
+            "/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error",
+            "--proto", "=https", "--connect-timeout", "30", "--max-time", "180",
+            "--max-filesize", str(PINS[version][1]), "--output", path, url,
+        ], directory, {"PATH": "/usr/bin:/bin", "HOME": str(directory)},
+            f"pinned v{version} release download", timeout=190)
     verify_binary(path, PINS[version])
     path.chmod(0o700)
     return path.resolve()
