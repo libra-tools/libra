@@ -854,6 +854,9 @@ pub struct ShellCommandRequest {
     pub approval: Option<ToolApprovalContext>,
     pub justification: Option<String>,
     pub safety_decision: Option<SafetyDecision>,
+    /// Runtime-owned AI identifiers propagated to a nested Libra command so
+    /// its revision builder can attach the pending link to the new Change.
+    pub ai_operation: Option<crate::internal::ai::tools::AiOperationContext>,
 }
 
 #[derive(Default, Clone)]
@@ -926,9 +929,10 @@ pub async fn run_shell_command_with_approval(
         approval,
         justification,
         safety_decision,
+        ai_operation,
     } = request;
 
-    let spec = CommandSpec::shell(
+    let mut spec = CommandSpec::shell(
         &command,
         cwd.clone(),
         timeout_ms,
@@ -938,6 +942,28 @@ pub async fn run_shell_command_with_approval(
             .unwrap_or(SandboxPermissions::UseDefault),
         justification.clone(),
     );
+    if let Some(ai_operation) = ai_operation {
+        spec.env.insert(
+            "LIBRA_AI_OPERATION_ID".to_string(),
+            ai_operation.operation_id,
+        );
+        if !ai_operation.pending_operation_ids.is_empty() {
+            spec.env.insert(
+                "LIBRA_AI_PENDING_OPERATION_IDS".to_string(),
+                ai_operation.pending_operation_ids.join(","),
+            );
+        }
+        if let Some(run_id) = ai_operation.run_id {
+            spec.env.insert("LIBRA_AI_RUN_ID".to_string(), run_id);
+        }
+        if let Some(intent_id) = ai_operation.intent_id {
+            spec.env.insert("LIBRA_AI_INTENT_ID".to_string(), intent_id);
+        }
+        if let Some(session_id) = ai_operation.session_id {
+            spec.env
+                .insert("LIBRA_AI_SESSION_ID".to_string(), session_id);
+        }
+    }
 
     let allow_all_commands = if let Some(ctx) = approval.as_ref() {
         let scope = ctx
@@ -4064,6 +4090,7 @@ mod tests {
                     approval: Some(ctx),
                     justification: None,
                     safety_decision: None,
+                    ai_operation: None,
                 })
                 .await
             }
@@ -4157,6 +4184,7 @@ mod tests {
                     approval: Some(ctx),
                     justification: None,
                     safety_decision: None,
+                    ai_operation: None,
                 })
                 .await
             }
@@ -4247,6 +4275,7 @@ mod tests {
                 "policy denial remains authoritative",
                 super::super::runtime::hardening::BlastRadius::Workspace,
             )),
+            ai_operation: None,
         })
         .await
         .expect_err("safety deny should stop before network upgrade approval");
@@ -4478,6 +4507,7 @@ mod tests {
             approval: Some(ctx),
             justification: None,
             safety_decision: None,
+            ai_operation: None,
         })
         .await
         .expect("allow-all approval policy should run without prompting");
@@ -4520,6 +4550,7 @@ mod tests {
                 "policy denial remains authoritative",
                 super::super::runtime::hardening::BlastRadius::Workspace,
             )),
+            ai_operation: None,
         })
         .await
         .expect_err("safety deny should override allow-all approval cache");
@@ -4576,6 +4607,7 @@ mod tests {
                     approval: Some(ctx),
                     justification: None,
                     safety_decision: None,
+                    ai_operation: None,
                 })
                 .await
             }

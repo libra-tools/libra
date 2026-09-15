@@ -8,8 +8,8 @@
 //! smoke test for the MCP server: TUI-side details may change, but the wire protocol
 //! must keep round-tripping.
 //!
-//! **Layer:** L1 — uses local HTTP server on dynamically allocated ports. Builds
-//! the binary on demand inside the test so the harness picks up local edits.
+//! **Layer:** L1 — uses local HTTP server on dynamically allocated ports and
+//! reuses the binary built by Cargo/nextest for the integration test.
 
 use std::{
     process::{Command, Stdio},
@@ -146,7 +146,7 @@ async fn mcp_post(
 
 /// Scenario: full end-to-end MCP flow over the Streamable HTTP transport.
 ///
-/// 1. Build the `libra` binary (so the test runs against current code).
+/// 1. Reuse the `libra` binary built by Cargo/nextest for this integration test.
 /// 2. Initialize a temp-dir repo with isolated HOME/XDG_CONFIG_HOME.
 /// 3. Start `libra code` (default Web Code UI) on dynamically allocated ports.
 /// 4. Wait up to 30 seconds for the MCP TCP listener to accept connections.
@@ -175,20 +175,10 @@ async fn test_e2e_mcp_flow() {
 
     println!("Test Repo Path: {:?}", repo_path);
 
-    // Build binary first to ensure it's fresh
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "libra"])
-        .status()
-        .expect("Failed to build libra");
-    assert!(status.success(), "cargo build failed");
-
-    let project_root = std::env::current_dir().expect("Failed to get current dir");
-    // Honor CARGO_TARGET_DIR like the sigterm case below — a hardcoded
-    // target/ path ENOENTs under an isolated target dir (PS-02 terra R1).
-    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| project_root.join("target"))
-        .join("debug/libra");
+    // Reuse the binary built by Cargo/nextest. Building from inside an
+    // integration test can deadlock on Cargo's target-directory lock while
+    // the test runner is still executing this binary.
+    let libra_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_libra"));
 
     // Init repo
     let status = Command::new(&libra_bin)
@@ -480,18 +470,7 @@ async fn test_web_only_sigterm_releases_ports() {
     let config_home = home_dir.join(".config");
     std::fs::create_dir_all(&config_home).expect("failed to create isolated HOME");
 
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "libra"])
-        .env("LIBRA_SKIP_WEB_BUILD", "1")
-        .status()
-        .expect("Failed to build libra");
-    assert!(status.success(), "cargo build failed");
-
-    let project_root = std::env::current_dir().expect("Failed to get current dir");
-    let libra_bin = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| project_root.join("target"))
-        .join("debug/libra");
+    let libra_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_libra"));
 
     let status = Command::new(&libra_bin)
         .args(["init"])

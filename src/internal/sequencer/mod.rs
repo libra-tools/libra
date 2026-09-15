@@ -55,6 +55,15 @@ impl SequenceKind {
         }
     }
 
+    /// CLI spelling used in durable operation records. The storage token
+    /// remains cherry_pick, while operation names follow the invoked command.
+    fn command_name(self) -> &'static str {
+        match self {
+            SequenceKind::CherryPick => "cherry-pick",
+            _ => self.as_str(),
+        }
+    }
+
     fn from_token(token: &str) -> Option<Self> {
         match token {
             "merge" => Some(SequenceKind::Merge),
@@ -472,8 +481,11 @@ async fn claim_fields(
 pub(crate) async fn begin_control_operation(
     control: SequencerControl,
     argv: &[String],
+    repository_ref_lease_managed_by_command_boundary: bool,
 ) -> CliResult<Option<crate::internal::operation_wrapper::OperationBoundary>> {
-    use crate::internal::operation_wrapper::{OperationMeta, OperationScope, begin_operation};
+    use crate::internal::operation_wrapper::{
+        OperationMeta, OperationScope, begin_sequencer_control_operation,
+    };
 
     // The enumeration is the authority on what a control action IS: anything
     // entering the operation log must be one of the declared ones, or the
@@ -527,8 +539,25 @@ pub(crate) async fn begin_control_operation(
         duplicate_window: false,
         ..OperationScope::default()
     };
-    match begin_operation(meta, scope).await {
-        Ok(boundary) => Ok(Some(boundary)),
+    match begin_sequencer_control_operation(meta, scope).await {
+        Ok(mut boundary) => {
+            if !repository_ref_lease_managed_by_command_boundary
+                && control.mutation_scope().repository_refs
+                && let Err(err) = boundary.acquire_repository_ref_lease_after_claim().await
+            {
+                let _ = boundary
+                    .finish(crate::internal::operation_wrapper::BoundaryOutcome::Failed)
+                    .await;
+                return Err(
+                    CliError::fatal(format!("cannot start this operation: {err}"))
+                        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                        .with_hint(
+                            "another repository ref update is running; wait for it to finish, then retry",
+                        ),
+                );
+            }
+            Ok(Some(boundary))
+        }
         Err(err) => Err(
             CliError::fatal(format!("cannot start this operation: {err}"))
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
@@ -1444,12 +1473,12 @@ impl SequencerControl {
     /// in `operation`, and its human description.
     pub(crate) fn describe_operation(self) -> (String, String) {
         let (command, action) = match self {
-            SequencerControl::Start(kind) => (kind.as_str(), "start"),
-            SequencerControl::Continue(kind) => (kind.as_str(), "continue"),
-            SequencerControl::Skip(kind) => (kind.as_str(), "skip"),
-            SequencerControl::Abort(kind) => (kind.as_str(), "abort"),
-            SequencerControl::Quit(kind) => (kind.as_str(), "quit"),
-            SequencerControl::Restart(kind) => (kind.as_str(), "restart"),
+            SequencerControl::Start(kind) => (kind.command_name(), "start"),
+            SequencerControl::Continue(kind) => (kind.command_name(), "continue"),
+            SequencerControl::Skip(kind) => (kind.command_name(), "skip"),
+            SequencerControl::Abort(kind) => (kind.command_name(), "abort"),
+            SequencerControl::Quit(kind) => (kind.command_name(), "quit"),
+            SequencerControl::Restart(kind) => (kind.command_name(), "restart"),
             SequencerControl::AmStart => ("am", "start"),
             SequencerControl::AmContinue => ("am", "continue"),
             SequencerControl::AmSkip => ("am", "skip"),

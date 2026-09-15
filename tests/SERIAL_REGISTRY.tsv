@@ -881,6 +881,7 @@ test_worktree_repair_deduplicates_entries	lane:cwd	changes the process working d
 test_worktree_repair_json_reports_changed_state	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_repair_persists_main_flag_fix_without_duplicates	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 trusted_dirs_env_allowlist_extra	lane:env	mutates process-wide environment variables via set_var/remove_var (composable env lane)
+undo_restores_current_symbolic_branch_tip_and_preserves_other_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unknown_interaction_id_is_rejected_without_state_change	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 unmerged_path_never_pairs_as_a_staged_rename_source	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unmerged_stage_presence_to_xy_mapping	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

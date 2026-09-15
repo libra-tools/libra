@@ -329,9 +329,26 @@ pub async fn execute(stash_cmd: Stash) {
 /// apply, drop, show, branch, clear).
 pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<()> {
     // §C.10: finish any rollback an interrupted `stash branch` recorded.
-    recover_stash_branch_journal()
-        .await
-        .map_err(CliError::from)?;
+    if matches!(&stash_cmd, Stash::Pop { .. }) {
+        let _repository_ref_lease =
+            crate::internal::operation_wrapper::acquire_request_repository_ref_lease_wait(
+                "stash pop recovery",
+            )
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot acquire repository ref lease before stash recovery: {error}"
+                ))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            })?;
+        recover_stash_branch_journal()
+            .await
+            .map_err(CliError::from)?;
+    } else {
+        recover_stash_branch_journal()
+            .await
+            .map_err(CliError::from)?;
+    }
 
     // W2 §C.4.3: the stash STACK (`refs/stash` + reflog) stays deliberately
     // repository-shared — a stash pushed in one worktree may be applied in
@@ -969,7 +986,7 @@ async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
     // Phase 2 (C.10): drop ONLY the applied entry — located by its raw line
     // under the stack lock. A CAS miss keeps the entry and reports; the
     // successful local apply is never rolled back.
-    match do_drop(None, Some(&raw_line)) {
+    match do_drop_with_repository_ref_lease(None, Some(&raw_line)).await {
         Ok(_) => {}
         Err(StashError::StackChanged) => {
             return Err(StashError::StackChangedAfterApply { stash_id });
@@ -2221,6 +2238,29 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
     // may win. A hold inside the lock serializes the second process's
     // resolve behind the first's publication, which tests nothing.
     hold_for_drop_rendezvous()?;
+    do_drop_after_rendezvous(stash, expected_line)
+}
+
+async fn do_drop_with_repository_ref_lease(
+    stash: Option<String>,
+    expected_line: Option<&str>,
+) -> Result<StashOutput, StashError> {
+    // Let every pop apply its already-resolved entry and reach the CAS
+    // rendezvous before serializing the shared-ref write. The lease stays held
+    // only for the stack lock and publication, so a later pop observes the
+    // first one's raw-line removal and reports a CAS miss.
+    hold_for_drop_rendezvous()?;
+    let _repository_ref_lease =
+        crate::internal::operation_wrapper::acquire_request_repository_ref_lease_wait("stash pop")
+            .await
+            .map_err(|error| StashError::Other(error.to_string()))?;
+    do_drop_after_rendezvous(stash, expected_line)
+}
+
+fn do_drop_after_rendezvous(
+    stash: Option<String>,
+    expected_line: Option<&str>,
+) -> Result<StashOutput, StashError> {
     let _stack_lock = acquire_stash_stack_lock()?;
     let git_dir = util::request_storage_path();
     // §C.10 recovery: a tip left stale by a crash is repaired FIRST, under the

@@ -33,6 +33,7 @@ use crate::{
     internal::{
         ai::automation::{VCS_EVENT_POST_COMMIT, dispatch_current_repo_vcs_event_to_history},
         branch::Branch,
+        change::{RelationKind, record_current_repo_commit_revision_for_active_operation},
         config::{
             LocalIdentityTarget, env_first_non_empty, read_cascaded_config_value,
             resolve_user_identity_sources,
@@ -310,6 +311,9 @@ pub enum CommitError {
     #[error("failed to update HEAD: {0}")]
     HeadUpdate(String),
 
+    #[error("failed to persist change revision: {0}")]
+    ChangeRevision(String),
+
     #[error("pre-commit hook failed: {0}")]
     PreCommitHook(String),
 
@@ -446,6 +450,9 @@ impl From<CommitError> for CliError {
                 .with_hint("run 'libra fsck' to inspect missing or mistyped objects")
                 .with_hint("restore the object or remove the bad index entry before committing"),
             CommitError::ObjectStorage(..) => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+            }
+            CommitError::ChangeRevision(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
             CommitError::ParentCommitLoad { .. } => CliError::fatal(error.to_string())
@@ -1351,6 +1358,15 @@ async fn run_commit_with_index(
         // after ref update never points the branch at a missing object.
         save_commit_object(&storage, &commit)?;
         update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+        // Record the change revision only after HEAD has advanced; a failed ref
+        // update must not leave a projection for an unreachable commit (the
+        // projection is a GC root and would anchor the object forever).
+        record_current_repo_commit_revision_for_active_operation(
+            commit.id.to_string(),
+            Some((parents_commit_ids[0].to_string(), RelationKind::Amend)),
+        )
+        .await
+        .map_err(|error| CommitError::ChangeRevision(error.to_string()))?;
         if !skip_all_hooks {
             run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
             let rewrite_input = format!("{} {}\n", parents_commit_ids[0], commit.id);
@@ -1465,6 +1481,12 @@ async fn run_commit_with_index(
     // ref update never points the branch at a missing object.
     save_commit_object(&storage, &commit)?;
     update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+    // Record the change revision only after HEAD has advanced; a failed ref
+    // update must not leave a projection for an unreachable commit (the
+    // projection is a GC root and would anchor the object forever).
+    record_current_repo_commit_revision_for_active_operation(commit.id.to_string(), None)
+        .await
+        .map_err(|error| CommitError::ChangeRevision(error.to_string()))?;
     if !skip_all_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
     }

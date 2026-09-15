@@ -252,6 +252,8 @@ impl<M: CompletionModel> ToolLoopAction<M> {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                intent_id: None,
+                run_id: None,
                 active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,

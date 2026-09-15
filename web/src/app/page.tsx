@@ -6,6 +6,7 @@ import { SessionComposer } from "@/components/workspace/composer/SessionComposer
 import { SessionExecutionRepair } from "@/components/workspace/execution-repair/SessionExecutionRepair";
 import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/SessionGoalTaskSkill";
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
+import { OperationGraphHost } from "@/components/workspace/operation-graph/OperationGraphHost";
 import { SessionLifecycle } from "@/components/workspace/session-lifecycle/SessionLifecycle";
 import { SessionSseResilience } from "@/components/workspace/sse-resilience/SessionSseResilience";
 import { SessionThreadGraph } from "@/components/workspace/thread-graph/SessionThreadGraph";
@@ -37,6 +38,7 @@ function PlaceholderShell() {
       <SessionLifecycle />
       <SessionUsage />
       <SessionThreadGraph />
+      <OperationGraphHost />
       <SessionExecutionRepair />
       <SessionWorkflow />
       <SessionSseResilience />

@@ -122,7 +122,7 @@ fn global_schema_repair_rechecks_attestation_under_lock() {
 #[test]
 fn global_schema_repair_rechecks_receipt_manifest_under_lock() {
     repair_recheck_after_lock(
-        "INSERT INTO schema_versions VALUES(2026090802,'unregistered','fixture')",
+        "INSERT INTO schema_versions SELECT MAX(version)+1,'unregistered','fixture' FROM schema_versions",
     );
 }
 
@@ -164,7 +164,7 @@ fn global_schema_repair_ineligible_keeps_main_db() {
         "INSERT INTO reference(name,kind) VALUES('main','Branch')",
         "DROP INDEX idx_config_kv_key",
         "DELETE FROM schema_versions WHERE version=(SELECT MIN(version) FROM schema_versions)",
-        "INSERT INTO schema_versions VALUES(2026090802,'unknown','fixture')",
+        "INSERT INTO schema_versions SELECT MAX(version)+1,'unknown','fixture' FROM schema_versions",
         "UPDATE metadata_kv SET value='not-the-bootstrap-seed'",
         "CREATE TABLE sqliteXhidden(value TEXT); INSERT INTO sqliteXhidden VALUES('repository data')",
     ] {
@@ -727,11 +727,22 @@ fn config_doctor_reports_receipt() {
         data["configuration"]["observed_version"],
         fixture.latest_schema_version.to_string()
     );
-    assert_eq!(data["legacy"]["observed_version"], "2026090801");
-    assert_eq!(data["legacy"]["latest_version"], "2026090801");
+    let latest_repository_migration = libra::internal::db::schema::migrations_for_role(
+        libra::internal::db::DatabaseRole::Repository,
+    )
+    .pop()
+    .expect("latest repository migration");
+    assert_eq!(
+        data["legacy"]["observed_version"],
+        latest_repository_migration.version.to_string()
+    );
+    assert_eq!(
+        data["legacy"]["latest_version"],
+        latest_repository_migration.version.to_string()
+    );
     assert_eq!(
         data["legacy"]["verified_name"],
-        "operation_v2_branch_convergence"
+        latest_repository_migration.name
     );
     fixture.success(
         &fixture.root,

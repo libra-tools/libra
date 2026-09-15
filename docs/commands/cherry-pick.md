@@ -302,3 +302,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 | `LBR-CONFLICT-002` | `merge`/`rebase` started while a cherry-pick is in progress, or a new pick started over an in-progress sequence | Finish or cancel the cherry-pick first |
 | `LBR-IO-001` | Failed to load an object or cherry-pick state | Check repository integrity and retry |
 | `LBR-IO-002` | Failed to save object, index, or update branch ref/state | Check filesystem permissions and repository writability |
+
+Cherry-picked revisions use the sidecar Change ID projection and typed
+predecessor genealogy. Existing commit headers remain readable for import, but
+new commits do not depend on or inject a `change-id` header.

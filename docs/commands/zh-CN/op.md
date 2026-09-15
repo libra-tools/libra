@@ -92,8 +92,11 @@ libra op show @{0} --view
 
 从先前捕获的 operation view 恢复受支持的 HEAD/ref 状态，而不是任意工作树或嵌套仓库内容。HEAD 和捕获的 branch refs 会重置为目标 view，本地分支中不存在于该 view 的会被 prune，因此 restore 会复现该 operation 的精确本地分支集合。恢复后的 HEAD branch 始终保留；remote-tracking refs 和 Libra-owned internal refs（locked `main`/`intent`/`traces` branches 以及保留 `libra/` namespace，例如 AI history branch `libra/intent`）永不 prune。
 
+仓库级 restore（`--what all --confirm-repo-wide`）在会删除快照中不存在的 linked worktree 的 HEAD 时拒绝执行：该 worktree 是在快照之后创建的，restore 后必须重新创建或 checkout 其 HEAD。
+
 ```bash
-libra op restore [--force] [--dry-run] <OP_REF>
+libra op restore [--what <all|working-copy|index|sequencer|sparse|head>] \
+  [--confirm-repo-wide] [--force] [--dry-run] <OP_REF>
 ```
 
 ### 选项
@@ -113,6 +116,52 @@ libra op restore @{0} --force
 ```bash
 libra op restore @{0} --dry-run
 ```
+
+### `--what <FACET>`
+
+选择要恢复的状态 facet。默认值为 `all`，也可以选择 `working-copy`、
+`index`、`sequencer`、`sparse` 或 `head`。v2 restore 会输出 receipt，其中包含
+目标 view、选择的 facet、路径数量，以及真实恢复产生的新 operation ID。
+
+### `--confirm-repo-wide`
+
+显式确认目标 view 含有多个 workspace。引擎仍只会对当前请求固定的 worktree
+应用恢复，并拒绝不包含当前 worktree 的目标。
+
+机器调用方可以使用命令的标准 `--json` 输出模式取得 receipt。dry-run 不写入
+operation，也不会修改工作区。
+
+## `libra op undo`、`redo` 和 `revert`
+
+这些命令都会追加新的 operation，不会改写或删除 commit 对象。`undo` 要求目标
+是当前唯一 head，并移动到它的 parent view；`redo` 只接受当前的 undo head，并
+重放该 undo 记录的源 operation；`revert` 必须显式提供 `--parent`，并将该
+parent 的 view 作为逆向结果应用。
+
+```bash
+libra op undo <OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op redo <UNDO_OP_REF> [--force] [--confirm-repo-wide] [--dry-run]
+libra op revert <OP_REF> --parent <PARENT_OP_REF> \
+  [--force] [--confirm-repo-wide] [--dry-run]
+```
+
+三个命令都支持 JSON receipt，包含选择的 facet、变更路径数量、目标 view，以及
+实际发布时的新 operation ID。dry-run 只计算计划，不发布 operation。
+工作区 dirty 时默认拒绝，必须显式使用 `--force`。
+
+## `libra op doctor`
+
+检查 operation 对象闭包、heads、未完成 journal 和 workspace pointer。默认只读；
+`--fix` 才会执行 journal 恢复和 pointer 重建，`--dry-run` 只报告计划中的修复。
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
+`--fix` 会收敛中断但未达终态的 operation：已发布 head 的命令（进程崩溃前其
+mutation 已完成）被推进为 `success`，且若它是当前 head，则把 workspace pointer
+重建到其捕获的 view；全局孤儿（head 发布前崩溃）的 running operation 被 fail
+closed，下一次 mutation 边界会把磁盘漂移记录为 external snapshot。
 
 ## 示例
 
@@ -189,5 +238,24 @@ pointer/CAS 在 replay 开始前发生变化，则仍须从新的 baseline 重�
 - Ignore 检查共用扫描的原始 deadline，不为每个路径重新计时。Ignore 判定未知、ignore 文件读取失败（含 invalid UTF-8）或该 deadline 到期时，捕获标记为 `Partial` 并丢弃 visible-file listing；不会 hash 或持久化该被拒绝 listing 中的文件，不能把不可读规则当成允许扫描的空规则。
 - 检测到身份漂移时，同样丢弃 listing 并把捕获标记为 `Partial`。快照不会冻结外部文件系统，也不保证任意持续并发改写下的原子视图，包括两次检查之间先改变再恢复的 ABA。Listing 可能读取 ignore 规则，不是仅 metadata 的操作；扫描 deadline 不等于所有捕获阶段或任意文件系统 I/O 均有 30 秒硬时限。
 - 命令结果、快照完整性与可恢复性是不同维度。命令失败仍可能留下 operation／pre-snapshot 记录，但这不允许捕获不透明的嵌套内容。`Full` 或 `--force` 都不会赋予恢复未捕获内容或不受支持状态的能力。
+
+## `libra op reconcile`
+
+当并发操作 head 的状态可证明无歧义时，收敛 head 集合（plan-20260822 OL-13）。
+
+```bash
+libra op reconcile [--dry-run]
+```
+
+并发发布（例如两个 CLI 进程或两个 worktree 对同一 operation head 集合发布）会保留为兄弟 head：后发布者被 head 比较交换（CAS）拦截，随后作为额外 head 记录，而不是覆盖先发布者。只要存在多个 head，`op undo/redo/revert/restore` 都会拒绝执行（`refusing to guess`），因为不存在唯一的当前 head。
+
+`op reconcile` 检查每个兄弟 head 捕获的 view，并且：
+
+- 当所有共享引用在各并发 view 中一致时收敛 head 集合：记录一个 append-only 的 `reconcile` 操作（所有兄弟 head 作为显式父节点），并把 head 集合推进到该单一节点；
+- 当至少一个引用在不同 head 间目标不同（包括双方观察到的目标）时报告全部冲突并保持 head 集合不变——reconcile 绝不猜测胜者。
+
+reconcile 操作本身不改变任何仓库内容，只记录收敛点，使后续 undo/restore 操作有唯一的无歧义 head 可供锚定。
+
+收敛或「无可收敛」时退出码为 `0`；报告冲突时为非零（JSON 输出携带 `outcome: "conflicted"` 与完整冲突列表）。
 
 当前分支尚未发布的数据库过渡见 [operation-v2 收敛](init.md#operation-v2-收敛当前分支未发布)。

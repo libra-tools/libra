@@ -224,6 +224,53 @@ async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>, M
     builtin_runner()?.run_pending(conn).await
 }
 
+/// Every non-down migration SQL file in `sql/migrations/` must be referenced
+/// by the migration registry source. An orphan file (like the earlier
+/// `2026090801_change_identity_prefix_index.sql`) silently shadows a
+/// registration that the runtime never applies, and invites a future version
+/// collision with a real migration of the same number.
+#[test]
+fn every_migration_sql_file_is_referenced_by_the_registry() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let migrations_dir = PathBuf::from(manifest_dir).join("sql/migrations");
+    let db_src_dir = PathBuf::from(manifest_dir).join("src/internal/db");
+
+    let mut files = std::fs::read_dir(&migrations_dir)
+        .expect("read sql/migrations")
+        .map(|entry| entry.expect("migration dir entry").file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name.ends_with(".sql") && !name.ends_with("_down.sql")
+        })
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    files.sort();
+
+    let mut source = String::new();
+    let mut stack = vec![db_src_dir];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read db source dir") {
+            let entry = entry.expect("db source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                source.push_str(&std::fs::read_to_string(&path).expect("read db source file"));
+            }
+        }
+    }
+
+    let unreferenced = files
+        .into_iter()
+        .filter(|file| !source.contains(file.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        unreferenced.is_empty(),
+        "migration SQL file(s) are not referenced by the registry source in \
+         src/internal/db: {unreferenced:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Builtin runner contract: current runtime migrations are registered
 // ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ use crate::internal::ai::{
     mcp::{resource::*, server::LibraMcpServer},
     sandbox::ToolRuntimeContext,
     tools::{
-        context::{ToolInvocation, ToolOutput, ToolPayload},
+        context::{AiOperationContext, ToolInvocation, ToolOutput, ToolPayload},
         error::{ToolError, ToolResult},
         handlers::parse_argument_value,
         spec::{FunctionParameters, ToolSpec},
@@ -282,11 +282,14 @@ pub async fn call_mcp_tool(
     server: Arc<LibraMcpServer>,
     tool_name: &str,
     arguments: &str,
+    ai_operation: Option<&AiOperationContext>,
 ) -> ToolResult<ToolOutput> {
     let result: Result<CallToolResult, rmcp::model::ErrorData> = match tool_name {
         "run_libra_vcs" => {
             let params: RunLibraVcsParams = parse_args(arguments)?;
-            server.run_libra_vcs_impl(params).await
+            server
+                .run_libra_vcs_impl_with_ai_operation(params, ai_operation)
+                .await
         }
         "create_intent" => {
             let params: CreateIntentParams = parse_args(arguments)?;
@@ -479,14 +482,26 @@ impl Source for McpSource {
             if safety_decision.is_needs_human()
                 && libra_vcs_allow_all_active(runtime_context.as_ref()).await
             {
-                let result = self.server.run_libra_vcs_impl_unchecked(params).await;
+                let result = self
+                    .server
+                    .run_libra_vcs_impl_unchecked_with_ai_operation(
+                        params,
+                        invocation.ai_operation.as_ref(),
+                    )
+                    .await;
                 return result
                     .map(call_tool_result_to_output)
                     .map_err(mcp_error_to_tool_error);
             }
         }
 
-        call_mcp_tool(self.server.clone(), &tool_name, &arguments).await
+        call_mcp_tool(
+            self.server.clone(),
+            &tool_name,
+            &arguments,
+            invocation.ai_operation.as_ref(),
+        )
+        .await
     }
 }
 

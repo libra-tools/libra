@@ -2262,12 +2262,71 @@ enum AddCheckout {
     },
 }
 
+/// Fence worktree lifecycle actions that publish or remove shared HEAD/branch
+/// rows. Acquire this before the registry and branch-attach locks so the lock
+/// order matches ordinary repository mutations and restore.
+async fn acquire_worktree_ref_lease()
+-> WorktreeResult<crate::internal::operation::middleware::ScopeLease> {
+    let scope = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        .or_else(|| crate::internal::worktree_scope::RequestScope::resolve(util::cur_dir()))
+        .ok_or_else(|| {
+            WorktreeError::OperationBlocked(
+                "cannot acquire repository ref lease outside a pinned worktree".to_string(),
+            )
+        })?;
+    let db_path = crate::utils::path::database();
+    let db = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+        .await
+        .map_err(|error| {
+            WorktreeError::OperationBlocked(format!(
+                "cannot open repository database before changing worktree refs: {error}"
+            ))
+        })?;
+    let repo_id = RepoIdentity::resolve(&db)
+        .await
+        .map_err(|error| {
+            WorktreeError::OperationBlocked(format!(
+                "cannot resolve repository identity before changing worktree refs: {error}"
+            ))
+        })?
+        .as_str()
+        .to_string();
+    let shared_repository =
+        crate::internal::config::ConfigKv::get_with_conn(&db, "core.sharedRepository")
+            .await
+            .map_err(|error| {
+                WorktreeError::OperationBlocked(format!(
+                    "cannot read core.sharedRepository before changing worktree refs: {error}"
+                ))
+            })?;
+    if shared_repository
+        .as_ref()
+        .is_some_and(|entry| entry.encrypted)
+    {
+        return Err(WorktreeError::OperationBlocked(
+            "core.sharedRepository must be plaintext before changing worktree refs".to_string(),
+        ));
+    }
+    crate::internal::operation::middleware::ScopeLease::acquire_repository_wait(
+        &scope,
+        &repo_id,
+        shared_repository.as_ref().map(|entry| entry.value.as_str()),
+    )
+    .await
+    .map_err(|error| {
+        WorktreeError::OperationBlocked(format!(
+            "cannot acquire repository ref lease before changing worktree refs: {error}"
+        ))
+    })
+}
+
 async fn add_worktree(
     path: String,
     target_spec: Option<String>,
     detach: bool,
     new_branch: Option<String>,
 ) -> WorktreeResult<WorktreeAddOutput> {
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
     // delete this add's freshly seeded rows).
@@ -5322,6 +5381,7 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// to guard); leaked rows would otherwise be re-inherited by a worktree
 /// re-created at the same path (deterministic instance id).
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
 
@@ -5508,6 +5568,7 @@ fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -
 /// Order matters: registry last — a half-completed delete cannot silently
 /// unregister a worktree whose directory is still present.
 async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;

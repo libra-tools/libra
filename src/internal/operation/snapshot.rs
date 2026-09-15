@@ -131,6 +131,7 @@ pub struct WorkspaceSnapshotter {
     pub(crate) io: Arc<WorktreeIo>,
     pub pointer: super::WorkspaceStatePointer,
     pub capture_policy: CapturePolicy,
+    storage: Option<ClientStorage>,
     timeout: Duration,
     max_files: usize,
     max_bytes: u64,
@@ -143,6 +144,7 @@ impl WorkspaceSnapshotter {
             io: Arc::new(default_worktree_io()),
             pointer,
             capture_policy: CapturePolicy::TrackedAndUntracked,
+            storage: None,
             timeout: DEFAULT_TIMEOUT,
             max_files: DEFAULT_MAX_FILES,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -152,6 +154,11 @@ impl WorkspaceSnapshotter {
     #[allow(dead_code)]
     pub(crate) fn with_io(mut self, io: Arc<WorktreeIo>) -> Self {
         self.io = io;
+        self
+    }
+
+    pub(crate) fn with_storage(mut self, storage: ClientStorage) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -286,7 +293,10 @@ impl WorkspaceSnapshotter {
             Err(error) => return Err(SnapshotError::Index(error.to_string())),
         };
         let scan = self.scan_working_copy_until(deadline).await?;
-        let storage = ClientStorage::init_local(self.scope.storage.join("objects"));
+        let storage = self
+            .storage
+            .clone()
+            .unwrap_or_else(|| ClientStorage::init_local(self.scope.storage.join("objects")));
         let index_bytes = match fs::File::open(&index_path) {
             Ok(file) => {
                 let mut bytes = Vec::new();

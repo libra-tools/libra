@@ -23,14 +23,87 @@ use uuid::Uuid;
 
 use crate::internal::{
     branch::Branch,
+    config::ConfigKv,
     head::Head,
     model::reference,
     operation::{
         OperationGraphRecord, OperationParentRecord, OperationQueryPage, OperationRecord,
         OperationService, OperationStatus, OperationViewRecord, OperationViewRefRecord,
         OperationViewWorkspaceRecord,
+        middleware::{
+            ScopeLease, command_may_mutate_shared_refs, repository_ref_lease_is_held,
+            with_repository_ref_lease,
+        },
     },
+    workspace::RepoIdentity,
 };
+
+async fn acquire_repository_ref_lease(
+    db: &DatabaseConnection,
+    scope: &crate::internal::operation::PinnedRequestScope,
+    repo_id: &str,
+    command_name: &str,
+    wait: bool,
+) -> Result<ScopeLease, OperationError> {
+    let shared_repository = ConfigKv::get_with_conn(db, "core.sharedRepository")
+        .await
+        .map_err(|error| {
+            OperationError::begin(format!(
+                "cannot read core.sharedRepository before acquiring the repository ref lease: {error}"
+            ))
+        })?;
+    if shared_repository
+        .as_ref()
+        .is_some_and(|entry| entry.encrypted)
+    {
+        return Err(OperationError::begin(
+            "core.sharedRepository must be plaintext before acquiring the repository ref lease",
+        ));
+    }
+    let shared_repository_value = shared_repository.as_ref().map(|entry| entry.value.as_str());
+    let lease = if wait {
+        ScopeLease::acquire_repository_wait(scope, repo_id, shared_repository_value).await
+    } else {
+        ScopeLease::acquire_repository(scope, repo_id, shared_repository_value).await
+    };
+    lease.map_err(|error| {
+        OperationError::begin(format!(
+            "cannot acquire repository ref lease for command '{command_name}': {error}"
+        ))
+    })
+}
+
+fn command_defers_repository_lease_until_control_claim(command_name: &str) -> bool {
+    matches!(
+        command_name.trim().split_ascii_whitespace().next(),
+        Some("merge" | "rebase" | "cherry-pick" | "revert" | "am" | "bisect")
+    )
+}
+
+pub(crate) async fn acquire_request_repository_ref_lease_wait(
+    command_name: &str,
+) -> Result<Option<ScopeLease>, OperationError> {
+    if repository_ref_lease_is_held() {
+        return Ok(None);
+    }
+    let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+    else {
+        return Err(OperationError::begin(
+            "cannot acquire repository ref lease outside a pinned worktree",
+        ));
+    };
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(OperationError::begin)?;
+    let repo_id = RepoIdentity::resolve(&db)
+        .await
+        .map_err(|error| OperationError::begin(error.to_string()))?
+        .as_str()
+        .to_string();
+    let lease =
+        acquire_repository_ref_lease(&db, &request_scope, &repo_id, command_name, true).await?;
+    Ok(Some(lease))
+}
 
 const PARENT_RESOLUTION_PAGE_SIZE: u64 = 200;
 const DEDUP_WINDOW_SECS: i64 = 5;
@@ -437,6 +510,33 @@ where
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
 
+    // Legacy transaction wrappers also write shared branch and HEAD rows.
+    // Take the repository fence before opening the transaction; ref writers
+    // cannot race a confirmed repository-wide restore between snapshot and
+    // commit. A pinned request scope supplies the common storage directory.
+    let _repository_lease = if (scope.ownership == OperationOwnership::Repository
+        || command_may_mutate_shared_refs(&meta.command_name))
+        && !repository_ref_lease_is_held()
+    {
+        if let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        {
+            Some(
+                acquire_repository_ref_lease(
+                    db,
+                    &request_scope,
+                    &meta.repo_id,
+                    &meta.command_name,
+                    false,
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
     let start_ts = Utc::now().timestamp();
@@ -519,7 +619,13 @@ where
         .take(scope.parent_policy.max_parents)
         .collect::<Vec<_>>();
 
-    let payload = match operation(&txn).await {
+    let payload_future = operation(&txn);
+    let payload_result = if _repository_lease.is_some() {
+        with_repository_ref_lease(payload_future).await
+    } else {
+        payload_future.await
+    };
+    let payload = match payload_result {
         Ok(payload) => payload,
         Err(err) => {
             txn.rollback().await.map_err(|rollback_err| {
@@ -745,6 +851,7 @@ pub struct OperationBoundary {
     selected_parents: Vec<String>,
     parent_metrics: ParentSelectionMetrics,
     _dedup_guard: Option<ActiveDedupGuard>,
+    _repository_lease: Option<ScopeLease>,
 }
 
 /// How a boundary-recorded operation ended.
@@ -765,14 +872,58 @@ pub async fn begin_operation(
     begin_operation_with_conn(&db, meta, scope).await
 }
 
+/// Claim a sequencer control slot before acquiring the repository ref lease.
+pub(crate) async fn begin_sequencer_control_operation(
+    meta: OperationMeta,
+    scope: OperationScope,
+) -> Result<OperationBoundary, OperationError> {
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(OperationError::begin)?;
+    begin_operation_with_conn_policy(&db, meta, scope, true).await
+}
+
 /// [`begin_operation`] against a caller-provided connection.
 pub async fn begin_operation_with_conn(
     db: &DatabaseConnection,
     meta: OperationMeta,
     scope: OperationScope,
 ) -> Result<OperationBoundary, OperationError> {
+    begin_operation_with_conn_policy(db, meta, scope, false).await
+}
+
+async fn begin_operation_with_conn_policy(
+    db: &DatabaseConnection,
+    meta: OperationMeta,
+    scope: OperationScope,
+    defer_repository_lease_until_control_claim: bool,
+) -> Result<OperationBoundary, OperationError> {
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
+
+    let repository_lease = if command_may_mutate_shared_refs(&meta.command_name)
+        && !(defer_repository_lease_until_control_claim
+            && command_defers_repository_lease_until_control_claim(&meta.command_name))
+        && !repository_ref_lease_is_held()
+    {
+        if let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        {
+            Some(
+                acquire_repository_ref_lease(
+                    db,
+                    &request_scope,
+                    &meta.repo_id,
+                    &meta.command_name,
+                    false,
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
@@ -922,6 +1073,7 @@ pub async fn begin_operation_with_conn(
             selection_latency_us,
         },
         _dedup_guard: dedup_guard,
+        _repository_lease: repository_lease,
     })
 }
 
@@ -1206,6 +1358,49 @@ impl OperationBoundary {
     /// The operation id this boundary claimed.
     pub fn op_id(&self) -> &str {
         &self.op_id
+    }
+
+    /// Acquire the repository ref lease after this worktree's sequencer claim
+    /// is durable. This lets independent worktrees claim their own control
+    /// slots before the shared-ref mutation gate serializes their execution.
+    pub(crate) async fn acquire_repository_ref_lease_after_claim(
+        &mut self,
+    ) -> Result<(), OperationError> {
+        if self._repository_lease.is_some()
+            || repository_ref_lease_is_held()
+            || !command_may_mutate_shared_refs(&self.meta.command_name)
+        {
+            return Ok(());
+        }
+        let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        else {
+            return Ok(());
+        };
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(OperationError::begin)?;
+        self._repository_lease = Some(
+            acquire_repository_ref_lease(
+                &db,
+                &request_scope,
+                &self.meta.repo_id,
+                &self.meta.command_name,
+                true,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn run_with_repository_ref_lease<T>(
+        &self,
+        future: impl Future<Output = T>,
+    ) -> T {
+        if self._repository_lease.is_some() {
+            with_repository_ref_lease(future).await
+        } else {
+            future.await
+        }
     }
 
     /// Close the claim: collect the view and record the outcome, in one short

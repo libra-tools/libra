@@ -318,6 +318,7 @@ mod bundle_test;
 mod cache_test;
 mod case_handling_test;
 mod cat_file_test;
+mod change_revision_provenance_test;
 mod check_attr_test;
 mod check_ignore_test;
 mod check_mailmap_test;

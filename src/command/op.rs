@@ -4,7 +4,7 @@ use std::{collections::HashSet, str::FromStr};
 
 use clap::{Parser, Subcommand};
 use git_internal::hash::ObjectHash;
-use sea_orm::DbErr;
+use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 use serde::Serialize;
 
 use crate::{
@@ -15,12 +15,15 @@ use crate::{
         db::get_db_conn_instance,
         head::Head,
         operation::{
-            OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
-            OperationService, OperationStatus,
+            DoctorEngine, DoctorReport, OperationGraphRecord, OperationPage, OperationQueryPage,
+            OperationService, OperationStoreV2, ReconcileEngine, ReconcileError, ReconcileOutcome,
+            RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, UndoEngine, UndoError,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
+        worktree_scope::RequestScope,
     },
     utils::{
+        client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         util,
@@ -82,6 +85,64 @@ pub enum OpCommand {
         /// Only show what would be done
         #[clap(long)]
         dry_run: bool,
+
+        /// Facet selection for an operation-log v2 restore.
+        #[clap(long, value_enum, default_value_t = RestoreWhat::All)]
+        what: RestoreWhat,
+
+        /// Explicitly acknowledge a repository-wide/multi-worktree target.
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Append an operation that moves the current state back to a prior operation's parent.
+    Undo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Re-apply the operation that was undone by the selected undo operation.
+    Redo {
+        op_ref: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Apply the inverse of an operation relative to an explicit parent.
+    Revert {
+        op_ref: String,
+        #[arg(long)]
+        parent: String,
+        #[clap(long)]
+        force: bool,
+        #[clap(long)]
+        dry_run: bool,
+        #[clap(long)]
+        confirm_repo_wide: bool,
+    },
+
+    /// Converge concurrent operation heads when their states are provably unambiguous.
+    Reconcile {
+        /// Only report what would happen
+        #[clap(long)]
+        dry_run: bool,
+    },
+
+    /// Diagnose operation state; repair is opt-in with --fix.
+    Doctor {
+        #[clap(long)]
+        fix: bool,
+        #[clap(long)]
+        dry_run: bool,
     },
 }
 
@@ -128,11 +189,25 @@ pub enum OpOutput {
         /// Human-readable restore confirmation.
         message: String,
     },
+    #[serde(rename = "restore_v2")]
+    RestoreV2 { receipt: RestoreReceipt },
+    #[serde(rename = "undo")]
+    Undo { receipt: RestoreReceipt },
+    #[serde(rename = "redo")]
+    Redo { receipt: RestoreReceipt },
+    #[serde(rename = "revert")]
+    Revert { receipt: RestoreReceipt },
+    #[serde(rename = "reconcile")]
+    Reconcile { outcome: ReconcileOutcome },
+    #[serde(rename = "doctor")]
+    Doctor { report: DoctorReport },
 }
 
 #[derive(Debug, Clone, Serialize)]
 /// One entry rendered by `op log`.
 pub struct OpLogEntry {
+    /// Zero-based index in the complete, unfiltered operation history.
+    pub index: usize,
     /// Operation identifier.
     pub op_id: String,
     /// Recorded command name.
@@ -145,6 +220,26 @@ pub struct OpLogEntry {
     pub status: String,
     /// Completion timestamp in unix seconds, if the operation finished.
     pub end_ts: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationHistorySource {
+    Legacy,
+    V2,
+}
+
+#[derive(Clone, Debug)]
+struct OperationHistoryEntry {
+    index: usize,
+    source: OperationHistorySource,
+    op_id: String,
+    command_name: String,
+    description: String,
+    actor: String,
+    status: String,
+    start_ts: i64,
+    end_ts: Option<i64>,
+    view_id: String,
 }
 
 /// Execute `libra op` using default CLI output settings.
@@ -170,8 +265,294 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             op_ref,
             force,
             dry_run,
-        } => handle_op_restore(op_ref, force, dry_run, output).await,
+            what,
+            confirm_repo_wide,
+        } => handle_op_restore(op_ref, force, dry_run, what, confirm_repo_wide, output).await,
+        OpCommand::Undo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_undo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Redo {
+            op_ref,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_redo(op_ref, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Revert {
+            op_ref,
+            parent,
+            force,
+            dry_run,
+            confirm_repo_wide,
+        } => handle_op_revert(op_ref, parent, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Reconcile { dry_run } => handle_op_reconcile(dry_run, output).await,
+        OpCommand::Doctor { fix, dry_run } => handle_op_doctor(fix, dry_run, output).await,
     }
+}
+
+async fn v2_engine_for_repo(repo_id: &str) -> CliResult<RestoreEngine> {
+    let Some(scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let db = get_db_conn_instance().await;
+    Ok(RestoreEngine::new(scope, repo_id, db, storage))
+}
+
+async fn v2_engine_and_ref(repo_id: &str, op_ref: &str) -> CliResult<(RestoreEngine, String)> {
+    let engine = v2_engine_for_repo(repo_id).await?;
+    let entry = resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?;
+    Ok((engine, entry.op_id))
+}
+
+async fn handle_op_undo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .undo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("undo", receipt, output)
+}
+
+async fn handle_op_redo(
+    op_ref: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let receipt = UndoEngine::new(restore)
+        .redo(op_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("redo", receipt, output)
+}
+
+async fn handle_op_revert(
+    op_ref: String,
+    parent: String,
+    force: bool,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    ensure_transition_clean(force).await?;
+    let repo_id = current_repo_id().await?;
+    let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+    let parent_id = resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
+        .await?
+        .op_id;
+    let receipt = UndoEngine::new(restore)
+        .revert(op_id, parent_id, dry_run, confirm_repo_wide)
+        .await
+        .map_err(undo_cli_error)?;
+    emit_transition_output("revert", receipt, output)
+}
+
+async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let scope = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+        .ok_or_else(|| CliError::fatal("v2 operation state is unavailable in this repository"))?;
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let database = get_db_conn_instance().await;
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let engine = ReconcileEngine::new(scope, &repo_id, store);
+    let outcome = engine
+        .reconcile(dry_run)
+        .await
+        .map_err(|error| match &error {
+            ReconcileError::Cas(message) => CliError::fatal(format!(
+                "reconcile failed because the head set changed concurrently: {message}"
+            ))
+            .with_hint("re-run 'libra op reconcile' to converge the new head set"),
+            other => CliError::fatal(other.to_string()),
+        })?;
+    let payload = OpOutput::Reconcile { outcome };
+    let conflicted = matches!(
+        &payload,
+        OpOutput::Reconcile {
+            outcome: ReconcileOutcome::Conflicted { .. }
+        }
+    );
+    if output.is_json() {
+        emit_json_data("op", &payload, output)?;
+    } else if !output.quiet {
+        match &payload {
+            OpOutput::Reconcile { outcome } => match outcome {
+                ReconcileOutcome::NothingToReconcile => {
+                    println!("Nothing to reconcile: the operation log has a single head.");
+                }
+                ReconcileOutcome::DryRunConverged { parents } => {
+                    println!(
+                        "Would converge {} concurrent operation heads:\n  {}",
+                        parents.len(),
+                        parents.join("\n  ")
+                    );
+                }
+                ReconcileOutcome::Converged {
+                    reconcile_op_id,
+                    parents,
+                    generation,
+                } => {
+                    println!(
+                        "Converged {} concurrent operation heads into reconcile operation {reconcile_op_id} (generation {generation}).",
+                        parents.len()
+                    );
+                }
+                ReconcileOutcome::Conflicted { conflicts } => {
+                    eprintln!(
+                        "Cannot reconcile: concurrent heads disagree on {} reference(s). The head set is preserved; resolve the conflicts and retry.",
+                        conflicts.len()
+                    );
+                    for conflict in conflicts {
+                        eprintln!("  {} {}:", conflict.kind, conflict.name);
+                        for (head, target) in &conflict.targets {
+                            eprintln!("    {head} -> {target}");
+                        }
+                    }
+                }
+            },
+            _ => unreachable!("payload constructed above"),
+        }
+    }
+    if conflicted {
+        return Err(CliError::fatal(
+            "reconcile conflicts must be resolved before the head set can converge",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect the conflict targets above, resolve the reference disagreement, then retry",
+        ));
+    }
+    Ok(())
+}
+
+async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let restore = v2_engine_for_repo(&repo_id).await?;
+    let report = DoctorEngine::new(
+        RequestScope::try_resolve(util::cur_dir())
+            .map_err(|error| {
+                CliError::fatal(format!("failed to resolve repository scope: {error}"))
+            })?
+            .ok_or_else(|| {
+                CliError::fatal("v2 operation state is unavailable in this repository")
+            })?,
+        repo_id,
+        restore.store().clone(),
+    )
+    .inspect(dry_run, fix)
+    .await
+    .map_err(|error| CliError::fatal(error.to_string()))?;
+    let payload = OpOutput::Doctor { report };
+    if output.is_json() {
+        emit_json_data("op", &payload, output)
+    } else if output.quiet {
+        Ok(())
+    } else {
+        println!(
+            "Operation doctor: {} issue(s)",
+            payload_report(&payload).issues.len()
+        );
+        for issue in &payload_report(&payload).issues {
+            println!("{}: {}", issue.code, issue.message);
+        }
+        for fixed in &payload_report(&payload).fixed {
+            println!("fixed: {fixed}");
+        }
+        Ok(())
+    }
+}
+
+fn payload_report(payload: &OpOutput) -> &DoctorReport {
+    let OpOutput::Doctor { report } = payload else {
+        unreachable!()
+    };
+    report
+}
+
+fn emit_transition_output(
+    action: &str,
+    receipt: RestoreReceipt,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let payload = match action {
+        "undo" => OpOutput::Undo { receipt },
+        "redo" => OpOutput::Redo { receipt },
+        "revert" => OpOutput::Revert { receipt },
+        _ => return Err(CliError::fatal("unknown operation transition")),
+    };
+    if output.is_json() {
+        emit_json_data("op", &payload, output)
+    } else if output.quiet {
+        Ok(())
+    } else {
+        let receipt = match &payload {
+            OpOutput::Undo { receipt }
+            | OpOutput::Redo { receipt }
+            | OpOutput::Revert { receipt } => receipt,
+            _ => unreachable!(),
+        };
+        println!(
+            "{} {} facet(s), {} path(s)",
+            action,
+            receipt.restored_facets.len(),
+            receipt.changed_paths
+        );
+        if let Some(op_id) = &receipt.new_op_id {
+            println!("New operation recorded: {}", &op_id[..8.min(op_id.len())]);
+        } else {
+            println!("Dry run: no operation was published.");
+        }
+        Ok(())
+    }
+}
+
+fn undo_cli_error(error: UndoError) -> CliError {
+    match error {
+        UndoError::NotUndo(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(RestoreError::HeadConfirmationRequired)
+        | UndoError::Restore(RestoreError::WrongWorkspace(_))
+        | UndoError::Restore(RestoreError::Cas(_)) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+        UndoError::Restore(RestoreError::Storage(message))
+            if message.contains("not found") || message.contains("not a completed") =>
+        {
+            CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
+        UndoError::Restore(_) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+    }
+}
+
+async fn ensure_transition_clean(force: bool) -> CliResult<()> {
+    if !force && !status::is_clean().await {
+        return Err(CliError::fatal("working tree has uncommitted changes")
+            .with_stable_code(StableErrorCode::ConflictUnresolved)
+            .with_hint("use --force to transition anyway, or commit/stash changes first"));
+    }
+    Ok(())
 }
 
 /// Render one `op log` request, including optional command filtering and paging.
@@ -215,12 +596,7 @@ async fn handle_op_log(
     );
     println!();
 
-    let page_start = result
-        .page
-        .saturating_sub(1)
-        .saturating_mul(result.per_page) as usize;
-    for (page_offset, op) in entries.iter().enumerate() {
-        let idx = page_start + page_offset;
+    for op in &entries {
         let short_id = &op.op_id[..8.min(op.op_id.len())];
         let timestamp = op
             .end_ts
@@ -228,7 +604,7 @@ async fn handle_op_log(
             .unwrap_or_else(|| "running".to_string());
 
         if verbose {
-            println!("{short_id}@{{{idx}}}");
+            println!("{short_id}@{{{}}}", op.index);
             println!("  command: {}", op.command_name);
             println!("  description: {}", op.description);
             println!("  actor: {}", op.actor);
@@ -237,8 +613,8 @@ async fn handle_op_log(
             println!();
         } else {
             println!(
-                "{short_id}@{{{idx}}} {} {} - {} [{}]",
-                op.command_name, op.description, timestamp, op.status
+                "{short_id}@{{{}}} {} {} - {} [{}]",
+                op.index, op.command_name, op.description, timestamp, op.status
             );
         }
     }
@@ -246,87 +622,319 @@ async fn handle_op_log(
     Ok(())
 }
 
-/// Query one operation-log page, applying the optional command filter before pagination.
-async fn query_operation_log_page<C: sea_orm::ConnectionTrait>(
+const OPERATION_HISTORY_CTE: &str = r#"
+WITH source_rows AS (
+    SELECT op_id, command_name, description, actor, start_ts, end_ts, status,
+           view_id, 'legacy' AS source,
+           start_ts * 1000 AS sort_start_ts_ms,
+           end_ts * 1000 AS sort_end_ts_ms, 0 AS source_priority
+      FROM legacy_operation
+     WHERE repo_id = ?
+    UNION ALL
+    SELECT op_id, COALESCE(command_name, kind) AS command_name,
+           COALESCE(description, kind) AS description,
+           COALESCE(actor, '') AS actor, start_ts, end_ts, status,
+           post_view_oid AS view_id, 'v2' AS source,
+           CAST(start_ts / 1000 AS INTEGER) * 1000 AS sort_start_ts_ms,
+           CAST(end_ts / 1000 AS INTEGER) * 1000 AS sort_end_ts_ms,
+           1 AS source_priority
+      FROM operation
+     WHERE repo_id = ?
+), deduplicated AS (
+    SELECT source_rows.*,
+           ROW_NUMBER() OVER (PARTITION BY op_id ORDER BY source_priority DESC) AS duplicate_rank
+      FROM source_rows
+), ranked AS (
+    SELECT op_id, command_name, description, actor, start_ts, end_ts, status,
+           view_id, source,
+           ROW_NUMBER() OVER (
+               ORDER BY sort_end_ts_ms DESC, sort_start_ts_ms DESC, op_id DESC
+           ) - 1 AS history_index
+      FROM deduplicated
+     WHERE duplicate_rank = 1
+)
+"#;
+
+const OPERATION_HISTORY_FIELDS: &str = "op_id, command_name, description, actor, start_ts, end_ts, status, view_id, source, history_index";
+
+/// Query the cross-version history in its canonical newest-first order.
+///
+/// Legacy timestamps only carry one-second resolution, while v2 timestamps are
+/// milliseconds. The CTE rounds v2 values to the shared one-second precision,
+/// then uses the time-ordered operation id to break same-second ties consistently.
+async fn query_operation_log_page<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,
     query_page: OperationQueryPage,
     command_filter: Option<&str>,
-) -> CliResult<OperationPage<OperationLogListItem>> {
+) -> CliResult<OperationPage<OperationHistoryEntry>> {
+    let query_page = query_page.normalized();
     let command_filter = command_filter
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    OperationService::list_operations_by_repo_and_command_paginated_with_conn(
-        db,
-        repo_id,
-        command_filter,
-        query_page,
-    )
-    .await
-    .map_err(|e| CliError::fatal(format!("failed to query operations: {e}")))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let count_sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT COUNT(*) AS total FROM ranked \
+         WHERE (? IS NULL OR command_name = ?)"
+    );
+    let count_row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            count_sql,
+            [
+                repo_id.to_string().into(),
+                repo_id.to_string().into(),
+                command_filter.clone().into(),
+                command_filter.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to count operations: {error}")))?
+        .ok_or_else(|| CliError::fatal("operation history count returned no row"))?;
+    let total = count_row
+        .try_get::<i64>("", "total")
+        .map_err(|error| CliError::fatal(format!("failed to read operation count: {error}")))?;
+    let offset = i64::try_from(query_page.offset()).unwrap_or(i64::MAX);
+    let list_sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+         WHERE (? IS NULL OR command_name = ?) ORDER BY history_index LIMIT ? OFFSET ?"
+    );
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            list_sql,
+            [
+                repo_id.to_string().into(),
+                repo_id.to_string().into(),
+                command_filter.clone().into(),
+                command_filter.into(),
+                i64::try_from(query_page.per_page)
+                    .unwrap_or(i64::MAX)
+                    .into(),
+                offset.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to query operations: {error}")))?;
+    let items = rows
+        .iter()
+        .map(operation_history_entry_from_row)
+        .collect::<CliResult<Vec<_>>>()?;
+
+    Ok(OperationPage {
+        items,
+        page: query_page.page,
+        per_page: query_page.per_page,
+        total: u64::try_from(total).unwrap_or(0),
+    })
+}
+
+fn operation_history_entry_from_row(
+    row: &sea_orm::QueryResult,
+) -> CliResult<OperationHistoryEntry> {
+    macro_rules! field {
+        ($name:literal, $ty:ty) => {
+            row.try_get::<$ty>("", $name).map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read operation history field '{}': {error}",
+                    $name
+                ))
+            })?
+        };
+    }
+
+    let source = match field!("source", String).as_str() {
+        "legacy" => OperationHistorySource::Legacy,
+        "v2" => OperationHistorySource::V2,
+        other => {
+            return Err(CliError::fatal(format!(
+                "unknown operation history source '{other}'"
+            )));
+        }
+    };
+    let raw_start_ts = field!("start_ts", i64);
+    let raw_end_ts = field!("end_ts", Option<i64>);
+    let (start_ts, end_ts) = match source {
+        OperationHistorySource::Legacy => (raw_start_ts, raw_end_ts),
+        OperationHistorySource::V2 => (
+            raw_start_ts.div_euclid(1000),
+            raw_end_ts.map(|timestamp| timestamp.div_euclid(1000)),
+        ),
+    };
+    let stored_status = field!("status", String);
+    let status = match (source, stored_status.as_str()) {
+        (OperationHistorySource::V2, "success") => "succeeded".to_string(),
+        (OperationHistorySource::V2, "aborted") => "canceled".to_string(),
+        (_, status) => status.to_string(),
+    };
+    let history_index = field!("history_index", i64);
+    let index = usize::try_from(history_index)
+        .map_err(|_| CliError::fatal("operation history index is out of range"))?;
+
+    Ok(OperationHistoryEntry {
+        index,
+        source,
+        op_id: field!("op_id", String),
+        command_name: field!("command_name", String),
+        description: field!("description", String),
+        actor: field!("actor", String),
+        status,
+        start_ts,
+        end_ts,
+        view_id: field!("view_id", String),
+    })
 }
 
 /// Render one `op show` request after resolving the supplied operation reference.
 async fn handle_op_show(op_ref: String, show_view: bool, output: &OutputConfig) -> CliResult<()> {
     let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
-
-    let graph = load_operation_graph(&db, &op_id).await?;
-    let op_record = &graph.operation;
+    let entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+    let legacy_graph = if entry.source == OperationHistorySource::Legacy {
+        Some(load_operation_graph(&db, &entry.op_id).await?)
+    } else {
+        None
+    };
     let op_output = OpOutput::Show {
-        op_id: op_record.op_id.clone(),
-        command_name: op_record.command_name.clone(),
-        description: op_record.description.clone(),
-        actor: op_record.actor.clone(),
-        status: status_label(op_record.status).to_string(),
-        start_ts: op_record.start_ts,
-        end_ts: op_record.end_ts,
-        view_id: op_record.view_id.clone(),
+        op_id: entry.op_id.clone(),
+        command_name: entry.command_name.clone(),
+        description: entry.description.clone(),
+        actor: entry.actor.clone(),
+        status: entry.status.clone(),
+        start_ts: entry.start_ts,
+        end_ts: entry.end_ts,
+        view_id: entry.view_id.clone(),
     };
 
     if output.is_json() {
         return emit_json_data("op", &op_output, output);
     }
 
-    let short_id = &op_record.op_id[..8.min(op_record.op_id.len())];
+    let short_id = &entry.op_id[..8.min(entry.op_id.len())];
     println!("Operation: {short_id}");
-    println!("Command: {}", op_record.command_name);
-    println!("Description: {}", op_record.description);
-    println!("Actor: {}", op_record.actor);
-    println!("Status: {}", status_label(op_record.status));
-    println!("Started: {}", format_timestamp(op_record.start_ts));
-    if let Some(end_ts) = op_record.end_ts {
+    println!("Command: {}", entry.command_name);
+    println!("Description: {}", entry.description);
+    println!("Actor: {}", entry.actor);
+    println!("Status: {}", entry.status);
+    println!("Started: {}", format_timestamp(entry.start_ts));
+    if let Some(end_ts) = entry.end_ts {
         println!("Completed: {}", format_timestamp(end_ts));
         println!(
             "Duration: {}ms",
-            end_ts.saturating_sub(op_record.start_ts) * 1000
+            end_ts.saturating_sub(entry.start_ts) * 1000
         );
     }
-    println!("View ID: {}", op_record.view_id);
+    println!("View ID: {}", entry.view_id);
 
     if show_view {
-        println!();
-        println!("View Snapshot:");
-        println!(
-            "  HEAD: {} ({})",
-            graph.view.head_target, graph.view.head_kind
-        );
-        println!("  Refs:");
-        for ref_rec in &graph.refs {
-            let ref_name = if let Some(remote) = &ref_rec.ref_remote {
-                format!("{}/{}/{}", ref_rec.ref_kind, remote, ref_rec.ref_name)
-            } else {
-                format!("{} {}", ref_rec.ref_kind, ref_rec.ref_name)
-            };
-            println!(
-                "    {}: {}",
-                ref_name,
-                &ref_rec.target_oid[..7.min(ref_rec.target_oid.len())]
-            );
+        if let Some(graph) = legacy_graph {
+            print_legacy_view_snapshot(&graph);
+        } else {
+            print_v2_view_snapshot(&repo_id, &entry.op_id).await?;
         }
     }
 
+    Ok(())
+}
+
+fn print_legacy_view_snapshot(graph: &OperationGraphRecord) {
+    println!();
+    println!("View Snapshot:");
+    println!(
+        "  HEAD: {} ({})",
+        graph.view.head_target, graph.view.head_kind
+    );
+    println!("  Refs:");
+    for ref_rec in &graph.refs {
+        let ref_name = if let Some(remote) = &ref_rec.ref_remote {
+            format!("{}/{}/{}", ref_rec.ref_kind, remote, ref_rec.ref_name)
+        } else {
+            format!("{} {}", ref_rec.ref_kind, ref_rec.ref_name)
+        };
+        println!(
+            "    {}: {}",
+            ref_name,
+            &ref_rec.target_oid[..7.min(ref_rec.target_oid.len())]
+        );
+    }
+}
+
+async fn print_v2_view_snapshot(repo_id: &str, op_id: &str) -> CliResult<()> {
+    let Some(scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let db = get_db_conn_instance().await;
+    let store = OperationStoreV2::new_for_repo(repo_id, db, storage);
+    let operation = store
+        .load_operation(op_id)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load v2 operation '{op_id}': {error}"))
+        })?
+        .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+    let view = store.load_view(&operation.post_view_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load v2 view for '{op_id}': {error}"))
+    })?;
+
+    println!();
+    println!("View Snapshot:");
+    if let Some(snapshot_oid) = view.workspaces.values().next() {
+        let snapshot = store.load_snapshot(snapshot_oid).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to load v2 workspace snapshot for '{op_id}': {error}"
+            ))
+        })?;
+        use crate::internal::operation::HeadState;
+        match snapshot.head {
+            HeadState::Symbolic { reference } => {
+                if let Some(branch) = reference.strip_prefix("refs/heads/") {
+                    println!("  HEAD: {branch} (branch)");
+                } else {
+                    println!("  HEAD: {reference} (symbolic)");
+                }
+            }
+            HeadState::Detached { oid } => {
+                let oid = oid.to_string();
+                println!("  HEAD: {} (detached)", &oid[..7.min(oid.len())]);
+            }
+        }
+    } else {
+        println!("  HEAD: (not captured)");
+    }
+
+    println!("  Refs:");
+    let refs_bytes = store.load_object(&view.refs_facet_oid).map_err(|error| {
+        CliError::fatal(format!("failed to load v2 refs for '{op_id}': {error}"))
+    })?;
+    let refs_value: serde_json::Value = serde_json::from_slice(&refs_bytes).map_err(|error| {
+        CliError::fatal(format!("failed to decode v2 refs for '{op_id}': {error}"))
+    })?;
+    if let Some(references) = refs_value
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+    {
+        for reference in references {
+            let Some(kind) = reference.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(name) = reference.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let ref_name = reference
+                .get("remote")
+                .and_then(serde_json::Value::as_str)
+                .map(|remote| format!("{kind}/{remote}/{name}"))
+                .unwrap_or_else(|| format!("{kind} {name}"));
+            if let Some(target) = reference.get("commit").and_then(serde_json::Value::as_str) {
+                println!("    {ref_name}: {}", &target[..7.min(target.len())]);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -388,11 +996,27 @@ async fn handle_op_restore(
     op_ref: String,
     force: bool,
     dry_run: bool,
+    what: RestoreWhat,
+    confirm_repo_wide: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let target_op_id = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+    let target_entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+    if target_entry.source == OperationHistorySource::V2 {
+        return handle_v2_restore(
+            &db,
+            &repo_id,
+            &target_entry.op_id,
+            force,
+            what,
+            dry_run,
+            confirm_repo_wide,
+            output,
+        )
+        .await;
+    }
+    let target_op_id = target_entry.op_id;
     let target_graph = load_operation_graph(&db, &target_op_id).await?;
     let target_op = target_graph.operation.clone();
 
@@ -668,7 +1292,110 @@ async fn handle_op_restore(
     Ok(())
 }
 
+/// Prefer the v2 restore engine when the reference names a v2 operation. The
+/// existing v1 graph remains available during the migration window; it is
+/// intentionally not converted into a fabricated v2 view.
+#[allow(clippy::too_many_arguments)]
+async fn handle_v2_restore(
+    db: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    op_id: &str,
+    force: bool,
+    what: RestoreWhat,
+    dry_run: bool,
+    confirm_repo_wide: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let Some(operation_scope) = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "v2 operation state is unavailable in this repository",
+        ));
+    };
+    let object_storage = ClientStorage::init_local(operation_scope.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(repo_id, db.clone(), object_storage.clone());
+    let operation = store
+        .load_operation(op_id)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to load v2 operation: {error}")))?
+        .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+    if !force && !status::is_clean().await {
+        return Err(CliError::fatal("working tree has uncommitted changes")
+            .with_stable_code(StableErrorCode::ConflictUnresolved)
+            .with_hint("use --force to restore anyway, or commit/stash changes first"));
+    }
+    let engine = RestoreEngine::new(operation_scope, repo_id, db.clone(), object_storage);
+    let receipt = engine
+        .restore(
+            op_id.to_string(),
+            operation.post_view_oid,
+            what,
+            dry_run,
+            confirm_repo_wide,
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("v2 restore failed: {error}"))
+                .with_stable_code(restore_error_code(&error))
+        })?;
+    let op_output = OpOutput::RestoreV2 { receipt };
+    if output.is_json() {
+        emit_json_data("op", &op_output, output)?;
+    } else if !output.quiet {
+        let OpOutput::RestoreV2 { receipt } = &op_output else {
+            unreachable!();
+        };
+        println!(
+            "{} {} {} path(s)",
+            if receipt.dry_run {
+                "Would restore"
+            } else {
+                "Restored"
+            },
+            receipt.target_op_id,
+            receipt.changed_paths
+        );
+        if let Some(new_op_id) = &receipt.new_op_id {
+            println!("New operation recorded: {new_op_id}");
+        }
+    }
+    Ok(())
+}
+
+fn restore_error_code(error: &RestoreError) -> StableErrorCode {
+    match error {
+        RestoreError::WorkspaceMissing(_)
+        | RestoreError::WrongWorkspace(_)
+        | RestoreError::IncompleteSnapshot
+        | RestoreError::HeadConfirmationRequired => StableErrorCode::CliInvalidTarget,
+        RestoreError::Cas(_) => StableErrorCode::ConflictUnresolved,
+        RestoreError::Object { .. } | RestoreError::IncompleteView => StableErrorCode::RepoCorrupt,
+        RestoreError::Io(_) => StableErrorCode::IoWriteFailed,
+        RestoreError::Facet(_) | RestoreError::Storage(_) => {
+            StableErrorCode::ConflictOperationBlocked
+        }
+    }
+}
+
 /// Read the current repository id from config and validate that it is non-empty.
+async fn resolve_v2_history_ref<C: ConnectionTrait>(
+    db: &C,
+    repo_id: &str,
+    op_ref: &str,
+) -> CliResult<OperationHistoryEntry> {
+    let entry = resolve_op_ref(db, repo_id, op_ref).await?;
+    if entry.source != OperationHistorySource::V2 {
+        return Err(CliError::fatal(format!(
+            "operation '{}' resolves to legacy history and cannot be used by v2 undo/redo/revert",
+            entry.op_id
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+        .with_hint("select a v2 operation from `libra op log`"));
+    }
+    Ok(entry)
+}
+
 async fn current_repo_id() -> CliResult<String> {
     ConfigKv::get("libra.repoid")
         .await
@@ -708,33 +1435,47 @@ async fn load_operation_graph<C: sea_orm::ConnectionTrait>(
         })
 }
 
-/// Resolve an operation reference that may be either a raw id or an indexed `@{n}` entry.
-async fn resolve_op_ref<C: sea_orm::ConnectionTrait>(
+/// Resolve an operation reference against the same cross-version order used by `op log`.
+async fn resolve_op_ref<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,
     op_ref: &str,
-) -> CliResult<String> {
-    if let Some(index_str) = op_ref.strip_prefix("@{")
-        && let Some(index_end) = index_str.find('}')
+) -> CliResult<OperationHistoryEntry> {
+    if let Some(index_text) = op_ref
+        .strip_prefix("@{")
+        .and_then(|value| value.strip_suffix('}'))
     {
-        let index: usize = index_str[..index_end].parse().map_err(|_| {
+        let index = index_text.parse::<usize>().map_err(|_| {
             CliError::fatal(format!("invalid operation index: {op_ref}"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         })?;
-        let page = OperationQueryPage {
-            page: 1,
-            per_page: (index + 1) as u64,
-        };
-        let result =
-            OperationService::list_operations_by_repo_paginated_with_conn(db, repo_id, page)
-                .await
-                .map_err(|e| CliError::fatal(format!("failed to query operations: {e}")))?;
-
-        return result
-            .items
-            .into_iter()
-            .nth(index)
-            .map(|op| op.op_id)
+        let index_value = i64::try_from(index).map_err(|_| {
+            CliError::fatal(format!("operation index {index} out of range"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to see available operations")
+        })?;
+        let sql = format!(
+            "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+             WHERE history_index = ?"
+        );
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [
+                    repo_id.to_string().into(),
+                    repo_id.to_string().into(),
+                    index_value.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to resolve operation index: {error}"))
+            })?;
+        return row
+            .as_ref()
+            .map(operation_history_entry_from_row)
+            .transpose()?
             .ok_or_else(|| {
                 CliError::fatal(format!("operation index {index} out of range"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -742,28 +1483,44 @@ async fn resolve_op_ref<C: sea_orm::ConnectionTrait>(
             });
     }
 
-    Ok(op_ref.to_string())
+    let sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+         WHERE op_id = ?"
+    );
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [
+                repo_id.to_string().into(),
+                repo_id.to_string().into(),
+                op_ref.to_string().into(),
+            ],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to resolve operation '{op_ref}': {error}"))
+        })?;
+    row.as_ref()
+        .map(operation_history_entry_from_row)
+        .transpose()?
+        .ok_or_else(|| {
+            CliError::fatal(format!("operation '{op_ref}' not found"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to list available operations")
+        })
 }
 
-/// Convert one service log item into the command-layer output shape.
-fn log_entry_from_item(op: &OperationLogListItem) -> OpLogEntry {
+/// Convert one canonical history row into the command-layer log output shape.
+fn log_entry_from_item(op: &OperationHistoryEntry) -> OpLogEntry {
     OpLogEntry {
+        index: op.index,
         op_id: op.op_id.clone(),
         command_name: op.command_name.clone(),
         description: op.description.clone(),
         actor: op.actor.clone(),
-        status: status_label(op.status).to_string(),
+        status: op.status.clone(),
         end_ts: op.end_ts,
-    }
-}
-
-/// Convert an operation status enum into its stable CLI label.
-fn status_label(status: OperationStatus) -> &'static str {
-    match status {
-        OperationStatus::Running => "running",
-        OperationStatus::Succeeded => "succeeded",
-        OperationStatus::Failed => "failed",
-        OperationStatus::Canceled => "canceled",
     }
 }
 

@@ -443,7 +443,8 @@ mod tests {
         // runtime (web/headless.rs), not configuration
         "pending-start.json", // crash-recovery seed for a Phase 1 attempt, not configuration
         "settings.json",      // EXTERNAL provider settings (e.g. Claude Code's
-                              // .claude/settings.json) written by `agent enable` — not a .libra surface
+        // .claude/settings.json) written by `agent enable` — not a .libra surface
+        "file_history.json", // legacy AI file-undo manifest, persisted state rather than configuration
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one

@@ -18,8 +18,38 @@ use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub(crate) const REPOSITORY_REF_LEASE_HELD_ENV: &str = "LIBRA_INTERNAL_REPOSITORY_REF_LEASE_HELD";
+
+tokio::task_local! {
+    static CURRENT_OPERATION_ID: String;
+    static CURRENT_REPOSITORY_REF_LEASE: ();
+}
+
+/// Return the operation id active for the current async command.
+pub(crate) fn current_operation_id() -> Option<String> {
+    CURRENT_OPERATION_ID.try_with(Clone::clone).ok()
+}
+
+/// Run a future with the operation id of an existing persisted boundary.
+pub(crate) async fn with_operation_id<T>(
+    operation_id: String,
+    future: impl Future<Output = T>,
+) -> T {
+    CURRENT_OPERATION_ID.scope(operation_id, future).await
+}
+
+pub(crate) fn repository_ref_lease_is_held() -> bool {
+    CURRENT_REPOSITORY_REF_LEASE.try_with(|_| ()).is_ok()
+        || std::env::var_os(REPOSITORY_REF_LEASE_HELD_ENV).is_some_and(|value| value == "1")
+}
+
+pub(crate) async fn with_repository_ref_lease<T>(future: impl Future<Output = T>) -> T {
+    CURRENT_REPOSITORY_REF_LEASE.scope((), future).await
+}
+
 mod lease;
-use lease::{LeaseFilePermissions, ScopeLease};
+use lease::LeaseFilePermissions;
+pub(crate) use lease::ScopeLease;
 
 use super::{
     Completeness, JournalEntry, JournalPhase, OperationKind, OperationMetaV2, OperationStatusV2,
@@ -76,6 +106,75 @@ pub fn classify_command(name: &str) -> Result<MutationClass, ClassificationError
         _ => return Err(ClassificationError::Unknown(name)),
     };
     Ok(class)
+}
+
+/// Whether a command can change a ref shared by linked worktrees. The first
+/// token is used because legacy operation records include control arguments
+/// (for example, `rebase --continue`) in `command_name`.
+pub(crate) fn command_may_mutate_shared_refs(command_name: &str) -> bool {
+    let normalized = command_name.trim().to_ascii_lowercase();
+    let mut parts = normalized.split_ascii_whitespace();
+    let command = parts.next().unwrap_or_default();
+    if command == "op" {
+        return matches!(parts.next(), Some("restore" | "undo" | "redo" | "revert"));
+    }
+    matches!(
+        command,
+        "branch"
+            | "br"
+            | "tag"
+            | "commit"
+            | "ci"
+            | "reset"
+            | "fetch"
+            | "pull"
+            | "push"
+            | "merge"
+            | "rebase"
+            | "rb"
+            | "cherry-pick"
+            | "cp"
+            | "revert"
+            | "am"
+            | "bisect"
+            | "checkout"
+            | "switch"
+            | "sw"
+            | "update-ref"
+            | "symbolic-ref"
+            | "reflog"
+            | "notes"
+            | "replace"
+            | "stash"
+            | "remote"
+            | "worktree"
+            | "shell"
+            | "exec"
+            | "external-git"
+            | "hook"
+            | "fast-import"
+    )
+}
+
+fn operation_needs_repository_lease(meta: &OperationMetaV2, class: MutationClass) -> bool {
+    if class == MutationClass::ExternalOrUnknown {
+        return true;
+    }
+    let Some(command_name) = meta.command_name.as_deref() else {
+        return matches!(
+            class,
+            MutationClass::RepoMutation | MutationClass::SequencerMutation
+        );
+    };
+    let mut parts = command_name.split_ascii_whitespace();
+    if parts.next() == Some("stash") && parts.next() == Some("pop") {
+        // The stash entry is applied before its raw-line CAS. That critical
+        // section takes the repository lease after the pop rendezvous, so two
+        // worktrees can both apply and exactly one can win the shared-stack
+        // delete.
+        return false;
+    }
+    command_may_mutate_shared_refs(command_name)
 }
 
 #[derive(Debug, Error)]
@@ -240,7 +339,7 @@ where
         class,
         post_snapshot_complete: false,
     };
-    let value = f(&mut txn).await?;
+    let value = with_operation_id(txn.op_id.clone(), f(&mut txn)).await?;
     Ok(OperationResult {
         value,
         operation_id: should_record.then_some(txn.op_id),
@@ -297,6 +396,16 @@ where
                 .to_string(),
         ));
     }
+    let shared_repository_value = shared_repository.as_ref().map(|entry| entry.value.as_str());
+    // Repository-wide ref transitions take the common lease before the
+    // worktree lease, matching restore's lock order. Worktree-only edits keep
+    // their existing concurrency across linked worktrees.
+    let _repository_lease =
+        if operation_needs_repository_lease(&meta, class) && !repository_ref_lease_is_held() {
+            Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
+        } else {
+            None
+        };
     let lease_permissions = LeaseFilePermissions::from_shared_repository(
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )?;
@@ -326,7 +435,7 @@ where
             Staleness::Fresh => {}
             state => {
                 return Err(OperationError::Stale(format!(
-                    "working-copy pointer is {state:?} against current heads"
+                    "working-copy pointer is {state:?} against current heads; run `libra op doctor --fix` to recover an interrupted operation"
                 )));
             }
         }
@@ -344,7 +453,14 @@ where
                 .to_string(),
         ));
     }
-    let pre_refs = capture_reference_state(&db).await?;
+    let pre_refs = capture_reference_state_with_repository_lease(
+        &db,
+        scope,
+        &repo_id,
+        shared_repository_value,
+        _repository_lease.is_some(),
+    )
+    .await?;
 
     // The pointer records the last captured workspace, so a changed disk
     // state on entry is an external mutation that must become its own DAG
@@ -404,10 +520,28 @@ where
         {
             Ok(generation) => generation,
             Err(error) => {
-                let _ = store
-                    .update_operation_status(&external_id, OperationStatusV2::Failed)
-                    .await;
-                return Err(OperationError::Cas(error.to_string()));
+                // ADR-OL-06: a concurrent publication keeps both candidates as
+                // sibling heads instead of overwriting one of them; the head
+                // set is converged later by `libra op reconcile`.
+                match store
+                    .merge_op_heads(
+                        &repo_id,
+                        &scope_key,
+                        &external.parent_op_ids,
+                        std::slice::from_ref(&external_id),
+                    )
+                    .await
+                {
+                    Ok(generation) => generation,
+                    Err(merge_error) => {
+                        let _ = store
+                            .update_operation_status(&external_id, OperationStatusV2::Failed)
+                            .await;
+                        return Err(OperationError::Cas(format!(
+                            "{error}; sibling head merge also failed: {merge_error}"
+                        )));
+                    }
+                }
             }
         };
         let mut external_pointer =
@@ -493,7 +627,13 @@ where
         now_millis(),
     )
     .await?;
-    let value = match f(&mut txn).await {
+    let operation_future = with_operation_id(txn.op_id.clone(), f(&mut txn));
+    let operation_result = if _repository_lease.is_some() {
+        with_repository_ref_lease(operation_future).await
+    } else {
+        operation_future.await
+    };
+    let value = match operation_result {
         Ok(value) => value,
         Err(error) => {
             persist_failed_operation(
@@ -552,7 +692,14 @@ where
         .await?;
         return Err(OperationError::ExternalUnverified);
     }
-    let post_refs = capture_reference_state(&db).await?;
+    let post_refs = capture_reference_state_with_repository_lease(
+        &db,
+        scope,
+        &repo_id,
+        shared_repository_value,
+        _repository_lease.is_some(),
+    )
+    .await?;
     let full_view_is_unchanged = pre.snapshot.completeness == Completeness::Full
         && post.snapshot.completeness == Completeness::Full
         && pre.content_oid == post.content_oid
@@ -621,10 +768,28 @@ where
     {
         Ok(generation) => generation,
         Err(error) => {
-            let _ = store
-                .update_operation_status(&operation_id, OperationStatusV2::Failed)
-                .await;
-            return Err(OperationError::Cas(error.to_string()));
+            // ADR-OL-06: a concurrent publication keeps both candidates as
+            // sibling heads instead of overwriting one of them; the head set
+            // is converged later by `libra op reconcile`.
+            match store
+                .merge_op_heads(
+                    &repo_id,
+                    &scope_key,
+                    &operation.parent_op_ids,
+                    std::slice::from_ref(&operation_id),
+                )
+                .await
+            {
+                Ok(generation) => generation,
+                Err(merge_error) => {
+                    let _ = store
+                        .update_operation_status(&operation_id, OperationStatusV2::Failed)
+                        .await;
+                    return Err(OperationError::Cas(format!(
+                        "{error}; sibling head merge also failed: {merge_error}"
+                    )));
+                }
+            }
         }
     };
     let mut operation_pointer =
@@ -747,6 +912,21 @@ async fn capture_reference_state(
     Ok(serde_json::Value::Array(references))
 }
 
+async fn capture_reference_state_with_repository_lease(
+    db: &DatabaseConnection,
+    scope: &PinnedRequestScope,
+    repo_id: &str,
+    shared_repository: Option<&str>,
+    lease_already_held: bool,
+) -> Result<serde_json::Value, OperationError> {
+    let _read_lease = if lease_already_held || repository_ref_lease_is_held() {
+        None
+    } else {
+        Some(ScopeLease::acquire_repository_wait(scope, repo_id, shared_repository).await?)
+    };
+    capture_reference_state(db).await
+}
+
 async fn append_journal(
     store: &OperationStoreV2,
     operation_id: &str,
@@ -837,6 +1017,79 @@ mod tests {
             classify_command("future-command"),
             Err(ClassificationError::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn operation_restore_commands_take_the_repository_ref_fence() {
+        for command in ["op restore", "op undo --last", "op redo", "op revert"] {
+            assert!(
+                command_may_mutate_shared_refs(command),
+                "{command} can restore a shared branch tip"
+            );
+        }
+        assert!(!command_may_mutate_shared_refs("op log"));
+    }
+
+    #[test]
+    fn stash_pop_defers_the_repository_ref_fence_until_its_stack_cas() {
+        let pop = OperationMetaV2 {
+            command_name: Some("stash pop".to_string()),
+            ..OperationMetaV2::default()
+        };
+        assert!(!operation_needs_repository_lease(
+            &pop,
+            MutationClass::RepoMutation
+        ));
+
+        let push = OperationMetaV2 {
+            command_name: Some("stash".to_string()),
+            ..OperationMetaV2::default()
+        };
+        assert!(operation_needs_repository_lease(
+            &push,
+            MutationClass::RepoMutation
+        ));
+    }
+
+    #[tokio::test]
+    async fn operation_id_context_matches_the_operation_txn() {
+        let root = tempfile::tempdir().expect("scope root");
+        let scope = crate::internal::worktree_scope::RequestScope {
+            scope: crate::internal::worktree_scope::WorktreeScope::Main,
+            workdir: root.path().to_path_buf(),
+            gitdir: root.path().join(".libra"),
+            storage: root.path().to_path_buf(),
+            worktree_root: root.path().to_path_buf(),
+        };
+
+        let result = run_with_operation(
+            &scope,
+            OperationMetaV2::default(),
+            MutationClass::RepoMutation,
+            |txn| {
+                let expected = txn.op_id.clone();
+                async move {
+                    assert_eq!(current_operation_id().as_deref(), Some(expected.as_str()));
+                    Ok::<_, OperationError>(expected)
+                }
+            },
+        )
+        .await
+        .expect("operation");
+        assert_eq!(result.operation_id.as_deref(), Some(result.value.as_str()));
+        assert!(current_operation_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_control_boundary_id_can_scope_a_command() {
+        with_operation_id("persisted-control-op".to_string(), async {
+            assert_eq!(
+                current_operation_id().as_deref(),
+                Some("persisted-control-op")
+            );
+        })
+        .await;
+        assert!(current_operation_id().is_none());
     }
 
     #[tokio::test]

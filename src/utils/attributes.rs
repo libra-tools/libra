@@ -277,7 +277,9 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
 }
 
 pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeState> {
-    let workdir = util::working_dir();
+    // Pure merge helpers are also used before a Libra repository is initialized.
+    // Outside one there are no repository attribute sources to apply.
+    let workdir = util::try_working_dir().ok()?;
     let absolute = absolute_in_workdir(path, &workdir)?;
     let mut state = None;
     for source in attribute_sources_for_path(&workdir, &absolute) {
@@ -299,7 +301,9 @@ pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeStat
 }
 
 pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeState> {
-    let workdir = util::working_dir();
+    let Ok(workdir) = util::try_working_dir() else {
+        return BTreeMap::new();
+    };
     let Some(absolute) = absolute_in_workdir(path, &workdir) else {
         return BTreeMap::new();
     };

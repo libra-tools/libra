@@ -25,6 +25,7 @@ pub mod ai;
 pub mod alternates;
 pub mod auth;
 pub mod branch;
+pub mod change;
 pub mod config;
 pub mod config_ownership;
 pub mod db;

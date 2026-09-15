@@ -28,6 +28,10 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
+        change::{
+            RelationKind,
+            record_current_repo_commit_revision_with_predecessors_for_active_operation,
+        },
         head::Head,
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
@@ -1836,6 +1840,26 @@ impl RebaseTodoAction {
     }
 }
 
+fn replay_genealogy_predecessors(
+    original_commit: &Commit,
+    previous_commit: ObjectHash,
+    action: RebaseTodoAction,
+) -> Vec<(String, RelationKind)> {
+    match action {
+        RebaseTodoAction::Fixup | RebaseTodoAction::Squash => vec![
+            (previous_commit.to_string(), RelationKind::Squash),
+            (original_commit.id.to_string(), RelationKind::Squash),
+        ],
+        RebaseTodoAction::Amend => vec![
+            (previous_commit.to_string(), RelationKind::Amend),
+            (original_commit.id.to_string(), RelationKind::Amend),
+        ],
+        RebaseTodoAction::Pick => {
+            vec![(original_commit.id.to_string(), RelationKind::Rebase)]
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RebaseTodoItem {
     commit: ObjectHash,
@@ -2341,8 +2365,15 @@ async fn run_sandboxed_rebase_exec(
         use_linux_sandbox_bwrap: true,
         ..Default::default()
     };
+    // Rebase --exec may invoke Libra again inside this operation. Its parent
+    // still owns the repository ref lease, so descendants inherit this marker
+    // and avoid waiting on the lease held by their own parent.
+    let command = format!(
+        "export {}=1; {command}",
+        crate::internal::operation::middleware::REPOSITORY_REF_LEASE_HELD_ENV,
+    );
     run_shell_command(
-        command,
+        &command,
         &cwd,
         Some(15 * 60 * 1000),
         1024 * 1024,
@@ -3545,6 +3576,12 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
                 })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
+        record_current_repo_commit_revision_with_predecessors_for_active_operation(
+            new_commit.id.to_string(),
+            replay_genealogy_predecessors(&original_commit, state.current_head, action),
+        )
+        .await
+        .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
 
         let previous_tip = state.current_head;
         state.current_head = new_commit.id;
@@ -4684,6 +4721,14 @@ async fn replay_commit_with_unified_merge(
 
     if let Err(e) = save_object(&new_commit, &new_commit.id) {
         return ReplayResult::internal(ReplayErrorKind::CommitSave, e.to_string());
+    }
+    if let Err(error) = record_current_repo_commit_revision_with_predecessors_for_active_operation(
+        new_commit.id.to_string(),
+        replay_genealogy_predecessors(&commit_to_replay, *new_parent_id, action),
+    )
+    .await
+    {
+        return ReplayResult::internal(ReplayErrorKind::CommitSave, error.to_string());
     }
 
     // Update index and working directory

@@ -71,7 +71,6 @@
      `created_op_id` TEXT NOT NULL,
      `created_at`    INTEGER NOT NULL
  );
-
  CREATE TABLE IF NOT EXISTS `change_revision` (
      `change_id`        TEXT NOT NULL,
      `commit_oid`       TEXT NOT NULL,

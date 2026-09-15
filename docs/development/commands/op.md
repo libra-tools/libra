@@ -8,6 +8,9 @@ extension rather than a Git command. The current public surface supports:
 - `libra op log`
 - `libra op show`
 - `libra op restore`
+- `libra op undo` / `libra op redo` / `libra op revert` (plan-20260822 OL-11)
+- `libra op reconcile` (plan-20260822 OL-13)
+- `libra op doctor`
 
 ## Compatibility
 

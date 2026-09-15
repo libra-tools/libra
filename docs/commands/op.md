@@ -8,6 +8,7 @@ Inspect and restore command-level operation history.
 libra op log [OPTIONS]
 libra op show [OPTIONS] <OP_REF>
 libra op restore [OPTIONS] <OP_REF>
+libra op reconcile [OPTIONS]
 ```
 
 ## Description
@@ -15,11 +16,13 @@ libra op restore [OPTIONS] <OP_REF>
 `libra op` provides a command-line surface over the operation graph persisted by
 the operation service and wrapper layers.
 
-It currently supports three subcommands:
+It currently supports these subcommands:
 
 - `op log`: list recorded operations with pagination and optional command filter.
 - `op show`: inspect one operation and, optionally, the captured restore view.
 - `op restore`: move HEAD and branch refs back to a previously captured view.
+- `op reconcile`: converge concurrent operation heads when their states are
+  provably unambiguous.
 
 ## Operation References
 
@@ -28,6 +31,14 @@ It currently supports three subcommands:
 - A concrete operation id, for example `019e3f00-8ee5-7e62-a54c-0ab1f1bba0f9`
 - A reflog-style index, for example `@{0}` for the newest operation or `@{1}`
   for the previous one
+
+Indices use one newest-first history across retained legacy and operation-v2
+records. V2-only entries such as `external.snapshot`, undo, and redo appear in
+that same history. The `index` in `op log --json` is the zero-based index for
+the complete history; command filters and pagination do not renumber it. Thus
+`op show @{n}` and `op restore @{n}` target the operation displayed at index
+`n`. `op undo`, `op redo`, and `op revert` resolve that same index, but require
+a v2 operation; selecting a legacy-only row reports an unsupported target.
 
 ## `libra op log`
 
@@ -143,6 +154,24 @@ libra op restore @{1}
 libra op restore @{1} --dry-run
 ```
 
+## `libra op doctor`
+
+Diagnose operation object closure, heads, unfinished journals, and the
+workspace pointer. Read-only by default; `--fix` performs journal recovery and
+pointer rebuild, `--dry-run` only reports the planned repairs.
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
+`--fix` recovers interrupted operations that never reached a terminal state.
+A command that already published its head (the operation completed its mutation
+before the process died) is advanced to `success` and, when it is the current
+head, the workspace pointer is rebuilt to its captured view. A globally
+orphaned running operation (crash before head publication) is failed closed;
+the next mutation boundary records any on-disk drift as an external snapshot.
+
+
 ## Notes
 
 - `op restore` records a new `op restore` operation on success.
@@ -150,6 +179,10 @@ libra op restore @{1} --dry-run
 - Restore resets HEAD and the branch refs captured in the target view, and
   prunes local branches that are absent from that view (the restored HEAD branch
   is always kept; remote-tracking refs are left untouched).
+- A repository-wide restore (`--what all --confirm-repo-wide`) refuses to run
+  when it would delete the HEAD of a linked worktree that is absent from the
+  target snapshot; such a worktree was created after the snapshot, and its HEAD
+  must be recreated or checked out after the restore.
 
 ### Operation-scoped execution (unreleased)
 
@@ -253,6 +286,39 @@ coexist. A v2 `Full` capture is not a promise of full restore support.
   failed command can still leave operation/pre-snapshot records; this does not
   permit capturing opaque nested content. Neither `Full` nor `--force` grants
   restore support for uncaptured contents or unsupported state.
+
+## `libra op reconcile`
+
+Converge concurrent operation heads when their states are provably
+unambiguous (plan-20260822 OL-13).
+
+```bash
+libra op reconcile [--dry-run]
+```
+
+Concurrent publications (for example, two CLI processes or two worktrees
+publishing against the same operation head set) are retained as sibling
+heads: the second publisher is fenced by the head compare-and-swap and then
+recorded as an additional head instead of overwriting the first. While more
+than one head exists, undo/redo/revert/restore refuse to run (`refusing to
+guess`) because there is no single current head.
+
+`op reconcile` inspects every sibling head's captured view and:
+
+- converges the head set when every shared reference agrees across the
+  concurrent views: it records one append-only `reconcile` operation with all
+  siblings as explicit parents and advances the head set to that single node;
+- reports every reference whose target differs between heads (including both
+  observed targets) and leaves the head set untouched when at least one
+  conflict exists — reconciliation never guesses a winner.
+
+The reconcile operation itself changes no repository content; it only records
+the convergence point so subsequent undo/restore operations have a single
+unambiguous head to anchor on.
+
+Exit status is `0` for convergence or `nothing to reconcile`, and non-zero
+when conflicts are reported (the JSON output carries `outcome: "conflicted"`
+with the full conflict list).
 
 The unreleased database transition is documented under
 [operation-v2 convergence](init.md#operation-v2-convergence-current-branch-unreleased).

@@ -48,8 +48,14 @@ impl RepairFixture {
         fs::create_dir_all(home.join(".config")).unwrap();
         let db = home.join(".libra/config.db");
         let system = root.join("system.db");
+        fs::write(&db, b"").unwrap();
         runtime().block_on(async {
-            let conn = libra::internal::db::create_database(db.to_str().unwrap()).await.unwrap();
+            let conn = connect(&db, false).await;
+            conn.execute_unprepared(include_str!(
+                "../fixtures/config_repair/v0.22.19-global-config.sql"
+            ))
+            .await
+            .unwrap();
             conn.execute_raw(Statement::from_sql_and_values(conn.get_database_backend(),
                 "INSERT INTO config_kv (key,value,encrypted) VALUES ('test.repair','preserved',0),('test.secret',?,1)",
                 [CANARY.into()])).await.unwrap();

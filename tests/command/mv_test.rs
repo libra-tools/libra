@@ -457,15 +457,18 @@ async fn test_mv_rejects_source_path_outside_workdir() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = ChangeDirGuard::new(temp_path.path());
 
-    let outside_src = temp_path
+    let outside_dir = tempfile::tempdir_in(temp_path.path().parent().unwrap()).unwrap();
+    let outside_dir_name = outside_dir
         .path()
-        .parent()
-        .unwrap()
-        .join("mv_outside_src.txt");
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    let outside_src = outside_dir.path().join("source.txt");
     fs::write(&outside_src, "x").unwrap();
+    let outside_src_arg = format!("../{outside_dir_name}/source.txt");
 
     let output = Command::new(env!("CARGO_BIN_EXE_libra"))
-        .args(["mv", "../mv_outside_src.txt", "renamed.txt"])
+        .args(["mv", &outside_src_arg, "renamed.txt"])
         .output()
         .expect("failed to execute libra mv outside-source case");
 
@@ -489,17 +492,17 @@ async fn test_mv_rejects_destination_path_outside_workdir() {
     let _guard = ChangeDirGuard::new(temp_path.path());
 
     stage_file("inside.txt", "x").await;
-    let outside_dst = temp_path
+    let outside_dir = tempfile::tempdir_in(temp_path.path().parent().unwrap()).unwrap();
+    let outside_dir_name = outside_dir
         .path()
-        .parent()
-        .unwrap()
-        .join("mv_outside_dst.txt");
-    if outside_dst.exists() {
-        fs::remove_file(&outside_dst).unwrap();
-    }
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    let outside_dst = outside_dir.path().join("destination.txt");
+    let outside_dst_arg = format!("../{outside_dir_name}/destination.txt");
 
     let output = Command::new(env!("CARGO_BIN_EXE_libra"))
-        .args(["mv", "inside.txt", "../mv_outside_dst.txt"])
+        .args(["mv", "inside.txt", &outside_dst_arg])
         .output()
         .expect("failed to execute libra mv outside-destination case");
 

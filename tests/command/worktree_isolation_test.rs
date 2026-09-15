@@ -3961,6 +3961,12 @@ fn sequencer_state_rows_are_gc_roots_across_scopes() {
         );
     };
     sqlite("DELETE FROM reflog;");
+    // CH04's change projection is also a documented GC root. Remove the
+    // commit's projection so the state rows below are the only anchors under
+    // test; otherwise the negative control can never become a prune candidate.
+    sqlite(&format!(
+        "DELETE FROM change_revision WHERE commit_oid = '{oid}';"
+    ));
 
     // Plant a FOREIGN-scope rebase_state row anchoring the commit.
     sqlite(&format!(
