@@ -395,42 +395,44 @@ async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<
     if output.is_json() {
         emit_json_data("op", &payload, output)?;
     } else if !output.quiet {
-        match &payload {
-            OpOutput::Reconcile { outcome } => match outcome {
-                ReconcileOutcome::NothingToReconcile => {
-                    println!("Nothing to reconcile: the operation log has a single head.");
-                }
-                ReconcileOutcome::DryRunConverged { parents } => {
-                    println!(
-                        "Would converge {} concurrent operation heads:\n  {}",
-                        parents.len(),
-                        parents.join("\n  ")
-                    );
-                }
-                ReconcileOutcome::Converged {
-                    reconcile_op_id,
-                    parents,
-                    generation,
-                } => {
-                    println!(
-                        "Converged {} concurrent operation heads into reconcile operation {reconcile_op_id} (generation {generation}).",
-                        parents.len()
-                    );
-                }
-                ReconcileOutcome::Conflicted { conflicts } => {
-                    eprintln!(
-                        "Cannot reconcile: concurrent heads disagree on {} reference(s). The head set is preserved; resolve the conflicts and retry.",
-                        conflicts.len()
-                    );
-                    for conflict in conflicts {
-                        eprintln!("  {} {}:", conflict.kind, conflict.name);
-                        for (head, target) in &conflict.targets {
-                            eprintln!("    {head} -> {target}");
-                        }
+        let OpOutput::Reconcile { outcome } = &payload else {
+            return Err(CliError::fatal(
+                "internal error: reconcile produced an unexpected output payload",
+            ));
+        };
+        match outcome {
+            ReconcileOutcome::NothingToReconcile => {
+                println!("Nothing to reconcile: the operation log has a single head.");
+            }
+            ReconcileOutcome::DryRunConverged { parents } => {
+                println!(
+                    "Would converge {} concurrent operation heads:\n  {}",
+                    parents.len(),
+                    parents.join("\n  ")
+                );
+            }
+            ReconcileOutcome::Converged {
+                reconcile_op_id,
+                parents,
+                generation,
+            } => {
+                println!(
+                    "Converged {} concurrent operation heads into reconcile operation {reconcile_op_id} (generation {generation}).",
+                    parents.len()
+                );
+            }
+            ReconcileOutcome::Conflicted { conflicts } => {
+                eprintln!(
+                    "Cannot reconcile: concurrent heads disagree on {} reference(s). The head set is preserved; resolve the conflicts and retry.",
+                    conflicts.len()
+                );
+                for conflict in conflicts {
+                    eprintln!("  {} {}:", conflict.kind, conflict.name);
+                    for (head, target) in &conflict.targets {
+                        eprintln!("    {head} -> {target}");
                     }
                 }
-            },
-            _ => unreachable!("payload constructed above"),
+            }
         }
     }
     if conflicted {
@@ -462,31 +464,20 @@ async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> Cl
     .inspect(dry_run, fix)
     .await
     .map_err(|error| CliError::fatal(error.to_string()))?;
-    let payload = OpOutput::Doctor { report };
     if output.is_json() {
-        emit_json_data("op", &payload, output)
-    } else if output.quiet {
-        Ok(())
-    } else {
-        println!(
-            "Operation doctor: {} issue(s)",
-            payload_report(&payload).issues.len()
-        );
-        for issue in &payload_report(&payload).issues {
-            println!("{}: {}", issue.code, issue.message);
-        }
-        for fixed in &payload_report(&payload).fixed {
-            println!("fixed: {fixed}");
-        }
-        Ok(())
+        return emit_json_data("op", &OpOutput::Doctor { report }, output);
     }
-}
-
-fn payload_report(payload: &OpOutput) -> &DoctorReport {
-    let OpOutput::Doctor { report } = payload else {
-        unreachable!()
-    };
-    report
+    if output.quiet {
+        return Ok(());
+    }
+    println!("Operation doctor: {} issue(s)", report.issues.len());
+    for issue in &report.issues {
+        println!("{}: {}", issue.code, issue.message);
+    }
+    for fixed in &report.fixed {
+        println!("fixed: {fixed}");
+    }
+    Ok(())
 }
 
 fn emit_transition_output(
@@ -494,23 +485,7 @@ fn emit_transition_output(
     receipt: RestoreReceipt,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let payload = match action {
-        "undo" => OpOutput::Undo { receipt },
-        "redo" => OpOutput::Redo { receipt },
-        "revert" => OpOutput::Revert { receipt },
-        _ => return Err(CliError::fatal("unknown operation transition")),
-    };
-    if output.is_json() {
-        emit_json_data("op", &payload, output)
-    } else if output.quiet {
-        Ok(())
-    } else {
-        let receipt = match &payload {
-            OpOutput::Undo { receipt }
-            | OpOutput::Redo { receipt }
-            | OpOutput::Revert { receipt } => receipt,
-            _ => unreachable!(),
-        };
+    let print = |receipt: &RestoreReceipt| {
         println!(
             "{} {} facet(s), {} path(s)",
             action,
@@ -522,8 +497,21 @@ fn emit_transition_output(
         } else {
             println!("Dry run: no operation was published.");
         }
-        Ok(())
+    };
+    if output.is_json() {
+        let payload = match action {
+            "undo" => OpOutput::Undo { receipt },
+            "redo" => OpOutput::Redo { receipt },
+            "revert" => OpOutput::Revert { receipt },
+            _ => return Err(CliError::fatal("unknown operation transition")),
+        };
+        return emit_json_data("op", &payload, output);
     }
+    if output.quiet {
+        return Ok(());
+    }
+    print(&receipt);
+    Ok(())
 }
 
 fn undo_cli_error(error: UndoError) -> CliError {
@@ -1277,13 +1265,12 @@ async fn handle_op_restore(
         return emit_json_data("op", &op_output, output);
     }
 
-    println!(
-        "{}",
-        match op_output {
-            OpOutput::Restore { message, .. } => message,
-            _ => unreachable!(),
-        }
-    );
+    let OpOutput::Restore { message, .. } = &op_output else {
+        return Err(CliError::fatal(
+            "internal error: legacy restore produced an unexpected output payload",
+        ));
+    };
+    println!("{message}");
     println!(
         "New operation recorded: {}",
         &result.op_id[..8.min(result.op_id.len())]
@@ -1339,13 +1326,9 @@ async fn handle_v2_restore(
             CliError::fatal(format!("v2 restore failed: {error}"))
                 .with_stable_code(restore_error_code(&error))
         })?;
-    let op_output = OpOutput::RestoreV2 { receipt };
     if output.is_json() {
-        emit_json_data("op", &op_output, output)?;
+        emit_json_data("op", &OpOutput::RestoreV2 { receipt }, output)?;
     } else if !output.quiet {
-        let OpOutput::RestoreV2 { receipt } = &op_output else {
-            unreachable!();
-        };
         println!(
             "{} {} {} path(s)",
             if receipt.dry_run {

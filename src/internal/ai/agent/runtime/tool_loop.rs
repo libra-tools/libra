@@ -381,9 +381,18 @@ fn bounded_pending_operation_ids(
     }
     newest_first.reverse();
     if newest_first.len() < pending.len() {
+        // Truncation silently severs the causal chain for the oldest pending
+        // operations; the dropped ids are recorded in the link store's own
+        // cleanup path below via `cleanup_pending_ai_operations`, but the
+        // event must also be visible in structured logs for diagnosis.
+        let dropped: Vec<&str> = pending[..pending.len() - newest_first.len()]
+            .iter()
+            .map(|entry| entry.operation_id.as_str())
+            .collect();
         tracing::warn!(
             pending = pending.len(),
             bounded = newest_first.len(),
+            dropped = ?dropped,
             "pending AI operation batch exceeded its cap; older operations were dropped"
         );
     }

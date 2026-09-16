@@ -169,7 +169,25 @@ pub async fn record_current_repo_commit_revision_with_predecessors_for_active_op
         None if crate::internal::worktree_scope::WorktreeScope::request_scope().is_some() => {
             return Err(ChangeRevisionBuildError::MissingOperationContext);
         }
-        None => Uuid::now_v7().to_string(),
+        None => {
+            // Standalone in-process callers have no operation boundary; a
+            // fresh UUID keeps the revision valid but severs provenance from
+            // the operation log, so it must stay visible when it happens.
+            let generated = Uuid::now_v7().to_string();
+            let commit_oid = commit_oid.into();
+            tracing::warn!(
+                commit = %commit_oid,
+                op_id = %generated,
+                "change revision recorded without an active operation context; \
+                 provenance will not resolve through the operation log"
+            );
+            return record_current_repo_commit_revision_with_predecessors(
+                generated,
+                commit_oid,
+                predecessors,
+            )
+            .await;
+        }
     };
     record_current_repo_commit_revision_with_predecessors(op_id, commit_oid, predecessors).await
 }

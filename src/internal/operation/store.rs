@@ -567,20 +567,75 @@ impl OperationStoreV2 {
     }
 
     pub async fn list_operations(&self) -> Result<Vec<OperationV2>, StoreError> {
+        // Two bulk queries (operations + parent edges) instead of one
+        // `load_operation` per row: reconcile walks the whole log, so the
+        // previous N+1 pattern issued 2N+1 statements per call.
         let rows = self
             .db
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT op_id FROM operation WHERE repo_id = ? ORDER BY start_ts, op_id",
+                "SELECT op_id, kind, status, command_name, description, args_digest, actor, \
+                 pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
+                 predecessor_map_oid, causal_context_id \
+                 FROM operation WHERE repo_id = ? ORDER BY start_ts, op_id",
                 [self.repo_id.clone().into()],
             ))
             .await?;
+        let parent_rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT p.op_id, p.parent_op_id FROM operation_parent p \
+                 JOIN operation o ON o.op_id = p.op_id \
+                 WHERE o.repo_id = ? ORDER BY p.op_id, p.ordinal",
+                [self.repo_id.clone().into()],
+            ))
+            .await?;
+        let mut parents_by_op: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in parent_rows {
+            let op_id: String = row.try_get("", "op_id")?;
+            let parent_op_id: String = row.try_get("", "parent_op_id")?;
+            parents_by_op.entry(op_id).or_default().push(parent_op_id);
+        }
+
         let mut operations = Vec::with_capacity(rows.len());
         for row in rows {
-            let op_id = row.try_get::<String>("", "op_id")?;
-            if let Some(operation) = self.load_operation(&op_id).await? {
-                operations.push(operation);
-            }
+            let op_id: String = row.try_get("", "op_id")?;
+            let parse_oid = |field: &'static str| -> Result<ObjectHash, StoreError> {
+                let value = row.try_get::<String>("", field)?;
+                value
+                    .parse()
+                    .map_err(|_| StoreError::InvalidObjectHash(value))
+            };
+            let parse_optional_oid =
+                |field: &'static str| -> Result<Option<ObjectHash>, StoreError> {
+                    let value = row.try_get::<Option<String>>("", field)?;
+                    value
+                        .map(|value| {
+                            value
+                                .parse()
+                                .map_err(|_| StoreError::InvalidObjectHash(value))
+                        })
+                        .transpose()
+                };
+            operations.push(OperationV2 {
+                parent_op_ids: parents_by_op.remove(&op_id).unwrap_or_default(),
+                pre_view_oid: parse_oid("pre_view_oid")?,
+                post_view_oid: parse_oid("post_view_oid")?,
+                kind: row.try_get::<String>("", "kind")?.parse()?,
+                status: row.try_get::<String>("", "status")?.parse()?,
+                metadata: OperationMetaV2 {
+                    command_name: row.try_get("", "command_name")?,
+                    description: row.try_get("", "description")?,
+                    args_digest: row.try_get("", "args_digest")?,
+                    actor: row.try_get("", "actor")?,
+                    causal_context_id: row.try_get("", "causal_context_id")?,
+                },
+                restores_op_id: row.try_get("", "restores_op_id")?,
+                reverts_op_id: row.try_get("", "reverts_op_id")?,
+                predecessor_map_oid: parse_optional_oid("predecessor_map_oid")?,
+                op_id,
+            });
         }
         Ok(operations)
     }
