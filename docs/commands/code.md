@@ -549,6 +549,12 @@ The `web_search` tool requires the session network policy to allow outbound acce
 | `review` | `code-review` | Code review focus. |
 | `research` | `explore` | Exploratory research and analysis. |
 
+## Rust toolchains in task worktrees
+
+On Unix, Libra task shells use a task-local `HOME` and `CARGO_HOME`. When `RUSTUP_HOME` is unset, Libra retains the original user's existing `~/.rustup` directory before isolating `HOME`, so Cargo can locate installed toolchains when the sandbox makes that root and the tool executables available. Filesystem-restricted sandboxes still need policy-provided access to those paths. An explicit `RUSTUP_HOME` is inherited as supplied; `RUSTUP_TOOLCHAIN` and project toolchain selection keep their normal meaning.
+
+The implicit root must be an existing directory at an absolute, UTF-8 path. If it cannot be derived, configure `RUSTUP_HOME` explicitly for the installed toolchain root. Cargo's cache, XDG paths and Libra logs remain task-local. Rustup uses the shared installation; existing approvals and filesystem/network policies govern access and any toolchain installation or update. Windows continues to use its existing `USERPROFILE`-based Rustup behavior.
+
 ## Common Commands
 
 ```bash

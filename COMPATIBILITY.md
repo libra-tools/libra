@@ -676,3 +676,7 @@ A successful discovery whose child waits for a request normally incurs the full
 100 ms native-exit observation window, once per discovery operation. This is
 separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
+
+### Task shell Rust toolchains (Libra extension)
+
+On Unix, isolated task shells retain the user's existing default Rustup root when `RUSTUP_HOME` is unset and an absolute UTF-8 `~/.rustup` directory exists. Explicit `RUSTUP_HOME`, toolchain selection and sandbox permissions keep their existing meaning. HOME, Cargo cache, XDG and logs remain task-local; Rustup installation/update access remains subject to the existing policy. Configure `RUSTUP_HOME` explicitly when the default root cannot be derived. Windows USERPROFILE behavior is unchanged. See [code](docs/commands/code.md#rust-toolchains-in-task-worktrees).

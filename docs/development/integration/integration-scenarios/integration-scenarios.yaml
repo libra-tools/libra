@@ -1,4 +1,13 @@
 # Libra Black-Box CLI Integration Test Scenario Registry
+# FIX-PKT-04: Unix task-shell Rustup root preservation is covered by three inline
+# sandbox::runtime tests (task_shell_preserves_default_rustup_home,
+# task_shell_preserves_explicit_rustup_environment,
+# task_shell_rustup_home_derivation_is_conservative) and the existing executor
+# Cargo-project case in a subprocess without RUSTUP_HOME/CARGO. Toolchain choice
+# is preserved, automatic installation disabled, HOME/Cargo cache isolation and
+# scope/lockfile/target assertions retained. This adds no cli.* scenario ID and
+# makes no live-sandbox/platform claim; see integration-test-plan.md.
+#
 #
 # This is the **source of truth** for the set of cli.* and live.* scenarios
 # used by the integration runner (tools/integration-runner) and check-plan.

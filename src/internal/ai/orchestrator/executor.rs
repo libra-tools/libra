@@ -5086,6 +5086,61 @@ mod tests {
     #[tokio::test]
     #[serial(sandbox_env)]
     async fn execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep() {
+        #[cfg(unix)]
+        {
+            const CHILD: &str = "LIBRA_TEST_TASK_CARGO_WITHOUT_RUSTUP_HOME";
+            if std::env::var_os(CHILD).is_none() {
+                // Cargo-launched tests inherit RUSTUP_HOME; an installed Libra
+                // normally does not. Exercise that condition in a child so no
+                // other test sees a modified process-wide HOME or toolchain env.
+                let home = tempfile::tempdir().unwrap();
+                let rustup_home = std::env::var_os("RUSTUP_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|path| path.join(".rustup")));
+                if let Some(root) = rustup_home.filter(|path| path.is_dir()) {
+                    std::os::unix::fs::symlink(
+                        root.canonicalize().unwrap(),
+                        home.path().join(".rustup"),
+                    )
+                    .unwrap();
+                }
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "internal::ai::orchestrator::executor::tests::execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("HOME", home.path())
+                    .env_remove("RUSTUP_HOME")
+                    .env_remove("CARGO")
+                    .env("RUSTUP_AUTO_INSTALL", "0")
+                    .kill_on_drop(true);
+                // Preserve explicit toolchain selection. RUSTUP_AUTO_INSTALL=0
+                // keeps current rustup (1.28+) from installing a missing one.
+                let output = tokio::time::timeout(Duration::from_secs(180), command.output())
+                    .await
+                    .expect("isolated Cargo task test exceeded its deadline")
+                    .expect("spawn isolated Cargo task test");
+                assert!(
+                    output.status.success(),
+                    "isolated Cargo task failed: {:?}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout
+                        .lines()
+                        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                    "expected exactly one passing child test, got: {stdout}",
+                );
+                return;
+            }
+            assert!(std::env::var_os("RUSTUP_HOME").is_none());
+        }
         let (_helper_guard, _bwrap_guard) = force_no_ambient_bwrap();
         let repo = tempfile::tempdir().unwrap();
         test::setup_with_new_libra_in(repo.path()).await;
@@ -5135,7 +5190,7 @@ mod tests {
         .unwrap();
 
         let result = &run_state.ordered_task_results()[0];
-        assert_eq!(result.status, TaskNodeStatus::Completed);
+        assert_eq!(result.status, TaskNodeStatus::Completed, "{result:#?}");
         assert!(result.policy_violations.is_empty());
         assert!(repo.path().join("libra/Cargo.toml").exists());
         assert!(repo.path().join("libra/src/main.rs").exists());

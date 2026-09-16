@@ -459,6 +459,12 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `review` | `code-review` | 聚焦代码审查。 |
 | `research` | `explore` | 探索式研究和分析。 |
 
+## 任务工作树中的 Rust 工具链
+
+在 Unix 上，Libra 任务 shell 使用任务独立的 `HOME` 和 `CARGO_HOME`。未设置 `RUSTUP_HOME` 时，Libra 会在隔离 `HOME` 前保留原用户已有的 `~/.rustup` 目录位置，让 Cargo 在 sandbox 允许访问该根目录及工具执行档时找到已安装工具链。限制文件系统可见性的 sandbox 仍须通过策略提供这些路径的访问。显式 `RUSTUP_HOME` 原样继承；`RUSTUP_TOOLCHAIN` 和项目的工具链选择维持原有含义。
+
+隐式根目录须实际存在，且路径为绝对 UTF-8 路径；无法推导时，请显式配置指向已安装工具链根的 `RUSTUP_HOME`。Cargo 缓存、XDG 路径和 Libra 日志仍按任务隔离。Rustup 使用共享安装目录；工具链访问、安装或更新仍受既有审批和文件系统/网络策略约束。Windows 延续基于 `USERPROFILE` 的 Rustup 行为。
+
 ## 常用命令
 
 ```bash

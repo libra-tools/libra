@@ -441,7 +441,7 @@ pub struct SandboxRuntimeConfig {
 5. `SandboxTransformRequest` 增 `backend: SandboxBackendChoice` + `vm: Option<&ContainerVmHandle>`（`runtime.rs:350-367`），`build_command_from_spec`（`mod.rs:1408-1462`）填入。
 6. `select_initial`（`runtime.rs:409-445`）：macOS 分支据 `backend` 返回 `MacosAppleContainer`（`AppleContainer`，或 `Auto` 且探针过）或 `MacosSeatbelt`。**`Auto` 在 v1 等价 seatbelt（D5 注）。**
 7. `transform`（`runtime.rs:579-687`）加 `SandboxType::MacosAppleContainer => { … }` 臂：用 `AppleContainerRuntime::exec_argv(vm, &spec)` 产出 argv；`new_session=false`（`runtime.rs:698-701` 集合不含它）；不设 seccomp。**若 `vm` 为 `None`**（没有会话 VM 句柄）→ 按 enforcement 返回 `EnforcementFailed`/降级（见 Phase 5）。
-8. `exec_argv`：`[container, exec, --workdir <guest_cwd>, (-e K=V)*, <id>, $SHELL, -c, <cmd>]`。**路径/env 翻译**（§9.2）：把 `spec.cwd` 的 `host_worktree` 前缀换成 `guest_worktree`；env 里指向宿主 worktree 的覆盖（`apply_task_worktree_env_overrides` 注入的 `HOME/XDG_*/CARGO_HOME`，`runtime.rs:101-119`）**不能原样带进 guest**——要么重映射到 guest 路径，要么交给 guest 自己的 `$HOME`（推荐后者：VM 内用 guest 默认 HOME，只透传无害的 env）。
+8. `exec_argv`：`[container, exec, --workdir <guest_cwd>, (-e K=V)*, <id>, $SHELL, -c, <cmd>]`。**路径/env 翻译**（§9.2）：把 `spec.cwd` 的 `host_worktree` 前缀换成 `guest_worktree`；env 里指向宿主路径的覆盖（`apply_task_worktree_env_overrides` 注入的 `HOME/XDG_*/CARGO_HOME/LIBRA_LOG_FILE` 及条件保留的 `RUSTUP_HOME`；后者指向共享宿主工具链安装根）**不能原样带进 guest**——要么重映射到 guest 路径，要么交给 guest 自己的 `$HOME`（推荐后者：VM 内用 guest 默认 HOME，只透传无害的 env）。
 
 验收：纯 L1 单测——给定 backend/policy/cwd/env 与一个假的 `ContainerVmHandle`，断言 `transform` 产出的 argv 形如 `container exec --workdir /workspace/sub -e … <id> /bin/sh -c "<cmd>"`，cwd 翻译正确、worktree-env 不泄漏宿主路径；`backend=seatbelt` 时与现状逐字节一致（回归）。`FromStr` / 配置优先级单测。`cargo fmt/clippy/test` 三过。
 
@@ -579,10 +579,10 @@ v1 的确定性做法：
 ### 9.2 路径与 env 翻译（易错点，务必单测）
 
 - `--workdir`：`spec.cwd`（`runtime.rs:48`）若在 `host_worktree` 下，前缀替换为 `guest_worktree`；否则回退 `/workspace` 并 warn。
-- **不要**把 `apply_task_worktree_env_overrides`（`runtime.rs:101-119`）注入的宿主路径 `HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME/CARGO_HOME/LIBRA_LOG_FILE` 原样带进 guest——这些指向宿主 worktree 子目录，在 guest 里无意义或会误指。两种处理：
+- **不要**把 `apply_task_worktree_env_overrides` 注入的宿主路径 `HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME/CARGO_HOME/LIBRA_LOG_FILE` 及条件保留的 `RUSTUP_HOME` 原样带进 guest——前者指向宿主 worktree 子目录，后者指向共享宿主工具链安装根；这些路径在 guest 里无意义或会误指。两种处理：
   1. **推荐**：VM 后端跳过这些 host-path 覆盖，让 guest 用镜像里的默认 `$HOME` 等；只透传与路径无关的 env（`PATH` 用 guest 的、`LANG` 等）。
   2. 或：把这些路径同样前缀重映射到 guest（仅当对应目录也在挂载内）。
-- **精确实现点（务必只对 VM 生效）**：`apply_task_worktree_env_overrides`（`runtime.rs:101-119`）是在 `CommandSpec::shell` 构造时**上游**写进 `spec.env` 的，等到 `transform` 时这些键已在 env map 里。因此过滤要发生在 **VM 后端臂内**（`exec_argv` 拼 `-e` 之前，或 transform 的 `MacosAppleContainer` 臂里）对**已填充的 `spec.env`** 做一次按 `SandboxType` 区分的剔除——**deny-list**：`HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`CARGO_HOME`、`LIBRA_LOG_FILE`、`TMPDIR`（这些指向宿主路径，带进 guest 会导致 `CARGO_HOME` 指向不存在目录而构建失败）；其余键 allow。**绝不能**在通用路径上剔除，否则会破坏 seatbelt 臂（它需要这些宿主路径覆盖）。建议写成 `fn guest_env(spec_env) -> HashMap` 只在 VM 臂调用，并配单测断言 seatbelt 臂 env 不变、VM 臂剔除了上述 6 个键。
+- **精确实现点（务必只对 VM 生效）**：`apply_task_worktree_env_overrides` 是在 `CommandSpec::shell` 构造时**上游**写进 `spec.env` 的，等到 `transform` 时这些键已在 env map 里。因此过滤要发生在 **VM 后端臂内**（`exec_argv` 拼 `-e` 之前，或 transform 的 `MacosAppleContainer` 臂里）对**已填充的 `spec.env`** 做一次按 `SandboxType` 区分的剔除——**deny-list**：`HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`CARGO_HOME`、`RUSTUP_HOME`、`LIBRA_LOG_FILE`、`TMPDIR`（这些指向宿主路径，带进 guest 会导致 `CARGO_HOME` 指向不存在目录而构建失败）；其余键 allow。**绝不能**在通用路径上剔除，否则会破坏 seatbelt 臂（它需要这些宿主路径覆盖）。建议写成 `fn guest_env(spec_env) -> HashMap` 只在 VM 臂调用，并配单测断言 seatbelt 臂 env 不变、VM 臂剔除了上述 7 个键。
 - `TMPDIR`：现有逻辑注入宿主私有 0700 tmpdir（`mod.rs:1212-1213,1373-1379`）；VM 内应让 guest 用自己的 `/tmp`（ephemeral），故 VM 后端不透传宿主 `TMPDIR`。
 - `LIBRA_SANDBOX_NETWORK_DISABLED`（`runtime.rs:558-563`）：对 VM 仍可作为 guest 内进程的提示信号透传，但真正强制靠 `--network none`（§8.1）。
 

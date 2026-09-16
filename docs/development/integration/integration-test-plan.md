@@ -709,3 +709,7 @@ A successful discovery whose child waits for a request normally incurs the full
 100 ms native-exit observation window, once per discovery operation. This is
 separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
+
+## Task shell Rustup regression (FIX-PKT-04)
+
+The default lib suite covers `internal::ai::sandbox::runtime::tests::{task_shell_preserves_default_rustup_home,task_shell_preserves_explicit_rustup_environment,task_shell_rustup_home_derivation_is_conservative}` on Unix. They exercise original-home derivation, explicit precedence, missing/non-UTF-8 roots, non-task directories and continued task-local HOME/Cargo/XDG/log paths. The existing `internal::ai::orchestrator::executor::tests::execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep` runs the real Cargo fixture in a controlled subprocess without inherited RUSTUP_HOME/CARGO, preserves explicit toolchain selection, disables automatic installation with `RUSTUP_AUTO_INSTALL=0` on rustup 1.28+, and retains the lockfile/target/scope assertions. This exposes the installed-product environment even under a Cargo-launched suite. These are inline Cargo cases, not new integration-runner scenario IDs or proof of bwrap/macOS/Windows execution. Run the related sandbox/orchestrator/shell modules and compatibility guards, then the full default suite for the shared runtime change.
