@@ -408,11 +408,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
                      migration runner in Rust, not by a .sql file)",
     },
     MutableStateSurface {
-        table: "configuration_schema_versions",
-        owner: StateOwner::Repository,
-        rationale: "persistent migration receipts are scoped to a configuration database, not a worktree",
-    },
-    MutableStateSurface {
         table: "config",
         owner: StateOwner::Repository,
         rationale: "repository configuration and metadata",
