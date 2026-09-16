@@ -10,7 +10,9 @@ use git_internal::{
 use url::Url;
 
 use crate::{
-    git_protocol::{ServiceType, add_pkt_line_string, read_pkt_line},
+    git_protocol::{
+        PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType, add_pkt_line_string, read_pkt_line,
+    },
     internal::branch::Branch,
 };
 
@@ -73,6 +75,11 @@ pub fn parse_discovered_references(
     mut response_content: Bytes,
     service: ServiceType,
 ) -> Result<DiscoveryResult, GitError> {
+    if response_content.is_empty() {
+        return Err(GitError::NetworkError(format!(
+            "{PKT_LINE_PROTOCOL_ERROR_PREFIX}empty discovery response"
+        )));
+    }
     let mut ref_list = Vec::new(); // refs
     let mut capabilities = Vec::new(); // capabilities
     let mut saw_header = false; // header seen or not
@@ -89,7 +96,8 @@ pub fn parse_discovered_references(
     };
 
     loop {
-        let (bytes_take, pkt_line) = read_pkt_line(&mut response_content);
+        let (bytes_take, pkt_line) = read_pkt_line(&mut response_content)
+            .map_err(|error| GitError::NetworkError(error.to_string()))?;
         if bytes_take == 0 {
             if response_content.is_empty() {
                 break;
@@ -143,10 +151,10 @@ pub fn parse_discovered_references(
                     let format_kind = match format_cap.as_str() {
                         "object-format=sha1" => HashKind::Sha1,
                         "object-format=sha256" => HashKind::Sha256,
-                        other => {
-                            return Err(GitError::NetworkError(format!(
-                                "Unsupported object format capability: {other}"
-                            )));
+                        _ => {
+                            return Err(GitError::NetworkError(
+                                "Unsupported object format capability".to_string(),
+                            ));
                         }
                     };
                     if format_kind != detected_kind {
@@ -211,22 +219,22 @@ pub fn generate_upload_pack_content(
     // deliberately NOT advertised: a thin pack deltas against objects OUTSIDE the
     // pack, which the self-contained decoder cannot complete. `report-status` is a
     // push (receive-pack) capability and has no place on an upload-pack want line.
-    let mut capability = vec![
+    let mut requested_caps = vec![
         "side-band-64k",
         "multi_ack_detailed",
         "ofs-delta",
         "include-tag",
     ];
     if get_wire_hash_kind() == HashKind::Sha256 {
-        capability.push("object-format=sha256");
+        requested_caps.push("object-format=sha256");
     }
-    let capability = capability.join(" ");
+    let requested_caps = requested_caps.join(" ");
     for w in want {
         if !write_first_line {
             add_pkt_line_string(
                 &mut buf,
                 format!(
-                    "want {w} {capability} agent=libra/{}\n",
+                    "want {w} {requested_caps} agent=libra/{}\n",
                     env!("CARGO_PKG_VERSION")
                 )
                 .to_string(),
@@ -275,7 +283,140 @@ impl From<Branch> for DiscoveredReference {
 
 #[cfg(test)]
 mod test {
-    use super::generate_upload_pack_content;
+    use super::*;
+    use crate::git_protocol::PktLineError;
+
+    fn discovery_error(input: &[u8]) -> String {
+        match parse_discovered_references(Bytes::copy_from_slice(input), ServiceType::UploadPack) {
+            Err(GitError::NetworkError(detail)) => detail,
+            other => panic!("expected a network error, received {other:?}"),
+        }
+    }
+
+    fn advertisement(hash: &str, caps: &str) -> Bytes {
+        let mut bytes = BytesMut::new();
+        add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+        bytes.extend_from_slice(b"0000");
+        add_pkt_line_string(&mut bytes, format!("{hash} refs/heads/main\0{caps}\n"));
+        bytes.extend_from_slice(b"0000");
+        bytes.freeze()
+    }
+
+    #[test]
+    fn pkt_line_discovery_propagates_pkt_line_error() {
+        assert_eq!(
+            discovery_error(b"0008abc"),
+            PktLineError::TruncatedPayload.to_string()
+        );
+    }
+
+    #[test]
+    fn pkt_line_discovery_marker_prefix_contract() {
+        let detail = discovery_error(b"0001");
+        assert!(detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+        assert_eq!(detail.matches(PKT_LINE_PROTOCOL_ERROR_PREFIX).count(), 1);
+        assert_eq!(
+            detail,
+            "pkt-line protocol error: frame length is smaller than the four-byte header"
+        );
+    }
+
+    #[test]
+    fn pkt_line_discovery_marker_detection_semantics_starts_with() {
+        let detail = discovery_error(b"0001");
+        assert!(detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+        for wrapped in [
+            format!("network error: {detail}"),
+            format!(" {detail}"),
+            detail.to_uppercase(),
+        ] {
+            assert!(!wrapped.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+        }
+    }
+
+    #[test]
+    fn pkt_line_discovery_capability_echo_fixed_phrase() {
+        let bytes = advertisement(&"1".repeat(40), "object-format=unsupported");
+        assert_eq!(
+            discovery_error(&bytes),
+            "Unsupported object format capability"
+        );
+    }
+
+    #[test]
+    fn pkt_line_discovery_capability_echo_sentinel() {
+        let sentinel = "PRIVATE_CAPABILITY_SENTINEL\x1b[31m";
+        let bytes = advertisement(&"1".repeat(40), &format!("object-format={sentinel}"));
+        let detail = discovery_error(&bytes);
+        assert_eq!(detail, "Unsupported object format capability");
+        assert!(!detail.contains(sentinel));
+        assert!(!detail.contains('\x1b'));
+    }
+
+    #[test]
+    fn pkt_line_discovery_rejects_empty_response() {
+        assert_eq!(
+            discovery_error(b""),
+            format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}empty discovery response")
+        );
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let result = parse_discovered_references(Bytes::from_static(b"0000"), service)
+                .expect("valid flush");
+            assert!(result.refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn pkt_line_discovery_rejects_malformed_no_panic() {
+        for malformed in [
+            b"0".as_slice(),
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            // A panic fails this test directly; also exercise a later discovery frame.
+            assert!(discovery_error(malformed).starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+            let mut response = BytesMut::new();
+            add_pkt_line_string(&mut response, "# service=git-upload-pack\n".to_string());
+            response.extend_from_slice(b"0000");
+            response.extend_from_slice(malformed);
+            assert!(discovery_error(&response).starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+        }
+    }
+
+    #[test]
+    fn pkt_line_discovery_valid_response_regression() {
+        for (kind, width, cap) in [
+            (HashKind::Sha1, 40, "object-format=sha1"),
+            (HashKind::Sha256, 64, "object-format=sha256"),
+        ] {
+            for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+                let hash = "1".repeat(width);
+                let result = parse_discovered_references(advertisement(&hash, cap), service)
+                    .expect("valid advertisement");
+                assert_eq!(result.hash_kind, kind);
+                assert_eq!(result.capabilities, vec![cap]);
+                assert_eq!(
+                    result.refs,
+                    vec![DiscoveredReference {
+                        _hash: hash,
+                        _ref: "refs/heads/main".to_string()
+                    }]
+                );
+                let empty =
+                    parse_discovered_references(advertisement(&"0".repeat(width), cap), service)
+                        .expect("valid empty repository");
+                assert!(empty.refs.is_empty());
+                assert_eq!(empty.hash_kind, kind);
+            }
+        }
+    }
 
     #[test]
     fn upload_pack_want_line_advertises_expected_capabilities() {

@@ -9,6 +9,19 @@ a deprecation (**弃用**) risk if Apple removes `sandbox-exec`. See
 [`../tracing/agent.md`](../tracing/agent.md) §5 for the read-isolation
 asymmetry and fail-closed metadata-only degrade when the backend is missing.
 
+The shared `run_bounded_exporter` Unix `pre_exec` sets both soft and hard
+`RLIMIT_CORE` to zero next to the existing per-platform `RLIMIT_FSIZE`.
+Failure to set either limit fails spawn with context. Core limits propagate
+to exporter descendants without changing the parent process; SIGXFSZ
+disposition, byte caps, deadlines and sandbox controls are unchanged.
+This also suppresses cores from unexpected exporter crashes. Piped core
+handlers decide whether to honor the limit. systemd-coredump v259 honors
+it when `core_pattern` passes the limit through `%c`; brief signal metadata
+can remain. The regression
+`opencode_export_core_limits_are_zero_in_child_and_descendants` exercises
+the real runner and confirms child/descendant limits and unchanged parent
+limits. It does not establish the cause of any historical linker SIGKILL.
+
 The active development contract, backlog, and compatibility guardrails live in
 [`../tracing/agent.md`](../tracing/agent.md). Keep this file as the command
 development index entry so `docs/development/commands/README.md` can list every

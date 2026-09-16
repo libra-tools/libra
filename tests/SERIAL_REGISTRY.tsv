@@ -18,6 +18,10 @@ agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_object_gc_findings_reachability	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 agent_push_after_prune_requires_force_rewrite_and_lease_protects	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
+agent_push_seed_readiness_accepts_missing_or_empty_marker_dir	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	checkpoint seed readiness uses a direct-library index queue and restoring delay hook; preserve classifier-required exclusion
+agent_push_seed_readiness_rejects_marker_path_io_error	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	checkpoint seed readiness uses a direct-library index queue and restoring delay hook; preserve classifier-required exclusion
+agent_push_seed_readiness_rejects_terminal_marker	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	checkpoint seed readiness uses a direct-library index queue and restoring delay hook; preserve classifier-required exclusion
+agent_push_seed_waits_for_durable_index_retirement	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	checkpoint seed readiness uses a direct-library index queue and restoring delay hook; preserve classifier-required exclusion
 agent_push_writes_private_agent_traces_ref	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 agent_remove_gemini_uninstalls_legacy_hooks_idempotent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_remove_preserves_user_hook_entries	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -92,6 +96,9 @@ json_pull_follow_up_fast_forward_reports_old_and_new_commits	lane:env	mutates or
 json_status_includes_upstream_tracking_info	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 json_status_prefers_fully_qualified_row_over_legacy_short_row	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 json_status_resolves_fully_qualified_tracking_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+json_status_upstream_counts_shapes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+json_status_upstream_counts_unavailable_are_null	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+json_status_upstream_counts_unavailable_cached_and_api	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 json_switch_guess_has_tracking_fields_and_clean_stderr	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 json_switch_track_has_tracking_fields	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 libra_code_provider_codex_boots_against_mock_app_server	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
@@ -788,6 +795,11 @@ test_status_porcelain	lane:cwd	changes the process working directory (ChangeDirG
 test_status_porcelain_format_with_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_basic	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_branch_metadata_includes_upstream_counts	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_branch_counts_upstream_ancestor_486	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_branch_counts_behind_and_diverged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_branch_counts_merge_history_matches_rev_list	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_branch_counts_unavailable	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_branch_counts_shallow_boundaries	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_deleted_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_executable_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_file_modes_and_hashes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -890,3 +902,4 @@ worktree_doctor_reports_scope_diagnostics	lane:cloud_live+cwd+env+hash_kind+work
 worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
+branch_vv_counts_upstream_shapes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

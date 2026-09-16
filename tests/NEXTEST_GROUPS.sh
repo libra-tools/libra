@@ -71,9 +71,9 @@ fi
 
 emit() {
     printf '%s\n' "# generated — do not edit"
-    printf '%s\n' "# regenerate: sh tests/NEXTEST_GROUPS.sh  (source of truth: tests/SERIAL_REGISTRY.tsv)"
+    printf '%s\n' "# regenerate: sh tests/NEXTEST_GROUPS.sh (groups: tests/SERIAL_REGISTRY.tsv; timeouts: generator)"
     printf '%s\n' "# plan-20260827 NP-01 / ADR-NP-01: union external-resource mutual-exclusion group."
-    printf '%s\n' "# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit);"
+    printf '%s\n' "# plan-20260827 NP-02: profiles carry runner behavior only (groups/threads/junit/timeouts);"
     printf '%s\n' "# Cargo features and env always travel with the command line."
     printf '\n%s\n%s\n' "[test-groups.external]" "max-threads = 1"
     printf '\n%s\n%s\n' "[profile.default.junit]" 'path = "junit.xml"'
@@ -82,6 +82,12 @@ emit() {
     printf '%s\n' "# section's --test-threads=1 semantic verbatim: provider scenario tests"
     printf '%s\n' "# are calibrated for single-threaded timing (lease-release sleeps)."
     printf '\n%s\n%s\n%s\n' "[profile.test-provider]" "test-threads = 1" 'junit = { path = "junit.xml" }'
+    printf '\n%s\n' "# MIG-R03: these two cases embed cargo build and may wait for its lock."
+    printf '%s\n' "# Warn every 120s; terminate after 20 minutes, with 10s shutdown grace."
+    printf '%s\n' "# Timeout-only: external-resource group membership remains registry-derived."
+    printf '%s\n' "[[profile.default.overrides]]"
+    printf '%s\n' "filter = 'binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))'"
+    printf '%s\n' 'slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }'
     LC_ALL=C sort "$TMP" | while IFS="$(printf '\t')" read -r kind name; do
         printf '\n%s\n' "[[profile.default.overrides]]"
         if [ "$kind" = "F" ]; then
@@ -98,7 +104,7 @@ if [ "${1:-}" = "--stdout" ]; then
 else
     mkdir -p "$ROOT/.config"
     emit > "$OUT"
-    fn_n=$(grep -c "^filter = 'test(/" "$OUT")
-    bin_n=$(grep -c "^filter = 'binary(=" "$OUT")
+    fn_n=$(awk -F'\t' '$1 == "F" { n++ } END { print n+0 }' "$TMP")
+    bin_n=$(awk -F'\t' '$1 == "B" { n++ } END { print n+0 }' "$TMP")
     echo "wrote $OUT (external group: $fn_n test filters + $bin_n binary filters)"
 fi

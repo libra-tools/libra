@@ -48,6 +48,9 @@ flowchart TD
 
 ## 当前状态
 
+- `--grep` 在 `CommitFilter::passes_non_path_filters` 中复用现有 `parse_commit_msg` 识别签名，再按借用签名切片末端恢复未trim的正文；仅查询真实subject/body/trailer，不搜索 `Commit.message` 中嵌入的PGP/SSH签名头（含gpgsig-sha256）。大小写/invert使用同一消息，空pattern仍不过滤；human/JSON/machine共享选择逻辑，输出schema不变。未签名消息里长得像签名头的字面量仍是消息。实际消息开头的空格、tab和空行保留，unsigned只剥离存储分隔换行。每个非空grep提交增加既有parser的线性扫描；消息为原String的借用切片，不分配新的消息String，不改变对象、签名验证或提交写入。
+- 回归证据入口：lib `command::log::tests::log_grep_ignores_embedded_signature_headers` 与 `command_test::command::log_test::log_grep_signed_commit_uses_message_only`；后者通过真实hash-object/update-ref/log覆盖四类签名头组合及unsigned×三种输出×七种查询，共105次（含前导空白）。签名载荷为不做密码学验证的确定性fixture；原 `log_grep_ignore_case_and_invert_grep` 保留。此专项是Cargo门，非场景runner新增覆盖。
+
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/log.md`。
 - Synopsis：`libra log [OPTIONS] [<revision-range>...] [[--] <path>...]`。

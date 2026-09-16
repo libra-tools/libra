@@ -65,6 +65,87 @@ notes: |
   requires explicit opt-in and hash-pinned v0.22.16/v0.22.19 binaries. The
   integration-test-plan matrix and plan-20260910.md record exact isolated gates;
   these are not new cli.* runner scenarios and never repair ambient user DBs.
+  PKT-10's 25 pkt-line command-boundary cases remain Cargo library tests in
+  command::ls_remote::pkt_line_boundary_tests, run with
+  cargo test --lib command::ls_remote::pkt_line_boundary_tests.
+  The empty-advertisement fixture reaches actual fetch/clone/ls-remote/pull
+  handlers; the clone fetch-phase fixture verifies two discovery GETs and the
+  wanted-object POST. Both use bounded local HTTP through HttpsClient, not TLS
+  or live remotes. URL carrier matrices do not replace later raw Git/SSH reader
+  coverage. No new cli.* scenario is registered; the integration plan matrix
+  and plan-20260901.md PKT-10 hold scope and actual execution evidence.
+  PKT-09 adds four named push receive-pack status gates to the existing Cargo
+  library tests (cargo test --lib pkt_line_push_); existing
+  validate_receive_pack_response cases remain regression coverage. A bounded
+  local HTTP fixture drives actual receive-pack discovery and a delete-only
+  POST, verifies malformed/truncated/status/flush errors and unchanged local
+  tracking refs. It does not claim TLS/SSH or remote rollback proof. This is
+  Cargo-only coverage, not a new cli.* runner scenario; actual evidence belongs
+  to plan-20260901.md PKT-09.
+  PKT-08 adds ten named pkt_line_client_ Cargo library gates over the actual
+  Git/SSH advertisement reader loops: bounds, flush, empty/max payload, typed
+  partial-header/payload EOF, ordinary IO and idle timeouts. Tests use AsyncRead
+  inputs plus actual local TCP Git object-fetch advertisements and public
+  fetch/clone/pull error conversions. They do not prove complete command
+  execution or SSH process cleanup. No cli.* runner scenario is added.
+  PKT-12 has eleven Cargo library gates for shared SSH advertisement error
+  wrappers, native exit status without captured output echo, bounded direct-child
+  cleanup and real ordinary-IO cleanup. Fifty malformed-frame and five native
+  exit-255/empty-advertisement command cases require Unix. PKT-11 removed the old
+  non-terminal prerequisite because stderr is now captured in every context;
+  the existing push timeout gate also covers classifier priority and ordinary IO.
+  Actual run evidence is recorded in plan-20260901.md. No cli.* scenario is added.
+  Two existing command_test cases, test_fetch_ssh_host_key_failure_is_reported
+  and test_push_ssh_host_key_failure_is_reported, also run human/JSON/machine CLI
+  modes. Under PKT-11 they pin exit128/NET001, fixed host-verification guidance,
+  each command's complete network-hint vector, no raw stderr in either stream,
+  and push ref safety. Fetch checks network connectivity; push checks the remote
+  URL and network connectivity. The earlier PKT-12 NET002/headerEOF/SSH255 and
+  protocol-hint results remain historical in plan-20260901.md. Names and serial
+  lanes are retained; rejected runs are not acceptance.
+  PKT-11 retains twelve Cargo library gate names for fixed SSH diagnostics,
+  metadata-only traces, always-on BatchMode, bounded stderr/stdout capture,
+  host-trust guidance, a real local PTY and a local encrypted-key failure fixture.
+  Six capture paths run stderr floods; collector cancellation and 16 MiB protocol
+  output rejection are covered in the same gate through actual clone/delete-only
+  push, NET001, decoded JSON and unchanged local tracking refs. The host-trust
+  and timeout-precedence gates use current-thread runtimes and read configuration
+  immediately after database writes, without a yield or blocking nested runtime.
+  Existing fetch/push host-key CLI
+  tests cover three output modes without new test targets or serial-lane changes.
+  These are local fake-SSH fixtures, not live OpenSSH authentication evidence.
+  Actual execution and release proofs are recorded in plan-20260901.md.
+
+  These fixed 16 MiB advertisement and receive-pack response limits apply only to
+  Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+  cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+  SSH advertisement exceeds the cap; this does not require a read-only user to
+  change the server's refs. Otherwise, ask the repository maintainer to reduce the
+  advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+  Host-trust classification requires an incomplete first header with no stdout
+  bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+  any stdout byte arrives, including a partial header, host-like stderr cannot
+  select host-specific guidance. Failures after a complete advertisement retain
+  fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+  heuristic, not fingerprint verification.
+
+  A successful discovery whose child waits for a request normally incurs the full
+  100 ms native-exit observation window, once per discovery operation. This is
+  separate from the two-second direct-child cleanup budget; no benchmark or
+  arbitrary-descendant cleanup guarantee is implied.
+
+  SSH host identity changes retain a distinct fixed warning: the change may
+  indicate interception or legitimate key rotation. Verify the new fingerprint
+  through a trusted channel before replacing an existing known_hosts entry; do not
+  bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+  but their fixed messages and guidance differ.
+
+  A stderr collection timeout does not by itself discard complete protocol output
+  and an observed local exit status. Non-zero exit status and primary read errors
+  still fail the operation. Unavailable diagnostics produce only a fixed debug
+  notice, without fabricated empty-stream counts or digests. Stdout collection or
+  process-wait failures retain their normal error handling.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---
@@ -215,7 +296,7 @@ scenarios:
   - id: cli.commit-status-log
     wave: 1
     group: core
-    purpose: "Core status/add/commit/log closed loop with message sources, dry-run/amend/conventional commits, status --exit-code, porcelain v2 rename/typechange visibility, explicit --untracked-files/--branch behavior, status -z NUL output, JSON status/log envelopes, and log --follow coverage. Required-sandbox repository hook lifecycle, caller-env isolation, and post-hook order are delegated to compat_libra_hooks_lifecycle."
+    purpose: "Core status/add/commit/log closed loop with message sources, dry-run/amend/conventional commits, status --exit-code, porcelain v2 rename/typechange visibility, explicit --untracked-files/--branch behavior, status -z NUL output, JSON status/log envelopes, and log --follow coverage. Required-sandbox repository hook lifecycle, caller-env isolation, and post-hook order are delegated to compat_libra_hooks_lifecycle. Signed-commit log --grep message-only selection (PGP/SSH gpgsig/gpgsig-sha256 header immediately after committer excluded, actual leading message whitespace preserved, case-fold/invert, human/JSON/machine) is covered separately by command_test::command::log_test::log_grep_signed_commit_uses_message_only and lib command::log::tests::log_grep_ignores_embedded_signature_headers; this runner scenario does not claim that coverage."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, global_db_isolation, lbr_error, negative_exit]

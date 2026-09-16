@@ -604,13 +604,24 @@ impl CommitFilter {
         if let Some(pattern) = &self.grep
             && !pattern.is_empty()
         {
-            let matches = if self.grep_ignore_case {
-                commit
-                    .message
-                    .to_lowercase()
-                    .contains(&pattern.to_lowercase())
+            // Recognize the embedded signature with the shared parser, but keep
+            // actual message whitespace: its display slice uses trim_start().
+            let message = if let Some(signature) = parse_commit_msg(&commit.message).1 {
+                // INVARIANT: the shared parser returns a signature subslice of
+                // commit.message, ending at a UTF-8 boundary within that string.
+                let signature_end = signature.as_ptr() as usize - commit.message.as_ptr() as usize
+                    + signature.len();
+                let after_signature = &commit.message[signature_end..];
+                after_signature
+                    .strip_prefix("\n\n")
+                    .unwrap_or(after_signature)
             } else {
-                commit.message.contains(pattern.as_str())
+                commit.message.strip_prefix('\n').unwrap_or(&commit.message)
+            };
+            let matches = if self.grep_ignore_case {
+                message.to_lowercase().contains(&pattern.to_lowercase())
+            } else {
+                message.contains(pattern.as_str())
             };
             // `--invert-grep` keeps the non-matching commits: exclude exactly
             // when `matches == invert_grep` (matches & !invert, or !matches & invert).
@@ -2737,6 +2748,113 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn log_grep_ignores_embedded_signature_headers() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        for (name, kind) in [
+            ("gpgsig", "PGP"),
+            ("gpgsig", "SSH"),
+            ("gpgsig-sha256", "PGP"),
+            ("gpgsig-sha256", "SSH"),
+        ] {
+            let signature = format!(
+                "{name} -----BEGIN {kind} SIGNATURE-----\n FiX OnlySignatureToken\n -----END {kind} SIGNATURE-----"
+            );
+            let message = crate::common_utils::format_commit_msg(
+                "add beta\n\nBody Needle\n\nTicket: 42\n",
+                Some(&signature),
+            );
+            let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &message);
+            for (pattern, ignore_case, invert, expected) in [
+                ("OnlySignatureToken", false, false, false),
+                ("onlysignaturetoken", true, false, false),
+                ("OnlySignatureToken", false, true, true),
+                ("Fix", true, false, false),
+                ("Fix", true, true, true),
+                ("add beta", false, false, true),
+                ("Body Needle", false, false, true),
+                ("body needle", false, false, false),
+                ("body needle", true, false, true),
+                ("Body Needle", false, true, false),
+                ("Ticket: 42", false, false, true),
+                ("", false, true, true),
+            ] {
+                let filter = CommitFilter::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(pattern.to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .with_grep_options(ignore_case, invert);
+                assert_eq!(
+                    filter.passes_non_path_filters(&commit),
+                    expected,
+                    "{name}/{kind}: {pattern:?}, ignore_case={ignore_case}, invert={invert}"
+                );
+            }
+        }
+        for signature in [
+            None,
+            Some("gpgsig -----BEGIN PGP SIGNATURE-----\n FiX\n -----END PGP SIGNATURE-----"),
+            Some("gpgsig -----BEGIN SSH SIGNATURE-----\n FiX\n -----END SSH SIGNATURE-----"),
+            Some("gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n FiX\n -----END PGP SIGNATURE-----"),
+            Some("gpgsig-sha256 -----BEGIN SSH SIGNATURE-----\n FiX\n -----END SSH SIGNATURE-----"),
+        ] {
+            for body in [
+                "  leading spaces",
+                "\n\tleading blank and tab",
+                "\n-----END PGP SIGNATURE-----",
+            ] {
+                let stored = crate::common_utils::format_commit_msg(body, signature);
+                let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &stored);
+                for invert in [false, true] {
+                    let filter = CommitFilter::new(
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        Some(body.into()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_grep_options(false, invert);
+                    assert_eq!(
+                        filter.passes_non_path_filters(&commit),
+                        !invert,
+                        "verbatim body {body:?}, signature={signature:?}"
+                    );
+                }
+            }
+        }
+        // A signature-looking literal in an unsigned message remains searchable.
+        let literal = crate::common_utils::format_commit_msg(
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n literal body\n -----END PGP SIGNATURE-----",
+            None,
+        );
+        let unsigned = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &literal);
+        let filter = CommitFilter::new(
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some("literal body".into()),
+            None,
+            None,
+            None,
+        );
+        assert!(filter.passes_non_path_filters(&unsigned));
+    }
 
     // Test parameter parsing
     #[test]

@@ -1817,6 +1817,167 @@ fn classifier_ignores_string_literals_and_reads_same_line_attributes() {
     );
 }
 
+fn nextest_external_members(config: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let parsed: toml::Value = toml::from_str(config).map_err(|error| error.to_string())?;
+    let overrides = parsed
+        .get("profile")
+        .and_then(|profile| profile.get("default"))
+        .and_then(|default| default.get("overrides"))
+        .and_then(toml::Value::as_array)
+        .ok_or("profile.default.overrides must be an array")?;
+    let mut fns = Vec::new();
+    let mut binaries = Vec::new();
+    for entry in overrides {
+        let table = entry.as_table().ok_or("override must be a table")?;
+        let Some(group) = table.get("test-group") else {
+            // nextest resolves each property independently: a timeout-only
+            // rule is not group membership, even when its filter overlaps.
+            continue;
+        };
+        if group.as_str().ok_or("test-group must be a string")? != "external" {
+            continue;
+        }
+        let filter = table
+            .get("filter")
+            .and_then(toml::Value::as_str)
+            .ok_or("external override filter must be a string")?;
+        let (members, name) = if let Some(name) = filter
+            .strip_prefix("test(/(^|::)")
+            .and_then(|rest| rest.strip_suffix("$/)"))
+        {
+            (&mut fns, name)
+        } else if let Some(name) = filter
+            .strip_prefix("binary(=")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            (&mut binaries, name)
+        } else {
+            return Err(format!("unknown external filter: {filter}"));
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!("invalid external filter identifier: {filter}"));
+        }
+        // Do not deduplicate: the exact registry comparison must catch duplicates.
+        members.push(name.to_owned());
+    }
+    fns.sort();
+    binaries.sort();
+    Ok((fns, binaries))
+}
+
+#[test]
+fn nextest_group_membership_ignores_timeout_only_overrides() {
+    let fixture = r#"
+[[profile.default.overrides]]
+slow-timeout = { grace-period = '10s', terminate-after = 10, period = '120s' }
+filter = "binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))"
+
+[[profile.default.overrides]]
+test-group = "external"
+filter = 'test(/(^|::)external_case$/)'
+
+[[profile.default.overrides]]
+filter = "binary(=e2e_mcp_flow)"
+test-group = 'external'
+"#;
+    let expected = (vec!["external_case".into()], vec!["e2e_mcp_flow".into()]);
+    assert_eq!(
+        nextest_external_members(fixture).expect("valid fixture"),
+        expected
+    );
+    assert_ne!(
+        nextest_external_members(&fixture.replace("external_case", "wrong_case"))
+            .expect("valid mutated member"),
+        expected,
+        "a changed member must remain visible to the bidirectional guard"
+    );
+    let duplicate = format!(
+        "{fixture}\n[[profile.default.overrides]]\nfilter = 'binary(=e2e_mcp_flow)'\ntest-group = 'external'\n"
+    );
+    assert_eq!(
+        nextest_external_members(&duplicate)
+            .expect("valid duplicate")
+            .1
+            .len(),
+        2
+    );
+    assert_ne!(
+        nextest_external_members(&duplicate).expect("valid duplicate"),
+        expected
+    );
+    let missing = fixture.replace("test-group = 'external'", "test-group = 'another-group'");
+    assert_ne!(
+        nextest_external_members(&missing).expect("other group"),
+        expected
+    );
+    for invalid in [
+        fixture.replace("test-group = 'external'", "test-group = 42"),
+        fixture.replace("filter = 'test(/(^|::)external_case$/)'", "filter = 42"),
+        fixture.replace("filter = 'test(/(^|::)external_case$/)'", ""),
+        fixture.replace("test(/(^|::)external_case$/)", "test(=external_case)"),
+        fixture.replace("binary(=e2e_mcp_flow)\"", "binary(=e2e_mcp_flow) | all()\""),
+    ] {
+        assert!(
+            nextest_external_members(&invalid).is_err(),
+            "must reject invalid external membership: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn nextest_mcp_tests_have_twenty_minute_timeout() {
+    let committed = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .expect("read .config/nextest.toml");
+    let config: toml::Value = toml::from_str(&committed).expect("valid nextest TOML");
+    let expected: toml::Value = toml::from_str(r#"
+filter = 'binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_only_sigterm_releases_ports))'
+slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }
+"#).expect("valid expected policy");
+
+    // Inspect the whole tree, not just the known override: a new profile,
+    // default, or second override must not silently widen timeouts or retries.
+    fn collect_policy_tables<'a>(value: &'a toml::Value, tables: &mut Vec<&'a toml::Value>) {
+        match value {
+            toml::Value::Table(table) => {
+                if table
+                    .keys()
+                    .any(|key| key.contains("timeout") || key == "retries")
+                {
+                    tables.push(value);
+                }
+                for child in table.values() {
+                    collect_policy_tables(child, tables);
+                }
+            }
+            toml::Value::Array(entries) => {
+                for entry in entries {
+                    collect_policy_tables(entry, tables);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut policies = Vec::new();
+    collect_policy_tables(&config, &mut policies);
+    assert_eq!(
+        policies,
+        vec![&expected],
+        "only the exact two-case MCP time policy is allowed; no retries or timeout-as-pass settings"
+    );
+    let overrides = config["profile"]["default"]["overrides"]
+        .as_array()
+        .expect("default overrides array");
+    assert_eq!(
+        overrides.iter().filter(|entry| *entry == &expected).count(),
+        1,
+        "the sole policy must be a default-profile override, inherited by other profiles"
+    );
+}
+
 /// plan-20260827 NP-01 (ADR-NP-01): `.config/nextest.toml` is a generated
 /// artifact — regenerating it from `tests/SERIAL_REGISTRY.tsv` must reproduce
 /// the committed file byte for byte, and the `external` union group must hold
@@ -1891,18 +2052,8 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     expected_fns.sort();
     expected_bins.sort();
 
-    let mut toml_fns: Vec<String> = committed
-        .lines()
-        .filter_map(|l| l.strip_prefix("filter = 'test(/(^|::)"))
-        .map(|l| l.trim_end_matches("$/)'").to_string())
-        .collect();
-    let mut toml_bins: Vec<String> = committed
-        .lines()
-        .filter_map(|l| l.strip_prefix("filter = 'binary(="))
-        .map(|l| l.trim_end_matches(")'").to_string())
-        .collect();
-    toml_fns.sort();
-    toml_bins.sort();
+    let (toml_fns, toml_bins) = nextest_external_members(&committed)
+        .expect("valid structural external-group membership in .config/nextest.toml");
 
     assert_eq!(
         toml_fns, expected_fns,
@@ -1914,6 +2065,6 @@ fn nextest_groups_toml_matches_generator_and_registry() {
         "external group binary(=..) members must equal the pure-global site \
          rows' host targets"
     );
-    assert_eq!(toml_fns.len(), 209, "union fn member count drifted");
+    assert_eq!(toml_fns.len(), 213, "union fn member count drifted");
     assert_eq!(toml_bins.len(), 7, "site host target count drifted");
 }

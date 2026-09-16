@@ -2917,3 +2917,1130 @@ fn cherry_pick_in_progress_blocks_other_sequences() {
     let after = run_libra_command(&["revert", "HEAD", "--no-edit"], &p);
     assert_eq!(after.status.code(), Some(0), "sequence clear after abort");
 }
+
+/// Everything an ADR-HF-04 refusal must leave untouched (GC-HF-02): index bytes,
+/// HEAD, refs, unmerged entries, reflog and `sequence_state` rows, sequencer
+/// sidecar files (absent vs bytes), and every worktree file outside `.libra`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RefusalSnapshot {
+    pub(crate) index: Vec<u8>,
+    pub(crate) head: String,
+    pub(crate) refs: String,
+    pub(crate) unmerged: String,
+    pub(crate) reflog: Vec<String>,
+    pub(crate) sequence_state: Vec<String>,
+    pub(crate) sidecars: std::collections::BTreeMap<&'static str, Option<Vec<u8>>>,
+    pub(crate) worktree: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+}
+
+/// Rows of a repository database table rendered with SQLite `quote()` in rowid
+/// order, so any insert, update or delete changes the result.
+fn repo_table_rows(repo: &std::path::Path, table: &str) -> Vec<String> {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let db = repo.join(".libra/libra.db");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let conn = Database::connect(format!("sqlite://{}?mode=ro", db.display()))
+            .await
+            .expect("open repo db");
+        let columns: Vec<String> = conn
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT name FROM pragma_table_info('{table}')"),
+            ))
+            .await
+            .expect("read table columns")
+            .iter()
+            .map(|row| row.try_get_by_index::<String>(0).expect("column name"))
+            .collect();
+        assert!(!columns.is_empty(), "table {table} must exist");
+        let expr = columns
+            .iter()
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        let rows = conn
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT {expr} FROM \"{table}\" ORDER BY rowid"),
+            ))
+            .await
+            .expect("read table rows");
+        rows.iter()
+            .map(|row| row.try_get_by_index::<String>(0).expect("row text"))
+            .collect()
+    })
+}
+
+fn worktree_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+) {
+    for entry in std::fs::read_dir(dir).expect("read worktree dir") {
+        let path = entry.expect("worktree entry").path();
+        if path.file_name().is_some_and(|name| name == ".libra") {
+            continue;
+        }
+        if path.is_dir() {
+            worktree_files(root, &path, files);
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .expect("relative path")
+                .to_path_buf();
+            files.insert(relative, std::fs::read(&path).expect("read worktree file"));
+        }
+    }
+}
+
+pub(crate) fn refusal_snapshot(p: &std::path::Path) -> RefusalSnapshot {
+    let text =
+        |args: &[&str]| String::from_utf8_lossy(&run_libra_command(args, p).stdout).to_string();
+    let index = std::fs::read(p.join(".libra/index")).expect("read index");
+    let sidecars = [
+        "CHERRY_PICK_MSG",
+        "REVERT_EDITMSG",
+        "COMMIT_EDITMSG",
+        "revert-state.json",
+    ]
+    .into_iter()
+    .map(|name| (name, std::fs::read(p.join(".libra").join(name)).ok()))
+    .collect();
+    let mut worktree = std::collections::BTreeMap::new();
+    worktree_files(p, p, &mut worktree);
+    RefusalSnapshot {
+        index,
+        head: text(&["rev-parse", "HEAD"]),
+        refs: text(&["show-ref"]),
+        unmerged: text(&["ls-files", "-u"]),
+        reflog: repo_table_rows(p, "reflog"),
+        sequence_state: repo_table_rows(p, "sequence_state"),
+        sidecars,
+        worktree,
+    }
+}
+
+/// `conflict_repo` plus two clean commits on `clean` (children of `main`), then a
+/// single-commit `--no-commit` pick of the conflicting feature commit. That stop is
+/// M-UNMERGED U5 and leaves `shared.txt` unmerged with no sequence state.
+fn unmerged_index_repo() -> (tempfile::TempDir, String, String) {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "clean"], p),
+        "branch clean",
+    );
+    for (file, msg) in [("c1.txt", "clean one"), ("c2.txt", "clean two")] {
+        std::fs::write(p.join(file), format!("{msg}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add clean");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit clean",
+        );
+    }
+    let clean1 = cp_rev_parse(p, "HEAD~1");
+    let clean2 = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+
+    // U5: the single-commit `-n` conflict is terminal and points at `libra add`.
+    let stop = run_libra_command(&["cherry-pick", "-n", &feat], p);
+    assert_eq!(stop.status.code(), Some(128), "no-commit conflict exit");
+    let (human, report) = parse_cli_error_stderr(&stop.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001");
+    assert!(!human.contains("multi-commit"), "U5 wording: {human}");
+    assert!(
+        !human.contains("--continue"),
+        "U5 must not point at --continue: {human}"
+    );
+    assert!(human.contains("libra add"), "U5 guidance: {human}");
+    let unmerged =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-u"], p).stdout).to_string();
+    assert!(
+        unmerged.contains("shared.txt"),
+        "the fixture must leave an unmerged index: {unmerged}"
+    );
+    (repo, clean1, clean2)
+}
+
+/// M-UNMERGED U2-U7 (ADR-HF-04): on an unmerged index every new pick form refuses
+/// to start with exit 128 / `LBR-CONFLICT-001`, names the conflicted path, and
+/// writes nothing (GC-HF-02).
+#[test]
+fn test_cherry_pick_refuses_unmerged_index_matrix() {
+    let (repo, clean1, clean2) = unmerged_index_repo();
+    let p = repo.path();
+    let before = refusal_snapshot(p);
+    let rows: [(&str, Vec<&str>); 4] = [
+        ("U2", vec!["cherry-pick", clean1.as_str()]),
+        ("U3", vec!["cherry-pick", "-n", clean1.as_str()]),
+        ("U4", vec!["cherry-pick", clean1.as_str(), clean2.as_str()]),
+        ("U7", vec!["cherry-pick", "--ff", clean1.as_str()]),
+    ];
+    for (row, args) in rows {
+        let out = run_libra_command(&args, p);
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{row} exit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CONFLICT-001", "{row}");
+        assert!(
+            human.contains("index has unmerged entries"),
+            "{row}: {human}"
+        );
+        assert!(
+            human.contains("unmerged paths: shared.txt"),
+            "{row}: {human}"
+        );
+        assert_eq!(refusal_snapshot(p), before, "{row} must not write");
+    }
+
+    // U6: JSON mode emits only the error envelope.
+    let out = run_libra_command(&["cherry-pick", "--json", &clean1], p);
+    assert_eq!(out.status.code(), Some(128), "U6 exit");
+    assert!(
+        out.stdout.is_empty(),
+        "U6 stdout must carry no data: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001");
+    assert_eq!(refusal_snapshot(p), before, "U6 must not write");
+
+    // No refusal claimed a cherry-pick sequence.
+    let abort = run_libra_command(&["cherry-pick", "--abort"], p);
+    let (_human, report) = parse_cli_error_stderr(&abort.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "no sequence may exist");
+    assert_eq!(refusal_snapshot(p), before);
+}
+
+/// Fixture for M-UNMERGED U8-U10: `feature` adds `new.txt` (and, when
+/// `conflicting`, also edits `shared.txt` against `main`); `main` then holds an
+/// untracked `new.txt` that the pick would overwrite.
+fn untracked_collision_repo(conflicting: bool) -> (tempfile::TempDir, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let stage = |file: &str, content: &str| {
+        std::fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+    };
+    let commit = |msg: &str| {
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    stage("shared.txt", "base\n");
+    commit("base shared");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    stage("new.txt", "feature\n");
+    if conflicting {
+        stage("shared.txt", "feature side\n");
+    }
+    commit("feature adds new.txt");
+    let feat = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    if conflicting {
+        stage("shared.txt", "main side\n");
+        commit("main edit");
+    }
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    (repo, feat)
+}
+
+/// M-UNMERGED U8-U10 (ADR-HF-04): a pick that would overwrite an untracked file
+/// is refused with exit 128 / `LBR-CONFLICT-001` before any index, worktree, ref,
+/// reflog or sequence write, on the commit, `--no-commit` and conflict paths.
+#[test]
+fn test_cherry_pick_refuses_untracked_overwrite_before_any_write() {
+    for (row, conflicting, no_commit) in [
+        ("U8", false, false),
+        ("U9", false, true),
+        ("U10", true, false),
+    ] {
+        let (repo, feat) = untracked_collision_repo(conflicting);
+        let p = repo.path();
+        let before = refusal_snapshot(p);
+        let mut args = vec!["cherry-pick"];
+        if no_commit {
+            args.push("-n");
+        }
+        args.push(feat.as_str());
+        let out = run_libra_command(&args, p);
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{row} exit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CONFLICT-001", "{row}");
+        assert!(
+            human.contains("untracked working tree file would be overwritten: new.txt"),
+            "{row}: {human}"
+        );
+        assert!(!human.contains("--continue"), "{row}: {human}");
+        assert_eq!(refusal_snapshot(p), before, "{row} must not write");
+        let abort = run_libra_command(&["cherry-pick", "--abort"], p);
+        let (_human, report) = parse_cli_error_stderr(&abort.stderr);
+        assert_eq!(
+            report.error_code, "LBR-REPO-003",
+            "{row}: no sequence may exist"
+        );
+    }
+}
+
+fn head_paths(p: &std::path::Path) -> String {
+    String::from_utf8_lossy(&run_libra_command(&["ls-tree", "-r", "--name-only", "HEAD"], p).stdout)
+        .to_string()
+}
+
+fn status_text(p: &std::path::Path) -> String {
+    let out = run_libra_command(&["status"], p);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// M-UNMERGED U11-U14 (ADR-HF-04): `--ff` refuses an untracked overwrite before its
+/// reset; a sequence whose later commit would overwrite an untracked file stops
+/// before that commit with its state saved, and `--continue` then re-attempts the
+/// commit instead of recording the untouched index as it.
+#[test]
+fn test_cherry_pick_untracked_overwrite_on_ff_and_sequences() {
+    // U11: fast-forward onto a direct child.
+    let (repo, feat) = untracked_collision_repo(false);
+    let p = repo.path();
+    let before = refusal_snapshot(p);
+    let out = run_libra_command(&["cherry-pick", "--ff", &feat], p);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "U11 exit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "U11");
+    assert!(
+        human.contains("untracked working tree file would be overwritten: new.txt"),
+        "U11: {human}"
+    );
+    assert_eq!(refusal_snapshot(p), before, "U11 must not write");
+
+    // U12 / U13: resuming through --continue or --skip.
+    for (row, verb) in [("U12", "--continue"), ("U13", "--skip")] {
+        let (repo, f1, f2) = conflict_sequence_repo();
+        let p = repo.path();
+        assert_eq!(
+            run_libra_command(&["cherry-pick", &f1, &f2], p)
+                .status
+                .code(),
+            Some(128),
+            "{row} setup"
+        );
+        std::fs::write(p.join("extra.txt"), "mine\n").unwrap();
+        if verb == "--continue" {
+            std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+            assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+        }
+        let stop = run_libra_command(&["cherry-pick", verb], p);
+        assert_eq!(
+            stop.status.code(),
+            Some(128),
+            "{row} stop: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        let (human, report) = parse_cli_error_stderr(&stop.stderr);
+        assert_eq!(report.error_code, "LBR-CONFLICT-001", "{row}");
+        assert!(
+            human.contains("untracked working tree file would be overwritten: extra.txt"),
+            "{row}: {human}"
+        );
+        assert!(
+            human.contains("libra cherry-pick --continue"),
+            "{row}: {human}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.join("extra.txt")).unwrap(),
+            "mine\n",
+            "{row}: file kept"
+        );
+        assert!(
+            !head_paths(p).contains("extra.txt"),
+            "{row}: stopped commit not applied"
+        );
+        assert!(
+            status_text(p).contains("cherry-pick in progress"),
+            "{row}: sequence kept"
+        );
+        std::fs::remove_file(p.join("extra.txt")).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["cherry-pick", "--continue"], p),
+            "re-attempt",
+        );
+        assert!(
+            head_paths(p).contains("extra.txt"),
+            "{row}: --continue must apply the stopped commit"
+        );
+        assert!(
+            !status_text(p).contains("cherry-pick in progress"),
+            "{row}: sequence finished"
+        );
+    }
+
+    // U14: a fresh two-commit pick whose second commit collides.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    for (file, msg) in [("c1.txt", "adds c1"), ("new.txt", "adds new")] {
+        std::fs::write(p.join(file), format!("{msg}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    }
+    let c1 = cp_rev_parse(p, "HEAD~1");
+    let c2 = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let out = run_libra_command(&["cherry-pick", &c1, &c2], p);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "U14 exit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (human, _report) = parse_cli_error_stderr(&out.stderr);
+    assert!(
+        human.contains("libra cherry-pick --continue"),
+        "U14: {human}"
+    );
+    assert!(
+        head_paths(p).contains("c1.txt") && !head_paths(p).contains("new.txt"),
+        "U14: stop after c1"
+    );
+    assert!(
+        status_text(p).contains("cherry-pick in progress"),
+        "U14: sequence kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("new.txt")).unwrap(),
+        "mine\n",
+        "U14: file kept"
+    );
+    std::fs::remove_file(p.join("new.txt")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "U14 re-attempt",
+    );
+    assert!(
+        head_paths(p).contains("new.txt"),
+        "U14: --continue must apply the stopped commit"
+    );
+}
+
+/// A repository whose `feature` branch adds each file in its own commit (the
+/// first on top of `main`); returns the commit ids with `main` checked out.
+fn feature_commits_repo(files: &[&str]) -> (tempfile::TempDir, Vec<String>) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    let mut ids = Vec::new();
+    for file in files {
+        std::fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("adds {file}"), "--no-verify"], p),
+            "commit",
+        );
+        ids.push(cp_rev_parse(p, "HEAD"));
+    }
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    (repo, ids)
+}
+
+fn log_subjects(p: &std::path::Path) -> Vec<String> {
+    String::from_utf8_lossy(&run_libra_command(&["log", "--format=%s"], p).stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn run_interrupted_after_head_move(args: &[&str], p: &std::path::Path) -> std::process::Output {
+    let out = spawn_libra_command_with_env(
+        args,
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_HEAD", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for interrupted libra");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("test-injected cherry-pick interruption"),
+        "failpoint must fire: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// M-UNMERGED U15-U16 (ADR-HF-04): a pick that lands moves the sequence row past
+/// itself in the HEAD transaction, so an interruption right after HEAD moves
+/// never makes `--continue` replay it.
+#[test]
+fn test_cherry_pick_interrupted_after_head_move_does_not_replay() {
+    // U15: a resumed pick lands, then the run is interrupted.
+    let (repo, ids) = feature_commits_repo(&["c1.txt", "new.txt", "c3.txt"]);
+    let p = repo.path();
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let stop = run_libra_command(
+        &["cherry-pick", "--empty=keep", &ids[0], &ids[1], &ids[2]],
+        p,
+    );
+    assert_eq!(
+        stop.status.code(),
+        Some(128),
+        "U15 stop: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    std::fs::remove_file(p.join("new.txt")).unwrap();
+    run_interrupted_after_head_move(&["cherry-pick", "--continue"], p);
+    assert!(
+        head_paths(p).contains("new.txt"),
+        "U15: landed before the cut"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "U15 resume",
+    );
+    let subjects = log_subjects(p);
+    assert_eq!(
+        subjects.iter().filter(|s| *s == "adds new.txt").count(),
+        1,
+        "U15: the landed pick must not be replayed: {subjects:?}"
+    );
+    assert!(head_paths(p).contains("c3.txt"), "U15: the rest applied");
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "U15 done"
+    );
+
+    // U16: a resolved conflict is finalized, then the run is interrupted.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--empty=keep", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "U16 conflict"
+    );
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+    let before = log_subjects(p).len();
+    run_interrupted_after_head_move(&["cherry-pick", "--continue"], p);
+    assert_eq!(log_subjects(p).len(), before + 1, "U16: resolution landed");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "U16 resume",
+    );
+    assert_eq!(
+        log_subjects(p).len(),
+        before + 2,
+        "U16: the resolution must not be recorded twice: {:?}",
+        log_subjects(p)
+    );
+    assert!(head_paths(p).contains("extra.txt"), "U16: f2 applied");
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "U16 done"
+    );
+}
+
+/// M-UNMERGED U17 (ADR-HF-04): a `--no-commit` run whose later commit would
+/// overwrite an untracked file keeps the earlier pick staged, writes no sequence,
+/// and the remaining commit can be picked again once the file is moved.
+#[test]
+fn test_cherry_pick_no_commit_partial_untracked_stop() {
+    let (repo, ids) = feature_commits_repo(&["c1.txt", "new.txt"]);
+    let p = repo.path();
+    let head = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let out = run_libra_command(&["cherry-pick", "-n", &ids[0], &ids[1]], p);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "U17 exit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "U17");
+    assert!(
+        human.contains("earlier picks of this '--no-commit' run stay staged"),
+        "U17: {human}"
+    );
+    assert!(!human.contains("--continue"), "U17: {human}");
+    assert_eq!(cp_rev_parse(p, "HEAD"), head, "U17: HEAD unchanged");
+    assert_eq!(
+        std::fs::read_to_string(p.join("new.txt")).unwrap(),
+        "mine\n",
+        "U17: file kept"
+    );
+    let staged = |p: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["ls-files"], p).stdout).to_string()
+    };
+    let listed = staged(p);
+    assert!(
+        listed.lines().any(|l| l == "c1.txt") && !listed.lines().any(|l| l == "new.txt"),
+        "U17: c1 staged, new.txt not: {listed}"
+    );
+    let abort = run_libra_command(&["cherry-pick", "--abort"], p);
+    let (_human, report) = parse_cli_error_stderr(&abort.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "U17: no sequence");
+
+    std::fs::remove_file(p.join("new.txt")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "-n", &ids[1]], p),
+        "U17: pick the remaining commit again",
+    );
+    let listed = staged(p);
+    assert!(
+        listed.lines().any(|l| l == "c1.txt") && listed.lines().any(|l| l == "new.txt"),
+        "U17: both picks staged: {listed}"
+    );
+    assert_eq!(cp_rev_parse(p, "HEAD"), head, "U17: still uncommitted");
+}
+
+fn run_interrupted_after_control_reset(args: &[&str], p: &std::path::Path) -> std::process::Output {
+    let out = spawn_libra_command_with_env(
+        args,
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_CONTROL_RESET", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for interrupted libra");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("test-injected cherry-pick interruption after the control reset"),
+        "failpoint must fire: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// M-CRASH X1-X4 (#477 HF-31): an interruption between a pick's HEAD move and
+/// its sequence row, or between a `--skip`/`--abort` reset and its row change,
+/// neither loses the remaining commits, replays a landed one, nor lets
+/// `--continue` commit the reset index.
+#[test]
+fn test_cherry_pick_sequence_survives_interruption_matrix() {
+    // X1 / X2: a fresh three-commit pick (plain, then `--ff` along a direct-child
+    // chain) is interrupted right after its first commit lands.
+    for (row, ff) in [("X1", false), ("X2", true)] {
+        for finish in ["--continue", "--abort"] {
+            let (repo, ids) = feature_commits_repo(&["c1.txt", "c2.txt", "c3.txt"]);
+            let p = repo.path();
+            let start = cp_rev_parse(p, "HEAD");
+            let mut args = vec!["cherry-pick"];
+            if ff {
+                args.push("--ff");
+            }
+            args.extend(ids.iter().map(String::as_str));
+            run_interrupted_after_head_move(&args, p);
+            assert!(
+                head_paths(p).contains("c1.txt"),
+                "{row}: the first commit landed"
+            );
+            assert!(
+                status_text(p).contains("cherry-pick in progress"),
+                "{row}: the sequence survives the interruption"
+            );
+            assert_cli_success(
+                &run_libra_command(&["cherry-pick", finish], p),
+                &format!("{row} {finish}"),
+            );
+            if finish == "--continue" {
+                if ff {
+                    assert_eq!(
+                        cp_rev_parse(p, "HEAD"),
+                        ids[2],
+                        "{row}: --continue keeps --ff, ending at the last commit itself"
+                    );
+                }
+                let subjects = log_subjects(p);
+                for file in ["c1.txt", "c2.txt", "c3.txt"] {
+                    let subject = format!("adds {file}");
+                    assert_eq!(
+                        subjects.iter().filter(|s| **s == subject).count(),
+                        1,
+                        "{row}: {file} applied exactly once: {subjects:?}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    cp_rev_parse(p, "HEAD"),
+                    start,
+                    "{row}: --abort restores the start"
+                );
+            }
+            assert!(
+                !status_text(p).contains("cherry-pick in progress"),
+                "{row} {finish}: finished"
+            );
+        }
+    }
+
+    // X3: `--skip` is interrupted after resetting the conflicted pick.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "X3 conflict"
+    );
+    let before = log_subjects(p);
+    run_interrupted_after_control_reset(&["cherry-pick", "--skip"], p);
+    let refused = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert!(
+        !refused.status.success(),
+        "X3: --continue must refuse after an interrupted --skip: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let (human, report) = parse_cli_error_stderr(&refused.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "X3: {human}");
+    assert!(human.contains("libra cherry-pick --skip"), "X3: {human}");
+    assert_eq!(
+        log_subjects(p),
+        before,
+        "X3: no commit is made from the reset index"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--skip"], p),
+        "X3 re-run --skip",
+    );
+    assert!(head_paths(p).contains("extra.txt"), "X3: the rest applied");
+    assert!(
+        !log_subjects(p).iter().any(|s| s == "f1 edit"),
+        "X3: the skipped commit is not recorded"
+    );
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X3 done"
+    );
+
+    // X4: `--abort` is interrupted after resetting HEAD to the start.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    let start = cp_rev_parse(p, "HEAD");
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f2, &f1], p)
+            .status
+            .code(),
+        Some(128),
+        "X4: f2 lands, then f1 conflicts"
+    );
+    assert_ne!(
+        cp_rev_parse(p, "HEAD"),
+        start,
+        "X4: HEAD moved before the stop"
+    );
+    run_interrupted_after_control_reset(&["cherry-pick", "--abort"], p);
+    let refused = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert!(
+        !refused.status.success(),
+        "X4: --continue must refuse after an interrupted --abort: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let (human, report) = parse_cli_error_stderr(&refused.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "X4: {human}");
+    assert!(human.contains("libra cherry-pick --abort"), "X4: {human}");
+    let skip = run_libra_command(&["cherry-pick", "--skip"], p);
+    assert!(
+        !skip.status.success(),
+        "X4: --skip must refuse under an unfinished --abort: {}",
+        String::from_utf8_lossy(&skip.stdout)
+    );
+    let (human, report) = parse_cli_error_stderr(&skip.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "X4 --skip: {human}");
+    assert!(
+        human.contains("libra cherry-pick --abort"),
+        "X4 --skip: {human}"
+    );
+    assert_eq!(
+        cp_rev_parse(p, "HEAD"),
+        start,
+        "X4: no commit is made from the reset index"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "X4 re-run --abort",
+    );
+    assert_eq!(cp_rev_parse(p, "HEAD"), start, "X4: restored");
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X4 done"
+    );
+}
+
+fn set_sequence_payload(repo: &std::path::Path, payload: &str) {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let db = repo.join(".libra/libra.db");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let conn = Database::connect(format!("sqlite://{}?mode=rw", db.display()))
+            .await
+            .expect("open repo db");
+        let result = conn
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE sequence_state SET payload = ? WHERE kind = 'cherry_pick'",
+                [payload.into()],
+            ))
+            .await
+            .expect("rewrite sequence payload");
+        assert_eq!(result.rows_affected(), 1, "exactly one cherry-pick row");
+    });
+}
+
+/// M-CRASH X5-X8 (#477 HF-31): legacy, corrupt and marked rows; a final pick
+/// dropped by `--empty=drop`; a concurrent start that claims first; and a HEAD
+/// moved by hand during a non-conflict stop.
+#[test]
+fn test_cherry_pick_sequence_state_edge_cases() {
+    // X5: rows written by binaries without the conflict flag and phase keys.
+    for verb in ["--continue", "--skip", "--abort"] {
+        let (repo, f1, f2) = conflict_sequence_repo();
+        let p = repo.path();
+        let start = cp_rev_parse(p, "HEAD");
+        assert_eq!(
+            run_libra_command(&["cherry-pick", &f1, &f2], p)
+                .status
+                .code(),
+            Some(128),
+            "X5 {verb} conflict"
+        );
+        set_sequence_payload(p, r#"{"signoff":false}"#);
+        if verb == "--continue" {
+            std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+            assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+        }
+        assert_cli_success(
+            &run_libra_command(&["cherry-pick", verb], p),
+            &format!("X5 legacy {verb}"),
+        );
+        match verb {
+            "--continue" => {
+                let subjects = log_subjects(p);
+                assert_eq!(
+                    subjects.iter().filter(|s| *s == "f1 edit").count(),
+                    1,
+                    "X5: a legacy row still finalizes the resolved commit: {subjects:?}"
+                );
+                assert!(head_paths(p).contains("extra.txt"), "X5: rest applied");
+            }
+            "--skip" => assert!(head_paths(p).contains("extra.txt"), "X5: skip continues"),
+            _ => assert_eq!(cp_rev_parse(p, "HEAD"), start, "X5: abort restores"),
+        }
+        assert!(
+            !status_text(p).contains("cherry-pick in progress"),
+            "X5 legacy {verb}: finished"
+        );
+    }
+    // X5: a corrupt payload keeps `--abort` and `--quit` usable.
+    for verb in ["--abort", "--quit"] {
+        let (repo, f1, f2) = conflict_sequence_repo();
+        let p = repo.path();
+        let start = cp_rev_parse(p, "HEAD");
+        assert_eq!(
+            run_libra_command(&["cherry-pick", &f1, &f2], p)
+                .status
+                .code(),
+            Some(128),
+            "X5 corrupt conflict"
+        );
+        set_sequence_payload(p, "not json");
+        assert_cli_success(
+            &run_libra_command(&["cherry-pick", verb], p),
+            &format!("X5 corrupt {verb}"),
+        );
+        if verb == "--abort" {
+            assert_eq!(cp_rev_parse(p, "HEAD"), start, "X5: corrupt abort restores");
+        }
+        assert!(
+            !status_text(p).contains("cherry-pick in progress"),
+            "X5 corrupt {verb}: cleared"
+        );
+    }
+    // X5: `--quit` forgets a row an interrupted `--abort` marked.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "X5 marked conflict"
+    );
+    run_interrupted_after_control_reset(&["cherry-pick", "--abort"], p);
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--quit"], p),
+        "X5 marked --quit",
+    );
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X5 marked --quit: cleared"
+    );
+
+    // X6: the final pick of a fresh run is dropped by `--empty=drop`.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    for (file, content, msg) in [
+        ("c1.txt", "c1\n", "adds c1"),
+        ("same.txt", "same\n", "adds same"),
+    ] {
+        std::fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    }
+    let c1 = cp_rev_parse(p, "HEAD~1");
+    let c2 = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("same.txt"), "same\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "same.txt"], p), "add same");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main has same", "--no-verify"], p),
+        "commit same",
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--empty=drop", &c1, &c2], p),
+        "X6 pick",
+    );
+    assert!(
+        head_paths(p).contains("c1.txt"),
+        "X6: the first pick landed"
+    );
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X6: a dropped final pick ends the sequence"
+    );
+
+    // X6: a pick dropped while `--continue` resumes the sequence also advances
+    // the row, so an interruption right after the drop leaves no stale row.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    std::fs::write(p.join("extra.txt"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra.txt"], p), "add extra");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main has extra", "--no-verify"], p),
+        "commit extra",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--empty=drop", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "X6 resume conflict"
+    );
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+    let cut = spawn_libra_command_with_env(
+        &["cherry-pick", "--continue"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_FAIL_AFTER_DROP", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for interrupted libra");
+    assert!(
+        String::from_utf8_lossy(&cut.stderr)
+            .contains("test-injected cherry-pick interruption after a dropped pick"),
+        "X6: the drop failpoint must fire: {}",
+        String::from_utf8_lossy(&cut.stderr)
+    );
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X6: the resumed drop cleared the row before the interruption"
+    );
+
+    // X7: a multi-commit run refused before anything lands releases its own
+    // claim, so the refusal writes nothing and leaves no sequence.
+    let (repo, ids) = feature_commits_repo(&["new.txt", "c2.txt"]);
+    let p = repo.path();
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let before = refusal_snapshot(p);
+    let mut args = vec!["cherry-pick"];
+    args.extend(ids.iter().map(String::as_str));
+    let out = run_libra_command(&args, p);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "X7 release: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        refusal_snapshot(p),
+        before,
+        "X7: a refused multi-commit start releases its claim and writes nothing"
+    );
+
+    // X7: when releasing that claim fails, the failure is reported instead of
+    // the refusal, and the kept claim stays visible.
+    let (repo, ids) = feature_commits_repo(&["new.txt", "c2.txt"]);
+    let p = repo.path();
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let mut args = vec!["cherry-pick"];
+    args.extend(ids.iter().map(String::as_str));
+    let out = spawn_libra_command_with_env(
+        &args,
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_FAIL_RELEASE_CLAIM", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert!(
+        !out.status.success(),
+        "X7: a failed release must not succeed"
+    );
+    let (human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(
+        report.error_code, "LBR-IO-002",
+        "X7: a failed release is reported, not the refusal: {human}"
+    );
+    assert!(
+        human.contains("releasing the sequence claim"),
+        "X7: {human}"
+    );
+    assert!(
+        status_text(p).contains("cherry-pick in progress"),
+        "X7: the kept claim stays visible"
+    );
+
+    // X7: a concurrent `--quit` and a new start claim the sequence before a
+    // refused run releases its own claim; the fenced release keeps the new row.
+    let (repo, ids) = feature_commits_repo(&["new.txt", "c2.txt"]);
+    let p = repo.path();
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    let mut args = vec!["cherry-pick"];
+    args.extend(ids.iter().map(String::as_str));
+    let out = spawn_libra_command_with_env(
+        &args,
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_RECLAIM_BEFORE_RELEASE", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "X7 reclaim: the refusal is still reported: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        repo_table_rows(p, "sequence_state").len(),
+        1,
+        "X7: the release must not erase the row a later start claimed"
+    );
+
+    // X7: a concurrent start claims the sequence before this run does.
+    let (repo, ids) = feature_commits_repo(&["c1.txt", "c2.txt"]);
+    let p = repo.path();
+    let before = refusal_snapshot(p);
+    let mut args = vec!["cherry-pick"];
+    args.extend(ids.iter().map(String::as_str));
+    let out = spawn_libra_command_with_env(
+        &args,
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_CHERRY_PICK_RACE_BEFORE_CLAIM", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for raced libra");
+    assert!(
+        !out.status.success(),
+        "X7: the start that loses the claim must be refused: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let (human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-002", "X7: {human}");
+    let mut after = refusal_snapshot(p);
+    assert_eq!(
+        after.sequence_state.len(),
+        1,
+        "X7: only the competitor's row exists"
+    );
+    after.sequence_state = before.sequence_state.clone();
+    assert_eq!(after, before, "X7: the loser writes nothing");
+
+    // X8: HEAD moved by hand onto the stopped commit is not taken as landed.
+    let (repo, ids) = feature_commits_repo(&["c1.txt", "new.txt"]);
+    let p = repo.path();
+    std::fs::write(p.join("new.txt"), "mine\n").unwrap();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &ids[0], &ids[1]], p)
+            .status
+            .code(),
+        Some(128),
+        "X8 stop"
+    );
+    std::fs::remove_file(p.join("new.txt")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &ids[1]], p),
+        "X8 move HEAD by hand",
+    );
+    let cont = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert!(
+        !cont.status.success(),
+        "X8: --continue must not silently skip the stopped commit: {}",
+        String::from_utf8_lossy(&cont.stdout)
+    );
+    assert!(
+        status_text(p).contains("cherry-pick in progress"),
+        "X8: the sequence is kept"
+    );
+}

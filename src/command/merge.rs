@@ -14403,6 +14403,173 @@ fn short_object_id(object_id: &ObjectHash) -> String {
 mod merge_rename_content_test;
 
 #[cfg(test)]
+mod repository_fixture {
+    use std::{env, panic::AssertUnwindSafe, path::PathBuf};
+
+    use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind};
+
+    use crate::utils::{
+        pager::LIBRA_TEST_ENV,
+        test::{
+            ChangeDirGuard, ConfigDbFixture, CwdLockGuard, ScopedEnvVar, cwd_lock_guard,
+            setup_with_new_libra_in,
+        },
+        util::{self, DATABASE, ROOT_DIR},
+    };
+
+    struct HashKindRestore(HashKind);
+
+    impl Drop for HashKindRestore {
+        fn drop(&mut self) {
+            set_hash_kind(self.0);
+        }
+    }
+
+    pub(super) struct MergeTestRepository {
+        // Restore CWD before removing either sandbox; keep the outer lock until
+        // environment and hash-kind restoration have also completed.
+        _cwd: ChangeDirGuard,
+        _runtime: tokio::runtime::Runtime,
+        config: ConfigDbFixture,
+        _non_interactive: ScopedEnvVar,
+        _hash_kind: HashKindRestore,
+        repo: tempfile::TempDir,
+        repo_path: PathBuf,
+        _cwd_lock: CwdLockGuard,
+    }
+
+    impl MergeTestRepository {
+        pub(super) fn new() -> Self {
+            let cwd_lock = cwd_lock_guard();
+            let repo = tempfile::tempdir().expect("isolated merge repository");
+            let repo_path = repo
+                .path()
+                .canonicalize()
+                .expect("canonical merge repository");
+            let hash_kind = HashKindRestore(get_hash_kind());
+            let non_interactive = ScopedEnvVar::set(LIBRA_TEST_ENV, "1");
+            let config = ConfigDbFixture::new().expect("isolated merge configuration");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("merge fixture setup runtime");
+            let cwd = ChangeDirGuard::new(&repo_path);
+            // Own cleanup before setup: an initialization panic may already have
+            // populated the process-wide repository connection cache.
+            let fixture = Self {
+                _cwd: cwd,
+                _runtime: runtime,
+                config,
+                _non_interactive: non_interactive,
+                _hash_kind: hash_kind,
+                repo,
+                repo_path,
+                _cwd_lock: cwd_lock,
+            };
+            fixture
+                ._runtime
+                .block_on(setup_with_new_libra_in(&fixture.repo_path));
+            fixture
+        }
+    }
+
+    impl Drop for MergeTestRepository {
+        fn drop(&mut self) {
+            // The cache outlives the runtime. Close its pool while the runtime,
+            // CWD lock and repository still exist (also required for Windows cleanup).
+            self._runtime
+                .block_on(crate::internal::db::reset_db_conn_instance_for_path(
+                    &self.repo_path.join(ROOT_DIR).join(DATABASE),
+                ));
+            util::reset_objects_storage_cache_for_path(
+                &self.repo_path.join(ROOT_DIR).join("objects"),
+            );
+        }
+    }
+
+    fn assert_merge_fixture_restoration(unwind: bool) {
+        let _cwd_lock = cwd_lock_guard();
+        let _hash_kind = HashKindRestore(get_hash_kind());
+        set_hash_kind(HashKind::Sha256);
+        let _non_interactive = ScopedEnvVar::set(LIBRA_TEST_ENV, "0");
+        let original_cwd = env::current_dir().expect("original CWD");
+        let keys = [
+            "LIBRA_CONFIG_GLOBAL_DB",
+            "LIBRA_CONFIG_SYSTEM_DB",
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            LIBRA_TEST_ENV,
+        ];
+        let previous = keys.map(env::var_os);
+        let mut paths = None;
+        let mut pool = None;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let fixture = MergeTestRepository::new();
+            paths = Some((
+                fixture.repo.path().to_path_buf(),
+                fixture.config.root().to_path_buf(),
+            ));
+            let conn = fixture
+                ._runtime
+                .block_on(crate::internal::db::get_db_conn_instance_for_path(
+                    &fixture.repo_path.join(ROOT_DIR).join(DATABASE),
+                ))
+                .expect("fixture's cached repository connection");
+            pool = Some(conn.get_sqlite_connection_pool().clone());
+            assert_eq!(
+                env::current_dir()
+                    .expect("fixture CWD")
+                    .canonicalize()
+                    .expect("canonical fixture CWD"),
+                fixture.repo_path
+            );
+            assert!(fixture.repo.path().join(".libra").is_dir());
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+            assert_eq!(env::var_os(LIBRA_TEST_ENV), Some("1".into()));
+            assert_eq!(
+                env::var_os("LIBRA_CONFIG_GLOBAL_DB"),
+                Some(fixture.config.global_db().as_os_str().to_owned())
+            );
+            assert_eq!(
+                env::var_os("LIBRA_CONFIG_SYSTEM_DB"),
+                Some(fixture.config.system_db().as_os_str().to_owned())
+            );
+            if unwind {
+                panic!("intentional merge fixture unwind");
+            }
+        }));
+        assert_eq!(result.is_err(), unwind);
+        assert_eq!(env::current_dir().expect("restored CWD"), original_cwd);
+        assert_eq!(keys.map(env::var_os), previous);
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+        assert!(
+            pool.expect("fixture pool was acquired").is_closed(),
+            "cached pool must close before cleanup"
+        );
+        let (repo, config) = paths.expect("fixture was constructed before the unwind");
+        assert!(
+            !repo.exists() && !config.exists(),
+            "fixture directories must be cleaned up"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+    fn merge_fixture_restores_process_state_on_return() {
+        assert_merge_fixture_restoration(false);
+        // The shared setup's once-only test flag must not break later fixtures.
+        assert_merge_fixture_restoration(false);
+    }
+
+    #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+    fn merge_fixture_restores_process_state_on_panic() {
+        assert_merge_fixture_restoration(true);
+    }
+}
+
+#[cfg(test)]
 mod driver {
     use super::*;
     use crate::utils::test;
@@ -14505,7 +14672,9 @@ mod driver {
     }
 
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn recursive_binary_driver_uses_the_original_for_the_virtual_ancestor() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         // `merge_virtual_items` obtains the attribute source from the ambient
         // worktree. Hold the process-wide CWD lock while parallel tests may
         // otherwise switch to their own temporary repositories.
@@ -15057,7 +15226,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn strategy_option_resolves_add_add_but_never_modify_delete() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base = merge_entry(1, TreeItemMode::Blob);
         let ours = merge_entry(2, TreeItemMode::Blob);
         let theirs = merge_entry(3, TreeItemMode::Blob);
@@ -16051,7 +16222,9 @@ mod recursive {
     /// Git's `merged_merge_bases = merge(merged_merge_bases, next)` loop
     /// (`merge-ort.c` `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn folds_three_ancestors_pairwise_into_one_tree() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let root = blob_entry(&mut blobs, "0\n", TreeItemMode::Blob);
         let first = items(&[("f", root), ("g", root), ("h", root)]);
@@ -16082,7 +16255,9 @@ mod recursive {
     /// conflicted text the same way. The markers carry the depth's width and
     /// Git's temporary-branch labels.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn records_conflicting_ancestor_content_with_labelled_widened_markers() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let base = items(&[("f", blob_entry(&mut blobs, "0\n", TreeItemMode::Blob))]);
         let ours = items(&[("f", blob_entry(&mut blobs, "a\n", TreeItemMode::Blob))]);
@@ -16106,7 +16281,9 @@ mod recursive {
     /// loads the virtual ancestor's content BY OBJECT ID — so a `--dry-run`
     /// has to keep it addressable in memory too, not only the conflicted ones.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn cleanly_merged_ancestor_content_stays_addressable_without_being_written() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let base = items(&[(
             "m",
@@ -16138,7 +16315,9 @@ mod recursive {
     /// version (`merge-ort.c` `process_entry`, lines 4374-4381 at
     /// git@`3cb9185f6`).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn change_delete_inside_an_ancestor_keeps_the_base_version() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let base_entry = blob_entry(&mut blobs, "0\n", TreeItemMode::Blob);
         let base = items(&[("f", base_entry)]);
@@ -16157,7 +16336,9 @@ mod recursive {
     /// steals the ORIGINAL buffer for a virtual ancestor, so a conflicting
     /// binary keeps the base's content — never a side's.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn binary_conflict_inside_an_ancestor_keeps_the_original_content() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let binary = |blobs: &mut VirtualBlobs, byte: u8| {
             let blob = Blob::from_content_bytes(vec![0xff, byte, 0x00]);
@@ -16181,7 +16362,9 @@ mod recursive {
     /// Recording nothing instead would turn the outer merge's add/add into a
     /// one-sided add and silently drop a side.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn binary_add_add_inside_an_ancestor_records_the_empty_blob() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let binary = |blobs: &mut VirtualBlobs, byte: u8| {
             let blob = Blob::from_content_bytes(vec![0x00, byte]);
@@ -16224,7 +16407,9 @@ mod recursive {
     /// Binary-ness follows Git's `buffer_is_binary` — a NUL byte in the first
     /// 8000 — not UTF-8 validity. Valid UTF-8 carrying a NUL is binary…
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn utf8_content_containing_a_nul_is_binary_like_git() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let entry = |blobs: &mut VirtualBlobs, text: &str| {
             let blob = Blob::from_content_bytes(text.as_bytes().to_vec());
@@ -16251,7 +16436,9 @@ mod recursive {
     /// must survive the merge byte for byte (a lossy string round-trip would
     /// rewrite those bytes as U+FFFD).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn non_utf8_content_without_a_nul_merges_as_text_like_git() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let entry = |blobs: &mut VirtualBlobs, bytes: &[u8]| {
             let blob = Blob::from_content_bytes(bytes.to_vec());
@@ -16280,7 +16467,9 @@ mod recursive {
     /// Symlinks are not content-merged: `merge-ort.c` keeps the ORIGINAL under
     /// `call_depth`, which is NOTHING when there is no original.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn symlink_conflict_inside_an_ancestor_keeps_the_original() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let link = |blobs: &mut VirtualBlobs, target: &str| {
             let blob = Blob::from_content_bytes(target.as_bytes().to_vec());
@@ -16309,7 +16498,9 @@ mod recursive {
     /// (`handle_content_merge` asserts equal `S_IFMT`); the ancestor keeps the
     /// original.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn mixed_kinds_inside_an_ancestor_keep_the_original() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
         let entry = |blobs: &mut VirtualBlobs, text: &str, mode| {
             let blob = Blob::from_content_bytes(text.as_bytes().to_vec());
@@ -16816,7 +17007,9 @@ mod tree {
     /// that path, Git traverses the directory, finds no file and leaves the
     /// file where it is (plain modify/delete). Both walks must agree.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn an_empty_subtree_is_in_the_way_only_when_the_base_had_nothing_there() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let dir_side = dir(&[
             ("keep.txt", Node::Blob(1)),
@@ -16904,7 +17097,9 @@ mod tree {
     /// and `moved/` equals the base on ours while theirs rewrote a leaf deep
     /// inside: the walk must open neither `shared/` nor ours' `moved/`.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn pruned_subtrees_are_not_read() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let shared = deep(1);
         let (base, _) = build(
@@ -16996,7 +17191,9 @@ mod tree {
     /// differing level per distinct tree, never more (the walk hits the cache).
     /// No blob is read anywhere.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn a_subtree_only_we_changed_is_adopted_with_only_the_gates_reads() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let (base, _) = build(
             &mut graph,
@@ -17037,7 +17234,9 @@ mod tree {
     /// same-change, add/add, modify/delete, mode-only, symlink, and a
     /// directory replaced by a file.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn incremental_and_flattening_paths_agree() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let (base, _) = build(
             &mut graph,
@@ -17128,7 +17327,9 @@ mod tree {
     /// No base (unrelated histories): the empty virtual base gives the same
     /// answers on both paths, including the add/add conflict.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn incremental_and_flattening_paths_agree_without_a_base() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let (ours, _) = build(
             &mut graph,
@@ -17164,7 +17365,9 @@ mod tree {
     /// adopted-from-theirs subtree with unchanged nested parts, and a
     /// theirs-added subtree (which the gate enumerates in full).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn unopened_trees_are_heads_own() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut graph = CountingTrees::default();
         let shared = deep(1);
         let nested_unchanged = deep(7);
@@ -17268,7 +17471,9 @@ mod tree {
     /// never visited it; one inside a subtree all three sides share passes
     /// through untouched, unvisited.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn gitlinks_inside_pruned_subtrees_follow_adr_mg_01() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         // Pass-through: identical everywhere, buried, never opened.
         let mut graph = CountingTrees::default();
         let sub = dir(&[("vendor", dir(&[("lib", Node::Gitlink(1))]))]);
@@ -17356,7 +17561,9 @@ mod tree {
     /// changed on one side. Reads must scale with the changed paths (their
     /// depth and their directories' siblings), not with the tree.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn synthetic_large_tree_reads_scale_with_changes_not_size() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         const DIRS: usize = 100;
         const SUBDIRS: usize = 40;
         const FILES: usize = 25; // 100 × 40 × 25 = 100_000 files
@@ -17438,7 +17645,9 @@ mod tree {
     /// identical on both sides is never opened, so the pruning MG-03 bought is
     /// kept for everything a rename cannot reach.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn rename_collection_reads_only_the_subtrees_that_differ() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         const DIRS: usize = 60;
         const SUBDIRS: usize = 20;
         const FILES: usize = 20; // 60 × 20 × 20 = 24_000 files
@@ -17753,7 +17962,9 @@ mod rename {
     /// the other side's entry are moved there, and the source disappears
     /// (Git's `process_renames`).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn an_accepted_rename_moves_the_base_and_the_other_side_onto_the_new_path() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base_entry = file("base\n");
         let theirs_entry = file("theirs\n");
         let ours_entry = file("base\n");
@@ -17778,7 +17989,9 @@ mod rename {
     /// Every shape MG-05 leaves to MG-06 is declined with a reason, and
     /// declining changes nothing about the maps.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn path_level_rename_shapes_are_classified_and_the_collision_is_settled() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base_entry = file("base\n");
         // Both sides renamed the source, to different paths and to the same.
         let base = items(&[("old.txt", base_entry)]);
@@ -18402,7 +18615,9 @@ mod rename_conflict {
     /// carries only its own side, and both destinations hold the SAME merged
     /// object (`merge-ort.c:3021-3068`). Measured: `1 old`, `2 a`, `3 b`.
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn one_to_two_records_both_destinations_and_drops_the_source() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
         let ours_entry = file("l1\nOURS\nl3\nl4\nl5\nl6\nl7\nl8\n");
         let theirs_entry = file("l1\nl2\nTHEIRS\nl4\nl5\nl6\nl7\nl8\n");
@@ -18456,7 +18671,9 @@ mod rename_conflict {
     /// side keeps its stage, the deleting side has none, and the conflict is
     /// forced even for a PURE rename (`merge-ort.c:3202-3221`).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn rename_delete_moves_the_base_to_the_new_path() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
         let mut base = items(&[("old", base_entry)]);
         let mut ours = items(&[("new", base_entry)]);
@@ -18489,7 +18706,9 @@ mod rename_conflict {
     /// still follows the rename, but the type-changed entry SURVIVES under the
     /// old name and Git says nothing about a rename (`merge-ort.c:3205-3212`).
     #[test]
+    #[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
     fn a_type_changed_source_survives_and_is_not_announced() {
+        let _repository = super::repository_fixture::MergeTestRepository::new();
         let base_entry = file("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
         let link = MergeTreeEntry {
             hash: Blob::from_content("target").id,

@@ -148,6 +148,14 @@ the default version 1 payload remains shape-compatible and never gains those
 fields implicitly. OpenCode reports `transcript_discoverable` unsupported
 because batch discovery is unavailable; explicit-ID `importable` and
 `export_bridge` availability depend on its trusted offline exporter/sandbox.
+On Unix, the exporter subprocess and its descendants run with both soft and
+hard `RLIMIT_CORE` set to zero. This suppresses core files for intentional
+limit enforcement and unexpected exporter crashes when the system core
+handler honors that limit; signal events may still appear in system logs.
+Libra retains the exporter exit status and bounded stderr diagnostics. This
+child-only setting leaves the parent Libra process and system configuration
+unchanged.
+
 On macOS the sandboxed export uses seatbelt (`sandbox-exec`; deprecated by
 Apple and may be removed) so store writes and network are denied outside the
 OpenCode data dir; host read is not confined (global `file-read*`), unlike

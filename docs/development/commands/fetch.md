@@ -32,7 +32,7 @@ flowchart TD
 
 - 底层操作对象：`RemoteConfig`（remote URL、refspec 和凭据配置）；`GitClient` / protocol client（Git wire 协议协商）；SSH transport（SSH remote 连接和认证）；HTTPS transport（HTTP(S) remote 连接和认证）；pack / idx 对象（传输包、索引、delta 和完整性校验）；`Branch` / branch store（SQLite refs 上的分支读写、过滤和上游关系）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ReflogContext` / `with_reflog`（SQLite reflog 写入和动作记录）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）；`Commit`（提交对象、父提交关系和提交消息载荷）；SeaORM / `.libra/libra.db`（配置、refs、reflog、AI/发布元数据等 SQLite 表）；Vault/libvault（身份、密钥或 vault-backed 签名边界）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
-- 全局配置 schema 保护（P0-12）：CLI dispatch 前通过 `utils::client_storage::inspect_global_config_schema_future` 检查 `~/.libra/config.db` / `LIBRA_CONFIG_GLOBAL_DB`。`fetch` 默认把 future schema 视为 fail-closed 配置错误，返回 `LBR-CONFIG-001`（category `config`，exit 128），避免静默忽略全局 tiered storage 配置；`--offline` 或 `LIBRA_READ_POLICY=offline|local` 明确降级时仅 warning 一次并继续本地对象访问。诊断必须包含二进制路径、二进制版本、配置 DB 路径、当前/支持的 schema 版本和升级命令，且不得泄露 `vault.env.*` secret。回归测试：`compat_global_config_schema_future`。
+- 配置 schema 保护（MIG-04，更新 P0-12 的 CLI preflight 描述）：dispatch 前通过 `utils::client_storage::inspect_configuration_schema_issues` 只读检查 GlobalConfig 与 SystemConfig 的角色化元数据。当前 manifest 已知的 Repository-only receipt 不造成配置 future；真正配置 future 或未注册／名称不匹配的 receipt 在命令需要该作用域时以 `LBR-CONFIG-001`（category `config`，exit 128）fail-closed。完整 process/repo-local storage 配置可使 GlobalConfig 不再必需（`cloud` 还需满足 D1 配置），但不能豁免 SystemConfig 问题。`--offline` 或 `LIBRA_READ_POLICY=offline|local` 仅用于明确的本地对象访问，warning 一次，不授权远端同步。诊断保留二进制路径／版本、配置 DB 路径、当前／支持版本和升级命令，并标明 scope/ledger/reason，不输出配置值、未信任 receipt 名称或 `vault.env.*` secret。回归测试：`compat_global_config_schema_future`。完整契约见 [config 设计](config.md)、[role map](../internal/database-migration-scope.md) 与[用户 fetch 文档](../../commands/fetch.md)；旧 Global helper 仍用于既有 cascade 路径，不代表 CLI preflight 仍是 Global-only。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
 ## 实现历史
@@ -75,3 +75,268 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Async pkt-line lengths and EOF
+
+Fetch's async reader uses `pkt_frame_payload_len` before allocating a payload.
+Lengths one through three carry `PktFrameError` through `io::ErrorKind::InvalidData`;
+flush, length-four and `ffff` frames retain their wire semantics. An EOF after any
+header byte or within a payload carries the existing `PktLineError::TruncatedHeader`
+or `TruncatedPayload`, with its leading marker and fixed reason, to `LBR-NET-002`.
+Only EOF before the first header byte remains a normal frame-boundary EOF. Other
+I/O errors preserve their original kind; ordinary `PacketRead` classification is
+still assigned to PKT-10. UTF8/hex-header decoding errors also carry the existing
+fixed `PktLineError` reasons: the new post-pack reader must not expose remote bytes.
+PKT-13 still owns shared strict ASCII-hex validation across all async readers.
+
+A malformed or truncated frame takes precedence over `IncompletePack`, even after
+some pack bytes arrive. It reports the precise pkt-line reason without a byte
+count or additional CLI hint. `IncompletePack` and its retry hint remain for an
+unfinished pack ending at a clean frame boundary; both paths are `LBR-NET-002`.
+
+Once the pack checksum is verified, `read_fetch_stream` makes one nonblocking
+observation of the buffered or first immediately available transport chunk. It
+validates every frame beginning in that chunk, including any remainder spanning
+later chunks, without appending trailer payloads to the completed pack. It then
+returns; it does not drain a continually ready stream of new chunks. No available
+frame bytes (Pending, boundary EOF or a boundary transport error) retains the
+previous completed-pack success behavior. A read error after observing a frame
+byte still propagates. This bounds trailing work to the observed chunk plus at
+most one frame, while preserving completion without an idle connection closing.
+Flush still terminates the packet sequence, so bytes after it are not parsed.
+An observed partial frame must still complete or fail. Existing network idle
+timeouts can fail this read with `LBR-NET-001`; no new timeout is introduced and
+the partial frame is not silently accepted merely because the pack was complete.
+
+## Malformed HTTP(S) discovery responses
+
+During HTTP(S) reference discovery, Libra rejects a zero-byte advertisement and
+malformed pkt-line frames, including short or non-hexadecimal headers, frame
+lengths below four, and truncated payloads. A valid `0000` flush remains distinct
+from an absent response; a valid empty-repository advertisement is supported.
+An unsupported object-format capability reports the fixed message
+`Unsupported object format capability` without echoing its remote value.
+Check that the URL points to a Git smart HTTP service and that a proxy has not
+truncated or replaced the response; then retry.
+
+The buffered parser preserves typed pkt-line failures as raw `GitError::NetworkError`
+details with the shared leading marker. Empty discovery responses use the same
+marker. `map_fetch_discovery_error` matches the raw detail with `starts_with`
+and maps these pkt-line discovery errors to `LBR-NET-002`; it does not search the
+formatted outer error. Non-marker network errors remain `LBR-NET-001`, including
+the fixed unsupported-object-format capability diagnostic. The other command adapters now follow the same raw-marker classification;
+streaming header grammar remains a separate transport concern.
+
+The marker branch attaches the fixed hint
+`check that the remote serves Git data and that a proxy has not altered the response`.
+Other non-marker discovery parse errors also remain `LBR-NET-001`; fully typing
+those errors is deferred under DEFER-04. The raw-marker mapping applies whenever
+an existing transport supplies that marker; asynchronous header readers are
+covered separately by PKT-13.
+
+## pkt-line boundary classification
+
+The `fetch` boundary maps detected pkt-line errors to `LBR-NET-002`, including
+empty HTTP(S) discovery advertisements. Match `GitError::NetworkError(detail)`
+using the shared `PKT_LINE_PROTOCOL_ERROR_PREFIX` on the raw detail, before
+timeout or host-key heuristics. Object-transfer IO carriers, plus the
+clone/ls-remote/pull discovery IO carriers, use `fetch::is_pkt_line_io_error`,
+which compares a bounded Display prefix without allocating a second complete
+message. Marker matching itself is O(prefix length); normal user-message
+formatting still costs O(message length). Never classify using a formatted outer
+error, a remote URL, case folding, trimming, or a substring search.
+
+Object-transfer setup reports detected pkt-line errors with the same protocol
+hint. A truncated header or payload while reading the fetch stream retains
+`LBR-NET-002` with no extra CLI hint. An incomplete pack ending at a clean frame
+boundary retains its byte count and `the connection dropped mid-transfer — retry
+the fetch` hint. A transport reset while reading a packet is `LBR-NET-001`.
+
+An upload-pack EOF at a frame boundary before pack data begins, including a
+zero-byte POST response, returns `LBR-NET-001` with
+`check network connectivity and retry`. An empty discovery advertisement remains
+`LBR-NET-002`.
+
+Marker discovery/transfer-setup errors use the exact `check that the remote serves Git data and that a proxy has not altered the response`
+hint. Non-marker network failures retain `LBR-NET-001`; clone discovery's ordinary
+IO errors retain `LBR-IO-001`. Authentication, local metadata errors and existing
+non-marker host-key handling follows the SSH section below. Other untyped discovery parsing
+errors retain existing classification (DEFER-04); this change does not complete
+strict async header validation or the later Git/SSH reader work.
+
+The default tests exercise all command conversions with raw carriers and parser
+errors, preserve the fetch PacketRead no-hint contract, and prove empty
+advertisements reach all four actual command handlers. The clone transfer case
+checks both discovery requests and a POST containing the advertised wanted OID.
+Its local HTTP fixture runs the production HttpsClient path; it does not exercise
+TLS negotiation or certificate validation.
+
+The prefix sink avoids allocating a full Display output itself; the Display
+implementation (including OS-error formatting) or earlier diagnostic redaction
+may still allocate. The two HTTP fixtures use a two-worker Tokio runtime so
+synchronous configuration lookup does not stop the cached pool and server.
+
+## Git and SSH advertisement frame boundaries
+
+The Git/SSH pkt-line advertisement readers reject declared lengths `0001` through
+`0003`, incomplete four-byte headers, and EOF inside a declared payload. Flush
+`0000`, empty-payload `0004` and maximum-size `ffff` frames retain their behavior.
+Their typed pkt-line errors classify as `LBR-NET-002` at the reader boundary;
+ordinary transport IO and idle timeouts remain `LBR-NET-001` when classified.
+
+During the `git://` object-fetch advertisement, fetch, clone and pull already
+report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
+hint is `check that the remote serves Git data and that a proxy has not altered the response`.
+Lengths 1–3 previously could panic; truncated advertisements previously returned
+`LBR-NET-001` with a network/transfer hint. Git discovery can still report `LBR-NET-001`. SSH advertisement propagation
+and bounded cleanup are described below; complete ASCII-hex header validation
+remains separate work.
+
+This advertisement is distinct from an upload-pack response after negotiation:
+HTTP(S) framing and empty upload-pack response classifications are unchanged.
+Tests exercise real local TCP object-fetch advertisement reads and the public
+fetch/clone/pull error conversions, without claiming full command execution or
+bounded SSH cleanup. Check the remote Git service or proxy for malformed frames.
+
+The shared `pkt_frame_payload_len` is called before allocating a non-flush payload.
+`pkt_line_read_error` maps `UnexpectedEof` at the exact header/payload read into
+`InvalidData` with a downcastable `PktLineError`; ordinary IO keeps its cause.
+SSH retains its existing ordinary-read context. No duplicate frame-reason enum is
+introduced. The private loops accept `AsyncRead + Unpin`; concrete TCP/child-stdout
+callers remain unchanged. Only cfg(test) module helpers expose the reader to the
+cross-client tests. No production visibility is broadened for tests.
+
+The ten named PKT-08 gates cover both clients' invalid lower bounds, flush, empty
+payload and upper bound plus paired payload/header EOF cases. The latter also pin
+ordinary reset/idle-timeout classification. They execute the actual reader loop
+with deterministic AsyncRead inputs, including a pending duplex stream for idle
+timeout, and inspect the typed source before the public CliError conversion.
+The invalid-length and two EOF gates also run actual local TCP GitClient::fetch_objects
+advertisement reads, verify the service request and typed source, and convert each
+result through public fetch/clone/pull errors. These are transport-plus-conversion
+tests, not complete command or SSH-process tests. Header ASCII-hex checks and the
+remaining Git discovery wrapper propagation are separate later work. The new per-frame
+checks are O(1); existing advertisement collection still scales with input size.
+
+## SSH advertisement error handling
+
+SSH advertisement lengths `0001` through `0003`, incomplete headers (including
+zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
+reason and marker are retained without captured SSH stdout/stderr.
+
+An incomplete required header has one host-trust exception: local SSH exit status
+255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
+returns fixed host-verification guidance and `LBR-NET-001`. This classification
+does not verify the remote fingerprint. Other missing advertisements, including
+authentication failures, still use `LBR-NET-002`; an available non-zero local exit
+status adds `SSH exited with status N` and fixed connectivity, trusted-host,
+ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+
+After an incomplete required header, Libra allows up to 100 milliseconds to
+observe the SSH exit status, then requests termination if needed. Other read
+errors request termination immediately. The status window, direct-child reap and
+output collection share a two-second cleanup deadline. Protocol and typed
+host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+and timeout errors keep their transport classification and may include a fixed
+local cleanup warning. Termination can change the observed exit status. This
+does not promise cleanup of arbitrary descendant processes.
+
+Clone places targeted host-verification guidance in its structured hints. The
+other command boundaries retain fixed host guidance in the message and their
+existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
+captured remote stderr in either case.
+
+The `git://` object-fetch path already classifies the listed frame errors as
+`LBR-NET-002`; Git discovery and non-ASCII/non-hex async header classifications
+remain separate work. HTTP(S) framing behavior is unchanged.
+
+## SSH authentication and captured diagnostics
+
+Libra invokes SSH with `BatchMode=yes` for both terminal and non-terminal callers.
+It does not prompt for a private-key passphrase or an interactive host-key
+decision during a Libra command. Load or unlock an encrypted key in `ssh-agent`
+before retrying. For host trust, verify the fingerprint through a trusted
+provider console or another trusted channel before manually updating
+`~/.ssh/known_hosts`. Alternatively, make a separate interactive SSH connection
+and compare the displayed fingerprint before accepting it. For example,
+`ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
+port. Do not accept a fingerprint that has not been verified.
+
+`ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
+`no` values. `ask` leaves that SSH option to the user's SSH configuration;
+`BatchMode=yes` still prevents interactive decisions. Explicit values are
+forwarded to SSH. Choose a host-trust policy appropriate to your repository.
+
+SSH stderr is always captured, including in terminal sessions. It is drained
+from process startup, retaining at most 64 KiB while counting and hashing the
+remaining bytes. User-facing errors contain fixed text and a local exit status
+when available. Raw remote stderr is neither printed nor logged. Debug diagnostics
+contain only the status, total and retained byte counts, and a SHA-256 digest of
+the collected stream. Failed or cancelled collection may prevent these metadata
+from being reported; no completed digest is claimed in that case. Hashing work
+is proportional to the number of bytes drained.
+
+SSH reference advertisements and receive-pack responses each have a 16 MiB
+aggregate limit. An oversized advertisement fails with `LBR-NET-001` and guidance
+to use the repository’s HTTPS URL if available, or ask its maintainer to reduce refs. An oversized push response fails with `LBR-NET-001`
+and guidance to push fewer refs; it is not accepted as a truncated success.
+These limits can affect repositories with very large ref sets or updates. The
+streamed fetch pack is not subject to this cap. A failed push response does not
+prove that the server rolled back its refs: inspect the remote state before
+retrying. Existing IO timeouts still apply.
+
+After a complete discovery advertisement, Libra allows up to 100 milliseconds
+for SSH to exit before requesting termination, within a two-second total
+cleanup deadline. Captured-output tasks are cancelled when their owner exits or
+their deadline expires, including when a descendant keeps a pipe open.
+
+## SSH capture validation scope
+
+The twelve named PKT-11 library gates retain the original plan names. They cover
+fixed diagnostics and metadata-only tracing, both service argument lists, three
+non-zero-exit paths, malformed-advertisement cleanup and all six capture paths
+under stderr floods. The flood gate also covers retained-prefix/full-stream
+digest accounting, collector cancellation, and oversized advertisement and push
+response rejection. The host-trust gate covers native exit 255, typed primary
+error preservation through a secondary cleanup warning, the internal discovery
+carrier and an actual local fake-SSH clone command. Existing fetch/push CLI cases
+retain their names and test human, JSON and machine output plus remote-ref safety.
+The terminal gate uses a real local PTY. The passphrase gate creates an encrypted
+local key without an agent and exercises a simulated SSH failure; it does not
+claim live OpenSSH network authentication. Actual run IDs and results belong in
+plan-20260901.md after execution; the existence of these tests is not acceptance.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

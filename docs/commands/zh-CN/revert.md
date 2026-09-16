@@ -31,6 +31,8 @@ revert 提交使用当前 author 与 committer 身份/日期，并在创建提�
 
 该命令要求处于活动分支（不是 detached HEAD）。它接受一个或多个提交引用，按给定顺序依次回滚（每个各自生成一个 revert commit）；冲突会停止该序列，用 `libra revert --continue` 收尾、`libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。当冲突中断多提交回滚时，其后仍待处理的提交会被记住，并在 `--continue`/`--skip` 续作序列时自动回滚。`-n/--no-commit` 与 `-m/--mainline` 仅适用于单个提交。
 
+新的 revert 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或 `revert-state.json` 之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 以 `your index file is unmerged` 拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 revert；该拒绝不写 revert state，`--continue`、`--skip`、`--abort` 对它不适用。
+
 ## 选项
 
 ### `-n`, `--no-commit`
@@ -215,6 +217,7 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | 合并提交缺 `-m`、对非合并提交传 `-m`、父编号越界、非法 `--cleanup`，或 `-e`/`--edit` 下未配置编辑器、编辑器中止或消息为空 | 合并提交传有效 `-m <父编号>`；cleanup 使用 `strip`/`whitespace`/`verbatim`/`scissors`/`default`；`--edit` 需配置编辑器并保存非空消息 |
 | `LBR-CONFLICT-001` | 文件已被后续提交修改，产生冲突 | 解决冲突后 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 取消 |
+| `LBR-CONFLICT-001` | 索引已有未合并条目时新的 revert 被拒绝（不写 revert state） | 逐条解决并 `libra add`（或用 `libra reset --hard` 放弃）后重新执行 revert；`--continue`/`--skip`/`--abort` 不适用 |
 | `LBR-REPO-002` | apply/continue/skip/abort 期间索引损坏或不可读 | 修复或恢复 `.libra/index`；revert state 会保留以便重试恢复 |
 | `LBR-IO-001` | 无法加载对象（提交、树、blob） | 检查仓库完整性 |
 | `LBR-IO-002` | 无法保存对象、索引或更新 HEAD | 检查文件系统权限和仓库可写性 |

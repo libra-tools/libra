@@ -8,8 +8,8 @@ use serde::Serialize;
 use url::Url;
 
 use crate::{
-    command::fetch::{RemoteClient, resolve_remote_default_branch},
-    git_protocol::ServiceType::UploadPack,
+    command::fetch::{RemoteClient, is_pkt_line_io_error, resolve_remote_default_branch},
+    git_protocol::{PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType::UploadPack},
     internal::{
         config::ConfigKv,
         protocol::{DiscRef, ssh_client::is_ssh_spec},
@@ -211,6 +211,16 @@ impl From<LsRemoteError> for CliError {
                 GitError::UnAuthorized(_) => CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
                     .with_hint("check SSH key / HTTP credentials and repository access rights"),
+                GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::NetworkProtocol)
+                        .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+                }
+                GitError::IOError(source) if is_pkt_line_io_error(source) => {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::NetworkProtocol)
+                        .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+                }
                 GitError::NetworkError(_) | GitError::IOError(_) => {
                     CliError::fatal(error.to_string())
                         .with_stable_code(StableErrorCode::NetworkUnavailable)
@@ -251,12 +261,12 @@ async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteErr
         });
     }
 
-    let client = RemoteClient::from_spec_with_remote(&remote_url, remote_name.as_deref()).map_err(
-        |reason| LsRemoteError::InvalidRemote {
+    let client = RemoteClient::from_spec_with_remote(&remote_url, remote_name.as_deref())
+        .await
+        .map_err(|reason| LsRemoteError::InvalidRemote {
             spec: visible_remote.clone(),
             reason: sanitize_remote_error_reason(&reason, &remote_url),
-        },
-    )?;
+        })?;
     let discovery = client
         .discovery_reference(UploadPack)
         .await
@@ -360,4 +370,816 @@ fn write_ref_lines<W: Write>(writer: &mut W, data: &LsRemoteOutput) -> std::io::
         writeln!(writer, "{}\t{}", entry.hash, entry.refname)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pkt_line_boundary_tests {
+    use std::{
+        fmt, io,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use axum::{
+        Router,
+        body::{Body, Bytes, to_bytes},
+        extract::State,
+        http::{Request, StatusCode},
+        response::Response,
+    };
+    use clap::Parser;
+    use git_internal::errors::GitError;
+    use serial_test::serial;
+    use tempfile::tempdir;
+    use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+
+    use super::{LsRemoteArgs, LsRemoteError};
+    use crate::{
+        command::{
+            clone::{self, CloneArgs, CloneError},
+            fetch::{self, FetchArgs, FetchError},
+            pull::{self, PullArgs, PullError},
+        },
+        git_protocol::{
+            PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType::UploadPack, add_pkt_line_string,
+            read_pkt_line,
+        },
+        internal::{config::ConfigKv, protocol::parse_discovered_references},
+        utils::{
+            error::{CliError, StableErrorCode},
+            output::OutputConfig,
+            test::{ChangeDirGuard, setup_with_new_libra_in},
+        },
+    };
+
+    const PROTOCOL_HINT: &str =
+        "check that the remote serves Git data and that a proxy has not altered the response";
+    const NETWORK_HINT: &str = "check network connectivity and retry";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Boundary {
+        LsRemote,
+        CloneDiscovery,
+        CloneObjects,
+        ClonePacket,
+        FetchObjects,
+        FetchPacket,
+        PullDiscovery,
+        PullObjects,
+        PullPacket,
+    }
+    const ALL: [Boundary; 9] = [
+        Boundary::LsRemote,
+        Boundary::CloneDiscovery,
+        Boundary::CloneObjects,
+        Boundary::ClonePacket,
+        Boundary::FetchObjects,
+        Boundary::FetchPacket,
+        Boundary::PullDiscovery,
+        Boundary::PullObjects,
+        Boundary::PullPacket,
+    ];
+
+    fn discovery_boundary(boundary: Boundary, remote: &str, source: GitError) -> CliError {
+        match boundary {
+            Boundary::LsRemote => LsRemoteError::Discovery {
+                remote: remote.to_string(),
+                source,
+            }
+            .into(),
+            Boundary::CloneDiscovery => CloneError::DiscoverRemote {
+                source: FetchError::Discovery {
+                    remote: remote.to_string(),
+                    source,
+                },
+            }
+            .into(),
+            Boundary::PullDiscovery => PullError::Fetch(FetchError::Discovery {
+                remote: remote.to_string(),
+                source,
+            })
+            .into(),
+            _ => panic!("not a discovery boundary: {boundary:?}"),
+        }
+    }
+
+    fn io_boundary(boundary: Boundary, remote: &str, source: io::Error) -> CliError {
+        match boundary {
+            Boundary::LsRemote | Boundary::CloneDiscovery | Boundary::PullDiscovery => {
+                discovery_boundary(boundary, remote, GitError::IOError(source))
+            }
+            Boundary::CloneObjects => CloneError::FetchFailed {
+                source: FetchError::FetchObjects {
+                    remote: remote.to_string(),
+                    source,
+                },
+            }
+            .into(),
+            Boundary::ClonePacket => CloneError::FetchFailed {
+                source: FetchError::PacketRead { source },
+            }
+            .into(),
+            Boundary::FetchObjects => FetchError::FetchObjects {
+                remote: remote.to_string(),
+                source,
+            }
+            .into(),
+            Boundary::FetchPacket => FetchError::PacketRead { source }.into(),
+            Boundary::PullObjects => PullError::Fetch(FetchError::FetchObjects {
+                remote: remote.to_string(),
+                source,
+            })
+            .into(),
+            Boundary::PullPacket => PullError::Fetch(FetchError::PacketRead { source }).into(),
+        }
+    }
+
+    fn is_discovery(boundary: Boundary) -> bool {
+        matches!(
+            boundary,
+            Boundary::LsRemote | Boundary::CloneDiscovery | Boundary::PullDiscovery
+        )
+    }
+
+    fn parser_error(boundary: Boundary, remote: &str, wire: &[u8]) -> CliError {
+        if is_discovery(boundary) {
+            discovery_boundary(
+                boundary,
+                remote,
+                parse_discovered_references(Bytes::copy_from_slice(wire), UploadPack)
+                    .expect_err("malformed advertisement must fail in the parser"),
+            )
+        } else {
+            let source = read_pkt_line(&mut Bytes::copy_from_slice(wire))
+                .expect_err("malformed frame must fail in the parser");
+            io_boundary(
+                boundary,
+                remote,
+                io::Error::new(io::ErrorKind::InvalidData, source),
+            )
+        }
+    }
+
+    fn assert_protocol(boundary: Boundary, error: &CliError) {
+        assert_eq!(
+            error.stable_code(),
+            StableErrorCode::NetworkProtocol,
+            "{boundary:?}: {error:?}"
+        );
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+        let expected = if matches!(boundary, Boundary::FetchPacket | Boundary::PullPacket) {
+            Vec::new()
+        } else {
+            vec![PROTOCOL_HINT]
+        };
+        assert_eq!(
+            error
+                .hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{boundary:?}"
+        );
+        if matches!(
+            boundary,
+            Boundary::PullDiscovery | Boundary::PullObjects | Boundary::PullPacket
+        ) {
+            assert_eq!(
+                error.details().get("phase"),
+                Some(&serde_json::json!("fetch"))
+            );
+        }
+    }
+
+    fn marker_cases(boundaries: &[Boundary], remote: &str) {
+        for &boundary in boundaries {
+            for wire in [b"0001".as_slice(), b"0", b"0008abc", b"SECR", b"\xff000"] {
+                assert_protocol(boundary, &parser_error(boundary, remote, wire));
+            }
+            // The marker has priority over both timeout kind/text and the clone host-key heuristic.
+            let detail =
+                format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout; host key verification failed");
+            assert_protocol(
+                boundary,
+                &io_boundary(
+                    boundary,
+                    remote,
+                    io::Error::new(io::ErrorKind::TimedOut, detail.clone()),
+                ),
+            );
+            if is_discovery(boundary) {
+                assert_protocol(
+                    boundary,
+                    &discovery_boundary(boundary, remote, GitError::NetworkError(detail)),
+                );
+            }
+        }
+    }
+
+    fn non_marker_cases(boundaries: &[Boundary], remote: &str) {
+        for &boundary in boundaries {
+            for detail in [
+                "connection reset".to_string(),
+                "timed out".to_string(),
+                format!("wrapper: {PKT_LINE_PROTOCOL_ERROR_PREFIX}invalid"),
+                format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}invalid"),
+                format!("prefix {PKT_LINE_PROTOCOL_ERROR_PREFIX}invalid"),
+                "PKT-LINE protocol error: invalid".to_string(),
+            ] {
+                for kind in [
+                    io::ErrorKind::ConnectionReset,
+                    io::ErrorKind::TimedOut,
+                    io::ErrorKind::UnexpectedEof,
+                    io::ErrorKind::InvalidData,
+                ] {
+                    let error = io_boundary(boundary, remote, io::Error::new(kind, detail.clone()));
+                    let (code, hint) = match boundary {
+                        Boundary::CloneDiscovery => (
+                            StableErrorCode::IoReadFailed,
+                            "check filesystem permissions and repository integrity",
+                        ),
+                        Boundary::LsRemote => (
+                            StableErrorCode::NetworkUnavailable,
+                            "check the remote URL and network connectivity",
+                        ),
+                        Boundary::CloneObjects | Boundary::ClonePacket => (
+                            StableErrorCode::NetworkUnavailable,
+                            "network error during transfer; check connectivity and retry",
+                        ),
+                        _ => (StableErrorCode::NetworkUnavailable, NETWORK_HINT),
+                    };
+                    assert_eq!(
+                        error.stable_code(),
+                        code,
+                        "{boundary:?}/{kind:?}: {error:?}"
+                    );
+                    assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+                    assert_eq!(
+                        error
+                            .hints()
+                            .iter()
+                            .map(|hint| hint.as_str())
+                            .collect::<Vec<_>>(),
+                        [hint]
+                    );
+                }
+                if is_discovery(boundary) {
+                    let error =
+                        discovery_boundary(boundary, remote, GitError::NetworkError(detail));
+                    assert_eq!(
+                        error.stable_code(),
+                        StableErrorCode::NetworkUnavailable,
+                        "{boundary:?}: {error:?}"
+                    );
+                    let hint = match boundary {
+                        Boundary::LsRemote => "check the remote URL and network connectivity",
+                        Boundary::CloneDiscovery => {
+                            "check the remote host, DNS, VPN/proxy, and network connectivity"
+                        }
+                        _ => NETWORK_HINT,
+                    };
+                    assert_eq!(
+                        error
+                            .hints()
+                            .iter()
+                            .map(|hint| hint.as_str())
+                            .collect::<Vec<_>>(),
+                        [hint]
+                    );
+                }
+            }
+            if is_discovery(boundary) {
+                let error = discovery_boundary(
+                    boundary,
+                    remote,
+                    GitError::UnAuthorized("permission denied".to_string()),
+                );
+                assert_eq!(error.stable_code(), StableErrorCode::AuthPermissionDenied);
+                assert_eq!(
+                    error
+                        .hints()
+                        .iter()
+                        .map(|hint| hint.as_str())
+                        .collect::<Vec<_>>(),
+                    ["check SSH key / HTTP credentials and repository access rights"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_matrix_ls_remote_marker_maps_net_002() {
+        marker_cases(&[Boundary::LsRemote], "origin");
+        let remote = "https://user:credential_7c41@example.invalid/repo";
+        let source = read_pkt_line(&mut Bytes::from_static(b"SECR")).unwrap_err();
+        for source in [
+            GitError::NetworkError(source.to_string()),
+            GitError::IOError(io::Error::new(io::ErrorKind::InvalidData, source)),
+        ] {
+            let sanitized = super::sanitize_discovery_error(source, remote);
+            let error = discovery_boundary(Boundary::LsRemote, "origin", sanitized);
+            assert_protocol(Boundary::LsRemote, &error);
+            assert!(!error.render_report().contains("credential_7c41"));
+        }
+    }
+    #[test]
+    fn pkt_line_matrix_clone_discovery_marker_maps_net_002() {
+        marker_cases(&[Boundary::CloneDiscovery], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_clone_fetch_phase_marker_maps_net_002() {
+        marker_cases(&[Boundary::CloneObjects, Boundary::ClonePacket], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_fetch_objects_marker_maps_net_002() {
+        marker_cases(&[Boundary::FetchObjects], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_pull_discovery_marker_maps_net_002() {
+        marker_cases(&[Boundary::PullDiscovery], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_pull_fetch_objects_marker_maps_net_002() {
+        marker_cases(&[Boundary::PullObjects], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_ls_remote_stays_net_001() {
+        non_marker_cases(&[Boundary::LsRemote], "origin");
+        let error: CliError =
+            LsRemoteError::ConfigRead("unreadable local config".to_string()).into();
+        assert_eq!(error.stable_code(), StableErrorCode::IoReadFailed);
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_clone_discovery_stays_net_001() {
+        use crate::internal::protocol::ssh_client::{
+            SSH_HOST_KEY_CHANGED_GUIDANCE, SSH_HOST_KEY_CHANGED_SIGNAL, SSH_HOST_KEY_GUIDANCE,
+            SSH_HOST_KEY_UNCONFIRMED_SIGNAL,
+        };
+
+        non_marker_cases(&[Boundary::CloneDiscovery], "origin");
+        // Only the local carrier at the start of the inner NetworkError selects
+        // host guidance; raw diagnostic lookalikes remain ordinary network errors.
+        for detail in [
+            "Host key verification failed.".to_string(),
+            "REMOTE HOST IDENTIFICATION HAS CHANGED".to_string(),
+            format!("context: {SSH_HOST_KEY_UNCONFIRMED_SIGNAL}lookalike"),
+            format!("context: {SSH_HOST_KEY_CHANGED_SIGNAL}lookalike"),
+        ] {
+            let error = discovery_boundary(
+                Boundary::CloneDiscovery,
+                "ssh://example.invalid/repo",
+                GitError::NetworkError(detail),
+            );
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                ["check the remote host, DNS, VPN/proxy, and network connectivity"]
+            );
+        }
+        for (signal, message, guidance) in [
+            (
+                SSH_HOST_KEY_UNCONFIRMED_SIGNAL,
+                "SSH host key could not be verified",
+                SSH_HOST_KEY_GUIDANCE,
+            ),
+            (
+                SSH_HOST_KEY_CHANGED_SIGNAL,
+                "SSH host identity has changed",
+                SSH_HOST_KEY_CHANGED_GUIDANCE,
+            ),
+        ] {
+            let error = discovery_boundary(
+                Boundary::CloneDiscovery,
+                "ssh://example.invalid/repo",
+                GitError::NetworkError(format!("{signal}{message}; MATRIX_HOST_SENTINEL")),
+            );
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.exit_code(), 128);
+            assert_eq!(error.message(), message);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [guidance]
+            );
+            assert!(error.hints()[0].as_str().contains("~/.ssh/known_hosts"));
+            for rendered in [error.render(), error.render_report(), error.render_json()] {
+                assert!(!rendered.contains(signal));
+                assert!(!rendered.contains("MATRIX_HOST_SENTINEL"));
+            }
+        }
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_clone_fetch_phase_stays_net_001() {
+        non_marker_cases(&[Boundary::CloneObjects, Boundary::ClonePacket], "origin");
+        let error = CliError::from(CloneError::FetchFailed {
+            source: FetchError::IncompletePack { received: 3 },
+        });
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+        assert_eq!(
+            error
+                .hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            ["network error during transfer; check connectivity and retry"]
+        );
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_fetch_objects_stays_net_001() {
+        non_marker_cases(&[Boundary::FetchObjects], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_pull_discovery_stays_net_001() {
+        non_marker_cases(&[Boundary::PullDiscovery], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_non_marker_pull_fetch_objects_stays_net_001() {
+        non_marker_cases(&[Boundary::PullObjects], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_parametrized_git_marker_maps_net_002() {
+        marker_cases(&ALL, "git://example.invalid/repo");
+    }
+    #[test]
+    fn pkt_line_matrix_parametrized_git_non_marker_stays_net_001() {
+        non_marker_cases(&ALL, "git://example.invalid/repo");
+    }
+    #[test]
+    fn pkt_line_matrix_parametrized_ssh_marker_maps_net_002() {
+        marker_cases(&ALL, "ssh://git@example.invalid/repo");
+    }
+    #[test]
+    fn pkt_line_matrix_parametrized_ssh_non_marker_stays_net_001() {
+        non_marker_cases(&ALL, "ssh://git@example.invalid/repo");
+    }
+    #[test]
+    fn pkt_line_matrix_parametrized_https_non_marker_stays_net_001() {
+        non_marker_cases(&ALL, "https://example.invalid/repo");
+        // A marker in the displayed remote must never override a non-marker inner error.
+        non_marker_cases(
+            &ALL,
+            &format!("https://example.invalid/{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout"),
+        );
+    }
+    #[test]
+    fn pkt_line_matrix_fetch_packet_read_non_marker_io_stays_net_001() {
+        non_marker_cases(&[Boundary::FetchPacket], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_pull_packet_read_non_marker_io_stays_net_001() {
+        non_marker_cases(&[Boundary::PullPacket], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_fetch_packet_read_marker_maps_net_002() {
+        marker_cases(&[Boundary::FetchPacket], "origin");
+    }
+    #[test]
+    fn pkt_line_matrix_pull_packet_read_marker_maps_net_002() {
+        marker_cases(&[Boundary::PullPacket], "origin");
+    }
+
+    #[test]
+    fn pkt_line_matrix_zero_echo_sentinel() {
+        const SENTINEL: &str = "REMOTE_BOUNDARY_SECRET_7c41";
+        for boundary in ALL {
+            for header in [b"SECR".as_slice(), b"\xff000", b"0001", b"ffff"] {
+                let wire = [header, SENTINEL.as_bytes()].concat();
+                let error = parser_error(boundary, "https://example.invalid/repo", &wire);
+                assert_protocol(boundary, &error);
+                for rendered in [error.render(), error.render_report(), error.render_json()] {
+                    assert!(!rendered.contains(SENTINEL), "{boundary:?}: {rendered}");
+                    assert!(!rendered.contains("SECR"), "{boundary:?}: {rendered}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pkt_line_matrix_marker_constant_single_source() {
+        let forbidden = ["pkt-line", " protocol error: \""].concat();
+        for source in [
+            include_str!("ls_remote.rs"),
+            include_str!("clone.rs"),
+            include_str!("fetch.rs"),
+            include_str!("pull.rs"),
+        ] {
+            assert!(source.contains("PKT_LINE_PROTOCOL_ERROR_PREFIX"));
+            assert!(
+                !source.contains(&forbidden),
+                "mapper duplicates marker literal"
+            );
+        }
+        #[derive(Debug)]
+        struct Chunked {
+            text: String,
+            suffix_formatted: Arc<AtomicBool>,
+        }
+        impl fmt::Display for Chunked {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                for ch in self.text.chars() {
+                    write!(f, "{ch}")?;
+                }
+                self.suffix_formatted.store(true, Ordering::SeqCst);
+                f.write_str("never needed by the prefix classifier")
+            }
+        }
+        impl std::error::Error for Chunked {}
+        for (text, expected) in [
+            (PKT_LINE_PROTOCOL_ERROR_PREFIX.to_string(), true),
+            (format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}"), false),
+            (format!("é{PKT_LINE_PROTOCOL_ERROR_PREFIX}"), false),
+            (PKT_LINE_PROTOCOL_ERROR_PREFIX[..8].to_string(), false),
+        ] {
+            let suffix = Arc::new(AtomicBool::new(false));
+            let error = io::Error::other(Chunked {
+                text: text.clone(),
+                suffix_formatted: suffix.clone(),
+            });
+            assert_eq!(fetch::is_pkt_line_io_error(&error), expected, "{text:?}");
+            if expected || text.starts_with(' ') || text.starts_with('é') {
+                assert!(!suffix.load(Ordering::SeqCst));
+            }
+        }
+        assert!(!fetch::is_pkt_line_io_error(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+    }
+
+    // HTTP is routed through the production HttpsClient. This tests Git protocol
+    // framing and command adapters, not TLS negotiation or certificate validation.
+    // Both command-path tests use two runtime workers: synchronous timeout-config
+    // lookups must leave the cached SQL pool and HTTP server able to make progress.
+    const OID: &str = "1111111111111111111111111111111111111111";
+    #[derive(Clone, Copy)]
+    enum ResponseMode {
+        EmptyAdvertisement,
+        MalformedFetch,
+    }
+    type Transcript = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+    #[derive(Clone)]
+    struct ServerState {
+        mode: ResponseMode,
+        transcript: Transcript,
+    }
+    struct TestServer {
+        url: String,
+        transcript: Transcript,
+        task: JoinHandle<()>,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            self.task.abort();
+        }
+    }
+
+    async fn respond(State(state): State<ServerState>, request: Request<Body>) -> Response {
+        let method = request.method().to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .expect("mock URI")
+            .to_string();
+        let body = to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .expect("bounded mock request");
+        state
+            .transcript
+            .lock()
+            .unwrap()
+            .push((method.clone(), path.clone(), body.to_vec()));
+        let (content_type, response) = if method == "GET"
+            && path == "/repo/info/refs?service=git-upload-pack"
+        {
+            let mut bytes = bytes::BytesMut::new();
+            if matches!(state.mode, ResponseMode::MalformedFetch) {
+                add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+                bytes.extend_from_slice(b"0000");
+                add_pkt_line_string(
+                    &mut bytes,
+                    format!(
+                        "{OID} HEAD\0multi_ack_detailed side-band-64k ofs-delta symref=HEAD:refs/heads/main object-format=sha1\n"
+                    ),
+                );
+                add_pkt_line_string(&mut bytes, format!("{OID} refs/heads/main\n"));
+                bytes.extend_from_slice(b"0000");
+            }
+            (
+                "application/x-git-upload-pack-advertisement",
+                bytes.to_vec(),
+            )
+        } else if method == "POST" && path == "/repo/git-upload-pack" {
+            (
+                "application/x-git-upload-pack-result",
+                b"0008NAK\n0001REMOTE_BOUNDARY_SECRET_7c41".to_vec(),
+            )
+        } else {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .body(Body::from(response))
+            .unwrap()
+    }
+
+    impl TestServer {
+        async fn start(mode: ResponseMode) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let transcript = Arc::new(Mutex::new(Vec::new()));
+            let state = ServerState {
+                mode,
+                transcript: transcript.clone(),
+            };
+            let app = Router::new().fallback(respond).with_state(state);
+            let (shutdown, shutdown_requested) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_requested.await;
+                    })
+                    .await
+                    .expect("mock server should remain healthy");
+            });
+            Self {
+                url: format!("http://{address}/repo/"),
+                transcript,
+                task,
+                shutdown: Some(shutdown),
+            }
+        }
+        fn requests(&self) -> Vec<(String, String, Vec<u8>)> {
+            self.transcript.lock().unwrap().clone()
+        }
+        async fn stop(&mut self) {
+            self.shutdown
+                .take()
+                .expect("mock stopped once")
+                .send(())
+                .expect("mock still running");
+            tokio::time::timeout(Duration::from_secs(5), &mut self.task)
+                .await
+                .expect("mock shutdown bounded")
+                .expect("mock shutdown succeeds");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(env, cwd, hash_kind)]
+    async fn pkt_line_matrix_parametrized_https_marker_maps_net_002() {
+        marker_cases(&ALL, "https://example.invalid/repo");
+        let parent = tempdir().unwrap();
+        setup_with_new_libra_in(parent.path()).await;
+        let _cwd = ChangeDirGuard::new(parent.path());
+        let mut server = TestServer::start(ResponseMode::MalformedFetch).await;
+        let destination = parent.path().join("clone-target");
+        let args = CloneArgs::try_parse_from([
+            "clone",
+            server.url.as_str(),
+            destination.to_str().unwrap(),
+        ])
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(45),
+            clone::execute_safe(args, &OutputConfig::default()),
+        )
+        .await
+        .expect("clone bounded")
+        .expect_err("bad fetch frame must fail");
+        assert_protocol(Boundary::ClonePacket, &error);
+        assert!(
+            error.message().contains("failed to read fetch stream"),
+            "{error:?}"
+        );
+        assert!(
+            !error
+                .render_report()
+                .contains("REMOTE_BOUNDARY_SECRET_7c41")
+        );
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.0 == "GET" && r.1 == "/repo/info/refs?service=git-upload-pack")
+                .count(),
+            2,
+            "{requests:?}"
+        );
+        let posts = requests
+            .iter()
+            .filter(|r| r.0 == "POST" && r.1 == "/repo/git-upload-pack")
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 1, "{requests:?}");
+        assert!(String::from_utf8_lossy(&posts[0].2).contains(&format!("want {OID}")));
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(env, cwd, hash_kind)]
+    async fn pkt_line_discovery_empty_response_regression_fetch_clone_lsremote_pull() {
+        let mut server = TestServer::start(ResponseMode::EmptyAdvertisement).await;
+        for command in ["fetch", "clone", "ls-remote", "pull"] {
+            let repo = tempdir().unwrap();
+            setup_with_new_libra_in(repo.path()).await;
+            let _cwd = ChangeDirGuard::new(repo.path());
+            if matches!(command, "fetch" | "pull") {
+                ConfigKv::set("remote.origin.url", &server.url, false)
+                    .await
+                    .unwrap();
+            }
+            let output = OutputConfig::default();
+            let destination = repo.path().join("clone-target");
+            let before = server.requests().len();
+            let error = tokio::time::timeout(Duration::from_secs(45), async {
+                match command {
+                    "fetch" => fetch::execute_safe(
+                        FetchArgs::try_parse_from(["fetch", "origin"]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "clone" => clone::execute_safe(
+                        CloneArgs::try_parse_from([
+                            "clone",
+                            server.url.as_str(),
+                            destination.to_str().unwrap(),
+                        ])
+                        .unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "ls-remote" => super::execute_safe(
+                        LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "pull" => pull::execute_safe(
+                        PullArgs::try_parse_from(["pull", "--ff-only", "origin", "main"]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect("empty advertisement command must terminate");
+            assert_eq!(
+                error.stable_code(),
+                StableErrorCode::NetworkProtocol,
+                "{command}: {error:?}"
+            );
+            assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+            assert!(
+                error.message().contains(&format!(
+                    "{PKT_LINE_PROTOCOL_ERROR_PREFIX}empty discovery response"
+                )),
+                "{command}: {error:?}"
+            );
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [PROTOCOL_HINT]
+            );
+            if command == "pull" {
+                assert_eq!(
+                    error.details().get("phase"),
+                    Some(&serde_json::json!("fetch"))
+                );
+            }
+            let requests = server.requests();
+            assert_eq!(requests.len(), before + 1, "{command}: {requests:?}");
+            assert_eq!(
+                (&requests[before].0[..], &requests[before].1[..]),
+                ("GET", "/repo/info/refs?service=git-upload-pack")
+            );
+        }
+        server.stop().await;
+    }
 }

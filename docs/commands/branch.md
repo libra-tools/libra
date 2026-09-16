@@ -55,7 +55,7 @@ The `--contains` and `--no-contains` filters (aliased as `--with` and `--without
 | | `--format` | `<format>` | Render each branch with a for-each-ref format string (e.g. `%(refname:short)`, `%(objectname)`, `%(HEAD)`, `%(upstream)`, `%(if)`…`%(end)`). Replaces the default `* name` listing (and `-v`/`--column`); shares the for-each-ref atom engine |
 | | `--column[=<mode>]` | `always` / `auto` / `never` | Lay the branch list out in columns instead of one per line (bare `--column` means `always`; `auto` only when stdout is a terminal). Column mode shows plain, uncolored names. |
 | | `--no-column` | | Do not lay the branch list out in columns (equivalent to `--column=never`), countermanding an earlier `--column` (last one wins). Branches list one-per-line by default, so on its own this is a no-op. |
-| `-v` | `--verbose` | | List each branch with its tip's short sha and commit subject. Repeat (`-vv`) to also show the upstream-tracking segment `[<upstream>: ahead N, behind M]` (counts omitted when the remote-tracking ref has not been fetched; nothing shown for a branch with no configured upstream). Takes precedence over `--column`. |
+| `-v` | `--verbose` | | List each branch with its tip's short sha and commit subject. Repeat (`-vv`) to also show the upstream-tracking segment `[<upstream>: ahead N, behind M]` (the same counts `status` reports; they are omitted when the remote-tracking ref has not been fetched, or when the counts cannot be computed — the latter with a warning; nothing shown for a branch with no configured upstream). Takes precedence over `--column`. |
 
 ### Flag examples
 

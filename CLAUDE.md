@@ -267,7 +267,7 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 - `LIBRA_HOME` — per-user Libra state directory (installer default `~/.libra`; any non-empty value is accepted, but use an absolute path — the upgrade install-directory lock rejects relative paths; holds `upgrade/settings.json` and upgrade state)
 - `LIBRA_CONFIG_GLOBAL_DB` / `LIBRA_CONFIG_SYSTEM_DB` — override the global (`~/.libra/config.db`) / system (`/etc/libra/config.db`) config SQLite path (`LIBRA_CONFIG_GLOBAL_DB` also redirects upgrade state for test isolation)
 - `LIBRA_COMMITTER_NAME` / `LIBRA_COMMITTER_EMAIL` — committer identity overrides (consulted after `GIT_COMMITTER_NAME` / `GIT_AUTHOR_NAME` and `GIT_COMMITTER_EMAIL` / `GIT_AUTHOR_EMAIL` / `EMAIL`)
-- `LIBRA_SSH_COMMAND` — ssh binary used for the SSH transport (default `ssh`); `LIBRA_SSH_STRICT_HOST_KEY_CHECKING` (or the `ssh.strictHostKeyChecking` config key) — host-key mode `ask` (default: no `StrictHostKeyChecking` option is passed, so `~/.ssh/config` and the OpenSSH TOFU prompt govern) / `yes` / `accept-new` / `no`. When stdin is not a TTY libra adds `BatchMode=yes`, so headless agents and CI must use `accept-new` or pre-seed `known_hosts`
+- `LIBRA_SSH_COMMAND` — ssh binary used for the SSH transport (default `ssh`); `LIBRA_SSH_STRICT_HOST_KEY_CHECKING` (or `ssh.strictHostKeyChecking`) accepts `ask` / `yes` / `accept-new` / `no`. `ask` omits that SSH option so `~/.ssh/config` governs the host-key policy. Libra always passes `BatchMode=yes`, including with terminal stdin: load or unlock encrypted keys in `ssh-agent`, and verify host fingerprints through a trusted channel before updating `known_hosts` or accepting a separate interactive SSH connection. A changed-key warning remains distinct and requires verification before replacing an existing entry. SSH stderr is captured with bounded retention; see `docs/commands/config.md`.
 - `LIBRA_NO_HOOKS` — set to `1`/`true`/`yes`/`on` to skip repository hooks under `.libra/hooks`; hook processes receive `LIBRA_HOOK_NAME`, `LIBRA_DIR`, `LIBRA_COMMON_DIR`, `LIBRA_HOOK_SOURCE`, `LIBRA_WORK_TREE` (`docs/commands/repository-hooks.md`)
 - `LIBRA_CODE_LEASE_DURATION_MS` — `libra code` automation lease length; `LIBRA_CODE_SESSION_WRITE_RATE_LIMIT` / `LIBRA_CODE_SESSION_WRITE_RATE_WINDOW_SECS` — Code UI per-session write rate limit (default 120 writes / 60 s)
 - `LIBRA_SANDBOX_ENFORCEMENT`, `LIBRA_SANDBOX_NETWORK_DISABLED`, `LIBRA_LINUX_SANDBOX_EXE`, `LIBRA_USE_LINUX_SANDBOX_BWRAP`, `LIBRA_BWRAP_BINARY` (absolute path override for `bwrap`), `LIBRA_SECCOMP_POLICY` (path to a precompiled seccomp BPF policy; unset → `~/.libra/seccomp.bpf`, auto-compiled from the bundled template on Linux when missing; an empty value disables seccomp — `docs/sandbox-seccomp.md`) — sandbox toggles (`docs/development/commands/sandbox.md`, `docs/development/tracing/sandbox.md`)
@@ -293,3 +293,24 @@ here so contributors do not waste time trying to set them at runtime:
 - `LIBRA_RUN_LIVE_AGENT_GATE=1` — `test-live-agent` gate (`agent_live_gate_test`; real local `claude` / `codex` / `opencode` stores); `LIBRA_RUN_LOCAL_AGENTS=1` — Wave 7 `agent_local_capture_smoke_test` (drives real local agent sessions; tuned by `LIBRA_LOCAL_AGENT_SET`)
 - `LIBRA_RUN_PERF=1` — Wave 6 `code_ui_perf_smoke_test` / SSE soak gate (`--features test-provider`; tuned by `LIBRA_PERF_CEILING_MS`, `LIBRA_SSE_SOAK_SECS`); `LIBRA_RUN_LIVE=1` — model-generation matrix live gate; `LIBRA_AI_LIVE_OLLAMA=1` + `OLLAMA_HOST` — `ai_ollama_live_gate_test`
 - `LIBRA_TEST_HOME` — test-only home-directory override; `LIBRA_TEST_LOG=1` (or `RUST_LOG`) — opt-in tracing output from the shared test helpers in `src/utils/test.rs` (quiet by default); `LIBRA_TEST=1` — test sentinel read by the binary (pager, maintenance lock, operation wrapper, `am` failpoints, debug-only `stash` / `status` seams, `test-upgrade` trust-root injection)
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

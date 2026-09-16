@@ -90,6 +90,7 @@ cargo test --test ai_agent_test -- --test-threads=1
 | Config 输入、密钥与兼容入口 | `--stdin`、`--encrypt`、`--plaintext`、`--import`、`path`、`edit`、Git 兼容隐藏 flag、SSH/GPG key 生成 | 1 | 已实现 | `cli.config-set-input-and-encryption`, `cli.config-get-default-and-patterns`, `cli.config-list-variants`, `cli.config-import-path-edit`, `cli.config-key-generation`, `cli.config-git-compat-mode` |
 | Init 参数矩阵 | 普通仓库、目标目录、quiet、初始分支、object/ref format、bare/shared、template、from-git、vault | 1 | 已实现 | `cli.init-basic`, `cli.init-directory-and-quiet`, `cli.init-branch-and-format-options`, `cli.init-bare-and-shared`, `cli.init-template`, `cli.init-from-git-repository`, `cli.init-vault` |
 | Core 写入闭环 | `status`、`add`、`commit`、`log`、message source、amend、dry-run、porcelain v2、rename/typechange；commit hook 顺序/消息修改/caller-env 隔离/逃逸阀/沙箱边界 | 1 | 已实现 | Runner: `cli.commit-status-log`; Cargo: `compat_libra_hooks_lifecycle` |
+| log 消息筛选 | `log --grep` 仅查询subject/body/trailer，排除committer后首个gpgsig/gpgsig-sha256的PGP/SSH签名头且保留真实消息前导空白；大小写/invert与human/JSON/machine一致 | 1 | Cargo-only，隔离真实CLI fixture；非runner场景新增覆盖 | Cargo: `command_test::command::log_test::log_grep_signed_commit_uses_message_only`；lib: `command::log::tests::log_grep_ignores_embedded_signature_headers` |
 | 分支与工作区切换 | `branch`、`switch`、`checkout`、detach、path checkout、远端分支可见性、`switch --guess`/`--no-guess` DWIM、worktree-scoped `switch -`/`checkout -` 分支与 detached previous-target 切换及 fail-closed 缺失/删除来源、未支持 switch flag 的负向路径、符号引用行为；`post-checkout` argv/show-current/already-on/逃逸阀 | 1 | 已实现 | Runner: `cli.branch-switch-checkout`; Cargo: `compat_previous_branch_shortcut`, `compat_libra_hooks_lifecycle` |
 | 工作区恢复与差异 | `diff`（含 P1-08a raw/compact/filter/full-index/prefix review metadata、P1-08b `-S`/`-G` pickaxe，以及 P1-08c bare/regex-valued `--color-words`、`--word-diff-regex`、Myers/MyersMinimal/Patience/Histogram/Anchored 与算法简写）、`restore`（含真实 `--overlay`/`--no-overlay` 切换）、`reset` 的五种模式（P1-07c `--merge`/`--keep` 的精确保留/拒绝/回滚矩阵在 Cargo compat），以及 restore/reset `--pathspec-from-file` 缺失文件、无效 algorithm/`-G` regex 和无效 word regex 的负向路径 | 1 | 已实现 | Runner: `cli.restore-reset-diff`; Cargo: `command_test::test_diff_algorithms`, `command_test::test_diff_word_diff_modes`, `compat_diff_review_options`, `ai_libra_vcs_safety_test`, `compat_noninteractive_history_controls` |
 | 工作流命令 | `stash`、`bisect`、`worktree` 当前参数面及未支持 Git 参数的负向路径 | 1 | 已实现 | `cli.stash-bisect-worktree` |
@@ -100,10 +101,45 @@ cargo test --test ai_agent_test -- --test-threads=1
 | 文件级命令与 LFS 本地能力 | `clean`、`rm`、`mv`、`lfs track/untrack/ls-files`、本地 lock 负向路径 | 1 | 已实现 | `cli.clean-rm-mv-lfs-basic` |
 | 其他 CLI 外壳能力 | `open`、root `--json/-J`、`--machine`、`--quiet`、颜色/progress/exit-code-on-warning | 1 | 已实现 | `cli.open-smoke`, `cli.cross-cutting-flags` |
 | 安装器短别名 | IX-01 默认相对 `lba -> libra`、same-version 缺失修复/幂等、`--no-alias`/`LIBRA_NO_ALIAS=1`、既有 regular/foreign symlink 保护、无 symlink 能力回退 | 1 | 已实现（Cargo 驱动 POSIX 完整 installer smoke） | Cargo: `compat_install_alias` |
+| pkt-line 命令错误边界 | fetch/clone/ls-remote/pull 的 marker 协议错误与普通 IO/网络错误归类；真实空 HTTP advertisement 四命令路径和 clone discovery→fetch POST | 1 | Cargo library 场景已实现；执行证据见 plan-20260901.md PKT-10 | Cargo library: `command::ls_remote::pkt_line_boundary_tests`（25 项；非 cli.* runner scenario） |
+| push receive-pack 状态报告 | 未识别状态行、畸形/截断帧、状态报告缺flush（含空响应及unpack/ng拒绝）、固定诊断及本地tracking引用保持 | 1 | Cargo library场景；实际验收见plan-20260901.md PKT-09 | Cargo library: `command::push::test` 中4个PKT-09具名门（非cli.* runner scenario） |
+| Git/SSH advertisement 读取边界 | 双客户端长度下界/flush/空payload/上限/标头与payload EOF及普通IO/超时分类；真实TCP Git取对象广告与fetch/clone/pull错误转换 | 1 | Cargo library场景；完整命令与SSH清理仍未验证 | Cargo library: `pkt_line_client_` 十个PKT-08具名门（非cli.* runner scenario） |
 | Schema 与本地协议 | schema 建链自动升级、local clone/remote/ls-remote/fetch/pull（含 refspec 精确映射、remotes.default、rename namespace、symref、pull-rebase hook/JSON child 隔离）、shallow fetch、拒绝 file remote push | 2 | 已实现 | Runner: `cli.schema-upgrade-observable`, `cli.clone-fetch-pull-local`, `cli.fetch-depth-local`, `cli.push-local-file-remote-rejected`; Cargo: `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history` |
 | 对象读取与树遍历 | `rev-parse`、`show-ref` / `show-ref --branches` / `show-ref --no-branches` / `show-ref --no-tags` / `show-ref --hash[=<n>]` / `show-ref --no-hash` / `show-ref --abbrev[=<n>]` / `show-ref --no-abbrev` / `show-ref --dereference` / `show-ref --no-dereference` / `show-ref --verify` / `show-ref --no-verify` / `show-ref --exists` / `show-ref --no-exists` / `show-ref --head` / `show-ref --no-head` / `show-ref --exclude-existing[=<pattern>]`、`for-each-ref --points-at`、`cat-file`、`hash-object --stdin` / `--path` / `--no-filters`、`show`、`rev-list` / multi revision / `A..B` / `^A` / `A...B` / `rev-list --count` / `rev-list -n` / `rev-list --skip` / `rev-list --since` / `rev-list --after` / `rev-list --until` / `rev-list --before` / `rev-list --merges` / `rev-list --no-merges` / `rev-list --min-parents` / `rev-list --max-parents` / `rev-list --no-min-parents` / `rev-list --no-max-parents` / `rev-list --first-parent` / `rev-list --author` / `rev-list --committer` / `rev-list --grep` / `rev-list -- <path>` / `rev-list --left-right` / `rev-list --left-only` / `rev-list --right-only` / `rev-list --cherry-pick` / `rev-list --cherry-mark` / `rev-list --cherry` / `rev-list --parents` / `rev-list --children` / `rev-list --timestamp`、`fsck`、sha256 object format；`ls-tree` 默认/递归/子目录/`--full-name`/`--full-tree` 路径场景 | 2 | 已实现 | `cli.object-readback`, `cli.show-ref-exclude-existing`, `cli.ls-tree-smoke`, `cli.sha256-object-readback` |
 | 维护命令 | `gc`、`prune`、`archive`（tar/zip、`--prefix`、`--output`、`--list`、`TREEISH <path>...` pathspec）、`verify-pack <idx>...` / `verify-pack --pack` / `verify-pack -v` / `verify-pack -s`、内部 `index-pack --stdin` / `--keep` / `--progress` / `--no-progress` fixture | 2 | 已实现 | `cli.gc-smoke`, `cli.archive-smoke`, `cli.verify-pack-smoke` |
 | GitHub live remote | `gh` 创建/清理私有临时 repo、`push` refspec/tag/delete/force/mirror、真实 clone/fetch/pull | 3 | 已实现，需显式 live gate | `live.github-create-push-clone-fetch` |
+
+
+PKT-10 的 pkt-line 边界场景使用默认 Cargo library 测试：
+`cargo test --lib command::ls_remote::pkt_line_boundary_tests`。
+模块包含 25 个具名门；其中
+`pkt_line_discovery_empty_response_regression_fetch_clone_lsremote_pull`
+通过各命令实际 `execute_safe` 路径核对空 advertisement 的 GET、`LBR-NET-002`、
+exit 128、提示及 pull 的 fetch phase；
+`pkt_line_matrix_parametrized_https_marker_maps_net_002`
+核对 clone 两次 discovery GET 和带 wanted OID 的 fetch POST。
+本地 HTTP fixture 运行生产 HttpsClient，不宣称覆盖 TLS 握手或证书验证；
+git/ssh/https URL carrier 矩阵只验证 mapper。原始 Git/SSH framing 与严格异步
+header grammar 属于 PKT-08/13。fixture 使用临时仓库、env/cwd/hash_kind 锁、
+有界请求/等待与 server shutdown；无新增 feature gate 或 live remote。
+这些库测试不是 integration-runner 的新 cli.* 场景，完整运行及发布证据保存在
+`plan-20260901.md` 对应任务卡；文档映射检查为
+
+```bash
+cargo test --test compat_matrix_alignment
+```
+
+PKT-09 的状态报告回归使用既有 Cargo library 入口：
+
+```bash
+cargo test --lib pkt_line_push_
+cargo test --lib validate_receive_pack_response
+```
+
+其中4个新增具名门登记于 plan-20260901.md PKT-09；真实push fixture经本地HTTP
+完成receive-pack discovery和delete-only POST，核对畸形/截断响应返回LBR-NET-002
+及本地tracking ref不变。测试不宣称TLS、SSH或真实远端回滚覆盖；YAML notes同步
+Cargo-only范围，没有新增cli.* runner场景。
 
 **剩余覆盖缺口**：默认本地 wave 已覆盖当前 runner 注册的 `cli.*` 场景；需要真实 GitHub 远端的 `live.*` 场景不进入默认阻断门，只能在具备 `gh` 登录态和仓库创建/删除权限时运行。新增或修改 Git 兼容命令时，必须把对应场景加入本表、YAML、场景文档和 runner registry；如果当前 runner 尚未实现，必须在 YAML 和文档中保留明确的未实现状态，而不能只在本表声明覆盖。
 
@@ -589,3 +625,87 @@ CI 在 Wave 0 调用此脚本，失败即阻断 PR。
 3. 未实现能力必须用 `BASELINE_GAP-*` 标记，不允许写成默认可执行步骤。
 4. 若引入新的 live gate 环境变量，必须同步更新 `.env.test.example`、本计划 Wave 说明、`compat_matrix_alignment` 的 env 规则（如需）。
 5. 修改 §3.3 Path → Wave 映射，须同步更新 `tools/integration-runner/config/path-wave-map.toml`（如已落地）。
+
+### PKT-12 SSH advertisement error gates (Cargo-only)
+
+The eleven `pkt_line_client_` PKT-12 library gates cover shared inner/outer error
+formatting, native non-zero SSH exits with fixed status/guidance, successful/failed
+output collection, preservation of collected output when cleanup fails, and real
+ordinary-error child reaping. PKT-11 captures stderr for terminal and
+non-terminal callers, so the real-command gate no longer requires non-terminal
+stdin. The original PKT-12 prerequisite remains historical run evidence only.
+Unix child gates include fifty malformed-frame command cases and five native
+exit-255/empty-advertisement cases across ls-remote/fetch/clone/pull/push. The
+existing `transport_timeout_uses_push_idle_timeout` gate covers push classifier
+priority and ordinary errors. These are Cargo-only cases, not new cli.* runner
+scenarios. Actual run evidence belongs in plan-20260901.md; Unix process tests do
+not claim Windows execution coverage.
+
+### PKT-12 existing SSH host-key CLI cases
+
+`command_test::command::fetch_test::test_fetch_ssh_host_key_failure_is_reported`
+and `command_test::command::push_test::test_push_ssh_host_key_failure_is_reported`
+retain their names and serial lanes. Each runs the real CLI in human, JSON and
+machine modes. Under PKT-11 these cases pin exit 128 / `LBR-NET-001`, fixed
+host-verification guidance, and no raw host-key stderr in either output stream.
+Their complete network-hint vectors differ: fetch checks network connectivity;
+push checks the remote URL and network connectivity. Push also verifies no remote
+ref was created. The earlier PKT-12 NET002/incomplete-header/SSH255 and protocol
+hint expectations, including the rejected wrong-hint assertion and corrected
+rerun, remain historical evidence in plan-20260901.md. These are local fake-SSH
+CLI tests, with current source and execution acceptance recorded separately.
+
+## SSH capture validation scope
+
+The twelve named PKT-11 library gates retain the original plan names. They cover
+fixed diagnostics and metadata-only tracing, both service argument lists, three
+non-zero-exit paths, malformed-advertisement cleanup and all six capture paths
+under stderr floods. The flood gate also covers retained-prefix/full-stream
+digest accounting, collector cancellation, and oversized advertisement and push
+response rejection through actual clone/delete-only push commands, NET001, distinct
+network hints, decoded JSON and unchanged local tracking refs. The host-trust gate
+uses a current-thread runtime without a yield after setup; timeout precedence is
+also checked immediately after config writes. Both exercise asynchronous transport
+configuration without a blocking nested-runtime join. The host-trust gate covers native exit 255, typed primary
+error preservation through a secondary cleanup warning, the internal discovery
+carrier and an actual local fake-SSH clone command. Existing fetch/push CLI cases
+retain their names and test human, JSON and machine output plus remote-ref safety.
+The terminal gate uses a real local PTY. The passphrase gate creates an encrypted
+local key without an agent and exercises a simulated SSH failure; it does not
+claim live OpenSSH network authentication. Actual run IDs and results belong in
+plan-20260901.md after execution; the existence of these tests is not acceptance.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

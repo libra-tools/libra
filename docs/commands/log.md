@@ -211,6 +211,14 @@ Filter commits by message. `--grep` keeps commits whose message contains the
 case-insensitive (author/committer matching is already case-insensitive in
 Libra). `--invert-grep` keeps commits whose message does *not* match.
 
+The search covers the commit subject, body, and trailers. PGP or SSH signatures in
+a `gpgsig` or `gpgsig-sha256` header immediately after `committer` are excluded, including with `-i` and `--invert-grep`; text in
+the actual message remains searchable. This applies to human, `--json`, and
+`--machine` output. An empty `--grep` pattern leaves message filtering disabled.
+Leading spaces, tabs, and blank lines in the actual message remain searchable.
+Other imported header layouts (such as `encoding` before `gpgsig`) retain the
+existing parsing behavior.
+
 ```bash
 libra log --grep "fix(" -n 20
 libra log --grep fix -i              # case-insensitive

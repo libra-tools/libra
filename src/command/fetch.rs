@@ -12,6 +12,7 @@ use std::{
 };
 
 use clap::Parser;
+use futures_util::FutureExt;
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind},
@@ -22,7 +23,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionError,
 };
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -33,7 +34,11 @@ use crate::{
             RemotePruneEntry, classify_stale_tracking_branches, remote_advertised_branch_names,
         },
     },
-    git_protocol::ServiceType::{self, UploadPack},
+    git_protocol::{
+        PKT_LINE_PROTOCOL_ERROR_PREFIX, PktLineError,
+        ServiceType::{self, UploadPack},
+        pkt_frame_payload_len,
+    },
     internal::{
         branch::Branch,
         config::{ConfigKv, ConfigKvEntry, RemoteConfig},
@@ -87,10 +92,13 @@ impl RemoteClient {
     /// Create a `RemoteClient` from a URL spec, optionally providing the
     /// logical remote name so that vault-backed SSH keys can be resolved
     /// via `vault.ssh.<remote>.privkey`.
-    pub(crate) fn from_spec_with_remote(spec: &str, remote: Option<&str>) -> Result<Self, String> {
+    pub(crate) async fn from_spec_with_remote(
+        spec: &str,
+        remote: Option<&str>,
+    ) -> Result<Self, String> {
         // Check for SSH-style URLs first (before Url::parse which doesn't handle SCP-style)
         if is_ssh_spec(spec) {
-            let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote)?;
+            let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
             return Ok(Self::Ssh(client));
         }
 
@@ -117,7 +125,8 @@ impl RemoteClient {
                     Ok(Self::Git(GitClient::from_url(&url)))
                 }
                 "ssh" => {
-                    let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote)?;
+                    let client =
+                        configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
                     Ok(Self::Ssh(client))
                 }
                 other => Err(format!("unsupported remote scheme '{other}'")),
@@ -155,7 +164,10 @@ impl RemoteClient {
 
     /// Apply the connect/idle timeouts resolved from the environment, config, and
     /// built-in defaults for this remote. A no-op for local remotes.
-    pub(crate) fn with_resolved_fetch_timeouts(self, remote: Option<&str>) -> Result<Self, String> {
+    pub(crate) async fn with_resolved_fetch_timeouts(
+        self,
+        remote: Option<&str>,
+    ) -> Result<Self, String> {
         let is_local = matches!(self, Self::Local(_));
         if is_local {
             return Ok(self);
@@ -165,19 +177,22 @@ impl RemoteClient {
             "connectTimeout",
             "LIBRA_FETCH_CONNECT_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let idle = resolve_fetch_timeout(
             remote,
             "idleTimeout",
             "LIBRA_FETCH_IDLE_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let first_byte = resolve_fetch_timeout(
             remote,
             "firstByteTimeout",
             "LIBRA_FETCH_FIRST_BYTE_TIMEOUT_MS",
             Duration::from_secs(DEFAULT_FIRST_BYTE_TIMEOUT_SECS),
-        );
+        )
+        .await;
         let client = self.with_network_timeouts(connect, idle)?;
         // The first-byte timeout only applies to the git:// path today; http/ssh
         // bound the first response through their own read timeouts.
@@ -217,11 +232,14 @@ impl RemoteClient {
 
 const SSH_KEY_TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<SshClient, String> {
+async fn configure_ssh_client(
+    mut client: SshClient,
+    remote: Option<&str>,
+) -> Result<SshClient, String> {
     if let Err(error) = cleanup_expired_vault_ssh_temp_files() {
         tracing::warn!("failed to clean up expired SSH key temp files: {error}");
     }
-    if let Some(mode) = load_ssh_host_key_checking_mode() {
+    if let Some(mode) = load_ssh_host_key_checking_mode().await {
         client = client.with_strict_host_key_checking(mode)?;
     }
     // Try to load vault SSH key for authentication.
@@ -229,9 +247,9 @@ fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<S
     // 1. vault.ssh.<remote>.privkey (vault-encrypted, decrypted to temp file)
     // 2. Legacy filesystem path ~/.libra/ssh-keys/<repo-id>/id_ed25519
     // 3. No explicit key (fall back to system default SSH agent/keys)
-    if let Some(key_file) = try_load_vault_ssh_key_for_remote(remote)? {
+    if let Some(key_file) = try_load_vault_ssh_key_for_remote(remote).await? {
         client = client.with_temp_key_file(key_file);
-    } else if let Some(key_path) = try_load_legacy_ssh_key_path() {
+    } else if let Some(key_path) = try_load_legacy_ssh_key_path().await {
         client = client.with_key_path(key_path);
     }
     Ok(client)
@@ -243,7 +261,7 @@ fn configure_ssh_client(mut client: SshClient, remote: Option<&str>) -> Result<S
 /// to a secure temporary file, and keeps that file alive for the lifetime
 /// of the SSH client. On abnormal process termination, the 24h GC pass will
 /// clean up stale `.tmp` files under `~/.libra/tmp/`.
-fn try_load_vault_ssh_key_for_remote(
+async fn try_load_vault_ssh_key_for_remote(
     remote: Option<&str>,
 ) -> Result<Option<tempfile::NamedTempFile>, String> {
     let Some(remote) = remote else {
@@ -256,7 +274,7 @@ fn try_load_vault_ssh_key_for_remote(
     }
 
     let privkey_key = format!("vault.ssh.{remote}.privkey");
-    let Some(entry) = load_config_entry_sync(&privkey_key)? else {
+    let Some(entry) = load_config_entry(&privkey_key).await? else {
         return Ok(None);
     };
 
@@ -267,7 +285,8 @@ fn try_load_vault_ssh_key_for_remote(
     }
 
     // Decrypt the private key using the vault unseal key.
-    let unseal_key = load_vault_unseal_key_sync()?
+    let unseal_key = load_unseal_key()
+        .await
         .ok_or_else(|| format!("failed to load vault unseal key for remote '{remote}'"))?;
     let ciphertext = hex::decode(&entry.value)
         .map_err(|e| format!("failed to decode vault SSH private key '{privkey_key}': {e}"))?;
@@ -308,47 +327,14 @@ fn try_load_vault_ssh_key_for_remote(
     Ok(Some(tmp_file))
 }
 
-/// Load a full config entry (including the `encrypted` flag) synchronously.
-fn load_config_entry_sync(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
+/// Load a full config entry (including the `encrypted` flag) without blocking
+/// the runtime worker that returns connections to the shared SQLite pool.
+async fn load_config_entry(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
     use crate::internal::config::ConfigKv;
 
-    fn read_entry_sync(dotted_key: &str) -> Result<Option<ConfigKvEntry>, String> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("failed to create tokio runtime for config read: {e}"))?;
-        // `get_best_effort` returns an actionable `Err` (instead of panicking)
-        // when the repository database cannot be opened — e.g. an enclosing
-        // repo whose schema is out of date.
-        rt.block_on(ConfigKv::get_best_effort(dotted_key))
-            .map_err(|e| format!("failed to read config key '{dotted_key}': {e}"))
-    }
-
-    let key = dotted_key.to_string();
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(|| read_entry_sync(&key))
-                .join()
-                .map_err(|_| format!("failed to join config read thread for key '{key}'"))?
-        }),
-        Err(_) => read_entry_sync(&key),
-    }
-}
-
-/// Load the vault unseal key synchronously.
-fn load_vault_unseal_key_sync() -> Result<Option<Vec<u8>>, String> {
-    fn read_unseal_key_sync() -> Result<Option<Vec<u8>>, String> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("failed to create tokio runtime for vault read: {e}"))?;
-        Ok(rt.block_on(load_unseal_key()))
-    }
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(read_unseal_key_sync)
-                .join()
-                .map_err(|_| "failed to join vault read thread".to_string())?
-        }),
-        Err(_) => read_unseal_key_sync(),
-    }
+    ConfigKv::get_best_effort(dotted_key)
+        .await
+        .map_err(|e| format!("failed to read config key '{dotted_key}': {e}"))
 }
 
 fn resolve_home_directory() -> Result<PathBuf, String> {
@@ -465,13 +451,13 @@ fn cleanup_expired_vault_ssh_temp_files_in(
 
 /// Try to load SSH key from the legacy filesystem path
 /// `~/.libra/ssh-keys/<repo-id>/id_ed25519`.
-fn try_load_legacy_ssh_key_path() -> Option<String> {
+async fn try_load_legacy_ssh_key_path() -> Option<String> {
     // Only try vault key lookup inside a Libra repository.
     if try_get_storage_path(None).is_err() {
         return None;
     }
 
-    let repo_id = load_repo_id_sync()?;
+    let repo_id = load_config("libra", None, "repoid").await?;
     let home = dirs::home_dir()?;
     let key_path = home
         .join(".libra")
@@ -486,10 +472,6 @@ fn try_load_legacy_ssh_key_path() -> Option<String> {
     }
 }
 
-fn load_repo_id_sync() -> Option<String> {
-    load_config_sync("libra", None, "repoid")
-}
-
 /// Load host key checking mode from env/config for SSH transport.
 ///
 /// Precedence:
@@ -498,10 +480,10 @@ fn load_repo_id_sync() -> Option<String> {
 ///
 /// When unset, the `SshClient` default (`ask`) applies: no
 /// `StrictHostKeyChecking` option is passed to `ssh`, so the user's
-/// `~/.ssh/config` governs and OpenSSH runs its interactive trust prompt on
-/// first connection (TOFU) — matching Git's transport behavior. Supported
+/// `~/.ssh/config` governs the host-key policy. BatchMode is always enabled,
+/// so interactive trust and passphrase prompts run separately. Supported
 /// values: `ask`, `yes`, `accept-new`, `no`.
-fn load_ssh_host_key_checking_mode() -> Option<String> {
+async fn load_ssh_host_key_checking_mode() -> Option<String> {
     if let Ok(raw) = std::env::var("LIBRA_SSH_STRICT_HOST_KEY_CHECKING") {
         let mode = raw.trim();
         if !mode.is_empty() {
@@ -513,7 +495,7 @@ fn load_ssh_host_key_checking_mode() -> Option<String> {
     if util::try_get_storage_path(None).is_err() {
         return None;
     }
-    load_config_sync("ssh", None, "strictHostKeyChecking")
+    load_config("ssh", None, "strictHostKeyChecking").await
 }
 
 /// Default connect timeout for a network fetch (seconds).
@@ -533,7 +515,7 @@ const DEFAULT_FIRST_BYTE_TIMEOUT_SECS: u64 = 30;
 /// falls through to the *next* source (not straight to the default) — so a typo
 /// or a `0` can never leave a fetch with a zero-duration timeout, and a bad
 /// remote-scoped value never masks a valid un-scoped `fetch.<key>`.
-fn resolve_fetch_timeout(
+async fn resolve_fetch_timeout(
     remote: Option<&str>,
     config_key: &str,
     env_var: &str,
@@ -555,18 +537,18 @@ fn resolve_fetch_timeout(
     }
     // 2. remote-scoped config `fetch.<remote>.<key>` (seconds), validated on its own.
     if let Some(remote) = remote
-        && let Some(duration) = parse_secs(load_config_sync("fetch", Some(remote), config_key))
+        && let Some(duration) = parse_secs(load_config("fetch", Some(remote), config_key).await)
     {
         return duration;
     }
     // 3. un-scoped config `fetch.<key>` (seconds).
-    if let Some(duration) = parse_secs(load_config_sync("fetch", None, config_key)) {
+    if let Some(duration) = parse_secs(load_config("fetch", None, config_key).await) {
         return duration;
     }
     default
 }
 
-fn load_config_sync(configuration: &str, name: Option<&str>, key: &str) -> Option<String> {
+async fn load_config(configuration: &str, name: Option<&str>, key: &str) -> Option<String> {
     use crate::internal::config::ConfigKv;
 
     let dotted_key = match name {
@@ -574,29 +556,15 @@ fn load_config_sync(configuration: &str, name: Option<&str>, key: &str) -> Optio
         None => format!("{configuration}.{key}"),
     };
 
-    // `get_best_effort` never panics when the (possibly *enclosing*) repository
-    // database is missing or its schema is out of date; it returns an `Err`
-    // that we log and swallow here, so transport setup degrades to "no config
-    // value" instead of dumping a panic to stderr during `clone`/`fetch`.
-    fn read_value_sync(dotted_key: &str) -> Option<String> {
-        let rt = tokio::runtime::Runtime::new().ok()?;
-        match rt.block_on(ConfigKv::get_best_effort(dotted_key)) {
-            Ok(entry) => entry.map(|e| e.value),
-            Err(err) => {
-                tracing::debug!("skipping config read for '{dotted_key}': {err}");
-                None
-            }
+    // Await on the caller's runtime: blocking a worker can strand the task
+    // returning the cached pool's only connection (see internal::db).
+    // Preserve best-effort configuration when an enclosing repo is unusable.
+    match ConfigKv::get_best_effort(&dotted_key).await {
+        Ok(entry) => entry.map(|e| e.value),
+        Err(err) => {
+            tracing::debug!("skipping config read for '{dotted_key}': {err}");
+            None
         }
-    }
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => std::thread::scope(|s| {
-            s.spawn(|| read_value_sync(&dotted_key))
-                .join()
-                .ok()
-                .flatten()
-        }),
-        Err(_) => read_value_sync(&dotted_key),
     }
 }
 
@@ -879,6 +847,11 @@ impl From<FetchError> for CliError {
             FetchError::Discovery { source, .. } => {
                 map_fetch_discovery_error(error.to_string(), source)
             }
+            FetchError::FetchObjects { source, .. } if is_pkt_line_io_error(source) => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
             FetchError::FetchObjects { source, .. } => map_fetch_io_error(
                 error.to_string(),
                 source,
@@ -886,13 +859,13 @@ impl From<FetchError> for CliError {
             )
             .with_hint("check network connectivity and retry"),
             FetchError::PacketRead { source } => {
-                if is_timeout_io_error(source) {
+                if is_pkt_line_io_error(source) {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::NetworkProtocol)
+                } else {
                     CliError::fatal(error.to_string())
                         .with_stable_code(StableErrorCode::NetworkUnavailable)
                         .with_hint("check network connectivity and retry")
-                } else {
-                    CliError::fatal(error.to_string())
-                        .with_stable_code(StableErrorCode::NetworkProtocol)
                 }
             }
             FetchError::RemoteBranchNotFound { .. } => CliError::command_usage(error.to_string())
@@ -945,6 +918,11 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         GitError::UnAuthorized(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::AuthPermissionDenied)
             .with_hint("check SSH key / HTTP credentials and repository access rights"),
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
             .with_hint("check network connectivity and retry"),
@@ -954,6 +932,45 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         }
         _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol),
     }
+}
+
+/// Inspect the inner IO diagnostic without allocating its complete formatted message.
+/// Only the marker prefix is compared; formatting stops as soon as it matches or differs.
+pub(crate) fn is_pkt_line_io_error(error: &std::io::Error) -> bool {
+    struct PrefixMatcher<'a> {
+        remaining: &'a [u8],
+        matched: bool,
+        rejected: bool,
+    }
+
+    impl std::fmt::Write for PrefixMatcher<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.matched || self.rejected {
+                return Err(std::fmt::Error);
+            }
+            let count = self.remaining.len().min(text.len());
+            if self.remaining[..count] != text.as_bytes()[..count] {
+                self.rejected = true;
+                return Err(std::fmt::Error);
+            }
+            self.remaining = &self.remaining[count..];
+            if self.remaining.is_empty() {
+                self.matched = true;
+                // Deliberately stop Display before it formats any suffix.
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let mut matcher = PrefixMatcher {
+        remaining: PKT_LINE_PROTOCOL_ERROR_PREFIX.as_bytes(),
+        matched: false,
+        rejected: false,
+    };
+    let _ = std::fmt::write(&mut matcher, format_args!("{error}"));
+    matcher.matched
 }
 
 fn map_fetch_io_error(
@@ -1372,16 +1389,21 @@ pub(crate) async fn discover_remote_with_name(
     remote_spec: &str,
     remote_name: Option<&str>,
 ) -> Result<(RemoteClient, DiscoveryResult), FetchError> {
-    let remote_client = RemoteClient::from_spec_with_remote(remote_spec, remote_name)
-        .and_then(|client| client.with_resolved_fetch_timeouts(remote_name))
-        .map_err(|message| {
-            let (kind, reason) = classify_remote_spec_error(remote_spec, &message);
-            FetchError::InvalidRemoteSpec {
-                spec: remote_spec.to_string(),
-                kind,
-                reason,
-            }
-        })?;
+    let remote_client = async {
+        RemoteClient::from_spec_with_remote(remote_spec, remote_name)
+            .await?
+            .with_resolved_fetch_timeouts(remote_name)
+            .await
+    }
+    .await
+    .map_err(|message| {
+        let (kind, reason) = classify_remote_spec_error(remote_spec, &message);
+        FetchError::InvalidRemoteSpec {
+            spec: remote_spec.to_string(),
+            kind,
+            reason,
+        }
+    })?;
     let discovery = remote_client
         .discovery_reference(UploadPack)
         .await
@@ -2336,6 +2358,7 @@ async fn read_fetch_stream(
     let mut reader = StreamReader::new(result_stream);
     let mut data_out = FetchStreamData::default();
     let mut pack_completion = PackCompletionTracker::default();
+    let mut ready_tail_bytes = None;
     let mut reach_pack = false;
     let mut saw_shallow_response = false;
     let render_progress = matches!(output.progress, ProgressMode::Text);
@@ -2346,6 +2369,17 @@ async fn read_fetch_stream(
     let time = Instant::now();
 
     loop {
+        if pack_completion.complete && ready_tail_bytes.is_none() {
+            // A completed pack must not wait for an idle transport. Validate the
+            // buffered (or first immediately available) chunk, finishing any
+            // frame begun there, without draining an unbounded stream of trailers.
+            // At this boundary EOF, Pending and transport errors retain the old
+            // complete-pack success behavior; errors within a frame still fail.
+            match reader.fill_buf().now_or_never() {
+                Some(Ok(bytes)) if !bytes.is_empty() => ready_tail_bytes = Some(bytes.len()),
+                _ => break,
+            }
+        }
         let (len, data) = match read_pkt_line(&mut reader).await {
             Ok(packet) => packet,
             Err(source) if source.kind() == io::ErrorKind::UnexpectedEof && reach_pack => break,
@@ -2357,6 +2391,15 @@ async fn read_fetch_stream(
                 continue;
             }
             break;
+        }
+        if let Some(remaining) = &mut ready_tail_bytes {
+            *remaining = remaining.saturating_sub(len);
+            if *remaining == 0 {
+                break;
+            }
+            // Trailers were previously ignored after a complete pack. Validate
+            // their framing without appending unchecked bytes to that pack.
+            continue;
         }
         if !reach_pack {
             if let Some(oid) = parse_shallow_packet(&data, b"shallow ") {
@@ -2375,9 +2418,7 @@ async fn read_fetch_stream(
                 if let Some(progress) = &progress {
                     progress.tick(data_out.pack_data.len() as u64);
                 }
-                if pack_completion.observe(&data_out.pack_data) {
-                    break;
-                }
+                let _ = pack_completion.observe(&data_out.pack_data);
                 continue;
             }
         }
@@ -2401,9 +2442,7 @@ async fn read_fetch_stream(
                         if let Some(progress) = &progress {
                             progress.tick(data_out.pack_data.len() as u64);
                         }
-                        if pack_completion.observe(&data_out.pack_data) {
-                            break;
-                        }
+                        let _ = pack_completion.observe(&data_out.pack_data);
                     }
                     2 => handle_remote_progress(
                         payload,
@@ -3649,33 +3688,42 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
 /// Read 4 bytes hex number
 async fn read_hex_4(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u32> {
     let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf).await?;
+    // Only EOF before the first byte is a normal frame boundary.
+    reader.read_exact(&mut buf[..1]).await?;
+    reader.read_exact(&mut buf[1..]).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, PktLineError::TruncatedHeader)
+        } else {
+            error
+        }
+    })?;
     let hex_str = std::str::from_utf8(&buf).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "invalid packet line header '{}'",
-                String::from_utf8_lossy(&buf)
-            ),
+            PktLineError::InvalidHeaderEncoding,
         )
     })?;
-    u32::from_str_radix(hex_str, 16).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid packet line header '{hex_str}'"),
-        )
-    })
+    u32::from_str_radix(hex_str, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, PktLineError::InvalidHexHeader))
 }
 
 /// async version of `read_pkt_line`
 /// - return (raw length, data)
 async fn read_pkt_line(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(usize, Vec<u8>)> {
     let len = read_hex_4(reader).await?;
+    let payload_len = pkt_frame_payload_len(len)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if len == 0 {
         return Ok((0, Vec::new()));
     }
-    let mut data = vec![0u8; (len - 4) as usize];
-    reader.read_exact(&mut data).await?;
+    let mut data = vec![0u8; payload_len];
+    reader.read_exact(&mut data).await.map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, PktLineError::TruncatedPayload)
+        } else {
+            error
+        }
+    })?;
     Ok((len as usize, data))
 }
 
@@ -3690,8 +3738,8 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use git_internal::hash::ObjectHash;
 
-    #[test]
-    fn resolve_fetch_timeout_env_millis_wins() {
+    #[tokio::test]
+    async fn resolve_fetch_timeout_env_millis_wins() {
         // A unique env var name so no concurrent real fetch reads it. The env
         // branch returns before any config read, keeping this deterministic.
         let var = "LIBRA_TEST_FETCH_TIMEOUT_ENV_WINS";
@@ -3699,13 +3747,14 @@ mod tests {
         // is unique to this test so no other thread observes it.
         unsafe { std::env::set_var(var, "2500") };
         let resolved =
-            super::resolve_fetch_timeout(None, "connectTimeout", var, Duration::from_secs(30));
+            super::resolve_fetch_timeout(None, "connectTimeout", var, Duration::from_secs(30))
+                .await;
         unsafe { std::env::remove_var(var) };
         assert_eq!(resolved, Duration::from_millis(2500));
     }
 
-    #[test]
-    fn resolve_fetch_timeout_ignores_unparseable_env() {
+    #[tokio::test]
+    async fn resolve_fetch_timeout_ignores_unparseable_env() {
         let var = "LIBRA_TEST_FETCH_TIMEOUT_GARBAGE";
         // SAFETY: as above.
         unsafe { std::env::set_var(var, "not-a-number") };
@@ -3716,24 +3765,93 @@ mod tests {
             "connectTimeoutTestUnset",
             var,
             Duration::from_secs(9),
-        );
+        )
+        .await;
         unsafe { std::env::remove_var(var) };
         assert_eq!(resolved, Duration::from_secs(9));
     }
 
-    #[test]
-    fn resolve_fetch_timeout_ignores_zero_env() {
+    #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    async fn resolve_fetch_timeout_ignores_zero_env() {
+        use crate::{
+            internal::config::ConfigKv,
+            utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+        };
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
         let var = "LIBRA_TEST_FETCH_TIMEOUT_ZERO";
-        // SAFETY: as above. A `0` must not become a zero-duration timeout.
-        unsafe { std::env::set_var(var, "0") };
-        let resolved = super::resolve_fetch_timeout(
-            None,
-            "connectTimeoutTestUnset",
-            var,
-            Duration::from_secs(11),
-        );
-        unsafe { std::env::remove_var(var) };
-        assert_eq!(resolved, Duration::from_secs(11));
+        let _env = ScopedEnvVar::set(var, "0");
+        // No yield or extra workers: every config write must return its pooled
+        // connection while the immediately following asynchronous read awaits it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    None,
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(11)
+            );
+            ConfigKv::set("fetch.connectTimeoutTestZeroEnv", "7", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(7)
+            );
+            ConfigKv::set("fetch.origin.connectTimeoutTestZeroEnv", "3", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_secs(3)
+            );
+            for invalid in ["0", "invalid", "-1"] {
+                ConfigKv::set("fetch.origin.connectTimeoutTestZeroEnv", invalid, false)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    super::resolve_fetch_timeout(
+                        Some("origin"),
+                        "connectTimeoutTestZeroEnv",
+                        var,
+                        Duration::from_secs(11)
+                    )
+                    .await,
+                    Duration::from_secs(7)
+                );
+            }
+            let _env = ScopedEnvVar::set(var, "250");
+            assert_eq!(
+                super::resolve_fetch_timeout(
+                    Some("origin"),
+                    "connectTimeoutTestZeroEnv",
+                    var,
+                    Duration::from_secs(11)
+                )
+                .await,
+                Duration::from_millis(250)
+            );
+        })
+        .await
+        .expect("config precedence must resolve without blocking the runtime worker");
     }
     use tempfile::tempdir;
 
@@ -3750,6 +3868,162 @@ mod tests {
             test::ScopedEnvVar,
         },
     };
+
+    #[test]
+    fn pkt_line_fetch_marker_maps_to_lbr_net_002() {
+        use git_internal::errors::GitError;
+
+        use crate::{
+            git_protocol::{PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType::UploadPack},
+            internal::protocol::parse_discovered_references,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for response in [
+            b"".as_slice(),
+            b"0",
+            b"00",
+            b"000",
+            b"\xff000",
+            b"zzzz",
+            b"+004",
+            b"0001",
+            b"0002",
+            b"0003",
+            b"0008abc",
+        ] {
+            let source = parse_discovered_references(Bytes::copy_from_slice(response), UploadPack)
+                .expect_err("malformed discovery must fail");
+            assert!(
+                matches!(&source, GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX))
+            );
+            let error = CliError::from(FetchError::Discovery {
+                remote: "https://example.invalid/repo".to_string(),
+                source,
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+            assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "check that the remote serves Git data and that a proxy has not altered the response"
+                ]
+            );
+        }
+        let source = GitError::NetworkError(format!("{PKT_LINE_PROTOCOL_ERROR_PREFIX}timeout"));
+        let error = CliError::from(FetchError::Discovery {
+            remote: "origin".to_string(),
+            source,
+        });
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+    }
+
+    #[test]
+    fn pkt_line_fetch_non_marker_stays_net_001() {
+        use git_internal::errors::GitError;
+
+        use crate::{
+            git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for detail in [
+            "connection refused".to_string(),
+            "operation timed out".to_string(),
+            "Unsupported object format capability".to_string(),
+            format!("wrapper: {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            format!(" {PKT_LINE_PROTOCOL_ERROR_PREFIX}malformed"),
+            "PKT-LINE protocol error: malformed".to_string(),
+        ] {
+            let error = CliError::from(FetchError::Discovery {
+                remote: "origin".to_string(),
+                source: GitError::NetworkError(detail),
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-001");
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                ["check network connectivity and retry"]
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = CliError::from(FetchError::Discovery {
+                remote: "origin".to_string(),
+                source: GitError::IOError(std::io::Error::new(kind, "transport failure")),
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkUnavailable);
+        }
+        let error = CliError::from(FetchError::Discovery {
+            remote: "origin".to_string(),
+            source: GitError::UnAuthorized("permission denied".to_string()),
+        });
+        assert_eq!(error.stable_code(), StableErrorCode::AuthPermissionDenied);
+    }
+
+    #[test]
+    fn pkt_line_fetch_zero_echo_sentinel() {
+        use crate::{
+            git_protocol::ServiceType::UploadPack,
+            internal::protocol::parse_discovered_references,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        let sentinel = "REMOTE_FETCH_SECRET_7b1c";
+        for header in [b"zzzz".as_slice(), b"\xff000", b"0001", b"ffff"] {
+            let mut response = header.to_vec();
+            response.extend_from_slice(sentinel.as_bytes());
+            let source = parse_discovered_references(Bytes::from(response), UploadPack)
+                .expect_err("invalid header or truncated payload must fail");
+            assert!(!source.to_string().contains(sentinel));
+            let error = CliError::from(FetchError::Discovery {
+                remote: "https://example.invalid/repo".to_string(),
+                source,
+            });
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            for rendered in [
+                error.to_string(),
+                error.render_for_stderr(),
+                error.render_json(),
+            ] {
+                assert!(!rendered.contains(sentinel));
+                assert!(!rendered.contains('�'));
+            }
+        }
+    }
+
+    /// Cross-module fallback anchor; fetch discovery itself sets an explicit code.
+    #[test]
+    fn pkt_line_fetch_classifier_fallback_anchored() {
+        use crate::{
+            git_protocol::{PktFrameError, PktLineError},
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        for source in [
+            PktLineError::TruncatedHeader,
+            PktLineError::InvalidHeaderEncoding,
+            PktLineError::InvalidHexHeader,
+            PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            PktLineError::InvalidFrameLength(PktFrameError::LengthAboveMaximum),
+            PktLineError::TruncatedPayload,
+        ] {
+            let error = CliError::fatal(source.to_string());
+            assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        }
+    }
 
     /// `--no-progress` forces progress reporting off while leaving progress on
     /// when the flag is absent (and short-circuits when it is already off).
@@ -4105,6 +4379,364 @@ mod tests {
         pack
     }
 
+    fn assert_async_pkt_protocol_error(source: std::io::Error) {
+        use crate::{
+            git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            source
+                .to_string()
+                .starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX)
+        );
+        let error = CliError::from(FetchError::PacketRead { source });
+        assert_eq!(error.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+        assert!(
+            error.hints().is_empty(),
+            "pkt-line errors have no additional CLI hint"
+        );
+        for text in [
+            error.to_string(),
+            error.render_for_stderr(),
+            error.render_json(),
+        ] {
+            assert!(!text.contains("SECRET"));
+            assert!(!text.contains("SECR"));
+            assert!(!text.contains('�'));
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_rejects_len_below_four() {
+        use crate::git_protocol::PktFrameError;
+
+        for frame in [b"0001".as_slice(), b"0002", b"0003"] {
+            let source = super::read_pkt_line(&mut &frame[..]).await.unwrap_err();
+            assert_eq!(
+                source
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<PktFrameError>()),
+                Some(&PktFrameError::LengthBelowHeader),
+            );
+            assert_async_pkt_protocol_error(source);
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_flush_regression() {
+        let mut input = b"00000004".as_slice();
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (0, vec![]));
+        assert_eq!(input, b"0004");
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (4, vec![]));
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_len4_regression() {
+        let mut input = b"00040005x".as_slice();
+        assert_eq!(super::read_pkt_line(&mut input).await.unwrap(), (4, vec![]));
+        assert_eq!(input, b"0005x");
+        assert_eq!(
+            super::read_pkt_line(&mut input).await.unwrap(),
+            (5, b"x".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_upper_bound_regression() {
+        let payload = vec![0xa5; 65_531];
+        let mut frame = b"ffff".to_vec();
+        frame.extend_from_slice(&payload);
+        let mut input = frame.as_slice();
+        assert_eq!(
+            super::read_pkt_line(&mut input).await.unwrap(),
+            (65_535, payload)
+        );
+        assert!(input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_helper_single_source() {
+        use crate::git_protocol::{PktFrameError, pkt_frame_payload_len};
+
+        // Compare the reader's wire contract with the shared public validator,
+        // including empty frames and the allocation bounds on either side.
+        for len in [0, 1, 2, 3, 4, 5, 16, 255, 65_535] {
+            let expected = pkt_frame_payload_len(len);
+            let mut frame = format!("{len:04x}").into_bytes();
+            if let Ok(payload_len) = expected {
+                frame.extend(vec![0x61; payload_len]);
+            }
+            let actual = super::read_pkt_line(&mut frame.as_slice()).await;
+            match expected {
+                Ok(payload_len) => {
+                    let (raw_len, data) = actual.unwrap();
+                    assert_eq!(raw_len, len as usize);
+                    assert_eq!(data, vec![0x61; payload_len]);
+                }
+                Err(expected) => {
+                    let source = actual.unwrap_err();
+                    assert_eq!(
+                        source
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<PktFrameError>()),
+                        Some(&expected),
+                    );
+                    assert_async_pkt_protocol_error(source);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_reach_pack_truncated_eof() {
+        use std::{
+            io,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        use crate::git_protocol::PktLineError;
+
+        let output = OutputConfig::default();
+        let pack = empty_pack_bytes();
+        let malformed = [
+            (b"S".as_slice(), PktLineError::TruncatedHeader),
+            (b"SE".as_slice(), PktLineError::TruncatedHeader),
+            (b"SEC".as_slice(), PktLineError::TruncatedHeader),
+            (b"0040SECRET\xff".as_slice(), PktLineError::TruncatedPayload),
+            (b"SECR".as_slice(), PktLineError::InvalidHexHeader),
+            (
+                b"\xff\xff\xff\xff".as_slice(),
+                PktLineError::InvalidHeaderEncoding,
+            ),
+        ];
+        for sideband in [false, true] {
+            let mut response = BytesMut::new();
+            let mut payload = if sideband { vec![1] } else { vec![] };
+            payload.extend_from_slice(&pack);
+            append_pkt_line(&mut response, &payload);
+            for (tail, expected) in malformed {
+                for split_chunks in 0..3 {
+                    let chunks = if split_chunks == 2 {
+                        std::iter::once(response.clone().freeze())
+                            .chain(tail.iter().map(|byte| Bytes::copy_from_slice(&[*byte])))
+                            .collect()
+                    } else if split_chunks == 1 {
+                        vec![response.clone().freeze(), Bytes::copy_from_slice(tail)]
+                    } else {
+                        let mut combined = response.clone();
+                        // Also exercise multiple valid trailers before truncation.
+                        append_pkt_line(&mut combined, b"\x02progress\n");
+                        append_pkt_line(&mut combined, b"\x01ignored trailer");
+                        combined.extend_from_slice(tail);
+                        vec![combined.freeze()]
+                    };
+                    let mut stream: FetchStream = stream::iter(chunks.into_iter().map(Ok)).boxed();
+                    let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                        .await
+                        .err()
+                        .expect("an observed truncated frame must fail after a complete pack");
+                    let FetchError::PacketRead { source } = error else {
+                        panic!("expected packet read failure")
+                    };
+                    assert_eq!(
+                        source
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<PktLineError>()),
+                        Some(&expected)
+                    );
+                    assert_async_pkt_protocol_error(source);
+                }
+            }
+
+            // A reached pack with a missing checksum must not turn a partial
+            // pkt-line into either boundary EOF or the later IncompletePack error.
+            let mut incomplete_payload = if sideband { vec![1] } else { vec![] };
+            incomplete_payload.extend_from_slice(&pack[..pack.len() - 5]);
+            for (tail, expected) in malformed {
+                let mut incomplete_response = BytesMut::new();
+                append_pkt_line(&mut incomplete_response, &incomplete_payload);
+                incomplete_response.extend_from_slice(tail);
+                let mut stream: FetchStream =
+                    stream::iter([Ok(incomplete_response.freeze())]).boxed();
+                let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                    .await
+                    .err()
+                    .expect("truncated framing must take precedence over incomplete pack");
+                let FetchError::PacketRead { source } = error else {
+                    panic!("expected packet read failure")
+                };
+                assert_eq!(
+                    source
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<PktLineError>()),
+                    Some(&expected)
+                );
+                assert_async_pkt_protocol_error(source);
+            }
+
+            // A valid frame begun in the observed chunk may finish in later
+            // chunks. Cover both split headers and split payloads, then an idle
+            // connection: completion must preserve the original checked pack.
+            let frame = Bytes::from_static(b"000b\x02hello\n");
+            for split in [1, 2, 3, 4, 6, frame.len() - 1] {
+                let mut remainder = BytesMut::from(&frame[split..]);
+                // A later chunk can contain bytes beyond the completed frame.
+                // They lie outside the observed chunk and its final frame.
+                remainder.extend_from_slice(b"SECR");
+                let mut stream: FetchStream = stream::iter([
+                    Ok(response.clone().freeze()),
+                    Ok(frame.slice(..split)),
+                    Ok(remainder.freeze()),
+                ])
+                .chain(stream::pending())
+                .boxed();
+                let data = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_fetch_stream(&mut stream, &output, "fetch origin"),
+                )
+                .await
+                .expect("finish a fragmented valid trailer without waiting for EOF")
+                .unwrap();
+                assert_eq!(data.pack_data, pack);
+            }
+
+            let mut valid_tail = BytesMut::new();
+            append_pkt_line(&mut valid_tail, b"\x02progress\n");
+            append_pkt_line(&mut valid_tail, b"\x01ignored trailer");
+            append_pkt_line(&mut valid_tail, b"");
+            let mut stream: FetchStream =
+                stream::iter([Ok(response.clone().freeze()), Ok(valid_tail.freeze())])
+                    .chain(stream::pending())
+                    .boxed();
+            let data = tokio::time::timeout(
+                Duration::from_millis(250),
+                read_fetch_stream(&mut stream, &output, "fetch origin"),
+            )
+            .await
+            .expect("valid ready trailers must not wait for EOF")
+            .unwrap();
+            assert_eq!(
+                data.pack_data, pack,
+                "trailers must not corrupt the completed pack"
+            );
+
+            let mut flushed = response.clone();
+            flushed.extend_from_slice(b"0000SECR");
+            let mut stream: FetchStream = stream::iter([Ok(flushed.freeze())])
+                .chain(stream::pending())
+                .boxed();
+            let data = tokio::time::timeout(
+                Duration::from_millis(250),
+                read_fetch_stream(&mut stream, &output, "fetch origin"),
+            )
+            .await
+            .expect("flush must finish without reading subsequent bytes")
+            .unwrap();
+            assert_eq!(data.pack_data, pack);
+
+            // A peer can keep producing ready valid packets forever. Validate the
+            // observed chunk only, rather than delaying completion indefinitely.
+            let polls = Arc::new(AtomicUsize::new(0));
+            let tail_polls = polls.clone();
+            let tail = stream::repeat_with(move || {
+                let polled = tail_polls.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    polled < 3,
+                    "completed fetch must not drain an unbounded tail"
+                );
+                Ok(Bytes::from_static(b"0004"))
+            });
+            let mut stream: FetchStream = stream::iter([Ok(response.clone().freeze())])
+                .chain(tail)
+                .boxed();
+            let data = read_fetch_stream(&mut stream, &output, "fetch origin")
+                .await
+                .unwrap();
+            assert_eq!(data.pack_data, pack);
+            assert_eq!(polls.load(Ordering::Relaxed), 1);
+
+            let mut stream: FetchStream = stream::iter([
+                Ok(response.clone().freeze()),
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "transport reset",
+                )),
+            ])
+            .boxed();
+            let data = read_fetch_stream(&mut stream, &output, "fetch origin")
+                .await
+                .unwrap();
+            assert_eq!(
+                data.pack_data, pack,
+                "preserve a reset after a complete pack at a frame boundary"
+            );
+
+            for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::TimedOut] {
+                let mut stream: FetchStream = stream::iter([
+                    Ok(response.clone().freeze()),
+                    Ok(Bytes::from_static(b"0")),
+                    Err(io::Error::new(kind, "transport failure")),
+                ])
+                .boxed();
+                let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(
+                    matches!(&error, FetchError::PacketRead { source } if source.kind() == kind)
+                );
+                if kind == io::ErrorKind::TimedOut {
+                    let cli = crate::utils::error::CliError::from(error);
+                    assert_eq!(
+                        cli.stable_code(),
+                        crate::utils::error::StableErrorCode::NetworkUnavailable
+                    );
+                    assert_eq!(
+                        cli.hints()
+                            .iter()
+                            .map(|hint| hint.as_str())
+                            .collect::<Vec<_>>(),
+                        ["check network connectivity and retry"]
+                    );
+                }
+            }
+        }
+
+        // Partial reads before any pack have the same typed carrier. A clean
+        // boundary EOF remains distinguishable from either truncation reason.
+        for (frame, expected) in malformed {
+            let source = super::read_pkt_line(&mut &frame[..]).await.unwrap_err();
+            assert_eq!(
+                source
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<PktLineError>()),
+                Some(&expected)
+            );
+            assert_async_pkt_protocol_error(source);
+        }
+        let source = super::read_pkt_line(&mut b"".as_slice()).await.unwrap_err();
+        assert_eq!(source.kind(), io::ErrorKind::UnexpectedEof);
+        for partial in [b"".as_slice(), b"0", b"0008a"] {
+            let mut source = stream::iter([
+                Ok(Bytes::copy_from_slice(partial)),
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "transport reset",
+                )),
+            ]);
+            let mut reader = tokio_util::io::StreamReader::new(&mut source);
+            let error = super::read_pkt_line(&mut reader).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
+    }
+
     #[tokio::test]
     async fn read_fetch_stream_accepts_eof_after_complete_pack_without_flush() {
         let pack = empty_pack_bytes();
@@ -4144,14 +4776,24 @@ mod tests {
             stream::iter(vec![Ok::<Bytes, std::io::Error>(response.freeze())]).boxed();
         let output = OutputConfig::default();
 
-        let result = read_fetch_stream(&mut stream, &output, "fetch origin").await;
-        let is_incomplete = matches!(&result, Err(super::FetchError::IncompletePack { .. }));
+        let error = read_fetch_stream(&mut stream, &output, "fetch origin")
+            .await
+            .err()
+            .expect("an incomplete pack must fail at a clean frame boundary");
         assert!(
-            is_incomplete,
-            "a truncated pack must surface as IncompletePack, got: {}",
-            result
-                .err()
-                .map_or_else(|| "Ok(..)".to_string(), |e| e.to_string())
+            matches!(&error, FetchError::IncompletePack { received } if *received == pack.len())
+        );
+        let cli = crate::utils::error::CliError::from(error);
+        assert_eq!(
+            cli.stable_code(),
+            crate::utils::error::StableErrorCode::NetworkProtocol
+        );
+        assert_eq!(
+            cli.hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            ["the connection dropped mid-transfer — retry the fetch"]
         );
     }
 

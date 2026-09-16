@@ -2,7 +2,9 @@
 //! (LCAs) of two commits.
 //!
 //! This is the single, correct implementation behind `libra merge-base`, the
-//! `diff A...B` three-dot range, `merge`, `rebase` and `am`. Unlike a
+//! `diff A...B` three-dot range, `merge`, `rebase` and `am`, and — through
+//! [`ahead_behind`], which reuses the same painting — the upstream
+//! ahead/behind counts shown by `status` and `branch -vv`. Unlike a
 //! first-found walk it returns true LCAs: a common ancestor is a merge base
 //! only when it is not a *strict* ancestor of another common ancestor, so
 //! criss-cross histories yield every maximal common ancestor (with `--all`) and
@@ -211,6 +213,30 @@ fn paint_down_to_common_many<S: CommitSource>(
     lhs: &ObjectHash,
     rhs: &[ObjectHash],
 ) -> Result<(Vec<ObjectHash>, WalkStats), MergeBaseError> {
+    let walk = paint_walk(source, lhs, rhs)?;
+    Ok((walk.candidates, walk.stats))
+}
+
+/// Everything a drained two-sided paint leaves behind.
+struct PaintWalk {
+    /// The final paint of every commit the walk visited. Because a commit is
+    /// re-queued whenever it gains ANY flag, `lhs`/`rhs` here are exactly its
+    /// reachability from the two sides once the queue is empty — `stale` only
+    /// changes which commits are recorded as candidates, never how far the
+    /// side flags propagate.
+    painted: HashMap<ObjectHash, Paint>,
+    /// Commits reached from both sides, in the order the walk found them.
+    candidates: Vec<ObjectHash>,
+    stats: WalkStats,
+}
+
+/// The shared painting core behind [`paint_down_to_common_many`] and
+/// [`ahead_behind`].
+fn paint_walk<S: CommitSource>(
+    source: &mut S,
+    lhs: &ObjectHash,
+    rhs: &[ObjectHash],
+) -> Result<PaintWalk, MergeBaseError> {
     let mut painted: HashMap<ObjectHash, Paint> = HashMap::new();
     let mut queue: BinaryHeap<Queued> = BinaryHeap::new();
     let mut result = Vec::new();
@@ -219,7 +245,11 @@ fn paint_down_to_common_many<S: CommitSource>(
         ..WalkStats::default()
     };
     if rhs.is_empty() {
-        return Ok((result, stats));
+        return Ok(PaintWalk {
+            painted,
+            candidates: result,
+            stats,
+        });
     }
 
     // Deduplicate seeds before queueing them. In particular, `lhs` may also be
@@ -281,7 +311,82 @@ fn paint_down_to_common_many<S: CommitSource>(
         stats.peak_resident_entries = stats.peak_resident_entries.max(painted.len() + queue.len());
     }
 
-    Ok((result, stats))
+    Ok(PaintWalk {
+        painted,
+        candidates: result,
+        stats,
+    })
+}
+
+/// How far two commits have diverged: `ahead` counts the commits reachable
+/// from `local` but not from `upstream`, `behind` the commits reachable from
+/// `upstream` but not from `local`. These are the two numbers
+/// `rev-list --left-right --count <upstream>...<local>` prints (right, then
+/// left), and the ones Git shows as `[ahead N, behind M]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AheadBehind {
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+/// A [`CommitSource`] that treats shallow boundary commits as roots.
+///
+/// A shallow clone keeps a boundary commit but not its parents, so loading
+/// those parents would fail. Git grafts the boundary as parentless; this does
+/// the same, so a shallow repository still gets counts for the history it has.
+struct ShallowBoundaries<'a, S> {
+    inner: &'a mut S,
+    boundaries: &'a HashSet<ObjectHash>,
+}
+
+impl<S: CommitSource> CommitSource for ShallowBoundaries<'_, S> {
+    fn node(&mut self, id: &ObjectHash) -> Result<CommitNode, MergeBaseError> {
+        let mut node = self.inner.node(id)?;
+        if self.boundaries.contains(id) {
+            node.parents.clear();
+        }
+        Ok(node)
+    }
+}
+
+/// Count the commits `local` and `upstream` do not share.
+///
+/// Uses the same painting as [`merge_bases`], drained to the end, then counts
+/// the commits carrying only one side's flag. `boundaries` are the shallow
+/// boundary commits (empty for a complete repository); every other commit must
+/// be loadable, otherwise the counts cannot be known and
+/// [`MergeBaseError::Load`] is returned rather than a silently short number.
+pub fn ahead_behind(
+    local: &ObjectHash,
+    upstream: &ObjectHash,
+    boundaries: &HashSet<ObjectHash>,
+) -> Result<AheadBehind, MergeBaseError> {
+    ahead_behind_with(&mut ObjectStoreCommits::new(), local, upstream, boundaries)
+}
+
+fn ahead_behind_with<S: CommitSource>(
+    source: &mut S,
+    local: &ObjectHash,
+    upstream: &ObjectHash,
+    boundaries: &HashSet<ObjectHash>,
+) -> Result<AheadBehind, MergeBaseError> {
+    if local == upstream {
+        return Ok(AheadBehind::default());
+    }
+    let mut source = ShallowBoundaries {
+        inner: source,
+        boundaries,
+    };
+    let walk = paint_walk(&mut source, local, std::slice::from_ref(upstream))?;
+    let mut counts = AheadBehind::default();
+    for paint in walk.painted.values() {
+        match (paint.lhs, paint.rhs) {
+            (true, false) => counts.ahead += 1,
+            (false, true) => counts.behind += 1,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Reduce merge-base candidates to the maximal ones: drop any candidate that is
@@ -1133,6 +1238,327 @@ mod tests {
             "doubling the trunk must more than double the replaced \
              implementation's work (it is quadratic in the shared history): \
              {small} -> {doubled} reads"
+        );
+    }
+
+    /// Oracle for [`ahead_behind`]: two complete ancestor sets (shallow
+    /// boundaries treated as roots) and their two set differences. It reads the
+    /// graph directly, so it never moves the read counter the bound test uses.
+    fn reference_ahead_behind(
+        graph: &TestGraph,
+        local: &ObjectHash,
+        upstream: &ObjectHash,
+        boundaries: &HashSet<ObjectHash>,
+    ) -> AheadBehind {
+        let reach = |start: &ObjectHash| -> HashSet<ObjectHash> {
+            let mut seen = HashSet::new();
+            let mut queue = VecDeque::from([*start]);
+            while let Some(id) = queue.pop_front() {
+                if !seen.insert(id) || boundaries.contains(&id) {
+                    continue;
+                }
+                queue.extend(graph.nodes[&id].parents.iter().copied());
+            }
+            seen
+        };
+        let local_reach = reach(local);
+        let upstream_reach = reach(upstream);
+        AheadBehind {
+            ahead: local_reach.difference(&upstream_reach).count(),
+            behind: upstream_reach.difference(&local_reach).count(),
+        }
+    }
+
+    fn counts(graph: &mut TestGraph, local: u32, upstream: u32) -> AheadBehind {
+        counts_with(graph, local, upstream, &HashSet::new())
+    }
+
+    /// Run [`ahead_behind_with`] and assert it agrees with the oracle.
+    fn counts_with(
+        graph: &mut TestGraph,
+        local: u32,
+        upstream: u32,
+        boundaries: &HashSet<ObjectHash>,
+    ) -> AheadBehind {
+        let (local_id, upstream_id) = (TestGraph::id(local), TestGraph::id(upstream));
+        let painted =
+            ahead_behind_with(graph, &local_id, &upstream_id, boundaries).expect("ahead/behind");
+        assert_eq!(
+            painted,
+            reference_ahead_behind(graph, &local_id, &upstream_id, boundaries),
+            "ahead/behind of {local} against {upstream} must agree with the oracle"
+        );
+        painted
+    }
+
+    #[test]
+    fn ahead_behind_matrix() {
+        // A1: equal tips.
+        let mut graph = TestGraph::new();
+        let tip = graph.chain(0, 5, None);
+        assert_eq!(counts(&mut graph, tip, tip), AheadBehind::default());
+
+        // A2 (#486): upstream is local's parent, above a 1 000-commit trunk.
+        let mut graph = TestGraph::new();
+        let trunk = graph.chain(0, 1_000, None);
+        graph.add(1_000, &[trunk], 1_000);
+        assert_eq!(
+            counts(&mut graph, 1_000, trunk),
+            AheadBehind {
+                ahead: 1,
+                behind: 0
+            }
+        );
+
+        // A3: local is three commits behind.
+        let mut graph = TestGraph::new();
+        let tip = graph.chain(0, 20, None);
+        assert_eq!(
+            counts(&mut graph, tip - 3, tip),
+            AheadBehind {
+                ahead: 0,
+                behind: 3
+            }
+        );
+
+        // A4: linear divergence, two local and five upstream commits.
+        let mut graph = TestGraph::new();
+        let base = graph.chain(0, 30, None);
+        let local = graph.chain(100, 2, Some(base));
+        let upstream = graph.chain(200, 5, Some(base));
+        assert_eq!(
+            counts(&mut graph, local, upstream),
+            AheadBehind {
+                ahead: 2,
+                behind: 5
+            }
+        );
+
+        // A5: local merged a three-commit side branch; A6: the same history
+        // seen from the other side, so the merge is on the upstream side.
+        let mut graph = TestGraph::new();
+        let base = graph.chain(0, 30, None);
+        let side = graph.chain(100, 3, Some(base));
+        let upstream = graph.chain(200, 1, Some(base));
+        let local_first = graph.chain(300, 1, Some(base));
+        graph.add(400, &[local_first, side], 400);
+        assert_eq!(
+            counts(&mut graph, 400, upstream),
+            AheadBehind {
+                ahead: 5,
+                behind: 1
+            }
+        );
+        assert_eq!(
+            counts(&mut graph, upstream, 400),
+            AheadBehind {
+                ahead: 1,
+                behind: 5
+            }
+        );
+
+        // A7: criss-cross merges.
+        let mut graph = TestGraph::new();
+        let base = graph.chain(0, 10, None);
+        graph.add(100, &[base], 100);
+        graph.add(200, &[base], 101);
+        graph.add(101, &[100, 200], 102);
+        graph.add(201, &[200, 100], 103);
+        assert_eq!(
+            counts(&mut graph, 101, 201),
+            AheadBehind {
+                ahead: 1,
+                behind: 1
+            }
+        );
+
+        // A8: no shared history.
+        let mut graph = TestGraph::new();
+        let left = graph.chain(0, 4, None);
+        let right = graph.chain(100, 5, None);
+        assert_eq!(
+            counts(&mut graph, left, right),
+            AheadBehind {
+                ahead: 4,
+                behind: 5
+            }
+        );
+
+        // A9: one tip newer than the whole trunk, the other older than all of it.
+        let mut graph = TestGraph::new();
+        let base = graph.chain(0, 50, None);
+        graph.add(100, &[base], u64::MAX / 2);
+        graph.add(101, &[100], u64::MAX / 2 + 1);
+        graph.add(200, &[base], 0);
+        assert_eq!(
+            counts(&mut graph, 101, 200),
+            AheadBehind {
+                ahead: 2,
+                behind: 1
+            }
+        );
+        assert_eq!(
+            counts(&mut graph, 200, 101),
+            AheadBehind {
+                ahead: 1,
+                behind: 2
+            }
+        );
+
+        // A10: the shared ancestor is reached through a long path on one side
+        // and a short one on the other — the shape the replaced BFS miscounted
+        // — under increasing, decreasing and scattered committer dates.
+        for layout in 0..3u32 {
+            let date = |n: u32| -> u64 {
+                match layout {
+                    0 => u64::from(n),
+                    1 => 10_000 - u64::from(n),
+                    _ => u64::from((n * 7_919) % 1_000),
+                }
+            };
+            let mut graph = TestGraph::new();
+            let base = graph.chain(0, 40, None);
+            let mut previous = base;
+            for n in 100..112 {
+                graph.add(n, &[previous], date(n));
+                previous = n;
+            }
+            graph.add(300, &[base], date(300));
+            assert_eq!(
+                counts(&mut graph, previous, 300),
+                AheadBehind {
+                    ahead: 12,
+                    behind: 1
+                },
+                "date layout {layout}"
+            );
+            assert_eq!(
+                counts(&mut graph, 300, previous),
+                AheadBehind {
+                    ahead: 1,
+                    behind: 12
+                },
+                "date layout {layout}"
+            );
+        }
+
+        // A11: commit 5 is a shallow boundary; its parent 4 was never fetched.
+        let mut graph = TestGraph::new();
+        graph.add(5, &[4], 5);
+        graph.chain(6, 2, Some(5));
+        graph.add(8, &[5], 8);
+        let boundaries = HashSet::from([TestGraph::id(5)]);
+        assert_eq!(
+            counts_with(&mut graph, 7, 8, &boundaries),
+            AheadBehind {
+                ahead: 2,
+                behind: 1
+            }
+        );
+
+        // A12: the same missing parent without a boundary makes the counts
+        // unknowable — an error, never a silently short number.
+        let error = ahead_behind_with(
+            &mut graph,
+            &TestGraph::id(7),
+            &TestGraph::id(8),
+            &HashSet::new(),
+        )
+        .expect_err("a missing non-boundary commit must fail");
+        assert!(matches!(error, MergeBaseError::Load(_)));
+    }
+
+    #[test]
+    fn ahead_behind_read_bound() {
+        const TRUNK: u32 = 12_000;
+        let trunk = usize::try_from(TRUNK).expect("trunk fits");
+
+        // The #486 shape: upstream is local's parent, so the drained paint reads
+        // the whole shared trunk once per flag it gains.
+        let mut linear = TestGraph::new();
+        let tip = linear.chain(0, TRUNK, None);
+        linear.add(TRUNK, &[tip], u64::from(TRUNK));
+        linear.reads = 0;
+        let got = ahead_behind_with(
+            &mut linear,
+            &TestGraph::id(TRUNK),
+            &TestGraph::id(tip),
+            &HashSet::new(),
+        )
+        .expect("ahead/behind");
+        assert_eq!(
+            got,
+            AheadBehind {
+                ahead: 1,
+                behind: 0
+            }
+        );
+        let (commits, edges) = (trunk + 1, trunk);
+        assert!(
+            linear.reads <= 3 * (commits + edges),
+            "linear history: {} reads over {commits} commits / {edges} edges",
+            linear.reads
+        );
+
+        // Adversarial dates: local older than the whole trunk, upstream newer.
+        let mut skewed = TestGraph::new();
+        let tip = skewed.chain(0, TRUNK, None);
+        skewed.add(TRUNK, &[tip], 0);
+        skewed.add(TRUNK + 1, &[tip], u64::MAX / 2);
+        skewed.reads = 0;
+        let got = ahead_behind_with(
+            &mut skewed,
+            &TestGraph::id(TRUNK),
+            &TestGraph::id(TRUNK + 1),
+            &HashSet::new(),
+        )
+        .expect("ahead/behind");
+        assert_eq!(
+            got,
+            AheadBehind {
+                ahead: 1,
+                behind: 1
+            }
+        );
+        let (commits, edges) = (trunk + 2, trunk + 1);
+        assert!(
+            skewed.reads <= 3 * (commits + edges),
+            "skewed dates: {} reads over {commits} commits / {edges} edges",
+            skewed.reads
+        );
+
+        // Wide merge history: two octopus tips over the same fan of leaves, so
+        // edges dominate commits.
+        const FAN: u32 = 500;
+        let fan = usize::try_from(FAN).expect("fan fits");
+        let mut wide = TestGraph::new();
+        wide.add(0, &[], 0);
+        let leaves: Vec<u32> = (1..=FAN).collect();
+        for leaf in &leaves {
+            wide.add(*leaf, &[0], u64::from(*leaf));
+        }
+        wide.add(FAN + 1, &leaves, u64::from(FAN) + 1);
+        wide.add(FAN + 2, &leaves, u64::from(FAN) + 2);
+        wide.reads = 0;
+        let got = ahead_behind_with(
+            &mut wide,
+            &TestGraph::id(FAN + 1),
+            &TestGraph::id(FAN + 2),
+            &HashSet::new(),
+        )
+        .expect("ahead/behind");
+        assert_eq!(
+            got,
+            AheadBehind {
+                ahead: 1,
+                behind: 1
+            }
+        );
+        let (commits, edges) = (fan + 3, 3 * fan);
+        assert!(
+            wide.reads <= 3 * (commits + edges),
+            "wide merge history: {} reads over {commits} commits / {edges} edges",
+            wide.reads
         );
     }
 }

@@ -27,7 +27,10 @@
 //!   deadline (default 3 s — expiry kills the child's process group). stderr
 //!   is capped and redacted before it can appear in any error text
 //!   (GC-DR-13). A child that leaves descendants in its process group after
-//!   exit is killed without its output being accepted.
+//!   exit is killed without its output being accepted. On Unix both core
+//!   limits are zero in the child and its descendants; system handlers that
+//!   honor RLIMIT_CORE suppress core files, including unexpected crashes,
+//!   while signal metadata may still be logged.
 //!
 //! Sandbox: the Required offline profile lives in
 //! [`run_export_subprocess_sandboxed`] — assembled via
@@ -256,6 +259,17 @@ async fn run_bounded_exporter(
                 if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Suppress exporter core files when the system handler honors
+                // RLIMIT_CORE (including systemd-coredump). This covers both
+                // intentional SIGXFSZ enforcement and unexpected child crashes;
+                // it leaves signal handling and the parent limits unchanged.
+                let core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -422,8 +436,8 @@ async fn run_bounded_exporter(
 /// (`SandboxEnforcement::Required` semantics). Assembly is delegated to
 /// [`crate::internal::ai::sandbox::SandboxManager::transform`]; execution
 /// stays in [`run_bounded_exporter`] (file-backed stdout, `RLIMIT_FSIZE`,
-/// process group, wall clock, 16 MiB). Linux uses trusted bwrap; macOS uses
-/// seatbelt (`sandbox-exec`). Fail-CLOSED when the sandbox cannot be
+/// `RLIMIT_CORE=0`, process group, wall clock, 16 MiB). Linux uses trusted
+/// bwrap; macOS uses seatbelt (`sandbox-exec`). Fail-CLOSED when the sandbox cannot be
 /// provided: the capability is unavailable — never a degraded unsandboxed
 /// run (GC-DR-14).
 pub async fn run_export_subprocess_sandboxed(
@@ -1188,6 +1202,43 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out), "export|sess_1-2");
     }
 
+    /// Core limits are set on the exporter child, inherited by its children,
+    /// and leave the caller process resource limits unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_export_core_limits_are_zero_in_child_and_descendants() {
+        let parent_core_limits = || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes to our valid rlimit and does not mutate
+            // the process resource limits.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+            (limit.rlim_cur, limit.rlim_max)
+        };
+        let before = parent_core_limits();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(
+            dir.path(),
+            r#"ulimit -Sc; ulimit -Hc; /bin/sh -c 'ulimit -Sc; ulimit -Hc'"#,
+        );
+        let out = run_export_subprocess(&bin, "core_limits", ExportLimits::default())
+            .await
+            .expect("exporter can report its inherited core limits");
+        assert_eq!(
+            out,
+            b"0\n0\n0\n0\n",
+            "both exporter and descendant must inherit zero soft/hard core limits; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(
+            parent_core_limits(),
+            before,
+            "parent core limits must remain unchanged"
+        );
+    }
+
     /// opencode_export_bytes_path_byte_cap: over-cap output kills the run —
     /// error, never a silent truncation.
     #[cfg(unix)]
@@ -1532,7 +1583,8 @@ printf 'offline-ok'"#,
 
     /// SBX-03: execution stays `run_bounded_exporter` (file-backed stdout
     /// with the 16 MiB poll cap, per-OS RLIMIT_FSIZE — strict on Linux, 8
-    /// GiB backstop on macOS (FIX-SBX-01) — process group, 3s wall clock).
+    /// GiB backstop on macOS (FIX-SBX-01) — RLIMIT_CORE=0 in the child,
+    /// process group, 3s wall clock).
     /// Linux keep_fds store fd is non-CLOEXEC.
     #[tokio::test]
     async fn runner_controls_preserved() {

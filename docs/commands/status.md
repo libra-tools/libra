@@ -141,6 +141,18 @@ Control whether ahead/behind counts are shown in the branch tracking line. `--no
 suppresses the counts while still showing the upstream branch name. The default is to show the
 counts when an upstream is configured.
 
+The counts are the commits reachable from only one side — the same two numbers
+`libra rev-list --left-right --count <upstream>...HEAD` prints (behind, then ahead). They are
+computed with the painting walk shared with `merge-base`, so merges, criss-cross and date-skewed
+histories count exactly as Git counts them; in a shallow repository the boundary commits are
+treated as roots. When the counts cannot be computed (a commit in either history cannot be read),
+status still succeeds: the short format shows no bracket, porcelain v2 omits `# branch.ab`, the
+long format omits the tracking sentence, JSON reports `ahead`/`behind` as `null`, and a
+`cannot count commits ahead/behind '<upstream>'` warning is emitted (code
+`upstream_counts_unavailable`, source `metadata`; the same happens when the shallow boundary list
+is malformed or unreadable, where Git would die). On an unborn branch the
+counts are omitted the same way, without a warning.
+
 ```bash
 libra status --short --branch --no-ahead-behind
 libra status --porcelain --branch --no-ahead-behind
@@ -262,6 +274,7 @@ other subsystems are folded into the same list (see below):
 | `dirty_cache_concurrent_invalidate` | `cache` | A concurrent writer invalidated the cache mid-read |
 | `dirty_cache_path_unencodable` | `cache` | A non-UTF-8 path could not be stored in the dirty cache; its row was omitted (the full status still reports it) |
 | `repository_preflight` | `config` | A repository-level advisory raised before the command ran (e.g. a pending durable object-index repair) |
+| `upstream_counts_unavailable` | `metadata` | The upstream ahead/behind counts could not be computed (a commit in either history, or the shallow boundary list, could not be read); the counts are omitted, never guessed |
 
 The `source` column is a frozen enum: `config`, `probe`, `rename_detect`, `worktree`,
 `metadata`, `cache`. `probe` and `rename_detect` are deliberately distinct — a `probe`
@@ -578,7 +591,10 @@ Detached HEAD:
   (the tracking ref is resolved under its fully-qualified
   `refs/remotes/<remote>/<branch>` name — the shape clone/fetch/push write —
   with a legacy short-name fallback; issue #464)
-- `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`
+- `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`, on an unborn branch,
+  or when the counts cannot be computed (a commit in either history cannot be read —
+  `data.warnings[]` then carries an `upstream_counts_unavailable` warning); otherwise they
+  equal `libra rev-list --left-right --count <upstream>...HEAD` (right, then left)
 - `is_clean` is `true` only when staged, unstaged, untracked, and unmerged
   lists are empty, no global merge state is active, **and** `io_blocked` is
   empty ("cannot inspect" is never clean)

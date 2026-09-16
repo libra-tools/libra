@@ -2707,3 +2707,48 @@ fn branch_format_renders_for_each_ref_atoms() {
         "non-current branch should have no marker: {marked_text}"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(cwd)]
+/// M-RENDER `branch -vv` column (#486): equal, ahead, behind and diverged.
+async fn branch_vv_counts_upstream_shapes() {
+    use super::status_test::{
+        commit_named_file, rev_parse, upstream_tracking_repo, write_upstream_ref,
+    };
+
+    let repo = upstream_tracking_repo(5);
+    let p = repo.path();
+    let _cwd = libra::utils::test::ChangeDirGuard::new(p);
+    let main_line = |p: &std::path::Path| -> String {
+        let output = run_libra_command(&["branch", "-vv"], p);
+        assert_cli_success(&output, "branch -vv");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.starts_with("* main"))
+            .expect("current branch line")
+            .to_string()
+    };
+
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    let line = main_line(p);
+    assert!(
+        line.contains("[origin/main]") && !line.contains("ahead") && !line.contains("behind"),
+        "{line}"
+    );
+
+    write_upstream_ref(&rev_parse(p, "HEAD~1")).await;
+    let line = main_line(p);
+    assert!(line.contains("[origin/main: ahead 1]"), "{line}");
+
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD~2"], p),
+        "reset --hard HEAD~2",
+    );
+    let line = main_line(p);
+    assert!(line.contains("[origin/main: behind 2]"), "{line}");
+
+    commit_named_file(p, "l1");
+    let line = main_line(p);
+    assert!(line.contains("[origin/main: ahead 1, behind 2]"), "{line}");
+}

@@ -848,6 +848,10 @@ fn json_warnings_schema_snapshot() {
             libra::command::status::StatusWarningCode::RepositoryPreflight,
             "repository_preflight",
         ),
+        (
+            libra::command::status::StatusWarningCode::UpstreamCountsUnavailable,
+            "upstream_counts_unavailable",
+        ),
     ] {
         assert_eq!(serde_json::to_value(code).expect("serialize code"), name);
     }
@@ -855,7 +859,7 @@ fn json_warnings_schema_snapshot() {
     // without a pinned wire name here would be free to change spelling.
     assert_eq!(
         libra::command::status::StatusWarningCode::ALL.len(),
-        15,
+        16,
         "a warning code was added or removed; pin its wire name in this snapshot"
     );
 
@@ -892,6 +896,7 @@ fn json_warnings_schema_snapshot() {
         ("dirty_cache_concurrent_invalidate", 12),
         ("dirty_cache_path_unencodable", 13),
         ("repository_preflight", 14),
+        ("upstream_counts_unavailable", 15),
     ] {
         assert!(
             discriminants

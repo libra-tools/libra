@@ -641,51 +641,64 @@ jobs:
   verify-homebrew-formula:
     needs: update-homebrew-tap
     runs-on: macos-latest
+    timeout-minutes: 15
     permissions: {}
     steps:
+      - name: Download this release's formula commit
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: formula-commit-sha
+
       - name: Install and verify Homebrew formula
         shell: bash
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          set +e
+          set -euo pipefail
 
-          warn() {
-            local message="$1"
-            echo "::warning::$message"
-            {
-              echo "### Homebrew formula verification warning"
-              echo
-              echo "$message"
-            } >> "$GITHUB_STEP_SUMMARY"
+          fail() {
+            echo "::error::$1" >&2
+            exit 1
           }
 
-          if ! brew tap libra-tools/libra; then
-            warn "Failed to tap libra-tools/libra; skipping Homebrew formula verification."
-            exit 0
-          fi
+          # A later release can advance tap HEAD while this run is still finishing.
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_UPGRADE=1
+          [[ -f "$GITHUB_WORKSPACE/formula-commit-sha.txt" && -r "$GITHUB_WORKSPACE/formula-commit-sha.txt" ]] || fail "The release formula commit artifact is missing or unreadable."
+          formula_commit="$(tr -d '\r\n' < "$GITHUB_WORKSPACE/formula-commit-sha.txt")" || fail "Failed to read the release formula commit artifact."
+          [[ "$formula_commit" =~ ^[0-9a-f]{40}$ ]] || fail "The release formula commit artifact is invalid."
 
-          if ! brew install libra-tools/libra/libra; then
-            warn "Failed to install libra-tools/libra/libra; skipping version verification."
-            exit 0
-          fi
+          brew tap libra-tools/libra || fail "Failed to tap libra-tools/libra."
+          tap_dir="$(brew --repo libra-tools/libra)" || fail "Failed to locate the Homebrew tap."
+          [[ -n "$tap_dir" ]] || fail "The Homebrew tap path is empty."
+          git -C "$tap_dir" fetch --depth=1 origin "$formula_commit" || fail "Failed to fetch the release formula commit."
+          git -C "$tap_dir" checkout --detach "$formula_commit" || fail "Failed to select the release formula commit."
+          actual_commit="$(git -C "$tap_dir" rev-parse HEAD)" || fail "Failed to read the checked-out formula commit."
+          [[ "$actual_commit" == "$formula_commit" ]] || fail "The checked-out formula commit does not match this release."
 
-          if ! actual_version="$(libra --version 2>&1)"; then
-            warn "The installed libra binary failed to report its version."
-            exit 0
-          fi
-
+          brew install libra-tools/libra/libra || fail "Failed to install the release Homebrew formula."
+          formula_prefix="$(brew --prefix --installed libra-tools/libra/libra)" || fail "Failed to locate the installed Libra formula."
+          [[ -n "$formula_prefix" ]] || fail "The installed Libra formula path is empty."
+          actual_version="$("$formula_prefix/bin/libra" --version)" || fail "The installed Libra binary failed to report its version."
           expected_version="libra ${GITHUB_REF_NAME#v}"
-          if [[ "$actual_version" != "$expected_version" ]]; then
-            warn "Installed version '$actual_version' does not match expected version '$expected_version'."
-            exit 0
-          fi
+          [[ "$actual_version" == "$expected_version" ]] || fail "The installed Libra version does not match this release."
 
           {
             echo "### Homebrew formula verification"
             echo
-            echo "Verified $expected_version from libra-tools/libra."
+            echo "Verified $expected_version from formula commit $formula_commit."
           } >> "$GITHUB_STEP_SUMMARY"
+          printf 'version=%s\nformula_commit=%s\nrelease_commit=%s\nrun_id=%s\n' \
+            "$GITHUB_REF_NAME" "$formula_commit" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            > "$GITHUB_WORKSPACE/homebrew-verify-pass.txt"
+
+      - name: Upload successful Homebrew verification
+        if: success()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: homebrew-verify-pass
+          path: homebrew-verify-pass.txt
+          if-no-files-found: error
 
   request-stable-manifest:
     needs: build-and-upload

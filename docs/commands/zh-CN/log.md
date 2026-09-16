@@ -177,6 +177,12 @@ libra log --author "alice@example.com"
 `--regexp-ignore-case` 改为大小写不敏感匹配（author/committer 在 Libra 中本就大小写不敏感）；
 `--invert-grep` 保留消息**不**匹配的提交。
 
+搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
+`-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
+人类输出、`--json` 和 `--machine` 使用相同筛选范围。空 `--grep` 模式保持不过滤消息的既有行为。
+实际消息开头的空格、tab 和空行仍可搜索。
+此处识别紧跟 committer 的 gpgsig/gpgsig-sha256 签名头；其他导入头顺序（例如 encoding 在 gpgsig 前）沿用既有解析行为。
+
 ```bash
 libra log --grep "fix(" -n 20
 libra log --grep fix -i              # 大小写不敏感

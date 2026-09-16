@@ -495,6 +495,7 @@ trigger a fuzzy match suggestion via edit distance.
 | Pack encoding failed | `LBR-INTERNAL-001` | 128 | Issues URL |
 | Remote unpack failed | `LBR-NET-002` | 128 | "retry or check server logs" |
 | Remote ref update rejected | `LBR-NET-002` | 128 | "check branch protection rules" |
+| Unexpected receive-pack status line / missing status-report flush | `LBR-NET-002` | 128 | "check the remote Git service or proxy response and retry" |
 | Network error | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | LFS upload failed | `LBR-NET-001` | 128 | "check LFS endpoint configuration" |
 | Tracking ref update failed | `LBR-IO-002` | 128 | -- |
@@ -505,3 +506,137 @@ trigger a fuzzy match suggestion via edit distance.
 - Discovery / connection: 60s connection timeout
 - Upload / receive-pack: 600s idle timeout (no data progress triggers timeout)
 - Timeouts are mapped to `NetworkUnavailable` with `phase` detail
+
+## pkt-line protocol errors
+
+Malformed pkt-line frames in HTTP(S) reference discovery, or in receive-pack
+status responses over HTTP(S) or SSH, fail with `LBR-NET-002`. An absent HTTP(S) discovery advertisement also
+uses `LBR-NET-002`. These errors have a fixed `pkt-line protocol error: ` reason
+and do not include the malformed header or payload. Check the remote Git service
+and any proxy that may truncate or replace its response, then retry. Other
+discovery connectivity failures and transport configuration errors retain
+`LBR-NET-001`; authentication and timeout handling retain their existing behavior.
+
+## Receive-pack status reports
+
+An unexpected receive-pack status line returns `LBR-NET-002` (exit 128), with
+`pkt-line protocol error: unexpected receive-pack status line`. The diagnostic
+does not echo that status line. Every report must reach an explicit `0000`
+flush before its unpack/ref statuses are interpreted. An empty response or EOF
+before that flush returns `LBR-NET-002` with the fixed reason
+`missing receive-pack status flush`, including truncated unpack/`ng` rejections.
+Both cases use `check the remote Git service or proxy response and retry`.
+
+Ordinary transport failures retain `LBR-NET-001`. Completely framed server-declared unpack failures
+and `ng` ref rejections retain `LBR-NET-002` with their existing server-log or
+branch-protection hints; valid `ng` reasons remain visible. Local remote-tracking
+refs are updated only after successful status validation. A failed response
+does not prove the server rolled back its refs: inspect the remote state before
+retrying an update.
+
+## SSH advertisement error handling
+
+SSH advertisement lengths `0001` through `0003`, incomplete headers (including
+zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
+reason and marker are retained without captured SSH stdout/stderr.
+
+An incomplete required header has one host-trust exception: local SSH exit status
+255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
+returns fixed host-verification guidance and `LBR-NET-001`. This classification
+does not verify the remote fingerprint. Other missing advertisements, including
+authentication failures, still use `LBR-NET-002`; an available non-zero local exit
+status adds `SSH exited with status N` and fixed connectivity, trusted-host,
+ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+
+After an incomplete required header, Libra allows up to 100 milliseconds to
+observe the SSH exit status, then requests termination if needed. Other read
+errors request termination immediately. The status window, direct-child reap and
+output collection share a two-second cleanup deadline. Protocol and typed
+host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+and timeout errors keep their transport classification and may include a fixed
+local cleanup warning. Termination can change the observed exit status. This
+does not promise cleanup of arbitrary descendant processes.
+
+Clone places targeted host-verification guidance in its structured hints. The
+other command boundaries retain fixed host guidance in the message and their
+existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
+captured remote stderr in either case.
+
+The `git://` object-fetch path already classifies the listed frame errors as
+`LBR-NET-002`; Git discovery and non-ASCII/non-hex async header classifications
+remain separate work. HTTP(S) framing behavior is unchanged.
+
+## SSH authentication and captured diagnostics
+
+Libra invokes SSH with `BatchMode=yes` for both terminal and non-terminal callers.
+It does not prompt for a private-key passphrase or an interactive host-key
+decision during a Libra command. Load or unlock an encrypted key in `ssh-agent`
+before retrying. For host trust, verify the fingerprint through a trusted
+provider console or another trusted channel before manually updating
+`~/.ssh/known_hosts`. Alternatively, make a separate interactive SSH connection
+and compare the displayed fingerprint before accepting it. For example,
+`ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
+port. Do not accept a fingerprint that has not been verified.
+
+`ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
+`no` values. `ask` leaves that SSH option to the user's SSH configuration;
+`BatchMode=yes` still prevents interactive decisions. Explicit values are
+forwarded to SSH. Choose a host-trust policy appropriate to your repository.
+
+SSH stderr is always captured, including in terminal sessions. It is drained
+from process startup, retaining at most 64 KiB while counting and hashing the
+remaining bytes. User-facing errors contain fixed text and a local exit status
+when available. Raw remote stderr is neither printed nor logged. Debug diagnostics
+contain only the status, total and retained byte counts, and a SHA-256 digest of
+the collected stream. Failed or cancelled collection may prevent these metadata
+from being reported; no completed digest is claimed in that case. Hashing work
+is proportional to the number of bytes drained.
+
+SSH reference advertisements and receive-pack responses each have a 16 MiB
+aggregate limit. An oversized advertisement fails with `LBR-NET-001` and guidance
+to use the repository’s HTTPS URL if available, or ask its maintainer to reduce refs. An oversized push response fails with `LBR-NET-001`
+and guidance to push fewer refs; it is not accepted as a truncated success.
+These limits can affect repositories with very large ref sets or updates. The
+streamed fetch pack is not subject to this cap. A failed push response does not
+prove that the server rolled back its refs: inspect the remote state before
+retrying. Existing IO timeouts still apply.
+
+After a complete discovery advertisement, Libra allows up to 100 milliseconds
+for SSH to exit before requesting termination, within a two-second total
+cleanup deadline. Captured-output tasks are cancelled when their owner exits or
+their deadline expires, including when a descendant keeps a pipe open.
+
+### SSH host identity and diagnostic collection
+
+SSH host identity changes retain a distinct fixed warning: the change may
+indicate interception or legitimate key rotation. Verify the new fingerprint
+through a trusted channel before replacing an existing known_hosts entry; do not
+bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
+but their fixed messages and guidance differ.
+
+A stderr collection timeout does not by itself discard complete protocol output
+and an observed local exit status. Non-zero exit status and primary read errors
+still fail the operation. Unavailable diagnostics produce only a fixed debug
+notice, without fabricated empty-stream counts or digests. Stdout collection or
+process-wait failures retain their normal error handling.
+
+### SSH limits and host-classification boundaries
+
+These fixed 16 MiB advertisement and receive-pack response limits apply only to
+Libra's SSH transport. The HTTPS and Git transports do not impose this particular
+cap. If the server provides an HTTPS endpoint, use its HTTPS remote URL when an
+SSH advertisement exceeds the cap; this does not require a read-only user to
+change the server's refs. Otherwise, ask the repository maintainer to reduce the
+advertised ref set. The streamed fetch pack remains outside this aggregate cap.
+
+Host-trust classification requires an incomplete first header with no stdout
+bytes observed, local exit 255 and a recognized retained stderr pattern. Once
+any stdout byte arrives, including a partial header, host-like stderr cannot
+select host-specific guidance. Failures after a complete advertisement retain
+fixed generic diagnostics. The pre-advertisement pattern remains a diagnostic
+heuristic, not fingerprint verification.
+
+A successful discovery whose child waits for a request normally incurs the full
+100 ms native-exit observation window, once per discovery operation. This is
+separate from the two-second direct-child cleanup budget; no benchmark or
+arbitrary-descendant cleanup guarantee is implied.

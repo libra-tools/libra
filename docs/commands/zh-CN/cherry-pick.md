@@ -29,6 +29,10 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 当某提交无法干净应用时，Libra 执行三方 apply（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树），并把未解决的发散路径写入索引（stage 1/2/3）与工作树（行级冲突标记，与 Git 一致）。`-X ours/theirs` 可只解决重叠 hunk 而保留 clean 变更。进行中的序列持久化到统一 SQLite `sequence_state` 表，因此你可以解决剩余冲突后用 `--continue` 续作、用 `--skip` 丢弃冲突提交，或用 `--abort`/`--quit` 撤销整个序列。cherry-pick 序列进行期间，其他 sequencer 操作被阻止（`LBR-CONFLICT-002`）。
 
+新的 cherry-pick 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或序列状态之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 同样拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 cherry-pick；该拒绝不产生序列，`--continue`、`--skip`、`--abort`、`--quit` 对它不适用。发生冲突的 `-n`/`--no-commit` pick 同样不产生可继续的序列：解决后 `libra add`（或 `libra rm`）并执行 `libra commit`，或用 `libra reset --hard` 放弃已暂存的 pick。会覆盖未跟踪工作树文件的 pick 在该提交写入任何内容之前被拒绝：移走或删除提示中的文件后重新执行命令；若逐提交序列中之前的提交已落地，则改为执行 `libra cherry-pick --continue`（会重新尝试停住的提交，Git 则会丢弃它）；若 `--no-commit` 运行中之前的 pick 已暂存，则没有序列，用 `-n` 重新 pick 剩余提交，或用 `libra reset --hard` 放弃全部。
+
+逐提交模式的多提交 pick 在应用第一个提交之前就记录序列，并随每个应用的提交推进（普通提交与分支更新在同一数据库事务里完成；`--ff` 快进则在重置前先写入恢复标记），因此运行被中断、或在之前的提交落地后遇到非冲突错误而停止时，序列保持进行中：用 `libra cherry-pick --continue`、`--skip` 或 `--abort` 收尾。`--ff` 会沿用到 `--continue` 与 `--skip` 应用的提交。`--skip` 与 `--abort` 在重置之前先记录自身；若被中断，重跑同一命令即可完成，完成前 `--continue` 以 `LBR-REPO-003` 拒绝。
+
 该内容合并与 `libra merge` 完全共用路径上的 `merge` gitattribute 及
 `merge.default` 回退：内建 `text`、`binary`、`union`，未知名称回退
 `text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
@@ -291,12 +295,15 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 | 代码 | 条件 | 提示 |
 |------|-----------|------|
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
-| `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick，或 `--continue` 在错误的分支上 | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 |
+| `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick、`--continue` 在错误的分支上，或被中断的 `--skip`/`--abort` 尚未完成（完成前 `--continue` 拒绝） | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 / 重跑被中断的 `--skip` 或 `--abort`（或用 `--quit` 放弃序列） |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | merge commit 未带 `-m`、`-m` 越界、非法 `--cleanup`/`--empty` mode、空提交未带 `--allow-empty`、冗余提交未带 `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`，或空消息未带 `--allow-empty-message` | 使用提示中指明的标志 |
 | `LBR-UNSUPPORTED-001` | 传入了不支持的自定义 `--strategy`，**或** pick 序列的输入中存在需要裁决的 `160000` gitlink（submodule） | 去掉 `--strategy`；gitlink 情形请在 Libra 之外解决 submodule 指针，或从相关提交中移除该条目——拒绝发生在任何索引/工作树/状态写入之前 |
-| `LBR-CONFLICT-001` | Cherry-pick 期间发生冲突（三方冲突，或未跟踪文件会被覆盖） | 解决冲突并 `libra add` 后用 `libra cherry-pick --continue`（或 `--skip`/`--abort`/`--quit`） |
-| `LBR-CONFLICT-002` | cherry-pick 进行中时启动了 `merge`/`rebase`，或在进行中的序列上又发起新的 pick | 先完成或取消该 cherry-pick |
+| `LBR-CONFLICT-001` | 三方冲突使逐提交 pick 序列停止 | 解决冲突并 `libra add` 后用 `libra cherry-pick --continue`（或 `--skip`/`--abort`/`--quit`） |
+| `LBR-CONFLICT-001` | 索引已有未合并条目时新的 pick 被拒绝（不发起序列） | 逐条解决并 `libra add`（或用 `libra reset --hard` 放弃）后重新执行 cherry-pick；`--continue`/`--skip`/`--abort` 不适用 |
+| `LBR-CONFLICT-001` | `--no-commit` pick 因冲突停止（没有可续作的序列） | 解决后 `libra add`（或 `libra rm`）并执行 `libra commit`，或用 `libra reset --hard` 放弃已暂存的 pick；`--continue`/`--skip`/`--abort` 不适用 |
+| `LBR-CONFLICT-001` | pick 会覆盖未跟踪的工作树文件（在该提交写入索引、工作树或引用之前拒绝） | 移走或删除提示中的文件。若本次尚未应用或暂存任何内容，则未写入任何内容，重新执行同一命令；若逐提交序列中之前的提交已落地，序列停在该提交之前，执行 `libra cherry-pick --continue`（会重新尝试该提交）、`--skip` 或 `--abort`；若 `--no-commit` 运行中之前的 pick 已暂存，则没有序列：用 `-n` 重新 pick 剩余提交，或用 `libra reset --hard` 放弃全部 |
+| `LBR-CONFLICT-002` | cherry-pick 进行中时启动了其他 sequencer 操作（`merge`、`rebase` 或 `revert`），或在进行中的序列上又发起新的 pick | 先完成或取消进行中的序列 |
 | `LBR-IO-001` | 无法加载对象或 cherry-pick 状态 | 检查仓库完整性并重试 |
 | `LBR-IO-002` | 无法保存对象、索引，或更新分支引用/状态 | 检查文件系统权限和仓库可写性 |
 

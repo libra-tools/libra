@@ -153,6 +153,35 @@ Fixtures must assert that:
 Tests and ordinary diagnostic tools must not enumerate or print configuration
 values, tokens, credentials, or schema dumps from an ambient database.
 
+### Repository context in acceptance tests
+
+The mutable-state inventory covers Repository/Worktree/Composite state, not a
+second configuration ownership catalog. Its whole-source DDL guard recognizes
+the exact configuration ledger through `SchemaLedger::Configuration` and checks
+the GlobalConfig/SystemConfig role mapping. The ledger is neither Repository
+state nor migration scratch. Unknown tables still fail closed; both source-scan
+directions and real schema materialization remain required. Fresh Repository
+materialization must not contain the configuration-only ledger.
+
+Synthetic merge tests still call the real attribute resolver. Each affected
+test therefore owns a temporary Libra repository and `ConfigDbFixture`, even
+when all merged blobs stay in memory. `MergeTestRepository` initializes once per
+test, keeps its setup runtime alive, and restores CWD before deleting temporary
+directories. Repository paths are canonicalized so symlinked temporary roots
+work on all platforms. Before dropping its runtime it evicts and closes its
+cached repository connection and clears the object-storage cache, including
+when initialization or the test body panics. An outer CWD lock remains held
+through environment and hash-kind restoration. Normal-return and panic
+regression cases verify restoration and cleanup, including an explicit
+closed-pool assertion; tests use named CWD/environment/hash-kind serialization
+rather than depending on the checkout being a Libra repository.
+
+The current serial classifier traverses `tests/`, not `src/` unit modules. These
+unit tests still need their named serial annotations, but adding them to the TSV
+would create dangling registry rows. Run the unchanged registry guard and
+nextest generator to verify synchronization; do not widen or weaken the
+classifier to accommodate a fixture-only change.
+
 ## Legacy receipt classification and repair boundary
 
 An unknown or newer receipt is not repairable merely because a later source

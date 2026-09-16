@@ -51,6 +51,7 @@ flowchart TD
 - 公开参数新增可重复 `-X/--strategy-option <ours|theirs>`（last-wins）与 `--cleanup=<mode>`；前者经 `merge::merge_bytes_with_favor` 做 hunk-level 偏向，后者复用 commit cleanup parser，并在任何 sequencer action 前校验。两者随 `RevertState` 续作。
 - **冲突 sequencer**：`three_way_revert_blob` 使用 base=被 revert blob / ours=当前 / theirs=选定 parent，并在内容合并前按路径选择 text/binary/union；text 无 `-X` 时重叠区域写 marker，有 `-X` 时共享 hunk resolver。`RevertState` 通过 atomic+fsynced JSON 保存 orig/reverted/signoff/edit/cleanup/strategy_option/remaining/conflicted paths；`--continue`/`--skip` 续作保持相同策略。driver 由当次工作树 attributes/config 重新选择，不写入 state。
 - apply、root revert、`--skip`/`--abort` 恢复路径都对不可读/损坏的 index fail-closed（`LBR-REPO-002`），不会再把 load failure 当作空 index 后覆盖工作树；state 保留供修复后重试。
+- unmerged-index start guard（#477 HF-03，ADR-HF-04）：新的 revert 在 `run_revert` 解析目标之前复用 `cherry_pick::unmerged_index_paths()` 检查索引；存在未合并条目即以 `RevertError::UnmergedIndex`（`LBR-CONFLICT-001`，128）拒绝并列出最多 10 条路径，零写入；该检查只拦截新开始的 revert，`--continue`/`--skip`/`--abort` 在检查之前分派，而这次拒绝不写 revert state，控制动词对它无从作用。
 
 
 ## 还未实现的功能

@@ -2205,18 +2205,60 @@ async fn test_push_ssh_host_key_failure_is_reported() {
         String::from_utf8_lossy(&remote_add_out.stderr)
     );
 
-    let push_out = libra_command(&local_dir)
-        .env("LIBRA_SSH_COMMAND", &ssh_script)
-        .env("LIBRA_TEST_SSH_FAIL", "hostkey")
-        .args(["push", "origin", &current_branch])
-        .output()
-        .expect("failed to run push over fake ssh");
-    let stderr = String::from_utf8_lossy(&push_out.stderr);
-    assert!(
-        stderr.contains("Host key verification failed."),
-        "push should surface SSH host-key failures, stderr: {stderr}"
-    );
-
+    for mode in [None, Some("--json"), Some("--machine")] {
+        let mut command = libra_command(&local_dir);
+        command
+            .env("LIBRA_SSH_COMMAND", &ssh_script)
+            .env("LIBRA_TEST_SSH_FAIL", "hostkey");
+        if let Some(mode) = mode {
+            command.arg(mode);
+        }
+        let output = command
+            .args(["push", "origin", &current_branch])
+            .output()
+            .expect("failed to run push over fake ssh");
+        assert_eq!(output.status.code(), Some(128), "{mode:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("\"error_code\""),
+            "{mode:?}: missing structured error: {stderr}"
+        );
+        let (_, report) = super::parse_cli_error_stderr(&output.stderr);
+        assert_eq!(report.error_code, "LBR-NET-001", "{mode:?}: {report:?}");
+        assert_eq!(report.exit_code, 128, "{mode:?}: {report:?}");
+        for expected in [
+            "SSH host trust needs confirmation:",
+            "SSH host key could not be verified",
+            "verify the host fingerprint",
+            "trusted provider console",
+            "ssh.strictHostKeyChecking",
+        ] {
+            assert!(
+                report.message.contains(expected),
+                "{mode:?}: missing {expected:?}: {report:?}"
+            );
+        }
+        assert_eq!(
+            report.hints.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["check the remote URL and network connectivity"],
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("pkt-line protocol error:"),
+            "{mode:?}: {report:?}"
+        );
+        assert!(
+            !report.message.contains("ssh-keyscan"),
+            "{mode:?}: {report:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for text in [stderr.as_ref(), stdout.as_ref()] {
+            assert!(
+                !text.contains("Host key verification failed."),
+                "raw SSH stderr leaked in {mode:?}: {text}"
+            );
+        }
+    }
     let remote_head_out = Command::new("git")
         .args([
             "--git-dir",

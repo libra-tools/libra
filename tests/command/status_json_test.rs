@@ -429,3 +429,187 @@ fn json_status_paths_are_relative() {
         assert!(!s.starts_with('/'), "path should be relative: {s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Upstream ahead/behind counts (#486)
+// ---------------------------------------------------------------------------
+
+fn json_upstream(repo: &std::path::Path) -> serde_json::Value {
+    let output = run_libra_command(&["--json", "status"], repo);
+    assert_cli_success(&output, "json status");
+    parse_json_stdout(&output)
+}
+
+/// `data.warnings[]` holds exactly one `upstream_counts_unavailable` warning.
+fn assert_upstream_count_warning(envelope: &serde_json::Value) {
+    let warnings = envelope["data"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("data.warnings[] is an array: {envelope}"));
+    let matching: Vec<_> = warnings
+        .iter()
+        .filter(|warning| warning["code"] == "upstream_counts_unavailable")
+        .collect();
+    assert_eq!(matching.len(), 1, "one upstream-count warning: {envelope}");
+    assert_eq!(matching[0]["source"], "metadata", "{envelope}");
+    assert!(
+        matching[0]["message"].as_str().is_some_and(
+            |message| message.starts_with("cannot count commits ahead/behind 'origin/main'")
+        ),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-RENDER R4, R1, R2 and R3 in the JSON `upstream` object.
+async fn json_status_upstream_counts_shapes() {
+    use super::status_test::{
+        commit_named_file, rev_parse, upstream_tracking_repo, write_upstream_ref,
+    };
+
+    let repo = upstream_tracking_repo(5);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+    let counts = |parsed: &serde_json::Value| {
+        let upstream = &parsed["data"]["upstream"];
+        assert_eq!(upstream["gone"], false, "{parsed}");
+        (upstream["ahead"].clone(), upstream["behind"].clone())
+    };
+
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    assert_eq!(
+        counts(&json_upstream(p)),
+        (serde_json::json!(0), serde_json::json!(0))
+    );
+
+    write_upstream_ref(&rev_parse(p, "HEAD~1")).await;
+    assert_eq!(
+        counts(&json_upstream(p)),
+        (serde_json::json!(1), serde_json::json!(0))
+    );
+
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD~2"], p),
+        "reset --hard HEAD~2",
+    );
+    assert_eq!(
+        counts(&json_upstream(p)),
+        (serde_json::json!(0), serde_json::json!(2))
+    );
+
+    commit_named_file(p, "l1");
+    assert_eq!(
+        counts(&json_upstream(p)),
+        (serde_json::json!(1), serde_json::json!(2))
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-UNKNOWN U2 and U3 in JSON: `ahead`/`behind` are `null` with `gone: false`;
+/// only the unreadable history carries a warning.
+async fn json_status_upstream_counts_unavailable_are_null() {
+    use super::{
+        loose_object_path,
+        status_test::{rev_parse, upstream_tracking_repo, write_upstream_ref},
+    };
+
+    {
+        let repo = upstream_tracking_repo(5);
+        let p = repo.path();
+        let _cwd = ChangeDirGuard::new(p);
+        write_upstream_ref(&rev_parse(p, "HEAD~1")).await;
+        fs::remove_file(loose_object_path(p, &rev_parse(p, "HEAD~3")))
+            .expect("remove a shared commit");
+        let output = run_libra_command(&["--json", "status"], p);
+        assert_cli_success(&output, "json status");
+        assert!(
+            output.stderr.is_empty(),
+            "JSON mode keeps stderr clean: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed = parse_json_stdout(&output);
+        let upstream = &parsed["data"]["upstream"];
+        assert_eq!(upstream["gone"], false, "{parsed}");
+        assert!(upstream["ahead"].is_null(), "{parsed}");
+        assert!(upstream["behind"].is_null(), "{parsed}");
+        assert_upstream_count_warning(&parsed);
+    }
+
+    let repo = upstream_tracking_repo(1);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "fresh"], p),
+        "switch --orphan fresh",
+    );
+    for (key, value) in [
+        ("branch.fresh.remote", "origin"),
+        ("branch.fresh.merge", "refs/heads/main"),
+    ] {
+        assert_cli_success(&run_libra_command(&["config", key, value], p), key);
+    }
+    let parsed = json_upstream(p);
+    let upstream = &parsed["data"]["upstream"];
+    assert_eq!(upstream["gone"], false, "{parsed}");
+    assert!(upstream["ahead"].is_null(), "{parsed}");
+    assert!(upstream["behind"].is_null(), "{parsed}");
+    assert!(
+        parsed["data"]["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.is_empty()),
+        "an unborn branch is not an unavailable count: {parsed}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-UNKNOWN U2 on the other delivery paths: the dirty-cache `--cached` mode,
+/// `--exit-code-on-warning` under `--json`, and the embedding API — which
+/// carries the warning in its own envelope without touching the process
+/// warning tracker.
+async fn json_status_upstream_counts_unavailable_cached_and_api() {
+    use super::{
+        loose_object_path,
+        status_test::{rev_parse, upstream_tracking_repo, write_upstream_ref},
+    };
+
+    let repo = upstream_tracking_repo(5);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+    write_upstream_ref(&rev_parse(p, "HEAD~1")).await;
+    fs::remove_file(loose_object_path(p, &rev_parse(p, "HEAD~3"))).expect("remove a shared commit");
+
+    assert_cli_success(
+        &run_libra_command(&["status", "--scan"], p),
+        "status --scan",
+    );
+    let cached = run_libra_command(&["--json", "status", "--cached"], p);
+    assert_cli_success(&cached, "json status --cached");
+    let parsed = parse_json_stdout(&cached);
+    assert_eq!(parsed["data"]["freshness"], "cached", "{parsed}");
+    assert!(parsed["data"]["upstream"]["ahead"].is_null(), "{parsed}");
+    assert_upstream_count_warning(&parsed);
+
+    let gated = run_libra_command(&["--json", "--exit-code-on-warning", "status"], p);
+    assert_eq!(
+        gated.status.code(),
+        Some(9),
+        "the warning drives exit 9: {}",
+        String::from_utf8_lossy(&gated.stderr)
+    );
+    assert_upstream_count_warning(&parse_json_stdout(&gated));
+
+    libra::utils::output::reset_warning_tracker();
+    assert!(!libra::utils::output::warning_was_emitted());
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(p)
+        .await
+        .expect("api status");
+    assert_upstream_count_warning(&envelope);
+    assert!(
+        !libra::utils::output::warning_was_emitted(),
+        "the API path must not touch the process warning tracker"
+    );
+}

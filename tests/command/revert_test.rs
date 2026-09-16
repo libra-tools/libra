@@ -1722,3 +1722,65 @@ fn test_revert_skip_clears_state_on_drain_error() {
         "retry reports no in-progress revert"
     );
 }
+
+/// M-UNMERGED U1 (ADR-HF-04): `revert --no-commit` (and a plain revert) refuse to
+/// start on an unmerged index with exit 128 / `LBR-CONFLICT-001` and write nothing
+/// (GC-HF-02).
+#[test]
+fn test_revert_refuses_unmerged_index() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, msg: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    commit("shared.txt", "base\n", "base shared");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    commit("shared.txt", "feature side\n", "feature edit");
+    let feat = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    commit("shared.txt", "main side\n", "main edit");
+    let stop = run_libra_command(&["cherry-pick", "-n", &feat], p);
+    assert_eq!(stop.status.code(), Some(128), "fixture conflict");
+
+    let before = super::cherry_pick_test::refusal_snapshot(p);
+    assert!(
+        before.unmerged.contains("shared.txt"),
+        "fixture must be unmerged: {}",
+        before.unmerged
+    );
+    for args in [
+        vec!["revert", "--no-commit", "HEAD"],
+        vec!["revert", "HEAD"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert_eq!(out.status.code(), Some(128), "{args:?} exit");
+        let (human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CONFLICT-001", "{args:?}");
+        assert!(
+            human.contains("index has unmerged entries"),
+            "{args:?}: {human}"
+        );
+        assert!(
+            human.contains("unmerged paths: shared.txt"),
+            "{args:?}: {human}"
+        );
+        assert_eq!(
+            super::cherry_pick_test::refusal_snapshot(p),
+            before,
+            "{args:?} must not write"
+        );
+    }
+    let abort = run_libra_command(&["revert", "--abort"], p);
+    assert_ne!(abort.status.code(), Some(0), "no revert may be in progress");
+    assert_eq!(super::cherry_pick_test::refusal_snapshot(p), before);
+}

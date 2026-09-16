@@ -3306,3 +3306,107 @@ fn test_log_only_trailers_display_and_errors() {
     let out = run_libra_command(&["log", "--trailer", "=x", "--no-pager"], p);
     assert_eq!(out.status.code(), Some(129), "empty key is a usage error");
 }
+
+#[test]
+fn log_grep_signed_commit_uses_message_only() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let tree_output = run_libra_command(&["rev-parse", "HEAD^{tree}"], p);
+    assert_cli_success(&tree_output, "resolve fixture tree");
+    let tree = String::from_utf8(tree_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let branch_output = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    assert_cli_success(&branch_output, "resolve fixture branch");
+    let branch = String::from_utf8(branch_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    for (header, kind) in [
+        ("gpgsig", "PGP"),
+        ("gpgsig", "SSH"),
+        ("gpgsig-sha256", "PGP"),
+        ("gpgsig-sha256", "SSH"),
+        ("", "unsigned"),
+    ] {
+        // An opaque signature fixture is sufficient: this gate checks message
+        // selection, not cryptographic verification. The search token occurs
+        // only in the signature header, never in the actual subject/body.
+        let signature_header = if header.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{header} -----BEGIN {kind} SIGNATURE-----\n FiX OnlySignatureToken\n -----END {kind} SIGNATURE-----\n"
+            )
+        };
+        // The first blank line ends the object headers; the next newline and
+        // spaces belong to the user's message and must remain searchable.
+        let raw = format!(
+            "tree {tree}\nauthor fixture <fixture@example.invalid> 1700000000 +0000\ncommitter fixture <fixture@example.invalid> 1700000000 +0000\n{signature_header}\n\n  add beta\n\nBody Needle\n\nTicket: 42\n"
+        );
+        let object = run_libra_command_with_stdin(
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            p,
+            &raw,
+        );
+        assert_cli_success(&object, "store signature-header fixture commit");
+        let oid = String::from_utf8(object.stdout).unwrap().trim().to_string();
+        assert_eq!(oid.len(), 40);
+        assert_cli_success(
+            &run_libra_command(&["update-ref", &branch, &oid], p),
+            "point fixture branch at signed-body commit",
+        );
+
+        for mode in ["human", "json", "machine"] {
+            for (pattern, ignore_case, invert, expected) in [
+                ("OnlySignatureToken", false, false, 0),
+                ("Fix", true, false, 0),
+                ("Fix", true, true, 1),
+                ("Body Needle", false, false, 1),
+                ("body needle", true, false, 1),
+                ("Body Needle", false, true, 0),
+                ("\n  add beta", false, false, 1),
+            ] {
+                let mut args = match mode {
+                    "human" => vec!["log", "--oneline"],
+                    "json" => vec!["--json", "log"],
+                    "machine" => vec!["--machine", "log"],
+                    _ => unreachable!(),
+                };
+                args.extend(["--grep", pattern]);
+                if ignore_case {
+                    args.push("-i");
+                }
+                if invert {
+                    args.push("--invert-grep");
+                }
+                let output = run_libra_command(&args, p);
+                assert_cli_success(&output, "log signed fixture selection");
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    !text.contains("OnlySignatureToken"),
+                    "signature must not be presented as message text"
+                );
+                if mode == "human" {
+                    assert_eq!(
+                        text.lines().count(),
+                        expected,
+                        "{header}/{kind} {args:?}: {text}"
+                    );
+                    assert_eq!(text.contains("add beta"), expected == 1);
+                } else {
+                    let output = parse_json_stdout(&output);
+                    let commits = output["data"]["commits"].as_array().unwrap();
+                    assert_eq!(commits.len(), expected, "{header}/{kind} {args:?}");
+                    assert_eq!(output["data"]["total"], expected);
+                    if expected == 1 {
+                        assert_eq!(commits[0]["hash"], oid);
+                        assert_eq!(commits[0]["subject"], "add beta");
+                    }
+                }
+            }
+        }
+    }
+}

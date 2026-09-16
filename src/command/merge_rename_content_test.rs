@@ -38,7 +38,9 @@ fn merge(
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn binary_fold_uses_original_content_and_independently_merged_mode() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: both binary versions diverged and one side made it executable.
     let mut blobs = VirtualBlobs::new();
     let base = entry(&mut blobs, b"base\0", TreeItemMode::Blob);
@@ -55,7 +57,9 @@ fn binary_fold_uses_original_content_and_independently_merged_mode() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn binary_fold_without_a_regular_original_records_empty_content() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: a missing or symlink original with genuinely divergent binaries.
     let mut blobs = VirtualBlobs::new();
     let old_link = entry(&mut blobs, b"original-target", TreeItemMode::Link);
@@ -72,7 +76,9 @@ fn binary_fold_without_a_regular_original_records_empty_content() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn binary_fold_does_not_hide_an_unresolved_mode_conflict() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: without a regular original, both regular modes differ from it.
     let mut blobs = VirtualBlobs::new();
     let old_link = entry(&mut blobs, b"original-target", TreeItemMode::Link);
@@ -89,7 +95,9 @@ fn binary_fold_does_not_hide_an_unresolved_mode_conflict() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn symlink_fold_restores_the_complete_original_and_remains_unclean() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: nontrivial symlink versions, including a different original kind.
     // Real rename detection is exact-only for links, so this pins the helper
     // boundary rather than claiming an unreachable CLI shape is exercised.
@@ -108,7 +116,9 @@ fn symlink_fold_restores_the_complete_original_and_remains_unclean() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     let _cwd_lock = crate::utils::test::cwd_lock_guard();
     // Given: callers normally supply an original; absence needs an optional
     // path result and belongs to virtual_conflict_resolution instead.
@@ -134,7 +144,9 @@ fn non_file_rename_without_an_original_refuses_the_invalid_helper_contract() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn binary_fold_resolves_trivial_oids_before_the_virtual_original_fallback() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     // Given: one side changes content while the other changes only the mode.
     let mut blobs = VirtualBlobs::new();
     let base = entry(&mut blobs, b"base\0", TreeItemMode::Blob);
@@ -152,7 +164,9 @@ fn binary_fold_resolves_trivial_oids_before_the_virtual_original_fallback() {
 }
 
 #[test]
+#[serial_test::serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
 fn outer_binary_content_selection_preserves_mode_and_mode_conflicts() {
+    let _repository = super::repository_fixture::MergeTestRepository::new();
     let _cwd_lock = crate::utils::test::cwd_lock_guard();
     // Given: nontrivial binary versions with different modes, with or without
     // an original that can explain the executable-bit change.

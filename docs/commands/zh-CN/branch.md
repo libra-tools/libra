@@ -52,7 +52,7 @@ libra branch --show-current
 | | `--format` | `<format>` | 以 for-each-ref 格式串渲染每个分支（如 `%(refname:short)`、`%(objectname)`、`%(HEAD)`、`%(upstream)`、`%(if)`…`%(end)`）。取代默认 `* name` 列表（及 `-v`/`--column`），复用 for-each-ref atom 引擎 |
 | | `--column[=<mode>]` | `always` / `auto` / `never` | 将分支列表按列布局而非每行一个（bare `--column` 即 `always`；`auto` 仅在 stdout 为终端时）。列模式显示纯文本无颜色的名称。 |
 | | `--no-column` | | 不按列布局列出分支（等价于 `--column=never`），撤销先前的 `--column`（最后出现者生效）。分支默认每行一个，故单独使用时为 no-op。 |
-| `-v` | `--verbose` | | 每个分支附带其 tip 的短 sha 与提交 subject。重复（`-vv`）时额外显示上游 tracking 段 `[<upstream>: ahead N, behind M]`（remote-tracking ref 未 fetch 时省略计数；无配置上游的分支不显示）。优先于 `--column`。 |
+| `-v` | `--verbose` | | 每个分支附带其 tip 的短 sha 与提交 subject。重复（`-vv`）时额外显示上游 tracking 段 `[<upstream>: ahead N, behind M]`（计数与 `status` 相同；remote-tracking ref 未 fetch 或计数无法计算时省略计数，后者会发出 warning；无配置上游的分支不显示）。优先于 `--column`。 |
 
 ### 标志示例
 

@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use super::{fetch, merge, rebase, stash};
 use crate::{
+    git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
     internal::{
         config::{ConfigKv, LocalIdentityTarget, RemoteConfig, read_cascaded_config_value_strict},
         head::Head,
@@ -952,6 +953,11 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::Discovery { source, .. } => {
             map_fetch_discovery_error(error.to_string(), source)
         }
+        fetch::FetchError::FetchObjects { source, .. } if fetch::is_pkt_line_io_error(source) => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         fetch::FetchError::FetchObjects { source, .. } => map_fetch_io_error(
             error.to_string(),
             source,
@@ -959,12 +965,13 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         )
         .with_hint("check network connectivity and retry"),
         fetch::FetchError::PacketRead { source } => {
-            if is_timeout_io_error(source) {
-                return CliError::fatal(error.to_string())
+            if fetch::is_pkt_line_io_error(source) {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::NetworkProtocol)
+            } else {
+                CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::NetworkUnavailable)
-                    .with_hint("check network connectivity and retry");
+                    .with_hint("check network connectivity and retry")
             }
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::NetworkProtocol)
         }
         fetch::FetchError::RemoteBranchNotFound { .. } => {
             CliError::command_usage(error.to_string())
@@ -1015,6 +1022,16 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
         GitError::UnAuthorized(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::AuthPermissionDenied)
             .with_hint("check SSH key / HTTP credentials and repository access rights"),
+        GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
+        GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
             .with_hint("check network connectivity and retry"),

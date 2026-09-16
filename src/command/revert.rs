@@ -96,6 +96,11 @@ enum RevertError {
     #[error("unresolved conflict markers remain in '{0}'")]
     UnresolvedConflicts(String),
 
+    /// ADR-HF-04: a new revert refuses to start while the index still has
+    /// unmerged entries, before any index, worktree, ref or state write.
+    #[error("revert is not possible because the index has unmerged entries")]
+    UnmergedIndex(Vec<String>),
+
     #[error("failed to access revert state: {0}")]
     StateIo(String),
 
@@ -234,7 +239,7 @@ impl RevertError {
             Self::Signoff(_) => StableErrorCode::CliInvalidArguments,
             Self::Identity(_) => StableErrorCode::AuthMissingCredentials,
             Self::MultiCommitUnsupported(_) => StableErrorCode::CliInvalidArguments,
-            Self::Conflicts { .. } | Self::UnresolvedConflicts(_) => {
+            Self::Conflicts { .. } | Self::UnresolvedConflicts(_) | Self::UnmergedIndex(_) => {
                 StableErrorCode::ConflictUnresolved
             }
             Self::RevertInProgress | Self::NoRevertInProgress => StableErrorCode::RepoStateInvalid,
@@ -286,6 +291,9 @@ impl From<RevertError> for CliError {
             RevertError::ConflictStyleRead(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("check repository integrity and retry"),
+            RevertError::UnmergedIndex(paths) => {
+                crate::command::cherry_pick::unmerged_index_cli_error(message, &paths)
+            }
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -440,6 +448,14 @@ async fn run_revert(args: RevertArgs) -> Result<RevertOutput, RevertError> {
 
     if let Head::Detached(_) = Head::current().await {
         return Err(RevertError::DetachedHead);
+    }
+
+    // ADR-HF-04: refuse before resolving targets or writing anything while the
+    // index still has unmerged entries (Git: "your index file is unmerged.").
+    let unmerged =
+        crate::command::cherry_pick::unmerged_index_paths().map_err(RevertError::IndexLoad)?;
+    if !unmerged.is_empty() {
+        return Err(RevertError::UnmergedIndex(unmerged));
     }
 
     // `--no-commit` and `-m` operate on a single revert; combining them with
@@ -1601,6 +1617,10 @@ mod tests {
     fn revert_error_display_pins_each_variant() {
         assert_eq!(RevertError::NotInRepo.to_string(), "not a libra repository",);
         assert_eq!(
+            RevertError::UnmergedIndex(vec!["a.txt".to_string()]).to_string(),
+            "revert is not possible because the index has unmerged entries",
+        );
+        assert_eq!(
             RevertError::DetachedHead.to_string(),
             "you are in a 'detached HEAD' state; reverting is not allowed",
         );
@@ -1710,6 +1730,10 @@ mod tests {
                 paths: "ignored".to_string(),
             }
             .stable_code(),
+            StableErrorCode::ConflictUnresolved,
+        );
+        assert_eq!(
+            RevertError::UnmergedIndex(vec!["a.txt".to_string()]).stable_code(),
             StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(

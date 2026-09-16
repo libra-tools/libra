@@ -31,6 +31,7 @@ use crate::{
         init::InitError,
         restore::{RestoreArgs, RestoreError},
     },
+    git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
     internal::{
         ai::history::HistoryManager,
         branch::{self, Branch},
@@ -1017,21 +1018,34 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
                     .with_hint("check SSH key / HTTP credentials and repository access rights")
             }
+            GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
+            GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
+            GitError::NetworkError(detail)
+                if detail.starts_with(crate::internal::protocol::ssh_client::SSH_HOST_KEY_CHANGED_SIGNAL) =>
+            {
+                CliError::fatal("SSH host identity has changed")
+                    .with_stable_code(StableErrorCode::NetworkUnavailable)
+                    .with_hint(crate::internal::protocol::ssh_client::SSH_HOST_KEY_CHANGED_GUIDANCE)
+            }
+            GitError::NetworkError(detail)
+                if detail.starts_with(crate::internal::protocol::ssh_client::SSH_HOST_KEY_UNCONFIRMED_SIGNAL) =>
+            {
+                CliError::fatal("SSH host key could not be verified")
+                    .with_stable_code(StableErrorCode::NetworkUnavailable)
+                    .with_hint(crate::internal::protocol::ssh_client::SSH_HOST_KEY_GUIDANCE)
+            }
             GitError::NetworkError(_) => {
-                let message = source.to_string();
-                let error = CliError::fatal(format!("remote discovery failed: {message}"))
-                    .with_stable_code(StableErrorCode::NetworkUnavailable);
-                if message.to_lowercase().contains("host key verification failed") {
-                    error.with_hint(
-                        "the remote host key is not in ~/.ssh/known_hosts yet; accept it once via \
-                         `ssh -T <host>` or `ssh-keyscan -t ed25519 <host> >> ~/.ssh/known_hosts`, \
-                         or set ssh.strictHostKeyChecking to `accept-new`",
-                    )
-                } else {
-                    error.with_hint(
-                        "check the remote host, DNS, VPN/proxy, and network connectivity",
-                    )
-                }
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkUnavailable)
+                    .with_hint("check the remote host, DNS, VPN/proxy, and network connectivity")
             }
             GitError::IOError(_) => CliError::fatal(format!("remote discovery failed: {source}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
@@ -1056,6 +1070,14 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
         fetch::FetchError::ObjectFormatMismatch { .. } => CliError::fatal(source.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the remote and local repository use different object formats"),
+        fetch::FetchError::FetchObjects { source: error, .. }
+        | fetch::FetchError::PacketRead { source: error }
+            if fetch::is_pkt_line_io_error(error) =>
+        {
+            CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+                .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
         fetch::FetchError::FetchObjects { .. } | fetch::FetchError::PacketRead { .. } => {
             CliError::fatal(source.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
@@ -3880,19 +3902,19 @@ mod tests {
     fn discover_remote_host_key_error_maps_to_host_key_hint() {
         let cli = map_discover_remote_error(fetch::FetchError::Discovery {
             remote: "git@example.com/repo.git".to_string(),
-            source: GitError::NetworkError(
-                "SSH read failed: early eof; exit status 255, stderr: \
-                 No ED25519 host key is known for example.com and you have requested \
-                 strict checking.\nHost key verification failed."
-                    .to_string(),
-            ),
+            source: GitError::NetworkError(format!(
+                "{}fixture private detail",
+                crate::internal::protocol::ssh_client::SSH_HOST_KEY_UNCONFIRMED_SIGNAL
+            )),
         });
 
         assert_eq!(cli.stable_code(), StableErrorCode::NetworkUnavailable);
         assert_eq!(cli.exit_code(), 128);
         let hint = cli.hints()[0].as_str();
         assert!(
-            hint.contains("~/.ssh/known_hosts") && hint.contains("ssh-keyscan"),
+            hint.contains("~/.ssh/known_hosts")
+                && hint.contains("trusted")
+                && !hint.contains("ssh-keyscan"),
             "host key failure should surface a targeted hint, got: {hint}"
         );
     }

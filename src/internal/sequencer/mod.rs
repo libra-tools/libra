@@ -729,6 +729,26 @@ where
     .await
 }
 
+/// Clear this worktree's row of `kind` only while its payload still contains
+/// `needle` (#477 HF-31): a run releasing its own claim after an early refusal
+/// must not erase a row another start claimed after a concurrent `--quit`.
+/// Returns whether a row was removed.
+pub(crate) async fn clear_if_payload_contains(
+    kind: SequenceKind,
+    needle: &str,
+) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ? AND instr(payload, ?) > 0",
+            [kind.as_str().into(), current_scope_key().into(), needle.into()],
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// The FIRST write of a starting `am`, as an atomic claim (§C.4.4) — see
 /// [`claim_start`].
 pub(crate) async fn claim_start_am(state: &AmSequenceState) -> Result<(), String> {
@@ -2035,6 +2055,39 @@ mod tests {
         assert_eq!(
             load().await.expect("load").expect("present").current_oid,
             "f".repeat(40)
+        );
+    }
+
+    /// #477 HF-31: a fenced clear removes the row only while its payload still
+    /// carries the caller's token.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn clear_if_payload_contains_only_removes_the_owners_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let mut row = sample(SequenceKind::CherryPick);
+        row.payload = r#"{"claim_token":"theirs"}"#.to_string();
+        save(&row).await.expect("save");
+        let mine = r#""claim_token":"mine""#;
+        assert!(
+            !clear_if_payload_contains(SequenceKind::CherryPick, mine)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_some(),
+            "another owner's row stays"
+        );
+        let theirs = r#""claim_token":"theirs""#;
+        assert!(
+            clear_if_payload_contains(SequenceKind::CherryPick, theirs)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_none(),
+            "the owner's row is removed"
         );
     }
 

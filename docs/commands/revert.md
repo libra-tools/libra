@@ -44,6 +44,8 @@ conflict interrupts a multi-commit revert, the commits still pending behind it a
 remembered and reverted automatically once `--continue`/`--skip` resumes the
 sequence. `-n/--no-commit` and `-m/--mainline` apply only to a single commit.
 
+A new revert refuses to start while the index has unmerged entries: before resolving any target or writing to the index, working tree, refs, or `revert-state.json`, it exits 128 with `LBR-CONFLICT-001` and names up to ten unmerged paths (Git refuses with `your index file is unmerged`). Resolve each path and `libra add` it, or discard the conflict with `libra reset --hard`, then rerun the revert; the refusal writes no revert state, so `--continue`, `--skip`, and `--abort` do not apply to it.
+
 ## Options
 
 ### `-n`, `--no-commit`
@@ -290,6 +292,7 @@ three-way merge while preserving every clean inverse hunk.
 | `LBR-CLI-003` | Cannot resolve the commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid mainline, invalid `--cleanup`, or an editor/empty-message failure | Pass a valid mainline/cleanup mode; for `--edit`, configure an editor and save a non-empty message |
 | `LBR-CONFLICT-001` | File was modified by a later commit, creating a conflict | Resolve conflicts then `libra revert --continue`, skip the commit with `libra revert --skip`, or cancel with `libra revert --abort` |
+| `LBR-CONFLICT-001` | A new revert refused because the index already has unmerged entries (no revert state is written) | Resolve the listed paths and `libra add` them (or discard with `libra reset --hard`), then rerun the revert; `--continue`/`--skip`/`--abort` do not apply |
 | `LBR-REPO-002` | The index is corrupt or unreadable during apply/continue/skip/abort | Repair or restore `.libra/index`; the revert state is retained so recovery can be retried |
 | `LBR-IO-001` | Failed to load object (commit, tree, blob) | Check repository integrity |
 | `LBR-IO-002` | Failed to save object, index, or update HEAD | Check filesystem permissions and repository writability |

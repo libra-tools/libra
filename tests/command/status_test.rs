@@ -3022,3 +3022,387 @@ async fn test_status_short_branch_reports_up_to_date_with_fully_qualified_tracki
         "fully-qualified tracking ref must never render [gone]: {output_str}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upstream ahead/behind counts (#486)
+// ---------------------------------------------------------------------------
+
+/// A repository whose `main` tracks `origin/main`, with `commits` linear
+/// commits `c1..cN`. Point the tracking ref with [`write_upstream_ref`].
+pub(super) fn upstream_tracking_repo(commits: usize) -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    for n in 1..=commits {
+        commit_named_file(repo.path(), &format!("c{n}"));
+    }
+    for (key, value) in [
+        ("branch.main.remote", "origin"),
+        ("branch.main.merge", "refs/heads/main"),
+    ] {
+        let output = run_libra_command(&["config", key, value], repo.path());
+        assert_cli_success(&output, key);
+    }
+    repo
+}
+
+/// Write `<name>.txt` and commit it with the message `<name>`.
+pub(super) fn commit_named_file(repo: &std::path::Path, name: &str) {
+    fs::write(repo.join(format!("{name}.txt")), format!("{name}\n")).expect("write file");
+    let output = run_libra_command(&["add", "."], repo);
+    assert_cli_success(&output, &format!("add {name}"));
+    let output = run_libra_command(&["commit", "-m", name, "--no-verify"], repo);
+    assert_cli_success(&output, &format!("commit {name}"));
+}
+
+pub(super) fn rev_parse(repo: &std::path::Path, spec: &str) -> String {
+    let output = run_libra_command(&["rev-parse", spec], repo);
+    assert_cli_success(&output, &format!("rev-parse {spec}"));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Point `refs/remotes/origin/main` at `oid`. No CLI command writes a
+/// remote-tracking ref directly, so this goes through the branch store, which
+/// resolves the repository from the process cwd: the caller must hold a
+/// `ChangeDirGuard` on the repository.
+pub(super) async fn write_upstream_ref(oid: &str) {
+    libra::internal::branch::Branch::update_branch("refs/remotes/origin/main", oid, Some("origin"))
+        .await
+        .expect("write refs/remotes/origin/main");
+}
+
+fn status_stdout(repo: &std::path::Path, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &args.join(" "));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Assert the short, porcelain v2 and long renderings of the tracking counts.
+fn assert_tracking_text(repo: &std::path::Path, bracket: &str, branch_ab: &str, long: &str) {
+    let short = status_stdout(repo, &["status", "--short", "--branch"]);
+    let expected_short = if bracket.is_empty() {
+        "## main...origin/main".to_string()
+    } else {
+        format!("## main...origin/main {bracket}")
+    };
+    assert_eq!(
+        short.lines().next(),
+        Some(expected_short.as_str()),
+        "short branch line: {short}"
+    );
+    let porcelain = status_stdout(repo, &["status", "--porcelain=v2", "--branch"]);
+    let expected_ab = format!("# branch.ab {branch_ab}");
+    assert!(
+        porcelain.lines().any(|line| line == expected_ab),
+        "porcelain v2 must contain {expected_ab:?}: {porcelain}"
+    );
+    let long_output = status_stdout(repo, &["status"]);
+    assert!(
+        long_output.contains(long),
+        "long format must contain {long:?}: {long_output}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-RENDER R1: the #486 reproduction — upstream is local's direct parent.
+async fn test_status_branch_counts_upstream_ancestor_486() {
+    let repo = upstream_tracking_repo(5);
+    let _cwd = ChangeDirGuard::new(repo.path());
+    write_upstream_ref(&rev_parse(repo.path(), "HEAD~1")).await;
+
+    assert_tracking_text(
+        repo.path(),
+        "[ahead 1]",
+        "+1 -0",
+        "Your branch is ahead of 'origin/main' by 1 commit.",
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-RENDER R4, R2 and R3: equal, behind by two, then diverged 1/2.
+async fn test_status_branch_counts_behind_and_diverged() {
+    let repo = upstream_tracking_repo(5);
+    let _cwd = ChangeDirGuard::new(repo.path());
+    write_upstream_ref(&rev_parse(repo.path(), "HEAD")).await;
+    assert_tracking_text(
+        repo.path(),
+        "",
+        "+0 -0",
+        "Your branch is up to date with 'origin/main'.",
+    );
+
+    let output = run_libra_command(&["reset", "--hard", "HEAD~2"], repo.path());
+    assert_cli_success(&output, "reset --hard HEAD~2");
+    assert_tracking_text(
+        repo.path(),
+        "[behind 2]",
+        "+0 -2",
+        "Your branch is behind 'origin/main' by 2 commits.",
+    );
+
+    commit_named_file(repo.path(), "l1");
+    assert_tracking_text(
+        repo.path(),
+        "[ahead 1, behind 2]",
+        "+1 -2",
+        "and have 1 and 2 different commits each",
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-RENDER R5: a local merge of a side branch against a diverged upstream
+/// counts exactly what `rev-list --left-right --count` reports.
+async fn test_status_branch_counts_merge_history_matches_rev_list() {
+    let repo = upstream_tracking_repo(3);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "upstream-line"], p),
+        "switch -c upstream-line",
+    );
+    commit_named_file(p, "u1");
+    let upstream_tip = rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], p),
+        "switch -c side",
+    );
+    commit_named_file(p, "s1");
+    commit_named_file(p, "s2");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    commit_named_file(p, "m1");
+    assert_cli_success(
+        &run_libra_command(&["merge", "side", "-m", "merge side"], p),
+        "merge side",
+    );
+    write_upstream_ref(&upstream_tip).await;
+
+    let counts = status_stdout(
+        p,
+        &[
+            "rev-list",
+            "--count",
+            "--left-right",
+            &format!("{upstream_tip}...HEAD"),
+        ],
+    );
+    let (behind, ahead) = counts
+        .trim()
+        .split_once('\t')
+        .expect("rev-list --left-right --count prints left<TAB>right");
+    assert_eq!((ahead, behind), ("4", "1"), "rev-list oracle: {counts}");
+
+    assert_tracking_text(
+        p,
+        &format!("[ahead {ahead}, behind {behind}]"),
+        &format!("+{ahead} -{behind}"),
+        &format!("and have {ahead} and {behind} different commits each"),
+    );
+    let json = run_libra_command(&["--json", "status"], p);
+    assert_cli_success(&json, "json status");
+    let upstream = &parse_json_stdout(&json)["data"]["upstream"];
+    assert_eq!(
+        (
+            upstream["ahead"].to_string(),
+            upstream["behind"].to_string()
+        ),
+        (ahead.to_string(), behind.to_string()),
+        "JSON counts: {upstream}"
+    );
+    let branches = status_stdout(p, &["branch", "-vv"]);
+    let expected = format!("[origin/main: ahead {ahead}, behind {behind}]");
+    assert!(
+        branches
+            .lines()
+            .any(|line| line.starts_with("* main") && line.contains(&expected)),
+        "branch -vv must report {expected}: {branches}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-UNKNOWN U1–U3 for the text renderers: shallow boundaries still count,
+/// an unreadable commit shows no counts plus a warning, and an unborn branch
+/// shows no counts without a warning.
+async fn test_status_branch_counts_unavailable() {
+    {
+        let repo = upstream_tracking_repo(5);
+        let p = repo.path();
+        let _cwd = ChangeDirGuard::new(p);
+        write_upstream_ref(&rev_parse(p, "HEAD~1")).await;
+        let boundary = rev_parse(p, "HEAD~2");
+        let below_boundary = rev_parse(p, "HEAD~3");
+
+        // U1: HEAD~2 is a shallow boundary and its parent was never fetched.
+        fs::write(p.join(".libra").join("shallow"), format!("{boundary}\n"))
+            .expect("write shallow boundaries");
+        fs::remove_file(loose_object_path(p, &below_boundary))
+            .expect("remove the commit below the shallow boundary");
+        let output = run_libra_command(&["status", "--short", "--branch"], p);
+        assert_cli_success(&output, "status on a shallow history");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).lines().next(),
+            Some("## main...origin/main [ahead 1]")
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("warning:"),
+            "a shallow boundary must not warn: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // U2: without the boundary, the same missing commit is unreadable.
+        fs::remove_file(p.join(".libra").join("shallow")).expect("remove shallow file");
+        let output = run_libra_command(&["status", "--short", "--branch"], p);
+        assert_cli_success(&output, "status with an unreadable commit");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).lines().next(),
+            Some("## main...origin/main")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot count commits ahead/behind 'origin/main'"),
+            "unavailable counts must warn: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let porcelain = status_stdout(p, &["status", "--porcelain=v2", "--branch"]);
+        assert!(
+            porcelain.contains("# branch.upstream origin/main"),
+            "{porcelain}"
+        );
+        assert!(
+            !porcelain.contains("# branch.ab"),
+            "porcelain v2 must omit # branch.ab: {porcelain}"
+        );
+        let long = status_stdout(p, &["status"]);
+        assert!(
+            !long.contains("Your branch"),
+            "the long format must omit the tracking sentence: {long}"
+        );
+        let output = run_libra_command(&["branch", "-vv"], p);
+        assert_cli_success(&output, "branch -vv with an unreadable commit");
+        let branches = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            branches
+                .lines()
+                .any(|line| line.starts_with("* main") && line.contains("[origin/main]")),
+            "branch -vv must show only the upstream: {branches}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot count commits ahead/behind 'origin/main'"),
+            "branch -vv must warn too: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run_libra_command(&["--exit-code-on-warning", "branch", "-vv"], p);
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "the branch -vv warning drives exit 9: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The warning is a structured status warning, so it drives exit 9.
+        let output = run_libra_command(
+            &["--exit-code-on-warning", "status", "--short", "--branch"],
+            p,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "an unavailable count is a status warning: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // U3: an unborn branch with a configured upstream.
+    let repo = upstream_tracking_repo(1);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "fresh"], p),
+        "switch --orphan fresh",
+    );
+    for (key, value) in [
+        ("branch.fresh.remote", "origin"),
+        ("branch.fresh.merge", "refs/heads/main"),
+    ] {
+        assert_cli_success(&run_libra_command(&["config", key, value], p), key);
+    }
+    // Git prints `## No commits yet on fresh...origin/main [gone]` here; Libra
+    // keeps its unborn header and does not call an existing upstream gone.
+    assert_eq!(
+        status_stdout(p, &["status", "--short", "--branch"])
+            .lines()
+            .next(),
+        Some("## fresh...origin/main")
+    );
+    let output = run_libra_command(&["status", "--porcelain=v2", "--branch"], p);
+    assert_cli_success(&output, "porcelain v2 on an unborn branch");
+    let porcelain = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        porcelain.contains("# branch.upstream origin/main"),
+        "{porcelain}"
+    );
+    assert!(
+        !porcelain.contains("# branch.ab"),
+        "an unborn branch must not report +0 -0: {porcelain}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("warning:"),
+        "an unborn branch is not an unavailable count: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+/// M-UNKNOWN U4–U5: a malformed or unreadable shallow list makes the counts
+/// unavailable, and a listed boundary is a root even when its parents are
+/// present (git 2.54 reports `[ahead 4, behind 2]` for the same history).
+async fn test_status_branch_counts_shallow_boundaries() {
+    let repo = upstream_tracking_repo(5);
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    let boundary = rev_parse(p, "HEAD~1");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD~2"], p),
+        "reset --hard HEAD~2",
+    );
+    commit_named_file(p, "l1");
+    let shallow = p.join(".libra").join("shallow");
+
+    // U5: c4 is listed while c3..c1 are all still readable.
+    fs::write(&shallow, format!("{boundary}\n")).expect("write shallow boundaries");
+    assert_tracking_text(
+        p,
+        "[ahead 4, behind 2]",
+        "+4 -2",
+        "and have 4 and 2 different commits each",
+    );
+
+    // U4: a malformed entry, then a shallow path that cannot be read as a file.
+    fs::write(&shallow, "zzzz\n").expect("write a malformed shallow list");
+    let malformed = run_libra_command(&["status", "--short", "--branch"], p);
+    fs::remove_file(&shallow).expect("remove shallow file");
+    fs::create_dir(&shallow).expect("make the shallow path a directory");
+    let unreadable = run_libra_command(&["status", "--short", "--branch"], p);
+    for (label, output) in [("malformed", malformed), ("unreadable", unreadable)] {
+        assert_cli_success(&output, &format!("status with a {label} shallow list"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).lines().next(),
+            Some("## main...origin/main"),
+            "{label} shallow list must omit the counts"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot count commits ahead/behind 'origin/main'"),
+            "{label} shallow list must warn: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

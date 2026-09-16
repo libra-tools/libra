@@ -1,7 +1,7 @@
 //! Implements status reporting with ignore policy support, computing staged/unstaged/untracked sets and printing concise summaries.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     io,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
@@ -793,6 +793,11 @@ declare_status_warning_enum! {
         /// with an empty structured list — §B.5 forbids a stderr-only
         /// channel.
         RepositoryPreflight = 14,
+        /// #486: the upstream ahead/behind counts could not be computed (a
+        /// commit in either history, or the shallow boundary list, could not
+        /// be read). The counts are omitted — never guessed — and the rest of
+        /// status is unaffected.
+        UpstreamCountsUnavailable = 15,
     }
 }
 
@@ -807,9 +812,9 @@ impl StatusWarningCode {
             StatusWarningCode::SimilarityBudgetExceeded
             | StatusWarningCode::RenameLimitProductSkipped
             | StatusWarningCode::RenamePathEncodingUnsupported => StatusWarningSource::RenameDetect,
-            StatusWarningCode::MetadataUnavailable | StatusWarningCode::MetadataBudgetExceeded => {
-                StatusWarningSource::Metadata
-            }
+            StatusWarningCode::MetadataUnavailable
+            | StatusWarningCode::MetadataBudgetExceeded
+            | StatusWarningCode::UpstreamCountsUnavailable => StatusWarningSource::Metadata,
             StatusWarningCode::WorktreeBudgetExceeded
             | StatusWarningCode::WorktreeReadFailed
             | StatusWarningCode::WorktreePermissionDenied
@@ -1167,9 +1172,10 @@ impl From<StatusError> for CliError {
 pub struct UpstreamInfo {
     /// Tracking ref display name, e.g. "origin/main"
     pub remote_ref: String,
-    /// Commits ahead of upstream (None when gone)
+    /// Commits ahead of upstream (None when gone, on an unborn branch, or when
+    /// the counts cannot be computed)
     pub ahead: Option<usize>,
-    /// Commits behind upstream (None when gone)
+    /// Commits behind upstream (None in the same cases as `ahead`)
     pub behind: Option<usize>,
     /// True when upstream is configured but tracking ref no longer exists
     pub gone: bool,
@@ -1564,7 +1570,7 @@ async fn collect_status_data(
     };
 
     // Resolve upstream tracking info
-    let upstream = resolve_upstream_info(&head, head_oid.as_ref()).await?;
+    let upstream = resolve_upstream_info(&head, head_oid.as_ref(), &mut warnings).await?;
     let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
@@ -1613,11 +1619,13 @@ async fn collect_status_data(
             source: StatusWarningCode::RepositoryPreflight.source(),
         });
     }
+    // The upstream-count warning is a `metadata` read failure too, but it
+    // never touched rename detection.
     rename_scan_blocked |= warnings.iter().any(|warning| {
         matches!(
             warning.source,
             StatusWarningSource::Worktree | StatusWarningSource::Metadata
-        )
+        ) && warning.code != StatusWarningCode::UpstreamCountsUnavailable
     });
     let mut data = StatusData {
         head,
@@ -1828,6 +1836,7 @@ fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> C
                     warning.source,
                     StatusWarningSource::Worktree | StatusWarningSource::Metadata
                 ) && !warning.message.starts_with("cannot inspect '")
+                    && warning.code != StatusWarningCode::UpstreamCountsUnavailable
             });
         }
     }
@@ -3534,7 +3543,9 @@ async fn run_status_cache_mode(
     } else {
         None
     };
-    let upstream = resolve_upstream_info(&head, head_oid_hash.as_ref()).await?;
+    let mut upstream_warnings = Vec::new();
+    let upstream =
+        resolve_upstream_info(&head, head_oid_hash.as_ref(), &mut upstream_warnings).await?;
     let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
@@ -3608,6 +3619,7 @@ async fn run_status_cache_mode(
                 .collect::<Vec<_>>()
                 .into_iter()
                 .chain(preflight.drain(..))
+                .chain(upstream_warnings)
                 .collect()
         },
         quote_path: extras.quote_path,
@@ -6067,16 +6079,19 @@ fn print_branch_info(
                 if u.gone {
                     format!("## {tracking} [gone]")
                 } else if show_ahead_behind {
-                    let ahead = u.ahead.unwrap_or(0);
-                    let behind = u.behind.unwrap_or(0);
-                    if ahead > 0 && behind > 0 {
-                        format!("## {tracking} [ahead {ahead}, behind {behind}]")
-                    } else if ahead > 0 {
-                        format!("## {tracking} [ahead {ahead}]")
-                    } else if behind > 0 {
-                        format!("## {tracking} [behind {behind}]")
-                    } else {
-                        format!("## {tracking}")
+                    match (u.ahead, u.behind) {
+                        (Some(ahead), Some(behind)) if ahead > 0 && behind > 0 => {
+                            format!("## {tracking} [ahead {ahead}, behind {behind}]")
+                        }
+                        (Some(ahead), Some(_)) if ahead > 0 => {
+                            format!("## {tracking} [ahead {ahead}]")
+                        }
+                        (Some(_), Some(behind)) if behind > 0 => {
+                            format!("## {tracking} [behind {behind}]")
+                        }
+                        // Up to date, or no counts (unborn branch, or counts
+                        // that could not be computed).
+                        _ => format!("## {tracking}"),
                     }
                 } else {
                     format!("## {tracking}")
@@ -6129,9 +6144,13 @@ fn write_branch_info_v2(
     if let Some(u) = upstream {
         write!(writer, "# branch.upstream {}", u.remote_ref).map_err(write_err)?;
         writer.write_all(term).map_err(write_err)?;
-        if !u.gone && show_ahead_behind {
-            let ahead = u.ahead.unwrap_or(0);
-            let behind = u.behind.unwrap_or(0);
+        // Like Git, `# branch.ab` is only written when the counts exist: an
+        // unborn branch or uncountable history omits the line rather than
+        // claiming `+0 -0`.
+        if !u.gone
+            && show_ahead_behind
+            && let (Some(ahead), Some(behind)) = (u.ahead, u.behind)
+        {
             write!(writer, "# branch.ab +{ahead} -{behind}").map_err(write_err)?;
             writer.write_all(term).map_err(write_err)?;
         }
@@ -6160,9 +6179,13 @@ fn status_config_read_error(context: &str, error: anyhow::Error) -> CliError {
         .with_stable_code(StableErrorCode::IoReadFailed)
 }
 
+/// When the ahead/behind counts cannot be computed, the reason is pushed onto
+/// `warnings` as an `upstream_counts_unavailable` warning — this invocation's
+/// structured list, never the process-wide warning tracker (§B.4.3).
 async fn resolve_upstream_info(
     head: &Head,
     local_commit: Option<&ObjectHash>,
+    warnings: &mut Vec<StatusWarning>,
 ) -> CliResult<Option<UpstreamInfo>> {
     let branch_name = match head {
         Head::Branch(name) => name.clone(),
@@ -6229,82 +6252,55 @@ async fn resolve_upstream_info(
         }
     };
 
-    let (ahead, behind) = compute_ahead_behind(local_commit, &tracking_commit);
+    let (ahead, behind) = match upstream_ahead_behind(local_commit, &tracking_commit) {
+        Ok((ahead, behind)) => (Some(ahead), Some(behind)),
+        Err(reason) => {
+            let code = StatusWarningCode::UpstreamCountsUnavailable;
+            warnings.push(StatusWarning {
+                code,
+                message: format!(
+                    "cannot count commits ahead/behind '{remote_ref_display}': {reason}"
+                ),
+                source: code.source(),
+            });
+            (None, None)
+        }
+    };
 
     Ok(Some(UpstreamInfo {
         remote_ref: remote_ref_display,
-        ahead: Some(ahead),
-        behind: Some(behind),
+        ahead,
+        behind,
         gone: false,
     }))
 }
 
-/// Compute the number of commits ahead/behind between two refs.
+/// Count how far `local` and `upstream` have diverged for the tracking segment
+/// of `status` and `branch -vv`, as `(ahead, behind)`.
 ///
-/// Performs a bidirectional BFS from both tips, classifying each commit as
-/// local-only, remote-only, or common (reachable from both sides).  Once a
-/// commit is found from the opposite side it is reclassified as common and
-/// its ancestors are not enqueued again, which reduces redundant work when
-/// the histories share a recent merge-base.
-///
-/// **Complexity**: proportional to the number of commits reachable from
-/// both tips until the queues are drained.  For disjoint histories (no
-/// common ancestor) this visits all reachable commits from both sides.
-/// Falls back gracefully when a commit object is missing or corrupt
-/// (e.g. shallow clone) by stopping traversal on that branch.
-pub(crate) fn compute_ahead_behind(local: &ObjectHash, remote: &ObjectHash) -> (usize, usize) {
-    if local == remote {
-        return (0, 0);
+/// Delegates to [`crate::internal::merge_base::ahead_behind`], the painting
+/// shared with merge-base, with the repository's shallow boundaries treated as
+/// roots. `Err` carries a human-readable reason when the counts cannot be known
+/// (unreadable shallow metadata, or a commit in either history that cannot be
+/// loaded); callers then show no counts instead of a guessed number.
+pub(crate) fn upstream_ahead_behind(
+    local: &ObjectHash,
+    upstream: &ObjectHash,
+) -> Result<(usize, usize), String> {
+    if local == upstream {
+        return Ok((0, 0));
     }
-
-    let mut local_only: HashSet<ObjectHash> = HashSet::new();
-    let mut remote_only: HashSet<ObjectHash> = HashSet::new();
-    let mut common: HashSet<ObjectHash> = HashSet::new();
-    let mut local_queue: VecDeque<ObjectHash> = VecDeque::new();
-    let mut remote_queue: VecDeque<ObjectHash> = VecDeque::new();
-
-    local_queue.push_back(*local);
-    remote_queue.push_back(*remote);
-
-    while !local_queue.is_empty() || !remote_queue.is_empty() {
-        // Expand one commit from the local side.
-        if let Some(hash) = local_queue.pop_front() {
-            if common.contains(&hash) {
-                // Already common — skip without expanding parents.
-                continue;
-            } else if remote_only.remove(&hash) {
-                // Discovered from the remote side too → merge-base.
-                common.insert(hash);
-            } else if local_only.insert(hash)
-                && let Some(commit) = Commit::try_load(&hash)
-            {
-                for parent in &commit.parent_commit_ids {
-                    if !common.contains(parent) {
-                        local_queue.push_back(*parent);
-                    }
-                }
-            }
-        }
-
-        // Expand one commit from the remote side.
-        if let Some(hash) = remote_queue.pop_front() {
-            if common.contains(&hash) {
-                continue;
-            } else if local_only.remove(&hash) {
-                common.insert(hash);
-            } else if remote_only.insert(hash)
-                && let Some(commit) = Commit::try_load(&hash)
-            {
-                for parent in &commit.parent_commit_ids {
-                    if !common.contains(parent) {
-                        remote_queue.push_back(*parent);
-                    }
-                }
-            }
-        }
-    }
-
-    (local_only.len(), remote_only.len())
+    let boundaries = crate::command::fetch::read_shallow_boundaries()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|oid| {
+            oid.parse::<ObjectHash>()
+                .map_err(|_| format!("invalid shallow boundary '{oid}'"))
+        })
+        .collect::<Result<HashSet<ObjectHash>, String>>()?;
+    crate::internal::merge_base::ahead_behind(local, upstream, &boundaries)
+        .map(|counts| (counts.ahead, counts.behind))
+        .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -7188,7 +7184,7 @@ mod test {
         .await
         .expect("dropping config_kv table should succeed");
 
-        let err = resolve_upstream_info(&Head::Branch("main".to_string()), None)
+        let err = resolve_upstream_info(&Head::Branch("main".to_string()), None, &mut Vec::new())
             .await
             .expect_err("missing config_kv table should surface as an error");
 

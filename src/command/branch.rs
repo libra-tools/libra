@@ -2085,8 +2085,9 @@ async fn branch_verbose_suffix(branch_name: &str, commit_hash: &str, verbose: u8
 
 /// Resolve the `[<upstream>: ahead N, behind M]` tracking segment for a local
 /// branch (`-vv`). Returns `None` when the branch has no configured upstream.
-/// When the remote-tracking ref cannot be resolved (e.g. never fetched), the
-/// ahead/behind counts are omitted and only `[<upstream>]` is shown.
+/// When the remote-tracking ref cannot be resolved (e.g. never fetched), or the
+/// counts cannot be computed (a warning says why), the ahead/behind counts are
+/// omitted and only `[<upstream>]` is shown.
 async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Option<String> {
     let remote = ConfigKv::get(&format!("branch.{branch_name}.remote"))
         .await
@@ -2102,12 +2103,22 @@ async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Opti
     let upstream_display = format!("{remote}/{merge_short}");
     let remote_ref = format!("refs/remotes/{remote}/{merge_short}");
 
-    let counts = match get_target_commit(&remote_ref).await {
-        Ok(upstream_commit) => branch_commit
-            .parse::<ObjectHash>()
-            .ok()
-            .map(|local| super::status::compute_ahead_behind(&local, &upstream_commit)),
-        Err(_) => None,
+    let counts = match (
+        get_target_commit(&remote_ref).await,
+        branch_commit.parse::<ObjectHash>(),
+    ) {
+        (Ok(upstream_commit), Ok(local)) => {
+            match super::status::upstream_ahead_behind(&local, &upstream_commit) {
+                Ok(counts) => Some(counts),
+                Err(reason) => {
+                    crate::utils::error::emit_warning(format!(
+                        "cannot count commits ahead/behind '{upstream_display}': {reason}"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
     };
     let segment = match counts {
         Some((ahead, behind)) if ahead > 0 && behind > 0 => {

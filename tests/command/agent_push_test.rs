@@ -265,6 +265,12 @@ async fn seed_checkpoint_commit(
     .await
     .expect("retire seeded checkpoint writer marker");
 
+    // Direct library writes outlive the foreground seed; the next CLI may
+    // otherwise correctly refuse cleanup while their durable markers remain.
+    wait_for_seeded_object_index(repo)
+        .await
+        .expect("seeded checkpoint object index must be ready before invoking the CLI");
+
     written.commit_hash.to_string()
 }
 
@@ -547,4 +553,160 @@ fn agent_push_after_prune_requires_force_rewrite_and_lease_protects() {
         Some(&*old_tip),
         "a lease-rejected push must not move the remote ref"
     );
+}
+
+#[cfg(unix)]
+async fn wait_for_seeded_object_index(repo: &Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    if !ClientStorage::wait_for_background_tasks_until(deadline).await {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "seeded checkpoint object-index queue did not drain within 10 seconds",
+        ));
+    }
+
+    // A drained queue may have failed terminally. Never repair or ignore its
+    // durable markers here: that would conceal a fixture indexing failure.
+    let marker_dir = repo.join(".libra/object-index-repair");
+    let mut entries = match fs::read_dir(&marker_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot inspect seeded checkpoint index markers at '{}': {error}",
+                    marker_dir.display()
+                ),
+            ));
+        }
+    };
+    if let Some(entry) = entries.next() {
+        let entry = entry.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read seeded checkpoint index marker entry at '{}': {error}",
+                    marker_dir.display()
+                ),
+            )
+        })?;
+        return Err(std::io::Error::other(format!(
+            "seeded checkpoint index queue drained but still contains a durable marker: {}",
+            entry.path().display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+fn agent_push_seed_waits_for_durable_index_retirement() {
+    let repo = tempfile::tempdir().expect("create seed-readiness fixture");
+    init_repo_base(repo.path());
+    let runtime = tokio::runtime::Runtime::new().expect("create seed-readiness runtime");
+    runtime.block_on(async {
+        let conn = connect_repo_db(repo.path()).await;
+        seed_stopped_session(&conn, "seed-readiness-session").await;
+        // Set only after child-CLI setup. Delay the direct-library FIFO, not
+        // child commands, and restore the caller's original value on drop.
+        let delay =
+            libra::utils::test::ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "250");
+        seed_checkpoint_commit(
+            &conn,
+            repo.path(),
+            "cc000000-0000-4000-8000-000000000013",
+            "seed-readiness-session",
+            CheckpointScope::Temporary,
+            702,
+        )
+        .await;
+
+        // Capture readiness AT RETURN, before the cleanup drain below. With
+        // the original seed helper this records a non-empty repair directory.
+        let marker_dir = repo.path().join(".libra/object-index-repair");
+        let markers_at_return = match fs::read_dir(&marker_dir) {
+            Ok(entries) => entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        };
+        // Even the deliberate pre-fix red run drains before restoring the
+        // environment or removing the fixture. This does not change the
+        // captured predicate and must never be moved before its observation.
+        let drained = ClientStorage::wait_for_background_tasks_until(
+            std::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        drop(delay);
+        conn.close().await.expect("close seed-readiness connection");
+        assert!(drained, "seed-readiness regression cleanup did not drain");
+        let markers_at_return = markers_at_return.expect("inspect markers at seed return");
+        assert!(
+            markers_at_return.is_empty(),
+            "checkpoint seed returned before durable index readiness: {markers_at_return:?}"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+async fn agent_push_seed_readiness_rejects_terminal_marker() {
+    let repo = tempfile::tempdir().expect("create terminal-marker fixture");
+    let marker_dir = repo.path().join(".libra/object-index-repair");
+    fs::create_dir_all(&marker_dir).expect("create marker directory");
+    let marker = marker_dir.join("pending.json");
+    fs::write(&marker, b"fixture-only").expect("create durable marker witness");
+    let error = wait_for_seeded_object_index(repo.path())
+        .await
+        .expect_err("a terminal marker must not be treated as ready");
+    assert!(
+        error
+            .to_string()
+            .contains("still contains a durable marker")
+    );
+    assert!(
+        marker.exists(),
+        "readiness must not remove or replay markers"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+async fn agent_push_seed_readiness_rejects_marker_path_io_error() {
+    let repo = tempfile::tempdir().expect("create marker-path fixture");
+    fs::create_dir(repo.path().join(".libra")).expect("create storage directory");
+    fs::write(
+        repo.path().join(".libra/object-index-repair"),
+        b"not a directory",
+    )
+    .expect("create invalid marker-directory witness");
+    let error = wait_for_seeded_object_index(repo.path())
+        .await
+        .expect_err("marker-directory I/O errors must not mean ready");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    assert!(
+        error
+            .to_string()
+            .contains("cannot inspect seeded checkpoint index markers")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cloud_live, cwd, env, hash_kind, workspace_failpoints)]
+async fn agent_push_seed_readiness_accepts_missing_or_empty_marker_dir() {
+    let repo = tempfile::tempdir().expect("create empty-marker fixture");
+    wait_for_seeded_object_index(repo.path())
+        .await
+        .expect("a missing marker directory is ready");
+    fs::create_dir_all(repo.path().join(".libra/object-index-repair"))
+        .expect("create empty marker directory");
+    wait_for_seeded_object_index(repo.path())
+        .await
+        .expect("an empty marker directory is ready");
 }

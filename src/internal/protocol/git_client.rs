@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use git_internal::errors::GitError;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 use url::Url;
@@ -15,7 +15,9 @@ use super::{
     DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content,
     parse_discovered_references,
 };
-use crate::git_protocol::{ServiceType, add_pkt_line_string};
+use crate::git_protocol::{
+    PktLineError, ServiceType, add_pkt_line_string, pkt_frame_payload_len, pkt_line_read_error,
+};
 
 const DEFAULT_GIT_PORT: u16 = 9418;
 
@@ -108,7 +110,11 @@ impl GitClient {
 
     /// Read exactly `buf.len()` bytes, failing if the peer goes idle for longer
     /// than `idle_timeout` (rather than blocking forever on a stalled socket).
-    async fn read_exact_idle(&self, stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), IoError> {
+    async fn read_exact_idle<R: AsyncRead + Unpin>(
+        &self,
+        stream: &mut R,
+        buf: &mut [u8],
+    ) -> Result<(), IoError> {
         match tokio::time::timeout(self.idle_timeout, stream.read_exact(buf)).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => Err(IoError::other(format!(
@@ -135,11 +141,16 @@ impl GitClient {
         }
     }
 
-    async fn read_advertisement(&self, stream: &mut TcpStream) -> Result<Bytes, IoError> {
+    async fn read_advertisement<R: AsyncRead + Unpin>(
+        &self,
+        stream: &mut R,
+    ) -> Result<Bytes, IoError> {
         let mut buf = BytesMut::new();
         loop {
             let mut len_buf = [0u8; 4];
-            self.read_exact_idle(stream, &mut len_buf).await?;
+            self.read_exact_idle(stream, &mut len_buf)
+                .await
+                .map_err(|error| pkt_line_read_error(error, PktLineError::TruncatedHeader))?;
             let len_str = std::str::from_utf8(&len_buf)
                 .map_err(|e| IoError::other(format!("Invalid pkt-line length: {e}")))?;
             let len = usize::from_str_radix(len_str, 16)
@@ -148,8 +159,13 @@ impl GitClient {
             if len == 0 {
                 break;
             }
-            let mut data = vec![0u8; len - 4];
-            self.read_exact_idle(stream, &mut data).await?;
+            let payload_len = pkt_frame_payload_len(len as u32).map_err(|error| {
+                IoError::new(std::io::ErrorKind::InvalidData, PktLineError::from(error))
+            })?;
+            let mut data = vec![0u8; payload_len];
+            self.read_exact_idle(stream, &mut data)
+                .await
+                .map_err(|error| pkt_line_read_error(error, PktLineError::TruncatedPayload))?;
             buf.extend_from_slice(&data);
         }
         Ok(buf.freeze())
@@ -231,8 +247,276 @@ impl GitClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) async fn read_test_stream<R: AsyncRead + Unpin>(
+        stream: &mut R,
+        idle: Duration,
+    ) -> Result<Bytes, IoError> {
+        let client = GitClient::from_url(&Url::parse("git://fixture.invalid/repo").unwrap())
+            .with_network_timeouts(Duration::from_secs(1), idle);
+        client.read_advertisement(stream).await
+    }
+
+    pub(crate) async fn read_frame_fixture(mut input: &[u8]) -> Result<Bytes, IoError> {
+        read_test_stream(&mut input, Duration::from_secs(1)).await
+    }
+
+    async fn assert_tcp_fetch_advertisement_error(input: &[u8], expected: PktLineError) {
+        use crate::{
+            command::{clone::CloneError, fetch::FetchError, pull::PullError},
+            utils::error::{CliError, StableErrorCode},
+        };
+
+        // The object-fetch advertisement uses a second TCP connection and
+        // returns the real reader error without discovery's string wrapper.
+        // Exercise that public transport method before the command conversions.
+        for command in ["fetch", "clone", "pull"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let input = input.to_vec();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = [0; 4];
+                socket.read_exact(&mut header).await.unwrap();
+                let len = usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+                assert!((4..=1024).contains(&len));
+                let mut request = vec![0; pkt_frame_payload_len(len as u32).unwrap()];
+                socket.read_exact(&mut request).await.unwrap();
+                socket.write_all(&input).await.unwrap();
+                socket.shutdown().await.unwrap();
+                request
+            });
+            struct AbortServer(tokio::task::JoinHandle<Vec<u8>>);
+            impl Drop for AbortServer {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let mut server = AbortServer(server);
+            let client =
+                GitClient::from_url(&Url::parse(&format!("git://{address}/repo")).unwrap())
+                    .with_network_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+            let source = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.fetch_objects(&[], &[], &[], None),
+            )
+            .await
+            .expect("TCP fetch advertisement bounded")
+            .err()
+            .expect("bad advertisement must fail before upload-pack request");
+            let request = tokio::time::timeout(Duration::from_secs(5), &mut server.0)
+                .await
+                .expect("TCP fixture bounded")
+                .expect("TCP fixture succeeded");
+            assert_eq!(
+                request.as_slice(),
+                b"git-upload-pack /repo\0host=127.0.0.1\0"
+            );
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                source
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<PktLineError>()),
+                Some(&expected)
+            );
+            let source = FetchError::FetchObjects {
+                remote: "fixture".to_string(),
+                source,
+            };
+            let cli: CliError = match command {
+                "fetch" => source.into(),
+                "clone" => CloneError::FetchFailed { source }.into(),
+                "pull" => PullError::Fetch(source).into(),
+                _ => unreachable!(),
+            };
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+            assert_eq!(cli.stable_code().exit_code().as_i32(), 128);
+            assert!(cli.message().contains(&expected.to_string()));
+            assert_eq!(
+                cli.hints().iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+                [
+                    "check that the remote serves Git data and that a proxy has not altered the response"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_git_rejects_len_below_four() {
+        for input in [b"0001", b"0002", b"0003"] {
+            assert_typed_frame_error(
+                read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::InvalidFrameLength(
+                    crate::git_protocol::PktFrameError::LengthBelowHeader,
+                ),
+            );
+            assert_tcp_fetch_advertisement_error(
+                input,
+                PktLineError::InvalidFrameLength(
+                    crate::git_protocol::PktFrameError::LengthBelowHeader,
+                ),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_git_flush_regression() {
+        assert_eq!(
+            read_frame_fixture(b"0000zzzz").await.unwrap(),
+            b"0000".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_git_len4_regression() {
+        let input = b"00040005x0000";
+        assert_eq!(read_frame_fixture(input).await.unwrap(), input.as_slice());
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_git_upper_bound_regression() {
+        for header in [b"ffff", b"FFFF"] {
+            let mut input = header.to_vec();
+            input.extend_from_slice(&vec![0xff; 0xffff - 4]);
+            input.extend_from_slice(b"0000");
+            assert_eq!(read_frame_fixture(&input).await.unwrap(), input.as_slice());
+        }
+    }
+
+    pub(crate) fn assert_typed_frame_error(error: IoError, expected: PktLineError) {
+        use crate::{
+            command::fetch::FetchError,
+            utils::error::{CliError, StableErrorCode},
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<PktLineError>()),
+            Some(&expected)
+        );
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(
+            error
+                .to_string()
+                .starts_with(crate::git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX)
+        );
+        let cli = CliError::from(FetchError::PacketRead { source: error });
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-002");
+        assert_eq!(cli.stable_code().exit_code().as_i32(), 128);
+        assert!(cli.hints().is_empty());
+    }
+
+    struct ResetReader;
+    impl AsyncRead for ResetReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(IoError::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset fixture",
+            )))
+        }
+    }
+
+    fn assert_transport_error(error: IoError, reason: &str) {
+        use crate::{
+            command::fetch::FetchError,
+            utils::error::{CliError, StableErrorCode},
+        };
+        assert!(
+            !error
+                .to_string()
+                .starts_with(crate::git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX)
+        );
+        assert!(error.to_string().contains(reason));
+        let cli = CliError::from(FetchError::PacketRead { source: error });
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkUnavailable);
+        assert_eq!(cli.stable_code().as_str(), "LBR-NET-001");
+        assert_eq!(
+            cli.hints().iter().map(|h| h.as_str()).collect::<Vec<_>>(),
+            ["check network connectivity and retry"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_truncated_payload_eof_net_002() {
+        use crate::internal::protocol::ssh_client::tests as ssh;
+        for input in [b"0005".as_slice(), b"0008abc", b"ffffabc"] {
+            assert_typed_frame_error(
+                read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::TruncatedPayload,
+            );
+            assert_typed_frame_error(
+                ssh::read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::TruncatedPayload,
+            );
+            assert_tcp_fetch_advertisement_error(input, PktLineError::TruncatedPayload).await;
+        }
+        // Ordinary IO retains its reason and existing per-client context/kind.
+        let mut reset = ResetReader;
+        let error = read_test_stream(&mut reset, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_transport_error(error, "connection reset fixture");
+        let error = ssh::read_test_stream(&mut reset, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_transport_error(error, "SSH read failed: connection reset fixture");
+    }
+
+    #[tokio::test]
+    async fn pkt_line_client_partial_header_eof_net_002() {
+        use crate::internal::protocol::ssh_client::tests as ssh;
+        for input in [
+            b"".as_slice(),
+            b"0",
+            b"00",
+            b"000",
+            b"0005x",
+            b"0005x0",
+            b"0005x00",
+            b"0005x000",
+        ] {
+            assert_typed_frame_error(
+                read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::TruncatedHeader,
+            );
+            assert_typed_frame_error(
+                ssh::read_frame_fixture(input).await.unwrap_err(),
+                PktLineError::TruncatedHeader,
+            );
+            assert_tcp_fetch_advertisement_error(input, PktLineError::TruncatedHeader).await;
+        }
+        // Keep the duplex peer open to exercise actual timeout, not EOF.
+        let (_writer, mut reader) = tokio::io::duplex(1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_test_stream(&mut reader, Duration::from_millis(10)),
+        )
+        .await
+        .expect("bounded git reader")
+        .unwrap_err();
+        assert_transport_error(error, "idle");
+        let (_writer, mut reader) = tokio::io::duplex(1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            ssh::read_test_stream(&mut reader, Duration::from_millis(10)),
+        )
+        .await
+        .expect("bounded ssh reader")
+        .unwrap_err();
+        assert_transport_error(error, "timed out");
+    }
 
     #[test]
     fn from_url_sets_default_timeouts() {

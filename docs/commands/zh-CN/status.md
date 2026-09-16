@@ -81,6 +81,8 @@ libra status --no-branch          # 抑制配置的 status.branch=true
 
 控制分支 tracking 行中是否显示 ahead/behind 计数。`--no-ahead-behind` 抑制计数，但仍显示 upstream 分支名。默认是在配置了 upstream 时显示计数。
 
+计数是只能从一侧到达的提交数，与 `libra rev-list --left-right --count <upstream>...HEAD` 输出的两个数字相同（先 behind 后 ahead）。计数由与 `merge-base` 共用的标记遍历算出，因此 merge、criss-cross 与日期偏斜的历史都与 Git 的计数一致；shallow 仓库中的边界提交视为根。计数无法计算时（任一侧历史中有提交读不到），status 仍然成功：短格式不带括号，porcelain v2 省略 `# branch.ab`，长格式不输出 tracking 句子，JSON 的 `ahead`/`behind` 为 `null`，并发出 `cannot count commits ahead/behind '<upstream>'` warning（code `upstream_counts_unavailable`，source `metadata`；shallow 边界列表格式错误或读不到时同样如此，而 Git 会直接退出）。unborn 分支同样省略计数，但不发 warning。
+
 ```bash
 libra status --short --branch --no-ahead-behind
 libra status --porcelain --branch --no-ahead-behind
@@ -145,6 +147,7 @@ libra status --find-renames=75
 | `dirty_cache_concurrent_invalidate` | `cache` | 并发写者在读取途中使缓存失效 |
 | `dirty_cache_path_unencodable` | `cache` | 非 UTF-8 路径无法存入 dirty 缓存，其行被省略（完整 status 仍会报告该路径） |
 | `repository_preflight` | `config` | 命令运行前发出的仓库级提示（例如 durable object-index 修复待完成） |
+| `upstream_counts_unavailable` | `metadata` | 无法计算 upstream ahead/behind 计数（任一侧历史中的提交或 shallow 边界列表读不到）；计数被省略而非猜测 |
 
 `source` 列是冻结枚举：`config`、`probe`、`rename_detect`、`worktree`、`metadata`、`cache`。`probe` 与 `rename_detect` 刻意区分——`probe` 警告表示候选可能根本没被**看到**，而 `rename_detect` 表示看到了但无法评分。`config` 用于与扫描无关的仓库级提示——目前即上表的 `repository_preflight`。配置**解析**本身从不告警：非法值一律 fail-closed 而非降级。
 
@@ -376,7 +379,7 @@ Detached HEAD：
 - 在分支上时，`head.name` 是分支名；detached 时，`head.oid` 是提交哈希
 - 未配置 tracking 分支或 HEAD detached 时，`upstream` 为 `null`
 - 远程 tracking 分支不再存在时，`upstream.gone` 为 `true`
-- `gone` 为 `true` 时，`upstream.ahead` / `upstream.behind` 为 `null`
+- `gone` 为 `true`、处于 unborn 分支，或计数无法计算（任一侧历史中有提交读不到，此时 `data.warnings[]` 含 `upstream_counts_unavailable` warning）时，`upstream.ahead` / `upstream.behind` 为 `null`；其余情况下两者等于 `libra rev-list --left-right --count <upstream>...HEAD` 的输出（先右后左）
 - 只有 staged、unstaged、untracked、unmerged 列表都为空、没有全局 merge
   状态、**且** `io_blocked` 为空时，`is_clean` 才为 `true`（「无法检查」永远不是干净）
 - 新初始化且无提交的仓库中，`has_commits` 为 `false`
