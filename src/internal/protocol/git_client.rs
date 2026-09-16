@@ -16,7 +16,8 @@ use super::{
     parse_discovered_references,
 };
 use crate::git_protocol::{
-    PktLineError, ServiceType, add_pkt_line_string, pkt_frame_payload_len, pkt_line_read_error,
+    PktLineError, ServiceType, add_pkt_line_string, decode_pkt_line_header, is_pkt_line_io_error,
+    pkt_frame_payload_len, pkt_line_read_error,
 };
 
 const DEFAULT_GIT_PORT: u16 = 9418;
@@ -151,10 +152,9 @@ impl GitClient {
             self.read_exact_idle(stream, &mut len_buf)
                 .await
                 .map_err(|error| pkt_line_read_error(error, PktLineError::TruncatedHeader))?;
-            let len_str = std::str::from_utf8(&len_buf)
-                .map_err(|e| IoError::other(format!("Invalid pkt-line length: {e}")))?;
-            let len = usize::from_str_radix(len_str, 16)
-                .map_err(|e| IoError::other(format!("Invalid pkt-line length: {e}")))?;
+            let len = decode_pkt_line_header(&len_buf)
+                .map_err(|error| IoError::new(std::io::ErrorKind::InvalidData, error))?
+                as usize;
             buf.extend_from_slice(&len_buf);
             if len == 0 {
                 break;
@@ -186,7 +186,13 @@ impl GitClient {
         let response = self
             .read_advertisement(&mut stream)
             .await
-            .map_err(|e| GitError::NetworkError(format!("Failed to read response: {e}")))?;
+            .map_err(|error| {
+                if is_pkt_line_io_error(&error) {
+                    GitError::NetworkError(error.to_string())
+                } else {
+                    GitError::NetworkError(format!("Failed to read response: {error}"))
+                }
+            })?;
         parse_discovered_references(response, service)
     }
 
@@ -248,6 +254,314 @@ impl GitClient {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    struct Pkt13TcpFixture {
+        listener: std::sync::Arc<tokio::net::TcpListener>,
+        task: tokio::task::JoinHandle<Vec<u8>>,
+        url: String,
+    }
+    impl Drop for Pkt13TcpFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    impl Pkt13TcpFixture {
+        async fn new(wire: Option<&[u8]>) -> Self {
+            let listener =
+                std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let url = format!("git://{}/repo", listener.local_addr().unwrap());
+            let acceptor = listener.clone();
+            let wire = wire.map(<[u8]>::to_vec);
+            let task = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async move {
+                    let (mut socket, _) = acceptor.accept().await.unwrap();
+                    let mut header = [0; 4];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let length = crate::git_protocol::decode_pkt_line_header(&header).unwrap();
+                    assert!((4..=1024).contains(&length), "bounded service request");
+                    let mut request = vec![0; pkt_frame_payload_len(length).unwrap()];
+                    socket.read_exact(&mut request).await.unwrap();
+                    if let Some(wire) = wire {
+                        // A peer may reject the header and close before this
+                        // fixture finishes writing or half-closing its socket.
+                        // Command assertions still require the exact typed error.
+                        let allow_rejected_peer_close = |result: std::io::Result<()>| {
+                            match result {
+                                Ok(()) => {}
+                                Err(error) if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::NotConnected
+                                ) => {}
+                                Err(error) => panic!("TCP fixture IO failed: {error}"),
+                            }
+                        };
+                        allow_rejected_peer_close(socket.write_all(&wire).await);
+                        allow_rejected_peer_close(socket.shutdown().await);
+                        let mut unexpected = [0; 1];
+                        match socket.read(&mut unexpected).await {
+                            Ok(0) => {}
+                            Err(error) if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::NotConnected
+                            ) => {}
+                            other => panic!("client must stop before sending negotiation or pack bytes: {other:?}"),
+                        }
+                    } else {
+                        // A real idle peer, not a fabricated error string.
+                        std::future::pending::<()>().await;
+                    }
+                    request
+                })
+                .await
+                .expect("TCP fixture must remain bounded")
+            });
+            Self {
+                listener,
+                task,
+                url,
+            }
+        }
+        async fn verify(&mut self, service: &str) {
+            let request = tokio::time::timeout(Duration::from_secs(12), &mut self.task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                request,
+                format!("{service} /repo\0host=127.0.0.1\0").as_bytes()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), self.listener.accept())
+                    .await
+                    .is_err(),
+                "no extra connection may be queued"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_git_client_header_marker() {
+        for (wire, expected) in [
+            (b"+004".as_slice(), PktLineError::InvalidHexHeader),
+            (b"SECR", PktLineError::InvalidHexHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+        ] {
+            assert_typed_frame_error(read_frame_fixture(wire).await.unwrap_err(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_git_discovery_wrapper_passthrough() {
+        for (wire, reason) in [
+            (b"SECR".as_slice(), PktLineError::InvalidHexHeader),
+            (b"000", PktLineError::TruncatedHeader),
+            (b"0005", PktLineError::TruncatedPayload),
+        ] {
+            let mut fixture = Pkt13TcpFixture::new(Some(wire)).await;
+            let client = GitClient::from_url(&Url::parse(&fixture.url).unwrap())
+                .with_network_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.discovery_reference(ServiceType::UploadPack),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                matches!(&error, GitError::NetworkError(detail) if detail == &reason.to_string()),
+                "{error:?}"
+            );
+            fixture.verify("git-upload-pack").await;
+        }
+        let fixture = Pkt13TcpFixture::new(None).await;
+        let client = GitClient::from_url(&Url::parse(&fixture.url).unwrap())
+            .with_network_timeouts(Duration::from_secs(1), Duration::from_millis(200));
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.discovery_reference(ServiceType::UploadPack),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(&error, GitError::NetworkError(detail) if detail.starts_with("Failed to read response: ") && detail.contains("connection idle")),
+            "{error:?}"
+        );
+        // Dropping the fixture aborts its idle server and releases the listener.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    async fn pkt_line_header_git_frame_errors_end_to_end_net_002() {
+        use clap::Parser;
+
+        use crate::{
+            command::{clone, fetch, ls_remote, pull, push},
+            git_protocol::PktFrameError,
+            internal::{branch::Branch, config::ConfigKv},
+            utils::{
+                error::StableErrorCode,
+                output::OutputConfig,
+                test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+            },
+        };
+        let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let cases = [
+            (
+                b"0001".as_slice(),
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (
+                b"0002",
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (
+                b"0003",
+                PktLineError::InvalidFrameLength(PktFrameError::LengthBelowHeader),
+            ),
+            (b"", PktLineError::TruncatedHeader),
+            (b"0", PktLineError::TruncatedHeader),
+            (b"00", PktLineError::TruncatedHeader),
+            (b"000", PktLineError::TruncatedHeader),
+            (b"0005", PktLineError::TruncatedPayload),
+            (
+                b"0040PKT13_REMOTE_SECRET_8af32",
+                PktLineError::TruncatedPayload,
+            ),
+            (b"ffffabc", PktLineError::TruncatedPayload),
+            (
+                b"SECRPKT13_REMOTE_SECRET_8af32",
+                PktLineError::InvalidHexHeader,
+            ),
+            (b"+004", PktLineError::InvalidHexHeader),
+            (b" 004", PktLineError::InvalidHexHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+        ];
+        let mut checked = 0;
+        for (wire, reason) in cases {
+            for command in ["ls-remote", "fetch", "clone", "pull", "push"] {
+                let repo = tempfile::tempdir().unwrap();
+                setup_with_new_libra_in(repo.path()).await;
+                let _cwd = ChangeDirGuard::new(repo.path());
+                let mut fixture = Pkt13TcpFixture::new(Some(wire)).await;
+                ConfigKv::set("remote.origin.url", &fixture.url, false)
+                    .await
+                    .unwrap();
+                let tracking = "refs/remotes/origin/main";
+                let oid = "1111111111111111111111111111111111111111";
+                if command == "push" {
+                    Branch::update_branch(tracking, oid, Some("origin"))
+                        .await
+                        .unwrap();
+                }
+                let target = repo.path().join("clone-target");
+                let output = OutputConfig::default();
+                let error = tokio::time::timeout(Duration::from_secs(30), async {
+                    match command {
+                        "ls-remote" => ls_remote::execute_safe(
+                            ls_remote::LsRemoteArgs::try_parse_from(["ls-remote", "origin"])
+                                .unwrap(),
+                            &output,
+                        )
+                        .await
+                        .unwrap_err(),
+                        "fetch" => fetch::execute_safe(
+                            fetch::FetchArgs::try_parse_from(["fetch", "origin"]).unwrap(),
+                            &output,
+                        )
+                        .await
+                        .unwrap_err(),
+                        "clone" => clone::execute_safe(
+                            clone::CloneArgs::try_parse_from([
+                                "clone",
+                                fixture.url.as_str(),
+                                target.to_str().unwrap(),
+                            ])
+                            .unwrap(),
+                            &output,
+                        )
+                        .await
+                        .unwrap_err(),
+                        "pull" => pull::execute_safe(
+                            pull::PullArgs::try_parse_from(["pull", "--ff-only", "origin", "main"])
+                                .unwrap(),
+                            &output,
+                        )
+                        .await
+                        .unwrap_err(),
+                        "push" => push::execute_safe(
+                            push::PushArgs::try_parse_from(["push", "origin", ":refs/heads/main"])
+                                .unwrap(),
+                            &output,
+                        )
+                        .await
+                        .unwrap_err(),
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .expect("malformed TCP command must terminate");
+                assert_eq!(
+                    error.stable_code(),
+                    StableErrorCode::NetworkProtocol,
+                    "{command}: {error:?}"
+                );
+                assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+                assert_eq!(error.stable_code().exit_code().as_i32(), 128);
+                assert!(
+                    error.message().contains(&reason.to_string()),
+                    "{command}: {error:?}"
+                );
+                let hint = if command == "push" {
+                    "check the remote Git service or proxy response and retry"
+                } else {
+                    "check that the remote serves Git data and that a proxy has not altered the response"
+                };
+                assert_eq!(
+                    error
+                        .hints()
+                        .iter()
+                        .map(|item| item.as_str())
+                        .collect::<Vec<_>>(),
+                    [hint],
+                    "{command}: {error:?}"
+                );
+                for rendered in [
+                    error.render(),
+                    error.render_report(),
+                    error.render_json().to_string(),
+                ] {
+                    for forbidden in ["PKT13_REMOTE_SECRET", "SECR", "+004", "�"] {
+                        assert!(!rendered.contains(forbidden), "{command}: {rendered}");
+                    }
+                }
+                fixture
+                    .verify(if command == "push" {
+                        "git-receive-pack"
+                    } else {
+                        "git-upload-pack"
+                    })
+                    .await;
+                let actual = Branch::find_branch_result(tracking, Some("origin"))
+                    .await
+                    .unwrap();
+                if command == "push" {
+                    assert_eq!(actual.unwrap().commit.to_string(), oid);
+                } else {
+                    assert!(
+                        actual.is_none(),
+                        "failed discovery must not create a tracking ref"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 70);
+    }
+
     use super::*;
 
     pub(crate) async fn read_test_stream<R: AsyncRead + Unpin>(

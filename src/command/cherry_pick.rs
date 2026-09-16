@@ -165,6 +165,16 @@ enum CherryPickError {
     #[error("an interrupted 'libra cherry-pick --{0}' has not finished")]
     ControlPending(ControlPhase),
 
+    /// #477 HF-01: the stopped commit was concluded by a later `reset`, so
+    /// `--continue` has nothing of it left to finalize.
+    #[error("the stopped commit was already concluded by a later reset")]
+    StopConcluded,
+
+    /// #477 HF-01: the row claims an externally concluded stop but has no
+    /// remaining commits, which no writer produces.
+    #[error("cherry-pick state is inconsistent: {0}")]
+    CorruptState(String),
+
     #[error("a cherry-pick is already in progress")]
     InProgress,
 
@@ -217,6 +227,8 @@ impl CherryPickError {
             | Self::UntrackedOverwrite { .. } => StableErrorCode::ConflictUnresolved,
             Self::InProgress => StableErrorCode::ConflictOperationBlocked,
             Self::NoCherryPickInProgress => StableErrorCode::RepoStateInvalid,
+            Self::StopConcluded => StableErrorCode::RepoStateInvalid,
+            Self::CorruptState(_) => StableErrorCode::RepoCorrupt,
             Self::ControlPending(_) => StableErrorCode::RepoStateInvalid,
             Self::WrongBranch { .. } => StableErrorCode::RepoStateInvalid,
             Self::LoadObject(_) => StableErrorCode::IoReadFailed,
@@ -309,6 +321,16 @@ impl From<CherryPickError> for CliError {
             CherryPickError::NoCherryPickInProgress => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint("there is no cherry-pick to --continue/--skip/--abort/--quit"),
+            CherryPickError::CorruptState(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("cancel the sequence with 'libra cherry-pick --abort'")
+                .with_hint("or forget it with 'libra cherry-pick --quit'"),
+            CherryPickError::StopConcluded => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(
+                    "skip it with 'libra cherry-pick --skip' to apply the remaining commits",
+                )
+                .with_hint("or forget the sequence with 'libra cherry-pick --quit'"),
             CherryPickError::ControlPending(phase) => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("run 'libra cherry-pick --{phase}' again to finish it"))
@@ -440,6 +462,12 @@ struct CherryPickOpts {
     /// start claimed since. Absent in older rows and single-commit picks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim_token: Option<String>,
+    /// #477 HF-01: the stopped commit was concluded from outside the sequence
+    /// (a later `reset`, and from HF-29 a later `commit`). Additive, so a row
+    /// written here still loads on binaries that predate the field (ER-HF-02),
+    /// which keep seeing an ordinary stopped sequence.
+    #[serde(default)]
+    stop_concluded: bool,
     #[serde(default)]
     append_source: bool,
     #[serde(default)]
@@ -484,6 +512,7 @@ impl CherryPickOpts {
             ff: args.ff,
             ff_landing: None,
             claim_token: None,
+            stop_concluded: false,
             append_source: args.append_source,
             signoff: args.signoff,
             edit: args.edit,
@@ -914,6 +943,18 @@ async fn load_state_or_err() -> Result<CherryPickState, CherryPickError> {
         .ok_or(CherryPickError::NoCherryPickInProgress)
 }
 
+/// Fail closed on a row whose external-conclusion marker contradicts its todo
+/// (#477 HF-01): no writer marks a sequence that has nothing left to pick, so
+/// the row is corrupt. `--abort`/`--quit` stay available to clean it up.
+fn reject_inconsistent_conclusion(state: &CherryPickState) -> Result<(), CherryPickError> {
+    if state.stop_concluded && state.todo.is_empty() {
+        return Err(CherryPickError::CorruptState(
+            "the stopped commit is marked concluded but no commits remain".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject continuing on a different branch than the one the sequence began on.
 async fn ensure_on_state_branch(state: &CherryPickState) -> Result<(), CherryPickError> {
     let current = current_branch_name().await?;
@@ -936,7 +977,7 @@ fn silent_child_output(output: &OutputConfig) -> OutputConfig {
 /// the stdout/JSON envelope.
 async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPickError> {
     let child = silent_child_output(output);
-    crate::command::reset::execute_safe(
+    crate::command::reset::execute_safe_internal(
         crate::command::reset::ResetArgs {
             target: Some(target.to_string()),
             soft: false,
@@ -1059,6 +1100,7 @@ async fn run_cherry_pick(
             head_name: head_name.clone(),
             head_orig: orig,
             current_oid: commit_ids[0],
+            stop_concluded: false,
             todo: commit_ids[1..].iter().copied().collect(),
             opts_json: opts_json_with_conflict_flag(&opts_json, false),
         })
@@ -1105,6 +1147,7 @@ async fn run_cherry_pick(
                     head_name: head_name.clone(),
                     head_orig,
                     current_oid: *commit_id,
+                    stop_concluded: false,
                     todo: commit_ids[i + 1..].iter().copied().collect(),
                     opts_json: opts_json_with_conflict_flag(&opts_json, false),
                 };
@@ -1137,6 +1180,7 @@ async fn run_cherry_pick(
                     head_name: head_name.clone(),
                     head_orig,
                     current_oid: *commit_id,
+                    stop_concluded: false,
                     todo: commit_ids[i + 1..].iter().copied().collect(),
                     // This claim only happens on a conflict stop — say so
                     // durably (§C.5 conflict-phase discriminator).
@@ -1204,14 +1248,43 @@ fn opts_json_with_conflict_flag(opts_json: &str, stopped_on_conflict: bool) -> S
     match serde_json::from_str::<CherryPickOpts>(opts_json) {
         Ok(mut opts) => {
             opts.stopped_on_conflict = stopped_on_conflict;
-            // A position write means no `--skip`/`--abort` is still pending
-            // and no fast-forward is between its row write and its reset.
+            // A position write means no `--skip`/`--abort` is still pending,
+            // no fast-forward is between its row write and its reset, and the
+            // sequence is no longer sitting on an externally concluded stop.
             opts.control_phase = None;
             opts.ff_landing = None;
+            opts.stop_concluded = false;
             serde_json::to_string(&opts).unwrap_or_else(|_| opts_json.to_string())
         }
         Err(_) => opts_json.to_string(),
     }
+}
+
+/// `opts_json` marked as externally concluded (#477 HF-01). Options this
+/// binary cannot read are an error rather than a silent no-op: the row is left
+/// byte-identical and the caller (`reset`) warns about the state it could not
+/// update, naming `libra cherry-pick --quit`.
+fn opts_json_with_stop_concluded(opts_json: &str) -> Result<String, String> {
+    let mut opts: CherryPickOpts = serde_json::from_str(opts_json)
+        .map_err(|e| format!("failed to read the stopped sequence's saved options: {e}"))?;
+    opts.stop_concluded = true;
+    serde_json::to_string(&opts).map_err(|e| format!("failed to record the concluded stop: {e}"))
+}
+
+/// End the cherry-pick item a stopped sequence is sitting on, because a later
+/// `reset` concluded it (ADR-HF-03 items 1 and 4, #477 HF-01). Reused by HF-29
+/// for the `commit` entry point.
+pub(crate) async fn snapshot_stopped_cherry_pick()
+-> Result<Option<crate::internal::sequencer::SequenceState>, String> {
+    sequencer::snapshot_stopped_sequence(SequenceKind::CherryPick).await
+}
+
+/// Conclude exactly the row `snapshot` describes (see
+/// [`sequencer::conclude_stopped_sequence`] for why the caller snapshots first).
+pub(crate) async fn conclude_stopped_cherry_pick(
+    snapshot: crate::internal::sequencer::SequenceState,
+) -> Result<crate::internal::sequencer::ExternalConclusion, String> {
+    sequencer::conclude_stopped_sequence(snapshot, opts_json_with_stop_concluded).await
 }
 
 /// The `--skip`/`--abort` still pending in a row's options (#477 HF-31); `None`
@@ -1487,6 +1560,7 @@ async fn resume_picks(
             head_name: head_name.to_string(),
             head_orig,
             current_oid: commit_id,
+            stop_concluded: false,
             todo: todo.clone(),
             // STRIPPED flag: this save happens before the attempt, so if the
             // pick stops on a NON-conflict error the row must not carry a
@@ -1548,8 +1622,19 @@ async fn run_cherry_pick_continue(
 ) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    // The corrupt-row check runs before the control-phase one: a row that is
+    // both marked concluded with nothing left and mid-`--skip` is corrupt, and
+    // must fail closed (LBR-REPO-002) rather than look like a resumable phase.
+    reject_inconsistent_conclusion(&state)?;
     if let Some(phase) = opts_json_control_phase(&state.opts_json) {
         return Err(CherryPickError::ControlPending(phase));
+    }
+    if state.stop_concluded {
+        // #477 HF-01: a later `reset` concluded the stopped commit. Committing
+        // the current index as that commit would record someone else's work
+        // under its message; `--skip` drains the rest (HF-02 makes `--continue`
+        // do that directly).
+        return Err(CherryPickError::StopConcluded);
     }
 
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
@@ -1663,6 +1748,7 @@ async fn run_cherry_pick_continue(
 async fn run_cherry_pick_skip(output: &OutputConfig) -> Result<CherryPickOutput, CherryPickError> {
     let state = load_state_or_err().await?;
     ensure_on_state_branch(&state).await?;
+    reject_inconsistent_conclusion(&state)?;
     if opts_json_control_phase(&state.opts_json) == Some(ControlPhase::Abort) {
         return Err(CherryPickError::ControlPending(ControlPhase::Abort));
     }
@@ -2802,6 +2888,7 @@ impl SequenceAdvance {
                 head_name: head_name.to_string(),
                 head_orig,
                 current_oid,
+                stop_concluded: false,
                 todo,
                 opts_json: opts_json_with_conflict_flag(opts_json, false),
             }
@@ -2863,6 +2950,11 @@ pub struct CherryPickState {
     pub head_orig: ObjectHash,
     /// The commit whose application is currently conflicted.
     pub current_oid: ObjectHash,
+    /// #477 HF-01: the stopped item was concluded from outside (a later
+    /// `reset`), recorded as `stop_concluded` in the row's serialized options.
+    /// The remaining `todo` is kept; `current_oid` still names the stopped
+    /// commit, which `--continue` must no longer record.
+    pub stop_concluded: bool,
     /// Remaining commits to pick, in order.
     pub todo: VecDeque<ObjectHash>,
     /// Serialized commit-modifier options (`-x`/`-s`/…) for the sequence.
@@ -2889,11 +2981,17 @@ impl CherryPickState {
             .map_err(|e| format!("invalid head_orig hash: {e}"))?;
         let current_oid = ObjectHash::from_str(state.current_oid.trim())
             .map_err(|e| format!("invalid current_oid hash: {e}"))?;
+        // #477 HF-01: the external-conclusion marker rides in the options, so
+        // the row itself stays valid for binaries that predate it.
+        let stop_concluded = serde_json::from_str::<CherryPickOpts>(&state.payload)
+            .map(|opts| opts.stop_concluded)
+            .unwrap_or(false);
         let todo = VecDeque::from(Self::parse_todo(&state.todo.join("\n"))?);
         Ok(CherryPickState {
             head_name: state.head_name,
             head_orig,
             current_oid,
+            stop_concluded,
             todo,
             opts_json: state.payload,
         })
@@ -3048,6 +3146,14 @@ mod tests {
             "a cherry-pick is already in progress",
         );
         assert_eq!(
+            CherryPickError::CorruptState("bad".to_string()).to_string(),
+            "cherry-pick state is inconsistent: bad",
+        );
+        assert_eq!(
+            CherryPickError::StopConcluded.to_string(),
+            "the stopped commit was already concluded by a later reset",
+        );
+        assert_eq!(
             CherryPickError::ControlPending(ControlPhase::Skip).to_string(),
             "an interrupted 'libra cherry-pick --skip' has not finished",
         );
@@ -3164,6 +3270,14 @@ mod tests {
         assert_eq!(
             CherryPickError::InProgress.stable_code(),
             StableErrorCode::ConflictOperationBlocked,
+        );
+        assert_eq!(
+            CherryPickError::CorruptState("bad".to_string()).stable_code(),
+            StableErrorCode::RepoCorrupt,
+        );
+        assert_eq!(
+            CherryPickError::StopConcluded.stable_code(),
+            StableErrorCode::RepoStateInvalid,
         );
         assert_eq!(
             CherryPickError::ControlPending(ControlPhase::Skip).stable_code(),

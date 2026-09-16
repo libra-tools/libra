@@ -1256,7 +1256,7 @@ fn cleanup_untracked_patch_targets(targets: &[String]) -> CliResult<()> {
 async fn reset_hard(target: &str, output: &OutputConfig) -> CliResult<()> {
     let mut child = output.child_output_config();
     child.quiet = true;
-    crate::command::reset::execute_safe(
+    crate::command::reset::execute_safe_internal(
         crate::command::reset::ResetArgs {
             target: Some(target.to_string()),
             soft: false,

@@ -1130,7 +1130,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
 // ── Batch 0: commit-modifier flags (-x / -s / -e / --allow-empty*) ──
 
 /// `libra rev-parse <rev>` → trimmed OID string (panics on failure).
-fn cp_rev_parse(repo: &std::path::Path, rev: &str) -> String {
+pub(crate) fn cp_rev_parse(repo: &std::path::Path, rev: &str) -> String {
     let out = run_libra_command(&["rev-parse", rev], repo);
     assert_cli_success(&out, "rev-parse");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -1655,6 +1655,7 @@ async fn cherry_pick_state_roundtrip_persists_and_clears() {
         head_name: "main".to_string(),
         head_orig: orig,
         current_oid: current,
+        stop_concluded: false,
         todo: std::collections::VecDeque::from(vec![next]),
         opts_json: "{\"x\":true}".to_string(),
     };
@@ -2935,7 +2936,7 @@ pub(crate) struct RefusalSnapshot {
 
 /// Rows of a repository database table rendered with SQLite `quote()` in rowid
 /// order, so any insert, update or delete changes the result.
-fn repo_table_rows(repo: &std::path::Path, table: &str) -> Vec<String> {
+pub(crate) fn repo_table_rows(repo: &std::path::Path, table: &str) -> Vec<String> {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
     let db = repo.join(".libra/libra.db");
@@ -4039,8 +4040,164 @@ fn test_cherry_pick_sequence_state_edge_cases() {
         "X8: --continue must not silently skip the stopped commit: {}",
         String::from_utf8_lossy(&cont.stdout)
     );
+    // The stop was on the last commit of the run, so the manual `reset --hard`
+    // concluded the whole sequence (#477 HF-01, ADR-HF-03 item 1).
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "X8: a whole-tree reset ends a sequence stopped on its last commit"
+    );
+}
+
+/// M-SEQ S7a (#477 HF-01, ADR-HF-03): a whole-tree reset keeps a multi-commit
+/// sequence, marks the stopped commit as concluded, and still blocks a new pick;
+/// `--skip` drains the rest (HF-02 teaches `--continue` the same).
+#[test]
+fn test_reset_keeps_multi_pick_sequence() {
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "S7a multi pick conflicts"
+    );
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard"], p),
+        "S7a reset --hard",
+    );
     assert!(
         status_text(p).contains("cherry-pick in progress"),
-        "X8: the sequence is kept"
+        "S7a: the sequence survives the reset: {}",
+        status_text(p)
+    );
+    let rows = repo_table_rows(p, "sequence_state");
+    assert_eq!(rows.len(), 1, "S7a: the row is kept");
+    assert!(
+        rows[0].contains(r#""stop_concluded":true"#) && rows[0].contains(&f2),
+        "S7a: the stopped commit is marked concluded in the payload and the todo is kept: {}",
+        rows[0]
+    );
+    assert!(
+        rows[0].contains(&f1),
+        "S7a: `current_oid` still names the stopped commit, so older binaries read the row: {}",
+        rows[0]
+    );
+    let blocked = run_libra_command(&["cherry-pick", &f1, &f2], p);
+    let (human, report) = parse_cli_error_stderr(&blocked.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "S7a: a new pick is still refused: {human}"
+    );
+    // In the HF-01 window `--continue` refuses instead of recording the reset
+    // index as the concluded commit; `--skip` applies the rest.
+    let cont = run_libra_command(&["cherry-pick", "--continue"], p);
+    let (human, report) = parse_cli_error_stderr(&cont.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "S7a --continue: {human}");
+    assert!(
+        human.contains("concluded by a later reset"),
+        "S7a --continue: {human}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--skip"], p),
+        "S7a skip",
+    );
+    assert!(
+        head_paths(p).contains("extra.txt"),
+        "S7a: the remaining commit is applied"
+    );
+    assert!(
+        !status_text(p).contains("cherry-pick in progress"),
+        "S7a: the sequence finished"
+    );
+}
+
+/// #477 HF-01: a row whose options claim an externally concluded stop but have
+/// no remaining commits is corrupt (no writer produces it). `--continue` and
+/// `--skip` fail closed with `LBR-REPO-002` and change nothing, while `--abort`
+/// still cleans up.
+#[test]
+fn test_cherry_pick_inconsistent_conclusion_marker_fails_closed() {
+    // The second payload also carries a control phase: the corrupt-row check
+    // must win over the "a control command is pending" one, or a concluded row
+    // mid-`--skip` reports LBR-REPO-003 instead of failing closed.
+    let payloads = [
+        r#"{"stop_concluded":true}"#,
+        r#"{"stop_concluded":true,"control_phase":"skip"}"#,
+    ];
+    for payload in payloads {
+        for verb in ["--continue", "--skip"] {
+            // A single-commit conflict stop: the row exists with an empty todo,
+            // so marking it concluded is the contradiction this test drives.
+            let (repo, f1, _f2) = conflict_sequence_repo();
+            let p = repo.path();
+            assert_eq!(
+                run_libra_command(&["cherry-pick", &f1], p).status.code(),
+                Some(128),
+                "{verb} {payload}: the pick conflicts"
+            );
+            set_sequence_payload(p, payload);
+            let before = repo_table_rows(p, "sequence_state");
+            let out = run_libra_command(&["cherry-pick", verb], p);
+            assert!(
+                !out.status.success(),
+                "{verb} {payload}: a corrupt row is refused"
+            );
+            let (human, report) = parse_cli_error_stderr(&out.stderr);
+            assert_eq!(
+                report.error_code, "LBR-REPO-002",
+                "{verb} {payload}: {human}"
+            );
+            assert!(
+                human.contains("libra cherry-pick --abort"),
+                "{verb} {payload}: the hint names the way out: {human}"
+            );
+            assert_eq!(
+                repo_table_rows(p, "sequence_state"),
+                before,
+                "{verb} {payload}: a corrupt row is left untouched"
+            );
+            assert_cli_success(
+                &run_libra_command(&["cherry-pick", "--abort"], p),
+                "--abort still cleans up",
+            );
+        }
+    }
+}
+
+/// #477 HF-01 (Codex R4): a stopped multi-commit sequence whose options this
+/// binary cannot parse must leave the row byte-identical AND warn — the marker
+/// callback is fallible precisely so an unreadable payload is never reported as
+/// "already marked" while the row silently survives the reset.
+#[test]
+fn test_reset_warns_when_the_stopped_sequence_payload_is_unreadable() {
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "the multi-commit pick conflicts"
+    );
+    set_sequence_payload(p, "{not json");
+    let before = repo_table_rows(p, "sequence_state");
+    let out = run_libra_command(&["reset", "--hard"], p);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stopped cherry-pick state could not be updated")
+            && stderr.contains("libra cherry-pick --quit"),
+        "the warning names the leftover state and its recovery command: {stderr}"
+    );
+    assert_eq!(
+        repo_table_rows(p, "sequence_state"),
+        before,
+        "the unreadable row is left byte-identical"
     );
 }

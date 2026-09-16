@@ -729,6 +729,151 @@ where
     .await
 }
 
+/// Outcome of concluding a stopped sequence item from outside the sequencer
+/// (#477 HF-01): `reset` (and later `commit`) ends the stopped item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalConclusion {
+    /// No cherry-pick row in this worktree: nothing to conclude.
+    NotInProgress,
+    /// The stopped item was the whole sequence (nothing left to pick), so the
+    /// row is gone.
+    Cleared,
+    /// A multi-commit sequence keeps its remaining `todo`; the stopped item is
+    /// marked concluded by an additive `stop_concluded` flag inside the
+    /// existing `payload` column (ADR-HF-03 item 3 — no schema change).
+    Marked,
+    /// The row changed between the read and the write — a concurrent `--quit`
+    /// plus a fresh start owns the sequence now. The conclusion is dropped and
+    /// the new owner's row is left exactly as it is (#477 HF-01, Codex R5).
+    Superseded,
+}
+
+/// End the sequence item a stopped run is sitting on, because a later `reset`
+/// concluded it (ADR-HF-03 items 1 and 4, #477 HF-01).
+///
+/// Clears the row when nothing remains, otherwise keeps `current_oid`, `todo`
+/// and the row shape and lets the owning command mark the payload
+/// (`mark_payload`). The marker is an additive payload field, so a row written
+/// here still loads on binaries that predate it (ER-HF-02).
+///
+/// `mark_payload` is fallible: a payload this binary cannot read must surface
+/// as an error so the caller warns about the row it left behind, never as a
+/// silent "already marked" (the unchanged-payload shortcut below would
+/// otherwise swallow it).
+pub async fn snapshot_stopped_sequence(
+    kind: SequenceKind,
+) -> Result<Option<SequenceState>, String> {
+    let Some(state) = load().await? else {
+        return Ok(None);
+    };
+    if state.kind != kind {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+/// Conclude exactly the `snapshot` the caller observed.
+///
+/// Taking the snapshot as an argument is what keeps `reset` honest (Codex R6):
+/// the row is read BEFORE the reset moves the tree, so a sequence started after
+/// the reset finished can never be concluded by it — the fence below simply
+/// misses and reports [`ExternalConclusion::Superseded`].
+pub async fn conclude_stopped_sequence(
+    snapshot: SequenceState,
+    mark_payload: impl Fn(&str) -> Result<String, String>,
+) -> Result<ExternalConclusion, String> {
+    let state = snapshot;
+    let payload = if state.todo.is_empty() {
+        None
+    } else {
+        let marked = mark_payload(&state.payload)?;
+        if marked == state.payload {
+            // Already concluded by an earlier reset; nothing more to mark.
+            return Ok(ExternalConclusion::Marked);
+        }
+        Some(marked)
+    };
+    reclaim_race_seam().await?;
+    // Fenced write: the DELETE/UPDATE only fires while every column still holds
+    // the snapshot this conclusion read. A `--quit` racing us, followed by a new
+    // pick, therefore keeps its own row instead of losing it to a stale write.
+    match payload {
+        None if clear_if_unchanged(&state).await? => Ok(ExternalConclusion::Cleared),
+        Some(payload) if mark_if_unchanged(&state, &payload).await? => {
+            Ok(ExternalConclusion::Marked)
+        }
+        _ => Ok(ExternalConclusion::Superseded),
+    }
+}
+
+/// `LIBRA_TEST`-gated seam that replaces this worktree's row between the
+/// conclusion's read and its fenced write, so the quit/reclaim race is a
+/// deterministic test rather than a timing hope (#477 HF-01, Codex R5).
+async fn reclaim_race_seam() -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(payload) = std::env::var_os("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE") else {
+        return Ok(());
+    };
+    let reclaimed = SequenceState {
+        kind: SequenceKind::CherryPick,
+        head_name: "master".to_string(),
+        head_orig: "0".repeat(40),
+        current_oid: "9".repeat(40),
+        todo: vec!["8".repeat(40)],
+        payload: payload.to_string_lossy().into_owned(),
+    };
+    save(&reclaimed).await
+}
+
+/// Delete this worktree's row only while it still matches `snapshot`.
+async fn clear_if_unchanged(snapshot: &SequenceState) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE worktree_id = ? AND kind = ? AND head_name = ? \
+             AND head_orig = ? AND current_oid = ? AND todo = ? AND payload = ?",
+            fence_values(snapshot),
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Rewrite only the payload of this worktree's row, and only while every other
+/// column still matches `snapshot`.
+async fn mark_if_unchanged(snapshot: &SequenceState, payload: &str) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let mut values = vec![payload.to_string().into()];
+    values.extend(fence_values(snapshot));
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE sequence_state SET payload = ?, updated_at = CURRENT_TIMESTAMP \
+             WHERE worktree_id = ? AND kind = ? AND head_name = ? AND head_orig = ? \
+             AND current_oid = ? AND todo = ? AND payload = ?",
+            values,
+        ))
+        .await
+        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// The snapshot columns both fenced statements compare against, in WHERE order.
+fn fence_values(snapshot: &SequenceState) -> Vec<sea_orm::Value> {
+    vec![
+        current_scope_key().into(),
+        snapshot.kind.as_str().into(),
+        snapshot.head_name.clone().into(),
+        snapshot.head_orig.clone().into(),
+        snapshot.current_oid.clone().into(),
+        snapshot.todo.join("\n").into(),
+        snapshot.payload.clone().into(),
+    ]
+}
+
 /// Clear this worktree's row of `kind` only while its payload still contains
 /// `needle` (#477 HF-31): a run releasing its own claim after an early refusal
 /// must not erase a row another start claimed after a concurrent `--quit`.
@@ -2056,6 +2201,151 @@ mod tests {
             load().await.expect("load").expect("present").current_oid,
             "f".repeat(40)
         );
+    }
+
+    /// #477 HF-01 (ER-HF-02): the external-conclusion marker is an additive
+    /// payload field — `current_oid`, `todo` and the row shape stay valid for a
+    /// binary that predates it — and a sequence with nothing left is cleared.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_conclusion_marker_uses_existing_columns() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        // Callers snapshot first (Codex R6); `taken()` is that read.
+        async fn taken() -> Option<SequenceState> {
+            snapshot_stopped_sequence(SequenceKind::CherryPick)
+                .await
+                .expect("snapshot")
+        }
+        let keep = |payload: &str| Ok(payload.to_string());
+        let mark = |payload: &str| Ok(format!("{payload}|concluded"));
+        let unreadable = |_: &str| Err("unreadable options".to_string());
+
+        // Nothing in progress: there is no snapshot to conclude.
+        assert!(taken().await.is_none(), "idle");
+
+        // Multi-commit sequence: only the payload changes.
+        let mut multi = sample(SequenceKind::CherryPick);
+        multi.todo = vec!["c".repeat(40), "d".repeat(40)];
+        multi.payload = r#"{"signoff":false}"#.to_string();
+        save(&multi).await.expect("save multi");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("mark"),
+            ExternalConclusion::Marked
+        );
+        let marked = load().await.expect("load").expect("row kept");
+        assert_eq!(
+            marked.current_oid, multi.current_oid,
+            "the stopped commit id stays readable by older binaries"
+        );
+        assert_eq!(marked.todo, multi.todo, "remaining todo is kept");
+        assert_eq!(marked.payload, format!("{}|concluded", multi.payload));
+        assert_eq!(marked.head_orig, multi.head_orig);
+        // Marking again is idempotent once the mark is present.
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("re-mark"),
+            ExternalConclusion::Marked
+        );
+
+        // A payload this binary cannot read is an error, not a silent "already
+        // marked": the row is left byte-identical for the caller to warn about.
+        let before = load().await.expect("load").expect("row kept");
+        assert!(
+            conclude_stopped_sequence(taken().await.expect("row"), unreadable)
+                .await
+                .is_err(),
+            "an unreadable payload must not report success"
+        );
+        let after = load().await.expect("load").expect("row kept");
+        assert_eq!(after.payload, before.payload, "payload untouched");
+        assert_eq!(after.current_oid, before.current_oid, "row untouched");
+        assert_eq!(after.todo, before.todo, "todo untouched");
+
+        // Nothing left to pick: the row goes away.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single).await.expect("save single");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("clear"),
+            ExternalConclusion::Cleared
+        );
+        assert!(load().await.expect("load").is_none());
+
+        // A different kind is left alone.
+        save(&sample(SequenceKind::Rebase))
+            .await
+            .expect("save rebase");
+        assert!(taken().await.is_none(), "a different kind is not ours");
+        assert!(
+            load().await.expect("load").is_some(),
+            "rebase state is untouched"
+        );
+        // Codex R5: a `--quit` racing the conclusion, followed by a fresh start,
+        // keeps its own row — the fenced write only fires on the snapshot it
+        // read, and the stale conclusion reports `Superseded`.
+        let reclaimed_payload = r#"{"signoff":true,"reclaimed":1}"#;
+        unsafe {
+            std::env::set_var("LIBRA_TEST", "1");
+            std::env::set_var(
+                "LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE",
+                reclaimed_payload,
+            );
+        }
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let mut racing = sample(SequenceKind::CherryPick);
+        racing.todo = vec!["e".repeat(40)];
+        racing.payload = r#"{"signoff":false}"#.to_string();
+        save(&racing).await.expect("save racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        let winner = load().await.expect("load").expect("reclaimed row kept");
+        assert_eq!(
+            winner.payload, reclaimed_payload,
+            "the row the concurrent start wrote survives"
+        );
+        assert_eq!(winner.current_oid, "9".repeat(40));
+
+        // Same fence on the clearing branch: nothing left to pick, but the row
+        // was reclaimed under us.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single_racing = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single_racing).await.expect("save single racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        assert_eq!(
+            load()
+                .await
+                .expect("load")
+                .expect("reclaimed row kept")
+                .payload,
+            reclaimed_payload,
+            "the clearing branch does not delete someone else's row"
+        );
+        unsafe {
+            std::env::remove_var("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE");
+            std::env::remove_var("LIBRA_TEST");
+        }
     }
 
     /// #477 HF-31: a fenced clear removes the row only while its payload still

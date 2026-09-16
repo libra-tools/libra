@@ -102,8 +102,8 @@ Marker discovery/transfer-setup errors use the exact `check that the remote serv
 hint. Non-marker network failures retain `LBR-NET-001`; clone discovery's ordinary
 IO errors retain `LBR-IO-001`. Authentication, local metadata errors and existing
 non-marker host-key handling follows the SSH section below. Other untyped discovery parsing
-errors retain existing classification (DEFER-04); this change does not complete
-strict async header validation or the later Git/SSH reader work.
+errors retain existing classification (DEFER-04). Shared strict ASCII-hex
+validation and Git/SSH reader propagation are described below.
 
 The default tests exercise all command conversions with raw carriers and parser
 errors, preserve the fetch PacketRead no-hint contract, and prove empty
@@ -129,15 +129,16 @@ During the `git://` object-fetch advertisement, fetch, clone and pull already
 report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
 hint is `check that the remote serves Git data and that a proxy has not altered the response`.
 Lengths 1–3 previously could panic; truncated advertisements previously returned
-`LBR-NET-001` with a network/transfer hint. Git discovery can still report `LBR-NET-001`. SSH advertisement propagation
-and bounded cleanup are described below; complete ASCII-hex header validation
-remains separate work.
+`LBR-NET-001` with a network/transfer hint. Git discovery now preserves these protocol errors through the command boundary.
+SSH propagation and bounded cleanup are described below. All readers require
+four ASCII hexadecimal header digits.
 
 This advertisement is distinct from an upload-pack response after negotiation:
-HTTP(S) framing and empty upload-pack response classifications are unchanged.
-Tests exercise real local TCP object-fetch advertisement reads and the public
-fetch/clone/pull error conversions, without claiming full command execution or
-bounded SSH cleanup. Check the remote Git service or proxy for malformed frames.
+HTTP(S) discovery framing and empty upload-pack response classifications are unchanged.
+Reader tests exercise local TCP object-fetch advertisements and public error
+conversions. Separate command tests exercise malformed Git discovery and SSH
+cleanup with local fixtures, not live OpenSSH authentication. Check the remote
+Git service or proxy for malformed frames.
 
 ## SSH advertisement error handling
 
@@ -167,9 +168,9 @@ other command boundaries retain fixed host guidance in the message and their
 existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
 captured remote stderr in either case.
 
-The `git://` object-fetch path already classifies the listed frame errors as
-`LBR-NET-002`; Git discovery and non-ASCII/non-hex async header classifications
-remain separate work. HTTP(S) framing behavior is unchanged.
+The `git://` discovery and object-fetch paths preserve the listed frame errors as
+`LBR-NET-002`. All asynchronous readers reject non-ASCII/non-hexadecimal headers
+with fixed protocol reasons. HTTP(S) discovery/advertisement framing is unchanged.
 
 ## SSH authentication and captured diagnostics
 
@@ -261,3 +262,47 @@ A successful discovery whose child waits for a request normally incurs the full
 100 ms native-exit observation window, once per discovery operation. This is
 separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
+
+## Strict pkt-line headers
+
+A pkt-line header must contain exactly four ASCII hexadecimal digits (`0`–`9`,
+`a`–`f` or `A`–`F`). Fetch streaming, `git://` advertisements and SSH advertisements
+reject leading signs such as `+004`, whitespace, non-hexadecimal text and invalid
+UTF-8. These failures return `LBR-NET-002` (exit 128), with fixed reasons that do
+not echo the header or payload. A peer that previously sent a signed or otherwise
+nonconforming header must send four hexadecimal digits before retrying.
+
+Git discovery also preserves protocol classification for lengths `0001`–`0003`,
+missing or partial required headers and truncated payloads. The same discovery
+classification reaches clone, fetch, pull, ls-remote and push. Check the remote
+Git service or proxy response. Their existing structured error fields remain;
+push retains its own protocol hint and the other commands retain theirs.
+
+Flush `0000`, empty-data `0004` and maximum-length `ffff` frames keep their existing
+meaning. Ordinary network errors and timeouts retain their existing categories.
+An empty fetch data stream before any complete pack remains a network failure;
+EOF after a completed pack keeps the existing success behavior. The SSH host-trust
+exception, captured-diagnostic limits and cleanup deadlines described above remain.
+
+## Header validation scope
+
+The ten named PKT-13 gates retain the plan's original names. The shared header
+decoder is used by the synchronous parser and all three asynchronous readers;
+the bounded IO marker classifier has one implementation in `git_protocol`, with
+a crate-visible fetch re-export for existing callers. Synchronous failure still
+leaves the input untouched. Four-byte validation does constant work without
+allocating or rendering peer bytes. Existing allocation and buffering behavior
+is unchanged: SSH advertisements retain their 16 MiB cap; Git TCP advertisements
+have no total-size cap.
+
+Direct reader fixtures cover strict UTF-8/ASCII-hex errors, valid case variants,
+flush/empty/maximum frames and typed CLI conversion. The Git discovery gate uses
+14 malformed byte sequences across five real `execute_safe` command paths (70
+cases), checking the service request, protocol reason, exact command hint, all
+three renderings and tracking-ref safety. The server tasks and listeners are
+bounded and cancelled on drop. Another gate exercises a real idle TCP peer to
+preserve the ordinary network wrapper. Fetch no-echo and empty-stream cases use
+`read_fetch_stream`; they are not fabricated marker-only errors. No new Cargo
+target or shared test helper is introduced. These are local fixtures, not live
+OpenSSH authentication;
+actual execution and release acceptance are recorded in plan-20260901.md.

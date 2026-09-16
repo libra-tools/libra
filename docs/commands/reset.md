@@ -32,6 +32,8 @@ unsupported diagnostic.
 
 When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft`, `--hard`, `--merge`, and `--keep`. When a pathspec reset restores a symlink from the target commit, the index entry keeps mode `120000` and the blob remains the link target bytes.
 
+A whole-tree reset (any mode, no pathspecs) also ends a stopped sequence item: it clears a stopped single-commit cherry-pick or revert, so the next pick or revert starts cleanly. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded here; finish it with `libra cherry-pick --skip` (or `--quit`) or `libra revert --abort`. A reset with pathspecs changes no sequence state, and an in-progress rebase is left alone. If that bookkeeping fails, the reset still succeeds and the leftover state is named in a warning.
+
 The default target is `HEAD`, making `libra reset` (with no arguments) equivalent to un-staging everything.
 
 ## Options

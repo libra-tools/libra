@@ -38,6 +38,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 `text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
 内容；binary driver 冲突则保留完整的存活侧（current 存在时优先），不插入文本标记。
 
+已停止的 pick 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 pick，下一次 cherry-pick 可以正常开始。多提交序列会保留剩余提交并记录被停提交已结束；此时 `--continue` 拒绝，而不是把重置后的索引记成该提交，用 `libra cherry-pick --skip` 应用其余提交。
+
 ## 选项
 
 ### `-n`, `--no-commit`
@@ -296,6 +298,8 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 |------|-----------|------|
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
 | `LBR-REPO-003` | HEAD detached、`--continue`/`--skip`/`--abort`/`--quit` 时没有进行中的 cherry-pick、`--continue` 在错误的分支上，或被中断的 `--skip`/`--abort` 尚未完成（完成前 `--continue` 拒绝） | 切换到分支 / 先发起 cherry-pick / 切回序列所在分支 / 重跑被中断的 `--skip` 或 `--abort`（或用 `--quit` 放弃序列） |
+| `LBR-REPO-003` | `--continue` 时之后的 reset 已结束该停止提交 | 用 `libra cherry-pick --skip` 消化剩余提交，或用 `--quit` / `--abort` 结束序列 |
+| `LBR-REPO-002` | 序列行声称被停提交已结束，却没有剩余提交——任何写入方都不会产生这种形态 | 状态原样不动：用 `libra cherry-pick --abort` 或 `--quit` 结束序列 |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | merge commit 未带 `-m`、`-m` 越界、非法 `--cleanup`/`--empty` mode、空提交未带 `--allow-empty`、冗余提交未带 `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`，或空消息未带 `--allow-empty-message` | 使用提示中指明的标志 |
 | `LBR-UNSUPPORTED-001` | 传入了不支持的自定义 `--strategy`，**或** pick 序列的输入中存在需要裁决的 `160000` gitlink（submodule） | 去掉 `--strategy`；gitlink 情形请在 Libra 之外解决 submodule 指针，或从相关提交中移除该条目——拒绝发生在任何索引/工作树/状态写入之前 |

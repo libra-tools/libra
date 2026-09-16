@@ -37,7 +37,7 @@ use crate::{
     git_protocol::{
         PKT_LINE_PROTOCOL_ERROR_PREFIX, PktLineError,
         ServiceType::{self, UploadPack},
-        pkt_frame_payload_len,
+        decode_pkt_line_header, pkt_frame_payload_len,
     },
     internal::{
         branch::Branch,
@@ -934,44 +934,8 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
     }
 }
 
-/// Inspect the inner IO diagnostic without allocating its complete formatted message.
-/// Only the marker prefix is compared; formatting stops as soon as it matches or differs.
-pub(crate) fn is_pkt_line_io_error(error: &std::io::Error) -> bool {
-    struct PrefixMatcher<'a> {
-        remaining: &'a [u8],
-        matched: bool,
-        rejected: bool,
-    }
-
-    impl std::fmt::Write for PrefixMatcher<'_> {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            if self.matched || self.rejected {
-                return Err(std::fmt::Error);
-            }
-            let count = self.remaining.len().min(text.len());
-            if self.remaining[..count] != text.as_bytes()[..count] {
-                self.rejected = true;
-                return Err(std::fmt::Error);
-            }
-            self.remaining = &self.remaining[count..];
-            if self.remaining.is_empty() {
-                self.matched = true;
-                // Deliberately stop Display before it formats any suffix.
-                Err(std::fmt::Error)
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    let mut matcher = PrefixMatcher {
-        remaining: PKT_LINE_PROTOCOL_ERROR_PREFIX.as_bytes(),
-        matched: false,
-        rejected: false,
-    };
-    let _ = std::fmt::write(&mut matcher, format_args!("{error}"));
-    matcher.matched
-}
+// Keep existing command callers on the shared bounded protocol classifier.
+pub(crate) use crate::git_protocol::is_pkt_line_io_error;
 
 fn map_fetch_io_error(
     message: String,
@@ -3697,14 +3661,7 @@ async fn read_hex_4(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<u32> {
             error
         }
     })?;
-    let hex_str = std::str::from_utf8(&buf).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            PktLineError::InvalidHeaderEncoding,
-        )
-    })?;
-    u32::from_str_radix(hex_str, 16)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, PktLineError::InvalidHexHeader))
+    decode_pkt_line_header(&buf).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// async version of `read_pkt_line`
@@ -3729,6 +3686,217 @@ async fn read_pkt_line(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(usi
 
 #[cfg(test)]
 mod tests {
+    fn pkt13_bad_headers() -> Vec<(&'static [u8; 4], crate::git_protocol::PktLineError)> {
+        use crate::git_protocol::PktLineError;
+        vec![
+            (b"+004", PktLineError::InvalidHexHeader),
+            (b"-004", PktLineError::InvalidHexHeader),
+            (b" 004", PktLineError::InvalidHexHeader),
+            (b"000\n", PktLineError::InvalidHexHeader),
+            (b"0x04", PktLineError::InvalidHexHeader),
+            (b"SECR", PktLineError::InvalidHexHeader),
+            (b"\xc3\xa900", PktLineError::InvalidHexHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+        ]
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_fetch_hex4_marker() {
+        use crate::git_protocol::PktLineError;
+        for (header, expected) in pkt13_bad_headers() {
+            let mut input = header.as_slice();
+            let error = super::read_hex_4(&mut input).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<PktLineError>()),
+                Some(&expected)
+            );
+            assert_eq!(error.to_string(), expected.to_string());
+            assert!(input.is_empty());
+        }
+        for (header, value) in [(b"0000", 0), (b"0004", 4), (b"00aF", 175), (b"FFFF", 65535)] {
+            assert_eq!(
+                super::read_hex_4(&mut header.as_slice()).await.unwrap(),
+                value
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_three_transports_bad_header_net_002() {
+        use crate::internal::protocol::{git_client::tests as git, ssh_client::tests as ssh};
+        // Real asynchronous reader loops, followed by the public PacketRead CLI
+        // conversion. Actual command discovery is covered by the TCP E2E gate.
+        for (header, expected) in pkt13_bad_headers() {
+            for source in [
+                super::read_pkt_line(&mut header.as_slice())
+                    .await
+                    .unwrap_err(),
+                git::read_frame_fixture(header).await.unwrap_err(),
+                ssh::read_frame_fixture(header).await.unwrap_err(),
+            ] {
+                git::assert_typed_frame_error(source, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_non_marker_regression() {
+        use crate::utils::error::{CliError, StableErrorCode};
+        let mut empty: FetchStream = stream::empty().boxed();
+        let error = read_fetch_stream(&mut empty, &OutputConfig::default(), "pkt13 empty stream")
+            .await
+            .err()
+            .expect("empty transport must fail before a complete pack");
+        assert!(
+            matches!(&error, FetchError::PacketRead { source } if source.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
+        let cli = CliError::from(error);
+        assert_eq!(cli.stable_code(), StableErrorCode::NetworkUnavailable);
+        assert_eq!(cli.stable_code().exit_code().as_i32(), 128);
+        assert_eq!(
+            cli.hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            ["check network connectivity and retry"]
+        );
+        for detail in [
+            "connection refused",
+            "operation timed out",
+            "wrapper: pkt-line protocol error: invalid",
+            " pkt-line protocol error: invalid",
+        ] {
+            let source = std::io::Error::other(detail);
+            assert!(!super::is_pkt_line_io_error(&source));
+            let cli = CliError::from(FetchError::PacketRead { source });
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkUnavailable);
+            assert_eq!(
+                cli.hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                ["check network connectivity and retry"]
+            );
+        }
+        // Preserve clean EOF after a completed pack rather than broadening the
+        // empty-stream failure to already completed transfers.
+        let pack = empty_pack_bytes();
+        let mut response = BytesMut::new();
+        append_pkt_line(&mut response, &pack);
+        let mut complete: FetchStream = stream::iter([Ok(response.freeze())]).boxed();
+        let result = read_fetch_stream(
+            &mut complete,
+            &OutputConfig::default(),
+            "pkt13 completed stream",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.pack_data, pack);
+    }
+
+    #[test]
+    fn pkt_line_header_marker_at_string_start_regression() {
+        use crate::{
+            git_protocol::PKT_LINE_PROTOCOL_ERROR_PREFIX,
+            utils::error::{CliError, StableErrorCode},
+        };
+        for (prefix, accepted) in [
+            ("", true),
+            ("wrapper: ", false),
+            (" ", false),
+            ("\n", false),
+        ] {
+            let detail = format!("{prefix}{PKT_LINE_PROTOCOL_ERROR_PREFIX}operation timed out");
+            let io = std::io::Error::other(detail.clone());
+            assert_eq!(super::is_pkt_line_io_error(&io), accepted);
+            assert_eq!(crate::git_protocol::is_pkt_line_io_error(&io), accepted);
+            let cli = CliError::from(FetchError::Discovery {
+                remote: "origin".to_string(),
+                source: git_internal::errors::GitError::NetworkError(detail),
+            });
+            assert_eq!(
+                cli.stable_code(),
+                if accepted {
+                    StableErrorCode::NetworkProtocol
+                } else {
+                    StableErrorCode::NetworkUnavailable
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_header_shared_helper_single_source() {
+        use crate::{
+            git_protocol::{decode_pkt_line_header, read_pkt_line},
+            internal::protocol::{git_client::tests as git, ssh_client::tests as ssh},
+        };
+        for (header, expected) in pkt13_bad_headers() {
+            assert_eq!(decode_pkt_line_header(header), Err(expected));
+            let mut bytes = Bytes::copy_from_slice(header);
+            let before = bytes.clone();
+            assert_eq!(read_pkt_line(&mut bytes), Err(expected));
+            assert_eq!(bytes, before, "sync rejection must not consume input");
+        }
+        for header in [b"0000", b"0004", b"0005", b"000A", b"00af", b"FFFF"] {
+            let length = decode_pkt_line_header(header).unwrap();
+            let payload = vec![b'x'; crate::git_protocol::pkt_frame_payload_len(length).unwrap()];
+            let mut wire = header.to_vec();
+            wire.extend_from_slice(&payload);
+            let mut sync = Bytes::copy_from_slice(&wire);
+            let (actual_length, actual_payload) = read_pkt_line(&mut sync).unwrap();
+            assert_eq!(
+                (actual_length, actual_payload.as_ref()),
+                (length as usize, payload.as_slice())
+            );
+            assert!(sync.is_empty());
+            assert_eq!(
+                super::read_pkt_line(&mut wire.as_slice()).await.unwrap(),
+                (length as usize, payload)
+            );
+            if length != 0 {
+                wire.extend_from_slice(b"0000");
+            }
+            assert_eq!(git::read_frame_fixture(&wire).await.unwrap().as_ref(), wire);
+            assert_eq!(ssh::read_frame_fixture(&wire).await.unwrap().as_ref(), wire);
+        }
+    }
+
+    #[tokio::test]
+    async fn pkt_line_fetch_async_zero_echo_sentinel() {
+        use crate::utils::error::{CliError, StableErrorCode};
+        // The remote bytes enter the real streaming fetch reader. No manually
+        // constructed protocol error is used as proof of reader sanitization.
+        for header in [b"SECR", b"+004", b"\xff000"] {
+            let mut wire = header.to_vec();
+            wire.extend_from_slice(b"PKT13_REMOTE_SECRET_8af32\x1b[31m\rspoof");
+            let mut source: FetchStream = stream::iter([Ok(Bytes::from(wire))]).boxed();
+            let error = read_fetch_stream(&mut source, &OutputConfig::default(), "pkt13 sentinel")
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(&error, FetchError::PacketRead { source } if source.kind() == std::io::ErrorKind::InvalidData)
+            );
+            let cli = CliError::from(error);
+            assert_eq!(cli.stable_code(), StableErrorCode::NetworkProtocol);
+            assert_eq!(cli.stable_code().exit_code().as_i32(), 128);
+            assert!(cli.hints().is_empty());
+            for rendered in [
+                cli.render(),
+                cli.render_report(),
+                cli.render_json().to_string(),
+            ] {
+                for forbidden in ["SECR", "+004", "PKT13_REMOTE_SECRET", "spoof", "�"] {
+                    assert!(!rendered.contains(forbidden), "{rendered}");
+                }
+            }
+        }
+    }
+
     use std::{
         fs,
         time::{Duration, SystemTime},

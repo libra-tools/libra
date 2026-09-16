@@ -179,7 +179,27 @@ pub async fn execute(args: ResetArgs) {
 /// pathspecs cannot be resolved, object reads fail, or HEAD/index/worktree
 /// updates fail.
 pub async fn execute_safe(args: ResetArgs, output: &OutputConfig) -> CliResult<()> {
-    let result = run_reset(args).await.map_err(CliError::from)?;
+    execute_safe_inner(args, output, true).await
+}
+
+/// `reset` as an INTERNAL step of another sequencer command (cherry-pick's
+/// `--ff`/`--skip`/`--abort`, `am`'s rollback).
+///
+/// #477 HF-01: those commands drive their own sequence row, so the
+/// external-conclusion rule (ADR-HF-03 item 1) must not fire underneath them —
+/// it is the user's own `libra reset` that concludes a stopped item.
+pub(crate) async fn execute_safe_internal(args: ResetArgs, output: &OutputConfig) -> CliResult<()> {
+    execute_safe_inner(args, output, false).await
+}
+
+async fn execute_safe_inner(
+    args: ResetArgs,
+    output: &OutputConfig,
+    conclude_sequences: bool,
+) -> CliResult<()> {
+    let result = run_reset(args, conclude_sequences)
+        .await
+        .map_err(CliError::from)?;
     render_reset_output(&result.output, output)?;
     for warning in result.warnings {
         emit_warning(warning);
@@ -449,7 +469,10 @@ struct ResetRequest {
     pathspecs: Vec<String>,
 }
 
-async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
+async fn run_reset(
+    args: ResetArgs,
+    conclude_sequences: bool,
+) -> Result<ResetExecution, ResetError> {
     util::require_repo().map_err(|_| ResetError::NotInRepo)?;
     let request = normalize_reset_request(&args).await?;
 
@@ -512,7 +535,29 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
     reject_reset_on_ai_managed_current_branch().await?;
 
     let target_commit_id = resolve_commit(&request.target).await?;
-    let reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
+
+    // ADR-HF-03 items 1, 4 and 5 (#477 HF-01): a user-invoked reset without
+    // pathspecs concludes a stopped cherry-pick/revert. The state is snapshotted
+    // BEFORE the reset moves the tree (Codex R6) so the conclusion can only ever
+    // end the stop this reset actually observed — a sequence started after the
+    // reset finished belongs to someone else and is left alone.
+    let stopped = if conclude_sequences {
+        snapshot_stopped_sequences().await
+    } else {
+        StoppedSequences::default()
+    };
+    let mut reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
+
+    // The reset itself is already durable, so a bookkeeping failure only adds a
+    // warning (exit 0) naming the command that finishes the leftover state.
+    // Resets run as an internal step of cherry-pick/am keep their caller's
+    // sequence intact.
+    if conclude_sequences {
+        started_after_reset_seam().await?;
+        reset_stats
+            .warnings
+            .extend(conclude_stopped_sequences(stopped).await);
+    }
 
     let subject = load_commit_summary_or_warn(&target_commit_id);
     let commit = target_commit_id.to_string();
@@ -1420,6 +1465,147 @@ async fn perform_guarded_reset(
 
 /// Perform the actual reset operation based on the specified mode.
 /// Updates HEAD pointer and optionally resets index and working directory.
+/// Conclude a stopped cherry-pick/revert item after a successful whole-tree
+/// reset (ADR-HF-03 items 1 and 4). Single-item sequences are cleared; a
+/// multi-commit sequence keeps its remaining work and records that the stopped
+/// item was concluded from outside (#477 HF-01).
+///
+/// Never fails the reset: a failure becomes a warning naming the command that
+/// finishes the leftover state, and STOPS the remaining cleanup steps, so the
+/// state a later step would have touched is left exactly as it was
+/// (ADR-HF-03 item 5, ordered contract).
+async fn conclude_stopped_sequences(stopped: StoppedSequences) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cherry_pick = match stopped.cherry_pick {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warnings.push(format!(
+                "reset completed, but the stopped cherry-pick state could not be read: {error}; finish it with 'libra cherry-pick --quit'"
+            ));
+            // Ordered contract: stop here, leaving any revert state untouched.
+            return warnings;
+        }
+    };
+    if let Err(error) = conclude_cherry_pick_with_seam(cherry_pick).await {
+        warnings.push(format!(
+            "reset completed, but the stopped cherry-pick state could not be updated: {error}; finish it with 'libra cherry-pick --quit'"
+        ));
+        // Ordered contract: stop here, leaving any revert state untouched.
+        return warnings;
+    }
+    let revert_snapshot = match stopped.revert {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return warnings,
+        Err(error) => {
+            warnings.push(format!(
+                "reset completed, but the stopped revert state could not be read: {error}; finish it with 'libra revert --abort'"
+            ));
+            return warnings;
+        }
+    };
+    if let Err(error) = crate::command::revert::conclude_stopped_revert(revert_snapshot).await {
+        warnings.push(format!(
+            "reset completed, but the stopped revert state could not be updated: {error}; finish it with 'libra revert --abort'"
+        ));
+    }
+    warnings
+}
+
+/// The cherry-pick half of the conclusion, behind a `LIBRA_TEST`-gated seam so
+/// the ordered-contract failure path is testable (#477 HF-01, ADR-HF-03 item 5).
+async fn conclude_cherry_pick_with_seam(
+    snapshot: Option<crate::internal::sequencer::SequenceState>,
+) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_CONCLUDE_CHERRY_PICK").is_some()
+    {
+        return Err("test-injected failure concluding the stopped cherry-pick".to_string());
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    crate::command::cherry_pick::conclude_stopped_cherry_pick(snapshot)
+        .await
+        .map(|_| ())
+}
+
+/// `LIBRA_TEST`-gated seam that starts a brand-new sequence in the window
+/// between a successful reset and its conclusion, so "a sequence started after
+/// the reset is never concluded by it" is a deterministic regression rather
+/// than a timing hope (#477 HF-01, Codex R6).
+async fn started_after_reset_seam() -> Result<(), ResetError> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(tag) = std::env::var_os("LIBRA_TEST_RESET_START_SEQUENCE_AFTER_RESET") else {
+        return Ok(());
+    };
+    // A seam that cannot set its state up would silently weaken its own test,
+    // so both writes surface through the reset's existing state-save error.
+    let tag = tag.to_string_lossy().into_owned();
+    crate::internal::sequencer::save(&crate::internal::sequencer::SequenceState {
+        kind: crate::internal::sequencer::SequenceKind::CherryPick,
+        head_name: "master".to_string(),
+        head_orig: "1".repeat(40),
+        current_oid: "2".repeat(40),
+        todo: vec!["3".repeat(40)],
+        payload: tag.clone(),
+    })
+    .await
+    .map_err(ResetError::IndexSave)?;
+    crate::command::revert::write_state_for_test(tag.as_bytes()).map_err(ResetError::IndexSave)?;
+    Ok(())
+}
+
+/// What a whole-tree reset saw stopped BEFORE it moved the tree.
+///
+/// Each half keeps its `Result`: a state that could not even be READ is
+/// leftover state the user must finish by hand, so it owes them the ADR-HF-03
+/// item 5 warning naming the recovery command — never a silent "nothing to
+/// conclude" (Codex R7).
+struct StoppedSequences {
+    cherry_pick: Result<Option<crate::internal::sequencer::SequenceState>, String>,
+    revert: Result<Option<Vec<u8>>, String>,
+}
+
+impl Default for StoppedSequences {
+    fn default() -> Self {
+        Self {
+            cherry_pick: Ok(None),
+            revert: Ok(None),
+        }
+    }
+}
+
+/// Read both stopped states before the reset runs.
+async fn snapshot_stopped_sequences() -> StoppedSequences {
+    StoppedSequences {
+        cherry_pick: snapshot_cherry_pick_with_seam().await,
+        revert: snapshot_revert_with_seam(),
+    }
+}
+
+/// `LIBRA_TEST`-gated seams making each snapshot read fail, so the warning path
+/// for an unreadable stopped state is a regression rather than a claim.
+async fn snapshot_cherry_pick_with_seam()
+-> Result<Option<crate::internal::sequencer::SequenceState>, String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_SNAPSHOT_CHERRY_PICK").is_some()
+    {
+        return Err("test-injected failure reading the stopped cherry-pick".to_string());
+    }
+    crate::command::cherry_pick::snapshot_stopped_cherry_pick().await
+}
+
+fn snapshot_revert_with_seam() -> Result<Option<Vec<u8>>, String> {
+    if std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var_os("LIBRA_TEST_RESET_FAIL_SNAPSHOT_REVERT").is_some()
+    {
+        return Err("test-injected failure reading the stopped revert".to_string());
+    }
+    crate::command::revert::snapshot_stopped_revert()
+}
+
 async fn perform_reset(
     target_commit_id: ObjectHash,
     mode: ResetMode,

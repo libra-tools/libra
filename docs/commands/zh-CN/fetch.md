@@ -355,10 +355,10 @@ Git/SSH pkt-line 广告读取器拒绝声明长度 `0001` 至 `0003`、不完整
 报告为 `LBR-NET-002`，包括零字节广告；提示为
 `check that the remote serves Git data and that a proxy has not altered the response`。
 长度 1–3 之前可能触发 panic；截断广告之前返回 `LBR-NET-001` 与网络/传输提示。
-Git discovery 包装仍可能返回 `LBR-NET-001`；SSH 广告透传与有界清理见下节。
-完整的 ASCII-hex 标头校验仍由后续改动处理。
+Git discovery 现在保留协议错误分类；SSH 广告透传与有界清理见下节。
+所有读取点均要求四位 ASCII 十六进制标头。
 
-该广告阶段不同于协商后的 upload-pack 响应：HTTP(S) 帧分类和空 upload-pack 响应
+该广告阶段不同于协商后的 upload-pack 响应：HTTP(S) discovery 广告帧分类和空 upload-pack 响应
 分类不变。测试已覆盖真实本机 TCP 取对象广告读取及公开 fetch/clone/pull 错误转换，
 不代表完整命令执行或有界 SSH 清理。畸形帧应检查远端 Git 服务或代理。
 
@@ -384,8 +384,8 @@ Clone 将主机核验指引放在结构化 hints 中；其它命令边界在 mes
 主机指引，并沿用 `LBR-NET-001` 的网络 hint。human、JSON 与 machine 诊断均
 不包含捕获的远端 stderr 原文。
 
-`git://` 取对象阶段已将上述帧错误归为 `LBR-NET-002`；Git discovery 与异步
-非 ASCII/非 hex 标头分类仍由后继处理，HTTP(S) 帧行为不变。
+`git://` discovery 与取对象阶段均将上述帧错误归为 `LBR-NET-002`；所有异步
+读取点拒绝非 ASCII/非十六进制标头并给出固定协议原因，HTTP(S) discovery 广告帧校验不变。
 
 ## SSH 认证与捕获诊断
 
@@ -436,3 +436,18 @@ HTTPS和Git传输没有这一特定上限。若服务器提供HTTPS端点，SSH�
 
 成功discovery的子程序若等待请求，通常会耗尽100 ms原生退出观察窗口，每次discovery
 分别承担该成本。这与两秒直接子程序清理预算分开，不构成性能基准或任意后代清理保证。
+
+## 严格 pkt-line 标头
+
+pkt-line 标头必须恰好包含四位 ASCII 十六进制数字（`0`–`9`、`a`–`f` 或 `A`–`F`）。
+fetch 流、`git://` 广告与 SSH 广告均拒绝 `+004` 等带符号标头、空白、非十六进制文字
+及无效 UTF-8，并返回 `LBR-NET-002`（退出128）。原因固定，不回显标头或 payload。
+此前发送带符号或其它不合规标头的对端，需要改为四位十六进制数字后重试。
+
+Git discovery 对长度 `0001`–`0003`、缺失/不完整的必需标头及截断 payload 也保留
+协议分类，并传递至 clone、fetch、pull、ls-remote 与 push。请检查远端 Git 服务或
+代理响应。结构化错误字段保持原有格式；push 保留自己的协议 hint，其它命令亦然。
+
+flush `0000`、空数据 `0004` 与最大长度 `ffff` 的语义不变；普通网络错误及超时保留
+原有分类。尚无完整 pack 时的空 fetch 数据流仍属于网络失败，完整 pack 之后的 EOF
+保留成功语义。上文 SSH 主机信任例外、捕获上限及清理截止时间保持不变。

@@ -124,6 +124,12 @@ notes: |
   tests cover three output modes without new test targets or serial-lane changes.
   These are local fake-SSH fixtures, not live OpenSSH authentication evidence.
   Actual execution and release proofs are recorded in plan-20260901.md.
+  PKT-13 retains ten Cargo library gates for shared strict ASCII-hex headers,
+  typed three-reader errors, actual fetch-stream no-echo and empty-stream behavior,
+  and 14 malformed Git discovery inputs across five commands (70 local TCP cases).
+  Service requests, exact hints, three renderings and unchanged tracking refs are
+  checked; server tasks are bounded and aborted on drop. No new target or shared
+  test runner is introduced. Actual execution is recorded in plan-20260901.md.
 
   These fixed 16 MiB advertisement and receive-pack response limits apply only to
   Libra's SSH transport. The HTTPS and Git transports do not impose this particular

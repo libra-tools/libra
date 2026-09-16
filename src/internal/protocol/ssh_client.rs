@@ -20,9 +20,9 @@ use tracing::instrument::WithSubscriber;
 use super::{
     DiscoveryResult, FetchStream, generate_upload_pack_content, parse_discovered_references,
 };
-use crate::{
-    command::fetch::is_pkt_line_io_error,
-    git_protocol::{PktLineError, ServiceType, pkt_frame_payload_len, pkt_line_read_error},
+use crate::git_protocol::{
+    PktLineError, ServiceType, decode_pkt_line_header, is_pkt_line_io_error, pkt_frame_payload_len,
+    pkt_line_read_error,
 };
 
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -508,10 +508,9 @@ impl SshClient {
                     None,
                 )
             })?;
-            let len_str = std::str::from_utf8(&len_buf)
-                .map_err(|e| IoError::other(format!("invalid pkt-line length: {e}")))?;
-            let len = usize::from_str_radix(len_str, 16)
-                .map_err(|e| IoError::other(format!("invalid pkt-line length: {e}")))?;
+            let len = decode_pkt_line_header(&len_buf)
+                .map_err(|error| IoError::new(std::io::ErrorKind::InvalidData, error))?
+                as usize;
             if buf.len().saturating_add(len.max(4)) > SSH_PROTOCOL_OUTPUT_LIMIT {
                 return Err(IoError::other(
                     "SSH advertisement exceeded the 16 MiB limit; use the repository's HTTPS URL if available, or ask its maintainer to reduce refs",
@@ -1076,6 +1075,18 @@ pub fn is_ssh_spec(spec: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn pkt_line_header_ssh_client_header_marker() {
+        use crate::internal::protocol::git_client::tests::assert_typed_frame_error;
+        for (wire, expected) in [
+            (b"+004".as_slice(), PktLineError::InvalidHexHeader),
+            (b"SECR", PktLineError::InvalidHexHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+        ] {
+            assert_typed_frame_error(read_frame_fixture(wire).await.unwrap_err(), expected);
+        }
+    }
+
     use super::*;
 
     const PKT11_SENTINEL: &str = "PKT11_REMOTE_SECRET_8dcbf3\x1b[31m\rspoof";

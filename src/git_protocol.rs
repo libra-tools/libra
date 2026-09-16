@@ -152,6 +152,57 @@ impl From<PktFrameError> for PktLineError {
     }
 }
 
+/// Decode the four ASCII hexadecimal digits of a pkt-line header.
+///
+/// Fixed typed errors never contain input bytes. This validates the encoding and
+/// digit alphabet only; callers validate frame length and payload separately.
+pub(crate) fn decode_pkt_line_header(header: &[u8; 4]) -> Result<u32, PktLineError> {
+    let text = core::str::from_utf8(header).map_err(|_| PktLineError::InvalidHeaderEncoding)?;
+    if !header.iter().all(u8::is_ascii_hexdigit) {
+        return Err(PktLineError::InvalidHexHeader);
+    }
+    u32::from_str_radix(text, 16).map_err(|_| PktLineError::InvalidHexHeader)
+}
+
+/// Inspect the inner IO diagnostic without allocating its complete formatted message.
+/// Only the marker prefix is compared; formatting stops as soon as it matches or differs.
+pub(crate) fn is_pkt_line_io_error(error: &std::io::Error) -> bool {
+    struct PrefixMatcher<'a> {
+        remaining: &'a [u8],
+        matched: bool,
+        rejected: bool,
+    }
+
+    impl std::fmt::Write for PrefixMatcher<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.matched || self.rejected {
+                return Err(std::fmt::Error);
+            }
+            let count = self.remaining.len().min(text.len());
+            if self.remaining[..count] != text.as_bytes()[..count] {
+                self.rejected = true;
+                return Err(std::fmt::Error);
+            }
+            self.remaining = &self.remaining[count..];
+            if self.remaining.is_empty() {
+                self.matched = true;
+                // Deliberately stop Display before it formats any suffix.
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let mut matcher = PrefixMatcher {
+        remaining: PKT_LINE_PROTOCOL_ERROR_PREFIX.as_bytes(),
+        matched: false,
+        rejected: false,
+    };
+    let _ = std::fmt::write(&mut matcher, format_args!("{error}"));
+    matcher.matched
+}
+
 /// Consume a single pkt-line frame from the front of `bytes` and return its
 /// `(declared_length, payload)`.
 ///
@@ -177,14 +228,12 @@ pub fn read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), PktLineError> 
     if bytes.is_empty() {
         return Ok((0, Bytes::new()));
     }
-    let header = bytes.get(..4).ok_or(PktLineError::TruncatedHeader)?;
-    let header_str =
-        core::str::from_utf8(header).map_err(|_| PktLineError::InvalidHeaderEncoding)?;
-    if !header.iter().all(u8::is_ascii_hexdigit) {
-        return Err(PktLineError::InvalidHexHeader);
-    }
-    let declared_len =
-        u32::from_str_radix(header_str, 16).map_err(|_| PktLineError::InvalidHexHeader)?;
+    let header: &[u8; 4] = bytes
+        .get(..4)
+        .ok_or(PktLineError::TruncatedHeader)?
+        .try_into()
+        .map_err(|_| PktLineError::TruncatedHeader)?;
+    let declared_len = decode_pkt_line_header(header)?;
     let payload_len = pkt_frame_payload_len(declared_len)?;
     if bytes.len() - 4 < payload_len {
         return Err(PktLineError::TruncatedPayload);

@@ -25,6 +25,8 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 
 提供 pathspec 时，命令执行有针对性的 mixed reset：只将命名文件在索引中重置为匹配目标提交，不移动 HEAD。这是取消暂存特定文件的主要方式。与 Git 一样，如果第一个裸位置参数是已知路径且不是 revision，`libra reset src/lib.rs` 会按 `HEAD` 目标的 pathspec reset 处理，等价于 `libra reset HEAD -- src/lib.rs`。如果同一个 token 既是 revision 又是文件名，reset 会拒绝猜测并报歧义；要把它作为目标 revision，请使用 `libra reset <revision> -- <file>`，要把它作为路径，请使用 `libra reset -- <file>`。Pathspec 与 `--soft`、`--hard`、`--merge`、`--keep` 不兼容。当 pathspec reset 从目标提交恢复符号链接时，索引条目会保留 mode `120000`，blob 仍是链接目标字节。
 
+无 pathspec 的整树 reset（任意模式）还会结束已停止的序列项：清除已停止的单提交 cherry-pick 或 revert 状态，使下一次 pick 或 revert 可以正常开始。多提交序列保留剩余提交，并记录被停提交已在此结束；用 `libra cherry-pick --skip`（或 `--quit`）、`libra revert --abort` 收尾。带 pathspec 的 reset 不改动任何序列状态，进行中的 rebase 也不受影响。若该收尾写入失败，reset 仍然成功，并在 warning 中指明残留状态。
+
 默认目标是 `HEAD`，因此不带参数的 `libra reset` 等价于取消暂存所有内容。
 
 `reset --hard` 恢复工作树时会保留 tree 中的文件类型：符号链接会恢复为真正的 symlink，链接 blob 字节作为目标路径写入；若工作树当前位置已有普通文件或已有 symlink，必要时会被替换为目标 symlink。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写入普通文件。

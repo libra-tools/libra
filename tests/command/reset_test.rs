@@ -2012,3 +2012,546 @@ fn reset_pathspec_from_file_rejects_escape() {
         report["message"]
     );
 }
+
+/// A repo whose `feature` branch has a commit conflicting with `main`
+/// (`shared.txt`) followed by a clean one (`clean.txt`); `main` diverges.
+fn seq_conflict_repo() -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |msg: &str| {
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    std::fs::write(p.join("shared.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    commit("init shared");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    std::fs::write(p.join("shared.txt"), "feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add f1");
+    commit("f1 edit");
+    let f1 = super::cherry_pick_test::cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("clean.txt"), "clean\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "clean.txt"], p), "add f2");
+    commit("f2 clean");
+    let f2 = super::cherry_pick_test::cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    commit("m edit");
+    (repo, f1, f2)
+}
+
+fn seq_status(p: &std::path::Path) -> String {
+    let out = run_libra_command(&["status"], p);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// M-SEQ S0-S2, S4a, S8, S9a (#477 HF-01, ADR-HF-03): a whole-tree reset ends a
+/// stopped single-commit cherry-pick/revert, leaves rebase alone, and a pathspec
+/// reset changes no sequence state.
+#[test]
+fn test_reset_clears_single_pick_and_revert_state_matrix() {
+    // S0: `--abort` still ends the sequence (regression guard).
+    let (repo, f1, f2) = seq_conflict_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1], p).status.code(),
+        Some(128),
+        "S0 pick conflicts"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "S0 abort",
+    );
+    assert!(!seq_status(p).contains("cherry-pick"), "S0: no state left");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "-n", &f2], p),
+        "S0: the next pick runs",
+    );
+
+    // S1 / S2: reset --hard / --mixed end a stopped single-commit pick.
+    for (row, mode) in [("S1", "--hard"), ("S2", "--mixed")] {
+        let (repo, f1, f2) = seq_conflict_repo();
+        let p = repo.path();
+        assert_eq!(
+            run_libra_command(&["cherry-pick", &f1], p).status.code(),
+            Some(128),
+            "{row} pick conflicts"
+        );
+        assert_cli_success(
+            &run_libra_command(&["reset", mode], p),
+            &format!("{row} reset"),
+        );
+        assert!(
+            !seq_status(p).contains("cherry-pick"),
+            "{row}: reset {mode} ends the stopped pick: {}",
+            seq_status(p)
+        );
+        if mode == "--mixed" {
+            assert!(
+                std::fs::read_to_string(p.join("shared.txt"))
+                    .unwrap()
+                    .contains("<<<<<<<"),
+                "{row}: --mixed keeps the working tree"
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["cherry-pick", &f2], p),
+            &format!("{row}: the next pick runs"),
+        );
+    }
+
+    // S4a: reset --hard ends a stopped single-commit revert.
+    let (repo, f1, _f2) = seq_conflict_repo();
+    let p = repo.path();
+    let main_commit = super::cherry_pick_test::cp_rev_parse(p, "HEAD");
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &f1], p)
+            .status
+            .code(),
+        Some(128),
+        "S4a revert conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "S4a reset");
+    assert!(
+        !seq_status(p).contains("revert"),
+        "S4a: no revert state left"
+    );
+    assert_cli_success(
+        &run_libra_command(&["revert", "--no-edit", &main_commit], p),
+        "S4a: the next revert runs",
+    );
+
+    // S8: a stopped rebase is left alone.
+    let (repo, _f1, _f2) = seq_conflict_repo();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["switch", "feature"], p), "S8 switch");
+    assert_eq!(
+        run_libra_command(&["rebase", "main"], p).status.code(),
+        Some(128),
+        "S8 rebase conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "S8 reset");
+    assert!(
+        seq_status(p).contains("rebase"),
+        "S8: rebase state survives: {}",
+        seq_status(p)
+    );
+    assert_cli_success(&run_libra_command(&["rebase", "--abort"], p), "S8 abort");
+
+    // S9a: a pathspec reset changes no sequence state.
+    let (repo, f1, f2) = seq_conflict_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "S9a pick conflicts"
+    );
+    let before = super::cherry_pick_test::repo_table_rows(p, "sequence_state");
+    assert_cli_success(
+        &run_libra_command(&["reset", "shared.txt"], p),
+        "S9a pathspec reset",
+    );
+    assert_eq!(
+        super::cherry_pick_test::repo_table_rows(p, "sequence_state"),
+        before,
+        "S9a: a pathspec reset leaves the sequence untouched"
+    );
+}
+
+/// A repo whose `main` history makes reverting the first two commits conflict on
+/// the first (a.txt was rewritten later) and leave a clean second one pending.
+fn multi_revert_repo() -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |msg: &str| {
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    // c1 adds a.txt, c2 adds b.txt, c3 rewrites a.txt: reverting c1 conflicts
+    // (a.txt changed since), while the pending revert of c2 applies cleanly.
+    for (file, content, msg) in [
+        ("a.txt", "one\n", "adds a"),
+        ("b.txt", "bee\n", "adds b"),
+        ("a.txt", "three\n", "a three"),
+    ] {
+        std::fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        commit(msg);
+    }
+    let c1 = super::cherry_pick_test::cp_rev_parse(p, "HEAD~2");
+    let c2 = super::cherry_pick_test::cp_rev_parse(p, "HEAD~1");
+    (repo, c1, c2)
+}
+
+/// M-SEQ S4a, multi-commit half (#477 HF-01, ADR-HF-03): a whole-tree reset
+/// marks a stopped multi-commit revert instead of clearing it, and `--continue`
+/// then refuses rather than recording the reset index as the concluded revert.
+#[test]
+fn test_reset_marks_multi_revert_and_continue_refuses() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    assert!(
+        p.join(".libra/revert-state.json").exists(),
+        "a revert is in progress"
+    );
+    // Reset to an explicit target other than HEAD: the skip below must keep it.
+    let target = super::cherry_pick_test::cp_rev_parse(p, "HEAD~1");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &target], p),
+        "reset --hard <target>",
+    );
+    assert_eq!(
+        super::cherry_pick_test::cp_rev_parse(p, "HEAD"),
+        target,
+        "the reset moved HEAD to the requested target"
+    );
+    assert!(
+        p.join(".libra/revert-state.json").exists(),
+        "the multi-commit sequence is kept, not cleared"
+    );
+    let cont = run_libra_command(&["revert", "--continue"], p);
+    assert!(
+        !cont.status.success(),
+        "--continue must refuse a concluded stop: {}",
+        String::from_utf8_lossy(&cont.stdout)
+    );
+    let (human, report) = parse_cli_error_stderr(&cont.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003", "{human}");
+    assert!(
+        human.contains("concluded by a later reset"),
+        "the refusal names the cause: {human}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["revert", "--skip"], p),
+        "--skip drains",
+    );
+    assert!(
+        !p.join(".libra/revert-state.json").exists(),
+        "the sequence finished"
+    );
+    assert_eq!(
+        super::cherry_pick_test::cp_rev_parse(p, "HEAD~1"),
+        target,
+        "--skip built on the reset target instead of restoring the original HEAD"
+    );
+}
+
+/// ADR-HF-03 item 5 (#477 HF-01): when concluding the cherry-pick half fails,
+/// the reset still succeeds, warns, and STOPS — the revert state a later step
+/// would have touched is left exactly as it was.
+#[test]
+fn test_reset_conclusion_failure_stops_before_revert_state() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    let before = std::fs::read(p.join(".libra/revert-state.json")).expect("revert state");
+    let out = spawn_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_RESET_FAIL_CONCLUDE_CHERRY_PICK", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stopped cherry-pick state could not be updated")
+            && stderr.contains("libra cherry-pick --quit"),
+        "the warning names the leftover state and its recovery command: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(p.join(".libra/revert-state.json")).expect("revert state kept"),
+        before,
+        "the ordered contract stops before touching revert state"
+    );
+}
+
+/// #477 HF-01 (Codex R5): the conclusion is fenced. When a concurrent `--quit`
+/// plus a fresh revert replaces the sidecar between the conclusion's read and
+/// its write, the new owner's state survives byte-for-byte instead of being
+/// overwritten by the stale snapshot — and the reset still succeeds.
+#[test]
+fn test_reset_conclusion_does_not_clobber_a_reclaimed_revert_state() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    let reclaimed = r#"{"reclaimed_by":"a concurrent revert"}"#;
+    let out = spawn_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_REVERT_RECLAIM_BEFORE_CONCLUDE", reclaimed),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".libra/revert-state.json")).expect("revert state"),
+        reclaimed,
+        "the state the concurrent revert wrote is left exactly as it is"
+    );
+}
+
+/// #477 HF-01 (Codex R6): the conclusion ends only the stop the reset actually
+/// observed. A cherry-pick/revert started in the window AFTER the reset moved
+/// the tree belongs to whoever started it, and the reset leaves both states
+/// exactly as that starter wrote them.
+#[test]
+fn test_reset_does_not_conclude_a_sequence_started_after_it() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    let started_after = "started-after-the-reset";
+    let out = spawn_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_RESET_START_SEQUENCE_AFTER_RESET", started_after),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".libra/revert-state.json")).expect("revert state"),
+        started_after,
+        "the revert that started after the reset keeps its own state"
+    );
+    let rows = super::cherry_pick_test::repo_table_rows(p, "sequence_state");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the new sequence row is still there: {rows:?}"
+    );
+    assert!(
+        rows[0].contains(started_after) && !rows[0].contains("stop_concluded"),
+        "the new sequence row is neither cleared nor marked: {}",
+        rows[0]
+    );
+}
+
+/// #477 HF-01 (Codex R7): a stopped state the reset cannot even READ is still
+/// leftover state, so it owes the user the ADR-HF-03 item 5 warning naming the
+/// recovery command — never a silent "nothing to conclude". The cherry-pick
+/// half failing also stops the ordered contract before revert state is touched.
+#[test]
+fn test_reset_warns_when_a_stopped_state_cannot_be_read() {
+    for (seam, phrase, command) in [
+        (
+            "LIBRA_TEST_RESET_FAIL_SNAPSHOT_CHERRY_PICK",
+            "stopped cherry-pick state could not be read",
+            "libra cherry-pick --quit",
+        ),
+        (
+            "LIBRA_TEST_RESET_FAIL_SNAPSHOT_REVERT",
+            "stopped revert state could not be read",
+            "libra revert --abort",
+        ),
+    ] {
+        let (repo, c1, c2) = multi_revert_repo();
+        let p = repo.path();
+        assert_eq!(
+            run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+                .status
+                .code(),
+            Some(128),
+            "{seam}: the first revert conflicts"
+        );
+        let before = std::fs::read(p.join(".libra/revert-state.json")).expect("revert state");
+        let out = spawn_libra_command_with_env(
+            &["reset", "--hard"],
+            p,
+            &[("LIBRA_TEST", "1"), (seam, "1")],
+        )
+        .wait_with_output()
+        .expect("wait for libra");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{seam}: the reset itself still succeeds: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(phrase) && stderr.contains(command),
+            "{seam}: the warning names the leftover state and its recovery command: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(p.join(".libra/revert-state.json")).expect("revert state kept"),
+            before,
+            "{seam}: an unreadable snapshot never mutates state"
+        );
+    }
+}
+
+/// #477 HF-01 (Codex R8): once the revert snapshot is taken, a failure to
+/// RE-READ the sidecar inside the fence is a real error, not "someone else owns
+/// it now". The reset still succeeds, but warns with the recovery command
+/// instead of silently reporting `Superseded`.
+#[test]
+fn test_reset_warns_when_the_revert_state_cannot_be_reread() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    let out = spawn_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_REVERT_UNREADABLE_BEFORE_CONCLUDE", "1"),
+        ],
+    )
+    .wait_with_output()
+    .expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stopped revert state could not be updated")
+            && stderr.contains("libra revert --abort"),
+        "a re-read failure warns with the recovery command: {stderr}"
+    );
+    assert!(
+        p.join(".libra/revert-state.json").exists(),
+        "the conclusion did not remove anything after the failed re-read"
+    );
+}
+
+/// #477 HF-01 (Codex R9): the revert sidecar lock is a real CROSS-PROCESS
+/// exclusion on every platform. This test process holds the lock while a
+/// `libra reset --hard` concludes: the child has already snapshotted the old
+/// sidecar (the ready marker proves it) and must wait for the lock, so the new
+/// sidecar written under the lock survives and the stale conclusion is dropped.
+#[test]
+fn test_reset_conclusion_waits_for_a_concurrent_revert_lock_holder() {
+    let (repo, c1, c2) = multi_revert_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "the first revert conflicts"
+    );
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(p.join(".libra/revert-state.lock"))
+        .expect("open revert state lock");
+    lock.lock().expect("hold the revert state lock");
+
+    let ready = p.join("conclude-ready.marker");
+    let ready_env = ready.to_string_lossy().into_owned();
+    let mut child = spawn_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_REVERT_CONCLUDE_READY_FILE", ready_env.as_str()),
+        ],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the reset never reached the revert conclusion");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // The child snapshotted the old sidecar and now waits for our lock: it
+    // cannot finish while we hold it (without the lock it would be done by now).
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("poll the reset").is_none(),
+        "the conclusion must wait for the revert state lock"
+    );
+    let reclaimed = r#"{"reclaimed_by":"a concurrent revert holding the lock"}"#;
+    std::fs::write(p.join(".libra/revert-state.json"), reclaimed).expect("reclaim sidecar");
+    lock.unlock().expect("release the revert state lock");
+
+    let out = child.wait_with_output().expect("wait for libra");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the reset itself still succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join(".libra/revert-state.json")).expect("revert state"),
+        reclaimed,
+        "the sidecar written under the lock survives the stale conclusion"
+    );
+}

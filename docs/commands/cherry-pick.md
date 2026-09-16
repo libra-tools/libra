@@ -43,6 +43,8 @@ can therefore resolve an overlapping pick by keeping current content followed
 by picked content; a binary-driver conflict keeps the complete surviving side
 (current when present) without adding text markers.
 
+A stopped pick does not outlive the working tree it stopped in: a later reset ends the stopped single-commit pick, so the next cherry-pick starts cleanly. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` then refuses rather than recording the reset index under that commit, and `libra cherry-pick --skip` applies the rest.
+
 ## Options
 
 ### `-n`, `--no-commit`
@@ -299,6 +301,8 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 |------|-----------|------|
 | `LBR-REPO-001` | Not inside a libra repository | Initialize with `libra init` or navigate to a repo |
 | `LBR-REPO-003` | HEAD detached, no cherry-pick in progress for `--continue`/`--skip`/`--abort`/`--quit`, `--continue` on the wrong branch, or an interrupted `--skip`/`--abort` that has not finished (`--continue` refuses until it does) | Switch to a branch / start a pick first / switch back to the sequence branch / re-run the interrupted `--skip` or `--abort` (or forget the sequence with `--quit`) |
+| `LBR-REPO-003` | `--continue` on a stop a later reset already concluded the stopped commit | Drain the rest with `libra cherry-pick --skip`, or end the sequence with `--quit` / `--abort` |
+| `LBR-REPO-002` | The sequence row claims its stopped commit was concluded while no commits remain — a shape no writer produces | Nothing is changed: end the sequence with `libra cherry-pick --abort` or `--quit` |
 | `LBR-CLI-003` | Cannot resolve a commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid/out-of-range `-m`, an invalid `--cleanup` or `--empty` mode, empty commit without `--allow-empty`, redundant commit without `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`, or empty message without `--allow-empty-message` | Use the flag named in the hint |
 | `LBR-UNSUPPORTED-001` | An unsupported custom `--strategy` was passed, **or** an input of the pick sequence carries a `160000` gitlink (submodule) the pick would have to arbitrate | Drop `--strategy`; for a gitlink, resolve the submodule pointer outside Libra or drop the entry from the commits involved — the refusal comes before the first index/worktree/state write |

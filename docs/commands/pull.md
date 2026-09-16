@@ -363,15 +363,15 @@ During the `git://` object-fetch advertisement, fetch, clone and pull already
 report these failures as `LBR-NET-002`, including a zero-byte advertisement. The
 hint is `check that the remote serves Git data and that a proxy has not altered the response`.
 Lengths 1–3 previously could panic; truncated advertisements previously returned
-`LBR-NET-001` with a network/transfer hint. Git discovery can still report `LBR-NET-001`. SSH advertisement propagation
-and bounded cleanup are described below; complete ASCII-hex header validation
-remains separate work.
+`LBR-NET-001` with a network/transfer hint. Git discovery now preserves these protocol errors through the command boundary.
+SSH propagation and bounded cleanup are described below. All readers require
+four ASCII hexadecimal header digits.
 
 This advertisement is distinct from an upload-pack response after negotiation:
-HTTP(S) framing and empty upload-pack response classifications are unchanged.
-Tests exercise real local TCP object-fetch advertisement reads and the public
-fetch/clone/pull error conversions, without claiming full command execution or
-bounded SSH cleanup. Check the remote Git service or proxy for malformed frames.
+HTTP(S) discovery framing and empty upload-pack response classifications are unchanged.
+Reader tests exercise local TCP object-fetch advertisements and public error
+conversions. Separate command tests exercise malformed Git discovery and SSH
+cleanup. Check the remote Git service or proxy for malformed frames.
 
 ## SSH advertisement error handling
 
@@ -401,9 +401,9 @@ other command boundaries retain fixed host guidance in the message and their
 existing `LBR-NET-001` network hint. Human, JSON and machine diagnostics omit raw
 captured remote stderr in either case.
 
-The `git://` object-fetch path already classifies the listed frame errors as
-`LBR-NET-002`; Git discovery and non-ASCII/non-hex async header classifications
-remain separate work. HTTP(S) framing behavior is unchanged.
+The `git://` discovery and object-fetch paths preserve the listed frame errors as
+`LBR-NET-002`. All asynchronous readers reject non-ASCII/non-hexadecimal headers
+with fixed protocol reasons. HTTP(S) discovery/advertisement framing is unchanged.
 
 ## SSH authentication and captured diagnostics
 
@@ -479,3 +479,24 @@ A successful discovery whose child waits for a request normally incurs the full
 100 ms native-exit observation window, once per discovery operation. This is
 separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
+
+## Strict pkt-line headers
+
+A pkt-line header must contain exactly four ASCII hexadecimal digits (`0`–`9`,
+`a`–`f` or `A`–`F`). Fetch streaming, `git://` advertisements and SSH advertisements
+reject leading signs such as `+004`, whitespace, non-hexadecimal text and invalid
+UTF-8. These failures return `LBR-NET-002` (exit 128), with fixed reasons that do
+not echo the header or payload. A peer that previously sent a signed or otherwise
+nonconforming header must send four hexadecimal digits before retrying.
+
+Git discovery also preserves protocol classification for lengths `0001`–`0003`,
+missing or partial required headers and truncated payloads. The same discovery
+classification reaches clone, fetch, pull, ls-remote and push. Check the remote
+Git service or proxy response. Their existing structured error fields remain;
+push retains its own protocol hint and the other commands retain theirs.
+
+Flush `0000`, empty-data `0004` and maximum-length `ffff` frames keep their existing
+meaning. Ordinary network errors and timeouts retain their existing categories.
+An empty fetch data stream before any complete pack remains a network failure;
+EOF after a completed pack keeps the existing success behavior. The SSH host-trust
+exception, captured-diagnostic limits and cleanup deadlines described above remain.

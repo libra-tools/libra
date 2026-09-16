@@ -90,6 +90,11 @@ enum RevertError {
     )]
     RevertInProgress,
 
+    /// #477 HF-01: the stopped commit was concluded by a later `reset`, so
+    /// `--continue` has nothing of it left to finalize.
+    #[error("the stopped commit was already concluded by a later reset")]
+    StopConcluded,
+
     #[error("no revert in progress")]
     NoRevertInProgress,
 
@@ -242,7 +247,9 @@ impl RevertError {
             Self::Conflicts { .. } | Self::UnresolvedConflicts(_) | Self::UnmergedIndex(_) => {
                 StableErrorCode::ConflictUnresolved
             }
-            Self::RevertInProgress | Self::NoRevertInProgress => StableErrorCode::RepoStateInvalid,
+            Self::RevertInProgress | Self::NoRevertInProgress | Self::StopConcluded => {
+                StableErrorCode::RepoStateInvalid
+            }
             Self::StateIo(_) => StableErrorCode::IoWriteFailed,
             Self::EmptyMessage | Self::InvalidCleanup(_) | Self::Editor(_) => {
                 StableErrorCode::CliInvalidArguments
@@ -257,6 +264,10 @@ impl From<RevertError> for CliError {
         let message = error.to_string();
         match error {
             RevertError::NotInRepo => CliError::repo_not_found(),
+            RevertError::StopConcluded => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("skip it with 'libra revert --skip' to revert the remaining commits")
+                .with_hint("or cancel the sequence with 'libra revert --abort'"),
             RevertError::DetachedHead => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("switch to a branch first with 'libra switch <branch>'"),
@@ -576,6 +587,7 @@ async fn revert_sequence(
                         cleanup: params.cleanup.clone(),
                         strategy_option: params.strategy_option,
                         remaining: ids[(i + 1)..].iter().map(|h| h.to_string()).collect(),
+                        stop_concluded: false,
                         conflicted_paths: conflicted_paths.clone(),
                     }
                     .save()?;
@@ -594,6 +606,13 @@ async fn revert_sequence(
 async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
     refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
+    if state.stop_concluded {
+        // #477 HF-01: a later `reset` concluded the stopped commit. Building a
+        // commit from the current index would record post-reset content under
+        // that commit's message; `--skip` drains the rest (HF-02 makes
+        // `--continue` do that directly).
+        return Err(RevertError::StopConcluded);
+    }
 
     // Refuse to finish while conflict markers remain in any *staged* file (the
     // index is what gets committed, so the user must resolve and re-`add`).
@@ -674,9 +693,21 @@ async fn run_revert_skip() -> Result<RevertOutput, RevertError> {
     refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
 
-    // HEAD is already at `orig_head` (the conflict stopped before committing), so
-    // restoring the index/worktree to its tree drops the conflict markers.
-    restore_to_orig_head(&state.orig_head).await?;
+    // Ordinarily HEAD is still at `orig_head` (the conflict stopped before
+    // committing), so restoring its tree drops the conflict markers. #477 HF-01:
+    // once a later `reset` concluded the stop, HEAD is wherever that reset left
+    // it — restoring `orig_head` would silently undo the user's chosen target —
+    // so the skip cleans against the CURRENT HEAD and the remainder applies on
+    // top of it.
+    let restore_target = if state.stop_concluded {
+        Head::current_commit()
+            .await
+            .ok_or_else(|| RevertError::LoadObject("failed to resolve HEAD".to_string()))?
+            .to_string()
+    } else {
+        state.orig_head.clone()
+    };
+    restore_to_orig_head(&restore_target).await?;
 
     // Clear the skipped commit's state before draining the rest, so a non-conflict
     // error among the remaining commits cannot leave stale state (see
@@ -895,6 +926,12 @@ struct RevertState {
     /// sequence. `#[serde(default)]` keeps older state files loadable.
     #[serde(default)]
     remaining: Vec<String>,
+    /// #477 HF-01: whether the stopped commit was concluded from outside the
+    /// revert (a later `reset`, and from HF-29 a later `commit`). The remaining
+    /// sequence is kept; `--continue` consuming this marker is HF-02.
+    /// `#[serde(default)]` keeps older state files loadable.
+    #[serde(default)]
+    stop_concluded: bool,
     /// Paths left with conflict markers for the user to resolve.
     conflicted_paths: Vec<String>,
 }
@@ -922,6 +959,12 @@ impl RevertState {
     }
 
     fn save(&self) -> Result<(), RevertError> {
+        let _lock = RevertStateLock::acquire().map_err(RevertError::StateIo)?;
+        self.save_locked()
+    }
+
+    /// [`Self::save`] for a caller that already holds [`RevertStateLock`].
+    fn save_locked(&self) -> Result<(), RevertError> {
         let path = Self::path();
         // Record the writer's scope (W2, ADR-0714-08) — see MergeState::save.
         let mut value =
@@ -945,12 +988,183 @@ impl RevertState {
     }
 
     fn cleanup() -> Result<(), RevertError> {
+        let _lock = RevertStateLock::acquire().map_err(RevertError::StateIo)?;
+        Self::cleanup_locked()
+    }
+
+    /// [`Self::cleanup`] for a caller that already holds [`RevertStateLock`].
+    fn cleanup_locked() -> Result<(), RevertError> {
         let path = Self::path();
         // Durable (§C.10): a resurrected revert-state replays a revert the
         // user already concluded.
         crate::utils::atomic_write::remove_durably(&path)
             .map_err(|e| RevertError::StateIo(format!("{}: {e}", path.display())))
     }
+}
+
+/// End the revert item a stopped sequence is sitting on, because a later
+/// `reset` concluded it (ADR-HF-03 items 1 and 4, #477 HF-01).
+///
+/// Removes the sidecar when nothing remains to revert, otherwise keeps the
+/// remaining commits and records `stop_concluded` (an additive
+/// `#[serde(default)]` field, so older binaries still read the file).
+/// Write raw sidecar bytes. Test-seam only: `reset`'s
+/// `LIBRA_TEST_RESET_START_SEQUENCE_AFTER_RESET` uses it to simulate a revert
+/// that starts after the reset finished.
+pub(crate) fn write_state_for_test(bytes: &[u8]) -> Result<(), String> {
+    let path = RevertState::path();
+    let _lock = RevertStateLock::acquire()?;
+    fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub(crate) fn snapshot_stopped_revert() -> Result<Option<Vec<u8>>, String> {
+    let path = RevertState::path();
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Conclude exactly the sidecar `snapshot` holds.
+///
+/// Two things make this a compare-and-swap rather than a check-then-act
+/// (Codex R5/R6): the exclusive [`RevertStateLock`] is held across the whole
+/// read/validate/write — and every other mutator ([`RevertState::save`],
+/// [`RevertState::cleanup`]) takes the same lock, so no protocol participant
+/// can interleave — and the file's bytes must still equal `snapshot`, so a
+/// revert that started before we got the lock keeps its own state. The caller
+/// snapshots BEFORE its reset, so a revert started after the reset is never
+/// concluded by it.
+pub(crate) async fn conclude_stopped_revert(
+    snapshot: Vec<u8>,
+) -> Result<crate::internal::sequencer::ExternalConclusion, String> {
+    use crate::internal::sequencer::ExternalConclusion;
+
+    let path = RevertState::path();
+    let state: RevertState = serde_json::from_slice(&snapshot)
+        .map_err(|e| format!("failed to read the stopped revert state: {e}"))?;
+    if state.stop_concluded && !state.remaining.is_empty() {
+        return Ok(ExternalConclusion::Marked);
+    }
+    conclude_ready_seam()?;
+    let _lock = RevertStateLock::acquire()?;
+    revert_reclaim_race_seam(&path)?;
+    // Only a changed or vanished sidecar means someone else owns the revert
+    // now. Any other read error is a real failure: it must reach `reset`'s
+    // warning (naming `libra revert --abort`) rather than masquerade as
+    // `Superseded` and leave the stop behind silently (Codex R8).
+    match fs::read(&path) {
+        Ok(current) if current == snapshot => {}
+        Ok(_) => return Ok(ExternalConclusion::Superseded),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExternalConclusion::Superseded);
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    if state.remaining.is_empty() {
+        RevertState::cleanup_locked().map_err(|e| e.to_string())?;
+        return Ok(ExternalConclusion::Cleared);
+    }
+    RevertState {
+        stop_concluded: true,
+        ..state
+    }
+    .save_locked()
+    .map_err(|e| e.to_string())?;
+    Ok(ExternalConclusion::Marked)
+}
+
+/// Exclusive advisory lock for `revert-state.json`, held across every mutation
+/// of the sidecar so the conclusion's validate-then-write cannot interleave
+/// with a fresh revert's write (#477 HF-01, Codex R6/R9). It uses std file
+/// locking — `flock` on Unix, `LockFileEx` on Windows — like
+/// `internal::layer::layer_mutation_lock`, so the exclusion holds on every
+/// release platform. A second acquisition, in this process or another, waits
+/// for the guard to drop.
+pub(crate) struct RevertStateLock {
+    file: std::fs::File,
+}
+
+impl RevertStateLock {
+    pub(crate) fn lock_path() -> PathBuf {
+        RevertState::path().with_extension("lock")
+    }
+
+    fn open_lock_file() -> Result<std::fs::File, String> {
+        let path = Self::lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub(crate) fn acquire() -> Result<Self, String> {
+        let file = Self::open_lock_file()?;
+        file.lock()
+            .map_err(|e| format!("failed to lock the revert state: {e}"))?;
+        Ok(Self { file })
+    }
+
+    /// Non-blocking acquisition, used by the test that proves exclusion.
+    #[cfg(test)]
+    fn try_acquire() -> Result<Option<Self>, String> {
+        let file = Self::open_lock_file()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("failed to lock the revert state: {e}"))
+            }
+        }
+    }
+}
+
+impl Drop for RevertStateLock {
+    fn drop(&mut self) {
+        // Closing the handle releases the lock too; unlocking first makes the
+        // release explicit and immediate on every platform.
+        let _ = self.file.unlock();
+    }
+}
+
+/// `LIBRA_TEST`-gated seam: create the file named by
+/// `LIBRA_TEST_REVERT_CONCLUDE_READY_FILE` once the snapshot is taken and just
+/// before the lock is requested, so a cross-process test can hold the lock and
+/// replace the sidecar knowing this conclusion already read the old one.
+fn conclude_ready_seam() -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(marker) = std::env::var_os("LIBRA_TEST_REVERT_CONCLUDE_READY_FILE") else {
+        return Ok(());
+    };
+    fs::write(&marker, b"ready").map_err(|e| format!("{}: {e}", Path::new(&marker).display()))
+}
+
+/// `LIBRA_TEST`-gated seam that rewrites the sidecar between the conclusion's
+/// read and its fenced write, making the quit/reclaim race deterministic.
+fn revert_reclaim_race_seam(path: &Path) -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    // Make the fenced re-read fail with a REAL I/O error (reading a directory
+    // fails on every platform and even as root), so the error mapping above is
+    // exercised through `fs::read` itself rather than a faked `Err`.
+    if std::env::var_os("LIBRA_TEST_REVERT_UNREADABLE_BEFORE_CONCLUDE").is_some() {
+        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        return fs::create_dir(path).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    let Some(contents) = std::env::var_os("LIBRA_TEST_REVERT_RECLAIM_BEFORE_CONCLUDE") else {
+        return Ok(());
+    };
+    fs::write(path, contents.as_encoded_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Result of reverting one commit against the current worktree.
@@ -1600,6 +1814,59 @@ async fn update_head(commit_id: &str) -> Result<(), RevertError> {
             .map_err(|e| RevertError::UpdateHead(e.to_string()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hf01_state_compat_tests {
+    use super::RevertState;
+
+    /// #477 HF-01 (ER-HF-02): a `revert-state.json` written before the marker
+    /// existed still parses, with `stop_concluded` defaulting to false.
+    #[test]
+    fn revert_state_without_stop_concluded_still_parses() {
+        let legacy = r#"{
+            "orig_head": "1111111111111111111111111111111111111111",
+            "reverted_commit": "2222222222222222222222222222222222222222",
+            "signoff": false,
+            "conflicted_paths": ["a.txt"]
+        }"#;
+        let state: RevertState = serde_json::from_str(legacy).expect("legacy sidecar parses");
+        assert!(!state.stop_concluded, "the marker defaults to false");
+        assert!(state.remaining.is_empty());
+        assert_eq!(state.conflicted_paths, vec!["a.txt".to_string()]);
+    }
+
+    /// #477 HF-01 (Codex R6): the sidecar lock is a real mutual exclusion, so
+    /// the conclusion's validate-then-write cannot interleave with the write of
+    /// a freshly started revert — every mutator goes through this same lock.
+    #[test]
+    #[serial_test::serial(cwd)]
+    fn revert_state_lock_excludes_a_second_holder() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(setup_with_new_libra_in(tmp.path()));
+
+        let held = super::RevertStateLock::acquire().expect("first holder");
+        assert!(
+            super::RevertStateLock::try_acquire()
+                .expect("try")
+                .is_none(),
+            "a second acquisition must wait while the first holder lives"
+        );
+        drop(held);
+        assert!(
+            super::RevertStateLock::try_acquire()
+                .expect("try")
+                .is_some(),
+            "the lock is released when the guard drops"
+        );
+    }
 }
 
 #[cfg(test)]

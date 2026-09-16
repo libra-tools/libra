@@ -713,3 +713,26 @@ arbitrary-descendant cleanup guarantee is implied.
 ## Task shell Rustup regression (FIX-PKT-04)
 
 The default lib suite covers `internal::ai::sandbox::runtime::tests::{task_shell_preserves_default_rustup_home,task_shell_preserves_explicit_rustup_environment,task_shell_rustup_home_derivation_is_conservative}` on Unix. They exercise original-home derivation, explicit precedence, missing/non-UTF-8 roots, non-task directories and continued task-local HOME/Cargo/XDG/log paths. The existing `internal::ai::orchestrator::executor::tests::execute_dag_syncs_cargo_project_without_treating_lockfile_or_target_as_scope_creep` runs the real Cargo fixture in a controlled subprocess without inherited RUSTUP_HOME/CARGO, preserves explicit toolchain selection, disables automatic installation with `RUSTUP_AUTO_INSTALL=0` on rustup 1.28+, and retains the lockfile/target/scope assertions. This exposes the installed-product environment even under a Cargo-launched suite. These are inline Cargo cases, not new integration-runner scenario IDs or proof of bwrap/macOS/Windows execution. Run the related sandbox/orchestrator/shell modules and compatibility guards, then the full default suite for the shared runtime change.
+
+## Header validation scope
+
+The ten named PKT-13 gates retain the plan's original names. The shared header
+decoder is used by the synchronous parser and all three asynchronous readers;
+the bounded IO marker classifier has one implementation in `git_protocol`, with
+a crate-visible fetch re-export for existing callers. Synchronous failure still
+leaves the input untouched. Four-byte validation does constant work without
+allocating or rendering peer bytes. Existing allocation and buffering behavior
+is unchanged: SSH advertisements retain their 16 MiB cap; Git TCP advertisements
+have no total-size cap.
+
+Direct reader fixtures cover strict UTF-8/ASCII-hex errors, valid case variants,
+flush/empty/maximum frames and typed CLI conversion. The Git discovery gate uses
+14 malformed byte sequences across five real `execute_safe` command paths (70
+cases), checking the service request, protocol reason, exact command hint, all
+three renderings and tracking-ref safety. The server tasks and listeners are
+bounded and cancelled on drop. Another gate exercises a real idle TCP peer to
+preserve the ordinary network wrapper. Fetch no-echo and empty-stream cases use
+`read_fetch_stream`; they are not fabricated marker-only errors. No new Cargo
+target or shared test helper is introduced. These are local fixtures, not live
+OpenSSH authentication;
+actual execution and release acceptance are recorded in plan-20260901.md.
