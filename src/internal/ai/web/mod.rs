@@ -64,9 +64,12 @@ use crate::{
             },
             usage::{UsageQueryFilter, UsageRecorder},
         },
+        change::{ChangeStore, RelationKind, predecessor_edges},
         db::establish_connection,
+        operation::OperationStoreV2,
+        workspace::RepoIdentity,
     },
-    utils::util::get_repo_name_from_url,
+    utils::{client_storage::ClientStorage, util::get_repo_name_from_url},
 };
 
 const CODE_CONTROL_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -629,6 +632,7 @@ fn code_router() -> Router<WebAppState> {
     // Auth layer matrix (matches docs/commands/code.md):
     //   /session          -> loopback only (observe)
     //   /thread-graph     -> loopback only (observe; indexed Intent/Plan/Task/Run graph)
+    //   /operation-graph  -> loopback only (observe; bounded Operation/Change graph)
     //   /events           -> loopback only (observe)
     //   /diagnostics      -> loopback only (observe)
     //   /threads          -> loopback only (observe; lists active thread projections)
@@ -650,6 +654,7 @@ fn code_router() -> Router<WebAppState> {
     let router = Router::new()
         .route("/session", get(code_session_handler))
         .route("/thread-graph", get(code_thread_graph_handler))
+        .route("/operation-graph", get(code_operation_graph_handler))
         .route("/events", get(code_events_handler))
         .route("/diagnostics", get(code_diagnostics_handler))
         .route("/threads", get(code_threads_handler))
@@ -958,6 +963,221 @@ async fn code_thread_graph_handler(
         retry_after_secs: None,
     })?;
     Ok(Json(projected))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationGraphRawQuery {
+    limit: Option<usize>,
+    depth: Option<usize>,
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationGraphOperation {
+    op_id: String,
+    kind: crate::internal::operation::OperationKind,
+    status: crate::internal::operation::OperationStatusV2,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_name: Option<String>,
+    parent_op_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationGraphRevision {
+    change_id: String,
+    commit_oid: String,
+    visibility: String,
+    revision_ordinal: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationGraphEdge {
+    successor_oid: String,
+    predecessor_oid: String,
+    relation_kind: RelationKind,
+    op_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationGraphChanges {
+    revisions: Vec<OperationGraphRevision>,
+    #[serde(rename = "predecessorEdges")]
+    predecessor_edges: Vec<OperationGraphEdge>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationGraphReadModel {
+    operations: Vec<OperationGraphOperation>,
+    head_op_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<OperationGraphChanges>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
+}
+
+const OPERATION_GRAPH_DEFAULT_LIMIT: usize = 50;
+const OPERATION_GRAPH_MAX_LIMIT: usize = 200;
+const OPERATION_GRAPH_MAX_DEPTH: usize = 32;
+const OPERATION_GRAPH_MAX_OFFSET: usize = 10_000;
+
+/// `GET /api/code/operation-graph` returns the bounded, redacted Operation v2
+/// and Change genealogy projection used by the read-only Code UI.
+async fn code_operation_graph_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    Query(query): Query<OperationGraphRawQuery>,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let limit = query
+        .limit
+        .unwrap_or(OPERATION_GRAPH_DEFAULT_LIMIT)
+        .clamp(1, OPERATION_GRAPH_MAX_LIMIT);
+    let depth = query
+        .depth
+        .unwrap_or(OPERATION_GRAPH_MAX_DEPTH)
+        .min(OPERATION_GRAPH_MAX_DEPTH);
+    let offset = query
+        .page_token
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<usize>()
+        .map_err(|error| WebApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "OPERATION_GRAPH_INVALID_PAGE".to_string(),
+            message: format!("operation-graph pageToken must be a bounded cursor: {error}"),
+            retry_after_secs: None,
+        })?;
+    if offset > OPERATION_GRAPH_MAX_OFFSET {
+        return Err(WebApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "OPERATION_GRAPH_INVALID_PAGE".to_string(),
+            message: format!(
+                "operation-graph pageToken exceeds the maximum cursor {OPERATION_GRAPH_MAX_OFFSET}"
+            ),
+            retry_after_secs: None,
+        });
+    }
+    let storage_root =
+        resolve_storage_root(state.working_dir.as_path()).ok_or_else(|| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "OPERATION_GRAPH_STORAGE_UNAVAILABLE".to_string(),
+            message: "cannot resolve the repository storage root for the operation graph"
+                .to_string(),
+            retry_after_secs: None,
+        })?;
+    let db_path = storage_root.join("libra.db");
+    let db_path = db_path.to_str().ok_or_else(|| WebApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "OPERATION_GRAPH_STORAGE_UNAVAILABLE".to_string(),
+        message: "libra database path is not valid UTF-8".to_string(),
+        retry_after_secs: None,
+    })?;
+    let db = establish_connection(db_path)
+        .await
+        .map_err(|error| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "OPERATION_GRAPH_DB_UNAVAILABLE".to_string(),
+            message: format!("failed to open operation graph storage: {error}"),
+            retry_after_secs: None,
+        })?;
+    let repo_id = RepoIdentity::resolve(&db)
+        .await
+        .map_err(|error| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "OPERATION_GRAPH_REPO_ID_UNAVAILABLE".to_string(),
+            message: format!("failed to resolve repository identity: {error}"),
+            retry_after_secs: None,
+        })?
+        .to_string();
+    let store = OperationStoreV2::new_for_repo(
+        repo_id.clone(),
+        db.clone(),
+        ClientStorage::init_local_existing(storage_root.join("objects")),
+    );
+    let head_op_ids = store
+        .read_all_heads(&repo_id)
+        .await
+        .map_err(|error| operation_graph_store_error(error.to_string()))?;
+    let (operation_ids, has_more) = store
+        .graph_operation_ids(&repo_id, depth, limit, offset)
+        .await
+        .map_err(|error| operation_graph_store_error(error.to_string()))?;
+    let mut operations = Vec::with_capacity(operation_ids.len());
+    for operation_id in operation_ids {
+        let operation = store
+            .load_operation(&operation_id)
+            .await
+            .map_err(|error| operation_graph_store_error(error.to_string()))?
+            .ok_or_else(|| {
+                operation_graph_store_error("operation head disappeared during read".to_string())
+            })?;
+        operations.push(OperationGraphOperation {
+            op_id: operation.op_id,
+            kind: operation.kind,
+            status: operation.status,
+            command_name: operation.metadata.command_name,
+            parent_op_ids: operation.parent_op_ids,
+        });
+    }
+
+    let revisions = ChangeStore::new(db.clone())
+        .revisions_for_repo(&repo_id, limit)
+        .await
+        .map_err(|error| operation_graph_store_error(error.to_string()))?;
+    let predecessor_edges = predecessor_edges(&db, &repo_id, limit)
+        .await
+        .map_err(|error| operation_graph_store_error(error.to_string()))?;
+    let changes =
+        (!revisions.is_empty() || !predecessor_edges.is_empty()).then(|| OperationGraphChanges {
+            revisions: revisions
+                .into_iter()
+                .map(|revision| OperationGraphRevision {
+                    change_id: revision.change_id.to_string(),
+                    commit_oid: revision.commit_oid,
+                    visibility: revision.visibility.to_string(),
+                    revision_ordinal: revision.revision_ordinal,
+                })
+                .collect(),
+            predecessor_edges: predecessor_edges
+                .into_iter()
+                .map(|edge| OperationGraphEdge {
+                    successor_oid: edge.successor_oid,
+                    predecessor_oid: edge.predecessor_oid,
+                    relation_kind: edge.relation_kind,
+                    op_id: edge.op_id,
+                })
+                .collect(),
+        });
+    let response = OperationGraphReadModel {
+        operations,
+        head_op_ids,
+        changes,
+        next_page_token: has_more.then(|| offset.saturating_add(limit).to_string()),
+    };
+    let projected =
+        project_json_for_wire(&response, state.secret_redactor.as_ref()).map_err(|error| {
+            WebApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "REDACTION_FAILED".to_string(),
+                message: format!("failed to redact operation graph for wire projection: {error}"),
+                retry_after_secs: None,
+            }
+        })?;
+    Ok(Json(projected))
+}
+
+fn operation_graph_store_error(message: String) -> WebApiError {
+    WebApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "OPERATION_GRAPH_UNAVAILABLE".to_string(),
+        message,
+        retry_after_secs: None,
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4878,5 +5098,144 @@ mod tests {
             !body.contains("event: code_workflow"),
             "over-budget bootstrap must not silently stream a truncated prefix: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn code_operation_graph_route_rejects_invalid_page_token() {
+        let app = thread_graph_test_app(PathBuf::from("/tmp/libra-operation-graph-missing"));
+        let (status, code) =
+            thread_graph_error_code(app, "/operation-graph?pageToken=not-a-cursor").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "OPERATION_GRAPH_INVALID_PAGE");
+    }
+
+    #[tokio::test]
+    async fn code_operation_graph_route_rejects_non_loopback() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra-operation-graph")),
+                code_ui: None,
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from((
+                Ipv4Addr::new(192, 0, 2, 10),
+                34567,
+            ))));
+        let (status, code) = thread_graph_error_code(app, "/operation-graph").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code, "LOOPBACK_REQUIRED");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn code_operation_graph_route_returns_bounded_redacted_projection() {
+        use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+
+        let secret = "sk-operation-graph-route-secret";
+        let temp = tempfile::tempdir().expect("temp repo");
+        crate::utils::test::setup_with_new_libra_in(temp.path()).await;
+        let db_path = temp
+            .path()
+            .join(".libra")
+            .join(crate::utils::util::DATABASE);
+        let db = establish_connection(db_path.to_str().expect("utf-8 db path"))
+            .await
+            .expect("open test db");
+        let repo_id = RepoIdentity::resolve(&db).await.expect("repo identity");
+        let storage = ClientStorage::init_local_existing(temp.path().join(".libra/objects"));
+        let store = OperationStoreV2::new_for_repo(repo_id.to_string(), db.clone(), storage);
+        let view_oid = ObjectHash::from_type_and_data(ObjectType::Blob, b"graph-view");
+        store
+            .write_operation(&crate::internal::operation::OperationV2 {
+                op_id: "graph-op-1".to_string(),
+                parent_op_ids: Vec::new(),
+                pre_view_oid: view_oid,
+                post_view_oid: view_oid,
+                kind: crate::internal::operation::OperationKind::Command,
+                status: crate::internal::operation::OperationStatusV2::Success,
+                metadata: crate::internal::operation::OperationMetaV2 {
+                    command_name: Some("commit".to_string()),
+                    description: Some(format!("{secret} must be redacted")),
+                    ..Default::default()
+                },
+                restores_op_id: None,
+                reverts_op_id: None,
+                predecessor_map_oid: None,
+            })
+            .await
+            .expect("write graph operation");
+        store
+            .write_operation(&crate::internal::operation::OperationV2 {
+                op_id: "graph-op-2".to_string(),
+                parent_op_ids: vec!["graph-op-1".to_string()],
+                pre_view_oid: view_oid,
+                post_view_oid: view_oid,
+                kind: crate::internal::operation::OperationKind::Reconcile,
+                status: crate::internal::operation::OperationStatusV2::Success,
+                metadata: crate::internal::operation::OperationMetaV2::default(),
+                restores_op_id: None,
+                reverts_op_id: None,
+                predecessor_map_oid: None,
+            })
+            .await
+            .expect("write child graph operation");
+        store
+            .cas_update_op_heads(
+                &repo_id.to_string(),
+                "main",
+                &[],
+                &["graph-op-2".to_string()],
+            )
+            .await
+            .expect("publish graph head");
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(temp.path().to_path_buf()),
+                code_ui: None,
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(
+                    SecretRedactor::default_runtime()
+                        .with_forbidden_env_values([("OPENAI_API_KEY", secret)]),
+                ),
+                workflow_hub: None,
+            })
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([127, 0, 0, 1], 1)),
+            ));
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/operation-graph?limit=1&depth=3")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(secret),
+            "operation graph leaked secret: {text}"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["headOpIds"][0], "graph-op-2");
+        assert_eq!(value["operations"].as_array().unwrap().len(), 1);
+        assert_eq!(value["nextPageToken"], "1");
+        assert!(value["operations"][0].get("prompt").is_none());
+        assert!(value["operations"][0].get("description").is_none());
+        assert!(value["operations"][0].get("actor").is_none());
     }
 }

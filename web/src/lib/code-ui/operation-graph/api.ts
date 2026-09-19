@@ -30,11 +30,7 @@ export class FetchOperationGraphTransport implements OperationGraphTransport {
   }
 }
 
-/**
- * Operation/Change read-only graph HTTP surface (OL-14). Production returns
- * 404 until the backend read model route is registered; the host component
- * treats that as empty state.
- */
+/** Operation/Change read-only graph HTTP surface (OL-14). */
 export function createOperationGraphApi(
   transport: OperationGraphTransport = new FetchOperationGraphTransport(),
 ) {

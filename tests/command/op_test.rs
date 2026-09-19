@@ -542,8 +542,8 @@ async fn test_op_indices_share_mixed_legacy_v2_history_through_transitions() {
 }
 
 #[test]
-/// V2 transitions resolve canonical indices but reject legacy-only targets.
-fn test_op_transitions_reject_legacy_indices_from_unified_history() {
+/// V2 transitions resolve canonical indices after the v1 runtime is retired.
+fn test_op_transitions_resolve_v2_indices_after_v1_retirement() {
     let repo = create_committed_repo_via_cli();
     let branch = run_libra_command(&["branch", "feature"], repo.path());
     assert_cli_success(&branch, "branch feature");
@@ -560,13 +560,15 @@ fn test_op_transitions_reject_legacy_indices_from_unified_history() {
     let operations = history["data"]["operations"]
         .as_array()
         .expect("operation array");
-    let legacy = operations
+    let external = operations
         .iter()
-        .find(|entry| entry["command_name"] == "branch")
-        .expect("legacy branch operation");
-    let legacy_ref = format!(
+        .find(|entry| entry["command_name"] == "external.snapshot")
+        .expect("external snapshot operation");
+    let external_ref = format!(
         "@{{{}}}",
-        legacy["index"].as_u64().expect("legacy operation index")
+        external["index"]
+            .as_u64()
+            .expect("external operation index")
     );
     let v2 = operations
         .iter()
@@ -574,22 +576,27 @@ fn test_op_transitions_reject_legacy_indices_from_unified_history() {
         .expect("v2 add operation");
     let v2_ref = format!("@{{{}}}", v2["index"].as_u64().expect("v2 index"));
 
-    let undo = run_libra_command(&["op", "undo", "--force", &legacy_ref], repo.path());
-    assert_invalid_target_error(&undo, "resolves to legacy history");
+    let undo = run_json_op(repo.path(), &["undo", "--force", "--dry-run", &v2_ref]);
+    assert_eq!(
+        undo["data"]["receipt"]["target_op_id"], v2["op_id"],
+        "v2 undo must resolve the canonical operation index"
+    );
 
-    let revert = run_libra_command(
+    let reverted = run_json_op(
+        repo.path(),
         &[
-            "op",
             "revert",
             &v2_ref,
             "--parent",
-            &legacy_ref,
+            &external_ref,
             "--force",
             "--dry-run",
         ],
-        repo.path(),
     );
-    assert_invalid_target_error(&revert, "resolves to legacy history");
+    assert_eq!(
+        reverted["data"]["receipt"]["target_op_id"], v2["op_id"],
+        "v2 revert must resolve the canonical parent index"
+    );
 }
 
 #[test]

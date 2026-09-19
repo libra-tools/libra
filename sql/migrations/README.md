@@ -186,6 +186,8 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026090801` | `operation_v2_branch_convergence` | `2026090801_operation_v2_branch_convergence.sql` (forward-only compatibility barrier for the independently shipped 0101/0601 branches; targeted missing-0101 catch-up and receipt/schema verification run in Rust under the existing writer transaction; `down: None`.) |
 | `2026090802` | `change_ai_link` | `2026090802_change_ai_link.sql` (CH-04: adds the AI-operation Change ID projection and its repository-scoped lookup indexes after operation-v2 branch convergence; forward-only.) |
 | `2026090803` | `change_identity_prefix_index_repair` | `2026090803_change_identity_prefix_index_repair.sql` (CH-02 compatibility repair: adds the repository-scoped Change ID prefix index for databases that already recorded 0802 before that index was shipped; forward-only.) |
+| `2026091801` | `operation_v1_retirement` | `2026091801_operation_v1_retirement.sql` (OL-15 forward-only retirement of the isolated legacy operation namespace after the v2 runtime cutover.) |
+| `2026091802` | `operation_v2_dedup_index` | `2026091802_operation_v2_dedup_index.sql` (OL-15 follow-up repair for the v2 five-second duplicate-operation lookup.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

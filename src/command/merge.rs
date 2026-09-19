@@ -1319,6 +1319,49 @@ pub async fn execute_safe(args: MergeArgs, output: &OutputConfig) -> CliResult<(
     Ok(())
 }
 
+/// Check the worktree collision that must be rejected before the central
+/// operation boundary captures a snapshot. The merge engine repeats this
+/// check after computing its exact result; this cheap target-tree check only
+/// protects the no-write contract without running the full merge twice.
+pub(crate) async fn preflight_before_operation_boundary(
+    args: &MergeArgs,
+    _output: &OutputConfig,
+) -> CliResult<()> {
+    if args.dry_run
+        || args.branch.is_empty()
+        || args.continue_merge
+        || args.abort
+        || args.restart
+        || args.quit
+        || args.strategy.contains(&MergeStrategy::Ours)
+    {
+        return Ok(());
+    }
+
+    let current_index = Index::load(path::index()).map_err(|error| {
+        CliError::fatal(format!("failed to load index: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for target_ref in &args.branch {
+        let target_id = resolve_merge_target(target_ref)
+            .await
+            .map_err(|_| PullMergeError::InvalidTarget(target_ref.clone()))?;
+        let target_commit: Commit =
+            load_object(&target_id).map_err(|error| PullMergeError::TargetLoad {
+                commit_id: target_id.to_string(),
+                detail: error.to_string(),
+            })?;
+        let (target_items, target_gitlinks) = commit_tree_split_for_merge(&target_commit)?;
+        let target_gitlink_paths: Vec<PathBuf> = target_gitlinks.keys().cloned().collect();
+        ensure_no_untracked_conflicts(
+            &current_index,
+            &worktree_paths_to_write(&target_items),
+            &target_gitlink_paths,
+        )?;
+    }
+    Ok(())
+}
+
 /// `--stat`: print a Git-style diffstat of what the merge changed (pre-merge
 /// HEAD vs the new commit). Human output only — `--json` already exposes
 /// `files_changed`. Skipped when there is no completed new commit (up-to-date,

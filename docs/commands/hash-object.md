@@ -1,6 +1,9 @@
 # `libra hash-object`
 
-Compute the Git-compatible object ID for raw file contents or standard input.
+## Description
+
+`hash-object` computes the Git-compatible object ID for raw file contents or
+standard input.
 
 ```bash
 libra hash-object [OPTIONS] <PATH>...

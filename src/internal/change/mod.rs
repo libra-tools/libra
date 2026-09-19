@@ -16,9 +16,10 @@ pub use builder::{
 pub use genealogy::{
     AiOperationLink, GenealogyError, GenealogyRevision, PredecessorEdge, RelationKind,
     ai_links_for_change, ai_links_for_intent, attach_pending_ai_operation_links,
-    evolution_for_commit, insert_predecessor, link_ai_operation, record_pending_ai_operation_link,
-    remove_pending_ai_operation_link,
+    evolution_for_commit, insert_predecessor, link_ai_operation, predecessor_edges,
+    record_pending_ai_operation_link, remove_pending_ai_operation_link,
 };
+pub(crate) use genealogy::{attach_pending_ai_operation_links_on, link_ai_operation_on};
 pub use identity::{ChangeId, ChangeIdError};
 pub use resolve::{ChangeIdResolution, ResolveError, resolve_change_id_prefix};
 pub use store::{ChangeRevision, ChangeStore, ChangeStoreError, RevisionVisibility};

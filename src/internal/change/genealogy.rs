@@ -105,6 +105,14 @@ pub async fn link_ai_operation(
     db: &DatabaseConnection,
     link: &AiOperationLink,
 ) -> Result<(), GenealogyError> {
+    link_ai_operation_on(db, link).await
+}
+
+/// Transaction-aware form of [`link_ai_operation`].
+pub(crate) async fn link_ai_operation_on<C: ConnectionTrait>(
+    db: &C,
+    link: &AiOperationLink,
+) -> Result<(), GenealogyError> {
     validate_ai_link(link)?;
     let change_exists = db
         .query_one_raw(Statement::from_sql_and_values(
@@ -222,12 +230,20 @@ pub async fn attach_pending_ai_operation_links(
     change_id: ChangeId,
     operation_ids: &[&str],
 ) -> Result<(), GenealogyError> {
+    attach_pending_ai_operation_links_on(db, repo_id, change_id, operation_ids).await
+}
+
+/// Transaction-aware form of [`attach_pending_ai_operation_links`].
+pub(crate) async fn attach_pending_ai_operation_links_on<C: ConnectionTrait>(
+    db: &C,
+    repo_id: &str,
+    change_id: ChangeId,
+    operation_ids: &[&str],
+) -> Result<(), GenealogyError> {
     if operation_ids.is_empty() {
         return Ok(());
     }
-    let placeholders = std::iter::repeat_n("?", operation_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders = vec!["?"; operation_ids.len()].join(", ");
     let query = format!(
         "UPDATE ai_operation_link SET change_id = ? \
          WHERE repo_id = ? AND operation_id IN ({placeholders}) AND change_id IS NULL"
@@ -411,6 +427,42 @@ pub async fn evolution_for_commit(
             [
                 commit_oid.to_string().into(),
                 (limit.clamp(1, 10_000) as i64).into(),
+            ],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let relation = row.try_get::<String>("", "relation_kind")?;
+            Ok(PredecessorEdge {
+                successor_oid: row.try_get("", "successor_oid")?,
+                predecessor_oid: row.try_get("", "predecessor_oid")?,
+                op_id: row.try_get("", "op_id")?,
+                relation_kind: relation_kind(&relation)?,
+                ordinal: row.try_get("", "ordinal")?,
+            })
+        })
+        .collect()
+}
+
+/// Return a bounded predecessor projection for the repository-local read
+/// model. The table is repository-local and its operation ids are redacted
+/// references, so the web layer can expose only this allowlisted shape.
+pub async fn predecessor_edges(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    limit: usize,
+) -> Result<Vec<PredecessorEdge>, GenealogyError> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT successor_oid, predecessor_oid, op_id, relation_kind, ordinal \
+             FROM change_predecessor p \
+             JOIN change_revision r ON r.commit_oid = p.successor_oid \
+             JOIN change_identity i ON i.change_id = r.change_id \
+             WHERE i.repo_id = ? ORDER BY p.rowid DESC LIMIT ?",
+            [
+                repo_id.to_string().into(),
+                (limit.clamp(1, 200) as i64).into(),
             ],
         ))
         .await?;

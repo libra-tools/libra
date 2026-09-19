@@ -219,15 +219,6 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         resolution: ReadResolution::RepositoryDatabase,
         consumer: ConfigConsumerKind::Extension,
     },
-    ConfigSurface {
-        surface: "publish worker-template manifest (init/status/deploy drift \
-                  gate reads ONE repository manifest)",
-        location: "publish/worker-template-manifest.json",
-        kind: SurfaceKind::File,
-        owner: ConfigOwner::Repository,
-        resolution: ReadResolution::CommonStorage,
-        consumer: ConfigConsumerKind::Extension,
-    },
 ];
 
 /// §C.4.1.1 / plan line 2272: EVERY Code/Agent database table, classified.
@@ -910,13 +901,6 @@ mod tests {
             by_location("sandbox.toml").consumer,
             ConfigConsumerKind::Security,
             "W4-12 must not reclassify sandbox.toml away from Security"
-        );
-        assert_eq!(
-            by_location("publish/worker-template-manifest.json").resolution,
-            ReadResolution::CommonStorage,
-            "the publish manifest was routed through the common-storage \
-             resolver in W0 — regressing to a workdir join reopens the \
-             per-worktree manifest fork"
         );
     }
 }

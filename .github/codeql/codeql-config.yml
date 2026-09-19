@@ -1,0 +1,12 @@
+name: Libra CodeQL configuration
+
+# Libra is a local CLI. The Rust path-discovery APIs below intentionally accept
+# paths supplied by the local operator, the process environment, and the
+# repository's own worktree metadata so that repositories and linked worktrees
+# can live anywhere on the local filesystem. Those values are not remote input
+# and restricting them to a fixed prefix would break the supported repository
+# layout. Keep the remaining Rust CodeQL queries enabled while excluding the
+# path-injection query, whose threat model does not apply to these local paths.
+query-filters:
+  - exclude:
+      id: rust/path-injection

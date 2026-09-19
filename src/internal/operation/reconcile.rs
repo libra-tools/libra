@@ -228,16 +228,17 @@ impl ReconcileEngine {
         }
         let mut merged_references: Vec<serde_json::Value> = Vec::new();
         for key in targets.keys() {
-            let (head, entry) = facets
-                .iter()
-                .find_map(|(head, references)| {
-                    references
-                        .iter()
-                        .find(|entry| reference_key(entry).is_ok_and(|parsed| parsed == *key))
-                        .map(|entry| (head.clone(), entry.clone()))
-                })
-                .expect("a reference row recorded in targets must exist in a facet");
-            let _ = head;
+            let Some(entry) = facets.iter().find_map(|(_, references)| {
+                references
+                    .iter()
+                    .find(|entry| reference_key(entry).is_ok_and(|parsed| parsed == *key))
+                    .cloned()
+            }) else {
+                return Err(ReconcileError::View(
+                    "reconcile".to_string(),
+                    format!("reference identity {key:?} disappeared during merge"),
+                ));
+            };
             merged_references.push(entry);
         }
 
@@ -296,7 +297,21 @@ impl ReconcileEngine {
             reverts_op_id: None,
             predecessor_map_oid: None,
         };
-        self.store.write_operation(&operation).await?;
+        let operation_worktree_id = Some(self.scope.scope.storage_key());
+        let operation_scope_kind = if self.scope.scope.is_linked() {
+            "linked"
+        } else {
+            "main"
+        };
+        self.store
+            .write_operation_with_scope_and_restorable(
+                &operation,
+                operation_worktree_id,
+                operation_scope_kind,
+                "declared",
+                true,
+            )
+            .await?;
         let generation = match self
             .store
             .cas_update_op_heads(

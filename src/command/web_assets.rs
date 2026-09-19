@@ -1,9 +1,9 @@
-//! Stub for the retired Next.js embed.
+//! Minimal assets retained after the retired Next.js embed.
 //!
 //! RC-20 stopped `build.rs` from exporting `web/out/` and rust-embed no
-//! longer ships those bytes. Callers in `internal/ai/web` still compile
-//! against `WebAssets::get` until RC-23 deletes that SCC. Every lookup
-//! returns `None`.
+//! longer ships the Code UI bytes. The loopback security notice is still a
+//! product contract, so keep its two small, static HTML pages available to
+//! the existing fallback handler without rebuilding or embedding the UI.
 
 use std::borrow::Cow;
 
@@ -15,7 +15,16 @@ pub struct EmbeddedFile {
 pub struct WebAssets;
 
 impl WebAssets {
-    pub fn get(_path: &str) -> Option<EmbeddedFile> {
-        None
+    pub fn get(path: &str) -> Option<EmbeddedFile> {
+        let data = match path {
+            "remote-notice/index.html" => include_str!("../../web/public/remote-notice/index.html"),
+            "remote-notice/zh-CN/index.html" => {
+                include_str!("../../web/public/remote-notice/zh-CN/index.html")
+            }
+            _ => return None,
+        };
+        Some(EmbeddedFile {
+            data: Cow::Borrowed(data.as_bytes()),
+        })
     }
 }

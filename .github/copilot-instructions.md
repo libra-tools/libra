@@ -111,7 +111,7 @@ Feature-gated Rust tests:
 ```bash
 cargo test --features test-network --test network_remotes_test -- --test-threads=1
 cargo test --features test-live-ai --test ai_agent_test --test ai_chat_agent_test -- --test-threads=1
-LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud --test cloud_storage_backup_test --test publish_live_test --test storage_r2_test -- --test-threads=1
+LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud --test cloud_storage_backup_test --test storage_r2_test -- --test-threads=1
 LIBRA_ENABLE_TEST_PROVIDER=1 cargo test --features test-provider --test code_ui_scenarios --test harness_self_test -- --test-threads=1   # local-only; CI dropped this step on 2026-08-31
 cargo test --features otlp --test otlp_telemetry -- --test-threads=1
 cargo test --features keyring --test auth_keyring_backend -- --test-threads=1

@@ -18,12 +18,11 @@ extension rather than a Git command. The current public surface supports:
 - Rationale: Git has reflog and reset/restore flows, but it does not expose this
   Libra operation-graph model or the command-level restore view used here.
 
-### Current-branch convergence contract (unreleased)
+### Current-branch convergence contract
 
-The `2026090801` branch-convergence migration is implemented in this unreleased
-branch and has passed focused migration validation, including a controlled
-old-binary repository upgrade. Full integration and release acceptance remain
-pending. It must retain original `2026090101` (`operation_v2`)
+The `2026090801` branch-convergence migration is implemented and has passed
+focused migration validation, including a controlled old-binary repository
+upgrade. It retains original `2026090101` (`operation_v2`)
 and `2026090601` (`legacy_config_table`, #472) receipt identities and existing
 timestamps, preserve legacy operation rows and `config`/`config_kv` values, and
 remain forward-only.
@@ -43,22 +42,21 @@ The barrier also fences binaries whose supported maximum is only 0601: after
 operation tables. Keep a verified SQLite online backup and the matching old
 binary before a live upgrade; linked worktrees share the database. There is no
 down migration, and binary rollback or deleting receipts cannot undo this
-transition. See the [user upgrade notes](../../commands/init.md#operation-v2-convergence-current-branch-unreleased).
+transition. See the [user upgrade notes](../../commands/init.md#operation-v2-convergence-current-branch).
 
 ## Implementation
 
 - CLI entry: `src/cli.rs::Commands::Op`.
 - Command implementation: `src/command/op.rs`.
-- Legacy storage/service layer: `src/internal/legacy_operation.rs` and
-  `src/internal/legacy_operation_model/`, using `legacy_operation*` tables.
-- Legacy transaction wrapper: `src/internal/operation_wrapper.rs`.
 - V2 storage/capture boundary: `src/internal/operation/{store,snapshot,middleware}.rs`.
 - Versioned schema migration: `src/internal/db/migration.rs` and
   `sql/migrations/2026090101_operation_v2.sql`; the convergence barrier above is
-  implemented and focused-QA validated, but unreleased. V2 tables are not
-  recreated by the former v1 lazy-bootstrap helper.
-- The legacy public inspection/restore path and v2 capture infrastructure coexist;
-  this convergence does not remove legacy data or declare the later cutover done.
+  implemented and focused-QA validated. V2 tables are not recreated by the
+  former v1 lazy-bootstrap helper.
+- Operation history, restore, and the Web read model consume only the v2
+  operation/change projections. Historical migration fixtures remain isolated
+  to forward-migration tests and are not runtime dependencies; migration
+  `2026091801` retires the temporary legacy namespace forward-only.
 
 ## Operation Log v2 mutation boundary
 
@@ -145,7 +143,7 @@ that uncertainty and tells the operator to inspect `libra status` and
 `WorkspaceSyncError`, including partial-write context, lease classification,
 and FUSE handling.
 
-### HEAD authority correction (unreleased)
+### HEAD authority correction
 
 The former v2 `snapshot.rs::read_head` read a possibly absent or stale HEAD
 sidecar and invented `refs/heads/main` when absent, while normal main and linked
@@ -183,7 +181,7 @@ by default and records bounded scans as partial rather than presenting an
 incomplete snapshot as complete. The focused contracts are registered in
 `tests/INDEX.md`; the full restore engine remains OL-10.
 
-The current-branch capture hardening is implemented but remains unreleased:
+The current-branch capture hardening is implemented:
 for a stable worktree, tracked `160000` gitlinks and descendants must not be
 enumerated, read, or written as parent snapshot blobs. Both lexical paths and physical directory aliases,
 including case/Unicode aliases recognized by the filesystem, must respect that
@@ -218,7 +216,18 @@ Command outcome, snapshot completeness, and restore capability are separate.
 Failure may still leave operation/pre-snapshot records, but never authorizes
 opaque nested-content capture. `Full` describes capture completeness within its
 supported scope; neither it nor `--force` implements full restore or adds support
-for uncaptured state. See the [user capture contract](../../commands/op.md#current-branch-capture-contract-unreleased).
+for uncaptured state. See the [user capture contract](../../commands/op.md#current-branch-capture-contract).
+
+### Operation and Change graph projection
+
+`GET /api/code/operation-graph` is a read-only, loopback-gated projection of
+Operation v2 heads, bounded ancestor nodes, Change revisions, and predecessor
+edges. `limit` is clamped to 200, `depth` to 32, and `pageToken` is a numeric
+bounded cursor. The response contains allowlisted identifiers, kinds, status,
+and relation metadata only; prompts, transcripts, secrets, lease tokens, and
+other operation internals are not part of the wire model. The Code UI displays
+unreconciled heads and links users to `libra op reconcile` without adding a
+write endpoint.
 
 ## Current Behavior
 
@@ -238,7 +247,7 @@ for uncaptured state. See the [user capture contract](../../commands/op.md#curre
 ## Remaining Gaps
 
 - Broader command coverage and the full v2 restore engine remain incremental;
-  the legacy public restore contract must not be confused with v2 capture.
-- Final integrated validation of request context, ignore capture and scope
-  leases, platform runtime coverage, and whole-tree integration/release gates
-  remain open; these notes do not establish validation or release acceptance.
+  restore contract must not be confused with v2 capture.
+- The feature-branch validation record in
+  `docs/development/plan/plan-20260822.md` is the source of truth for this
+  closeout. Version release and tag creation are outside this plan.

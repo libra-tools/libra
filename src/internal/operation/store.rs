@@ -7,7 +7,7 @@
 //! rows in a write-locked transaction.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     str::FromStr,
 };
@@ -430,6 +430,39 @@ impl OperationStoreV2 {
     }
 
     pub async fn write_operation(&self, operation: &OperationV2) -> Result<(), StoreError> {
+        self.write_operation_with_scope_and_restorable(
+            operation,
+            None,
+            "repository",
+            "declared",
+            true,
+        )
+        .await
+    }
+
+    pub async fn write_operation_with_restorable(
+        &self,
+        operation: &OperationV2,
+        restorable: bool,
+    ) -> Result<(), StoreError> {
+        self.write_operation_with_scope_and_restorable(
+            operation,
+            None,
+            "repository",
+            "declared",
+            restorable,
+        )
+        .await
+    }
+
+    pub async fn write_operation_with_scope_and_restorable(
+        &self,
+        operation: &OperationV2,
+        worktree_id: Option<&str>,
+        scope_kind: &str,
+        scope_provenance: &str,
+        restorable: bool,
+    ) -> Result<(), StoreError> {
         if self.repo_id.is_empty() {
             return Err(StoreError::Validation(
                 "operation store repository id cannot be empty".to_string(),
@@ -440,40 +473,55 @@ impl OperationStoreV2 {
                 "operation id cannot be empty".to_string(),
             ));
         }
+        if !matches!(scope_kind, "main" | "linked" | "repository" | "unknown") {
+            return Err(StoreError::Validation(format!(
+                "invalid operation scope kind '{scope_kind}'"
+            )));
+        }
+        if !matches!(scope_provenance, "declared" | "unknown") {
+            return Err(StoreError::Validation(format!(
+                "invalid operation scope provenance '{scope_provenance}'"
+            )));
+        }
         validate_parent_ids(&operation.op_id, &operation.parent_op_ids)?;
 
         let txn = begin_write_transaction(&self.db).await?;
         let start_ts = Utc::now().timestamp_millis();
         let insert_result = txn
-             .execute_raw(Statement::from_sql_and_values(
-                 DbBackend::Sqlite,
-                 "INSERT INTO operation (op_id, repo_id, format_version, kind, status, \
-                  command_name, description, args_digest, actor, worktree_id, scope_kind, \
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO operation (op_id, repo_id, format_version, kind, status, \
+                 command_name, description, args_digest, actor, worktree_id, scope_kind, \
+                  scope_provenance, \
                   pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
-                  predecessor_map_oid, causal_context_id, start_ts, end_ts) \
-                  VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, NULL, 'repository', ?, ?, ?, ?, ?, ?, ?, NULL)",
-                 [
-                     operation.op_id.clone().into(),
-                     self.repo_id.clone().into(),
-                     operation.kind.to_string().into(),
-                     operation.status.to_string().into(),
-                     operation.metadata.command_name.clone().into(),
-                     operation.metadata.description.clone().into(),
-                     operation.metadata.args_digest.clone().into(),
-                     operation.metadata.actor.clone().into(),
-                     operation.pre_view_oid.to_string().into(),
-                     operation.post_view_oid.to_string().into(),
-                     operation.restores_op_id.clone().into(),
-                     operation.reverts_op_id.clone().into(),
-                     operation
-                         .predecessor_map_oid
-                         .map(|oid| oid.to_string())
-                         .into(),
-                     operation.metadata.causal_context_id.clone().into(),
-                     start_ts.into(),
-                 ],
-             ))
-             .await;
+                  predecessor_map_oid, causal_context_id, restorable, start_ts, end_ts) \
+                  VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                [
+                    operation.op_id.clone().into(),
+                    self.repo_id.clone().into(),
+                    operation.kind.to_string().into(),
+                    operation.status.to_string().into(),
+                    operation.metadata.command_name.clone().into(),
+                    operation.metadata.description.clone().into(),
+                    operation.metadata.args_digest.clone().into(),
+                    operation.metadata.actor.clone().into(),
+                    worktree_id.map(ToOwned::to_owned).into(),
+                    scope_kind.to_string().into(),
+                    scope_provenance.to_string().into(),
+                    operation.pre_view_oid.to_string().into(),
+                    operation.post_view_oid.to_string().into(),
+                    operation.restores_op_id.clone().into(),
+                    operation.reverts_op_id.clone().into(),
+                    operation
+                        .predecessor_map_oid
+                        .map(|oid| oid.to_string())
+                        .into(),
+                    operation.metadata.causal_context_id.clone().into(),
+                    (restorable as i64).into(),
+                    start_ts.into(),
+                ],
+            ))
+            .await;
         if let Err(error) = insert_result {
             let _ = txn.rollback().await;
             return Err(StoreError::Database(error));
@@ -498,6 +546,50 @@ impl OperationStoreV2 {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn operation_is_restorable(&self, op_id: &str) -> Result<Option<bool>, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT restorable FROM operation WHERE repo_id = ? AND op_id = ?",
+                [self.repo_id.clone().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match row.try_get::<i64>("", "restorable")? {
+            0 => Ok(Some(false)),
+            1 => Ok(Some(true)),
+            value => Err(StoreError::Validation(format!(
+                "operation '{op_id}' has invalid restorable value {value}"
+            ))),
+        }
+    }
+
+    pub async fn operation_scope(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<(Option<String>, String, String)>, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT worktree_id, scope_kind, scope_provenance \
+                 FROM operation WHERE repo_id = ? AND op_id = ?",
+                [self.repo_id.clone().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            row.try_get::<Option<String>>("", "worktree_id")?,
+            row.try_get::<String>("", "scope_kind")?,
+            row.try_get::<String>("", "scope_provenance")?,
+        )))
     }
 
     /// Load one operation and its ordered parent edges for target validation.
@@ -846,6 +938,109 @@ impl OperationStoreV2 {
             .collect())
     }
 
+    /// Return the published operation heads across every worktree scope.
+    ///
+    /// The Web read model is repository-wide, so it must not silently pick a
+    /// single request scope and hide concurrent heads from the caller.
+    pub async fn read_all_heads(&self, repo_id: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT DISTINCT op_id FROM operation_head \
+                 WHERE repo_id = ? AND op_id <> ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into(), HEAD_GENERATION_SENTINEL.into()],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "op_id")
+                    .map_err(StoreError::Database)
+            })
+            .collect()
+    }
+
+    /// Return a bounded breadth-first page of operation ids reachable from the
+    /// repository's published heads. Each database read is bounded, and the
+    /// traversal stops once the requested page plus one continuation row has
+    /// been collected; it never materialises the full operation DAG.
+    pub async fn graph_operation_ids(
+        &self,
+        repo_id: &str,
+        depth: usize,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<String>, bool), StoreError> {
+        let limit = limit.clamp(1, 200);
+        let depth = depth.min(32);
+        let requested = limit.saturating_add(1).min(201);
+        let target = offset.saturating_add(requested);
+        let head_rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT DISTINCT op_id FROM operation_head \
+                 WHERE repo_id = ? AND op_id <> ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into(), HEAD_GENERATION_SENTINEL.into()],
+            ))
+            .await?;
+        let mut frontier = head_rows
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "op_id")
+                    .map_err(StoreError::Database)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        frontier.sort();
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        let mut current_depth = 0usize;
+        while !frontier.is_empty() && current_depth <= depth && ids.len() < target {
+            frontier.sort();
+            let current = frontier
+                .into_iter()
+                .filter(|operation_id| seen.insert(operation_id.clone()))
+                .take(target.saturating_sub(ids.len()))
+                .collect::<Vec<_>>();
+            ids.extend(current.iter().cloned());
+            if current_depth == depth || ids.len() >= target {
+                break;
+            }
+
+            let placeholders = vec!["?"; current.len()].join(", ");
+            let sql = format!(
+                "SELECT p.parent_op_id FROM operation_parent p \
+                 JOIN operation o ON o.op_id = p.parent_op_id \
+                 WHERE o.repo_id = ? AND p.op_id IN ({placeholders}) \
+                 ORDER BY p.parent_op_id LIMIT 200"
+            );
+            let mut values = Vec::with_capacity(current.len() + 1);
+            values.push(repo_id.to_string().into());
+            values.extend(current.into_iter().map(Into::into));
+            let parent_rows = self
+                .db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    sql,
+                    values,
+                ))
+                .await?;
+            frontier = parent_rows
+                .into_iter()
+                .map(|row| {
+                    row.try_get::<String>("", "parent_op_id")
+                        .map_err(StoreError::Database)
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?
+                .into_iter()
+                .collect();
+            current_depth = current_depth.saturating_add(1);
+        }
+        let has_more = ids.len() > offset.saturating_add(limit);
+        let page = ids.into_iter().skip(offset).take(limit).collect();
+        Ok((page, has_more))
+    }
+
     /// Whether `op_id` is referenced as a current operation head in any scope
     /// of this repository. Used by recovery to distinguish a globally orphaned
     /// running operation (safe to fail closed) from one another worktree still
@@ -1025,6 +1220,66 @@ impl OperationStoreV2 {
         txn.commit().await?;
         Ok(())
     }
+}
+
+/// Return the most recent successful repository operation with the same
+/// command and argument digest inside the short duplicate-operation window.
+///
+/// This is deliberately a v2-table query.  Callers use it for idempotency
+/// checks before applying a mutation; the operation row created by the v2
+/// boundary is updated with the digest immediately afterwards.
+pub(crate) async fn find_recent_success_by_args_digest(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    worktree_id: &str,
+    command_name: &str,
+    args_digest: &str,
+) -> Result<Option<String>, StoreError> {
+    let cutoff = Utc::now().timestamp_millis() - 5_000;
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT op_id FROM operation \
+             WHERE repo_id = ? AND (worktree_id = ? OR (? = '' AND worktree_id IS NULL)) \
+               AND command_name = ? AND args_digest = ? \
+               AND status = 'success' AND end_ts >= ? \
+               ORDER BY end_ts DESC, op_id DESC LIMIT 1",
+            [
+                repo_id.to_string().into(),
+                worktree_id.to_string().into(),
+                worktree_id.to_string().into(),
+                command_name.to_string().into(),
+                args_digest.to_string().into(),
+                cutoff.into(),
+            ],
+        ))
+        .await?;
+    row.map(|row| row.try_get("", "op_id").map_err(StoreError::Database))
+        .transpose()
+}
+
+/// Persist an idempotency digest on an already-created v2 operation row.
+pub(crate) async fn update_operation_args_digest(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    op_id: &str,
+    args_digest: &str,
+) -> Result<(), StoreError> {
+    let updated = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE operation SET args_digest = ? WHERE repo_id = ? AND op_id = ?",
+            [
+                args_digest.to_string().into(),
+                repo_id.to_string().into(),
+                op_id.to_string().into(),
+            ],
+        ))
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NotFound(op_id.to_string()));
+    }
+    Ok(())
 }
 
 async fn query_head_rows<C: ConnectionTrait>(

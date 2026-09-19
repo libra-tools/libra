@@ -1454,96 +1454,25 @@ pub(crate) fn require_repair_confirmation(confirm: bool, action: &str) -> CliRes
     .into_cli_error())
 }
 
-/// Open the operation-log audit boundary for one confirmed repair action (W0
-/// §C.11): exactly one row per EXECUTED action, closed with the action's
-/// outcome by [`finish_repair_operation`]. The boundary claim also takes this
-/// worktree's control slot for the duration, serializing the repair against
-/// any concurrent sequencer control action here.
+/// The CLI's v2 operation boundary owns the audit row for confirmed repair
+/// actions. Keep this small seam for callers that already structure the repair
+/// flow as begin/finish, without reopening the retired v1 operation wrapper.
+#[derive(Debug, Default)]
+pub(crate) struct RepairOperationBoundary;
+
 pub(crate) async fn begin_repair_operation(
     command_name: &str,
     target: Option<&str>,
-) -> CliResult<crate::internal::operation_wrapper::OperationBoundary> {
-    use crate::internal::operation_wrapper::{OperationMeta, OperationScope, begin_operation};
-
-    let db = crate::internal::db::get_db_conn_instance().await;
-    // Fail CLOSED on a missing/unreadable identity, like a sequencer control:
-    // without it the audit row cannot be attributed, and a repair that ran
-    // without its audit event is exactly what the W0 contract forbids.
-    let repo_id = RepoIdentity::resolve(&db)
-        .await
-        .map(|identity| identity.as_str().to_string())
-        .map_err(|error| {
-            CliError::fatal(format!("cannot record the repair operation: {error}"))
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-    let meta = OperationMeta {
-        command_name: command_name.to_string(),
-        description: match target {
-            Some(target) => format!("{command_name}: target {target}"),
-            None => format!("{command_name}: every registered worktree"),
-        },
-        actor: crate::internal::config::ConfigKv::get("user.name")
-            .await
-            .ok()
-            .flatten()
-            .map(|entry| entry.value)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "libra-user".to_string()),
-        repo_id,
-        // No dedup identity: re-running a confirmed repair to convergence is
-        // the documented flow, and each execution is its own audit row —
-        // never an accidental double submission to suppress.
-        args_digest: None,
-    };
-    // A repair's audit row is never restorable, so snapshotting every branch
-    // and workspace pointer would write rows nothing can ever read; record
-    // the head pointer, which is what `op log`/`op show` display (§C.14).
-    let scope = OperationScope {
-        include_refs: false,
-        include_workspace: false,
-        // Re-running a repair is ordinary (heal one invariant, then the next);
-        // overlap is excluded by the worktree-wide control slot, a real mutex
-        // rather than the five-second heuristic.
-        duplicate_window: false,
-        ..OperationScope::default()
-    };
-    begin_operation(meta, scope).await.map_err(|err| {
-        CliError::fatal(format!("cannot record the repair operation: {err}"))
-            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-            .with_hint(
-                "another control action is running or just completed in this worktree; wait for \
-                  it to finish, or inspect it with `libra op log`",
-            )
-    })
+) -> CliResult<RepairOperationBoundary> {
+    let _ = (command_name, target);
+    Ok(RepairOperationBoundary)
 }
 
-/// Close a repair action's audit boundary with its outcome, success OR
-/// failure — a repair that failed mid-way is still an executed action and
-/// its row says so. A failure to CLOSE is a command failure (W0 §C.11): the
-/// contract is exactly one row per executed action, closed with the outcome,
-/// and warning-and-continuing would leave a `running` row while reporting a
-/// successful repair — the audit gap the boundary exists to exclude. The
-/// error states plainly that the repair itself already happened, so the
-/// failure is never misread as the repair not running.
 pub(crate) async fn finish_repair_operation<T>(
-    boundary: crate::internal::operation_wrapper::OperationBoundary,
+    boundary: RepairOperationBoundary,
     result: CliResult<T>,
 ) -> CliResult<T> {
-    let outcome = if result.is_ok() {
-        crate::internal::operation_wrapper::BoundaryOutcome::Succeeded
-    } else {
-        crate::internal::operation_wrapper::BoundaryOutcome::Failed
-    };
-    if let Err(err) = boundary.finish(outcome).await {
-        return Err(CliError::fatal(format!(
-            "the repair completed, but its operation-log record could not be closed: {err}"
-        ))
-        .with_stable_code(StableErrorCode::IoWriteFailed)
-        .with_hint(
-            "the repair's effects stand; inspect the unclosed record with `libra op log`, \
-              and re-run the repair once the operation log is writable again",
-        ));
-    }
+    let _ = boundary;
     result
 }
 
@@ -2263,10 +2192,17 @@ enum AddCheckout {
 }
 
 /// Fence worktree lifecycle actions that publish or remove shared HEAD/branch
-/// rows. Acquire this before the registry and branch-attach locks so the lock
-/// order matches ordinary repository mutations and restore.
+/// rows. The registry lock is acquired by each lifecycle operation before this
+/// lease so concurrent adds queue on the registry before any other work starts.
 async fn acquire_worktree_ref_lease()
--> WorktreeResult<crate::internal::operation::middleware::ScopeLease> {
+-> WorktreeResult<Option<crate::internal::operation::middleware::ScopeLease>> {
+    // The v2 CLI boundary already holds the repository lease for a central
+    // `worktree` mutation. Re-acquiring the same flock from this process would
+    // self-deadlock before the command body starts; standalone callers still
+    // acquire the lease here.
+    if crate::internal::operation::middleware::repository_ref_lease_is_held() {
+        return Ok(None);
+    }
     let scope = crate::internal::worktree_scope::WorktreeScope::request_scope()
         .or_else(|| crate::internal::worktree_scope::RequestScope::resolve(util::cur_dir()))
         .ok_or_else(|| {
@@ -2313,6 +2249,7 @@ async fn acquire_worktree_ref_lease()
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )
     .await
+    .map(Some)
     .map_err(|error| {
         WorktreeError::OperationBlocked(format!(
             "cannot acquire repository ref lease before changing worktree refs: {error}"
@@ -2326,11 +2263,11 @@ async fn add_worktree(
     detach: bool,
     new_branch: Option<String>,
 ) -> WorktreeResult<WorktreeAddOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
     // delete this add's freshly seeded rows).
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let storage = util::storage_path();
     let target = resolve_path(&path, "worktree path")?;
 
@@ -5381,8 +5318,8 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// to guard); leaked rows would otherwise be re-inherited by a worktree
 /// re-created at the same path (deterministic instance id).
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let mut state = load_state()?;
 
     // §C.7: prune only handles entries whose path is PROVEN missing
@@ -5568,8 +5505,8 @@ fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -
 /// Order matters: registry last — a half-completed delete cannot silently
 /// unregister a worktree whose directory is still present.
 async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
 
@@ -8391,72 +8328,6 @@ mod tests {
         );
         assert!(output.cleanup_root_removed);
         assert!(!cleanup_root.exists());
-    }
-
-    /// W0 §C.11: a failure to CLOSE the audit boundary is a command failure —
-    /// warn-and-continue would leave a `running` row while reporting a
-    /// successful repair, the audit gap the boundary exists to exclude. Fault
-    /// injection: the operation table is dropped between begin and finish, so
-    /// the close cannot write its outcome.
-    #[tokio::test]
-    #[serial_test::serial(cwd, env)]
-    async fn finish_repair_operation_surfaces_close_failure() {
-        use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
-
-        use crate::{
-            internal::operation_wrapper::{
-                OperationMeta, OperationScope, begin_operation_with_conn,
-            },
-            utils::test::{ChangeDirGuard, setup_with_new_libra_in},
-        };
-
-        let repo = tempfile::tempdir().expect("tempdir");
-        setup_with_new_libra_in(repo.path()).await;
-        let _cwd = ChangeDirGuard::new(repo.path());
-
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory db");
-        for sql in [
-            "CREATE TABLE legacy_operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
-            "CREATE TABLE legacy_operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
-            "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
-            "CREATE TABLE legacy_operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
-            "CREATE TABLE legacy_operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
-            "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)",
-        ] {
-            db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
-                .await
-                .expect("create schema");
-        }
-
-        let meta = OperationMeta {
-            command_name: "worktree repair".to_string(),
-            description: "repair the worktree registry".to_string(),
-            actor: "test".to_string(),
-            repo_id: "repo_1".to_string(),
-            args_digest: None,
-        };
-        let boundary = begin_operation_with_conn(&db, meta, OperationScope::default())
-            .await
-            .expect("open the boundary");
-
-        // Fault injection: the close cannot write its outcome row.
-        db.execute_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "DROP TABLE legacy_operation".to_string(),
-        ))
-        .await
-        .expect("drop the operation table");
-
-        let err = finish_repair_operation(boundary, Ok::<_, CliError>(()))
-            .await
-            .expect_err("a close failure must surface as a command error");
-        let text = format!("{err:?}");
-        assert!(
-            text.contains("could not be closed"),
-            "the error names the unclosed audit record: {text}"
-        );
     }
 
     /// plan-20260714 W1: the BLOCKING registry acquisition keeps exactly one

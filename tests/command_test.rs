@@ -6,4 +6,3 @@
 //! command while still letting each command live in its own file.
 
 mod command;
-mod operation_wrapper_test;

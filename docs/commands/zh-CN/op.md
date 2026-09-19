@@ -8,17 +8,22 @@
 libra op log [OPTIONS]
 libra op show [OPTIONS] <OP_REF>
 libra op restore [OPTIONS] <OP_REF>
+libra op reconcile [OPTIONS]
 ```
 
 ## 说明
 
-`libra op` 在命令行上暴露 operation service 和 wrapper layers 持久化的 operation graph。
+`libra op` 在命令行上暴露 Operation v2 operation graph。
 
-当前支持三个子命令：
+当前支持四个子命令：
 
 - `op log`：列出已记录 operations，支持分页和可选命令过滤。
 - `op show`：检查一个 operation，并可选显示捕获的 restore view。
 - `op restore`：将 HEAD 和分支 refs 恢复到先前捕获的 view。
+- `op reconcile`：在多 worktree head 状态无歧义时记录 reconcile operation；冲突时保留所有 head。
+
+Operation history 只来自 Operation v2。查询和恢复使用同一 newest-first
+索引，分页不会重新编号；`@{n}` 始终指向 `op log` 中的完整历史索引。
 
 ## Operation References
 
@@ -188,7 +193,7 @@ libra op restore @{1} --dry-run
 - `op restore --dry-run` 不写入新 operation。
 - Restore 会重置 HEAD 和目标 view 中捕获的 branch refs，并 prune 该 view 中不存在的本地分支（恢复后的 HEAD branch 始终保留；remote-tracking refs 保持不变）。
 
-### Operation 作用域执行（未发布）
+### Operation 作用域执行
 
 对于经过 v2 operation middleware 的变更，每个 operation 都保持独立、已固定的仓库／工作树请求上下文，包括异步执行期间。独立 linked worktree 使用各自的 private gitdir 与 scope lease，即使共享仓库存储，也不会因这一 lease 彼此串行化；其他仓库锁和命令限制仍然适用。
 
@@ -200,7 +205,7 @@ libra op restore @{1} --dry-run
 group/all/数值 shared 仓库，由一个用户首次创建的锁仍能被 shared mode
 允许的其他用户打开；default/false/umask 模式继续遵循进程 umask。
 
-### 隔离 agent 任务的 sync-back operation（未发布）
+### 隔离 agent 任务的 sync-back operation
 
 隔离的 `libra code` DAG 任务在临时 copy 或 FUSE workspace 中运行工具，
 而不是在具有独立 operation scope 的真实 linked worktree 中运行。该
@@ -221,15 +226,15 @@ pointer/CAS 在 replay 开始前发生变化，则仍须从新的 baseline 重�
 **不会**自动重试：主 workspace 可能已经包含任务变更。请按错误提示先检查
 `libra status` 与 `libra op log`，再决定恢复还是重新运行。
 
-### HEAD 捕获的权威来源（未发布）
+### HEAD 捕获的权威来源
 
-新 v2 捕获读取 pinned worktree scope 的 SQLite HEAD 行，不读取 HEAD sidecar，也不凭空回退到 `main`。HEAD 行缺失、重复、损坏或查询失败时，会拒绝捕获，而不是用假定 HEAD 返回成功快照。有效 detached HEAD 的 commit 保留为快照引用的 root；仅 HEAD 改变也会反映到新快照的 content identity。这些行为已在未发布分支实现，完整集成、实现审查与发布验收仍待完成。
+新 v2 捕获读取 pinned worktree scope 的 SQLite HEAD 行，不读取 HEAD sidecar，也不凭空回退到 `main`。HEAD 行缺失、重复、损坏或查询失败时，会拒绝捕获，而不是用假定 HEAD 返回成功快照。有效 detached HEAD 的 commit 保留为快照引用的 root；仅 HEAD 改变也会反映到新快照的 content identity。这些行为属于当前 Operation v2 捕获契约，并由恢复、多 worktree 和最终验证门覆盖。
 
 这项修复不会重写既有不可变 manifest，也不代表已复现实际垃圾回收数据丢失；它不增加完整恢复能力或整个快照的 mixed-hash 并发支持。
 
-### 当前分支的捕获契约（未发布）
+### 当前分支的捕获契约
 
-以下 operation-v2 行为已在当前未发布分支实现，集成与发布验收仍待完成。既有 legacy `op` 查询／HEAD-ref 恢复接口与 v2 捕获基础设施并存。v2 的 `Full` 捕获不代表已支持完整恢复。
+以下 operation-v2 行为是当前唯一的运行时捕获契约。v2 的 `Full` 捕获不代表已支持完整恢复。
 
 - 在稳定工作树下，已跟踪 gitlink（index mode `160000`）及其子路径是父仓库快照的不透明边界：不得枚举、读取嵌套内容，或把内容持久化成父仓库 snapshot blobs。这不是子模块备份功能。
 - 该边界必须同时覆盖字面路径与物理目录别名，包括文件系统认定为同一目录的大小写／Unicode 拼写别名；不同拼写不得绕过边界。
@@ -258,4 +263,4 @@ reconcile 操作本身不改变任何仓库内容，只记录收敛点，使后�
 
 收敛或「无可收敛」时退出码为 `0`；报告冲突时为非零（JSON 输出携带 `outcome: "conflicted"` 与完整冲突列表）。
 
-当前分支尚未发布的数据库过渡见 [operation-v2 收敛](init.md#operation-v2-收敛当前分支未发布)。
+当前 feature 分支的前向数据库过渡见 [operation-v2 收敛](init.md#operation-v2-收敛当前分支)。本计划不包含版本发布或 tag。

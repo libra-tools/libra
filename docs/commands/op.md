@@ -13,8 +13,7 @@ libra op reconcile [OPTIONS]
 
 ## Description
 
-`libra op` provides a command-line surface over the operation graph persisted by
-the operation service and wrapper layers.
+`libra op` provides a command-line surface over the Operation v2 graph.
 
 It currently supports these subcommands:
 
@@ -32,13 +31,11 @@ It currently supports these subcommands:
 - A reflog-style index, for example `@{0}` for the newest operation or `@{1}`
   for the previous one
 
-Indices use one newest-first history across retained legacy and operation-v2
-records. V2-only entries such as `external.snapshot`, undo, and redo appear in
-that same history. The `index` in `op log --json` is the zero-based index for
-the complete history; command filters and pagination do not renumber it. Thus
-`op show @{n}` and `op restore @{n}` target the operation displayed at index
-`n`. `op undo`, `op redo`, and `op revert` resolve that same index, but require
-a v2 operation; selecting a legacy-only row reports an unsupported target.
+Indices use one newest-first history across Operation v2 records. Entries such
+as `external.snapshot`, undo, redo, and reconcile appear in that same history.
+The `index` in `op log --json` is the zero-based index for the complete history;
+command filters and pagination do not renumber it. Thus `op show @{n}` and
+`op restore @{n}` target the operation displayed at index `n`.
 
 ## `libra op log`
 
@@ -184,7 +181,7 @@ the next mutation boundary records any on-disk drift as an external snapshot.
   target snapshot; such a worktree was created after the snapshot, and its HEAD
   must be recreated or checked out after the restore.
 
-### Operation-scoped execution (unreleased)
+### Operation-scoped execution
 
 For mutations routed through the v2 operation middleware, each operation keeps
 its own pinned repository/worktree request context, including across asynchronous
@@ -211,7 +208,7 @@ repository, a lock first created by one user remains openable by the users that
 the shared mode permits; the default/false/umask modes continue to follow the
 process umask.
 
-### Isolated agent task sync-back operations (unreleased)
+### Isolated agent task sync-back operations
 
 An isolated `libra code` DAG task runs its tools in a temporary copy or FUSE
 workspace, not a true linked worktree with its own operation scope. Mutating
@@ -235,26 +232,24 @@ automatically: the main workspace may already contain the task changes. Follow
 the error guidance and inspect `libra status` plus `libra op log` before
 deciding whether to recover or rerun.
 
-### HEAD capture authority (unreleased)
+### HEAD capture authority
 
 New v2 captures read the pinned worktree scope's SQLite HEAD row, not a HEAD
 sidecar file or a fabricated `main` fallback. Missing, duplicate or corrupt
 HEAD rows, and query failures, reject capture rather than report a successful
 snapshot with an assumed HEAD. A valid detached HEAD commit remains a referenced
 snapshot root, and HEAD-only changes affect the new snapshot's content identity.
-This behavior is implemented on the unreleased branch; full integration,
-implementation review and release acceptance remain pending.
+This behavior is part of the Operation v2 capture contract and is covered by
+the operation restore and multi-worktree verification gates.
 
 This correction does not rewrite existing immutable manifests or establish
 that actual garbage-collection data loss has occurred. It adds neither full
 restore support nor concurrent mixed-hash snapshot support.
 
-### Current-branch capture contract (unreleased)
+### Current-branch capture contract
 
-The operation-v2 behavior below is implemented on this unreleased branch;
-integration and release acceptance remain pending. The existing
-legacy `op` inspection/HEAD-ref restore surface and v2 capture infrastructure
-coexist. A v2 `Full` capture is not a promise of full restore support.
+The operation-v2 behavior below is the sole runtime capture contract. A v2
+`Full` capture is not a promise of full restore support.
 
 - For a stable worktree, a tracked gitlink (index mode `160000`) and its
   descendants are opaque to the parent snapshot: nested content must not be
@@ -320,5 +315,5 @@ Exit status is `0` for convergence or `nothing to reconcile`, and non-zero
 when conflicts are reported (the JSON output carries `outcome: "conflicted"`
 with the full conflict list).
 
-The unreleased database transition is documented under
-[operation-v2 convergence](init.md#operation-v2-convergence-current-branch-unreleased).
+The forward-only database transition is documented under
+[operation-v2 convergence](init.md#operation-v2-convergence-current-branch).

@@ -35,12 +35,11 @@ async fn assert_revision_resolves_to_store(
         .try_get_by_index::<String>(0)
         .expect("revision operation id");
 
+    let table = store_table;
     let sql = match expected_command {
-        Some(_) if store_table == "legacy_operation" => {
-            "SELECT command_name FROM legacy_operation WHERE op_id = ?"
-        }
-        _ => {
-            let count_sql = format!("SELECT COUNT(*) FROM {store_table} WHERE op_id = ?");
+        Some(_) => format!("SELECT command_name FROM {table} WHERE op_id = ?"),
+        None => {
+            let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE op_id = ?");
             let row = database
                 .query_one_raw(Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
@@ -53,7 +52,7 @@ async fn assert_revision_resolves_to_store(
             let count = row.try_get_by_index::<i64>(0).expect("operation count");
             assert_eq!(
                 count, 1,
-                "revision {commit_oid} must resolve to exactly one {store_table} operation"
+                "revision {commit_oid} must resolve to exactly one {table} operation"
             );
             return;
         }
@@ -171,13 +170,7 @@ async fn cherry_pick_and_rebase_revisions_resolve_to_their_control_operations() 
         "rebase feature onto main",
     );
     let rebased_oid = head_oid(repo.path());
-    assert_revision_resolves_to_store(
-        repo.path(),
-        &rebased_oid,
-        "legacy_operation",
-        Some("rebase"),
-    )
-    .await;
+    assert_revision_resolves_to_store(repo.path(), &rebased_oid, "operation", Some("rebase")).await;
 
     assert_cli_success(
         &run_libra_command(&["switch", "main"], repo.path()),
@@ -188,13 +181,8 @@ async fn cherry_pick_and_rebase_revisions_resolve_to_their_control_operations() 
         "cherry-pick feature",
     );
     let picked_oid = head_oid(repo.path());
-    assert_revision_resolves_to_store(
-        repo.path(),
-        &picked_oid,
-        "legacy_operation",
-        Some("cherry-pick"),
-    )
-    .await;
+    assert_revision_resolves_to_store(repo.path(), &picked_oid, "operation", Some("cherry-pick"))
+        .await;
 }
 
 /// The change revision for a commit is recorded only after the branch ref has

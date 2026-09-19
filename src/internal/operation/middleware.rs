@@ -19,6 +19,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) const REPOSITORY_REF_LEASE_HELD_ENV: &str = "LIBRA_INTERNAL_REPOSITORY_REF_LEASE_HELD";
+pub(crate) const OPERATION_SCOPE_LEASE_HELD_ENV: &str = "LIBRA_INTERNAL_OPERATION_SCOPE_LEASE_HELD";
 
 tokio::task_local! {
     static CURRENT_OPERATION_ID: String;
@@ -41,6 +42,10 @@ pub(crate) async fn with_operation_id<T>(
 pub(crate) fn repository_ref_lease_is_held() -> bool {
     CURRENT_REPOSITORY_REF_LEASE.try_with(|_| ()).is_ok()
         || std::env::var_os(REPOSITORY_REF_LEASE_HELD_ENV).is_some_and(|value| value == "1")
+}
+
+pub(crate) fn operation_scope_lease_is_held() -> bool {
+    std::env::var_os(OPERATION_SCOPE_LEASE_HELD_ENV).is_some_and(|value| value == "1")
 }
 
 pub(crate) async fn with_repository_ref_lease<T>(future: impl Future<Output = T>) -> T {
@@ -111,6 +116,12 @@ pub fn classify_command(name: &str) -> Result<MutationClass, ClassificationError
 /// Whether a command can change a ref shared by linked worktrees. The first
 /// token is used because legacy operation records include control arguments
 /// (for example, `rebase --continue`) in `command_name`.
+///
+/// Sequencer operations update the current worktree's checked-out branch,
+/// index, and sequencer state. Their operation scope lease already serializes
+/// that worktree; a repository-wide lease would incorrectly serialize
+/// independent linked worktrees and block their control slots. Only commands
+/// whose primary target is shared repository state belong in this list.
 pub(crate) fn command_may_mutate_shared_refs(command_name: &str) -> bool {
     let normalized = command_name.trim().to_ascii_lowercase();
     let mut parts = normalized.split_ascii_whitespace();
@@ -123,23 +134,9 @@ pub(crate) fn command_may_mutate_shared_refs(command_name: &str) -> bool {
         "branch"
             | "br"
             | "tag"
-            | "commit"
-            | "ci"
-            | "reset"
             | "fetch"
             | "pull"
             | "push"
-            | "merge"
-            | "rebase"
-            | "rb"
-            | "cherry-pick"
-            | "cp"
-            | "revert"
-            | "am"
-            | "bisect"
-            | "checkout"
-            | "switch"
-            | "sw"
             | "update-ref"
             | "symbolic-ref"
             | "reflog"
@@ -175,6 +172,12 @@ fn operation_needs_repository_lease(meta: &OperationMetaV2, class: MutationClass
         return false;
     }
     command_may_mutate_shared_refs(command_name)
+}
+
+fn is_worktree_lifecycle_command(meta: &OperationMetaV2) -> bool {
+    meta.command_name
+        .as_deref()
+        .is_some_and(|command| command.split_ascii_whitespace().next() == Some("worktree"))
 }
 
 #[derive(Debug, Error)]
@@ -380,6 +383,12 @@ where
         .await
         .map_err(|error| OperationError::Storage(error.to_string()))?;
     let repo_id = identity.as_str().to_string();
+    let operation_worktree_id = Some(scope.scope.storage_key());
+    let operation_scope_kind = if scope.scope.is_linked() {
+        "linked"
+    } else {
+        "main"
+    };
     let shared_repository = ConfigKv::get_with_conn(&db, "core.sharedRepository")
         .await
         .map_err(|error| {
@@ -397,15 +406,22 @@ where
         ));
     }
     let shared_repository_value = shared_repository.as_ref().map(|entry| entry.value.as_str());
+    let worktree_lifecycle = is_worktree_lifecycle_command(&meta);
     // Repository-wide ref transitions take the common lease before the
     // worktree lease, matching restore's lock order. Worktree-only edits keep
     // their existing concurrency across linked worktrees.
-    let _repository_lease =
-        if operation_needs_repository_lease(&meta, class) && !repository_ref_lease_is_held() {
-            Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
+    let _repository_lease = if operation_needs_repository_lease(&meta, class)
+        && !repository_ref_lease_is_held()
+    {
+        let lease = if worktree_lifecycle {
+            ScopeLease::acquire_repository_wait(scope, &repo_id, shared_repository_value).await?
         } else {
-            None
+            ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?
         };
+        Some(lease)
+    } else {
+        None
+    };
     let lease_permissions = LeaseFilePermissions::from_shared_repository(
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )?;
@@ -413,7 +429,13 @@ where
     if let Some(error) = test_hooks::take_pre_lease_busy(&meta) {
         return Err(error);
     }
-    let _lease = ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?;
+    let _lease = if operation_scope_lease_is_held() {
+        None
+    } else if worktree_lifecycle {
+        Some(ScopeLease::acquire_with_permissions_wait(scope, &repo_id, lease_permissions).await?)
+    } else {
+        Some(ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?)
+    };
     let storage = ClientStorage::init_local(scope.storage.join("objects"));
     let store = OperationStoreV2::new_for_repo(&repo_id, db.clone(), storage.clone());
     let scope_key = scope.scope.storage_key().to_string();
@@ -495,7 +517,13 @@ where
             predecessor_map_oid: None,
         };
         store
-            .write_operation(&external)
+            .write_operation_with_scope_and_restorable(
+                &external,
+                operation_worktree_id,
+                operation_scope_kind,
+                "declared",
+                true,
+            )
             .await
             .map_err(|error| OperationError::Storage(error.to_string()))?;
         append_journal(
@@ -589,7 +617,13 @@ where
         predecessor_map_oid: None,
     };
     store
-        .write_operation(&operation)
+        .write_operation_with_scope_and_restorable(
+            &operation,
+            operation_worktree_id,
+            operation_scope_kind,
+            "declared",
+            class != MutationClass::SequencerMutation,
+        )
         .await
         .map_err(|error| OperationError::Storage(error.to_string()))?;
     append_journal(
@@ -627,6 +661,12 @@ where
         now_millis(),
     )
     .await?;
+    // Test-only rendezvous used by the linked-worktree concurrency regression:
+    // keep the committed running row visible long enough for the other
+    // worktree to claim its independent control slot. The gate is compiled
+    // out of release builds and requires the existing LIBRA_TEST marker.
+    #[cfg(debug_assertions)]
+    hold_test_operation_claim().await;
     let operation_future = with_operation_id(txn.op_id.clone(), f(&mut txn));
     let operation_result = if _repository_lease.is_some() {
         with_repository_ref_lease(operation_future).await
@@ -808,6 +848,23 @@ where
         operation_id: Some(operation_id),
         recorded: true,
     })
+}
+
+#[cfg(debug_assertions)]
+async fn hold_test_operation_claim() {
+    if std::env::var_os("LIBRA_TEST").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let Some(milliseconds) = std::env::var("LIBRA_TEST_HOLD_CLAIM_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+    else {
+        return;
+    };
+    if !milliseconds.is_zero() {
+        tokio::time::sleep(milliseconds).await;
+    }
 }
 
 /// A newly attached/re-created worktree has a fresh gitdir and therefore no
@@ -1049,6 +1106,45 @@ mod tests {
             &push,
             MutationClass::RepoMutation
         ));
+    }
+
+    #[test]
+    fn current_worktree_mutations_do_not_take_the_repository_ref_fence() {
+        for command in [
+            "commit",
+            "reset",
+            "merge",
+            "rebase --continue",
+            "cherry-pick",
+            "revert",
+            "am",
+            "bisect",
+            "checkout",
+            "switch",
+        ] {
+            assert!(
+                !operation_needs_repository_lease(
+                    &OperationMetaV2 {
+                        command_name: Some(command.to_string()),
+                        ..OperationMetaV2::default()
+                    },
+                    MutationClass::SequencerMutation,
+                ),
+                "{command} is scoped to the current worktree"
+            );
+        }
+        for command in ["branch", "tag", "fetch", "push", "update-ref", "worktree"] {
+            assert!(
+                operation_needs_repository_lease(
+                    &OperationMetaV2 {
+                        command_name: Some(command.to_string()),
+                        ..OperationMetaV2::default()
+                    },
+                    MutationClass::RepoMutation,
+                ),
+                "{command} changes shared repository state"
+            );
+        }
     }
 
     #[tokio::test]

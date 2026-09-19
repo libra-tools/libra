@@ -1331,7 +1331,18 @@ async fn establish_connection_auto_upgrades_stale_schema() {
         "connecting should migrate the schema up to the latest registered version"
     );
     assert!(column_exists(&raw, "operation", "format_version").await);
-    assert!(table_exists(&raw, "legacy_operation").await);
+    for table in [
+        "legacy_operation",
+        "legacy_operation_parent",
+        "legacy_operation_view",
+        "legacy_operation_view_ref",
+        "legacy_operation_view_workspace",
+    ] {
+        assert!(
+            !table_exists(&raw, table).await,
+            "OL-15 retirement must remove {table} from the runtime schema"
+        );
+    }
     assert!(table_exists(&raw, "operation_journal").await);
     assert_eq!(
         raw.query_one_raw(Statement::from_string(
@@ -3865,12 +3876,7 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
     }
     // Semantic OID columns the name heuristic cannot flag — pinned by hand;
     // each must be inventoried too.
-    for (table, column) in [
-        ("legacy_operation_view", "head_target"),
-        ("legacy_operation_view_workspace", "pointer_value"),
-        ("object_index", "o_id"),
-        ("metadata_kv", "value"),
-    ] {
+    for (table, column) in [("object_index", "o_id"), ("metadata_kv", "value")] {
         let inventoried = GC_OBJECT_SOURCE_INVENTORY
             .iter()
             .any(|source| source.location == table && source.column == column);
@@ -4561,6 +4567,44 @@ async fn operation_dedup_query_uses_its_index() {
     assert!(
         !detail.contains("SCAN operation"),
         "and must not scan the operation table: {detail}"
+    );
+}
+
+/// The v2 operation boundary uses repository scope and v2 status values. The
+/// OL-15 retirement must leave that hot-path query indexed after the v1 index
+/// disappears with the retired operation table.
+#[tokio::test]
+async fn operation_v2_dedup_query_uses_its_index() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+
+    let plan = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "EXPLAIN QUERY PLAN SELECT op_id FROM operation \
+             WHERE repo_id = 'r' AND scope_kind = 'repository' \
+               AND command_name = 'branch' AND args_digest = 'd' \
+               AND status = 'success' AND end_ts >= 0 \
+             ORDER BY end_ts DESC, op_id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("explain");
+    let detail: String = plan
+        .iter()
+        .filter_map(|row| row.try_get_by::<String, _>("detail").ok())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        detail.contains("idx_operation_v2_dedup_scope"),
+        "the v2 duplicate query must use its composite index, not scan: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN operation"),
+        "the v2 duplicate query must not scan the operation table: {detail}"
     );
 }
 

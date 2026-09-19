@@ -25,11 +25,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use git_internal::hash::{ObjectHash, get_hash_kind};
-use libra::internal::{
-    config::ConfigKv,
-    db::get_db_conn_instance,
-    operation::{OperationQueryPage, OperationService},
-};
+use libra::internal::config::ConfigKv;
 use serial_test::serial;
 use tempfile::tempdir;
 
@@ -69,89 +65,6 @@ fn test_branch_json_create_output_reports_branch() {
     assert_eq!(json["data"]["action"], "create");
     assert_eq!(json["data"]["name"], "feature");
     assert!(json["data"]["commit"].as_str().is_some());
-}
-
-#[tokio::test]
-#[serial(cwd)]
-async fn test_branch_create_records_operation_log() {
-    let repo = create_committed_repo_via_cli();
-
-    let output = run_libra_command(&["branch", "feature"], repo.path());
-    assert_cli_success(&output, "branch feature");
-
-    let _guard = ChangeDirGuard::new(repo.path());
-    let db = get_db_conn_instance().await;
-    let repo_id = ConfigKv::get("libra.repoid").await.unwrap().unwrap().value;
-    let page = OperationService::list_operations_by_repo_paginated_with_conn(
-        &db,
-        &repo_id,
-        OperationQueryPage {
-            page: 1,
-            per_page: 10,
-        },
-    )
-    .await
-    .unwrap();
-    let op = page
-        .items
-        .iter()
-        .find(|item| item.command_name == "branch")
-        .expect("branch create should record an operation");
-
-    let graph = OperationService::load_restore_view_by_operation_with_conn(&db, &op.op_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(graph.operation.command_name, "branch");
-    assert!(
-        graph
-            .operation
-            .description
-            .starts_with("create branch feature")
-    );
-    assert!(
-        graph
-            .refs
-            .iter()
-            .any(|reference| reference.ref_name == "feature")
-    );
-}
-
-#[tokio::test]
-#[serial(cwd)]
-async fn test_branch_create_mints_missing_repo_id_before_operation_log() {
-    let repo = create_committed_repo_via_cli();
-
-    {
-        let _guard = ChangeDirGuard::new(repo.path());
-        ConfigKv::unset_all("libra.repoid").await.unwrap();
-    }
-
-    let output = run_libra_command(&["branch", "legacy-feature"], repo.path());
-    assert_cli_success(&output, "branch legacy-feature without repo id");
-
-    let _guard = ChangeDirGuard::new(repo.path());
-    let repo_id = ConfigKv::get("libra.repoid")
-        .await
-        .unwrap()
-        .expect("branch create should mint repo id")
-        .value;
-    uuid::Uuid::parse_str(&repo_id).expect("minted repo id should be a UUID");
-
-    let db = get_db_conn_instance().await;
-    let page = OperationService::list_operations_by_repo_paginated_with_conn(
-        &db,
-        &repo_id,
-        OperationQueryPage {
-            page: 1,
-            per_page: 10,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(page.items.iter().any(|item| {
-        item.command_name == "branch" && item.description.contains("legacy-feature")
-    }));
 }
 
 /// Scenario: human-readable branch creation must print "Created branch
@@ -353,11 +266,10 @@ fn test_branch_ignore_case_sorts_case_insensitively() {
 }
 
 /// Scenario (Unix only): if SQLite write permission is revoked
-/// (`chmod 0o444`), `branch --set-upstream-to` must surface an
-/// `LBR-IO-002` error mentioning the failing config key. The original
-/// permission mode is restored before assertions to avoid TempDir
-/// teardown failures. Skipped under root because the chmod injection
-/// has no effect.
+/// (`chmod 0o444`), the v2 operation boundary must fail closed before
+/// attempting the branch config write. The original permission mode is
+/// restored before assertions to avoid TempDir teardown failures. Skipped
+/// under root because the chmod injection has no effect.
 #[cfg(unix)]
 #[test]
 fn test_branch_set_upstream_surfaces_config_write_failure() {
@@ -388,7 +300,7 @@ fn test_branch_set_upstream_surfaces_config_write_failure() {
     assert_eq!(output.status.code(), Some(128));
     assert_eq!(report.error_code, "LBR-IO-002");
     assert!(
-        stderr.contains("failed to persist branch config 'branch.main.remote'"),
+        stderr.contains("operation storage failed"),
         "unexpected stderr: {stderr}"
     );
 }

@@ -4231,8 +4231,8 @@ fn concurrent_control_slots_are_held_per_worktree() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let rows = match sqlite_query_no_wait(
             &db,
-            "SELECT worktree_id FROM legacy_operation WHERE status = 'running' \
-             AND control_slot IS NOT NULL ORDER BY worktree_id",
+            "SELECT op_id FROM operation WHERE status = 'running' \
+             AND command_name = 'rebase' ORDER BY op_id",
         ) {
             Ok(rows) => rows,
             Err(err) => {
@@ -9497,14 +9497,8 @@ fn a_converged_bisect_still_blocks_a_sequence_until_reset() {
 /// SAME control action with the same arguments inside the five-second window
 /// are two legitimate operations, and neither is refused as a duplicate.
 ///
-/// **What this half can and cannot prove.** Sequencer control actions do not
-/// enter `with_operation_log` today, so nothing here reaches the dedup query;
-/// this is the end-to-end INVARIANT — the criterion holds for a user now, and
-/// keeps holding the day the controls are wrapped. The teeth are at the
-/// wrapper seam, where the key actually lives:
-/// `operation_wrapper_test::the_same_action_in_another_worktree_is_not_a_duplicate`
-/// seeds another worktree's identical success and requires this scope's
-/// submission to be accepted, and it fails if the key loses `worktree_id`.
+/// The unified v2 boundary records each physical worktree's running operation,
+/// so identical control actions remain independent while both callbacks hold.
 #[test]
 fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
     let repo = repo_with_feature();

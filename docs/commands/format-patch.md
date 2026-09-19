@@ -25,6 +25,9 @@ commits, the command exits with an error, except that
 
 ## Options
 
+The `format-patch` options below control the generated mail headers, patch
+body, and series metadata.
+
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
 | `[revision-range]` | | `A..B` range or single commit; single commit means `<commit>..HEAD` | `HEAD` |

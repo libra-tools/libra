@@ -581,39 +581,18 @@ async fn current_branch_for_pull() -> Result<String, PullError> {
     })
 }
 
-/// Whether this `pull` will REBASE, resolved exactly as the command itself
-/// resolves it — flags first, then `branch.<name>.rebase`, then `pull.rebase`.
-///
-/// Dispatch needs the answer BEFORE the handler runs, because a pull that
-/// rebases must hold the worktree's sequencer control slot across the whole
-/// command: the fetch and a possible autostash happen before the rebase
-/// begins, and starting them beside another worktree-local sequence is how a
-/// pull ends up rebasing on top of someone else's half-finished work. A
-/// configured `pull.rebase = true` makes a bare `libra pull` such a command,
-/// so keying the slot on the `--rebase` FLAG would miss it.
-///
-/// Errors are answered `false`: a pull that cannot resolve its own branch or
-/// config is about to fail in the handler with a better message, and taking a
-/// control slot for it would only change which error the user sees.
-/// The pull's RESOLVED integration mode, for dispatch (W2 r8 #4):
-/// `Some(true)` = rebase, `Some(false)` = merge, `None` = the pull cannot
-/// resolve a mode at all — a detached HEAD or unreadable config is about to
-/// be refused by the handler, and claiming a sequencer control slot for it
-/// would persist a failed control operation for a command that never touched
-/// the sequencer.
+#[cfg(test)]
 pub(crate) async fn resolved_pull_mode(args: &PullArgs) -> Option<bool> {
-    // The branch is resolved FIRST, even for an explicit `--rebase`: on a
-    // detached HEAD the handler refuses the pull outright.
     let Ok(branch) = current_branch_for_pull().await else {
         return None;
     };
     if args.rebase {
         return Some(true);
     }
-    match resolve_effective_pull_options(args, &branch).await {
-        Ok(options) => Some(options.rebase),
-        Err(_) => None,
-    }
+    resolve_effective_pull_options(args, &branch)
+        .await
+        .ok()
+        .map(|options| options.rebase)
 }
 
 async fn resolve_effective_pull_options(

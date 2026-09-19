@@ -255,12 +255,23 @@ mod supported {
             }
             for ancestor in self.parent.ancestors().skip(1) {
                 let info = metadata(ancestor)?;
-                let trusted_owner = info.uid() == 0 || info.uid() == self.uid;
-                // Sticky roots such as /tmp cannot have this user's private
-                // child renamed by a different unprivileged owner.
+                // The filesystem root is a mount boundary and cannot be
+                // replaced by renaming an unprivileged directory. Some
+                // user namespaces expose it with a synthetic owner instead
+                // of uid 0, so ownership is not meaningful for this one
+                // immutable ancestor; every ordinary non-sticky ancestor
+                // remains current-user- or root-owned below.
+                let is_filesystem_root = ancestor.parent().is_none();
                 // MetadataExt::mode is u32 even where libc::mode_t is u16
                 // (macOS). Use the portable Unix sticky permission bit.
-                let safe_mode = info.mode() & 0o022 == 0 || info.mode() & 0o1000 != 0;
+                let sticky = info.mode() & 0o1000 != 0;
+                // A sticky directory protects the private child from rename
+                // or removal by another unprivileged owner, even when a
+                // user-namespace gives the directory a synthetic UID (as it
+                // commonly does for /tmp).
+                let trusted_owner =
+                    is_filesystem_root || info.uid() == 0 || info.uid() == self.uid || sticky;
+                let safe_mode = info.mode() & 0o022 == 0 || sticky;
                 if !info.is_dir() || !trusted_owner || !safe_mode {
                     return Err(refused(
                         "repair target has an unsafe ancestor directory; use private local storage",

@@ -253,13 +253,63 @@ impl ChangeStore {
             .collect()
     }
 
+    /// Return a bounded repository-wide revision projection for read-only
+    /// consumers such as the Code UI operation graph.
+    pub async fn revisions_for_repo(
+        &self,
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChangeRevision>, ChangeStoreError> {
+        let rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT r.change_id, r.commit_oid, r.created_op_id, r.visibility, \
+                 r.revision_ordinal FROM change_revision r \
+                 JOIN change_identity i ON i.change_id = r.change_id \
+                 WHERE i.repo_id = ? ORDER BY r.revision_ordinal DESC, r.commit_oid DESC LIMIT ?",
+                [
+                    repo_id.to_string().into(),
+                    (limit.clamp(1, 200) as i64).into(),
+                ],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let id = row.try_get::<String>("", "change_id")?;
+                Ok(ChangeRevision {
+                    change_id: id
+                        .parse()
+                        .map_err(|_| ChangeStoreError::InvalidChangeId(id.clone()))?,
+                    commit_oid: row.try_get("", "commit_oid")?,
+                    created_op_id: row.try_get("", "created_op_id")?,
+                    visibility: match row.try_get::<String>("", "visibility")?.as_str() {
+                        "visible" => RevisionVisibility::Visible,
+                        "hidden" => RevisionVisibility::Hidden,
+                        value => return Err(ChangeStoreError::InvalidChangeId(value.to_string())),
+                    },
+                    revision_ordinal: row.try_get("", "revision_ordinal")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn change_id_for_commit(
         &self,
         repo_id: &str,
         commit_oid: &str,
     ) -> Result<Option<ChangeId>, ChangeStoreError> {
-        let row = self
-            .db
+        self.change_id_for_commit_on(&self.db, repo_id, commit_oid)
+            .await
+    }
+
+    pub(crate) async fn change_id_for_commit_on<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        repo_id: &str,
+        commit_oid: &str,
+    ) -> Result<Option<ChangeId>, ChangeStoreError> {
+        let row = db
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "SELECT r.change_id FROM change_revision r \

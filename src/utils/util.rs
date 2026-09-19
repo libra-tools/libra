@@ -173,9 +173,7 @@ pub fn cur_dir() -> PathBuf {
 ///   directory (the override is an isolation hook, not a storage policy).
 pub fn is_global_libra_home(path: &Path) -> bool {
     let path = canonicalize_deepest_existing(path).unwrap_or_else(|_| path.to_path_buf());
-    let canonical = |home: PathBuf| {
-        canonicalize_deepest_existing(&home).unwrap_or(home)
-    };
+    let canonical = |home: PathBuf| canonicalize_deepest_existing(&home).unwrap_or(home);
     let home = crate::internal::upgrade::home::resolve_libra_home()
         .ok()
         .map(canonical);

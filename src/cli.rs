@@ -1901,7 +1901,9 @@ fn command_mutates_worktree_state(command: &Commands) -> bool {
 /// mutation classes. `command_scope` remains the authority for coverage: a
 /// newly added `Commands` variant must still be classified there before this
 /// adapter can compile and run.
-fn operation_class_for_command(command: &Commands) -> crate::internal::operation::MutationClass {
+async fn operation_class_for_command(
+    command: &Commands,
+) -> crate::internal::operation::MutationClass {
     use crate::internal::operation::MutationClass;
     // Global repair owns its SQLite boundary and never acquires Repository
     // resources. Keep the repository-scope census read-only, but classify its
@@ -1917,6 +1919,9 @@ fn operation_class_for_command(command: &Commands) -> crate::internal::operation
         command,
         Commands::Commit(args) if args.dry_run || args.porcelain
     ) {
+        return MutationClass::ReadOnly;
+    }
+    if matches!(command, Commands::Merge(args) if args.dry_run) {
         return MutationClass::ReadOnly;
     }
     if matches!(command_scope(command), CommandScope::ReadOnly) {
@@ -1945,6 +1950,9 @@ fn operation_class_for_command(command: &Commands) -> crate::internal::operation
     }
     match command {
         Commands::Config(args) if config_command_is_read_only(args) => MutationClass::ReadOnly,
+        Commands::Branch(args) if command::branch::set_upstream_is_idempotent(args).await => {
+            MutationClass::ReadOnly
+        }
         Commands::Agent(args) if agent_command_is_read_only(args) => MutationClass::ReadOnly,
         Commands::Merge(_)
         | Commands::Rebase(_)
@@ -1979,24 +1987,15 @@ fn operation_class_for_command(command: &Commands) -> crate::internal::operation
 }
 
 /// Commands with a pre-existing operation boundary must not be wrapped a
-/// second time by the CLI adapter.  The legacy wrapper is intentionally kept
-/// for OL-15 compatibility, while the Agent gateway owns its own boundary;
-/// nesting either wrapper would take two leases and can deadlock a command
-/// that legitimately invokes another Libra operation.
+/// second time by the CLI adapter. The Agent gateway and these command-owned
+/// paths already own their operation transaction; nesting a boundary would
+/// take two leases and can deadlock a command that invokes another operation.
 fn command_has_existing_operation_boundary(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Branch(_)
-            | Commands::Op(_)
+        Commands::Op(_)
             | Commands::Config(_)
-            | Commands::Worktree(_)
             | Commands::ReadTree(_)
-            | Commands::Merge(_)
-            | Commands::Rebase(_)
-            | Commands::CherryPick(_)
-            | Commands::Revert(_)
-            | Commands::Am(_)
-            | Commands::Bisect(_)
             | Commands::Repack(_)
             | Commands::Maintenance(_)
             | Commands::File(_)
@@ -2006,7 +2005,98 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
+    ) || matches!(
+        command,
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command: command::worktree::WorktreeSubcommand::Remove {
+                delete_dir: true,
+                ..
+            },
+        })
     )
+}
+
+/// Build metadata for commands that use the central v2 operation boundary.
+/// Descriptions remain semantic and redacted: arbitrary argv is not persisted
+/// because option values can contain paths or other user data.
+async fn operation_metadata_for_command(
+    command: &Commands,
+    utf8_argv: &[String],
+) -> crate::internal::operation::OperationMetaV2 {
+    let command_name = if matches!(command, Commands::Stash(Stash::Pop { .. })) {
+        "stash pop".to_string()
+    } else {
+        utf8_argv
+            .iter()
+            .skip(1)
+            .find(|argument| !argument.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let description = match command {
+        Commands::Branch(args) => {
+            if let Some(name) = &args.new_branch {
+                format!("create branch {name}")
+            } else if let Some(name) = &args.delete {
+                format!("delete branch {name}")
+            } else if let Some(name) = &args.delete_safe {
+                format!("delete branch {name}")
+            } else if !args.rename.is_empty() {
+                format!("rename branch {}", args.rename.join(" -> "))
+            } else if !args.copy.is_empty() {
+                format!("copy branch {}", args.copy.join(" -> "))
+            } else if !args.copy_force.is_empty() {
+                format!("copy branch {}", args.copy_force.join(" -> "))
+            } else if let Some(command::branch::BranchSubcommand::Reset(reset)) = &args.subcommand {
+                format!("reset branch {}", reset.branch)
+            } else {
+                format!("{command_name} mutation")
+            }
+        }
+        Commands::Stash(Stash::Pop { .. }) => "stash pop mutation".to_string(),
+        _ => format!("{command_name} mutation"),
+    };
+    crate::internal::operation::OperationMetaV2 {
+        command_name: Some(command_name),
+        description: Some(description),
+        actor: Some(operation_actor_for_metadata().await),
+        ..Default::default()
+    }
+}
+
+/// Resolve the configured actor without making a metadata lookup failure hide
+/// the command result. The fallback is stable and contains no host identity.
+async fn operation_actor_for_metadata() -> String {
+    let has_repository = match crate::internal::worktree_scope::RequestScope::try_resolve(
+        utils::util::cur_dir(),
+    ) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(error = %error, "operation actor scope lookup failed; using fallback");
+            false
+        }
+    };
+    if !has_repository {
+        return env::var("LIBRA_ACTOR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "libra-user".to_string());
+    }
+    match ConfigKv::get("user.name").await {
+        Ok(Some(entry)) if !entry.value.trim().is_empty() => entry.value,
+        Ok(_) => env::var("LIBRA_ACTOR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "libra-user".to_string()),
+        Err(error) => {
+            tracing::debug!(error = %error, "operation actor config lookup failed; using fallback");
+            env::var("LIBRA_ACTOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "libra-user".to_string())
+        }
+    }
 }
 
 fn config_command_is_read_only(args: &command::config::ConfigArgs) -> bool {
@@ -2332,6 +2422,7 @@ fn global_config_schema_future_error(
 /// or `rebase` invocation that is not a control action in this sense — a fresh
 /// `cherry-pick <commit>` IS one (`Start`), because it can leave a sequence
 /// behind.
+#[cfg(test)]
 async fn sequencer_control_for(
     command: &Commands,
 ) -> Option<crate::internal::sequencer::SequencerControl> {
@@ -2921,9 +3012,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // is owned by the command/Agent boundary; keeping this call at the
     // central parse seam prevents a new surface from bypassing classification.
     let schema_doctor = matches!(&args.command, Commands::Config(cfg) if command::config::is_schema_doctor_request(cfg));
-    let operation_class = operation_class_for_command(&args.command);
+    let operation_class = operation_class_for_command(&args.command).await;
     let use_central_operation_boundary = !command_has_existing_operation_boundary(&args.command);
-    let is_stash_pop = matches!(&args.command, Commands::Stash(Stash::Pop { .. }));
     // Read-only commands must not charge their census diagnostic to the
     // active logfile; `logfile info` reports rolled-file sizes exactly.
     if !matches!(
@@ -3116,25 +3206,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         background_index_scope,
     );
 
-    // §C.9 / §C.11 W1: sequencer control actions enter the operation log
-    // through BOUNDARY recording. The claim is taken here, once, before the
-    // handler runs — and released after it returns — because the wrapper's
-    // closure form holds a write transaction for the whole body, and every
-    // control action writes HEAD/refs through the POOLED entry points, which
-    // `internal/head.rs:41` and `internal/branch.rs:298` document as a
-    // deadlock. Doing it at dispatch also means one site covers every control
-    // rather than twenty call sites drifting apart.
-    let control_boundary = match sequencer_control_for(&args.command).await {
-        Some(control) => {
-            crate::internal::sequencer::begin_control_operation(
-                control,
-                &utf8_argv,
-                use_central_operation_boundary,
-            )
-            .await?
-        }
-        None => None,
-    };
+    if use_central_operation_boundary && let Commands::Merge(merge_args) = &args.command {
+        command::merge::preflight_before_operation_boundary(merge_args, &output).await?;
+    }
 
     let remote_prune_name = match &args.command {
         Commands::Remote(command::remote::RemoteCmds::Prune {
@@ -3143,9 +3217,16 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         }) => Some(name.clone()),
         _ => None,
     };
-    let control_operation_id = control_boundary
-        .as_ref()
-        .map(|boundary| boundary.op_id().to_string());
+    let central_operation_meta = if use_central_operation_boundary
+        && !matches!(
+            operation_class,
+            crate::internal::operation::MutationClass::ReadOnly
+                | crate::internal::operation::MutationClass::InternalWorker
+        ) {
+        Some(operation_metadata_for_command(&args.command, &utf8_argv).await)
+    } else {
+        None
+    };
     let command_future = async {
         match args.command {
             Commands::Init(cmd_args) => {
@@ -3403,21 +3484,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         )
         && use_central_operation_boundary
     {
-        let command_name = if is_stash_pop {
-            "stash pop".to_string()
-        } else {
-            utf8_argv
-                .iter()
-                .skip(1)
-                .find(|argument| !argument.starts_with('-'))
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string())
-        };
-        let meta = crate::internal::operation::OperationMetaV2 {
-            command_name: Some(command_name),
-            description: Some("CLI mutation".to_string()),
-            ..Default::default()
-        };
+        let meta = central_operation_meta
+            .ok_or_else(|| CliError::fatal("internal error: missing central operation metadata"))?;
         let outcome = crate::internal::operation::run_with_operation(
             &scope,
             meta,
@@ -3435,40 +3503,11 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Err(error) => Err(operation_error_to_cli(error, remote_prune_name.as_deref())),
         }
     } else {
-        match control_operation_id {
-            Some(operation_id) => {
-                let future =
-                    crate::internal::operation::with_operation_id(operation_id, command_future);
-                if let Some(boundary) = control_boundary.as_ref() {
-                    boundary.run_with_repository_ref_lease(future).await
-                } else {
-                    future.await
-                }
-            }
-            None => command_future.await,
-        }
+        command_future.await
     };
 
     background_index_guard.finish().await;
 
-    // Close the control-action claim BEFORE propagating the command's own
-    // error, so a failed control still records an operation with its outcome
-    // instead of leaving a `running` row behind. A failure to close is
-    // reported as a warning: the command already happened, and turning a
-    // bookkeeping error into a command failure would misreport it.
-    if let Some(boundary) = control_boundary {
-        let outcome = if command_result.is_ok() {
-            crate::internal::operation_wrapper::BoundaryOutcome::Succeeded
-        } else {
-            crate::internal::operation_wrapper::BoundaryOutcome::Failed
-        };
-        if let Err(err) = boundary.finish(outcome).await {
-            // Post-envelope: see emit_post_envelope_warning.
-            crate::utils::error::emit_post_envelope_warning(format!(
-                "the command finished, but its operation-log record could not be closed: {err}"
-            ));
-        }
-    }
     command_result?;
 
     // Check only after the queue outcome has been recorded, so

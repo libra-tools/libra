@@ -3864,11 +3864,12 @@ async fn run_sandboxed_rebase_exec(
         ..Default::default()
     };
     // Rebase --exec may invoke Libra again inside this operation. Its parent
-    // still owns the repository ref lease, so descendants inherit this marker
-    // and avoid waiting on the lease held by their own parent.
+    // still owns the operation boundary leases, so descendants inherit these
+    // markers and avoid waiting on leases held by their own parent.
     let command = format!(
-        "export {}=1; {command}",
+        "export {}=1; export {}=1; {command}",
         crate::internal::operation::middleware::REPOSITORY_REF_LEASE_HELD_ENV,
+        crate::internal::operation::middleware::OPERATION_SCOPE_LEASE_HELD_ENV,
     );
     run_shell_command(
         &command,

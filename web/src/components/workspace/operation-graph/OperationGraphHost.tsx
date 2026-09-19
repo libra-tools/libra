@@ -39,8 +39,7 @@ export function OperationGraphHost({ query }: OperationGraphHostProps) {
         if (cancelled) return;
         const status = (thrown as { status?: number }).status;
         if (status === 404) {
-          // The backend read-model route is not registered yet: empty state.
-          setView(null);
+          setError("operation graph route unavailable");
           return;
         }
         const message = (thrown as { message?: string }).message;

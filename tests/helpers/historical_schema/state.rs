@@ -167,7 +167,7 @@ pub(crate) async fn assert_current(conn: &DatabaseConnection) {
             .contains(&"workspace_id".to_string()),
         "the pending capture-scope migration must actually apply"
     );
-    for table in ["legacy_operation", "operation_head", "operation_journal"] {
+    for table in ["operation_head", "operation_journal"] {
         assert!(
             !columns(conn, table).await.is_empty(),
             "current schema must contain {table}"

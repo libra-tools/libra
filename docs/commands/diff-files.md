@@ -16,12 +16,16 @@ changes (index vs working tree). Path limiters go after `--`; as Git plumbing it
 ignores porcelain `diff.renames`. Global output flags such as
 `libra --json diff-files` still apply.
 
+The unsupported porcelain flag surface is intentional; use the shared
+`libra diff` command for the documented patch and status options.
+
 ## Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
 | `-- <path>...` | Limit the diff to paths. | `libra diff-files -- src/` |
 | `--json` / `--machine` | Structured diff output. | `libra --json diff-files` |
+| porcelain flag surface | Intentionally limited; use `libra diff` for the documented patch and status options. | `libra diff --no-patch` |
 
 ## Exit codes
 

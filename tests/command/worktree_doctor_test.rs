@@ -1128,26 +1128,32 @@ fn worktree_dir_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// The repository's operation rows, newest first, read through the public
-/// operation service (the same API `libra op log` paginates).
+/// The repository's Operation v2 rows, newest first.
 #[cfg(unix)]
-async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::OperationLogListItem> {
-    use libra::internal::operation::{OperationQueryPage, OperationService};
-
+async fn operation_rows(repo: &Path) -> Vec<(String, String, String)> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     let conn = repo_db(repo).await;
     let repo_id = repo_identity(&conn).await;
-    let page = OperationService::list_operations_by_repo_paginated_with_conn(
-        &conn,
-        &repo_id,
-        OperationQueryPage {
-            page: 1,
-            per_page: 200,
-        },
-    )
-    .await
-    .expect("list operation rows");
-    let mut rows = page.items;
-    rows.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+    let mut rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT op_id, command_name, status FROM operation \
+             WHERE repo_id = ? ORDER BY start_ts, op_id",
+            [repo_id.into()],
+        ))
+        .await
+        .expect("list operation rows")
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sea_orm::DbErr>((
+                row.try_get::<String>("", "op_id")?,
+                row.try_get::<String>("", "command_name")?,
+                row.try_get::<String>("", "status")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode operation rows");
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
     rows
 }
 
@@ -1168,8 +1174,6 @@ async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::Operatio
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
 async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
-    use libra::internal::operation::OperationStatus;
-
     enum RepairAction {
         IdentityPath,
         RegistryAll,
@@ -1400,33 +1404,12 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
         );
         let new_rows: Vec<_> = operations_after
             .iter()
-            .filter(|after| {
-                !operations_before
-                    .iter()
-                    .any(|before| before.op_id == after.op_id)
-            })
+            .filter(|after| !operations_before.iter().any(|before| before.0 == after.0))
             .collect();
         assert_eq!(new_rows.len(), 1, "{command_name}: the audit row is unique");
         let audit = new_rows[0];
-        assert_eq!(
-            audit.command_name, command_name,
-            "the audit row names the action"
-        );
-        assert_eq!(
-            audit.status,
-            OperationStatus::Succeeded,
-            "the audit row records the outcome"
-        );
-        assert!(
-            audit.description.contains(command_name),
-            "the audit row describes the action: {}",
-            audit.description
-        );
-        assert!(!audit.actor.is_empty(), "the audit row names an actor");
-        assert!(
-            audit.end_ts.is_some(),
-            "the audit row is finished, not left running"
-        );
+        assert_eq!(audit.1, "worktree", "the v2 audit row names the command");
+        assert_eq!(audit.2, "success", "the audit row records the outcome");
 
         // Only the target scope changed.
         assert_eq!(

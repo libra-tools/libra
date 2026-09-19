@@ -27,6 +27,34 @@ filter = 'binary(=e2e_mcp_flow) & (test(=test_e2e_mcp_flow) | test(=test_web_onl
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }
 
 [[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_approval_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_generation_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_lease_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_model_generation_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_security_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_sse_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
+filter = 'binary(=code_ui_remote_state_matrix)'
+test-group = 'external'
+
+[[profile.default.overrides]]
 filter = 'test(/(^|::)cloud_full_workflow_end_to_end$/)'
 test-group = 'external'
 

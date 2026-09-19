@@ -54,20 +54,22 @@ Opening an older repository or global config database automatically recreates a 
 legacy `config` table without changing existing configuration. The ignored home
 `libra.db` artifact is left untouched; commands no longer open it as a repository.
 
-### Operation-v2 convergence (current branch, unreleased)
+### Operation-v2 convergence (current branch)
 
-The `2026090801` convergence migration is implemented in this unreleased branch
+The `2026090801` convergence migration is implemented on the feature branch
 and has passed focused migration validation, including a controlled old-binary
-repository upgrade. Full integration and release acceptance remain pending.
+repository upgrade. This plan does not include a version bump or release.
 
 - The forward-only `2026090801` migration must retain the original
   `2026090101` (`operation_v2`) and `2026090601` (`legacy_config_table`, #472)
   migration receipts, including existing receipt timestamps. A #472 repository
   with v1 operations needs the missing operation-v2 migration, not just a newer
   maximum version number.
-- Existing v1 operation data must remain in the `legacy_operation*` namespace.
-  Existing `config` and `config_kv` values and the #472 missing-table repair must
-  be preserved; convergence is not permission to delete legacy data.
+- The earlier convergence migration temporarily isolated v1 operation data in
+  the `legacy_operation*` namespace. After the v2 runtime cutover, migration
+  `2026091801` retires that namespace forward-only; historical migration tests
+  retain the old schema only as upgrade fixtures. Existing `config` and
+  `config_kv` values and the #472 missing-table repair remain preserved.
 - Once `2026090801` commits, a binary supporting schemas only through
   `2026090601` must refuse the newer repository schema before using incompatible
   operation tables. The package version string alone does not identify a
@@ -82,8 +84,8 @@ repository upgrade. Full integration and release acceptance remain pending.
   rollback does not restore the database; recovery needs the matching
   pre-upgrade backup and binary.
 
-See [operation capture limits](op.md#current-branch-capture-contract-unreleased)
-and the [convergence rationale](../development/commands/op.md#current-branch-convergence-contract-unreleased).
+See [operation capture limits](op.md#current-branch-capture-contract)
+and the [convergence rationale](../development/commands/op.md#current-branch-convergence-contract).
 
 ## Options
 

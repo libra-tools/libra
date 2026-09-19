@@ -329,26 +329,13 @@ pub async fn execute(stash_cmd: Stash) {
 /// apply, drop, show, branch, clear).
 pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<()> {
     // §C.10: finish any rollback an interrupted `stash branch` recorded.
-    if matches!(&stash_cmd, Stash::Pop { .. }) {
-        let _repository_ref_lease =
-            crate::internal::operation_wrapper::acquire_request_repository_ref_lease_wait(
-                "stash pop recovery",
-            )
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "cannot acquire repository ref lease before stash recovery: {error}"
-                ))
-                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-            })?;
-        recover_stash_branch_journal()
-            .await
-            .map_err(CliError::from)?;
-    } else {
-        recover_stash_branch_journal()
-            .await
-            .map_err(CliError::from)?;
-    }
+    // `libra cli` places stash mutations inside the v2 operation boundary,
+    // which owns the repository ref lease for the complete command. Recovery
+    // therefore runs under that same boundary instead of taking the retired
+    // v1 wrapper lease a second time.
+    recover_stash_branch_journal()
+        .await
+        .map_err(CliError::from)?;
 
     // W2 §C.4.3: the stash STACK (`refs/stash` + reflog) stays deliberately
     // repository-shared — a stash pushed in one worktree may be applied in
@@ -2250,10 +2237,6 @@ async fn do_drop_with_repository_ref_lease(
     // only for the stack lock and publication, so a later pop observes the
     // first one's raw-line removal and reports a CAS miss.
     hold_for_drop_rendezvous()?;
-    let _repository_ref_lease =
-        crate::internal::operation_wrapper::acquire_request_repository_ref_lease_wait("stash pop")
-            .await
-            .map_err(|error| StashError::Other(error.to_string()))?;
     do_drop_after_rendezvous(stash, expected_line)
 }
 

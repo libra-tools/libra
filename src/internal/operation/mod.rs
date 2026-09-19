@@ -12,19 +12,17 @@ pub mod undo;
 pub mod view;
 pub mod working_copy;
 
-// OL-15 removes this compatibility service. Re-exporting it keeps existing
-// command integrations source-compatible while all new code uses v2 types.
 pub use doctor::{DoctorEngine, DoctorError, DoctorIssue, DoctorReport};
 pub use facet::{
     FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
     FacetRestoreCtx, RestorePolicy, StateFacet,
 };
 pub use facets::{RawIndexFacet, SequencerFacet, SparseFacet, registry_for_scope};
+pub(crate) use middleware::current_operation_id;
 pub use middleware::{
     ClassificationError, MutationClass, OperationError, OperationFuture, OperationResult,
     OperationTxn, classify_command, run_with_operation,
 };
-pub(crate) use middleware::{current_operation_id, with_operation_id};
 pub use reconcile::{ReconcileEngine, ReconcileError, ReconcileOutcome, RefConflict};
 pub use restore::{
     RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, recover_restore_transactions,
@@ -39,5 +37,3 @@ pub use view::{
     CapturePolicy, Completeness, HeadState, RepoViewV2, WorkspaceId, WorkspaceSnapshotV2,
 };
 pub use working_copy::{PinnedRequestScope, PointerError, Staleness, WorkspaceStatePointer};
-
-pub use crate::internal::legacy_operation::*;

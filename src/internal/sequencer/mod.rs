@@ -57,6 +57,7 @@ impl SequenceKind {
 
     /// CLI spelling used in durable operation records. The storage token
     /// remains cherry_pick, while operation names follow the invoked command.
+    #[cfg(test)]
     fn command_name(self) -> &'static str {
         match self {
             SequenceKind::CherryPick => "cherry-pick",
@@ -464,219 +465,6 @@ async fn claim_fields(
         )),
         Err(err) => Err(format!("failed to claim sequence_state: {err}")),
     }
-}
-
-/// Open the operation-log boundary for one sequencer control action
-/// (§C.9, §C.11 W1).
-///
-/// The digest is the invocation's argv, which is what makes two worktrees
-/// running the identical `--continue` distinguishable only by scope — the
-/// case the scope-aware dedup key exists for. It also makes a repeated
-/// `--continue` in the SAME worktree, while the first is still running,
-/// refusable: the claim is a unique index, not a check.
-///
-/// Returns `None` when the repository has no operation log to write to (a
-/// command run outside a repository is refused long before this, but the
-/// helper must not turn a missing repo id into a control-action failure).
-pub(crate) async fn begin_control_operation(
-    control: SequencerControl,
-    argv: &[String],
-    repository_ref_lease_managed_by_command_boundary: bool,
-) -> CliResult<Option<crate::internal::operation_wrapper::OperationBoundary>> {
-    use crate::internal::operation_wrapper::{
-        OperationMeta, OperationScope, begin_sequencer_control_operation,
-    };
-
-    // The enumeration is the authority on what a control action IS: anything
-    // entering the operation log must be one of the declared ones, or the
-    // §C.9 list has drifted from the code it describes.
-    debug_assert!(
-        SequencerControl::ALL.contains(&control),
-        "undeclared sequencer control entered the operation log: {control:?}"
-    );
-    let (command_name, description) = control.describe_operation();
-    // Fail CLOSED: without an identity there is no boundary, and without a
-    // boundary there is no worktree-wide control mutex.
-    let repo_id = control_repo_id().await.map_err(|message| {
-        CliError::fatal(message).with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-    let meta = OperationMeta {
-        command_name,
-        description,
-        actor: control_actor().await,
-        repo_id,
-        args_digest: Some(control_args_digest(argv, &control_position(control).await)),
-    };
-    // A boundary-recorded operation is never restorable, so snapshotting every
-    // branch and workspace pointer would write rows nothing can ever read —
-    // per control action, on the hot path of a `bisect` that marks dozens of
-    // candidates. Record the head pointer, which is what `op log`/`op show`
-    // display, and nothing else (§C.14).
-    let scope = OperationScope {
-        include_refs: false,
-        include_workspace: false,
-        // No control action is subject to the five-second succeeded-window.
-        //
-        // The window guesses that an identical command repeated within five
-        // seconds is an accidental double submission. That guess does not hold
-        // for a sequence, in either direction, and the suite proves both:
-        //
-        //   * a RESUMPTION legitimately repeats at an unchanged position —
-        //     `test_rebase_empty_drop_survives_conflict_resume` drives two
-        //     `rebase --continue` calls where the first dropped an empty
-        //     commit, so the position never moved;
-        //   * a fresh START legitimately repeats too —
-        //     `readded_worktree_does_not_inherit_bisect_session` removes and
-        //     re-adds a worktree and starts the same bisect again, and
-        //     `bisect reset` followed by `bisect start <same args>` is simply
-        //     how a user starts over.
-        //
-        // Nothing is lost by dropping it: a genuine double start is refused by
-        // the start-time mutex and the atomic claim, with a message that says
-        // what is actually wrong ("a bisect is already in progress") instead of
-        // "duplicate operation". Overlap is excluded by the worktree-wide
-        // control slot, which is a real mutex rather than a heuristic.
-        duplicate_window: false,
-        ..OperationScope::default()
-    };
-    match begin_sequencer_control_operation(meta, scope).await {
-        Ok(mut boundary) => {
-            if !repository_ref_lease_managed_by_command_boundary
-                && control.mutation_scope().repository_refs
-                && let Err(err) = boundary.acquire_repository_ref_lease_after_claim().await
-            {
-                let _ = boundary
-                    .finish(crate::internal::operation_wrapper::BoundaryOutcome::Failed)
-                    .await;
-                return Err(
-                    CliError::fatal(format!("cannot start this operation: {err}"))
-                        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                        .with_hint(
-                            "another repository ref update is running; wait for it to finish, then retry",
-                        ),
-                );
-            }
-            Ok(Some(boundary))
-        }
-        Err(err) => Err(
-            CliError::fatal(format!("cannot start this operation: {err}"))
-                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                .with_hint(
-                    "another identical command is running or just completed in this worktree; \
-             wait for it to finish, or inspect it with `libra op log`",
-                ),
-        ),
-    }
-}
-
-/// SHA-256 over the invocation's argv AND the sequence position it acts on,
-/// NUL-separated so no two payloads can collide by concatenation.
-///
-/// The position is what keeps duplicate suppression honest. `libra bisect
-/// good` twice in a row is the NORMAL way to drive a bisect, and the two
-/// invocations have byte-identical argv — without the position, the second
-/// would land inside the five-second succeeded-window and be refused as a
-/// repeat of the first. Two runs that act on the SAME position really are the
-/// same operation; two that act on different ones are not.
-fn control_args_digest(argv: &[String], position: &str) -> String {
-    let payload = format!("{}\0@{position}", argv.join("\0"));
-    let digest = ring::digest::digest(&ring::digest::SHA256, payload.as_bytes());
-    format!("sha256:{}", hex::encode(digest.as_ref()))
-}
-
-/// Where this worktree's sequence currently stands, as the dedup identity sees
-/// it: the commit a sequence stopped on, or the bisect candidate checked out.
-/// `"none"` when nothing is in progress — which is right for a start, where
-/// two racers genuinely ARE the same operation.
-async fn control_position(control: SequencerControl) -> String {
-    // The position is a log label now that no control enters thefive-second
-    // window, so a read that races the slot cannot affect exclusion.
-    if control.is_fresh_start() {
-        return "none".to_string();
-    }
-    let position = match control {
-        SequencerControl::BisectStart
-        | SequencerControl::BisectMark
-        | SequencerControl::BisectSkip
-        | SequencerControl::BisectReset
-        | SequencerControl::BisectRun => scoped_bisect_position().await,
-        _ => load_stored()
-            .await
-            .ok()
-            .flatten()
-            .map(|stored| stored.current_oid),
-    };
-    position
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-/// The candidate this worktree's bisect currently has checked out.
-async fn scoped_bisect_position() -> Option<String> {
-    let Ok(db) = request_db_checked().await else {
-        // The position is a LOG LABEL, not an exclusion key (§C.9): the control
-        // slot is what excludes. A database we cannot open is reported by the
-        // command's own path a moment later with actionable context, so this
-        // must not abort — it just has no position to record.
-        return None;
-    };
-    let scope_key = current_scope_key();
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT current FROM bisect_state WHERE worktree_id = ? LIMIT 1",
-            [scope_key.into()],
-        ))
-        .await
-        .ok()??;
-    row.try_get_by_index::<Option<String>>(0).ok()?
-}
-
-async fn control_actor() -> String {
-    crate::internal::config::ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "libra-user".to_string())
-}
-
-/// The repository id, WITHOUT creating one: a control action must not be the
-/// thing that first writes `libra.repoid`.
-///
-/// Read through the REQUEST-BOUND connection (§C.4.2) and fallible: the ambient
-/// `ConfigKv::get` opens the cwd's database and aborts if it cannot, and an
-/// absent or unreadable identity used to mean "no boundary" — which silently
-/// dropped the worktree-wide control mutex, letting a concurrent `--continue`
-/// and `--abort` run together.
-async fn control_repo_id() -> Result<String, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-
-    let db = request_db_checked().await?;
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT `value` FROM `config_kv` WHERE `key` = 'libra.repoid' \
-             ORDER BY `id` DESC LIMIT 1",
-            [],
-        ))
-        .await
-        .map_err(|error| format!("cannot read this repository's identity: {error}"))?;
-    let value: Option<String> = match row {
-        Some(row) => row
-            .try_get_by_index(0)
-            .map_err(|error| format!("this repository's identity is unreadable: {error}"))?,
-        None => None,
-    };
-    value
-        .filter(|value| !value.trim().is_empty() && value != "unknown-repo")
-        .ok_or_else(|| {
-            "this repository has no recorded identity (`libra.repoid`), so a sequencer control \
-             action cannot claim its worktree's control slot — run `libra status` once to \
-             record one, or `libra worktree doctor` to inspect the repository"
-                .to_string()
-        })
 }
 
 /// Whether a database error is the PRIMARY KEY/UNIQUE violation that means
@@ -1534,6 +1322,7 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
 // listed here — rather than derived later from whatever the commands happen to
 // do — precisely so that guard has something authoritative to check against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum SequencerControl {
     Start(SequenceKind),
     Continue(SequenceKind),
@@ -1563,6 +1352,7 @@ pub(crate) enum SequencerControl {
 
 /// What a control action mutates (§C.9 / §C.4.1.1 inventory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct ControlMutationScope {
     /// THIS worktree's HEAD, index or working files.
     pub(crate) worktree_state: bool,
@@ -1572,6 +1362,7 @@ pub(crate) struct ControlMutationScope {
     pub(crate) sequencer_state: bool,
 }
 
+#[cfg(test)]
 impl SequencerControl {
     pub(crate) fn mutation_scope(self) -> ControlMutationScope {
         match self {
@@ -1622,19 +1413,6 @@ impl SequencerControl {
                 sequencer_state: true,
             },
         }
-    }
-
-    /// Whether this control BEGINS a sequence, as opposed to driving or
-    /// ending one already in progress.
-    ///
-    /// `bisect run` is NOT one: it requires an existing session and drives it,
-    /// so re-running a script the user just fixed is a continuation and must
-    /// not be refused as a repeat.
-    pub(crate) fn is_fresh_start(self) -> bool {
-        matches!(
-            self,
-            SequencerControl::Start(_) | SequencerControl::AmStart | SequencerControl::BisectStart
-        )
     }
 
     /// The operation-log identity of this control: the command name recorded
@@ -1847,47 +1625,16 @@ impl WorktreeControl {
 /// continue/abort/skip, so the in-progress op can still be concluded. The
 /// error names the blocking op and how to conclude or abort it.
 pub async fn ensure_none_in_progress(next: SequenceKind) -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::Start(next)).await
-}
-
-/// The mutex, entered by a DECLARED control action (§C.9).
-///
-/// Only controls whose declared `mutation_scope` includes `sequencer_state`
-/// are subject to it — that declaration is what makes an action a sequencer
-/// control rather than an ordinary command, and reading it here keeps the
-/// enumeration honest instead of decorative.
-pub(crate) async fn ensure_none_for_control(control: SequencerControl) -> CliResult<()> {
-    debug_assert!(
-        control.mutation_scope().sequencer_state,
-        "only sequencer-state controls enter the mutex: {control:?}"
-    );
-    let next = match control {
-        SequencerControl::Start(kind)
-        | SequencerControl::Continue(kind)
-        | SequencerControl::Skip(kind)
-        | SequencerControl::Abort(kind)
-        | SequencerControl::Quit(kind)
-        | SequencerControl::Restart(kind) => ActiveSequenceKind::Known(kind),
-        SequencerControl::AmStart
-        | SequencerControl::AmContinue
-        | SequencerControl::AmSkip
-        | SequencerControl::AmAbort => ActiveSequenceKind::Am,
-        SequencerControl::BisectStart
-        | SequencerControl::BisectMark
-        | SequencerControl::BisectSkip
-        | SequencerControl::BisectReset
-        | SequencerControl::BisectRun => ActiveSequenceKind::Bisect,
-    };
-    ensure_none_for(next).await
+    ensure_none_for(ActiveSequenceKind::Known(next)).await
 }
 
 pub(crate) async fn ensure_none_for_am() -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::AmStart).await
+    ensure_none_for(ActiveSequenceKind::Am).await
 }
 
 /// The bisect side of the symmetric mutex (§C.4.4).
 pub(crate) async fn ensure_none_for_bisect() -> CliResult<()> {
-    ensure_none_for_control(SequencerControl::BisectStart).await
+    ensure_none_for(ActiveSequenceKind::Bisect).await
 }
 
 async fn ensure_none_for(next: ActiveSequenceKind) -> CliResult<()> {

@@ -172,8 +172,6 @@ test_blame_regex_line_range	lane:cwd+env+hash_kind	fail-closed body (TA-01 globa
 test_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_all_shows_unborn_head_even_with_remote_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_contains_commit_filter	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_branch_create_mints_missing_repo_id_before_operation_log	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_branch_create_records_operation_log	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_create_track_modes_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_create_without_base_surfaces_corrupt_head_storage	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_delete_safe	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -825,3 +823,65 @@ worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the proc
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 branch_vv_counts_upstream_shapes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+<site:tests/code_ui_remote_approval_matrix.rs:macro:approval_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_generation_matrix.rs:macro:generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_lease_matrix.rs:macro:lease_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_model_generation_matrix.rs:macro:model_generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_security_matrix.rs:macro:security_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_sse_matrix.rs:macro:sse_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+<site:tests/code_ui_remote_state_matrix.rs:macro:state_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
+basic_chat_submit_updates_transcript	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_attach_rejected_when_control_disabled	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_cancel_turn_aborts_in_flight_turn_without_automation_token	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_expired_controller_token_is_rejected_and_releases_snapshot	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_oversized_message_returns_payload_too_large	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_same_client_reconnect_renews_existing_lease	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_static_app_loads_and_submit_updates_snapshot	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_unknown_interaction_id_is_rejected_without_state_change	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+browser_write_appends_redacted_control_audit	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+cancel_running_turn_returns_session_to_idle	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+code_session_sigterm_exits_and_releases_ports	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+code_session_starts_web_and_cleans_control_files	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+default_control_paths_reject_second_live_instance	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+default_control_paths_restart_after_stale_pid_takeover	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+oversized_message_is_rejected_before_reaching_runtime	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+perf_session_snapshot_serialises_100k_entry_transcript_under_200ms	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+perf_sse_broadcast_delivers_1k_events_in_monotonic_seq_order	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+perf_sse_http_stream_survives_configured_soak_duration	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+perf_threads_endpoint_handles_10_concurrent_readers_within_2s	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+phase0_runtime_helpers_persist_intent_and_context_snapshot_conditionally	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+plan_review_empty_revision_note_is_typed_and_preserves_authority	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_head_drift_survives_resume_and_requires_explicit_modify	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_metadata_only_drift_warns_but_exact_execute_recheck_succeeds	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_modify_next_plain_text_opens_replacement_plan_gate	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_network_allow_enters_runtime_queue	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_network_allow_returns_conflict_and_preserves_pending_gate	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_network_policy_survives_web_resume_and_can_be_denied	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_repository_replacement_after_modify_keeps_revision_note_retryable	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_repository_replacement_blocks_modify_and_preserves_gate	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_workflow_intent_review_cancel_clears_review_interaction	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_workflow_intent_review_confirm_transitions_session_past_review	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_workflow_intent_review_modify_clears_review_interaction	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+plan_workflow_intent_review_survives_resume_and_can_be_confirmed	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+projection_resolver_load_for_resume_rebuilds_and_classifies_planning_review	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+projection_resolver_rebuilds_and_loads_thread_query_indexes	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+projection_resolver_rebuilds_missing_thread_projection_from_history	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+runtime_formal_writes_preserve_order_and_minimal_object_set	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+second_browser_attach_with_different_client_returns_conflict	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_automation_attach_omitted_kind_without_origin_succeeds	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_automation_write_body_size_too_large_is_413_payload_too_large	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_message_cross_site_origin_is_403_origin_required	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_message_missing_origin_is_403_origin_required	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_write_body_size_too_large_is_413_payload_too_large	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_write_cross_site_origin_is_403_origin_required	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_write_missing_origin_is_403_origin_required	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_browser_write_trusted_loopback_origin_succeeds	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+security_session_rate_limit_triggers_and_recovers	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+sse_slow_consumer	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+state_cancel_while_executing_tool_settles_running_tool_call	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+state_detach_while_thinking_allows_turn_to_settle	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+test_ai_flow_local	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_ai_flow_r2	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge
+test_intent_flow	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+unknown_interaction_id_is_rejected_without_state_change	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; restored after merge

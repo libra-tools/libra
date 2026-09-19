@@ -140,18 +140,24 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
     assert_eq!(
         values::<i64>(
             &fresh,
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (\
-            'idx_legacy_operation_dedup_scope', 'idx_legacy_operation_control_slot')"
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_operation_v2_dedup_scope'"
         )
         .await,
-        [2]
+        [1]
+    );
+    assert_eq!(
+        values::<i64>(
+            &fresh,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'legacy_operation%'"
+        )
+        .await,
+        [0]
     );
     assert_eq!(
         values::<i64>(&fresh, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'legacy_operation_%_domain_%'").await,
-        [4]
+        [0]
     );
     let legacy = make_legacy_database(&legacy_path).await;
-    let original_rows = operation_rows(&legacy, "").await;
     let original_receipts = receipts(&legacy).await;
     assert!(
         original_receipts
@@ -174,11 +180,19 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
     for (version, receipt) in original_receipts {
         assert_eq!(upgraded_receipts.get(&version), Some(&receipt));
     }
-    // Then the canonical schema and every legacy column survive convergence.
+    // Then the canonical schema survives convergence and the v1 namespace is
+    // retired by the final forward-only migration.
     assert_eq!(schema_signature(&legacy).await, fresh_signature);
-    assert_eq!(operation_rows(&legacy, "legacy_").await, original_rows);
     assert_eq!(
         values::<i64>(&legacy, "SELECT COUNT(*) FROM operation").await,
+        [0]
+    );
+    assert_eq!(
+        values::<i64>(
+            &legacy,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'legacy_operation%'"
+        )
+        .await,
         [0]
     );
 
@@ -192,7 +206,6 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
         .await
         .expect("upgraded database reopens");
     assert_eq!(receipts(&reopened).await, upgraded_receipts);
-    assert_eq!(operation_rows(&reopened, "legacy_").await, original_rows);
     assert_eq!(schema_signature(&reopened).await, fresh_signature);
 }
 
@@ -272,4 +285,16 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
             .await
             .contains(&"ordinal".to_string())
     );
+    let operation_columns = table_columns(&conn, "operation").await;
+    for column in [
+        "restorable",
+        "control_slot",
+        "claim_owner",
+        "scope_provenance",
+    ] {
+        assert!(
+            operation_columns.iter().any(|actual| actual == column),
+            "operation v2 must retain boundary-claim column {column}"
+        );
+    }
 }

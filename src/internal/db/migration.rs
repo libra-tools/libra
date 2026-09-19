@@ -17,8 +17,9 @@
 //!   version row before executing the DDL, guaranteeing single
 //!   application even under concurrent upgraders.
 //! - [`MigrationRunner`] — owns the registered migration set and applies
-//!   pending migrations in monotonic version order. Tracks applied
-//!   migrations in a dedicated `schema_versions` table.
+//!   pending migrations in monotonic version order. Tracks applied migrations
+//!   in a dedicated `schema_versions` table and can close a receipt gap left
+//!   by an independently shipped branch.
 //!
 //! # Concurrency model
 //!
@@ -272,8 +273,10 @@ impl MigrationRunner {
         max_schema_version(conn).await
     }
 
-    /// Apply every registered migration whose version is greater than the
-    /// current applied version. Each migration runs inside its own
+    /// Apply every registered migration without a receipt, in version order.
+    /// Receipt-based selection is required when independently shipped
+    /// branches leave a lower migration absent while recording a later one.
+    /// Each migration runs inside its own
     /// transaction, with both the `up` DDL and the `schema_versions` row
     /// insert atomic together.
     ///
@@ -310,11 +313,16 @@ impl MigrationRunner {
         ensure_schema_versions_table(conn).await?;
         let current = self.current_version(conn).await?;
         gate().await;
+        let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if let Some(current) = current
-                && migration.version <= current
+            // A later receipt is a forward barrier for independently shipped
+            // migration branches. Once the database has recorded a higher
+            // version, an absent lower receipt is historical divergence, not
+            // a pending migration to replay.
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
             {
                 continue;
             }
@@ -345,6 +353,7 @@ impl MigrationRunner {
             };
             if inserted {
                 applied.push(migration.version);
+                applied_versions.insert(migration.version);
             }
         }
 
@@ -365,18 +374,20 @@ impl MigrationRunner {
     ) -> Result<Vec<i64>, MigrationError> {
         ensure_schema_versions_table(conn).await?;
         let current = self.current_version(conn).await?;
+        let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
         for migration in &self.migrations {
             if migration.version > target {
                 break;
             }
-            if let Some(current) = current
-                && migration.version <= current
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
             {
                 continue;
             }
             if apply_one_migration(conn, migration).await? {
                 applied.push(migration.version);
+                applied_versions.insert(migration.version);
             }
         }
         Ok(applied)
@@ -521,6 +532,26 @@ async fn max_schema_version(conn: &DatabaseConnection) -> Result<Option<i64>, Mi
         )))
     })?;
     Ok(version)
+}
+
+async fn applied_schema_versions(
+    conn: &DatabaseConnection,
+) -> Result<BTreeSet<i64>, MigrationError> {
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT version FROM schema_versions ORDER BY version".to_string(),
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get_by_index::<i64>(0).map_err(|error| {
+                MigrationError::Database(DbErr::Custom(format!(
+                    "schema_versions.version decode failed: {error}"
+                )))
+            })
+        })
+        .collect()
 }
 
 /// Apply one migration atomically. Returns `true` when this call inserted
@@ -1815,6 +1846,26 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             ),
             down: None,
         },
+        Migration {
+            version: 2026091801,
+            name: "operation_v1_retirement",
+            up: include_str!("../../../sql/migrations/2026091801_operation_v1_retirement.sql"),
+            down: None,
+        },
+        Migration {
+            version: 2026091802,
+            name: "operation_v2_dedup_index",
+            up: include_str!("../../../sql/migrations/2026091802_operation_v2_dedup_index.sql"),
+            down: None,
+        },
+        Migration {
+            version: 2026091901,
+            name: "operation_boundary_claim_columns",
+            up: include_str!(
+                "../../../sql/migrations/2026091901_operation_boundary_claim_columns.sql"
+            ),
+            down: None,
+        },
     ]
 }
 
@@ -2275,9 +2326,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 62);
+        assert_eq!(runner.len(), 65);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026090803));
+        assert_eq!(runner.max_registered_version(), Some(2026091901));
     }
 
     #[test]

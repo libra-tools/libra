@@ -15,6 +15,7 @@ pub(super) const CONFIG_REPAIR: i64 = 2026090601;
 pub(super) const CONVERGENCE: i64 = 2026090801;
 pub(super) const CHANGE_AI_LINK: i64 = 2026090802;
 pub(super) const CHANGE_IDENTITY_PREFIX_INDEX_REPAIR: i64 = 2026090803;
+pub(super) const BOUNDARY_CLAIM_COLUMNS: i64 = 2026091901;
 
 pub(super) async fn branch_database(tip: i64) -> (TempDir, PathBuf, DatabaseConnection) {
     assert!([OPERATION_V2, CONFIG_REPAIR].contains(&tip));
@@ -105,18 +106,24 @@ pub(super) async fn rows(conn: &DatabaseConnection, table: &str) -> Vec<String> 
     .collect()
 }
 
-pub(super) async fn operation_rows(conn: &DatabaseConnection, prefix: &str) -> Vec<Vec<String>> {
-    let mut captured = Vec::new();
-    for table in [
-        "operation",
-        "operation_parent",
-        "operation_view",
-        "operation_view_ref",
-        "operation_view_workspace",
-    ] {
-        captured.push(rows(conn, &format!("{prefix}{table}")).await);
-    }
-    captured
+pub(super) async fn operation_rows_without_boundary_columns(
+    conn: &DatabaseConnection,
+) -> Vec<String> {
+    conn.query_all_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT json_array(
+             op_id, repo_id, format_version, kind, status, command_name,
+             description, args_digest, actor, worktree_id, scope_kind,
+             pre_view_oid, post_view_oid, restores_op_id, reverts_op_id,
+             predecessor_map_oid, causal_context_id, start_ts, end_ts
+         ) AS payload
+         FROM operation ORDER BY payload",
+    ))
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get_by_index(0).unwrap())
+    .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]

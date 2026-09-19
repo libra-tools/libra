@@ -3080,17 +3080,6 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view_ref",
-        column: "target_oid",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo/view snapshots must stay restorable",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
         location: "agent_checkpoint",
         column: "parent_commit",
         status: GcSourceStatus::TracedRoot,
@@ -3176,28 +3165,6 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         read_bound: "full table scan, one query per collection pass",
         corruption: GcCorruptionPolicy::FailClosed,
         note: "workspace sync-back baseline (W4 §C.8)",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view",
-        column: "head_target",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo view HEAD pointer — rooted when it is an OID (a name is ref-anchored)",
-    },
-    GcObjectSource {
-        origin: GcSourceOrigin::Column,
-        location: "legacy_operation_view_workspace",
-        column: "pointer_value",
-        status: GcSourceStatus::TracedRoot,
-        kind: GcStorageKind::SqliteColumn,
-        schema: "migration-owned SQLite column",
-        read_bound: "full table scan, one query per collection pass",
-        corruption: GcCorruptionPolicy::FailClosed,
-        note: "undo view workspace pointer — rooted when it is an OID",
     },
     GcObjectSource {
         origin: GcSourceOrigin::Column,
@@ -3409,9 +3376,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
     enum CellMode {
         /// A non-empty cell MUST be a valid OID (fail closed otherwise).
         StrictOid,
-        /// The cell may hold a ref/branch NAME or an OID — only an
-        /// OID-parsing value roots (names are anchored via repository refs).
-        OidIfParses,
         /// An operation view manifest whose workspace snapshots must be
         /// expanded before the ordinary Git object walk.
         V2View,
@@ -3428,24 +3392,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
             "SELECT blob FROM notes",
             &["blob"],
             CellMode::StrictOid,
-        ),
-        (
-            "legacy_operation_view_ref",
-            "SELECT target_oid FROM legacy_operation_view_ref",
-            &["target_oid"],
-            CellMode::StrictOid,
-        ),
-        (
-            "legacy_operation_view",
-            "SELECT head_target FROM legacy_operation_view",
-            &["head_target"],
-            CellMode::OidIfParses,
-        ),
-        (
-            "legacy_operation_view_workspace",
-            "SELECT pointer_value FROM legacy_operation_view_workspace",
-            &["pointer_value"],
-            CellMode::OidIfParses,
         ),
         (
             "operation",
@@ -3541,11 +3487,6 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
                                     .with_stable_code(StableErrorCode::RepoCorrupt)
                                 })?;
                                 walk_reachable(&hash, storage, boundaries, reachable)?;
-                            }
-                            CellMode::OidIfParses => {
-                                if let Some(hash) = parse_object_hash(trimmed) {
-                                    walk_reachable(&hash, storage, boundaries, reachable)?;
-                                }
                             }
                             CellMode::V2View => {
                                 let hash = parse_object_hash(trimmed).ok_or_else(|| {

@@ -105,6 +105,23 @@ impl ScopeLease {
         repo_id: &str,
         permissions: LeaseFilePermissions,
     ) -> Result<Self, OperationError> {
+        Self::acquire_with_permissions_mode(scope, repo_id, permissions, false).await
+    }
+
+    pub(super) async fn acquire_with_permissions_wait(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+        permissions: LeaseFilePermissions,
+    ) -> Result<Self, OperationError> {
+        Self::acquire_with_permissions_mode(scope, repo_id, permissions, true).await
+    }
+
+    async fn acquire_with_permissions_mode(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+        permissions: LeaseFilePermissions,
+        wait: bool,
+    ) -> Result<Self, OperationError> {
         let key = format!("{repo_id}:{}", scope.scope.storage_key());
         let gitdir_info = scope.gitdir.join("info");
         let path = gitdir_info.join("operation-v2.lock");
@@ -123,10 +140,23 @@ impl ScopeLease {
                 path.display()
             ))
         })??;
-        // Git's default lock timeout is zero: one attempt, no waiting or retry.
-        // There is no await between acquisition and returning its owning guard.
-        file.try_lock()
-            .map_err(|error| lock_error(error, &key, &path))?;
+        if wait {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(TryLockError::Error(error)) => {
+                        return Err(lock_error(TryLockError::Error(error), &key, &path));
+                    }
+                }
+            }
+        } else {
+            // Git's default lock timeout is zero: one attempt, no waiting or retry.
+            file.try_lock()
+                .map_err(|error| lock_error(error, &key, &path))?;
+        }
         verify_parent(&parent, &gitdir_info)?;
         Ok(Self {
             _file: file,

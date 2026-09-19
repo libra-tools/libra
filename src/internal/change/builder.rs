@@ -3,14 +3,14 @@
 use std::str::FromStr;
 
 use git_internal::hash::ObjectHash;
-use sea_orm::{DatabaseConnection, DatabaseTransaction};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction};
 use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
     AiOperationLink, ChangeId, ChangeRevision, ChangeStore, ChangeStoreError, GenealogyError,
-    PredecessorEdge, RelationKind, RevisionVisibility, attach_pending_ai_operation_links,
-    link_ai_operation,
+    PredecessorEdge, RelationKind, RevisionVisibility, attach_pending_ai_operation_links_on,
+    link_ai_operation_on,
 };
 
 #[derive(Debug, Error)]
@@ -61,48 +61,20 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
         .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
     let repo_id = repo_id.to_string();
     let op_id = op_id.into();
-    let operation_id = op_id.clone();
     let commit_oid = commit_oid.into();
-    let revision = build_revision_with_predecessors(
+    let pending_operation_ids = pending_ai_operation_ids();
+    build_revision_with_predecessors_with_ai_context(
         database.clone(),
         repo_id.as_str(),
         op_id,
         commit_oid,
         predecessors,
+        &pending_operation_ids,
     )
-    .await?;
-    link_ai_operation(
-        &database,
-        &AiOperationLink {
-            operation_id,
-            change_id: revision.change_id,
-            session_id: None,
-            run_id: None,
-            tool_invocation_id: None,
-            intent_id: None,
-            repo_id: repo_id.clone(),
-            worktree_id: None,
-            workspace_id: None,
-            lease_generation: None,
-            config_provenance_digest: None,
-            redaction_version: "v1".to_string(),
-        },
-    )
-    .await?;
-    let mut operation_ids = std::env::var("LIBRA_AI_PENDING_OPERATION_IDS")
-        .ok()
-        .into_iter()
-        .flat_map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    if let Ok(operation_id) = std::env::var("LIBRA_AI_OPERATION_ID") {
-        operation_ids.push(operation_id);
-    }
-    let operation_ids = operation_ids.iter().map(String::as_str).collect::<Vec<_>>();
-    attach_pending_ai_operation_links(&database, &repo_id, revision.change_id, &operation_ids)
-        .await?;
-    Ok(revision)
+    .await
 }
 
+#[cfg(test)]
 async fn build_revision_with_predecessors(
     database: DatabaseConnection,
     repo_id: &str,
@@ -110,13 +82,59 @@ async fn build_revision_with_predecessors(
     commit_oid: String,
     predecessors: Vec<(String, RelationKind)>,
 ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    let builder =
+        revision_builder_for_predecessors(database, repo_id, op_id, commit_oid, predecessors)
+            .await?;
+    builder.build().await
+}
+
+async fn build_revision_with_predecessors_with_ai_context(
+    database: DatabaseConnection,
+    repo_id: &str,
+    op_id: String,
+    commit_oid: String,
+    predecessors: Vec<(String, RelationKind)>,
+    pending_operation_ids: &[String],
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    let builder =
+        revision_builder_for_predecessors(database, repo_id, op_id, commit_oid, predecessors)
+            .await?;
+    builder.build_with_ai_context(pending_operation_ids).await
+}
+
+async fn revision_builder_for_predecessors(
+    database: DatabaseConnection,
+    repo_id: &str,
+    op_id: String,
+    commit_oid: String,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevisionBuilder, ChangeRevisionBuildError> {
+    revision_builder_for_predecessors_on(
+        &database,
+        database.clone(),
+        repo_id,
+        op_id,
+        commit_oid,
+        predecessors,
+    )
+    .await
+}
+
+async fn revision_builder_for_predecessors_on<C: ConnectionTrait>(
+    lookup_database: &C,
+    database: DatabaseConnection,
+    repo_id: &str,
+    op_id: String,
+    commit_oid: String,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevisionBuilder, ChangeRevisionBuildError> {
     let inherited_predecessor = predecessors
         .iter()
         .find(|(_, relation_kind)| relation_kind.preserves_change_identity());
     let (inherited, origin) = match inherited_predecessor {
         Some((predecessor_oid, _)) => {
             match ChangeStore::new(database.clone())
-                .change_id_for_commit(repo_id, predecessor_oid)
+                .change_id_for_commit_on(lookup_database, repo_id, predecessor_oid)
                 .await?
             {
                 Some(change_id) => (Some(change_id), "generated"),
@@ -140,7 +158,52 @@ async fn build_revision_with_predecessors(
     }
     .set_commit_oid(commit_oid)
     .with_identity_origin(origin);
-    builder.set_predecessors(predecessors).build().await
+    Ok(builder.set_predecessors(predecessors))
+}
+
+fn pending_ai_operation_ids() -> Vec<String> {
+    let mut operation_ids = std::env::var("LIBRA_AI_PENDING_OPERATION_IDS")
+        .ok()
+        .into_iter()
+        .flat_map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if let Ok(operation_id) = std::env::var("LIBRA_AI_OPERATION_ID") {
+        operation_ids.push(operation_id);
+    }
+    operation_ids
+}
+
+async fn link_revision_on<C: ConnectionTrait>(
+    database: &C,
+    repo_id: &str,
+    revision: &ChangeRevision,
+    pending_operation_ids: &[String],
+) -> Result<(), ChangeRevisionBuildError> {
+    link_ai_operation_on(
+        database,
+        &AiOperationLink {
+            operation_id: revision.created_op_id.clone(),
+            change_id: revision.change_id,
+            session_id: None,
+            run_id: None,
+            tool_invocation_id: None,
+            intent_id: None,
+            repo_id: repo_id.to_string(),
+            worktree_id: None,
+            workspace_id: None,
+            lease_generation: None,
+            config_provenance_digest: None,
+            redaction_version: "v1".to_string(),
+        },
+    )
+    .await?;
+    let operation_ids = pending_operation_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    attach_pending_ai_operation_links_on(database, repo_id, revision.change_id, &operation_ids)
+        .await?;
+    Ok(())
 }
 
 /// Record a revision using the persisted operation boundary active for this command.
@@ -201,22 +264,51 @@ pub async fn record_split_revisions<I>(
 where
     I: IntoIterator<Item = (String, String, Vec<String>)>,
 {
-    let mut recorded = Vec::new();
-    for (operation_id, commit_oid, predecessors) in revisions {
-        let predecessors = predecessors
-            .into_iter()
-            .map(|oid| (oid, RelationKind::Split))
-            .collect();
-        recorded.push(
-            record_current_repo_commit_revision_with_predecessors(
+    let database = crate::internal::db::get_db_conn_instance().await;
+    let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
+        .await
+        .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?
+        .to_string();
+    let pending_operation_ids = pending_ai_operation_ids();
+    let transaction = crate::internal::db::begin_write_transaction(&database)
+        .await
+        .map_err(ChangeStoreError::Database)?;
+    let result = async {
+        let mut recorded = Vec::new();
+        for (operation_id, commit_oid, predecessors) in revisions {
+            let predecessors = predecessors
+                .into_iter()
+                .map(|oid| (oid, RelationKind::Split))
+                .collect();
+            let builder = revision_builder_for_predecessors_on(
+                &transaction,
+                database.clone(),
+                &repo_id,
                 operation_id,
                 commit_oid,
                 predecessors,
             )
-            .await?,
-        );
+            .await?;
+            let revision = builder.build_on(&transaction).await?;
+            link_revision_on(&transaction, &repo_id, &revision, &pending_operation_ids).await?;
+            recorded.push(revision);
+        }
+        Ok::<_, ChangeRevisionBuildError>(recorded)
     }
-    Ok(recorded)
+    .await;
+    match result {
+        Ok(recorded) => {
+            transaction
+                .commit()
+                .await
+                .map_err(ChangeStoreError::Database)?;
+            Ok(recorded)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 /// Record a visible duplicate revision with a typed `duplicate` edge.
@@ -578,6 +670,38 @@ impl ChangeRevisionBuilder {
                 Err(error)
             }
         }
+    }
+
+    async fn build_with_ai_context(
+        self,
+        pending_operation_ids: &[String],
+    ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+        let transaction = crate::internal::db::begin_write_transaction(&self.db)
+            .await
+            .map_err(ChangeStoreError::Database)?;
+        let revision = match self.build_on(&transaction).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = link_revision_on(
+            &transaction,
+            &self.repo_id,
+            &revision,
+            pending_operation_ids,
+        )
+        .await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(ChangeStoreError::Database)?;
+        Ok(revision)
     }
 
     async fn build_on(

@@ -13,7 +13,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statemen
 
 use crate::internal::ai::observed_agents::RedactedBytes;
 
-/// Inputs to [`HistoryManager::append_checkpoint_commit`].
+/// Inputs to [`crate::internal::ai::history::HistoryManager::append_checkpoint_commit`].
 ///
 /// All byte slices live for the duration of the call; the function does not
 /// retain references after returning.
@@ -203,7 +203,7 @@ impl CheckpointScope {
     }
 }
 
-/// Output from [`HistoryManager::append_checkpoint_commit`]; what the caller
+/// Output from [`crate::internal::ai::history::HistoryManager::append_checkpoint_commit`]; what the caller
 /// stores in `agent_checkpoint`.
 ///
 /// Naming discipline (AG-20): `commit_hash` is the freshly-written commit on
@@ -227,7 +227,7 @@ pub struct CheckpointCommit {
     pub object_count: u64,
 }
 
-/// Outcome of [`HistoryManager::erase_session_local`] — the three-face
+/// Outcome of [`crate::internal::ai::history::HistoryManager::erase_session_local`] — the three-face
 /// local erasure result for one session (AG-24a).
 #[derive(Debug, Clone)]
 pub struct SessionEraseOutcome {

@@ -45,6 +45,11 @@ pub struct MutableStateSurface {
 pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
     // ── Sequencer / operation state (W1) ─────────────────────────────────
     MutableStateSurface {
+        table: "legacy_operation",
+        owner: StateOwner::Repository,
+        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
+    },
+    MutableStateSurface {
         table: "sequence_state",
         owner: StateOwner::Worktree,
         rationale: "one in-progress cherry-pick/am/revert sequence per worktree",
@@ -133,11 +138,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Composite,
         rationale: "the operation log is repository-wide, but its worktree_id is a real \
                      routing key: dedup windows and `op restore` are scope-fenced (§C.9)",
-    },
-    MutableStateSurface {
-        table: "legacy_operation",
-        owner: StateOwner::Composite,
-        rationale: "the active v1 operation logger remains scope-routed during the OL-02 staging window",
     },
     MutableStateSurface {
         table: "ai_operation_link",
@@ -495,19 +495,19 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",
     "head_scope_unique_guard",
-    "layer__down_guard_2026072303",
-    "layer__legacy_rows_need_explicit_adopt_2026072303",
-    "operation__down_guard_2026073003",
-    "operation__down_guard_2026073004",
     "legacy_operation__staging",
     "legacy_operation_parent__staging",
     "legacy_operation_view__staging",
     "legacy_operation_view_ref__staging",
     "legacy_operation_view_workspace__staging",
+    "layer__down_guard_2026072303",
+    "layer__legacy_rows_need_explicit_adopt_2026072303",
+    "operation__down_guard_2026073003",
+    "operation__down_guard_2026073004",
+    "operation_scope_provenance_down_guard",
     "operation_view",
     "operation_view_ref",
     "operation_view_workspace",
-    "operation_scope_provenance_down_guard",
     "rebase_state__down_guard_2026072101",
     "sequence_state__down_guard_2026071901",
     "source_call_log__rebuild",
@@ -849,12 +849,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut scoped = BTreeSet::new();
-        // `legacy_operation` is created by the copy-first Rust migration
-        // helper, whose final table name is assembled outside a standalone
-        // SQL file. Keep that known production shape in the scope inventory;
-        // the broader Rust corpus contains remote D1 schemas that are not
-        // part of the local repository database.
-        scoped.insert("legacy_operation".to_string());
         for chunk in lowered.split("create table").skip(1) {
             let after = body_after_create_table(chunk);
             let name = table_name_after(chunk);

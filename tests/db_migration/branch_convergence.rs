@@ -13,14 +13,15 @@ use super::{
 #[path = "branch_convergence/fixtures.rs"]
 mod fixtures;
 use fixtures::{
-    CHANGE_AI_LINK, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, CONFIG_REPAIR, CONVERGENCE, OPERATION_V2,
-    branch_database, operation_rows, receipts, rows, snapshot,
+    BOUNDARY_CLAIM_COLUMNS, CHANGE_AI_LINK, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, CONFIG_REPAIR,
+    CONVERGENCE, OPERATION_V2, branch_database, operation_rows_without_boundary_columns, receipts,
+    rows, snapshot,
 };
 
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 62);
+    assert_eq!(migrations.len(), 65);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -37,6 +38,9 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
                 CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
                 "change_identity_prefix_index_repair"
             ),
+            (2026091801, "operation_v1_retirement"),
+            (2026091802, "operation_v2_dedup_index"),
+            (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
         ]
     );
     assert!(migrations.last().unwrap().down.is_none());
@@ -67,7 +71,12 @@ async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
     let runner = super::all_builtin_runner().unwrap();
     assert_eq!(
         runner.run_pending(&conn).await.unwrap(),
-        vec![CHANGE_IDENTITY_PREFIX_INDEX_REPAIR]
+        vec![
+            CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+            2026091801,
+            2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
+        ]
     );
 
     // Then the repair is durable and subsequent opens are no-ops.
@@ -95,7 +104,6 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(before.last().unwrap().0, CONFIG_REPAIR);
     assert!(!before.iter().any(|row| row.0 == OPERATION_V2));
     assert!(column_exists(&conn, "operation", "view_id").await);
-    let legacy = operation_rows(&conn, "").await;
     let config = rows(&conn, "config").await;
     let modern = rows(&conn, "config_kv").await;
     conn.close().await.unwrap();
@@ -105,15 +113,24 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
         .await
         .unwrap();
 
-    // Then old rows survive in their legacy namespace and v2 starts empty.
+    // Then v2 starts empty and the final runtime schema has retired the
+    // temporary legacy namespace.
     assert!(column_exists(&conn, "operation", "format_version").await);
     assert!(table_exists(&conn, "operation_head").await);
-    assert_eq!(operation_rows(&conn, "legacy_").await, legacy);
+    for table in [
+        "legacy_operation",
+        "legacy_operation_parent",
+        "legacy_operation_view",
+        "legacy_operation_view_ref",
+        "legacy_operation_view_workspace",
+    ] {
+        assert!(!table_exists(&conn, table).await);
+    }
     assert!(rows(&conn, "operation").await.is_empty());
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 62);
+    assert_eq!(after.len(), 65);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
@@ -122,6 +139,9 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
             "change_identity_prefix_index_repair",
         ),
+        (2026091801, "operation_v1_retirement"),
+        (2026091802, "operation_v2_dedup_index"),
+        (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -131,7 +151,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR);
+    assert_eq!(after.last().unwrap().0, BOUNDARY_CLAIM_COLUMNS);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -148,7 +168,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
 }
 
 #[tokio::test]
-async fn operation_v2_branch_keeps_modern_and_legacy_rows_without_recopying() {
+async fn operation_v2_branch_keeps_modern_rows_without_recopying() {
     // Given the remote branch already copied legacy rows and recorded 0101.
     let (_dir, path, conn) = branch_database(OPERATION_V2).await;
     conn.execute_unprepared(
@@ -161,8 +181,7 @@ async fn operation_v2_branch_keeps_modern_and_legacy_rows_without_recopying() {
          BEGIN SELECT RAISE(ABORT,'legacy rows must not be recopied'); END;"
     ).await.unwrap();
     let before = receipts(&conn).await;
-    let legacy = operation_rows(&conn, "legacy_").await;
-    let modern = rows(&conn, "operation").await;
+    let modern = operation_rows_without_boundary_columns(&conn).await;
     let heads = rows(&conn, "operation_head").await;
     let journals = rows(&conn, "operation_journal").await;
 
@@ -177,12 +196,23 @@ async fn operation_v2_branch_keeps_modern_and_legacy_rows_without_recopying() {
             CONVERGENCE,
             CHANGE_AI_LINK,
             CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+            2026091801,
+            2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
         ]
     );
-    assert_eq!(operation_rows(&conn, "legacy_").await, legacy);
-    assert_eq!(rows(&conn, "operation").await, modern);
+    assert_eq!(operation_rows_without_boundary_columns(&conn).await, modern);
     assert_eq!(rows(&conn, "operation_head").await, heads);
     assert_eq!(rows(&conn, "operation_journal").await, journals);
+    for table in [
+        "legacy_operation",
+        "legacy_operation_parent",
+        "legacy_operation_view",
+        "legacy_operation_view_ref",
+        "legacy_operation_view_workspace",
+    ] {
+        assert!(!table_exists(&conn, table).await);
+    }
     let after = receipts(&conn).await;
     for receipt in before {
         assert!(after.contains(&receipt));
@@ -216,7 +246,8 @@ async fn catch_up_failure_rolls_back_schema_data_and_both_new_receipts() {
 
 #[tokio::test]
 async fn convergence_barrier_refuses_rollback_below_the_old_binary_tip_atomically() {
-    // Given a successfully converged repository with preserved legacy rows.
+    // Given a successfully converged repository with the legacy namespace
+    // retired.
     let (_dir, path, conn) = branch_database(CONFIG_REPAIR).await;
     db::upgrade_database_schema(&path).await.unwrap();
     let before = snapshot(&conn).await;
@@ -249,7 +280,6 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
     let (_dir, path, left) = branch_database(CONFIG_REPAIR).await;
     let url = format!("sqlite://{}", path.display());
     let right = connect(&url).await;
-    let expected = operation_rows(&left, "").await;
     let rendezvous = Arc::new(Barrier::new(2));
     let other = Arc::clone(&rendezvous);
     let first = all_builtin_runner().unwrap();
@@ -274,8 +304,10 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
             CONVERGENCE,
             CHANGE_AI_LINK,
             CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+            2026091801,
+            2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
         ]
     );
-    assert_eq!(operation_rows(&left, "legacy_").await, expected);
-    assert_eq!(receipts(&left).await.len(), 62);
+    assert_eq!(receipts(&left).await.len(), 65);
 }

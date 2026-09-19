@@ -59,7 +59,7 @@ cargo test --test ai_agent_test -- --test-threads=1
 | resume 回归 | 已存在 | `tests/code_resume_test.rs` |
 | codex runtime 回归 | 已存在 | `tests/code_codex_runtime_test.rs` |
 | 网络层集成测试 | 已存在 | `tests/network_remotes_test.rs`（`test-network`） |
-| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`、`tests/publish_live_test.rs`（`test-live-cloud`） |
+| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`（`test-live-cloud`） |
 | 文档/兼容一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 | 集成计划一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 
@@ -297,9 +297,6 @@ LIBRA_RUN_LIVE=1 cargo test --features test-provider \
 # D1/R2 live gate（依赖 LIBRA_D1_* + LIBRA_STORAGE_*）
 cargo test --features test-live-cloud --test cloud_storage_backup_test -- --test-threads=1
 
-# publish live gate（额外要求 LIBRA_ENABLE_TEST_LIVE_CLOUD=1）
-LIBRA_ENABLE_TEST_LIVE_CLOUD=1 cargo test --features test-live-cloud \
-  --test publish_live_test publish_live -- --test-threads=1
 ```
 
 通过标准：
