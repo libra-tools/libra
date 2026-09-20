@@ -5,9 +5,9 @@
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
 //! and the entity is registered in [`crate::internal::model`].
 //!
-//! The former in-memory SourcePool producer was retired with the Code-era
-//! source runtime; this entity remains for migration and compatibility data
-//! retained by existing repositories.
+//! No live producer remains after retirement of the Code-era source runtime;
+//! this entity is retained solely for migration and compatibility data in
+//! existing repositories.
 
 use sea_orm::{DbErr, entity::prelude::*};
 
