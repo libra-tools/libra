@@ -343,7 +343,7 @@ fn repair_invocation_refused_without_confirmation(command: &WorktreeSubcommand) 
             dry_run,
             confirm,
             ..
-        } => !(*migrate_layout && *dry_run) && !*confirm,
+        } => !(*confirm || *migrate_layout && *dry_run),
         _ => false,
     }
 }

@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`push`（含 `-- <pathspec>` 部分 stash）/ `pop` / `list` / `apply` / `drop` / `show` / `branch` / `clear` supported；`apply`/`pop` 三方合并到当前工作树（非 HEAD），保留无关未提交改动，且默认只写工作树、不重建 index（恢复出的 tracked 修改保持未暂存，Git 的 `--index` 恢复模式仍未公开）；`create` / `store` deferred (see [docs/development/commands/_compatibility.md#d8-stash-create](docs/development/commands/_compatibility.md#d8-stash-create) and [#d9-stash-store](docs/development/commands/_compatibility.md#d9-stash-store))
+- 兼容级别：`partial`。`push`（含 `-- <pathspec>` 部分 stash）/ `pop` / `list` / `apply` / `drop` / `show` / `branch` / `clear` supported；`apply`/`pop` 三方合并到当前工作树（非 HEAD），保留无关未提交改动；默认保留已跟踪路径的当前 index（恢复出的 tracked 修改保持未暂存）并把 stash 索引相对基础提交新增的路径重新加入索引；`apply`/`pop --index` 三方合并 stash 索引（冲突 `LBR-CONFLICT-001`，零写入）；`stash branch` 按 `--index` 语义应用；`create` / `store` deferred (see [docs/development/commands/_compatibility.md#d8-stash-create](docs/development/commands/_compatibility.md#d8-stash-create) and [#d9-stash-store](docs/development/commands/_compatibility.md#d9-stash-store))
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 
@@ -43,6 +43,10 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-09-21（issues/476 WT-11）：`apply`/`pop` 新增 `--index`（索引三方合并，冲突 `LBR-CONFLICT-001` / `conflicts in index. Try without --index.` 且零写入）；默认 apply 把 stash 索引相对基础提交新增的路径重新加入当前索引；`stash branch` 按 `--index` 语义应用；JSON 加项 `index_restored`。回归：`stash_test::test_stash_index_restoration_matrix`。
+- 2026-09-21（issues/476 WT-10）：`stash push` / pathspec push / `create_held_stash_commit` 共用 `format_stash_push_message`——默认 `WIP on <branch>: <abbrev7> <subject>`（主题经 `parse_commit_msg` 剥掉 vault `gpgsig` 与前导空行），`-m` 与 autostash 名称为 `On <branch>: <msg>`，分离 HEAD 用 `(no branch)`。旧 reflog 条目不改写。回归：`stash_test::test_stash_message_format_matrix` 与 helper 单测。
+- 2026-09-20（issues/476 WT-09）：`run_push` 预检顺序改为「先初始提交、后改动」（对齐 Git `builtin/stash.c:1524-1537`）——无 HEAD 时即使树干净或只有未跟踪文件也返回 128 `LBR-REPO-003`；`execute_safe` 在全局 `--quiet` 且非 JSON 时把该失败改为 `CliError::silent_exit(128)`（仅退出码），`--json` 仍输出 error envelope。回归：`stash_test::test_stash_push_no_initial_commit_matrix`。
+- 2026-09-20（issues/476 WT-08）：新增 CLI 参数改写 `rewrite_bare_stash_args`（`src/cli.rs`）——省略子命令的 `libra stash` 与首参数以 `-` 开头（含 `--`）的形态插入 `push`；已知子命令保持不变；其它首 token 报用法错误 129，文案对齐 Git `subcommand wasn't specified; 'push' can't be assumed due to unexpected token '<tok>'`（git 2.55.0 实测 exit 128）。`STASH_EXAMPLES` 与 `stash --help`/命令页说明省略子命令的行为。回归：`cli::tests::bare_stash_rewrites_to_push`、`stash_test::test_bare_stash_is_push_matrix`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-06-06 `99ac8a43`（`feat(stash): add 'stash show -p/--patch' unified diff`）：该提交曾为 `stash show` 引入 `-p` / `--patch` 统一 diff；该能力一度从 HEAD 回退，现已重新实现 —— `Stash::Show` 新增 `patch: bool`，`run_show` 在 `-p` 下复用 `log::generate_diff(&stash_commit, …)`（stash commit 的第一父即 base，故等价于 `git stash show -p`），`StashOutput::Show` 增加加项 `patch: Option<String>`（`skip_serializing_if = "Option::is_none"`，无 `-p` 时 JSON 不含该字段）。与“还未实现的功能”表“✅ 已实现”一致。
 - 2026-06-12 `57dc1cf8`（`feat(p0-rejection): add -p/--patch flag rejection across add, commit, checkout, restore, reset, rebase, stash`）：该提交标题列出 stash，但 stash 从未引入过 `-p` / `--patch` 的*拒绝*逻辑——对 stash 而言它是 no-op。注意这与上面重新实现的 `stash show -p`（统一 diff 显示，非拒绝）无关：当前 HEAD 的 `Stash::Show` 已带 `patch: bool` clap 标志，`-p` 是受支持的 patch 显示参数，而非被拒绝的交互式 patch 模式。
@@ -56,17 +60,17 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 路径匹配（**FIX-AD-01**，取代旧 AU-05 审计行）：`paths_matching_pathspec` 经共享 `PathspecSet` 匹配（`stash_pathspec_set` 从 raw specs 构建，spec 相对调用者当前目录解析），支持 plain name、wildcard 与 `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`；空列表匹配全部（`.` 同理）；非法 magic 为硬错误（不静默回退）；`--literal-pathspecs` 下按字面。回归 `test_stash_push_pathspec_glob_stashes_all_matches`。
 - 用户文档：`docs/commands/stash.md`。
-- Synopsis：`libra stash (push [-m <message>] [-- <pathspec>...] | pop [<stash>] | list | apply [<stash>] | drop [<stash>] | show [<stash>] [-p | --patch] [--name-only | --name-status] | branch <branch> [<stash>] | clear [--force])`。
-- 公开参数/子命令包括：`push [-m, --message <MESSAGE>] [-u, --include-untracked] [--no-include-untracked] [-a, --all] [-k, --keep-index] [-- <pathspec>...]`、`pop [<stash>]`、`list`、`apply [<stash>]`、`drop [<stash>]`、`show [<stash>] [-p, --patch] [--name-only] [--name-status]`、`branch <branch> [<stash>]`、`clear [--force]`。
+- Synopsis：`libra stash (push [-m <message>] [-- <pathspec>...] | pop [--index] [<stash>] | list | apply [--index] [<stash>] | drop [<stash>] | show [<stash>] [-p | --patch] [--name-only | --name-status] | branch <branch> [<stash>] | clear [--force])`。
+- 公开参数/子命令包括：`push [-m, --message <MESSAGE>] [-u, --include-untracked] [--no-include-untracked] [-a, --all] [-k, --keep-index] [-- <pathspec>...]`、`pop [--index] [<stash>]`、`list`、`apply [--index] [<stash>]`、`drop [<stash>]`、`show [<stash>] [-p, --patch] [--name-only] [--name-status]`、`branch <branch> [<stash>]`、`clear [--force]`。
 
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容矩阵说明 | `push` / `pop` / `list` / `apply` / `drop` / `show` / `branch` / `clear` 支持；`push` 支持 `-m`、`-u` / `--include-untracked`、`-a` / `--all`、`-k` / `--keep-index`、`-- <pathspec>`（部分 stash）；`apply`/`pop` 合并到当前工作树保留无关改动，并默认保留当前 index，让恢复出的 tracked 修改保持未暂存；`pop/apply --index`、`create` / `store` 延后 (see [docs/development/commands/_compatibility.md#d8-stash-create](docs/development/commands/_compatibility.md#d8-stash-create) and [#d9-stash-store](docs/development/commands/_compatibility.md#d9-stash-store)) | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| 兼容矩阵说明 | `push` / `pop` / `list` / `apply` / `drop` / `show` / `branch` / `clear` 支持；`push` 支持 `-m`、`-u` / `--include-untracked`、`-a` / `--all`、`-k` / `--keep-index`、`-- <pathspec>`（部分 stash）；`apply`/`pop` 合并到当前工作树保留无关改动；默认保留已跟踪路径的当前 index 并把 stash 索引新增路径重新暂存；`apply`/`pop --index` 与 `stash branch` 恢复索引；`create` / `store` 延后 (see [docs/development/commands/_compatibility.md#d8-stash-create](docs/development/commands/_compatibility.md#d8-stash-create) and [#d9-stash-store](docs/development/commands/_compatibility.md#d9-stash-store)) | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
 | ✅ 已实现 | Patch 级差异 (stash show) | `stash show -p` / `--patch` 复用 `log::generate_diff(&stash_commit, …)`（stash commit 第一父即 base，等价于 `git stash show -p`）输出统一 diff；人类格式仅打印 diff（无摘要脚注），JSON 加项 `patch`（无 `-p` 时省略，向后兼容）。带集成测试 `test_stash_show_patch_emits_unified_diff`。 |
-| ✅ 已实现 | Pathspec（部分 stash） | 原始对照：Git `stash push -- <pathspec>`；当前说明：`run_push_pathspec` 把 stash 树构造为「HEAD 叠加命名路径的索引/工作区内容」（经 `merge::create_tree_from_items_map` 建嵌套树），记录后只把命名路径重置回 HEAD，其余工作树原样保留；无匹配→`PathspecNoMatch`/`LBR-CLI-003`。pop 侧由 do_apply 的「ours=当前工作树」修复保证不冲掉无关改动，且默认不重建 index，恢复结果以未暂存工作树修改呈现；若当前 index 无法读取则显式报错并保留 stash。pathspec 匹配支持精确路径、目录前缀与 `.`（整树），经 `util::to_workdir_path` 归一化（支持子目录相对 pathspec）；`-u`/`-a`/`-k` 与 pathspec 同用被拒（`PathspecWithOption`/`LBR-CLI-002`）。**staged-only 改动**：因 Libra 无 `stash apply --index`，pathspec push 的 worktree 树按「有未暂存改动取工作区、否则取暂存内容、否则 HEAD」折叠，故 pop 能恢复 staged-only 选择为未暂存工作树内容（与 git pop-without-index 丢弃不同，Libra 不丢）。带集成测试 `test_stash_push_pathspec_stashes_only_matched`/`_directory`/`_no_match_errors`/`test_stash_pop_preserves_unrelated_uncommitted_change`/`test_stash_pop_restores_unstaged_change_without_staging`/`test_stash_pop_restores_staged_only_change_as_unstaged_by_default`/`test_stash_pop_restores_mixed_file_as_unstaged_worktree_content`/`test_stash_pop_reports_index_load_failure_without_dropping_stash`。 |
+| ✅ 已实现 | Pathspec（部分 stash） | 原始对照：Git `stash push -- <pathspec>`；当前说明：`run_push_pathspec` 把 stash 树构造为「HEAD 叠加命名路径的索引/工作区内容」（经 `merge::create_tree_from_items_map` 建嵌套树），记录后只把命名路径重置回 HEAD，其余工作树原样保留；无匹配→`PathspecNoMatch`/`LBR-CLI-003`。pop 侧由 do_apply 的「ours=当前工作树」修复保证不冲掉无关改动，且默认不重建 index，恢复结果以未暂存工作树修改呈现；若当前 index 无法读取则显式报错并保留 stash。pathspec 匹配支持精确路径、目录前缀与 `.`（整树），经 `util::to_workdir_path` 归一化（支持子目录相对 pathspec）；`-u`/`-a`/`-k` 与 pathspec 同用被拒（`PathspecWithOption`/`LBR-CLI-002`）。**staged-only 改动**：pathspec push 的 worktree 树按「有未暂存改动取工作区、否则取暂存内容、否则 HEAD」折叠，故默认 pop 能把 staged-only 选择恢复为未暂存工作树内容；`pop --index` 另把 stash 索引层三方合并回去。带集成测试 `test_stash_push_pathspec_stashes_only_matched`/`_directory`/`_no_match_errors`/`test_stash_pop_preserves_unrelated_uncommitted_change`/`test_stash_pop_restores_unstaged_change_without_staging`/`test_stash_pop_restores_staged_only_change_as_unstaged_by_default`/`test_stash_pop_restores_mixed_file_as_unstaged_worktree_content`/`test_stash_pop_reports_index_load_failure_without_dropping_stash`。 |
 | 兼容差异项 | Plumbing create/store | 原始对照：不支持 (延后 — see compatibility/declined.md D8/D9)；相关参数/替代：stash create / stash store；当前说明：不适用。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 
 ## 维护要求
@@ -74,3 +78,4 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+- 2026-09-20（plan issues/470 FM-04）：`has_changes()` 在 `core.fileMode=true` 时把仅 mode 变化视为本地修改，使 `stash push` 能保存并还原该变化。

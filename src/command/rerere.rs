@@ -267,6 +267,8 @@ async fn apply(scope: &WorktreeScope, rr_dir: &Path, stage_replayed: bool) -> Cl
 /// writes stage 0 but does not clear the unmerged stages a sequencer left.
 async fn stage_path(path: &str) -> CliResult<()> {
     let args = crate::command::add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![path.to_string()],
         all: false,
         update: false,

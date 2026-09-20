@@ -405,3 +405,42 @@ fn test_update_index_force_remove_matrix() {
     let parsed = parse_json_stdout(&output);
     assert_eq!(parsed["data"]["removed"], 1, "removed count: {parsed}");
 }
+
+/// FM-03 (M-CFG K5, plan issues/470): `update-index <path>` keeps an existing
+/// entry's mode when `core.fileMode=false`.
+#[cfg(unix)]
+#[test]
+fn test_update_index_path_honors_core_filemode_false() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{assert_cli_success, configure_identity_via_cli};
+
+    let repo = init_repo();
+    let root = repo.path();
+    configure_identity_via_cli(root);
+    let tool = root.join("tool.sh");
+    fs::write(&tool, "#!/bin/sh\necho v1\n").expect("write tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    assert_cli_success(&run_libra_command(&["add", "tool.sh"], root), "stage tool");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "exec", "--no-verify"], root),
+        "commit tool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::write(&tool, "#!/bin/sh\necho v2\n").expect("rewrite tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["update-index", "tool.sh"], root),
+        "update-index",
+    );
+    let out = run_libra_command(&["ls-files", "--stage", "tool.sh"], root);
+    assert_cli_success(&out, "ls-files");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("100755"),
+        "K5 existing mode must be kept: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

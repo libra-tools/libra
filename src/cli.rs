@@ -790,6 +790,11 @@ pub enum Stash {
     Pop {
         #[arg(help = "The stash to pop")]
         stash: Option<String>,
+        #[arg(
+            long = "index",
+            help = "Reinstate the stashed index as well as the working tree"
+        )]
+        index: bool,
     },
     #[command(about = "List the stashes that you currently have")]
     List,
@@ -797,6 +802,11 @@ pub enum Stash {
     Apply {
         #[arg(help = "The stash to apply")]
         stash: Option<String>,
+        #[arg(
+            long = "index",
+            help = "Reinstate the stashed index as well as the working tree"
+        )]
+        index: bool,
     },
     #[command(about = "Remove a single stashed state from the stash list")]
     Drop {
@@ -1112,6 +1122,54 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<s
 /// `FIX-AD-01`: inject the hidden pathspec-separator sentinel for `show` when
 /// the user wrote `--`, so a bare pathspec with no revision means `HEAD`
 /// (Git parity). Arity-free: it only adds a flag right after the subcommand.
+/// WT-08 (ADR-WT-06): an omitted `stash` subcommand is `stash push`.
+///
+/// - `libra stash` (nothing after it) -> `stash push`
+/// - `libra stash -m x` / `libra stash -- a.txt` (first token starts with `-`)
+///   -> `stash push <rest>`
+/// - a known subcommand (`push`/`pop`/`apply`/`list`/`show`/`drop`/`branch`/
+///   `clear`/`save`/`create`) is left alone
+/// - anything else is a usage error with Git's wording (git 2.55.0:
+///   `subcommand wasn't specified; 'push' can't be assumed due to unexpected
+///   token 'foo'`, exit 128; Libra keeps its usage exit 129)
+fn rewrite_bare_stash_args(args: Vec<std::ffi::OsString>) -> CliResult<Vec<std::ffi::OsString>> {
+    let Some((stash_index, _from_double_dash)) = find_subcommand_index(&args) else {
+        return Ok(args);
+    };
+    if !matches!(args.get(stash_index), Some(name) if name == "stash") {
+        return Ok(args);
+    }
+    let Some(next) = args.get(stash_index + 1) else {
+        let mut out = args;
+        out.push(std::ffi::OsString::from("push"));
+        return Ok(out);
+    };
+    let next = next.to_string_lossy().into_owned();
+    if next.starts_with('-') {
+        // `-h`/`--help` must reach the TOP-LEVEL stash help (subcommand list
+        // and the EXAMPLES banner), exactly like Git; inserting `push` here
+        // would render `stash push --help` instead.
+        if matches!(next.as_str(), "-h" | "--help") {
+            return Ok(args);
+        }
+        let mut out = Vec::with_capacity(args.len() + 1);
+        out.extend(args.iter().take(stash_index + 1).cloned());
+        out.push(std::ffi::OsString::from("push"));
+        out.extend(args.iter().skip(stash_index + 1).cloned());
+        return Ok(out);
+    }
+    const SUBCOMMANDS: &[&str] = &[
+        "push", "pop", "apply", "list", "show", "drop", "branch", "clear", "save", "create",
+    ];
+    if SUBCOMMANDS.contains(&next.as_str()) {
+        return Ok(args);
+    }
+    Err(CliError::command_usage(format!(
+        "subcommand wasn't specified; 'push' can't be assumed due to unexpected token '{next}'"
+    ))
+    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments))
+}
+
 fn rewrite_show_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let Some((show_index, _from_double_dash)) = find_subcommand_index(&args) else {
         return args;
@@ -1513,7 +1571,7 @@ fn repair_invocation_refused_without_confirmation(
     ) {
         return !matches!(command, WorktreeSubcommand::Repair { yes: true, .. });
     }
-    !(*migrate_layout && *dry_run) && !*confirm
+    !(*confirm || *migrate_layout && *dry_run)
 }
 
 fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {
@@ -3032,7 +3090,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         argv.clone(),
         &<Cli as clap::CommandFactory>::command(),
     );
-    let argv = status_resolution.argv.clone();
+    let argv = rewrite_bare_stash_args(status_resolution.argv.clone())?;
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
     reject_unsupported_single_dash_control(&utf8_argv)?;
@@ -3660,6 +3718,59 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// WT-08 (ADR-WT-06): an omitted `stash` subcommand is rewritten to
+    /// `stash push`; known subcommands and other commands are untouched.
+    #[test]
+    fn bare_stash_rewrites_to_push() {
+        fn argv(parts: &[&str]) -> Vec<std::ffi::OsString> {
+            parts.iter().map(std::ffi::OsString::from).collect()
+        }
+        fn view(parts: &[&str]) -> Vec<String> {
+            rewrite_bare_stash_args(argv(parts))
+                .expect("rewrite")
+                .iter()
+                .map(|token| token.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        assert_eq!(view(&["libra", "stash"]), ["libra", "stash", "push"]);
+        assert_eq!(
+            view(&["libra", "stash", "-m", "x"]),
+            ["libra", "stash", "push", "-m", "x"]
+        );
+        assert_eq!(
+            view(&["libra", "--json", "stash", "--", "a.txt"]),
+            ["libra", "--json", "stash", "push", "--", "a.txt"]
+        );
+        // Known subcommands, and other commands, are untouched.
+        assert_eq!(view(&["libra", "stash", "pop"]), ["libra", "stash", "pop"]);
+        assert_eq!(
+            view(&["libra", "stash", "list", "--json"]),
+            ["libra", "stash", "list", "--json"]
+        );
+        assert_eq!(view(&["libra", "status"]), ["libra", "status"]);
+        // `--help`/`-h` keep the top-level stash help (EXAMPLES banner).
+        assert_eq!(
+            view(&["libra", "stash", "--help"]),
+            ["libra", "stash", "--help"]
+        );
+        assert_eq!(view(&["libra", "stash", "-h"]), ["libra", "stash", "-h"]);
+        // M-BARE B6: an unexpected first token is a usage error with Git's
+        // wording (git 2.55.0 exits 128; Libra keeps its usage code).
+        let error = rewrite_bare_stash_args(argv(&["libra", "stash", "foo"]))
+            .expect_err("unexpected token foo");
+        assert_eq!(
+            error.stable_code(),
+            crate::utils::error::StableErrorCode::CliInvalidArguments
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("'push' can't be assumed due to unexpected token 'foo'"),
+            "{error}"
+        );
+    }
 
     /// M-WAIT W5: with the generation lock busy, the read-only preflight
     /// skips the bounded replay silently — no warning, no error.

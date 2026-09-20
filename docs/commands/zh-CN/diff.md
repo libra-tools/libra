@@ -34,6 +34,8 @@ Diff 引擎默认使用 Myers，与 Git 及底层内建引擎一致。`--minimal
 
 工作树中的已跟踪符号链接按链接目标 blob 字节参与 diff。修改 symlink 目标会显示旧目标和新目标的内容差异；dangling symlink 不会因为目标不存在而被当作删除路径。
 
+文件 mode 遵循 `core.filemode`：为 `true`（Unix 默认）时，仅 mode 变化（owner-execute 位不同、内容未变）会渲染 mode 头（`old mode 100644` / `new mode 100755`）并在 `--summary` 下输出 `mode change` 行；为 `false` 时不 diff 仅 mode 的差异。条目类型变化（普通文件 ↔ 符号链接）始终显示。
+
 Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改。
 
 当 stdout 被管道连接且下游命令提前退出时，stdout `BrokenPipe` 会被视为正常管道终止；不会打印 panic/backtrace 或 `Broken pipe` 诊断。

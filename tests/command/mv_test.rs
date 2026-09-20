@@ -24,6 +24,8 @@ fn test_mv_cli_outside_repository_returns_fatal_128() {
 async fn stage_file(path: &str, content: &str) {
     test::ensure_file(path, Some(content));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![path.to_string()],
         all: false,
         update: false,
@@ -1017,5 +1019,71 @@ fn test_mv_json_omits_skipped_when_none() {
     assert!(
         json["data"].get("skipped").is_none(),
         "skipped must be omitted when nothing was skipped: {json}"
+    );
+}
+
+/// WT-01 (M-GUARD G7, issues/476): issue-verified `mv -n` / `-f` / `-k`.
+#[test]
+fn test_mv_issue476_verified_surface_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("src.txt"), "src\n").expect("src");
+    fs::write(root.join("dst.txt"), "dst\n").expect("dst");
+    assert_cli_success(
+        &run_libra_command(&["add", "src.txt", "dst.txt"], root),
+        "G7 add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "mv files", "--no-verify"], root),
+        "G7 commit",
+    );
+
+    let dry = run_libra_command(&["mv", "-n", "src.txt", "src-new.txt"], root);
+    assert_eq!(dry.status.code(), Some(0), "G7 -n exit");
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains("Checking rename of 'src.txt' to 'src-new.txt'"),
+        "G7 -n check: {dry_out}"
+    );
+    assert!(
+        dry_out.contains("Renaming src.txt to src-new.txt"),
+        "G7 -n rename: {dry_out}"
+    );
+    assert!(root.join("src.txt").is_file(), "G7 -n must not move");
+    assert!(!root.join("src-new.txt").exists(), "G7 -n must not create");
+
+    let force = run_libra_command(&["mv", "-f", "src.txt", "dst.txt"], root);
+    assert_cli_success(&force, "G7 -f");
+    assert!(!root.join("src.txt").exists(), "G7 -f removes source");
+    assert_eq!(
+        fs::read_to_string(root.join("dst.txt")).expect("dst after -f"),
+        "src\n",
+        "G7 -f overwrites the tracked destination"
+    );
+
+    fs::write(root.join("keep.txt"), "keep\n").expect("keep");
+    assert_cli_success(
+        &run_libra_command(&["add", "keep.txt"], root),
+        "G7 keep add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "keep", "--no-verify"], root),
+        "G7 keep commit",
+    );
+    fs::create_dir_all(root.join("dest")).expect("dest");
+    let skip = run_libra_command(&["mv", "-k", "missing.txt", "keep.txt", "dest"], root);
+    assert_eq!(skip.status.code(), Some(0), "G7 -k exit");
+    assert!(
+        String::from_utf8_lossy(&skip.stderr).is_empty(),
+        "G7 -k stderr: {}",
+        String::from_utf8_lossy(&skip.stderr)
+    );
+    assert!(
+        !root.join("keep.txt").exists(),
+        "G7 -k moves the valid source"
+    );
+    assert!(
+        root.join("dest/keep.txt").is_file(),
+        "G7 -k lands the valid source"
     );
 }

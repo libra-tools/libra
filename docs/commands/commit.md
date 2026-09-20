@@ -190,6 +190,9 @@ libra commit -m "fix(auth): handle expired tokens" --conventional
 
 Automatically stage tracked files that have been modified or deleted before committing.
 Equivalent to running `libra add -u` before `libra commit`. Does not add new untracked files.
+File modes follow `core.filemode`: with `true` (the Unix default) a mode-only change to a
+tracked regular file is committed too, while `false` ignores it (an invalid value fails the
+commit closed).
 
 ```bash
 libra commit -a -m "Fix typo"

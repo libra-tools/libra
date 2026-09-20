@@ -242,9 +242,9 @@ fn site_rows_point_at_real_attribute_sites() {
             continue;
         };
         assert!(
-            !inner
+            inner
                 .rsplit_once(':')
-                .is_some_and(|(_, tail)| tail.parse::<usize>().is_ok()),
+                .is_none_or(|(_, tail)| tail.parse::<usize>().is_err()),
             "site key {key} is line-anchored; TA-02 bans line numbers in keys"
         );
         if let Some((path, rest)) = inner.split_once(":macro:") {

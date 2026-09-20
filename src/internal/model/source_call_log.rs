@@ -5,6 +5,7 @@
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
 //! and the entity is registered in [`crate::internal::model`].
 //!
+
 //! No live producer remains after retirement of the Code-era source runtime;
 //! this entity is retained solely for migration and compatibility data in
 //! existing repositories.

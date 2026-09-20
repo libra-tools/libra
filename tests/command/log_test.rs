@@ -812,6 +812,8 @@ async fn test_log_patch_no_pathspec() {
     // Create file A and commit
     test::ensure_file("A.txt", Some("Content A\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("A.txt")],
         all: false,
         update: false,
@@ -850,6 +852,8 @@ async fn test_log_patch_no_pathspec() {
     // Create file B and commit
     test::ensure_file("B.txt", Some("Content B\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("B.txt")],
         all: false,
         update: false,
@@ -949,6 +953,8 @@ async fn test_log_patch_with_pathspec() {
     test::ensure_file("B.txt", Some("Content B\n"));
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -1087,6 +1093,8 @@ async fn test_log_stat() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1124,6 +1132,8 @@ async fn test_log_stat() {
 
     test::ensure_file("file2.txt", Some("content A\ncontent B\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -1189,6 +1199,8 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1226,6 +1238,8 @@ async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
 
     test::ensure_file("file1.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1309,6 +1323,8 @@ async fn test_log_stat_with_modifications() {
 
     test::ensure_file("test.txt", Some("line1\nline2\nline3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test.txt")],
         all: false,
         update: false,
@@ -1346,6 +1362,8 @@ async fn test_log_stat_with_modifications() {
 
     test::ensure_file("test.txt", Some("line1\nline2 modified\nline3\nline4\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test.txt")],
         all: false,
         update: false,
@@ -1562,6 +1580,8 @@ async fn test_log_graph_simple_chain() {
 
     test::ensure_file("file1.txt", Some("content1\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1599,6 +1619,8 @@ async fn test_log_graph_simple_chain() {
 
     test::ensure_file("file2.txt", Some("content2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -1654,6 +1676,8 @@ async fn test_log_stat_and_graph_combined() {
 
     test::ensure_file("combo.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("combo.txt")],
         all: false,
         update: false,
@@ -1794,6 +1818,8 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
     // Commit a normal file first.
     test::ensure_file("a.txt", Some("A\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("a.txt")],
         all: false,
         update: false,
@@ -1832,6 +1858,8 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
     // Commit a file named "-2" to validate pathspec handling.
     test::ensure_file("-2", Some("dash\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("-2")],
         all: false,
         update: false,
@@ -2086,6 +2114,8 @@ async fn test_log_grep_filtering() {
     // Create first commit: fix message
     test::ensure_file("file1.txt", Some("content1\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -2124,6 +2154,8 @@ async fn test_log_grep_filtering() {
     // Create second commit: feat message
     test::ensure_file("file2.txt", Some("content2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file2.txt")],
         all: false,
         update: false,
@@ -2162,6 +2194,8 @@ async fn test_log_grep_filtering() {
     // Create third commit: docs message
     test::ensure_file("file3.txt", Some("content3\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file3.txt")],
         all: false,
         update: false,
@@ -2255,6 +2289,8 @@ async fn test_log_reverse_outputs_oldest_first() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2283,6 +2319,8 @@ async fn test_log_reverse_outputs_oldest_first() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -2327,6 +2365,8 @@ async fn test_log_range_excludes_start_commit() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2356,6 +2396,8 @@ async fn test_log_range_excludes_start_commit() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -2399,6 +2441,8 @@ async fn test_log_all_includes_branches() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -2459,6 +2503,8 @@ async fn test_log_all_includes_branches() {
 
     test::ensure_file("side.txt", Some("side\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["side.txt".into()],
         all: false,
         update: false,
@@ -2505,6 +2551,8 @@ async fn test_log_follow_detects_rename() {
 
     test::ensure_file("old.txt", Some("content\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["old.txt".into()],
         all: false,
         update: false,
@@ -2534,6 +2582,8 @@ async fn test_log_follow_detects_rename() {
     std::fs::remove_file(temp_path.path().join("old.txt")).unwrap();
     test::ensure_file("new.txt", Some("content\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["old.txt".into(), "new.txt".into()],
         all: false,
         update: false,
@@ -2578,6 +2628,8 @@ async fn test_log_line_range_flag_accepted() {
 
     test::ensure_file("a.txt", Some("line1\nline2\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -3070,6 +3122,8 @@ fn test_log_pretty_named_presets() {
 async fn commit_file(path: &str, content: &str, message: &str) -> String {
     test::ensure_file(path, Some(content));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![path.into()],
         all: false,
         update: false,

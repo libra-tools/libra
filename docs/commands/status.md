@@ -41,6 +41,14 @@ compares the stored link target bytes, and reports target changes as
 modifications instead of following the link or treating dangling symlinks as
 deleted.
 
+With `core.filemode=true` (the Unix default) a tracked regular file whose
+owner-execute bit differs from the index while its content is unchanged is a
+mode-only modification and is reported in every output format (short, long,
+porcelain v2, and JSON). With `core.filemode=false` mode-only differences are
+ignored; entry-type changes (for example a regular file replaced by a symlink)
+are always reported. An invalid `core.filemode` value fails `status` closed
+before any output.
+
 ### Display config defaults (`status.*`)
 
 When the corresponding CLI flag is absent, Libra honors these Git-compatible
@@ -192,17 +200,19 @@ is not columnar by default, so on its own this is a no-op.
 libra status --no-column
 ```
 
-### `--find-renames [PERCENT]`
+### `-M [PERCENT]` / `--find-renames [PERCENT]`
 
-Set the rename-detection similarity threshold. Rename detection is **on by default** at 50%
-(matching Git), so `--find-renames` is only needed to change the threshold or to re-enable
-detection after `status.renames=false`. When a deleted file and a new file are similar enough,
+`-M[<n>]` is the short form of `--find-renames[=<n>]` (Git's spelling). Set the
+rename-detection similarity threshold. Rename detection is **on by default** at 50%
+(matching Git), so `-M` / `--find-renames` is only needed to change the threshold or to
+re-enable detection after `status.renames=false`. When a deleted file and a new file are similar enough,
 they are reported as one rename pair (`renamed: old -> new`) instead of separate delete/add
 entries. The CLI accepts Git's full raw score grammar — a bare integer is read as
 `0.<digits>` (so `505` is 50.5%), `N%` is a literal percent (`100%` = exact-only), and
-decimals work (`0.8`); `0`/bare re-enable the 50% default. The three spellings
-`--no-renames` / `--renames` / `--find-renames[=N]` obey true last-one-wins in argv order
-(so `--no-renames --find-renames=80` re-enables at 80%). `-z` also has the Git-parity
+decimals work (`0.8`); `0`/bare re-enable the 50% default. The four spellings
+`--no-renames` / `--renames` / `--find-renames[=N]` / `-M[<n>]` obey true last-one-wins in
+argv order (so `--no-renames -M80` re-enables at 80%), and `-M` composes with other short
+flags (`-sM90`). A non-numeric value such as `-Mabc` fails closed with `LBR-CLI-002`. `-z` also has the Git-parity
 `--null` long alias; a bare `-z`/`--null` with no explicit format forces porcelain v1, and
 combining it with `--long` or the cache modes fails closed. The embedding API's
 `find_renames: Option<u8>` keeps the simpler 0–100 percent range (documented narrowing —
@@ -707,7 +717,7 @@ a branch needs to be pushed or pulled, without having to run separate `libra log
 | Quiet mode | `git status -q` | N/A | `libra status --quiet` (global flag) |
 | Column display | `git status --column` | N/A | `libra status --column` (`--no-column` countermands) |
 | Ahead/behind display | `git status -sb` (text only) | N/A | Human + structured `upstream` object in JSON |
-| Find renames | `git status -M` | Automatic | `--find-renames` / `--renames` |
+| Find renames | `git status -M` | Automatic | `-M[<n>]` / `--find-renames` / `--renames` |
 | Ignore submodules | `git status --ignore-submodules` | N/A | N/A (no submodules) |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
 | Error hints | Minimal | Minimal | Every error type has an actionable hint |
@@ -753,5 +763,5 @@ Every `StatusError` variant maps to an explicit `StableErrorCode`.
   base `??` row and only sits out rename scoring (with a
   `rename_path_encoding_unsupported` warning)
 - jj's `jj status` always uses a short format and does not distinguish staged from unstaged changes (jj has no staging area)
-- Rename detection is supported via `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; Git's short `-M` alias is not exposed
+- Rename detection is supported via Git's `-M[<n>]` / `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; all four spellings share the last-one-wins argv order
 - `--column` column-aligned display is supported; `--no-column` (equivalent to `--column=never`) countermands an earlier `--column` via clap's symmetric override (last one wins), and status is not columnar by default so `--no-column` alone is a no-op

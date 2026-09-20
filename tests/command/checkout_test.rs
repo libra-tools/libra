@@ -209,6 +209,8 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
     test::ensure_file("foo.txt", Some("v1"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["foo.txt".into()],
             all: false,
             update: false,
@@ -311,6 +313,8 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,
@@ -357,6 +361,8 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
     test::ensure_file("dirty.txt", Some("uncommitted"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["dirty.txt".into()],
             all: false,
             update: false,
@@ -427,6 +433,8 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,
@@ -520,6 +528,8 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
     test::ensure_file("base.txt", Some("base"));
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["base.txt".into()],
             all: false,
             update: false,

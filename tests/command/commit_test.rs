@@ -67,6 +67,8 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
 
     test::ensure_file("identity.txt", Some("identity"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["identity.txt".into()],
         all: false,
         update: false,
@@ -249,6 +251,8 @@ async fn test_execute_commit() {
         test::ensure_file("bb/b.txt", Some("b"));
         test::ensure_file("bb/c.txt", Some("c"));
         let args = AddArgs {
+            intent_to_add: false,
+            sparse: false,
             all: true,
             update: false,
             verbose: false,
@@ -351,6 +355,8 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
 
     test::ensure_file("tracked.txt", Some("v1"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["tracked.txt".into()],
         all: false,
         update: false,
@@ -434,6 +440,8 @@ async fn test_commit_with_all_flag_records_deletions() {
 
     test::ensure_file("keep.txt", Some("keep"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["keep.txt".into()],
         all: false,
         update: false,
@@ -542,6 +550,8 @@ async fn test_commit_sha256() {
     // Create and add a file
     test::ensure_file("a.txt", Some("hello sha256"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".to_string()],
         all: false,
         update: false,
@@ -639,6 +649,8 @@ async fn test_commit_with_custom_author() {
     // Create a file and add it
     test::ensure_file("test.txt", Some("test content"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".into()],
         all: false,
         update: false,
@@ -905,6 +917,8 @@ async fn test_commit_with_actual_changes() {
     std::fs::write(&test_file, "test content").unwrap();
 
     let add_args = add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".to_string()],
         all: false,
         update: false,
@@ -996,6 +1010,8 @@ async fn test_commit_signoff_persists_trailer() {
 
     test::ensure_file("signed.txt", Some("signed content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["signed.txt".into()],
         all: false,
         update: false,
@@ -1168,6 +1184,8 @@ async fn test_commit_without_identity_fails_by_default() {
 
     test::ensure_file("autodetect.txt", Some("content"));
     add::execute(add::AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["autodetect.txt".into()],
         all: false,
         update: false,
@@ -1258,6 +1276,8 @@ async fn test_commit_cleanup_strips_comments() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1453,6 +1473,8 @@ async fn test_commit_trailer_appended() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1495,6 +1517,8 @@ async fn test_commit_dry_run_does_not_create_commit() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1538,6 +1562,8 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1568,6 +1594,8 @@ async fn test_commit_reuse_message() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -1612,6 +1640,8 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("a.txt", Some("a\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["a.txt".into()],
         all: false,
         update: false,
@@ -1640,6 +1670,8 @@ async fn test_commit_fixup_sets_subject() {
 
     test::ensure_file("b.txt", Some("b\n"));
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["b.txt".into()],
         all: false,
         update: false,
@@ -2455,4 +2487,54 @@ fn test_commit_all_keeps_skip_worktree_entry() {
     let index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("reload");
     let entry = index.get("s", 0).expect("s must stay tracked");
     assert!(entry.flags.skip_worktree, "the bit must survive commit -a");
+}
+
+/// FM-04 (M-DET D4/D6, plan-20260918): `commit -a` records a mode-only change
+/// when `core.fileMode` is enabled and reports nothing to commit when false.
+#[cfg(unix)]
+#[test]
+fn test_commit_all_updates_mode_only_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let run = root.join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").expect("write");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_cli_success(&run_libra_command(&["add", "run.sh"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // D4: mode-only change is committed.
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "mode", "--no-verify"], root),
+        "commit -a",
+    );
+    let tree = run_libra_command(&["ls-tree", "HEAD", "run.sh"], root);
+    assert!(
+        String::from_utf8_lossy(&tree.stdout).starts_with("100644"),
+        "D4 tree mode: {}",
+        String::from_utf8_lossy(&tree.stdout)
+    );
+
+    // D6: with fileMode=false a further chmod is not a change to commit.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    let out = run_libra_command(&["commit", "-a", "-m", "ignored", "--no-verify"], root);
+    assert_ne!(out.status.code(), Some(0), "D6 must have nothing to commit");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to commit")
+            || String::from_utf8_lossy(&out.stderr).contains("nothing added")
+            || String::from_utf8_lossy(&out.stderr).contains("no changes added"),
+        "D6 message: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

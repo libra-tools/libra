@@ -127,6 +127,8 @@ async fn test_remove_single_file() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -212,6 +214,8 @@ async fn test_remove_cached() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -278,6 +282,8 @@ async fn test_remove_directory_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -376,6 +382,8 @@ async fn test_remove_directory_without_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -473,6 +481,8 @@ async fn test_remove_modified_file() {
     let file_path = create_file("test_file.txt", "Initial content");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -558,6 +568,8 @@ async fn test_remove_multiple_files() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -623,6 +635,8 @@ async fn test_remove_dry_run() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -697,6 +711,8 @@ async fn test_remove_dry_run_cached() {
     let file_path = create_file("test_file.txt", "Test content");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_file.txt")],
         all: false,
         update: false,
@@ -760,6 +776,8 @@ async fn test_remove_dry_run_recursive() {
 
     // Add all files to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_dir")],
         all: false,
         update: false,
@@ -831,6 +849,8 @@ async fn test_remove_ignore_unmatch() {
 
     // Add file 1 to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("test_dir/file1.txt")],
         all: false,
         update: false,
@@ -892,6 +912,8 @@ async fn test_remove_pathspec_from_file_newline() {
 
     // Add all files to index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -946,6 +968,8 @@ async fn test_remove_pathspec_from_file_nul() {
 
     // Add all files to index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: false,
@@ -1000,6 +1024,8 @@ async fn test_remove_pathspec_from_file_ignore_unmatch() {
     let file1 = create_file("file1.txt", "File 1 content");
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from("file1.txt")],
         all: false,
         update: false,
@@ -1106,5 +1132,187 @@ fn test_remove_sparse_flag_is_noop() {
     assert!(
         !tracked_list.contains("tracked.txt"),
         "rm --cached --sparse untracks the file from the index: {tracked_list}"
+    );
+}
+
+/// WT-04 (M-RM R1–R5, issues/476): the three `rm` refusal classes are
+/// `LBR-CONFLICT-002` (category=conflict, exit 128) with Git's wording and its
+/// 4-space file-list indent.
+#[test]
+fn test_remove_refusal_error_code_matrix() {
+    fn setup() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        init_repo_via_cli(&root);
+        configure_identity_via_cli(&root);
+        fs::write(root.join("a.txt"), "a\n").expect("write a");
+        fs::write(root.join("b.txt"), "b\n").expect("write b");
+        assert_cli_success(&run_libra_command(&["add", "a.txt", "b.txt"], &root), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "init", "--no-verify"], &root),
+            "commit",
+        );
+        (repo, root)
+    }
+
+    // R1: a staged change is refused with the conflict code and 4-space indent.
+    let (_repo, root) = setup();
+    fs::write(root.join("a.txt"), "a2\n").expect("stage change");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "add staged");
+    let refused = run_libra_command(&["rm", "a.txt"], &root);
+    assert_eq!(refused.status.code(), Some(128), "R1 exit");
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("the following file has changes staged in the index:"),
+        "R1 wording: {stderr}"
+    );
+    assert!(
+        stderr.contains("\n    a.txt\n"),
+        "R1 4-space indent: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\ta.txt"),
+        "R1 must not use tabs: {stderr}"
+    );
+    assert!(stderr.contains("LBR-CONFLICT-002"), "R1 code: {stderr}");
+    assert!(
+        !stderr.contains("LBR-INTERNAL-001"),
+        "R1 old code: {stderr}"
+    );
+
+    // R2: a local modification.
+    let (_repo, root) = setup();
+    fs::write(root.join("a.txt"), "a3\n").expect("modify");
+    let refused = run_libra_command(&["rm", "a.txt"], &root);
+    assert_eq!(refused.status.code(), Some(128), "R2 exit");
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("the following file has local modifications:"),
+        "R2 wording: {stderr}"
+    );
+    assert!(stderr.contains("\n    a.txt\n"), "R2 indent: {stderr}");
+    assert!(stderr.contains("LBR-CONFLICT-002"), "R2 code: {stderr}");
+
+    // R3: staged content differs from both the worktree file and HEAD.
+    let (_repo, root) = setup();
+    fs::write(root.join("a.txt"), "staged\n").expect("stage");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "add");
+    fs::write(root.join("a.txt"), "worktree\n").expect("modify after stage");
+    let refused = run_libra_command(&["rm", "--cached", "a.txt"], &root);
+    assert_eq!(refused.status.code(), Some(128), "R3 exit");
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("staged content different from both the\nfile and the HEAD:"),
+        "R3 wording: {stderr}"
+    );
+    assert!(
+        stderr.contains("(use -f to force removal)"),
+        "R3 hint: {stderr}"
+    );
+    assert!(stderr.contains("LBR-CONFLICT-002"), "R3 code: {stderr}");
+
+    // R4: two refused files use the plural heading.
+    let (_repo, root) = setup();
+    fs::write(root.join("a.txt"), "a4\n").expect("stage a");
+    fs::write(root.join("b.txt"), "b4\n").expect("stage b");
+    assert_cli_success(
+        &run_libra_command(&["add", "a.txt", "b.txt"], &root),
+        "add both",
+    );
+    let refused = run_libra_command(&["rm", "a.txt", "b.txt"], &root);
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("the following files have changes staged in the index:"),
+        "R4 plural heading: {stderr}"
+    );
+    assert!(stderr.contains("\n    a.txt\n"), "R4 first file: {stderr}");
+    assert!(stderr.contains("\n    b.txt\n"), "R4 second file: {stderr}");
+
+    // R5: the structured envelope carries the same classification, dry-run too.
+    let (_repo, root) = setup();
+    fs::write(root.join("a.txt"), "a5\n").expect("stage");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &root), "add");
+    for args in [
+        &["--json", "rm", "a.txt"][..],
+        &["--json", "rm", "--dry-run", "a.txt"][..],
+    ] {
+        let refused = run_libra_command(args, &root);
+        assert_eq!(refused.status.code(), Some(128), "R5 {args:?} exit");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&refused.stderr).unwrap_or_else(|error| {
+                panic!(
+                    "R5 {args:?}: not JSON: {error}: {}",
+                    String::from_utf8_lossy(&refused.stderr)
+                )
+            });
+        assert_eq!(parsed["ok"], serde_json::json!(false), "R5 {args:?}");
+        assert_eq!(parsed["error_code"], "LBR-CONFLICT-002", "R5 {args:?}");
+        assert_eq!(parsed["category"], "conflict", "R5 {args:?}");
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("changes staged in the index:"),
+            "R5 {args:?} message: {parsed}"
+        );
+    }
+    // Regression: `nosuch.txt` and `rm -f a.txt` keep their behavior (R6).
+    let (_repo, root) = setup();
+    let missing = run_libra_command(&["rm", "nosuch.txt"], &root);
+    assert_ne!(missing.status.code(), Some(0), "R6 unmatched path");
+    let forced = run_libra_command(&["rm", "-f", "a.txt"], &root);
+    assert_cli_success(&forced, "R6 -f removes");
+}
+
+/// WT-04 (M-RM R7, issues/476): the t3600 staged-content refusal cases.
+#[test]
+fn test_t3600_staged_content_refusals() {
+    // t3600:35-59 — a staged change is refused; `-f` overrides.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("f.txt"), "one\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    fs::write(root.join("f.txt"), "two\n").expect("modify");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], root), "stage");
+    let refused = run_libra_command(&["rm", "f.txt"], root);
+    assert_eq!(refused.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("LBR-CONFLICT-002"));
+    assert_cli_success(&run_libra_command(&["rm", "-f", "f.txt"], root), "rm -f");
+
+    // t3600:809 / :823 — `--cached` refusals keep the file and the index.
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("g.txt"), "base\n").expect("write");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    // Staged content differs from the worktree AND from HEAD.
+    fs::write(root.join("g.txt"), "staged\n").expect("stage edit");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], root), "add staged");
+    fs::write(root.join("g.txt"), "worktree\n").expect("worktree edit");
+    let refused = run_libra_command(&["rm", "--cached", "g.txt"], root);
+    assert_eq!(refused.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("staged content different from both the\nfile and the HEAD:"),
+    );
+    assert!(
+        root.join("g.txt").exists(),
+        "refusal keeps the worktree file"
+    );
+    let listing = run_libra_command(&["ls-files"], root);
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).contains("g.txt"),
+        "refusal keeps the index entry"
     );
 }

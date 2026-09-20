@@ -434,6 +434,69 @@ fn loose_object_path(repo: &Path, hash: &str) -> std::path::PathBuf {
 }
 
 /// Initialize a repository through the CLI to exercise the real process entrypoint.
+/// Set `skip_worktree` on a tracked path through the git-internal index API
+/// (the CLI entry point arrives with plan issues/490 SW-07).
+#[allow(dead_code)]
+pub(crate) fn mark_skip_worktree(repo: &Path, path: &str) {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+    let index_path = repo.join(".libra/index");
+    let mut index =
+        Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index for marking");
+    let (hash, mode, size) = {
+        let entry = index.get(path, 0).expect("tracked path");
+        (entry.hash, entry.mode, entry.size)
+    };
+    let mut entry = IndexEntry::new_from_blob(path.to_string(), hash, size);
+    entry.mode = mode;
+    entry.flags.skip_worktree = true;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+}
+
+/// Whether a tracked path currently carries the `skip_worktree` bit.
+#[allow(dead_code)]
+pub(crate) fn skip_worktree_set(repo: &Path, path: &str) -> bool {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .expect("load index")
+        .get(path, 0)
+        .is_some_and(|entry| entry.flags.skip_worktree)
+}
+
+/// The stage-0 index entry for `path` as `(mode, hash hex, size,
+/// intent_to_add, skip_worktree)`, or `None` when the path has no stage 0.
+#[allow(dead_code)]
+pub(crate) fn index_entry_snapshot(
+    repo: &Path,
+    path: &str,
+) -> Option<(u32, String, u32, bool, bool)> {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .ok()?
+        .get(path, 0)
+        .map(|entry| {
+            (
+                entry.mode,
+                entry.hash.to_string(),
+                entry.size,
+                entry.flags.intent_to_add,
+                entry.flags.skip_worktree,
+            )
+        })
+}
+
+/// The on-disk index header version (2 or 3).
+#[allow(dead_code)]
+pub(crate) fn index_version(repo: &Path) -> u32 {
+    let bytes = std::fs::read(repo.join(".libra/index")).expect("read index");
+    u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+}
+
 fn init_repo_via_cli(repo: &Path) {
     fs::create_dir_all(repo).expect("failed to create repository directory");
     let output = run_libra_command(&["init"], repo);

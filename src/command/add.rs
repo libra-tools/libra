@@ -156,6 +156,20 @@ pub struct AddArgs {
     #[clap(long)]
     pub resolved: bool,
 
+    /// Allow updating entries that exist outside the sparse-checkout definition
+    /// (skip-worktree). Without it such pathspecs are reported and `add` exits
+    /// 1; with it the entry is staged and its skip-worktree bit is preserved.
+    /// Mirrors Git's `add --sparse`.
+    #[clap(long)]
+    pub sparse: bool,
+
+    /// Record intent-to-add entries (empty blob plus the index v3
+    /// `intent_to_add` extended flag) for the matched paths without staging
+    /// content. Mirrors Git's `add -N/--intent-to-add`; the flag stays hidden
+    /// until the follow-up card lands the full write surface.
+    #[clap(short = 'N', long = "intent-to-add", hide = true)]
+    pub intent_to_add: bool,
+
     /// Interactively choose hunks to stage (`add -p`).
     #[clap(short = 'p', long = "patch")]
     pub patch: bool,
@@ -363,6 +377,14 @@ pub struct AddOutput {
     /// `error: cannot chmod …` lines and in JSON as `chmod_rejected`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chmod_rejected: Vec<ChmodRejection>,
+    /// Pathspecs that matched only skip-worktree (sparse-checkout) entries.
+    /// Reported as the sparse diagnostic and exit 1; `--sparse` opts out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparse_paths: Vec<String>,
+    /// Paths recorded as intent-to-add entries (empty blob plus the index v3
+    /// extended flag) by `add -N`; under `--dry-run` they are only previewed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_to_add: Vec<String>,
     /// Whether this was a dry-run (no actual changes made)
     pub dry_run: bool,
 }
@@ -380,6 +402,8 @@ impl AddOutput {
             failed: Vec::new(),
             missing: Vec::new(),
             chmod_rejected: Vec::new(),
+            sparse_paths: Vec::new(),
+            intent_to_add: Vec::new(),
             dry_run,
         }
     }
@@ -396,7 +420,7 @@ impl AddOutput {
     /// [`Self::ignored`] in [`check_ignored_only_error`] to detect the
     /// "everything was filtered out" failure mode.
     fn is_empty(&self) -> bool {
-        self.total_staged() == 0 && self.refreshed.is_empty()
+        self.total_staged() == 0 && self.refreshed.is_empty() && self.intent_to_add.is_empty()
     }
 
     fn wrote_index(&self) -> bool {
@@ -433,6 +457,8 @@ struct ValidatedPathspecs {
     /// candidate (dry-run only). Reported as stderr warnings and the JSON
     /// payload.
     missing: Vec<String>,
+    /// Pathspecs that matched only skip-worktree entries (ADR-SW-04/05).
+    sparse: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -586,6 +612,25 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     }
     if result.wrote_index() {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
+    }
+
+    // ADR-SW-05: sparse pathspecs exit 1 after rendering; text mode prints the
+    // header, each pathspec, and the hint, while JSON carries `sparse_paths`.
+    if !result.sparse_paths.is_empty() {
+        if !output.is_json() {
+            eprintln!(
+                "The following paths and/or pathspecs matched paths that exist outside of your \
+                 sparse-checkout definition, so will not be updated in the index:"
+            );
+            for path in &result.sparse_paths {
+                eprintln!("    {path}");
+            }
+            eprintln!("hint: use 'libra add --sparse <path>' to update such entries");
+            eprintln!(
+                "hint: or clear the skip-worktree bit with 'libra update-index --no-skip-worktree <path>'"
+            );
+        }
+        return Err(CliError::silent_exit(1));
     }
 
     // ADR-CH-02: a `--chmod` refusal exits 1 after rendering, warning
@@ -861,6 +906,7 @@ fn stage_resolved_path(
     index: &mut Index,
     workdir: &Path,
     storage_path: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let rel = Path::new(file);
     let file_abs = workdir.join(rel);
@@ -904,7 +950,9 @@ fn stage_resolved_path(
             for stage in 1..=3 {
                 index.remove(file, stage);
             }
-            crate::utils::index_ext::update_preserving_flags(index, entry);
+            crate::utils::index_ext::update_preserving_file_mode_except_intent(
+                index, entry, file_mode,
+            );
             Ok(StagedAction::Modified)
         }
     }
@@ -1130,6 +1178,7 @@ async fn run_add_patch(
         false,
         true,
         false,
+        args.sparse,
     )?;
     let mut files = visible_changes.modified;
     files.extend(visible_changes.deleted);
@@ -1294,6 +1343,7 @@ async fn run_add_patch(
     Ok(add_output)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_add_resolved(
     args: &AddArgs,
     workdir: &Path,
@@ -1302,6 +1352,7 @@ async fn run_add_resolved(
     layer_scope: &crate::internal::worktree_scope::WorktreeScope,
     pathspec_ctx: PathspecMatchContext<'_>,
     mut index: Index,
+    file_mode: bool,
 ) -> CliResult<AddOutput> {
     let pathspecs = PathspecSet::from_workdir_with_default_icase(
         &args.pathspec,
@@ -1386,7 +1437,7 @@ async fn run_add_resolved(
     }
 
     for file in &files {
-        match stage_resolved_path(file, &mut index, workdir, storage_path) {
+        match stage_resolved_path(file, &mut index, workdir, storage_path, file_mode) {
             Ok(action) => match action {
                 StagedAction::Modified => add_output.modified.push(file.clone()),
                 StagedAction::Removed => add_output.removed.push(file.clone()),
@@ -1447,6 +1498,160 @@ async fn run_add_resolved(
 ///
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
+/// Build the index entry `add -N` records: the empty blob, zeroed stat data
+/// (Git's smudged shape, so a later `add` re-hashes the content) and the index
+/// v3 intent-to-add extended flag.
+fn intent_to_add_entry(path: String, mode: u32) -> IndexEntry {
+    let mut entry = IndexEntry::new_from_blob(path, Blob::from_content_bytes(Vec::new()).id, 0);
+    entry.mode = mode;
+    entry.flags.intent_to_add = true;
+    entry
+}
+
+/// `add -N/--intent-to-add` (plan-20260918 WT-05): record an empty-blob entry
+/// carrying the index v3 `intent_to_add` extended flag for every matched path
+/// that is not already tracked, without staging content. Tracked paths are a
+/// successful no-op (Git's `t2203:56`), a pathspec matching nothing keeps the
+/// ordinary "did not match any files" error, and a dry-run writes nothing.
+#[allow(clippy::too_many_arguments)]
+async fn run_add_intent_to_add(
+    args: &AddArgs,
+    workdir: &Path,
+    index_path: &Path,
+    storage_path: &Path,
+    layer_scope: &crate::internal::worktree_scope::WorktreeScope,
+    pathspec_ctx: PathspecMatchContext<'_>,
+    mut index: Index,
+    file_mode: bool,
+) -> CliResult<AddOutput> {
+    let (visible_changes, ignored_changes) = if args.force {
+        status::changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+            pathspec_ctx.ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
+    } else {
+        status::changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+            pathspec_ctx.ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
+    };
+
+    let validated = validate_pathspecs(
+        &args.pathspec,
+        pathspec_ctx,
+        &visible_changes,
+        &ignored_changes,
+        &index,
+        args.ignore_missing,
+        args.force,
+        false,
+        false,
+        args.sparse,
+    )?;
+
+    let mut add_output = AddOutput::empty(args.dry_run);
+    add_output.ignored = validated.ignored.clone();
+    add_output.missing = validated.missing.clone();
+    {
+        let mut sparse = validated.sparse.clone();
+        sparse.sort();
+        sparse.dedup();
+        add_output.sparse_paths = sparse;
+    }
+
+    // Only untracked paths gain an intent-to-add entry; a pathspec that also
+    // matched a tracked path is a no-op for that path (N3).
+    let mut files = filter_candidates(&visible_changes.new, &validated.pathspecs);
+    files.sort();
+    files.dedup();
+
+    // Layer never-enters-commit guard (lore.md 2.4): even a content-less entry
+    // must not name an overlay path.
+    crate::internal::layer::verify_staging_context(workdir, layer_scope)?;
+    let owned: std::collections::HashSet<String> =
+        crate::internal::layer::LayerStore::owned_path_set_strict(layer_scope)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!(
+                    "cannot verify layer-owned paths before staging: {e}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+            .into_iter()
+            .collect();
+    if !owned.is_empty() {
+        let blocked: Vec<String> = files
+            .iter()
+            .filter_map(|file| crate::internal::layer::normalize_key(file))
+            .filter(|key| owned.contains(key))
+            .collect();
+        if let Some(first) = blocked.first() {
+            return Err(CliError::from(AddError::LayerPath {
+                path: first.clone(),
+                count: blocked.len(),
+            }));
+        }
+    }
+
+    // The empty blob is the tree-side placeholder Git stores for an
+    // intent-to-add entry; the file's real content is deliberately not read.
+    let empty_blob = Blob::from_content_bytes(Vec::new());
+    let mut wrote_entries = false;
+    for file in &files {
+        let file_abs = workdir.join(file);
+        if util::is_sub_path(&file_abs, storage_path) {
+            continue;
+        }
+        let path_str = file.display().to_string();
+        if args.dry_run {
+            add_output.intent_to_add.push(path_str);
+            continue;
+        }
+        let metadata =
+            file_abs
+                .symlink_metadata()
+                .map_err(|source| AddError::CreateIndexEntry {
+                    path: file.clone(),
+                    source,
+                })?;
+        let mode = if metadata.file_type().is_symlink() {
+            0o120000
+        } else if file_mode && worktree_exec_bit(&metadata) {
+            0o100755
+        } else {
+            0o100644
+        };
+        empty_blob
+            .try_save()
+            .map_err(|source| AddError::ObjectSave {
+                path: file.clone(),
+                source,
+            })?;
+        crate::utils::index_ext::update_preserving_flags(
+            &mut index,
+            intent_to_add_entry(path_str.clone(), mode),
+        );
+        add_output.intent_to_add.push(path_str);
+        wrote_entries = true;
+    }
+
+    if wrote_entries {
+        index
+            .save(index_path)
+            .map_err(|source| AddError::IndexSave {
+                path: index_path.to_path_buf(),
+                source,
+            })?;
+    }
+
+    if add_output.ignored.is_empty() {
+        return Ok(add_output);
+    }
+    check_ignored_only_error(add_output)
+}
+
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     if let Some(err) = resolved_option_conflict(args) {
         return Err(err);
@@ -1459,6 +1664,10 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             AddError::Workdir { source }
         }
     })?;
+    // ADR-FM-04: `core.fileMode=false` keeps an existing entry's recorded mode
+    // and makes new paths plain 100644. Resolved once per invocation; an
+    // invalid value fails closed before any staging.
+    let file_mode = crate::internal::config::core_file_mode().await?;
     // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
     // ignore resolver skips layer-owned paths (a no-op with no layers).
     // W1 §C.4.1.1: the scope is derived from the CAPTURED workdir (not the
@@ -1559,16 +1768,37 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             &layer_scope,
             pathspec_ctx,
             index,
+            file_mode,
+        )
+        .await;
+    }
+
+    if args.intent_to_add {
+        return run_add_intent_to_add(
+            args,
+            &workdir,
+            &index_path,
+            &storage_path,
+            &layer_scope,
+            pathspec_ctx,
+            index,
+            file_mode,
         )
         .await;
     }
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+            ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
     } else {
-        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+            ignore_case,
+            file_mode,
+        )
+        .map_err(|source| AddError::Status { source })?
     };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
@@ -1585,6 +1815,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         args.force,
         args.update,
         args.update && args.ignore_errors,
+        args.sparse,
     )?;
 
     let mut add_output = AddOutput::empty(args.dry_run);
@@ -1598,6 +1829,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     }
     // Pathspecs skipped by `--ignore-missing` are surfaced as stderr warnings.
     add_output.missing = validated.missing.clone();
+    // Sparse pathspecs (skip-worktree only) are reported and exit 1 after
+    // rendering (ADR-SW-05).
+    {
+        let mut sparse = validated.sparse.clone();
+        sparse.sort();
+        sparse.dedup();
+        add_output.sparse_paths = sparse;
+    }
 
     // --- Refresh mode ---
     if args.refresh {
@@ -1649,6 +1888,37 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         for path in collect_unmerged_paths(&index) {
             let candidate = PathBuf::from(&path);
             if validated.pathspecs.matches_path(&candidate) && !files.contains(&candidate) {
+                files.push(candidate);
+            }
+        }
+    }
+    // ADR-SW-04/05: without `--sparse` a skip-worktree path is never staged
+    // or deleted; with `--sparse` a matched skip-worktree entry whose worktree
+    // file still exists and differs from the index is stageable (the index
+    // helper preserves the bit).
+    if !args.sparse {
+        files.retain(|path| {
+            path.to_str()
+                .and_then(|name| index.get(name, 0))
+                .is_none_or(|entry| !entry.flags.skip_worktree)
+        });
+    } else {
+        for entry in index.tracked_entries(0) {
+            if !entry.flags.skip_worktree {
+                continue;
+            }
+            let candidate = PathBuf::from(&entry.name);
+            if !validated.pathspecs.matches_path(&candidate) || files.contains(&candidate) {
+                continue;
+            }
+            let absolute = workdir.join(&candidate);
+            if absolute.symlink_metadata().is_err() {
+                continue;
+            }
+            let changed = index.is_modified(&entry.name, 0, &workdir)
+                || crate::command::calc_file_blob_hash(&absolute)
+                    .is_ok_and(|hash| !index.verify_hash(&entry.name, 0, &hash));
+            if changed {
                 files.push(candidate);
             }
         }
@@ -1730,7 +2000,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 }
                 continue;
             }
-            let status = check_file_status(file, &index, &workdir)?;
+            let status = check_file_status(file, &index, &workdir, file_mode)?;
             match status {
                 FileStatus::New => add_output.added.push(path_str),
                 FileStatus::Modified => add_output.modified.push(path_str),
@@ -1828,9 +2098,9 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // Stage each file (`--renormalize` force-rewrites instead of diffing).
     for file in &files {
         let staged = if args.renormalize {
-            renormalize_entry(file, &mut index, &workdir)
+            renormalize_entry(file, &mut index, &workdir, file_mode)
         } else {
-            stage_a_file(file, &mut index, &workdir, &storage_path).await
+            stage_a_file(file, &mut index, &workdir, &storage_path, file_mode).await
         };
         match staged {
             Ok(action) => {
@@ -1982,6 +2252,7 @@ fn renormalize_entry(
     file: &Path,
     index: &mut Index,
     workdir: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let file_str = file.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
         path: file.to_path_buf(),
@@ -2016,7 +2287,7 @@ fn renormalize_entry(
             path: file.to_path_buf(),
             source,
         })?;
-    crate::utils::index_ext::update_preserving_flags(index, entry);
+    crate::utils::index_ext::update_preserving_file_mode_except_intent(index, entry, file_mode);
     Ok(StagedAction::Modified)
 }
 
@@ -2033,7 +2304,7 @@ fn renormalize_entry(
 ///   some paths were ignored — those become warnings instead.
 /// - Stable code is [`StableErrorCode::AddNothingStaged`].
 fn check_ignored_only_error(output: AddOutput) -> CliResult<AddOutput> {
-    if !output.ignored.is_empty() && output.is_empty() {
+    if !output.ignored.is_empty() && output.is_empty() && output.sparse_paths.is_empty() {
         let mut message =
             String::from("the following paths are ignored by configured ignore rules:");
         for path in &output.ignored {
@@ -2107,6 +2378,9 @@ fn render_dry_run(w: &mut impl Write, result: &AddOutput) -> CliResult<()> {
     for f in &result.added {
         writeln!(w, "add: {f}").map_err(write_err)?;
     }
+    for f in &result.intent_to_add {
+        writeln!(w, "add: {f}").map_err(write_err)?;
+    }
     for f in &result.modified {
         writeln!(w, "add: {f}").map_err(write_err)?;
     }
@@ -2147,13 +2421,16 @@ fn render_refresh(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliR
 fn render_normal(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliResult<()> {
     let total = result.total_staged();
 
-    if total == 0 {
+    if total == 0 && result.intent_to_add.is_empty() {
         writeln!(w, "nothing to add").map_err(write_err)?;
         return Ok(());
     }
 
     // Verbose: per-file listing
     if verbose {
+        for f in &result.intent_to_add {
+            writeln!(w, "add(intent-to-add): {f}").map_err(write_err)?;
+        }
         for f in &result.added {
             writeln!(w, "add(new): {f}").map_err(write_err)?;
         }
@@ -2163,6 +2440,11 @@ fn render_normal(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliRe
         for f in &result.removed {
             writeln!(w, "removed: {f}").map_err(write_err)?;
         }
+    }
+
+    // Intent-to-add alone has no staged content; Git stays silent here.
+    if total == 0 {
+        return Ok(());
     }
 
     // Summary line
@@ -2265,6 +2547,7 @@ fn validate_pathspecs(
     force: bool,
     update_known_only: bool,
     ignore_unknown_pathspecs: bool,
+    sparse: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
     let pathspecs = PathspecSet::from_workdir_with_default_icase(
         raw_pathspecs,
@@ -2274,7 +2557,27 @@ fn validate_pathspecs(
     )
     .map_err(|source| AddError::Pathspec { source })?;
 
-    let index_known = index_paths_any_stage(index);
+    // ADR-SW-04/05 (SW-06): skip-worktree entries are sparse-checkout paths.
+    // Without `--sparse` they are not ordinary add candidates, and a pathspec
+    // matching only such entries becomes a sparse pathspec. With `--sparse` a
+    // skip-worktree entry is stageable while its worktree file exists; a
+    // deleted one falls through to the ordinary "did not match any files"
+    // error.
+    let skip_worktree_paths: std::collections::HashSet<PathBuf> = index
+        .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| entry.flags.skip_worktree)
+        .map(|entry| PathBuf::from(&entry.name))
+        .collect();
+    let mut index_known = index_paths_any_stage(index);
+    if !sparse {
+        index_known.retain(|path| !skip_worktree_paths.contains(path));
+    } else {
+        index_known.retain(|path| {
+            !skip_worktree_paths.contains(path)
+                || pathspec_ctx.workdir.join(path).symlink_metadata().is_ok()
+        });
+    }
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
     let selectable_candidates = if update_known_only {
@@ -2287,11 +2590,28 @@ fn validate_pathspecs(
 
     let mut ignored = Vec::new();
     let mut missing = Vec::new();
+    // A pathspec that matches a skip-worktree entry but nothing else is a
+    // sparse pathspec (matrix D1–D3, D6–D9). It is reported separately and
+    // never classified as ignored/missing.
+    let mut sparse_pathspecs = Vec::new();
+    if !sparse && !skip_worktree_paths.is_empty() {
+        let skip_candidates: Vec<PathBuf> = skip_worktree_paths.iter().cloned().collect();
+        let unmatched_without_skip = pathspecs.unmatched_positive_specs(&all_candidates);
+        let unmatched_with_skip = pathspecs.unmatched_positive_specs(&skip_candidates);
+        for raw in unmatched_without_skip {
+            if !unmatched_with_skip.contains(&raw) {
+                sparse_pathspecs.push(raw.to_string());
+            }
+        }
+    }
 
     let unmatched_selectable = pathspecs.unmatched_positive_specs(&selectable_candidates);
     if !unmatched_selectable.is_empty() {
         let unmatched_all = pathspecs.unmatched_positive_specs(&all_candidates);
         for raw in unmatched_selectable {
+            if sparse_pathspecs.iter().any(|spec| spec == raw) {
+                continue;
+            }
             if !unmatched_all.contains(&raw) {
                 ignored.push(raw.to_string());
                 continue;
@@ -2343,6 +2663,7 @@ fn validate_pathspecs(
         pathspecs,
         ignored,
         missing,
+        sparse: sparse_pathspecs,
     })
 }
 
@@ -2462,6 +2783,7 @@ async fn stage_a_file(
     index: &mut Index,
     workdir: &Path,
     storage_path: &Path,
+    file_mode: bool,
 ) -> Result<StagedAction, AddError> {
     let file_abs = workdir.join(file);
     if !util::is_sub_path(&file_abs, workdir) {
@@ -2487,7 +2809,8 @@ async fn stage_a_file(
         return Ok(StagedAction::Unchanged);
     }
 
-    let file_status = check_file_status(file, index, workdir)?;
+    let mode_dirty = mode_only_worktree_change(index, file_str, &file_abs, file_mode);
+    let file_status = check_file_status(file, index, workdir, file_mode)?;
     match file_status {
         FileStatus::New => {
             // Stat BEFORE reading: the entry's stat must describe the
@@ -2508,7 +2831,9 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-            crate::utils::index_ext::update_preserving_flags(index, entry);
+            crate::utils::index_ext::update_preserving_file_mode_except_intent(
+                index, entry, file_mode,
+            );
             clear_conflict_stages(index, file_str);
             Ok(StagedAction::Added)
         }
@@ -2516,14 +2841,14 @@ async fn stage_a_file(
             let unmerged = path_has_conflict_stages(index, file_str);
             let missing_stage0 = !index.tracked(file_str, 0);
             let content_dirty = !missing_stage0 && index.is_modified(file_str, 0, workdir);
-            if unmerged || missing_stage0 || content_dirty {
+            if unmerged || missing_stage0 || content_dirty || mode_dirty {
                 let pre_read = file_abs.symlink_metadata().ok();
                 let blob =
                     gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
                     })?;
-                if missing_stage0 || !index.verify_hash(file_str, 0, &blob.id) {
+                if missing_stage0 || mode_dirty || !index.verify_hash(file_str, 0, &blob.id) {
                     blob.try_save().map_err(|source| AddError::ObjectSave {
                         path: file.to_path_buf(),
                         source,
@@ -2538,7 +2863,9 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-                    crate::utils::index_ext::update_preserving_flags(index, entry);
+                    crate::utils::index_ext::update_preserving_file_mode_except_intent(
+                        index, entry, file_mode,
+                    );
                 }
                 clear_conflict_stages(index, file_str);
                 return Ok(StagedAction::Modified);
@@ -2571,6 +2898,45 @@ enum FileStatus {
     NotFound,
 }
 
+/// Whether a tracked regular file differs from the index only in its
+/// owner-execute bit (ADR-FM-05). Only meaningful when `core.fileMode` is
+/// enabled.
+fn mode_only_worktree_change(
+    index: &Index,
+    file_str: &str,
+    file_abs: &Path,
+    file_mode: bool,
+) -> bool {
+    if !file_mode {
+        return false;
+    }
+    let Ok(metadata) = file_abs.symlink_metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    index.get(file_str, 0).is_some_and(|entry| {
+        entry.mode & 0o100000 == 0o100000
+            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+    })
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 /// Compute a [`FileStatus`] for `file` (relative to `workdir`) using the
 /// in-memory `index`.
 ///
@@ -2581,7 +2947,12 @@ enum FileStatus {
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::InvalidPathEncoding`] when `file` is not UTF-8.
-fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileStatus, AddError> {
+fn check_file_status(
+    file: &Path,
+    index: &Index,
+    workdir: &Path,
+    file_mode: bool,
+) -> Result<FileStatus, AddError> {
     let file_str = file.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
         path: file.to_path_buf(),
     })?;
@@ -2599,7 +2970,10 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
         } else {
             Ok(FileStatus::New)
         }
-    } else if unmerged || index.is_modified(file_str, 0, workdir) {
+    } else if unmerged
+        || index.is_modified(file_str, 0, workdir)
+        || mode_only_worktree_change(index, file_str, &file_abs, file_mode)
+    {
         Ok(FileStatus::Modified)
     } else {
         Ok(FileStatus::Unchanged)
@@ -2618,6 +2992,25 @@ fn gen_blob_from_file(path: impl AsRef<Path>) -> io::Result<Blob> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// WT-05: the `add -N` entry is the empty blob with zeroed stat data and
+    /// the index v3 intent-to-add extended flag set (and skip-worktree clear).
+    #[test]
+    fn intent_to_add_entry_shape() {
+        let _guard = git_internal::hash::set_hash_kind_for_test(git_internal::hash::HashKind::Sha1);
+        let entry = intent_to_add_entry("new.txt".to_string(), 0o100644);
+        assert_eq!(entry.size, 0, "intent-to-add stat data is zeroed");
+        assert_eq!(entry.mode, 0o100644);
+        assert!(entry.flags.intent_to_add, "intent-to-add flag must be set");
+        assert!(!entry.flags.skip_worktree, "skip-worktree must stay clear");
+        assert_eq!(
+            entry.hash.to_string(),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            "entry must carry the empty blob"
+        );
+        let symlink = intent_to_add_entry("link".to_string(), 0o120000);
+        assert_eq!(symlink.mode, 0o120000, "symlink mode is preserved");
+    }
 
     /// Pin the `Display` format for the static-message and direct-message
     /// variants of [`AddError`]. These strings are used as the `CliError`
@@ -2912,6 +3305,7 @@ mod test {
                 force,
                 false,
                 false,
+                false,
             )
             .expect("validate_pathspecs")
         };
@@ -2938,6 +3332,7 @@ mod test {
             &changes,
             &changes,
             &index,
+            false,
             false,
             false,
             false,

@@ -49,7 +49,9 @@ fn staging_commands_route_replacements_through_the_flag_helper() {
         let source = fs::read_to_string(root.join(module))
             .unwrap_or_else(|error| panic!("read {module}: {error}"));
         let production = source.split("#[cfg(test)]").next().unwrap_or("");
-        if production.contains("update_preserving_flags") {
+        if production.contains("update_preserving_flags")
+            || production.contains("update_preserving_file_mode")
+        {
             helper_users += 1;
         }
         for (index, line) in production.lines().enumerate() {

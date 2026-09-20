@@ -171,6 +171,11 @@ Requires `--pathspec-from-file`; using it alone is a usage error.
 
 ### `--chmod=(+|-)x`
 
+Staged file modes also honor `core.filemode`: when it is `false`, re-staging
+an existing entry keeps its recorded mode and a new path is recorded as
+`100644`; `--chmod` (and `update-index --cacheinfo`) still apply the explicit
+mode. An invalid `core.filemode` value fails `add` closed before any write.
+
 Force the executable bit recorded in the index for the matched paths: `+x` records
 mode `100755`, `-x` records `100644`. The blob content is unchanged. A path whose
 recorded mode actually changes is reported as modified, even when its content did
@@ -234,6 +239,25 @@ exit 129). Git reports the same combination as exit 128.
 ```bash
 libra add --resolved
 libra add --resolved path/to/file
+```
+
+### `--sparse`
+
+Allow updating entries that exist outside the sparse-checkout definition
+(skip-worktree entries). Without it, a pathspec that matches only such an
+entry is reported on stderr — a header naming the sparse-checkout definition,
+each pathspec, and a hint — and `add` exits 1 without touching the index
+(`--dry-run`, `--ignore-missing`, `--renormalize`, and `--chmod` included).
+JSON carries `data.sparse_paths: [string]` and no human diagnostic.
+
+With `--sparse` the entry is stageable: a modified working-tree file is staged
+and the skip-worktree bit is preserved; a deleted working-tree file keeps the
+ordinary `pathspec '…' did not match any files` error. A pathspec that also
+matches a non-sparse entry gets no sparse diagnostic.
+
+```bash
+libra add --sparse path/to/sparse-file
+libra --json add --dry-run --ignore-missing path/to/sparse-file
 ```
 
 ### `-p, --patch`

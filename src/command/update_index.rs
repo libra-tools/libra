@@ -120,6 +120,11 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
         })?
     };
 
+    // ADR-FM-04: `core.fileMode=false` keeps an existing entry's mode and makes
+    // new paths plain 100644. (--cacheinfo carries an explicit mode and is
+    // unaffected.)
+    let file_mode = crate::internal::config::core_file_mode().await?;
+
     let mut updated = 0usize;
     let mut removed = 0usize;
 
@@ -182,7 +187,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
 
         let absolute = resolve_within_worktree(path_str, &workdir).map_err(usage)?;
         let entry = stage_working_tree_path(path_str, &absolute, &workdir)?;
-        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
+        crate::utils::index_ext::update_preserving_file_mode(&mut index, entry, file_mode);
         updated += 1;
     }
 

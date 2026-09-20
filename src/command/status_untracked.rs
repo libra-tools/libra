@@ -66,6 +66,7 @@ pub(crate) fn collect_status_worktree_changes(
     untracked_mode: UntrackedFiles,
     include_ignored: bool,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<StatusWorktreeChanges, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
@@ -86,6 +87,7 @@ pub(crate) fn collect_status_worktree_changes(
         tracked.files(),
         &mut io_blocked,
         index_file_mtime,
+        file_mode,
     )?;
     let mut ignored_files = Vec::new();
 
@@ -221,6 +223,7 @@ fn collect_tracked_worktree_changes(
     tracked_files: &[PathBuf],
     io_blocked: &mut Vec<crate::command::status_probe::IoBlockedEvent>,
     index_file_mtime: Option<std::time::SystemTime>,
+    file_mode: bool,
 ) -> Result<Changes, StatusError> {
     let mut changes = Changes::default();
     for file in tracked_files {
@@ -280,6 +283,19 @@ fn collect_tracked_worktree_changes(
             }
             Ok(metadata) => metadata,
         };
+        // ADR-FM-05: with core.fileMode=true a regular file whose owner
+        // execute bit differs from the index is a mode-only modification.
+        if file_mode
+            && metadata.is_file
+            && !metadata.is_symlink
+            && index.get(file_str, 0).is_some_and(|entry| {
+                entry.mode & 0o100000 == 0o100000
+                    && (entry.mode & 0o111 != 0) != (metadata.mode & 0o111 != 0)
+            })
+        {
+            changes.modified.push(file.clone());
+            continue;
+        }
         // Compare against the metadata we ALREADY hold rather than calling
         // `Index::is_modified`, which re-stats the path and `unwrap()`s the
         // result: a path deleted or made unreadable between the two stats

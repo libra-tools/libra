@@ -11999,7 +11999,7 @@ fn apply_incremental_renames(
         occupancy.apply(path, false, true, 1);
     }
     let occupies_marker_only = |path: &Path, occupancy: &DestinationOccupancy| {
-        !occupancy.files.get(path).is_some_and(|count| *count > 0)
+        occupancy.files.get(path).is_none_or(|count| *count == 0)
             && occupancy.markers.get(path).is_some_and(|count| *count > 0)
     };
     let conflicted_paths: HashSet<&PathBuf> = conflicts.iter().map(|(path, _)| path).collect();

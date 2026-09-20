@@ -20,6 +20,8 @@ libra status [OPTIONS] [pathspec]...
 
 已跟踪符号链接与普通文件参与相同的 HEAD/索引/工作树比较。`status` 将符号链接本身视为工作树对象，比较存储的链接目标字节，并将目标变化报告为修改，而不是跟随链接或将 dangling symlink 视为已删除。
 
+当 `core.filemode=true`（Unix 默认）时，已跟踪普通文件的 owner-execute 位与索引不同而内容未变，属于仅 mode 变化，会在所有输出格式（short、long、porcelain v2、JSON）中被报告为修改；当 `core.filemode=false` 时忽略仅 mode 的差异，但条目类型变化（如普通文件被替换为符号链接）始终会被报告。非法的 `core.filemode` 值会在任何输出前使 `status` fail-closed。
+
 ### 显示相关的 config 默认值（`status.*`）
 
 未传对应 CLI 标志时，Libra 会尊重以下 Git 兼容默认值，每个键都按 local → global → system 级联读取（键不区分大小写；local/global 的加密值先解密；legacy 行同样生效；不可读或不支持的 system scope 会被跳过）：
@@ -113,9 +115,9 @@ libra status --column
 libra status --no-column
 ```
 
-### `--find-renames [PERCENT]`
+### `-M [PERCENT]` / `--find-renames [PERCENT]`
 
-设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。CLI 接受 Git 完整 raw 语法——裸整数按 `0.<digits>` 读取（`505` 即 50.5%）、`N%` 为字面百分比（`100%` 仅 exact）、支持小数（`0.8`）;`0`/裸形式回到 50% 默认。三种拼写 `--no-renames` / `--renames` / `--find-renames[=N]` 按 argv 顺序真正 last-one-wins（`--no-renames --find-renames=80` 会以 80% 重新启用）。`-z` 另有 Git 对齐的 `--null` 长别名；裸 `-z`/`--null` 无显式格式时强制 porcelain v1,与 `--long`/缓存模式组合 fail-closed。嵌入 API 的 `find_renames: Option<u8>` 保持较窄的 0–100 百分比（已记录收窄——CLI 语法为完整表面）。
+`-M[<n>]` 是 `--find-renames[=<n>]` 的短写法（Git 拼写）。设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `-M` / `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。CLI 接受 Git 完整 raw 语法——裸整数按 `0.<digits>` 读取（`505` 即 50.5%）、`N%` 为字面百分比（`100%` 仅 exact）、支持小数（`0.8`）;`0`/裸形式回到 50% 默认。四种拼写 `--no-renames` / `--renames` / `--find-renames[=N]` / `-M[<n>]` 按 argv 顺序真正 last-one-wins（`--no-renames -M80` 会以 80% 重新启用），`-M` 可与其他短选项组成集群（`-sM90`）；非数值（如 `-Mabc`）以 `LBR-CLI-002` fail-closed。`-z` 另有 Git 对齐的 `--null` 长别名；裸 `-z`/`--null` 无显式格式时强制 porcelain v1,与 `--long`/缓存模式组合 fail-closed。嵌入 API 的 `find_renames: Option<u8>` 保持较窄的 0–100 百分比（已记录收窄——CLI 语法为完整表面）。
 
 renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限与相似度比较预算的有界 inexact spanhash 扫描。上限由 `status.renameLimit`（回退到 `diff.renameLimit`）经严格 local → global → system 级联决定：非负整数，`0` 关闭上限，默认 1000（对齐 Git）；非法值在任何输出前 fail-closed，超限只跳过 exhaustive 阶段并给出结构化 `rename_limit_product_skipped` 警告。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树——但仅在 `status.renameUntracked` 配置（Libra 扩展，严格布尔，默认 `false`）启用时才会检测，因为 unstaged 的"新"路径都是未跟踪文件。默认关闭时，已跟踪→未跟踪的移动按 Git 语义呈现为 `D` + `??`，不产生 unstaged rename 记录。启用扩展后，destination 候选来自独立的有界 worktree probe（R0-3）：`-uno` 与折叠的 untracked 目录只隐藏**显示**标记、绝不隐藏 probe；候选按与显示扫描同一 tracked/ignore 分层做资格（tracked 路径、case-fold 别名、unmerged stage 与 ignored 路径一律不入围）；调用级双预算（枚举 50k / 合格目的地 10k）为遍历定界——触顶保留部分配对并给出结构化 `probe_truncated` 警告。目录下候选全部被 rename 消费时其 `? dir/` 标记被折叠移除；truncated 或阻塞的 probe 保守保留标记。不可读路径绝不静默降级为「无 rename」：文本格式以 `LBR-IO-001` fail-closed，`--json` 则通过 `data.io_blocked[]` 报告部分结果（见下文 *io_blocked 部分结果契约*）。名字不是合法 UTF-8 的 destination 保留其基础 `??` 行，但在本版本中完全不参与 rename 评分，并给出一条 `rename_path_encoding_unsupported` 警告（非 UTF-8 候选评分为延后扩展）。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
@@ -453,7 +455,7 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 | Quiet 模式 | `git status -q` | N/A | `libra status --quiet`（全局标志） |
 | 列显示 | `git status --column` | N/A | `libra status --column`（`--no-column` 撤销） |
 | Ahead/behind 显示 | `git status -sb`（仅文本） | N/A | 人类 + JSON 中结构化 `upstream` 对象 |
-| 查找 renames | `git status -M` | 自动 | `--find-renames` / `--renames` |
+| 查找 renames | `git status -M` | 自动 | `-M[<n>]` / `--find-renames` / `--renames` |
 | 忽略 submodules | `git status --ignore-submodules` | N/A | N/A（无 submodules） |
 | 结构化 JSON 输出 | N/A | N/A | `--json` / `--machine` |
 | 错误提示 | 最少 | 最少 | 每种错误类型都有可操作提示 |
@@ -487,5 +489,5 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 - `--porcelain v2` 输出真实的 v2 行语法（带 mode/hash 列的 `1`/`2`/`u`/`?`/`!` 记录）；`--json` 仍是更丰富的结构化表面
 - `-z` 下 Unix porcelain v1/v2 写出 RAW OS 路径字节（不 quote，非 UTF-8 名字无损）；非 `-z` 格式按 `core.quotePath` 处理 `0x7F` 以上字节——默认 `true` 时八进制转义，`false` 时原样写出。非 UTF-8 名字绝不使 status 失败——它保留基础 `??` 行，仅不参与 rename 评分（附 `rename_path_encoding_unsupported` 警告）
 - jj 的 `jj status` 始终使用短格式，并且不区分已暂存与未暂存更改（jj 没有暂存区）
-- 通过 `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；不暴露 Git 的短别名 `-M`
+- 通过 Git 的 `-M[<n>]` / `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；四种拼写共享同一 argv last-one-wins 顺序
 - 支持 `--column` 列对齐显示；`--no-column`（等价于 `--column=never`）经 clap `overrides_with` 撤销先前的 `--column`（最后出现者生效），status 默认非列式故单独使用为 no-op

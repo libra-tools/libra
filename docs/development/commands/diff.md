@@ -96,3 +96,4 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+- 2026-09-20（plan issues/470 FM-04）：`resolve_worktree_side`/`resolve_diff_side` 增加 `file_mode`；为 `false` 时工作树侧改用索引记录的 mode，从而不 diff 仅 mode 差异（`run_diff` 解析 `core_file_mode()`，非法值以 `DiffError::InvalidConfig` 失败）。

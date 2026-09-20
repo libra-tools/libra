@@ -613,3 +613,39 @@ async fn json_status_upstream_counts_unavailable_cached_and_api() {
         "the API path must not touch the process warning tracker"
     );
 }
+
+/// FM-04 (M-DET D1, plan-20260918): a mode-only change appears in JSON
+/// `modified` when `core.fileMode` is enabled.
+#[cfg(unix)]
+#[test]
+fn json_status_mode_only_change_is_modified() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let file = root.join("plain.txt");
+    fs::write(&file, "plain\n").expect("write");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod");
+    assert_cli_success(&run_libra_command(&["add", "plain.txt"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+    let output = run_libra_command(&["--json", "status"], root);
+    assert_cli_success(&output, "json status");
+    let parsed = parse_json_stdout(&output);
+    let modified = parsed["data"]["unstaged"]["modified"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        modified
+            .iter()
+            .any(|entry| entry.as_str() == Some("plain.txt")),
+        "mode-only change must be in modified: {parsed}"
+    );
+}

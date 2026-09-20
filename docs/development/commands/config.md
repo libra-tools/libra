@@ -38,6 +38,7 @@ flowchart TD
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
 ## 实现历史
+- 2026-09-20（plan issues/470 FM-03）：新增共享读取 `internal::config::core_file_mode()`（大小写不敏感读 `core.fileMode`/`core.filemode`，Unix 默认 true、非法值 fail-closed 并沿用 `commit.verbose` 的 `CliError::command_usage` 映射）；`index_ext::update_preserving_file_mode` 在 `false` 时保留旧条目 mode、新路径 100644；接入 `add`/`commit -a`/`update-index <path>`，`status` 仅做非法值校验。纯解析函数 `resolve_core_file_mode` 带单测。
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-07-15（plan-20260708 P0-12 回归修复）：`internal::config` 的两条级联读取（`read_cascaded_config_value_strict` 与 `global_config_value`）在 global scope 读取失败时，改为先经 `utils::client_storage::inspect_global_config_schema_future_at_path` 做类型化 future-schema 探测：命中则复用 P0-12 的去重警告（`emit_global_config_schema_future_warning`）并把 global scope 视为未设置继续级联；其它失败保持 fail-closed 原样传播（`LBR-IO-001` 契约不变）。此前 P1-05 家族给 `status`/`branch`/`tag`/`merge`/`commit`/`fetch`/`init`/`diff`/`log` 等命令加的配置默认读取会把 schema-newer 的全局库当普通 I/O 失败，破坏 P0-12「本地命令警告一次并继续」的既定行为（回归由 `compat_global_config_schema_future::local_command_warns_once_and_continues` 钉住）。

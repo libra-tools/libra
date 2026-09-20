@@ -1481,3 +1481,60 @@ fn test_restore_honors_process_umask_for_entry_modes() {
         "100644 entry under umask 077 must be 600"
     );
 }
+
+/// WT-01 (M-GUARD G7, issues/476): issue-verified restore `--staged` / `-S -W` / `--source=HEAD`.
+#[test]
+fn test_restore_issue476_verified_surface_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    std::fs::write(root.join("tracked.txt"), "staged\n").expect("stage");
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], root), "G7 add");
+    let staged = run_libra_command(&["restore", "--staged", "tracked.txt"], root);
+    assert_cli_success(&staged, "G7 --staged");
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("Updated 1 path(s) from HEAD"),
+        "G7 --staged: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("worktree"),
+        "staged\n",
+        "G7 --staged leaves the worktree"
+    );
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert_cli_success(&status, "G7 status after --staged");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(" M tracked.txt"),
+        "G7 --staged leaves an unstaged edit: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    std::fs::write(root.join("tracked.txt"), "both\n").expect("both");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], root),
+        "G7 add both",
+    );
+    let both = run_libra_command(&["restore", "-S", "-W", "tracked.txt"], root);
+    assert_cli_success(&both, "G7 -S -W");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("both worktree"),
+        "tracked\n",
+        "G7 -S -W restores the worktree"
+    );
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "G7 -S -W leaves a clean tree: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    std::fs::write(root.join("tracked.txt"), "source\n").expect("source dirty");
+    let source = run_libra_command(&["restore", "--source=HEAD", "tracked.txt"], root);
+    assert_cli_success(&source, "G7 --source=HEAD");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("source worktree"),
+        "tracked\n",
+        "G7 --source=HEAD restores HEAD content"
+    );
+}

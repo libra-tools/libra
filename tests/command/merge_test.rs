@@ -9218,7 +9218,10 @@ fn merge_preserves_symlinks_and_executable_bits_when_it_writes() {
         let p = repo.path();
         commit_file(p, "target.txt", "target\n", "root");
         std::fs::write(p.join("tool.sh"), "#!/bin/sh\necho ours\n").expect("tool");
-        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+        // The base script is NOT executable: `feature` adds both the new
+        // content and the executable bit, so the merge write must set `0755`
+        // from the merged entry rather than inherit the 0644 on disk.
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o644))
             .expect("chmod");
         std::os::unix::fs::symlink("target.txt", p.join("link")).expect("symlink");
         assert_cli_success(&run_libra_command(&["add", "tool.sh", "link"], p), "add");
@@ -9229,8 +9232,11 @@ fn merge_preserves_symlinks_and_executable_bits_when_it_writes() {
         assert_cli_success(&run_libra_command(&["branch", "feature"], p), "feature");
         commit_file(p, "ours.txt", "ours\n", "ours unrelated");
         assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "feature");
-        // Theirs rewrites the script (same mode) so the merge must write it.
+        // Theirs rewrites the script and adds the executable bit so the merge
+        // must write it.
         std::fs::write(p.join("tool.sh"), "#!/bin/sh\necho theirs\n").expect("tool");
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
         assert_cli_success(&run_libra_command(&["add", "tool.sh"], p), "add tool");
         assert_cli_success(
             &run_libra_command(
@@ -9240,12 +9246,37 @@ fn merge_preserves_symlinks_and_executable_bits_when_it_writes() {
             "theirs",
         );
         assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
-        // A mode-only change is invisible to `status` (a pre-existing gap), so
-        // the merge still runs — and its write must restore `0755` from the
-        // entry rather than inherit whatever is on disk.
-        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o600))
-            .expect("chmod down");
+        // ADR-FM-05 (FM-04): a mode-only worktree change is now a real
+        // modification, so the merge refuses before writing anything — Git
+        // reports "Your local changes ... would be overwritten by merge" for
+        // the same setup.
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod up");
+        let refused = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env);
+        assert_ne!(
+            refused.status.code(),
+            Some(0),
+            "walk {env:?}: merge must refuse on a mode-only change"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("uncommitted changes, cannot merge"),
+            "walk {env:?}: refusal diagnostic: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(
+            std::fs::metadata(p.join("tool.sh"))
+                .expect("script")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "walk {env:?}: a refused merge writes nothing"
+        );
 
+        // Restore the recorded mode and merge: the write must carry the merged
+        // entry's executable bit even though the on-disk file was 0644.
+        std::fs::set_permissions(p.join("tool.sh"), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
         assert_cli_success(
             &run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", env),
             "clean merge",

@@ -5,10 +5,11 @@ Stash the changes in a dirty working directory away.
 ## Synopsis
 
 ```
+libra stash [-m <message>] [-u | -a] [-k | --keep-index] [-- <pathspec>...]
 libra stash push [-m <message>] [-u | -a] [-k | --keep-index] [-- <pathspec>...]
-libra stash pop [<stash>]
+libra stash pop [--index] [<stash>]
 libra stash list
-libra stash apply [<stash>]
+libra stash apply [--index] [<stash>]
 libra stash drop [<stash>]
 libra stash show [<stash>] [-p | --patch] [--name-only | --name-status]
 libra stash branch <branch> [<stash>]
@@ -17,7 +18,21 @@ libra stash clear [--force]
 
 ## Description
 
-`libra stash` saves your local modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. Default `apply` / `pop` leave the current index intact, so restored tracked changes appear as unstaged working-tree changes; Git's `--index` restore mode is not exposed yet. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
+`libra stash` with no subcommand (or with options first) is exactly
+`libra stash push`; any other first token that is not a known subcommand is a
+usage error (`subcommand wasn't specified; 'push' can't be assumed due to
+unexpected token '<tok>'`, Git's wording). `libra stash` saves your local
+modifications to a new stash entry and reverts the working directory to match HEAD. By default, `stash push` records tracked index/worktree changes and leaves untracked files alone. Use `-u` / `--include-untracked` to include visible untracked files, or `-a` / `--all` to include ignored files too. Pass `-- <pathspec>...` (file or directory paths; `.` selects the whole tree) to stash only the changes to those paths, leaving every other change in the working tree. A pathspec cannot be combined with `-u`/`-a`/`-k`. The modifications can be restored later with `libra stash pop` or `libra stash apply`, which replay the stash onto the CURRENT working tree (not HEAD) — so any unrelated uncommitted change you made in the meantime, including the paths a pathspec push left behind, is preserved. Default `apply` / `pop` leave already-tracked index entries intact (restored tracked changes appear as unstaged working-tree changes) and re-stage paths the stash index added relative to the base commit. `apply` / `pop --index` three-way-merges the stash index onto the current index; an index conflict is `LBR-CONFLICT-001` (`conflicts in index. Try without --index.`) and writes nothing. `stash branch` applies with `--index` semantics. A repository without an initial commit fails `stash push` with `128`
+(`LBR-REPO-003`, `you do not have the initial commit yet`) **before** the
+change check, so this failure is reported even when the tree is clean or only
+untracked files exist; under the global `--quiet` the human error is
+suppressed and only the exit code is returned (`--json` still emits the error
+envelope). Default stash messages are `WIP on <branch>: <abbrev7> <subject>`,
+where `<subject>` is the first non-empty line of the HEAD commit message after
+stripping a vault `gpgsig` header. `-m <message>` (and rebase/merge autostash)
+records `On <branch>: <message>`. Detached HEAD uses `(no branch)` in place of
+the branch name. Older stash reflog entries that lack these prefixes still
+list, show, apply, and pop. If `stash push` is run on a clean working tree and no requested untracked files exist, it exits successfully as a no-op and reports that there are no local changes to save.
 
 Stash entries are stored as specially-structured commit objects under `.libra/refs/stash`, with a flat-file list tracking the stash stack. Each stash captures both the index state and worktree state at the time of creation.
 
@@ -41,7 +56,7 @@ Save your local modifications to a new stash and clean the working directory.
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
-| Message | `-m` | `--message` | Optional descriptive message for the stash entry. If omitted, a default "WIP on `<branch>`: `<short-hash>` ..." message is generated. |
+| Message | `-m` | `--message` | Optional descriptive message, recorded as `On <branch>: <message>` (detached HEAD uses `(no branch)`). If omitted, the default is `WIP on <branch>: <abbrev7> <subject>`, where `<subject>` is the HEAD commit subject after stripping a vault `gpgsig` header and leading blank lines. |
 | Include untracked | `-u` | `--include-untracked` | Include visible untracked files in the stash and remove them from the worktree. Ignored files remain in place. |
 | No include untracked | | `--no-include-untracked` | Do not include untracked files (the default), countermanding an earlier `-u`/`--include-untracked` (last one wins). Untracked files are excluded by default, so on its own this is a no-op. |
 | Include all | `-a` | `--all` | Include visible untracked and ignored files in the stash, then remove them from the worktree. |
@@ -70,15 +85,19 @@ libra stash push -- src/main.rs docs/
 
 #### `pop`
 
-Apply the top stash entry and remove it from the stash list. Equivalent to `apply` followed by `drop`. By default, restored tracked changes are written to the working tree only and are not staged.
+Apply the top stash entry and remove it from the stash list. Equivalent to `apply` followed by `drop`. By default, already-tracked changes return as unstaged working-tree edits and newly staged files are put back in the index. `--index` also restores the stashed index layer.
 
-| Argument | Description |
+| Argument / option | Description |
 |----------|-------------|
 | `<stash>` | Stash reference, e.g. `stash@{1}`. Defaults to `stash@{0}` (the most recent stash). |
+| `--index` | Three-way-merge the stash index onto the current index. Conflicts fail with `LBR-CONFLICT-001` and leave the stash, index, and worktree unchanged. |
 
 ```bash
 # Pop the latest stash
 libra stash pop
+
+# Pop and restore the index
+libra stash pop --index
 
 # Pop a specific stash
 libra stash pop stash@{2}
@@ -94,14 +113,16 @@ libra stash list
 
 #### `apply`
 
-Apply a stash entry without removing it from the stash list. Useful when you want to apply the same stash to multiple branches. By default, restored tracked changes are written to the working tree only and are not staged.
+Apply a stash entry without removing it from the stash list. Useful when you want to apply the same stash to multiple branches. Default and `--index` restore rules match `pop`.
 
-| Argument | Description |
+| Argument / option | Description |
 |----------|-------------|
 | `<stash>` | Stash reference, e.g. `stash@{1}`. Defaults to `stash@{0}`. |
+| `--index` | Three-way-merge the stash index onto the current index. Conflicts fail with `LBR-CONFLICT-001` and leave the stash, index, and worktree unchanged. |
 
 ```bash
 libra stash apply
+libra stash apply --index
 libra stash apply stash@{1}
 ```
 
@@ -314,7 +335,8 @@ The `data.action` field is one of: `noop`, `push`, `pop`, `apply`, `drop`, `list
     "action": "pop",
     "index": 0,
     "stash_id": "abc1234...",
-    "branch": "main"
+    "branch": "main",
+    "index_restored": true
   }
 }
 ```
@@ -392,11 +414,15 @@ The structured envelope always emits the full `files` list. The `--name-only` / 
 
 ### How `pop` / `apply` treat the index
 
-Default `stash pop` and `stash apply` restore tracked content to the working tree while leaving the current index unchanged. A change that was staged when stashed comes back as an unstaged working-tree edit unless a future `--index` mode is added. This matches Git's default `stash pop` / `stash apply` behavior and prevents a later `libra commit` from committing restored stash content before the user runs `libra add`.
+Default `stash pop` and `stash apply` restore tracked content to the working tree while leaving already-tracked index entries unchanged. A change that was staged when stashed comes back as an unstaged working-tree edit. Paths that the stash index added relative to the base commit are re-staged (Git: `A  s.txt`). `--index` three-way-merges the stash index onto the current index so mixed files return as `MM`. An index merge conflict is `LBR-CONFLICT-001` (`conflicts in index. Try without --index.`), keeps the stash, and writes nothing. `stash branch` always applies with `--index` semantics.
 
 ### How `--keep-index` works
 
 `stash push --keep-index` stores the same stash metadata as a normal push, then writes the saved index back and restores the worktree to the index state. For a mixed file with both staged and unstaged edits, the staged content remains in the index and worktree, while the unstaged delta is saved in the stash.
+
+### How stash messages are formatted
+
+`stash push` (including a bare `libra stash` and `stash push -- <pathspec>`) and rebase/merge autostash share one message helper. The default is `WIP on <branch>: <abbrev7> <subject>`. The subject is taken from the HEAD commit after `parse_commit_msg` strips a vault `gpgsig` block, then the first non-empty line — so a signed `init` commit lists as `WIP on main: abc1234 init`, not `WIP on main: abc1234 gpgsig -----BEGIN PGP SIGNATURE-----`. A custom `-m` value and the autostash name `autostash` become `On <branch>: <message>`. Detached HEAD substitutes `(no branch)`. Existing reflog lines that predate these prefixes are left untouched and still list, show, apply, and pop.
 
 ### Why a curated subcommand model?
 
@@ -417,8 +443,8 @@ Libra preserves Git's `stash@{N}` reference syntax for familiarity. Users migrat
 | No include untracked | `--no-include-untracked` (countermands `-u`) | `--no-include-untracked` | N/A |
 | Include all (ignored too) | `-a` / `--all` | `-a` / `--all` | N/A |
 | Pathspec (partial stash) | `stash push -- <pathspec>...` (plain names, wildcards, and `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` match through the shared pathspec engine; `.` = whole tree; not combinable with `-u`/`-a`/`-k` → `LBR-CLI-002`; no match → `LBR-CLI-003`) | `stash push [--] <pathspec>...` | N/A |
-| Pop | `stash pop [ref]` | `stash pop [--index] [<stash>]` | N/A |
-| Apply | `stash apply [ref]` | `stash apply [--index] [<stash>]` | N/A |
+| Pop | `stash pop [--index] [ref]` | `stash pop [--index] [<stash>]` | N/A |
+| Apply | `stash apply [--index] [ref]` | `stash apply [--index] [<stash>]` | N/A |
 | Drop | `stash drop [ref]` | `stash drop [<stash>]` | N/A |
 | List | `stash list` | `stash list [<log-options>]` | N/A |
 | Show file-level summary | `stash show [<stash>] [--name-only \| --name-status]` | `stash show [<stash>]` | N/A |

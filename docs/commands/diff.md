@@ -41,6 +41,12 @@ reader uses `symlink_metadata`/`read_link`, so dangling symlinks are still
 diffed as symlinks and are not treated as deleted merely because their targets
 do not exist.
 
+File modes follow `core.filemode`: with `true` (the Unix default) a mode-only
+change (owner-execute bit differs, content unchanged) renders the mode header
+(`old mode 100644` / `new mode 100755`) and a `mode change` line under
+`--summary`; with `false` mode-only differences are not diffed. Entry-type
+changes (regular file ↔ symlink) are always shown.
+
 Pathspec arguments filter the diff to only show changes in matching files or directories.
 
 When stdout is piped and the downstream command exits early, stdout `BrokenPipe` is treated as

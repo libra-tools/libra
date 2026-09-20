@@ -37,6 +37,8 @@ async fn test_add_single_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -78,6 +80,8 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
 
     let error = add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
             update: false,
@@ -122,6 +126,8 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
         .expect("remove injected marker-directory conflict");
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["marker-failure.txt".to_string()],
             all: false,
             update: false,
@@ -183,6 +189,8 @@ async fn test_add_dispatches_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["automated.txt".to_string()],
             all: false,
             update: false,
@@ -234,6 +242,8 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
 
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["dry-run.txt".to_string()],
             all: false,
             update: false,
@@ -282,6 +292,8 @@ async fn test_add_multiple_files() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![
             String::from("test_file_1.txt"),
             String::from("test_file_2.txt"),
@@ -348,6 +360,8 @@ async fn test_add_all_flag() {
 
     // Execute add command with --all flag
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![],
         all: true,
         update: false,
@@ -414,6 +428,8 @@ async fn test_add_update_flag() {
 
     // Add only one file to the index
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(tracked_file)],
         all: false,
         update: false,
@@ -451,6 +467,8 @@ async fn test_add_update_flag() {
 
     // Execute add command with --update flag
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: false,
         update: true,
@@ -526,6 +544,8 @@ async fn test_add_with_ignore_patterns() {
 
     // Execute add command with all files
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(".")],
         all: true,
         update: false,
@@ -616,6 +636,8 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -646,6 +668,8 @@ async fn test_add_force_tracks_ignored_file() {
 
     // Force add should stage the ignored file
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -686,6 +710,8 @@ async fn test_add_force_tracks_ignored_file() {
     );
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![ignored_path.into()],
         all: false,
         update: false,
@@ -740,6 +766,8 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Baseline: without --force the ignored directory stays hidden
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![".".into()],
         all: false,
         update: false,
@@ -778,6 +806,8 @@ async fn test_add_force_dot_includes_ignored_directory() {
 
     // Re-run with --force to include ignored entries
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![".".into()],
         all: false,
         update: false,
@@ -826,6 +856,8 @@ async fn test_add_dry_run() {
 
     // Execute add command with dry-run
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -878,6 +910,8 @@ async fn test_add_without_path_should_error() {
 
     // Try running `add` without any pathspec and without --all
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![], // Empty pathspec
         all: false,       // Not using --all
         update: false,
@@ -920,6 +954,8 @@ async fn test_add_nonexistent_file_should_error() {
 
     // Try to add non-existent file
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(fake_path)],
         all: false,
         update: false,
@@ -966,6 +1002,8 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
     // Add same file twice
     for i in 0..2 {
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec![String::from(file_path)],
             all: false,
             update: false,
@@ -1017,6 +1055,8 @@ async fn test_add_empty_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -1063,6 +1103,8 @@ async fn test_add_sub_directory_file() {
 
     // Execute add command
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![String::from(file_path)],
         all: false,
         update: false,
@@ -1111,6 +1153,8 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
     fs::write("paths.txt", "file1.txt\n").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![],
         all: false,
         update: false,
@@ -1155,6 +1199,8 @@ async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
     fs::write("paths.bin", b"keep.txt\0").unwrap();
 
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![],
         all: false,
         update: false,
@@ -2791,6 +2837,8 @@ async fn test_add_ignored_dispatch_before_exit_one() {
 
     let error = add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["other.txt".to_string(), "top.log".to_string()],
             all: false,
             update: false,
@@ -3781,5 +3829,531 @@ fn test_add_pathspec_from_file_rejects_interactive() {
     assert!(
         String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
         "rejected combinations must write nothing"
+    );
+}
+
+/// Set `skip_worktree` on a tracked path through the git-internal index API.
+fn mark_skip_worktree_for_add(repo: &std::path::Path, path: &str) {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+    let index_path = repo.join(".libra/index");
+    let mut index =
+        Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index for marking");
+    let (hash, mode, size) = {
+        let entry = index.get(path, 0).expect("tracked path");
+        (entry.hash, entry.mode, entry.size)
+    };
+    let mut entry = IndexEntry::new_from_blob(path.to_string(), hash, size);
+    entry.mode = mode;
+    entry.flags.skip_worktree = true;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+}
+
+fn skip_worktree_set_for_add(repo: &std::path::Path, path: &str) -> bool {
+    use git_internal::{hash::HashKind, internal::index::Index};
+    Index::load_with_hash_kind(HashKind::Sha1, repo.join(".libra/index"))
+        .expect("load index")
+        .get(path, 0)
+        .is_some_and(|entry| entry.flags.skip_worktree)
+}
+
+/// SW-06 (M-ADVICE D1–D5, D8–D9, plan-20260918): sparse pathspec diagnostics
+/// and the `--sparse` opt-in for a skip-worktree entry.
+#[test]
+fn test_add_sparse_path_advice_matrix() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("other"), "other\n").expect("write other");
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "other", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree_for_add(root, "s");
+    assert!(
+        skip_worktree_set_for_add(root, "s"),
+        "precondition: the skip-worktree bit must be set"
+    );
+
+    // D1: deleted skip-worktree file, --dry-run --ignore-missing.
+    fs::remove_file(root.join("s")).expect("remove s");
+    let d1 = run_libra_command(&["add", "--dry-run", "--ignore-missing", "s"], root);
+    assert_eq!(d1.status.code(), Some(1), "D1 exit 1: {d1:?}");
+    let stderr = String::from_utf8_lossy(&d1.stderr);
+    assert!(
+        stderr.contains("outside of your sparse-checkout definition") && stderr.contains('s'),
+        "D1 sparse diagnostic: {stderr}"
+    );
+    assert!(stderr.contains("hint:"), "D1 hint: {stderr}");
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "D1 index unchanged: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+
+    // D2: `add s` and `add --dry-run s` behave the same.
+    for args in [vec!["add", "s"], vec!["add", "--dry-run", "s"]] {
+        let out = run_libra_command(&args, root);
+        assert_eq!(out.status.code(), Some(1), "D2 {:?} exit 1", args);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("sparse-checkout"),
+            "D2 {:?} diagnostic",
+            args
+        );
+    }
+
+    // D3: modified skip-worktree file is not staged by a plain add.
+    fs::write(root.join("s"), "modified\n").expect("modify s");
+    let d3 = run_libra_command(&["add", "s"], root);
+    assert_eq!(d3.status.code(), Some(1), "D3 exit 1");
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+        "D3 must not stage the new content"
+    );
+
+    // D4: --sparse stages the new content and keeps the bit.
+    let d4 = run_libra_command(&["add", "--sparse", "s"], root);
+    assert_cli_success(&d4, "D4 add --sparse");
+    assert!(
+        skip_worktree_set_for_add(root, "s"),
+        "D4 the skip-worktree bit must survive"
+    );
+    let staged = run_libra_command(&["diff", "--staged", "--", "s"], root);
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("modified"),
+        "D4 must stage the new content: {}",
+        String::from_utf8_lossy(&staged.stdout)
+    );
+
+    // D5: --sparse with a deleted file reports the ordinary not-matched error.
+    fs::remove_file(root.join("s")).expect("remove s again");
+    let d5 = run_libra_command(&["add", "--sparse", "--dry-run", "s"], root);
+    assert_ne!(d5.status.code(), Some(0), "D5 must fail");
+    assert!(
+        String::from_utf8_lossy(&d5.stderr).contains("did not match any files"),
+        "D5 not-matched error: {}",
+        String::from_utf8_lossy(&d5.stderr)
+    );
+
+    // D8: --renormalize/--chmod on a skip-worktree path report sparse.
+    fs::write(root.join("s"), "renormalize-me\n").expect("rewrite s");
+    for args in [
+        vec!["add", "--renormalize", "s"],
+        vec!["add", "--chmod=+x", "s"],
+    ] {
+        let out = run_libra_command(&args, root);
+        assert_eq!(out.status.code(), Some(1), "D8 {:?} exit 1", args);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("sparse-checkout"),
+            "D8 {:?} diagnostic",
+            args
+        );
+    }
+
+    // D9: JSON carries `sparse_paths` and stays human-silent on stderr.
+    fs::remove_file(root.join("s")).ok();
+    let d9 = run_libra_command(
+        &["--json", "add", "--dry-run", "--ignore-missing", "s"],
+        root,
+    );
+    assert_eq!(d9.status.code(), Some(1), "D9 exit 1");
+    let parsed = parse_json_stdout(&d9);
+    assert_eq!(
+        parsed["data"]["sparse_paths"],
+        serde_json::json!(["s"]),
+        "D9 sparse_paths: {parsed}"
+    );
+    assert!(
+        String::from_utf8_lossy(&d9.stderr).trim().is_empty(),
+        "D9 JSON must not print the human diagnostic: {}",
+        String::from_utf8_lossy(&d9.stderr)
+    );
+}
+
+/// SW-06 (M-ADVICE D6/D7): a pathspec matching both a sparse and a dense entry
+/// gets no sparse diagnostic, and unrelated unmatched pathspecs keep their
+/// ordinary error.
+#[test]
+fn test_add_dense_and_sparse_pathspec_no_advice() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s_entry"), "s\n").expect("write s_entry");
+    assert_cli_success(&run_libra_command(&["add", "s_entry"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree_for_add(root, "s_entry");
+    fs::write(root.join("dense_entry"), "dense\n").expect("write dense_entry");
+
+    let d6 = run_libra_command(&["add", "*_entry"], root);
+    assert_cli_success(&d6, "D6 add *_entry");
+    assert!(
+        !String::from_utf8_lossy(&d6.stderr).contains("sparse-checkout"),
+        "D6 must not emit the sparse diagnostic"
+    );
+    let staged = run_libra_command(&["diff", "--staged", "--name-only"], root);
+    let staged_text = String::from_utf8_lossy(&staged.stdout).to_string();
+    assert!(
+        staged_text.contains("dense_entry") && !staged_text.contains("s_entry"),
+        "D6 stages only the dense entry: {staged_text}"
+    );
+
+    let d7 = run_libra_command(&["add", "nonexistent"], root);
+    assert_ne!(d7.status.code(), Some(0), "D7 must fail");
+    assert!(
+        !String::from_utf8_lossy(&d7.stderr).contains("sparse-checkout"),
+        "D7 must not emit the sparse diagnostic"
+    );
+}
+
+/// FM-03 (M-CFG K1–K4, K6, plan issues/470): `core.fileMode=false` makes new
+/// files plain `100644`, keeps an existing entry's mode, leaves `--chmod`
+/// unaffected, and an invalid value fails add/status closed.
+#[cfg(unix)]
+#[test]
+fn test_add_honors_core_filemode_false_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn index_mode(root: &std::path::Path, path: &str) -> String {
+        let out = run_libra_command(&["ls-files", "--stage", path], root);
+        assert_cli_success(&out, "ls-files --stage");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    // K1: `init` wrote core.filemode=true (the canonical lower-case key).
+    let get = run_libra_command(&["config", "get", "core.filemode"], root);
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout).trim(),
+        "true",
+        "K1 init must record core.fileMode=true"
+    );
+
+    // K2: new executable file under fileMode=false is recorded 100644.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    let exe = root.join("new-exe");
+    fs::write(&exe, "#!/bin/sh\n").expect("write exe");
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod exe");
+    assert_cli_success(&run_libra_command(&["add", "new-exe"], root), "K2 add");
+    assert_eq!(index_mode(root, "new-exe"), "100644", "K2 new file");
+
+    // K3: an existing 100755 entry keeps its mode when re-staged with false.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "true"], root),
+        "reenable fileMode",
+    );
+    let tool = root.join("tool.sh");
+    fs::write(&tool, "#!/bin/sh\necho v1\n").expect("write tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    assert_cli_success(&run_libra_command(&["add", "tool.sh"], root), "stage tool");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "exec", "--no-verify"], root),
+        "commit tool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode again",
+    );
+    fs::write(&tool, "#!/bin/sh\necho v2\n").expect("rewrite tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(&run_libra_command(&["add", "tool.sh"], root), "K3 add");
+    assert_eq!(
+        index_mode(root, "tool.sh"),
+        "100755",
+        "K3 existing mode must be kept"
+    );
+
+    // K4: --chmod still applies explicitly.
+    let chmod_new = root.join("chmod-new");
+    fs::write(&chmod_new, "#!/bin/sh\n").expect("write chmod-new");
+    assert_cli_success(
+        &run_libra_command(&["add", "--chmod=+x", "chmod-new"], root),
+        "K4 add --chmod",
+    );
+    assert_eq!(index_mode(root, "chmod-new"), "100755", "K4 --chmod");
+
+    // K6: invalid value fails add and status closed with the exact message.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "notabool"], root),
+        "set invalid",
+    );
+    fs::write(root.join("another.txt"), "x\n").expect("write another");
+    let add = run_libra_command(&["add", "another.txt"], root);
+    assert_ne!(add.status.code(), Some(0), "K6 add must fail");
+    assert!(
+        String::from_utf8_lossy(&add.stderr)
+            .contains("bad boolean config value 'notabool' for 'core.filemode'"),
+        "K6 add message: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let status = run_libra_command(&["status"], root);
+    assert_ne!(status.status.code(), Some(0), "K6 status must fail");
+    assert!(
+        String::from_utf8_lossy(&status.stderr)
+            .contains("bad boolean config value 'notabool' for 'core.filemode'"),
+        "K6 status message: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // Lower-case key spelling is honored (`core.filemode`).
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.filemode", "false"], root),
+        "set lowercase key",
+    );
+    // `config unset` the camel-case key so the lower-case one is the only value.
+    let _ = run_libra_command(&["config", "unset", "core.fileMode"], root);
+    let lower = run_libra_command(&["ls-files", "--stage"], root);
+    assert_cli_success(&lower, "ls-files after lowercase config");
+}
+
+/// FM-04 (M-DET D3/D6, plan-20260918): a mode-only worktree change is staged
+/// by `add` when `core.fileMode` is enabled and ignored when it is false.
+#[cfg(unix)]
+#[test]
+fn test_add_mode_only_change_respects_filemode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn index_mode(root: &std::path::Path, path: &str) -> String {
+        let out = run_libra_command(&["ls-files", "--stage", path], root);
+        assert_cli_success(&out, "ls-files --stage");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    let run = root.join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").expect("write");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    assert_cli_success(&run_libra_command(&["add", "run.sh"], root), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // D6: fileMode=false — add keeps the recorded 100755.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "false"], root),
+        "disable fileMode",
+    );
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], root),
+        "add with fileMode=false",
+    );
+    assert_eq!(
+        index_mode(root, "run.sh"),
+        "100755",
+        "D6 must keep the index mode"
+    );
+
+    // D3: fileMode=true — add stages the mode-only change.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.fileMode", "true"], root),
+        "enable fileMode",
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], root),
+        "add with fileMode=true",
+    );
+    assert_eq!(
+        index_mode(root, "run.sh"),
+        "100644",
+        "D3 must stage the mode change"
+    );
+}
+
+/// WT-05 (M-ITA-ADD N1–N7, plan-20260918): `add -N/--intent-to-add` records
+/// empty-blob entries carrying the index v3 intent-to-add extended flag,
+/// leaves tracked paths untouched, writes nothing for unmatched pathspecs or
+/// dry-runs, and clears the flag once the real content is staged.
+#[test]
+fn test_add_intent_to_add_matrix() {
+    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("tracked.txt"), "tracked\n").expect("write tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], root),
+        "add tracked",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // N5: dry-run previews the intent-to-add path and writes nothing.
+    fs::write(root.join("dry.txt"), "dry\n").expect("write dry");
+    let dry = run_libra_command(&["add", "-N", "-n", "dry.txt"], root);
+    assert_cli_success(&dry, "add -N -n");
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains("add: dry.txt"),
+        "N5 preview: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        index_entry_snapshot(root, "dry.txt").is_none(),
+        "N5 must not write an index entry"
+    );
+
+    // N1: a new path becomes an empty-blob entry flagged intent-to-add.
+    fs::write(root.join("new.txt"), "content\n").expect("write new");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "new.txt"], root),
+        "add -N",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "new.txt"),
+        Some((0o100644, EMPTY_BLOB.to_string(), 0, true, false)),
+        "N1 entry shape"
+    );
+    // N7: any extended flag makes the on-disk index v3.
+    assert_eq!(index_version(root), 3, "N7 index version with a flag set");
+
+    // N2: a directory records each contained file.
+    fs::create_dir_all(root.join("dir/sub")).expect("mkdir");
+    fs::write(root.join("dir/f.txt"), "f\n").expect("write f");
+    fs::write(root.join("dir/sub/g.txt"), "g\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "dir"], root),
+        "add -N dir",
+    );
+    for path in ["dir/f.txt", "dir/sub/g.txt"] {
+        assert_eq!(
+            index_entry_snapshot(root, path),
+            Some((0o100644, EMPTY_BLOB.to_string(), 0, true, false)),
+            "N2 entry {path}"
+        );
+    }
+
+    // N3: tracked paths and repeated `-N` are successful no-ops.
+    let tracked_before = index_entry_snapshot(root, "tracked.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "tracked.txt"], root),
+        "add -N tracked",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "tracked.txt"),
+        tracked_before,
+        "N3 tracked entry unchanged"
+    );
+    let ita_before = index_entry_snapshot(root, "new.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "new.txt"], root),
+        "add -N again",
+    );
+    assert_eq!(
+        index_entry_snapshot(root, "new.txt"),
+        ita_before,
+        "N3 repeated -N unchanged"
+    );
+
+    // N4: an unmatched pathspec fails with exit 128 and zero writes.
+    let missing = run_libra_command(&["add", "-N", "nonexist"], root);
+    // M-ITA-ADD N4 says 128 (Git); Libra classifies an unmatched pathspec as a
+    // usage error (129 / LBR-CLI-003) on every add path — deviation registered
+    // in the card record.
+    assert_eq!(
+        missing.status.code(),
+        Some(129),
+        "N4 exit: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("pathspec 'nonexist' did not match any files"),
+        "N4 message: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert!(
+        index_entry_snapshot(root, "nonexist").is_none(),
+        "N4 must not write an entry"
+    );
+
+    // N6/N7: staging the real content replaces the entry, clears the flag and
+    // returns the index to v2 once every intent-to-add bit is gone.
+    fs::write(root.join("new.txt"), "real\n").expect("rewrite new");
+    assert_cli_success(
+        &run_libra_command(&["add", "new.txt", "dir"], root),
+        "add real content",
+    );
+    let staged = index_entry_snapshot(root, "new.txt").expect("staged entry");
+    assert_eq!(staged.0, 0o100644, "N6 mode");
+    assert_ne!(staged.1, EMPTY_BLOB, "N6 real blob replaces the empty blob");
+    assert!(!staged.3, "N6 intent-to-add flag cleared");
+    assert_eq!(
+        index_version(root),
+        2,
+        "N7 back to v2 when all flags are clear"
+    );
+}
+
+/// WT-01 (M-GUARD G8, issues/476): `add .` on a clean tree is a successful no-op.
+#[test]
+fn test_add_dot_on_clean_tree_guard() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    let before = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&before, "G8 ls-files before");
+    let status_before = run_libra_command(&["status", "--porcelain"], root);
+    assert_cli_success(&status_before, "G8 status before");
+    assert!(
+        String::from_utf8_lossy(&status_before.stdout)
+            .trim()
+            .is_empty(),
+        "G8 fixture must start clean: {}",
+        String::from_utf8_lossy(&status_before.stdout)
+    );
+
+    let add = run_libra_command(&["add", "."], root);
+    assert_eq!(add.status.code(), Some(0), "G8 add . exit");
+    assert_cli_success(&add, "G8 add .");
+
+    let after = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&after, "G8 ls-files after");
+    assert_eq!(
+        after.stdout, before.stdout,
+        "G8 add . must not change the index"
+    );
+    let status_after = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        String::from_utf8_lossy(&status_after.stdout)
+            .trim()
+            .is_empty(),
+        "G8 add . must leave the tree clean: {}",
+        String::from_utf8_lossy(&status_after.stdout)
     );
 }

@@ -174,7 +174,17 @@ jobs:
 
       - name: Prepare isolated test home
         shell: bash
-        run: mkdir -p "$RUNNER_TEMP/libra-ci-home/.config"
+        run: |
+          mkdir -p "$RUNNER_TEMP/libra-ci-home/.config"
+          chmod 700 "$RUNNER_TEMP/libra-ci-home" "$RUNNER_TEMP/libra-ci-home/.config"
+          # Keep the scratch root out of $RUNNER_TEMP: repair-path tests
+          # validate the target's ancestor chain and reject group/world-
+          # writable non-sticky ancestors, and the self-hosted runner's
+          # _work tree inherits the runner service's umask (0002). /tmp is
+          # sticky, so a scratch under it always qualifies.
+          scratch="$(mktemp -d /tmp/libra-ci-scratch.XXXXXXXX)"
+          chmod 700 "$scratch"
+          echo "LIBRA_TEST_SCRATCH_DIR=$scratch" >> "$GITHUB_ENV"
 
       - name: Check compatibility matrix drift
         run: cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact
@@ -207,11 +217,13 @@ jobs:
           LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
         run: |
           set -euo pipefail
-          # Self-hosted runners may use a collaborative 0002 umask. The
-          # mode-materialization assertions and documented default test
+          # Tests assert Git-style 0755/0644 modes and reject group/world-
+          # writable repair inputs. Self-hosted runners may use umask 0002.
+          # The mode-materialization assertions and documented default test
           # contract use the normal 0022 baseline; tests that exercise other
           # umasks set them explicitly in their child process.
           umask 0022
+
           # plan-20260827 NP-04 disposition ①+②: one nextest invocation runs
           # lib + bins + every default-feature integration target INCLUDING
           # command_test — one process per test dissolves the in-process cwd
@@ -272,6 +284,16 @@ jobs:
           cargo test --features test-upgrade \
             --test upgrade_auto_test \
             --test upgrade_publish_contract_test -- --test-threads=1
+
+      # The scratch root lives on /tmp (outside the runner's auto-cleaned
+      # _work tree), so it must be removed explicitly even on failure.
+      - name: Clean up CI scratch
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${LIBRA_TEST_SCRATCH_DIR:-}" ]; then
+            rm -rf "$LIBRA_TEST_SCRATCH_DIR"
+          fi
 
   # The `command_test` half of what `cargo test --all` used to do in one job.
   # See the note on compat-offline-core's test step for why it is split out:

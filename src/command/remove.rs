@@ -314,7 +314,7 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
                     }
                 ));
                 for file in files {
-                    error_msg.push_str(&format!("\t{}\n", file));
+                    error_msg.push_str(&format!("    {}\n", file));
                 }
                 error_msg.push_str("(use --cached to keep the file, or -f to force removal)");
             }
@@ -328,7 +328,7 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
                     }
                 ));
                 for file in files {
-                    error_msg.push_str(&format!("\t{}\n", file));
+                    error_msg.push_str(&format!("    {}\n", file));
                 }
                 error_msg.push_str("(use --cached to keep the file, or -f to force removal)");
             }
@@ -343,12 +343,15 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
                 }
             ));
             for file in diff_status.index_commit_workingtree {
-                error_msg.push_str(&format!("\t{}\n", file));
+                error_msg.push_str(&format!("    {}\n", file));
             }
             error_msg.push_str("(use -f to force removal)");
         }
         if !error_msg.is_empty() {
-            return Err(CliError::failure(error_msg.trim_end().to_string()));
+            // ADR-WT-02 (WT-04): the three refusal classes are operation
+            // conflicts — LBR-CONFLICT-002 with category=conflict — while the
+            // exit code stays 128 (Git exits 1; the code change is DEFER-03).
+            return Err(CliError::conflict(error_msg.trim_end().to_string()));
         }
     }
 

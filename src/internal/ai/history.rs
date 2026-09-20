@@ -2809,10 +2809,10 @@ impl HistoryManager {
         let current_exe = std::env::current_exe()
             .context("resolve Libra executable for rejected-cleanup index helper")?;
         let program = if cfg!(debug_assertions)
-            && !current_exe
+            && current_exe
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem == "libra")
+                .is_none_or(|stem| stem != "libra")
         {
             current_exe
                 .parent()

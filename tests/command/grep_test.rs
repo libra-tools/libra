@@ -19,6 +19,8 @@ use super::{assert_cli_success, parse_cli_error_stderr, parse_json_stdout, run_l
 async fn add_and_commit(message: &str, pathspec: Vec<String>) {
     add::execute_safe(
         AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec,
             all: false,
             update: false,

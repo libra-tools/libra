@@ -208,6 +208,11 @@ Note: jj's `file untrack` is conceptually similar to `libra rm --cached` -- it s
 
 ## Error Handling
 
+The three refusal classes below exit `128` with the stable code
+`LBR-CONFLICT-002` (`category=conflict`), matching Git's wording and its
+4-space file-list indent. Git exits `1` for these refusals; the exit-code
+change is deliberately deferred (DEFER-03).
+
 | Scenario | Behavior | Exit |
 |----------|----------|------|
 | No pathspecs provided | Error: nothing specified for removal | non-zero |

@@ -3453,6 +3453,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3531,6 +3533,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3580,6 +3584,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,
@@ -3632,6 +3638,8 @@ mod test {
 
         test::ensure_file("tracked.txt", Some("tracked\n"));
         add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
             pathspec: vec!["tracked.txt".into()],
             all: false,
             update: false,

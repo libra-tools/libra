@@ -608,6 +608,8 @@ async fn setup_repo_with_commit_with(
 
     std::fs::write("file.txt", content).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".into()],
         all: false,
         update: false,
@@ -808,6 +810,8 @@ async fn test_force_tag() {
     // Make second commit with updated content
     std::fs::write("file.txt", "v2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".into()],
         all: false,
         update: false,
@@ -1016,6 +1020,8 @@ async fn test_annotation_lines_tag() {
     // Make second commit with updated content
     std::fs::write("file.txt", "annotation-tag").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".into()],
         all: false,
         update: false,
@@ -1079,6 +1085,8 @@ async fn test_annotation_lines_tag() {
 
     std::fs::write("file.txt", "annotation-multi-line-tag").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".into()],
         all: false,
         update: false,

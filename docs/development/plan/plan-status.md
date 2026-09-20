@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-20（下次更新时替换）。
+> **当前快照：** 2026-09-21（下次更新时替换）。
 
 ---
 
@@ -22,8 +22,9 @@
 |---|---|---|---|
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 已排期 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 `pending` |
-| [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭 |
-| [`plan-20260917.md`](plan-20260917.md)（含 `plan-20260917-sp00-spawn.md`） | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete` |
+| [`plan-20260920.md`](plan-20260920.md) | 横切（拆 Code/Publish/Worker） | **已收口** | RC-00..RC-36 全部 `done/complete`；完成判据全勾选；DEFER-RC-04/05/06/07 已关闭；RC-00 缝清单已并入正文附录 |
+| [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 原 `plan-20260919-gpg-import.md`；R29 双 PASS；15 卡尚未执行 |
+| [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | **已收口** | SH-00..SP-01 五卡全部 `done/complete`；SP-00 结论文档已并入正文附录 |
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 未启动 | CAP-01..07 全部 `pending`；双评审（Codex/Claude）已 PASS，尚未开工 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 未启动 | FL-00..FL-07 全部 `pending`；前置 plan-20260907 未收口 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 未启动 | MB-06/09/12 已取消（`done`）；MB-01..05 `pending`；MB-07/08/10/11 `blocked` |
@@ -52,7 +53,7 @@
 
 ### issues/ 下的计划（Issue 驱动的 Git 对齐修复计划）
 
-`issues/` 目录每份文件对应一个 GitHub Issue，是独立的可执行计划。除 `477`（已收口）与 `486`（已关闭）外全部为设计计划（`pending`，尚未 Codex review）。状态列取值同上。
+`issues/` 目录每份文件对应一个 GitHub Issue，是独立的可执行计划。`477` 已收口、`486` 已关闭、`476` 执行中（用户 2026-09-20 覆盖：执行期间不调用 Codex/Claude 评审）。其余多为设计计划。状态列取值同上。
 
 | 计划 | Issue 主题 | 状态 | 任务卡 |
 |---|---|---|---|
@@ -60,7 +61,7 @@
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
 | [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 未启动 | CL-01..CL-15（15 卡） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
-| [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | 未启动 | WT-01..WT-11（8 卡；intent-to-add 已迁至 plan-20260918 WT-05..07，关闭依赖 DEP-WT-09） |
+| [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
 | [`issues/478.md`](issues/478.md) | log/show/diff/grep/blame/notes/reflog 命令族 | 未启动 | LG-01..LG-25（25 卡） |
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | 未启动 | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
@@ -89,6 +90,7 @@
 | [`plan-20260913.md`](plan-20260913.md) | FL-00..FL-07 | **前置 plan-20260907 完整收口**（DEP-FL-04） |
 | [`plan-20260916.md`](plan-20260916.md) | CAP-01..CAP-07 | 双评审已 PASS；开工时按 ER-CAP-02 pin 重核 |
 | [`plan-20260919.md`](plan-20260919.md) | GCX-02/03/04 | GCX-01 已 `done`（v0.23.1）；GCX-02→03→04 串行；写集与 plan-20260918 串行（DEP-GCX-02） |
+| [`plan-20260921.md`](plan-20260921.md) | VG-00..VG-14（15 卡） | R29 双 PASS；Phase 0 剩余 DEP 复核、`gpg --version` 证据、VG-00 go、ADR Accepted |
 | `issues/` 设计计划 | 见「计划一览」issues 表 | 各计划 Codex review `PASS` 前不得开工；`issues/476`/`479`/`483`/`490` 与 `plan-20260918` 写集串行（DEP-WT-09 / DEP-PL-04 / DEP-AD-06 / DEP-AD-07） |
 
 ---
@@ -128,6 +130,21 @@
 | M2-01 冻结 M2 合同与领域类型 | **`in-progress`** |
 | M2-01K..M2-15（含 M2-15 发布点） | `pending` |
 
+### 3.6 issues/476（工作树命令族）
+
+发布窗口：WT-01 → WT-02 → WT-04 → WT-08 → WT-09 → WT-10 → WT-11 → WT-03。用户 2026-09-20 覆盖 ER-05（执行 Agent 自审）。
+
+| 卡 | 状态 | 发布 |
+|---|---|---|
+| WT-02 `status -M` | `done`/`remote-pending` | v0.23.29 |
+| WT-04 `rm` 拒绝分类 | `done`/`remote-pending` | v0.23.30 |
+| WT-08 裸 stash = push | `done`/`remote-pending` | v0.23.31 |
+| WT-09 stash push 预检顺序 | `done`/`remote-pending` | v0.23.32 |
+| WT-10 消息格式 | `done`/`remote-pending` | v0.23.33 |
+| WT-11 `--index` 恢复 | `done`/`remote-pending` | v0.23.34 |
+| **WT-01 回归守卫** | **`done`/`remote-pending`（C 组落地中）** | **v0.23.35** |
+| WT-03 init 默认 ignore | `pending`（DEP-WT-08 用户评审） | — |
+
 ### 3.4 plan-20260822（Operation Log v2）
 
 | 卡 | 状态 |
@@ -151,9 +168,9 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `plan-20260918` → `OI-04`（批量发布 repair marker），`in-progress`，commit `42bc58a` 已落地，当前版本面三处一致 `0.23.7`（`Cargo.toml` / `install.sh` / `install.ps1`，`web/` 与 `worker/` 已随 plan-20260920 删除，`compat_version_surface_sync` 为权威）。
-- **下一步（OI-04 完成后）：** `plan-20260918` → `OI-05`（marker 注册失败错误契约）。开工前必须按 G-10 / DEP-AD-12 与 `plan-20260904` CX-30 做 `src/cli.rs` 三态串行核对（CX-30 `pending` 且 `src/cli.rs` clean 才放行）。
-- **OI-05 之后的串行发布窗口：** IA-01 → … → WT-07（见 3.1），AU 卡不 bump 不发布。
+- **当前正在执行：** `issues/476` → `WT-01`（回归守卫），`done`/`remote-pending`，版本面三处 `0.23.35`（C 组提交/tag/`gh release` 进行中）。
+- **下一步（WT-01 C/D 落地后）：** `issues/476` → `WT-03` 仍等 DEP-WT-08 / ADR-WT-04；无其它未阻塞卡。
+- **并行窗口（不在本执行指针）：** `plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `stash.rs` 写集。
 
 ---
 
@@ -179,7 +196,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`issues/473`](issues/473.md) | IN-01 / IN-03 / IN-02 | 空模板自引用防护 / 存储路径前置检测 / 换格式 reinit fail-closed | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/474`](issues/474.md) | CL-01 | fsck 断链检测与 shallow 豁免 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/475`](issues/475.md) | CF-02 / CF-01 | key/模式校验与退出码 / 带 value-pattern 的删除 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
-| [`issues/476`](issues/476.md) | WT-01 / WT-02 / WT-04 | 已验证面回归守卫 / `status -M` 短写法 / `rm` 拒绝文案 | 无 | 尚未 Codex review | WT-03/08..11 关闭依赖 DEP-WT-09 | ❌ 禁止开工 |
+| [`issues/476`](issues/476.md) | WT-03 | `init` 不再创建默认 `.libraignore` | DEP-WT-08、DEP-WT-05 | 用户 2026-09-20 覆盖：执行 Agent 自审 | DEP-WT-08（ADR-WT-04 用户评审）未满足 | ❌ 阻塞 |
 | [`issues/478`](issues/478.md) | LG-01 | `log`/`rev-list` `--grep` 模式类型与匹配范围 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/479`](issues/479.md) | EC-01 | plumbing 退出码契约守卫 | 无 | 尚未 Codex review | DEP-PL-04：与 plan-20260918 `add.rs` 串行 | ❌ 禁止开工 |
 | [`issues/480`](issues/480.md) | HP-01 / HP-02 | `remote add` 默认 refspec 与 `--mirror` / `remote rename` 改写推送目标 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |

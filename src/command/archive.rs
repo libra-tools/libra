@@ -818,7 +818,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::utils::test::ChangeDirGuard;
+    use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
 
     #[test]
     fn archive_format_accepts_supported_names() {
@@ -971,7 +971,14 @@ mod tests {
     }
 
     #[test]
+    #[serial(cwd)]
     fn filter_entries_by_pathspecs_keeps_matching_files_and_dirs() {
+        let repo = tempdir().expect("failed to create archive pathspec repository");
+        tokio::runtime::Runtime::new()
+            .expect("failed to create test runtime")
+            .block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
         let hash =
             ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
         let entries = vec![
@@ -1002,7 +1009,14 @@ mod tests {
     /// FIX-AD-01: `archive` pathspecs match through the shared pathspec engine —
     /// wildcards and `:(literal)` behave like Git, plain names still prefix-match.
     #[test]
+    #[serial(cwd)]
     fn filter_entries_by_pathspecs_supports_wildcards_and_magic() {
+        let repo = tempdir().expect("failed to create archive pathspec repository");
+        tokio::runtime::Runtime::new()
+            .expect("failed to create test runtime")
+            .block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
         let hash =
             ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
         let entry = |path: &str| ArchiveEntry {

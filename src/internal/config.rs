@@ -1492,6 +1492,45 @@ pub async fn read_cascaded_config_value(
     global_config_value(key).await
 }
 
+/// Resolve `core.fileMode` (plan issues/470 FM-03, ADR-FM-04).
+///
+/// Unix defaults to `true`, every other platform to `false`. The key is read
+/// case-insensitively (`core.fileMode` and `core.filemode`), and an invalid
+/// value fails closed with the same `CliError::command_usage` mapping as
+/// `commit.verbose`: `bad boolean config value '<value>' for 'core.filemode'`.
+pub async fn core_file_mode() -> crate::utils::error::CliResult<bool> {
+    use crate::utils::error::{CliError, StableErrorCode};
+
+    let mut raw = None;
+    for key in ["core.fileMode", "core.filemode"] {
+        match read_cascaded_config_value(LocalIdentityTarget::CurrentRepo, key).await {
+            Ok(Some(value)) => {
+                raw = Some(value);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(
+                    CliError::fatal(format!("failed to read core.fileMode: {error}"))
+                        .with_stable_code(StableErrorCode::RepoStateInvalid),
+                );
+            }
+        }
+    }
+    resolve_core_file_mode(raw.as_deref()).map_err(CliError::command_usage)
+}
+
+/// Pure core of [`core_file_mode`]: apply Git's boolean parsing to the raw
+/// value, defaulting to `true` on Unix and `false` elsewhere. Kept separate so
+/// the default/case/invalid cases are unit-testable without a repository.
+pub fn resolve_core_file_mode(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        Some(value) => parse_git_bool(value)
+            .ok_or_else(|| format!("bad boolean config value '{value}' for 'core.filemode'")),
+        None => Ok(cfg!(unix)),
+    }
+}
+
 /// Parse a Git-compatible boolean config value (`git_config_bool` semantics):
 /// `true`/`yes`/`on` (case-insensitive) and any non-zero integer — with an
 /// optional `k`/`m`/`g` unit suffix, as Git's int parser accepts — are true;
@@ -3702,5 +3741,32 @@ mod tests {
             ..resolution
         };
         assert!(legacy_global_config_notice(&migrated).is_none());
+    }
+
+    /// FM-03 (ADR-FM-04, M-CFG K1/K6/K7): the pure `core.fileMode` resolver.
+    #[test]
+    fn resolve_core_file_mode_default_case_and_invalid() {
+        // K1/K7: absent value defaults by platform.
+        assert_eq!(super::resolve_core_file_mode(None), Ok(cfg!(unix)));
+        // Case-insensitive Git booleans.
+        for value in ["true", "TRUE", "Yes", "on", "1"] {
+            assert_eq!(
+                super::resolve_core_file_mode(Some(value)),
+                Ok(true),
+                "{value}"
+            );
+        }
+        for value in ["false", "FALSE", "No", "off", "0"] {
+            assert_eq!(
+                super::resolve_core_file_mode(Some(value)),
+                Ok(false),
+                "{value}"
+            );
+        }
+        // K6: invalid values fail closed with the commit.verbose message shape.
+        assert_eq!(
+            super::resolve_core_file_mode(Some("notabool")),
+            Err("bad boolean config value 'notabool' for 'core.filemode'".to_string())
+        );
     }
 }

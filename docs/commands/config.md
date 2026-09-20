@@ -566,6 +566,30 @@ libra config unset --global code.defaultProvider
 
 Valid values are the provider ids accepted by `libra code --provider`: `anthropic`, `codex`, `deepseek`, `gemini`, `kimi`, `ollama`, `openai`, `zhipu`. A configured value skips credential detection; an unset or empty value falls through to it; an unrecognized id makes `libra code` exit 129 (`LBR-CLI-002`) listing the valid ids without echoing the stored value. The key lives in this SQLite config database only — it is unrelated to the `[code.*]` profile sections of `agents.toml` (`[code.multi_agent]`, `[code.goal]`, …), and neither carrier falls back to the other. See [code.md](code.md) for the full resolution ladder.
 
+## The `core.filemode` Key
+
+`core.filemode` (read case-insensitively) controls how `add`,
+`update-index <path>`, and `commit -a` record file modes when staging from the
+working tree. Unset, it defaults to `true` on Unix and `false` elsewhere. With
+`false`, re-staging an existing entry keeps the mode already recorded in the
+index and a new path is recorded as `100644` (an executable working-tree file
+does not become `100755`); `add --chmod=+x` and `update-index --cacheinfo`
+carry an explicit mode and are unaffected. With `true` (the Unix default) a
+mode-only worktree change — a tracked regular file whose owner-execute bit
+differs from the index while its content is unchanged — is reported by
+`status`, rendered by `diff`, staged by `add`/`commit -a`/`update-index
+<path>`, and treated as a local modification by `stash push`; with `false`
+those commands ignore mode-only differences while entry-type changes (for
+example a regular file replaced by a symlink) stay visible. An invalid
+boolean value fails `add`/`status` closed with `bad boolean config value
+'<value>' for 'core.filemode'` before any index write, mirroring
+`commit.verbose`.
+
+```bash
+libra config set core.filemode false
+libra config get core.filemode
+```
+
 ## Reserved `upgrade.*` Namespace
 
 The auto-upgrade configuration is a reserved namespace stored in

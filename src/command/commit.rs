@@ -1096,7 +1096,11 @@ async fn run_commit_with_index(
             .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
         let auto_stage_applied = if args.all {
-            auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose)?
+            // ADR-FM-04: `core.fileMode=false` keeps existing modes.
+            let file_mode = crate::internal::config::core_file_mode()
+                .await
+                .map_err(|error| CommitError::InvalidConfig(error.to_string()))?;
+            auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose, file_mode)?
         } else {
             false
         };
@@ -2870,8 +2874,9 @@ async fn create_tree_with_persistence(
 fn auto_stage_tracked_changes(
     persist_objects: bool,
     cache_preview_objects: bool,
+    file_mode: bool,
 ) -> Result<bool, CommitError> {
-    let mut pending = status::changes_to_be_staged().map_err(|e| {
+    let mut pending = status::changes_to_be_staged_with_file_mode(file_mode).map_err(|e| {
         CommitError::AutoStage(format!("failed to determine working tree status: {e}"))
     })?;
     let index_path = path::index();
@@ -3027,7 +3032,7 @@ fn auto_stage_tracked_changes(
                 .map_err(|e| {
                     CommitError::AutoStage(format!("failed to create index entry: {}", e))
                 })?;
-        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
+        crate::utils::index_ext::update_preserving_file_mode(&mut index, entry, file_mode);
         if let Some(path) = file.to_str() {
             for stage in 1..=3 {
                 index.remove(path, stage);

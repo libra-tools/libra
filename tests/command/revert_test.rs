@@ -131,6 +131,8 @@ async fn test_basic_revert() {
     // --- 1. C1: Add 1.txt ---
     fs::write("1.txt", "content1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["1.txt".to_string()],
         all: false,
         update: false,
@@ -170,6 +172,8 @@ async fn test_basic_revert() {
     // --- 2. C2: Modify 1.txt ---
     fs::write("1.txt", "content1\ncontent2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["1.txt".to_string()],
         all: false,
         update: false,
@@ -210,6 +214,8 @@ async fn test_basic_revert() {
     fs::remove_file("1.txt").unwrap();
     fs::write("2.txt", "content3").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![],
         all: true,
         update: false,
@@ -334,6 +340,8 @@ async fn test_revert_no_commit() {
     // Create initial commits
     fs::write("test.txt", "original").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".to_string()],
         all: false,
         update: false,
@@ -371,6 +379,8 @@ async fn test_revert_no_commit() {
 
     fs::write("test.txt", "modified").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["test.txt".to_string()],
         all: false,
         update: false,
@@ -461,6 +471,8 @@ async fn test_revert_root_commit() {
     // Create initial commit
     fs::write("initial.txt", "initial content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["initial.txt".to_string()],
         all: false,
         update: false,
@@ -561,6 +573,8 @@ async fn test_revert_root_commit_creates_empty_tree_commit() {
 
     fs::write("initial.txt", "initial content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["initial.txt".to_string()],
         all: false,
         update: false,

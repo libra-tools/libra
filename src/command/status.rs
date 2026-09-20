@@ -178,8 +178,12 @@ pub struct StatusArgs {
     pub null_terminated: bool,
 
     /// Detect renames in staged/unstaged changes.
-    /// The optional value is the similarity threshold percentage (default 50).
+    /// The optional value is the similarity threshold (`-M`, `-M<n>`, `-M<n>%`,
+    /// `--find-renames[=<n>]`, default 50%). `-M` keeps Git's glued-value short
+    /// form; the pre-clap argv scan records the raw value and applies the
+    /// shared `libra diff` score grammar.
     #[clap(
+        short = 'M',
         long = "find-renames",
         value_name = "PERCENT",
         num_args = 0..=1,
@@ -508,6 +512,18 @@ pub(crate) fn normalize_status_argv(
                 // Placeholder keeps clap from rejecting Git raw syntax the
                 // resolver validates later.
                 argv[j] = std::ffi::OsString::from("--find-renames=50");
+            } else if tok == "-M" {
+                // WT-02: `-M` is the short spelling of `--find-renames`; a
+                // bare `-M` is the default threshold. The raw value is
+                // recorded here and the token is rewritten so clap never
+                // sees Git's glued score syntax.
+                occurrences.push(RenameThresholdOccurrence::FindRaw(std::ffi::OsString::new()));
+                argv[j] = std::ffi::OsString::from("-M50");
+            } else if let Some(raw) = tok.strip_prefix("-M") {
+                occurrences.push(RenameThresholdOccurrence::FindRaw(
+                    std::ffi::OsString::from(raw),
+                ));
+                argv[j] = std::ffi::OsString::from("-M50");
             } else if tok == "--renames" {
                 occurrences.push(RenameThresholdOccurrence::EnableDefault);
             } else if tok == "--no-renames" {
@@ -533,12 +549,31 @@ pub(crate) fn normalize_status_argv(
                 // every character after that is a VALUE, not a flag. `-uno`
                 // is `-u=no` and `-J=ndjson` is a global with an attached
                 // value; neither contributes flags.
-                for ch in cluster.chars() {
+                for (idx, ch) in cluster.char_indices() {
                     if ch == '=' {
                         break;
                     }
                     match status_shorts.get(&ch) {
-                        Some(true) => break,
+                        Some(true) => {
+                            // `-M` is the one OPTIONAL-value short (WT-02): the
+                            // rest of the cluster after `M` is its raw
+                            // threshold, so `-sM90` is `-s` plus `-M90`. Every
+                            // other value-taking short keeps the plain break.
+                            if ch == 'M' {
+                                let rest = &cluster[idx + ch.len_utf8()..];
+                                let raw = if rest.is_empty() {
+                                    std::ffi::OsString::new()
+                                } else {
+                                    std::ffi::OsString::from(rest)
+                                };
+                                occurrences.push(RenameThresholdOccurrence::FindRaw(raw));
+                                // Preserve the preceding flags; only the value
+                                // is replaced by the clap-safe placeholder.
+                                argv[j] =
+                                    std::ffi::OsString::from(format!("-{}M50", &cluster[..idx]));
+                            }
+                            break;
+                        }
                         // An unknown letter means this is not a cluster we
                         // understand; clap will report it. Recording flags
                         // from the rest would be guessing.
@@ -1340,10 +1375,14 @@ async fn collect_status_data(
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
+    // ADR-FM-05 (FM-04): mode-only worktree changes are reported only when
+    // core.fileMode is enabled.
+    let file_mode = crate::internal::config::core_file_mode().await?;
     let worktree = status_untracked::collect_status_worktree_changes(
         args.untracked_files.unwrap_or(UntrackedFiles::Normal),
         args.ignored,
         ignore_case,
+        file_mode,
     )
     .map_err(CliError::from)?;
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
@@ -2661,6 +2700,9 @@ pub(crate) async fn execute_safe_with_resolution(
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
     let mut extras = apply_status_config_defaults(&mut args).await?;
+    // ADR-FM-04 K6: an invalid `core.fileMode` fails status closed (no output,
+    // zero writes) with the commit.verbose mapping.
+    let _ = crate::internal::config::core_file_mode().await?;
     crate::command::status::warn_sparse_checkout_unsupported_once().await;
 
     if let Some(resolution) = resolution {
@@ -6522,8 +6564,12 @@ fn changes_to_be_staged_with_policy_and_ignore_case(
         path: index_path.clone(),
         source,
     })?;
-    let (mut visible, ignored) =
-        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
+    let (mut visible, ignored) = changes_to_be_staged_split_with_index(
+        &workdir,
+        &index,
+        ignore_case,
+        default_core_file_mode(),
+    )?;
     match policy {
         IgnorePolicy::Respect => Ok(visible),
         IgnorePolicy::OnlyIgnored => Ok(ignored),
@@ -6543,13 +6589,60 @@ pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusErr
 pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_safe_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04): the callers already resolved the config.
+pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)
+}
+
+/// `changes_to_be_staged` with an explicit `core.fileMode` value (FM-04).
+pub fn changes_to_be_staged_with_file_mode(file_mode: bool) -> Result<Changes, StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
+    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
+        path: index_path.clone(),
+        source,
+    })?;
+    let (visible, _) =
+        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case, file_mode)?;
+    Ok(visible)
+}
+
+/// Platform default for `core.fileMode` when the config value is not resolved
+/// by a command entry: Unix enables mode comparison, other platforms do not.
+fn default_core_file_mode() -> bool {
+    cfg!(unix)
+}
+
+/// Owner-execute bit of a worktree file (false on platforms without POSIX
+/// permission bits).
+fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 /// Emit the one-time `core.sparseCheckout=true` unsupported warning.
@@ -6590,19 +6683,32 @@ fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError
 pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
     ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+        ignore_case,
+        default_core_file_mode(),
+    )
+}
+
+/// [`changes_to_be_staged_split_force_with_ignore_case`] with an explicit
+/// `core.fileMode` value (FM-04).
+pub(crate) fn changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
+    ignore_case: bool,
+    file_mode: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
+    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case, file_mode)
 }
 
 fn changes_to_be_staged_split_force_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6641,16 +6747,30 @@ fn changes_to_be_staged_split_force_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }
@@ -6690,6 +6810,7 @@ fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
+    file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
@@ -6745,16 +6866,30 @@ fn changes_to_be_staged_split_with_index(
             }
         }
         let file_abs = workdir.join(file);
-        if file_abs.symlink_metadata().is_err() {
-            visible.deleted.push(file.clone());
-        } else if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                visible.modified.push(file.clone());
+        match file_abs.symlink_metadata() {
+            Err(_) => visible.deleted.push(file.clone()),
+            Ok(metadata) => {
+                // ADR-FM-05: with core.fileMode=true a regular file whose owner
+                // execute bit differs from the index is a mode-only change.
+                let mode_only_change = file_mode
+                    && metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && index.get(file_str, 0).is_some_and(|entry| {
+                        entry.mode & 0o100000 == 0o100000
+                            && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
+                    });
+                if mode_only_change {
+                    visible.modified.push(file.clone());
+                } else if index.is_modified(file_str, 0, workdir) {
+                    let file_hash =
+                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
+                            path: file_abs.clone(),
+                            source,
+                        })?;
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        visible.modified.push(file.clone());
+                    }
+                }
             }
         }
     }
@@ -7047,6 +7182,66 @@ mod argv_normalization_test {
             resolution.argv[3],
             std::ffi::OsString::from("--find-renames=505")
         );
+    }
+
+    /// WT-02: `-M[<raw>]` is scanned as another `--find-renames` spelling —
+    /// standalone and inside a short cluster — recording the raw value for
+    /// the resolver while argv carries the clap-safe placeholder.
+    #[test]
+    fn short_m_rename_spellings_are_scanned() {
+        let resolution = normalize(&["libra", "status", "--porcelain", "-M"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "bare -M");
+        assert_eq!(
+            resolution.argv[3],
+            std::ffi::OsString::from("-M50"),
+            "bare -M is rewritten so clap cannot eat the next token"
+        );
+
+        let resolution = normalize(&["libra", "status", "-M90%"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "glued -M90%");
+        assert_eq!(resolution.argv[2], std::ffi::OsString::from("-M50"));
+
+        let resolution = normalize(&["libra", "status", "-sM90"]);
+        assert_eq!(resolution.rename_occurrences.len(), 1, "clustered -sM90");
+        assert_eq!(
+            resolution.argv[2],
+            std::ffi::OsString::from("-sM50"),
+            "the preceding flags survive the rewrite"
+        );
+        assert!(
+            resolution.format.short_explicit,
+            "-s is still a format flag"
+        );
+    }
+
+    /// WT-02/M4: `-M` takes part in the LAST-occurrence-wins ordering across
+    /// all rename spellings, and only the winning raw value is interpreted.
+    #[test]
+    fn short_m_takes_part_in_last_wins_ordering() {
+        for (argv, expected) in [
+            (&["libra", "status", "-M", "--no-renames"][..], None),
+            (&["libra", "status", "--no-renames", "-M"][..], Some(30000)),
+            (&["libra", "status", "-M90", "--renames"][..], Some(30000)),
+            (&["libra", "status", "--renames", "-M90"][..], Some(54000)),
+            (&["libra", "status", "-M90%"][..], Some(54000)),
+        ] {
+            let resolution = normalize(argv);
+            let threshold = resolve_status_threshold(&StatusArgs::default(), Some(&resolution))
+                .unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+            assert_eq!(threshold, expected, "{argv:?}");
+        }
+
+        // An invalid `-M` that a later spelling overrides is never parsed...
+        let resolution = normalize(&["libra", "status", "-Mabc", "--no-renames"]);
+        assert_eq!(
+            resolve_status_threshold(&StatusArgs::default(), Some(&resolution)).expect("resolve"),
+            None
+        );
+        // ...while an invalid WINNER fails closed with LBR-CLI-002 (M5).
+        let resolution = normalize(&["libra", "status", "-Mabc"]);
+        let error = resolve_status_threshold(&StatusArgs::default(), Some(&resolution))
+            .expect_err("invalid winner");
+        assert_eq!(error.stable_code(), StableErrorCode::CliInvalidArguments);
     }
 
     /// §B.4.3: the API percent field accepts ONLY 0..=100 — a struct-literal

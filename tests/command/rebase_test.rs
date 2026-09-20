@@ -1916,6 +1916,8 @@ async fn test_basic_rebase() {
     // 1. Create initial commits on master
     fs::write(temp_path.path().join("file.txt"), "content1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -1954,6 +1956,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("file.txt"), "content1\ncontent2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2009,6 +2013,8 @@ async fn test_basic_rebase() {
     // 3. Create commits on feature branch
     fs::write(temp_path.path().join("feature_a.txt"), "featureA").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_a.txt".to_string()],
         all: false,
         update: false,
@@ -2047,6 +2053,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("feature_b.txt"), "featureB").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_b.txt".to_string()],
         all: false,
         update: false,
@@ -2101,6 +2109,8 @@ async fn test_basic_rebase() {
 
     fs::write(temp_path.path().join("master_only.txt"), "master_change").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master_only.txt".to_string()],
         all: false,
         update: false,
@@ -2232,6 +2242,8 @@ async fn test_rebase_preserves_untracked_files() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2286,6 +2298,8 @@ async fn test_rebase_preserves_untracked_files() {
 
     fs::write(temp_path.path().join("feature.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -2340,6 +2354,8 @@ async fn test_rebase_preserves_untracked_files() {
 
     fs::write(temp_path.path().join("file.txt"), "base\nmaster").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2446,6 +2462,8 @@ async fn test_rebase_already_up_to_date() {
     // Create commits on master
     fs::write(temp_path.path().join("file1.txt"), "content1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -2484,6 +2502,8 @@ async fn test_rebase_already_up_to_date() {
 
     fs::write(temp_path.path().join("file2.txt"), "content2").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file2.txt".to_string()],
         all: false,
         update: false,
@@ -2580,6 +2600,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
     // Create initial commit on master
     fs::write(temp_path.path().join("file.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -2634,6 +2656,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     fs::write(temp_path.path().join("feature.txt"), "feature content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -2688,6 +2712,8 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     fs::write(temp_path.path().join("master.txt"), "master content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master.txt".to_string()],
         all: false,
         update: false,
@@ -2839,6 +2865,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     // Create base commit on master
     fs::write(temp_path.path().join("base.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -2892,6 +2920,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     .await;
     fs::write(temp_path.path().join("feature.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature.txt".to_string()],
         all: false,
         update: false,
@@ -2946,6 +2976,8 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     .await;
     fs::write(temp_path.path().join("master.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["master.txt".to_string()],
         all: false,
         update: false,
@@ -3122,6 +3154,8 @@ async fn test_rebase_continue_no_rebase() {
     // Create initial commit
     fs::write(temp_path.path().join("file.txt"), "content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -3200,6 +3234,8 @@ async fn test_rebase_skip_no_rebase() {
     // Create initial commit
     fs::write(temp_path.path().join("file.txt"), "content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -3280,6 +3316,8 @@ async fn test_rebase_with_conflict_and_abort() {
     // 1. Create initial commit on master with a file
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3338,6 +3376,8 @@ async fn test_rebase_with_conflict_and_abort() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3392,6 +3432,8 @@ async fn test_rebase_with_conflict_and_abort() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3562,6 +3604,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     // 1. Base commit on master with binary content
     fs::write(&file_path, &base_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -3615,6 +3659,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     .await;
     fs::write(&file_path, &feature_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -3668,6 +3714,8 @@ async fn test_rebase_binary_conflict_writes_markers() {
     .await;
     fs::write(&file_path, &master_bytes).unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["binary.bin".to_string()],
         all: false,
         update: false,
@@ -3814,6 +3862,8 @@ async fn test_rebase_with_conflict_and_skip() {
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     fs::write(temp_path.path().join("other.txt"), "other base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "other.txt".to_string()],
         all: false,
         update: false,
@@ -3873,6 +3923,8 @@ async fn test_rebase_with_conflict_and_skip() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -3916,6 +3968,8 @@ async fn test_rebase_with_conflict_and_skip() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["feature_only.txt".to_string()],
         all: false,
         update: false,
@@ -3970,6 +4024,8 @@ async fn test_rebase_with_conflict_and_skip() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4111,6 +4167,8 @@ async fn test_rebase_with_conflict_and_continue() {
     // 1. Create initial commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4169,6 +4227,8 @@ async fn test_rebase_with_conflict_and_continue() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4223,6 +4283,8 @@ async fn test_rebase_with_conflict_and_continue() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master modification").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4320,6 +4382,8 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // Stage the resolved file
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -4406,6 +4470,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     fs::write(temp_path.path().join("file2.txt"), "base2").unwrap();
     fs::write(temp_path.path().join("file3.txt"), "base3").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec![
             "file1.txt".to_string(),
             "file2.txt".to_string(),
@@ -4465,6 +4531,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     // Commit 1: modify file1 (will conflict)
     fs::write(temp_path.path().join("file1.txt"), "feature1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -4508,6 +4576,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     )
     .unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["new_feature.txt".to_string()],
         all: false,
         update: false,
@@ -4547,6 +4617,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     // Commit 3: modify file3 (no conflict)
     fs::write(temp_path.path().join("file3.txt"), "feature3").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file3.txt".to_string()],
         all: false,
         update: false,
@@ -4601,6 +4673,8 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     fs::write(temp_path.path().join("file1.txt"), "master1").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file1.txt".to_string()],
         all: false,
         update: false,
@@ -4759,6 +4833,8 @@ async fn test_rebase_state_persistence() {
     // 1. Create initial commit
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4813,6 +4889,8 @@ async fn test_rebase_state_persistence() {
 
     fs::write(temp_path.path().join("file.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -4867,6 +4945,8 @@ async fn test_rebase_state_persistence() {
 
     fs::write(temp_path.path().join("file.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5026,6 +5106,8 @@ async fn test_rebase_fast_forward_branch_behind() {
     // Initial commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5096,6 +5178,8 @@ async fn test_rebase_fast_forward_branch_behind() {
 
     fs::write(temp_path.path().join("file.txt"), "master-advance").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5205,6 +5289,8 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5275,6 +5361,8 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
     fs::write(temp_path.path().join("file.txt"), "master-advance").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5385,6 +5473,8 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     // Base commit on master
     fs::write(temp_path.path().join("base.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["base.txt".to_string()],
         all: false,
         update: false,
@@ -5455,6 +5545,8 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
     fs::write(temp_path.path().join("new.txt"), "master-content").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["new.txt".to_string()],
         all: false,
         update: false,
@@ -5565,6 +5657,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     // Base commit on master
     fs::write(temp_path.path().join("file.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5619,6 +5713,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     fs::write(temp_path.path().join("file.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5673,6 +5769,8 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     fs::write(temp_path.path().join("file.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["file.txt".to_string()],
         all: false,
         update: false,
@@ -5790,6 +5888,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     fs::write(temp_path.path().join("clean.txt"), "base-clean").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "clean.txt".to_string()],
         all: false,
         update: false,
@@ -5845,6 +5945,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     fs::write(temp_path.path().join("conflict.txt"), "feature-conflict").unwrap();
     fs::write(temp_path.path().join("clean.txt"), "feature-clean").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "clean.txt".to_string()],
         all: false,
         update: false,
@@ -5899,6 +6001,8 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     fs::write(temp_path.path().join("conflict.txt"), "master-conflict").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -6034,6 +6138,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     // Base commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -6089,6 +6195,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     fs::write(temp_path.path().join("conflict.txt"), "feature").unwrap();
     fs::write(temp_path.path().join("new.txt"), "added").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string(), "new.txt".to_string()],
         all: false,
         update: false,
@@ -6161,6 +6269,8 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     fs::write(temp_path.path().join("conflict.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -6295,6 +6405,8 @@ async fn test_rebase_continue_requires_resolution() {
     // Base commit on master
     fs::write(temp_path.path().join("conflict.txt"), "base").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -6349,6 +6461,8 @@ async fn test_rebase_continue_requires_resolution() {
 
     fs::write(temp_path.path().join("conflict.txt"), "feature").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,
@@ -6403,6 +6517,8 @@ async fn test_rebase_continue_requires_resolution() {
 
     fs::write(temp_path.path().join("conflict.txt"), "main").unwrap();
     add::execute(AddArgs {
+        intent_to_add: false,
+        sparse: false,
         pathspec: vec!["conflict.txt".to_string()],
         all: false,
         update: false,

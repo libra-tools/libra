@@ -35,6 +35,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-09-20（issues/476 WT-04）：三类拒绝（暂存改动 / 本地修改 / 暂存内容与文件和 HEAD 都不同）由 `CliError::failure`（未设码，推断 `LBR-INTERNAL-001`）改为 `CliError::conflict` → `LBR-CONFLICT-002`（category=conflict，exit 128）；文件列表缩进由 `\t` 恢复为 Git 的 4 个空格（2026-06-06 `17e563bb` 的提交信息已宣称 4-space indent，实际回归后在此修正）。回归：`remove_test::test_remove_refusal_error_code_matrix`、`remove_test::test_t3600_staged_content_refusals`、`command::remove` 单测。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-01-13 `9d37fd8d`（`feat(rm): support --pathspec-from-file and --pathspec-file-nul (#117)`）：基础实现节点：support --pathspec-from-file and --pathspec-file-nul (#117)；当前实现的主要轮廓可追溯到该提交。
 - 2026-05-15 `8d9a89c9`（`feat(commands): structure mv and rm output`）：功能演进：structure mv and rm output；该节点扩展了当前命令可用的参数或行为。
