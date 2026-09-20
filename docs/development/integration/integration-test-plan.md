@@ -11,8 +11,8 @@
 
 **测试引用规范**（跨 agent 沟通统一使用）：
 
-- 文件级：`code_ui_remote_lease_matrix`（即 `cargo test --test` 后跟的名字）
-- 测试级：`code_ui_remote_lease_matrix::lease_expires_after_ttl`（三段式）
+- 文件级：`code_cli_dispatch_test`（即 `cargo test --test` 后跟的名字）
+- 测试级：`code_cli_dispatch_test::libra_code_is_unknown`（三段式）
 - 不要用文件相对路径或行号——rename / refactor 会失效；三段式稳定
 
 **4 条最常用命令**：
@@ -21,17 +21,17 @@
 # Wave 0：编译 + 格式 + lint + 文档一致性
 cargo +nightly fmt --all --check && \
   cargo clippy --all-targets --all-features -- -D warnings && \
-  cargo test --no-run --all-targets --features test-provider,test-network,test-live-ai,test-live-cloud && \
+  cargo test --no-run --all-targets --features test-network,test-live-ai,test-live-cloud && \
   cargo test --test compat_matrix_alignment -- --test-threads=1
 
 # Wave 1：命令层 + 兼容性
 cargo test --test command_test -- --test-threads=1
 
-# Wave 2：Code UI 矩阵（最小子集）
-cargo test --features test-provider --test code_ui_scenarios -- --test-threads=1
+# Wave 2：拆除后残留针（`libra code` 未知命令 + KEEP session/hardening）
+cargo test --test code_cli_dispatch_test -- --test-threads=1
 
-# Wave 4：Live AI（需 DEEPSEEK_API_KEY；务必先设成本闸门，见 §9.3）
-cargo test --test ai_agent_test -- --test-threads=1
+# Wave 4：Live agent capture gate（需 LIBRA_RUN_LIVE_AGENT_GATE=1）
+cargo test --features test-live-agent --test agent_live_gate_test -- --test-threads=1
 ```
 
 **3 个最常踩的坑**：
@@ -51,15 +51,11 @@ cargo test --test ai_agent_test -- --test-threads=1
 |---|---|---|
 | 命令层集成测试汇总入口 | 已存在 | `tests/command_test.rs` + `tests/command/*.rs` |
 | 兼容性专项测试 | 已存在 | `tests/compat/*.rs` + `Cargo.toml` `[[test]]` 注册 |
-| Code UI Web process harness | 已存在（non-TTY） | `tests/harness/code_session.rs` |
-| Code UI 事件流 harness | 已存在 | `tests/harness/event_stream.rs` |
-| Code UI 数据驱动矩阵 runner | 已存在 | `tests/code_ui_remote_{lease,sse,state,security,generation,approval,model_generation}_matrix.rs` |
-| Code UI 场景回归 | 已存在 | `tests/code_ui_scenarios.rs` |
-| MCP 双入口回归 | 已存在 | `tests/code_mcp_dual_entry_test.rs` |
-| resume 回归 | 已存在 | `tests/code_resume_test.rs` |
-| codex runtime 回归 | 已存在 | `tests/code_codex_runtime_test.rs` |
+| Code UI Web / 矩阵 / scenarios | 已删除（plan-20260920 RC-23） | 公开 `libra code` 针留在 `tests/code_cli_dispatch_test.rs` |
+| 本地 agent 采集 smoke | 已存在 | `tests/agent_local_capture_smoke_test.rs` + `tests/harness/agent_local_capture.rs` |
+| KEEP session / hardening | 已存在 | `tests/ai_session_jsonl_test.rs`、`tests/ai_hardening_contract_test.rs`、`tests/ai_command_safety_test.rs`、`tests/ai_file_undo_test.rs` |
 | 网络层集成测试 | 已存在 | `tests/network_remotes_test.rs`（`test-network`） |
-| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`（`test-live-cloud`） |
+| Cloud live 集成测试 | 已存在 | `tests/cloud_storage_backup_test.rs`（`test-live-cloud`；`publish_live_test` 随 RC-35 删除） |
 | 文档/兼容一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 | 集成计划一致性 Rust 守卫 | 已存在 | `tests/compat/matrix_alignment.rs` |
 
@@ -159,7 +155,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # 编译基线（两条都必须 pass，feature 代码路径才被覆盖）
 cargo test --no-run --all-targets
-cargo test --no-run --all-targets --features test-provider,test-network,test-live-ai,test-live-cloud
+cargo test --no-run --all-targets --features test-network,test-live-ai,test-live-cloud
 
 # 文档/兼容性一致性
 cargo test --test compat_matrix_alignment -- --test-threads=1
@@ -195,7 +191,6 @@ set -a; source .env.test; set +a
 | `src/internal/ai/providers/**` | 2 | + 4 |
 | `src/internal/ai/tools/**` | 2 | — |
 | `src/internal/ai/intentspec/**`、`workflow_objects.rs` | 2 | + 4 |
-| `src/internal/ai/mcp/**` | 2 | — |
 | `src/internal/protocol/**`、`src/git_protocol.rs` | 1 | + 3 |
 | `src/utils/client_storage.rs`、`src/utils/d1_client.rs` | 1 | + 5 |
 | `src/internal/model/**`、`sql/*.sql` | 1, 2 | — |
@@ -232,32 +227,17 @@ cargo test --test compat_branch_lossy_wrapper_guard -- --test-threads=1
 
 通过标准：全部 green，无 skip/fail。
 
-## 4.2 Wave 2：Code UI 与本地自动化控制（必跑）
+## 4.2 Wave 2：拆除后残留针与本地采集（必跑）
+
+Code UI / `test-provider` 矩阵已随 plan-20260920 RC-23 删除。留下未知命令针与 KEEP session/hardening。
 
 ```bash
-# test-provider 矩阵与场景
-cargo test --features test-provider \
-  --test harness_self_test \
-  --test code_ui_scenarios \
-  --test code_ui_remote_lease_matrix \
-  --test code_ui_remote_sse_matrix \
-  --test code_ui_remote_state_matrix \
-  --test code_ui_remote_security_matrix \
-  --test code_ui_remote_generation_matrix \
-  --test code_ui_remote_approval_matrix \
-  -- --test-threads=1
-
-# Code 路径专项
-cargo test --features test-provider \
-  --test code_cli_dispatch_test \
-  --test code_provider_boot_test \
-  --test code_tool_acl_test \
-  --test code_mcp_dual_entry_test \
-  --test code_resume_test \
-  --test code_codex_default_web_test \
-  --test ai_code_ui_headless_test \
-  --test code_codex_runtime_test \
-  -- --test-threads=1
+cargo test --test code_cli_dispatch_test -- --test-threads=1
+cargo test --test code_provider_resolution_test -- --test-threads=1
+cargo test --test ai_session_jsonl_test -- --test-threads=1
+cargo test --test ai_hardening_contract_test -- --test-threads=1
+cargo test --test ai_command_safety_test -- --test-threads=1
+cargo test --test ai_file_undo_test -- --test-threads=1
 ```
 
 通过标准：全部 green。
@@ -276,14 +256,9 @@ cargo test --features test-network --test network_remotes_test -- --test-threads
 > 闸门 env 当前**未实现**自动 fail-fast，靠人工监控；详见 `BASELINE_GAP-INTEG-005`。
 
 ```bash
-# DeepSeek live（ai_agent_test / ai_chat_agent_test 内部按 DEEPSEEK_API_KEY gate）
-cargo test --test ai_agent_test -- --test-threads=1
-cargo test --test ai_chat_agent_test -- --test-threads=1
-
-# Code UI live model generation（ignored + 明确开关）
-LIBRA_RUN_LIVE=1 cargo test --features test-provider \
-  --test code_ui_remote_model_generation_matrix \
-  -- --ignored --test-threads=1
+# 外部 agent 本地 store live gate（内部执行器 live 目标已随 RC-23 删除）
+LIBRA_RUN_LIVE_AGENT_GATE=1 cargo test --features test-live-agent \
+  --test agent_live_gate_test -- --test-threads=1
 ```
 
 通过标准：
@@ -297,6 +272,7 @@ LIBRA_RUN_LIVE=1 cargo test --features test-provider \
 # D1/R2 live gate（依赖 LIBRA_D1_* + LIBRA_STORAGE_*）
 cargo test --features test-live-cloud --test cloud_storage_backup_test -- --test-threads=1
 
+# publish live gate 已随 RC-35 删除；不要再调用已删除的 publish live target
 ```
 
 通过标准：
@@ -305,13 +281,9 @@ cargo test --features test-live-cloud --test cloud_storage_backup_test -- --test
 
 ## 4.6 Wave 6：性能 smoke（可选）
 
-```bash
-LIBRA_RUN_PERF=1 cargo test --features test-provider \
-  --test code_ui_perf_smoke_test \
-  -- --ignored --test-threads=1
-```
+Code UI SSE/perf smoke（`code_ui_perf_smoke_test`）已随 RC-23 删除。本 wave 不再有默认 `--test` 入口；趋势观察改走 agent 捕获 span 测试或另立计划。
 
-通过标准：全部 green；用于趋势观察，不作为默认阻断门。
+通过标准：N/A（无现行 target）。
 
 ---
 
@@ -392,7 +364,7 @@ nodes:
       shell: "bash -lc"
       workdir: "/data/ci/libra"
       concurrency: 1
-    features: ["test-provider", "test-network", "test-live-ai", "test-live-cloud"]
+    features: ["test-network", "test-live-ai", "test-live-cloud"]
     waves: [1, 2, 3]
     providers:
       - provider_id: "deepseek"
@@ -416,7 +388,7 @@ nodes:
       workdir: "/home/ci/libra"
       ssh_key_ref: "CI_AGENT_KEY"
       concurrency: 1
-    features: ["test-provider", "test-live-ai"]
+    features: ["test-live-ai"]
     waves: [4]
     providers:
       - provider_id: "deepseek"
@@ -550,7 +522,7 @@ runtime:
 
 ```
 ## Test Plan
-- New:      <target>::<fn>  // e.g. code_ui_remote_lease_matrix::lease_expires_after_ttl
+- New:      <target>::<fn>  // e.g. code_cli_dispatch_test::libra_code_is_unknown
 - Modified: <target>::<fn>
 - Deleted:  <target>::<fn>
 - Waves run locally: 0, 1, 2 (+ 4 if applicable)

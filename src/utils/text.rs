@@ -96,9 +96,87 @@ pub fn relative_date_at(now: i64, ts: i64) -> String {
     unit((days + 183) / 365, "year")
 }
 
+/// Decode one Git C-style quoted string (the inverse of the `quote_path` family
+/// used by `status`/`ls-files` and by `--pathspec-from-file`'s non-NUL mode).
+/// `Ok(None)` when `raw` is not quoted — callers then use it verbatim. On
+/// success `raw` must be exactly one quoted string (`"..."`); `Err` describes a
+/// malformed one (missing closing quote, trailing bytes after it, a trailing
+/// backslash, an unsupported escape, or a non-UTF-8 result).
+///
+/// Escape handling follows Git's `unquote_c_style` for the named escapes
+/// (`\a \b \f \n \r \t \v`, `\\`, `\"`) and for octal byte values, with two
+/// documented divergences: it accepts one to three octal digits (Git requires
+/// exactly three) and it rejects trailing bytes after the closing quote instead
+/// of ignoring them (PSF-02 review P2-1).
+pub fn decode_c_quoted(raw: &str) -> Result<Option<String>, String> {
+    let bytes = raw.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return Ok(None);
+    }
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 1usize;
+    loop {
+        let Some(&byte) = bytes.get(index) else {
+            return Err("unterminated quoted path".to_string());
+        };
+        match byte {
+            b'"' => {
+                index += 1;
+                if index != bytes.len() {
+                    return Err("trailing bytes after the closing quote".to_string());
+                }
+                let text = String::from_utf8(decoded)
+                    .map_err(|_| "quoted path is not valid UTF-8".to_string())?;
+                return Ok(Some(text));
+            }
+            b'\\' => {
+                index += 1;
+                let Some(&escape) = bytes.get(index) else {
+                    return Err("quoted path ends with a backslash".to_string());
+                };
+                match escape {
+                    b'a' => decoded.push(0x07),
+                    b'b' => decoded.push(0x08),
+                    b'f' => decoded.push(0x0c),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'v' => decoded.push(0x0b),
+                    b'\\' => decoded.push(b'\\'),
+                    b'"' => decoded.push(b'"'),
+                    digit @ b'0'..=b'7' => {
+                        let mut value = u16::from(digit - b'0');
+                        let mut digits = 1usize;
+                        while digits < 3 {
+                            match bytes.get(index + 1) {
+                                Some(next @ b'0'..=b'7') => {
+                                    index += 1;
+                                    value = (value << 3) + u16::from(next - b'0');
+                                    digits += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        // Git masks the accumulated octal value to one byte.
+                        decoded.push((value & 0xff) as u8);
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported quoted-path escape '\\{}'",
+                            char::from(other)
+                        ));
+                    }
+                }
+            }
+            other => decoded.push(other),
+        }
+        index += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{levenshtein, relative_date_at, short_display_hash};
+    use super::{decode_c_quoted, levenshtein, relative_date_at, short_display_hash};
 
     const HOUR: i64 = 3600;
     const DAY: i64 = 86_400;
@@ -165,5 +243,47 @@ mod tests {
     #[test]
     fn relative_date_future_is_guarded() {
         assert_eq!(relative_date_at(1000, 2000), "in the future");
+    }
+
+    /// PSF-02 (plan-20260918): the shared decoder mirrors Git's
+    /// `unquote_c_style` — unquoted input passes through, escapes and octal
+    /// decode, and malformed quoting fails closed.
+    #[test]
+    fn decode_c_quoted_matches_git_unquote_semantics() {
+        assert_eq!(decode_c_quoted("plain.txt"), Ok(None));
+        assert_eq!(
+            decode_c_quoted("\"qu\\\"ote.txt\""),
+            Ok(Some("qu\"ote.txt".to_string()))
+        );
+        assert_eq!(
+            decode_c_quoted("\"we ird.txt\""),
+            Ok(Some("we ird.txt".to_string()))
+        );
+        assert_eq!(
+            decode_c_quoted("\"tab\\there\\n\""),
+            Ok(Some("tab\there\n".to_string()))
+        );
+        // Three octal digits decode and mask to one byte; one-to-three digits
+        // are accepted (a documented divergence: Git requires exactly three).
+        assert_eq!(
+            decode_c_quoted("\"oct\\101l\""),
+            Ok(Some("octAl".to_string()))
+        );
+        // Malformed forms fail closed.
+        assert!(decode_c_quoted("\"unterminated").is_err());
+        assert!(decode_c_quoted("\"trailing\" junk").is_err());
+        assert!(decode_c_quoted("\"bad\\q\"").is_err());
+        assert!(decode_c_quoted("\"ends\\\"").is_err());
+
+        // A multi-byte UTF-8 name written as octal escapes — the shape
+        // `status`/`ls-files` emit under `core.quotePath` — decodes back.
+        assert_eq!(
+            decode_c_quoted("\"\\303\\251.txt\""),
+            Ok(Some("é.txt".to_string()))
+        );
+        // Round-trip against the forward `quote_pathname` helper
+        // (ADR-PSF-02 §2 makes them inverses).
+        let quoted = crate::command::status::quote_pathname(std::path::Path::new("é.txt"), true);
+        assert_eq!(decode_c_quoted(&quoted), Ok(Some("é.txt".to_string())));
     }
 }

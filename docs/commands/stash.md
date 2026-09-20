@@ -414,7 +414,7 @@ Libra preserves Git's `stash@{N}` reference syntax for familiarity. Users migrat
 | Include untracked | `-u` / `--include-untracked` | `-u` / `--include-untracked` | N/A |
 | No include untracked | `--no-include-untracked` (countermands `-u`) | `--no-include-untracked` | N/A |
 | Include all (ignored too) | `-a` / `--all` | `-a` / `--all` | N/A |
-| Pathspec (partial stash) | `stash push -- <pathspec>...` (file/dir paths, `.` = whole tree; not combinable with `-u`/`-a`/`-k` → `LBR-CLI-002`; no match → `LBR-CLI-003`) | `stash push [--] <pathspec>...` | N/A |
+| Pathspec (partial stash) | `stash push -- <pathspec>...` (plain names, wildcards, and `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` match through the shared pathspec engine; `.` = whole tree; not combinable with `-u`/`-a`/`-k` → `LBR-CLI-002`; no match → `LBR-CLI-003`) | `stash push [--] <pathspec>...` | N/A |
 | Pop | `stash pop [ref]` | `stash pop [--index] [<stash>]` | N/A |
 | Apply | `stash apply [ref]` | `stash apply [--index] [<stash>]` | N/A |
 | Drop | `stash drop [ref]` | `stash drop [<stash>]` | N/A |

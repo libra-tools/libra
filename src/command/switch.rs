@@ -153,7 +153,6 @@ pub enum SwitchError {
     #[error("remote branch name is required")]
     MissingTrackTarget,
 
-    #[allow(dead_code)]
     #[error("branch name is required when using --detach")]
     MissingDetachTarget,
 

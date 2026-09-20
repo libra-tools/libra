@@ -213,35 +213,6 @@ where
     fsync_parent_dir(parent)
 }
 
-/// Re-sync a visible recovery sidecar and its containing directory before an
-/// exact idempotent ACK, with a narrow hook between file and parent syncs for
-/// scoped durability tests. A prior atomic replacement can be observable even
-/// if its final directory sync reported failure.
-pub(crate) fn sync_file_and_parent_durably_with_pre_parent_sync_hook<F>(
-    path: &Path,
-    pre_parent_sync: F,
-) -> io::Result<()>
-where
-    F: FnOnce() -> io::Result<()>,
-{
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "cannot fsync the parent of a path with none: {}",
-                path.display()
-            ),
-        )
-    })?;
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?
-        .sync_all()?;
-    pre_parent_sync()?;
-    fsync_parent_dir(parent)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

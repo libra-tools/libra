@@ -2,6 +2,8 @@
 //! No ambient HOME/configuration or external binary downloads are consulted.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
     fs,
@@ -13,6 +15,14 @@ use std::{
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 
 pub const CANARY: &str = "MIG06_SYNTHETIC_SECRET_MUST_NOT_LEAK";
+
+#[cfg(unix)]
+fn set_private_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn set_private_mode(_path: &Path, _mode: u32) {}
 
 pub struct RepairFixture {
     _temp: tempfile::TempDir,
@@ -43,12 +53,20 @@ impl RepairFixture {
     pub fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
+        set_private_mode(&root, 0o700);
         let home = root.join("home");
         fs::create_dir_all(home.join(".libra")).unwrap();
         fs::create_dir_all(home.join(".config")).unwrap();
+        // The repair path intentionally verifies private Unix permissions.
+        // tempfile's directory is private, but its children inherit the
+        // process umask and are not a stable fixture contract under CI.
+        set_private_mode(&home, 0o700);
+        set_private_mode(&home.join(".libra"), 0o700);
+        set_private_mode(&home.join(".config"), 0o700);
         let db = home.join(".libra/config.db");
         let system = root.join("system.db");
         fs::write(&db, b"").unwrap();
+        set_private_mode(&db, 0o600);
         runtime().block_on(async {
             let conn = connect(&db, false).await;
             conn.execute_unprepared(include_str!(
@@ -108,6 +126,12 @@ impl RepairFixture {
     }
 
     pub fn repair(&self) -> Output {
+        for ending in ["-wal", "-shm", "-journal"] {
+            let sidecar = suffix(&self.db, ending);
+            if sidecar.exists() {
+                set_private_mode(&sidecar, 0o600);
+            }
+        }
         run(self.repair_command())
     }
 

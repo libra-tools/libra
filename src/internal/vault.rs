@@ -321,110 +321,6 @@ pub fn armored_to_signature_hex(armored: &str) -> Result<String> {
     Ok(hex::encode(sig_bytes))
 }
 
-/// Generate an SSH key pair in the vault for Git transport authentication.
-///
-/// Configures the SSH CA, creates a role, and issues a certificate with a
-/// generated user keypair. The private key is stored at
-/// `~/.libra/ssh-keys/<repo-id>/id_ed25519` and the public key is returned.
-#[allow(dead_code)]
-pub async fn generate_ssh_key(
-    root_dir: &Path,
-    unseal_key: &[u8],
-    user_name: &str,
-) -> Result<String> {
-    let vault = create_vault(root_dir).await?;
-
-    vault
-        .unseal(&[unseal_key])
-        .await
-        .map_err(|e| anyhow!("vault unseal failed: {e}"))?;
-
-    let root_token = recover_root_token(unseal_key).await?;
-    vault.set_token(&root_token);
-
-    // Step 1: Configure SSH CA (generates CA keypair if not already configured)
-    let ca_data = serde_json::json!({
-        "key_type": "ed25519",
-    });
-    vault
-        .write(
-            Some(root_token.clone()),
-            format!("{PKI_MOUNT_PATH}/config/ca/ssh"),
-            ca_data.as_object().cloned(),
-        )
-        .await
-        .map_err(|e| anyhow!("vault SSH CA configuration failed: {e}"))?;
-
-    // Step 2: Create SSH role for user certificates
-    // NOTE:
-    // OpenSSH in many environments does not accept PKCS8-encoded Ed25519 private keys.
-    // Vault's SSH issue API returns PKCS8 for generated keys, which can lead to
-    // `Load key ...: invalid format` when invoking `ssh -i`.
-    // Use RSA here so the returned private key is consumable by OpenSSH directly.
-    let role_data = serde_json::json!({
-        "key_type": "rsa",
-        "key_bits": 3072,
-        "cert_type_ssh": "user",
-        "default_user": "git",
-        "allowed_users": "git",
-        "ttl": "3650d",
-        "max_ttl": "3650d",
-    });
-    vault
-        .write(
-            Some(root_token.clone()),
-            format!("{PKI_MOUNT_PATH}/roles/ssh/{SSH_ROLE_NAME}"),
-            role_data.as_object().cloned(),
-        )
-        .await
-        .map_err(|e| anyhow!("vault SSH role creation failed: {e}"))?;
-
-    // Step 3: Issue SSH certificate with generated keypair
-    let issue_data = serde_json::json!({
-        "key_type": "rsa",
-        "key_bits": 3072,
-        "valid_principals": ["git"],
-        "ttl": "3650d",
-        "key_id": format!("libra-{user_name}"),
-    });
-    let resp = vault
-        .write(
-            Some(root_token.clone()),
-            format!("{PKI_MOUNT_PATH}/issue/ssh/{SSH_ROLE_NAME}"),
-            issue_data.as_object().cloned(),
-        )
-        .await
-        .map_err(|e| anyhow!("vault SSH key issuance failed: {e}"))?;
-
-    let data = resp
-        .and_then(|r| r.data)
-        .ok_or_else(|| anyhow!("no data in vault SSH issue response"))?;
-
-    let private_key = data
-        .get("private_key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("no private_key in vault SSH response"))?;
-
-    let public_key = data
-        .get("public_key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("no public_key in vault SSH response"))?;
-
-    // Store private key to filesystem for backward compat (will be removed in future)
-    store_ssh_private_key(private_key).await?;
-
-    // Store public key in config for easy retrieval.
-    upsert_config_value("vault.ssh_pubkey", public_key).await;
-
-    vault
-        .seal()
-        .await
-        .map_err(|e| anyhow!("vault seal failed: {e}"))?;
-
-    // Return both public and private keys so callers can store them per-remote
-    Ok(public_key.to_string())
-}
-
 /// Generate an SSH key pair and return (public_key, private_key) without
 /// storing them. The caller is responsible for per-remote storage.
 #[allow(dead_code)]
@@ -510,69 +406,6 @@ pub async fn generate_ssh_key_pair(
     Ok((public_key, private_key))
 }
 
-/// Retrieve the SSH public key from config.
-#[allow(dead_code)]
-pub async fn get_ssh_public_key() -> Option<String> {
-    use crate::internal::config::ConfigKv;
-    ConfigKv::get("vault.ssh_pubkey")
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.value)
-}
-
-/// Retrieve the GPG (PGP) public key from the vault.
-#[allow(dead_code)]
-pub async fn get_gpg_public_key(root_dir: &Path, unseal_key: &[u8]) -> Result<String> {
-    use crate::internal::config::ConfigKv;
-
-    // Prefer cached value from config, populated during key generation.
-    if let Some(entry) = ConfigKv::get("vault.gpg.pubkey").await.ok().flatten() {
-        return Ok(entry.value);
-    }
-    if let Some(entry) = ConfigKv::get("vault.gpg_pubkey").await.ok().flatten() {
-        return Ok(entry.value);
-    }
-
-    let vault = create_vault(root_dir).await?;
-
-    vault
-        .unseal(&[unseal_key])
-        .await
-        .map_err(|e| anyhow!("vault unseal failed: {e}"))?;
-
-    let root_token = recover_root_token(unseal_key).await?;
-    vault.set_token(&root_token);
-
-    let read_result = async {
-        let pgp_key_path = format!("{PKI_MOUNT_PATH}/keys/{PGP_KEY_NAME}");
-        let resp = vault
-            .read(Some(root_token), &pgp_key_path)
-            .await
-            .map_err(|e| anyhow!("vault read PGP key failed: {e}"))?;
-
-        resp.and_then(|r| r.data)
-            .and_then(|d| d.get("public_key").cloned())
-            .and_then(|v| v.as_str().map(String::from))
-            .ok_or_else(|| anyhow!("no PGP public key found in vault"))
-    }
-    .await;
-
-    let seal_result = vault
-        .seal()
-        .await
-        .map_err(|e| anyhow!("vault seal failed: {e}"));
-
-    match (read_result, seal_result) {
-        (Ok(public_key), Ok(())) => Ok(public_key),
-        (Ok(_), Err(seal_err)) => Err(seal_err),
-        (Err(read_err), Ok(())) => Err(read_err),
-        (Err(read_err), Err(seal_err)) => {
-            Err(read_err.context(format!("additionally failed to reseal vault: {seal_err}")))
-        }
-    }
-}
-
 /// Get the path to the SSH private key file for the current repo.
 pub async fn ssh_key_path() -> Result<std::path::PathBuf> {
     use crate::internal::config::ConfigKv;
@@ -586,45 +419,6 @@ pub async fn ssh_key_path() -> Result<std::path::PathBuf> {
         .join("ssh-keys")
         .join(repo_id)
         .join("id_ed25519"))
-}
-
-/// Check if an SSH key has been generated for this repo.
-#[allow(dead_code)]
-pub async fn ssh_key_exists() -> bool {
-    ssh_key_path().await.map(|p| p.exists()).unwrap_or(false)
-}
-
-/// Store the SSH private key to `~/.libra/ssh-keys/<repo-id>/id_ed25519`.
-async fn store_ssh_private_key(private_key: &str) -> Result<()> {
-    let path = ssh_key_path().await?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("failed to create ~/.libra/ssh-keys/")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
-                || format!("failed to set permissions to 700 on '{}'", parent.display()),
-            )?;
-        }
-    }
-    tokio::fs::write(&path, private_key)
-        .await
-        .context("failed to write SSH private key")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_context(
-            || {
-                format!(
-                    "failed to set permissions to 600 on SSH private key '{}'",
-                    path.display()
-                )
-            },
-        )?;
-    }
-    Ok(())
 }
 
 /// Convert a hex-encoded PGP detached signature into an armored PGP signature
@@ -660,22 +454,6 @@ pub fn signature_to_gpgsig(signature_hex: &str) -> Result<String> {
     }
 
     Ok(gpgsig)
-}
-
-/// Check whether the vault has been initialized in this repository.
-#[allow(dead_code)]
-pub fn vault_exists(root_dir: &Path) -> bool {
-    if let Ok(path) = std::env::var("VAULT_SQLITE_FILENAME") {
-        let configured = Path::new(&path);
-        return if configured.is_absolute() {
-            configured.exists()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(configured).exists())
-                .unwrap_or(false)
-        };
-    }
-    root_dir.join(VAULT_DB_NAME).exists()
 }
 
 /// Load the unseal key for a specific configuration scope.

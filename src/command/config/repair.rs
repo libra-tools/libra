@@ -268,9 +268,10 @@ mod supported {
                 // A sticky directory protects the private child from rename
                 // or removal by another unprivileged owner, even when a
                 // user-namespace gives the directory a synthetic UID (as it
-                // commonly does for /tmp).
-                let trusted_owner =
-                    is_filesystem_root || info.uid() == 0 || info.uid() == self.uid || sticky;
+                // commonly does for /tmp). It does not establish ownership:
+                // an attacker-controlled sticky directory must not become a
+                // trusted path component merely by setting its mode bit.
+                let trusted_owner = is_filesystem_root || info.uid() == 0 || info.uid() == self.uid;
                 let safe_mode = info.mode() & 0o022 == 0 || sticky;
                 if !info.is_dir() || !trusted_owner || !safe_mode {
                     return Err(refused(

@@ -485,7 +485,6 @@ pub(crate) async fn run_init(args: InitArgs) -> Result<InitOutput, InitError> {
     run_init_internal(args, &InitProgress::disabled()).await
 }
 
-#[allow(dead_code)]
 /// Legacy initialization helper retained for tests and older call sites.
 ///
 /// # Side Effects

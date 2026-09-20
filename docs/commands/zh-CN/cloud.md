@@ -457,4 +457,4 @@ Libra 已经通过 `LIBRA_STORAGE_*` 环境变量为分层对象缓存提供通�
 | `LBR-IO-002` | 恢复对象哈希不匹配 |
 | `LBR-IO-002` | 保存恢复对象到本地存储失败 |
 | `LBR-IO-002` | 元数据同步/恢复失败 |
-| `LBR-IO-002` | cloud 操作前无法重放耐久的本地 object-index repair marker |
+| `LBR-IO-002` | cloud 操作前无法重放耐久的本地 object-index repair marker；若原因为锁超时，错误信息会指出锁持有者（pid 与用途）或说明无法判定持有者——等待该进程结束后重试（锁等待采用 Git 式二次退避，最长 10 秒），且不要删除 `.libra/object-index-repair-locks` 下的锁文件。只读命令在锁忙时静默跳过回放并由下一条命令重试；`cloud sync` 保持阻塞等待并 fail-closed |

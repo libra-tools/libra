@@ -1,5 +1,7 @@
 # `libra code` 开发设计
 
+> **已移除（plan-20260920）：** `libra code`、Code UI/Web 执行器与相关 tracing 面已于 0.23.0 拆除。本文保留为历史设计记录；现行外部 Agent 观测面见 `docs/development/tracing/agent.md`。
+
 ## 文档职责
 
 本文是 `docs/development/tracing/plan.md` 的 Code 阶段目标文档，承接 C1~C8。它只描述 `libra code` 的内部 AgentRuntime、TUI/Web/headless/MCP、approval/sandbox/tool gate、session persistence 与 mutating fix bridge；`libra agent` 的 observed external-agent 捕获、hook、transcript、checkpoint 和 read-only review/investigate evidence 由 [`agent.md`](agent.md) 负责。

@@ -469,7 +469,10 @@ libra log -L1,10:src/main.rs
 ### `[PATHS...]`
 
 Limit diff output to the specified paths. Used with `-p`, `--name-only`, `--name-status`,
-`--stat`, or `--shortstat`.
+`--stat`, or `--shortstat`. Paths match through the shared pathspec engine, so plain
+prefixes, wildcards, and the `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`
+magic forms all work; `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` turns them
+literal.
 
 ```bash
 libra log -- src/

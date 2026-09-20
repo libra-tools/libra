@@ -45,8 +45,10 @@ an existing `TREEISH`. `export-subst` is not implemented.
 `..` path components are rejected to prevent archive path traversal.
 
 `PATH` arguments must also be relative and must not contain `..`. Directory
-pathspecs include all matching files below that directory. `--list` does not
-require a repository.
+pathspecs include all matching files below that directory. Plain names, wildcards,
+and the `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic forms all match through
+the shared pathspec engine (`--literal-pathspecs` turns them literal). `--list` does
+not require a repository.
 
 ## Examples
 

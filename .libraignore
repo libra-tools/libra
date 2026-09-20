@@ -39,33 +39,13 @@ target-codex-review/
 .env.test
 .env
 
-# Frontend
-web/node_modules/
-web/.next/
-web/.pnpm-store/
-
-# Publish Worker (Phase 6/7)
-worker/node_modules/
-worker/.next/
-worker/.open-next/
-worker/.wrangler/
-worker/.turbo/
-worker/.pnpm-store/
-worker/test-results/
-worker/playwright-report/
-worker/.next-types/
-worker/.dev.vars
-worker/.dev.vars.*
-worker/cloudflare-env.d.ts
-worker/*.tsbuildinfo
-worker/coverage/
-
 # AI
 .codex
 .claude
 .antigravitycli
 .omo
 .opencode
+.teamx
 
 # Integration
 target*

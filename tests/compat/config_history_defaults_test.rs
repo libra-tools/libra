@@ -6,6 +6,7 @@ use std::{
     process::{Command, Output},
 };
 
+use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -230,19 +231,16 @@ fn merge_verify_signatures_rejection_precedes_autostash_and_object_writes() {
     // Dirty the worktree so a (wrongly ordered) merge would create an
     // autostash — which writes commit/tree objects — before verification.
     fs::write(repo.join("base.txt"), "dirty local edit\n").expect("dirty worktree");
-    let objects_before = count_files(&repo.join(".libra").join("objects"));
-
     let rejected = fixture.run(&repo, &["merge", "feature"]);
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not have a GPG signature"));
 
-    // Fail-closed means NO mutation at all: no autostash objects, no stash
-    // entry, and the local edit untouched in the worktree.
-    let objects_after = count_files(&repo.join(".libra").join("objects"));
-    assert_eq!(
-        objects_before, objects_after,
-        "verification must precede object writes"
-    );
+    // A rejected mutation may still create the v2 failed-Operation audit
+    // objects. The user-visible merge domain must remain untouched: no
+    // autostash objects/sidecar or stash entry, and the local edit survives.
+    let operations = fixture.success(&repo, &["--json", "op", "log", "-n", "1"]);
+    let operations: Value = serde_json::from_slice(&operations.stdout).expect("op log JSON");
+    assert_eq!(operations["data"]["operations"][0]["status"], "failed");
     let stash = fixture.success(&repo, &["stash", "list"]);
     assert!(String::from_utf8_lossy(&stash.stdout).trim().is_empty());
     assert_eq!(
@@ -406,25 +404,6 @@ fn commit_help_documents_gpgsign_precedence() {
         text.contains("vault.signing"),
         "commit --help must keep documenting the vault.signing fallback"
     );
-}
-
-fn count_files(dir: &Path) -> usize {
-    let mut count = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                count += 1;
-            }
-        }
-    }
-    count
 }
 
 fn write_and_commit(fixture: &Fixture, repo: &Path, file: &str, body: &str, subject: &str) {

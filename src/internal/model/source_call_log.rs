@@ -1,5 +1,5 @@
 //! SeaORM entity for the [`source_call_log`](../../../../sql/migrations/2026052301_source_call_log.sql)
-//! table — persistent telemetry of every external Source / MCP /
+//! table — persistent telemetry of every external Source /
 //! OpenAPI call routed through `SourcePool`.
 //!
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
@@ -23,7 +23,7 @@ pub struct Model {
     /// Session that issued the source call. Indexed for
     /// `libra usage report --by=source` future query.
     pub session_id: String,
-    /// `SourcePool` slug ("mcp:git-tools", "openapi:weather", etc.).
+    /// `SourcePool` slug ("openapi:weather", "git-tools", etc.).
     pub source_slug: String,
     /// Public tool name the caller asked for (post-prefix).
     pub tool_name: String,

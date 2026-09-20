@@ -13,7 +13,7 @@ libra --json sandbox status
 
 `libra sandbox status` reports the sandbox backend Libra would use for AI shell
 execution diagnostics. It does not require a repository, so it can be used while
-debugging provider or CI hosts before running `libra code`.
+debugging provider or CI hosts for external-agent capture and review.
 
 The default runtime is best-effort: Linux uses the external helper configured by
 `LIBRA_LINUX_SANDBOX_EXE`, and if that helper is unavailable `libra` will try

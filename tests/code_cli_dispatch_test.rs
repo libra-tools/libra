@@ -37,8 +37,8 @@ fn assert_unknown_code(output: &std::process::Output, context: &str) {
     );
     let diag = diag_of(output);
     assert!(
-        !diag.contains("Web Code UI") || diag.contains("not a libra command"),
-        "{context} must not start the Web Code UI: {diag}"
+        !diag.contains("Web Code UI"),
+        "{context} must not advertise the removed Web Code UI: {diag}"
     );
 }
 

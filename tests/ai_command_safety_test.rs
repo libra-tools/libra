@@ -4,8 +4,8 @@
 //! fixture corpus that later CEX-02 / CEX-03 enforcement work must preserve.
 
 use libra::internal::ai::{
-    runtime::hardening::{CommandSafetySurface, SafetyDecision, SafetyDisposition},
-    tools::utils::classify_ai_command_safety,
+    command_safety::classify_ai_command_safety,
+    hardening::{BlastRadius, CommandSafetySurface, SafetyDecision, SafetyDisposition},
 };
 use serde::Deserialize;
 
@@ -31,20 +31,12 @@ fn fixtures() -> Vec<Fixture> {
 
 #[test]
 fn ai_command_safety_decision_constructors_pin_three_way_contract() {
-    let allow = SafetyDecision::allow(
-        "fixture.allow",
-        "read-only fixture",
-        libra::internal::ai::runtime::hardening::BlastRadius::Workspace,
-    );
+    let allow = SafetyDecision::allow("fixture.allow", "read-only fixture", BlastRadius::Workspace);
     assert!(allow.is_allow());
     assert!(!allow.is_deny());
     assert!(!allow.is_needs_human());
 
-    let deny = SafetyDecision::deny(
-        "fixture.deny",
-        "destructive fixture",
-        libra::internal::ai::runtime::hardening::BlastRadius::System,
-    );
+    let deny = SafetyDecision::deny("fixture.deny", "destructive fixture", BlastRadius::System);
     assert!(deny.is_deny());
     assert!(!deny.is_allow());
     assert!(!deny.is_needs_human());
@@ -52,7 +44,7 @@ fn ai_command_safety_decision_constructors_pin_three_way_contract() {
     let needs_human = SafetyDecision::needs_human(
         "fixture.needs_human",
         "ambiguous fixture",
-        libra::internal::ai::runtime::hardening::BlastRadius::Unknown,
+        BlastRadius::Unknown,
     );
     assert!(needs_human.is_needs_human());
     assert!(!needs_human.is_allow());

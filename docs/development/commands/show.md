@@ -8,6 +8,7 @@
 
 - 兼容级别：`partial`。object/commit display、`--name-only`、`--name-status`、`--raw`、`--stat`、`--patch-with-stat`（先 diffstat 块再完整 patch，Git 对 `-p --stat` 的旧式同义词；复用 `--stat` 的 `show_diffstat` 与默认 patch 渲染）、`--summary`（仅创建/删除文件的 mode 摘要，复用 `generate_diff` 输出并解析 `new file mode`/`deleted file mode`，与 `diff --summary` 同一子集，不做 rename/copy/mode-change 检测）、`--oneline`、`--pretty=<fmt>`、`--format=<fmt>`（`--pretty` 的别名）、`--abbrev-commit`/`--no-abbrev-commit`（切换 header 哈希缩写）和 path filters 已支持；`--pretty` 复用 log 的 `CommitFormatter`（`oneline`/`format:<tmpl>`/`tformat:<tmpl>`/自定义模板 + 命名预设 `short`/`full`/`fuller`/`reference`/`raw`，经 log 的 `FormatType::Preset`，见 log.md）；`medium` 映射默认 Full。`--raw` 选择原始 diff 格式（`:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>`，id 缩写 7 位，与 `--pretty=raw` 预设不同），经 `raw_diff_lines_for_commit` + 纯函数 `build_raw_lines`：从 commit 与首父 tree 的 `get_plain_items_with_mode` 独立构建 mode-aware 变更集（path 排序；两侧 `(mode,id)` 不同即 `M`，故同 blob 的 mode-only 变化也报告，见下方专门行）。
 
+- 路径匹配（**FIX-AD-01**）：人读与 JSON 两条路径均经共享 `PathspecSet` 匹配——`show_effective_paths`/`show_pathspec_set` 把 spec 展开为具体的 changed paths；匹配为空时不再回退为「无过滤」（人读不渲染 diffstat）。`-- <PATHS>...` 无 revision 时由 `cli.rs` 的 `rewrite_show_pathspec_separator_args` 注入隐藏哨兵（`SHOW_PATHSPEC_SEPARATOR_FLAG`），`execute_safe` 将首 positional 归为 pathspec 并补 `HEAD`；无 `--` 的不可解析 token 仍报 `bad revision`。`--literal-pathspecs` 下按字面。回归 `test_show_pathspec_glob_filters_stat` / `test_show_separator_pathspec_implies_head`。
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
 

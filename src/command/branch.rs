@@ -939,12 +939,6 @@ enum BranchError {
     #[error("failed to read config '{key}': {detail}")]
     SortConfigRead { key: &'static str, detail: String },
 
-    /// Kept for Display-pin stability. Unconfigured remotes on `-u` now map to
-    /// [`Self::UpstreamMissing`] (Git P6 wording).
-    #[allow(dead_code)]
-    #[error("invalid upstream '{0}'")]
-    InvalidUpstream(String),
-
     #[error("the requested upstream branch '{0}' does not exist")]
     UpstreamMissing(String),
 
@@ -956,12 +950,6 @@ enum BranchError {
 
     #[error("cannot set up tracking information; starting point '{0}' is not a branch")]
     TrackStartNotBranch(String),
-
-    /// Kept for Display-pin stability. Unconfigured remotes on `-u` now map to
-    /// [`Self::UpstreamMissing`] (Git P6 wording).
-    #[allow(dead_code)]
-    #[error("remote '{0}' not found")]
-    RemoteNotFound(String),
 
     #[error("{0}")]
     ConfigReadFailed(String),
@@ -1117,11 +1105,6 @@ impl From<BranchError> for CliError {
             }
             BranchError::SortConfigRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
-            BranchError::InvalidUpstream(upstream) => {
-                CliError::fatal(format!("invalid upstream '{upstream}'"))
-                    .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("expected format: 'remote/branch'")
-            }
             BranchError::UpstreamMissing(upstream) => CliError::command_usage(format!(
                 "the requested upstream branch '{upstream}' does not exist"
             ))
@@ -1146,11 +1129,6 @@ impl From<BranchError> for CliError {
             ))
             .with_stable_code(StableErrorCode::CliInvalidTarget)
             .with_hint("use a local branch or a remote-tracking name such as origin/main"),
-            BranchError::RemoteNotFound(remote) => {
-                CliError::fatal(format!("remote '{remote}' not found"))
-                    .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("use 'libra remote -v' to inspect configured remotes")
-            }
             BranchError::ConfigReadFailed(detail) => CliError::fatal(detail)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint("check whether the repository database is readable."),
@@ -3174,7 +3152,7 @@ pub fn is_valid_git_branch_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::PathBuf, str::FromStr};
+    use std::{collections::HashSet, str::FromStr};
 
     use clap::Parser;
     use git_internal::hash::{ObjectHash, get_hash_kind};
@@ -3371,26 +3349,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    struct CurrentDirGuard {
-        original: PathBuf,
-    }
-
-    #[allow(dead_code)]
-    impl CurrentDirGuard {
-        fn change_to(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().expect("failed to read current dir");
-            std::env::set_current_dir(path).expect("failed to change current dir");
-            Self { original }
-        }
-    }
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     fn any_hash() -> ObjectHash {
         ObjectHash::from_str(&ObjectHash::zero_str(get_hash_kind())).unwrap()
     }
@@ -3450,10 +3408,6 @@ mod tests {
             "not a valid object name: 'deadbeef'",
         );
         assert_eq!(
-            BranchError::InvalidUpstream("origin/missing".to_string()).to_string(),
-            "invalid upstream 'origin/missing'",
-        );
-        assert_eq!(
             BranchError::UpstreamMissing("nosuch".to_string()).to_string(),
             "the requested upstream branch 'nosuch' does not exist",
         );
@@ -3468,10 +3422,6 @@ mod tests {
         assert_eq!(
             BranchError::TrackStartNotBranch("abc1234".to_string()).to_string(),
             "cannot set up tracking information; starting point 'abc1234' is not a branch",
-        );
-        assert_eq!(
-            BranchError::RemoteNotFound("origin".to_string()).to_string(),
-            "remote 'origin' not found",
         );
         assert_eq!(
             BranchError::RenameTooManyArgs.to_string(),

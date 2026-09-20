@@ -149,5 +149,5 @@ recreate a row after replay and destructive cleanup have consumed its marker.
 | Object type outside blob/commit/tree/tag | `LBR-CLI-002` | 129 | `hash-object supports blob, commit, tree, and tag` |
 | Content is not a well-formed object of `-t <type>` (without `--literally`) | `LBR-CLI-002` | 129 | `pass --literally to hash malformed content without validation` |
 | Input file cannot be read | `LBR-IO-001` | 128 | Verify the path exists and is readable |
-| Object cannot be written | `LBR-IO-002` | 128 | Check object storage permissions and disk space |
+| Object cannot be written | `LBR-IO-002` | 128 | Check object storage permissions and disk space; when the cause is cloud object-index marker registration, payloads were stored safely and a direct retry reuses them (no paths are staged by `hash-object` and no lock-file cleanup is needed) |
 | Object stored but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported repository database/marker error; the next repo command retries automatically |

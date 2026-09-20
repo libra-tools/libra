@@ -153,22 +153,6 @@ Every tool invocation from an AI agent passes through a configurable safety sand
 - **Cloud backup**: Sync your entire repository state (including AI history) to Cloudflare D1 + R2
 - **Portable**: Move a Libra repository between machines with all AI context intact
 
-### 🌐 MCP Protocol Native
-
-Libra natively supports the [Model Context Protocol](https://modelcontextprotocol.io/), enabling direct integration with Claude Desktop, Cursor, and any MCP-compatible client. Configure once, use everywhere.
-
-```json
-{
-  "mcpServers": {
-    "libra": {
-      "command": "/path/to/libra",
-      "args": ["code", "--stdio"],
-      "cwd": "/path/to/your/libra/repo"
-    }
-  }
-}
-```
-
 ---
 
 ## Supported AI Providers

@@ -939,7 +939,6 @@ pub enum ReplayErrorKind {
     CommitLoad,
     /// Retained for Display/JSON pins. Parentless commits now replay via an
     /// empty-base merge (`--root --onto`) or object reuse (`--root`).
-    #[allow(dead_code)]
     MissingParent,
     BaseTreeLoad,
     TheirTreeLoad,

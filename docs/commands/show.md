@@ -46,7 +46,7 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `--no-notes` | | Do not show commit notes. Accepted no-op: Libra's show never displays notes inline. |
 | `--no-mailmap` | | Do not apply a `.mailmap`. Accepted no-op: Libra's show shows the raw recorded identities. |
 | `--no-show-signature` | | Do not display the GPG signature of signed commits. Accepted no-op: Libra's show never displays commit signatures inline. (Git's `--show-signature` is not implemented.) |
-| `<PATHS>...` | | Limit output to matching paths (pathspec filter for commit diffs). |
+| `<PATHS>...` | | Limit output to matching paths (pathspec filter for commit diffs). Matches through the shared pathspec engine (plain prefixes, wildcards, and `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`); with `--` and no revision, `HEAD` is implied. |
 
 ### Examples
 

@@ -1,5 +1,7 @@
 # `libra code` Agent framework 与 Web-only 迁移计划
 
+> **已移除（plan-20260920）：** `libra code` 公开命令、Web 执行器、AgentRuntime、MCP/tools 与 `web/` 内部模块已于 0.23.0 拆除。本文保留为历史设计记录；现行外部 Agent 观测入口是 `libra agent`，仓库备份是 `libra cloud`。
+
 > Status: agent-executable（可交给 Agent 按卡执行；本文档已包含自举清单、执行协议、代码漂移防护、测试骨架、接口契约与常见陷阱，具备直接开发条件）
 > Scope: 先设计并落地独立 Agent framework，再迁移 TUI-owned 行为，最后移除 Code TUI 并让 Web Code UI 成为唯一交互面；新增 entireio/cli 对齐轨道只扩展外部 Agent 能力、checkpoint/export 与 review/investigate 工作流，不改变 MCP 与内部 AgentRuntime 的边界。
 > Companion docs: Web/runtime 现状见 [`docs/development/commands/_general.md`](../commands/_general.md)；控制面契约见 [`docs/commands/code.md`](../../commands/code.md)「本地自动化控制」一节（W5-01 起，原 code-control 页降为迁移说明）；`libra agent` 外部捕获公共 CLI/API、E1-E9 wire 契约、AG-16~AG-24 任务卡与验收命令见 [`docs/development/tracing/agent.md`](../tracing/agent.md)；MCP stdio 独立命令拆分见 `mcp.md`（历史拆分计划，文档已删除、未落地，不得作为事实源；当前 MCP stdio 与 code-control 的边界见 `docs/development/tracing/code.md` 的 C6）。

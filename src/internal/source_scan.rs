@@ -432,7 +432,7 @@ mod tests {
                 let _ = "kept_after_use";
             }
 
-            #[cfg(feature = "test-provider")]
+            #[cfg(feature = "test-network")]
             fn feature_gated_is_production() {
                 let _ = "kept_feature_gate";
             }

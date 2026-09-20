@@ -637,16 +637,9 @@ mod tests {
     }
 
     #[test]
-    fn inventory_marks_agents_as_extension() {
-        let agents = surface_by_location("agents.toml").expect("agents.toml registered");
-        assert_eq!(agents.consumer, ConfigConsumerKind::Extension);
-    }
-
-    #[test]
-    fn directory_surfaces_are_registered() {
-        for location in ["rules", "contexts", "agents", "commands", "skills", "hooks"] {
-            let surface = surface_by_location(location).expect(location);
-            assert_eq!(surface.kind, SurfaceKind::Directory);
-        }
+    fn inventory_marks_automations_as_extension() {
+        let automations =
+            surface_by_location("automations.toml").expect("automations.toml registered");
+        assert_eq!(automations.consumer, ConfigConsumerKind::Extension);
     }
 }

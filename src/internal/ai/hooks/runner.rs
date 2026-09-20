@@ -65,11 +65,6 @@ impl HookRunner {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn working_dir(&self) -> &Path {
-        &self.working_dir
-    }
-
     /// Quick existence check used by the agent runtime to skip hook plumbing
     /// entirely when no hooks are configured.
     pub fn has_hooks(&self) -> bool {

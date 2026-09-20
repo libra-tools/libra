@@ -1,6 +1,6 @@
 //! W4-11: shared RequestScope + resolver helpers for security-sensitive loaders.
 //!
-//! Domain merge (tighten-only sandbox/hooks/approval/MCP, rules/contexts
+//! Domain merge (tighten-only sandbox/hooks/approval, rules/contexts
 //! overlay-add) stays in each loader. This module only pins scope, calls the
 //! W4-06 resolver, and formats fail-closed diagnostics that name the source
 //! layer without echoing file contents.

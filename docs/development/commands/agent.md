@@ -131,8 +131,8 @@ same identity count by simulating coverage removal in a rolled-back transaction.
 - **Scope:** repository/worktree/workspace/actor scope is derived from the
   trusted context at handshake (GC-LB-06/07); self-reported identity is never
   a credential. `deepseek-harness` is NOT an `AgentKind` (ADR-LB-02).
-- **Non-goals:** not `libra code --control stdio` and not an MCP server
-  (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
+- **Non-goals:** not `libra code --control stdio`; a plain JSON-RPC 2.0
+  NDJSON bridge, not a tool-serving protocol (ADR-LB-01). Implemented: the CLI + protocol + transport (LB-01), the durable
   session/event/operation storage (LB-02), the session/event ingress (LB-03),
   the typed read methods (LB-04), mutation admission/approval/actor binding
   (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`

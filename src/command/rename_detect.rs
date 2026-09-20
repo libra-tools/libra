@@ -82,7 +82,6 @@ pub enum BlobEvidence {
     /// by the live `status` sides (HEAD/index carry known OIDs and worktree
     /// OIDs are streamed this call) — R0-3's untracked rename destinations
     /// are the intended producer.
-    #[allow(dead_code)]
     Unknown,
 }
 

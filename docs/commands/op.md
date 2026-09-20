@@ -210,7 +210,8 @@ process umask.
 
 ### Isolated agent task sync-back operations
 
-An isolated `libra code` DAG task runs its tools in a temporary copy or FUSE
+An isolated agent task (plan-20260920 removed `libra code`; this section is
+historical for the removed Code UI) runs its tools in a temporary copy or FUSE
 workspace, not a true linked worktree with its own operation scope. Mutating
 tool calls there still pass permission, hardening, audit, redaction, and
 sandbox checks, but they do not each publish an `agent.tool.*` operation

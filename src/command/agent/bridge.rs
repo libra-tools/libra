@@ -3,7 +3,7 @@
 //!
 //! This is the ONLY standard inbound write transport for the Harness plugin.
 //! It is deliberately NOT `libra code --control stdio` (a client that
-//! controls a live Code session) and NOT an MCP server.
+//! controls a live Code session) — a plain JSON-RPC 2.0 NDJSON bridge.
 //!
 //! stdout carries exactly one JSON-RPC 2.0 NDJSON frame per response; all
 //! diagnostics go to stderr (GC-LB-04). The protocol, method allowlist,

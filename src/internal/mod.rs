@@ -14,7 +14,7 @@
 //! - [`protocol`]: clients for Git's wire protocols (smart HTTP, ssh, local fs) plus
 //!   the LFS client. These are pluggable behind the `protocol::SmartProtocol` trait.
 //! - [`log`]: rendering of `git log`–style output and date/time parsing helpers.
-//! - [`ai`]: agent runtime and Code UI services used by `libra code`.
+//! - [`ai`]: agent runtime and external-agent capture services.
 //! - [`vault`]: encrypted at-rest storage for credentials and provider secrets.
 //!
 //! Modules here may depend on `git-internal` and on each other but should *not* depend

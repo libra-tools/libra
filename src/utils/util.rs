@@ -1341,16 +1341,6 @@ where
     }
 }
 
-#[allow(dead_code)]
-/// Convert a path to relative path to the current directory
-/// - `path` must be absolute or relative (to current dir)
-pub fn to_current_dir<P>(path: P) -> PathBuf
-where
-    P: AsRef<Path>,
-{
-    to_relative(path, cur_dir())
-}
-
 /// Convert a workdir path to relative path
 /// - `base` must be absolute or relative (to current dir)
 pub fn workdir_to_relative<P, B>(path: P, base: B) -> PathBuf

@@ -2133,6 +2133,71 @@ fn test_reset_literal_pathspecs_global() {
     assert!(!names.contains("*.txt"), "*.txt was reset: {names}");
 }
 
+/// FIX-AD-01: `reset -- <pathspec>` unstages every matching path through the
+/// shared pathspec engine, so a glob covers `x.txt` as well as the literal
+/// `*.txt` (Git parity).
+#[test]
+fn test_reset_pathspec_glob_unstages_all_matches() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    std::fs::write(p.join("notes.md"), "md\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "x.txt", "*.txt", "notes.md"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    std::fs::write(p.join("x.txt"), "x2\n").unwrap();
+    std::fs::write(p.join("*.txt"), "star2\n").unwrap();
+    std::fs::write(p.join("notes.md"), "md2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "x.txt", "*.txt", "notes.md"], p),
+        "stage",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["reset", "--", "*.txt"], p),
+        "reset glob",
+    );
+    let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let names = String::from_utf8_lossy(&cached.stdout);
+    assert!(
+        !names.contains("x.txt"),
+        "x.txt unstaged by the glob: {names}"
+    );
+    assert!(!names.contains("*.txt"), "*.txt unstaged: {names}");
+    assert!(names.contains("notes.md"), "notes.md untouched: {names}");
+
+    // `:(exclude)` pairs with the include spec — it must never form an
+    // exclude-only set that unstages the whole index (FIX-AD-01 review P0-1).
+    assert_cli_success(
+        &run_libra_command(&["add", "*.txt", "x.txt", "notes.md"], p),
+        "re-stage",
+    );
+    let out = run_libra_command(&["reset", "--", "*.txt", ":(exclude)x.txt"], p);
+    assert_cli_success(&out, "reset with an exclude spec");
+    let cached = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    let names = String::from_utf8_lossy(&cached.stdout);
+    assert!(
+        !names.contains("*.txt"),
+        "*.txt reset by the include spec: {names}"
+    );
+    assert!(
+        names.contains("x.txt"),
+        "x.txt is excluded, so it stays staged: {names}"
+    );
+    assert!(
+        names.contains("notes.md"),
+        "a path the user did not name must stay staged: {names}"
+    );
+}
+
 /// A repo whose `feature` branch has a commit conflicting with `main`
 /// (`shared.txt`) followed by a clean one (`clean.txt`); `main` diverges.
 fn seq_conflict_repo() -> (tempfile::TempDir, String, String) {

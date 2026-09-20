@@ -22,7 +22,6 @@ pub mod lfs_client;
 pub mod local_client;
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)
 
-#[allow(dead_code)] // todo: unimplemented
 pub trait ProtocolClient {
     /// create client from url
     fn from_url(url: &Url) -> Self;

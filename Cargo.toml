@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.23.1"
+version = "0.23.12"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -17,7 +17,6 @@ worktree-fuse  = []   # Unix FUSE-backed worktree commands (optional)
 test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
-test-provider  = []   # deterministic hidden provider for local Code UI automation tests
 test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
 test-upgrade   = []   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
 fastcdc        = []   # default-OFF FastCDC LFS transport (in-tree; reuses ring SHA-256)
@@ -80,6 +79,7 @@ tokio = { version = "1.52.1", features = [
     "rt",
     "macros",
     "process",
+    "signal",
     "sync",
     "time"
 ]}
@@ -99,19 +99,7 @@ infer = "0.19.0"
 pathdiff = "0.2.3"
 crc32fast = "1.5.0"
 dirs = "6.0.0"
-dagrs = "0.8.1"
-rig-core = { version = "0.35.0", default-features = false, features = ["rmcp", "reqwest", "rustls"] }
-rmcp = { version = "1.5.0", features = [
-    "macros",
-    "transport-streamable-http-server",
-    "transport-streamable-http-server-session",
-    "transport-io"
-] }
-hyper-util = { version = "0.1.20", features = ["full"] }
 axum = "0.8.9"
-tower = "0.5.3"
-tower-http = { version = "0.6.8", features = ["fs"] }
-rust-embed = { version = "8.11.0", features = ["mime-guess", "include-exclude"] }
 mime_guess = "2.0.5"
 tempfile = "3.27.0"
 
@@ -578,6 +566,17 @@ required-features = ["keyring"]
 name = "agent_live_gate_test"
 path = "tests/agent_live_gate_test.rs"
 required-features = ["test-live-agent"]
+
+# plan-20260920 RC-13: `libra code` is no longer a public command; this guard
+# pins the unknown-command surface (allowlisted by RC-30).
+[[test]]
+name = "code_cli_dispatch_test"
+path = "tests/code_cli_dispatch_test.rs"
+
+# plan-20260920 RC-16: `libra code` provider/boot flags are unknown commands.
+[[test]]
+name = "code_provider_resolution_test"
+path = "tests/code_provider_resolution_test.rs"
 
 [[test]]
 name = "compat_serial_registry"

@@ -1,6 +1,9 @@
 //! Append-only JSONL session event storage.
 
-#[cfg(any(test, feature = "test-provider"))]
+// Code-era intent-revision / phase1 helpers stay so old `events.jsonl`
+// files still load. Their last in-tree callers were deleted with RC-23.
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     cell::Cell,
@@ -783,14 +786,6 @@ pub enum CodeCommandStatus {
     Succeeded { summary: String },
     Failed { reason: String },
     Indeterminate { effect: String, reason: String },
-}
-
-pub(crate) fn claimed_intent_revision_consumer_status(
-    replay: &CodeWorkflowReplay,
-    consumption: &IntentRevisionConsumption,
-) -> Result<CodeCommandStatus, CodeCommandStoreError> {
-    validated_intent_revision_consumption_receipts(replay)?
-        .claimed_intent_revision_consumer_status(consumption)
 }
 
 fn intent_revision_consumption_from_claim(
@@ -2215,6 +2210,7 @@ impl<'a> IntentRevisionReplayIndex<'a> {
         )
     }
 
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     fn latest_recoverable_intent_revision_attempt_before_claim(
         &self,
         claim: &IntentRevisionConsumptionClaim,
@@ -2271,7 +2267,7 @@ impl<'a> IntentRevisionReplayIndex<'a> {
 /// One Modify terminal whose command, interaction, review lineage and optional
 /// HMAC commitment were validated against the shared replay index.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionSourceTerminal<'a> {
     pub(crate) interaction_id: &'a str,
     pub(crate) command: &'a CodeCommandIdentity,
@@ -2289,7 +2285,7 @@ pub(crate) struct ValidatedIntentRevisionSourceTerminal<'a> {
 // The sibling Web startup reconciler consumes this complete projection through
 // the batch API; individual fields are intentionally available before that
 // caller is migrated away from its legacy per-terminal scans.
-#[allow(dead_code)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionReceipt<'a> {
     pub(crate) consumption: &'a IntentRevisionConsumption,
     pub(crate) source_terminal_index: usize,
@@ -2309,6 +2305,7 @@ pub(crate) struct ValidatedIntentRevisionReceipt<'a> {
 /// events plus indexed marker/attempt relationships; it never rescans the
 /// complete event log per receipt or per retry attempt.
 #[derive(Debug)]
+#[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
 pub(crate) struct ValidatedIntentRevisionReceiptIndex<'a> {
     replay_index: IntentRevisionReplayIndex<'a>,
     source_terminals: Vec<ValidatedIntentRevisionSourceTerminal<'a>>,
@@ -2316,15 +2313,15 @@ pub(crate) struct ValidatedIntentRevisionReceiptIndex<'a> {
     committed_consumer_statuses: HashMap<CodeCommandIdentity, CodeCommandStatus>,
 }
 
+#[allow(dead_code)] // frozen W2-03 anchors pinned by compat_matrix_alignment
 impl<'a> ValidatedIntentRevisionReceiptIndex<'a> {
-    #[allow(dead_code)]
     pub(crate) fn source_terminals(
         &self,
     ) -> impl ExactSizeIterator<Item = &ValidatedIntentRevisionSourceTerminal<'a>> {
         self.source_terminals.iter()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     pub(crate) fn source_terminal_for_interaction(
         &self,
         interaction_id: &str,
@@ -2412,7 +2409,7 @@ impl<'a> ValidatedIntentRevisionReceiptIndex<'a> {
         .filter(|receipt| receipt.consumption == consumption)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // frozen W2-03 anchor pinned by compat_matrix_alignment
     pub(crate) fn committed_consumer_status(
         &self,
         identity: &CodeCommandIdentity,
@@ -3152,11 +3149,11 @@ pub struct SessionJsonlStore {
     /// Optional fan-out after a successful Code workflow append (SSE wire v2).
     /// Shared across clones so every writer of this session log publishes once.
     on_code_workflow_append: Option<CodeWorkflowAppendHook>,
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     test_faults: Arc<SessionJsonlTestFaults>,
 }
 
-#[cfg(any(test, feature = "test-provider"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct SessionJsonlTestFaults {
     fail_next_combined_terminal_append: AtomicBool,
@@ -3205,7 +3202,7 @@ impl SessionJsonlStore {
             session_root,
             command_status_cache: Arc::new(Mutex::new(None)),
             on_code_workflow_append: None,
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             test_faults: Arc::new(SessionJsonlTestFaults::default()),
         }
     }
@@ -3213,46 +3210,32 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped combined-terminal append failure. Clones of
     /// this session store share the fault, while unrelated tests/sessions do
     /// not race through a process-global flag.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_combined_terminal_append_for_test(&self) {
         self.test_faults
             .fail_next_combined_terminal_append
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_combined_terminal_append_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_combined_terminal_append
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped non-terminal response checkpoint failure.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_pending_interaction_checkpoint_for_test(&self) {
         self.test_faults
             .fail_next_pending_interaction_checkpoint
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_pending_interaction_checkpoint_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_pending_interaction_checkpoint
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped fault after a complete JSONL row is written but
     /// before its durability sync. A retry must re-sync an exact existing row
     /// before acknowledging success.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_durable_sync_after_write_for_test(&self) {
         self.test_faults
             .fail_next_durable_sync_after_write
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_durable_sync_after_write_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_durable_sync_after_write
@@ -3262,14 +3245,14 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure for an explicit event-log re-sync.
     /// This is distinct from the post-write fault above so exact retry tests
     /// can prove that observing an existing row never bypasses fsync.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_events_log_resync_for_test(&self) {
         self.test_faults
             .fail_next_events_log_resync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     fn take_events_log_resync_failure_for_test(&self) -> bool {
         self.test_faults
             .fail_next_events_log_resync
@@ -3279,34 +3262,20 @@ impl SessionJsonlStore {
     /// Arm one instance-scoped failure before the Phase 1 seed parent sync.
     /// The initial write reaches this point after replacement; an exact retry
     /// reaches it after re-syncing the visible seed file.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_parent_sync_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_parent_sync
             .store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_phase1_seed_parent_sync_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_phase1_seed_parent_sync
-            .swap(false, Ordering::AcqRel)
-    }
-
     /// Arm one instance-scoped failure after a Phase 1 start seed has been
     /// unlinked but before the containing directory is synced.
-    #[cfg(any(test, feature = "test-provider"))]
+    #[cfg(test)]
     pub fn fail_next_phase1_seed_sync_after_remove_for_test(&self) {
         self.test_faults
             .fail_next_phase1_seed_sync_after_remove
             .store(true, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-provider"))]
-    pub(crate) fn take_phase1_seed_sync_after_remove_failure_for_test(&self) -> bool {
-        self.test_faults
-            .fail_next_phase1_seed_sync_after_remove
-            .swap(false, Ordering::AcqRel)
     }
 
     /// Register a callback invoked after each successful Code workflow append.
@@ -3641,7 +3610,7 @@ impl SessionJsonlStore {
                 ),
             )
         })?;
-        #[cfg(any(test, feature = "test-provider"))]
+        #[cfg(test)]
         if self.take_events_log_resync_failure_for_test() {
             return Err(io::Error::other(
                 "injected failure while re-syncing the durable session event log",
@@ -3708,7 +3677,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL row write and before sync",
@@ -3785,7 +3754,7 @@ impl SessionJsonlStore {
             )
         })?;
         if durable {
-            #[cfg(any(test, feature = "test-provider"))]
+            #[cfg(test)]
             if self.take_durable_sync_after_write_failure_for_test() {
                 return Err(io::Error::other(
                     "injected failure after durable JSONL batch write and before sync",
@@ -3925,22 +3894,6 @@ impl SessionJsonlStore {
             Err(error) => return Err(error),
         }
         self.load_code_workflow_replay()
-    }
-
-    pub(crate) fn load_intent_revision_workflow_replay_committed(
-        &self,
-    ) -> io::Result<CodeWorkflowReplay> {
-        let _lock = self.acquire_code_workflow_append_lock()?;
-        match fs::metadata(self.events_path()) {
-            Ok(_) => self.sync_events_log()?,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        self.load_intent_revision_workflow_replay()
     }
 
     /// Read the bounded workflow suffix after a durable projection cursor.
@@ -4145,40 +4098,6 @@ impl SessionJsonlStore {
         }
         self.sync_events_log()?;
         Ok(consumption)
-    }
-
-    /// Resolve a pre-admission Claiming sidecar to its exact durable command
-    /// row without requiring that command to remain Pending. Startup uses the
-    /// returned status to rearm only a canonical pre-mutation cancellation;
-    /// all other terminal-without-receipt states remain fail-closed.
-    pub(crate) fn resolve_claimed_intent_revision_consumption(
-        &self,
-        claim: &IntentRevisionConsumptionClaim,
-    ) -> Result<(IntentRevisionConsumption, CodeCommandStatus), CodeCommandStoreError> {
-        let consumer_intent = &claim.consumer_intent;
-        if !consumer_intent.is_valid() || !intent_revision_consumption_claim_is_valid(claim) {
-            return Err(CodeCommandStoreError::InvalidIntent);
-        }
-        let _lock = self.acquire_code_workflow_append_lock()?;
-        self.invalidate_command_status_cache();
-        let replay = self.load_intent_revision_workflow_replay()?;
-        let consumption = intent_revision_consumption_from_claim(&replay, consumer_intent, claim)?;
-        let Some((consumer, status)) = self.code_command_status(&consumer_intent.identity)? else {
-            return Err(CodeCommandStoreError::MissingIntent {
-                command_id: consumer_intent.identity.command_id.clone(),
-            });
-        };
-        if consumer != *consumer_intent {
-            return Err(payload_conflict(&consumer_intent.identity));
-        }
-        let exact_status = claimed_intent_revision_consumer_status(&replay, &consumption)?;
-        if exact_status != status {
-            return Err(CodeCommandStoreError::TerminalConflict {
-                command_id: consumer_intent.identity.command_id.clone(),
-            });
-        }
-        self.sync_events_log()?;
-        Ok((consumption, status))
     }
 
     /// Commit the irreversible IntentSpec revision consume boundary. The

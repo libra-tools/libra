@@ -98,10 +98,23 @@ libra add --ignore-errors src/
 
 ### `--pathspec-from-file <file>`
 
-从 `<file>` 读取 pathspec（每行一个），并与命令行 pathspec 合并。文件中的条目使用与位置 pathspec 相同的共享匹配器和 magic 形式。不支持用 `-` 表示 stdin；请传入真实路径。列表为 NUL 分隔时，配合 `--pathspec-file-nul` 使用。空行会被忽略。
+从 `<file>` 读取 pathspec（每行一个）；命令行不得同时给出 pathspec。文件中的条目使用与位置 pathspec 相同的共享匹配器和 magic 形式。值为 `-` 时从 stdin 读取（绝不打开工作树里字面名为 `-` 的文件）。换行模式按 `\n` 分割并去掉每行末尾的一个 `\r`，因此 CRLF 列表可用；空行会被忽略。列表为 NUL 分隔（例如其它工具的 `-z` 输出）时配合 `--pathspec-file-nul`——NUL 模式保留每个字节（含 CR）。
+
+内容非 UTF-8 或文件无法读取时为致命 `LBR-IO-001`（exit 128），零写入。空列表按用法错误处理
+（`nothing specified, nothing added`，exit 129）——Git 把空列表视为零操作，属有意差异。
+
+换行模式下，以 `"` 开头的行按 Git C-style 引号字符串解码（`\n`、`\t`、`\"`、`\\`、八进制转义等），
+因此含空格或引号的路径可正确传入；未加引号的行按字面使用。引号格式错误（未闭合、闭合引号后有多余
+字节、未知转义）为致命 `LBR-IO-001`（exit 128），零写入。NUL 模式不解码。
+
+`--pathspec-from-file` 不能与 `-p`/`--patch`、`--edit`、`--interactive` 或命令行 pathspec 参数共用
+（Git 的 `cannot be used together` 契约）：每种组合都是用法错误（`LBR-CLI-002`，exit 129）、零写入。
+（Git 对同样组合以 exit 128 拒绝；Libra 的 129 是其用法错误码——属有意差异。
+`--interactive` 保留其自身的 declined-flag 拒绝：exit 128 + `LBR-UNSUPPORTED-001`。）
 
 ```bash
 libra add --pathspec-from-file paths.txt
+printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-
 libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ```
 
@@ -112,8 +125,17 @@ libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ### `--chmod=(+|-)x`
 
 强制设置命中路径在索引中记录的可执行位：`+x` 记为 mode `100755`，`-x` 记为 `100644`。
-blob 内容不变；只影响普通文件（符号链接与 gitlink 跳过）。仅 mode 变化的路径也会被报告为
-modified。非法取值（非 `+x` / `-x`）按用法错误处理。
+blob 内容不变；仅 mode 变化的路径也会被报告为 modified。
+
+只有普通文件才有可执行位。命中的符号链接（`120000`）或 gitlink（`160000`）会被拒绝：条目保持不变，
+每条拒绝向 stderr 输出一行 `error: cannot chmod +x '<path>'`，其余路径照常处理后 `add` 以 1 退出。
+`--json` 模式下改为在 envelope 上输出 `chmod_rejected: [{"path", "flip"}]`，退出码同为 1。
+（Git 此处退出 255；Libra 采用与 ignored-path 报告共用的进程级 exit 1 模型。）
+
+非法取值（非 `+x` / `-x`）按用法错误处理。
+
+在没有 pathspec（也没有 `-A`、`-u`、`--refresh`、`--renormalize`、`--resolved`）时，`--chmod` 是成功的
+零操作：`add` exit 0，不写索引、不写对象——因为没有可施加 mode 的目标。
 
 ```bash
 libra add --chmod=+x scripts/build.sh
@@ -132,8 +154,10 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-在 `--dry-run` 下，对没有匹配 add 候选的 pathspec 跳过而非报错（会向 stderr 打印警告）。与 Git 一致：
-`--ignore-missing` 需要配合 `--dry-run`。只命中 ignored 文件的 pathspec 仍按 ignored-path warning 报告。
+在 `--dry-run` 下，对没有匹配 add 候选的 pathspec 按 ignore 规则（`.libraignore`、`.gitignore`）分类：
+命中 ignore 规则的路径跟其它 ignored 路径一样报告，并使 `add` 以 1 退出（若它是唯一 pathspec，
+则仍走 `LBR-ADD-001` / 退出码 128 契约）；未命中 ignore 的路径则跳过并在 stderr 打印警告。与 Git
+一致：`--ignore-missing` 需要配合 `--dry-run`。
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
@@ -218,8 +242,10 @@ add 'src/lib.rs' (modified)
 ```text
 warning: the following paths are ignored by configured ignore rules:
 ignored.log
-Hint: use '-f' to force staging of ignored files
+Hint: use -f if you really want to add them.
 ```
+
+当部分路径已被暂存（或由 dry-run 报告）**且**另有显式 pathspec 被 ignore 时，`add` 会完成整个操作——暂存、输出、警告与 automation 事件——然后以 `1` 退出（与 Git 一致）。当**全部**路径都被 ignore 且没有其它暂存时，`add` 以 `LBR-ADD-001` / `128` 失败（与 Git 的 1 是有意差异）。`--json` 保持 stdout 的常规 data envelope（ignored 路径在 `data.ignored`），退出码为 `1`；退出码 `1` 优先于 `--exit-code-on-warning` 的 `9`。
 
 `--quiet` 会抑制所有 `stdout` 输出，但保留 `stderr` warnings。
 
@@ -340,7 +366,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 交互式 patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
 | 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` Web Code UI） |
 | 暂存前编辑 diff | `git add -e` / `--edit` | N/A | N/A |
-| 仅 chmod | `git add --chmod=+x` | N/A | N/A |
+| 仅 chmod | `git add --chmod=+x` | `libra add --chmod=+x`（非普通索引条目会被拒绝并以 exit 1 结束） | N/A |
 | Sparse checkout 路径 | `git add --sparse` | N/A | N/A |
 | Ignore 文件 | `.gitignore` | N/A（jj 使用 `.gitignore`） | `.gitignore` + `.libraignore` |
 | 结构化 JSON 输出 | N/A | N/A | `--json` / `--machine` |
@@ -366,7 +392,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 无法保存索引 | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh 失败 | `LBR-IO-001` | 128 | -- |
 | 条目创建失败 | `LBR-IO-002` | 128 | -- |
-| 对象或持久索引 marker 写入失败 | `LBR-IO-002` | 128 | 检查存储权限后重试；错误会正常返回，不会 panic |
+| 对象或持久索引 marker 写入失败 | `LBR-IO-002` | 128 | 检查存储权限后重试；错误会正常返回、不会 panic，且暂存区保持不变：错误信息说明对象负载已安全写入、未暂存任何路径，直接重试会复用已存储的负载、无需任何锁文件清理。若失败形态为锁超时，错误信息会指出持有者（其 pid 与用途，如 `marker_publication`、`queued_update`、`replay`、`deletion_fence`）或说明无法判定持有者；等待该进程结束后重试即可。锁等待采用 Git 式二次退避，最长等待 10 秒。不要删除 `.libra/object-index-repair-locks` 下的锁文件：它们只用于仲裁并发写入，本身不会阻塞任何操作，且会在持有进程退出时自动释放。只读命令在锁忙时会静默跳过待回放的云索引 repair marker（无告警），由下一条命令重试 |
 | 路径已暂存但云索引修复仍待处理，且使用 `--exit-code-on-warning` | `LBR-WARN-001` | 9 | 修复警告中的数据库/marker 问题；下一条仓库命令会自动重试 |
 | 工作目录错误 | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | 状态计算失败 | `LBR-REPO-002` | 128 | -- |
@@ -381,6 +407,9 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 - jj 没有 `add` 命令；它自动跟踪所有工作树更改
 - Libra 的 `add` 是 `commit` 前必需步骤，匹配 Git 的显式暂存模型
 - `.gitignore` 与 `.libraignore` 都使用 Git ignore 模式语法；同目录内 `.libraignore` 可显式覆盖 `.gitignore`，导入和非 bare clone 仍会复制 `.gitignore` 规则，而不是删除或重命名原文件
+- 未被 ignore 的缺失 pathspec 仍会输出 Libra 的 `--ignore-missing` 跳过 warning（Git 此时静默）
+- 目录 pathspec 下，已存在的被忽略父目录不会被额外列出（Git 也会列出它）
+- C-quoted 的 `--pathspec-from-file` 行可接受 1–3 位八进制数字（Git 要求恰好三位），且会拒绝闭合引号之后的剩余字节（Git 忽略它们）
 - LFS 跟踪文件会在暂存期间自动转换为指针文件
 - 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-i`/`--interactive`，D15 剩余入口）。请用 `libra add -p` 或 `libra add <pathspec>`。
 

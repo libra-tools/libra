@@ -67,7 +67,7 @@ fn missing_pathspec_is_fatal_and_atomic() {
 }
 
 /// Scenario: a mix of staged-eligible and ignored paths must succeed (exit
-/// code 0) for the eligible ones while warning on stderr about the ignored
+/// code 1, like Git) for the eligible ones while warning on stderr about the ignored
 /// path. Confirms only the non-ignored file appears in `status --short`.
 #[test]
 fn partial_ignore_stages_good_files_and_warns() {
@@ -79,8 +79,13 @@ fn partial_ignore_stages_good_files_and_warns() {
     fs::write(repo.join("ignored.txt"), "ignored").unwrap();
 
     let output = run_libra(&["add", "good.txt", "ignored.txt"], &repo);
-    // Partial ignore: good.txt staged successfully → exit 0 (warning on stderr)
-    assert_eq!(output.status.code(), Some(0));
+    // ADR-IA-02: mixed ignore stages good.txt and exits 1 (Git parity).
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "mixed ignored add must exit 1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

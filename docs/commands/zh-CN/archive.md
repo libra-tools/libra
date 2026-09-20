@@ -36,7 +36,7 @@ attributes 修改不会影响对既有 `TREEISH` 的归档。`export-subst` 尚�
 
 `--prefix <PREFIX>` 必须是相对路径。绝对前缀和包含 `..` 路径组件的前缀会被拒绝，以防止归档路径穿越。
 
-`PATH` 参数也必须是相对路径且不得包含 `..`。目录 pathspec 会包含该目录下所有匹配文件。`--list` 不要求位于仓库中。
+`PATH` 参数也必须是相对路径且不得包含 `..`。目录 pathspec 会包含该目录下所有匹配文件。普通名称、通配符以及 `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic 均经共享 pathspec 引擎匹配（`--literal-pathspecs` 会将其转为字面）。`--list` 不要求位于仓库中。
 
 ## 示例
 

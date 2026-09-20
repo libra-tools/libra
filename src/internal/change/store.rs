@@ -254,7 +254,7 @@ impl ChangeStore {
     }
 
     /// Return a bounded repository-wide revision projection for read-only
-    /// consumers such as the Code UI operation graph.
+    /// consumers such as CLI operation-history views.
     pub async fn revisions_for_repo(
         &self,
         repo_id: &str,

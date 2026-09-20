@@ -26,7 +26,8 @@ use crate::{
         log::{
             ChangeType,
             config::{configured_date, configured_pretty, resolve_cli_date},
-            generate_diff, get_changed_files_for_commit, parse_pretty_format,
+            generate_diff, get_changed_files_for_commit,
+            get_changed_files_for_commit_matching_pathspec, parse_pretty_format,
         },
     },
     common_utils::parse_commit_msg,
@@ -42,7 +43,9 @@ use crate::{
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
-        path, util,
+        path,
+        pathspec::PathspecSet,
+        util,
     },
 };
 
@@ -59,6 +62,11 @@ EXAMPLES:
     libra show --format='%h %s' HEAD        Custom header format (alias for --pretty)
     libra show --abbrev-commit HEAD         Abbreviate the commit hash in the header
     libra --json show HEAD                  Structured JSON output for agents";
+
+/// Hidden `--`-separator sentinel injected by `cli` (`FIX-AD-01`): tells `show`
+/// that everything after `--` is a pathspec, so a bare pathspec with no
+/// revision still means `HEAD <pathspec>` (Git parity).
+pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-separator";
 
 /// Shows commits, tags, trees, or blobs.
 #[derive(Parser, Debug)]
@@ -155,6 +163,11 @@ pub struct ShowArgs {
     /// Limit output to matching paths.
     #[clap(value_name = "PATHS", num_args = 0..)]
     pub pathspec: Vec<String>,
+
+    /// Internal sentinel injected by `cli` when the user wrote `--`
+    /// (`FIX-AD-01`): a leading pathspec with no revision then means `HEAD`.
+    #[clap(long = SHOW_PATHSPEC_SEPARATOR_FLAG, hide = true)]
+    pub pathspec_separator: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +295,17 @@ pub async fn execute(args: ShowArgs) {
 /// `<rev>:<path>`) and prints its contents with diff formatting.
 pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::from(ShowError::NotInRepo))?;
+
+    // `FIX-AD-01`: `show -- <pathspec>` with no revision means `HEAD` limited to
+    // that pathspec (Git parity). clap routes the first positional to `object`,
+    // so shift it into the pathspec list once the `--` sentinel confirms the
+    // separator was used.
+    if args.pathspec_separator && args.pathspec.is_empty() {
+        if let Some(object) = args.object.take() {
+            args.pathspec.push(object);
+        }
+        args.object = Some("HEAD".to_string());
+    }
 
     if let Some(date) = args.date.take() {
         args.date = Some(resolve_cli_date(&date)?);
@@ -472,9 +496,12 @@ async fn show_commit(
 
     // Render patch-style details when requested.
     if !args.no_patch {
-        let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+        let paths = show_effective_paths(&commit, &args.pathspec).await?;
 
-        if args.patch_with_stat {
+        // `FIX-AD-01`: a pathspec that matches no changed path renders no
+        // diff/stat block — an empty `paths` otherwise means "no filter".
+        if !args.pathspec.is_empty() && paths.is_empty() {
+        } else if args.patch_with_stat {
             // `--patch-with-stat` (Git's `-p --stat`): the diffstat block followed
             // by the full patch.
             let diffstat = show_diffstat(&commit, paths.clone()).await?;
@@ -680,6 +707,34 @@ fn build_raw_lines(
     out
 }
 
+/// `FIX-AD-01`: the concrete changed paths a `show` pathspec list selects for
+/// `commit`. Wildcard / `:(magic)` specs expand through the shared pathspec
+/// engine; plain specs keep their prefix behavior. An empty pathspec list
+/// returns no filters (the renderers treat that as "all").
+async fn show_effective_paths(commit: &Commit, raw: &[String]) -> CliResult<Vec<PathBuf>> {
+    let Some(set) = show_pathspec_set(raw)? else {
+        return Ok(Vec::new());
+    };
+    let changed = get_changed_files_for_commit_matching_pathspec(commit, &set).await?;
+    Ok(changed.into_iter().map(|change| change.path).collect())
+}
+
+/// `FIX-AD-01`: build the shared-engine pathspec set for a `show` invocation
+/// (`None` when no pathspecs were given).
+fn show_pathspec_set(raw: &[String]) -> CliResult<Option<PathspecSet>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let set = PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))?;
+    Ok(Some(set))
+}
+
 async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<()> {
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
@@ -688,7 +743,7 @@ async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> Cl
         return Ok(());
     }
 
-    let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    let paths = show_effective_paths(&commit, &args.pathspec).await?;
     if args.stat || args.name_only || args.name_status || args.raw {
         // --stat / --name-only / --name-status / --raw human paths only need
         // tree-level file lists, not blob contents.  Use the same function so
@@ -979,6 +1034,8 @@ fn show_unsupported_object_type_error(object_type: impl Into<String>) -> CliErro
 async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     let object_ref = args.object.as_deref().unwrap_or("HEAD");
     let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    // `FIX-AD-01`: the JSON path also matches through the shared pathspec engine.
+    let path_specs = show_pathspec_set(&args.pathspec)?;
 
     if let Some((rev, path)) = object_ref.split_once(':') {
         return collect_commit_file_output(rev, path).await;
@@ -987,7 +1044,7 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref) {
-        return collect_object_output(&hash, &paths).await;
+        return collect_object_output(&hash, &paths, path_specs.as_ref()).await;
     }
 
     if let Ok(commit_hash) = util::get_commit_base(object_ref).await {
@@ -998,10 +1055,10 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
                 } else {
                     commit_hash
                 };
-                return collect_tag_output(&tag_hash, &paths).await;
+                return collect_tag_output(&tag_hash, &paths, path_specs.as_ref()).await;
             }
             _ => {
-                return collect_commit_output(&commit_hash, &paths).await;
+                return collect_commit_output(&commit_hash, &paths, path_specs.as_ref()).await;
             }
         }
     }
@@ -1009,15 +1066,19 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
     Err(show_bad_revision_error(object_ref))
 }
 
-async fn collect_object_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<ShowOutput> {
+async fn collect_object_output(
+    hash: &ObjectHash,
+    paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
+) -> CliResult<ShowOutput> {
     let storage = ClientStorage::init(path::objects());
     let obj_type = storage
         .get_object_type(hash)
         .map_err(|e| show_object_load_error(hash, e))?;
 
     match obj_type {
-        ObjectType::Commit => collect_commit_output(hash, paths).await,
-        ObjectType::Tag => collect_tag_output(hash, paths).await,
+        ObjectType::Commit => collect_commit_output(hash, paths, path_specs).await,
+        ObjectType::Tag => collect_tag_output(hash, paths, path_specs).await,
         ObjectType::Tree => collect_tree_output(hash).await,
         ObjectType::Blob => collect_blob_output(hash).await,
         _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
@@ -1033,11 +1094,17 @@ fn resolve_existing_object_hash(object_ref: &str) -> Option<ObjectHash> {
 async fn collect_commit_output(
     commit_hash: &ObjectHash,
     paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
 ) -> CliResult<ShowOutput> {
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
     let (subject, body) = split_subject_and_body(&commit.message);
-    let files = get_changed_files_for_commit(&commit, paths).await?;
+    let files = match path_specs {
+        Some(set) if !set.is_empty() => {
+            get_changed_files_for_commit_matching_pathspec(&commit, set).await?
+        }
+        _ => get_changed_files_for_commit(&commit, paths).await?,
+    };
 
     Ok(ShowOutput::Commit(ShowCommitData {
         hash: commit.id.to_string(),
@@ -1066,7 +1133,11 @@ async fn collect_commit_output(
     }))
 }
 
-async fn collect_tag_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<ShowOutput> {
+async fn collect_tag_output(
+    hash: &ObjectHash,
+    paths: &[PathBuf],
+    path_specs: Option<&PathspecSet>,
+) -> CliResult<ShowOutput> {
     match tag::load_object_trait(hash).await {
         Ok(tag::TagObject::Tag(tag_obj)) => {
             // Validate the target object is accessible so that quiet / JSON
@@ -1088,7 +1159,9 @@ async fn collect_tag_output(hash: &ObjectHash, paths: &[PathBuf]) -> CliResult<S
                 target_type: format!("{:?}", tag_obj.object_type).to_lowercase(),
             }))
         }
-        Ok(tag::TagObject::Commit(commit)) => collect_commit_output(&commit.id, paths).await,
+        Ok(tag::TagObject::Commit(commit)) => {
+            collect_commit_output(&commit.id, paths, path_specs).await
+        }
         Ok(_) => Err(show_unsupported_object_type_error("tag target")),
         Err(e) => Err(show_object_load_error(hash, e)),
     }

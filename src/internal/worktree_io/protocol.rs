@@ -112,7 +112,7 @@ impl ObjectStoreCapability {
     /// Return the loose-object pathname for an OID without opening it. This
     /// is intentionally read-only and accepts only canonical SHA-1/SHA-256
     /// hexadecimal object names.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by lib unit tests
     pub(crate) fn object_path(&self, oid: &str) -> io::Result<PathBuf> {
         if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(io::Error::new(

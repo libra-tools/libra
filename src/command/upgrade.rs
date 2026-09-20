@@ -304,6 +304,7 @@ const INSTALL_SCRIPT_HINT: &str =
 pub const UPGRADE_EXAMPLES: &str = "\
 EXAMPLES:
   libra upgrade                 Check the signed release channel; ask before installing
+                                (the prompt defaults to Yes — a bare Enter accepts)
   libra upgrade --check         Only report whether a newer version exists
   libra upgrade --yes           Install a newer version without the confirmation prompt
   libra --json upgrade --check  Machine-readable status for scripts
@@ -559,23 +560,32 @@ fn report_status(
     Ok(())
 }
 
-/// `y`/`yes` (any case) accepts; everything else — including EOF — declines.
-fn parse_confirmation(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+/// `y`/`yes` (any case) accepts, `n`/`no` (any case) declines; an empty
+/// answer (a bare Enter) takes `default`, and anything else declines so a
+/// typo never installs an upgrade.
+fn parse_confirmation(raw: &str, default: bool) -> bool {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        "" => default,
+        _ => false,
+    }
 }
 
-/// The prompt goes to STDERR so a piped stdout never receives it.
+/// The prompt goes to STDERR so a piped stdout never receives it. The
+/// default answer is YES: a bare Enter — or EOF on a terminal that went
+/// away — accepts the offered upgrade.
 fn confirm(question: &str) -> std::io::Result<bool> {
-    eprint!("{question} [y/N] ");
+    eprint!("{question} [Y/n] ");
     std::io::stderr().flush()?;
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line)?;
     if read == 0 {
-        // EOF declines (the [y/N] default).
+        // EOF takes the [Y/n] default (the answer that was never given).
         eprintln!();
-        return Ok(false);
+        return Ok(true);
     }
-    Ok(parse_confirmation(&line))
+    Ok(parse_confirmation(&line, true))
 }
 
 /// Map a manual-flow error onto the closest stable code: network transport
@@ -631,12 +641,25 @@ mod upgrade_cli_tests {
     use super::*;
 
     #[test]
-    fn confirmation_accepts_only_yes_forms() {
+    fn confirmation_accepts_yes_forms_and_a_bare_enter_takes_the_default() {
         for yes in ["y", "Y", "yes", "YES", " y \n"] {
-            assert!(parse_confirmation(yes), "{yes:?} must accept");
+            assert!(parse_confirmation(yes, true), "{yes:?} must accept");
         }
-        for no in ["", "n", "no", "nope", "yy", "es", "yes!", "\n"] {
-            assert!(!parse_confirmation(no), "{no:?} must decline");
+        // A bare Enter follows the prompt's default: Yes for `libra upgrade`.
+        for empty in ["", " \n", "\t\n"] {
+            assert!(
+                parse_confirmation(empty, true),
+                "{empty:?} must take the default"
+            );
+            assert!(
+                !parse_confirmation(empty, false),
+                "{empty:?} must take the default"
+            );
+        }
+        for no in [
+            "n", "N", "no", "NO", " n \n", "nope", "yy", "es", "yes!", "yess",
+        ] {
+            assert!(!parse_confirmation(no, true), "{no:?} must decline");
         }
     }
 

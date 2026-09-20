@@ -5717,23 +5717,6 @@ async fn restore_metadata(
     Ok(deferred_capture_refs)
 }
 
-/// Restore refs metadata and fail hard when the metadata object is missing.
-///
-/// `libra cloud restore` keeps its historical warning-only behavior through
-/// [`restore_metadata`]. The former clone-from-publish path needed a stricter
-/// contract (RC-34 removed that caller; RC-35 deletes the leftover).
-#[allow(dead_code)]
-pub(crate) async fn restore_metadata_strict(
-    db_conn: &sea_orm::DatabaseConnection,
-    r2_storage: &RemoteStorage,
-) -> CloudResult<()> {
-    let data = r2_storage
-        .get_metadata()
-        .await
-        .map_err(|e| CloudError::Generic(format!("failed to download metadata: {}", e)))?;
-    restore_metadata_from_bytes_strict(db_conn, &data).await
-}
-
 async fn restore_metadata_from_bytes(
     db_conn: &sea_orm::DatabaseConnection,
     data: &[u8],
@@ -5741,32 +5724,6 @@ async fn restore_metadata_from_bytes(
     let references: Vec<reference::Model> = serde_json::from_slice(data)
         .map_err(|e| CloudError::Generic(format!("Failed to deserialize metadata: {}", e)))?;
     restore_metadata_models(db_conn, references, false).await
-}
-
-#[allow(dead_code)] // RC-34: only reached from restore_metadata_strict
-async fn restore_metadata_from_bytes_strict(
-    db_conn: &sea_orm::DatabaseConnection,
-    data: &[u8],
-) -> CloudResult<()> {
-    let references: Vec<reference::Model> = serde_json::from_slice(data)
-        .map_err(|e| CloudError::Generic(format!("Failed to deserialize metadata: {}", e)))?;
-    validate_strict_refs_metadata(&references)?;
-    restore_metadata_models_with_capture_policy(db_conn, references, true, false)
-        .await
-        .map(|_| ())
-}
-
-#[allow(dead_code)] // RC-34: only reached from restore_metadata_strict
-fn validate_strict_refs_metadata(references: &[reference::Model]) -> CloudResult<()> {
-    if !references
-        .iter()
-        .any(|model| model.kind == reference::ConfigKind::Head && model.remote.is_none())
-    {
-        return Err(CloudError::Generic(
-            "metadata does not contain local HEAD reference".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 async fn restore_metadata_models(
@@ -6415,70 +6372,6 @@ mod tests {
         assert!(message.contains("checkpoint-pruned-locally"));
         assert!(message.contains("libra cloud sync"));
         assert!(message.contains("already pruned locally"));
-    }
-
-    #[test]
-    #[serial(cwd, env)]
-    fn restore_metadata_strict_fails_when_metadata_object_is_missing() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let repo = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", home.path());
-        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
-        rt.block_on(setup_with_new_libra_in(repo.path()));
-        let _cwd = ChangeDirGuard::new(repo.path());
-
-        rt.block_on(async {
-            let db_conn = db::get_db_conn_instance().await;
-            let remote = RemoteStorage::new(Arc::new(InMemory::new()));
-
-            let error = restore_metadata_strict(&db_conn, &remote)
-                .await
-                .expect_err("strict metadata restore must fail on missing metadata.json");
-
-            let message = error.to_string();
-            assert!(
-                message.contains("failed to download metadata"),
-                "error should explain metadata download failure: {message}",
-            );
-        });
-    }
-
-    #[test]
-    #[serial(cwd, env)]
-    fn restore_metadata_strict_fails_when_metadata_has_no_local_head() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let repo = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", home.path());
-        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
-        rt.block_on(setup_with_new_libra_in(repo.path()));
-        let _cwd = ChangeDirGuard::new(repo.path());
-
-        rt.block_on(async {
-            let db_conn = db::get_db_conn_instance().await;
-            let remote = RemoteStorage::new(Arc::new(InMemory::new()));
-            let refs = vec![reference::Model {
-                id: 0,
-                name: Some("main".to_string()),
-                kind: reference::ConfigKind::Branch,
-                commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-                remote: None,
-                worktree_id: None,
-            }];
-            let metadata = serde_json::to_vec(&refs).expect("metadata should serialize");
-            remote.put_metadata(&metadata).await.unwrap();
-
-            let error = restore_metadata_strict(&db_conn, &remote)
-                .await
-                .expect_err("strict metadata restore must reject metadata without HEAD");
-
-            let message = error.to_string();
-            assert!(
-                message.contains("metadata does not contain local HEAD reference"),
-                "error should explain missing HEAD: {message}",
-            );
-        });
     }
 
     #[tokio::test]

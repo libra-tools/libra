@@ -160,7 +160,7 @@ Top-5 最重要差距（两榜合成）：
 | LR-08 | A | 已验证→已验证 | `walgit/walgit@4ff4f7a` 原生 Git URI 供包（E2） | `grep -rn 'trait Forge\|pull_request\|check_runs' src` = 0 | 无 Forge／PR／CI 机器接口 | 不变 | 保持 | E4 |
 | LR-09 | A | 已验证→已验证 | `walgit/walgit@bf65c01` 退役前可达性守恒证明（E2） | `src/internal/sparse/mod.rs:26`；`src/utils/media/transfer.rs`；`media_fastcdc_test` | sparse／hydrate／FastCDC 有基础；partial clone/VFS 缺，对象退役无守恒证明 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 | LR-10 | B | 已验证→已验证 | `StepzeroLab/research-git@62bcdf5` capsule／provenance（E2，沿用） | `src/internal/ai/capability_package/manifest.rs:62`；`src/cli.rs` 未注册 package | artifact／skill 有基础，capsule lifecycle／ablation 缺失 | 不变 | 保持 | E4 |
-| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@0d1f50007` session 事件面（E2） | `src/internal/ai/runtime/worker.rs`；`a643dfb`；v0.22.0；bridge `session/created\|event\|flush\|disposed` 面未变 | Web-only runtime 与 SSE v2 已发布；deepseek 格式升 v3 不影响按方法分发的 bridge | 不变（本轮复核 bridge 事件面） | 保持 | E4 |
+| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@0d1f50007` session 事件面（E2） | `src/internal/ai/runtime/worker.rs`；`a643dfb`；v0.22.0；bridge `session/created\|event\|flush\|disposed` 面未变 | Web-only runtime 与 SSE v2 已发布；deepseek 格式升 v3 不影响按方法分发的 bridge | 不变（本轮复核 bridge 事件面）；Code UI/Web 执行器与公开 `libra code` 已由 plan-20260920 拆除（产品表面已拆除） | 保持 | E4 |
 | AG-ATTR | B | 候选→候选 | `git-ai-project/git-ai@7ace11b09` 会话按 rollout 文件名键控（E2，账本关闭） | `src/internal/ai/agent_import.rs`；`grep -rn ai_edit_trace src sql` = 0 | 原生 transcript 导入存在，归一化行级归因仍缺 | 不变 | 保持 | E4 |
 | MEM-01 | C | 已排期→已排期 | `akitaonrails/ai-memory@2be13836`+`c83076b3` 载荷转义修复与 no-op 回归（E2） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 命令 | VCS-native storage／privacy baseline 未实现；竞品隐私细节修复波加剧时间压力 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 | MEM-02 | C | 已排期→已排期 | `rohitg00/agentmemory@e04ba88` hybrid retrieval（E2，沿用）；`ai-memory` v2.3.0 多 provider embedding（E2） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` = 0 | 无本地 FTS/BM25 与有界 SessionStart 注入 | 不变 | 保持 | E4 |
@@ -170,7 +170,7 @@ Top-5 最重要差距（两榜合成）：
 | MEM-06 | C | 候选→已验证 | `akitaonrails/ai-memory@74bd791c` 跨项目 agent inbox/queue（E3，随 v2.3.0 发布） | `grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；`workspace.rs:211` WorkspaceLease 同构基础 | 协调通道问题域被竞品实证可行，Libra 侧实现为零 | 扩大（竞品） | 更新状态（候选→已验证） | E3 |
 | SB-01 | SB | 实施中→实施中 | `git/git@997c1daf1d` worktree_basename 越界读修复（E2） | `src/git_protocol.rs:227 read_pkt_line` 返回 `Result`（pkt-line 已收口）；`src/internal/ai/tools/registry.rs:100` cwd `panic!` | pkt-line 切片完成；生产 panic 面未清零（ToolRegistry 等），解析越界/下溢防护需持续对齐 | 缩小（Libra）+扩大（竞品）＝双方 | 更新判据 | E4 |
 | SB-02 | SB | 实施中→实施中 | `anomalyco/opencode@709af586` 拒绝后停止 run（E2） | `src/internal/ai/mcp/server.rs:46-47` authz 默认 None；`src/internal/ai/tools/utils.rs` 写重定向 needs_human | authorizer 生产接线与 shell fail-closed 仍缺；权限路径规范化与拒绝后行为缺规范 | 扩大（竞品） | 补充完成判据 ×2 | E4 |
-| SB-03 | SB | 已验证→已验证 | `walgit/walgit@bf65c01` 退役权限与守恒证明（E2，参照列同时服务 LR-09） | `src/utils/d1_client.rs:3286 ensure_publish_schema` 逐语句、无事务；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变（本轮核对锚点行号） | 保持 | E2 |
+| SB-03 | SB | 已验证→已验证 | `walgit/walgit@bf65c01` 退役权限与守恒证明（E2，参照列同时服务 LR-09） | `ensure_publish_schema` 逐语句、无事务（**历史锚点：已随 plan-20260920 RC-35 删除**）；wrangler 第二套 runner | D1 runner 仍缺事务账本与单一迁移事实源 | 不变（本轮核对锚点行号） | 保持 | E2 |
 | SB-04 | SB | 实施中→实施中 | `epicgames/lore@7ccb6a1` shutdown 后调用显式失败（E2） | `grep -rn ProcessScope src tests` = 0；`src/internal/process_terminate.rs:12` ProcessTerminateGate；nextest CI `a8218ac` | 测试隔离已改善；child scope 抽象、中断清理与 shutdown 语义未统一 | 扩大（竞品） | 补充完成判据 ×1 | E4 |
 
 不做 Top-3（按 (S+D+X) 从「不采纳/延后」候选中取）：
@@ -214,12 +214,12 @@ Libra 自身（HEAD `9da06b4bf700472781c2e76ec48e96815475caf3`，`Cargo.toml` ve
 - **LR-03**：**已排期→实施中**——sidecar Change ID 模块 `src/internal/change/{identity,genealogy,store,resolve,builder,workflows}.rs` 与 `tests/command/change_revision_provenance_test.rs` 随 `9da06b4` 合入（HEAD，**未发布**，v0.22.47 无 `internal/change/`）；`plan-20260822.md:123` ADR-OL-04 冻结 sidecar-only（不写 commit header）。
 - **LR-05**：cherry-pick 序列一致性修复（`3128bc2` HF-01、`7190507`、`9be09fe`，v0.22.39-42）与 unmerged staging（`06d0840`）；merge 主线继续收敛，versioned conflict object 仍无，状态保持实施中。
 - **CT-01**：仍实施中；本轮 `tests/compat-ledger/t4` 仍 34 toml 无新 wave；DEFER-09 关闭表述沿用第 11 轮。
-- **UP-01 / RT-01**：保持已实现（本周期 28 个 tag 均经签名链发布，属既有四证据的持续兑现，不重复登记）。
+- **UP-01 / RT-01**：保持已实现；RT-01 的产品表面（`libra code`/Web 执行器）已由 plan-20260920 拆除（本周期 28 个 tag 均经签名链发布，属既有四证据的持续兑现，不重复登记）。
 - **SB-02 / plan-20260830**：SBX-01..05 已合入维持；authorizer 生产仍未安装（`server.rs:46-47` 默认 None）。**SB-04 / plan-20260827**：nextest CI 与序列注册维持；`grep -rn ProcessScope src tests` = 0（child scope 仍缺）。
 - **Memory**：仍无实现——`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 memory 子命令、`grep -rn 'fts5\|bm25'` = 0、`grep -rn 'MemoryCoordinator\|CoordinationView' src` = 0；MEM-01/02 维持已排期，MEM-06 本轮由竞品证据推进为已验证。
 - **未发布变更（v0.22.47..HEAD，3 条）**：`9da06b4` operation/change genealogy milestones（上两行）；`06d0840` add unmerged staging、`-u` pathspec 检查、literal-pathspecs（用户可见行为变更）；`07ba2d9` pkt-line 计划收口文档。CHANGELOG `[Unreleased]` 另有 isolated agent task 单一 `agent.task.sync-back` operation 语义与 operation-v2 HEAD pinning（触及「兼容与迁移」「数据正确性」门禁，须随发布补迁移/回滚证据）。
 - **stale facts 更正**：第 10 轮遗留的 `ssh.strictHostKeyChecking` 文档债已闭合（`COMPATIBILITY.md:617` 与 clone/config/fetch/push 命令文档均已记录）；plan-20260901 已完成（索引状态同步更新）。
-- **日期计划对账**：磁盘含 `plan-20260918.md`（`add` 收口，排在 `issues/477` 之后）与 `plan-20260917.md`（cargo-test 进程内剥落）；索引已补齐 `plan-20260902`..`plan-20260918`；`plan-20260916.md`（Mega remote Agent Capture 客户端）为设计态；`plan-20260901` 状态由实施中更新为已完成（其自述收口门与 DEFER-02 登记以其修订史为准）。
+- **日期计划对账**：磁盘含 `plan-20260918.md`（`add` 收口，排在 `issues/477` 之后）与 `plan-20260917.md`（cargo-test 进程内剥落）；索引已补齐 `plan-20260902`..`plan-20260918` 与 [`plan-20260919-gpg-import.md`](plan-20260919-gpg-import.md)（R29 双 PASS，尚未开工）；`plan-20260916.md`（Mega remote Agent Capture 客户端）为设计态；`plan-20260901` 状态由实施中更新为已完成（其自述收口门与 DEFER-02 登记以其修订史为准）。
 - deepseek-harness bridge：`plan-20260818.md` 事实不变；本轮复核上游 `session/created|event|flush|disposed` 事件面仍在（deepseek 上游 `packages/core/session/src/index.ts` 的 50–81 行），bridge 按方法分发、不锁定 `SESSION_FORMAT_VERSION`（现 v3），事件面依赖成立；载荷字段级兼容列入待验证账本。
 ---
 
@@ -395,8 +395,8 @@ flowchart LR
 | **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 实施中 | 首个 t4 wave 与 FIX-01..05 B 段 waves 已合入并发布；**DEFER-09 已由 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭**（更正：非「转 blocked」）；测试并行度已落地（`a8218ac` nextest、`b6959e5`/`315132a` 序列注册）；剩余 S4 族 waves 与 S2 离线发现器（DEP-01 + SB-04 前置）；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
 | **UP-01** | 官方签名自动升级链 | P0 | 已实现 | 四证据齐备：代码 `895589d`（手动 `libra upgrade`）+ `2ea10cc`/`a0cb725`/`4bb5672`/`fc9c203`；测试 `upgrade_auto_test`（31 fn）等；文档 `docs/commands/upgrade.md`、`COMPATIBILITY.md:118`、`docs/error-codes.md LBR-UPGRADE-001`、`release-signing-auto-upgrade.md`（D1–D10）；tags v0.22.1/2/6..10（D10 首签 v0.22.7，closeout `00bc815`）。残留 DEFER-02..06 与 CHANGELOG 0.22.1..0.22.10 条目文档债 |
 | **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list\|show/doctor（`run_worktree_doctor`、`begin_repair_operation`）已合入；缺 parallel lanes、挂载/注册重叠拒绝、崩溃矩阵完整性、capture/export ownership 复核 |
-| **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 实施中 | v1 已发布；v2 `RepoViewV2`/`WorkspaceSnapshotV2` 随 v0.22.44+ 发布（`src/internal/operation/store.rs:375`），crash-safe restore/undo/redo/doctor 已随 `9da06b4` 合入（未发布）；[`plan-20260822.md`](plan-20260822.md) M2/M3 已关 |
-| **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 实施中 | sidecar 模块 `src/internal/change/`（identity/genealogy/store/resolve/builder/workflows）+ `change_revision_provenance_test.rs` 已随 `9da06b4` 合入（**未发布**）；ADR-OL-04 sidecar-only（`plan-20260822.md:123`） |
+| **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 实施中（PR #503 收口） | v1 已发布；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo/doctor 与多 worktree reconcile 已发布；[`plan-20260822.md`](plan-20260822.md) M2/M3/M6 已关；OL-14（Web 图）已取消；OL-15A runtime cutover 与 OL-15 v1 retirement 已在 PR #503 落地，等待远端兼容门禁 |
+| **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 实施中 | sidecar 模块 `src/internal/change/`（identity/genealogy/store/resolve/builder/workflows）+ `change_revision_provenance_test.rs` 已随 `9da06b4` 合入并随 v0.23.0 发布；ADR-OL-04 sidecar-only（`plan-20260822.md:123`） |
 | **LR-04** | 非交互 Hunk API、归属与 Stack 编辑 | P0 | 已验证 | 有只读 hunk；无稳定 ID、assignment、mutation；gitbutler 本轮把未提交区 ID `zz`→`@` 并支持 committed hunk mutation（Agent 面向 ID 契约变更，E1 线索） |
 | **LR-05** | 一等冲突对象与 Modeless Sequencer | P1 | 实施中 | merge 主路径、rename/D-F/octopus/mergetool/签名已随 `plan-20260903` 交付；versioned conflict object / descendant rebase 仍无 |
 | **LR-08** | Forge/PR/CI 与 Stacked Review | P1 | 已验证 | 无 Forge trait、PR/CI 状态、stack mapping |
@@ -655,7 +655,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 1. **CT-01 收尾**（版本管理）：CT4-01 发布卡已执行（v0.21.21）；DEFER-09 已承接关闭；剩余 CT 后续 S4 族 waves 与 S2 离线发现器（DEP-01 + SB-04 前置）。
 2. ~~**UP-01**（版本管理）~~：**已实现**（v0.22.10，四证据齐备）；残留 DEFER-02..06 与 CHANGELOG 文档债按各自条件处置，不再占据执行队列。
-3. **LR-02/LR-03**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行；v1 已发布，v2 `RepoViewV2`/`WorkspaceSnapshotV2` 已随 v0.22.44+ 发布、crash-safe restore/undo/redo 已随 `9da06b4` 合入（未发布）；sidecar Change ID 模块已合入（未发布）——两者剩余均为发布验收与并发/重写谱系收口。
+3. **LR-02/LR-03**（版本管理）：按 [`plan-20260822.md`](plan-20260822.md) 执行；v2 `RepoViewV2`/`WorkspaceSnapshotV2`、crash-safe restore/undo/redo、多 worktree reconcile（OL-13）与 sidecar Change ID 已发布；OL-14 已取消，OL-15A runtime cutover 与 OL-15 v1 retirement 已由 PR #503 收口，剩余为远端兼容证据与计划记账。
 4. ~~**RT-01 收尾**（Agent 生成代码）~~：已实现——plan-20260715 完成判据全勾选并经 plan-20260824（DF-01..DF-09，v0.22.0）收口；后续按 DEFER-08 等重启条件独立立项。
 5. **SB-01/SB-02/SB-04 收口**（横切）：SB-01 的 pkt-line 切片已随 plan-20260901 完成收口（v0.22.47），剩余生产 panic 面清零（如 `registry.rs:100` cwd panic）作为后续日期计划候选；SB-02 的 authorizer 生产接线与 SB-04 的 child scope 抽象是下一批日期计划候选。
 6. **B 类 Code provider / 凭据 UX**：plan-20260825 已完成（逐卡 review-PASS，发布按 2026-08-30 豁免裁决闭合）。
@@ -738,7 +738,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260818.md`](plan-20260818.md) | B（deepseek-harness bridge） | 已完成 | `libra agent bridge --stdio` 唯一标准入站面；LB-01..LB-07 全部合入，protocol v1 的 20 个 method 自 `v0.21.1` 起全部实现（`v0.21.0` 首发）；不覆盖 MCP/旧工具服务器恢复，TypeScript 侧 `@libra-tools/dsh-bundle` 归兄弟仓 `REL-TS-01` |
 | [`plan-20260819.md`](plan-20260819.md) | C（MEM-01/02） | 已排期 | M2 研发历程记忆首个纵向切片（MemoryNote/MemoryEvent、MemoryWriter、FTS5/BM25、`libra memory` 命令面）；实现未开始；不覆盖 MCP 面、向量检索、团队同步与 MEM-03..06 |
 | [`plan-20260821.md`](plan-20260821.md) | A（UP-01） | 已完成 | 客户端与发布 CI 侧全部落地（trust table、generation floor、`release.yml` OIDC publish、install 验签）；closeout `00bc815`（2026-09-01）；D10 首签随 v0.22.7、v0.22.8 收全绿 run；残留 DEFER-02..06 与 CHANGELOG 0.22.1..0.22.10 文档债 |
-| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03） | 已排期 | Operation Log v2 + Working Copy 快照 + 稳定 Change ID 实施计划（OL-01..OL-12、CH-*）；OL-01 worktree I/O 已合入（merge `dad35f2`）、v1 `libra op` 已发布；`[OL-00]` spike `in-progress / remote-pending`；v2 未开始 |
+| [`plan-20260822.md`](plan-20260822.md) | A（LR-02/LR-03） | 实施中（PR #503 收口） | OL-01..13、CH-01..04 全部 `done/complete`；**OL-14（Web 图）已取消**；OL-15A `done/complete`、OL-15 `done/remote-pending`（v1 runtime retirement 已实现，等待 compat-offline-core） |
 | [`plan-20260824.md`](plan-20260824.md) | B（RT-01 延后项收口） | 已完成 | 承接 0715 的 DEFER-01/08/10 与 skill activation 残差；DF-01..DF-09 九卡全部 done/complete（文档事实源、fix bridge、SSE v2 默认、skill activation provider 消费、v1 物理删除）；DEP-02 以 v0.21.29 满足，v0.22.0（minor，breaking：SSE 仅支持 wire v2）已发布 |
 | [`plan-20260825.md`](plan-20260825.md) | B（Code provider / RT-01 后续） | 已完成 | `libra code` provider 解析与凭据文案收口全部落地（凭据探测三态、`code.defaultProvider`、生效 provider 标签单源、会话 provenance 与 `--resume` 继承）；TA-03/06/07 由 plan-20260827 承接完成；发布面按用户 2026-08-30 豁免裁决闭合（代码已随 v0.21.28..v0.22.0 实际发布） |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度与序列注册） | 已完成 | NP-00..05 六卡全部 complete（nextest 离线 CI face `a8218ac`、串行注册 `315132a`、TA-03/06/07 承接）；D 组 CI 证据环境受阻部分按 backfill 窗口记录 |
@@ -757,7 +757,9 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | 承接 monoengine `DEFER-AC-01`：新增 `libra agent capture-push` HTTP 客户端；双评审 PASS，任务卡尚未执行 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已排期 | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡；**在 [`issues/477.md`](issues/477.md) 全部剩余卡完成后执行**。`add -p` 仍由 477 Phase 4 交付 |
+| [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | 实施中（收尾） | 公开 Code/Publish 表面已随 0.23.0 删除；内部 SCC、leftover、Code UI 测试面与 `worker/` 已删；剩余 RC-32 文档收口 |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁到 XDG） | 已排期 | 用户 2026-09-19 裁决：global config DB + 全域 vault unseal key 迁到 `<XDG_CONFIG_HOME|~/.config>/libra`（macOS 同）；旧库首次使用自动迁移并保留备份；`~/.libra` 仍为 `LIBRA_HOME`；四个 `independent` 卡、`patch` 发布 |
+| [`plan-20260919-gpg-import.md`](plan-20260919-gpg-import.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | 已排期 | 用户 2026-09-19 指示 Codex+Claude 双评审：**R29 同版双 `PASS`（P0/P1/P2 全 0）**；15 卡（家族 REL-VG-01 + 四张独立 patch VG-06/07/08/14），任务卡尚未执行，Phase 0 剩余项：DEP 复核、`gpg --version` 证据、VG-00 go 结论、ADR Accepted |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

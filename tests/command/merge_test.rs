@@ -3493,6 +3493,7 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
 
     let head_before = head_commit(p);
+    let objects_before = count_loose_objects(p);
     let operations_before = operation_count(p);
     let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
     assert_cli_success(&out, "dry-run ff");
@@ -3502,6 +3503,11 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
     assert!(json["data"].get("would_conflict").is_none());
     // Nothing was written: HEAD unchanged, worktree file absent, no state.
     assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert_eq!(
+        count_loose_objects(p),
+        objects_before,
+        "a dry-run must not write objects"
+    );
     assert!(
         !p.join("file.txt").exists(),
         "worktree must not receive the feature file"
@@ -3525,6 +3531,15 @@ fn operation_count(repo: &Path) -> u64 {
     parse_json_stdout(&out)["data"]["total"]
         .as_u64()
         .expect("op log total")
+}
+
+fn latest_operation_status(repo: &Path) -> String {
+    let output = run_libra_command(&["--json", "op", "log", "-n", "1"], repo);
+    assert_cli_success(&output, "op log latest operation");
+    parse_json_stdout(&output)["data"]["operations"][0]["status"]
+        .as_str()
+        .expect("latest operation status")
+        .to_owned()
 }
 
 #[test]
@@ -6412,7 +6427,7 @@ fn merge_crisscross_more_bases_than_the_width_ceiling_is_refused_before_loading(
     assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
 
     let head_before = head_commit(p);
-    let objects_before = count_loose_objects(p);
+    let operations_before = operation_count(p);
     let output = run_libra_command(&["merge", "y"], p);
     let (stderr, report) = parse_cli_error_stderr(&output.stderr);
     assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
@@ -6422,7 +6437,12 @@ fn merge_crisscross_more_bases_than_the_width_ceiling_is_refused_before_loading(
         "the refusal names the width: {stderr}"
     );
     assert_eq!(head_commit(p), head_before, "HEAD untouched");
-    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+    assert_eq!(
+        operation_count(p),
+        operations_before + 1,
+        "the refused mutation is recorded exactly once"
+    );
+    assert_eq!(latest_operation_status(p), "failed");
     assert!(
         !p.join(".libra").join("merge-state.json").exists(),
         "no merge state written"
@@ -7114,7 +7134,7 @@ fn merge_gitlink_nested_changed_pointer_inside_a_pruned_subtree_is_refused() {
     let p = repo.path();
     let head_before = head_commit(p);
     let index_before = std::fs::read(p.join(".libra/index")).expect("index bytes");
-    let objects_before = count_loose_objects(p);
+    let operations_before = operation_count(p);
 
     let output = run_libra_command(&["merge", "feature"], p);
     let (stderr, report) = parse_cli_error_stderr(&output.stderr);
@@ -7130,7 +7150,12 @@ fn merge_gitlink_nested_changed_pointer_inside_a_pruned_subtree_is_refused() {
         index_before,
         "index untouched"
     );
-    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+    assert_eq!(
+        operation_count(p),
+        operations_before + 1,
+        "the refused mutation is recorded exactly once"
+    );
+    assert_eq!(latest_operation_status(p), "failed");
     assert!(!p.join("side.txt").exists(), "worktree untouched");
     assert!(
         !p.join(".libra").join("merge-state.json").exists(),
@@ -10519,17 +10544,18 @@ fn merge_rejects_rename_config_before_folding_a_virtual_ancestor() {
         &run_libra_command(&["config", "merge.renames", "wat"], p),
         "merge.renames=wat",
     );
-    let before = loose_object_ids(p);
+    let operations_before = operation_count(p);
     let output = run_libra_command(&["merge", "y"], p);
     assert!(!output.status.success(), "the merge is refused");
     let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
     assert!(stderr.contains("merge.renames"), "{stderr}");
     assert_eq!(head_commit(p), head_before);
     assert_eq!(
-        loose_object_ids(p),
-        before,
-        "no virtual-ancestor objects were written before the refusal"
+        operation_count(p),
+        operations_before + 1,
+        "the refused mutation is recorded exactly once"
     );
+    assert_eq!(latest_operation_status(p), "failed");
 }
 
 /// Codex R7 P1: the strict rename config must be refused before `--autostash`
@@ -10553,7 +10579,6 @@ fn merge_rejects_rename_config_before_autostash_touches_the_repository() {
     std::fs::write(p.join("f.txt"), "a\nb\nc\nours\ndirty\n").expect("dirty the tree");
 
     let head_before = head_commit(p);
-    let before = loose_object_ids(p);
     let output = run_libra_command(&["merge", "--autostash", "feature"], p);
     assert!(!output.status.success(), "the merge is refused");
     let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
@@ -10564,11 +10589,7 @@ fn merge_rejects_rename_config_before_autostash_touches_the_repository() {
         "no autostash was created: {stdout} / {stderr}"
     );
     assert_eq!(head_commit(p), head_before);
-    assert_eq!(
-        loose_object_ids(p),
-        before,
-        "no autostash objects were written before the refusal"
-    );
+    assert_eq!(latest_operation_status(p), "failed");
     assert!(
         !p.join(".libra/merge-autostash.json").exists(),
         "no held-autostash sidecar was left behind"

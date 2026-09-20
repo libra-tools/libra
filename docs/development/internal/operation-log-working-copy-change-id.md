@@ -451,13 +451,13 @@ graph TB
 | 1. Operation/Snapshot 底座 | 固定 mutation/state census；实现不可变 View、Operation DAG、journal、CAS heads 和 bounded I/O |
 | 2. 完整快照与 Undo | 覆盖 HEAD/refs/index/files/sequencer；接入全部CLI mutation并进行shadow验证；开放crash-safe undo/redo/restore |
 | 3. Change ID 与 Genealogy | 接入amend/rebase/squash/split/duplicate，形成完整revision evolution，并关联Intent/Run/Invocation |
-| 4. 并发、Web 与收口 | 支持多worktree Operation heads/reconcile；提供Operation/Change Web图；移除v1 Operation代码 |
+| 4. 并发与收口 | 支持多worktree Operation heads/reconcile；移除 v1 Operation 代码（原「Web 图」项已随 `web/` 拆除取消；PR #503 由 OL-15A 完成 v1-boundary runtime cutover，OL-15 完成 removal） |
 
 实施遵循三个顺序：
 
 - 先证明快照完整，再开放 Undo；
 - 先证明单 worktree 恢复，再开放自动并发收敛；
-- 先冻结后端事实源，再构建 Web projection。
+- 先冻结后端事实源，再构建投影消费面（Web projection 已取消——`web/` 于 2026-09-20 随 plan-20260920 整体拆除，现行投影消费面为 `libra op log/show`）。
 
 第一版最小闭环是：在固定RequestScope下，完整记录单worktree的CLI修改及其Intent等AI因果链接，安全恢复最近或指定的可恢复Operation，并保证Undo commit不改变已有Commit OID。人工、Agent和automation只要调用Libra CLI，就自然获得相同能力，不需要第二套接入路径。具体结构体、函数设计与实现路径见第 5 节。
 
@@ -467,15 +467,15 @@ graph TB
 
 ### 5.1 模块划分与文件落点
 
-当前 `src/internal/operation_wrapper.rs` 与 v1 `OperationService`、`operation_view*` 三表构成旧 operation 路径。最终方案仍**不维护 v1 长期兼容层或双写 adapter**；但 OL-02～OL-04 的安全基础窗口必须保持 active wrapper 可用。因此 migration 在单事务内以 copy-first 方式将 v1 表迁移到明确的 `legacy_operation*` 命名空间，再创建 v2 canonical schema；现有 v1 DAO/service 仅改为访问 legacy 表，新 `OperationStoreV2` 只访问 v2 表。OL-09/OL-15 完成 runtime cutover、回归和删除验收后，才移除 legacy 表与 v1 代码。
+当前 `src/internal/operation_wrapper.rs` 与 v1 `OperationService`、`operation_view*` 三表构成旧 operation 路径。最终方案仍**不维护 v1 长期兼容层或双写 adapter**；但 OL-02～OL-04 的安全基础窗口必须保持 active wrapper 可用。因此 migration 在单事务内以 copy-first 方式将 v1 表迁移到明确的 `legacy_operation*` 命名空间，再创建 v2 canonical schema；现有 v1 DAO/service 仅改为访问 legacy 表，新 `OperationStoreV2` 只访问 v2 表。v1-boundary runtime cutover（DEP-05）与 OL-15 完成 runtime cutover、回归和删除验收后，才移除 legacy 表与 v1 代码。
 
 #### ADR-OL-01b：OL-02～OL-04 legacy staging
 
 - **Status:** Accepted for the 2026-09-05 execution window
 - **Atomic migration:** migration runner 在同一 SQLite 写事务中 claim version、创建 staging 表、copy v1 行、校验行数和关键字段、删除旧 source 并 rename 为 `legacy_*`，最后创建八张 v2 表；任一步失败都回滚 version claim、staging、rename 与数据。
 - **No false genealogy:** v1 的 view/workspace 快照不能无损重建 `RepoViewV2`/`WorkspaceSnapshotV2`，因此旧行不转换成 v2 view、journal、head、change genealogy 或 AI link。无法无损映射的字段继续保留在 legacy 数据中。
-- **Runtime boundary:** 本窗口 active operation logging 继续只读写 `legacy_operation*`；v2 store/codec 只读写 v2 表；禁止 v1/v2 双写。maintenance/object-root 路径也显式使用 legacy 命名空间，避免迁移后运行时断裂。
-- **Deletion condition:** 只有 OL-09/OL-15 完成所有 CLI/Agent mutation cutover、active logging smoke、legacy 读写零命中守卫、object-root/maintenance 收口、备份与删除演练、兼容矩阵验收后，才允许单独删除 `legacy_*` 表、legacy model/service 和 fixture；在此之前不得删除或清空 legacy 数据。
+- **Runtime boundary:** PR #503 起 active operation logging 只写 v2 表；v2 store/codec 只读写 v2 表；禁止 v1/v2 双写。migration/schema-convergence fixture 仍显式使用 `legacy_operation*`，但 maintenance/object-root 不再从 legacy namespace 读取。
+- **Deletion condition:** v1-boundary runtime cutover（OL-15A）与 OL-15 已完成所有剩余 CLI/Agent mutation cutover、active logging smoke、legacy 读写零命中守卫、object-root/maintenance 收口、备份与删除演练的代码侧验收；历史 migration/schema fixture 保留 legacy namespace，前向迁移不回写旧表。远端兼容矩阵仍由 PR #503 的 `compat-offline-core` 复核。
 
 | 新模块/文件 | 职责 | 借鉴的 jj 实现 |
 |---|---|---|
@@ -897,7 +897,7 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 
 ### 5.4 实现路径与阶段门
 
-实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做 Web projection。OL-02～OL-04 的落地窗口采用 ADR-OL-01b 的 legacy staging；最终仍不维护 v1 长期兼容层，OL-09/OL-15 完成切换后删除 legacy。
+实施顺序与主计划（`/Users/jackie/ospp/libra-operation-log-change-id-plan-20260814.md`）的 Phase 0-8 依赖顺序保持一致：先证明快照完整，再开放 Undo；先单 worktree，再并发收敛；先冻结后端事实源，再做投影消费面（Web projection 已取消）。OL-02～OL-04 的落地窗口采用 ADR-OL-01b 的 legacy staging；PR #503 的 OL-15A 已完成 runtime cutover，OL-15 已完成 v1 retirement，migration/schema fixtures 继续保留 legacy namespace 作为历史升级证据。
 
 每个阶段进入下一阶段的 Gate 必要条件：本阶段验证入口的测试全部通过（含既有 `status`/CLI 回归与 fail-closed 守卫），任一未通过不得推进，不允许把未验证代码带进下一阶段。每阶段对应具体写集与验证入口：
 
@@ -910,7 +910,7 @@ pub fn resolve_change_id_prefix(db: &DatabaseConnection, repo_id: &str,
 | 4 可逆用户工作流 | `operation/{restore,undo,doctor}.rs`、`src/command/op.rs` 新子命令 | `cargo test --test operation_restore_faults`；`--test op_undo_redo`；crash matrix | Gate-4：crash/数据安全 review、秒级 SLO、机器接口冻结 |
 | 5 稳定逻辑身份 | `change/{identity,store,resolve}.rs`、commit serialization adapter | `cargo test internal::change::identity`；`--test change_id_resolution` | Gate-5：Change ID 格式、legacy synthetic、sidecar 投影与既有 header 导入语义 |
 | 6 Rewrite 与 Agent 逻辑链接 | `change/{builder,genealogy}.rs`、commit/rebase/cherry-pick/squash 调用点、`ai_operation_link` | `cargo test --test change_genealogy_rebase`；`--test change_genealogy_squash_split` | Gate-6：relation 语义、hook/Git 兼容、AI FileHistoryStore 读取迁移（非 operation v1） |
-| 7 并发与 Web 展示 | `operation/store.rs` 多 head reconcile、独立 Operation/Change read model | `cargo test --test operation_restore_multi_worktree`；web graph tests | Gate-7：multihead fallback、redaction、bounded graph |
+| 7 并发与收口 | `operation/store.rs` 多 head reconcile | `cargo test --test operation_restore_multi_worktree` | Gate-7：multihead fallback（原 Web 图/redaction/bounded graph 项随 Web 图取消） |
 | 8 移除 v1 与 GA | 删除 v1 代码/表/命令路径（`operation_wrapper.rs`、`operation_view*` 与 v1 model、v1 `op` 分支）、文档与测试收口 | `rg 'operation_wrapper|operation_view|restorable' src` 零命中；签名 release | Gate-8：v1 代码移除完成、默认值、retention 批准 |
 
 依赖链：`worktree_io → store → snapshot → middleware → restore → undo`；`store → change/identity → change/builder → change/genealogy`；Agent gateway 消费 middleware 与 genealogy。每个生产 mutation surface 都由注册表穷举分类，未知/新增 mutation 默认 fail closed；所有跨介质窗口（对象/refs/index/worktree/SQLite/AI link）都有 journal phase 与 doctor 动作。

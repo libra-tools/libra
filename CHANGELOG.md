@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.23.3] — 2026-09-20
+
+### Removed: MCP and the `web/` directory
+
+- Removed every remaining MCP trace: the unused `rmcp` / `rig-core`
+  dependencies, hardening MCP tool classifications, `ControlInfo.mcp_url`,
+  the `e2e_mcp_flow` test and nine unregistered Code-era test files, and all
+  MCP mentions in code, tests, and current-facing docs. `libra` has no MCP
+  server surface and none is planned (DEFER-RC-04 closed by user decision).
+- Deleted the `web/` Next.js tree (39k files) and the release workflow's
+  Node/pnpm steps. Release version surfaces are now three: `Cargo.toml`,
+  `install.sh`, `install.ps1` (`compat_version_surface_sync` updated).
+  The long-orphaned `show_ref_exists` / `show_ref_verify` command tests were
+  removed with the Code-era test files (their assertions predate current
+  `show-ref` behavior).
+
+### Fixed: Windows release build
+
+The v0.23.2 Windows build failed because `tokio::signal` was not enabled on
+Windows (previously inherited through a dependency that was removed). The
+`signal` tokio feature is now declared explicitly, so `libra agent review` /
+`investigate` / `service` compile on `x86_64-pc-windows-msvc`.
+
+## [0.23.2] — 2026-09-20
+
+### Completed: internal Code executor removal and dead-code cleanup
+
+Finalizes the plan-20260920 teardown started in 0.23.0. No public surface
+changed in this release — the breaking surface removal shipped in 0.23.0.
+
+- Removed the Code UI / AgentRuntime executor compile SCC and its leftovers
+  (~223k lines): `web`, `orchestrator`, `runtime`, `mcp`, `codex`, `agent`,
+  `goal*`, `context_budget`, `projection`, `tools`, `usage`, `providers`,
+  `prompt`, `intentspec`, `node_adapter`, `libra_vcs`, `workspace_snapshot`,
+  `generated_artifacts`, and the non-SCC `client` / `commands` / `skills` /
+  `capability_package` / `package` modules. The binary no longer links any
+  Code-era executor.
+- `libra agent doctor` gains a read-only `legacy_code_residue` diagnostic
+  (`.libra/sessions/code`, `.libra/code`, `refs/libra/intent`); frozen
+  `ai_*` / `agent_usage_stats` tables stay untouched (ADR-RC-04).
+- Removed the Code UI test infrastructure: the `test-provider` feature, the
+  `web-check` CI job, the SSE-soak and model-generation nightly workflows,
+  and the `code_ui_*` / harness scenario targets.
+- Swept dead code left by the removal: fault-injection seams, zero-caller
+  legacy config/vault APIs, orphaned test fixtures and stale Code-era docs.
+- Long-lived docs, tracing pages, error-code references, and the plan index
+  now reflect the removal; `tests/INDEX.md` rows restored for kept targets.
+
+## [0.23.1] — 2026-09-19
+
+### Changed: global configuration moved to the XDG config directory
+
+Global config (`config.db`, vault unseal key, global hooks) now lives under
+`<XDG_CONFIG_HOME or ~/.config>/libra` on all platforms (macOS included). An
+existing `~/.libra/config.db` is migrated automatically on first use and kept
+as a backup; `LIBRA_HOME` (`bin/`, `env`, `upgrade/`) is unchanged.
+
 ## [0.23.0] — 2026-09-19
 
 ### Removed: public Code, graph, usage, and Publish surfaces

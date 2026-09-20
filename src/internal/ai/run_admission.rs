@@ -443,7 +443,6 @@ fn process_alive(_pid: i32) -> bool {
 /// across processes. Released on drop (including process death). Mirrors the
 /// run-store `RunLock` flock pattern.
 struct AdmissionLock {
-    #[allow(dead_code)]
     file: std::fs::File,
 }
 

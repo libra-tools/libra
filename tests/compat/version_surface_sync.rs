@@ -1,4 +1,4 @@
-//! plan-20260714 PD-00 follow-up guard: the FOUR release version surfaces
+//! plan-20260714 PD-00 follow-up guard: the THREE release version surfaces
 //! must stay in lockstep.
 //!
 //! PD-00 closed a drift where `Cargo.toml` and `web/package.json` were
@@ -6,10 +6,11 @@
 //! a stale fallback silently installs an OLD binary whenever the release
 //! API is unreachable and `LIBRA_ALLOW_FALLBACK=1` is set. The card's
 //! explicit follow-up condition ("if it drifts again, add a guard that
-//! reads all four files and asserts they agree") is what this target
+//! reads all files and asserts they agree") is what this target
 //! implements. PD-10 later added the Windows installer `$DefaultVersion`.
-//! plan-20260920 RC-36 removed the Publish `worker/` host, so that
-//! `package.json` is no longer a version surface.
+//! plan-20260920 RC-36 removed the Publish `worker/` host, and the
+//! post-plan follow-up removed the whole `web/` tree, so the surfaces are
+//! now: `Cargo.toml`, `install.sh`, `install.ps1`.
 
 use std::{fs, path::Path};
 
@@ -30,19 +31,6 @@ fn cargo_version() -> String {
         }
     }
     panic!("Cargo.toml has no package version line");
-}
-
-fn package_json_version(relative: &str) -> String {
-    let text = read(relative);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("\"version\": \"")
-            && let Some(value) = rest.strip_suffix("\",").or_else(|| rest.strip_suffix('"'))
-        {
-            return value.to_string();
-        }
-    }
-    panic!("{relative} has no version field");
 }
 
 /// The RAW `$DefaultVersion` value from the Windows installer, exactly as
@@ -89,14 +77,9 @@ fn install_default_version_raw() -> String {
 #[test]
 fn all_release_version_surfaces_agree() {
     let cargo = cargo_version();
-    let web = package_json_version("web/package.json");
     let install = install_default_version_raw();
     let install_ps1 = install_ps1_default_version_raw();
 
-    assert_eq!(
-        web, cargo,
-        "web/package.json version must match Cargo.toml ({cargo})"
-    );
     // Exact equality against the ONE canonical spelling, `v<cargo>`. The
     // value is used verbatim by the shell, so anything else — a stale
     // version, a missing prefix, or a doubled one — is a broken download.

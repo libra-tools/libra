@@ -102,7 +102,10 @@ fn add_returns_marker_registration_failure_without_saving_the_index() {
     let (_human, report) = parse_cli_error_stderr(&failed.stderr);
     assert_eq!(report.error_code, "LBR-IO-002");
     assert!(
-        report.message.contains("failed to store object"),
+        report
+            .message
+            .contains("object payloads were stored safely")
+            && report.message.contains("no paths were staged"),
         "unexpected error report: {report:?}"
     );
     let ls = run_libra_command(&["ls-files"], repo.path());

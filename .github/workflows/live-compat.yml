@@ -1,13 +1,17 @@
 name: Live compatibility gates
 
-# L3 gates that require real provider/cloud credentials. These jobs are
+# L3 gates that require real cloud credentials. These jobs are
 # intentionally separate from base.yml so they never become required PR checks.
 # Missing secrets produce an explicit skip instead of a false failure, which
 # keeps forks and local mirrors usable.
+#
+# The former Code-era live AI job (DeepSeek agent loop/chat) was deleted with
+# its targets in plan-20260920; the surviving surface is `libra cloud` D1/R2
+# repository backup, covered by compat-live-cloud.
 
 on:
   schedule:
-    # Daily at 04:30 UTC, staggered after model-generation-nightly.
+    # Daily at 04:30 UTC.
     - cron: "30 4 * * *"
   workflow_dispatch: {}
 
@@ -19,48 +23,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  live-ai:
-    name: compat-live-ai
-    runs-on: [self-hosted]
-    timeout-minutes: 60
-
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - name: Check live AI secrets
-        id: gate
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          if [ -z "${DEEPSEEK_API_KEY}" ]; then
-            echo "::warning::DEEPSEEK_API_KEY secret is not configured; skipping compat-live-ai."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "skip=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Install stable toolchain
-        if: steps.gate.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Run live AI tests
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          cargo test --features test-live-ai \
-            --test ai_agent_test \
-            --test ai_chat_agent_test \
-            -- --test-threads=1 --nocapture
-
   live-cloud:
     name: compat-live-cloud
     runs-on: [self-hosted]
@@ -69,7 +31,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
 
     steps:
       - name: Checkout repository
@@ -118,7 +79,6 @@ jobs:
       - name: Run live cloud tests
         if: steps.gate.outputs.skip != 'true'
         env:
-          LIBRA_ENABLE_TEST_LIVE_CLOUD: "1"
           LIBRA_D1_ACCOUNT_ID: ${{ secrets.LIBRA_D1_ACCOUNT_ID }}
           LIBRA_D1_API_TOKEN: ${{ secrets.LIBRA_D1_API_TOKEN }}
           LIBRA_D1_DATABASE_ID: ${{ secrets.LIBRA_D1_DATABASE_ID }}
@@ -127,7 +87,10 @@ jobs:
           LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
           LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
         run: |
+          # cloud_storage_backup_test: `libra cloud` D1 index + R2 object round trip.
+          # agent_cloud_tombstone_test: D1 agent-capture mirror tombstone propagation.
+          # storage_r2_test is L1 in-memory and already runs in base.yml.
           cargo test --features test-live-cloud \
             --test cloud_storage_backup_test \
-            --test storage_r2_test \
+            --test agent_cloud_tombstone_test \
             -- --test-threads=1 --nocapture

@@ -1,21 +1,9 @@
 //! CEX-10 file-level undo contract tests.
 
-use std::{collections::BTreeSet, fs, sync::Arc};
+use std::{collections::BTreeSet, fs};
 
-use libra::internal::ai::{
-    sandbox::{FileHistoryRuntimeContext, ToolRuntimeContext},
-    session::file_history::{FileHistoryError, FileHistoryStore},
-    tools::{
-        ToolRegistryBuilder,
-        context::{ToolInvocation, ToolPayload},
-        handlers::ApplyPatchHandler,
-    },
-};
+use libra::internal::ai::session::file_history::{FileHistoryError, FileHistoryStore};
 use tempfile::TempDir;
-
-fn wrap_patch(body: &str) -> String {
-    format!("*** Begin Patch\n{body}\n*** End Patch")
-}
 
 #[test]
 fn file_history_undo_restores_multi_file_batch_atomically() {
@@ -109,57 +97,4 @@ fn file_history_keeps_at_most_50_versions_per_file() {
         .undo_latest_batch(workspace.path())
         .expect_err("oldest version should be pruned");
     assert!(matches!(err, FileHistoryError::NoUndoBatch));
-}
-
-#[tokio::test]
-async fn apply_patch_records_preimages_for_undo() {
-    let workspace = TempDir::new().expect("workspace");
-    let session_root = workspace.path().join(".libra").join("sessions").join("s1");
-    fs::write(workspace.path().join("a.txt"), "old\n").expect("write a");
-
-    let registry = ToolRegistryBuilder::with_working_dir(workspace.path().to_path_buf())
-        .register("apply_patch", Arc::new(ApplyPatchHandler))
-        .build();
-    let invocation = ToolInvocation::new(
-        "call-1",
-        "apply_patch",
-        ToolPayload::Function {
-            arguments: serde_json::json!({
-                "input": wrap_patch(
-                    r#"*** Update File: a.txt
-@@
--old
-+new"#
-                )
-            })
-            .to_string(),
-        },
-        workspace.path().to_path_buf(),
-    )
-    .with_runtime_context(ToolRuntimeContext {
-        file_history: Some(FileHistoryRuntimeContext {
-            session_root: session_root.clone(),
-            batch_id: "turn-1".to_string(),
-        }),
-        ..ToolRuntimeContext::default()
-    });
-
-    let output = registry
-        .dispatch(invocation)
-        .await
-        .expect("apply_patch should succeed");
-    assert!(output.is_success());
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("a.txt")).expect("read patched"),
-        "new\n"
-    );
-
-    let store = FileHistoryStore::new(session_root);
-    store
-        .undo_latest_batch(workspace.path())
-        .expect("undo latest batch");
-    assert_eq!(
-        fs::read_to_string(workspace.path().join("a.txt")).expect("read restored"),
-        "old\n"
-    );
 }

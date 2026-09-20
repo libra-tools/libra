@@ -400,7 +400,7 @@ Libra 保留 Git 的 `stash@{N}` 引用语法以保持熟悉度。从 Git 迁移
 | 包含未跟踪 | `-u` / `--include-untracked` | `-u` / `--include-untracked` | N/A |
 | 不包含未跟踪 | `--no-include-untracked`（撤销 `-u`） | `--no-include-untracked` | N/A |
 | 包含全部（也含忽略文件） | `-a` / `--all` | `-a` / `--all` | N/A |
-| Pathspec（部分 stash） | `stash push -- <pathspec>...`（文件/目录路径，`.` 选整树，其余保留；不能与 `-u`/`-a`/`-k` 同用→`LBR-CLI-002`；无匹配→`LBR-CLI-003`） | `stash push [--] <pathspec>...` | N/A |
+| Pathspec（部分 stash） | `stash push -- <pathspec>...`（普通名称、通配符与 `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` 经共享 pathspec 引擎匹配；`.` 选整树，其余保留；不能与 `-u`/`-a`/`-k` 同用→`LBR-CLI-002`；无匹配→`LBR-CLI-003`） | `stash push [--] <pathspec>...` | N/A |
 | Pop | `stash pop [ref]` | `stash pop [--index] [<stash>]` | N/A |
 | Apply | `stash apply [ref]` | `stash apply [--index] [<stash>]` | N/A |
 | Drop | `stash drop [ref]` | `stash drop [<stash>]` | N/A |

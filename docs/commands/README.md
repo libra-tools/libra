@@ -142,7 +142,6 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra code` | | Removed. Capture external agents with `libra agent` | [code.md](code.md) |
 | `libra code-control` | | Removed with `libra code`. Use `libra agent` | [code-control.md](code-control.md) |
-| Codex data storage | | Link `libra code --provider codex` to Codex app-server and persist Codex session data | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | List, run, and inspect AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | Removed. Usage stats only served the deleted developer agent | [usage.md](usage.md) |
 | `libra graph` | | Removed. Use `libra --json agent graph <session>` for the capture graph | [graph.md](graph.md) |
@@ -225,5 +224,5 @@ Libra's command-line interface is designed with these principles:
 4. **Security by default** — Vault-backed signing and secret encryption are enabled by default, not opt-in.
 5. **Explicit over implicit** — Commands like `clean` require `-f` or `-n`; `status --exit-code` is an explicit opt-in rather than Git's ambiguous exit code behavior.
 6. **Actionable errors** — Every error includes a stable code (`LBR-*`), a human-readable message, and a hint for resolution.
-7. **AI-native development** — The `libra code` command integrates AI agents directly into the version control workflow with multi-provider support and MCP protocol.
+7. **AI-native development** — External-agent capture (`libra agent`) observes Claude/Codex/OpenCode sessions into versioned checkpoints; read-only `review` / `investigate` run supervised agents (the `libra code` Web UI was removed in 0.23.0).
 8. **Cloud-native storage** — Built-in tiered storage (S3/R2) and cloud backup (D1/R2) for distributed monorepo workflows.

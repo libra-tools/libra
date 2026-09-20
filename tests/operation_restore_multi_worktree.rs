@@ -655,3 +655,156 @@ async fn reconcile_nothing_to_do_on_single_head() {
     let outcome = engine.reconcile(false).await.expect("reconcile");
     assert_eq!(outcome, ReconcileOutcome::NothingToReconcile);
 }
+
+/// After reconcile converges the head set, the transition commands regain
+/// their single-head precondition: a dry-run `op undo` of the converged head
+/// succeeds where it was rejected while two sibling heads existed.
+#[tokio::test]
+async fn restore_is_available_after_reconcile_converges() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .expect("libra command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database.clone(), storage.clone());
+    let baseline_id = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads")
+        .first()
+        .cloned()
+        .expect("baseline head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("baseline")
+        .expect("baseline operation");
+    let baseline_view = store
+        .load_view(&baseline.post_view_oid)
+        .expect("baseline view");
+    let main_snapshot = baseline_view
+        .workspaces
+        .get("main")
+        .copied()
+        .expect("baseline main workspace snapshot");
+
+    // Two sibling operations sharing a provably identical refs facet.
+    let refs = baseline_view.refs_facet_oid;
+    for op in ["reconcile-a", "reconcile-b"] {
+        let view = RepoViewV2 {
+            schema_version: 2,
+            repo_id: repo_id.clone(),
+            refs_facet_oid: refs,
+            workspaces: [("main".to_string(), main_snapshot)].into_iter().collect(),
+            change_roots: Vec::new(),
+            extension_facets: Default::default(),
+        };
+        let view_oid = store.write_view_manifest(&view).expect("view manifest");
+        store
+            .write_operation(&OperationV2 {
+                op_id: op.to_string(),
+                parent_op_ids: vec![baseline_id.clone()],
+                pre_view_oid: view_oid,
+                post_view_oid: view_oid,
+                kind: OperationKind::Command,
+                status: OperationStatusV2::Success,
+                metadata: OperationMetaV2::default(),
+                restores_op_id: None,
+                reverts_op_id: None,
+                predecessor_map_oid: None,
+            })
+            .await
+            .expect("operation");
+    }
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            pinned.scope.storage_key(),
+            std::slice::from_ref(&baseline_id),
+            &["reconcile-a".to_string()],
+        )
+        .await
+        .expect("publish a");
+    store
+        .merge_op_heads(
+            &repo_id,
+            pinned.scope.storage_key(),
+            std::slice::from_ref(&baseline_id),
+            &["reconcile-b".to_string()],
+        )
+        .await
+        .expect("retain both heads");
+
+    // While the head set is forked, the transition refuses to guess.
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .env("LIBRA_SKIP_WEB_BUILD", "1")
+        .args(["op", "undo", "reconcile-a", "--dry-run", "--force"])
+        .current_dir(repository.path())
+        .output()
+        .expect("undo before reconcile");
+    assert!(
+        !output.status.success(),
+        "a transition must be refused while sibling heads exist"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unique current operation head"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Reconcile converges the head set.
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .env("LIBRA_SKIP_WEB_BUILD", "1")
+        .args(["op", "reconcile", "--json"])
+        .current_dir(repository.path())
+        .output()
+        .expect("reconcile");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let heads = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads");
+    assert_eq!(heads.len(), 1, "reconcile converges to a single head");
+
+    // A dry-run undo of the converged head is available again.
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .env("LIBRA_SKIP_WEB_BUILD", "1")
+        .args(["op", "undo", &heads[0], "--dry-run", "--force"])
+        .current_dir(repository.path())
+        .output()
+        .expect("undo after reconcile");
+    assert!(
+        output.status.success(),
+        "restore/undo must be available after reconcile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

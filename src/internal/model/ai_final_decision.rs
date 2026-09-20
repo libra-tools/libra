@@ -2,7 +2,8 @@
 //!
 //! The terminal artifact in the ValidationReport -> RiskScoreBreakdown ->
 //! DecisionProposal -> Decision chain (Implementation Phase 4). A row records
-//! the resolved [`FinalDecisionVerdict`](crate::internal::ai::runtime::contracts::FinalDecisionVerdict)
+//! the resolved final-decision verdict string (the Code-era
+//! `runtime::contracts::FinalDecisionVerdict` type was deleted with RC-23)
 //! for a thread once a DecisionProposal has been finalised. Shape mirrors
 //! `ai_decision_proposal` so the same latest-pointer persistence pattern
 //! applies.

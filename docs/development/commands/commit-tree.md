@@ -37,12 +37,12 @@ GIT_INDEX_FILE 等价物）合成离线修订组合环路。发布走 `update-re
 
 ## 延后（有因）
 
-MCP-first 有状态 handle（行文的另一形态；MCP 服务器 28 工具全一次性，
-首个跨调用状态需 handle 生命周期/TTL 驱逐/授权设计轮；草图：
-revision_tree_open/update/write/seal 覆于服务器持有的 Index map）；
+有状态 revision-tree handle（行文的另一形态；首个跨调用状态需
+handle 生命周期/TTL 驱逐/授权设计轮；草图：
+revision_tree_open/update/write/seal 覆于服务持有的 Index map）；
 `mktree`（被 --index-file + write-tree 严格支配）；vault 签名 `-S`；
 日期覆盖 env；`LIBRA_INDEX_FILE` 全局 env（爆炸半径过大，逐命令旗标即
-范围化等价物）；`run_libra_vcs` MCP allowlist 扩容（安全面变更，
+范围化等价物）；`run_libra_vcs` allowlist 扩容（安全面变更，
 --index-file 落地后的候选项）。
 
 ## 实现历史

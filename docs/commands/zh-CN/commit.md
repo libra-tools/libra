@@ -448,7 +448,7 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 | 无法读取消息文件 | `LBR-IO-001` | 128 | -- |
 | 空提交消息 | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree 创建失败 | `LBR-INTERNAL-001` | 128 | Issues URL |
-| 对象存储失败 | `LBR-IO-002` | 128 | -- |
+| 对象存储失败 | `LBR-IO-002` | 128 | 若原因为云索引 repair marker 注册失败，采用规范文案：负载已安全写入、未暂存任何路径，直接重试复用负载、无需锁文件清理；锁超时另附持有者说明，锁文件永不删除 |
 | 父提交缺失 | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD 更新失败 | `LBR-IO-002` | 128 | -- |
 | Blocking 仓库 hook 失败 | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |

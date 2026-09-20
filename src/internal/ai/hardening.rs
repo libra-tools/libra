@@ -68,10 +68,11 @@ impl PrincipalContext {
     /// than `PrincipalRole`):
     ///
     /// - `ActorKind::System` → `PrincipalRole::System`
-    /// - `ActorKind::Human` / `ActorKind::Agent` / `ActorKind::McpClient`
+    /// - `ActorKind::Human` / `ActorKind::Agent`
     ///   → `PrincipalRole::Contributor` (all act on behalf of the
     ///   workspace owner, distinct from platform-level System)
-    /// - `ActorKind::Other(_)` → `PrincipalRole::Observer` (fail-closed
+    /// - `ActorKind::Other(_)` (and any actor kind beyond Human/Agent/System)
+    ///   → `PrincipalRole::Observer` (fail-closed
     ///   to least-privilege for unknown actor categories)
     ///
     /// The `principal_id` is the verbatim
@@ -82,10 +83,8 @@ impl PrincipalContext {
         use git_internal::internal::object::types::ActorKind;
         let role = match actor.kind() {
             ActorKind::System => PrincipalRole::System,
-            ActorKind::Human | ActorKind::Agent | ActorKind::McpClient => {
-                PrincipalRole::Contributor
-            }
-            ActorKind::Other(_) => PrincipalRole::Observer,
+            ActorKind::Human | ActorKind::Agent => PrincipalRole::Contributor,
+            ActorKind::Other(_) | ActorKind::McpClient => PrincipalRole::Observer,
         };
         Self {
             principal_id: actor.id().to_string(),
@@ -296,7 +295,6 @@ impl ToolBoundaryPolicy {
                 "search_files",
                 "web_search",
                 "request_user_input",
-                "mcp_read",
                 "run_libra_vcs",
             ]
             .into_iter()
@@ -309,7 +307,6 @@ impl ToolBoundaryPolicy {
                 "submit_intent_draft",
                 "submit_plan_draft",
                 "submit_task_complete",
-                "mcp_write",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1108,7 +1105,7 @@ mod tests {
     }
 
     /// `PrincipalContext::from_actor` must map every `ActorKind` variant
-    /// to the right `PrincipalRole`. Human / Agent / McpClient all
+    /// to the right `PrincipalRole`. Human / Agent
     /// collapse to `Contributor` (they act on behalf of the workspace
     /// owner); System maps to `System`; the open-ended `Other(_)` variant
     /// is fail-closed to `Observer` (least privilege) so a malformed
@@ -1120,7 +1117,6 @@ mod tests {
         let human = ActorRef::new(ActorKind::Human, "user@example").unwrap();
         let agent = ActorRef::new(ActorKind::Agent, "libra-coder").unwrap();
         let system = ActorRef::new(ActorKind::System, "libra-orchestrator").unwrap();
-        let mcp_client = ActorRef::new(ActorKind::McpClient, "mcp-user").unwrap();
         let other = ActorRef::new(ActorKind::Other("custom".to_string()), "unknown").unwrap();
 
         assert_eq!(
@@ -1142,13 +1138,6 @@ mod tests {
             PrincipalContext {
                 principal_id: "libra-orchestrator".to_string(),
                 role: PrincipalRole::System,
-            }
-        );
-        assert_eq!(
-            PrincipalContext::from_actor(&mcp_client),
-            PrincipalContext {
-                principal_id: "mcp-user".to_string(),
-                role: PrincipalRole::Contributor,
             }
         );
         assert_eq!(

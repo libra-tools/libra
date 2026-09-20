@@ -206,6 +206,23 @@ impl PathspecSet {
             .collect()
     }
 
+    /// Return the normalized workdir-relative match path (magic stripped,
+    /// current-dir prefix applied) and its case-fold flag for a raw positive
+    /// spec, or `None` when no positive spec carries that raw spelling. Read-
+    /// only: matching semantics are untouched. Used by `add --dry-run
+    /// --ignore-missing` to classify unmatched pathspecs against ignore rules.
+    ///
+    /// Limitation: the ignore engine matches case-sensitively, so a caller that
+    /// forwards the path to `should_ignore` cannot honor the returned `icase`
+    /// flag (the M-MISS M10 row is therefore only asserted under
+    /// `core.ignorecase`).
+    pub fn positive_spec_match_path(&self, raw: &str) -> Option<(&str, bool)> {
+        self.specs
+            .iter()
+            .find(|spec| !spec.exclude && spec.raw == raw)
+            .map(|spec| (spec.normalized.as_str(), spec.icase))
+    }
+
     /// Return plain positive prefix pathspecs that can be passed to older
     /// command engines as a pre-filter without changing behavior.
     pub fn plain_positive_prefixes(&self) -> Option<Vec<PathBuf>> {
@@ -739,5 +756,56 @@ mod tests {
             let specs = parse_at_root(&["*.txt"]);
             assert!(specs.matches_path("x.txt"));
         });
+    }
+
+    #[test]
+    fn positive_spec_match_path_normalizes_and_preserves_icase() {
+        // Plain spec at the workdir root: no magic, no prefix, case-sensitive.
+        let root = set(&["a.txt"], "");
+        assert_eq!(
+            root.positive_spec_match_path("a.txt"),
+            Some(("a.txt", false))
+        );
+
+        // Relative specs are resolved from the current directory prefix.
+        let sub = set(&["a.txt"], "sub");
+        assert_eq!(
+            sub.positive_spec_match_path("a.txt"),
+            Some(("sub/a.txt", false))
+        );
+
+        // :(top) anchors at the workdir root regardless of cwd.
+        let top = set(&[":(top)README.md"], "src");
+        assert_eq!(
+            top.positive_spec_match_path(":(top)README.md"),
+            Some(("README.md", false))
+        );
+
+        // :(literal) keeps wildcard characters verbatim.
+        let literal = set(&[":(literal)we*ird.txt"], "");
+        assert_eq!(
+            literal.positive_spec_match_path(":(literal)we*ird.txt"),
+            Some(("we*ird.txt", false))
+        );
+
+        // :(icase) surfaces the case-fold flag.
+        let icase = set(&[":(icase)X.log"], "");
+        assert_eq!(
+            icase.positive_spec_match_path(":(icase)X.log"),
+            Some(("X.log", true))
+        );
+
+        // :(glob) keeps the raw match body (wildcard intact), no case-fold.
+        let glob = set(&[":(glob)foo.*"], "");
+        assert_eq!(
+            glob.positive_spec_match_path(":(glob)foo.*"),
+            Some(("foo.*", false))
+        );
+
+        // Unknown raw spelling (or an exclude-only spec) yields None.
+        let missing = set(&["a.txt"], "");
+        assert_eq!(missing.positive_spec_match_path("b.txt"), None);
+        let excluded = set(&[":(exclude)a.txt"], "");
+        assert_eq!(excluded.positive_spec_match_path(":(exclude)a.txt"), None);
     }
 }

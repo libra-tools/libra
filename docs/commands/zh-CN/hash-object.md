@@ -128,5 +128,5 @@ ownership lock，因此迟到的排队
 | 对象类型不在 blob/commit/tree/tag 之内 | `LBR-CLI-002` | 129 | `hash-object supports blob, commit, tree, and tag` |
 | 内容不是 `-t <type>` 的良构对象（且未加 `--literally`） | `LBR-CLI-002` | 129 | `pass --literally to hash malformed content without validation` |
 | 无法读取输入文件 | `LBR-IO-001` | 128 | 确认路径存在且可读 |
-| 无法写入对象 | `LBR-IO-002` | 128 | 检查对象存储权限和磁盘空间 |
+| 无法写入对象 | `LBR-IO-002` | 128 | 检查对象存储权限和磁盘空间；若原因为云索引 repair marker 注册失败，负载已安全写入，直接重试即可复用（hash-object 不暂存任何路径，也无需锁文件清理） |
 | 对象已写入但云索引修复仍待处理，且使用 `--exit-code-on-warning` | `LBR-WARN-001` | 9 | 修复警告中的仓库数据库/marker 问题；下一条仓库命令会自动重试 |

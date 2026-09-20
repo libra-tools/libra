@@ -241,33 +241,6 @@ pub(crate) mod test_hooks {
         POST_MUTATION_FAILURE.get_or_init(|| Mutex::new(None))
     }
 
-    pub(crate) fn fail_next_lease_for_causal_context(causal_context_id: String) {
-        if let Ok(mut slot) = pre_lease_busy().lock() {
-            *slot = Some(causal_context_id);
-        }
-    }
-
-    pub(crate) fn clear_pre_lease_busy() {
-        if let Ok(mut slot) = pre_lease_busy().lock() {
-            *slot = None;
-        }
-    }
-
-    pub(crate) fn fail_after_mutation_for_causal_context(
-        causal_context_id: String,
-        reason: String,
-    ) {
-        if let Ok(mut slot) = post_mutation_failure().lock() {
-            *slot = Some((causal_context_id, reason));
-        }
-    }
-
-    pub(crate) fn clear_post_mutation_failure() {
-        if let Ok(mut slot) = post_mutation_failure().lock() {
-            *slot = None;
-        }
-    }
-
     pub(super) fn take_pre_lease_busy(meta: &OperationMetaV2) -> Option<OperationError> {
         let causal_context_id = meta.causal_context_id.as_deref()?;
         let mut slot = pre_lease_busy().lock().ok()?;
@@ -892,6 +865,20 @@ fn now_millis() -> i64 {
 }
 
 fn snapshot_error_to_operation(error: SnapshotError) -> OperationError {
+    // ADR-OI-05 item 3: marker-registration failures carry the stored-object
+    // count and the unchanged staging state in the error envelope details.
+    if let SnapshotError::MarkerBatchFlush {
+        stored_objects,
+        message,
+    } = error
+    {
+        return OperationError::Cli(
+            CliError::fatal(message)
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+                .with_detail("stored_objects", stored_objects as u64)
+                .with_detail("staged", 0usize),
+        );
+    }
     let detail = error.to_string();
     let lower = detail.to_ascii_lowercase();
     if lower.contains("failed to load tree object") || lower.contains("existing tree object") {
@@ -902,10 +889,12 @@ fn snapshot_error_to_operation(error: SnapshotError) -> OperationError {
     }
     if lower.contains("failed to register its cloud object-index repair marker")
         || lower.contains("failed to store object")
+        || lower.contains("cloud object-index repair markers could not be registered")
     {
+        // ADR-OI-05 item 2/4: the storage layer already carries the single-
+        // prefix canonical message; surface it unchanged with the IO code.
         return OperationError::Cli(
-            CliError::fatal(format!("failed to store object: {detail}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed),
+            CliError::fatal(detail).with_stable_code(StableErrorCode::IoWriteFailed),
         );
     }
     if lower.contains("index") {

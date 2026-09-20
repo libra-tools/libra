@@ -7,7 +7,7 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet, VecDeque},
     io::IsTerminal,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
 };
@@ -40,6 +40,7 @@ use crate::{
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
+        pathspec::PathspecSet,
         util,
     },
 };
@@ -441,6 +442,9 @@ struct CommitFilter {
     since: Option<i64>,
     until: Option<i64>,
     paths: Vec<PathBuf>,
+    /// `FIX-AD-01`: the same path filters as a shared-engine pathspec set
+    /// (wildcards and `:(magic)` supported). `None` keeps prefix matching.
+    path_specs: Option<PathspecSet>,
     grep: Option<String>,
     /// `-i`/`--regexp-ignore-case`: case-insensitive `--grep` message match.
     grep_ignore_case: bool,
@@ -513,6 +517,7 @@ impl CommitFilter {
             since,
             until,
             paths,
+            path_specs: None,
             grep,
             grep_ignore_case: false,
             invert_grep: false,
@@ -527,6 +532,29 @@ impl CommitFilter {
     fn with_trailer_filters(mut self, trailer_filters: Vec<TrailerFilter>) -> Self {
         self.trailer_filters = trailer_filters;
         self
+    }
+
+    /// `FIX-AD-01`: attach the shared-engine pathspec set used for path
+    /// filtering (wildcards and `:(magic)`). `None` keeps prefix matching.
+    fn with_pathspec(mut self, path_specs: Option<PathspecSet>) -> Self {
+        self.path_specs = path_specs;
+        self
+    }
+
+    /// `FIX-AD-01`: the changed files for `commit` under this filter's path
+    /// constraints — the shared pathspec engine when one is attached, the
+    /// legacy prefix matcher otherwise.
+    async fn changed_files_for(
+        &self,
+        commit: &Commit,
+        prefix_filters: &[PathBuf],
+    ) -> Result<Vec<FileChange>, CliError> {
+        match self.path_specs.as_ref() {
+            Some(set) if !set.is_empty() => {
+                get_changed_files_for_commit_matching_pathspec(commit, set).await
+            }
+            _ => get_changed_files_for_commit(commit, prefix_filters).await,
+        }
     }
 
     /// Apply `-i`/`--regexp-ignore-case` and `--invert-grep` to the `--grep`
@@ -645,7 +673,7 @@ impl CommitFilter {
         if let Some(changes) = cached_changes {
             Ok(!changes.is_empty())
         } else {
-            commit_touches_paths(commit, &self.paths).await
+            commit_touches_paths(commit, &self.paths, self.path_specs.as_ref()).await
         }
     }
 
@@ -1006,6 +1034,22 @@ async fn resolve_log_inputs(args: &LogArgs) -> CliResult<(Vec<String>, Vec<Strin
     Ok((ranges, paths))
 }
 
+/// Build the shared-engine pathspec set for `log`'s effective pathspecs
+/// (`FIX-AD-01`). `None` when there are no pathspecs.
+fn log_pathspec_set(raw: &[String]) -> CliResult<Option<PathspecSet>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    PathspecSet::from_workdir(raw, &current_dir, &workdir)
+        .map(Some)
+        .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))
+}
+
 fn configured_follow_path(paths: &[PathBuf], enabled: bool) -> Option<PathBuf> {
     (enabled && paths.len() == 1 && util::workdir_to_absolute(&paths[0]).is_file())
         .then(|| paths[0].clone())
@@ -1160,7 +1204,7 @@ fn sort_commits_newest_first(commits: &mut [Commit], by_author_date: bool) {
 
 /// Parsed line-range specifier for `-L`.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // -L parsing validates the spec; range-aware filtering is a best-effort stub
 struct LineRange {
     start: usize,
     end: usize,
@@ -1376,6 +1420,13 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
     } else {
         path_filters.clone()
     };
+    // `FIX-AD-01`: the shared-engine pathspec set mirrors the effective path
+    // filters (empty while `--follow` does its own path walking).
+    let path_specs = if effective_follow.is_some() {
+        None
+    } else {
+        log_pathspec_set(&paths)?
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1395,7 +1446,8 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep)
-    .with_trailer_filters(parse_trailer_filters(&args.trailers)?);
+    .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
+    .with_pathspec(path_specs);
 
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(&args, &ranges).await?;
@@ -1721,6 +1773,13 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
     } else {
         path_filters.clone()
     };
+    // `FIX-AD-01`: the shared-engine pathspec set mirrors the effective path
+    // filters (empty while `--follow` does its own path walking).
+    let path_specs = if effective_follow.is_some() {
+        None
+    } else {
+        log_pathspec_set(&paths)?
+    };
     let (min_parents, max_parents) = resolve_parent_bounds(
         args.merges,
         args.no_merges,
@@ -1740,7 +1799,8 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep)
-    .with_trailer_filters(parse_trailer_filters(&args.trailers)?);
+    .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
+    .with_pathspec(path_specs);
 
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
@@ -1776,7 +1836,9 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
             continue;
         }
 
-        let files = get_changed_files_for_commit(&commit, effective_path_filters).await?;
+        let files = filter
+            .changed_files_for(&commit, effective_path_filters)
+            .await?;
         if !filter.matches(&commit, Some(&files)).await? {
             continue;
         }
@@ -1874,7 +1936,11 @@ async fn select_log_commits(
         let cached_changes = if filter.paths.is_empty() && !keep_changed_files {
             None
         } else {
-            Some(get_changed_files_for_commit(&commit, &effective_path_filters).await?)
+            Some(
+                filter
+                    .changed_files_for(&commit, &effective_path_filters)
+                    .await?,
+            )
         };
 
         if !filter.matches(&commit, cached_changes.as_deref()).await? {
@@ -1887,10 +1953,19 @@ async fn select_log_commits(
             continue;
         }
 
+        // `FIX-AD-01` (review P1-1): the renderers must see the engine-expanded
+        // concrete paths, not the raw prefixes — otherwise `-p`/`--stat`/
+        // `--shortstat` would still filter the rendered diff literally.
+        let render_paths = match (filter.path_specs.as_ref(), cached_changes.as_ref()) {
+            (Some(set), Some(changes)) if !set.is_empty() => {
+                changes.iter().map(|change| change.path.clone()).collect()
+            }
+            _ => effective_path_filters.clone(),
+        };
         selected.push(SelectedLogCommit {
             commit,
             cached_changes,
-            path_filters: effective_path_filters,
+            path_filters: render_paths,
         });
     }
 
@@ -2164,7 +2239,21 @@ fn build_commit_diff_items(
     Ok(diffs)
 }
 
-async fn commit_touches_paths(commit: &Commit, filters: &[PathBuf]) -> Result<bool, CliError> {
+async fn commit_touches_paths(
+    commit: &Commit,
+    filters: &[PathBuf],
+    pathspecs: Option<&PathspecSet>,
+) -> Result<bool, CliError> {
+    // `FIX-AD-01`: when a shared-engine pathspec set was built, use it so
+    // wildcards and `:(magic)` match like Git. An empty set matches
+    // everything (the caller passed no path filters).
+    if let Some(set) = pathspecs {
+        if set.is_empty() {
+            return Ok(true);
+        }
+        let changes = get_changed_files_for_commit_matching_pathspec(commit, set).await?;
+        return Ok(!changes.is_empty());
+    }
     if filters.is_empty() {
         return Ok(true);
     }
@@ -2176,6 +2265,25 @@ async fn commit_touches_paths(commit: &Commit, filters: &[PathBuf]) -> Result<bo
 pub(crate) async fn get_changed_files_for_commit(
     commit: &Commit,
     paths: &[PathBuf],
+) -> Result<Vec<FileChange>, CliError> {
+    changed_files_for_commit_with(commit, |path| {
+        paths.is_empty() || paths.iter().any(|filter| util::is_sub_path(path, filter))
+    })
+    .await
+}
+
+/// `FIX-AD-01`: like [`get_changed_files_for_commit`], but matches each changed
+/// path against the shared pathspec engine (wildcards and `:(magic)`).
+pub(crate) async fn get_changed_files_for_commit_matching_pathspec(
+    commit: &Commit,
+    pathspecs: &PathspecSet,
+) -> Result<Vec<FileChange>, CliError> {
+    changed_files_for_commit_with(commit, |path| pathspecs.matches_path(path)).await
+}
+
+async fn changed_files_for_commit_with(
+    commit: &Commit,
+    matches: impl Fn(&Path) -> bool,
 ) -> Result<Vec<FileChange>, CliError> {
     let tree = load_object::<Tree>(&commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
@@ -2192,20 +2300,13 @@ pub(crate) async fn get_changed_files_for_commit(
         Vec::new()
     };
 
-    let matches_filter = |path: &PathBuf, filters: &[PathBuf]| -> bool {
-        if filters.is_empty() {
-            return true;
-        }
-        filters.iter().any(|filter| util::is_sub_path(path, filter))
-    };
-
     let old_files: HashSet<PathBuf> = old_blobs.iter().map(|(path, _)| path.clone()).collect();
     let new_files: HashSet<PathBuf> = new_blobs.iter().map(|(path, _)| path.clone()).collect();
 
     let mut changed_files = Vec::new();
 
     for file in &new_files {
-        if !old_files.contains(file) && matches_filter(file, paths) {
+        if !old_files.contains(file) && matches(file.as_path()) {
             changed_files.push(FileChange {
                 path: file.clone(),
                 status: ChangeType::Added,
@@ -2216,7 +2317,7 @@ pub(crate) async fn get_changed_files_for_commit(
     for (file, new_hash) in &new_blobs {
         if let Some((_, old_hash)) = old_blobs.iter().find(|(old_file, _)| old_file == file)
             && new_hash != old_hash
-            && matches_filter(file, paths)
+            && matches(file.as_path())
         {
             changed_files.push(FileChange {
                 path: file.clone(),
@@ -2226,7 +2327,7 @@ pub(crate) async fn get_changed_files_for_commit(
     }
 
     for file in &old_files {
-        if !new_files.contains(file) && matches_filter(file, paths) {
+        if !new_files.contains(file) && matches(file.as_path()) {
             changed_files.push(FileChange {
                 path: file.clone(),
                 status: ChangeType::Deleted,

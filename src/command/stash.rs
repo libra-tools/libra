@@ -48,7 +48,9 @@ use crate::{
         object,
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
-        path, tree, util,
+        path,
+        pathspec::PathspecSet,
+        tree, util,
     },
 };
 
@@ -655,47 +657,37 @@ fn tree_mode_to_unix_perm(mode: TreeItemMode) -> u32 {
     }
 }
 
-/// Resolve user pathspecs to the set of candidate paths they select. A pathspec
-/// matches a path when they are equal or the path lies under the pathspec
-/// directory (`<spec>/...`); separators are normalised to `/`. An empty/`.`
-/// pathspec (the repository root) matches every candidate. Returns a sorted,
-/// de-duplicated list for deterministic processing.
-fn paths_matching_pathspec(pathspec: &[String], candidates: &HashSet<String>) -> Vec<String> {
-    let norm = |s: &str| {
-        s.trim_start_matches("./")
-            .trim_end_matches('/')
-            .replace('\\', "/")
-    };
-    // The root pathspec — `.`, `./`, or the empty string after normalising a
-    // worktree-relative path at the repo root — selects the whole tree.
-    let match_all = pathspec.iter().any(|s| {
-        let n = norm(s);
-        n.is_empty() || n == "."
-    });
-    if match_all {
-        let mut all: Vec<String> = candidates.iter().cloned().collect();
-        all.sort();
-        all.dedup();
-        return all;
-    }
-    let specs: Vec<String> = pathspec
-        .iter()
-        .map(|s| norm(s))
-        .filter(|s| !s.is_empty())
-        .collect();
+/// Resolve user pathspecs to the set of candidate paths they select through the
+/// shared pathspec engine (`FIX-AD-01`): plain prefixes, wildcards, and the
+/// `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic forms all match
+/// like Git (specs resolve against the caller's current directory). An empty
+/// list matches every candidate. Returns a sorted, de-duplicated list for
+/// deterministic processing.
+fn paths_matching_pathspec(
+    pathspec: &[String],
+    candidates: &HashSet<String>,
+) -> Result<Vec<String>, StashError> {
+    let set = stash_pathspec_set(pathspec)?;
     let mut matched: Vec<String> = candidates
         .iter()
-        .filter(|path| {
-            let p = norm(path);
-            specs
-                .iter()
-                .any(|spec| p == *spec || p.starts_with(&format!("{spec}/")))
-        })
+        .filter(|path| set.matches_path(Path::new(path)))
         .cloned()
         .collect();
     matched.sort();
     matched.dedup();
-    matched
+    Ok(matched)
+}
+
+/// `FIX-AD-01`: build the shared-engine pathspec set for `stash push`'s
+/// pathspecs. An empty list builds the empty set, which matches everything; an
+/// invalid spec (bad magic) is a hard error rather than a silent fallback.
+fn stash_pathspec_set(pathspec: &[String]) -> Result<PathspecSet, StashError> {
+    let workdir = util::working_dir();
+    let current_dir = std::env::current_dir().map_err(|error| {
+        StashError::Other(format!("failed to resolve current directory: {error}"))
+    })?;
+    PathspecSet::from_workdir(pathspec, &current_dir, &workdir)
+        .map_err(|error| StashError::Other(error.to_string()))
 }
 
 /// `stash push -- <pathspec>`: stash only the changes to the matched paths.
@@ -749,20 +741,7 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
     for p in index.tracked_files() {
         candidates.insert(p.to_string_lossy().replace('\\', "/"));
     }
-    // Normalise each pathspec to a worktree-relative path so a pathspec given
-    // relative to the caller's current directory (a subdirectory of the repo)
-    // matches the repo-root-relative candidates — like Git's other pathspec
-    // commands. `to_workdir_path` resolves against the repo root.
-    let normalised: Vec<String> = options
-        .pathspec
-        .iter()
-        .map(|spec| {
-            util::to_workdir_path(spec)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    let matched = paths_matching_pathspec(&normalised, &candidates);
+    let matched = paths_matching_pathspec(&options.pathspec, &candidates)?;
     if matched.is_empty() {
         return Err(StashError::PathspecNoMatch(options.pathspec.join(" ")));
     }

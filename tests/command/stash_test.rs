@@ -1463,6 +1463,51 @@ async fn test_stash_push_pathspec_stashes_only_matched() {
     );
 }
 
+/// FIX-AD-01: a wildcard pathspec is expanded through the shared pathspec
+/// engine, so `*.txt` stashes the literal `*.txt` and `a.txt` (Git parity),
+/// while a non-matching path is left untouched.
+#[test]
+fn test_stash_push_pathspec_glob_stashes_all_matches() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+
+    fs::write(p.join("*.txt"), "S0\n").unwrap();
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    fs::write(p.join("notes.md"), "N0\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "*.txt", "a.txt", "notes.md"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+
+    fs::write(p.join("*.txt"), "S1\n").unwrap();
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    fs::write(p.join("notes.md"), "N1\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "*.txt"], p);
+    assert!(
+        out.status.success(),
+        "stash push *.txt: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(p.join("*.txt")).unwrap(), "S0\n");
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A0\n",
+        "the glob must also stash a.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("notes.md")).unwrap(),
+        "N1\n",
+        "a non-matching path keeps its change"
+    );
+}
+
 /// A directory pathspec selects every changed file beneath it; files outside the
 /// directory are left dirty.
 #[tokio::test]

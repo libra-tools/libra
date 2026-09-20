@@ -1,9 +1,10 @@
 //! Guard the optional live compatibility workflow shape.
 //!
-//! Live AI/cloud gates require external secrets, so they must remain outside
-//! the base required-check workflow. This test locks the local contract that
-//! `compat-live-*` jobs are manual/scheduled, secret-gated, and absent from
-//! `base.yml`.
+//! The live-cloud gate requires external cloud secrets, so it must remain
+//! outside the base required-check workflow. This test locks the local
+//! contract that `compat-live-cloud` is manual/scheduled, secret-gated, and
+//! absent from `base.yml`; the former Code-era live AI job and its deleted
+//! targets (plan-20260920) must not silently return.
 
 use std::{fs, path::PathBuf};
 
@@ -18,14 +19,13 @@ fn live_compat_workflow_is_optional_and_secret_gated() {
     for required in [
         "workflow_dispatch: {}",
         "schedule:",
-        "name: compat-live-ai",
         "name: compat-live-cloud",
-        "DEEPSEEK_API_KEY",
         "LIBRA_D1_ACCOUNT_ID",
         "LIBRA_STORAGE_SECRET_KEY",
         "skip=true",
-        "--features test-live-ai",
         "--features test-live-cloud",
+        "--test cloud_storage_backup_test",
+        "--test agent_cloud_tombstone_test",
     ] {
         assert!(
             live.contains(required),
@@ -37,6 +37,22 @@ fn live_compat_workflow_is_optional_and_secret_gated() {
         assert!(
             !live.contains(forbidden),
             "live compatibility workflow must not run as a required PR/push gate: {forbidden}"
+        );
+    }
+
+    // plan-20260920: the Code-era live AI job was removed together with the
+    // `ai_agent_test` / `ai_chat_agent_test` targets and the `test-live-ai`
+    // feature's only consumers.
+    for forbidden in [
+        "compat-live-ai",
+        "DEEPSEEK_API_KEY",
+        "--features test-live-ai",
+        "ai_agent_test",
+        "ai_chat_agent_test",
+    ] {
+        assert!(
+            !live.contains(forbidden),
+            "live compatibility workflow must not keep the removed Code-era live AI surface: {forbidden}"
         );
     }
 

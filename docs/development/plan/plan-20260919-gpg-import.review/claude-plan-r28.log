@@ -1,0 +1,80 @@
+# Plan Review R28 - Final Verification
+
+经过逐项核对，确认 R27 修复与所有历史验证点：
+
+## R27 修复核实（VG-11 三项）
+
+### ✓ G8 已进入 Verification
+- **判据规范** G8：`signing_subkey_selected_by_newest_valid_self_signature`
+- **Verification 列表** 包含该测试名（8 个 vault 测试之一）
+- **对应关系**：G8 AC「属性来源 = newest-effective-self-signature」→ 具名测试
+
+### ✓ G10 名称统一
+- **判据规范** G10：`primary_key_signs_when_no_usable_signing_subkey`（单数形式）
+- **Verification 列表** 与判据规范一致
+- **AC 表述**：「无合格 subkey 时 primary 自身合格可用」与测试名对应
+
+### ✓ 测试矩阵正确
+- **矩阵行**：`vault 8 新（G1–G10 逐门；G1–G3 合 1） | config_test 1（G11 Display-pin）+ 回归`
+- **门计数验证**：G1-G3 合并为 1 个测试 `signing_subkey_requires_sign_flag_and_valid_binding`，加上 G4-G10 独立测试 = 8 个 vault 测试；G11 为 config_test Display-pin 测试
+- **与 Granularity 一致**：`AC=11/8@EX-VG-01; VER=5/8`（11 个门，EX-VG-01 豁免）
+
+---
+
+## 历史验证点保持确认
+
+| 验证点 | 轮次 | 状态 | 证据定位 |
+|---|---|---|---|
+| **Capture/verify manifest** | R16-R20 | ✓ | `MANIFEST` 在 supervisor 目录 `/tmp/issue-vg/guard-manifests/`；`"x"` 独占创建；verify 只读 manifest |
+| **Supervisor permit** | R20 | ✓ | 单次精确 permit（`card\tmanifest_sha256\tpermit_id`）+ `os.replace` 原子消费 + 审计账本追加 |
+| **Per-file jq** | R12-R13 | ✓ | VG-12 sentinel：`for jf in ... do jq -e '...select(.key?=="vault.gpg.seckey_enc")...`（逐档断言） |
+| **Pre-tag push main** | R13 | ✓ | VG-09 发布脚本：`libra push origin main` → `ls-remote` 校验 SHA → `libra tag -a` |
+| **Triple gate** | 全程 | ✓ | 完成判据：`cargo +nightly fmt`/`cargo clippy`/`cargo nextest run --all` 三连 |
+| **REL-VG-01 引用** | R19 | ✓ | 9 张家族子卡 `Release boundary: family child（REL-VG-01）`；VG-09 `family release point（REL-VG-01）` |
+| **ER-06a ACs** | R18+ | ✓ | 全 15 卡覆盖；VG-00/VG-09 标注 `N/A` 并给出理由（spike/release 无新命令面） |
+| **Harness umask/trap** | R23-R25 | ✓ | 三个 sentinel 脚本：`set -eu` → `umask 077` → `DIR=$(mktemp ...)` → `trap 'rm -rf ...' EXIT`（单次 trap） |
+| **VG-14 接线** | R22-R24 | ✓ | deps 含 `DEP-VG-02`；Phase 3 四卡；M3 四个 patch；ER-06a AC + 网站门；独立发布 |
+| **pgp in [dependencies]** | R10 | ✓ | VG-02 写集：`Cargo.toml`（移入）+ `Cargo.lock`；AC：`cargo build` 成功；G1：build 门 |
+| **VCS helper 统一** | R10-R11 | ✓ | DEP-VG-02/guard.sh/网站门三处：`if [ -e .git ] && [ ! -e .libra ]` exactly-one 逻辑一致 |
+| **全量 dirty 快照** | R10-R14 | ✓ | `collect()` 对 `root_paths` 全量计算 `[digest, XY, mode]`；verify 比对 `base["root"].items()` |
+| **show-origin 双分支** | R10-R11 | ✓ | VG-12 G6 + sentinel：`--show-origin` human + `--show-origin --json` 两命令；jq 逐档断言 |
+
+---
+
+## 粒度审计表抽查
+
+| 卡 | exception 列 | 审计表 AC | 卡内 AC | 判据规范门数 | 一致性 |
+|---|---|---|---|---|---|
+| VG-05 | `EX-VG-01` | `15/8@EX-VG-01` | 8 个 AC + 7 个机械门（G9–G15）= 15 | G1–G15 列举 | ✓ |
+| VG-11 | `EX-VG-01` | `11/8@EX-VG-01` | 8 个 AC（资格/选择语义） | G1–G11（G1-G3 合 1） | ✓ |
+| VG-07 | `EX-VG-01` | `11/8@EX-VG-01` | 8 个 AC（flag 组合/真值表） | G1–G11 逐门 | ✓ |
+| VG-08 | `EX-VG-01` | `12/8@EX-VG-01` | 8 个 AC + 4 个故障注入（G9–G12） | G1–G12 列举 | ✓ |
+| VG-14 | `EX-VG-01` | `12/8@EX-VG-01` | 7 个 AC（staged 序列/补偿） | G1–G12 列举 | ✓ |
+| VG-04 | `N/A` | `8/8` | 8 个 AC | 8 个具名测试（无机械门族） | ✓ |
+
+---
+
+## 关键不变量终检
+
+| 不变量 | 守护卡 | 机制 | 证据 |
+|---|---|---|---|
+| **历史公钥只增不减** | VG-13/VG-08 | ADR-VG-04 + GC-VG-07；VG-08 可删键 allowlist 不含 `history.*`/`generated_pubkey` | VG-13 G5 + VG-08 G3 测试 |
+| **redaction predicate-first** | VG-12 | `is_vault_internal_key` 先于 `encrypted` 判定；`--reveal` Display-pin 拒绝 | VG-12 G2/G3/G4 + sentinel |
+| **首度导入签名策略** | VG-03 | `vault.signing` 未设置 → 导入后置 `true`；显式 `false` → 保持并提示 | VG-03 AC4/5 + 两分支测试 |
+| **staged 补偿完整性** | VG-14 | ADR-VG-06 表：(a)–(e) 逐步 before-image + 重跑幂等 | VG-14 G1–G6 故障注入 + AC3 |
+| **家族发布原子性** | VG-09 | REL-VG-01：9 张子卡 → 唯一发布点 VG-09；中间坏状态不可见 | ADR-VG-11 + Phase 2 退出条件 |
+
+---
+
+## 结论
+
+- **P0 项**：0（无执行阻塞、数据破坏、矛盾定义）
+- **P1 项**：0（R27 三项已修复；历史验证点全数保持；无新发现不一致）
+- **P2 项**：0（无非阻塞性措辞/格式问题）
+
+所有关键验证点通过；VG-11 修复完整；计划可执行。
+
+---
+
+**VERDICT: PASS**
+EXIT=0

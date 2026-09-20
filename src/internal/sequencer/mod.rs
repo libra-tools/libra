@@ -1308,11 +1308,10 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
 /// §C.9 asks W1 for exactly this: "`worktree add/move/remove/repair/migrate`
 /// 与 sequencer start/continue/skip/abort 声明 mutation scope，为 LR-02
 /// wrapper coverage guard 提供枚举" — the declaration, so LR-02's coverage
-/// guard has a complete list to check the wrapper against. Entering the
-/// operation wrapper itself is LR-02 work: `with_operation_log` runs its
-/// business closure INSIDE a `DatabaseTransaction`, while these actions
-/// check out files and open their own pooled transactions, which the
-/// `_with_conn` contract in `internal/branch.rs` documents as a deadlock.
+/// middleware coverage guard has a complete list to check the mutation
+/// boundary against. These actions run inside the v2 operation middleware;
+/// their checkout/file work and pooled transactions are kept in the
+/// `_with_conn` contract in `internal/branch.rs` to avoid deadlocks.
 ///
 /// The match in [`SequencerControl::mutation_scope`] is exhaustive with no
 /// wildcard, so a new control action does not compile until it declares.
@@ -1786,7 +1785,7 @@ mod tests {
     }
 
     /// Every control the CLI can DISPATCH must be declared, or
-    /// `begin_control_operation`'s debug assertion aborts the command.
+    /// the v2 control-operation declaration's debug assertion aborts the command.
     ///
     /// This is not hypothetical: `revert --skip` dispatched
     /// `Skip(SequenceKind::Revert)` while `ALL` listed only the cherry-pick and

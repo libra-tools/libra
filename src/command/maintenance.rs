@@ -4894,36 +4894,14 @@ mod tests {
                 "loose-object write STAGING inside the object store: objects are hardlinked out of it on publish, and an orphaned temp file is re-writable content, never the only copy",
             ),
             ("stash-stack.lock", "the shared stash stack's advisory lock"),
-            ("contexts", "agent context files (§C.4.1.1 config surface)"),
-            ("rules", "agent rule files (§C.4.1.1 config surface)"),
-            (
-                "skills",
-                "agent skill definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
-            ),
             ("hooks.json", "hook configuration (§C.4.1.1 config surface)"),
-            (
-                "dagrs-checkpoints",
-                "agent scheduler checkpoints; task graph state, no object ids",
-            ),
             (
                 "tmp/commit-preview",
                 "scratch directory for commit previews",
             ),
             (
-                "commands",
-                "custom command definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
-            ),
-            (
                 "automations.toml",
                 "automation rules (§C.4.1.1 config surface)",
-            ),
-            (
-                "agents.toml",
-                "agent registry file (§C.4.1.1 config surface)",
-            ),
-            (
-                "agents",
-                "agent definition files (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
             ),
             (
                 "objects",
@@ -4933,10 +4911,6 @@ mod tests {
             (
                 "lost-found",
                 "where `fsck` WRITES dangling objects it found; never an input",
-            ),
-            (
-                "libra.db",
-                "the database; its OID columns are the inventory's other half",
             ),
             (
                 "info",

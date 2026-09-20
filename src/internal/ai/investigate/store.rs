@@ -369,7 +369,6 @@ pub struct InvestigateRunPage {
 /// crashed driver never leaves a permanently stuck run.
 #[derive(Debug)]
 pub struct RunLock {
-    #[allow(dead_code)]
     file: File,
     run_id: String,
 }

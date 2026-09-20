@@ -357,7 +357,7 @@ pub enum AgentRunEvent {
     },
 }
 
-impl crate::internal::ai::runtime::Event for AgentRunEvent {
+impl crate::internal::ai::event::Event for AgentRunEvent {
     fn event_kind(&self) -> &'static str {
         match self {
             Self::Spawned { .. } => "spawned",

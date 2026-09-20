@@ -113,12 +113,12 @@ structured report is always present.
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
 | `128` | `LBR-AUTH-002` | `auth` | Credential present but permission denied | forbidden push, insufficient scope |
 | `128` | `LBR-IO-001` | `io` | Read/open/load failure | failed to open pack, failed to read index |
-| `128` | `LBR-IO-002` | `io` | Write/save/update/remove failure | failed to write index, failed to remove file |
+| `128` | `LBR-IO-002` | `io` | Write/save/update/remove failure | failed to write index, failed to remove file, failed to register its cloud object-index repair marker |
 | `128` | `LBR-INTERNAL-001` | `internal` | Unexpected internal invariant failure | invariant break, unclassified internal failure |
 | `128` | `LBR-BISECT-001` | `repo` | `bisect view` / `bisect run` invoked outside an active bisect session | running `bisect view` before `bisect start` |
 | `128` | `LBR-BISECT-002` | `internal` | `bisect run` command exited with code ≥ 128 or was killed by a signal | run script aborted via SIGINT, exit 130 |
 | `128` | `LBR-BISECT-003` | `repo` | `bisect run` cannot advance because no candidate commits remain | bisect already converged when `run` is invoked |
-| `129` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
+| `128` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
 | `128` | `LBR-UNSUPPORTED-001` | `internal` | Operation declined because the requested mode is intentionally unsupported in this batch | requesting a Git feature explicitly declined in `docs/development/commands/_compatibility.md`, such as a `merge`/`rebase`/`cherry-pick` that would have to arbitrate a `160000` gitlink (`D24`) |
 | `128` | `LBR-AGENT-001` | `internal` | AI agent run exceeded a configured budget dimension (tokens, tool calls, wall-clock, source calls, or cost) | a sub-agent ran 500 tool calls when `max_tool_calls = 200` |
 | `128` | `LBR-AGENT-002` | `internal` | External `libra-agent-*` agents are disabled (`agent.external_agents.enabled` defaults to `false`) | `libra agent rpc invoke` before opting in to external discovery |
@@ -336,7 +336,7 @@ failures as `-32000` with `data.status` and `data.code`.
 | `PLAN_EXECUTION_NOT_AVAILABLE` | `409` | Historical Web 409 while confirmed-plan execution was unwired. After W2-04, Network Allow admits execution onto the serialized runtime queue instead of producing this code. Older clients may still decode the catalogued 409. |
 | `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority remains pending and unconsumed; send a non-empty change description or Cancel. |
 | `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
-| `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart `libra code` or fix redactor configuration, then retry. |
+| `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart the agent bridge / capture session or fix redactor configuration, then retry. |
 | `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `2`/`v2` (the only wire; `1`/`v1` was removed in 0.22.0 — the error names `v0.21.29` as the last release serving wire v1). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested but no SessionStore-backed workflow hub is mounted (today: default Web headless persistence; managed Codex Web does not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (reconnecting with an ahead cursor would permanently skip live events). |

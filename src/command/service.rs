@@ -22,7 +22,7 @@
 //! transport (the lore row's OR is satisfied by the loopback branch), a
 //! filesystem watcher feeding marks (accelerator only — needs a new heavy
 //! dependency; marks flow through the token-gated endpoint), repo/status
-//! read passthroughs, MCP (already served by `libra code`), daemonization
+//! read passthroughs, daemonization
 //! (foreground + external supervision), and §7.7 automatic replay.
 
 use std::{
@@ -702,7 +702,6 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         mode: "service".to_string(),
         pid: std::process::id(),
         base_url: base_url.clone(),
-        mcp_url: None,
         working_dir: util::working_dir(),
         thread_id: None,
         started_at: chrono::Utc::now(),

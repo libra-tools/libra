@@ -38,7 +38,7 @@ fn assert_unknown_code(output: &std::process::Output, context: &str) {
 
 #[test]
 fn libra_code_provider_flags_are_unknown() {
-    let output = run(&["code", "--port", "0", "--mcp-port", "0"]);
+    let output = run(&["code", "--port", "0"]);
     assert_unknown_code(&output, "libra code --port");
 }
 

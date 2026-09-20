@@ -1109,6 +1109,36 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<s
     out
 }
 
+/// `FIX-AD-01`: inject the hidden pathspec-separator sentinel for `show` when
+/// the user wrote `--`, so a bare pathspec with no revision means `HEAD`
+/// (Git parity). Arity-free: it only adds a flag right after the subcommand.
+fn rewrite_show_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let Some((show_index, _from_double_dash)) = find_subcommand_index(&args) else {
+        return args;
+    };
+    if !matches!(args.get(show_index), Some(name) if name == "show") {
+        return args;
+    }
+    let has_separator = args.iter().skip(show_index + 1).any(|arg| arg == "--");
+    if !has_separator {
+        return args;
+    }
+    // A trailing `--` carries no pathspec, so the sentinel must not fire —
+    // otherwise `show HEAD --` would shift HEAD into the pathspec list
+    // (`FIX-AD-01` review P1-2).
+    if args.last().is_some_and(|arg| arg == "--") {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.extend(args.iter().take(show_index + 1).cloned());
+    out.push(std::ffi::OsString::from(format!(
+        "--{}",
+        command::show::SHOW_PATHSPEC_SEPARATOR_FLAG
+    )));
+    out.extend(args.iter().skip(show_index + 1).cloned());
+    out
+}
+
 fn reset_has_positional_target_before_separator(
     args: &[std::ffi::OsString],
     start: usize,
@@ -2159,7 +2189,7 @@ fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
     // are already covered by mechanisms that predate this lock:
     //
     // * VCS mutations from an agent go through `run_libra_vcs`, which spawns
-    //   `libra` as a SUBPROCESS (`internal/ai/mcp/resource.rs`) — the child
+    //   `libra` as a SUBPROCESS — the child
     //   takes the shared hold like any other command;
     // * an agent-run directory without a manifest fails the GC root walk
     //   closed at any age, so the objectize → finalize window of a review or
@@ -2195,21 +2225,38 @@ async fn repair_pending_object_index_updates_before_command(
     require_complete: bool,
 ) -> CliResult<()> {
     let db_path = storage.join(utils::util::DATABASE);
-    match utils::client_storage::ClientStorage::repair_pending_object_index_updates(&db_path).await {
-        Ok(outcome) if outcome.remaining && require_complete => Err(CliError::fatal(format!(
+    let result = if require_complete {
+        utils::client_storage::ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .map(Some)
+    } else {
+        utils::client_storage::ClientStorage::repair_pending_object_index_updates_if_uncontended(
+            &db_path,
+        )
+        .await
+    };
+    match result {
+        Ok(None) => {
+            // The generation lock is busy (ADR-OI-03 item 2 / M-WAIT W5): skip
+            // this bounded replay without waiting and without a warning; the
+            // next repository command retries.
+            tracing::debug!("skipped object-index replay preflight: generation lock busy");
+            Ok(())
+        }
+        Ok(Some(outcome)) if outcome.remaining && require_complete => Err(CliError::fatal(format!(
             "cannot run this operation while durable local object-index repair is pending: repaired {} marker(s), but more remain for a later bounded replay",
             outcome.repaired
         ))
         .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
         .with_hint("rerun the command until the bounded repair queue is empty; if it does not shrink, inspect the repository database and repair-marker directory.")),
-        Ok(outcome) if outcome.remaining => {
+        Ok(Some(outcome)) if outcome.remaining => {
             utils::error::emit_warning(format!(
                 "replayed {} durable cloud object-index repair marker(s), but more remain for the next repository command; cloud operations and destructive agent cleanup stay fail-closed until the queue is empty",
                 outcome.repaired
             ));
             Ok(())
         }
-        Ok(_) => Ok(()),
+        Ok(Some(_)) => Ok(()),
         Err(error) if require_complete => Err(CliError::fatal(format!(
             "cannot run this operation while durable local object-index repair is pending: {error}"
         ))
@@ -2977,6 +3024,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
+    let argv = rewrite_show_pathspec_separator_args(argv);
     // §B.4.3 (R0-4): rewrite the status/st argument slice so Git's raw
     // `--find-renames` grammar survives clap and the three rename spellings
     // obey true last-one-wins via the occurrence list.
@@ -3563,6 +3611,13 @@ impl BackgroundIndexDrainGuard {
 
     async fn finish(self) {
         const DRAIN_BUDGET: Duration = Duration::from_secs(60);
+        #[cfg(debug_assertions)]
+        if let Ok(path) = std::env::var("LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH") {
+            // Debug-build test hook for M-BATCH B1: report how many repository-wide
+            // generation lock acquisitions this invocation made.
+            let count = utils::client_storage::generation_lock_acquisition_count();
+            let _ = std::fs::write(path, count.to_string());
+        }
         let drained = utils::client_storage::ClientStorage::wait_for_background_tasks_until(
             Instant::now() + DRAIN_BUDGET,
         )
@@ -3605,6 +3660,63 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// M-WAIT W5: with the generation lock busy, the read-only preflight
+    /// skips the bounded replay silently — no warning, no error.
+    #[tokio::test]
+    #[serial(env)]
+    async fn preflight_replay_skips_busy_generation_lock_without_warning() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let storage = tempfile::tempdir().expect("create storage dir");
+            let db_path = storage.path().join(crate::utils::util::DATABASE);
+            let db_conn = db::create_database(
+                db_path
+                    .to_str()
+                    .expect("temporary database path should be UTF-8"),
+            )
+            .await
+            .expect("create database");
+            ConfigKv::set_with_conn(&db_conn, "libra.repoid", "cli-skip-repo", false)
+                .await
+                .expect("set repo id");
+
+            // Hold the generation lock with a raw flock; the preflight must skip
+            // without waiting and without warning.
+            let lock_dir = storage.path().join("object-index-repair-locks");
+            std::fs::create_dir_all(&lock_dir).expect("create lock dir");
+            let lock_path = lock_dir.join("object-index-repair-generation.lock");
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open generation lock file");
+            // SAFETY: flock on an owned descriptor held until the end of the test.
+            assert_eq!(
+                unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+
+            let warnings_before = crate::utils::output::pending_warning_messages().len();
+            repair_pending_object_index_updates_before_command(storage.path(), false)
+                .await
+                .expect("busy preflight must succeed");
+            assert_eq!(
+                crate::utils::output::pending_warning_messages().len(),
+                warnings_before,
+                "a busy-lock skip must not emit a replay warning"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // The raw-flock reproduction is unix-only; the skip semantics are
+            // covered cross-platform by `client_storage::tests::nonblocking_preflight_skips_busy_generation_lock`.
+        }
+    }
 
     /// §C.9: what the CLI actually maps, asserted by CALLING the mapper.
     ///

@@ -50,8 +50,6 @@
 //! future variants will carry payloads (maps), and `#[serde(other)]` requires
 //! a unit catch-all.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -67,7 +65,6 @@ pub mod patchset;
 pub mod permission;
 pub mod run;
 pub mod task;
-pub mod workspace_sizing;
 pub mod workspace_strategy;
 
 // ----------------------------------------------------------------------------

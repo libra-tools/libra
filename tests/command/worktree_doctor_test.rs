@@ -829,16 +829,12 @@ async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision()
 /// promise recovery as a side effect.
 #[test]
 fn worktree_doctor_hints_are_inspect_only() {
-    const SOURCES: [(&str, &str); 3] = [
+    const SOURCES: [(&str, &str); 2] = [
         (
             "workspace.rs",
             include_str!("../../src/internal/workspace.rs"),
         ),
         ("worktree.rs", include_str!("../../src/command/worktree.rs")),
-        (
-            "environment.rs",
-            include_str!("../../src/internal/ai/runtime/environment.rs"),
-        ),
     ];
     for (name, source) in SOURCES {
         for (index, line) in source.lines().enumerate() {

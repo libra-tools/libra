@@ -218,5 +218,5 @@ Libra 的命令行接口基于以下原则设计：
 4. **默认安全** — 默认启用 vault-backed signing 和 secret encryption，而不是要求用户显式选择。
 5. **显式优先于隐式** — `clean` 等命令要求 `-f` 或 `-n`；`status --exit-code` 是显式 opt-in，而不是 Git 中含糊的退出码行为。
 6. **可操作的错误** — 每个错误都包含稳定代码（`LBR-*`）、人类可读消息和解决提示。
-7. **AI 原生开发** — `libra code` 命令将 AI agents 直接集成到版本控制工作流，并支持多 provider 和 MCP 协议。
+7. **AI 原生开发** — 外部 Agent 捕获（`libra agent`）把 Claude/Codex/OpenCode 会话观测为版本化 checkpoint；只读 `review` / `investigate` 运行受监督的 agent（`libra code` Web UI 已于 0.23.0 移除）。
 8. **云原生存储** — 内置分层存储（S3/R2）和云备份（D1/R2），服务分布式 monorepo 工作流。

@@ -16,12 +16,12 @@
 - 入口与分发：`src/cli.rs::Commands::LsFiles` 公开顶层命令，dispatch 到 `src/command/ls_files.rs::execute_safe`。
 - 源码分层：参数模型为 `LsFilesArgs`；结果条目由 `FileEntry` 表示；输出统一走 `OutputConfig`、human text、`--json` 和 `--machine` 路径。
 - 执行路径：命令只读加载 `.libra/index`，按 state filter 和 pathspec 收集索引/工作树条目。`--modified` 对工作树文件计算 blob hash 并与索引 hash 比较；`--others` 扫描工作树并可通过 `--exclude-standard` 套用 Git/Libra ignore 来源。
-- 副作用边界：该命令不得写入索引、对象库、refs、reflog、SQLite/D1、工作树或远端；AI/MCP `run_libra_vcs ls-files` 也按只读命令分类。
+- 副作用边界：该命令不得写入索引、对象库、refs、reflog、SQLite/D1、工作树或远端；AI `run_libra_vcs ls-files` 也按只读命令分类。
 
 ## 实现历史
 
 - 2026-06-13 `8d4fb969`：引入基础索引列举实现轮廓。
-- 2026-06-20 PR #415：公开 `ls-files` 顶层命令，补齐 pathspec、`--error-unmatch`、`-z`、AI/MCP 只读安全覆盖、用户文档和兼容矩阵。
+- 2026-06-20 PR #415：公开 `ls-files` 顶层命令，补齐 pathspec、`--error-unmatch`、`-z`、AI 只读安全覆盖、用户文档和兼容矩阵。
 - 2026-07-09（plan-20260708 P0-06）：直接 stdout 写入改走全局 `stdout_write_error` 映射，下游提前关闭管道时静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 2026-07-09（plan-20260708 P0-11）：`--deleted` / `--modified` 的工作树存在性判断改用 `symlink_metadata`，dangling tracked symlink 不再被误列为 deleted；symlink target 变化继续按 blob hash 差异列为 modified。回归覆盖：`compat_symlink_basic`。
 - 2026-07-09（plan-20260708 P1-01）：`ls-files` pathspec 过滤切到共享 `src/utils/pathspec/`，新增 `top`/`exclude`/`icase`/`literal`/`glob` magic 与子目录相对语义守卫。回归覆盖：`compat_pathspec_magic`。
@@ -36,7 +36,7 @@
 - P0-11 后，tracked symlink 由 `symlink_metadata` 判定存在，`ls-files --deleted` 不会把 dangling symlink 当作缺失；`--modified` 通过 symlink target bytes 对比 index blob。
 - P1-01 后，普通 pathspec、默认通配符和 `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic 均由共享 matcher 处理；`--error-unmatch` 只检查正向 pathspec，exclude-only pathspec 不触发未匹配错误。
 - P1-03 后，`--error-unmatch <missing>` 对未匹配的正向 pathspec 退出 1；stderr 继续携带 `LBR-CLI-003` 以保持 Libra 稳定错误码契约。
-- 回归测试：`tests/command_test.rs` 的 `command::ls_files_test::` 覆盖 CLI 行为；`tests/ai_libra_vcs_safety_test.rs` 覆盖 AI/MCP 只读安全；compat 文档测试覆盖 help、用户文档和命令索引同步。
+- 回归测试：`tests/command_test.rs` 的 `command::ls_files_test::` 覆盖 CLI 行为；`tests/ai_libra_vcs_safety_test.rs` 覆盖 AI 只读安全；compat 文档测试覆盖 help、用户文档和命令索引同步。
 
 ## 还未实现的功能
 
@@ -55,4 +55,4 @@
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)。
 - 行为变更必须同步 `COMPATIBILITY.md`、`docs/commands/ls-files.md`、`docs/commands/zh-CN/ls-files.md` 和相关测试。
-- 新增 Git 兼容参数时必须明确 tier、错误码、JSON / machine 输出契约、AI/MCP 安全分类和回归测试。
+- 新增 Git 兼容参数时必须明确 tier、错误码、JSON / machine 输出契约、AI 安全分类和回归测试。

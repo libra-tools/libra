@@ -199,7 +199,7 @@ pub enum AgentSubcommand {
     /// Repository-scoped JSON-RPC 2.0 NDJSON ingress for the DeepSeek
     /// Harness plugin (plan-20260818 LB-01). This is the ONLY standard
     /// inbound write transport for Harness; it is not `libra code --control`
-    /// and not an MCP server.
+    /// and is a plain JSON-RPC 2.0 NDJSON transport.
     #[command(about = "Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)")]
     Bridge(bridge::BridgeArgs),
 }
@@ -558,14 +558,6 @@ fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
         out.push(kind);
     }
     Ok(out)
-}
-
-/// Reserved refuse helper for future agent subcommands that need an explicit
-/// non-zero-exit refuse path. Currently unused (all subcommands are
-/// implemented); kept as a small seam rather than re-added ad hoc later.
-#[allow(dead_code)]
-fn refuse(message: &str) -> CliResult<()> {
-    Err(CliError::fatal(message.to_string()))
 }
 
 #[cfg(test)]

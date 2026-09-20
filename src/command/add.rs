@@ -21,7 +21,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -120,7 +120,9 @@ pub struct AddArgs {
     #[clap(long)]
     pub ignore_errors: bool,
 
-    /// Read pathspecs from a file (one per line, or NUL-separated with --pathspec-file-nul).
+    /// Read pathspecs from a file, one per line (or NUL-separated with
+    /// `--pathspec-file-nul`). Use `-` to read the list from stdin. Cannot be
+    /// combined with `-p`/`--patch`, interactive mode, or pathspec arguments.
     #[clap(long = "pathspec-from-file", value_name = "FILE")]
     pub pathspec_from_file: Option<String>,
 
@@ -140,8 +142,10 @@ pub struct AddArgs {
     #[clap(long)]
     pub renormalize: bool,
 
-    /// Under `--dry-run`, silently skip pathspecs that match no file instead of
-    /// failing. Mirrors Git's `add --ignore-missing`, which requires `--dry-run`.
+    /// Under `--dry-run`, classify pathspecs that match no add candidate against
+    /// the configured ignore rules: ignored patterns are reported and make the
+    /// run exit non-zero; others are skipped with a warning. Mirrors Git's
+    /// `add --ignore-missing`, which requires `--dry-run`.
     #[clap(long = "ignore-missing", requires = "dry_run")]
     pub ignore_missing: bool,
 
@@ -220,6 +224,13 @@ pub enum AddError {
     /// cloud object index could not be registered.
     #[error("failed to store object for '{path}': {source}")]
     ObjectSave { path: PathBuf, source: io::Error },
+    /// Batch publication of cloud object-index repair markers failed after
+    /// the payloads were stored (ADR-OI-04 / M-BATCH B2).
+    #[error("failed to store object: {source}")]
+    ObjectIndexBatchFlush {
+        stored_objects: usize,
+        source: io::Error,
+    },
     /// Path bytes are not valid UTF-8 — Libra's index does not yet preserve
     /// non-UTF-8 paths verbatim.
     #[error("path '{path}' is not valid UTF-8")]
@@ -266,8 +277,18 @@ impl From<AddError> for CliError {
             AddError::RefreshFailed { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
-            AddError::CreateIndexEntry { .. } | AddError::ObjectSave { .. } => {
+            AddError::CreateIndexEntry { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+            }
+            AddError::ObjectSave { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+                .with_detail("stored_objects", 1usize)
+                .with_detail("staged", 0usize),
+            AddError::ObjectIndexBatchFlush { stored_objects, .. } => {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                    .with_detail("stored_objects", *stored_objects as u64)
+                    .with_detail("staged", 0usize)
             }
             AddError::InvalidPathEncoding { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -303,6 +324,16 @@ pub struct AddFailure {
     pub message: String,
 }
 
+/// One entry in [`AddOutput::chmod_rejected`]: a path whose index entry is not
+/// a regular file (symlink `120000` / gitlink `160000`), so `--chmod` cannot
+/// set or clear its executable bit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChmodRejection {
+    pub path: String,
+    /// The requested flip — `"+x"` or `"-x"`.
+    pub flip: String,
+}
+
 /// Structured result of a single `libra add` invocation.
 ///
 /// Built by [`run_add`] and consumed by [`render_add_output`] (text mode) or
@@ -327,6 +358,11 @@ pub struct AddOutput {
     /// payload so agent callers can see what was skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
+    /// Paths refused under `--chmod` because their index entry is not a
+    /// regular file (symlink/gitlink). Reported in text mode as
+    /// `error: cannot chmod …` lines and in JSON as `chmod_rejected`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chmod_rejected: Vec<ChmodRejection>,
     /// Whether this was a dry-run (no actual changes made)
     pub dry_run: bool,
 }
@@ -343,6 +379,7 @@ impl AddOutput {
             ignored: Vec::new(),
             failed: Vec::new(),
             missing: Vec::new(),
+            chmod_rejected: Vec::new(),
             dry_run,
         }
     }
@@ -388,6 +425,7 @@ enum StagedAction {
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
 /// ignored entries (reported as warnings).
+#[derive(Debug)]
 struct ValidatedPathspecs {
     pathspecs: PathspecSet,
     ignored: Vec<String>,
@@ -454,25 +492,38 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     let verbose = args.verbose;
     let dry_run = args.dry_run;
 
+    // ADR-PSF-03: `--pathspec-from-file` cannot be combined with an interactive
+    // mode or with command-line pathspec arguments — Git refuses both with
+    // `cannot be used together` before any write. (`--edit`/`--interactive`
+    // keep their own declined-flag refusal, which fires at parse time before
+    // this gate.)
+    if args.pathspec_from_file.is_some() {
+        if args.patch {
+            return Err(CliError::command_usage(
+                "options '--pathspec-from-file' and '-p/--patch' cannot be used together",
+            ));
+        }
+        if !args.pathspec.is_empty() {
+            return Err(CliError::command_usage(
+                "'--pathspec-from-file' and pathspec arguments cannot be used together",
+            ));
+        }
+    }
+
     // If --pathspec-from-file is specified, read and merge pathspecs.
     if let Some(file) = args.pathspec_from_file.take() {
-        let data = std::fs::read(&file).map_err(|e| {
-            CliError::fatal(format!("cannot read pathspec file '{}': {}", file, e))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
-        let separator: u8 = if args.pathspec_file_nul { 0 } else { b'\n' };
-        let from_file: Vec<String> = data
-            .split(|b| *b == separator)
-            .filter_map(|s| {
-                let s = std::str::from_utf8(s).ok()?.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
-            })
-            .collect();
-        args.pathspec.extend(from_file);
+        // ADR-PSF-01: the value `-` reads the list from stdin (never a worktree
+        // file literally named `-`); anything else is a file path.
+        let data = if file == PATHSPEC_FROM_FILE_STDIN {
+            read_pathspec_stdin()?
+        } else {
+            std::fs::read(&file).map_err(|e| {
+                CliError::fatal(format!("cannot read pathspec file '{}': {}", file, e))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+        };
+        args.pathspec
+            .extend(parse_pathspec_file(&data, args.pathspec_file_nul)?);
     }
 
     if (args.no_auto_advance || args.auto_advance) && !args.patch {
@@ -496,7 +547,27 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
         return Err(patch_machine_mode_error(output, args.dry_run));
     }
 
-    let result = run_add(&args).await?;
+    // ADR-OI-04: accumulate marker publication for the whole staging pass.
+    // `run_add` flushes right before each index write so durable markers
+    // never lag behind index content; the end flush publishes any remainder.
+    util::objects_storage().begin_object_index_batch();
+    let result = match run_add(&args).await {
+        Ok(result) => {
+            let batch_storage = util::objects_storage();
+            let stored_objects = batch_storage.pending_object_index_batch_count();
+            batch_storage.end_object_index_batch().map_err(|source| {
+                AddError::ObjectIndexBatchFlush {
+                    stored_objects,
+                    source,
+                }
+            })?;
+            result
+        }
+        Err(error) => {
+            util::objects_storage().abort_object_index_batch();
+            return Err(error);
+        }
+    };
 
     if args.patch {
         if result.wrote_index() {
@@ -516,7 +587,122 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
     }
 
+    // ADR-CH-02: a `--chmod` refusal exits 1 after rendering, warning
+    // tracking, and event dispatch — the same "render then non-zero" model as
+    // the ignored report. Text mode prints one `error: cannot chmod …` line
+    // per refused path; JSON carries `chmod_rejected` on the envelope instead.
+    if !result.chmod_rejected.is_empty() {
+        if !output.is_json() {
+            for rejection in &result.chmod_rejected {
+                eprintln!(
+                    "error: cannot chmod {} '{}'",
+                    rejection.flip, rejection.path
+                );
+            }
+        }
+        return Err(CliError::silent_exit(1));
+    }
+
+    // ADR-IA-02 item 1 / M-EXIT E1-E2: a mixed ignored report exits 1 after
+    // full rendering, warning tracking, and event dispatch (Git parity).
+    // "Only ignored" forms never reach this point: `check_ignored_only_error`
+    // returns `LBR-ADD-001` / 128 from `run_add` instead.
+    if !result.ignored.is_empty() {
+        return Err(CliError::silent_exit(1));
+    }
+
     Ok(())
+}
+
+/// Git's `--pathspec-from-file` stdin sentinel and the bounded-stdin cap
+/// (ADR-PSF-01).
+const PATHSPEC_FROM_FILE_STDIN: &str = "-";
+const PATHSPEC_FROM_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a `--pathspec-from-file=-` list from stdin, bounded. Any failure is a
+/// hard `LBR-IO-001` error with zero writes (ADR-PSF-01 item 4).
+fn read_pathspec_stdin() -> CliResult<Vec<u8>> {
+    let mut data = Vec::new();
+    io::stdin()
+        .lock()
+        .take(PATHSPEC_FROM_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .map_err(|error| {
+            CliError::fatal(format!("cannot read pathspec list from stdin: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    if data.len() as u64 > PATHSPEC_FROM_FILE_MAX_BYTES {
+        return Err(CliError::fatal(format!(
+            "pathspec list from stdin exceeds {PATHSPEC_FROM_FILE_MAX_BYTES} bytes"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed));
+    }
+    Ok(data)
+}
+
+/// Decode a `--pathspec-from-file` payload (ADR-PSF-01/02): NUL mode splits on
+/// `0` and keeps every byte; otherwise lines split on `\n` with one trailing
+/// `\r` stripped and one C-style quoted line decoded (Git's `unquote_c_style`).
+/// Empty entries are dropped; a non-UTF-8 entry or malformed quoting is a hard
+/// `LBR-IO-001` failure rather than a silent skip. The quote decoding is the
+/// shared [`crate::utils::text::decode_c_quoted`] helper — no second state
+/// machine lives here.
+fn parse_pathspec_file(data: &[u8], nul: bool) -> CliResult<Vec<String>> {
+    let mut pathspecs = Vec::new();
+    if nul {
+        // NUL mode: split on `0` and keep every byte (CR included).
+        for entry in data.split(|byte| *byte == 0) {
+            if let Some(text) = parse_pathspec_entry(entry, false)? {
+                pathspecs.push(text);
+            }
+        }
+    } else {
+        // LF mode: one trailing CR is stripped only when it precedes the
+        // terminating LF — an unterminated final segment keeps its bytes
+        // verbatim (Git parity, PSF-01 review P1-1).
+        for raw in data.split_inclusive(|byte| *byte == b'\n') {
+            let entry = match raw.strip_suffix(b"\n") {
+                Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+                None => raw,
+            };
+            if let Some(text) = parse_pathspec_entry(entry, true)? {
+                pathspecs.push(text);
+            }
+        }
+    }
+    Ok(pathspecs)
+}
+
+/// Decode one `--pathspec-from-file` entry: drop empty entries, reject
+/// non-UTF-8, and (newline mode only) decode one C-style quoted line
+/// (ADR-PSF-02). An empty C-quoted string is dropped rather than becoming the
+/// whole-tree pathspec (PSF-02 review P1-1: fail closed, never stage
+/// everything).
+fn parse_pathspec_entry(entry: &[u8], decode_quotes: bool) -> CliResult<Option<String>> {
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(entry).map_err(|_| {
+        CliError::fatal("pathspec list contains a non-UTF-8 entry".to_string())
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    if !decode_quotes {
+        return Ok(Some(text.to_string()));
+    }
+    match crate::utils::text::decode_c_quoted(text) {
+        Ok(Some(decoded)) => {
+            if decoded.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(decoded))
+            }
+        }
+        Ok(None) => Ok(Some(text.to_string())),
+        Err(reason) => Err(CliError::fatal(format!(
+            "line is badly quoted in --pathspec-from-file: {reason}: {text}"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)),
+    }
 }
 
 const CONFLICT_MARKER_SIZE: usize = 7;
@@ -940,6 +1126,7 @@ async fn run_add_patch(
         &Changes::default(),
         &index,
         false,
+        false,
         true,
         false,
     )?;
@@ -1089,6 +1276,14 @@ async fn run_add_patch(
             }
         }
     }
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
     index
         .save(index_path)
         .map_err(|source| AddError::IndexSave {
@@ -1207,6 +1402,14 @@ async fn run_add_resolved(
             }
         }
     }
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
 
     index
         .save(index_path)
@@ -1283,6 +1486,23 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         Some(value) => Some(parse_chmod(value)?),
         None => None,
     };
+
+    // ADR-CH-05: `--chmod` with no pathspec (and no whole-tree selector) is a
+    // successful no-op — there is nothing to apply the mode to, and Git exits 0
+    // without writing. Short-circuit before the empty-pathspec usage gate below,
+    // which exists precisely because an empty spec would otherwise match the
+    // whole tree.
+    if args.pathspec.is_empty()
+        && args.chmod.is_some()
+        && !args.all
+        && !args.update
+        && !args.refresh
+        && !args.renormalize
+        && !args.resolved
+        && !args.patch
+    {
+        return Ok(AddOutput::empty(args.dry_run));
+    }
 
     // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
     // permits an empty pathspec (operate on the whole tracked set). `--resolved`
@@ -1361,6 +1581,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         &ignored_changes,
         &index,
         args.ignore_missing,
+        args.force,
         args.update,
         args.update && args.ignore_errors,
     )?;
@@ -1389,6 +1610,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         } else {
             let refreshed = do_refresh_files(&mut index, &tracked_modified, &workdir)?;
             add_output.refreshed = refreshed.iter().map(|f| f.display().to_string()).collect();
+            let batch_storage = util::objects_storage();
+            let stored_objects = batch_storage.pending_object_index_batch_count();
+            batch_storage.flush_object_index_batch().map_err(|source| {
+                AddError::ObjectIndexBatchFlush {
+                    stored_objects,
+                    source,
+                }
+            })?;
             index
                 .save(&index_path)
                 .map_err(|source| AddError::IndexSave {
@@ -1636,6 +1865,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         )?;
     }
 
+    let batch_storage = util::objects_storage();
+    let stored_objects = batch_storage.pending_object_index_batch_count();
+    batch_storage
+        .flush_object_index_batch()
+        .map_err(|source| AddError::ObjectIndexBatchFlush {
+            stored_objects,
+            source,
+        })?;
     index
         .save(&index_path)
         .map_err(|source| AddError::IndexSave {
@@ -1660,10 +1897,17 @@ fn parse_chmod(value: &str) -> CliResult<u32> {
     }
 }
 
-/// Force the executable bit on every matched, tracked **regular** file. Symlinks
-/// and gitlinks are skipped (they have no executable bit). A path whose mode
-/// already matches is left untouched; a real change is reported as `modified`.
-/// In `dry_run` the index is not mutated, only the report.
+/// The `"(+|-)x"` spelling a `--chmod` target mode requests: `+x` sets the
+/// executable bit (`100755`), `-x` clears it (`100644`).
+fn chmod_flip(target_mode: u32) -> &'static str {
+    if target_mode & 0o111 != 0 { "+x" } else { "-x" }
+}
+
+/// Force the executable bit on every matched, tracked **regular** file.
+/// Symlinks and gitlinks carry no executable bit and are refused (recorded in
+/// [`AddOutput::chmod_rejected`]). A path whose mode already matches is left
+/// untouched; a real change is reported as `modified`. In `dry_run` the index
+/// is not mutated, only the report.
 fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
@@ -1684,9 +1928,18 @@ fn apply_chmod(
         else {
             continue;
         };
-        // Only regular blobs carry an executable bit; a path already at the
-        // target mode needs no change.
-        if current_mode & 0o170000 != 0o100000 || current_mode == target_mode {
+        // Non-regular index entries (symlinks `120000`, gitlinks `160000`)
+        // carry no executable bit: record the refusal, leave the entry
+        // unchanged, and keep processing the remaining paths (ADR-CH-01).
+        if current_mode & 0o170000 != 0o100000 {
+            out.chmod_rejected.push(ChmodRejection {
+                path: file_str.to_string(),
+                flip: chmod_flip(target_mode).to_string(),
+            });
+            continue;
+        }
+        // A regular blob already at the target mode needs no change.
+        if current_mode == target_mode {
             continue;
         }
         let file_abs = workdir.join(file);
@@ -1955,7 +2208,6 @@ fn render_warnings_stderr(result: &AddOutput) {
         }
         eprintln!();
         eprintln!("Hint: use -f if you really want to add them.");
-        eprintln!("Hint: use 'libra restore --staged <file>' to unstage if needed");
     }
     if !result.failed.is_empty() {
         eprintln!(
@@ -1993,6 +2245,9 @@ fn write_err(e: io::Error) -> CliError {
 ///   tracked files in the index, and ignored changes.
 /// - Pathspecs that match only an ignored entry are returned in
 ///   [`ValidatedPathspecs::ignored`] so they can be reported as warnings.
+/// - Under `ignore_missing` (and not `force`), a spec that matches nothing is
+///   classified against the configured ignore rules: ignored → `ignored`
+///   (reported, non-zero via the caller), otherwise → `missing` (skip warning).
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::PathOutsideRepo`] for any pathspec resolving outside
@@ -2008,6 +2263,7 @@ fn validate_pathspecs(
     ignored_changes: &Changes,
     index: &Index,
     ignore_missing: bool,
+    force: bool,
     update_known_only: bool,
     ignore_unknown_pathspecs: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
@@ -2042,6 +2298,25 @@ fn validate_pathspecs(
                 continue;
             }
             if ignore_missing {
+                // ADR-IA-03: a spec that matched nothing is classified against
+                // the configured ignore rules (unless `--force`, which skips the
+                // ignore check, mirroring Git). Ignored → reported and, via the
+                // caller's exit-1 decision, non-zero; otherwise it stays a
+                // skipped-warning `missing` spec.
+                if !force
+                    && pathspecs.positive_spec_match_path(raw).is_some_and(
+                        |(match_path, _icase)| {
+                            crate::utils::ignore::should_ignore(
+                                Path::new(match_path),
+                                crate::utils::ignore::IgnorePolicy::Respect,
+                                index,
+                            )
+                        },
+                    )
+                {
+                    ignored.push(raw.to_string());
+                    continue;
+                }
                 missing.push(raw.to_string());
                 continue;
             }
@@ -2489,5 +2764,191 @@ mod test {
         out.added.push("a.rs".to_string());
         assert_eq!(out.total_staged(), 1);
         assert!(!out.is_empty());
+    }
+
+    /// CH-01 (plan-20260918): `apply_chmod` refuses non-regular index entries
+    /// (symlink `120000`, gitlink `160000`) into `chmod_rejected` with the
+    /// requested flip, while a regular `100644` entry is still updated in the
+    /// report; a dry run leaves the index untouched.
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn apply_chmod_refuses_nonregular_entries() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        std::fs::write(repo.path().join("reg"), "reg\n").unwrap();
+
+        let mut index = Index::new();
+        for (name, mode) in [("link", 0o120000u32), ("gl", 0o160000), ("reg", 0o100644)] {
+            let mut entry = IndexEntry::new_from_blob(name.to_string(), ObjectHash::default(), 0);
+            entry.mode = mode;
+            index.add(entry);
+        }
+        let specs = PathspecSet::from_workdir(
+            &["link".to_string(), "gl".to_string(), "reg".to_string()],
+            repo.path(),
+            repo.path(),
+        )
+        .expect("pathspec compiles");
+        let mut out = AddOutput::empty(false);
+        apply_chmod(&mut index, 0o100755, &specs, true, &mut out).expect("apply_chmod");
+
+        let rejected: Vec<&str> = out.chmod_rejected.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            rejected.contains(&"link"),
+            "symlink must be refused: {rejected:?}"
+        );
+        assert!(
+            rejected.contains(&"gl"),
+            "gitlink must be refused: {rejected:?}"
+        );
+        assert!(
+            !rejected.contains(&"reg"),
+            "regular entry must not be refused: {rejected:?}"
+        );
+        assert!(
+            out.chmod_rejected.iter().all(|r| r.flip == "+x"),
+            "flip must reflect the request: {:?}",
+            out.chmod_rejected
+        );
+        assert!(
+            out.modified.contains(&"reg".to_string()),
+            "regular entry is updated in the report: {:?}",
+            out.modified
+        );
+        // Dry run: the refused entries keep their original modes in the index.
+        assert_eq!(index.get("link", 0).unwrap().mode, 0o120000);
+        assert_eq!(index.get("gl", 0).unwrap().mode, 0o160000);
+        assert_eq!(index.get("reg", 0).unwrap().mode, 0o100644);
+    }
+
+    /// PSF-01 (plan-20260918): `parse_pathspec_file` implements the delimiter
+    /// contract — LF mode strips one trailing CR, NUL mode keeps every byte,
+    /// blanks are dropped, and non-UTF-8 is a hard error.
+    #[test]
+    fn parse_pathspec_file_splits_and_strips_cr() {
+        let lf = parse_pathspec_file(b"a.txt\r\nb.txt\r\n", false).unwrap();
+        assert_eq!(lf, vec!["a.txt".to_string(), "b.txt".to_string()]);
+
+        // A CR that is not a line terminator is kept.
+        let inner_cr = parse_pathspec_file(b"a\rb\n", false).unwrap();
+        assert_eq!(inner_cr, vec!["a\rb".to_string()]);
+
+        // Blank lines are dropped.
+        let blanks = parse_pathspec_file(b"\n\na.txt\n\n", false).unwrap();
+        assert_eq!(blanks, vec!["a.txt".to_string()]);
+
+        // NUL mode splits on 0 and keeps CR bytes verbatim.
+        let nul = parse_pathspec_file(b"a.txt\r\n\0b.txt", true).unwrap();
+        assert_eq!(nul, vec!["a.txt\r\n".to_string(), "b.txt".to_string()]);
+
+        // Non-UTF-8 is a hard failure, never a silent skip.
+        assert!(
+            parse_pathspec_file(b"\xff\xfe", false).is_err(),
+            "non-UTF-8 must fail"
+        );
+
+        // An empty payload yields no pathspecs (falls through to the gate).
+        assert!(parse_pathspec_file(b"", false).unwrap().is_empty());
+
+        // PSF-02: newline mode decodes one C-style quoted line.
+        let quoted = parse_pathspec_file(b"\"qu\\\"ote.txt\"\n", false).unwrap();
+        assert_eq!(quoted, vec!["qu\"ote.txt".to_string()]);
+        let spaced = parse_pathspec_file(b"\"we ird.txt\"\n", false).unwrap();
+        assert_eq!(spaced, vec!["we ird.txt".to_string()]);
+
+        // NUL mode keeps quoting verbatim (no C-quote decoding).
+        let nul_quoted = parse_pathspec_file(b"\"a.txt\"\0", true).unwrap();
+        assert_eq!(nul_quoted, vec!["\"a.txt\"".to_string()]);
+
+        // Unterminated quoting is a hard failure.
+        assert!(parse_pathspec_file(b"\"we ird.txt\n", false).is_err());
+
+        // PSF-01 review P1-1: a CR is stripped only when it precedes the
+        // terminating LF; an unterminated final segment keeps it.
+        assert_eq!(
+            parse_pathspec_file(b"a.txt\r", false).unwrap(),
+            vec!["a.txt\r".to_string()]
+        );
+        assert_eq!(
+            parse_pathspec_file(b"a.txt\n\r", false).unwrap(),
+            vec!["a.txt".to_string(), "\r".to_string()]
+        );
+
+        // PSF-02 review P1-1: an empty C-quoted string is dropped, never the
+        // whole-tree pathspec (fail closed).
+        assert!(parse_pathspec_file(b"\"\"\n", false).unwrap().is_empty());
+    }
+
+    /// IA-02 (ADR-IA-03): `validate_pathspecs` classifies an unmatched spec
+    /// against the ignore rules when `ignore_missing` is set, and `force`
+    /// skips that classification — unit-tested directly over the
+    /// `(ignore_missing, force)` combinations.
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn validate_pathspecs_classifies_ignored_missing() {
+        use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+        let repo = tempfile::tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        std::fs::write(repo.path().join(".libraignore"), "*.log\n").unwrap();
+
+        let index = Index::new();
+        let changes = Changes::default();
+        let ctx = || PathspecMatchContext {
+            workdir: repo.path(),
+            current_dir: repo.path(),
+            ignore_case: false,
+        };
+        let classify = |spec: &str, ignore_missing: bool, force: bool| {
+            validate_pathspecs(
+                &[spec.to_string()],
+                ctx(),
+                &changes,
+                &changes,
+                &index,
+                ignore_missing,
+                force,
+                false,
+                false,
+            )
+            .expect("validate_pathspecs")
+        };
+
+        // An ignored non-existent path lands in `ignored`.
+        let validated = classify("x.log", true, false);
+        assert_eq!(validated.ignored, vec!["x.log".to_string()]);
+        assert!(validated.missing.is_empty());
+
+        // An un-ignored non-existent path stays a `missing` skip.
+        let validated = classify("note.txt", true, false);
+        assert!(validated.ignored.is_empty());
+        assert_eq!(validated.missing, vec!["note.txt".to_string()]);
+
+        // `force` skips the ignore classification (Git parity).
+        let validated = classify("x.log", true, true);
+        assert!(validated.ignored.is_empty());
+        assert_eq!(validated.missing, vec!["x.log".to_string()]);
+
+        // Without `ignore_missing` an unmatched spec is a hard error.
+        let err = validate_pathspecs(
+            &["nope.txt".to_string()],
+            ctx(),
+            &changes,
+            &changes,
+            &index,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("unmatched spec without ignore_missing must fail");
+        assert!(
+            matches!(err, AddError::PathspecNotMatched { .. }),
+            "{err:?}"
+        );
     }
 }

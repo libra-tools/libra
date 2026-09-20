@@ -10,7 +10,7 @@
 //! ## Non-goals (ADR-LB-01 / ADR-LB-02)
 //!
 //! - This is NOT `libra code --control stdio` (a client controlling a live
-//!   Code session) and NOT an MCP server. It is the only standard inbound
+//!   Code session). It is the only standard inbound
 //!   write transport for Harness.
 //! - `deepseek-harness` is NOT added to the `AgentKind` provider roster. The
 //!   bridge uses its own source identity and durable tables (LB-02).

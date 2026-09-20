@@ -3449,6 +3449,60 @@ fn test_log_literal_pathspecs_global() {
     );
 }
 
+/// FIX-AD-01: `log -- <pathspec>` matches through the shared pathspec engine
+/// (wildcards and `:(literal)`), like Git. `--literal-pathspecs` still turns
+/// them literal (see the test above).
+#[test]
+fn test_log_pathspec_globs_match_via_shared_engine() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "x-commit", "--no-verify"], p),
+        "commit x",
+    );
+    std::fs::write(p.join("*.txt"), "star\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "*.txt"], p), "add star");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "star-commit", "--no-verify"], p),
+        "commit star",
+    );
+
+    // `*.txt` matches both the literal `*.txt` and `x.txt` (Git glob parity).
+    let glob = run_libra_command(&["log", "--oneline", "--", "*.txt"], p);
+    assert_cli_success(&glob, "glob pathspec");
+    let text = String::from_utf8_lossy(&glob.stdout);
+    assert!(
+        text.contains("x-commit") && text.contains("star-commit"),
+        "{text}"
+    );
+
+    // A narrower wildcard matches only the one commit.
+    let narrow = run_libra_command(&["log", "--oneline", "--", "x*"], p);
+    assert_cli_success(&narrow, "narrow wildcard");
+    let text = String::from_utf8_lossy(&narrow.stdout);
+    assert!(text.contains("x-commit"), "{text}");
+    assert!(!text.contains("star-commit"), "{text}");
+
+    // `:(literal)` disables the wildcard and matches the literal name.
+    let literal = run_libra_command(&["log", "--oneline", "--", ":(literal)*.txt"], p);
+    assert_cli_success(&literal, "literal magic");
+    let text = String::from_utf8_lossy(&literal.stdout);
+    assert!(text.contains("star-commit"), "{text}");
+    assert!(!text.contains("x-commit"), "{text}");
+
+    // `--stat` must render the engine-expanded paths too, not the raw prefix
+    // (FIX-AD-01 review P1-1).
+    let stat = run_libra_command(&["log", "--oneline", "--stat", "--", "*.txt"], p);
+    assert_cli_success(&stat, "log --stat glob");
+    let text = String::from_utf8_lossy(&stat.stdout);
+    assert!(text.contains("x.txt"), "the glob reaches --stat: {text}");
+    assert!(text.contains("*.txt"), "{text}");
+}
+
 #[test]
 fn log_grep_signed_commit_uses_message_only() {
     let repo = create_committed_repo_via_cli();

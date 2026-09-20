@@ -46,7 +46,7 @@ pub struct AgentPermissionProfile {
     #[serde(default)]
     pub denied_tools: BTreeSet<String>,
 
-    /// MCP / Source Pool slugs the sub-agent may read from. Per CEX-S2-10,
+    /// Source Pool slugs the sub-agent may read from. Per CEX-S2-10,
     /// the slug namespace itself is owned by Step 1.10.
     #[serde(default)]
     pub allowed_source_slugs: BTreeSet<String>,

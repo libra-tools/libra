@@ -28,9 +28,11 @@
 //!   is capped and redacted before it can appear in any error text
 //!   (GC-DR-13). A child that leaves descendants in its process group after
 //!   exit is killed without its output being accepted. On Unix both core
-//!   limits are zero in the child and its descendants; system handlers that
-//!   honor RLIMIT_CORE suppress core files, including unexpected crashes,
-//!   while signal metadata may still be logged.
+//!   limits are zero in the child and its descendants, and `SIGXFSZ` is set
+//!   to `SIG_IGN` so the `RLIMIT_FSIZE` write-time bound fails over-cap
+//!   writes with `EFBIG` instead of terminating the child (no core file, no
+//!   "abnormal termination" journal noise); system handlers that honor
+//!   `RLIMIT_CORE` still suppress core files from other unexpected crashes.
 //!
 //! Sandbox: the Required offline profile lives in
 //! [`run_export_subprocess_sandboxed`] — assembled via
@@ -259,10 +261,24 @@ async fn run_bounded_exporter(
                 if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // `RLIMIT_FSIZE` over-run must not be a fatal signal: with the
+                // default disposition the kernel SIGXFSZ-kills the child, and
+                // system handlers (systemd-coredump) journal it as an
+                // "abnormal termination" crash — with whole core files when the
+                // handler predates RLIMIT_CORE=0. The byte cap is enforced by
+                // the parent's size poll + post-exit recheck, so the child
+                // dying adds nothing but noise. Ignoring SIGXFSZ turns each
+                // over-cap write into `EFBIG` while the file still cannot grow
+                // past `max_bytes + 1`: the cap stays hard, there is just no
+                // crash to report. (Ignored dispositions persist across exec,
+                // so descendants inherit it too.)
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
                 // Suppress exporter core files when the system handler honors
-                // RLIMIT_CORE (including systemd-coredump). This covers both
-                // intentional SIGXFSZ enforcement and unexpected child crashes;
-                // it leaves signal handling and the parent limits unchanged.
+                // RLIMIT_CORE (including systemd-coredump). This covers
+                // unexpected child crashes (SIGSEGV/SIGABRT etc.); SIGXFSZ is
+                // ignored above and can no longer core.
                 let core = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,

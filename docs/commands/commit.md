@@ -727,7 +727,7 @@ candidate OIDs while holding that fence through the prune transaction. With
 | Message file unreadable | `LBR-IO-001` | 128 | -- |
 | Empty commit message | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree creation failed | `LBR-INTERNAL-001` | 128 | Issues URL |
-| Object storage failed | `LBR-IO-002` | 128 | -- |
+| Object storage failed | `LBR-IO-002` | 128 | When the cause is cloud object-index marker registration, the canonical message applies: payloads were stored safely, no paths were staged, and a direct retry reuses them without lock-file cleanup; lock timeouts name the holder and lock files must never be deleted |
 | Parent commit missing | `LBR-REPO-002` | 128 | "the parent commit is missing or corrupted" |
 | HEAD update failed | `LBR-IO-002` | 128 | -- |
 | Blocking repository hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass repository hooks" |

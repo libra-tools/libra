@@ -372,7 +372,7 @@ libra log -L1,10:src/main.rs
 
 ### `[PATHS...]`
 
-将 diff 输出限制到指定路径。与 `-p`、`--name-only`、`--name-status`、`--stat` 或 `--shortstat` 一起使用。
+将 diff 输出限制到指定路径。与 `-p`、`--name-only`、`--name-status`、`--stat` 或 `--shortstat` 一起使用。路径经共享 pathspec 引擎匹配：普通前缀、通配符以及 `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic 均可用；`--literal-pathspecs` / `GIT_LITERAL_PATHSPECS` 会将其转为字面匹配。
 
 ```bash
 libra log -- src/

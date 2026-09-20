@@ -115,7 +115,6 @@ fn normalize_path_for_sqlite(db_path: &str) -> String {
 /// - Returns `IOError(NotFound)` if the database file does not exist on disk.
 /// - A schema *newer* than this binary supports is surfaced as `IOError::other`
 ///   with an "install a newer Libra binary" hint (it cannot be migrated down).
-#[allow(dead_code)]
 pub async fn establish_connection(db_path: &str) -> Result<DatabaseConnection, IOError> {
     establish_connection_with_busy_timeout(db_path, Duration::from_secs(30)).await
 }
@@ -126,7 +125,6 @@ pub async fn establish_connection(db_path: &str) -> Result<DatabaseConnection, I
 /// contention instead of waiting for long periods. Like
 /// [`establish_connection`], it brings the schema up to date by applying any
 /// pending migrations on open.
-#[allow(dead_code)]
 pub async fn establish_connection_with_busy_timeout(
     db_path: &str,
     busy_timeout: Duration,
@@ -763,7 +761,6 @@ async fn apply_database_schema_upgrades(
 /// - `db_path` is the path to the SQLite database file.
 /// - Returns `Ok(())` if the database file was created and the schema was set up successfully.
 /// - Returns an `IOError` if the database file already exists, or if there was an error creating the file or setting up the schema.
-#[allow(dead_code)]
 pub async fn create_database(db_path: &str) -> io::Result<DatabaseConnection> {
     create_database_for_role(db_path, DatabaseRole::Repository).await
 }

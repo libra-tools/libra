@@ -41,8 +41,12 @@ whether it still exists — an existing path is staged, a missing one is dropped
 
 Working-tree staging returns `LBR-IO-002` if the blob or its durable cloud
 index marker cannot be written; it does not panic or save an index entry that
-lacks repair ownership. A normal retry re-registers a payload that the failed
-attempt already persisted.
+lacks repair ownership. The failure message follows the canonical wording:
+the object payloads were stored safely, no paths were staged, and a direct
+retry reuses the already-stored payloads without any lock-file cleanup (lock
+timeouts additionally name the lock holder, and lock files must never be
+deleted). A normal retry re-registers a payload that the failed attempt
+already persisted.
 
 Local index persistence and the later cloud-catalog update have separate
 durability boundaries. If a terminal background `object_index` error happens

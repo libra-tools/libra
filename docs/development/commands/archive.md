@@ -40,7 +40,7 @@ flowchart TD
 ## 当前状态
 
 - 公开状态：已公开；模块状态：`src/command/mod.rs` 导出 `archive`，`src/cli.rs::Commands::Archive` 负责 CLI 接入。
-- 路径匹配审计（AU-05）：`entry_matches_pathspec` 为路径相等或目录前缀，不通配；越界/`..` 校验不因字面模式放宽。全局 `--literal-pathspecs` 下与关闭时相同（天然字面）。
+- 路径匹配（**FIX-AD-01**，取代旧 AU-05 审计行）：`filter_entries_by_pathspecs` 经共享 `PathspecSet::matches_path` 匹配（`archive_pathspec_set` 从 raw specs 构建），支持 plain name、wildcard 与 `:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`；`validate_pathspec` 的绝对/`..` 拒绝在匹配前保留（不因字面模式放宽）；`--literal-pathspecs` 下按字面。回归单测 `filter_entries_by_pathspecs_supports_wildcards_and_magic`。
 - 用户文档：`docs/commands/archive.md`。
 - Synopsis：`libra archive [OPTIONS] [TREEISH] [PATH]...` / `libra archive --list`。
 - 公开参数包括：`[TREEISH]`、`[PATH]...`、`-l, --list`、`-f, --format <FMT>`、`-o, --output <FILE>`、`--prefix <PREFIX>`、`-v, --verbose`、`--add-file=<file>`（可重复）、`--compression-level <0-9>`、`--mtime <time>`（设置所有条目修改时间；缺省=归档 commit 的 committer 时间，不再是 epoch 0；tar `set_mtime` + zip `last_modified_time` 含 symlink 条目）。`--compression-level` 经 `create_archive` 线程到三种压缩写入器：tar.gz→`flate2::Compression::new(l)`（0=不压缩），tar.bz2→`bzip2::Compression::new(l.clamp(1,9))`（bzip2 无 0 级，0 视为 1），zip→`FileOptions::compression_level(Some(l as i32))`；plain tar 不压缩故忽略。`ArchiveEntry` 的内容来源抽象为 `ArchiveSource`（`Blob(hash)` 走对象库 / `Inline(Vec<u8>)` 走未跟踪文件），三种写入器统一经 `load_entry_content` 读取，因此 `--add-file` 不向对象库写入任何 blob。

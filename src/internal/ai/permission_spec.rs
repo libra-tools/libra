@@ -44,7 +44,7 @@ pub struct AgentPermissionSpec {
     #[serde(default)]
     pub denied_tools: BTreeSet<String>,
 
-    /// MCP / Source Pool slugs the agent may read from.
+    /// Source Pool slugs the agent may read from.
     #[serde(default)]
     pub allowed_source_slugs: BTreeSet<String>,
 

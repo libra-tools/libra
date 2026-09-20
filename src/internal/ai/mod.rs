@@ -1,107 +1,30 @@
-//! AI Agent Infrastructure for Libra.
+//! AI capture, review, investigate, sandbox, and session infrastructure.
 //!
-//! This module is the root of every AI-related capability used by `libra code`,
-//! the MCP server, and the workflow orchestrator. It is organised as a small set
-//! of focused submodules that snap together at runtime:
-//!
-//! - **Agent framework** ([`agent`]): the [`Agent`] / [`AgentBuilder`] /
-//!   [`ChatAgent`] types that wrap a provider's completion model with tools,
-//!   preamble injection, and message history.
-//! - **Providers** ([`providers`]): one submodule per LLM backend (`gemini`,
-//!   `openai`, `anthropic`, `deepseek`, `kimi`, `zhipu`, `ollama`, ...) — each
-//!   implements [`CompletionModel`] so the rest of the stack stays
-//!   provider-agnostic.
-//! - **Completion contracts** ([`completion`]): the [`CompletionModel`], [`Chat`],
-//!   [`Prompt`], and [`Message`] traits/types that providers must satisfy.
-//! - **Tools** ([`tools`]): the registry and handlers (apply patch, shell, read
-//!   file, grep, ...) plus the [`tools::ToolOutput`] type returned to callers.
-//! - **Orchestrator** ([`orchestrator`]): the multi-phase IntentSpec / plan /
-//!   execute pipeline with DAG-aware task scheduling.
-//! - **Codex** ([`codex`]) and **MCP** ([`mcp`]): managed-runtime adapter and
-//!   Model Context Protocol server, respectively, both built on top of the
-//!   common [`Agent`] abstraction.
-//! - **Prompt engineering** ([`prompt`]) and **commands** ([`commands`]): YAML
-//!   slash-command parsing, prompt template rendering, and built-in agent
-//!   commands.
-//! - **Hooks** ([`hooks`]) and **sandbox** ([`sandbox`]): git-hook integration
-//!   plus filesystem/network sandboxing primitives shared by tool handlers.
-//! - **Session / history / projections** ([`session`], [`history`],
-//!   [`projection`]): durable state on disk, message history compaction, and
-//!   read-side projections for the Web Code UI.
-//! - **Runtime / web / VCS adapters** ([`runtime`], [`web`], [`libra_vcs`],
-//!   [`node_adapter`]): glue that connects the agent to the surrounding
-//!   environment (process supervisor, web UI, Libra repo, workflow DAG nodes).
-//! - **IntentSpec types** ([`intent`], [`intentspec`], [`workflow_objects`],
-//!   [`workspace_snapshot`], [`generated_artifacts`]): structured plan/intent
-//!   specifications and their persisted representations.
-//!
-//! # Example
-//! ```no_run
-//! use libra::internal::ai::{AgentBuilder, providers::gemini::Client};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = Client::from_env()?;
-//! let model = client.completion_model("gemini-2.5-flash");
-//! let agent = AgentBuilder::new(model)
-//!     .preamble("You are a helpful assistant")
-//!     .temperature(0.7)?
-//!     .build();
-//! # Ok(())
-//! # }
-//! ```
+//! The Code UI / AgentRuntime executor SCC was deleted in plan-20260920
+//! RC-23. This module now exports KEEP surfaces: hooks, observed agents,
+//! review, investigate, sandbox, automation, session, completion types,
+//! and source security/resolver helpers.
 
-// Agent framework: Agent, AgentBuilder, ChatAgent and their builders.
-pub mod agent;
 /// DeepSeek Harness bridge protocol/transport authority (plan-20260818 LB-01).
 pub mod agent_bridge;
 // Rule-driven automation MVP for hooks, cron, and source-triggered workflows.
 pub mod automation;
-// Step 2 sub-agent contracts (CEX-S2-10 schema-only scaffold) plus the
-// runtime extensions that landed with the OC orchestration runtime
-// (`feat(code): land opencode orchestration runtime`). Originally
-// gated behind the `subagent-scaffold` Cargo feature, but the
-// runtime entrypoints (`agent_run::AgentRunId`, `AgentRunEvent`,
-// `AgentRunEventEnvelope`) are now referenced ungated by
-// `agent/runtime/sub_agent.rs` and `session/jsonl.rs`, so the module
-// is unconditionally available.
+// Step 2 sub-agent contracts. Runtime wiring lived in `agent/runtime` (RC-23).
 pub mod agent_run;
 // Historical external-agent transcript import orchestration (M4 / DR-05).
-// Kept outside `observed_agents` so the capture adapters remain independent
-// from checkpoint/runtime persistence layers.
 pub mod agent_import;
 // Provider-root subagent transcript discovery and source-scoped content
 // revisions (plan-20260713 M5 / DR-06).
 pub mod subagent_content;
-// Capability packages (CEX-S2-17): auditable, checksum-verified bundles of
-// skills / commands / sources / sub-agent definitions plus the per-repo
-// installed-package store the session bootstrap reads.
-pub mod capability_package;
 // Canonical repo/worktree/workspace ownership for capture/import/export rows.
 pub mod capture_scope;
 // PD-02 checkpoint-scoped review/investigate input materialization.
 pub mod checkpoint_input;
-// Generic LLM client helpers shared across providers.
-pub mod client;
-// Adapter for the managed Codex provider runtime.
-pub mod codex;
-// YAML-defined slash commands and dispatcher.
-pub mod commands;
-// Completion-model trait and request/response types every provider implements.
+// Completion-model trait and request/response types.
 pub mod completion;
-// Provider-aware prompt context budget planning and allocation.
-pub mod context_budget;
-// OC-Phase 6 Goal mode runtime contract (P6.1 schema only).
-// Schema lives here; supervisor / verifier / tools / CLI land in P6.2-P6.7.
-pub mod goal;
-pub mod goal_command;
-pub mod goal_session;
-// Crate-private helpers for capturing artifacts produced by tool calls.
-pub(crate) mod generated_artifacts;
-// Per-turn coverage claim gate for external-agent checkpoint writers
-// (plan-20260713 DR-05c-0).
+// Per-turn coverage claim gate for external-agent checkpoint writers.
 pub mod coverage_gate;
-// Append-only event trait (plan-20260920 RC-01). `runtime::event` re-exports
-// this module until the executor SCC is deleted.
+// Append-only event trait (plan-20260920 RC-01).
 pub mod event;
 // OpenCode export-bridge job coordination (plan-20260713 DR-04b, ADR-DR-11).
 pub mod export_job;
@@ -109,7 +32,7 @@ pub mod export_job;
 pub mod history;
 // `refs/libra/traces` persistence API (plan-20260920 RC-02).
 pub mod traces;
-// Isolated workspace helper (plan-20260920 RC-03).
+// Isolated workspace helper (plan-20260920 RC-03 / RC-23).
 pub mod workspace_isolation;
 // Capture-side tool-call projection (plan-20260920 RC-04).
 pub mod tool_call_record;
@@ -124,64 +47,22 @@ pub mod permission_spec;
 pub mod tool_definition;
 // Git hooks integration that lets the agent observe commit events.
 pub mod hooks;
-// IntentSpec primitive types (Phase 0 / "what does the user want?").
-pub mod intent;
-// Structured IntentSpec schema, parsing, and review flow.
-pub mod intentspec;
-// VCS-side helpers used by tools that touch the repository.
-pub mod libra_vcs;
-// Model Context Protocol server exposing Libra to MCP-aware clients.
-pub mod mcp;
-// Adapter that lets agents participate as nodes in the workflow DAG.
-pub mod node_adapter;
-// Phase 0/1/2 orchestrator: intent -> plan -> execute pipeline.
-pub mod orchestrator;
-// External-Agent capture (CEX-EntireIO): contracts and redaction engine for
-// observing externally-hosted agents (Claude Code, Gemini CLI, …).
+// External-Agent capture (CEX-EntireIO): contracts and redaction engine.
 pub mod observed_agents;
-// Read-only projections of session state for UI consumers.
-pub mod projection;
-// Permission ruleset machinery (OC-Phase 2 P2.3): types + evaluate / disabled algorithms.
+// Permission ruleset machinery (OC-Phase 2 P2.3).
 pub mod permission;
-// Prompt templates and rendering helpers.
-pub mod prompt;
-// One submodule per LLM backend; each implements CompletionModel.
-pub mod providers;
-// AG-22 read-only agent review workflow engine (run store, reviewer
-// launcher, fan-in sink, terminal states).
+// AG-22 read-only agent review workflow engine.
 pub mod review;
-
 pub mod run_admission;
-// AG-23 read-only agent investigate workflow engine (strict round-robin
-// run store, turn loop, quorum/max-turns/pause states) — reuses review's
-// launcher/sink/isolation machinery.
+// AG-23 read-only agent investigate workflow engine.
 pub mod investigate;
-// Process-level runtime for long-running agents.
-pub mod runtime;
-// Filesystem/network sandbox shared by every tool handler.
+// Filesystem/network sandbox shared by capture and review.
 pub mod sandbox;
-// Markdown skills with tool-policy metadata and scanner warnings.
-pub mod skills;
-// Source Pool for MCP / REST / local-doc capability providers.
+// Source security + config resolver (SourcePool deleted in RC-23).
 pub mod sources;
 // Per-session persistent state.
 pub mod session;
-// Tool registry + handlers (ApplyPatch, Shell, ReadFile, ...).
-pub mod tools;
-// Provider-neutral usage persistence, aggregation, and display helpers.
-pub mod usage;
 // Misc utilities used across the AI module.
 pub mod util;
-// Optional embedded web UI for collaboration.
-pub mod web;
-// Persisted workflow object types (plans, executions, results).
-pub mod workflow_objects;
-// W0-02 frozen IntentSpec / Plan / network / repair baseline contracts.
-pub mod workflow_baseline;
-// Snapshot of the workspace consumed by tool calls and validators.
-pub mod workspace_snapshot;
 
-// Curated public surface: re-exports kept stable across patch releases.
-pub use agent::{Agent, AgentBuilder, ChatAgent};
 pub use completion::{Chat, CompletionModel, Message, Prompt};
-pub use node_adapter::{AgentAction, ToolLoopAction};

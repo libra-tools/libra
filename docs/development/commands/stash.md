@@ -54,7 +54,7 @@ flowchart TD
 ## 当前状态
 
 - 公开状态：已公开；模块状态：已导出。
-- 路径匹配审计（AU-05）：`stash push -- <pathspec>` 经 `paths_matching_pathspec` 做相等或目录前缀匹配，不通配。全局 `--literal-pathspecs` 下与关闭时相同（天然字面）。
+- 路径匹配（**FIX-AD-01**，取代旧 AU-05 审计行）：`paths_matching_pathspec` 经共享 `PathspecSet` 匹配（`stash_pathspec_set` 从 raw specs 构建，spec 相对调用者当前目录解析），支持 plain name、wildcard 与 `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`；空列表匹配全部（`.` 同理）；非法 magic 为硬错误（不静默回退）；`--literal-pathspecs` 下按字面。回归 `test_stash_push_pathspec_glob_stashes_all_matches`。
 - 用户文档：`docs/commands/stash.md`。
 - Synopsis：`libra stash (push [-m <message>] [-- <pathspec>...] | pop [<stash>] | list | apply [<stash>] | drop [<stash>] | show [<stash>] [-p | --patch] [--name-only | --name-status] | branch <branch> [<stash>] | clear [--force])`。
 - 公开参数/子命令包括：`push [-m, --message <MESSAGE>] [-u, --include-untracked] [--no-include-untracked] [-a, --all] [-k, --keep-index] [-- <pathspec>...]`、`pop [<stash>]`、`list`、`apply [<stash>]`、`drop [<stash>]`、`show [<stash>] [-p, --patch] [--name-only] [--name-status]`、`branch <branch> [<stash>]`、`clear [--force]`。

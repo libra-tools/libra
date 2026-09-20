@@ -42,19 +42,6 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target.rust }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
-
-      - name: Install web dependencies
-        run: pnpm --dir web install --frozen-lockfile
-
       - name: Install Linux dependencies
         if: matrix.target.os == 'linux'
         run: |

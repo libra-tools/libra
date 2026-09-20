@@ -10,10 +10,10 @@
 //! - `git_internal::internal::object::evidence::EvidenceKind` — the
 //!   persistent classification stored on the `Evidence` snapshot
 //!   (`Test` / `Lint` / `Build` / `Other(String)`). This is what we wrap.
-//! - `crate::internal::ai::runtime::contracts::EvidenceKind` — a runtime-side
-//!   classification used by Phase 3/4 dispatch
-//!   (`Test` / `Lint` / `Build` / `Security` / `Performance` / various
-//!   internal failure variants). Used only as a tag; not the schema source.
+//! - A Code-era runtime-side `EvidenceKind` (deleted with RC-23) used to tag
+//!   Phase 3/4 dispatch (`Test` / `Lint` / `Build` / `Security` /
+//!   `Performance` / various internal failure variants). It was never the
+//!   schema source.
 //!
 //! Per the audit closure, callers that need both types in the same file
 //! MUST `use ... as ...` to avoid name collisions. We follow that pattern

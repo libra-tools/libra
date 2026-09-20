@@ -1367,11 +1367,11 @@ pub fn emit_advisory_warning(message: impl std::fmt::Display) {
     eprintln!("warning: {message}");
 }
 
-/// W5-07 migration hint for the removed `libra code` Web aliases.
+/// W5-07 migration hint for the removed `libra code` aliases.
 ///
 /// When a clap parse failure came from the `code` subcommand and argv still
 /// carries the removed `--web` / `--web-only` flags (exact or `=value`
-/// forms), return one hint pointing at the default Web Code UI launch. The
+/// forms), return one hint pointing at the external-agent capture command. The
 /// matcher lives here — outside `src/command/` and `src/cli.rs` — so the
 /// removed-flag literals never reappear on the guarded CLI surface.
 pub(crate) fn removed_code_web_alias_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
@@ -1411,7 +1411,7 @@ pub(crate) fn removed_code_web_alias_hints(argv: &[std::ffi::OsString]) -> Vec<S
     });
     if has_removed_alias {
         vec![
-            "`--web` / `--web-only` were removed in the W5 breaking release; `libra code` already defaults to the Web Code UI — remove the flag"
+            "`--web` / `--web-only` were removed with `libra code`; use `libra agent` for external-agent capture"
                 .to_string(),
         ]
     } else {
@@ -1653,8 +1653,6 @@ fn is_network_unavailable_error(lower: &str) -> bool {
             "connection closed unexpectedly",
             "connection reset by peer",
             "remote end hung up unexpectedly",
-            "failed to start mcp server",
-            "failed to start web server",
         ],
     )
 }
@@ -1826,8 +1824,8 @@ mod tests {
             let hints = removed_code_web_alias_hints(&argv(args));
             assert_eq!(hints.len(), 1, "expected one hint for {args:?}");
             assert!(
-                hints[0].contains("already defaults to the Web Code UI"),
-                "hint must point at the default Web Code UI; got: {}",
+                hints[0].contains("use `libra agent`"),
+                "hint must point at external-agent capture; got: {}",
                 hints[0]
             );
         }

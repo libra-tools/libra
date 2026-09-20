@@ -131,14 +131,36 @@ libra add --ignore-errors src/
 
 ### `--pathspec-from-file <file>`
 
-Read pathspecs from `<file>` (one per line) and merge them with any pathspecs given on
-the command line. Entries use the same shared pathspec matcher and magic forms as
-positional pathspecs. Use `-` is not supported; pass a real path. Pair with
-`--pathspec-file-nul` when the list is NUL-separated (e.g. produced by another tool's
-`-z` output). Empty lines are ignored.
+Read pathspecs from `<file>` (one per line); the command line must then carry no
+pathspec arguments. Entries use the same shared pathspec matcher and magic forms as
+positional pathspecs. A value of `-` reads the list from stdin instead of opening a
+file (a worktree file literally named `-` is never read). Newline mode splits on `\n`
+and strips one trailing `\r` per line, so CRLF lists work; empty lines are ignored.
+Pair with `--pathspec-file-nul` when the list is NUL-separated (e.g. produced by
+another tool's `-z` output) — NUL mode keeps every byte, including a CR.
+
+A payload that is not valid UTF-8, or a file that cannot be read, is a fatal
+`LBR-IO-001` error (exit 128) with zero writes. An empty list is a usage error
+(`nothing specified, nothing added`, exit 129); Git accepts an empty list as a
+no-op, an intentional difference.
+
+In newline mode a line that starts with `"` is decoded as one Git C-style quoted
+string (`\n`, `\t`, `\"`, `\\`, octal escapes, …), so paths containing spaces
+or quotes survive; an unquoted line is used verbatim. Malformed quoting
+(unterminated, trailing bytes after the closing quote, or an unknown escape) is a
+fatal `LBR-IO-001` error (exit 128) with zero writes. NUL mode never decodes.
+
+`--pathspec-from-file` cannot be combined with `-p`/`--patch`, `--edit`,
+`--interactive`, or command-line pathspec arguments (Git's
+`cannot be used together` contract): each combination is a usage error
+(`LBR-CLI-002`, exit 129) that writes nothing. (Git refuses the same combinations
+with exit 128; Libra's 129 is its usage-error code — an intentional difference.
+`--interactive` keeps its own declined-flag refusal, exit 128 +
+`LBR-UNSUPPORTED-001`.)
 
 ```bash
 libra add --pathspec-from-file paths.txt
+printf 'a.txt\nb.txt\n' | libra add --pathspec-from-file=-
 libra add --pathspec-from-file paths.bin --pathspec-file-nul
 ```
 
@@ -150,10 +172,23 @@ Requires `--pathspec-from-file`; using it alone is a usage error.
 ### `--chmod=(+|-)x`
 
 Force the executable bit recorded in the index for the matched paths: `+x` records
-mode `100755`, `-x` records `100644`. The blob content is unchanged; only regular
-files are affected (symlinks and gitlinks are skipped). A path whose recorded mode
-actually changes is reported as modified, even when its content did not change. An
-invalid value (anything other than `+x` / `-x`) is a usage error.
+mode `100755`, `-x` records `100644`. The blob content is unchanged. A path whose
+recorded mode actually changes is reported as modified, even when its content did
+not change.
+
+Only regular files carry an executable bit. A matched symlink (`120000`) or
+gitlink (`160000`) is refused: the entry is left unchanged, an
+`error: cannot chmod +x '<path>'` line is printed to stderr for each refusal, and
+`add` exits 1 after the remaining paths have been processed normally. In `--json`
+mode the refusals appear as `chmod_rejected: [{"path", "flip"}]` on the envelope
+instead, with the same exit 1. (Git exits 255 here; Libra uses the process-level
+exit 1 model shared with the ignored-path report.)
+
+An invalid value (anything other than `+x` / `-x`) is a usage error.
+
+With no pathspec (and none of `-A`, `-u`, `--refresh`, `--renormalize`,
+`--resolved`), `--chmod` is a successful no-op: `add` exits 0 without touching
+the index or object store — there is nothing to apply the mode to.
 
 ```bash
 libra add --chmod=+x scripts/build.sh
@@ -173,10 +208,12 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-Under `--dry-run`, skip pathspecs that match no add candidate instead of failing
-(a warning is printed to stderr). Mirrors Git: `--ignore-missing` requires
-`--dry-run`. Pathspecs that only match ignored files are still reported as
-ignored-path warnings.
+Under `--dry-run`, a pathspec that matches no add candidate is classified
+against the configured ignore rules (`.libraignore`, `.gitignore`): an ignored
+pattern is reported like other ignored paths and makes `add` exit 1 (unless it
+is the only pathspec, which keeps the `LBR-ADD-001` / exit 128 contract); a
+path that is not ignored is skipped with a warning on stderr. Mirrors Git:
+`--ignore-missing` requires `--dry-run`.
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
@@ -276,8 +313,17 @@ Ignored files produce a warning on `stderr`:
 ```text
 warning: the following paths are ignored by configured ignore rules:
 ignored.log
-Hint: use '-f' to force staging of ignored files
+Hint: use -f if you really want to add them.
 ```
+
+When some paths were staged (or reported by a dry-run) **and** other explicit
+pathspecs were ignored, `add` finishes the whole operation — staging, output,
+warnings and automation events included — and then exits `1`, like Git.
+When *every* path was ignored and nothing else was staged, `add` fails with
+`LBR-ADD-001` and exits `128` instead (intentional difference from Git's 1).
+`--json` keeps the regular data envelope on stdout (with the ignored paths in
+`data.ignored`) and exits `1`; the exit code `1` also wins over
+`--exit-code-on-warning`'s `9`.
 
 `--quiet` suppresses all `stdout` output but preserves `stderr` warnings.
 
@@ -411,9 +457,9 @@ overrides.
 | Ignore errors | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A (not implemented) |
 | Interactive patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
-| Interactive select | `git add -i` / `--interactive` | N/A | N/A (use the `libra code` Web Code UI) |
+| Interactive select | `git add -i` / `--interactive` | N/A | N/A |
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
-| Chmod only | `git add --chmod=+x` | N/A | N/A |
+| Chmod only | `git add --chmod=+x` | `libra add --chmod=+x` (non-regular index entries are refused with exit 1) | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |
 | Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.gitignore` + `.libraignore` |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
@@ -441,7 +487,7 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 | Failed to save index | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh failed | `LBR-IO-001` | 128 | -- |
 | Entry creation failed | `LBR-IO-002` | 128 | -- |
-| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic |
+| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic and the staging area is unchanged: the message says the object payloads were stored safely, no paths were staged, and a direct retry reuses the already-stored payloads without any lock-file cleanup. When the failure is a lock timeout, the message names the holder (its pid and purpose, e.g. `marker_publication`, `queued_update`, `replay`, `deletion_fence`) or says the holder could not be determined; wait for that process to finish and retry. Waiting uses a Git-style quadratic backoff and gives up after 10 seconds. Never delete the lock files under `.libra/object-index-repair-locks`: they exist only to arbitrate concurrent writers, do not block anything by themselves, and are released automatically when their owner exits. Read-only commands that replay pending cloud-index repair markers skip the replay (silently, without a warning) when the lock is busy and retry on the next command |
 | Paths staged but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported database/marker error; the next repository command retries automatically |
 | Working directory error | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | Status computation failed | `LBR-REPO-002` | 128 | -- |
@@ -457,6 +503,13 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 - Libra's `add` is required before `commit`, matching Git's explicit staging model
 - `.gitignore` and `.libraignore` both use Git ignore syntax; `.libraignore`
   remains the Libra-specific override file when both exist in the same directory
+- An un-ignored missing pathspec still prints Libra's `--ignore-missing` skip
+  warning (Git is silent there)
+- With a directory pathspec, an already-existing ignored parent directory is not
+  additionally reported (Git also lists it)
+- C-quoted `--pathspec-from-file` lines accept one to three octal digits (Git
+  requires exactly three) and reject trailing bytes after the closing quote
+  (Git ignores them)
 - LFS-tracked files are automatically converted to pointer files during staging
 - Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-i`/`--interactive`, D15 remainder). Use `libra add -p` or `libra add <pathspec>`.
 

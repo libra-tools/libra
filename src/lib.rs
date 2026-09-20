@@ -3,7 +3,7 @@
 //! This crate has two faces:
 //! 1. The `libra` binary (see `main.rs`) parses the process argv and dispatches to
 //!    [`cli::parse`].
-//! 2. Embedders (integration tests, the Web Code UI, and external Rust crates that drive
+//! 2. Embedders (integration tests, external agents, and Rust crates that drive
 //!    Libra programmatically) call [`exec`] or [`exec_async`] with a pre-built argv.
 //!
 //! The supported, patch-compatible embedding API is [`exec`], [`exec_async`],

@@ -90,9 +90,14 @@ pub enum SnapshotError {
     Scan(#[from] ScanError),
     #[error("snapshot object write failed: {0}")]
     Object(String),
+    #[error("{message}")]
+    MarkerBatchFlush {
+        stored_objects: usize,
+        message: String,
+    },
     #[error("snapshot manifest is invalid: {0}")]
     View(#[from] super::view::ViewError),
-    #[error("state facet capture failed: {0}")]
+    #[error("state facet error: {0}")]
     Facet(#[from] FacetError),
     #[error("index metadata could not be read: {0}")]
     Index(String),
@@ -151,7 +156,7 @@ impl WorkspaceSnapshotter {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // constructed by tests to pin WorktreeIo-backed snapshot writes
     pub(crate) fn with_io(mut self, io: Arc<WorktreeIo>) -> Self {
         self.io = io;
         self
@@ -283,6 +288,34 @@ impl WorkspaceSnapshotter {
 
     /// Capture immutable blobs and a canonical `WorkspaceSnapshotV2` manifest.
     pub async fn capture(&mut self) -> Result<SnapshotOutcome, SnapshotError> {
+        // ADR-OI-04: batch the marker publication for all snapshot objects;
+        // on error nothing is enqueued (payloads stay stored and a retry
+        // re-registers them).
+        let storage = self
+            .storage
+            .clone()
+            .unwrap_or_else(|| ClientStorage::init_local(self.scope.storage.join("objects")));
+        storage.begin_object_index_batch();
+        let result = self.capture_inner().await;
+        match result {
+            Ok(outcome) => {
+                let stored_objects = storage.pending_object_index_batch_count();
+                storage.end_object_index_batch().map_err(|error| {
+                    SnapshotError::MarkerBatchFlush {
+                        stored_objects,
+                        message: error.to_string(),
+                    }
+                })?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                storage.abort_object_index_batch();
+                Err(error)
+            }
+        }
+    }
+
+    async fn capture_inner(&mut self) -> Result<SnapshotOutcome, SnapshotError> {
         let deadline = Instant::now() + self.timeout;
         // Validate authoritative repository state before scanning or writing snapshot objects.
         let head = read_head(&self.scope).await?;
@@ -888,6 +921,59 @@ mod ignore_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-BATCH B4: snapshot object writes publish their markers through the
+    /// batch interface — one generation lock for the whole batch, not one per
+    /// object.
+    #[tokio::test]
+    async fn snapshot_object_writes_publish_markers_in_batches() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        // A real repository database makes the batch key resolve (the key is
+        // the db path, derived from the storage base path).
+        let db_path = temp.path().join(crate::utils::util::DATABASE);
+        let db_conn = crate::internal::db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        crate::internal::config::ConfigKv::set_with_conn(
+            &db_conn,
+            "libra.repoid",
+            "snap-batch",
+            false,
+        )
+        .await
+        .expect("set repo id");
+        let objects = temp.path().join("objects");
+        let storage = ClientStorage::init_local(objects);
+        #[cfg(debug_assertions)]
+        let before = crate::utils::client_storage::batched_marker_publication_count();
+        storage.begin_object_index_batch();
+        for index in 0..10u32 {
+            let oid =
+                ObjectHash::from_type_and_data(ObjectType::Blob, format!("s{index}").as_bytes());
+            put_content_addressed_object(
+                &storage,
+                &oid,
+                format!("snapshot payload {index}").as_bytes(),
+                ObjectType::Blob,
+                "blob",
+            )
+            .expect("store snapshot object");
+        }
+        storage
+            .end_object_index_batch()
+            .expect("flush snapshot batch");
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            crate::utils::client_storage::batched_marker_publication_count() - before,
+            1,
+            "the snapshot batch must publish under a single batch publication"
+        );
+        ClientStorage::wait_for_background_tasks();
+    }
 
     #[test]
     fn untracked_regular_file_is_a_blob() {

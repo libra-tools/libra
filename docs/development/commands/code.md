@@ -1,5 +1,7 @@
 # Code Command Development
 
+> **已移除（plan-20260920）：** `libra code` 公开命令已于 0.23.0 删除；本文保留为历史开发记录。外部 Agent 观测入口是 `libra agent`。
+
 `libra code` is an intentionally different Libra AI extension, not a
 Git-compatible command.
 

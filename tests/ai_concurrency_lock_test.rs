@@ -1,9 +1,8 @@
-//! Integration acceptance for `libra code` Phase 0/2 concurrency lock —
-//! agent.md Implementation Phase 0/2 "repo+thread advisory lock、CAS
-//! conflict、SQLite busy、worktree reservation".
+//! Session-level advisory lock and CAS conflict acceptance (plan-20260920
+//! KEEP: the session store survives the `libra code` removal).
 //!
-//! The session-level advisory lock is the building block for the Phase 0/2
-//! concurrency contract: two writers must not interleave on the same
+//! The session-level advisory lock is the building block for the concurrency
+//! contract: two writers must not interleave on the same
 //! `(working_dir, thread_id)` pair, but writers for *different* sessions
 //! must not block one another. These tests pin five hermetic properties:
 //!

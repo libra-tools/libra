@@ -1,0 +1,79 @@
+Looking at the R28 revision, which contains only the two administrative fixes (修订历史 table R27 row addition and Review log chronological ordering) that Codex R28 identified, with no technical content changes since R27.
+
+Let me verify all checkpoint items systematically:
+
+## Verification of All Checkpoints
+
+**1. capture/verify manifests + supervisor permits** ✓
+- Two-phase implementation in guard script: capture (supervisor-only) creates immutable manifest at `/tmp/issue-vg/guard-manifests/<card>.json`
+- verify (card executor) reads manifest and compares
+- Single-use permit: `guard-permits/<card>.permit` with `card\tmanifest_sha256\tpermit_id` binding
+- Atomic consumption via `os.replace(permit, permit.consumed.<pid>)`
+- Audit ledger at `/tmp/issue-vg/guard-reset-ledger.tsv`
+
+**2. pgp in [dependencies]** ✓
+- VG-02 AC1 explicitly requires moving `pgp = "0.19.0"` from `[dev-dependencies]` to `[dependencies]`
+- Write set includes `Cargo.toml` and `Cargo.lock`
+- Verification gate G1: `cargo build` (default profile) must succeed
+
+**3. per-file jq** ✓
+- VG-12 sentinel script contains:
+```bash
+for jf in "$DIR/out-list.json" "$DIR/out-origin.json"; do
+  jq -e '.. | objects | select(.key?=="vault.gpg.seckey_enc") | .value=="<REDACTED>"' "$jf" >/dev/null || { echo "FAIL: JSON redaction missing in $jf"; exit 1; }
+done
+```
+
+**4. pre-tag push main + remote SHA** ✓
+- VG-09 release script step 1 pushes main first, then verifies remote SHA matches intended SHA via `libra ls-remote`, only then proceeds to step 2 (tag creation)
+
+**5. triple completion gate** ✓
+- 完成判据 second item: `cargo +nightly fmt --all --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`
+
+**6. REL-VG-01 citations** ✓
+- All 9 family child cards (VG-01, VG-10, VG-02, VG-11, VG-03, VG-13, VG-12, VG-04, VG-05) have `Release boundary: family child（REL-VG-01）`
+- VG-09 has `Release boundary: family release point（REL-VG-01）`
+- 34 occurrences of "REL-VG-01" throughout the plan
+
+**7. ER-06a ACs incl. VG-00/VG-09 N/A** ✓
+- VG-00 AC2: "ER-06a，计划级门不计入 G-03）：N/A —— 本卡为只读 spike，无用户可见命令面"
+- VG-09 AC8: "ER-06a，计划级门不计入 G-03）：N/A —— release 卡不新增命令面"
+- All other cards (VG-01–VG-14 except VG-00/VG-09) have full ER-06a AC requiring EN+zh-CN+dev docs+COMPATIBILITY.md+website sync
+
+**8. harness umask/trap** ✓
+- All three sentinel scripts (VG-02, VG-12, VG-09) follow identical pattern:
+  - `set -eu` at top
+  - Single `umask 077` after set
+  - `mktemp -d` creates isolated directory
+  - Single `trap 'rm -rf "$TMP" "$DIR"' EXIT` after directory setup
+
+**9. VG-14 wiring** ✓
+- Dependencies: `VG-08, DEP-VG-01, DEP-VG-02`
+- Sequencing: `VG-09 -> VG-06 -> VG-07 -> VG-08 -> VG-14`
+- Phase 3: explicitly lists VG-14 alongside VG-06/07/08
+- M3: "四个 patch" matches four independent releases
+- 独立发布 chain includes VG-14 as fourth patch
+- Appears in 追溯表 GAP-VG-11, risk register, and audit table
+
+**10. VG-11 G8/G10/matrix** ✓
+- 判据规范 G8: `signing_subkey_selected_by_newest_valid_self_signature`
+- 判据规范 G10: `primary_key_signs_when_no_usable_signing_subkey`
+- Verification explicitly lists both test names
+- 测试矩阵 VG-11 row: "vault 8 新（G1–G10 逐门；G1–G3 合 1）+ config_test 1（G11 Display-pin）"
+
+**Administrative fixes from R28 (both present):**
+- 修订历史 R27 row added with VG-11 G8/G10/matrix changes ✓
+- Review log strictly chronological: R26 Codex, R26 Claude, R27 Codex, R27 Claude, R28 Codex, R28 Claude, R29 placeholders ✓
+
+---
+
+## Summary
+
+All ten technical verification checkpoints pass. Both administrative corrections from Codex R28 are present. No technical content has changed since the R27 revision that Claude already passed.
+
+**P0 = 0**  
+**P1 = 0**  
+**P2 = 0**
+
+**VERDICT: PASS**
+EXIT=0

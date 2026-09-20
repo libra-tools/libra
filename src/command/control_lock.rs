@@ -94,8 +94,6 @@ pub struct ControlInfo {
     pub mode: String,
     pub pid: u32,
     pub base_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_url: Option<String>,
     pub working_dir: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
@@ -849,7 +847,7 @@ pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
 
 /// Fail-closed discovery/attach errors for `libra code --control stdio` (W4-10 / F34).
 ///
-/// Stable `code()` strings mirror Code UI JSON-RPC `error.data.code` naming so
+/// Stable `code()` strings provide a machine-readable error namespace so
 /// automation can key off the same identifiers whether the failure happens at
 /// local discovery or later at HTTP attach.
 #[derive(Debug)]
@@ -1422,7 +1420,6 @@ mod tests {
             mode: "write".to_string(),
             pid,
             base_url: base_url.to_string(),
-            mcp_url: Some("http://127.0.0.1:6789".to_string()),
             working_dir: PathBuf::from("/tmp/repo"),
             thread_id: None,
             started_at: Utc::now(),
@@ -1440,7 +1437,6 @@ mod tests {
             mode: "write".to_string(),
             pid,
             base_url: "http://127.0.0.1:3000".to_string(),
-            mcp_url: None,
             working_dir: PathBuf::from("/tmp/repo"),
             thread_id: None,
             started_at: Utc::now(),

@@ -1,5 +1,7 @@
 # `libra publish` 开发设计
 
+> **已移除（plan-20260920）：** `libra publish`、publish 管线、D1 publish API 与 `worker/` 已于 0.23.0 删除；本文保留为历史开发记录。仓库备份走 `libra cloud`。
+
 ## 命令实现目标
 
 `libra publish` 的目标是把仓库发布为只读 Cloudflare Worker 站点，并管理 init/status/deploy/unpublish 等发布流程。实现需要比较发布 refs、跳过已存在 artifact、保护站点 ID 和密钥配置，并提供结构化输出。

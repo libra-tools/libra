@@ -938,7 +938,7 @@ mod tests {
                  let _ = "CREATE TABLE `after_use` (id TEXT)";
              }
 
-             #[cfg(feature = "test-provider")]
+             #[cfg(feature = "test-network")]
              fn feature_gated_is_production() {
                  let _ = "CREATE TABLE `after_feature_gate` (id TEXT)";
              }

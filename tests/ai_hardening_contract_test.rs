@@ -2,7 +2,7 @@
 //!
 //! Pin the security/policy contracts that the AI runtime exposes to integrators:
 //! - `ToolBoundaryPolicy` decisions for observers vs humans, mutating vs read-only,
-//!   network vs local tools, and MCP read/write naming conventions.
+//!   network vs local tools, and `list_`/`create_` prefix classification.
 //! - `SecretRedactor::redact` removes the four common token shapes used in our log
 //!   summaries.
 //! - `InMemoryAuditSink` round-trips an `AuditEvent` with redaction applied.
@@ -10,7 +10,7 @@
 //! **Layer:** L1 — pure unit tests, no I/O, no external services.
 
 use chrono::Utc;
-use libra::internal::ai::runtime::{
+use libra::internal::ai::hardening::{
     AuditEvent, AuditSink, InMemoryAuditSink, PrincipalContext, PrincipalRole, SecretRedactor,
     ToolBoundaryPolicy, ToolOperation, ToolOperationDetails,
 };
@@ -92,13 +92,13 @@ fn sub_agent_spawn_is_a_mutating_task_boundary_operation() {
     assert!(!observer_decision.approval_required);
 }
 
-/// Scenario: MCP tool naming conventions classify into the right policy bucket.
-/// `list_decisions` (a read tool) is auto-allowed for system principals; the
-/// `create_decision` write tool requires approval for an Owner. Guards the
-/// prefix-based classifier that the policy uses to decide approval for unknown MCP
-/// tools at runtime.
+/// Scenario: `list_` / `create_` tool prefixes classify into the right policy
+/// bucket. `list_decisions` (a read tool) is auto-allowed for system
+/// principals; the `create_decision` write tool requires approval for an
+/// Owner. Guards the prefix-based classifier that the policy uses to decide
+/// approval for unknown tools at runtime.
 #[test]
-fn mcp_read_and_write_tool_prefixes_are_classified() {
+fn list_and_create_tool_prefixes_are_classified() {
     let policy = ToolBoundaryPolicy::default_runtime();
 
     let list_decisions = policy.decide(
@@ -173,11 +173,11 @@ async fn audit_sink_records_redacted_policy_events() {
 mod cex_00_5 {
     use chrono::Utc;
     use libra::internal::ai::{
-        hooks::lifecycle::{LifecycleEvent, LifecycleEventKind},
-        runtime::{
+        hardening::{
             AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext,
             SecretRedactor, ToolBoundaryPolicy, ToolOperation,
         },
+        hooks::lifecycle::{LifecycleEvent, LifecycleEventKind},
     };
     use uuid::Uuid;
 
@@ -257,7 +257,7 @@ mod cex_00_5 {
     /// Without the redactor call in the default impl this test fails.
     #[tokio::test]
     async fn record_event_redacts_secrets_from_event_summary() {
-        use libra::internal::ai::runtime::Event;
+        use libra::internal::ai::event::Event;
         use uuid::Uuid;
 
         struct LeakyEvent;

@@ -38,84 +38,18 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Check Rustdoc intra-doc links
         run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features
-
-  web-check:
-    name: compat-web-check
-    runs-on: [self-hosted]
-
-    env:
-      CARGO_TERM_COLOR: always
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
-
-      # Rust-oriented jobs skip the web build for speed. This dedicated job
-      # validates the Next.js source, generates a fresh static export, and
-      # compiles it into `WebAssets`; the generated directory is deliberately
-      # not version-controlled. Per docs/improvement/web.md Phase 5
-      # verification.
-      - name: Install web dependencies
-        run: pnpm --dir web install --frozen-lockfile
-
-      - name: Lint web
-        run: pnpm --dir web lint
-
-      - name: Test web
-        run: pnpm --dir web test
-
-      - name: Build web (static export → web/out/)
-        run: pnpm --dir web build
-
-      - name: Verify generated static export lifecycle
-        shell: bash
-        run: |
-          test -f web/out/index.html
-          if git ls-files --error-unmatch -- web/out >/dev/null 2>&1; then
-            echo "web/out is generated build output and must not be tracked." >&2
-            exit 1
-          fi
-          git check-ignore -q web/out/index.html
-
-      - name: Check generated export embeds into the Rust binary
-        env:
-          LIBRA_SKIP_WEB_BUILD: "1"
-        run: cargo check --lib
 
   owner-liveness-macos:
     # plan-20260714 W1 (§C.9): the operation claim decides whether a control
@@ -130,7 +64,6 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
-      LIBRA_SKIP_WEB_BUILD: 1
 
     steps:
       - name: Checkout repository
@@ -182,7 +115,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
       # libtest runs each test in a thread with a 2 MiB stack. An unoptimized
@@ -197,16 +129,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
 
       - name: Ensure ripgrep is available
         shell: bash
@@ -276,7 +198,6 @@ jobs:
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_TEST_GITHUB_TOKEN: ${{ secrets.LIBRA_TEST_GITHUB_TOKEN }}
           LIBRA_TEST_GITHUB_NAMESPACE: ${{ secrets.LIBRA_TEST_GITHUB_NAMESPACE }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           LIBRA_D1_ACCOUNT_ID: ${{ secrets.LIBRA_D1_ACCOUNT_ID }}
           LIBRA_D1_API_TOKEN: ${{ secrets.LIBRA_D1_API_TOKEN }}
           LIBRA_D1_DATABASE_ID: ${{ secrets.LIBRA_D1_DATABASE_ID }}
@@ -309,14 +230,9 @@ jobs:
 
       # REMOVED 2026-08-31 — the "Run Code UI automation scenarios" step is
       # dropped because `libra code` TUI support was removed upstream; the
-      # PTY/TUI-driven scenario targets (code_ui_scenarios, harness_self_test,
-      # lease/SSE/state matrices, ...) no longer describe product behavior.
-      # The compatibility guard still inventories these disabled targets:
-      #   --test code_codex_default_web_test
-      #   --test ai_code_ui_headless_test
-      #   --test code_codex_runtime_test
-      # The test files remain in the repo for local reference; restore this
-      # step from git history if a Code UI surface returns.
+      # PTY/TUI-driven scenario targets and their harness were removed with
+      # plan-20260920 RC-23/RC-30. Restore this step from git history if a
+      # Code UI surface returns.
 
       # lore.md 1.7: the OTLP wire test needs the feature compiled in
       # (required-features excludes it from the default `cargo test --all`).
@@ -325,7 +241,6 @@ jobs:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
-          LIBRA_SKIP_WEB_BUILD: "1"
         run: |
           cargo test --features otlp --test otlp_telemetry -- --test-threads=1
 
@@ -336,7 +251,6 @@ jobs:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
-          LIBRA_SKIP_WEB_BUILD: "1"
         run: |
           cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
 
@@ -348,7 +262,6 @@ jobs:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
-          LIBRA_SKIP_WEB_BUILD: "1"
           LIBRA_TEST: "1"
         run: |
           cargo test --features test-upgrade \
@@ -376,7 +289,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "1"
 
@@ -385,16 +297,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
 
       - name: Preserve Rust toolchain cache paths
         shell: bash
@@ -411,9 +313,9 @@ jobs:
 
       # Network-only test layer (`test-network` feature gate). Tests requiring outbound
       # network but no secrets are surfaced through this job; tests requiring real
-      # credentials live behind `test-live-ai` / `test-live-cloud` and run only in
-      # the `compat-live-*` (workflow_dispatch) jobs, which are intentionally not
-      # GitHub required-checks.
+      # credentials live behind `test-live-cloud` and run only in the optional
+      # live-cloud workflow (workflow_dispatch / schedule), which is intentionally
+      # not a GitHub required-check.
       - name: Run network-remote tests
         env:
           HOME: ${{ runner.temp }}/libra-ci-home
@@ -433,7 +335,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: stable
-      LIBRA_SKIP_WEB_BUILD: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_MIN_STACK: "16777216"
     steps:

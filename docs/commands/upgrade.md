@@ -25,7 +25,7 @@ libra upgrade [--check | -y|--yes]
    time) persisted next to the installed binary.
 3. Compares the signed latest version with the running version.
 4. If a newer version exists, shows both versions and the download size, and
-   asks for confirmation (`[y/N]`, default **No**).
+   asks for confirmation (`[Y/n]`, default **Yes** — a bare Enter accepts).
 5. On confirmation, downloads the artifact (sha256 and size enforced during
    streaming, ≤ 256 MiB), stages it next to the installed binary, runs a
    pre-install self-check, and commits an atomic install transaction with a
@@ -89,8 +89,9 @@ document.
 - **Revoked latest**: if the newest published version revokes itself, the
   command stays on the current version and says so.
 - **Non-interactive stdin without `--yes`**: refused with a clear error and
-  the exact flags to use — the command never installs on an unconfirmed
-  default.
+  the exact flags to use — the default-Yes answer only applies to an
+  interactive Enter on a terminal, never to unreadable or piped stdin, so an
+  unattended run can never install by accident.
 - **Concurrent upgrade**: if another Libra process holds the upgrade lock or
   made progress first, the command reports that nothing was applied and asks
   you to re-run.
