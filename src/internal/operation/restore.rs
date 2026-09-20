@@ -39,6 +39,7 @@ use crate::{
     internal::{
         branch::is_locked_branch,
         config::ConfigKv,
+        db::begin_write_transaction,
         head::Head,
         operation::{PointerError, facets::registry_for_scope},
         worktree_scope::WorktreeScope,
@@ -1091,7 +1092,14 @@ impl RestoreEngine {
             });
         }
 
-        let txn = crate::internal::db::begin_write_transaction(self.store.db())
+        // A deferred transaction would read (branch ownership, reference rows)
+        // before it writes, and SQLite returns SQLITE_BUSY immediately — without
+        // consulting busy_timeout — when a transaction that holds a read lock
+        // asks for the write lock while another connection owns the writer
+        // slot. That is the intermittent `database is locked` failure when the
+        // background object-index consumer writes the same repository during a
+        // restore. Take the write lock first, then read under it.
+        let txn = begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         if let Some(other_worktree) =
@@ -1264,7 +1272,11 @@ impl RestoreEngine {
             }
         }
         self.protect_linked_worktree_heads(references).await?;
-        let txn = crate::internal::db::begin_write_transaction(self.store.db())
+
+        // Same write-lock-first rule as `restore_symbolic_head_branch_tip`:
+        // keep the reference rewrite from racing the background index consumer
+        // through a read-then-write upgrade.
+        let txn = begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         self.protect_changed_branch_refs(&txn, references).await?;
