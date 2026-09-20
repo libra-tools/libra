@@ -207,6 +207,11 @@ jobs:
           LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
         run: |
           set -euo pipefail
+          # Self-hosted runners may use a collaborative 0002 umask. The
+          # mode-materialization assertions and documented default test
+          # contract use the normal 0022 baseline; tests that exercise other
+          # umasks set them explicitly in their child process.
+          umask 0022
           # plan-20260827 NP-04 disposition ①+②: one nextest invocation runs
           # lib + bins + every default-feature integration target INCLUDING
           # command_test — one process per test dissolves the in-process cwd

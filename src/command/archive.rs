@@ -351,11 +351,16 @@ fn filter_entries_by_pathspecs(
 
 /// `FIX-AD-01`: build the shared-engine pathspec set for `archive`'s pathspecs.
 fn archive_pathspec_set(raw: &[String]) -> Result<PathspecSet, CliError> {
-    let workdir = util::working_dir();
     let current_dir = std::env::current_dir().map_err(|error| {
         CliError::fatal(format!("failed to resolve current directory: {error}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
+    // Pathspec matching is also covered by pure unit tests that intentionally
+    // run outside a repository. Archive execution has already resolved its
+    // tree-ish before reaching this helper, so using the current directory as
+    // the lexical worktree fallback preserves matching semantics without
+    // turning a path filter into an unrelated repository-discovery panic.
+    let workdir = util::try_working_dir().unwrap_or_else(|_| current_dir.clone());
     PathspecSet::from_workdir(raw, &current_dir, &workdir)
         .map_err(|error| CliError::command_usage(format!("invalid archive pathspec: {error}")))
 }
@@ -809,8 +814,11 @@ mod tests {
     use std::str::FromStr;
 
     use git_internal::internal::object::tree::TreeItem;
+    use serial_test::serial;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::utils::test::ChangeDirGuard;
 
     #[test]
     fn archive_format_accepts_supported_names() {
@@ -1020,6 +1028,17 @@ mod tests {
         .expect("literal magic");
         let names: Vec<&str> = filtered.iter().map(|e| e.path.to_str().unwrap()).collect();
         assert_eq!(names, vec!["*.txt"]);
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn archive_pathspec_set_works_outside_a_libra_repository() {
+        let outside = tempdir().expect("temporary non-repository directory");
+        let _cwd = ChangeDirGuard::new(outside.path());
+
+        let set = archive_pathspec_set(&["src".to_string()])
+            .expect("archive pathspec parsing must not require repository discovery");
+        assert!(set.matches_path("src/main.rs"));
     }
 
     #[test]

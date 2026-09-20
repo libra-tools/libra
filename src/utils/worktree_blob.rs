@@ -203,6 +203,57 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worktree_permissions_request_umask_aware_entry_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(worktree_permissions(true).unwrap().mode() & 0o777, 0o777);
+        assert_eq!(worktree_permissions(false).unwrap().mode() & 0o777, 0o666);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_materialization_honors_umask_0002() {
+        use std::{env, os::unix::fs::PermissionsExt, process::Command};
+
+        const CHILD_ENV: &str = "LIBRA_TEST_WORKTREE_UMASK_0002";
+        if env::var_os(CHILD_ENV).is_some() {
+            // This process runs only the selected test, so changing its umask
+            // cannot leak into unrelated tests in the parent test process.
+            unsafe { libc::umask(0o002) };
+            let dir = tempfile::tempdir().expect("temporary worktree");
+            let executable = dir.path().join("run.sh");
+            let plain = dir.path().join("plain.txt");
+            write_worktree_blob(&executable, b"run", true).expect("write executable blob");
+            write_worktree_blob(&plain, b"plain", false).expect("write plain blob");
+            assert_eq!(
+                fs::metadata(executable).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+            assert_eq!(
+                fs::metadata(plain).unwrap().permissions().mode() & 0o777,
+                0o664
+            );
+            return;
+        }
+
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "utils::worktree_blob::tests::worktree_materialization_honors_umask_0002",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run umask regression child");
+        assert!(
+            output.status.success(),
+            "umask child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn dropped_writer_leaves_no_staging_file() {
         let dir = tempfile::tempdir().unwrap();
