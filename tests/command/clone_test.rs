@@ -1348,3 +1348,72 @@ fn test_clone_json_reports_fetch_transfer_counts() {
     );
     assert!(bytes > 0, "a non-empty source transfers bytes: {bytes}");
 }
+
+/// FM-01 (M-MAT T2): cloning a Libra source materializes executable entries
+/// with their execute bit and keeps ordinary files non-executable.
+#[cfg(unix)]
+#[test]
+fn test_clone_preserves_executable_bit_from_libra_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::run_libra_command;
+
+    let source = tempdir().expect("source dir");
+    let source_path = source.path();
+    assert!(
+        run_libra_command(&["init"], source_path).status.success(),
+        "init source"
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], source_path);
+    run_libra_command(&["config", "set", "user.email", "t@t"], source_path);
+    let script = source_path.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    fs::write(source_path.join("plain.txt"), "plain\n").expect("write plain");
+    assert!(
+        run_libra_command(&["add", "run.sh", "plain.txt"], source_path)
+            .status
+            .success(),
+        "stage files"
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "modes", "--no-verify"], source_path)
+            .status
+            .success(),
+        "commit files"
+    );
+
+    let dest_root = tempdir().expect("dest root");
+    let dest = dest_root.path().join("clone");
+    let output = run_libra_command(
+        &[
+            "clone",
+            source_path.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(
+        output.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(dest.join("run.sh"))
+            .expect("cloned script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "cloned 100755 entry must be executable"
+    );
+    assert_eq!(
+        fs::symlink_metadata(dest.join("plain.txt"))
+            .expect("cloned plain metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "cloned 100644 entry must not be executable"
+    );
+}

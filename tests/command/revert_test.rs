@@ -1965,3 +1965,56 @@ fn test_revert_conflict_labels_head_and_parent_of() {
         "L8c subject base: {body}"
     );
 }
+
+/// FM-02 (M-MAT2 U3): reverting a deletion restores the executable bit.
+#[cfg(unix)]
+#[test]
+fn test_revert_restores_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    fs::write(repo_path.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "base.txt"], repo_path),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo_path),
+        "commit base",
+    );
+    let script = repo_path.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho run\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "add script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add exec", "--no-verify"], repo_path),
+        "commit exec",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rm", "run.sh"], repo_path),
+        "rm script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "delete exec", "--no-verify"], repo_path),
+        "commit delete",
+    );
+    assert_cli_success(
+        &run_libra_command(&["revert", "--no-edit", "HEAD"], repo_path),
+        "revert deletion",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("restored script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "revert must restore the execute bit"
+    );
+}

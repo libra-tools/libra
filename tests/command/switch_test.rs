@@ -1174,3 +1174,73 @@ fn test_switch_bare_detach_detaches_at_head() {
         "D4 zero-write"
     );
 }
+
+/// FM-01 (M-MAT T5): switching to a branch whose entry is 100644 clears the
+/// execute bit, and switching back to the 100755 entry sets it again.
+#[cfg(unix)]
+#[test]
+fn test_switch_sets_and_clears_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    std::fs::write(repo_path.join("tool"), "v1\n").expect("write tool");
+    assert_cli_success(
+        &run_libra_command(&["add", "tool"], repo_path),
+        "stage plain tool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "plain tool", "--no-verify"], repo_path),
+        "commit plain tool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature branch",
+    );
+    let tool = repo_path.join("tool");
+    std::fs::write(&tool, "v2\n").expect("rewrite tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+    assert_cli_success(
+        &run_libra_command(&["add", "tool"], repo_path),
+        "stage executable tool",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "executable tool", "--no-verify"],
+            repo_path,
+        ),
+        "commit executable tool",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch to main",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&tool)
+            .expect("tool metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "switching to a 100644 entry must clear the execute bit"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], repo_path),
+        "switch to feature",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&tool)
+            .expect("tool metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "switching to a 100755 entry must set the execute bit"
+    );
+}

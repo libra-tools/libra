@@ -347,6 +347,8 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported.
 
+Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
+
 ## Options
 
 | Option | Description |

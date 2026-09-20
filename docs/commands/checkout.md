@@ -40,6 +40,8 @@ already-current branch does not invoke it. Set
 `LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
 [Repository hooks](repository-hooks.md).
 
+Checking out branches or paths materializes entries with their mode's permission bits (`100755` executable, `100644` plain) under the process `umask`; replacing an existing file clears a stale execute bit (plan issues/470 FM-01).
+
 ## Options
 
 | Flag | Long | Value | Description |

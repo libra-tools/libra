@@ -34,6 +34,8 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 
 `reset --hard` 恢复工作树时会保留 tree 中的文件类型：符号链接会恢复为真正的 symlink，链接 blob 字节作为目标路径写入；若工作树当前位置已有普通文件或已有 symlink，必要时会被替换为目标 symlink。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写入普通文件。
 
+工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

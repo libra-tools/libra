@@ -1794,8 +1794,7 @@ fn write_guarded_worktree_value(
         })?;
     }
     let mode = index_mode_to_tree_mode(value.mode)?;
-    write_worktree_entry(&full_path, mode, &blob.data)?;
-    apply_worktree_blob_mode(&full_path, mode)
+    write_worktree_entry(&full_path, mode, &blob.data)
 }
 
 fn apply_guarded_worktree_updates(
@@ -1958,7 +1957,6 @@ fn restore_worktree_snapshots(snapshots: &[WorktreePathSnapshot]) -> Result<(), 
                     })?;
                 let mode = index_mode_to_tree_mode(value.mode)?;
                 write_worktree_entry(&full_path, mode, &blob.data)?;
-                apply_worktree_blob_mode(&full_path, mode)?;
             }
         }
     }
@@ -2562,7 +2560,6 @@ fn restore_working_directory_from_tree_counted_typed(
                     write_worktree_entry(&file_path, item.mode, &blob.data)?;
                     files_restored += 1;
                 }
-                apply_worktree_blob_mode(&file_path, item.mode)?;
             }
         }
     }
@@ -2630,35 +2627,20 @@ fn write_worktree_entry(path: &Path, mode: TreeItemMode, content: &[u8]) -> Resu
         return write_worktree_symlink(path, content);
     }
 
-    remove_existing_symlink(path)?;
-    fs::write(path, content).map_err(|error| {
+    // Replace atomically with the entry-mode permissions (ADR-FM-02/03); the
+    // rename also replaces a symlink sitting at the path.
+    crate::utils::worktree_blob::write_worktree_blob(
+        path,
+        content,
+        mode == TreeItemMode::BlobExecutable,
+    )
+    .map_err(|error| {
         ResetError::WorktreeRestore(format!(
             "failed to write file {}: {}",
             path.display(),
             error
         ))
     })
-}
-
-fn remove_existing_symlink(path: &Path) -> Result<(), ResetError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(path).map_err(|error| {
-                ResetError::WorktreeRestore(format!(
-                    "failed to replace symlink {}: {}",
-                    path.display(),
-                    error
-                ))
-            })
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ResetError::WorktreeRead(format!(
-            "failed to inspect file {}: {}",
-            path.display(),
-            error
-        ))),
-    }
 }
 
 #[cfg(unix)]
@@ -2708,32 +2690,6 @@ fn write_worktree_symlink(path: &Path, _target: &[u8]) -> Result<(), ResetError>
         "symlink checkout is not supported on this platform: {}",
         path.display()
     )))
-}
-
-#[cfg(unix)]
-fn apply_worktree_blob_mode(path: &Path, mode: TreeItemMode) -> Result<(), ResetError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = match mode {
-        TreeItemMode::Blob => Some(0o644),
-        TreeItemMode::BlobExecutable => Some(0o755),
-        _ => None,
-    };
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
-            ResetError::WorktreeRestore(format!(
-                "failed to set mode on {}: {}",
-                path.display(),
-                error
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_worktree_blob_mode(_path: &Path, _mode: TreeItemMode) -> Result<(), ResetError> {
-    Ok(())
 }
 
 /// Remove empty directories from the working directory.

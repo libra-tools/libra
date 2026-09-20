@@ -1859,3 +1859,53 @@ fn test_stash_push_literal_pathspecs_global() {
     assert!(text.contains("x.txt"), "x.txt left dirty: {text}");
     assert!(!text.contains("*.txt"), "*.txt was stashed: {text}");
 }
+
+/// FM-02 (M-MAT2 U6): `stash pop` restores an executable file with its bit.
+#[cfg(unix)]
+#[test]
+fn test_stash_pop_materializes_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    let script = repo_path.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho v1\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "add script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "exec", "--no-verify"], repo_path),
+        "commit exec",
+    );
+    fs::write(&script, "#!/bin/sh\necho v2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push"], repo_path),
+        "stash push",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata after push")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "stash push must restore the HEAD executable"
+    );
+    assert_cli_success(
+        &run_libra_command(&["stash", "pop"], repo_path),
+        "stash pop",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata after pop")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "stash pop must restore the execute bit"
+    );
+}

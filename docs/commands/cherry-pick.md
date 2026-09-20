@@ -45,6 +45,8 @@ by picked content; a binary-driver conflict keeps the complete surviving side
 
 A stopped pick does not outlive the working tree it stopped in: a later reset ends the stopped single-commit pick once it clears unresolved index stages, so the next cherry-pick starts cleanly. Resolving the conflict and running a later commit ends the stopped single-commit pick the same way. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` does not re-commit a stop that was concluded outside the sequence, and instead applies the remaining commits.
 
+Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
+
 ## Options
 
 ### `-n`, `--no-commit`

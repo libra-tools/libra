@@ -40,6 +40,8 @@ regular marker file. Platforms that cannot create symlinks return an explicit
 unsupported diagnostic instead of materializing a regular file containing the
 target text.
 
+Restored files carry the source entry's permission bits: `100755` is created executable (`0777` before the process `umask`), `100644` plain (`0666` before `umask`), so `umask 077` yields `700`/`600`. Replacing an existing file goes through a same-directory temp file and rename, which also clears a stale execute bit (plan issues/470 FM-01).
+
 ## Options
 
 | Option | Short | Long | Description |

@@ -36,6 +36,8 @@ libra checkout [<tree-ish>] -- <pathspec>...
 `LIBRA_NO_HOOKS=1`。
 详见[仓库 hooks](repository-hooks.md)。
 
+检出分支或路径时会按条目 mode 的权限位物化（`100755` 可执行、`100644` 普通），并受进程 `umask` 约束；替换已存在文件时会清除遗留的可执行位（plan issues/470 FM-01）。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

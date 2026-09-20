@@ -26,6 +26,8 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 `curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
 禁止手工删除或修改 SQLite receipt。仅在明确需要本地对象访问时使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`；这些模式会告警，并不授权远端同步。
 
+检出的文件会按 tree 条目 mode 的权限位物化（`100755` 可执行、`100644` 普通），并受进程 `umask` 约束（plan issues/470 FM-01）。
+
 ## 选项
 
 ### `<REMOTE_REPO>`（必需）

@@ -53,6 +53,12 @@ impl StreamingAtomicFile {
         })
     }
 
+    /// Path of the staging temp file, for streaming writers that take a path
+    /// instead of a writer (for example the LFS downloader).
+    pub(crate) fn temp_path(&self) -> &Path {
+        self.temporary.path()
+    }
+
     /// Flush/fsync the payload, atomically replace `target`, and sync affected
     /// directories where the platform supports it.
     pub(crate) fn persist(self, target: &Path) -> io::Result<()> {

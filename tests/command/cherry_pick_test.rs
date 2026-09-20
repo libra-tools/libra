@@ -4521,3 +4521,104 @@ fn test_cherry_pick_conflict_label_includes_subject() {
         "L8b parent-of base: {body}"
     );
 }
+
+/// FM-02 (M-MAT2 U1/U2): cherry-picking an executable addition materializes the
+/// execute bit, and a conflicted executable file keeps it.
+#[cfg(unix)]
+#[test]
+fn test_cherry_pick_materializes_executable_bit_including_conflicts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    fs::write(repo_path.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "base.txt"], repo_path),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo_path),
+        "commit base",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature",
+    );
+    let script = repo_path.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho feature\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "add script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature exec", "--no-verify"], repo_path),
+        "commit feature",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "feature"], repo_path),
+        "cherry-pick feature",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "cherry-pick must materialize the execute bit"
+    );
+
+    // Conflict leg: both sides edit the same executable file.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "conflict-side"], repo_path),
+        "create conflict side",
+    );
+    fs::write(&script, "#!/bin/sh\necho side\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "add side edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side edit", "--no-verify"], repo_path),
+        "commit side edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "back to main",
+    );
+    fs::write(&script, "#!/bin/sh\necho main\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "add main edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], repo_path),
+        "commit main edit",
+    );
+    let output = run_libra_command(&["cherry-pick", "conflict-side"], repo_path);
+    assert!(
+        !output.status.success(),
+        "cherry-pick should conflict: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("conflicted script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "a conflicted executable file must keep the execute bit"
+    );
+}

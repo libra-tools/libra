@@ -33,6 +33,8 @@ Libra 不管理子模块内容。如果切换到分支或 detached 目标需要�
 新 OID 和 branch flag `1`；already-on no-op 不运行。只有显式绕过策略时才设置
 `LIBRA_NO_HOOKS=1`。sandbox 与输出行为见[仓库 hooks](repository-hooks.md)。
 
+切换时会按目标条目的权限位物化并受进程 `umask` 约束：条目为 `100755` 时设置可执行位，为 `100644` 时清除可执行位（plan issues/470 FM-01）。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

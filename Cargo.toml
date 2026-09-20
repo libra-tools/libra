@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.23.12"
+version = "0.23.18"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -259,6 +259,10 @@ path = "tests/compat/compat_ledger_schema.rs"
 [[test]]
 name = "compat_version_surface_sync"
 path = "tests/compat/version_surface_sync.rs"
+
+[[test]]
+name = "compat_worktree_blob_writes"
+path = "tests/compat/compat_worktree_blob_writes.rs"
 
 [[test]]
 name = "compat_r0_9_doc_closeout"

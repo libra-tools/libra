@@ -821,3 +821,5 @@ worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working dir
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 branch_vv_counts_upstream_shapes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_add_ignored_dispatch_before_exit_one	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_pull_fast_forward_materializes_executable_bit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_worktree_add_preserves_executable_bit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

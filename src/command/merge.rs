@@ -5131,8 +5131,12 @@ fn write_workdir_entry(
     if mode == TreeItemMode::Link {
         return write_workdir_symlink(workdir, relative, content);
     }
-    write_workdir_file(workdir, relative, content)?;
-    apply_file_mode(&workdir.join(relative), mode)
+    write_workdir_file_with_mode(
+        workdir,
+        relative,
+        content,
+        mode == TreeItemMode::BlobExecutable,
+    )
 }
 
 /// A symbolic link, target bytes verbatim (never UTF-8 validated). Windows has
@@ -5162,27 +5166,6 @@ fn write_workdir_symlink(workdir: &Path, relative: &Path, content: &[u8]) -> Res
     #[cfg(not(unix))]
     {
         write_workdir_file(workdir, relative, content)
-    }
-}
-
-/// `0755` for an executable entry, `0644` otherwise (Unix; a no-op elsewhere).
-/// Explicit because every write creates the file anew.
-fn apply_file_mode(path: &Path, mode: TreeItemMode) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let bits = if mode == TreeItemMode::BlobExecutable {
-            0o755
-        } else {
-            0o644
-        };
-        fs::set_permissions(path, fs::Permissions::from_mode(bits))
-            .map_err(|error| format!("failed to chmod {}: {error}", path.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
     }
 }
 
@@ -14007,20 +13990,27 @@ fn ensure_no_untracked_conflicts(
     Ok(())
 }
 
-fn write_workdir_file(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
+/// Mode-aware writer: the file is created with the entry-mode permissions
+/// under the process umask and replaced atomically through the shared
+/// worktree-blob primitive (ADR-FM-02/03). The path safety checks stay here:
+/// never write THROUGH a symbolic link (an ignored `foo -> /elsewhere` would
+/// redirect the write outside the working tree), and take over an ignored file
+/// or emptied directory standing where the blob must go.
+fn write_workdir_file_with_mode(
+    workdir: &Path,
+    relative: &Path,
+    content: &[u8],
+    executable: bool,
+) -> Result<(), String> {
     let file_path = workdir.join(relative);
     if let Some(parent) = file_path.parent() {
         clear_ancestor_files(workdir, relative)?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
-    // Never write THROUGH a symbolic link: an ignored `foo -> /elsewhere` is
-    // invisible to the untracked scan and would redirect the write outside the
-    // working tree. A symlink sitting exactly at the path is replaced by the
-    // file (as a checkout replaces it).
     refuse_symlink_components(workdir, relative)?;
     clear_write_target(&file_path)?;
-    fs::write(&file_path, content)
+    crate::utils::worktree_blob::write_worktree_blob(&file_path, content, executable)
         .map_err(|error| format!("failed to write {}: {error}", file_path.display()))
 }
 
@@ -14274,7 +14264,14 @@ fn write_conflict_markers(
                 return load_object::<Blob>(&rendered.hash)
                     .map(|blob| blob.data)
                     .map_err(|error| error.to_string())
-                    .and_then(|content| write_workdir_file(workdir, path, &content));
+                    .and_then(|content| {
+                        write_workdir_file_with_mode(
+                            workdir,
+                            path,
+                            &content,
+                            worktree_conflict_executable(path),
+                        )
+                    });
             }
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
@@ -14352,7 +14349,24 @@ fn write_conflict_markers(
             return write_workdir_entry(workdir, path, content.mode, &blob.data);
         }
     };
-    write_workdir_file(workdir, path, &content)
+    write_workdir_file_with_mode(workdir, path, &content, worktree_conflict_executable(path))
+}
+
+/// Conflict-marker files keep the executable bit of the unmerged index entry
+/// (stage 2, else stage 3/0): mode-aware materialization per ADR-FM-02/03.
+fn worktree_conflict_executable(path: &Path) -> bool {
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    Index::load(crate::utils::path::index())
+        .ok()
+        .and_then(|index| {
+            [2u8, 3, 0]
+                .iter()
+                .find_map(|stage| index.get(name, *stage))
+                .map(|entry| entry.mode & 0o111 != 0)
+        })
+        .unwrap_or(false)
 }
 
 /// Build the worktree content for a both-modified conflict.

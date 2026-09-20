@@ -41,3 +41,4 @@ pub mod tree;
 pub mod tree_attributes;
 pub mod util;
 pub mod worktree;
+pub mod worktree_blob;

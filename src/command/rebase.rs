@@ -5507,19 +5507,10 @@ fn create_tree_from_index(
     merge::create_tree_from_items_map(&items)
 }
 
+#[cfg(not(unix))]
 fn write_workdir_file(workdir: &Path, path: &Path, content: &[u8]) -> Result<(), String> {
     let file_path = workdir.join(path);
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create directory {}: {}", parent.display(), e))?;
-    }
-    if let Ok(metadata) = fs::symlink_metadata(&file_path)
-        && metadata.file_type().is_symlink()
-    {
-        fs::remove_file(&file_path)
-            .map_err(|e| format!("failed to replace symlink {}: {}", file_path.display(), e))?;
-    }
-    fs::write(&file_path, content)
+    crate::utils::worktree_blob::write_worktree_blob(&file_path, content, false)
         .map_err(|e| format!("failed to write {}: {}", file_path.display(), e))
 }
 
@@ -5550,10 +5541,14 @@ fn write_workdir_blob(
     content: &[u8],
 ) -> Result<(), String> {
     match mode {
-        TreeItemMode::Blob => write_workdir_file(workdir, path, content),
-        TreeItemMode::BlobExecutable => {
-            write_workdir_file(workdir, path, content)?;
-            set_executable_workdir_mode(&workdir.join(path))
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable => {
+            let file_path = workdir.join(path);
+            crate::utils::worktree_blob::write_worktree_blob(
+                &file_path,
+                content,
+                mode == TreeItemMode::BlobExecutable,
+            )
+            .map_err(|error| format!("failed to write {}: {error}", file_path.display()))
         }
         TreeItemMode::Link => write_workdir_symlink(workdir, path, content),
         TreeItemMode::Tree => Err(format!(
@@ -5565,23 +5560,6 @@ fn write_workdir_blob(
             path.display()
         )),
     }
-}
-
-#[cfg(unix)]
-fn set_executable_workdir_mode(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|error| {
-        format!(
-            "failed to set executable mode on {}: {error}",
-            path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn set_executable_workdir_mode(_path: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(unix)]

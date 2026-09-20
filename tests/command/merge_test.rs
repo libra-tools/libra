@@ -14403,3 +14403,61 @@ fn test_merge_conflict_label_uses_target_spelling_matrix() {
         assert_eq!(body, "resolved-rerere\n", "L9b replayed resolution");
     }
 }
+
+/// FM-01 (M-MAT T7): a fast-forward merge materializes the incoming
+/// executable entry with its execute bit.
+#[cfg(unix)]
+#[test]
+fn test_merge_fast_forward_preserves_executable_bit() {
+    use tempfile::tempdir;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    std::fs::write(repo_path.join("base.txt"), "base\n").expect("write base");
+    assert_cli_success(
+        &run_libra_command(&["add", "base.txt"], repo_path),
+        "stage base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo_path),
+        "commit base",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature branch",
+    );
+    let script = repo_path.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "stage script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature", "--no-verify"], repo_path),
+        "commit feature",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch to main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], repo_path),
+        "fast-forward merge",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "fast-forward merge must materialize the execute bit"
+    );
+}

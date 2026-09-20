@@ -7389,3 +7389,71 @@ fn test_rebase_autosquash_keeps_target_author_and_current_committer() {
         "a fold keeps the target commit's author and stamps the running user as committer"
     );
 }
+
+/// FM-02 (M-MAT2 U5): rebasing a rewrite that clears the execute bit
+/// materializes a non-executable file (the set direction is pinned by
+/// `test_rebase_preserves_executable_mode_in_rewritten_commit`).
+#[cfg(unix)]
+#[test]
+fn test_rebase_clears_executable_bit_in_rewritten_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    commit_file_via_cli(repo_path, "base.txt", "base\n", "Base");
+
+    let script = repo_path.join("script.sh");
+    fs::write(&script, "#!/bin/sh\necho v1\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "script.sh"], repo_path),
+        "stage executable",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "executable", "--no-verify"], repo_path),
+        "commit executable",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], repo_path),
+        "create feature",
+    );
+    fs::write(&script, "#!/bin/sh\necho v2\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "script.sh"], repo_path),
+        "stage non-executable",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "non-executable", "--no-verify"],
+            repo_path,
+        ),
+        "commit non-executable",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo_path),
+        "switch main",
+    );
+    commit_file_via_cli(repo_path, "main.txt", "main\n", "Main adds file");
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], repo_path),
+        "switch feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], repo_path),
+        "rebase onto main",
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "rebase must materialize the cleared execute bit"
+    );
+}

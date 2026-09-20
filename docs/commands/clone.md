@@ -51,6 +51,8 @@ Do not delete or edit SQLite receipts manually. Use `--offline` or
 `LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
 these modes warn and are not authorization for remote synchronization.
 
+Checked-out entries carry the tree mode's permission bits (`100755` executable, `100644` plain) under the process `umask` (plan issues/470 FM-01).
+
 ## Options
 
 ### `<REMOTE_REPO>` (required)

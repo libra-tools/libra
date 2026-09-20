@@ -34,7 +34,6 @@ use crate::{
         sparse::SparseView,
     },
     utils::{
-        atomic_write,
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         lfs,
@@ -393,7 +392,11 @@ fn land(
             error: Some(format!("could not create parent directory: {e}")),
         };
     }
-    if let Err(e) = atomic_write::write_atomic(&abs, &bytes, atomic_write::sync_data_enabled()) {
+    // Mode-aware atomic replacement (ADR-FM-02/03): the entry's executable bit
+    // is applied at creation time under the process umask, and the rename
+    // publishes content + permissions together.
+    let executable = mode == TreeItemMode::BlobExecutable;
+    if let Err(e) = crate::utils::worktree_blob::write_worktree_blob(&abs, &bytes, executable) {
         return PathReport {
             path: target.to_string(),
             oid: Some(oid_str.to_string()),
@@ -402,34 +405,6 @@ fn land(
             error: Some(format!("atomic write failed: {e}")),
         };
     }
-    // Executable bit. The content already landed atomically (never a corrupt
-    // file), but a chmod failure must be reported LOUDLY (Codex P1) — a file
-    // with the wrong mode can break scripts — not silently reported as
-    // "hydrated". write_atomic does not expose the temp handle, so the bit is
-    // set after the rename; a failure fails this path with an actionable note.
-    #[cfg(unix)]
-    if mode == TreeItemMode::BlobExecutable {
-        use std::os::unix::fs::PermissionsExt;
-        let set = std::fs::metadata(&abs).and_then(|meta| {
-            let mut perms = meta.permissions();
-            perms.set_mode(perms.mode() | 0o111);
-            std::fs::set_permissions(&abs, perms)
-        });
-        if let Err(e) = set {
-            return PathReport {
-                path: target.to_string(),
-                oid: Some(oid_str.to_string()),
-                status: "failed",
-                bytes: None,
-                error: Some(format!(
-                    "content hydrated but the executable bit could not be set (the file mode \
-                     is wrong): {e}"
-                )),
-            };
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
 
     PathReport {
         path: target.to_string(),

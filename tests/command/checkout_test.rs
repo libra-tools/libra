@@ -1266,3 +1266,44 @@ fn test_checkout_bare_detach_is_not_a_noop() {
         "D4 zero-write"
     );
 }
+
+/// FM-01 (M-MAT T4): `checkout -- <path>` materializes a deleted 100755 entry
+/// with its execute bit.
+#[cfg(unix)]
+#[test]
+fn test_checkout_restores_entry_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("failed to create repository root");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    let script = repo_path.join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_path),
+        "stage script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "executable", "--no-verify"], repo_path),
+        "commit script",
+    );
+    std::fs::remove_file(&script).expect("remove script");
+
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--", "run.sh"], repo_path),
+        "checkout -- run.sh",
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "checkout must restore the execute bit"
+    );
+}

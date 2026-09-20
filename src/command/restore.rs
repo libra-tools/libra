@@ -37,6 +37,7 @@ use crate::{
         path,
         pathspec::{PathspecError, PathspecSet},
         util,
+        worktree_blob::{WorktreeFileWriter, write_worktree_blob},
     },
 };
 
@@ -660,8 +661,6 @@ async fn restore_worktree_tracked(
             if !content_matches || !mode_matches {
                 restore_target_to_file_typed(*target, path_wd).await?;
                 restored.push(path_wd.display().to_string());
-            } else {
-                apply_worktree_target_mode(&path_abs, target.mode)?;
             }
         } else if !overlay && tracked {
             remove_worktree_path_for_restore(&path_abs)?;
@@ -1128,7 +1127,8 @@ fn worktree_mode_matches(path: &Path, mode: Option<TreeItemMode>) -> Result<bool
     let file_type = metadata.file_type();
     Ok(match mode {
         TreeItemMode::Link => file_type.is_symlink(),
-        TreeItemMode::Blob | TreeItemMode::BlobExecutable => file_type.is_file(),
+        TreeItemMode::Blob => file_type.is_file() && blob_exec_matches(&metadata, false),
+        TreeItemMode::BlobExecutable => file_type.is_file() && blob_exec_matches(&metadata, true),
         // A gitlink is represented by a directory in the working tree. Its
         // commit belongs to the nested repository and is intentionally not a
         // blob in the parent repository's object store.
@@ -1137,30 +1137,20 @@ fn worktree_mode_matches(path: &Path, mode: Option<TreeItemMode>) -> Result<bool
     })
 }
 
-#[cfg(unix)]
-fn apply_worktree_target_mode(path: &Path, mode: Option<TreeItemMode>) -> Result<(), RestoreError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(mode) = mode else {
-        return Ok(());
-    };
-    let Some(mode) = (match mode {
-        TreeItemMode::Blob => Some(0o644),
-        TreeItemMode::BlobExecutable => Some(0o755),
-        _ => None,
-    }) else {
-        return Ok(());
-    };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|_| RestoreError::WriteWorktree)
-}
-
-#[cfg(not(unix))]
-fn apply_worktree_target_mode(
-    _path: &Path,
-    _mode: Option<TreeItemMode>,
-) -> Result<(), RestoreError> {
-    Ok(())
+/// Compare a regular file's owner-execute bit against the entry mode (ADR-FM-02):
+/// a mode-only difference must force a rewrite, not a silent no-op.
+fn blob_exec_matches(metadata: &fs::Metadata, want_executable: bool) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (metadata.permissions().mode() & 0o111 != 0) == want_executable
+    }
+    #[cfg(not(unix))]
+    {
+        // No POSIX permission bits: the executable distinction is not observable.
+        let _ = (metadata, want_executable);
+        true
+    }
 }
 
 fn path_to_utf8(path: &Path) -> io::Result<&str> {
@@ -1366,8 +1356,9 @@ async fn restore_conflict_merge(
             fs::create_dir_all(parent).map_err(|_| RestoreError::WriteWorktree)?;
         }
         remove_existing_empty_directory(&path_abs)?;
-        remove_existing_symlink(&path_abs)?;
-        util::write_file(content.as_bytes(), &path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+        let executable = conflict_payload_is_executable(&index, path_str);
+        write_worktree_blob(&path_abs, content.as_bytes(), executable)
+            .map_err(|_| RestoreError::WriteWorktree)?;
         restored.push(path.display().to_string());
     }
     Ok(restored)
@@ -1475,27 +1466,37 @@ async fn restore_target_to_file_typed(
     remove_existing_empty_directory(&path_abs)?;
 
     if matches!(target.mode, Some(TreeItemMode::Link)) {
-        return write_worktree_symlink(&path_abs, &blob.data);
+        return write_restore_symlink(&path_abs, &blob.data);
     }
 
-    remove_existing_symlink(&path_abs)?;
+    let executable = matches!(target.mode, Some(TreeItemMode::BlobExecutable));
 
     match lfs::parse_pointer_data(&blob.data) {
         Some((oid, size)) => {
             let lfs_obj_path = lfs::lfs_object_path(&oid);
             if lfs_obj_path.exists() {
-                fs::copy(&lfs_obj_path, &path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+                let mut source =
+                    fs::File::open(&lfs_obj_path).map_err(|_| RestoreError::WriteWorktree)?;
+                let mut writer = WorktreeFileWriter::create(&path_abs, executable)
+                    .map_err(|_| RestoreError::WriteWorktree)?;
+                io::copy(&mut source, &mut writer).map_err(|_| RestoreError::WriteWorktree)?;
+                writer.finish().map_err(|_| RestoreError::WriteWorktree)?;
             } else {
+                let writer = WorktreeFileWriter::create(&path_abs, executable)
+                    .map_err(|_| RestoreError::WriteWorktree)?;
+                let temp_path = writer.temp_path().to_path_buf();
                 LFSClient::get()
                     .await
                     .map_err(|_| RestoreError::LfsDownload)?
-                    .download_object(&oid, size, &path_abs, None)
+                    .download_object(&oid, size, &temp_path, None)
                     .await
                     .map_err(|_| RestoreError::LfsDownload)?;
+                writer.finish().map_err(|_| RestoreError::WriteWorktree)?;
             }
         }
         None => {
-            util::write_file(&blob.data, &path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+            write_worktree_blob(&path_abs, &blob.data, executable)
+                .map_err(|_| RestoreError::WriteWorktree)?;
         }
     }
 
@@ -1644,39 +1645,27 @@ fn restore_target_index_size(target: RestoreTarget) -> Result<u32, RestoreError>
     u32::try_from(blob.data.len()).map_err(|_| RestoreError::ReadObject)
 }
 
-fn remove_existing_symlink(path: &Path) -> Result<(), RestoreError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(path).map_err(|_| RestoreError::WriteWorktree)
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(RestoreError::ReadWorktree),
-    }
+fn conflict_payload_is_executable(index: &Index, path: &str) -> bool {
+    [2u8, 3, 1].iter().any(|stage| {
+        index
+            .get(path, *stage)
+            .is_some_and(|entry| entry.mode & 0o100000 == 0o100000 && entry.mode & 0o111 != 0)
+    })
 }
 
 #[cfg(unix)]
-fn write_worktree_symlink(path: &Path, target: &[u8]) -> Result<(), RestoreError> {
-    use std::{
-        ffi::OsStr,
-        os::unix::{ffi::OsStrExt, fs::symlink},
-    };
-
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            return Err(RestoreError::WriteWorktree);
+fn write_restore_symlink(path: &Path, target: &[u8]) -> Result<(), RestoreError> {
+    match crate::utils::worktree_blob::write_worktree_symlink(path, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            Err(RestoreError::SymlinkUnsupported(path.display().to_string()))
         }
-        Ok(_) => fs::remove_file(path).map_err(|_| RestoreError::WriteWorktree)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(RestoreError::WriteWorktree),
+        Err(_) => Err(RestoreError::WriteWorktree),
     }
-
-    let target = Path::new(OsStr::from_bytes(target));
-    symlink(target, path).map_err(|_| RestoreError::WriteWorktree)
 }
 
 #[cfg(not(unix))]
-fn write_worktree_symlink(path: &Path, _target: &[u8]) -> Result<(), RestoreError> {
+fn write_restore_symlink(path: &Path, _target: &[u8]) -> Result<(), RestoreError> {
     Err(RestoreError::SymlinkUnsupported(path.display().to_string()))
 }
 
@@ -1689,28 +1678,40 @@ pub async fn restore_to_file(hash: &ObjectHash, path: &PathBuf) -> io::Result<()
     if let Some(parent) = path_abs.parent() {
         fs::create_dir_all(parent)?;
     }
-    if fs::symlink_metadata(&path_abs)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        fs::remove_file(&path_abs)?;
-    }
+    // Legacy entry point: it receives no explicit mode, so keep the index's
+    // executable bit when the path is tracked (ADR-FM-02).
+    let executable = Index::load(path::index())
+        .ok()
+        .and_then(|index| {
+            path.to_str().and_then(|name| {
+                index
+                    .get(name, 0)
+                    .map(|entry| entry.mode & 0o100000 == 0o100000 && entry.mode & 0o111 != 0)
+            })
+        })
+        .unwrap_or(false);
     match lfs::parse_pointer_data(&blob.data) {
         Some((oid, size)) => {
             let lfs_obj_path = lfs::lfs_object_path(&oid);
             if lfs_obj_path.exists() {
-                fs::copy(&lfs_obj_path, &path_abs)?;
+                let mut source = fs::File::open(&lfs_obj_path)?;
+                let mut writer = WorktreeFileWriter::create(&path_abs, executable)?;
+                io::copy(&mut source, &mut writer)?;
+                writer.finish()?;
             } else {
+                let writer = WorktreeFileWriter::create(&path_abs, executable)?;
+                let temp_path = writer.temp_path().to_path_buf();
                 let client = LFSClient::get()
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))?;
-                if let Err(e) = client.download_object(&oid, size, &path_abs, None).await {
+                if let Err(e) = client.download_object(&oid, size, &temp_path, None).await {
                     return Err(io::Error::other(e.to_string()));
                 }
+                writer.finish()?;
             }
         }
         None => {
-            util::write_file(&blob.data, &path_abs)?;
+            write_worktree_blob(&path_abs, &blob.data, executable)?;
         }
     }
     Ok(())
@@ -1757,9 +1758,6 @@ pub async fn restore_worktree(
             if hash != target.hash || !mode_matches {
                 restore_target_to_file_typed(*target, path_wd)
                     .await
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-            } else {
-                apply_worktree_target_mode(&path_abs, target.mode)
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
         } else if tracked {

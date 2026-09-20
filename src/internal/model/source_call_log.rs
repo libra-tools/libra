@@ -5,10 +5,9 @@
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
 //! and the entity is registered in [`crate::internal::model`].
 //!
-//! Producer is [`crate::internal::ai::sources::SourceCallLog`] (today
-//! the in-memory `Mutex<Vec<SourceCallRecord>>` shape from v0.16.x);
-//! v0.17.800 adds the on-disk shape so a session crash no longer
-//! drops the audit trail.
+//! The former in-memory SourcePool producer was retired with the Code-era
+//! source runtime; this entity remains for migration and compatibility data
+//! retained by existing repositories.
 
 use sea_orm::{DbErr, entity::prelude::*};
 

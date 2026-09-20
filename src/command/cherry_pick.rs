@@ -2071,6 +2071,8 @@ async fn cherry_pick_single_commit(
     )
     .map_err(|refusal| CherryPickSingleError::GitlinkUnsupported(refusal.to_string()))?;
 
+    let their_index_modes = tree_index_modes(&their_tree);
+    let base_index_modes = tree_index_modes(&parent_tree);
     let changes = diff_trees(&their_tree, &parent_tree);
     let needs_content_driver = changes.iter().any(|(path, their_hash, base_hash)| {
         let ours_hash = ours_items.get(path).copied();
@@ -2099,7 +2101,12 @@ async fn cherry_pick_single_commit(
         let ours_hash = ours_items.get(&path).cloned();
         if ours_hash == base_hash {
             match their_hash {
-                Some(th) => update_index_entry(&mut index, &path, th)?,
+                Some(th) => update_index_entry(
+                    &mut index,
+                    &path,
+                    th,
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?,
                 None => {
                     index.remove(path_to_utf8(&path)?, 0);
                 }
@@ -2120,11 +2127,27 @@ async fn cherry_pick_single_commit(
                         Some(ours_hash),
                         Some(their_hash),
                         favor,
+                        (
+                            current_index_mode(&current_index, &path),
+                            their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                        ),
                     )?;
                 } else {
                     index.remove(path_to_utf8(&path)?, 0);
-                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
-                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        ours_hash,
+                        2,
+                        current_index_mode(&current_index, &path),
+                    )?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        their_hash,
+                        3,
+                        their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                    )?;
                     conflicts.push((path, Some(ours_hash), Some(their_hash), None, driver));
                 }
                 continue;
@@ -2160,33 +2183,83 @@ async fn cherry_pick_single_commit(
                             path.display()
                         ))
                     })?;
-                    update_index_entry(&mut index, &path, blob.id)?;
+                    let mode = merged_entry_mode(
+                        current_index_mode(&current_index, &path),
+                        base_index_modes.get(&path).copied(),
+                        their_index_modes.get(&path).copied(),
+                    );
+                    update_index_entry(&mut index, &path, blob.id, mode)?;
                 }
                 merge::BuiltinMergeOutcome::Conflict(_) => {
                     index.remove(path_to_utf8(&path)?, 0);
                     if let Some(base_hash) = base_hash {
-                        add_stage_entry(&mut index, &path, base_hash, 1)?;
+                        add_stage_entry(
+                            &mut index,
+                            &path,
+                            base_hash,
+                            1,
+                            base_index_modes.get(&path).copied().unwrap_or(0o100644),
+                        )?;
                     }
-                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
-                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        ours_hash,
+                        2,
+                        current_index_mode(&current_index, &path),
+                    )?;
+                    add_stage_entry(
+                        &mut index,
+                        &path,
+                        their_hash,
+                        3,
+                        their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                    )?;
                     conflicts.push((path, Some(ours_hash), Some(their_hash), base_hash, driver));
                 }
             }
         } else if let Some(favor) = args.strategy_option.last().copied() {
             apply_favored_pick_resolution(
-                &mut index, &path, base_hash, ours_hash, their_hash, favor,
+                &mut index,
+                &path,
+                base_hash,
+                ours_hash,
+                their_hash,
+                favor,
+                (
+                    current_index_mode(&current_index, &path),
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                ),
             )?;
         } else {
             let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
             index.remove(path_to_utf8(&path)?, 0);
             if let Some(b) = base_hash {
-                add_stage_entry(&mut index, &path, b, 1)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    b,
+                    1,
+                    base_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?;
             }
             if let Some(o) = ours_hash {
-                add_stage_entry(&mut index, &path, o, 2)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    o,
+                    2,
+                    current_index_mode(&current_index, &path),
+                )?;
             }
             if let Some(t) = their_hash {
-                add_stage_entry(&mut index, &path, t, 3)?;
+                add_stage_entry(
+                    &mut index,
+                    &path,
+                    t,
+                    3,
+                    their_index_modes.get(&path).copied().unwrap_or(0o100644),
+                )?;
             }
             conflicts.push((path, ours_hash, their_hash, base_hash, driver));
         }
@@ -2589,6 +2662,43 @@ fn mergeable_tree_items(tree: &Tree) -> HashMap<PathBuf, ObjectHash> {
         .collect()
 }
 
+/// Index-mode map for a tree's non-gitlink entries.
+fn tree_index_modes(tree: &Tree) -> HashMap<PathBuf, u32> {
+    tree.get_plain_items_with_mode()
+        .into_iter()
+        .filter(|(_, _, mode)| *mode != TreeItemMode::Commit)
+        .map(|(path, _, mode)| (path, tree_mode_to_index_mode(mode)))
+        .collect()
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
+}
+
+/// Stage-0 mode currently recorded in the index, defaulting to a plain file.
+fn current_index_mode(index: &Index, path: &Path) -> u32 {
+    path.to_str()
+        .and_then(|name| index.get(name, 0))
+        .map(|entry| entry.mode)
+        .unwrap_or(0o100644)
+}
+
+/// Git's `merge_mode` behaviour: a side that matches the base yields to the
+/// other side's mode; otherwise ours wins.
+fn merged_entry_mode(ours: u32, base: Option<u32>, theirs: Option<u32>) -> u32 {
+    match (base, theirs) {
+        (Some(base), Some(theirs)) if ours == base => theirs,
+        (Some(base), Some(theirs)) if theirs == base => ours,
+        _ => ours,
+    }
+}
+
 /// Resolve a divergent cherry-pick path using the same hunk-level side
 /// preference as merge. A true three-sided content conflict preserves clean
 /// ranges; add/add and modify/delete conflicts select the requested whole side.
@@ -2599,6 +2709,7 @@ fn apply_favored_pick_resolution(
     ours_hash: Option<ObjectHash>,
     theirs_hash: Option<ObjectHash>,
     favor: MergeFavor,
+    modes: (u32, u32),
 ) -> Result<(), CherryPickSingleError> {
     let selected_hash = match (base_hash, ours_hash, theirs_hash) {
         (Some(base_hash), Some(ours_hash), Some(theirs_hash)) => {
@@ -2625,10 +2736,14 @@ fn apply_favored_pick_resolution(
         },
     };
 
+    let selected_mode = match favor {
+        MergeFavor::Ours => modes.0,
+        MergeFavor::Theirs => modes.1,
+    };
     let path_str = path_to_utf8(path)?;
     index.remove(path_str, 0);
     if let Some(hash) = selected_hash {
-        update_index_entry(index, path, hash)?;
+        update_index_entry(index, path, hash, selected_mode)?;
     }
     Ok(())
 }
@@ -2637,13 +2752,15 @@ fn update_index_entry(
     index: &mut Index,
     path: &Path,
     hash: ObjectHash,
+    mode: u32,
 ) -> Result<(), CherryPickSingleError> {
     let blob = git_internal::internal::object::blob::Blob::load(&hash);
-    let entry = IndexEntry::new_from_blob(
+    let mut entry = IndexEntry::new_from_blob(
         path_to_utf8(path)?.to_string(),
         hash,
         blob.data.len() as u32,
     );
+    entry.mode = mode;
     index.add(entry);
     Ok(())
 }
@@ -2654,6 +2771,7 @@ fn add_stage_entry(
     path: &Path,
     hash: ObjectHash,
     stage: u8,
+    mode: u32,
 ) -> Result<(), CherryPickSingleError> {
     let blob = git_internal::internal::object::blob::Blob::load(&hash);
     let mut entry = IndexEntry::new_from_blob(
@@ -2661,6 +2779,7 @@ fn add_stage_entry(
         hash,
         blob.data.len() as u32,
     );
+    entry.mode = mode;
     entry.flags.stage = stage;
     index.add(entry);
     Ok(())
@@ -2733,21 +2852,33 @@ fn write_conflict_markers_file(
     };
 
     let target = util::working_dir().join(path);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
+    let executable = index_entry_executable(path);
+    crate::utils::worktree_blob::write_worktree_blob(&target, &content, executable).map_err(
+        |e| {
             CherryPickSingleError::SaveFailed(format!(
-                "failed to create parent directory '{}': {e}",
-                parent.display()
+                "failed to write conflict markers to '{}': {e}",
+                target.display()
             ))
-        })?;
-    }
-    fs::write(&target, &content).map_err(|e| {
-        CherryPickSingleError::SaveFailed(format!(
-            "failed to write conflict markers to '{}': {e}",
-            target.display()
-        ))
-    })?;
+        },
+    )?;
     Ok(())
+}
+
+/// Executable bit of the index entry for `path` (stage 2, else 3/0), used by
+/// conflict-marker materialization (ADR-FM-02/03).
+fn index_entry_executable(path: &Path) -> bool {
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    Index::load(crate::utils::path::index())
+        .ok()
+        .and_then(|index| {
+            [2u8, 3, 0]
+                .iter()
+                .find_map(|stage| index.get(name, *stage))
+                .map(|entry| entry.mode & 0o111 != 0)
+        })
+        .unwrap_or(false)
 }
 
 /// Whole-file conflict presentation, used when a line-level merge does not apply
@@ -2831,20 +2962,27 @@ fn reset_workdir_tracked_only(
             }
             let blob = git_internal::internal::object::blob::Blob::load(&entry.hash);
             let target_path = workdir.join(path_str);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
+            if entry.mode & 0o170000 == 0o120000 {
+                crate::utils::worktree_blob::write_worktree_symlink(&target_path, &blob.data)
+                    .map_err(|e| {
+                        CherryPickSingleError::SaveFailed(format!(
+                            "failed to write symlink '{}': {e}",
+                            target_path.display()
+                        ))
+                    })?;
+            } else {
+                crate::utils::worktree_blob::write_worktree_blob(
+                    &target_path,
+                    &blob.data,
+                    entry.mode & 0o111 != 0,
+                )
+                .map_err(|e| {
                     CherryPickSingleError::SaveFailed(format!(
-                        "failed to create parent directory '{}': {e}",
-                        parent.display()
+                        "failed to write file '{}': {e}",
+                        target_path.display()
                     ))
                 })?;
             }
-            fs::write(&target_path, &blob.data).map_err(|e| {
-                CherryPickSingleError::SaveFailed(format!(
-                    "failed to write file '{}': {e}",
-                    target_path.display()
-                ))
-            })?;
         }
     }
     Ok(())

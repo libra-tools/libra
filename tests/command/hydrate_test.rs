@@ -151,3 +151,62 @@ fn dry_run_writes_nothing() {
     assert!(!p.join("scene.usd").exists(), "dry-run makes no change");
     assert!(String::from_utf8_lossy(&out.stdout).contains("would hydrate"));
 }
+
+/// FM-02 (M-MAT2 U7): hydrate creates an executable entry with `0777 & umask`.
+#[cfg(unix)]
+#[test]
+fn hydrate_honors_process_umask_for_executable_entry() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    assert_cli_success(&run_libra_command(&["config", "user.name", "t"], p), "name");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], p),
+        "email",
+    );
+    let tool = p.join("tool");
+    fs::write(&tool, "#!/bin/sh\necho hi\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tool"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "exec", "--no-verify"], p),
+        "commit",
+    );
+    fs::remove_file(&tool).unwrap();
+
+    let home = p.join(".libra-test-home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 077; exec {} hydrate tool",
+            env!("CARGO_BIN_EXE_libra")
+        ))
+        .current_dir(p)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(libra::utils::pager::LIBRA_TEST_ENV, "1")
+        .output()
+        .expect("hydrate under umask 077");
+    assert!(
+        output.status.success(),
+        "hydrate under umask 077 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(&tool)
+            .expect("tool metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "hydrate under umask 077 must materialize 700"
+    );
+}

@@ -648,15 +648,6 @@ fn index_mode_to_tree_mode(mode: u32) -> TreeItemMode {
     }
 }
 
-/// The Unix permission bits a restored worktree file should carry for a tree mode.
-#[cfg(unix)]
-fn tree_mode_to_unix_perm(mode: TreeItemMode) -> u32 {
-    match mode {
-        TreeItemMode::BlobExecutable => 0o755,
-        _ => 0o644,
-    }
-}
-
 /// Resolve user pathspecs to the set of candidate paths they select through the
 /// shared pathspec engine (`FIX-AD-01`): plain prefixes, wildcards, and the
 /// `:(top)`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)` magic forms all match
@@ -891,16 +882,14 @@ fn reset_pathspec_to_head(
             Some(entry) => {
                 let blob: Blob =
                     load_object(&entry.hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|e| StashError::WriteObject(e.to_string()))?;
-                }
-                fs::write(&full, &blob.data).map_err(|e| StashError::WriteObject(e.to_string()))?;
-                #[cfg(unix)]
-                {
-                    let perm = std::fs::Permissions::from_mode(tree_mode_to_unix_perm(entry.mode));
-                    let _ = fs::set_permissions(&full, perm);
-                }
+                // Mode-aware atomic replacement (ADR-FM-02/03): content and the
+                // entry's executable bit are published together under the umask.
+                crate::utils::worktree_blob::write_worktree_blob(
+                    &full,
+                    &blob.data,
+                    entry.mode == TreeItemMode::BlobExecutable,
+                )
+                .map_err(|e| StashError::WriteObject(e.to_string()))?;
                 // Pass the repo-relative path: the entry name is recorded
                 // verbatim (an absolute path would corrupt the index). The
                 // entry is smudged unconditionally (`pre_read = None`): the

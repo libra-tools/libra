@@ -2237,3 +2237,56 @@ fn worktree_list_porcelain_emits_attribute_lines() {
         "entry is terminated by a blank line: {text:?}"
     );
 }
+
+/// FM-01 (M-MAT T8): `worktree add` checks out the linked worktree with the
+/// entry's execute bit.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn test_worktree_add_preserves_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let script = repo_dir.path().join("run.sh");
+    std::fs::write(&script, "#!/bin/sh\necho run\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh"], repo_dir.path()),
+        "stage script",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "executable", "--no-verify"],
+            repo_dir.path(),
+        ),
+        "commit script",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt_mode"], repo_dir.path()),
+        "worktree add",
+    );
+
+    let output = run_libra_command(&["--json", "worktree", "list"], repo_dir.path());
+    assert_cli_success(&output, "worktree list");
+    let parsed = parse_json_stdout(&output);
+    let linked_path = parsed["data"]["worktrees"]
+        .as_array()
+        .expect("worktrees array")
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .and_then(|entry| entry["path"].as_str())
+        .expect("linked worktree path")
+        .to_string();
+    let linked_script = std::path::Path::new(&linked_path).join("run.sh");
+    assert_eq!(
+        std::fs::symlink_metadata(&linked_script)
+            .expect("linked script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "worktree add must materialize the execute bit"
+    );
+}

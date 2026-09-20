@@ -1684,3 +1684,46 @@ fn test_pull_refuses_local_upstream() {
         report.message
     );
 }
+
+/// FM-01 (M-MAT T7): pulling a fast-forward commit materializes its
+/// executable entry with the execute bit.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_fast_forward_materializes_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "initial pull",
+    );
+
+    let script = work_dir.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho run\n").expect("write remote script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod remote script");
+    git(&["add", "run.sh"], &work_dir);
+    git(&["commit", "-m", "remote executable"], &work_dir);
+    git(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["pull"], local_repo.path()),
+        "pull executable commit",
+    );
+    assert_eq!(
+        fs::symlink_metadata(local_repo.path().join("run.sh"))
+            .expect("pulled script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "pull fast-forward must materialize the execute bit"
+    );
+}

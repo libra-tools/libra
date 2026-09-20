@@ -40,6 +40,8 @@ Submodules are never merged (see `docs/commands/merge.md`): if a replayed commit
 
 Rebase state (the list of remaining and completed commits, the original HEAD, and the target base) is persisted in the SQLite database. Recovery-critical autostash, exec, and update-refs metadata is fsynced atomically in `.libra/rebase-aux.json` until the sequence reaches a terminal state. Legacy file-based state from older Libra versions is automatically migrated to the database on first access.
 
+Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
+
 ## Options
 
 | Option | Long | Description |

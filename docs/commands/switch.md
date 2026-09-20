@@ -34,6 +34,8 @@ OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
 `LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
 [Repository hooks](repository-hooks.md) for sandbox and output behavior.
 
+Switching materializes the target entry's permission bits under the process `umask`, setting or clearing the execute bit as the entry mode requires (plan issues/470 FM-01).
+
 ## Options
 
 | Flag | Long | Value | Description |

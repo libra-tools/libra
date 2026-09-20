@@ -3367,3 +3367,72 @@ fn test_reset_conclusion_waits_for_a_concurrent_revert_lock_holder() {
         "the sidecar written under the lock survives the stale conclusion"
     );
 }
+
+/// FM-02 (M-MAT2 U4): `reset --hard` under `umask 077` materializes 700/600.
+#[cfg(unix)]
+#[test]
+fn test_reset_hard_honors_process_umask() {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+    let script = repo_path.join("run.sh");
+    fs::write(&script, "#!/bin/sh\necho run\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(repo_path.join("plain.txt"), "plain\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "run.sh", "plain.txt"], repo_path),
+        "stage files",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "modes", "--no-verify"], repo_path),
+        "commit files",
+    );
+    fs::remove_file(&script).unwrap();
+    fs::remove_file(repo_path.join("plain.txt")).unwrap();
+
+    let home = repo_path.join(".libra-test-home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 077; exec {} reset --hard HEAD",
+            env!("CARGO_BIN_EXE_libra")
+        ))
+        .current_dir(repo_path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(libra::utils::pager::LIBRA_TEST_ENV, "1")
+        .output()
+        .expect("reset under umask 077");
+    assert!(
+        output.status.success(),
+        "reset under umask 077 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "100755 entry under umask 077 must be 700"
+    );
+    assert_eq!(
+        fs::symlink_metadata(repo_path.join("plain.txt"))
+            .expect("plain metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "100644 entry under umask 077 must be 600"
+    );
+}

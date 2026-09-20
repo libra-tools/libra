@@ -663,7 +663,17 @@ async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
         })
         .collect();
     let files_changed = tree_items.len();
-    let tree_id = build_tree_from_map(tree_items).await?;
+    let tree_modes: std::collections::HashMap<PathBuf, TreeItemMode> = index
+        .tracked_files()
+        .into_iter()
+        .filter_map(|path| {
+            let key = path.to_str()?;
+            index
+                .get(key, 0)
+                .map(|entry| (path.clone(), index_mode_to_tree_item(entry.mode)))
+        })
+        .collect();
+    let tree_id = build_tree_from_map(tree_items, &tree_modes).await?;
     let message = resolve_revert_message(
         &reverted_commit_id,
         state.signoff,
@@ -1370,6 +1380,24 @@ async fn revert_single_commit(
         reverted_tree.get_plain_items().into_iter().collect();
     let parent_files: std::collections::HashMap<_, _> =
         parent_tree.get_plain_items().into_iter().collect();
+    // Modes travel with the hashes: the revert result tree and the materialized
+    // worktree must keep each entry's executable/symlink mode (plan issues/470
+    // FM-02) instead of collapsing everything to a plain blob.
+    let mut current_modes: std::collections::HashMap<PathBuf, TreeItemMode> = current_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
+    let reverted_modes: std::collections::HashMap<PathBuf, TreeItemMode> = reverted_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
+    let parent_modes: std::collections::HashMap<PathBuf, TreeItemMode> = parent_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, _, mode)| (path, mode))
+        .collect();
 
     let modifies_existing_path = reverted_files.iter().any(|(path, reverted_hash)| {
         let parent_hash = parent_files.get(path);
@@ -1422,10 +1450,22 @@ async fn revert_single_commit(
                 MergeFavor::Ours => current_files.get(path).copied(),
                 MergeFavor::Theirs => parent_hash.copied(),
             };
+            let selected_mode = match favor {
+                MergeFavor::Ours => current_modes.get(path).copied(),
+                MergeFavor::Theirs => parent_modes.get(path).copied(),
+            };
             let previous = match selected {
                 Some(hash) => current_files.insert(path.clone(), hash),
                 None => current_files.remove(path),
             };
+            match selected_mode {
+                Some(mode) if selected.is_some() => {
+                    current_modes.insert(path.clone(), mode);
+                }
+                _ => {
+                    current_modes.remove(path);
+                }
+            }
             if previous != selected {
                 files_changed += 1;
             }
@@ -1444,7 +1484,13 @@ async fn revert_single_commit(
                 conflict_style,
                 &labels,
             )?;
+            let merged_mode = merged_tree_mode(
+                current_modes.get(path).copied(),
+                reverted_modes.get(path).copied(),
+                parent_modes.get(path).copied(),
+            );
             current_files.insert(path.clone(), merged_hash);
+            current_modes.insert(path.clone(), merged_mode);
             files_changed += 1;
             if conflicted {
                 conflicted_paths.push(path.display().to_string());
@@ -1456,7 +1502,15 @@ async fn revert_single_commit(
             if current_files.insert(path.clone(), *parent_hash) != Some(*parent_hash) {
                 files_changed += 1;
             }
+            current_modes.insert(
+                path.clone(),
+                parent_modes
+                    .get(path)
+                    .copied()
+                    .unwrap_or(TreeItemMode::Blob),
+            );
         } else if current_files.remove(path).is_some() {
+            current_modes.remove(path);
             files_changed += 1;
         }
     }
@@ -1479,7 +1533,13 @@ async fn revert_single_commit(
                         conflict_style,
                         &labels,
                     )?;
+                    let merged_mode = merged_tree_mode(
+                        current_modes.get(path).copied(),
+                        reverted_modes.get(path).copied(),
+                        parent_modes.get(path).copied(),
+                    );
                     current_files.insert(path.clone(), merged_hash);
+                    current_modes.insert(path.clone(), merged_mode);
                     files_changed += 1;
                     if conflicted {
                         conflicted_paths.push(path.display().to_string());
@@ -1490,10 +1550,17 @@ async fn revert_single_commit(
                 // inverse behavior: -X ours retains current, otherwise the
                 // deleted path is restored from the selected parent.
                 if let Some(favor) = params.strategy_option {
-                    if favor == MergeFavor::Theirs
-                        && current_files.insert(path.clone(), parent_hash) != Some(parent_hash)
-                    {
-                        files_changed += 1;
+                    if favor == MergeFavor::Theirs {
+                        if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
+                            files_changed += 1;
+                        }
+                        current_modes.insert(
+                            path.clone(),
+                            parent_modes
+                                .get(path)
+                                .copied()
+                                .unwrap_or(TreeItemMode::Blob),
+                        );
                     }
                     continue;
                 }
@@ -1501,6 +1568,13 @@ async fn revert_single_commit(
             if current_files.insert(path.clone(), parent_hash) != Some(parent_hash) {
                 files_changed += 1;
             }
+            current_modes.insert(
+                path.clone(),
+                parent_modes
+                    .get(path)
+                    .copied()
+                    .unwrap_or(TreeItemMode::Blob),
+            );
         }
     }
 
@@ -1513,7 +1587,7 @@ async fn revert_single_commit(
         });
     }
 
-    let final_tree_id = build_tree_from_map(current_files).await?;
+    let final_tree_id = build_tree_from_map(current_files, &current_modes).await?;
     let final_tree: Tree =
         load_object(&final_tree_id).map_err(|e| RevertError::LoadObject(e.to_string()))?;
 
@@ -1564,9 +1638,11 @@ async fn revert_single_commit(
 
 async fn build_tree_from_map(
     files: std::collections::HashMap<PathBuf, ObjectHash>,
+    modes: &std::collections::HashMap<PathBuf, TreeItemMode>,
 ) -> Result<ObjectHash, RevertError> {
     fn build_subtree(
         paths: &std::collections::HashMap<PathBuf, ObjectHash>,
+        modes: &std::collections::HashMap<PathBuf, TreeItemMode>,
         current_dir: &PathBuf,
     ) -> Result<Tree, RevertError> {
         let mut tree_items = Vec::new();
@@ -1575,7 +1651,7 @@ async fn build_tree_from_map(
             if let Ok(relative_path) = path.strip_prefix(current_dir) {
                 if relative_path.components().count() == 1 {
                     tree_items.push(git_internal::internal::object::tree::TreeItem {
-                        mode: git_internal::internal::object::tree::TreeItemMode::Blob,
+                        mode: modes.get(path).copied().unwrap_or(TreeItemMode::Blob),
                         name: path_to_utf8(relative_path)?.to_string(),
                         id: *hash,
                     });
@@ -1595,7 +1671,7 @@ async fn build_tree_from_map(
             }
         }
         for (subdir, subdir_files) in subdirs {
-            let subdir_tree = build_subtree(&subdir_files.into_iter().collect(), &subdir)?;
+            let subdir_tree = build_subtree(&subdir_files.into_iter().collect(), modes, &subdir)?;
             tree_items.push(git_internal::internal::object::tree::TreeItem {
                 mode: git_internal::internal::object::tree::TreeItemMode::Tree,
                 name: file_name_to_utf8(&subdir)?,
@@ -1607,7 +1683,7 @@ async fn build_tree_from_map(
     }
 
     let root_dir = PathBuf::new();
-    let root_tree = build_subtree(&files, &root_dir)?;
+    let root_tree = build_subtree(&files, modes, &root_dir)?;
     save_object(&root_tree, &root_tree.id).map_err(|e| RevertError::SaveObject(e.to_string()))?;
     Ok(root_tree.id)
 }
@@ -1672,7 +1748,7 @@ fn rebuild_index_from_tree(
             rebuild_index_from_tree(&subtree, index, full_path_str)?;
         } else {
             let blob = git_internal::internal::object::blob::Blob::load(&item.id);
-            let entry = IndexEntry::new_from_blob(
+            let mut entry = IndexEntry::new_from_blob(
                 full_path
                     .to_str()
                     .ok_or_else(|| {
@@ -1684,10 +1760,48 @@ fn rebuild_index_from_tree(
                 item.id,
                 blob.data.len() as u32,
             );
+            entry.mode = tree_mode_to_index_mode(item.mode);
             index.add(entry);
         }
     }
     Ok(())
+}
+
+/// Reverse of [`tree_mode_to_index_mode`] for index entries.
+fn index_mode_to_tree_item(mode: u32) -> TreeItemMode {
+    match mode & 0o170000 {
+        0o120000 => TreeItemMode::Link,
+        0o160000 => TreeItemMode::Commit,
+        0o040000 => TreeItemMode::Tree,
+        _ if mode & 0o111 != 0 => TreeItemMode::BlobExecutable,
+        _ => TreeItemMode::Blob,
+    }
+}
+
+/// Git's `merge_mode` behaviour for the revert 3-way merge (base = reverted
+/// commit, ours = current, theirs = parent): a side matching the base yields to
+/// the other side's mode; otherwise ours wins.
+fn merged_tree_mode(
+    ours: Option<TreeItemMode>,
+    base: Option<TreeItemMode>,
+    theirs: Option<TreeItemMode>,
+) -> TreeItemMode {
+    let ours = ours.unwrap_or(TreeItemMode::Blob);
+    match (base, theirs) {
+        (Some(base), Some(theirs)) if ours == base => theirs,
+        (Some(base), Some(theirs)) if theirs == base => ours,
+        _ => ours,
+    }
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
 }
 
 fn reset_workdir_safely(current_index: &Index, new_index: &Index) -> Result<(), RevertError> {
@@ -1713,20 +1827,27 @@ fn reset_workdir_safely(current_index: &Index, new_index: &Index) -> Result<(), 
         if let Some(entry) = new_index.get(path_str, 0) {
             let blob = git_internal::internal::object::blob::Blob::load(&entry.hash);
             let target_path = workdir.join(path_str);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
+            if entry.mode & 0o170000 == 0o120000 {
+                crate::utils::worktree_blob::write_worktree_symlink(&target_path, &blob.data)
+                    .map_err(|e| {
+                        RevertError::WriteWorktree(format!(
+                            "failed to write symlink '{}': {e}",
+                            target_path.display()
+                        ))
+                    })?;
+            } else {
+                crate::utils::worktree_blob::write_worktree_blob(
+                    &target_path,
+                    &blob.data,
+                    entry.mode & 0o111 != 0,
+                )
+                .map_err(|e| {
                     RevertError::WriteWorktree(format!(
-                        "failed to create directory '{}': {e}",
-                        parent.display()
+                        "failed to write '{}': {e}",
+                        target_path.display()
                     ))
                 })?;
             }
-            fs::write(&target_path, &blob.data).map_err(|e| {
-                RevertError::WriteWorktree(format!(
-                    "failed to write '{}': {e}",
-                    target_path.display()
-                ))
-            })?;
         }
     }
 

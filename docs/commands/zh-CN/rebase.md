@@ -39,6 +39,8 @@ libra rebase --edit-todo
 
 Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）持久化在 SQLite 数据库中。恢复关键的 autostash、exec 与 update-refs 元数据会原子且强制 fsync 到 `.libra/rebase-aux.json`，直到序列进入终态。旧 Libra 版本的 legacy file-based 状态会在首次访问时自动迁移到数据库。
 
+工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
+
 ## 选项
 
 | 选项 | 长选项 | 说明 |
