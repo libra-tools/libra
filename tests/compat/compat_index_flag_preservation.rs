@@ -26,6 +26,19 @@ const STAGING_MODULES: &[&str] = &[
 ///   the *destination*) would be wrong.
 const ALLOWED: &[(&str, &str)] = &[("src/command/mv.rs", "index.add(entry);")];
 
+/// SW-04 history-rewrite modules whose whole-index rebuild must carry
+/// `skip_worktree` over from the previous index.
+const REBUILD_MODULES: &[&str] = &[
+    "src/command/reset.rs",
+    "src/command/revert.rs",
+    "src/command/rebase.rs",
+];
+
+/// `read-tree` rebuilds (no `-m`) and therefore CLEARS the flags by design;
+/// its `-m` merge path goes through `merge_tree_into_index`, which preserves
+/// them through the update helper.
+const CLEAR_ON_REBUILD: &[&str] = &["src/command/read_tree.rs"];
+
 #[test]
 fn staging_commands_route_replacements_through_the_flag_helper() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -68,4 +81,21 @@ fn staging_commands_route_replacements_through_the_flag_helper() {
         helper_users >= 5,
         "expected the staging modules to use the helper (found {helper_users})"
     );
+
+    for module in REBUILD_MODULES {
+        let source = fs::read_to_string(root.join(module))
+            .unwrap_or_else(|error| panic!("read {module}: {error}"));
+        assert!(
+            source.contains("preserve_skip_worktree_from"),
+            "{module} rebuilds the index and must carry skip-worktree with preserve_skip_worktree_from"
+        );
+    }
+    for module in CLEAR_ON_REBUILD {
+        let source = fs::read_to_string(root.join(module))
+            .unwrap_or_else(|error| panic!("read {module}: {error}"));
+        assert!(
+            source.contains("merge_tree_into_index"),
+            "{module} must route its -m merge path through merge_tree_into_index"
+        );
+    }
 }

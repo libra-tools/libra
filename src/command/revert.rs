@@ -800,6 +800,7 @@ async fn restore_to_orig_head(orig_head_str: &str) -> Result<(), RevertError> {
     rebuild_index_from_tree(&tree, &mut new_index, "")?;
     let current_index =
         Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut new_index);
     reset_workdir_safely(&current_index, &new_index)?;
     new_index
         .save(path::index())
@@ -1613,6 +1614,7 @@ async fn revert_single_commit(
     rebuild_index_from_tree(&final_tree, &mut new_index, "")?;
     let current_index =
         Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut new_index);
     reset_workdir_safely(&current_index, &new_index)?;
     new_index
         .save(path::index())

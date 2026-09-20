@@ -715,6 +715,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     if util::require_repo().is_err() {
         return Err(CliError::from(DiffError::NotInRepo));
     }
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
     let mut args = args;
     resolve_positional_revisions(&mut args)
         .await
@@ -3385,6 +3386,15 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
     let mut files = Vec::new();
 
     for file in index.tracked_files() {
+        // ADR-SW-04 item 1: skip-worktree paths are sparse-checkout entries;
+        // their (absent or stale) worktree copy is not a diff.
+        if file
+            .to_str()
+            .and_then(|name| index.get(name, 0))
+            .is_some_and(|entry| entry.flags.skip_worktree)
+        {
+            continue;
+        }
         let absolute = util::workdir_to_absolute(&file);
         if std::fs::symlink_metadata(&absolute).is_ok() {
             files.push(file);
@@ -3405,6 +3415,10 @@ fn get_index_side(
     let entries = index
         .tracked_entries(0)
         .into_iter()
+        // ADR-SW-04 item 1: a skip-worktree path is intentionally absent or
+        // stale in the worktree and must not appear on the index side of a
+        // working-directory diff.
+        .filter(|entry| !entry.flags.skip_worktree)
         .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index));
     let mut blobs = Vec::new();
     let mut modes = HashMap::new();

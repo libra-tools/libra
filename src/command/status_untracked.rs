@@ -231,6 +231,15 @@ fn collect_tracked_worktree_changes(
         let Some(file_str) = file.to_str() else {
             continue;
         };
+        // ADR-SW-04 item 1: a skip-worktree entry is a sparse-checkout path
+        // whose worktree copy may legitimately be absent or stale; it is
+        // never a status change.
+        if index
+            .get(file_str, 0)
+            .is_some_and(|entry| entry.flags.skip_worktree)
+        {
+            continue;
+        }
         // A gitlink (mode 0o160000) records a submodule COMMIT, not a blob:
         // hashing the directory as file content would fail and be reported
         // as an unreadable path. Submodule status is out of R0 scope, so the

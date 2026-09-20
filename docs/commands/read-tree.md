@@ -23,6 +23,8 @@ cannot silently overwrite working-tree files. The Git options that would modify
 the working tree or perform a merge (`-u`, `-m`, `--reset`, `--prefix`) are not
 exposed — use `libra restore` / `libra checkout` to update the working tree.
 
+`-m`/`--merge` merges the tree into the current index: entries from the tree are added or updated, entries the tree does not mention are kept, and replaced entries keep their index v3 extended flags (skip-worktree / intent-to-add). Without `-m` the index is rebuilt from the tree and the extended flags are cleared, matching Git's rebuild semantics.
+
 ## Options
 
 | Option | Description | Example |

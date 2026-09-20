@@ -208,6 +208,24 @@ pub fn write_tree_from_leaves(
 /// (the tree carries no size); the tree id round-trips regardless because a tree
 /// is derived from `(mode, id, name)` only. This is the index half of
 /// `read-tree` — it does **not** touch the working tree.
+/// Merge a tree into an existing index (Git's `read-tree -m` single-tree
+/// form): tree entries are added or replaced through
+/// `index_ext::update_preserving_flags` so the replaced entry's v3 extended
+/// flags survive, and index entries the tree does not mention are kept.
+pub fn merge_tree_into_index(
+    tree_id: &ObjectHash,
+    index: &mut Index,
+) -> Result<(), TreePlumbingError> {
+    let mut files: Vec<(String, TreeItem)> = Vec::new();
+    collect_tree_leaves(tree_id, "", &mut files)?;
+    for (path, item) in files {
+        let mut entry = IndexEntry::new_from_blob(path, item.id, 0);
+        entry.mode = tree_mode_to_index_mode(item.mode);
+        crate::utils::index_ext::update_preserving_flags(index, entry);
+    }
+    Ok(())
+}
+
 pub fn read_tree_into_index(tree_id: &ObjectHash) -> Result<Index, TreePlumbingError> {
     let mut files: Vec<(String, TreeItem)> = Vec::new();
     collect_tree_leaves(tree_id, "", &mut files)?;

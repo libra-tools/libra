@@ -8,7 +8,7 @@
 
 - 兼容级别：`partial`。
 - 已支持：`read-tree <tree-ish>`（tree id / commit / ref / tag / `HEAD`，以及 `^{tree}`/`^{commit}` 等共享 revision 语法，严格剥离到 tree），`--json`/`--machine`。
-- 未公开：`-m`（合并）、`-u`（更新工作树）、`--reset`、`--prefix`、多 tree 合并（延后）。因此首版**不可能**静默覆盖工作树文件——它只写 index。
+- 已实现 `-m`/`--merge`（issues/490 SW-04）：合并进当前索引、经 `index_ext::update_preserving_flags` 保留扩展位；不带 `-m` 的重建按 Git 语义清除扩展位。未公开：`-u`（更新工作树）、`--reset`、`--prefix`、多 tree 合并（延后）。因此本命令**不可能**静默覆盖工作树文件——它只写 index。
 
 ## 设计方案
 
@@ -36,7 +36,7 @@
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | `-m`/`-u`/`--reset`/`--prefix`、多 tree 合并 | 延后；首版仅 index。更新工作树用 `restore`/`checkout`。 |
+| 兼容差异项 | `-u`/`--reset`/`--prefix`、多 tree 合并 | 延后；`-m` 已实现（SW-04）。更新工作树用 `restore`/`checkout`。 |
 | 精度 | 读入条目的 blob size 置 0 | 不影响 tree round-trip；后续如需精确 stat 再补。 |
 
 ## 维护要求

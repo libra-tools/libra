@@ -1954,6 +1954,7 @@ fn restore_current_head_tree(state: &RebaseState) -> Result<(), RebaseError> {
     let mut index = git_internal::internal::index::Index::new();
     rebuild_index_from_tree(&current_tree, &mut index, "")
         .map_err(|error| RebaseError::IndexRebuild(error.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut index);
     index
         .save(&index_file)
         .map_err(|error| RebaseError::IndexSave(error.to_string()))?;
@@ -4327,6 +4328,7 @@ async fn run_rebase_start(
         let mut index = git_internal::internal::index::Index::new();
         rebuild_index_from_tree(&upstream_tree, &mut index, "")
             .map_err(RebaseError::IndexRebuild)?;
+        crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut index);
         rebase_worktree_guard_structured(&index, "fast-forward rebase").await?;
         // The worktree is materialized AFTER the ref and index move below, so
         // anything that materialization would refuse has to be caught here —
@@ -4909,6 +4911,7 @@ async fn finalize_rebase(
     rebuild_index_from_tree(&final_tree, &mut index, "")
         .map_err(|error| anyhow::anyhow!(error))
         .context("failed to rebuild index from final tree")?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut index);
     reset_workdir_tracked_only(&current_index, &index)
         .map_err(|error| anyhow::anyhow!(error))
         .context("failed to reset working directory after rebase")?;
@@ -5254,6 +5257,7 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
         .map_err(|error| RebaseError::IndexLoad(error.to_string()))?;
     let mut index = git_internal::internal::index::Index::new();
     rebuild_index_from_tree(&orig_tree, &mut index, "").map_err(RebaseError::IndexRebuild)?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut index);
     reset_workdir_tracked_only(&current_index, &index).map_err(RebaseError::WorkdirReset)?;
     index
         .save(&index_file)
@@ -5434,6 +5438,7 @@ async fn run_rebase_skip(output: &OutputConfig) -> Result<RebaseOutput, RebaseEr
     let mut index = git_internal::internal::index::Index::new();
     rebuild_index_from_tree(&current_tree, &mut index, "")
         .map_err(|e| RebaseError::IndexRebuild(e.to_string()))?;
+    crate::utils::index_ext::preserve_skip_worktree_from(&current_index, &mut index);
     index
         .save(&index_file)
         .map_err(|e| RebaseError::IndexSave(e.to_string()))?;
@@ -6484,6 +6489,7 @@ fn restore_replay_index_and_workdir(
             e.to_string(),
         ));
     }
+    crate::utils::index_ext::preserve_skip_worktree_from(current_index, &mut index);
     if let Err(e) = index.save(index_file) {
         return Err(ReplayResult::internal(
             ReplayErrorKind::IndexSave,

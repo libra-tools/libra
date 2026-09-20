@@ -2406,3 +2406,53 @@ fn test_commit_allow_empty_message_matrix() {
     let show = run_libra_command(&["show", "-s", "--oneline"], p);
     assert_cli_success(&show, "E10 show");
 }
+
+/// SW-05 (M-HONOR H4, plan issues/490): `commit -a` keeps a skip-worktree
+/// entry whose worktree file is absent and preserves its extended bit.
+#[test]
+fn test_commit_all_keeps_skip_worktree_entry() {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s"), "s\n").expect("write s");
+    fs::write(root.join("other"), "other\n").expect("write other");
+    assert_cli_success(&run_libra_command(&["add", "s", "other"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    let index_path = root.join(".libra/index");
+    {
+        let mut index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load");
+        let (hash, mode, size) = {
+            let entry = index.get("s", 0).expect("tracked");
+            (entry.hash, entry.mode, entry.size)
+        };
+        let mut entry = IndexEntry::new_from_blob("s".to_string(), hash, size);
+        entry.mode = mode;
+        entry.flags.skip_worktree = true;
+        index.update(entry);
+        index
+            .save_with_hash_kind(HashKind::Sha1, &index_path)
+            .expect("save");
+    }
+    fs::remove_file(root.join("s")).expect("remove s");
+    // Give `commit -a` a real change to commit; the skip-worktree deletion
+    // alone is correctly "nothing to commit".
+    fs::write(root.join("other"), "changed\n").expect("modify other");
+
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "h4", "--no-verify"], root),
+        "commit -a",
+    );
+    let index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("reload");
+    let entry = index.get("s", 0).expect("s must stay tracked");
+    assert!(entry.flags.skip_worktree, "the bit must survive commit -a");
+}

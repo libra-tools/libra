@@ -1,14 +1,16 @@
 //! `libra read-tree` — read a tree object into the index. Plumbing companion to
 //! `write-tree`.
 //!
-//! First-version scope: it reads a single tree-ish into the index, **replacing**
-//! the current index content. It does **not** touch the working tree, and the
-//! Git options that would (`-u`, `-m`, `--prefix`, `--reset`) are not exposed —
-//! so this command can never silently overwrite working-tree files. Document
-//! those as deferred.
+//! Scope: it reads a single tree-ish into the index, **replacing** the current
+//! index content, or merges it with `-m`/`--merge` (tree entries are added or
+//! replaced, index entries the tree does not mention are kept, and replaced
+//! entries keep their index v3 extended flags). It does **not** touch the
+//! working tree, and the Git options that would (`-u`, `--prefix`, `--reset`)
+//! are not exposed — so this command can never silently overwrite
+//! working-tree files.
 
 use clap::Parser;
-use git_internal::hash::ObjectHash;
+use git_internal::{hash::ObjectHash, internal::index::Index};
 use serde::Serialize;
 
 use crate::{
@@ -36,6 +38,13 @@ pub struct ReadTreeArgs {
     #[clap(long = "index-file", value_name = "PATH")]
     pub index_file: Option<String>,
 
+    /// Merge the tree into the current index instead of replacing it: tree
+    /// entries are added or updated, index entries the tree does not mention
+    /// are kept, and replaced entries keep their extended flags
+    /// (skip-worktree / intent-to-add).
+    #[clap(short = 'm', long = "merge")]
+    pub merge: bool,
+
     /// The tree-ish to read: a tree object id, a commit id/ref/tag (peeled to
     /// its tree), or a branch name / `HEAD`.
     #[clap(value_name = "TREE-ISH")]
@@ -62,16 +71,25 @@ pub async fn execute_safe(args: ReadTreeArgs, output: &OutputConfig) -> CliResul
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     let tree_id = resolve_tree_ish(&args.tree_ish).await?;
-    let index = tree_plumbing::read_tree_into_index(&tree_id).map_err(|error| {
-        CliError::fatal(format!("failed to read tree '{}': {error}", args.tree_ish))
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-    let entries = index.tracked_entries(0).len();
     let index_path = args
         .index_file
         .clone()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(path::index);
+    let index = if args.merge {
+        let mut current = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+        tree_plumbing::merge_tree_into_index(&tree_id, &mut current).map_err(|error| {
+            CliError::fatal(format!("failed to read tree '{}': {error}", args.tree_ish))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+        current
+    } else {
+        tree_plumbing::read_tree_into_index(&tree_id).map_err(|error| {
+            CliError::fatal(format!("failed to read tree '{}': {error}", args.tree_ish))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?
+    };
+    let entries = index.tracked_entries(0).len();
     index.save(&index_path).map_err(|error| {
         CliError::fatal(format!("failed to save index: {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)

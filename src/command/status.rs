@@ -2661,6 +2661,8 @@ pub(crate) async fn execute_safe_with_resolution(
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
     let mut extras = apply_status_config_defaults(&mut args).await?;
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
+
     if let Some(resolution) = resolution {
         extras.rename_threshold = resolve_status_threshold(&args, Some(resolution))?;
         // The argv scan and clap must agree about which format flags were
@@ -6550,6 +6552,29 @@ pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
     changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
 }
 
+/// Emit the one-time `core.sparseCheckout=true` unsupported warning.
+///
+/// Libra honors the skip-worktree index bit but does not evaluate sparse
+/// patterns, so a repository that turns sparse checkout on gets one warning
+/// per process (ADR-SW-01 item 3).
+pub(crate) async fn warn_sparse_checkout_unsupported_once() {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.get().is_some() {
+        return;
+    }
+    let Ok(Some(entry)) = ConfigKv::get("core.sparseCheckout").await else {
+        return;
+    };
+    if crate::internal::config::parse_git_bool(&entry.value) == Some(true) {
+        let _ = WARNED.set(());
+        eprintln!(
+            "warning: core.sparseCheckout=true is not supported; Libra honors the \
+             skip-worktree index bit only"
+        );
+    }
+}
+
 /// List changes to be staged with --force semantics (recurse into ignored directories)
 pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
@@ -6676,6 +6701,15 @@ fn changes_to_be_staged_split_with_index(
         let Some(file_str) = file.to_str() else {
             continue;
         };
+        // ADR-SW-04 item 1: a skip-worktree entry is a sparse-checkout path —
+        // its worktree copy may legitimately be absent or stale, so neither
+        // shape is a change. add -u/-A and commit -a share this computation.
+        if index
+            .get(file_str, 0)
+            .is_some_and(|entry| entry.flags.skip_worktree)
+        {
+            continue;
+        }
         // A `160000` gitlink names a SUBMODULE commit, not a blob of this
         // repository. Comparing one against the working tree as a file reports
         // every submodule as deleted — or, when the directory exists, fails the

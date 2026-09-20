@@ -2519,6 +2519,7 @@ fn classify_nothing_to_commit() -> Result<CommitError, CommitError> {
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
 /// cannot be updated.
 pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
     let preview = args.dry_run || args.porcelain;
     // Keep the large commit state machine off callers' stacks. In particular,
     // direct library consumers and Tokio's default-size worker/test threads

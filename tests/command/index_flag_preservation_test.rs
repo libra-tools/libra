@@ -150,3 +150,220 @@ fn test_staging_commands_preserve_skip_worktree_matrix() {
     );
     assert!(listed.contains("s"), "s stays tracked: {listed}");
 }
+
+/// SW-04 (M-KEEP-B B1/B2): reset --hard / mixed reset and checkout/switch
+/// preserve the skip-worktree bit on untouched paths.
+#[test]
+fn test_history_commands_preserve_skip_worktree_matrix() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("other"), "other\n").expect("write other");
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "other", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree(root, "s");
+
+    // B1a: reset --hard.
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD"], root),
+        "B1 reset --hard",
+    );
+    assert_bit(root, "B1 reset --hard");
+
+    // B1b: mixed reset after staging a change.
+    fs::write(root.join("other"), "b1\n").expect("write b1");
+    assert_cli_success(&run_libra_command(&["add", "other"], root), "stage b1");
+    assert_cli_success(
+        &run_libra_command(&["reset", "HEAD"], root),
+        "B1 reset mixed",
+    );
+    assert_bit(root, "B1 reset mixed");
+
+    // B2a: checkout -- other restores one path.
+    fs::write(root.join("other"), "b2\n").expect("write b2");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--", "other"], root),
+        "B2 checkout --",
+    );
+    assert_bit(root, "B2 checkout --");
+
+    // B2b: switch round trip through a branch with a different tree.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], root),
+        "create side",
+    );
+    fs::write(root.join("side.txt"), "side\n").expect("write side");
+    assert_cli_success(&run_libra_command(&["add", "side.txt"], root), "stage side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side", "--no-verify"], root),
+        "commit side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], root), "switch main");
+    assert_bit(root, "B2 switch main");
+    assert_cli_success(&run_libra_command(&["switch", "side"], root), "switch side");
+    assert_bit(root, "B2 switch side");
+
+    // B3a: fast-forward merge back on main.
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "back to main",
+    );
+    assert_cli_success(&run_libra_command(&["merge", "side"], root), "B3 ff merge");
+    assert_bit(root, "B3 ff merge");
+
+    // B7: read-tree without -m clears the bit (Git rebuild semantics).
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "B7 read-tree",
+    );
+    assert!(
+        !skip_worktree_set(root, "s"),
+        "B7 read-tree without -m must clear the skip-worktree bit"
+    );
+
+    // B6: read-tree -m carries it back.
+    mark_skip_worktree(root, "s");
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "-m", "HEAD"], root),
+        "B6 read-tree -m",
+    );
+    assert_bit(root, "B6 read-tree -m");
+}
+
+/// SW-04 (M-KEEP-B B4/B5): cherry-pick, revert, rebase and am that do not
+/// touch the skip-worktree path preserve its bit.
+#[test]
+fn test_history_commands_b4_b5_preserve_skip_worktree() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("other"), "other\n").expect("write other");
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "other", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree(root, "s");
+
+    // B4a: cherry-pick an unrelated addition.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "cp-src"], root),
+        "create cp-src",
+    );
+    fs::write(root.join("cp.txt"), "cp\n").expect("write cp");
+    assert_cli_success(&run_libra_command(&["add", "cp.txt"], root), "stage cp");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "cp", "--no-verify"], root),
+        "commit cp",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], root), "switch main");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "cp-src"], root),
+        "B4 cherry-pick",
+    );
+    assert_bit(root, "B4 cherry-pick");
+
+    // B4b: revert an unrelated modification.
+    fs::write(root.join("other"), "revert-me\n").expect("write other");
+    assert_cli_success(&run_libra_command(&["add", "other"], root), "stage revert");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "to-revert", "--no-verify"], root),
+        "commit to-revert",
+    );
+    assert_cli_success(
+        &run_libra_command(&["revert", "--no-edit", "HEAD"], root),
+        "B4 revert",
+    );
+    assert_bit(root, "B4 revert");
+
+    // B4c: rebase a topic branch onto an advanced main.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "rb"], root),
+        "create rb",
+    );
+    fs::write(root.join("rb.txt"), "rb\n").expect("write rb");
+    assert_cli_success(&run_libra_command(&["add", "rb.txt"], root), "stage rb");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rb", "--no-verify"], root),
+        "commit rb",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], root), "switch main");
+    fs::write(root.join("main2.txt"), "main2\n").expect("write main2");
+    assert_cli_success(
+        &run_libra_command(&["add", "main2.txt"], root),
+        "stage main2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main2", "--no-verify"], root),
+        "commit main2",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "rb"], root), "switch rb");
+    assert_cli_success(&run_libra_command(&["rebase", "main"], root), "B4 rebase");
+    assert_bit(root, "B4 rebase");
+
+    // B5: apply a format-patch mail message.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "am-topic"], root),
+        "create am-topic",
+    );
+    fs::write(root.join("am.txt"), "am\n").expect("write am");
+    assert_cli_success(&run_libra_command(&["add", "am.txt"], root), "stage am");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "am topic", "--no-verify"], root),
+        "commit am",
+    );
+    let patch = run_libra_command(&["format-patch", "-1", "HEAD"], root);
+    assert!(
+        patch.status.success(),
+        "format-patch: {}",
+        String::from_utf8_lossy(&patch.stderr)
+    );
+    // `format-patch` reports the written file (stdout or stderr depending on
+    // the stream split); locate the `.patch` file in the repository root.
+    let patch_file = std::fs::read_dir(root)
+        .expect("read repo dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .find(|name| name.ends_with(".patch"))
+        .expect("format-patch must write a .patch file");
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch main before am",
+    );
+    assert_cli_success(&run_libra_command(&["am", &patch_file], root), "B5 am");
+    assert_bit(root, "B5 am");
+}
+
+/// SW-04 (M-KEEP-B B7): `read-tree` without `-m` rebuilds the index and clears
+/// the extended flags, matching Git's rebuild semantics.
+#[test]
+fn test_read_tree_without_merge_clears_flags() {
+    let repo = tempdir().expect("tempdir");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    fs::write(root.join("s"), "s\n").expect("write s");
+    assert_cli_success(&run_libra_command(&["add", "s"], root), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+    mark_skip_worktree(root, "s");
+    assert!(skip_worktree_set(root, "s"), "precondition");
+
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "read-tree",
+    );
+    assert!(
+        !skip_worktree_set(root, "s"),
+        "read-tree without -m must clear the extended flags"
+    );
+}

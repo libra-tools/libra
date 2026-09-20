@@ -489,6 +489,7 @@ pub async fn execute(args: AddArgs) {
 ///
 /// See: tests::test_add_single_file in tests/command/add_test.rs:12.
 pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::status::warn_sparse_checkout_unsupported_once().await;
     let verbose = args.verbose;
     let dry_run = args.dry_run;
 
