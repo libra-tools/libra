@@ -10561,7 +10561,8 @@ fn merge_rejects_rename_config_before_folding_a_virtual_ancestor() {
 /// Codex R7 P1: the strict rename config must be refused before `--autostash`
 /// writes a stash commit, a durable sidecar and resets the worktree — the
 /// mutation Codex R5's virtual-ancestor fix did not cover. The refusal leaves
-/// the object store, the gitdir and the dirty worktree exactly as they were.
+/// the merge-domain (HEAD, index, worktree, merge state, and autostash)
+/// untouched while the failed Operation remains auditable.
 #[test]
 fn merge_rejects_rename_config_before_autostash_touches_the_repository() {
     let repo = create_committed_repo_via_cli();

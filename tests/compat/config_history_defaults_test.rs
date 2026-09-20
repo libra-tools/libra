@@ -221,7 +221,7 @@ fn invalid_history_defaults_fail_before_changing_head() {
 }
 
 #[test]
-fn merge_verify_signatures_rejection_precedes_autostash_and_object_writes() {
+fn merge_verify_signatures_rejection_precedes_autostash_and_merge_side_effects() {
     let fixture = Fixture::new();
     let repo = fixture.repo("verify-before-autostash");
     fixture.feature_with_commits(&repo, &["unsigned feature"]);
