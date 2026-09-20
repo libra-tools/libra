@@ -35,6 +35,7 @@ pub const UPDATE_INDEX_EXAMPLES: &str = "\
 EXAMPLES:
     libra update-index --add a.txt b.txt        Stage files from the working tree
     libra update-index --remove old.txt         Drop a path from the index
+    libra update-index --force-remove old.txt   Drop a path even when its file is gone
     libra update-index --cacheinfo 100644,<oid>,dir/f.txt
                                                  Register an entry directly from an object id
     libra --json update-index --add a.txt       Structured JSON output for agents";
@@ -59,6 +60,12 @@ pub struct UpdateIndexArgs {
     /// Remove the positional paths from the index (rather than (re)staging them).
     #[clap(long)]
     pub remove: bool,
+
+    /// Drop the positional paths from the index regardless of whether the
+    /// working-tree file exists; paths the index does not know are a no-op.
+    /// Removes every stage of an unmerged path. Wins over --add/--remove.
+    #[clap(long = "force-remove")]
+    pub force_remove: bool,
 
     /// Register an index entry directly from `<mode>,<object>,<path>` without
     /// reading the working tree (the object need not exist yet). Repeatable.
@@ -119,13 +126,29 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
     // `--cacheinfo <mode>,<object>,<path>`: register entries directly.
     for spec in &args.cacheinfo {
         let entry = parse_cacheinfo(spec).map_err(usage)?;
-        index.update(entry);
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         updated += 1;
     }
 
     // Positional paths: remove, or (re)stage from the working tree.
     let workdir = util::working_dir();
     for path_str in &args.paths {
+        // `--force-remove` is unconditional and wins over `--add`/`--remove`
+        // (git 2.55: `update-index --force-remove --add <present-file>`
+        // removes the entry). Every stage of an unmerged path goes away.
+        if args.force_remove {
+            let mut removed_any = false;
+            for stage in [0u8, 1, 2, 3] {
+                if index.remove(path_str, stage).is_some() {
+                    removed_any = true;
+                }
+            }
+            if removed_any {
+                removed += 1;
+            }
+            continue;
+        }
+
         // `--add` and `--remove` are separate permissions, not alternatives:
         // Git reads `--add` as "a path the index does not know may be added"
         // and `--remove` as "a path missing from the work tree may be dropped".
@@ -159,7 +182,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
 
         let absolute = resolve_within_worktree(path_str, &workdir).map_err(usage)?;
         let entry = stage_working_tree_path(path_str, &absolute, &workdir)?;
-        index.update(entry);
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         updated += 1;
     }
 
@@ -312,4 +335,24 @@ fn stage_working_tree_path(
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::UpdateIndexArgs;
+
+    #[test]
+    fn force_remove_flag_parses_and_defaults_off() {
+        let args = UpdateIndexArgs::try_parse_from(["update-index", "--force-remove", "a.txt"])
+            .expect("--force-remove parses");
+        assert!(args.force_remove);
+        assert_eq!(args.paths, vec!["a.txt"]);
+        assert!(!args.add && !args.remove);
+
+        let plain = UpdateIndexArgs::try_parse_from(["update-index", "a.txt"])
+            .expect("plain invocation parses");
+        assert!(!plain.force_remove);
+    }
 }

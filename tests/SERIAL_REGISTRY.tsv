@@ -823,3 +823,7 @@ branch_vv_counts_upstream_shapes	lane:cwd	changes the process working directory 
 test_add_ignored_dispatch_before_exit_one	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_pull_fast_forward_materializes_executable_bit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_add_preserves_executable_bit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_index_unknown_extended_bit_fails_closed	lane:hash_kind	sets the thread-local object hash kind
+test_index_v2_bytes_unchanged	lane:hash_kind	sets the thread-local object hash kind
+test_index_v3_fixture_roundtrip_matrix	lane:hash_kind	sets the thread-local object hash kind
+test_index_v4_rejected	lane:hash_kind	sets the thread-local object hash kind

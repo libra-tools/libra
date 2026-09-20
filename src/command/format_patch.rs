@@ -961,6 +961,11 @@ fn patch_id_digest(kind: HashKind, bytes: &[u8]) -> Vec<u8> {
             use sha2::Digest as _;
             sha2::Sha256::digest(bytes).to_vec()
         }
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(bytes);
+            hasher.finalize_object_hash().as_ref().to_vec()
+        }
     }
 }
 

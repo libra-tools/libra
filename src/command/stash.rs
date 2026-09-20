@@ -908,7 +908,7 @@ fn reset_pathspec_to_head(
                     TreeItemMode::Link => 0o120000,
                     _ => 0o100644,
                 };
-                index.add(new_entry);
+                crate::utils::index_ext::update_preserving_flags(&mut index, new_entry);
             }
             None => {
                 if full.exists() {

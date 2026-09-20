@@ -3021,12 +3021,12 @@ fn auto_stage_tracked_changes(
                 }
             })?;
         }
-        index.update(
+        let entry =
             crate::command::verified_index_entry(&file, blob.id, &workdir, pre_read.as_ref())
                 .map_err(|e| {
                     CommitError::AutoStage(format!("failed to create index entry: {}", e))
-                })?,
-        );
+                })?;
+        crate::utils::index_ext::update_preserving_flags(&mut index, entry);
         if let Some(path) = file.to_str() {
             for stage in 1..=3 {
                 index.remove(path, stage);
@@ -3167,6 +3167,7 @@ fn read_auto_stage_symlink_blob(path: &std::path::Path) -> Result<Option<Blob>, 
 enum ObjectHasher {
     Sha1(sha1::Sha1),
     Sha256(sha2::Sha256),
+    Blake3(git_internal::utils::HashAlgorithm),
 }
 
 impl ObjectHasher {
@@ -3180,6 +3181,11 @@ impl ObjectHasher {
                 use sha2::Digest as _;
                 Self::Sha256(sha2::Sha256::new())
             }
+            git_internal::hash::HashKind::Blake3 => {
+                Self::Blake3(git_internal::utils::HashAlgorithm::new_for_kind(
+                    git_internal::hash::HashKind::Blake3,
+                ))
+            }
         }
     }
 
@@ -3191,6 +3197,9 @@ impl ObjectHasher {
             }
             Self::Sha256(hasher) => {
                 use sha2::Digest as _;
+                hasher.update(bytes);
+            }
+            Self::Blake3(hasher) => {
                 hasher.update(bytes);
             }
         }
@@ -3206,6 +3215,7 @@ impl ObjectHasher {
                 use sha2::Digest as _;
                 hasher.finalize().to_vec()
             }
+            Self::Blake3(hasher) => hasher.finalize_object_hash().as_ref().to_vec(),
         }
     }
 }
@@ -4002,7 +4012,7 @@ mod test {
                 name: "test".to_string(),
                 email: "test".to_string(),
                 timestamp: 1,
-                timezone: "test".to_string(),
+                timezone: "+0000".to_string(),
             };
 
             let commiter = Signature {
@@ -4010,7 +4020,7 @@ mod test {
                 name: "test".to_string(),
                 email: "test".to_string(),
                 timestamp: 1,
-                timezone: "test".to_string(),
+                timezone: "+0000".to_string(),
             };
 
             let zero = ObjectHash::from_bytes(&vec![0u8; get_hash_kind().size()]).unwrap();

@@ -8,7 +8,7 @@
 
 - 兼容级别：`partial`。
 - 已支持：`--add`、`--remove`、`--cacheinfo <mode>,<object>,<path>`（mode ∈ 100644/100755/120000/160000；对象登记时无需已存在，与 Git 一致；后续 `write-tree`/`commit` 会校验 blob/tree 对象存在和类型），`--json`/`--machine`。
-- 未公开（延后）：裸路径 stat 刷新、`--force-remove`、`--chmod`、`--assume-unchanged`、`--skip-worktree`、`--index-info`、`--refresh` 等。
+- 未公开（延后）：裸路径 stat 刷新、`--chmod`、`--assume-unchanged`、`--skip-worktree`、`--index-info`、`--refresh` 等。`--force-remove` 已随 issues/490 SW-02 落地。
 
 ## 设计方案
 
@@ -47,7 +47,7 @@
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | 裸路径 stat 刷新、`--force-remove`/`--chmod`/`--assume-unchanged`/`--skip-worktree`/`--index-info`/`--refresh` | 延后；按需补齐并同步矩阵与测试。 |
+| 兼容差异项 | 裸路径 stat 刷新、`--chmod`/`--assume-unchanged`/`--skip-worktree`/`--index-info`/`--refresh` | 延后；按需补齐并同步矩阵与测试。`--force-remove` 已实现（删除全部 stage、未知路径无操作、优先于 `--add`/`--remove`；SW-02）。 |
 
 ## 维护要求
 

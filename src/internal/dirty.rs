@@ -142,6 +142,7 @@ pub fn current_index_fingerprint(index_path: &Path) -> Result<String> {
     let width = match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => 20usize,
         git_internal::hash::HashKind::Sha256 => 32usize,
+        git_internal::hash::HashKind::Blake3 => 32usize,
     };
     let mut file = match std::fs::File::open(index_path) {
         Ok(file) => file,

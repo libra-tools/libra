@@ -607,6 +607,8 @@ mod hash_object_test;
 mod historical_schema;
 mod hooks_help_test;
 mod hydrate_test;
+mod index_flag_preservation_test;
+mod index_format_test;
 mod index_pack_keep_test;
 mod index_pack_progress_test;
 mod index_pack_stdin_test;

@@ -2017,7 +2017,7 @@ pub(crate) async fn fetch_repository_with_result(
     if let Some(pack_file) = pack_file {
         let index_version = match get_hash_kind() {
             HashKind::Sha1 => None,
-            HashKind::Sha256 => Some(2),
+            HashKind::Sha256 | HashKind::Blake3 => Some(2),
         };
         match index_version {
             Some(2) => index_pack::build_index_v2(&pack_file, &pack_file.replace(".pack", ".idx"))

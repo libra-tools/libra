@@ -674,7 +674,7 @@ fn perform_moves(
 
         remove_index_entry_all_stages(index, &dst_rel);
 
-        if index.remove(&src_rel, 0).is_some() {
+        if let Some(source_entry) = index.remove(&src_rel, 0) {
             // Stat BEFORE hashing the moved file — see verified_index_entry
             // (2026-08-06 R0-8 review).
             let pre_read = std::fs::symlink_metadata(dst).ok();
@@ -701,7 +701,11 @@ fn perform_moves(
                 });
 
             match new_entry {
-                Ok(entry) => index.add(entry),
+                Ok(mut entry) => {
+                    entry.flags.skip_worktree = source_entry.flags.skip_worktree;
+                    entry.flags.intent_to_add = source_entry.flags.intent_to_add;
+                    index.add(entry);
+                }
                 Err(err) => {
                     return Err(format!("fatal: {err}"));
                 }

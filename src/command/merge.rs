@@ -13990,6 +13990,13 @@ fn ensure_no_untracked_conflicts(
     Ok(())
 }
 
+/// Non-Unix platforms have no symlinks: the fallback writes the link target
+/// text as a regular file (matching `checkout`).
+#[cfg(not(unix))]
+fn write_workdir_file(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
+    write_workdir_file_with_mode(workdir, relative, content, false)
+}
+
 /// Mode-aware writer: the file is created with the entry-mode permissions
 /// under the process umask and replaced atomically through the shared
 /// worktree-blob primitive (ADR-FM-02/03). The path safety checks stay here:

@@ -692,7 +692,9 @@ fn build_bundle_index(pack: &Path, index: &Path) -> CliResult<()> {
     let index_name = index.to_string_lossy().into_owned();
     match get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => index_pack::build_index_v1(&pack_name, &index_name),
-        git_internal::hash::HashKind::Sha256 => index_pack::build_index_v2(&pack_name, &index_name),
+        git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => {
+            index_pack::build_index_v2(&pack_name, &index_name)
+        }
     }
     .map_err(|error| {
         CliError::fatal(format!("failed to index bundle pack: {error}"))

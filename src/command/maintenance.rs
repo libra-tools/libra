@@ -1937,6 +1937,11 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
     let digest: Vec<u8> = match oids[0].kind() {
         HashKind::Sha256 => sha2::Sha256::digest(&buf).to_vec(),
         HashKind::Sha1 => sha1::Sha1::digest(&buf).to_vec(),
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&buf);
+            hasher.finalize_object_hash().as_ref().to_vec()
+        }
     };
     buf.extend_from_slice(&digest);
     Some(buf)

@@ -903,7 +903,7 @@ fn stage_resolved_path(
             for stage in 1..=3 {
                 index.remove(file, stage);
             }
-            index.add(entry);
+            crate::utils::index_ext::update_preserving_flags(index, entry);
             Ok(StagedAction::Modified)
         }
     }
@@ -1271,7 +1271,7 @@ async fn run_add_patch(
                 if let Some(mode) = applied.mode {
                     entry.mode = mode;
                 }
-                index.update(entry);
+                crate::utils::index_ext::update_preserving_flags(&mut index, entry);
                 add_output.modified.push(path.clone());
             }
         }
@@ -1961,7 +1961,7 @@ fn apply_chmod(
             // force the next status to content-compare this entry.
             let mut updated = IndexEntry::new_from_blob(file_str.to_string(), hash, entry_size);
             updated.mode = target_mode;
-            index.update(updated);
+            crate::utils::index_ext::update_preserving_flags(index, updated);
         }
         let path_str = file.display().to_string();
         if !out.added.contains(&path_str) && !out.modified.contains(&path_str) {
@@ -2010,14 +2010,12 @@ fn renormalize_entry(
         path: file.to_path_buf(),
         source,
     })?;
-    index.update(
-        crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref()).map_err(
-            |source| AddError::CreateIndexEntry {
-                path: file.to_path_buf(),
-                source,
-            },
-        )?,
-    );
+    let entry = crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref())
+        .map_err(|source| AddError::CreateIndexEntry {
+            path: file.to_path_buf(),
+            source,
+        })?;
+    crate::utils::index_ext::update_preserving_flags(index, entry);
     Ok(StagedAction::Modified)
 }
 
@@ -2503,13 +2501,13 @@ async fn stage_a_file(
                 path: file.to_path_buf(),
                 source,
             })?;
-            index.add(
+            let entry =
                 crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref())
                     .map_err(|source| AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
-                    })?,
-            );
+                    })?;
+            crate::utils::index_ext::update_preserving_flags(index, entry);
             clear_conflict_stages(index, file_str);
             Ok(StagedAction::Added)
         }
@@ -2529,18 +2527,17 @@ async fn stage_a_file(
                         path: file.to_path_buf(),
                         source,
                     })?;
-                    index.update(
-                        crate::command::verified_index_entry(
-                            file,
-                            blob.id,
-                            workdir,
-                            pre_read.as_ref(),
-                        )
-                        .map_err(|source| AddError::CreateIndexEntry {
-                            path: file.to_path_buf(),
-                            source,
-                        })?,
-                    );
+                    let entry = crate::command::verified_index_entry(
+                        file,
+                        blob.id,
+                        workdir,
+                        pre_read.as_ref(),
+                    )
+                    .map_err(|source| AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    })?;
+                    crate::utils::index_ext::update_preserving_flags(index, entry);
                 }
                 clear_conflict_stages(index, file_str);
                 return Ok(StagedAction::Modified);

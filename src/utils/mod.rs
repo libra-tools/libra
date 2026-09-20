@@ -14,6 +14,7 @@ pub mod client_storage;
 pub mod convert;
 pub mod d1_client;
 pub mod ignore;
+pub mod index_ext;
 pub mod lfs;
 pub mod log_config;
 #[cfg(feature = "fastcdc")]

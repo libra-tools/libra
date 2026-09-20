@@ -1306,6 +1306,7 @@ async fn clone_into_destination(
     let object_format = match discovery.hash_kind {
         git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
         git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
+        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
     };
 
     // --- Step 4: Initialize repository ---

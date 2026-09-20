@@ -1057,6 +1057,7 @@ fn report_pack_error(result: &mut FsckResult, path: &std::path::Path, detail: &s
 enum PackHasher {
     Sha1(sha1::Sha1),
     Sha256(sha2::Sha256),
+    Blake3(git_internal::utils::HashAlgorithm),
 }
 
 impl PackHasher {
@@ -1071,6 +1072,9 @@ impl PackHasher {
                 use sha2::Digest as _;
                 PackHasher::Sha256(sha2::Sha256::new())
             }
+            HashKind::Blake3 => PackHasher::Blake3(
+                git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3),
+            ),
         }
     }
 
@@ -1082,6 +1086,9 @@ impl PackHasher {
             }
             PackHasher::Sha256(h) => {
                 use sha2::Digest as _;
+                h.update(data);
+            }
+            PackHasher::Blake3(h) => {
                 h.update(data);
             }
         }
@@ -1097,6 +1104,7 @@ impl PackHasher {
                 use sha2::Digest as _;
                 h.finalize().to_vec()
             }
+            PackHasher::Blake3(h) => h.finalize_object_hash().as_ref().to_vec(),
         }
     }
 }

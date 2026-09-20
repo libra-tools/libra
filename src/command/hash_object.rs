@@ -296,6 +296,7 @@ fn validate_object_content(
     let (raw_hash_len, hex_hash_len) = match object_hash {
         ObjectHash::Sha1(_) => (20usize, 40usize),
         ObjectHash::Sha256(_) => (32usize, 64usize),
+        ObjectHash::Blake3(_) => (32usize, 64usize),
     };
 
     let well_formed = match object_type {

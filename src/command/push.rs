@@ -2935,6 +2935,11 @@ fn encode_empty_pack(hash_kind: HashKind) -> Vec<u8> {
     let checksum = match hash_kind {
         HashKind::Sha1 => <Sha1 as Sha1Digest>::digest(&pack).to_vec(),
         HashKind::Sha256 => <Sha256 as Sha256Digest>::digest(&pack).to_vec(),
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&pack);
+            hasher.finalize_object_hash().as_ref().to_vec()
+        }
     };
     pack.extend_from_slice(&checksum);
     pack
@@ -3083,6 +3088,7 @@ fn zero_object_hash() -> ObjectHash {
     match get_hash_kind() {
         HashKind::Sha1 => ObjectHash::Sha1([0; 20]),
         HashKind::Sha256 => ObjectHash::Sha256([0; 32]),
+        HashKind::Blake3 => ObjectHash::Blake3([0; 32]),
     }
 }
 

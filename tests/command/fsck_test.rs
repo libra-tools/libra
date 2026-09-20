@@ -1199,3 +1199,35 @@ fn fsck_full_json_verbose_emits_clean_json() {
     let json = parse_json_stdout(&out);
     assert_eq!(json["command"], "fsck");
 }
+
+/// SW-01 (M-FMT F7, plan issues/490): `fsck` accepts an index version 3 with
+/// the skip-worktree extended bit when the referenced blob is present.
+#[test]
+fn test_fsck_accepts_v3_index_with_skip_worktree() {
+    use std::fs;
+
+    let repo = tempdir().expect("repo");
+    let repo_path = repo.path();
+    init_repo_via_cli(repo_path);
+    configure_identity_via_cli(repo_path);
+
+    // Materialize the fixture's blob ("hi\n") so the index entry resolves.
+    let blob = repo_path.join("a.txt");
+    fs::write(&blob, "hi\n").expect("write blob");
+    assert_cli_success(
+        &run_libra_command(&["hash-object", "-w", "a.txt"], repo_path),
+        "hash-object",
+    );
+    fs::remove_file(&blob).expect("remove worktree file");
+
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/index-v3/git-2.55-skip-worktree.index");
+    fs::copy(&fixture, repo_path.join(".libra/index")).expect("install v3 index fixture");
+
+    let output = run_libra_command(&["fsck"], repo_path);
+    assert!(
+        output.status.success(),
+        "fsck must accept a v3 index: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -275,3 +275,133 @@ fn add_directory_is_rejected_not_panicked() {
         String::from_utf8_lossy(&upd.stderr)
     );
 }
+
+/// SW-02 (M-FREMOVE R1–R5, plan issues/490): `--force-remove` drops paths
+/// regardless of worktree presence, wins over `--add`/`--remove`, clears every
+/// stage of an unmerged path, and reports the count in JSON.
+#[test]
+fn test_update_index_force_remove_matrix() {
+    use super::{assert_cli_success, configure_identity_via_cli};
+
+    let repo = init_repo();
+    let root = repo.path();
+    configure_identity_via_cli(root);
+    fs::write(root.join("tracked.txt"), "tracked\n").expect("write tracked");
+    fs::write(root.join("keep.txt"), "keep\n").expect("write keep");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt", "keep.txt"], root),
+        "stage files",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init", "--no-verify"], root),
+        "commit",
+    );
+
+    // R1: a tracked path with the file present is removed; the file survives.
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--force-remove", "tracked.txt"], root),
+        "R1 force-remove tracked",
+    );
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).expect("file survives"),
+        b"tracked\n"
+    );
+    let list = run_libra_command(&["ls-files"], root);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("tracked.txt"),
+        "entry must be gone: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    // R2: an unknown path is exit 0 with no change.
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--force-remove", "missing.txt"], root),
+        "R2 unknown path is a no-op",
+    );
+
+    // R4: force-remove wins over --add for a present file.
+    assert_cli_success(
+        &run_libra_command(
+            &["update-index", "--force-remove", "--add", "keep.txt"],
+            root,
+        ),
+        "R4 force-remove with --add",
+    );
+    let list = run_libra_command(&["ls-files"], root);
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("keep.txt"),
+        "force-remove must win over --add"
+    );
+
+    // R3: every stage of an unmerged path is removed.
+    fs::write(root.join("conflict.txt"), "base\n").expect("write base");
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], root),
+        "stage base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], root),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature",
+    );
+    fs::write(root.join("conflict.txt"), "feature\n").expect("write feature");
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], root),
+        "stage feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature", "--no-verify"], root),
+        "commit feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "back to main",
+    );
+    fs::write(root.join("conflict.txt"), "main\n").expect("write main");
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], root),
+        "stage main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], root),
+        "commit main",
+    );
+    let merge = run_libra_command(&["merge", "feature"], root);
+    assert!(
+        !merge.status.success(),
+        "merge should conflict: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    let unmerged = run_libra_command(&["ls-files", "-u"], root);
+    assert!(
+        !unmerged.stdout.is_empty(),
+        "conflict must leave unmerged stages"
+    );
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--force-remove", "conflict.txt"], root),
+        "R3 force-remove unmerged",
+    );
+    let unmerged = run_libra_command(&["ls-files", "-u"], root);
+    assert!(
+        unmerged.stdout.is_empty(),
+        "all stages must be removed: {}",
+        String::from_utf8_lossy(&unmerged.stdout)
+    );
+
+    // R5: JSON reports the removed count.
+    fs::write(root.join("again.txt"), "again\n").expect("write again");
+    assert_cli_success(
+        &run_libra_command(&["add", "again.txt"], root),
+        "stage again",
+    );
+    let output = run_libra_command(
+        &["--json", "update-index", "--force-remove", "again.txt"],
+        root,
+    );
+    assert_cli_success(&output, "R5 json");
+    let parsed = parse_json_stdout(&output);
+    assert_eq!(parsed["data"]["removed"], 1, "removed count: {parsed}");
+}

@@ -228,6 +228,7 @@ fn hash_kind_str() -> &'static str {
     match get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => "sha1",
         git_internal::hash::HashKind::Sha256 => "sha256",
+        git_internal::hash::HashKind::Blake3 => "blake3",
     }
 }
 

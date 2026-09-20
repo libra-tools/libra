@@ -703,11 +703,14 @@ fn restore_index_tracked(
         let path_str = path_to_utf8_typed(path)?;
         if !index.tracked(path_str, 0) {
             if let Some(target) = target_map.get(path) {
-                index.add(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    restore_target_index_size(*target)?,
-                ));
+                crate::utils::index_ext::update_preserving_flags(
+                    &mut index,
+                    index_entry_from_target(
+                        path_str.to_string(),
+                        *target,
+                        restore_target_index_size(*target)?,
+                    ),
+                );
                 restored.push(path.display().to_string());
             } else {
                 return Err(pathspec_not_matched(path));
@@ -718,11 +721,14 @@ fn restore_index_tracked(
                 .map(|entry| entry.mode == target.index_mode())
                 .unwrap_or(false);
             if !index.verify_hash(path_str, 0, &target.hash) || !mode_matches {
-                index.update(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    restore_target_index_size(*target)?,
-                ));
+                crate::utils::index_ext::update_preserving_flags(
+                    &mut index,
+                    index_entry_from_target(
+                        path_str.to_string(),
+                        *target,
+                        restore_target_index_size(*target)?,
+                    ),
+                );
                 restored.push(path.display().to_string());
             }
         } else if !overlay {
@@ -1785,11 +1791,10 @@ pub fn restore_index(filter: &[PathBuf], target_blobs: &[(PathBuf, ObjectHash)])
         if !index.tracked(path_str, 0) {
             if let Some(target) = target_blobs.get(path) {
                 let blob = Blob::load(&target.hash);
-                index.add(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    blob.data.len() as u32,
-                ));
+                crate::utils::index_ext::update_preserving_flags(
+                    &mut index,
+                    index_entry_from_target(path_str.to_string(), *target, blob.data.len() as u32),
+                );
             } else {
                 return Err(io::Error::other(format!(
                     "pathspec '{}' did not match any files",
@@ -1799,11 +1804,10 @@ pub fn restore_index(filter: &[PathBuf], target_blobs: &[(PathBuf, ObjectHash)])
         } else if let Some(target) = target_blobs.get(path) {
             if !index.verify_hash(path_str, 0, &target.hash) {
                 let blob = Blob::load(&target.hash);
-                index.update(index_entry_from_target(
-                    path_str.to_string(),
-                    *target,
-                    blob.data.len() as u32,
-                ));
+                crate::utils::index_ext::update_preserving_flags(
+                    &mut index,
+                    index_entry_from_target(path_str.to_string(), *target, blob.data.len() as u32),
+                );
             }
         } else {
             index.remove(path_str, 0);

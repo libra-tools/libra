@@ -460,8 +460,13 @@ fn parse_cleanup_index_roots(
             .map_err(|_| anyhow!("{what} has an invalid integer field"))?;
         Ok(u32::from_be_bytes(raw))
     };
-    if read_u32(4)? != 2 {
-        bail!("{what} is not a supported version-2 index");
+    // Index v2 and v3 are supported; v3 only adds the per-entry extended
+    // flags word (CE_EXTENDED), decoded through the git-internal helpers so
+    // Libra never carries a second extended-bit state machine (issues/490
+    // SW-01, ADR-SW-02).
+    let index_version = read_u32(4)?;
+    if index_version != 2 && index_version != 3 {
+        bail!("{what} is not a supported index version ({index_version})");
     }
     let entry_count = usize::try_from(read_u32(8)?)
         .with_context(|| format!("{what} entry count exceeds this platform"))?;
@@ -508,7 +513,21 @@ fn parse_cleanup_index_roots(
         roots.insert(hex::encode(&bytes[hash_start..hash_end]));
         let flags = u16::from_be_bytes([bytes[hash_end], bytes[hash_end + 1]]);
         let declared_name_len = usize::from(flags & 0x0fff);
-        let name_start = flags_end;
+        let mut name_start = flags_end;
+        if flags & 0x4000 != 0 {
+            // CE_EXTENDED: the extended flags word sits between the main flags
+            // and the name; unknown bits fail closed (git-internal validates).
+            let word_end = flags_end
+                .checked_add(2)
+                .ok_or_else(|| anyhow!("{what} extended flags offset overflow"))?;
+            if word_end > checksum_start {
+                bail!("{what} extended flags are truncated");
+            }
+            let word = u16::from_be_bytes([bytes[flags_end], bytes[flags_end + 1]]);
+            git_internal::internal::index::Flags::from_extended_word(word)
+                .map_err(|error| anyhow!("{what} has invalid extended flags: {error}"))?;
+            name_start = word_end;
+        }
         let name_end = if declared_name_len == 0x0fff {
             bytes[name_start..checksum_start]
                 .iter()
@@ -7077,6 +7096,52 @@ mod tests {
                 .join(&candidate_string[2..])
                 .exists(),
             "candidate reachable only through an annotated tag was deleted"
+        );
+    }
+
+    /// SW-01 (M-FMT F6, plan issues/490): the held-index cleanup parser accepts
+    /// a version-3 index with CE_SKIP_WORKTREE and extracts its roots through
+    /// the git-internal extended-flag decoder (no second state machine).
+    #[test]
+    fn parse_cleanup_index_roots_accepts_v3_extended_flags() {
+        use git_internal::{
+            hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+            internal::index::{Index as GitIndex, IndexEntry},
+        };
+
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("held-index");
+        let mut index = GitIndex::new();
+        let oid = ObjectHash::from_bytes(&[0x31u8; 20]).unwrap();
+        let mut entry = IndexEntry::new_from_blob("skip.txt".to_string(), oid, 3);
+        entry.flags.skip_worktree = true;
+        index.update(entry);
+        index.to_file(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let roots = super::parse_cleanup_index_roots(&bytes, 20, "held index")
+            .expect("v3 index with skip-worktree must parse");
+        let expected: std::collections::HashSet<String> =
+            std::iter::once(oid.to_string()).collect();
+        assert_eq!(roots, expected);
+
+        // An unknown extended bit still fails closed.
+        let mut patched = bytes.clone();
+        let word_offset = patched.len() - 20 - 3 - 2 - 2; // checksum + name + padding + ext word guess
+        // Locate the extended word robustly: flags at 12+40+20, extended at +2.
+        let ext = 12 + 40 + 20 + 2;
+        let _ = word_offset;
+        patched[ext] = 0x10;
+        patched[ext + 1] = 0x00;
+        let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Sha1);
+        hasher.update(&patched[..patched.len() - 20]);
+        let checksum = hasher.finalize_object_hash();
+        patched.truncate(patched.len() - 20);
+        patched.extend_from_slice(checksum.as_ref());
+        assert!(
+            super::parse_cleanup_index_roots(&patched, 20, "held index").is_err(),
+            "unknown extended bits must fail closed"
         );
     }
 }

@@ -2421,9 +2421,13 @@ fn reset_index_to_commit_typed(commit_id: &ObjectHash) -> Result<(), ResetError>
         .map_err(|e| object_load_error("tree", commit.tree_id.to_string(), e.to_string()))?;
 
     let index_file = path::index();
+    let previous = Index::load(&index_file).unwrap_or_else(|_| Index::new());
     let mut index = Index::new();
 
     rebuild_index_from_tree_typed(&tree, &mut index, "")?;
+    // Git's `unpack_trees(reset)` preserves skip-worktree across the rebuild
+    // (intent-to-add is not preserved: the path now has tree content).
+    crate::utils::index_ext::preserve_skip_worktree_from(&previous, &mut index);
 
     index
         .save(&index_file)

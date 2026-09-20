@@ -108,6 +108,7 @@ fn this_object_format() -> String {
     match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
         git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
+        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
     }
 }
 

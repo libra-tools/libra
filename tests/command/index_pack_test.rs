@@ -394,7 +394,7 @@ fn parse_idx_v2(bytes: &[u8], kind: HashKind) -> ParsedIdxV2 {
         entries,
         pack_hash,
         idx_hash,
-        idx_hash_basis_len: pack_hash_start,
+        idx_hash_basis_len: pack_hash_end,
     }
 }
 

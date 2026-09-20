@@ -175,6 +175,8 @@ unsupported 子面。
 - 状态：延后。Sparse checkout 依赖工作树配置和 skip-worktree 语义；Libra 已将 config/HEAD/refs 放入 SQLite，桥接成本高。
 - 重启条件：出现大型 monorepo 子树检出需求，并完成对象存储 + 部分检出的工程 RFC。
 
+- 进展（2026-09-20，issues/490 SW-01）：`git-internal` 已升级到 `=0.10.0`，索引 **v3 扩展标志字**（`CE_SKIP_WORKTREE` / `CE_INTENT_TO_ADD`）的读取、写入（按需输出 v3，否则保持 v2 字节不变）与未知扩展位 fail-closed 已落地；Libra 的 AI history 清理解析器接受 v3 并复用依赖的扩展位解码。设置/观察入口（`update-index --skip-worktree`、`ls-files` 的 `S` 标记）与 `status`/`add` 的尊重语义仍待 490 SW-03..SW-07，`clone --sparse` / 顶层 `sparse-checkout` 保持延后。
+
 - lore.md 2.2 landed the NON-declined complement: `libra sparse-view`, a strictly READ-ONLY view filter over `ls-files`/`diff` (working-tree) output that NEVER materializes or prunes the working tree, never writes skip-worktree bits, and never filters the to-be-committed set (status stays honest). The materializing `sparse-checkout` command and `clone --sparse` remain declined here.
 
 ### D15：跨命令 patch mode

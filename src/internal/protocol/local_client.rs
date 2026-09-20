@@ -938,6 +938,11 @@ fn empty_pack_bytes(hash_kind: HashKind) -> Vec<u8> {
             hasher.update(&pack);
             pack.extend_from_slice(&hasher.finalize());
         }
+        HashKind::Blake3 => {
+            let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+            hasher.update(&pack);
+            pack.extend_from_slice(hasher.finalize_object_hash().as_ref());
+        }
     }
     pack
 }
