@@ -719,8 +719,8 @@ fn config_doctor_uses_global_role() {
     let cli = include_str!("../../src/cli.rs")
         .split_whitespace()
         .collect::<String>();
-    assert!(cli.contains("if!schema_doctor{crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;enforce_global_config_schema_policy(&args.command).await?;}"));
-    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_))"));
+    assert!(cli.contains("if!schema_doctor{if!command_is_agent_hook_entry(&args.command){crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;}enforce_global_config_schema_policy(&args.command).await?;}"));
+    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_))&&!command_is_agent_hook_entry(&args.command)"));
 }
 
 #[test]

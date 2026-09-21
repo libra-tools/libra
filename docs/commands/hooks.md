@@ -61,6 +61,27 @@ coverage claim; inspect the state with `libra agent session show <session>`.
 actionable error pointing at `libra agent remove gemini` instead of
 silently capturing data.
 
+## Read-only / immutable installations
+
+Hook entries are exempt from Libra's auto-upgrade machinery (issue #502).
+A hook host may run with the Libra installation on a read-only filesystem
+(immutable container, CI sandbox, read-only mount), where the auto-upgrade
+startup recovery gate would fail to take `<install-dir>/.libra-upgrade.lock`
+and leak an `auto-upgrade recovery could not complete` warning into the
+host's hook diagnostics. `libra hooks <provider> <event>` therefore skips
+both the startup recovery gate and the `upgrade.mode=auto` check: it never
+attempts to create `.libra-upgrade.lock`, emits no auto-upgrade warning,
+and stays within the host's hook timeout. Normal (non-hook) commands are
+unaffected and keep the existing auto-upgrade behavior — a crashed install
+transaction is still recovered by the next regular command.
+
+Capture failures stay observable without exposing hook payloads: the codex
+path records a non-sensitive `agent.hook.ingest` tracing warning
+(provider, verb, `reason="capture_failed"`) and a retryable diagnostic on
+the captured session (`libra agent session show <session>`); see the hook
+invocation observability work tracked as CX-03 in
+`docs/development/plan/plan-20260904.md`.
+
 To enable capture, run `libra agent enable --agent <name>` for a
 supported roster agent; this installs the provider hook config.
 To disable capture, run `libra agent disable --agent <name>`.

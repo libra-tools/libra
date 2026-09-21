@@ -101,7 +101,10 @@ fn sync_post_install_probe(
 }
 
 /// Startup recovery gate (§A.7/§A.10). Must run before repo preflight and
-/// user-command dispatch.
+/// user-command dispatch. Agent hook entries (`libra hooks <provider>
+/// <event>`) are exempt (issue #502): the recovery lock lives in the install
+/// directory, which may be read-only in hook host sandboxes, and a callback
+/// must not warn about or wait on unrelated self-update work.
 ///
 /// - No install context / no transaction ⇒ `Ok(())` (the common case).
 /// - A clean recovery (commit / rollback / abort) ⇒ `Ok(())`, with an

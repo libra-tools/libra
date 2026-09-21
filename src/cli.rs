@@ -2918,6 +2918,26 @@ fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliEr
     cli_error
 }
 
+/// `libra hooks <provider> <event>` entry points (and the legacy hidden
+/// alias `libra agent hooks <agent> <verb>` that pre-rename hook configs
+/// still invoke) are called by external agent hosts (Claude Code, Codex) on
+/// every lifecycle event — often under a host-side timeout and sometimes
+/// with the Libra installation on a read-only filesystem (immutable
+/// container, CI sandbox, read-only mount). A hook callback must stay
+/// bounded and must not depend on the install directory being writable, so
+/// hook entries skip both the auto-upgrade startup recovery gate and the
+/// `upgrade.mode=auto` check (issue #502); the next normal command still
+/// runs both.
+fn command_is_agent_hook_entry(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Hooks(_)
+            | Commands::Agent(command::agent::AgentArgs {
+                command: command::agent::AgentSubcommand::Hooks(_),
+            })
+    )
+}
+
 /// Run the `upgrade.mode=auto` check and surface its outcome (§A.8). It never
 /// errors and reports only in human mode, through an advisory warning that
 /// does not affect the command's exit status, so it cannot disturb the user's
@@ -3156,8 +3176,14 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // transaction exits here rather than running the user's command.
     // Diagnosis must not mutate the installation or inspect other DB scopes,
     // including when its own argument validation will reject the invocation.
+    // Agent hook entries skip the gate (issue #502): the recovery lock lives
+    // in the install directory, which may be a read-only mount in hook host
+    // sandboxes, and a callback must not pay for or warn about unrelated
+    // self-update work.
     if !schema_doctor {
-        crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
+        if !command_is_agent_hook_entry(&args.command) {
+            crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
+        }
         enforce_global_config_schema_policy(&args.command).await?;
     }
     if let Commands::Tag(tag_args) = &args.command {
@@ -3300,7 +3326,13 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // is inert (no I/O) until keys are provisioned. The explicit `libra
     // upgrade` command is exempt: it runs the same pipeline itself, and a
     // background install racing the interactive one would be confusing.
-    if !schema_doctor && !matches!(args.command, Commands::Upgrade(_)) {
+    // Agent hook entries are exempt too (issue #502): a host-invoked
+    // callback must stay within its timeout and must not touch the install
+    // directory, which may be mounted read-only.
+    if !schema_doctor
+        && !matches!(args.command, Commands::Upgrade(_))
+        && !command_is_agent_hook_entry(&args.command)
+    {
         run_auto_upgrade_check_hook(&output).await;
     }
 

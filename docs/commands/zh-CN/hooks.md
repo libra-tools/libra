@@ -25,6 +25,12 @@ Codex 回调对宿主 Agent 属于辅助采集：在非 Libra 仓库中触发，
 
 `libra hooks gemini <verb>` 不再摄入：gemini 已是 uninstall-only（AG-17），降级前安装的过时 hook 配置会得到指向 `libra agent remove gemini` 的可操作错误，而不是静默捕获数据。
 
+## 只读 / 不可变安装
+
+hook 入口不参与 Libra 的自动升级机制（issue #502）。hook 宿主可能在 Libra 安装目录位于只读文件系统（不可变容器、CI 沙箱、只读挂载）的环境中运行，此时自动升级的启动恢复门无法获取 `<install-dir>/.libra-upgrade.lock`，会把 `auto-upgrade recovery could not complete` 警告泄漏进宿主的 hook 诊断。`libra hooks <provider> <event>` 因此同时跳过启动恢复门和 `upgrade.mode=auto` 检查：不尝试创建 `.libra-upgrade.lock`、不产生自动升级警告，并保持在宿主 hook 超时之内。普通（非 hook）命令不受影响，保留既有自动升级行为——崩溃的安装事务仍由下一条常规命令恢复。
+
+捕获失败在不暴露 hook 载荷的前提下保持可观测：codex 路径记录一条不含敏感信息的 `agent.hook.ingest` tracing 警告（provider、verb、`reason="capture_failed"`），并在已捕获的 session 上记录可重试诊断（`libra agent session show <session>`）；另见 `docs/development/plan/plan-20260904.md` 中 CX-03 跟踪的 hook 调用可观测性工作。
+
 要启用捕获，对 supported roster 中的 agent 运行 `libra agent enable --agent <name>`；这会安装提供商 hook 配置。要禁用捕获，运行 `libra agent disable --agent <name>`。
 
 ## 提供商和事件
