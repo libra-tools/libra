@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-22（下次更新时替换）。
+> **当前快照：** 2026-09-23（下次更新时替换）。
 
 ---
 
@@ -59,7 +59,7 @@
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
-| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 未启动 | CL-01..CL-15（15 卡） |
+| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `in-progress`/`locally-accepted`（C 组 `v0.23.47`）；CL-02..CL-15 pending |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
@@ -165,6 +165,15 @@
 
 **阻塞登记：** PR #456（`Anduin9527:codex/memory-m2-core-draft-pr`）不可直接合并（距 main 296 commits、39 档冲突、依赖已删 Code SCC）；由 M2-16A 正向移植、M2-16E 收口关闭（ADR-M2-15）。
 
+### 3.7 issues/474（clone 浅克隆 / bundle / bare / mirror）
+
+发布窗口：CL-01 → … → CL-15。Phase 0 Codex R6 `PASS`（2026-09-23）。
+
+| 卡 | 状态 | 发布 |
+|---|---|---|
+| **CL-01 fsck 断链检测与 shallow 豁免** | **`in-progress`/`locally-accepted`** | **v0.23.47（C 组进行中）** |
+| CL-02..CL-15 | `pending` | — |
+
 ### 3.6 issues/476（工作树命令族）
 
 发布窗口：WT-01 → WT-02 → WT-04 → WT-08 → WT-09 → WT-10 → WT-11 → WT-03。用户 2026-09-20 覆盖 ER-05（执行 Agent 自审）。
@@ -203,9 +212,9 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `issues/476` → `WT-01`（回归守卫），`done`/`remote-pending`，版本面三处 `0.23.35`（C 组提交/tag/`gh release` 进行中）。
-- **下一步（WT-01 C/D 落地后）：** `issues/476` → `WT-03` 仍等 DEP-WT-08 / ADR-WT-04；无其它未阻塞卡。
-- **并行窗口（不在本执行指针）：** `plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `stash.rs` 写集。
+- **当前正在执行：** `issues/474` → `CL-01`（fsck 断链检测与 shallow 豁免），`in-progress`/`locally-accepted`，版本面三处 `0.23.47`（C 组提交/PR/`gh release` 进行中）。
+- **下一步（CL-01 D 组落地后）：** `issues/474` → `CL-02`（log/rev-list shallow walk helper）。
+- **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---
 
@@ -230,7 +239,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260911`](plan-20260911.md) | PI-01 | Repository-only `agent_kind=pi` migration | 无（DEP-PI-04 已满足：9/10 已收口） | **Claude Code 429 无 verdict，禁止开工** | DEP-PI-01/03 | ❌ 禁止开工 |
 | [`issues/470`](issues/470.md) | FM-01 | 共享写入原语与 `restore` 系物化 | 无 | 尚未 Codex review | 关闭依赖 plan-20260918 FM-03/04（DEP-FM-06/07） | ❌ 禁止开工 |
 | [`issues/473`](issues/473.md) | IN-01 / IN-03 / IN-02 | 空模板自引用防护 / 存储路径前置检测 / 换格式 reinit fail-closed | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
-| [`issues/474`](issues/474.md) | CL-01 | fsck 断链检测与 shallow 豁免 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
+| [`issues/474`](issues/474.md) | CL-01 | fsck 断链检测与 shallow 豁免 | 无 | **R6 `PASS`** | 无 | ✅ `locally-accepted`（C 组 `v0.23.47`） |
 | [`issues/475`](issues/475.md) | CF-02 / CF-01 | key/模式校验与退出码 / 带 value-pattern 的删除 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/476`](issues/476.md) | WT-03 | `init` 不再创建默认 `.libraignore` | DEP-WT-08、DEP-WT-05 | 用户 2026-09-20 覆盖：执行 Agent 自审 | DEP-WT-08（ADR-WT-04 用户评审）未满足 | ❌ 阻塞 |
 | [`issues/478`](issues/478.md) | LG-01 | `log`/`rev-list` `--grep` 模式类型与匹配范围 | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |

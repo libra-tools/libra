@@ -210,6 +210,191 @@ fn report_absent_or_intentional(hash: &ObjectHash, obj_type: &str, missing_id: F
     }
 }
 
+/// Load `.libra/shallow` as a set of boundary commits.
+///
+/// A missing file is an empty set (complete history). An unreadable or
+/// illegal file is fail-closed: a corrupt boundary list must not be treated
+/// as a healthy complete repository (ADR-CL-04 / M-FSCK F5).
+fn load_shallow_boundaries() -> CliResult<HashSet<ObjectHash>> {
+    match crate::command::fetch::read_shallow_boundaries() {
+        Ok(oids) => parse_shallow_oids(oids.iter().map(|oid| oid.as_str())),
+        Err(error) => Err(CliError::from(error).with_hint(
+            "shallow metadata is corrupt; fix or remove .libra/shallow and re-run fsck",
+        )),
+    }
+}
+
+/// Parse shallow OID strings. Exposed for unit tests so F5 does not need a
+/// full repository.
+fn parse_shallow_oids<'a, I>(oids: I) -> CliResult<HashSet<ObjectHash>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut set = HashSet::new();
+    for oid in oids {
+        let Some(hash) = parse_object_hash(oid) else {
+            return Err(CliError::fatal(format!(
+                "shallow metadata cannot be trusted: invalid object id '{oid}'"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "each line of .libra/shallow must be a full object id; remove the file if the clone is complete",
+            ));
+        };
+        set.insert(hash);
+    }
+    Ok(set)
+}
+
+/// Parent OIDs of commits listed in `.libra/shallow`. Those parents are
+/// allowed to be absent: the boundary commit is treated as a root for
+/// connectivity (Git `shallow.c` / ADR-CL-04).
+fn exempt_parent_oids(
+    storage: &ClientStorage,
+    shallow: &HashSet<ObjectHash>,
+) -> HashSet<ObjectHash> {
+    let mut exempt = HashSet::new();
+    for commit_id in shallow {
+        let Ok(data) = storage.get(commit_id) else {
+            continue;
+        };
+        let Ok(commit) = Commit::from_bytes(&data, *commit_id) else {
+            continue;
+        };
+        exempt.extend(commit.parent_commit_ids.iter().copied());
+    }
+    exempt
+}
+
+/// Parents that connectivity must demand. A shallow-boundary commit is
+/// treated as a root: its parents may be absent.
+fn parents_to_check<'a>(
+    commit_id: &ObjectHash,
+    parents: &'a [ObjectHash],
+    shallow: &HashSet<ObjectHash>,
+) -> &'a [ObjectHash] {
+    if shallow.contains(commit_id) {
+        &[]
+    } else {
+        parents
+    }
+}
+
+#[cfg(test)]
+fn object_type_name(obj_type: ObjectType) -> &'static str {
+    match obj_type {
+        ObjectType::Commit => "commit",
+        ObjectType::Tree => "tree",
+        ObjectType::Blob => "blob",
+        ObjectType::Tag => "tag",
+        _ => "unknown",
+    }
+}
+
+fn tree_entry_type_name(mode: TreeItemMode) -> &'static str {
+    match mode {
+        TreeItemMode::Tree => "tree",
+        TreeItemMode::Commit => "commit",
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => "blob",
+    }
+}
+
+/// Record a Git-style broken link + missing object. Returns whether the
+/// report flips the exit code (false only for intentional absence).
+fn record_missing_link(
+    result: &mut FsckResult,
+    from_type: &str,
+    from: &ObjectHash,
+    to_type: &str,
+    to: &ObjectHash,
+) -> bool {
+    if is_intentionally_absent(to) {
+        let flipped = report(FsckMsgId::IntentionalAbsence, to_type, &to.to_string());
+        result.has_errors |= flipped;
+        return flipped;
+    }
+
+    if !stdout_suppressed() {
+        println!("broken link from {} {}", from_type, from);
+        println!("              to {} {}", to_type, to);
+    }
+
+    let flipped = report(FsckMsgId::Missing, to_type, &to.to_string());
+    result.has_errors |= flipped;
+    result.broken_links.push(BrokenLink {
+        from_type: from_type.to_string(),
+        from: from.to_string(),
+        to_type: to_type.to_string(),
+        to: to.to_string(),
+    });
+    if !result
+        .missing_objects
+        .iter()
+        .any(|missing| missing.object_id == to.to_string())
+    {
+        result.missing_objects.push(MissingObject {
+            object_type: to_type.to_string(),
+            object_id: to.to_string(),
+        });
+    }
+    if result.overall_status == CheckStatus::Ok {
+        result.overall_status = CheckStatus::Missing;
+    }
+    flipped
+}
+
+/// Walk every stored object and report missing trees, parents, and tree
+/// entries. Runs for default, `--strict`, and `--connectivity-only`.
+/// Commits listed in `shallow` do not have their parents demanded.
+fn check_broken_links(
+    all_hashes: &[ObjectHash],
+    storage: &ClientStorage,
+    result: &mut FsckResult,
+    shallow: &HashSet<ObjectHash>,
+) -> CliResult<()> {
+    for hash in all_hashes {
+        let Ok(obj_type) = storage.get_object_type(hash) else {
+            continue;
+        };
+        let Ok(data) = storage.get(hash) else {
+            continue;
+        };
+        match obj_type {
+            ObjectType::Commit => {
+                let Ok(commit) = Commit::from_bytes(&data, *hash) else {
+                    continue;
+                };
+                if !storage.exist(&commit.tree_id) {
+                    record_missing_link(result, "commit", hash, "tree", &commit.tree_id);
+                }
+                for parent in parents_to_check(hash, &commit.parent_commit_ids, shallow) {
+                    if !storage.exist(parent) {
+                        record_missing_link(result, "commit", hash, "commit", parent);
+                    }
+                }
+            }
+            ObjectType::Tree => {
+                let Ok(tree) = Tree::from_bytes(&data, *hash) else {
+                    continue;
+                };
+                for item in &tree.tree_items {
+                    if !storage.exist(&item.id) {
+                        record_missing_link(
+                            result,
+                            "tree",
+                            hash,
+                            tree_entry_type_name(item.mode),
+                            &item.id,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn tag_parse_error_msg_id(error: &impl std::fmt::Display) -> FsckMsgId {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("missing object type")
@@ -403,6 +588,22 @@ pub struct HealReport {
     pub messages: Vec<String>,
 }
 
+/// A missing object-to-object reference (Git `broken link from` / `to`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrokenLink {
+    pub from_type: String,
+    pub from: String,
+    pub to_type: String,
+    pub to: String,
+}
+
+/// An object that was referenced but is absent from storage.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MissingObject {
+    pub object_type: String,
+    pub object_id: String,
+}
+
 /// Result of fsck verification
 #[derive(Debug, Serialize)]
 pub struct FsckResult {
@@ -424,6 +625,14 @@ pub struct FsckResult {
     /// Repair outcome, present only when `--heal` was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heal: Option<HealReport>,
+    /// Missing object-graph edges. Present on every JSON result (empty when
+    /// the graph is intact) so callers can distinguish "not checked" from
+    /// "checked and clean".
+    #[serde(default)]
+    pub broken_links: Vec<BrokenLink>,
+    /// Referenced objects that are absent. Deduplicated by object id.
+    #[serde(default)]
+    pub missing_objects: Vec<MissingObject>,
 }
 
 /// Result of checking the index file
@@ -814,7 +1023,9 @@ async fn check_single_object(
     let hash = parse_object_hash(object_id)
         .ok_or_else(|| CliError::command_usage(format!("invalid object ID: {}", object_id)))?;
 
-    let (check_result, has_errors) = verify_object(&hash, storage, false, true, strict).await?;
+    let shallow = load_shallow_boundaries()?;
+    let (check_result, has_errors) =
+        verify_object(&hash, storage, false, true, strict, &shallow).await?;
 
     let overall_status = match check_result.status {
         CheckStatus::Ok => {
@@ -854,6 +1065,8 @@ async fn check_single_object(
         overall_status,
         has_errors,
         heal: None,
+        broken_links: Vec::new(),
+        missing_objects: Vec::new(),
     })
 }
 
@@ -872,7 +1085,14 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         overall_status: CheckStatus::Ok,
         has_errors: false,
         heal: None,
+        broken_links: Vec::new(),
+        missing_objects: Vec::new(),
     };
+
+    // Shallow metadata is read before any connectivity walk so a corrupt
+    // `.libra/shallow` cannot be mistaken for a complete repository (F5).
+    let shallow = load_shallow_boundaries()?;
+    let exempt_missing = exempt_parent_oids(storage, &shallow);
 
     // Get all object hashes
     let all_hashes = list_all_objects_in_storage(storage)
@@ -886,22 +1106,14 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
     sorted_hashes.sort();
 
     // Stage 2: Check each object (sorted by hash)
-    check_objects(
-        &sorted_hashes,
-        storage,
-        &mut result,
-        args.verbose,
-        args.connectivity_only,
-        args.strict,
-    )
-    .await?;
+    check_objects(&sorted_hashes, storage, &mut result, args, &shallow).await?;
 
     // Stage 3: Check HEAD link
     let head_is_unborn = check_head().await;
 
     // Stage 4: Check reflog entries
     if !args.no_reflogs {
-        check_reflogs(storage, &mut result, args.verbose).await?;
+        check_reflogs(storage, &mut result, args.verbose, &exempt_missing).await?;
     }
 
     // Stage 5: Check refs point to valid objects
@@ -920,6 +1132,10 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         args.connectivity_only,
     )
     .await?;
+
+    // Default / --strict / --connectivity-only all report missing parents,
+    // trees, and tree entries. Shallow-boundary commits skip parent checks.
+    check_broken_links(&all_hashes, storage, &mut result, &shallow)?;
 
     // Stage 8: Find dangling and unreachable objects
     find_dangling_unreachable(
@@ -1231,9 +1447,8 @@ async fn check_objects(
     sorted_hashes: &[String],
     storage: &ClientStorage,
     result: &mut FsckResult,
-    verbose: bool,
-    connectivity_only: bool,
-    strict: bool,
+    args: &FsckArgs,
+    shallow: &HashSet<ObjectHash>,
 ) -> CliResult<()> {
     for hash_str in sorted_hashes {
         let hash = match parse_object_hash(hash_str) {
@@ -1241,7 +1456,7 @@ async fn check_objects(
             None => continue,
         };
 
-        if verbose && !stdout_suppressed() {
+        if args.verbose && !stdout_suppressed() {
             // Get object type for verbose output only
             if let Ok(obj_type) = storage.get_object_type(&hash) {
                 let type_name = match obj_type {
@@ -1257,8 +1472,15 @@ async fn check_objects(
             }
         }
 
-        let (check_result, reported_errors) =
-            verify_object(&hash, storage, connectivity_only, true, strict).await?;
+        let (check_result, reported_errors) = verify_object(
+            &hash,
+            storage,
+            args.connectivity_only,
+            true,
+            args.strict,
+            shallow,
+        )
+        .await?;
         result.objects_checked += 1;
         result.has_errors |= reported_errors;
 
@@ -1400,11 +1622,16 @@ fn print_notices(head_is_unborn: bool, _result: &FsckResult) {
     }
 }
 
-/// Check reflogs and print entries
+/// Check reflogs and print entries.
+///
+/// `exempt_missing` are parent OIDs of shallow-boundary commits: they are
+/// allowed to be absent, including when a reflog still names them (a
+/// two-commit-then-delete fixture, or a rewritten shallow tip).
 async fn check_reflogs(
     storage: &ClientStorage,
     result: &mut FsckResult,
     verbose: bool,
+    exempt_missing: &HashSet<ObjectHash>,
 ) -> CliResult<()> {
     let db_conn = db::get_db_conn_instance().await;
 
@@ -1422,16 +1649,20 @@ async fn check_reflogs(
         let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
 
         if !is_null_oid(&entry.old_oid)
-            && let Some(_hash) = parse_object_hash(&entry.old_oid)
-            && !storage.exist(&_hash)
+            && let Some(hash) = parse_object_hash(&entry.old_oid)
+            && !storage.exist(&hash)
+            && !exempt_missing.contains(&hash)
+            && !is_intentionally_absent(&hash)
         {
             result.reflog_issues += 1;
             report(FsckMsgId::Missing, "unknown", &entry.old_oid);
         }
 
         if !is_null_oid(&entry.new_oid)
-            && let Some(_hash) = parse_object_hash(&entry.new_oid)
-            && !storage.exist(&_hash)
+            && let Some(hash) = parse_object_hash(&entry.new_oid)
+            && !storage.exist(&hash)
+            && !exempt_missing.contains(&hash)
+            && !is_intentionally_absent(&hash)
         {
             result.reflog_issues += 1;
             report(FsckMsgId::Missing, "unknown", &entry.new_oid);
@@ -1489,8 +1720,15 @@ async fn check_connectivity(
                 println!("Checking {}", hash);
             }
         }
-        let (check_result, reported_errors) =
-            verify_object(hash, storage, connectivity_only, false, false).await?;
+        let (check_result, reported_errors) = verify_object(
+            hash,
+            storage,
+            connectivity_only,
+            false,
+            false,
+            &HashSet::new(),
+        )
+        .await?;
         result.has_errors |= reported_errors;
         if check_result.status != CheckStatus::Ok && result.overall_status == CheckStatus::Ok {
             result.overall_status = check_result.status.clone();
@@ -1983,6 +2221,7 @@ async fn verify_object(
     connectivity_only: bool,
     report_errors: bool,
     strict: bool,
+    shallow: &HashSet<ObjectHash>,
 ) -> CliResult<(ObjectCheckResult, bool)> {
     let mut has_error = false;
 
@@ -2252,8 +2491,9 @@ async fn verify_object(
                             has_error |=
                                 report(FsckMsgId::BadObjectSha1, "commit", &hash.to_string());
                         }
-                        // Parents must exist and be commits.
-                        for parent in &commit.parent_commit_ids {
+                        // Parents must exist and be commits. Shallow-boundary
+                        // commits are treated as roots (ADR-CL-04 / M-FSCK F1).
+                        for parent in parents_to_check(hash, &commit.parent_commit_ids, shallow) {
                             if !storage.exist(parent) {
                                 has_error |= report_absent_or_intentional(
                                     parent,
@@ -2449,7 +2689,16 @@ async fn check_refs(storage: &ClientStorage, connectivity_only: bool) -> CliResu
             if let Some(hash) = parse_object_hash(commit_hash_str) {
                 if storage.exist(&hash) {
                     // Verify the object is actually valid
-                    match verify_object(&hash, storage, connectivity_only, false, false).await {
+                    match verify_object(
+                        &hash,
+                        storage,
+                        connectivity_only,
+                        false,
+                        false,
+                        &HashSet::new(),
+                    )
+                    .await
+                    {
                         Ok((check, _reported)) if check.status == CheckStatus::Ok => {
                             result.ok += 1;
                         }
@@ -2600,7 +2849,17 @@ fn validate_index_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::{FsckMsgId, tag_parse_error_msg_id};
+    use std::{collections::HashSet, str::FromStr};
+
+    use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+
+    use super::{
+        FsckMsgId, object_type_name, parents_to_check, parse_shallow_oids, tag_parse_error_msg_id,
+    };
+
+    fn test_oid(hex40: &str) -> ObjectHash {
+        ObjectHash::from_str(hex40).expect("object hash")
+    }
 
     #[test]
     fn is_valid_timezone_accepts_in_range_and_rejects_invalid() {
@@ -2628,5 +2887,46 @@ mod tests {
             tag_parse_error_msg_id(&"Missing object hash"),
             FsckMsgId::MissingObject
         );
+    }
+
+    #[test]
+    fn parse_shallow_oids_accepts_hex_and_rejects_garbage() {
+        let ok =
+            parse_shallow_oids(["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).expect("valid oid");
+        assert_eq!(ok.len(), 1);
+        assert!(
+            parse_shallow_oids(["not-a-hash"]).is_err(),
+            "illegal shallow lines must fail-closed"
+        );
+        assert!(
+            parse_shallow_oids(["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"]).is_err(),
+            "non-hex must fail-closed"
+        );
+    }
+
+    #[test]
+    fn parents_to_check_skips_parents_of_shallow_commits() {
+        let child = test_oid("cccccccccccccccccccccccccccccccccccccccc");
+        let parent = test_oid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let parents = vec![parent];
+        let mut shallow = HashSet::new();
+        assert_eq!(
+            parents_to_check(&child, &parents, &shallow),
+            &[parent],
+            "complete history still demands parents"
+        );
+        shallow.insert(child);
+        assert!(
+            parents_to_check(&child, &parents, &shallow).is_empty(),
+            "shallow-boundary commit is treated as a root"
+        );
+    }
+
+    #[test]
+    fn object_type_name_matches_git_fsck_tokens() {
+        assert_eq!(object_type_name(ObjectType::Commit), "commit");
+        assert_eq!(object_type_name(ObjectType::Tree), "tree");
+        assert_eq!(object_type_name(ObjectType::Blob), "blob");
+        assert_eq!(object_type_name(ObjectType::Tag), "tag");
     }
 }

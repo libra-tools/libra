@@ -2,7 +2,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::fs;
+use std::{fs, str::FromStr};
 
 use git_internal::{
     hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -1229,5 +1229,249 @@ fn test_fsck_accepts_v3_index_with_skip_worktree() {
         output.status.success(),
         "fsck must accept a v3 index: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M-FSCK: broken-link detection and shallow exemption (issue #474 CL-01)
+// ---------------------------------------------------------------------------
+
+fn two_commit_repo() -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("second.txt"), "second\n").expect("write second file");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert!(log.status.success(), "log --pretty=%H");
+    let hashes: Vec<String> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(hashes.len() >= 2, "expected two commits, got {:?}", hashes);
+    (repo, hashes[0].clone(), hashes[1].clone())
+}
+
+fn write_shallow(repo: &std::path::Path, oid: &str) {
+    fs::write(repo.join(".libra").join("shallow"), format!("{oid}\n"))
+        .expect("write .libra/shallow");
+}
+
+fn fsck_combined(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// F1: a shallow-boundary commit whose parent is absent must pass default,
+/// `--strict`, and `--connectivity-only`.
+#[test]
+fn test_fsck_reports_broken_links_matrix_shallow_exempt() {
+    let (repo, child, parent) = two_commit_repo();
+    fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent object");
+    write_shallow(repo.path(), &child);
+
+    for args in [
+        &["fsck"][..],
+        &["fsck", "--strict"],
+        &["fsck", "--connectivity-only"],
+    ] {
+        let output = run_libra_command(args, repo.path());
+        assert!(
+            output.status.success(),
+            "{args:?} must pass a shallow repo missing its parent, got: {}",
+            fsck_combined(&output)
+        );
+        let combined = fsck_combined(&output);
+        assert!(
+            !combined.contains("broken link"),
+            "{args:?} must not report a broken parent link for a shallow commit: {combined}"
+        );
+    }
+}
+
+/// F2: deleting `.libra/shallow` exposes the missing parent as a broken link.
+#[test]
+fn test_fsck_reports_broken_links_matrix_missing_parent() {
+    let (repo, child, parent) = two_commit_repo();
+    fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent object");
+    write_shallow(repo.path(), &child);
+    fs::remove_file(repo.path().join(".libra").join("shallow")).expect("remove shallow");
+
+    let output = run_libra_command(&["fsck"], repo.path());
+    assert!(
+        !output.status.success(),
+        "missing parent without shallow must fail"
+    );
+    let combined = fsck_combined(&output);
+    assert!(
+        combined.contains(&format!("broken link from commit {child}"))
+            && combined.contains(&format!("to commit {parent}")),
+        "must name the broken commit link: {combined}"
+    );
+    assert!(
+        combined.contains(&format!("missing commit {parent}")),
+        "must report missing commit: {combined}"
+    );
+
+    let json_out = run_libra_command(&["--json", "fsck"], repo.path());
+    assert!(!json_out.status.success(), "JSON fsck must also fail");
+    let json = parse_json_stdout(&json_out);
+    let links = &json["data"]["broken_links"];
+    assert!(
+        links.as_array().is_some_and(|rows| !rows.is_empty()),
+        "JSON broken_links must be present: {json}"
+    );
+    assert_eq!(links[0]["from"], child);
+    assert_eq!(links[0]["to"], parent);
+    assert_eq!(links[0]["from_type"], "commit");
+    assert_eq!(links[0]["to_type"], "commit");
+    let missing = &json["data"]["missing_objects"];
+    assert_eq!(missing[0]["object_id"], parent);
+    assert_eq!(missing[0]["object_type"], "commit");
+}
+
+/// F3: a missing tree or blob is a broken link.
+#[test]
+fn test_fsck_reports_broken_links_matrix_missing_tree_or_blob() {
+    let repo = create_committed_repo_via_cli();
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    let commit_hex = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .next()
+        .expect("HEAD")
+        .trim()
+        .to_string();
+
+    let _hash_guard = set_hash_kind_for_test(HashKind::Sha1);
+    let storage = ClientStorage::init(repo.path().join(".libra").join("objects"));
+    let commit_hash = ObjectHash::from_str(&commit_hex).expect("commit hash");
+    let data = storage.get(&commit_hash).expect("load commit");
+    let commit = Commit::from_bytes(&data, commit_hash).expect("parse commit");
+    let tree_hex = commit.tree_id.to_string();
+    fs::remove_file(loose_object_path(repo.path(), &tree_hex)).expect("delete tree");
+
+    let output = run_libra_command(&["fsck"], repo.path());
+    assert!(!output.status.success(), "missing tree must fail");
+    let combined = fsck_combined(&output);
+    assert!(
+        combined.contains("broken link from commit") && combined.contains("to tree"),
+        "must report commit→tree broken link: {combined}"
+    );
+    assert!(
+        combined.contains(&format!("missing tree {tree_hex}")),
+        "must report missing tree: {combined}"
+    );
+
+    // Missing blob: a tree entry whose payload object was deleted.
+    let repo = create_committed_repo_via_cli();
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    let commit_hex = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .next()
+        .expect("HEAD")
+        .trim()
+        .to_string();
+    let _hash_guard = set_hash_kind_for_test(HashKind::Sha1);
+    let storage = ClientStorage::init(repo.path().join(".libra").join("objects"));
+    let commit_hash = ObjectHash::from_str(&commit_hex).expect("commit hash");
+    let data = storage.get(&commit_hash).expect("load commit");
+    let commit = Commit::from_bytes(&data, commit_hash).expect("parse commit");
+    let tree_data = storage.get(&commit.tree_id).expect("load tree");
+    let tree = Tree::from_bytes(&tree_data, commit.tree_id).expect("parse tree");
+    let blob = tree
+        .tree_items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.mode,
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link
+            )
+        })
+        .expect("committed repo has a blob");
+    let blob_hex = blob.id.to_string();
+    fs::remove_file(loose_object_path(repo.path(), &blob_hex)).expect("delete blob");
+
+    let output = run_libra_command(&["fsck"], repo.path());
+    assert!(!output.status.success(), "missing blob must fail");
+    let combined = fsck_combined(&output);
+    assert!(
+        combined.contains("broken link from tree") && combined.contains("to blob"),
+        "must report tree→blob broken link: {combined}"
+    );
+    assert!(
+        combined.contains(&format!("missing blob {blob_hex}")),
+        "must report missing blob: {combined}"
+    );
+}
+
+/// F4: a complete repository still exits 0 and has empty JSON link lists.
+#[test]
+fn test_fsck_reports_broken_links_matrix_complete_repo() {
+    let repo = create_committed_repo_via_cli();
+    let output = run_libra_command(&["--json", "fsck"], repo.path());
+    assert_cli_success(&output, "fsck on complete repo");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["broken_links"], serde_json::json!([]));
+    assert_eq!(json["data"]["missing_objects"], serde_json::json!([]));
+}
+
+fn insert_obliteration_tombstone(repo: &std::path::Path, oid: &str) {
+    let db = repo.join(".libra").join("libra.db");
+    let status = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg(format!(
+            "INSERT INTO object_obliteration (oid, hash_kind, state) \
+             VALUES ('{oid}', 'sha1', 'obliterated');"
+        ))
+        .status()
+        .expect("sqlite3");
+    assert!(status.success(), "insert obliteration tombstone");
+}
+
+/// F6: a tombstoned missing parent is intentional absence, not a broken link.
+#[test]
+fn test_fsck_reports_broken_links_matrix_tombstoned_parent() {
+    let (repo, child, parent) = two_commit_repo();
+    fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent object");
+    insert_obliteration_tombstone(repo.path(), &parent);
+
+    let output = run_libra_command(&["--json", "fsck"], repo.path());
+    assert_cli_success(&output, "tombstoned missing parent must not fail fsck");
+    let combined = fsck_combined(&output);
+    assert!(
+        !combined.contains("broken link"),
+        "tombstone is not a broken link: {combined}"
+    );
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["broken_links"], serde_json::json!([]));
+    assert_eq!(json["data"]["missing_objects"], serde_json::json!([]));
+    let _ = child;
+}
+
+/// F5: illegal `.libra/shallow` lines fail closed.
+#[test]
+fn test_fsck_reports_broken_links_matrix_corrupt_shallow() {
+    let repo = create_committed_repo_via_cli();
+    write_shallow(repo.path(), "not-a-valid-object-id");
+    let output = run_libra_command(&["fsck"], repo.path());
+    assert!(
+        !output.status.success(),
+        "corrupt shallow metadata must fail closed"
+    );
+    let combined = fsck_combined(&output);
+    assert!(
+        combined.contains("shallow")
+            && (combined.contains("invalid") || combined.contains("corrupt")),
+        "must mention corrupt shallow metadata: {combined}"
     );
 }

@@ -25,6 +25,7 @@ The command performs the following checks:
 - **Ref consistency**: Verifies all references point to existing, valid objects
 - **Index integrity**: Validates index file structure and cross-references entries with object storage
 - **Reachability analysis**: Detects dangling and unreachable objects via BFS from refs, reflogs, and index
+- **Broken-link connectivity**: Confirms that each commit's tree and parents, and each tree entry, exist. Missing targets print Git-style `broken link from <type> <oid>` / `to <type> <oid>` plus `missing <type> <oid>` and fail the run. Commits listed in `.libra/shallow` are treated as roots: their parents are not demanded. A corrupt `.libra/shallow` file fails closed (`LBR-REPO-002`). Objects marked intentionally absent (obliteration tombstones) are reported as `intentionally absent` and do not fail the run or appear in `broken_links`. `--heal` runs before this walk. `--json` adds `broken_links` and `missing_objects` arrays.
 
 ## Options
 
@@ -122,7 +123,9 @@ Only check object existence, skip content validation. Significantly faster but d
 - Hash mismatches (content corrupted but object exists)
 - Format errors (object cannot be parsed)
 
-Still detects missing objects referenced by commits, trees, or refs.
+Still detects missing objects referenced by commits, trees, or refs, including
+Git-style broken-link reports. Shallow-boundary commits do not demand their
+parents. A corrupt `.libra/shallow` file still fails closed.
 
 ```bash
 libra fsck --connectivity-only
@@ -135,9 +138,13 @@ cause a non-zero exit):
 
 - commit author/committer emails must contain `@`, and their timezones must be a
   well-formed `±HHMM` offset within ±1400;
-- a commit's tree and parents must exist with the expected object types;
+- a commit's tree and parents must exist with the expected object types
+  (existence is also checked without `--strict`; `--strict` adds type checks);
 - a tree's entries must exist with object types matching their mode, and be in
   Git's canonical sort order.
+
+Shallow-boundary commits listed in `.libra/shallow` skip the parent-existence
+check in every mode, including `--strict`.
 
 ```bash
 libra fsck --strict
@@ -274,6 +281,19 @@ dangling commit 8ae045f3b2c1d9e7f6a5b4c3d2e1f0a9b8c7d6e5
 missing commit 6678874f0d5b658ae5c88b04020c64219f51f743
 ```
 
+### With a Broken Link
+
+A commit or tree that names an object that is not in storage (and is not a
+shallow-boundary parent) prints both the Git-style link and the missing object:
+
+```text
+broken link from commit 9f8e7d6c5b4a3210fedcba9876543210abcdef12
+              to commit 6678874f0d5b658ae5c88b04020c64219f51f743
+missing commit 6678874f0d5b658ae5c88b04020c64219f51f743
+```
+
+`--json` includes the same facts in `broken_links` and `missing_objects`.
+
 ## Exit Codes
 
 | Exit Code | Meaning |
@@ -299,6 +319,7 @@ The fsck command performs checks in the following order:
 5. **Ref validation**: Verify all refs point to valid objects
 6. **Index validation**: Check index file structure and entry integrity
 7. **Connectivity check**: Re-verify all objects with optional name resolution
+7b. **Broken-link walk**: Report missing commit parents, trees, and tree entries (`broken link` + `missing`); shallow-boundary commits skip parents
 8. **Reachability analysis**: Identify dangling and unreachable objects via BFS
 9. **Root commit report**: (with `--root`) List commits with no parents
 10. **Tag report**: (with `--tags`) List tagged commits

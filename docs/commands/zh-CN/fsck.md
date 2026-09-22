@@ -21,6 +21,7 @@ libra fsck [OPTIONS] [OBJECT]
 - **引用一致性**：验证所有引用都指向存在且有效的对象
 - **索引完整性**：验证索引文件结构，并用对象存储交叉检查条目
 - **可达性分析**：从 refs、reflogs 和 index 开始通过 BFS 检测 dangling 和 unreachable 对象
+- **断链连通性**：确认每个提交的树与父提交、每个树条目都存在。缺失时按 Git 风格输出 `broken link from <type> <oid>` / `to <type> <oid>` 以及 `missing <type> <oid>`，并以非零码退出。`.libra/shallow` 中的提交视为根，不检查其父提交。损坏的 `.libra/shallow` 会 fail-closed（`LBR-REPO-002`）。带 obliteration tombstone 的缺失对象报告为 `intentionally absent`，不失败、不进入 `broken_links`。`--heal` 在该检查之前运行。`--json` 增加 `broken_links` 与 `missing_objects` 数组。
 
 ## 选项
 
@@ -117,11 +118,27 @@ libra fsck --tags
 - 哈希不匹配（内容已损坏但对象存在）
 - 格式错误（对象无法解析）
 
-仍会检测 commit、tree 或 refs 引用的缺失对象。
+仍会检测 commit、tree 或 refs 引用的缺失对象，包括 Git 风格的断链报告。浅边界提交不要求其父提交存在。损坏的 `.libra/shallow` 仍会 fail-closed。
 
 ```bash
 libra fsck --connectivity-only
 ```
+
+### `--strict`
+
+额外的格式与图检查（作为错误报告，会导致非零退出）：
+
+- 提交的 author/committer 邮箱必须包含 `@`，时区必须是合法的 `±HHMM` 且在 ±1400 内；
+- 提交的树与父提交必须存在且类型正确（存在性检查在不加 `--strict` 时也会做；`--strict` 额外检查类型）；
+- 树条目必须存在、类型与 mode 匹配，并按 Git 规范排序。
+
+`.libra/shallow` 中的浅边界提交在所有模式（含 `--strict`）下都不检查父提交。
+
+```bash
+libra fsck --strict
+```
+
+注意：这是 `git fsck --strict` 的有意收窄子集。`.gitmodules` / HFS+ / NTFS 路径检查以及按消息的 `fsck.<msg-id>` 严重级别配置尚未实现。
 
 ### `--full` / `--no-full`
 
