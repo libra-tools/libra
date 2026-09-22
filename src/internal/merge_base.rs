@@ -49,7 +49,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 
-use crate::utils::object_ext::CommitExt;
+use crate::{internal::shallow::ShallowSet, utils::object_ext::CommitExt};
 
 /// Error raised when a commit in the graph cannot be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +57,9 @@ pub enum MergeBaseError {
     /// A commit object could not be loaded (missing, corrupt, or not a commit).
     #[error("failed to load commit {0}")]
     Load(String),
+    /// `.libra/shallow` could not be read or parsed (fail-closed).
+    #[error("{0}")]
+    Shallow(#[from] crate::internal::shallow::ShallowError),
 }
 
 /// The walk-relevant facts about one commit: who its parents are, and the
@@ -83,13 +86,15 @@ trait CommitSource {
 /// is read from the object store at most once per call.
 struct ObjectStoreCommits {
     nodes: HashMap<ObjectHash, CommitNode>,
+    shallow: ShallowSet,
 }
 
 impl ObjectStoreCommits {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self, MergeBaseError> {
+        Ok(Self {
             nodes: HashMap::new(),
-        }
+            shallow: ShallowSet::load()?,
+        })
     }
 }
 
@@ -101,7 +106,10 @@ impl CommitSource for ObjectStoreCommits {
         let commit: Commit =
             Commit::try_load(id).ok_or_else(|| MergeBaseError::Load(id.to_string()))?;
         let node = CommitNode {
-            parents: commit.parent_commit_ids.clone(),
+            parents: self
+                .shallow
+                .parents_for_walk(&commit.id, &commit.parent_commit_ids)
+                .to_vec(),
             date: commit.committer.timestamp as u64,
         };
         self.nodes.insert(*id, node.clone());
@@ -361,7 +369,7 @@ pub fn ahead_behind(
     upstream: &ObjectHash,
     boundaries: &HashSet<ObjectHash>,
 ) -> Result<AheadBehind, MergeBaseError> {
-    ahead_behind_with(&mut ObjectStoreCommits::new(), local, upstream, boundaries)
+    ahead_behind_with(&mut ObjectStoreCommits::new()?, local, upstream, boundaries)
 }
 
 fn ahead_behind_with<S: CommitSource>(
@@ -433,7 +441,7 @@ fn remove_redundant<S: CommitSource>(
 /// Every lowest common ancestor of `a` and `b`, sorted deterministically by hex
 /// id. Empty when the two commits share no history.
 pub fn merge_bases(a: &ObjectHash, b: &ObjectHash) -> Result<Vec<ObjectHash>, MergeBaseError> {
-    let mut source = ObjectStoreCommits::new();
+    let mut source = ObjectStoreCommits::new()?;
     merge_bases_with(&mut source, a, b)
 }
 
@@ -459,7 +467,7 @@ pub fn merge_base(a: &ObjectHash, b: &ObjectHash) -> Result<Option<ObjectHash>, 
 /// ancestor of another supplied head does not need to become a parent of the
 /// resulting merge commit.
 pub fn reduce_heads(heads: &[ObjectHash]) -> Result<Vec<ObjectHash>, MergeBaseError> {
-    let mut source = ObjectStoreCommits::new();
+    let mut source = ObjectStoreCommits::new()?;
     reduce_heads_with(&mut source, heads)
 }
 
@@ -488,7 +496,7 @@ fn reduce_heads_with<S: CommitSource>(
 /// between rounds. It is used for the octopus entry gate that rejects a set of
 /// heads with no single shared history unless unrelated histories are allowed.
 pub fn octopus_merge_bases(tips: &[ObjectHash]) -> Result<Vec<ObjectHash>, MergeBaseError> {
-    let mut source = ObjectStoreCommits::new();
+    let mut source = ObjectStoreCommits::new()?;
     octopus_merge_bases_with(&mut source, tips)
 }
 
@@ -527,7 +535,7 @@ pub fn merge_bases_many(
     one: &ObjectHash,
     others: &[ObjectHash],
 ) -> Result<Vec<ObjectHash>, MergeBaseError> {
-    let mut source = ObjectStoreCommits::new();
+    let mut source = ObjectStoreCommits::new()?;
     merge_bases_many_with(&mut source, one, others)
 }
 
@@ -545,7 +553,7 @@ fn merge_bases_many_with<S: CommitSource>(
 /// Whether `ancestor` is an ancestor of `descendant`. Reflexive: a commit is its
 /// own ancestor, matching `git merge-base --is-ancestor X X` (exit 0).
 pub fn is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> Result<bool, MergeBaseError> {
-    let mut source = ObjectStoreCommits::new();
+    let mut source = ObjectStoreCommits::new()?;
     is_ancestor_with(&mut source, ancestor, descendant)
 }
 

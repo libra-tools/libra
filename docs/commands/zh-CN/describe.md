@@ -12,7 +12,7 @@ libra describe [OPTIONS] [COMMIT]
 
 ## 说明
 
-`libra describe` 从给定提交（默认 `HEAD`）开始遍历提交祖先图（BFS），查找最近的标签。输出遵循 Git 的 describe 格式：
+`libra describe` 从给定提交（默认 `HEAD`）开始遍历提交祖先图（BFS），查找最近的标签。浅克隆中，`.libra/shallow` 列出的提交视为根（`--contains` 同样在边界停止）。损坏的 `.libra/shallow` fail-closed（`LBR-REPO-002`）。输出遵循 Git 的 describe 格式：
 
 - 精确匹配：`v1.2.3`
 - 带距离的可达标签：`v1.2.3-4-gabc1234`

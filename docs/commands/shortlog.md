@@ -16,7 +16,7 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 ## Description
 
-`libra shortlog` summarizes reachable commits grouped by author, primarily used for release announcements and contributor overviews. It walks the commit graph from the specified revision (defaulting to HEAD) and aggregates commits per author, displaying each author's commit count and optionally their commit subjects.
+`libra shortlog` summarizes reachable commits grouped by author, primarily used for release announcements and contributor overviews. It walks the commit graph from the specified revision (defaulting to HEAD) and aggregates commits per author, displaying each author's commit count and optionally their commit subjects. In a shallow clone the walk uses the same `.libra/shallow` roots as `log` (corrupt metadata fails closed as `LBR-REPO-002`). `--merges` / `--no-merges` still inspect recorded parent counts on the stored commit.
 
 When no revision is given and standard input is not a terminal and carries data, `libra shortlog` instead summarizes piped `git log` / `libra log` output (e.g. `git log | libra shortlog`), matching Git's stdin mode. An empty or terminal stdin falls back to the `HEAD` default (an intentional convenience over Git, which has no default revision). Pipe mode parses the default (`medium`) or `fuller` log format — `Author:` / `Commit:` identity headers and the 4-space-indented message — and honors the grouping and display options (`-n` / `-s` / `-e` / `--group` / `--author` / `-w` / `--top` / `--min-count` / `--reverse`); the walk-only filters (`--since` / `--until` / `--merges` / `--no-merges` / `--format`) have no commit objects to act on and are ignored, as in Git. Pipe mode still runs inside a Libra repository.
 

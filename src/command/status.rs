@@ -31,6 +31,7 @@ use crate::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
         head::Head,
+        shallow::ShallowSet,
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -6344,15 +6345,8 @@ pub(crate) fn upstream_ahead_behind(
     if local == upstream {
         return Ok((0, 0));
     }
-    let boundaries = crate::command::fetch::read_shallow_boundaries()
-        .map_err(|error| error.to_string())?
-        .iter()
-        .map(|oid| {
-            oid.parse::<ObjectHash>()
-                .map_err(|_| format!("invalid shallow boundary '{oid}'"))
-        })
-        .collect::<Result<HashSet<ObjectHash>, String>>()?;
-    crate::internal::merge_base::ahead_behind(local, upstream, &boundaries)
+    let shallow = ShallowSet::load().map_err(|error| error.to_string())?;
+    crate::internal::merge_base::ahead_behind(local, upstream, shallow.oids())
         .map(|counts| (counts.ahead, counts.behind))
         .map_err(|error| error.to_string())
 }

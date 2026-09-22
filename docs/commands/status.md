@@ -22,6 +22,8 @@ human-readable long format (default, also selectable explicitly with `--long`), 
 format, structured JSON for agent consumption, and `-z` NUL-terminated machine output. It can
 also detect renames (`--find-renames`), align output into columns (`--column`), and control
 whether upstream ahead/behind counts are shown (`--ahead-behind` / `--no-ahead-behind`).
+In a shallow clone, ahead/behind treats commits listed in `.libra/shallow` as
+roots. A corrupt shallow list hides the counts and warns rather than guessing.
 Optional pathspecs limit the reported staged, unstaged, unmerged, ignored, and
 untracked paths. They use the shared pathspec engine, including `:(top)`,
 `:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.

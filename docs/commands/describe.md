@@ -14,8 +14,10 @@ libra describe [OPTIONS] [COMMIT]
 ## Description
 
 `libra describe` walks the commit ancestry graph (BFS) from the given commit
-(default `HEAD`) to find the closest tag. The output follows Git's describe
-format:
+(default `HEAD`) to find the closest tag. In a shallow clone, commits listed in
+`.libra/shallow` are treated as roots (`--contains` also stops at those
+boundaries). A corrupt `.libra/shallow` file fails closed (`LBR-REPO-002`).
+The output follows Git's describe format:
 
 - Exact match: `v1.2.3`
 - Reachable tag with distance: `v1.2.3-4-gabc1234`

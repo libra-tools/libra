@@ -12,6 +12,10 @@ libra blame <file> [<commit>] [-L <range>]
 
 `libra blame` annotates each line of a file with the commit hash, author name, date, and line number of the commit that last modified that line. It walks the commit history from the specified revision (defaulting to HEAD) backward through parent commits, using diff operations to attribute lines to the earliest commit that introduced them.
 
+In a shallow clone, commits listed in `.libra/shallow` are treated as roots:
+blame does not follow their parents. A corrupt `.libra/shallow` file fails
+closed (`LBR-REPO-002`).
+
 The output format matches Git's blame format for familiarity: a short hash, author name (truncated to 15 characters), date, line number, and line content on each line.
 
 For large files, the `-L` option restricts output to a specific line range, reducing both computation time and output volume.

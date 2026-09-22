@@ -14,7 +14,7 @@ libra status [OPTIONS] [pathspec]...
 
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 
-该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
+该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。浅克隆中 ahead/behind 将 `.libra/shallow` 中的提交视为根；损坏的 shallow 列表会隐藏计数并告警，而不是猜测。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
 
 在 merge、rebase、cherry-pick 冲突期间，未合并的 index stage 条目会按冲突输出，而不会被误报为未跟踪文件。porcelain v1/短格式使用 Git 风格 XY 码（例如 `UU conflict.txt`）；porcelain v2 输出带 stage mode 与 object id 的 `u <XY> ...` 记录。默认长格式在 `Unmerged paths:` 标题下列出冲突路径，并带人类可读标签（`both modified:`、`deleted by them:`、`both added:` 等）与继续/中止提示。
 

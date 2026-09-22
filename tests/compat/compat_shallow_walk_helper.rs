@@ -1,6 +1,7 @@
-//! Guards ADR-CL-05: history walks in log / rev-list must go through
-//! `ShallowSet::parents_for_walk`. Display of recorded parents is allowed when
-//! the line (or the next line) carries `SHALLOW-DISPLAY`.
+//! Guards ADR-CL-05: history walks in log / rev-list / merge-base / status /
+//! blame / describe / shortlog must go through `ShallowSet::parents_for_walk`.
+//! Display of recorded parents is allowed when the line (or the next line)
+//! carries `SHALLOW-DISPLAY`.
 
 use std::{fs, path::PathBuf};
 
@@ -11,6 +12,11 @@ const WALK_FILES: &[&str] = &[
     "src/command/rev_list_filter.rs",
     "src/command/rev_list_children.rs",
     "src/command/rev_list_cherry.rs",
+    "src/internal/merge_base.rs",
+    "src/command/status.rs",
+    "src/command/blame.rs",
+    "src/command/describe.rs",
+    "src/command/shortlog.rs",
 ];
 
 #[test]
@@ -45,8 +51,7 @@ fn log_and_rev_list_walks_use_shallow_helper() {
     assert!(
         offenders.is_empty(),
         "new history walks must use internal::shallow::ShallowSet::parents_for_walk \
-         (add // SHALLOW-DISPLAY when the site prints recorded parents):
-{}",
+         (add // SHALLOW-DISPLAY when the site prints recorded parents):\n{}",
         offenders.join("\n")
     );
 }

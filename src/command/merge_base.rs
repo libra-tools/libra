@@ -82,10 +82,14 @@ pub async fn execute_safe(args: MergeBaseArgs, output: &OutputConfig) -> CliResu
     let a = resolve_commit(&args.commits[0]).await?;
     let b = resolve_commit(&args.commits[1]).await?;
 
-    let internal_err = |error: merge_base::MergeBaseError| {
-        CliError::fatal(error.to_string())
+    let internal_err = |error: merge_base::MergeBaseError| match &error {
+        merge_base::MergeBaseError::Shallow(shallow) => CliError::fatal(error.to_string())
             .with_exit_code(128)
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(shallow.hint()),
+        merge_base::MergeBaseError::Load(_) => CliError::fatal(error.to_string())
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::RepoStateInvalid),
     };
 
     if args.is_ancestor {

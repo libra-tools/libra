@@ -14,7 +14,7 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 ## 说明
 
-`libra shortlog` 汇总按作者分组的可达提交，主要用于发布公告和贡献者概览。它从指定修订（默认 HEAD）开始遍历提交图，并按作者聚合提交，显示每个作者的提交数量，以及可选的提交主题。
+`libra shortlog` 汇总按作者分组的可达提交，主要用于发布公告和贡献者概览。它从指定修订（默认 HEAD）开始遍历提交图，并按作者聚合提交，显示每个作者的提交数量，以及可选的提交主题。浅克隆中的遍历与 `log` 共用 `.libra/shallow` 根（损坏元数据 fail-closed，`LBR-REPO-002`）。`--merges` / `--no-merges` 仍按存储对象上记录的父提交数过滤。
 
 当未给定修订、且标准输入为带数据的非终端（管道）时，`libra shortlog` 改为汇总管道传入的 `git log` / `libra log` 输出（如 `git log | libra shortlog`），与 Git 的 stdin 模式对等：解析 medium/fuller 日志格式（`Author:` / `Commit:` 身份头与 4 空格缩进的消息），仅作用于分组与显示选项（`-n` / `-s` / `-e` / `--group` / `--author` / `-w` / `--top` / `--min-count` / `--reverse`），walk-only 过滤（`--since` / `--until` / `--merges` / `--no-merges` / `--format`）被忽略。空或终端 stdin 回落到 `HEAD` 默认；管道模式仍需在 Libra 仓库内运行。
 

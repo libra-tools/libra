@@ -15,6 +15,7 @@ use crate::{
     internal::{
         branch::Branch,
         config::ConfigKv,
+        shallow::ShallowSet,
         tag::{self, TagObject},
     },
     utils::{
@@ -207,6 +208,8 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
     let always = args.always;
     let dirty_mark = args.dirty;
     let first_parent = args.first_parent;
+    let shallow = ShallowSet::load()
+        .map_err(|error| DescribeError::CorruptReference(format!("{error}; {}", error.hint())))?;
 
     // Compile the --match / --exclude name filters once. Overly long or malformed
     // patterns are rejected up front as usage errors (CliInvalidArguments, 129).
@@ -336,11 +339,11 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
 
         // With --first-parent only the first parent is followed, so merge commits
         // do not pull in their merged-in side history.
-        let parents = commit.parent_commit_ids;
+        let parents = shallow.parents_for_walk(&commit.id, &commit.parent_commit_ids);
         let parents: &[ObjectHash] = if first_parent {
             &parents[..parents.len().min(1)]
         } else {
-            &parents
+            parents
         };
         for parent_id_str in parents {
             if !visited.contains(parent_id_str) {
@@ -402,6 +405,9 @@ async fn run_describe_contains(
     // an exact hit, and neither is "no descendant tag at all". Decide that up
     // front (the Dijkstra walk is irrelevant here) so every non-direct outcome
     // funnels to the same `NoExactMatch` the forward path returns.
+    let shallow = ShallowSet::load()
+        .map_err(|error| DescribeError::CorruptReference(format!("{error}; {}", error.hint())))?;
+
     if exact_match_only {
         return match tag_map.get(&start_hash) {
             Some(info) => {
@@ -495,7 +501,11 @@ async fn run_describe_contains(
                 commit_id: commit.to_string(),
                 detail: error.to_string(),
             })?;
-        for (i, parent) in commit_obj.parent_commit_ids.iter().enumerate() {
+        for (i, parent) in shallow
+            .parents_for_walk(&commit_obj.id, &commit_obj.parent_commit_ids)
+            .iter()
+            .enumerate()
+        {
             if first_parent && i > 0 {
                 break;
             }

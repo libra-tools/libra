@@ -33,6 +33,10 @@ second side's mark, so "one traversal" means one pass over the graph, not one
 visit per commit. Results are unchanged — committer dates only decide visit
 order, so a history with skewed or identical dates yields the same bases.
 
+In a shallow clone, commits listed in `.libra/shallow` are treated as roots:
+the walk does not follow their parents. A corrupt `.libra/shallow` file fails
+closed (`LBR-REPO-002`).
+
 ## Options
 
 | Option | Description | Example |

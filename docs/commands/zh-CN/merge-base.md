@@ -20,6 +20,8 @@ libra merge-base --is-ancestor <commit> <commit>
 
 查找过程从两个提交同时向下染色，走一个按 committer date 排序的优先队列（与 Git 的 `paint_down_to_common` 同构）：一次带着两侧标记的合并遍历，取代「每侧一次全量遍历 + 每个共同祖先各一次」。commit 在拿到另一侧标记时会被再次访问，因此「一次遍历」指的是对图的一趟，而不是每个 commit 只访问一次。结果不变——committer date 只决定访问顺序，日期乱序或全部相同的历史给出的 base 完全一致。
 
+浅克隆中，`.libra/shallow` 列出的提交视为根：不跟随其父提交。损坏的 `.libra/shallow` fail-closed（`LBR-REPO-002`）。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |
