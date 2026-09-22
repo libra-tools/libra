@@ -401,7 +401,8 @@ async fn test_push_invalid_remote() {
         eprintln!("skipped (LIBRA_TEST_GITHUB_TOKEN not set)");
         return;
     }
-    let temp_repo = init_temp_repo();
+    // Need a born `main` so `--set-upstream-to origin/main` can target it.
+    let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
     let _guard = ChangeDirGuard::new(temp_path);
 

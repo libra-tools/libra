@@ -1425,25 +1425,14 @@ fn test_fsck_reports_broken_links_matrix_complete_repo() {
     assert_eq!(json["data"]["missing_objects"], serde_json::json!([]));
 }
 
-fn insert_obliteration_tombstone(repo: &std::path::Path, oid: &str) {
-    let db = repo.join(".libra").join("libra.db");
-    let status = std::process::Command::new("sqlite3")
-        .arg(&db)
-        .arg(format!(
-            "INSERT INTO object_obliteration (oid, hash_kind, state) \
-             VALUES ('{oid}', 'sha1', 'obliterated');"
-        ))
-        .status()
-        .expect("sqlite3");
-    assert!(status.success(), "insert obliteration tombstone");
-}
-
 /// F6: a tombstoned missing parent is intentional absence, not a broken link.
 #[test]
 fn test_fsck_reports_broken_links_matrix_tombstoned_parent() {
     let (repo, child, parent) = two_commit_repo();
-    fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent object");
-    insert_obliteration_tombstone(repo.path(), &parent);
+    // Use the production obliterate path — do not shell out to `sqlite3(1)`,
+    // which is not installed on self-hosted CI runners.
+    let obliterate = run_libra_command(&["file", "obliterate", &parent, "--yes"], repo.path());
+    assert_cli_success(&obliterate, "obliterate parent commit");
 
     let output = run_libra_command(&["--json", "fsck"], repo.path());
     assert_cli_success(&output, "tombstoned missing parent must not fail fsck");

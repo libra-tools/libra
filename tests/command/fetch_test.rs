@@ -262,7 +262,9 @@ async fn test_fetch_invalid_remote() {
         eprintln!("skipped (LIBRA_TEST_GITHUB_TOKEN not set)");
         return;
     }
-    let temp_repo = init_temp_repo();
+    // Need a born `main` so `--set-upstream-to origin/main` can target it.
+    // A bare `init` leaves an unborn branch (`branch 'main' does not exist`).
+    let temp_repo = create_committed_repo_via_cli();
     let temp_path = temp_repo.path();
 
     eprintln!("Starting test: fetch from invalid remote");
