@@ -529,6 +529,117 @@ fn create_committed_repo_via_cli() -> tempfile::TempDir {
     repo
 }
 
+/// M-BOUND gdeep Git source: `c1←c2←c3`(main), `c2←dev1`(dev), tag `v1`→c1, `refs/mr/1`→c2.
+struct GdeepGitRepo {
+    dir: tempfile::TempDir,
+    c1: String,
+    c2: String,
+    c3: String,
+    dev1: String,
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn git {}: {error}", args.join(" ")))
+}
+
+fn git_success(repo: &Path, args: &[&str]) {
+    let output = git_output(repo, args);
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_rev_parse(repo: &Path, spec: &str) -> String {
+    let output = git_output(repo, &["rev-parse", spec]);
+    assert!(
+        output.status.success(),
+        "git rev-parse {spec} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Linear `main`-only Git history `c1←…←cN` for CL-04 cases that must not
+/// depend on `--single-branch` (CL-05).
+fn create_linear_git_repo(commits: usize) -> (tempfile::TempDir, Vec<String>) {
+    assert!(commits >= 1, "need at least one commit");
+    let dir = tempdir().expect("linear git tempdir");
+    let repo = dir.path();
+    git_success(repo, &["init", "-b", "main"]);
+    git_success(repo, &["config", "user.name", "Linear Tester"]);
+    git_success(repo, &["config", "user.email", "linear@test"]);
+    git_success(repo, &["config", "commit.gpgsign", "false"]);
+    let mut oids = Vec::with_capacity(commits);
+    for n in 1..=commits {
+        fs::write(repo.join("f.txt"), format!("c{n}\n")).expect("write linear file");
+        git_success(repo, &["add", "f.txt"]);
+        git_success(repo, &["commit", "-m", &format!("c{n}")]);
+        oids.push(git_rev_parse(repo, "HEAD"));
+    }
+    (dir, oids)
+}
+
+fn create_gdeep_git_repo() -> GdeepGitRepo {
+    let dir = tempdir().expect("gdeep tempdir");
+    let repo = dir.path();
+    git_success(repo, &["init", "-b", "main"]);
+    git_success(repo, &["config", "user.name", "Gdeep Tester"]);
+    git_success(repo, &["config", "user.email", "gdeep@test"]);
+    git_success(repo, &["config", "commit.gpgsign", "false"]);
+    git_success(repo, &["config", "tag.gpgsign", "false"]);
+    fs::write(repo.join("f.txt"), "c1\n").expect("write c1");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c1"]);
+    let c1 = git_rev_parse(repo, "HEAD");
+    fs::write(repo.join("f.txt"), "c2\n").expect("write c2");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c2"]);
+    let c2 = git_rev_parse(repo, "HEAD");
+    fs::write(repo.join("f.txt"), "c3\n").expect("write c3");
+    git_success(repo, &["add", "f.txt"]);
+    git_success(repo, &["commit", "-m", "c3"]);
+    let c3 = git_rev_parse(repo, "HEAD");
+    git_success(repo, &["checkout", "-b", "dev", &c2]);
+    fs::write(repo.join("dev.txt"), "dev1\n").expect("write dev1");
+    git_success(repo, &["add", "dev.txt"]);
+    git_success(repo, &["commit", "-m", "dev1"]);
+    let dev1 = git_rev_parse(repo, "HEAD");
+    git_success(repo, &["checkout", "main"]);
+    git_success(repo, &["tag", "-a", "v1", "-m", "v1", &c1]);
+    git_success(repo, &["update-ref", "refs/mr/1", &c2]);
+    GdeepGitRepo {
+        dir,
+        c1,
+        c2,
+        c3,
+        dev1,
+    }
+}
+
+fn read_shallow_oids(repo: &Path) -> Vec<String> {
+    let path = repo.join(".libra").join("shallow");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let mut oids: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    oids.sort();
+    oids
+}
+
 #[cfg(unix)]
 fn skip_permission_denied_test_if_root(test_name: &str) -> bool {
     unsafe extern "C" {

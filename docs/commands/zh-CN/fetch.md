@@ -117,7 +117,7 @@ LIBRA_FETCH_IDLE_TIMEOUT_MS=120000 libra fetch origin
 
 ## 浅 fetch 完整性
 
-`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点；本地 Libra 仓库不能（维持 fail-closed 为已决终态，D20），因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
+`--depth <N>` 只有在所选传输能返回 shallow boundary 元数据时才被接受。本地 Git 仓库和网络 Git 远程可以做到这一点。本地 Git 远程与 clone 使用同一套最短距离并集：父提交未被发送，或根提交恰好落在深度截止上时，该提交是 shallow 边界（issues/474 CL-04）。本地 Libra 仓库不能（维持 fail-closed 为已决终态，D20），因此 `libra fetch <本地 Libra 远程> --depth <N>` 会在下载对象或写入 `.libra/shallow` 之前失败，归类为 `LBR-REPO-002`。该 fail-closed 行为避免 remote-tracking ref 指向一个父提交缺失且没有 shallow 标记的提交。
 
 ## FETCH_HEAD
 

@@ -1,7 +1,7 @@
 //! Local protocol client using filesystem paths to run upload-pack/receive-pack locally and stream pack data over async pipes.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     future::Future,
     io::Error as IoError,
@@ -37,7 +37,7 @@ use crate::{
     git_protocol::ServiceType,
     internal::{
         branch::Branch, config::ConfigKv, db::get_db_conn_instance_for_path, head::Head,
-        protocol::DiscRef, reflog, tag,
+        protocol::DiscRef, reflog, shallow::ShallowSet, tag,
     },
     utils::{
         client_storage::ClientStorage,
@@ -482,6 +482,8 @@ impl LocalClient {
                 // Collect synchronously with the foreign hash kind active, then
                 // drop the (thread-local) guard before the async encode so it is
                 // never held across an `.await`.
+                // `want` is already scoped by fetch's single-branch / refspec
+                // plan (CL-05); this walk only truncates those tips by `--depth`.
                 let (entries, shallow) = {
                     let _hash_guard = HashKindRestoreGuard::switch_to(hash_kind);
                     collect_git_repo_entries(&storage, &self.repo_path, want, have, depth).map_err(
@@ -774,6 +776,10 @@ fn collect_loose_refs(
 /// by `depth`), every tree and blob they reference, and any annotated tag
 /// objects (peeled to their target commit). Reads exclusively from `storage`
 /// (the foreign `.git/objects`), never the current Libra repository.
+///
+/// Depth uses ADR-CL-02: shortest distance from any want, then one boundary
+/// pass after the union. A commit is a shallow boundary when at least one
+/// parent was not sent, or when a root sits exactly on the depth cutoff.
 fn collect_git_repo_entries(
     storage: &ClientStorage,
     repo_path: &Path,
@@ -784,10 +790,7 @@ fn collect_git_repo_entries(
     let have_set: HashSet<String> = have.iter().cloned().collect();
     let mut seen: HashSet<String> = have_set.clone();
     let mut entries: Vec<Entry> = Vec::new();
-    let mut commit_queue: VecDeque<(ObjectHash, usize)> = VecDeque::new();
-    let mut tree_roots: Vec<ObjectHash> = Vec::new();
-    // Commits whose parents are cut off by `depth` — the shallow boundary.
-    let mut shallow: Vec<String> = Vec::new();
+    let mut commit_seeds: Vec<ObjectHash> = Vec::new();
 
     // Resolve each want; peel annotated tags (emitting each tag object) down to
     // the commit they target.
@@ -807,38 +810,44 @@ fn collect_git_repo_entries(
                 match storage.get_object_type(&target) {
                     Ok(ObjectType::Tag) => current = target,
                     Ok(ObjectType::Commit) => {
-                        commit_queue.push_back((target, 0));
+                        commit_seeds.push(target);
                         break;
                     }
                     _ => break,
                 }
             }
         } else {
-            commit_queue.push_back((oid, 0));
+            commit_seeds.push(oid);
         }
     }
 
-    // Breadth-first over reachable commits.
-    while let Some((oid, distance)) = commit_queue.pop_front() {
-        if !seen.insert(oid.to_string()) {
-            continue;
-        }
-        let commit = Commit::from_bytes(&storage.get(&oid)?, oid)?;
-        tree_roots.push(commit.tree_id);
-        let parents = commit.parent_commit_ids.clone();
-        entries.push(Entry::from(commit));
-        if depth.is_none_or(|max| distance + 1 < max) {
-            for parent in parents {
-                if !seen.contains(&parent.to_string()) {
-                    commit_queue.push_back((parent, distance + 1));
-                }
-            }
-        } else {
-            // `depth` stops the walk here, so this commit is a shallow boundary
-            // (advertised even for a root commit, matching `git-upload-pack`).
-            shallow.push(oid.to_string());
-        }
+    let source_shallow = load_git_repo_shallow(repo_path)?;
+    let (included, distances, graphs) =
+        walk_git_commits_for_depth(storage, &commit_seeds, &have_set, depth, &source_shallow)?;
+
+    let mut tree_roots: Vec<ObjectHash> = Vec::new();
+    let mut included_oids: Vec<ObjectHash> = included.iter().copied().collect();
+    included_oids.sort_by_key(ToString::to_string);
+    for oid in &included_oids {
+        seen.insert(oid.to_string());
     }
+    for oid in &included_oids {
+        let graph = graphs.get(oid).ok_or_else(|| {
+            GitError::CustomError(format!("internal walk missed included commit {oid}"))
+        })?;
+        tree_roots.push(graph.tree_id);
+        let commit = Commit::from_bytes(&storage.get(oid)?, *oid)?;
+        entries.push(Entry::from(commit));
+    }
+
+    let shallow = shallow_boundaries_for_depth(
+        &included,
+        &distances,
+        &graphs,
+        &have_set,
+        depth,
+        &source_shallow,
+    );
 
     // Every tree and blob reachable from the collected commits.
     let mut tree_queue: VecDeque<ObjectHash> = tree_roots.into_iter().collect();
@@ -869,6 +878,118 @@ fn collect_git_repo_entries(
     include_reachable_tags(storage, repo_path, &have_set, &mut seen, &mut entries)?;
 
     Ok((entries, shallow))
+}
+
+/// Graph facts needed after the shortest-distance walk.
+struct WalkedCommit {
+    parents: Vec<ObjectHash>,
+    tree_id: ObjectHash,
+}
+
+type DepthWalkResult = (
+    HashSet<ObjectHash>,
+    HashMap<ObjectHash, usize>,
+    HashMap<ObjectHash, WalkedCommit>,
+);
+
+/// Shortest distance from any want, truncated at `depth`.
+fn load_git_repo_shallow(repo_path: &Path) -> Result<ShallowSet, GitError> {
+    ShallowSet::load_at(&repo_path.join("shallow")).map_err(|error| {
+        GitError::CustomError(format!("source shallow metadata is corrupt: {error}"))
+    })
+}
+
+fn walk_git_commits_for_depth(
+    storage: &ClientStorage,
+    seeds: &[ObjectHash],
+    have_set: &HashSet<String>,
+    depth: Option<usize>,
+    source_shallow: &ShallowSet,
+) -> Result<DepthWalkResult, GitError> {
+    let mut distances: HashMap<ObjectHash, usize> = HashMap::new();
+    let mut graphs: HashMap<ObjectHash, WalkedCommit> = HashMap::new();
+    let mut queue: VecDeque<(ObjectHash, usize)> = VecDeque::new();
+
+    for oid in seeds {
+        if have_set.contains(&oid.to_string()) {
+            continue;
+        }
+        if depth.is_some_and(|max| max == 0) {
+            continue;
+        }
+        distances.insert(*oid, 0);
+        queue.push_back((*oid, 0));
+    }
+
+    while let Some((oid, distance)) = queue.pop_front() {
+        if distances.get(&oid).is_some_and(|&known| known < distance) {
+            continue;
+        }
+        if depth.is_some_and(|max| distance >= max) {
+            distances.remove(&oid);
+            continue;
+        }
+        let graph = match graphs.entry(oid) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let commit = Commit::from_bytes(&storage.get(&oid)?, oid)?;
+                entry.insert(WalkedCommit {
+                    parents: commit.parent_commit_ids.clone(),
+                    tree_id: commit.tree_id,
+                })
+            }
+        };
+        if source_shallow.is_boundary(&oid) || depth.is_some_and(|max| distance + 1 >= max) {
+            continue;
+        }
+        for parent in graph.parents.clone() {
+            if have_set.contains(&parent.to_string()) {
+                continue;
+            }
+            let next = distance + 1;
+            if distances.get(&parent).is_none_or(|&known| next < known) {
+                distances.insert(parent, next);
+                queue.push_back((parent, next));
+            }
+        }
+    }
+
+    let included: HashSet<ObjectHash> = distances.keys().copied().collect();
+    Ok((included, distances, graphs))
+}
+
+/// ADR-CL-02 boundary pass: missing parent, or a root exactly on the cutoff.
+fn shallow_boundaries_for_depth(
+    included: &HashSet<ObjectHash>,
+    distances: &HashMap<ObjectHash, usize>,
+    graphs: &HashMap<ObjectHash, WalkedCommit>,
+    have_set: &HashSet<String>,
+    depth: Option<usize>,
+    source_shallow: &ShallowSet,
+) -> Vec<String> {
+    let mut shallow: Vec<String> = match depth {
+        Some(max) => included
+            .iter()
+            .filter_map(|oid| {
+                let graph = graphs.get(oid)?;
+                let distance = *distances.get(oid)?;
+                let missing_parent = graph.parents.iter().any(|parent| {
+                    !included.contains(parent) && !have_set.contains(&parent.to_string())
+                });
+                let root_at_cutoff = graph.parents.is_empty() && distance + 1 == max;
+                (missing_parent || root_at_cutoff).then_some(oid.to_string())
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for oid in source_shallow.oids() {
+        if included.contains(oid) {
+            shallow.push(oid.to_string());
+        }
+    }
+    shallow.sort();
+    shallow.dedup();
+    shallow
 }
 
 /// Add annotated tag objects whose peeled target is in the just-sent set.
@@ -1539,6 +1660,197 @@ mod tests {
             fs::canonicalize(env::current_dir().unwrap()).unwrap(),
             fs::canonicalize(original_dir).unwrap(),
             "serialized local protocol operations should restore caller cwd",
+        );
+    }
+
+    /// M-BOUND topology: `c1←c2←c3`(main), `c2←dev1`(dev), tag `v1`→c1, `refs/mr/1`→c2.
+    struct Gdeep {
+        _dir: tempfile::TempDir,
+        git_dir: PathBuf,
+        c1: String,
+        c2: String,
+        c3: String,
+        dev1: String,
+    }
+
+    fn git_rev_parse(repo: &Path, spec: &str) -> String {
+        String::from_utf8(
+            run_git(Some(repo), ["rev-parse", spec])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    fn build_gdeep() -> Gdeep {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("gdeep");
+        assert!(
+            run_git(None, ["init", "-b", "main", repo.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (k, v) in [
+            ("user.name", "Local Tester"),
+            ("user.email", "local@test"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+        ] {
+            run_git(Some(&repo), ["config", k, v]).status().unwrap();
+        }
+        fs::write(repo.join("f.txt"), "c1\n").unwrap();
+        run_git(Some(&repo), ["add", "f.txt"]).status().unwrap();
+        assert!(
+            run_git(Some(&repo), ["commit", "-m", "c1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let c1 = git_rev_parse(&repo, "HEAD");
+        fs::write(repo.join("f.txt"), "c2\n").unwrap();
+        run_git(Some(&repo), ["add", "f.txt"]).status().unwrap();
+        assert!(
+            run_git(Some(&repo), ["commit", "-m", "c2"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let c2 = git_rev_parse(&repo, "HEAD");
+        fs::write(repo.join("f.txt"), "c3\n").unwrap();
+        run_git(Some(&repo), ["add", "f.txt"]).status().unwrap();
+        assert!(
+            run_git(Some(&repo), ["commit", "-m", "c3"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let c3 = git_rev_parse(&repo, "HEAD");
+        assert!(
+            run_git(Some(&repo), ["checkout", "-b", "dev", &c2])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(repo.join("dev.txt"), "dev1\n").unwrap();
+        run_git(Some(&repo), ["add", "dev.txt"]).status().unwrap();
+        assert!(
+            run_git(Some(&repo), ["commit", "-m", "dev1"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dev1 = git_rev_parse(&repo, "HEAD");
+        run_git(Some(&repo), ["checkout", "main"]).status().unwrap();
+        assert!(
+            run_git(Some(&repo), ["tag", "-a", "v1", "-m", "v1", &c1])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            run_git(Some(&repo), ["update-ref", "refs/mr/1", &c2])
+                .status()
+                .unwrap()
+                .success()
+        );
+        Gdeep {
+            git_dir: repo.join(".git"),
+            _dir: dir,
+            c1,
+            c2,
+            c3,
+            dev1,
+        }
+    }
+
+    fn collect_gdeep(
+        gdeep: &Gdeep,
+        want: &[&str],
+        depth: Option<usize>,
+    ) -> (Vec<String>, Vec<String>) {
+        let hash_kind = git_repo_hash_kind(&gdeep.git_dir);
+        let _hash_guard = HashKindRestoreGuard::switch_to(hash_kind);
+        let storage = ClientStorage::init_local(gdeep.git_dir.join("objects"));
+        let wants: Vec<String> = want.iter().map(|oid| (*oid).to_string()).collect();
+        let (entries, shallow) =
+            collect_git_repo_entries(&storage, &gdeep.git_dir, &wants, &[], depth).unwrap();
+        let mut commits: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry.obj_type == ObjectType::Commit)
+            .map(|entry| entry.hash.to_string())
+            .collect();
+        commits.sort();
+        (commits, shallow)
+    }
+
+    #[test]
+    fn collect_git_repo_entries_depth1_single_want_is_b1() {
+        let gdeep = build_gdeep();
+        let (commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c3], Some(1));
+        assert_eq!(shallow, vec![gdeep.c3.clone()], "B1 boundary");
+        assert_eq!(commits, vec![gdeep.c3.clone()], "B1 sends only the tip");
+    }
+
+    #[test]
+    fn collect_git_repo_entries_depth1_union_is_b2() {
+        let gdeep = build_gdeep();
+        let (commits, shallow) =
+            collect_gdeep(&gdeep, &[&gdeep.c3, &gdeep.c1, &gdeep.dev1], Some(1));
+        let mut expected_commits = vec![gdeep.c1.clone(), gdeep.c3.clone(), gdeep.dev1.clone()];
+        expected_commits.sort();
+        assert_eq!(commits, expected_commits, "B2 does not send c2");
+        assert_eq!(
+            shallow,
+            {
+                let mut expected = vec![gdeep.c1.clone(), gdeep.c3.clone(), gdeep.dev1.clone()];
+                expected.sort();
+                expected
+            },
+            "B2 boundaries"
+        );
+    }
+
+    #[test]
+    fn collect_git_repo_entries_depth2_single_want_is_b3() {
+        let gdeep = build_gdeep();
+        let (commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c3], Some(2));
+        let mut expected_commits = vec![gdeep.c2.clone(), gdeep.c3.clone()];
+        expected_commits.sort();
+        assert_eq!(commits, expected_commits, "B3 sends two commits");
+        assert_eq!(shallow, vec![gdeep.c2.clone()], "B3 boundary is c2");
+    }
+
+    #[test]
+    fn collect_git_repo_entries_root_depth1_is_b4() {
+        let gdeep = build_gdeep();
+        let (commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c1], Some(1));
+        assert_eq!(commits, vec![gdeep.c1.clone()]);
+        assert_eq!(shallow, vec![gdeep.c1.clone()], "B4 root at cutoff");
+    }
+
+    #[test]
+    fn collect_git_repo_entries_depth_past_history_is_b5() {
+        let gdeep = build_gdeep();
+        let (commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c3], Some(10));
+        let mut expected = vec![gdeep.c1.clone(), gdeep.c2.clone(), gdeep.c3.clone()];
+        expected.sort();
+        assert_eq!(commits, expected, "B5 sends full history");
+        assert!(shallow.is_empty(), "B5 writes no shallow file");
+    }
+
+    #[test]
+    fn collect_git_repo_entries_union_does_not_mark_shared_parent_shallow() {
+        let gdeep = build_gdeep();
+        // c3 at depth 2 includes c2; the tag want also includes c1. c2 is not a
+        // boundary because its parent was sent by the other want (ADR-CL-02).
+        let (_commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c3, &gdeep.c1], Some(2));
+        assert!(
+            !shallow.contains(&gdeep.c2),
+            "shared parent already sent is not a boundary: {shallow:?}"
         );
     }
 }

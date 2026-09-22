@@ -185,6 +185,9 @@ so a typo never leaves a fetch with a zero or nonsensical timeout.
 
 `--depth <N>` is accepted only when the selected transport can return shallow
 boundary metadata. Local Git repositories and network Git remotes can do this.
+A local Git remote uses the same shortest-distance union as clone: a commit is
+a shallow boundary when a parent was not sent, or when a root sits exactly on
+the depth cutoff (issues/474 CL-04).
 Local Libra repositories cannot (the accepted end state — decision D20 in the
 development compatibility register), so `libra fetch <local-libra-remote>
 --depth <N>` fails before downloading objects or writing `.libra/shallow`,

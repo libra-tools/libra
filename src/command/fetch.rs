@@ -2722,7 +2722,7 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
 /// with this one about what counts as a boundary, which is precisely the
 /// disagreement that turns a shallow clone's GC into a corruption report.
 pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
-    read_shallow_boundaries_at(&shallow_file_path()?)
+    crate::internal::shallow::boundary_oids().map_err(shallow_read_error)
 }
 
 /// [`read_shallow_boundaries`] against an EXPLICIT shallow file (§C.4.2) —
@@ -2731,36 +2731,13 @@ pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> 
 pub(crate) fn read_shallow_boundaries_at(
     path: &std::path::Path,
 ) -> Result<BTreeSet<String>, FetchError> {
-    let path = path.to_path_buf();
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(source) => {
-            return Err(FetchError::LocalState {
-                message: format!(
-                    "failed to read shallow metadata '{}': {source}",
-                    path.display()
-                ),
-            });
-        }
-    };
+    crate::internal::shallow::boundary_oids_at(path).map_err(shallow_read_error)
+}
 
-    let mut boundaries = BTreeSet::new();
-    for (line_no, line) in content.lines().enumerate() {
-        let oid = line.trim();
-        if oid.is_empty() {
-            continue;
-        }
-        ObjectHash::from_str(oid).map_err(|source| FetchError::LocalState {
-            message: format!(
-                "invalid shallow metadata entry at '{}:{}': {source}",
-                path.display(),
-                line_no + 1
-            ),
-        })?;
-        boundaries.insert(oid.to_string());
+fn shallow_read_error(error: crate::internal::shallow::ShallowError) -> FetchError {
+    FetchError::LocalState {
+        message: error.to_string(),
     }
-    Ok(boundaries)
 }
 
 fn write_shallow_boundaries(boundaries: &BTreeSet<String>) -> Result<(), FetchError> {

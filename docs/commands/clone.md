@@ -183,6 +183,10 @@ rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
 shallow boundaries, so accepting the option would leave a clone with missing
 parents. This fail-closed behavior is the accepted end state (decision D20 in
 the development compatibility register), not a pending gap.
+A local Git source reached with `file://` or `--no-local` truncates by the
+shortest distance from any wanted tip, then one boundary pass: a commit is
+shallow when a parent was not sent, or when a root commit sits exactly on the
+depth cutoff (issues/474 CL-04).
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git

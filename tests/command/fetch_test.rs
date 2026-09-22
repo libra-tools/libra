@@ -2123,3 +2123,64 @@ fn test_fetch_refuses_local_upstream() {
         report.message
     );
 }
+
+/// M-BOUND via fetch: a local Git remote honors `--depth` on an explicit want.
+#[test]
+fn test_fetch_depth_local_git_boundaries() {
+    use super::{
+        assert_cli_success, create_gdeep_git_repo, init_repo_via_cli, read_shallow_oids,
+        run_libra_command,
+    };
+
+    let gdeep = create_gdeep_git_repo();
+    let source = format!("file://{}", gdeep.dir.path().display());
+    let dest = tempdir().expect("fetch dest");
+    init_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", &source], dest.path()),
+        "remote add",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "origin",
+                "--depth",
+                "1",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            dest.path(),
+        ),
+        "fetch --depth 1",
+    );
+    assert_eq!(
+        read_shallow_oids(dest.path()),
+        vec![gdeep.c3.clone()],
+        "fetch depth 1 boundary"
+    );
+
+    let dest2 = tempdir().expect("fetch dest2");
+    init_repo_via_cli(dest2.path());
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", &source], dest2.path()),
+        "remote add dest2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "origin",
+                "--depth",
+                "2",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            dest2.path(),
+        ),
+        "fetch --depth 2",
+    );
+    assert_eq!(
+        read_shallow_oids(dest2.path()),
+        vec![gdeep.c2.clone()],
+        "fetch depth 2 boundary"
+    );
+}

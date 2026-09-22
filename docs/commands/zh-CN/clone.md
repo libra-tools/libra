@@ -112,6 +112,7 @@ libra clone -l /path/to/source /path/to/dest
 创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。
 只有 Git 远程支持浅传输。
 本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
+通过 `file://` 或 `--no-local` 访问的本地 Git 源按各 want 的最短距离截断，再做一次边界计算：有父提交未被发送，或根提交恰好落在深度截止上时，该提交写入 `.libra/shallow`（issues/474 CL-04）。
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git

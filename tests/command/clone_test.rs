@@ -1417,3 +1417,174 @@ fn test_clone_preserves_executable_bit_from_libra_source() {
         "cloned 100644 entry must not be executable"
     );
 }
+
+/// M-BOUND: local Git `file://` / `--no-local` shallow clone writes the Git
+/// shortest-distance union boundary. `--single-branch --no-tags` isolates the
+/// walk from CL-05 branch/tag-range work.
+#[test]
+fn test_clone_depth_from_local_git_source_boundary_matrix() {
+    use super::{
+        assert_cli_success, create_gdeep_git_repo, create_linear_git_repo, git_success,
+        read_shallow_oids, run_libra_command,
+    };
+
+    let (linear, linear_oids) = create_linear_git_repo(3);
+    let c1 = &linear_oids[0];
+    let c2 = &linear_oids[1];
+    let c3 = &linear_oids[2];
+    let linear_url = format!("file://{}", linear.path().display());
+    let gdeep = create_gdeep_git_repo();
+    git_success(gdeep.dir.path(), &["update-ref", "-d", "refs/mr/1"]);
+    let gdeep_url = format!("file://{}", gdeep.dir.path().display());
+    let dest_root = tempdir().expect("dest root");
+
+    let b1 = dest_root.path().join("b1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            &linear_url,
+            b1.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B1 clone --depth 1");
+    assert_eq!(read_shallow_oids(&b1), vec![c3.clone()], "B1 shallow");
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], &b1);
+    assert_cli_success(&count, "B1 rev-list");
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "1",
+        "B1 count"
+    );
+
+    let b2 = dest_root.path().join("b2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--no-single-branch",
+            &gdeep_url,
+            b2.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B2 clone --no-single-branch");
+    let mut expected_b2 = vec![gdeep.c1.clone(), gdeep.c3.clone(), gdeep.dev1.clone()];
+    expected_b2.sort();
+    assert_eq!(read_shallow_oids(&b2), expected_b2, "B2 shallow");
+
+    let b3 = dest_root.path().join("b3");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "2",
+            "--single-branch",
+            "--no-tags",
+            &linear_url,
+            b3.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B3 clone --depth 2");
+    assert_eq!(read_shallow_oids(&b3), vec![c2.clone()], "B3 shallow");
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], &b3);
+    assert_cli_success(&count, "B3 rev-list");
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "2",
+        "B3 count"
+    );
+
+    let b3_path = dest_root.path().join("b3-path");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "2",
+            "--no-local",
+            "--single-branch",
+            "--no-tags",
+            linear.path().to_str().unwrap(),
+            b3_path.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B3 --no-local path");
+    assert_eq!(
+        read_shallow_oids(&b3_path),
+        vec![c2.clone()],
+        "B3 --no-local shallow"
+    );
+
+    let b5 = dest_root.path().join("b5");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "10",
+            "--single-branch",
+            "--no-tags",
+            &linear_url,
+            b5.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B5 depth past history");
+    assert!(
+        read_shallow_oids(&b5).is_empty(),
+        "B5 must not write .libra/shallow"
+    );
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], &b5);
+    assert_cli_success(&count, "B5 rev-list");
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "3",
+        "B5 full history"
+    );
+
+    let root_src = tempdir().expect("root source");
+    git_success(root_src.path(), &["init", "-b", "main"]);
+    git_success(root_src.path(), &["config", "user.name", "Root"]);
+    git_success(root_src.path(), &["config", "user.email", "root@test"]);
+    git_success(root_src.path(), &["config", "commit.gpgsign", "false"]);
+    fs::write(root_src.path().join("only.txt"), "root\n").expect("write root");
+    git_success(root_src.path(), &["add", "only.txt"]);
+    git_success(root_src.path(), &["commit", "-m", "root"]);
+    let root_oid =
+        String::from_utf8_lossy(&super::git_output(root_src.path(), &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+    let b4 = dest_root.path().join("b4");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            &format!("file://{}", root_src.path().display()),
+            b4.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "B4 single-root clone");
+    assert_eq!(read_shallow_oids(&b4), vec![root_oid], "B4 shallow");
+
+    let objects = run_libra_command(&["rev-list", "--objects", "--all"], &b1);
+    assert_cli_success(&objects, "B6 objects");
+    let object_text = String::from_utf8_lossy(&objects.stdout);
+    assert!(
+        !object_text.contains(c2),
+        "B6 must not contain c2: {object_text}"
+    );
+    assert!(
+        !object_text.contains(c1),
+        "B6 must not contain c1: {object_text}"
+    );
+}
