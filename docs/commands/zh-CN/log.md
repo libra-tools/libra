@@ -18,6 +18,8 @@ libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 
 当 stdout 被管道连接且下游命令提前退出时，`libra log` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
 
+浅克隆中，`.libra/shallow` 列出的提交会被当作根：`log` 不再跟随它们的父提交。损坏的 `.libra/shallow` 会 fail-closed（`LBR-REPO-002`）。若父提交从未获取却删除了该文件，同样 fail-closed，并提示运行 `libra fsck`。`%P` / `--parents` 仍打印对象里记录的父提交 ID。
+
 ## 选项
 
 ### `-n, --number <N>`

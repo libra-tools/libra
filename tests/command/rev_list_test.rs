@@ -1197,3 +1197,55 @@ fn test_rev_list_count_objects_edge_excludes_edge_commits() {
         "--count --objects-edge counts commits + objects, not the edge commits"
     );
 }
+
+fn two_commit_shallow_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("second.txt"), "second\n").expect("write second");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert_cli_success(&log, "log hashes");
+    let child = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .next()
+        .expect("HEAD")
+        .trim()
+        .to_string();
+    let parent = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .nth(1)
+        .expect("parent")
+        .trim()
+        .to_string();
+    std::fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent");
+    std::fs::write(
+        repo.path().join(".libra").join("shallow"),
+        format!("{child}\n"),
+    )
+    .expect("write shallow");
+    repo
+}
+
+/// M-WALK W2: rev-list counts only the shallow-reachable history.
+#[test]
+fn test_rev_list_counts_shallow_history() {
+    let repo = two_commit_shallow_repo();
+    for args in [
+        &["rev-list", "--count", "HEAD"][..],
+        &["rev-list", "--all", "--count"][..],
+    ] {
+        let output = run_libra_command(args, repo.path());
+        assert_cli_success(&output, &args.join(" "));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "1",
+            "{args:?} must count only the boundary commit"
+        );
+    }
+}

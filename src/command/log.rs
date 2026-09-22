@@ -33,6 +33,7 @@ use crate::{
             date_parser::parse_date,
             formatter::{CommitFormatter, FormatContext, FormatType, LogPreset},
         },
+        shallow::ShallowSet,
         tag::{self, TagObject},
     },
     utils::{
@@ -119,6 +120,25 @@ fn log_invalid_object_error(object: &str) -> CliError {
 
 fn log_repo_corrupt_error(message: impl Into<String>) -> CliError {
     CliError::fatal(message.into()).with_stable_code(StableErrorCode::RepoCorrupt)
+}
+
+fn load_walk_shallow() -> CliResult<ShallowSet> {
+    ShallowSet::load()
+        .map_err(|error| log_repo_corrupt_error(error.to_string()).with_hint(error.hint()))
+}
+
+fn history_parents<'a>(shallow: &ShallowSet, commit: &'a Commit) -> &'a [ObjectHash] {
+    shallow.parents_for_walk(&commit.id, &commit.parent_commit_ids)
+}
+
+fn first_history_parent(commit: &Commit) -> CliResult<Option<ObjectHash>> {
+    let shallow = load_walk_shallow()?;
+    Ok(history_parents(&shallow, commit).first().copied())
+}
+
+fn log_missing_history_error(error: impl std::fmt::Display) -> CliError {
+    log_repo_corrupt_error(format!("storage broken, object not found: {error}"))
+        .with_hint("run 'libra fsck' to inspect missing history")
 }
 
 #[derive(Parser, Debug)]
@@ -605,7 +625,7 @@ impl CommitFilter {
             }
         }
 
-        let parent_count = commit.parent_commit_ids.len();
+        let parent_count = commit.parent_commit_ids.len(); // SHALLOW-DISPLAY: recorded parents, not a walk
         if let Some(min) = self.min_parents
             && parent_count < min
         {
@@ -767,6 +787,7 @@ pub async fn get_reachable_commits(
     let mut queue = VecDeque::new();
     let mut commit_set: HashSet<ObjectHash> = HashSet::new();
     let mut reachable_commits: Vec<Commit> = Vec::new();
+    let shallow = load_walk_shallow()?;
 
     // Push the initial commit with depth 0
     let initial_hash =
@@ -779,9 +800,7 @@ pub async fn get_reachable_commits(
             continue;
         }
 
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
 
         // If depth is limited and the current depth exceeds the limit, skip further processing
         if let Some(max_depth) = depth
@@ -791,7 +810,7 @@ pub async fn get_reachable_commits(
         }
 
         // Add parent commits to the queue with incremented depth
-        for parent_commit_id in &commit.parent_commit_ids {
+        for parent_commit_id in history_parents(&shallow, &commit) {
             queue.push_back((*parent_commit_id, current_depth + 1));
         }
 
@@ -922,15 +941,14 @@ async fn parse_revision_expr(spec: &str) -> CliResult<RevisionExpr> {
 async fn reachable_commit_ids(tip: ObjectHash) -> CliResult<HashSet<ObjectHash>> {
     let mut reachable: HashSet<ObjectHash> = HashSet::new();
     let mut queue: VecDeque<ObjectHash> = VecDeque::new();
+    let shallow = load_walk_shallow()?;
     queue.push_back(tip);
     while let Some(commit_id) = queue.pop_front() {
         if !reachable.insert(commit_id) {
             continue;
         }
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("failed to load commit {commit_id}: {e}"))
-        })?;
-        for parent in &commit.parent_commit_ids {
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
+        for parent in history_parents(&shallow, &commit) {
             queue.push_back(*parent);
         }
     }
@@ -1146,14 +1164,13 @@ async fn get_reachable_commits_excluding(
     // closure ignores `--first-parent`/`depth`, which shape only the shown set.)
     let mut excludes: HashSet<ObjectHash> = HashSet::new();
     let mut exclude_queue: VecDeque<ObjectHash> = exclude_tips.into_iter().collect();
+    let shallow = load_walk_shallow()?;
     while let Some(commit_id) = exclude_queue.pop_front() {
         if !excludes.insert(commit_id) {
             continue;
         }
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
-        for parent_commit_id in &commit.parent_commit_ids {
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
+        for parent_commit_id in history_parents(&shallow, &commit) {
             exclude_queue.push_back(*parent_commit_id);
         }
     }
@@ -1167,9 +1184,7 @@ async fn get_reachable_commits_excluding(
             continue;
         }
 
-        let commit = load_object::<Commit>(&commit_id).map_err(|e| {
-            log_repo_corrupt_error(format!("storage broken, object not found: {e}"))
-        })?;
+        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
 
         if let Some(max_depth) = depth
             && current_depth >= max_depth
@@ -1177,7 +1192,7 @@ async fn get_reachable_commits_excluding(
             continue;
         }
 
-        for (idx, parent_commit_id) in commit.parent_commit_ids.iter().enumerate() {
+        for (idx, parent_commit_id) in history_parents(&shallow, &commit).iter().enumerate() {
             // `--first-parent` follows only the first parent of merge commits,
             // collapsing merged side branches out of the traversal.
             if first_parent && idx > 0 {
@@ -1257,11 +1272,11 @@ async fn commit_touches_path_follow(
     let current_items: HashMap<PathBuf, ObjectHash> = tree.get_plain_items().into_iter().collect();
     let current_blob = current_items.get(target).copied();
 
-    if commit.parent_commit_ids.is_empty() {
+    let Some(parent_id) = first_history_parent(commit)? else {
         return Ok(current_blob.map(|_| target.clone()));
-    }
+    };
 
-    let parent_commit = load_object::<Commit>(&commit.parent_commit_ids[0])
+    let parent_commit = load_object::<Commit>(&parent_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
     let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -1362,11 +1377,11 @@ async fn commit_affects_line_range(
         return Ok(true);
     };
 
-    if commit.parent_commit_ids.is_empty() {
+    let Some(parent_id) = first_history_parent(commit)? else {
         return Ok(true);
-    }
+    };
 
-    let parent_commit = load_object::<Commit>(&commit.parent_commit_ids[0])
+    let parent_commit = load_object::<Commit>(&parent_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
     let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
         .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -1567,6 +1582,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         for selected in &selected_commits {
             let child = selected.commit.id.to_string();
             for parent in &selected.commit.parent_commit_ids {
+                // SHALLOW-DISPLAY: edges among already-shown commits, not a walk
                 let parent_id = parent.to_string();
                 if visible.contains(&parent_id) {
                     map.entry(parent_id).or_default().push(child.clone());
@@ -1672,7 +1688,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         let abbreviate = |id: &str| id.chars().take(abbrev_len).collect::<String>();
         let extra_hashes = if args.parents {
             commit
-                .parent_commit_ids
+                .parent_commit_ids // SHALLOW-DISPLAY: --parents prints recorded ids
                 .iter()
                 .map(|p| abbreviate(&p.to_string()))
                 .collect::<Vec<_>>()
@@ -1878,7 +1894,7 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
             subject,
             body,
             parents: commit
-                .parent_commit_ids
+                .parent_commit_ids // SHALLOW-DISPLAY: JSON lists recorded parents
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -2013,8 +2029,8 @@ fn commit_changes_string_count(commit: &Commit, needle: &str) -> Result<bool, Cl
     }
 
     let new_blobs = load_tree_blobs(&commit.tree_id)?;
-    let old_blobs = if let Some(parent_id) = commit.parent_commit_ids.first() {
-        let parent = load_object::<Commit>(parent_id).map_err(|e| {
+    let old_blobs = if let Some(parent_id) = first_history_parent(commit)? {
+        let parent = load_object::<Commit>(&parent_id).map_err(|e| {
             log_repo_corrupt_error(format!("failed to load parent commit {parent_id}: {e}"))
         })?;
         load_tree_blobs(&parent.tree_id)?
@@ -2090,8 +2106,8 @@ fn commit_diff_matches_regex(commit: &Commit, regex: &regex::Regex) -> Result<bo
     }
 
     let new_blobs = load_tree_blobs(&commit.tree_id)?;
-    let old_blobs = if let Some(parent_id) = commit.parent_commit_ids.first() {
-        let parent = load_object::<Commit>(parent_id).map_err(|e| {
+    let old_blobs = if let Some(parent_id) = first_history_parent(commit)? {
+        let parent = load_object::<Commit>(&parent_id).map_err(|e| {
             log_repo_corrupt_error(format!("failed to load parent commit {parent_id}: {e}"))
         })?;
         load_tree_blobs(&parent.tree_id)?
@@ -2289,9 +2305,9 @@ async fn changed_files_for_commit_with(
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -2426,9 +2442,9 @@ pub async fn compute_commit_stat(
         .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
@@ -2587,7 +2603,7 @@ impl GraphState {
     /// A string containing the ASCII graph prefix for the commit.
     pub fn render(&mut self, commit: &Commit) -> String {
         let commit_id = commit.id;
-        let parent_ids = &commit.parent_commit_ids;
+        let parent_ids = &commit.parent_commit_ids; // SHALLOW-DISPLAY: graph columns for shown commits
 
         let mut prefix = String::new();
 
@@ -2720,9 +2736,9 @@ pub(crate) async fn generate_diff_with_options(
     let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items();
 
     // old_blobs from first parent if exists
-    let old_blobs: Vec<(PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
-        let parent = &commit.parent_commit_ids[0];
-        let parent_commit = load_object::<Commit>(parent)
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;

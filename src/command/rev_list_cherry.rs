@@ -9,6 +9,7 @@ use git_internal::{
 use super::{RevListArgs, rev_list_spec::RevListSide};
 use crate::{
     command::load_object,
+    internal::shallow::ShallowSet,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
@@ -97,7 +98,12 @@ fn mark_cherry_equivalents(commits: &mut [RevListSelectedCommit]) -> CliResult<(
 
 fn commit_patch_signature(commit: &Commit) -> CliResult<String> {
     let new_blobs = commit_tree_blobs(commit)?;
-    let old_blobs = if let Some(parent) = commit.parent_commit_ids.first() {
+    let shallow = ShallowSet::load()
+        .map_err(|error| rev_list_corrupt_error(error.to_string()).with_hint(error.hint()))?;
+    let old_blobs = if let Some(parent) = shallow
+        .parents_for_walk(&commit.id, &commit.parent_commit_ids)
+        .first()
+    {
         let parent = load_object::<Commit>(parent).map_err(|error| {
             rev_list_corrupt_error(format!("failed to load parent commit: {error}"))
         })?;

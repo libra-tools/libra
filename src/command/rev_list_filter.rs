@@ -154,7 +154,7 @@ pub(super) async fn filter_commits_by_pathspecs(
 }
 
 pub(super) fn commit_matches_parent_count(commit: &Commit, filter: ParentCountFilter) -> bool {
-    let parent_count = commit.parent_commit_ids.len();
+    let parent_count = commit.parent_commit_ids.len(); // SHALLOW-DISPLAY: recorded parents, not a walk
     parent_count >= filter.min && filter.max.is_none_or(|max| parent_count <= max)
 }
 

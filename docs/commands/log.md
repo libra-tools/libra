@@ -24,6 +24,12 @@ history range.
 When stdout is piped and the downstream command exits early, `libra log` exits quietly without
 printing panic/backtrace or `Broken pipe` diagnostics.
 
+In a shallow clone, commits listed in `.libra/shallow` are treated as roots: `log`
+does not follow their parents. A corrupt `.libra/shallow` file fails closed
+(`LBR-REPO-002`). Removing the file when parents were never fetched also fails
+closed and hints to run `libra fsck`. Recorded parent ids (`%P`, `--parents`)
+still come from the stored commit object.
+
 ## Options
 
 ### `-n, --number <N>`

@@ -350,7 +350,7 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
                     parents: if args.parents {
                         selected
                             .commit
-                            .parent_commit_ids
+                            .parent_commit_ids // SHALLOW-DISPLAY: --parents prints recorded ids
                             .iter()
                             .map(ToString::to_string)
                             .collect()
@@ -656,6 +656,7 @@ fn compute_boundary_entries(
         for selected in output.iter().rev() {
             let child_id = selected.commit.id.to_string();
             for parent in &selected.commit.parent_commit_ids {
+                // SHALLOW-DISPLAY: --boundary/--children edges among shown commits
                 let pid = parent.to_string();
                 if !output_ids.contains(&pid) {
                     boundary_children
@@ -674,7 +675,7 @@ fn compute_boundary_entries(
     let first_parent_boundary: HashSet<String> = if args.first_parent && args.parents {
         output
             .iter()
-            .filter_map(|selected| selected.commit.parent_commit_ids.first())
+            .filter_map(|selected| selected.commit.parent_commit_ids.first()) // SHALLOW-DISPLAY
             .map(ToString::to_string)
             .filter(|pid| !output_ids.contains(pid))
             .collect()
@@ -686,6 +687,7 @@ fn compute_boundary_entries(
     let mut boundary: Vec<Commit> = Vec::new();
     for selected in output {
         for parent in &selected.commit.parent_commit_ids {
+            // SHALLOW-DISPLAY: --boundary lists recorded missing-side parents
             let pid = parent.to_string();
             if !output_ids.contains(&pid)
                 && seen.insert(pid.clone())
@@ -711,7 +713,7 @@ fn compute_boundary_entries(
                 && (!args.first_parent || first_parent_boundary.contains(&commit.id.to_string()))
             {
                 commit
-                    .parent_commit_ids
+                    .parent_commit_ids // SHALLOW-DISPLAY: boundary --parents metadata
                     .iter()
                     .map(ToString::to_string)
                     .collect()

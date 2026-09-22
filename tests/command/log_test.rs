@@ -2,7 +2,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{cmp::min, str::FromStr};
+use std::{cmp::min, fs, str::FromStr};
 
 use clap::Parser;
 use git_internal::{
@@ -3659,4 +3659,135 @@ fn log_grep_signed_commit_uses_message_only() {
             }
         }
     }
+}
+
+fn two_commit_shallow_repo(delete_parent: bool) -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("second.txt"), "second\n").expect("write second");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let log = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert_cli_success(&log, "log hashes");
+    let hashes: Vec<String> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    assert!(hashes.len() >= 2, "expected two commits: {hashes:?}");
+    let child = hashes[0].clone();
+    let parent = hashes[1].clone();
+    if delete_parent {
+        fs::remove_file(loose_object_path(repo.path(), &parent)).expect("delete parent");
+    }
+    fs::write(
+        repo.path().join(".libra").join("shallow"),
+        format!("{child}\n"),
+    )
+    .expect("write shallow");
+    (repo, child, parent)
+}
+
+/// M-WALK W1/W3: log stops at the shallow boundary and does not error.
+#[test]
+fn test_log_stops_at_shallow_boundary_matrix() {
+    let (repo, child, parent) = two_commit_shallow_repo(true);
+    let oneline = run_libra_command(&["log", "--oneline"], repo.path());
+    assert_cli_success(&oneline, "log --oneline on shallow");
+    let text = String::from_utf8_lossy(&oneline.stdout);
+    assert!(
+        text.contains(&child[..7]),
+        "oneline must show the boundary commit: {text}"
+    );
+    assert!(
+        !text.contains(&parent[..7]),
+        "oneline must not walk past shallow: {text}"
+    );
+
+    let one = run_libra_command(&["log", "--format=%s", "-1", "HEAD"], repo.path());
+    assert_cli_success(&one, "log -1 HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&one.stdout).trim(),
+        "second",
+        "W1 subject"
+    );
+
+    let graph = run_libra_command(&["log", "--graph", "--oneline"], repo.path());
+    assert_cli_success(&graph, "log --graph on shallow");
+
+    let path = run_libra_command(&["log", "--oneline", "--", "second.txt"], repo.path());
+    assert_cli_success(&path, "log -- path on shallow");
+
+    let (range_repo, range_child, range_parent) = two_commit_shallow_repo(false);
+    let range = run_libra_command(
+        &[
+            "log",
+            "--oneline",
+            &format!("{range_parent}..{range_child}"),
+        ],
+        range_repo.path(),
+    );
+    assert_cli_success(&range, "log A..B crossing shallow");
+    let range_text = String::from_utf8_lossy(&range.stdout);
+    assert!(
+        range_text.contains(&range_child[..7]),
+        "range must include the boundary: {range_text}"
+    );
+    assert!(
+        !range_text.contains(&range_parent[..7]),
+        "range must stop at the boundary: {range_text}"
+    );
+}
+
+/// M-WALK W4: deleting `.libra/shallow` exposes the missing parent.
+#[test]
+fn test_log_missing_parent_without_shallow_fails() {
+    let (repo, _child, _parent) = two_commit_shallow_repo(true);
+    fs::remove_file(repo.path().join(".libra").join("shallow")).expect("remove shallow");
+    let output = run_libra_command(&["log", "--oneline"], repo.path());
+    assert!(
+        !output.status.success(),
+        "log must fail when the parent is missing and shallow is gone"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("LBR-REPO-002") || combined.contains("storage broken"),
+        "must report missing history: {combined}"
+    );
+    assert!(
+        combined.contains("fsck"),
+        "must hint to run fsck: {combined}"
+    );
+}
+
+/// M-WALK W5: a complete repository is unchanged.
+#[test]
+fn test_log_complete_repo_still_walks_parents() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("second.txt"), "second\n").expect("write second");
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let output = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    assert_cli_success(&output, "log on complete repo");
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(count, 2, "complete history must still list both commits");
 }

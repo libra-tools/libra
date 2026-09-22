@@ -12,6 +12,8 @@ libra rev-list [OPTIONS] [SPEC]
 
 `libra rev-list` 会将修订输入解析为提交，遍历可达历史，应用可选的父提交数量过滤和计数/限制过滤，并按从新到旧的顺序打印提交 ID。省略 `<SPEC>` 时，命令默认为 `HEAD`。输出格式可以通过 `--parents` 增加父提交 ID，也可以通过 `--timestamp` 增加提交者时间戳。`--reverse` 将输出翻转为从旧到新（在提交限制之后应用）。
 
+浅克隆中，`.libra/shallow` 列出的提交会被当作根，因此 `--count HEAD` 只统计已获取的历史。损坏的 `.libra/shallow` 会 fail-closed（`LBR-REPO-002`）。`--parents` 仍打印对象里记录的父提交 ID。
+
 ## 选项
 
 | 标志 | 说明 |

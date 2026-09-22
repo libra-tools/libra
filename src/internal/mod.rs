@@ -51,6 +51,7 @@ pub mod reflog;
 pub mod repo_hooks;
 pub mod revision_ordinal;
 pub mod sequencer;
+pub mod shallow;
 #[cfg(test)]
 pub mod source_scan;
 pub mod sparse;

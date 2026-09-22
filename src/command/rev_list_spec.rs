@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::{
     command::{load_object, log},
+    internal::shallow::ShallowSet,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         util::{self, CommitBaseError},
@@ -188,13 +189,22 @@ async fn reachable_commits(spec: &str, first_parent: bool) -> CliResult<Vec<Comm
 fn first_parent_reachable_commits(start: ObjectHash) -> CliResult<Vec<Commit>> {
     let mut commits = Vec::new();
     let mut current = Some(start);
+    let shallow = ShallowSet::load().map_err(|error| {
+        CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(error.hint())
+    })?;
 
     while let Some(commit_id) = current {
         let commit = load_object::<Commit>(&commit_id).map_err(|error| {
             CliError::fatal(format!("storage broken, object not found: {error}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run 'libra fsck' to inspect missing history")
         })?;
-        current = commit.parent_commit_ids.first().copied();
+        current = shallow
+            .parents_for_walk(&commit.id, &commit.parent_commit_ids)
+            .first()
+            .copied();
         commits.push(commit);
     }
 

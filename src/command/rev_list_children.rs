@@ -14,6 +14,7 @@ pub(super) fn build_rev_list_children(commits: &[Commit]) -> RevListChildren {
     for commit in commits {
         let child_id = commit.id.to_string();
         for parent_id in &commit.parent_commit_ids {
+            // SHALLOW-DISPLAY: children among already-selected commits
             let parent_id = parent_id.to_string();
             if visible_ids.contains(&parent_id) {
                 children
@@ -55,7 +56,7 @@ mod tests {
         Commit {
             id,
             tree_id: id,
-            parent_commit_ids: parents,
+            parent_commit_ids: parents, // SHALLOW-DISPLAY: test fixture
             author: test_signature(),
             committer: test_signature(),
             message: "test".to_string(),

@@ -12,6 +12,11 @@ libra rev-list [OPTIONS] [SPEC]... [-- <PATH>...]
 
 `libra rev-list` resolves one or more revision inputs to commits, walks the reachable history, applies optional exclusion/range, symmetric-difference side, cherry-equivalence, first-parent, author, committer, message grep, path, time-window, parent-count, and count/limit filters, and prints commit IDs newest first. When `<SPEC>` is omitted, the command defaults to `HEAD`. Output formatting can include parent commit IDs (`--parents`), child commit IDs (`--children`), committer timestamps (`--timestamp`), side markers (`--left-right`), and cherry-equivalence markers (`--cherry-mark` / `--cherry`). `--reverse` flips the output to oldest-first (applied after commit limiting).
 
+In a shallow clone, commits listed in `.libra/shallow` are treated as roots, so
+`--count HEAD` matches the fetched history. A corrupt `.libra/shallow` file
+fails closed (`LBR-REPO-002`). `--parents` still prints the ids recorded on
+the commit object.
+
 ## Options
 
 | Flag | Description |
