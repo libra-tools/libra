@@ -557,11 +557,12 @@ async fn encode_pack(entries: Vec<Entry>) -> CliResult<Vec<u8>> {
 // ----------------------------------------------------------------------------
 
 /// The parsed text header of a bundle.
-struct BundleHeader {
-    prerequisites: Vec<(String, String)>,
-    heads: Vec<(String, String)>,
+#[derive(Debug, Clone)]
+pub(crate) struct BundleHeader {
+    pub(crate) prerequisites: Vec<(String, String)>,
+    pub(crate) heads: Vec<(String, String)>,
     /// Byte offset where the pack begins (just after the blank line).
-    pack_offset: usize,
+    pub(crate) pack_offset: usize,
 }
 
 fn verify(file: &Path) -> CliResult<()> {
@@ -747,7 +748,7 @@ fn files_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn read_bundle_bounded(file: &Path, exit_code: i32) -> CliResult<Vec<u8>> {
+pub(crate) fn read_bundle_bounded(file: &Path, exit_code: i32) -> CliResult<Vec<u8>> {
     let input = fs::File::open(file).map_err(|error| read_err(error, exit_code))?;
     let size = input
         .metadata()
@@ -779,7 +780,7 @@ fn read_bundle_bounded(file: &Path, exit_code: i32) -> CliResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn verify_prerequisites(header: &BundleHeader, exit_code: i32) -> CliResult<()> {
+pub(crate) fn verify_prerequisites(header: &BundleHeader, exit_code: i32) -> CliResult<()> {
     let storage = util::objects_storage();
     let mut missing = Vec::new();
     for (oid, _) in &header.prerequisites {
@@ -799,7 +800,7 @@ fn verify_prerequisites(header: &BundleHeader, exit_code: i32) -> CliResult<()> 
     .with_stable_code(StableErrorCode::CliInvalidTarget))
 }
 
-fn validate_bundle_pack(pack: &[u8], exit_code: i32) -> CliResult<ObjectHash> {
+pub(crate) fn validate_bundle_pack(pack: &[u8], exit_code: i32) -> CliResult<ObjectHash> {
     let hash_len = get_hash_kind().size();
     if pack.len() < 12 + hash_len || &pack[0..4] != b"PACK" || pack[4..8] != [0, 0, 0, 2] {
         return Err(
@@ -828,7 +829,7 @@ fn validate_bundle_pack(pack: &[u8], exit_code: i32) -> CliResult<ObjectHash> {
 }
 
 /// Parse the text header up to the blank line that precedes the pack.
-fn parse_header(bytes: &[u8], exit_code: i32) -> CliResult<BundleHeader> {
+pub(crate) fn parse_header(bytes: &[u8], exit_code: i32) -> CliResult<BundleHeader> {
     // A malformed bundle is a verification failure (exit 1), matching
     // `git bundle verify` — exit 128 is reserved for usage errors.
     let invalid = |message: &str| {

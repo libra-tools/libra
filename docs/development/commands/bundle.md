@@ -10,7 +10,7 @@
 - create：explicit revisions + `--all`/`--branches`/`--tags`，完整 non-thin bundle。
 - verify/list-heads：v2 header、prerequisite、PACK v2、完整 trailer checksum（list-heads 只读 header）。
 - unbundle：验证并安装 pack/index，打印 heads，不更新 refs，与 Git unbundle 的消费边界一致。
-- 延后：prerequisite/thin/incremental range create、`libra clone <bundle>`、verify 全 entry decode。
+- 延后：prerequisite/thin/incremental range create、verify 全 entry decode。 `libra clone <bundle>` 已实现（issues/474 CL-09）。
 
 ## 设计方案
 
@@ -38,7 +38,7 @@
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | create | prerequisite/thin/`A..B` incremental | 延后；只写 full bundle。 |
-| clone | Libra clone-from-bundle | 先 unbundle + explicit update-ref，或 system Git clone。 |
+| clone | （已实现）`libra clone <bundle>` | 先判定仓库目录，再 `<path>.bundle` / `<path>`；HEAD 选择见 ADR-CL-06。 |
 | verify | exhaustive pack entry decode | checksum + version/prerequisite；unbundle 建 index 时执行更深验证。 |
 | scale | >1 GiB bundle | 明确拒绝。 |
 

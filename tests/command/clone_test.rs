@@ -2109,3 +2109,196 @@ fn test_clone_reject_shallow_local_git_source() {
     );
     assert!(!r5.join(".libra").exists(), "R5 must not leave a target");
 }
+
+/// M-BUNDLE U1–U8: clone from a Libra-created Git v2 bundle.
+#[test]
+fn test_clone_from_bundle_matrix() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "dev"], src.path()),
+        "branch dev",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "v1"], src.path()), "tag v1");
+    let parent = tempfile::tempdir().unwrap();
+
+    let b1 = parent.path().join("b1.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", b1.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "U1 create --all",
+    );
+    let u1 = run_libra_command(&["clone", b1.to_str().unwrap()], parent.path());
+    assert_cli_success(&u1, "U1 clone b1.bundle");
+    let u1_dest = parent.path().join("b1");
+    assert!(u1_dest.join(".libra").exists(), "U1 dest drops .bundle");
+    assert!(u1_dest.join("tracked.txt").exists(), "U1 checks out HEAD");
+
+    let nested = parent.path().join("dir");
+    fs::create_dir_all(&nested).unwrap();
+    let b3 = nested.join("b3.bundle");
+    fs::copy(&b1, &b3).unwrap();
+    let u1b = run_libra_command(
+        &["clone", nested.join("b3").to_str().unwrap()],
+        parent.path(),
+    );
+    assert_cli_success(&u1b, "U1 clone dir/b3");
+    assert!(parent.path().join("b3").join(".libra").exists());
+
+    let missing = parent.path().join("b4.bundle");
+    let u2 = run_libra_command(&["clone", missing.to_str().unwrap()], parent.path());
+    assert!(!u2.status.success(), "U2 missing bundle");
+    let u2_err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&u2.stdout),
+        String::from_utf8_lossy(&u2.stderr)
+    );
+    assert!(
+        u2_err.contains("does not exist"),
+        "U2 must say repository does not exist: {u2_err}"
+    );
+
+    let main_only = parent.path().join("main-only.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", main_only.to_str().unwrap(), "main"],
+            src.path(),
+        ),
+        "U3 create main",
+    );
+    let u3_dest = parent.path().join("u3");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                main_only.to_str().unwrap(),
+                u3_dest.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "U3 clone without HEAD",
+    );
+    assert!(u3_dest.join("tracked.txt").exists(), "U3 checks out main");
+
+    let dev_only = parent.path().join("dev-only.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", dev_only.to_str().unwrap(), "dev"],
+            src.path(),
+        ),
+        "U4 create dev",
+    );
+    let u4_dest = parent.path().join("u4");
+    let u4 = run_libra_command(
+        &[
+            "clone",
+            dev_only.to_str().unwrap(),
+            u4_dest.to_str().unwrap(),
+        ],
+        parent.path(),
+    );
+    assert_cli_success(&u4, "U4 clone without default branch");
+    assert!(
+        !u4_dest.join("tracked.txt").exists(),
+        "U4 must not check out a local branch"
+    );
+
+    let bare_dest = parent.path().join("bare-from-bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--bare",
+                b1.to_str().unwrap(),
+                bare_dest.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "U5 clone --bare",
+    );
+    assert!(bare_dest.join("libra.db").exists(), "U5 bare dest");
+    assert!(
+        !bare_dest.join("tracked.txt").exists(),
+        "U5 bare has no worktree"
+    );
+
+    let depth_dest = parent.path().join("depth-from-bundle");
+    let depth = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            b1.to_str().unwrap(),
+            depth_dest.to_str().unwrap(),
+        ],
+        parent.path(),
+    );
+    assert_cli_success(&depth, "U5 clone --depth 1");
+    let depth_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&depth.stdout),
+        String::from_utf8_lossy(&depth.stderr)
+    );
+    assert!(
+        depth_text.contains("--depth is ignored in local clones"),
+        "U5 must warn that --depth is ignored: {depth_text}"
+    );
+    assert!(depth_dest.join("tracked.txt").exists());
+
+    let incremental = parent.path().join("incremental.bundle");
+    let bytes = fs::read(&main_only).unwrap();
+    let header_end = bytes.windows(2).position(|w| w == b"\n\n").unwrap();
+    let mut inc = Vec::from(&bytes[..header_end + 1]);
+    inc.extend_from_slice(b"-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa missing\n");
+    inc.extend_from_slice(&bytes[header_end + 1..]);
+    fs::write(&incremental, inc).unwrap();
+    let u6_dest = parent.path().join("u6");
+    let u6 = run_libra_command(
+        &[
+            "clone",
+            incremental.to_str().unwrap(),
+            u6_dest.to_str().unwrap(),
+        ],
+        parent.path(),
+    );
+    assert!(!u6.status.success(), "U6 missing prerequisite");
+    assert!(
+        !u6_dest.join(".libra").exists(),
+        "U6 must not leave a target"
+    );
+
+    let corrupt = parent.path().join("corrupt.bundle");
+    fs::write(&corrupt, b"this is not a bundle\n").unwrap();
+    let u7_dest = parent.path().join("u7");
+    let u7 = run_libra_command(
+        &[
+            "clone",
+            corrupt.to_str().unwrap(),
+            u7_dest.to_str().unwrap(),
+        ],
+        parent.path(),
+    );
+    assert!(!u7.status.success(), "U7 corrupt bundle");
+    assert!(
+        !u7_dest.join(".libra").exists(),
+        "U7 must not leave a target"
+    );
+
+    let url = run_libra_command(&["config", "get", "remote.origin.url"], &u1_dest);
+    assert_cli_success(&url, "U8 remote.origin.url");
+    let origin = String::from_utf8_lossy(&url.stdout);
+    assert!(
+        origin.contains("b1.bundle"),
+        "U8 url must be the bundle path: {origin}"
+    );
+    let status = run_libra_command(&["status", "--short", "--branch"], &u1_dest);
+    assert_cli_success(&status, "U8 status");
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_text.contains("origin/"),
+        "U8 status should show origin tracking: {status_text}"
+    );
+}
