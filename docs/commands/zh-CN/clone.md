@@ -44,7 +44,7 @@ libra clone /path/to/local/repo
 
 ### `[LOCAL_PATH]`
 
-可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 或 `repo.bundle` 推断 `repo`）。如果无法推断，会返回错误，要求用户显式指定路径。
+可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 或 `repo.bundle` 推断 `repo`）。`--bare` 与 `--mirror` 使用 `<basename>.git`。空名与 `..` 会被拒绝。如果无法推断，会返回错误，要求用户显式指定路径。
 
 ```bash
 libra clone git@github.com:user/repo.git my-dir
@@ -76,7 +76,7 @@ libra clone --single-branch --no-single-branch git@github.com:user/repo.git
 
 ### `--bare`
 
-创建没有工作树的裸仓库。目标目录会直接成为对象存储。适用于中心/服务端仓库。
+创建没有工作树的裸仓库。目标目录会直接成为对象存储。省略目标时默认名为 `<basename>.git`。Libra 把 `libra.db` 与 `objects` 放在目标根目录（不写 Git 风格的 `config`/`HEAD`/`refs` 文件）。裸克隆不写 index 与工作树文件。适用于中心/服务端仓库。
 
 ```bash
 libra clone --bare git@github.com:user/repo.git

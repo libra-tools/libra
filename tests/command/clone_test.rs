@@ -2302,3 +2302,121 @@ fn test_clone_from_bundle_matrix() {
         "U8 status should show origin tracking: {status_text}"
     );
 }
+
+fn committed_named_repo(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use super::{
+        assert_cli_success, configure_identity_via_cli, init_repo_via_cli, run_libra_command,
+    };
+
+    let src = parent.join(name);
+    fs::create_dir_all(&src).expect("named source");
+    init_repo_via_cli(&src);
+    configure_identity_via_cli(&src);
+    fs::write(src.join("tracked.txt"), "tracked\n").expect("tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", ".libraignore", "tracked.txt"], &src),
+        "add named repo",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], &src),
+        "commit named repo",
+    );
+    src
+}
+
+/// M-BARE A1–A5: default dest names and bare layout (issues/474 CL-11, ADR-CL-06).
+#[test]
+fn test_clone_bare_and_mirror_default_names_and_layout() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let parent = tempfile::tempdir().unwrap();
+    let src = committed_named_repo(parent.path(), "gdeep");
+
+    assert_cli_success(
+        &run_libra_command(&["clone", "--bare", src.to_str().unwrap()], parent.path()),
+        "A1 clone --bare gdeep",
+    );
+    let a1 = parent.path().join("gdeep.git");
+    assert!(a1.join("libra.db").exists(), "A1 dest is gdeep.git");
+    assert!(!parent.path().join("gdeep").join("libra.db").exists());
+
+    let src2 = committed_named_repo(parent.path(), "mirror-src");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", "--mirror", src2.to_str().unwrap()],
+            parent.path(),
+        ),
+        "A2 clone --mirror mirror-src",
+    );
+    assert!(
+        parent
+            .path()
+            .join("mirror-src.git")
+            .join("libra.db")
+            .exists(),
+        "A2 dest is mirror-src.git"
+    );
+
+    let nested = parent.path().join("long/path/to/bare/dst");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--bare",
+                src.to_str().unwrap(),
+                nested.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "A3 intermediate dirs",
+    );
+    assert!(nested.join("libra.db").exists(), "A3 created intermediates");
+
+    assert!(
+        !a1.join("index").exists() && !a1.join(".libra").exists(),
+        "A4 bare has no worktree index"
+    );
+    assert!(
+        !a1.join("tracked.txt").exists(),
+        "A4 bare has no worktree files"
+    );
+    let status = run_libra_command(&["status"], &a1);
+    assert!(!status.status.success(), "A4 status needs a work tree");
+    let status_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status_text.contains("work tree"),
+        "A4 status should require a work tree: {status_text}"
+    );
+
+    let bundle = parent.path().join("b1.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            &src,
+        ),
+        "A5 create bundle",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", "--bare", bundle.to_str().unwrap()],
+            parent.path(),
+        ),
+        "A5 clone --bare bundle",
+    );
+    assert!(
+        parent.path().join("b1.git").join("libra.db").exists(),
+        "A5 bare bundle dest is b1.git"
+    );
+    assert_cli_success(
+        &run_libra_command(&["clone", bundle.to_str().unwrap()], parent.path()),
+        "A5 clone bundle",
+    );
+    assert!(
+        parent.path().join("b1").join(".libra").exists(),
+        "A5 ordinary bundle dest drops .bundle"
+    );
+}

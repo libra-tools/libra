@@ -81,8 +81,9 @@ libra clone /path/to/local/repo
 ### `[LOCAL_PATH]`
 
 Optional destination directory. When omitted, Libra infers the directory name from the
-repository URL (e.g., `repo` from `repo.git` or `repo.bundle`). If inference fails, an error is returned
-asking the user to specify the path explicitly.
+repository URL (e.g., `repo` from `repo.git` or `repo.bundle`). `--bare` and
+`--mirror` use `<basename>.git`. Empty names and `..` are rejected. If inference
+fails, an error is returned asking the user to specify the path explicitly.
 
 ```bash
 libra clone git@github.com:user/repo.git my-dir
@@ -123,7 +124,10 @@ libra clone --single-branch --no-single-branch git@github.com:user/repo.git
 ### `--bare`
 
 Create a bare repository without a working tree. The destination directory becomes the
-object store directly. Useful for central/server-side repositories.
+object store directly. When the destination is omitted, the default name is
+`<basename>.git`. Libra stores `libra.db` and `objects` at the destination root
+(no Git-style `config`/`HEAD`/`refs` files). A bare clone writes no index and no
+working-tree files. Useful for central/server-side repositories.
 
 ```bash
 libra clone --bare git@github.com:user/repo.git
