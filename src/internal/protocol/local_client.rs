@@ -1853,4 +1853,22 @@ mod tests {
             "shared parent already sent is not a boundary: {shallow:?}"
         );
     }
+
+    #[test]
+    fn collect_git_repo_entries_merges_source_shallow_boundaries() {
+        let gdeep = build_gdeep();
+        fs::write(gdeep.git_dir.join("shallow"), format!("{}\n", gdeep.c2)).unwrap();
+        let (commits, shallow) = collect_gdeep(&gdeep, &[&gdeep.c3], None);
+        assert!(commits.contains(&gdeep.c3), "tip is sent");
+        assert!(commits.contains(&gdeep.c2), "shallow tip is still sent");
+        assert!(
+            !commits.contains(&gdeep.c1),
+            "walk must stop at the source shallow boundary"
+        );
+        assert_eq!(
+            shallow,
+            vec![gdeep.c2.clone()],
+            "source shallow merges into the result"
+        );
+    }
 }

@@ -33,6 +33,7 @@ use crate::{
         head::Head,
         protocol::DiscoveryResult,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        shallow::{ShallowError, ShallowSet},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -137,14 +138,10 @@ pub struct CloneArgs {
     #[clap(long = "no-local", overrides_with = "local")]
     pub no_local: bool,
 
-    /// Fail if the clone would be a shallow repository that was not explicitly
-    /// requested — i.e. the source repository is shallow (matching
-    /// `git clone --reject-shallow`). Two narrowings vs Git: (1) for remotes
-    /// that can negotiate shallow boundaries, Libra cannot distinguish a shallow
-    /// source from `--depth`-induced shallowness, so passing `--depth`
-    /// suppresses the post-fetch check (Git would still reject); (2) local Libra
-    /// sources do not advertise shallow boundaries (declined by design, D20), so `--depth` fails
-    /// closed before this check.
+    /// Fail if the source repository is shallow (matching
+    /// `git clone --reject-shallow`). A local Git shallow source is inspected
+    /// before the destination is created. Local Libra sources do not advertise
+    /// shallow boundaries (D20), so `--depth` fails closed before this check.
     #[clap(long = "reject-shallow")]
     pub reject_shallow: bool,
 
@@ -319,9 +316,31 @@ fn remote_spec_is_plain_local_path(spec: &str) -> bool {
 fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteClient) -> bool {
     match remote_client {
         fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
+            // A shallow Git source must use the transport so its `.git/shallow`
+            // boundaries are copied (git `builtin/clone.c:1333-1340`).
+            if git_source_is_shallow(client.repo_path()) {
+                return false;
+            }
             remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local
         }
         _ => false,
+    }
+}
+
+fn git_source_is_shallow(repo_path: &Path) -> bool {
+    ShallowSet::load_at(&repo_path.join("shallow"))
+        .map(|set| !set.oids().is_empty())
+        .unwrap_or(true)
+}
+
+fn inspect_local_git_shallow(
+    remote_client: &fetch::RemoteClient,
+) -> Result<ShallowSet, ShallowError> {
+    match remote_client {
+        fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
+            ShallowSet::load_at(&client.repo_path().join("shallow"))
+        }
+        _ => Ok(ShallowSet::empty()),
     }
 }
 
@@ -508,8 +527,10 @@ pub enum CloneError {
     RestoreDirectory { path: PathBuf, source: io::Error },
     #[error("failed to initialize repository")]
     InitializeRepository { source: InitError },
-    #[error("source repository is shallow, reject to clone")]
+    #[error("source repository is shallow, reject to clone.")]
     RejectShallow,
+    #[error("failed to read source shallow metadata: {source}")]
+    SourceShallow { source: ShallowError },
     #[error("remote branch {branch} not found in upstream {remote}")]
     RemoteBranchNotFound { branch: String, remote: String },
     #[error("failed to inspect local branch state after fetch: {source}")]
@@ -570,6 +591,10 @@ impl From<CloneError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_exit_code(128)
                 .with_hint("the source is shallow; clone without --reject-shallow, or deepen the source first"),
+            CloneError::SourceShallow { source } => CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_exit_code(128)
+                .with_hint(source.hint()),
             CloneError::RemoteBranchNotFound {
                 ref branch,
                 ref remote,
@@ -1165,6 +1190,16 @@ async fn execute_clone_inner(
     let (remote_client, discovery) = fetch::discover_remote(&remote_repo)
         .await
         .map_err(|source| (CloneError::DiscoverRemote { source }, None))?;
+
+    // Inspect a local Git source's `.git/shallow` before creating the dest so
+    // `--reject-shallow` and corrupt metadata leave no partial clone behind.
+    match inspect_local_git_shallow(&remote_client) {
+        Ok(set) if !set.oids().is_empty() && args.reject_shallow => {
+            return Err((CloneError::RejectShallow, None));
+        }
+        Err(source) => return Err((CloneError::SourceShallow { source }, None)),
+        _ => {}
+    }
 
     // --- Step 3: Destination pre-checks ---
     if metadata_root.exists() && contains_initialized_repo(&metadata_root) {

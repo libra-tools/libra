@@ -122,9 +122,9 @@ libra clone --depth 50 git@github.com:user/repo.git
 
 ### `--reject-shallow`
 
-若克隆结果是你未请求的浅仓库（即源仓库本身是浅克隆），则失败，对齐 `git clone --reject-shallow`（exit 128）。只有在传输层能协商 shallow boundary 时，才允许与 `--depth` 同用；本地 Libra 源会在对象传输前拒绝 `--depth`，且不会留下已初始化的目标仓库。
+若**源**仓库是浅克隆则失败，对齐 `git clone --reject-shallow`（exit 128），且不留下目标目录。本地 Git 浅源在创建目标前检查；不带该标志克隆浅源时，会把源的 `.git/shallow` 边界并入 `.libra/shallow`，使 `log` / `fsck` 可遍历。本地 Libra 源带 `--depth` 仍在对象传输前以 `LBR-REPO-002` fail-closed。
 
-相对 Git 的两点收窄：(1) Libra 克隆本地路径源时会重取完整历史、不继承源的浅标记，故该检查主要在克隆浅 *remote* 时有意义；(2) 由于 Libra 无法区分“源是浅克隆”与“`--depth` 导致的浅克隆”，对支持 shallow 协商的远程，给出 `--depth` 会抑制 fetch 后的 `--reject-shallow` 检查（Git 即便带 `--depth` 也会拒绝浅源）。
+对能协商 shallow boundary 的网络远程，未请求 `--depth` 时仍会在 fetch 后拒绝意外的浅结果。
 
 ```bash
 libra clone --reject-shallow git@github.com:user/repo.git

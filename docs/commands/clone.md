@@ -202,19 +202,15 @@ libra clone --depth 50 git@github.com:user/repo.git
 
 ### `--reject-shallow`
 
-Fail if the clone would be a shallow repository that you did not request — i.e.
-the source repository is shallow — matching `git clone --reject-shallow`
-(exit 128). Combining it with `--depth` is allowed only for transports that can
-negotiate shallow boundaries. A local Libra source rejects `--depth` before
-object transfer, and no initialized target is left behind.
+Fail if the **source** repository is shallow — matching `git clone --reject-shallow`
+(exit 128) — and leave no destination directory behind. A local Git shallow
+source is inspected before the destination is created. Cloning a shallow Git
+source without this flag copies the source's `.git/shallow` boundaries into
+`.libra/shallow` so `log` / `fsck` stay walkable. A local Libra source with
+`--depth` still fails closed with `LBR-REPO-002` before object transfer.
 
-Two narrowings vs Git: (1) Libra's clone of a local-path source re-fetches the
-full history rather than inheriting the source's shallow marker, so this check
-is most meaningful when cloning a shallow *remote*; (2) because Libra cannot
-distinguish a shallow source from `--depth`-induced shallowness, passing
-`--depth` suppresses the post-fetch `--reject-shallow` check for remotes that
-do support shallow negotiation (Git would still reject a shallow source with
-`--depth`).
+For network remotes that negotiate shallow boundaries, a post-fetch check still
+rejects an unexpected shallow result when `--depth` was not requested.
 
 ```bash
 libra clone --reject-shallow git@github.com:user/repo.git

@@ -1942,3 +1942,170 @@ fn test_clone_local_path_ignores_shallow_options_matrix() {
         "L5 quiet suppresses the success summary"
     );
 }
+
+/// M-SSRC: clone a Git-generated shallow source, reject-shallow, and corrupt
+/// source metadata.
+#[test]
+fn test_clone_from_shallow_git_source_matrix() {
+    use super::{
+        assert_cli_success, create_linear_git_repo, git_success, read_shallow_oids,
+        run_libra_command,
+    };
+
+    let (linear, oids) = create_linear_git_repo(3);
+    let c3 = &oids[2];
+    let dest_root = tempdir().expect("ssrc dest");
+    let gshallow = dest_root.path().join("gshallow");
+    git_success(
+        dest_root.path(),
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            &format!("file://{}", linear.path().display()),
+            gshallow.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        gshallow.join(".git").join("shallow").is_file(),
+        "git must produce a shallow source"
+    );
+
+    let r1_path = dest_root.path().join("r1-path");
+    let out = run_libra_command(
+        &[
+            "clone",
+            gshallow.to_str().unwrap(),
+            r1_path.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "R1 clone plain shallow path");
+    assert_eq!(
+        read_shallow_oids(&r1_path),
+        vec![c3.clone()],
+        "R1 path shallow"
+    );
+    assert_cli_success(
+        &run_libra_command(&["log", "--oneline"], &r1_path),
+        "R1 path log",
+    );
+    assert_cli_success(&run_libra_command(&["fsck"], &r1_path), "R1 path fsck");
+
+    let r1_file = dest_root.path().join("r1-file");
+    let out = run_libra_command(
+        &[
+            "clone",
+            &format!("file://{}", gshallow.display()),
+            r1_file.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "R1 clone file:// shallow");
+    assert_eq!(
+        read_shallow_oids(&r1_file),
+        vec![c3.clone()],
+        "R1 file shallow"
+    );
+
+    let r2 = dest_root.path().join("r2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--reject-shallow",
+            gshallow.to_str().unwrap(),
+            r2.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(!out.status.success(), "R2 reject-shallow path");
+    assert_eq!(out.status.code(), Some(128));
+    let r2_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        r2_err.contains("source repository is shallow, reject to clone."),
+        "R2 Git text: {r2_err}"
+    );
+    assert!(!r2.join(".libra").exists(), "R2 must not leave a target");
+
+    let r2_nl = dest_root.path().join("r2-nl");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--reject-shallow",
+            "--no-local",
+            gshallow.to_str().unwrap(),
+            r2_nl.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(!out.status.success(), "R2 reject-shallow --no-local");
+    assert!(!r2_nl.join(".libra").exists());
+
+    let r3 = dest_root.path().join("r3");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--reject-shallow",
+            linear.path().to_str().unwrap(),
+            r3.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "R3 reject-shallow complete source");
+
+    let r4 = dest_root.path().join("r4");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            &format!("file://{}", gshallow.display()),
+            r4.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "R4 --depth 1 file:// shallow");
+    assert_eq!(read_shallow_oids(&r4), vec![c3.clone()], "R4 boundary");
+    assert_cli_success(&run_libra_command(&["log", "--oneline"], &r4), "R4 log");
+    assert_cli_success(&run_libra_command(&["fsck"], &r4), "R4 fsck");
+}
+
+#[test]
+fn test_clone_reject_shallow_local_git_source() {
+    use super::{create_linear_git_repo, git_success, run_libra_command};
+
+    let (linear, _) = create_linear_git_repo(2);
+    let dest_root = tempdir().expect("r5 dest");
+    let gshallow = dest_root.path().join("gshallow");
+    git_success(
+        dest_root.path(),
+        &[
+            "clone",
+            "--depth",
+            "1",
+            &format!("file://{}", linear.path().display()),
+            gshallow.to_str().unwrap(),
+        ],
+    );
+    fs::write(gshallow.join(".git").join("shallow"), "not-an-oid\n").expect("corrupt shallow");
+
+    let r5 = dest_root.path().join("r5");
+    let out = run_libra_command(
+        &[
+            "clone",
+            &format!("file://{}", gshallow.display()),
+            r5.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(!out.status.success(), "R5 corrupt source shallow");
+    assert_eq!(out.status.code(), Some(128));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("LBR-REPO-002"),
+        "R5 must be a repository error: {err}"
+    );
+    assert!(!r5.join(".libra").exists(), "R5 must not leave a target");
+}
