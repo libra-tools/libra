@@ -1737,3 +1737,208 @@ fn test_clone_depth_implies_single_branch_matrix() {
         "S5 FETCH_HEAD must record dev: {fetch_head}"
     );
 }
+
+/// M-LOCAL: a plain local Git path ignores `--depth` / `--shallow-*` / `--filter`
+/// with Git's warning text; `file://` and `--no-local` keep transport shallow;
+/// local Libra sources stay D20.
+#[test]
+fn test_clone_local_path_ignores_shallow_options_matrix() {
+    use super::{
+        assert_cli_success, create_committed_repo_via_cli, create_linear_git_repo,
+        read_shallow_oids, run_libra_command,
+    };
+
+    let (linear, _oids) = create_linear_git_repo(3);
+    let src = linear.path();
+    let dest_root = tempdir().expect("local-clone dest");
+
+    let l1 = dest_root.path().join("l1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            src.to_str().unwrap(),
+            l1.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L1 plain path --depth 1");
+    let l1_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        l1_err.contains("warning: --depth is ignored in local clones; use file:// instead."),
+        "L1 Git warning: {l1_err}"
+    );
+    assert!(
+        read_shallow_oids(&l1).is_empty(),
+        "L1 must not write shallow"
+    );
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], &l1);
+    assert_cli_success(&count, "L1 rev-list");
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "3",
+        "L1 complete history"
+    );
+
+    let l2 = dest_root.path().join("l2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--shallow-since",
+            "2000-01-01",
+            "--shallow-exclude",
+            "main",
+            "--filter",
+            "blob:none",
+            src.to_str().unwrap(),
+            l2.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L2 ignored shallow opts");
+    let l2_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        l2_err
+            .contains("warning: --shallow-since is ignored in local clones; use file:// instead."),
+        "L2 since warning: {l2_err}"
+    );
+    assert!(
+        l2_err.contains(
+            "warning: --shallow-exclude is ignored in local clones; use file:// instead."
+        ),
+        "L2 exclude warning: {l2_err}"
+    );
+    assert!(
+        l2_err.contains("warning: --filter is ignored in local clones; use file:// instead."),
+        "L2 filter warning: {l2_err}"
+    );
+    assert!(
+        read_shallow_oids(&l2).is_empty(),
+        "L2 must not write shallow"
+    );
+
+    let l3 = dest_root.path().join("l3");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--no-local",
+            "--depth",
+            "2",
+            src.to_str().unwrap(),
+            l3.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L3 --no-local --depth 2");
+    assert_eq!(
+        read_shallow_oids(&l3).len(),
+        1,
+        "L3 transport shallow boundary"
+    );
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], &l3);
+    assert_cli_success(&count, "L3 rev-list");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2", "L3 B3");
+
+    let l3l = dest_root.path().join("l3l");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "-l",
+            "--depth",
+            "1",
+            src.to_str().unwrap(),
+            l3l.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L3 -l --depth 1");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("warning: --depth is ignored in local clones; use file:// instead."),
+        "L3 -l warning"
+    );
+    assert!(read_shallow_oids(&l3l).is_empty(), "L3 -l complete clone");
+
+    let libra_src = create_committed_repo_via_cli();
+    let l4_path = dest_root.path().join("l4-path");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            libra_src.path().to_str().unwrap(),
+            l4_path.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "L4 plain Libra --depth must fail closed"
+    );
+    let l4_err = String::from_utf8_lossy(&out.stderr);
+    assert!(l4_err.contains("LBR-REPO-002"), "L4 path D20: {l4_err}");
+    assert!(
+        !l4_path.join(".libra").exists(),
+        "L4 must not leave a target"
+    );
+
+    let l4_file = dest_root.path().join("l4-file");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            &format!("file://{}", libra_src.path().display()),
+            l4_file.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert!(!out.status.success(), "L4 file:// Libra --depth must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-002"),
+        "L4 file:// D20"
+    );
+
+    let l5j = dest_root.path().join("l5-json");
+    let out = run_libra_command(
+        &[
+            "--json",
+            "clone",
+            "--depth",
+            "1",
+            src.to_str().unwrap(),
+            l5j.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L5 --json");
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        json.contains("--depth is ignored in local clones; use file:// instead."),
+        "L5 JSON warnings: {json}"
+    );
+
+    let l5q = dest_root.path().join("l5-quiet");
+    let out = run_libra_command(
+        &[
+            "--quiet",
+            "clone",
+            "--depth",
+            "1",
+            src.to_str().unwrap(),
+            l5q.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "L5 --quiet");
+    let quiet_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        quiet_err.contains("warning: --depth is ignored in local clones; use file:// instead."),
+        "L5 quiet still warns: {quiet_err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Cloned into"),
+        "L5 quiet suppresses the success summary"
+    );
+}

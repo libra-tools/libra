@@ -284,6 +284,72 @@ fn object_alternates_warning(args: &CloneArgs) -> Option<String> {
 /// if also given). Each given flag produces its own explanatory warning so the
 /// user knows it had no effect — mirroring Git, which warns and falls back to a
 /// full clone when a server cannot honor `--filter`.
+const LOCAL_CLONE_DEPTH_WARNING: &str = "--depth is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_SHALLOW_SINCE_WARNING: &str =
+    "--shallow-since is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_SHALLOW_EXCLUDE_WARNING: &str =
+    "--shallow-exclude is ignored in local clones; use file:// instead.";
+const LOCAL_CLONE_FILTER_WARNING: &str =
+    "--filter is ignored in local clones; use file:// instead.";
+
+fn remote_spec_is_file_url(spec: &str) -> bool {
+    spec.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
+fn remote_spec_is_plain_local_path(spec: &str) -> bool {
+    if remote_spec_is_file_url(spec) || spec.contains("://") {
+        return false;
+    }
+    // scp-like `git@host:path` is a network remote, not a filesystem path.
+    if let Some((user, rest)) = spec.split_once('@')
+        && !user.is_empty()
+        && rest.contains(':')
+        && !Path::new(spec).exists()
+    {
+        return false;
+    }
+    true
+}
+
+/// A plain filesystem Git path uses Git's local-clone rules: `--depth`,
+/// `--shallow-since`, `--shallow-exclude`, and `--filter` are ignored.
+/// `file://` and `--no-local` keep transport semantics. A local Libra source
+/// stays on the fail-closed path (D20).
+fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteClient) -> bool {
+    match remote_client {
+        fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
+            remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local
+        }
+        _ => false,
+    }
+}
+
+fn local_clone_ignored_option_warnings(args: &CloneArgs) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if args.depth.is_some() {
+        warnings.push(LOCAL_CLONE_DEPTH_WARNING.to_string());
+    }
+    if args.shallow_since.is_some() {
+        warnings.push(LOCAL_CLONE_SHALLOW_SINCE_WARNING.to_string());
+    }
+    if !args.shallow_exclude.is_empty() {
+        warnings.push(LOCAL_CLONE_SHALLOW_EXCLUDE_WARNING.to_string());
+    }
+    if args.filter.is_some() {
+        warnings.push(LOCAL_CLONE_FILTER_WARNING.to_string());
+    }
+    warnings
+}
+
+fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<String> {
+    if local_clone {
+        local_clone_ignored_option_warnings(args)
+    } else {
+        unsupported_fetch_optimization_warnings(args)
+    }
+}
+
 fn unsupported_fetch_optimization_warnings(args: &CloneArgs) -> Vec<String> {
     let mut warnings = Vec::new();
     if args.filter.is_some() {
@@ -979,6 +1045,10 @@ fn render_clone_result(result: &CloneOutput, output: &OutputConfig) -> CliResult
     if output.is_json() {
         return emit_json_data("clone", result, output);
     }
+    // Git still prints local-clone ignore warnings under `--quiet`.
+    for w in &result.warnings {
+        eprintln!("warning: {w}");
+    }
     if output.quiet {
         return Ok(());
     }
@@ -1026,11 +1096,6 @@ fn render_clone_result(result: &CloneOutput, output: &OutputConfig) -> CliResult
              run 'libra add .libraignore' (or 'libra add -A') to track them, \
              then 'libra commit' to record the change."
         );
-    }
-
-    // Warnings on stderr.
-    for w in &result.warnings {
-        eprintln!("warning: {w}");
     }
 
     Ok(())
@@ -1407,11 +1472,15 @@ async fn clone_into_destination(
     // branch so a flag-less `--single-branch` still writes one refspec.
     let single_branch = args.effective_single_branch();
     let fetch_branch = clone_fetch_branch(args, discovery, single_branch);
+    // A plain local Git path ignores `--depth` (git local-clone). `file://`
+    // and `--no-local` keep the transport depth.
+    let local_clone = uses_local_clone_semantics(args, remote_client);
+    let fetch_depth = if local_clone { None } else { args.depth };
     let fetch_result = fetch::fetch_repository_with_result(
         remote_config.clone(),
         fetch_branch.clone(),
         single_branch,
-        args.depth,
+        fetch_depth,
         false,
         Some(clone_tag_mode),
         false,
@@ -1507,7 +1576,7 @@ async fn clone_into_destination(
     let is_shallow = std::fs::read_to_string(util::storage_path().join("shallow"))
         .map(|contents| !contents.trim().is_empty())
         .unwrap_or(false);
-    if clone_should_reject_shallow(args.reject_shallow, is_shallow, args.depth) {
+    if clone_should_reject_shallow(args.reject_shallow, is_shallow, fetch_depth) {
         // Restore the cwd before returning so the caller's cleanup can remove
         // the partially-created destination.
         let _ = env::set_current_dir(original_dir);
@@ -1517,7 +1586,7 @@ async fn clone_into_destination(
     let mut warnings = init_output.warnings.clone();
     warnings.extend(shared_warnings);
     warnings.extend(object_alternates_warning(args));
-    warnings.extend(unsupported_fetch_optimization_warnings(args));
+    warnings.extend(clone_fetch_option_warnings(args, local_clone));
     // lore.md 3.2: `--deps-of` — scope the fresh clone's sparse VIEW to the
     // forward dependency closure of the requested roots (the graph was imported
     // by the implied `--notes` fetch above). The working tree stays fully checked
@@ -1556,7 +1625,7 @@ async fn clone_into_destination(
         repo_id: init_output.repo_id,
         vault_signing: init_output.vault_signing,
         ssh_key_detected: init_output.ssh_key_detected,
-        shallow: args.depth.is_some(),
+        shallow: fetch_depth.is_some(),
         warnings,
         gitignore_converted,
         source_kind: None,
@@ -1991,6 +2060,58 @@ mod tests {
         assert!(
             !parse(&["https://example.com/r.git"]).effective_single_branch(),
             "default clone fetches all branches"
+        );
+    }
+
+    #[test]
+    fn plain_local_path_uses_local_clone_semantics_unless_no_local_or_file_url() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            CloneArgs::try_parse_from(std::iter::once("clone").chain(args.iter().copied()))
+                .expect("clone args should parse")
+        };
+
+        assert!(
+            remote_spec_is_plain_local_path("/tmp/src"),
+            "absolute path is a local clone source"
+        );
+        assert!(
+            remote_spec_is_plain_local_path("./src"),
+            "relative path is a local clone source"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("file:///tmp/src"),
+            "file:// uses transport"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("https://example.com/r.git"),
+            "https is not a local path"
+        );
+        assert!(
+            !remote_spec_is_plain_local_path("git@example.com:user/r.git"),
+            "scp-like URL is not a local path"
+        );
+
+        let plain = parse(&["--depth", "1", "/tmp/src"]);
+        assert!(
+            !plain.no_local && remote_spec_is_plain_local_path(&plain.remote_repo),
+            "L1: plain path + --depth selects local-clone ignore"
+        );
+        let no_local = parse(&["--no-local", "--depth", "2", "/tmp/src"]);
+        assert!(
+            no_local.no_local,
+            "L3: --no-local keeps transport semantics"
+        );
+        let local_flag = parse(&["-l", "--depth", "1", "/tmp/src"]);
+        assert!(
+            !local_flag.no_local,
+            "L3: -l restores local-clone semantics"
+        );
+        let file_url = parse(&["--depth", "1", "file:///tmp/src"]);
+        assert!(
+            remote_spec_is_file_url(&file_url.remote_repo),
+            "file:// stays on the transport path"
         );
     }
 

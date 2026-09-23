@@ -166,12 +166,14 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 Accepted for Git compatibility and effectively no-ops. Git's `-l`/`--local` asks
 for local optimizations (copy/hardlink instead of the transport) when the source
 is on the local filesystem, and `--no-local` forces the transport to avoid
-hardlinks. Libra **never hardlinks** objects — it always copies — and how it
-reads a local-path source is determined by the source type, not by these flags:
-a local Libra repository is read directly, while a local Git repository is read
-in-process (Libra reads its refs and objects directly, with no `git-upload-pack`
-dependency). So both flags are accepted with no effect on the result. The two
-override each other; the last one given wins.
+hardlinks. Libra **never hardlinks** objects — it always copies. A plain filesystem Git
+path is a local clone: `--depth`, `--shallow-since`, `--shallow-exclude`, and
+`--filter` are ignored, and Libra prints Git's warning
+(`--depth is ignored in local clones; use file:// instead.`, and the matching
+texts for the other flags). `--quiet` still prints those warnings. `file://`
+and `--no-local` keep transport shallow semantics. `-l` / `--local` restores
+the local-clone path. A local Libra source is unchanged. The two flags override
+each other; the last one given wins.
 
 ```bash
 libra clone -l /path/to/source /path/to/dest
@@ -187,6 +189,7 @@ rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
 shallow boundaries, so accepting the option would leave a clone with missing
 parents. This fail-closed behavior is the accepted end state (decision D20 in
 the development compatibility register), not a pending gap.
+A plain filesystem Git path ignores `--depth` and warns (issues/474 CL-06).
 A local Git source reached with `file://` or `--no-local` truncates by the
 shortest distance from any wanted tip, then one boundary pass: a commit is
 shallow when a parent was not sent, or when a root commit sits exactly on the

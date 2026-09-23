@@ -101,7 +101,7 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `-l, --local` / `--no-local`
 
-为 Git 兼容而接受，实质为 no-op。当源位于本地文件系统时，Git 的 `-l`/`--local` 请求本地优化（用复制/硬链接代替传输），`--no-local` 则强制走传输以避免硬链接。Libra **从不硬链接**对象——始终复制——且其读取本地路径源的方式由源类型决定、与这两个 flag 无关：本地 Libra 仓库直接读取对象，本地 Git 仓库经 `git-upload-pack` 获取。故两者均按 no-op 接受、不影响结果。两者互相覆盖，最后出现者生效。
+Libra **从不硬链接**对象——始终复制。普通文件系统 Git 路径按本地克隆处理：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并打印 Git 的本地克隆警告（`--depth is ignored in local clones; use file:// instead.`，其余标志有对应原文）。`--quiet` 仍会打印这些警告。`file://` 与 `--no-local` 保持传输浅化语义；`-l` / `--local` 恢复本地克隆路径。本地 Libra 源不变。两个标志互相覆盖，最后出现者生效。
 
 ```bash
 libra clone -l /path/to/source /path/to/dest
@@ -112,6 +112,7 @@ libra clone -l /path/to/source /path/to/dest
 创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。除非给出 `--no-single-branch`，否则隐含 `--single-branch`（对齐 `git clone`）。
 只有 Git 远程支持浅传输。
 本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
+普通文件系统 Git 路径会忽略 `--depth` 并告警（issues/474 CL-06）。
 通过 `file://` 或 `--no-local` 访问的本地 Git 源按各 want 的最短距离截断，再做一次边界计算：有父提交未被发送，或根提交恰好落在深度截止上时，该提交写入 `.libra/shallow`（issues/474 CL-04）。
 
 ```bash
