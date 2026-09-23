@@ -136,23 +136,16 @@ libra clone --bare git@github.com:user/repo.git
 ### `--mirror`
 
 Set up a mirror of the source repository (like `git clone --mirror`). Implies
-`--bare`, and maps the fetched branches verbatim into `refs/heads/*` and keeps
-tags in `refs/tags/*` — without any `refs/remotes/*` tracking refs — then records
-the `remote.<name>.mirror=true` marker. Useful for serving or backing up a
+`--bare`, maps advertised refs verbatim (`refs/heads/*`, `refs/tags/*`,
+`refs/notes/*`, `refs/mr/*`, and other legal `refs/*` names), keeps no
+`refs/remotes/*` tracking refs, and records `remote.<name>.mirror=true` plus
+`remote.<name>.fetch=+refs/*:refs/*`. Useful for serving or backing up a
 repository.
-
-Narrowings vs Git: (1) Git mirrors `refs/*:refs/*` verbatim; Libra mirrors only
-what its fetch transfers — every fetched branch is promoted to `refs/heads/*` and
-tags are kept, but ref namespaces Libra does not fetch (e.g. `refs/notes/*`) are
-not mirrored. (2) Because Libra's fetch collapses `refs/heads/mr/*` and
-`refs/mr/*` into one tracking namespace, any such refs are mirrored as
-`refs/heads/mr/*` (provenance is not preserved). (3) The `mirror=true` marker is
-informational — no `+refs/*:refs/*` refspec is recorded and `libra fetch` is not
-yet mirror-aware, so refreshing the mirror is not automatic.
 
 ```bash
 libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 ```
+
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
@@ -526,7 +519,7 @@ not, because its operation-log model fetches all refs by design.
 | Shallow clone (depth) | `--depth <n>` | N/A | supported for Git remotes; local Libra sources fail closed (`LBR-REPO-002`); cloud rejects |
 | Shallow since date | `--shallow-since=<date>` | N/A | accepted no-op for Git remotes (ignored + warning; not applied, history bounded only by `--depth`); rejected for cloud |
 | Shallow exclude | `--shallow-exclude=<rev>` | N/A | accepted no-op for Git remotes (ignored + warning; not applied, history bounded only by `--depth`); rejected for cloud |
-| Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`; mirrors fetched branches into `refs/heads/*`, keeps tags, no tracking refs, sets `remote.<name>.mirror` marker; narrowed — only fetched branches/tags, refresh not mirror-aware) |
+| Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`; maps advertised `refs/*` verbatim including notes/mr, no tracking refs, sets `remote.<name>.mirror=true` and `remote.<name>.fetch=+refs/*:refs/*`) |
 | Reference repository | `--reference <repo>` / `--reference-if-able <repo>` | N/A | accepted no-op (Libra always copies objects, no alternates); `--reference` warns, `--reference-if-able` silent |
 | Shared object store | `--shared` / `-s` | N/A | accepted no-op (always copies); warns |
 | Dissociate from reference | `--dissociate` | N/A | accepted no-op (already self-contained); silent |

@@ -8,6 +8,7 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use clap::Parser;
@@ -184,13 +185,9 @@ pub struct CloneArgs {
     pub dissociate: bool,
 
     /// Set up a mirror of the source repository (Git's `--mirror`). Implies
-    /// `--bare`; maps the fetched branches into `refs/heads/*` and keeps tags in
-    /// `refs/tags/*` verbatim (no `refs/remotes/*` tracking refs), and records
-    /// `remote.<name>.mirror=true`. NARROWING vs Git: Libra mirrors only what it
-    /// fetches — `refs/notes/*` and other un-fetched namespaces are not mirrored,
-    /// and because fetch collapses `refs/mr/*` into the branch tracking namespace
-    /// any such refs become `refs/heads/mr/*`; the mirror marker is informational
-    /// (`libra fetch` is not yet mirror-aware).
+    /// `--bare`; maps advertised `refs/*` verbatim (no `refs/remotes/*` tracking
+    /// refs), and records `remote.<name>.mirror=true` plus
+    /// `remote.<name>.fetch=+refs/*:refs/*`.
     #[clap(long = "mirror")]
     pub mirror: bool,
 
@@ -1540,6 +1537,21 @@ async fn clone_into_destination(
     // and `--no-local` keep the transport depth.
     let local_clone = uses_local_clone_semantics(args, remote_client);
     let fetch_depth = if local_clone { None } else { args.depth };
+    if args.mirror {
+        let _ = ConfigKv::set(
+            &format!("remote.{remote_name}.url"),
+            &remote_config.url,
+            false,
+        )
+        .await;
+        let _ = ConfigKv::add(
+            &format!("remote.{remote_name}.fetch"),
+            "+refs/*:refs/*",
+            false,
+        )
+        .await;
+        let _ = ConfigKv::set(&format!("remote.{remote_name}.mirror"), "true", false).await;
+    }
     let fetch_result = fetch::fetch_repository_with_result(
         remote_config.clone(),
         fetch_branch.clone(),
@@ -1574,14 +1586,18 @@ async fn clone_into_destination(
         .refs
         .iter()
         .any(|reference| reference._ref == "HEAD");
-    let setup_result = setup_repository(
-        remote_config.clone(),
-        fetch_branch,
-        !args.bare && !args.no_checkout,
-        single_branch,
-        advertised_head,
-    )
-    .await?;
+    let setup_result = if args.mirror {
+        setup_mirror_repository(&remote_config, discovery).await?
+    } else {
+        setup_repository(
+            remote_config.clone(),
+            fetch_branch,
+            !args.bare && !args.no_checkout,
+            single_branch,
+            advertised_head,
+        )
+        .await?
+    };
 
     // lore.md 2.11: auto-register the source as an object alternate for a LOCAL
     // LIBRA source (a Git source's `git gc` does not consult Libra's borrowers
@@ -1625,15 +1641,6 @@ async fn clone_into_destination(
                     .to_string(),
             );
         }
-    }
-
-    // `--mirror`: turn the standard tracking-ref layout into a mirror — every
-    // fetched branch becomes a local `refs/heads/*` ref and the
-    // `refs/remotes/<name>/*` tracking refs are dropped — and record the
-    // informational `remote.<name>.mirror=true` marker (Libra's fetch is not yet
-    // mirror-aware, so refreshing the mirror is not automatic).
-    if args.mirror {
-        normalize_mirror_refs(&remote_name).await?;
     }
 
     // `--reject-shallow`: if the fetch left a shallow boundary that the user did
@@ -1714,27 +1721,75 @@ pub(crate) struct SetupResult {
     pub branch_name: Option<String>,
 }
 
-/// Normalize a freshly-cloned repository into a `--mirror` layout: promote every
-/// remote-tracking branch (`refs/remotes/<remote>/<name>`) to a verbatim local
-/// `refs/heads/<name>` branch, drop the tracking namespace, and record
-/// `remote.<remote>.mirror=true`. Tags (`refs/tags/*`) are already in place and
-/// are left untouched.
-///
-/// `setup_repository` has already created the default branch in `refs/heads/*`
-/// and pointed `HEAD` at it; this promotes the remaining branches and removes the
-/// remote-tracking refs that a mirror does not keep.
-///
-/// NARROWING vs Git: Git's `--mirror` mirrors `refs/*:refs/*` verbatim and makes
-/// future fetches force-update every ref. Libra mirrors only what its fetch
-/// transfers — every fetched tracking ref is promoted into `refs/heads/*` and
-/// tags are kept — so:
-/// - ref namespaces Libra does not fetch (e.g. `refs/notes/*`) are not mirrored;
-/// - because Libra's fetch collapses both `refs/heads/mr/*` and `refs/mr/*` into
-///   one `refs/remotes/<remote>/mr/*` tracking namespace, any such refs are
-///   promoted to `refs/heads/mr/*` (provenance is not preserved);
-/// - `mirror=true` is recorded only as a marker; `libra fetch` is not yet
-///   mirror-aware, so refreshing the mirror is not automatic (and no inert
-///   `+refs/*:refs/*` refspec is written).
+/// Configure HEAD after a `--mirror` fetch that already wrote refs verbatim.
+async fn setup_mirror_repository(
+    remote_config: &RemoteConfig,
+    discovery: &DiscoveryResult,
+) -> Result<SetupResult, CloneError> {
+    let _ = ConfigKv::set(
+        &format!("remote.{}.url", remote_config.name),
+        &remote_config.url,
+        false,
+    )
+    .await;
+
+    let remote_head = discovery
+        .refs
+        .iter()
+        .find(|reference| reference._ref == "HEAD")
+        .cloned();
+    let ref_heads = discovery
+        .refs
+        .iter()
+        .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_branch = fetch::resolve_remote_default_branch(
+        &discovery.capabilities,
+        &ref_heads,
+        remote_head.as_ref(),
+    );
+
+    let head = match (remote_head.as_ref(), default_branch) {
+        (Some(advertised), Some(name))
+            if ref_heads.iter().any(|reference| {
+                reference._ref == format!("refs/heads/{name}")
+                    && reference._hash == advertised._hash
+            }) =>
+        {
+            Head::Branch(name)
+        }
+        (Some(advertised), _) => {
+            let oid = ObjectHash::from_str(&advertised._hash).map_err(|error| {
+                CloneError::SetupFailed {
+                    message: format!(
+                        "mirror HEAD '{}' is not a valid object id: {error}",
+                        advertised._hash
+                    ),
+                }
+            })?;
+            Head::Detached(oid)
+        }
+        _ => {
+            return Ok(SetupResult { branch_name: None });
+        }
+    };
+    let branch_name = match &head {
+        Head::Branch(name) => Some(name.clone()),
+        Head::Detached(_) => None,
+    };
+    Head::update_result(head, None)
+        .await
+        .map_err(|error| CloneError::SetupFailed {
+            message: format!("failed to set mirror HEAD: {error}"),
+        })?;
+    Ok(SetupResult { branch_name })
+}
+
+/// Legacy promote-from-tracking helper retained for unit coverage of the
+/// pre-CL-12 layout transform (production `--mirror` uses
+/// [`setup_mirror_repository`] after a `+refs/*:refs/*` fetch).
+#[cfg(test)]
 async fn normalize_mirror_refs(remote_name: &str) -> Result<(), CloneError> {
     let db = get_db_conn_instance().await;
     let tracking = Branch::list_branches_result_with_conn(&db, Some(remote_name))

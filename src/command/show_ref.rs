@@ -258,7 +258,11 @@ pub(crate) async fn collect_raw_show_ref_entries(
         for branch in branches {
             entries.push(ShowRefEntry {
                 hash: branch.commit.to_string(),
-                refname: format!("refs/heads/{}", branch.name),
+                refname: if branch.name.starts_with("refs/") {
+                    branch.name.clone()
+                } else {
+                    format!("refs/heads/{}", branch.name)
+                },
             });
         }
 

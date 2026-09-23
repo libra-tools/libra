@@ -1199,16 +1199,91 @@ fn test_clone_mirror_maps_all_refs_and_sets_config() {
         config.contains("remote.origin.mirror=true"),
         "mirror marker config set: {config}"
     );
-    // Libra deliberately records no `+refs/*:refs/*` fetch refspec (it would be
-    // inert — Libra's fetch does not honor it).
     assert!(
-        !config.contains("+refs/*:refs/*"),
-        "no inert mirror fetch refspec is recorded: {config}"
+        config.contains("+refs/*:refs/*"),
+        "mirror fetch refspec recorded: {config}"
     );
     // --mirror implies --bare: no working tree checked out.
     assert!(
         !mirror.join("f.txt").exists(),
         "mirror is bare (no working-tree checkout)"
+    );
+}
+
+/// M-MIRROR (issues/474 CL-12): `--mirror` maps every advertised namespace
+/// verbatim (`refs/heads`, `refs/tags`, `refs/notes`, `refs/mr`), records the
+/// Git mirror config, and preserves a detached source HEAD (t5601:116-160).
+#[test]
+fn test_clone_mirror_all_namespaces_matrix() {
+    use super::{assert_cli_success, create_gdeep_git_repo, git_success, run_libra_command};
+
+    let gdeep = create_gdeep_git_repo();
+    git_success(gdeep.dir.path(), &["config", "user.email", "t@t"]);
+    git_success(gdeep.dir.path(), &["config", "user.name", "t"]);
+    git_success(gdeep.dir.path(), &["notes", "add", "-m", "n1"]);
+
+    let parent = tempfile::tempdir().unwrap();
+    let dest = parent.path().join("mirror");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--mirror",
+                gdeep.dir.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "M1 clone --mirror",
+    );
+    let refs = String::from_utf8_lossy(&run_libra_command(&["show-ref"], &dest).stdout).to_string();
+    assert!(refs.contains("refs/heads/main"), "M1 heads: {refs}");
+    assert!(refs.contains("refs/heads/dev"), "M1 dev: {refs}");
+    assert!(refs.contains("refs/tags/v1"), "M1 tags: {refs}");
+    assert!(refs.contains("refs/mr/1"), "M1 merge-request ref: {refs}");
+    assert!(refs.contains("refs/notes/commits"), "M1 notes ref: {refs}");
+    assert!(
+        !refs.contains("refs/remotes/"),
+        "M1 must not keep tracking refs: {refs}"
+    );
+    assert_eq!(
+        refs.matches("refs/tags/v1").count(),
+        1,
+        "M3 tag must not be duplicated: {refs}"
+    );
+
+    let config = String::from_utf8_lossy(&run_libra_command(&["config", "--list"], &dest).stdout)
+        .to_string();
+    assert!(
+        config.contains("remote.origin.mirror=true"),
+        "M2 mirror marker: {config}"
+    );
+    assert!(
+        config.contains("+refs/*:refs/*"),
+        "M2 mirror fetch refspec: {config}"
+    );
+
+    let detached_oid = super::git_rev_parse(gdeep.dir.path(), "HEAD");
+    git_success(gdeep.dir.path(), &["checkout", "--detach"]);
+    let dest2 = parent.path().join("detached");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--mirror",
+                gdeep.dir.path().to_str().unwrap(),
+                dest2.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "M4 clone detached mirror",
+    );
+    let head = run_libra_command(&["rev-parse", "HEAD"], &dest2);
+    assert_cli_success(&head, "M4 rev-parse HEAD");
+    let got = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(
+        got, detached_oid,
+        "M4 HEAD must stay on the detached commit"
     );
 }
 

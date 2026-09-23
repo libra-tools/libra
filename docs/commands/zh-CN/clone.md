@@ -84,13 +84,12 @@ libra clone --bare git@github.com:user/repo.git
 
 ### `--mirror`
 
-建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，把已获取的分支原样映射到 `refs/heads/*`、tag 保留在 `refs/tags/*`——不保留任何 `refs/remotes/*` tracking ref——并写入 `remote.<name>.mirror=true` 标记。适用于服务端托管或备份仓库。
-
-相对 Git 的收窄：(1) Git 原样镜像 `refs/*:refs/*`；Libra 只镜像其 fetch 传输的内容——每个已获取分支提升到 `refs/heads/*`、tag 保留，但 Libra 不获取的命名空间（如 `refs/notes/*`）不镜像。(2) 由于 Libra 的 fetch 把 `refs/heads/mr/*` 与 `refs/mr/*` 折叠进同一 tracking 命名空间，这类 ref 会被镜像为 `refs/heads/mr/*`（不保留出处）。(3) `mirror=true` 仅为标记——不写 `+refs/*:refs/*` refspec，且 `libra fetch` 尚不感知镜像，故刷新镜像不是自动的。
+建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，原样映射源广告的全部合法 ref（`refs/heads/*`、`refs/tags/*`、`refs/notes/*`、`refs/mr/*` 等），不保留 `refs/remotes/*` tracking ref，并写入 `remote.<name>.mirror=true` 与 `remote.<name>.fetch=+refs/*:refs/*`。适用于服务端托管或备份仓库。
 
 ```bash
 libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 ```
+
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
@@ -341,7 +340,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 浅克隆（depth） | `--depth <n>` | N/A | Git 远程支持；本地 Libra 源 fail-closed (`LBR-REPO-002`)；云端拒绝 |
 | 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
 | 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；不应用、仅按 `--depth` 限定）；云端拒绝 |
-| 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；把已获取分支映射到 `refs/heads/*`、保留 tag、无 tracking ref、设 `remote.<name>.mirror` 标记；收窄——仅 fetch 的分支/tag，刷新不感知镜像） |
+| 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；原样映射全部 `refs/*`，无 tracking ref，设 `remote.<name>.mirror` 与 `+refs/*:refs/*`） |
 | 引用仓库 | `--reference <repo>` / `--reference-if-able <repo>` | N/A | 接受式 no-op（Libra 总是拷贝对象、无 alternates）；`--reference` 告警，`--reference-if-able` 静默 |
 | 共享对象库 | `--shared` / `-s` | N/A | 接受式 no-op（总是拷贝）；告警 |
 | 从引用仓库脱离 | `--dissociate` | N/A | 接受式 no-op（已自包含）；静默 |

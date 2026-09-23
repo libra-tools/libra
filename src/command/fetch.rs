@@ -1506,7 +1506,19 @@ fn default_fetch_destination(remote: &str, source: &str) -> Result<String, Fetch
     })
 }
 
+fn is_mirror_wildcard_refspec(source: &str, destination: &str) -> bool {
+    source == "refs/*" && destination == "refs/*"
+}
+
 fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), FetchError> {
+    if is_mirror_wildcard_refspec("refs/*", destination)
+        || (refspec.contains("refs/*:refs/*")
+            && destination.starts_with("refs/")
+            && destination != "HEAD"
+            && !destination.ends_with("/HEAD"))
+    {
+        return Ok(());
+    }
     if destination.starts_with("refs/tags/") {
         return Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
@@ -1582,6 +1594,13 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
                     .to_string(),
         });
     }
+    if is_mirror_wildcard_refspec(&source, &destination) {
+        return Ok(FetchRefspec {
+            source,
+            destination,
+            force,
+        });
+    }
     validate_fetch_destination(&destination, raw)?;
 
     Ok(FetchRefspec {
@@ -1625,7 +1644,12 @@ fn expand_refspec(
                 reason: "destination wildcard is missing".to_string(),
             })?;
         for reference in refs {
-            if reference._ref.ends_with("^{}") {
+            if reference._ref.ends_with("^{}") || reference._ref == "HEAD" {
+                continue;
+            }
+            if is_mirror_wildcard_refspec(&spec.source, &spec.destination)
+                && reference._ref.starts_with("refs/tags/")
+            {
                 continue;
             }
             if let Some(middle) = reference
@@ -2904,7 +2928,11 @@ async fn compute_fetch_ref_preview(
     let db = crate::internal::sequencer::request_db_checked()
         .await
         .map_err(|message| FetchError::LocalState { message })?;
-    let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
+    let checked_out_branches = if repository_is_bare().await {
+        HashSet::new()
+    } else {
+        checked_out_local_branches_with_conn(&db).await?
+    };
     for plan in plans {
         if !plan.update_tracking {
             continue;
@@ -2966,6 +2994,15 @@ async fn checked_out_local_branches_with_conn<C: ConnectionTrait>(
         })
 }
 
+async fn repository_is_bare() -> bool {
+    ConfigKv::get("core.bare")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|entry| crate::internal::config::parse_git_bool(&entry.value))
+        .unwrap_or(false)
+}
+
 fn reject_checked_out_destination(
     plan: &FetchRefPlan,
     remote_scope: Option<&str>,
@@ -3002,9 +3039,13 @@ fn fetch_destination_storage(
             return Ok((destination.to_string(), Some(remote)));
         }
     }
+    if destination.starts_with("refs/") && destination != "HEAD" && !destination.ends_with("/HEAD")
+    {
+        return Ok((destination.to_string(), None));
+    }
     Err(FetchError::InvalidRefspec {
         refspec: destination.to_string(),
-        reason: "destination must be under refs/heads/* or refs/remotes/<remote>/*".to_string(),
+        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string(),
     })
 }
 
@@ -3249,10 +3290,15 @@ async fn update_references(
     let remote_config = remote_config.clone();
     let plans = plans.to_vec();
     let ref_heads = ref_heads.to_vec();
+    let bare_repo = repository_is_bare().await;
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
-            let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
+            let checked_out_branches = if bare_repo {
+                HashSet::new()
+            } else {
+                checked_out_local_branches_with_conn(txn).await?
+            };
             for plan in &plans {
                 if !plan.update_tracking {
                     continue;
@@ -4367,6 +4413,38 @@ mod tests {
         );
         // 4. No branches at all -> None.
         assert_eq!(resolve_remote_default_branch(&[], &[], None), None);
+    }
+
+    #[test]
+    fn mirror_wildcard_refspec_expands_all_non_tag_refs() {
+        use super::DiscRef;
+        let dr = |oid: &str, name: &str| DiscRef {
+            _hash: oid.to_string(),
+            _ref: name.to_string(),
+        };
+        let spec =
+            super::parse_fetch_refspec("+refs/*:refs/*", "origin").expect("mirror refspec parses");
+        assert!(super::is_mirror_wildcard_refspec(
+            &spec.source,
+            &spec.destination
+        ));
+        let advertised = vec![
+            dr("aaa", "refs/heads/main"),
+            dr("bbb", "refs/mr/1"),
+            dr("ccc", "refs/notes/commits"),
+            dr("ddd", "refs/tags/v1"),
+            dr("eee", "HEAD"),
+        ];
+        let dests: Vec<String> = super::expand_refspec(&spec, &advertised, "origin")
+            .expect("mirror refspec expands")
+            .into_iter()
+            .map(|plan| plan.destination)
+            .collect();
+        assert!(dests.contains(&"refs/heads/main".to_string()));
+        assert!(dests.contains(&"refs/mr/1".to_string()));
+        assert!(dests.contains(&"refs/notes/commits".to_string()));
+        assert!(!dests.iter().any(|dest| dest.starts_with("refs/tags/")));
+        assert!(!dests.iter().any(|dest| dest == "HEAD"));
     }
 
     #[test]
