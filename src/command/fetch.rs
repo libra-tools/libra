@@ -2064,7 +2064,13 @@ pub(crate) async fn fetch_repository_with_result(
         // `--dry-run --prune`: report the stale refs that would be removed, but
         // write nothing.
         let pruned = if prune {
-            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, true).await?
+            prune_after_fetch(
+                &remote_config.name,
+                &prune_branch_names,
+                &discovery.refs,
+                true,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -2092,7 +2098,13 @@ pub(crate) async fn fetch_repository_with_result(
         )
         .await?;
         let pruned = if prune {
-            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
+            prune_after_fetch(
+                &remote_config.name,
+                &prune_branch_names,
+                &discovery.refs,
+                false,
+            )
+            .await?
         } else {
             Vec::new()
         };
@@ -2219,9 +2231,16 @@ pub(crate) async fn fetch_repository_with_result(
     // `--prune`/`-p`: after the fetch has updated tracking refs, delete any
     // `refs/remotes/<name>/*` the remote no longer advertises (transactionally,
     // with an audit reflog entry). Only stale tracking refs for *this* remote
-    // are touched.
+    // are touched. Mirror remotes (`+refs/*:refs/*`) prune mirrored refs
+    // instead — see `prune_after_fetch`.
     let pruned = if prune {
-        prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
+        prune_after_fetch(
+            &remote_config.name,
+            &prune_branch_names,
+            &discovery.refs,
+            false,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -3272,6 +3291,108 @@ async fn prune_stale_remote_refs(
         },
     })?;
 
+    Ok(pruned)
+}
+
+async fn prune_after_fetch(
+    remote_name: &str,
+    remote_branch_names: &HashSet<String>,
+    advertised: &[DiscRef],
+    dry_run: bool,
+) -> Result<Vec<FetchPruneEntry>, FetchError> {
+    let specs = configured_fetch_refspecs(remote_name).await?;
+    if specs
+        .iter()
+        .any(|spec| is_mirror_wildcard_refspec(&spec.source, &spec.destination))
+    {
+        let live = advertised
+            .iter()
+            .filter(|reference| {
+                reference._ref.starts_with("refs/") && !reference._ref.ends_with("^{}")
+            })
+            .map(|reference| reference._ref.clone())
+            .collect::<HashSet<_>>();
+        prune_stale_mirror_refs(&live, dry_run).await
+    } else {
+        prune_stale_remote_refs(remote_name, remote_branch_names, dry_run).await
+    }
+}
+
+async fn prune_stale_mirror_refs(
+    live: &HashSet<String>,
+    dry_run: bool,
+) -> Result<Vec<FetchPruneEntry>, FetchError> {
+    let local =
+        Branch::list_branches_result(None)
+            .await
+            .map_err(|error| FetchError::UpdateRefs {
+                message: format!("failed to list mirrored refs for prune: {error}"),
+            })?;
+    let pruned: Vec<FetchPruneEntry> = local
+        .into_iter()
+        .filter(|branch| {
+            // Skip locked short names (`main`, AI capture refs). Fully-qualified
+            // `refs/...` names are still eligible so a mirror can drop extras.
+            !crate::internal::branch::is_locked_branch(&branch.name)
+                || branch.name.starts_with("refs/")
+        })
+        .filter_map(|branch| {
+            let dest = if branch.name.starts_with("refs/") {
+                branch.name.clone()
+            } else {
+                format!("refs/heads/{}", branch.name)
+            };
+            (!live.contains(&dest)).then(|| FetchPruneEntry {
+                remote_ref: dest,
+                branch: branch.name.clone(),
+                old_oid: Some(branch.commit.to_string()),
+            })
+        })
+        .collect();
+    if dry_run {
+        return Ok(pruned);
+    }
+
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
+    let to_delete = pruned.clone();
+    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    crate::internal::db::write_transaction(&db, |txn| {
+        Box::pin(async move {
+            for entry in &to_delete {
+                let context = ReflogContext {
+                    old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
+                    new_oid: zero.clone(),
+                    action: ReflogAction::Fetch,
+                };
+                Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
+                    .await
+                    .map_err(|source| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to record prune reflog for '{}': {source}",
+                            entry.remote_ref
+                        ),
+                    })?;
+                Branch::delete_branch_result_with_conn(txn, &entry.branch, None)
+                    .await
+                    .map_err(|source| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to prune mirrored ref '{}': {source}",
+                            entry.remote_ref
+                        ),
+                    })?;
+            }
+            Ok::<_, FetchError>(())
+        })
+    })
+    .await
+    .map_err(|source| FetchError::UpdateRefs {
+        message: match source {
+            TransactionError::Connection(error) => error.to_string(),
+            TransactionError::Transaction(error) => error.to_string(),
+        },
+    })?;
     Ok(pruned)
 }
 

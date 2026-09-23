@@ -14,7 +14,7 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 不带参数调用时，它从当前分支配置的 upstream 获取。已配置的本地 upstream（`branch.<name>.remote=.`）会在任何网络或 `FETCH_HEAD` 写入前被拒绝（`LBR-CLI-003`，退出 129）；Git 2.54 的 `fetch` 可以对本地 upstream 操作——该支持延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 选择一个源引用，并可用 `<src>:<dst>` 精确映射到本地目标。未显式给出 refspec 时会遵守 `remote.<name>.fetch`；该配置不存在时才回退为把所有远程分支映射到 `refs/remotes/<name>/*`。
 
-Fetch 支持 SSH、HTTPS、本地文件、Git v2 bundle 文件和 `git://` 传输。远程 URL 指向 bundle 时，每次 fetch（含 `--prune` 与 `--dry-run`）都会重新读取该文件。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
+Fetch 支持 SSH、HTTPS、本地文件、Git v2 bundle 文件和 `git://` 传输。远程 URL 指向 bundle 时，每次 fetch（含 `--prune` 与 `--dry-run`）都会重新读取该文件。当 `remote.<name>.fetch` 为 `+refs/*:refs/*`（`--mirror` 克隆）时，fetch 会原样更新这些 ref，`--prune` 会删除源上已不存在的镜像 ref。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
 
 ## 全局配置 Schema 保护
 
@@ -40,7 +40,7 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-显式 refspec 覆盖配置映射。形如 `fetch origin dev` 的裸源仍会下载该引用并写入 `FETCH_HEAD`；若已配置的 `remote.<name>.fetch` 并不映射 `dev`，则不会新建远程跟踪分支（对齐单分支克隆；issues/474 CL-05）。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标目前仅限 `refs/heads/*` 与 `refs/remotes/<remote>/*`，但两个命名空间中的保留 `HEAD` 目标、以及其它命名空间都会在任何写入前失败。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。标签目标继续由 `--tags` / `--no-tags` 管理，不通过 fetch refspec 写入。
+显式 refspec 覆盖配置映射。形如 `fetch origin dev` 的裸源仍会下载该引用并写入 `FETCH_HEAD`；若已配置的 `remote.<name>.fetch` 并不映射 `dev`，则不会新建远程跟踪分支（对齐单分支克隆；issues/474 CL-05）。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标目前仅限 `refs/heads/*` 与 `refs/remotes/<remote>/*`（保留 `HEAD` 目标会被拒绝）；`+refs/*:refs/*` 的 mirror refspec 还会映射其它合法的 `refs/*` 名称。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝（`core.bare=true` 的裸仓库跳过该检查）。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。标签目标继续由 `--tags` / `--no-tags` 管理，不通过 fetch refspec 写入。
 
 ## 选项
 
@@ -54,7 +54,7 @@ libra config set --add remote.origin.fetch \
 | `--no-tags` | 完全不获取标签，连从已获取提交可达的标签也不获取（覆盖默认的 auto-follow）。 | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | fetch 后不运行 repack/gc。为对齐 Git 而接受的 no-op：Libra 的 fetch 从不触发自动 gc，故无可禁用。 | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | 不在 stderr 显示进度条（“Receiving objects” spinner / 远端进度），对齐 `git fetch --no-progress`。 | `libra fetch origin --no-progress` |
-| `-p`, `--prune` | fetch 之后，删除不再是有效配置 refspec 映射目标的 `refs/remotes/<remote>/*` 远程跟踪引用；一次性显式 refspec 会保留当前配置映射的 destination、普通全远程范围以及本次选中目标。删除加一条审计 reflog 条目在同一个事务中执行。本地分支、标签、`refs/remotes/<remote>/HEAD` 和其他远程永远不会被触碰。带 `--dry-run` 时只报告陈旧引用而不删除。未传标志时，`fetch.prune` / `remote.<name>.prune` 配置可把修剪设为默认开启（见上文《抓取相关的 config 默认值》）；CLI 标志始终优先。 | `libra fetch origin -p` |
+| `-p`, `--prune` | fetch 之后，删除不再是有效配置 refspec 映射目标的 `refs/remotes/<remote>/*` 远程跟踪引用；在 `--mirror` 远程（`+refs/*:refs/*`）上则删除源已不再通告的镜像 ref（锁定短名如 `main` 会跳过）。一次性显式 refspec 会保留当前配置映射的 destination、普通全远程范围以及本次选中目标。删除加一条审计 reflog 条目在同一个事务中执行。非 mirror fetch 下本地分支、标签、`refs/remotes/<remote>/HEAD` 和其他远程永远不会被触碰。带 `--dry-run` 时只报告陈旧引用而不删除。未传标志时，`fetch.prune` / `remote.<name>.prune` 配置可把修剪设为默认开启（见上文《抓取相关的 config 默认值》）；CLI 标志始终优先。 | `libra fetch origin -p` |
 | `--no-prune` | 不修剪远程跟踪引用（默认）。`--prune`/`--no-prune` 构成 last-wins 切换：两者同时给出时，命令行最后一个生效（Git 语义）。显式 `--no-prune` 同时覆盖 `fetch.prune` / `remote.<name>.prune` 配置默认值。 | `libra fetch origin --no-prune` |
 | `--notes` | 另外通过专用旁路通道从远程导入文件依赖图（`refs/notes/deps`，lore.md 3.2）。默认关闭（Git 从不自动 fetch notes）。v1 仅从**本地 Libra 源**传输 notes；网络或普通 Git 远程会发出诚实的 “not supported yet” 告警且不导入任何图（推迟，D17）。导入会与本地已有边做并集合并（union-merge）并重新校验每个端点，且按 note 容错（格式错误的 note、或其 commit 在本地缺失的 note，会带告警跳过，绝不中止 fetch）。用 `remote.<name>.fetchNotesDeps=true` 按远程持久化该 opt-in。 | `libra fetch origin --notes` |
 | `-f`, `--force` | 允许非快进更新，并覆盖（clobber）指向别处的本地标签。强制更新在 `--porcelain` 中标记为 `+`，在人类输出中标记为 `(forced update)`。 | `libra fetch origin --tags --force` |

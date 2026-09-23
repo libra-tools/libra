@@ -2290,3 +2290,101 @@ fn test_fetch_from_bundle_remote_matrix() {
         "H3 must say the bundle does not exist: {h3_text}"
     );
 }
+
+/// M-MFETCH Q1–Q4: fetch into a `--mirror` clone updates and prunes verbatim refs.
+#[test]
+fn test_fetch_into_mirror_updates_and_prunes_all_refs() {
+    use super::{
+        assert_cli_success, create_gdeep_git_repo, git_rev_parse, git_success, run_libra_command,
+    };
+
+    let gdeep = create_gdeep_git_repo();
+    git_success(gdeep.dir.path(), &["config", "user.email", "t@t"]);
+    git_success(gdeep.dir.path(), &["config", "user.name", "t"]);
+    let parent = tempdir().expect("mirror parent");
+    let dest = parent.path().join("mirror");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--mirror",
+                gdeep.dir.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "clone --mirror",
+    );
+
+    git_success(gdeep.dir.path(), &["checkout", "-b", "feature2"]);
+    fs::write(gdeep.dir.path().join("f2.txt"), "f2\n").expect("f2");
+    git_success(gdeep.dir.path(), &["add", "f2.txt"]);
+    git_success(gdeep.dir.path(), &["commit", "-m", "feature2"]);
+    git_success(gdeep.dir.path(), &["tag", "v2"]);
+    let feature2 = git_rev_parse(gdeep.dir.path(), "HEAD");
+    git_success(gdeep.dir.path(), &["update-ref", "refs/mr/2", &feature2]);
+
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], dest.as_path()),
+        "Q1 fetch new refs",
+    );
+    let refs = String::from_utf8_lossy(&run_libra_command(&["show-ref"], &dest).stdout).to_string();
+    assert!(refs.contains("refs/heads/feature2"), "Q1 feature2: {refs}");
+    assert!(refs.contains("refs/tags/v2"), "Q1 tag v2: {refs}");
+    assert!(refs.contains("refs/mr/2"), "Q1 mr/2: {refs}");
+    assert!(
+        !refs.contains("refs/remotes/"),
+        "Q1 must not create tracking refs: {refs}"
+    );
+
+    fs::write(gdeep.dir.path().join("f2.txt"), "rewritten\n").expect("rewrite");
+    git_success(gdeep.dir.path(), &["add", "f2.txt"]);
+    git_success(gdeep.dir.path(), &["commit", "--amend", "--no-edit"]);
+    let rewritten = git_rev_parse(gdeep.dir.path(), "HEAD");
+    assert_ne!(rewritten, feature2);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], dest.as_path()),
+        "Q3 force fetch",
+    );
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature2"], &dest);
+    assert_cli_success(&after, "Q3 rev-parse feature2");
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        rewritten,
+        "Q3 must force-update the mirrored branch"
+    );
+
+    git_success(gdeep.dir.path(), &["checkout", "main"]);
+    git_success(gdeep.dir.path(), &["branch", "-D", "feature2"]);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune", "origin"], dest.as_path()),
+        "Q2 fetch --prune",
+    );
+    let pruned = run_libra_command(&["rev-parse", "refs/heads/feature2"], &dest);
+    assert!(
+        !pruned.status.success(),
+        "Q2 prune must drop refs/heads/feature2"
+    );
+
+    let src = create_committed_repo_via_cli();
+    let normal = parent.path().join("normal");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().unwrap(),
+                normal.to_str().unwrap(),
+            ],
+            parent.path(),
+        ),
+        "Q4 clone",
+    );
+    commit_file_via_cli(src.path(), "extra.txt", "e\n", "extra");
+    let extra = rev_parse_cli(src.path(), "HEAD");
+    assert_cli_success(&run_libra_command(&["fetch"], normal.as_path()), "Q4 fetch");
+    assert_eq!(
+        rev_parse_cli(&normal, "refs/remotes/origin/main"),
+        extra,
+        "Q4 non-mirror fetch still updates tracking"
+    );
+}
