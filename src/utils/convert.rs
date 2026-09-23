@@ -171,7 +171,7 @@ pub async fn convert_from_git_repository(
         });
     }
 
-    clone::setup_repository(remote, None, !is_bare)
+    clone::setup_repository(remote, None, !is_bare, false)
         .await
         .map(|_| ()) // discard SetupResult; convert only needs success/failure
         .map_err(|error| InitError::ConversionFailed {

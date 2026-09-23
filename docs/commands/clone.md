@@ -93,7 +93,10 @@ libra clone -b develop git@github.com:user/repo.git
 
 Fetch only the history leading to the tip of a single branch (HEAD, or the branch given
 by `-b`). Reduces transfer size for large repositories when only one branch is needed.
-Only Git remotes support this transport optimization.
+`--depth`, `--shallow-since`, and `--shallow-exclude` imply this flag unless
+`--no-single-branch` is given (matching `git clone`). A single-branch clone writes
+`remote.<name>.fetch=+refs/heads/<branch>:refs/remotes/<name>/<branch>`. Only Git remotes
+support this transport optimization.
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git
@@ -177,7 +180,8 @@ libra clone -l /path/to/source /path/to/dest
 ### `--depth <N>`
 
 Create a shallow clone with history truncated to the specified number of commits.
-`N` must be a positive integer.
+`N` must be a positive integer. Implies `--single-branch` unless `--no-single-branch`
+is given (matching `git clone`).
 Only Git remotes support shallow transfer. A local Libra source
 rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
 shallow boundaries, so accepting the option would leave a clone with missing
@@ -491,7 +495,9 @@ conditions.
 ### `--single-branch` flag
 
 When combined with `--branch`, `--single-branch` reduces the data transferred during clone
-by fetching only the specified branch's history. This is particularly useful for large
+by fetching only the specified branch's history. `--depth` / `--shallow-since` /
+`--shallow-exclude` imply the same narrowing unless `--no-single-branch` is given.
+This is particularly useful for large
 repositories with many long-lived branches where only one branch is needed for the current
 workflow (e.g., CI building a specific release branch). Git supports this as well; jj does
 not, because its operation-log model fetches all refs by design.

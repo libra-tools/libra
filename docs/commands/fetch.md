@@ -85,7 +85,10 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-Explicit refspecs override configured mappings. `remote add -t` and `remote
+Explicit refspecs override configured mappings. A bare source such as `fetch origin dev`
+still downloads that ref and records it in `FETCH_HEAD`, but when `remote.<name>.fetch`
+is already set and does not map `dev`, no new remote-tracking branch is created
+(matching a single-branch clone; issues/474 CL-05). `remote add -t` and `remote
 set-branches` write concrete `remote.<name>.fetch` values that later fetches now enforce.
 Config variable names are case-insensitive, so spellings such as
 `remote.origin.Fetch` are honored. Destinations are currently limited to

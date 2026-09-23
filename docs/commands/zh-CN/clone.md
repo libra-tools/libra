@@ -58,7 +58,7 @@ libra clone -b develop git@github.com:user/repo.git
 
 ### `--single-branch`
 
-只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。只有 Git 远程支持这种传输优化。
+只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。`--depth`、`--shallow-since`、`--shallow-exclude` 在未给出 `--no-single-branch` 时隐含此标志（对齐 `git clone`）。单分支克隆会写入 `remote.<name>.fetch=+refs/heads/<branch>:refs/remotes/<name>/<branch>`。只有 Git 远程支持这种传输优化。
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git
@@ -109,7 +109,7 @@ libra clone -l /path/to/source /path/to/dest
 
 ### `--depth <N>`
 
-创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。
+创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。除非给出 `--no-single-branch`，否则隐含 `--single-branch`（对齐 `git clone`）。
 只有 Git 远程支持浅传输。
 本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
 通过 `file://` 或 `--no-local` 访问的本地 Git 源按各 want 的最短距离截断，再做一次边界计算：有父提交未被发送，或根提交恰好落在深度截止上时，该提交写入 `.libra/shallow`（issues/474 CL-04）。
@@ -323,7 +323,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 ### `--single-branch` 标志
 
-与 `--branch` 组合时，`--single-branch` 通过只获取指定分支的历史来减少 clone 期间传输的数据量。这对包含许多长期分支的大型仓库尤其有用，例如 CI 构建某个特定 release 分支时只需要一个分支。Git 也支持此能力；jj 不支持，因为它的 operation-log 模型按设计获取所有 refs。
+与 `--branch` 组合时，`--single-branch` 通过只获取指定分支的历史来减少 clone 期间传输的数据量。`--depth` / `--shallow-since` / `--shallow-exclude` 在未给出 `--no-single-branch` 时同样收窄。这对包含许多长期分支的大型仓库尤其有用，例如 CI 构建某个特定 release 分支时只需要一个分支。Git 也支持此能力；jj 不支持，因为它的 operation-log 模型按设计获取所有 refs。
 
 ## 参数对比：Libra vs Git vs jj
 

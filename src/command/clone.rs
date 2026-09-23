@@ -74,7 +74,9 @@ pub struct CloneArgs {
     #[clap(short = 'b', long, required = false)]
     pub branch: Option<String>,
 
-    /// Clone only one branch, HEAD or --branch
+    /// Clone only one branch, HEAD or --branch. Also implied by `--depth`,
+    /// `--shallow-since`, and `--shallow-exclude` unless `--no-single-branch`
+    /// (or `--mirror`) is given, matching `git clone`.
     #[clap(long, overrides_with = "no_single_branch")]
     pub single_branch: bool,
 
@@ -89,7 +91,8 @@ pub struct CloneArgs {
     #[clap(long)]
     pub bare: bool,
 
-    /// Create a shallow clone with history truncated to N commits (must be > 0)
+    /// Create a shallow clone with history truncated to N commits (must be > 0).
+    /// Implies `--single-branch` unless `--no-single-branch` is given.
     #[clap(long, value_name = "N", value_parser = validate_depth)]
     pub depth: Option<usize>,
 
@@ -305,6 +308,47 @@ fn unsupported_fetch_optimization_warnings(args: &CloneArgs) -> Vec<String> {
         );
     }
     warnings
+}
+
+impl CloneArgs {
+    /// Git `builtin/clone.c:1025-1028`: `--depth` / `--shallow-since` /
+    /// `--shallow-exclude` imply `--single-branch` unless `--no-single-branch`
+    /// wins. `--mirror` fetches every namespace, so it never implies a single
+    /// branch.
+    pub(crate) fn effective_single_branch(&self) -> bool {
+        if self.mirror || self.no_single_branch {
+            return false;
+        }
+        self.single_branch
+            || self.depth.is_some()
+            || self.shallow_since.is_some()
+            || !self.shallow_exclude.is_empty()
+    }
+}
+
+fn clone_fetch_branch(
+    args: &CloneArgs,
+    discovery: &DiscoveryResult,
+    single_branch: bool,
+) -> Option<String> {
+    if let Some(branch) = args.branch.clone() {
+        return Some(branch);
+    }
+    if !single_branch {
+        return None;
+    }
+    let remote_head = discovery
+        .refs
+        .iter()
+        .find(|reference| reference._ref == "HEAD")
+        .cloned();
+    let ref_heads = discovery
+        .refs
+        .iter()
+        .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    fetch::resolve_remote_default_branch(&discovery.capabilities, &ref_heads, remote_head.as_ref())
 }
 
 fn clone_should_reject_shallow(
@@ -1358,10 +1402,15 @@ async fn clone_into_destination(
     // Capture the fetch result so the clone can report transfer counts
     // (`objects_fetched`/`bytes_received`) in its structured output. `dry_run`
     // and `force` are always false for a clone into a fresh repository.
+    // `--depth` / `--shallow-*` imply `--single-branch` unless
+    // `--no-single-branch` (git `builtin/clone.c:1025-1028`). Resolve HEAD's
+    // branch so a flag-less `--single-branch` still writes one refspec.
+    let single_branch = args.effective_single_branch();
+    let fetch_branch = clone_fetch_branch(args, discovery, single_branch);
     let fetch_result = fetch::fetch_repository_with_result(
         remote_config.clone(),
-        args.branch.clone(),
-        args.single_branch,
+        fetch_branch.clone(),
+        single_branch,
         args.depth,
         false,
         Some(clone_tag_mode),
@@ -1390,8 +1439,9 @@ async fn clone_into_destination(
 
     let setup_result = setup_repository(
         remote_config.clone(),
-        args.branch.clone(),
+        fetch_branch,
         !args.bare && !args.no_checkout,
+        single_branch,
     )
     .await?;
 
@@ -1615,6 +1665,7 @@ pub(crate) async fn setup_repository(
     remote_config: RemoteConfig,
     specified_branch: Option<String>,
     checkout_worktree: bool,
+    single_branch: bool,
 ) -> Result<SetupResult, CloneError> {
     let db = get_db_conn_instance().await;
     let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
@@ -1689,6 +1740,19 @@ pub(crate) async fn setup_repository(
                         false,
                     )
                     .await;
+                    if single_branch {
+                        let spec = format!(
+                            "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
+                            remote_config.name
+                        );
+                        let _ = ConfigKv::add_with_conn(
+                            txn,
+                            &format!("remote.{}.fetch", remote_config.name),
+                            &spec,
+                            false,
+                        )
+                        .await;
+                    }
                     Ok(())
                 })
             },
@@ -1880,6 +1944,54 @@ mod tests {
 
         assert_eq!(cli.stable_code(), StableErrorCode::RepoCorrupt);
         assert_eq!(cli.exit_code(), 128);
+    }
+
+    #[test]
+    fn depth_and_shallow_flags_imply_single_branch_unless_countermanded() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            CloneArgs::try_parse_from(std::iter::once("clone").chain(args.iter().copied()))
+                .expect("clone args should parse")
+        };
+
+        assert!(
+            parse(&["--depth", "1", "https://example.com/r.git"]).effective_single_branch(),
+            "S1: --depth implies --single-branch"
+        );
+        assert!(
+            parse(&["--single-branch", "https://example.com/r.git"]).effective_single_branch(),
+            "S2: explicit --single-branch"
+        );
+        assert!(
+            !parse(&[
+                "--depth",
+                "1",
+                "--no-single-branch",
+                "https://example.com/r.git"
+            ])
+            .effective_single_branch(),
+            "S3: --no-single-branch wins over --depth"
+        );
+        assert!(
+            parse(&["--shallow-since", "yesterday", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--shallow-since implies --single-branch even when ignored"
+        );
+        assert!(
+            parse(&["--shallow-exclude", "main", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--shallow-exclude implies --single-branch even when ignored"
+        );
+        assert!(
+            !parse(&["--mirror", "--depth", "1", "https://example.com/r.git"])
+                .effective_single_branch(),
+            "--mirror fetches every namespace"
+        );
+        assert!(
+            !parse(&["https://example.com/r.git"]).effective_single_branch(),
+            "default clone fetches all branches"
+        );
     }
 
     #[test]

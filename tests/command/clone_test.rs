@@ -1588,3 +1588,152 @@ fn test_clone_depth_from_local_git_source_boundary_matrix() {
         "B6 must not contain c1: {object_text}"
     );
 }
+
+/// M-SCOPE: `--depth` implies `--single-branch` (S1), explicit `--single-branch`
+/// (S2), `--no-single-branch` (S3), `-b` (S4), and a later source-only fetch
+/// updates FETCH_HEAD only (S5).
+#[test]
+fn test_clone_depth_implies_single_branch_matrix() {
+    use super::{assert_cli_success, create_gdeep_git_repo, run_libra_command};
+
+    let gdeep = create_gdeep_git_repo();
+    let url = format!("file://{}", gdeep.dir.path().display());
+    let dest_root = tempdir().expect("scope dest root");
+
+    let remote_refs = |repo: &std::path::Path| -> String {
+        let out = run_libra_command(
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+            repo,
+        );
+        assert_cli_success(&out, "for-each-ref remotes");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let fetch_spec = |repo: &std::path::Path| -> String {
+        let out = run_libra_command(&["config", "get", "remote.origin.fetch"], repo);
+        assert_cli_success(&out, "config get remote.origin.fetch");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let s1 = dest_root.path().join("s1");
+    let out = run_libra_command(
+        &["clone", "--depth", "1", &url, s1.to_str().unwrap()],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "S1 clone --depth 1");
+    let s1_refs = remote_refs(&s1);
+    assert!(
+        s1_refs.contains("refs/remotes/origin/main"),
+        "S1 must have origin/main: {s1_refs}"
+    );
+    assert!(
+        !s1_refs.contains("refs/remotes/origin/dev"),
+        "S1 must not have origin/dev: {s1_refs}"
+    );
+    assert!(
+        !s1_refs.contains("refs/remotes/origin/mr/"),
+        "S1 must not have origin/mr: {s1_refs}"
+    );
+    assert_eq!(
+        fetch_spec(&s1),
+        "+refs/heads/main:refs/remotes/origin/main",
+        "S1 fetch refspec"
+    );
+
+    let s2 = dest_root.path().join("s2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--single-branch",
+            gdeep.dir.path().to_str().unwrap(),
+            s2.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "S2 clone --single-branch path");
+    let s2_refs = remote_refs(&s2);
+    assert!(
+        s2_refs.contains("refs/remotes/origin/main"),
+        "S2 must have origin/main: {s2_refs}"
+    );
+    assert!(
+        !s2_refs.contains("refs/remotes/origin/dev"),
+        "S2 must not have origin/dev: {s2_refs}"
+    );
+    assert_eq!(
+        fetch_spec(&s2),
+        "+refs/heads/main:refs/remotes/origin/main",
+        "S2 fetch refspec"
+    );
+
+    let s3 = dest_root.path().join("s3");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--no-single-branch",
+            &url,
+            s3.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "S3 clone --no-single-branch");
+    let s3_refs = remote_refs(&s3);
+    assert!(
+        s3_refs.contains("refs/remotes/origin/main"),
+        "S3 must have origin/main: {s3_refs}"
+    );
+    assert!(
+        s3_refs.contains("refs/remotes/origin/dev"),
+        "S3 must have origin/dev: {s3_refs}"
+    );
+
+    let s4 = dest_root.path().join("s4");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "-b",
+            "dev",
+            &url,
+            s4.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "S4 clone -b dev");
+    let s4_refs = remote_refs(&s4);
+    assert!(
+        s4_refs.contains("refs/remotes/origin/dev"),
+        "S4 must have origin/dev: {s4_refs}"
+    );
+    assert!(
+        !s4_refs.contains("refs/remotes/origin/main"),
+        "S4 must not have origin/main: {s4_refs}"
+    );
+    assert_eq!(
+        fetch_spec(&s4),
+        "+refs/heads/dev:refs/remotes/origin/dev",
+        "S4 fetch refspec"
+    );
+    let head = run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &s4);
+    assert_cli_success(&head, "S4 HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "dev",
+        "S4 checks out dev"
+    );
+
+    let out = run_libra_command(&["fetch", "origin", "dev"], &s1);
+    assert_cli_success(&out, "S5 fetch origin dev");
+    let s5_refs = remote_refs(&s1);
+    assert!(
+        !s5_refs.contains("refs/remotes/origin/dev"),
+        "S5 must not create origin/dev: {s5_refs}"
+    );
+    let fetch_head = fs::read_to_string(s1.join(".libra/FETCH_HEAD")).expect("S5 FETCH_HEAD");
+    assert!(
+        fetch_head.contains("branch 'dev'"),
+        "S5 FETCH_HEAD must record dev: {fetch_head}"
+    );
+}

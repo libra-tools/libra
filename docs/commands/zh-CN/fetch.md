@@ -40,7 +40,7 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-显式 refspec 覆盖配置映射。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标目前仅限 `refs/heads/*` 与 `refs/remotes/<remote>/*`，但两个命名空间中的保留 `HEAD` 目标、以及其它命名空间都会在任何写入前失败。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。标签目标继续由 `--tags` / `--no-tags` 管理，不通过 fetch refspec 写入。
+显式 refspec 覆盖配置映射。形如 `fetch origin dev` 的裸源仍会下载该引用并写入 `FETCH_HEAD`；若已配置的 `remote.<name>.fetch` 并不映射 `dev`，则不会新建远程跟踪分支（对齐单分支克隆；issues/474 CL-05）。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标目前仅限 `refs/heads/*` 与 `refs/remotes/<remote>/*`，但两个命名空间中的保留 `HEAD` 目标、以及其它命名空间都会在任何写入前失败。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。标签目标继续由 `--tags` / `--no-tags` 管理，不通过 fetch refspec 写入。
 
 ## 选项
 

@@ -762,6 +762,10 @@ struct FetchRefPlan {
     reference: DiscRef,
     destination: String,
     force: bool,
+    /// When false, objects and FETCH_HEAD still update, but no tracking ref is
+    /// written. `git fetch <remote> <ref>` does this when the remote's
+    /// configured refspec does not map the requested ref (single-branch clone).
+    update_tracking: bool,
 }
 
 /// Typed classification for [`FetchError::InvalidRemoteSpec`] so that callers
@@ -1604,6 +1608,7 @@ fn expand_refspec(
                     reference: reference.clone(),
                     destination,
                     force: spec.force,
+                    update_tracking: true,
                 });
             }
         }
@@ -1612,6 +1617,7 @@ fn expand_refspec(
             reference: reference.clone(),
             destination: spec.destination.clone(),
             force: spec.force,
+            update_tracking: true,
         });
     } else {
         return Err(FetchError::RemoteBranchNotFound {
@@ -1628,12 +1634,10 @@ async fn build_fetch_ref_plans(
     branch: Option<&str>,
     single_branch: bool,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
-    let specs = if single_branch {
-        branch
-            .map(|branch| parse_fetch_refspec(branch, remote).map(|spec| vec![spec]))
-            .transpose()?
-            .unwrap_or_default()
-    } else if branch.is_some() {
+    if single_branch {
+        return single_branch_fetch_plans(remote, refs, branch).await;
+    }
+    let specs = if branch.is_some() {
         Vec::new()
     } else {
         configured_fetch_refspecs(remote).await?
@@ -1648,6 +1652,7 @@ async fn build_fetch_ref_plans(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        update_tracking: true,
                     })
             })
             .collect::<Vec<_>>()
@@ -1660,6 +1665,56 @@ async fn build_fetch_ref_plans(
     };
 
     deduplicate_fetch_ref_plans(plans)
+}
+
+/// `git fetch <remote> <ref>` on a single-branch clone: when the configured
+/// refspec maps the requested ref, update that tracking ref. When it does not,
+/// still fetch the objects and record FETCH_HEAD, but do not create a new
+/// remote-tracking branch.
+async fn single_branch_fetch_plans(
+    remote: &str,
+    refs: &[DiscRef],
+    branch: Option<&str>,
+) -> Result<Vec<FetchRefPlan>, FetchError> {
+    let Some(raw) = branch else {
+        return Ok(Vec::new());
+    };
+    let parsed = parse_fetch_refspec(raw, remote)?;
+    if raw.contains(':') {
+        return expand_refspec(&parsed, refs, remote);
+    }
+    let configured = configured_fetch_refspecs(remote).await?;
+    if configured.is_empty() {
+        return expand_refspec(&parsed, refs, remote);
+    }
+    let Some(reference) = refs
+        .iter()
+        .find(|reference| reference._ref == parsed.source)
+        .cloned()
+    else {
+        return Err(FetchError::RemoteBranchNotFound {
+            branch: parsed.source,
+            remote: remote.to_string(),
+        });
+    };
+    let requested = [reference.clone()];
+    let mut plans = Vec::new();
+    for spec in &configured {
+        match expand_refspec(spec, &requested, remote) {
+            Ok(expanded) => plans.extend(expanded),
+            Err(FetchError::RemoteBranchNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if plans.is_empty() {
+        plans.push(FetchRefPlan {
+            reference,
+            destination: parsed.destination,
+            force: false,
+            update_tracking: false,
+        });
+    }
+    Ok(plans)
 }
 
 fn deduplicate_fetch_ref_plans(plans: Vec<FetchRefPlan>) -> Result<Vec<FetchRefPlan>, FetchError> {
@@ -1688,6 +1743,7 @@ fn mapped_remote_tracking_branch_names(remote: &str, plans: &[FetchRefPlan]) -> 
     let prefix = format!("refs/remotes/{remote}/");
     plans
         .iter()
+        .filter(|plan| plan.update_tracking)
         .filter_map(|plan| plan.destination.strip_prefix(&prefix).map(str::to_owned))
         .collect()
 }
@@ -1706,6 +1762,7 @@ pub(crate) async fn configured_remote_tracking_branch_names(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        update_tracking: true,
                     })
             })
             .collect()
@@ -2806,6 +2863,9 @@ async fn compute_fetch_ref_preview(
         .map_err(|message| FetchError::LocalState { message })?;
     let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
     for plan in plans {
+        if !plan.update_tracking {
+            continue;
+        }
         let (storage_name, remote_scope) =
             fetch_destination_storage(&plan.destination, &remote_config.name)?;
         let old_oid = Branch::find_branch_result(&storage_name, remote_scope.as_deref())
@@ -3151,6 +3211,9 @@ async fn update_references(
             let mut updates = Vec::new();
             let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
             for plan in &plans {
+                if !plan.update_tracking {
+                    continue;
+                }
                 let (storage_name, remote_scope) =
                     fetch_destination_storage(&plan.destination, &remote_config.name)?;
                 let old_oid = Branch::find_branch_result_with_conn(
@@ -3235,7 +3298,7 @@ async fn update_references(
             let mapped_branch = remote_default_branch.as_ref().and_then(|branch_name| {
                 let source_ref = format!("refs/heads/{branch_name}");
                 plans.iter().find_map(|plan| {
-                    (plan.reference._ref == source_ref)
+                    (plan.update_tracking && plan.reference._ref == source_ref)
                         .then(|| plan.destination.strip_prefix(&tracking_prefix))
                         .flatten()
                 })
