@@ -309,12 +309,41 @@ fn remote_spec_is_plain_local_path(spec: &str) -> bool {
     true
 }
 
+/// Git `git_url_basename`: last path component, then drop `.git` / `.bundle`.
+fn clone_url_basename(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+    let name = url.rsplit_once('/').map(|(_, name)| name).unwrap_or(url);
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    let name = name.strip_suffix(".bundle").unwrap_or(name);
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Default destination when the user omitted `[LOCAL_PATH]`.
+/// Bare/mirror clones append `.git` (ADR-CL-06).
+fn inferred_clone_destination(url: &str, bare: bool) -> Option<String> {
+    let name = clone_url_basename(url)?;
+    if bare {
+        Some(format!("{name}.git"))
+    } else {
+        Some(name)
+    }
+}
+
 /// A plain filesystem Git path uses Git's local-clone rules: `--depth`,
 /// `--shallow-since`, `--shallow-exclude`, and `--filter` are ignored.
 /// `file://` and `--no-local` keep transport semantics. A local Libra source
 /// stays on the fail-closed path (D20).
 fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteClient) -> bool {
     match remote_client {
+        fetch::RemoteClient::Bundle(_) => {
+            remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local
+        }
         fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
             // A shallow Git source must use the transport so its `.git/shallow`
             // boundaries are copied (git `builtin/clone.c:1333-1340`).
@@ -1164,7 +1193,7 @@ async fn execute_clone_inner(
     let local_path = match &args.local_path {
         Some(path) => path.clone(),
         None => {
-            let repo_name = util::get_repo_name_from_url(&remote_repo)
+            let repo_name = inferred_clone_destination(&args.remote_repo, args.bare)
                 .ok_or((CloneError::CannotInferDestination, None))?;
             original_dir.join(repo_name).to_string_lossy().into_owned()
         }
@@ -1541,11 +1570,16 @@ async fn clone_into_destination(
         eprintln!("Checking out working copy ...");
     }
 
+    let advertised_head = discovery
+        .refs
+        .iter()
+        .any(|reference| reference._ref == "HEAD");
     let setup_result = setup_repository(
         remote_config.clone(),
         fetch_branch,
         !args.bare && !args.no_checkout,
         single_branch,
+        advertised_head,
     )
     .await?;
 
@@ -1770,16 +1804,18 @@ pub(crate) async fn setup_repository(
     specified_branch: Option<String>,
     checkout_worktree: bool,
     single_branch: bool,
+    advertised_head: bool,
 ) -> Result<SetupResult, CloneError> {
     let db = get_db_conn_instance().await;
     let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
 
     let branch_to_checkout = match specified_branch {
         Some(branch_name) => Some(branch_name),
-        None => match remote_head {
+        None if advertised_head => match remote_head {
             Some(Head::Branch(name)) => Some(name),
-            _ => None,
+            _ => default_tracked_branch(&db, &remote_config.name).await?,
         },
+        None => default_tracked_branch(&db, &remote_config.name).await?,
     };
 
     if let Some(branch_name) = branch_to_checkout {
@@ -1899,18 +1935,28 @@ pub(crate) async fn setup_repository(
         )
         .await;
 
-        let default_branch = "main";
-        let merge_ref = format!("refs/heads/{}", default_branch);
-        let _ = ConfigKv::set(&format!("branch.{default_branch}.merge"), &merge_ref, false).await;
-        let _ = ConfigKv::set(
-            &format!("branch.{default_branch}.remote"),
-            &remote_config.name,
-            false,
-        )
-        .await;
-
         Ok(SetupResult { branch_name: None })
     }
+}
+
+/// When the remote advertised no HEAD, check out `main`/`master` only if that
+/// tracking ref exists (M-BUNDLE U3). Otherwise leave the clone without a
+/// local branch (U4).
+async fn default_tracked_branch(
+    db: &sea_orm::DatabaseConnection,
+    remote: &str,
+) -> Result<Option<String>, CloneError> {
+    for name in ["main", "master"] {
+        let tracking = format!("refs/remotes/{remote}/{name}");
+        if Branch::find_branch_result_with_conn(db, &tracking, Some(remote))
+            .await
+            .map_err(|source| CloneError::LocalBranchState { source })?
+            .is_some()
+        {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Unit tests for the clone module
@@ -1922,6 +1968,32 @@ mod tests {
 
     use super::*;
     use crate::utils::test::{ChangeDirGuard, ScopedEnvVar};
+
+    #[test]
+    fn inferred_clone_destination_follows_git_url_basename() {
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep", false).as_deref(),
+            Some("gdeep")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep", true).as_deref(),
+            Some("gdeep.git")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/gdeep.git/", true).as_deref(),
+            Some("gdeep.git")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/b1.bundle", false).as_deref(),
+            Some("b1")
+        );
+        assert_eq!(
+            inferred_clone_destination("/tmp/b1.bundle", true).as_deref(),
+            Some("b1.git")
+        );
+        assert_eq!(inferred_clone_destination("/tmp/..", false), None);
+        assert_eq!(inferred_clone_destination("/tmp/.git", true), None);
+    }
 
     #[test]
     fn discover_remote_unauthorized_maps_to_auth_permission_denied() {

@@ -77,6 +77,7 @@ git clone repository.bundle restored
 | List heads | `libra bundle list-heads <f>` | `git bundle list-heads <f>` |
 | Import objects | `libra bundle unbundle <f>` | `git bundle unbundle <f>` |
 
-Deferred surfaces are prerequisite/thin/incremental bundle creation and cloning
-from a bundle through `libra clone`. `verify` checks checksum integrity but does
+Deferred surfaces are prerequisite/thin/incremental bundle creation.
+`libra clone <bundle>` reads a Git v2 bundle (directory first, then
+`<path>.bundle`, then `<path>`). `verify` checks checksum integrity but does
 not build a temporary index to exhaustively decode every pack entry.

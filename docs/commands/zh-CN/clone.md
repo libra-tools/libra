@@ -16,6 +16,8 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 对于裸克隆，不会执行工作树检出，仓库目录本身会直接成为对象存储。裸克隆不会创建 `.libraignore`。
 
+本地 Git v2 bundle 可作为源：排除仓库目录后依次尝试 `<path>.bundle` 与 `<path>`。默认目标目录名去掉 `.bundle` 后缀。`HEAD` 取自 bundle 的 `HEAD` 行；没有该行时，若 bundle 含默认分支则检出它，否则不创建本地分支。普通路径上的 `--depth` 会按本地克隆警告忽略。`remote.origin.url` 记录 bundle 的绝对路径。
+
 ## 全局配置 Schema 保护
 
 配置 schema 兼容性按角色判定。`libra clone` 在信任配置前，以只读方式检查 GlobalConfig 与 SystemConfig 元数据。真正的配置 future schema，或未注册／名称不匹配的迁移 receipt，在命令需要该作用域时以 `LBR-CONFIG-001` fail-closed。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future，受支持的配置值仍可读取。本 build 能识别 configuration-owned legacy-reader barrier；详见[配置兼容性](config.md#配置-schema-兼容性)。
@@ -42,7 +44,7 @@ libra clone /path/to/local/repo
 
 ### `[LOCAL_PATH]`
 
-可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 推断 `repo`）。如果无法推断，会返回错误，要求用户显式指定路径。
+可选目标目录。省略时，Libra 会从仓库 URL 推断目录名（例如从 `repo.git` 或 `repo.bundle` 推断 `repo`）。如果无法推断，会返回错误，要求用户显式指定路径。
 
 ```bash
 libra clone git@github.com:user/repo.git my-dir

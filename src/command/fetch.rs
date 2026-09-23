@@ -46,6 +46,7 @@ use crate::{
         model::reference as ref_model,
         protocol::{
             DiscRef, DiscoveryResult, FetchStream, ProtocolClient,
+            bundle_client::BundleClient,
             git_client::GitClient,
             https_client::HttpsClient,
             local_client::LocalClient,
@@ -86,6 +87,7 @@ pub(crate) enum RemoteClient {
     Local(LocalClient),
     Git(GitClient),
     Ssh(SshClient),
+    Bundle(BundleClient),
 }
 
 impl RemoteClient {
@@ -114,9 +116,7 @@ impl RemoteClient {
                     let path = url
                         .to_file_path()
                         .map_err(|_| format!("invalid file url: {spec}"))?;
-                    let client = LocalClient::from_path(path)
-                        .map_err(|e| format!("invalid local repository '{}': {}", spec, e))?;
-                    Ok(Self::Local(client))
+                    local_or_bundle_client(path, spec)
                 }
                 "git" => {
                     if url.host_str().is_none() {
@@ -138,12 +138,32 @@ impl RemoteClient {
             } else {
                 normalized
             };
-            let client = LocalClient::from_path(normalized)
-                .map_err(|e| format!("invalid local repository '{}': {}", spec, e))?;
-            Ok(Self::Local(client))
+            local_or_bundle_client(PathBuf::from(normalized), spec)
         }
     }
+}
 
+/// A local filesystem spec is a Git/Libra repo first; otherwise a bundle file
+/// (`<path>.bundle`, then `<path>`), matching git clone's recognition order.
+fn local_or_bundle_client(path: PathBuf, spec: &str) -> Result<RemoteClient, String> {
+    match LocalClient::from_path(&path) {
+        Ok(client) => Ok(RemoteClient::Local(client)),
+        Err(error) => match BundleClient::open_resolved(&path) {
+            Ok(client) => Ok(RemoteClient::Bundle(client)),
+            Err(bundle_error) => {
+                if looks_like_missing_bundle(&path, spec) {
+                    Err(format!("bundle file does not exist: {spec}"))
+                } else if path.is_file() {
+                    Err(format!("invalid local repository '{spec}': {bundle_error}"))
+                } else {
+                    Err(format!("invalid local repository '{spec}': {error}"))
+                }
+            }
+        },
+    }
+}
+
+impl RemoteClient {
     pub(crate) fn with_network_timeouts(
         self,
         connect_timeout: Duration,
@@ -168,7 +188,7 @@ impl RemoteClient {
         self,
         remote: Option<&str>,
     ) -> Result<Self, String> {
-        let is_local = matches!(self, Self::Local(_));
+        let is_local = matches!(self, Self::Local(_) | Self::Bundle(_));
         if is_local {
             return Ok(self);
         }
@@ -211,6 +231,7 @@ impl RemoteClient {
             RemoteClient::Local(client) => client.discovery_reference(service).await,
             RemoteClient::Git(client) => client.discovery_reference(service).await,
             RemoteClient::Ssh(client) => client.discovery_reference(service).await,
+            RemoteClient::Bundle(client) => client.discovery_reference(service).await,
         }
     }
 
@@ -226,6 +247,7 @@ impl RemoteClient {
             RemoteClient::Local(client) => client.fetch_objects(have, want, shallow, depth).await,
             RemoteClient::Git(client) => client.fetch_objects(have, want, shallow, depth).await,
             RemoteClient::Ssh(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Bundle(client) => client.fetch_objects(have, want, shallow, depth).await,
         }
     }
 }
@@ -1407,7 +1429,27 @@ pub(crate) async fn discover_remote_with_name(
 
 /// Classify a remote-spec construction failure into a typed kind and a
 /// human-readable reason string.
+fn looks_like_missing_bundle(path: &Path, spec: &str) -> bool {
+    let mut with_suffix = path.as_os_str().to_os_string();
+    with_suffix.push(".bundle");
+    let with_suffix = PathBuf::from(with_suffix);
+    let named_bundle =
+        path.extension().is_some_and(|ext| ext == "bundle") || spec.contains(".bundle");
+    named_bundle && !path.is_file() && !with_suffix.is_file()
+}
+
 fn classify_remote_spec_error(remote_spec: &str, message: &str) -> (RemoteSpecErrorKind, String) {
+    if message.starts_with("bundle file does not exist") {
+        let display = if remote_spec == "/" {
+            "/".to_string()
+        } else {
+            remote_spec.trim_end_matches('/').to_string()
+        };
+        return (
+            RemoteSpecErrorKind::MissingLocalRepo,
+            format!("bundle '{display}' does not exist"),
+        );
+    }
     if message.starts_with("invalid local repository") {
         let display = if remote_spec == "/" {
             "/".to_string()
@@ -1791,6 +1833,7 @@ pub(crate) fn normalize_remote_url(remote_input: &str, remote_client: &RemoteCli
             remote_input.to_string()
         }
         RemoteClient::Local(client) => client.repo_path().to_string_lossy().to_string(),
+        RemoteClient::Bundle(client) => client.path().to_string_lossy().to_string(),
     }
 }
 
@@ -5390,5 +5433,26 @@ mod tests {
         // Reject: unknown object type (5 is reserved, not 1..=4 / 6 / 7).
         let entry = [0x50_u8]; // 0b0_101_0000 = type 5
         assert_eq!(parse_pack_entry_data_offset(&entry, 0, 20), None);
+    }
+
+    #[test]
+    fn missing_bundle_path_is_an_invalid_local_repository() {
+        use super::{RemoteSpecErrorKind, classify_remote_spec_error, local_or_bundle_client};
+
+        let missing = std::env::temp_dir().join("libra-missing-b4.bundle");
+        let error = match local_or_bundle_client(missing.clone(), missing.to_str().unwrap()) {
+            Ok(_) => panic!("missing bundle must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("bundle file does not exist"),
+            "unexpected spec error: {error}"
+        );
+        let (kind, reason) = classify_remote_spec_error(missing.to_str().unwrap(), &error);
+        assert_eq!(kind, RemoteSpecErrorKind::MissingLocalRepo);
+        assert!(
+            reason.contains("does not exist"),
+            "U2 must report repository does not exist: {reason}"
+        );
     }
 }
