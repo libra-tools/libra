@@ -61,7 +61,7 @@
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
-| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`（`compat-network-remotes` 重跑排队中）；CL-04..CL-09 `locally-accepted`（未 bump） |
+| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`（`compat-network-remotes` 重跑排队中）；CL-04..CL-10 `locally-accepted`（未 bump） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
@@ -191,7 +191,8 @@
 | **CL-07 shallow Git 源克隆** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-06 发布窗口）** |
 | **CL-08 bundle create 写入 HEAD** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-07 发布窗口）** |
 | **CL-09 clone 接受 bundle 源** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-08 发布窗口）** |
-| CL-10..CL-15 | `pending` | 未 bump |
+| **CL-10 以 bundle 为 remote 的 fetch/pull** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-09 发布窗口）** |
+| CL-11..CL-15 | `pending` | 未 bump |
 
 ### 3.6 issues/476（工作树命令族）
 
@@ -233,7 +234,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 - **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
-- **下一步：** 完成 B3-00 focused VER / T-1 全量与发布。`issues/474` 的 `CL-09`..`CL-15` 正按窗口发布（合并后即开下一卡，不等待 release CDN）。
+- **下一步：** 完成 B3-00 focused VER / T-1 全量与发布。`issues/474` 的 `CL-10`..`CL-15` 正按窗口发布（合并后即开下一卡，不等待 release CDN）。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---

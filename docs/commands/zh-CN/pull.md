@@ -10,7 +10,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 ## 说明
 
-`libra pull` 组合了 `fetch` 和 `libra merge` 使用的同一合并引擎。它下载新对象，更新远程跟踪引用，然后将选中的 upstream 集成到当前分支。
+`libra pull` 组合了 `fetch` 和 `libra merge` 使用的同一合并引擎。它下载新对象，更新远程跟踪引用，然后将选中的 upstream 集成到当前分支。远程 URL 指向 Git v2 bundle 时，每次 pull 都会重新读取该文件，替换 bundle 后可以快进当前分支。
 
 使用 `--rebase`（`-r`）时，集成步骤会改为在获取到的 upstream tip 之上重放仅本地提交。这等价于 `libra fetch` 后跟 `libra rebase <upstream>`。
 

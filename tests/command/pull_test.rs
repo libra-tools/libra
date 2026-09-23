@@ -1727,3 +1727,58 @@ async fn test_pull_fast_forward_materializes_executable_bit() {
         "pull fast-forward must materialize the execute bit"
     );
 }
+
+/// M-BFETCH H2: pull fast-forwards from a replaced bundle remote.
+#[test]
+fn test_pull_from_bundle_remote_fast_forward() {
+    let src = create_committed_repo_via_cli();
+    let parent = tempdir().expect("bundle parent");
+    let bundle = parent.path().join("remote.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "create bundle",
+    );
+    let dest = parent.path().join("cloned");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", bundle.to_str().unwrap(), dest.to_str().unwrap()],
+            parent.path(),
+        ),
+        "clone from bundle",
+    );
+    let old_head = run_libra_command(&["rev-parse", "HEAD"], &dest);
+    assert_cli_success(&old_head, "old HEAD");
+    let old = String::from_utf8_lossy(&old_head.stdout).trim().to_string();
+
+    fs::write(src.path().join("next.txt"), "next\n").expect("next file");
+    assert_cli_success(
+        &run_libra_command(&["add", "next.txt"], src.path()),
+        "add next",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "next", "--no-verify"], src.path()),
+        "commit next",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "replace bundle",
+    );
+    let new_src = run_libra_command(&["rev-parse", "HEAD"], src.path());
+    assert_cli_success(&new_src, "src HEAD");
+    let expected = String::from_utf8_lossy(&new_src.stdout).trim().to_string();
+
+    let pull = run_libra_command(&["pull"], &dest);
+    assert_cli_success(&pull, "H2 pull from replaced bundle");
+    let new_head = run_libra_command(&["rev-parse", "HEAD"], &dest);
+    assert_cli_success(&new_head, "new HEAD");
+    let got = String::from_utf8_lossy(&new_head.stdout).trim().to_string();
+    assert_ne!(got, old, "H2 pull must move HEAD");
+    assert_eq!(got, expected, "H2 pull must fast-forward to the new tip");
+    assert!(dest.join("next.txt").exists(), "H2 pull restores new file");
+}

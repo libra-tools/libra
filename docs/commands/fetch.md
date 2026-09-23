@@ -22,8 +22,10 @@ one source ref and may map it to an exact local destination (`<src>:<dst>`). Whe
 explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
 all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
-Fetch supports SSH, HTTPS, local file, and `git://` transports. Vault-backed SSH keys
-are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
+Fetch supports SSH, HTTPS, local file, Git v2 bundle files, and `git://`
+transports. A remote URL that points at a bundle is re-read on every fetch
+(including `--prune` and `--dry-run`). Vault-backed SSH keys are loaded
+automatically when configured via `vault.ssh.<remote>.privkey`.
 
 ## Global Config Schema Guard
 

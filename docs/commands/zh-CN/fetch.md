@@ -14,7 +14,7 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 不带参数调用时，它从当前分支配置的 upstream 获取。已配置的本地 upstream（`branch.<name>.remote=.`）会在任何网络或 `FETCH_HEAD` 写入前被拒绝（`LBR-CLI-003`，退出 129）；Git 2.54 的 `fetch` 可以对本地 upstream 操作——该支持延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 选择一个源引用，并可用 `<src>:<dst>` 精确映射到本地目标。未显式给出 refspec 时会遵守 `remote.<name>.fetch`；该配置不存在时才回退为把所有远程分支映射到 `refs/remotes/<name>/*`。
 
-Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
+Fetch 支持 SSH、HTTPS、本地文件、Git v2 bundle 文件和 `git://` 传输。远程 URL 指向 bundle 时，每次 fetch（含 `--prune` 与 `--dry-run`）都会重新读取该文件。配置了 `vault.ssh.<remote>.privkey` 时，会自动加载 vault-backed SSH 密钥。
 
 ## 全局配置 Schema 保护
 

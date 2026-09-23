@@ -2184,3 +2184,109 @@ fn test_fetch_depth_local_git_boundaries() {
         "fetch depth 2 boundary"
     );
 }
+
+fn rev_parse_cli(repo: &Path, rev: &str) -> String {
+    let output = run_libra_command(&["rev-parse", rev], repo);
+    assert_cli_success(&output, &format!("rev-parse {rev}"));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn commit_file_via_cli(repo: &Path, name: &str, contents: &str, message: &str) {
+    fs::write(repo.join(name), contents).expect("write commit file");
+    assert_cli_success(
+        &run_libra_command(&["add", name], repo),
+        &format!("add {name}"),
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-verify"], repo),
+        message,
+    );
+}
+
+/// M-BFETCH H1–H4: fetch against a bundle remote.
+#[test]
+fn test_fetch_from_bundle_remote_matrix() {
+    let src = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "dev"], src.path()),
+        "branch dev",
+    );
+    let parent = tempdir().expect("bundle parent");
+    let bundle = parent.path().join("remote.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "create bundle",
+    );
+    let dest = parent.path().join("cloned");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", bundle.to_str().unwrap(), dest.to_str().unwrap()],
+            parent.path(),
+        ),
+        "clone from bundle",
+    );
+
+    let h1 = run_libra_command(&["fetch"], dest.as_path());
+    assert_cli_success(&h1, "H1 fetch after clone");
+
+    let old_main = rev_parse_cli(&dest, "refs/remotes/origin/main");
+    assert_cli_success(
+        &run_libra_command(&["rev-parse", "refs/remotes/origin/dev"], &dest),
+        "H4 origin/dev exists before prune",
+    );
+
+    commit_file_via_cli(src.path(), "next.txt", "next\n", "next");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+            src.path(),
+        ),
+        "replace bundle with new commit",
+    );
+    let new_src = rev_parse_cli(src.path(), "HEAD");
+
+    let dry = run_libra_command(&["fetch", "--dry-run"], dest.as_path());
+    assert_cli_success(&dry, "H4 fetch --dry-run");
+    assert_eq!(
+        rev_parse_cli(&dest, "refs/remotes/origin/main"),
+        old_main,
+        "H4 dry-run must not update tracking"
+    );
+
+    let h2 = run_libra_command(&["fetch"], dest.as_path());
+    assert_cli_success(&h2, "H2 fetch after bundle replace");
+    assert_eq!(
+        rev_parse_cli(&dest, "refs/remotes/origin/main"),
+        new_src,
+        "H2 tracking must move to the new bundle tip"
+    );
+
+    // Recreate a main-only bundle so origin/dev is no longer advertised.
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "main"],
+            src.path(),
+        ),
+        "replace bundle without dev",
+    );
+    let prune = run_libra_command(&["fetch", "--prune"], dest.as_path());
+    assert_cli_success(&prune, "H4 fetch --prune");
+    let pruned = run_libra_command(&["rev-parse", "refs/remotes/origin/dev"], &dest);
+    assert!(!pruned.status.success(), "H4 prune must drop origin/dev");
+
+    fs::remove_file(&bundle).expect("delete bundle");
+    let h3 = run_libra_command(&["fetch"], dest.as_path());
+    assert!(!h3.status.success(), "H3 missing bundle");
+    let h3_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&h3.stdout),
+        String::from_utf8_lossy(&h3.stderr)
+    );
+    assert!(
+        h3_text.contains("does not exist") && h3_text.to_ascii_lowercase().contains("bundle"),
+        "H3 must say the bundle does not exist: {h3_text}"
+    );
+}
