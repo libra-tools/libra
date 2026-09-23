@@ -640,6 +640,8 @@ async fn test_clone_with_depth() {
         Head::Branch(b) => assert_eq!(b, "main"),
         _ => panic!("should be branch"),
     };
+    // M-TEST T5: append T1 integrity assertions (live GitHub, depth 1).
+    assert_depth_clone_integrity(temp_path.path(), "1", true);
 }
 
 #[tokio::test]
@@ -690,6 +692,36 @@ async fn test_clone_with_depth_and_branch() {
         Head::Branch(b) => assert_eq!(b, "dev"),
         _ => panic!("should be branch"),
     };
+    // M-TEST T5: fixture `dev` has two commits, so depth 5 is untruncated.
+    assert_depth_clone_integrity(temp_path.path(), "2", false);
+}
+
+/// M-TEST T1 integrity checks shared by live (T5) and local depth clones.
+fn assert_depth_clone_integrity(
+    repo: &std::path::Path,
+    expected_count: &str,
+    expect_shallow: bool,
+) {
+    use super::{assert_cli_success, run_libra_command};
+
+    let count = run_libra_command(&["rev-list", "--count", "HEAD"], repo);
+    assert_cli_success(&count, "rev-list --count HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        expected_count,
+        "rev-list --count HEAD"
+    );
+    assert_cli_success(&run_libra_command(&["fsck"], repo), "fsck");
+    assert_cli_success(&run_libra_command(&["log", "-1", "--oneline"], repo), "log");
+    let shallow_flag = run_libra_command(&["rev-parse", "--is-shallow-repository"], repo);
+    assert_cli_success(&shallow_flag, "rev-parse --is-shallow-repository");
+    let is_shallow = String::from_utf8_lossy(&shallow_flag.stdout).trim() == "true";
+    assert_eq!(
+        is_shallow,
+        expect_shallow,
+        "shallow marker mismatch (file exists={})",
+        repo.join(".libra").join("shallow").is_file()
+    );
 }
 
 #[test]
@@ -2493,5 +2525,237 @@ fn test_clone_bare_and_mirror_default_names_and_layout() {
     assert!(
         parent.path().join("b1").join(".libra").exists(),
         "A5 ordinary bundle dest drops .bundle"
+    );
+}
+
+/// M-TEST T1: local deterministic `clone --depth N file://` integrity matrix.
+#[test]
+fn test_clone_depth_integrity_local_matrix() {
+    use super::{assert_cli_success, create_linear_git_repo, run_libra_command};
+
+    let (src, _oids) = create_linear_git_repo(4);
+    let url = format!("file://{}", src.path().display());
+    let dest_root = tempdir().expect("t1 dest root");
+
+    for (depth, expect_count, expect_shallow) in [
+        ("1", "1", true),
+        ("2", "2", true),
+        ("4", "4", true),
+        ("10", "4", false),
+    ] {
+        let dest = dest_root.path().join(format!("d{depth}"));
+        let out = run_libra_command(
+            &[
+                "clone",
+                "--depth",
+                depth,
+                "--single-branch",
+                "--no-tags",
+                &url,
+                dest.to_str().unwrap(),
+            ],
+            dest_root.path(),
+        );
+        assert_cli_success(&out, &format!("T1 clone --depth {depth}"));
+        assert_depth_clone_integrity(&dest, expect_count, expect_shallow);
+    }
+}
+
+/// M-TEST T2 / t5601:638-643 — shallow clone locally, then clone the shallow
+/// result and compare shallow files; destination must fsck clean.
+///
+/// Upstream uses two `git clone` steps. Libra consumes the Git-produced shallow
+/// source on the second step (CL-07); the first step stays on Git so the
+/// intermediate matches `ssrrcc/.git/shallow`.
+#[test]
+fn test_t5601_shallow_clone_locally() {
+    use super::{
+        assert_cli_success, create_linear_git_repo, git_success, read_shallow_oids,
+        run_libra_command,
+    };
+
+    let (src, oids) = create_linear_git_repo(3);
+    let tip = &oids[2];
+    let dest_root = tempdir().expect("t5601 dest");
+    let ssrrcc = dest_root.path().join("ssrrcc");
+    git_success(
+        dest_root.path(),
+        &[
+            "clone",
+            "--depth=1",
+            "--no-local",
+            src.path().to_str().unwrap(),
+            ssrrcc.to_str().unwrap(),
+        ],
+    );
+    let git_shallow = ssrrcc.join(".git").join("shallow");
+    assert!(git_shallow.is_file(), "git must write .git/shallow");
+    let git_oids: Vec<String> = fs::read_to_string(&git_shallow)
+        .expect("read git shallow")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(git_oids, vec![tip.clone()], "git shallow tip");
+
+    let ddsstt = dest_root.path().join("ddsstt");
+    let out = run_libra_command(
+        &["clone", ssrrcc.to_str().unwrap(), ddsstt.to_str().unwrap()],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "t5601 clone from shallow");
+    assert_eq!(
+        read_shallow_oids(&ddsstt),
+        git_oids,
+        "shallow files must match"
+    );
+    assert_cli_success(&run_libra_command(&["fsck"], &ddsstt), "t5601 fsck");
+}
+
+/// M-TEST T3 / t5500:142-186 — depth 1 / depth 2 counts and fsck.
+#[test]
+fn test_t5500_clone_shallow_depth() {
+    use super::{assert_cli_success, create_linear_git_repo, run_libra_command};
+
+    let (src, _) = create_linear_git_repo(5);
+    let url = format!("file://{}", src.path().display());
+    let dest_root = tempdir().expect("t5500 dest");
+
+    let shallow0 = dest_root.path().join("shallow0");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--no-single-branch",
+            "--depth",
+            "1",
+            &url,
+            shallow0.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "t5500 depth 1");
+    assert_depth_clone_integrity(&shallow0, "1", true);
+
+    let shallow = dest_root.path().join("shallow");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--no-single-branch",
+            "--depth",
+            "2",
+            &url,
+            shallow.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "t5500 depth 2");
+    assert_depth_clone_integrity(&shallow, "2", true);
+}
+
+/// M-TEST T4 / t5537:28-44 — clone from a depth-2 shallow clone keeps history
+/// and fscks clean.
+#[test]
+fn test_t5537_clone_from_shallow_clone() {
+    use super::{assert_cli_success, create_linear_git_repo, git_success, run_libra_command};
+
+    let (src, _) = create_linear_git_repo(4);
+    let dest_root = tempdir().expect("t5537 dest");
+    // Match upstream: Git produces the first shallow clone (--no-local --depth=2).
+    let shallow = dest_root.path().join("shallow");
+    git_success(
+        dest_root.path(),
+        &[
+            "clone",
+            "--no-local",
+            "--depth=2",
+            &format!("file://{}", src.path().display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    let log = git_success_log_subjects(&shallow);
+    assert_eq!(log, ["c4", "c3"], "upstream shallow log subjects: {log:?}");
+
+    let shallow2 = dest_root.path().join("shallow2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--no-local",
+            shallow.to_str().unwrap(),
+            shallow2.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "t5537 clone from shallow");
+    assert_cli_success(&run_libra_command(&["fsck"], &shallow2), "t5537 fsck");
+    let log2 = run_libra_command(&["log", "--format=%s"], &shallow2);
+    assert_cli_success(&log2, "t5537 log");
+    let log2_text = String::from_utf8_lossy(&log2.stdout);
+    let subjects: Vec<&str> = log2_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(subjects, ["c4", "c3"], "t5537 log subjects: {subjects:?}");
+}
+
+fn git_success_log_subjects(repo: &std::path::Path) -> Vec<String> {
+    use super::git_output;
+    let out = git_output(repo, &["log", "--format=%s"]);
+    assert!(
+        out.status.success(),
+        "git log failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// M-TEST T6 / P1b: one-commit + tag source depth clone must not report
+/// `upstream is gone` on `status --short --branch`.
+#[test]
+fn test_clone_depth_status_not_gone_with_tag() {
+    use super::{assert_cli_success, git_success, run_libra_command};
+
+    let src = tempdir().expect("p1b source");
+    git_success(src.path(), &["init", "-b", "main"]);
+    git_success(src.path(), &["config", "user.name", "P1b"]);
+    git_success(src.path(), &["config", "user.email", "p1b@test"]);
+    git_success(src.path(), &["config", "commit.gpgsign", "false"]);
+    git_success(src.path(), &["config", "tag.gpgsign", "false"]);
+    fs::write(src.path().join("only.txt"), "one\n").expect("write");
+    git_success(src.path(), &["add", "only.txt"]);
+    git_success(src.path(), &["commit", "-m", "only"]);
+    git_success(src.path(), &["tag", "-a", "v0", "-m", "v0"]);
+
+    let dest_root = tempdir().expect("p1b dest root");
+    let dest = dest_root.path().join("clone");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            &format!("file://{}", src.path().display()),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "P1b clone --depth 1");
+    assert_depth_clone_integrity(&dest, "1", true);
+
+    let status = run_libra_command(&["status", "--short", "--branch"], &dest);
+    assert_cli_success(&status, "P1b status");
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        text.lines().any(|l| l == "## main...origin/main"),
+        "P1b must report healthy upstream: {text}"
+    );
+    assert!(
+        !text.contains("[gone]") && !text.contains("upstream is gone"),
+        "P1b must not report gone: {text}"
     );
 }

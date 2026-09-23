@@ -237,3 +237,61 @@ fn clone_depth_from_local_git_source_is_walkable() {
     fixture.success(&dest, &["log", "-1", "--oneline"]);
     assert!(dest.join(".libra").join("shallow").is_file());
 }
+
+/// Local Git `--depth 2` integrity (issues/474 CL-14 M-TEST T1 companion).
+#[test]
+fn clone_depth_2_from_local_git_source_integrity() {
+    let fixture = CliFixture::new();
+    let source = fixture.path("git-source-d2");
+    fs::create_dir_all(&source).expect("create git source");
+    for args in [
+        ["init", "-b", "main"].as_slice(),
+        ["config", "user.name", "Integrity"].as_slice(),
+        ["config", "user.email", "integrity@test"].as_slice(),
+        ["config", "commit.gpgsign", "false"].as_slice(),
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&source)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+    for (name, contents) in [("one", "a\n"), ("two", "b\n"), ("three", "c\n")] {
+        fs::write(source.join("file.txt"), contents).expect("write");
+        let status = Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(&source)
+            .status()
+            .expect("git add");
+        assert!(status.success(), "git add");
+        let status = Command::new("git")
+            .args(["commit", "-m", name])
+            .current_dir(&source)
+            .status()
+            .expect("git commit");
+        assert!(status.success(), "git commit {name}");
+    }
+
+    let dest = fixture.path("git-clone-d2");
+    let remote = format!("file://{}", source.display());
+    fixture.success(
+        &fixture.root,
+        &[
+            "clone",
+            "--depth",
+            "2",
+            "--single-branch",
+            "--no-tags",
+            &remote,
+            dest.to_str().expect("utf8 dest"),
+        ],
+    );
+    let count = fixture.success(&dest, &["rev-list", "--count", "HEAD"]);
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+    fixture.success(&dest, &["fsck"]);
+    fixture.success(&dest, &["log", "-1", "--oneline"]);
+    let shallow = fixture.success(&dest, &["rev-parse", "--is-shallow-repository"]);
+    assert_eq!(String::from_utf8_lossy(&shallow.stdout), "true\n");
+    assert!(dest.join(".libra").join("shallow").is_file());
+}
