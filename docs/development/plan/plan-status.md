@@ -61,7 +61,7 @@
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
 | [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | 未启动 | IN-01..IN-12（12 卡） |
-| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`（`compat-network-remotes` 自托管 runner 掉线后重跑中）；CL-04..CL-07 `locally-accepted`（未 bump） |
+| [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | 实施中 | CL-01 `done`/`complete`（`v0.23.47`）；CL-02 `done`/`complete`（`v0.23.48`）；CL-03 C 组 `v0.23.49`（`compat-network-remotes` 重跑排队中）；CL-04..CL-08 `locally-accepted`（未 bump） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；WT-03 受 DEP-WT-08 阻塞；intent-to-add 已迁至 plan-20260918 |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495 |
@@ -182,7 +182,8 @@
 | **CL-05 `--depth` 隐含单分支** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-04 发布窗口）** |
 | **CL-06 普通路径忽略浅化参数** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-05 发布窗口）** |
 | **CL-07 shallow Git 源克隆** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-06 发布窗口）** |
-| CL-08..CL-15 | `pending` | 未 bump |
+| **CL-08 bundle create 写入 HEAD** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-07 发布窗口）** |
+| CL-09..CL-15 | `pending` | 未 bump |
 
 ### 3.6 issues/476（工作树命令族）
 
@@ -222,8 +223,8 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `issues/474` → `CL-03` 发布窗口（`v0.23.49`，PR #512）。`compat-network-remotes` 因自托管 runner 掉线失败后已 `--failed` 重跑；其余 base.yml 作业此前已绿。`CL-04`..`CL-07` 已 `locally-accepted`，均未 bump。
-- **下一步（CL-03 D 组落地后）：** 按窗口依次 bump 并发布 `CL-04` → `CL-07`。
+- **当前正在执行：** `issues/474` → `CL-03` 发布窗口（`v0.23.49`，PR #512）。`compat-network-remotes` 因自托管 runner 掉线失败后已 `--failed` 重跑；其余 base.yml 作业此前已绿。`CL-04`..`CL-08` 已 `locally-accepted`，均未 bump。
+- **下一步（CL-03 D 组落地后）：** 按窗口依次 bump 并发布 `CL-04` → `CL-08`。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---

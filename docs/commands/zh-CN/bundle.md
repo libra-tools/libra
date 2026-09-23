@@ -13,7 +13,7 @@ libra bundle unbundle <file>
 
 ## 说明
 
-- `create` 写完整、非 thin bundle。显式修订可与 `--all`、`--branches`、`--tags` 组合，且至少需要一种选择。annotated tag head 保留 tag 对象 OID，pack 包含其目标闭包。输出先写入私有临时文件并同步，再 rename 到目标。
+- `create` 写完整、非 thin bundle。显式修订可与 `--all`、`--branches`、`--tags` 组合，且至少需要一种选择。`--all` 与显式 `HEAD` 会广告一行 `HEAD`（分离 HEAD 指向该提交；附着 HEAD 仍写 `HEAD`，不改写成 `refs/heads/<branch>`）。annotated tag head 保留 tag 对象 OID，pack 包含其目标闭包。输出先写入私有临时文件并同步，再 rename 到目标。
 - `verify` 校验 v2 头、本地 prerequisite、pack 版本与完整 pack checksum。
 - `list-heads` 只打印 `<oid> <ref>` advertised heads，不导入对象。
 - `unbundle` 校验 prerequisite/checksum，构建正确的 SHA-1 或 SHA-256 pack index，并把 pack/index 对装入对象库。它打印 heads，但按 `git bundle unbundle` 语义**不更新 refs**。重复导入会先核对已安装 pair，再报告成功。
@@ -24,8 +24,8 @@ bundle 输入、收集的原始对象数据和最终输出各自以 1 GiB 为上
 
 | 选项 | 说明 |
 |---|---|
-| `<rev>...` | 把显式修订作为 advertised heads 包含。 |
-| `--all` | 包含全部本地分支和 tag。 |
+| `<rev>...` | 把显式修订作为 advertised heads 包含。`HEAD` 广告为 `HEAD`。 |
+| `--all` | 包含全部本地分支和 tag，并写入一行 `HEAD`。 |
 | `--branches` | 包含全部本地分支。 |
 | `--tags` | 包含全部本地 tag，并保留 annotated 对象。 |
 

@@ -16,9 +16,11 @@ libra bundle unbundle <file>
 
 - `create` writes a full, non-thin bundle. Explicit revisions may be combined
   with `--all`, `--branches`, or `--tags`; at least one selector is required.
-  Annotated tag heads retain the tag-object OID and the pack includes tag target
-  closure. Output uses a private temporary file, syncs it, then renames it into
-  place.
+  `--all` and an explicit `HEAD` revision advertise a `HEAD` line (detached
+  `HEAD` points at the detached commit; attached `HEAD` stays `HEAD`, not
+  `refs/heads/<branch>`). Annotated tag heads retain the tag-object OID and the
+  pack includes tag target closure. Output uses a private temporary file, syncs
+  it, then renames it into place.
 - `verify` validates the v2 header, local prerequisites, pack version, and the
   complete pack checksum.
 - `list-heads` prints the advertised `<oid> <ref>` lines without importing.
@@ -37,8 +39,8 @@ full-history only; prerequisite/thin/incremental range creation remains deferred
 
 | Option | Description |
 |---|---|
-| `<rev>...` | Include explicit revisions as advertised heads. |
-| `--all` | Include all local branches and tags. |
+| `<rev>...` | Include explicit revisions as advertised heads. `HEAD` is advertised as `HEAD`. |
+| `--all` | Include all local branches and tags, plus a `HEAD` line. |
 | `--branches` | Include all local branches. |
 | `--tags` | Include all local tags, preserving annotated objects. |
 

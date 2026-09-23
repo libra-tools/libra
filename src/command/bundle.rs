@@ -149,7 +149,8 @@ async fn create(
     include_branches: bool,
     include_tags: bool,
 ) -> CliResult<()> {
-    let heads = collect_bundle_heads(revs, all || include_branches, all || include_tags).await?;
+    let heads =
+        collect_bundle_heads(revs, all || include_branches, all || include_tags, all).await?;
 
     // Collect every object reachable from the tips (deduplicated).
     let mut seen: HashSet<ObjectHash> = HashSet::new();
@@ -226,6 +227,7 @@ async fn collect_bundle_heads(
     revs: &[String],
     include_branches: bool,
     include_tags: bool,
+    include_head: bool,
 ) -> CliResult<Vec<BundleHead>> {
     let mut branches = Branch::list_branches_result(None).await.map_err(|error| {
         CliError::fatal(format!("failed to list branches for bundle: {error}"))
@@ -274,6 +276,9 @@ async fn collect_bundle_heads(
             heads.push(head);
         }
     };
+    if include_head && let Some(head) = current_head_advertisement().await? {
+        add(head);
+    }
     if include_branches {
         for branch in &branches {
             add(BundleHead {
@@ -314,14 +319,10 @@ async fn collect_bundle_heads(
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
         })?;
-        let name = if rev == "HEAD" {
-            resolve_ref_name(rev).await
-        } else if rev.starts_with("refs/") {
-            rev.clone()
-        } else {
-            format!("refs/heads/bundle-export-{}", index + 1)
-        };
-        add(BundleHead { oid, name });
+        add(BundleHead {
+            oid,
+            name: advertised_name_for_rev(rev, index),
+        });
     }
 
     if heads.is_empty() {
@@ -908,19 +909,29 @@ fn split_oid_rest(line: &str) -> (String, String) {
 // shared helpers
 // ----------------------------------------------------------------------------
 
-/// Resolve the ref name a revision should be recorded under in the header.
-async fn resolve_ref_name(rev: &str) -> String {
+/// Advertised header name for an explicit revision after branch/tag lookup.
+/// `HEAD` stays `HEAD` (Git bundle create), including when attached to a branch.
+fn advertised_name_for_rev(rev: &str, index: usize) -> String {
     if rev == "HEAD" {
-        return match Head::current().await {
-            Head::Branch(name) => format!("refs/heads/{name}"),
-            Head::Detached(_) => "HEAD".to_string(),
-        };
-    }
-    if rev.starts_with("refs/") {
+        "HEAD".to_string()
+    } else if rev.starts_with("refs/") {
         rev.to_string()
     } else {
-        format!("refs/heads/{rev}")
+        format!("refs/heads/bundle-export-{}", index + 1)
     }
+}
+
+/// Current repository HEAD as a bundle advertisement, or `None` when unborn.
+async fn current_head_advertisement() -> CliResult<Option<BundleHead>> {
+    let oid = Head::current_commit_result().await.map_err(|error| {
+        CliError::fatal(format!("failed to resolve HEAD for bundle: {error}"))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
+    Ok(oid.map(|oid| BundleHead {
+        oid,
+        name: "HEAD".to_string(),
+    }))
 }
 
 fn object_error(id: &ObjectHash, error: git_internal::errors::GitError) -> CliError {
@@ -946,6 +957,19 @@ fn write_err(error: std::io::Error) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_name_for_explicit_head_is_head() {
+        assert_eq!(advertised_name_for_rev("HEAD", 0), "HEAD");
+        assert_eq!(
+            advertised_name_for_rev("refs/heads/main", 0),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            advertised_name_for_rev("orphan-oid", 2),
+            "refs/heads/bundle-export-3"
+        );
+    }
 
     #[test]
     fn parses_a_v2_header_with_heads() {
