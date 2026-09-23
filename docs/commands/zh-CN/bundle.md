@@ -61,4 +61,4 @@ git clone repository.bundle restored
 | 列出 heads | `libra bundle list-heads <f>` | `git bundle list-heads <f>` |
 | 导入对象 | `libra bundle unbundle <f>` | `git bundle unbundle <f>` |
 
-仍延后的 surface：prerequisite/thin/增量 bundle 创建，以及通过 `libra clone` 从 bundle 克隆。`verify` 会校验 checksum，但不会构建临时 index 来穷尽解码每个 pack entry。
+仍延后的 surface：prerequisite/thin/增量 bundle 创建。`libra clone <bundle>` 已支持读取 Git v2 bundle（先仓库目录，再 `<path>.bundle`，再 `<path>`）。`verify` 会校验 checksum，但不会构建临时 index 来穷尽解码每个 pack entry。

@@ -23,6 +23,14 @@ copied to matching `.libraignore` files so Libra ignore rules work immediately.
 For bare clones, no working tree checkout is performed and the repository directory itself
 becomes the object store. Bare clones do not create `.libraignore`.
 
+A local Git v2 bundle is a valid source: after a repository directory is ruled
+out, `clone` tries `<path>.bundle` and then `<path>`. The default destination
+name drops a `.bundle` suffix. `HEAD` is taken from the bundle's `HEAD` line;
+if that line is missing, the default branch is checked out when the bundle
+contains it; otherwise no local branch is created. `--depth` on a plain-path
+bundle is ignored with Git's local-clone warning. `remote.origin.url` records
+the bundle's absolute path.
+
 ## Global Config Schema Guard
 
 Configuration schema compatibility is role-scoped. Before `libra clone` trusts
@@ -73,7 +81,7 @@ libra clone /path/to/local/repo
 ### `[LOCAL_PATH]`
 
 Optional destination directory. When omitted, Libra infers the directory name from the
-repository URL (e.g., `repo` from `repo.git`). If inference fails, an error is returned
+repository URL (e.g., `repo` from `repo.git` or `repo.bundle`). If inference fails, an error is returned
 asking the user to specify the path explicitly.
 
 ```bash
