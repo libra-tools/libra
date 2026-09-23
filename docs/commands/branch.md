@@ -22,7 +22,7 @@ libra branch --show-current
 
 ## Description
 
-`libra branch` manages local and remote-tracking branch references stored in the SQLite database. Without arguments it lists local branches in refname order (the current branch is marked with `*` but is not moved to the top). `-v` / `-vv` pad the name column to the longest displayed name, including a detached first line `* (HEAD detached at <abbrev7>)`. `-a` prefixes remote-tracking names as `remotes/<remote>/<branch>`; `-r` omits that `remotes/` prefix. When given a positional `<new_branch>` argument it creates a new branch pointing at HEAD (or at `<commit_hash>` when provided).
+`libra branch` manages local and remote-tracking branch references stored in the SQLite database. Without arguments it lists local branches in refname order (the current branch is marked with `*` but is not moved to the top). `-v` / `-vv` pad the name column to the longest displayed name, including a detached first line `* (HEAD detached at <abbrev7>)`. `-a` prefixes remote-tracking names as `remotes/<remote>/<branch>`; `-r` omits that `remotes/` prefix. A cached remote HEAD prints as `remotes/<remote>/HEAD -> <remote>/<branch>` on `-a` and `<remote>/HEAD -> <remote>/<branch>` on `-r` (JSON keeps the full `refs/remotes/<remote>/HEAD` name). When given a positional `<new_branch>` argument it creates a new branch pointing at HEAD (or at `<commit_hash>` when provided).
 
 Deletion comes in two flavours: `-d` performs a safe delete that checks whether the branch has been fully merged into the current branch before removing it, while `-D` force-deletes regardless of merge status. Both refuse to delete the branch you are currently on.
 
@@ -80,6 +80,11 @@ libra branch -l
 
 # List all branches (local + remote)
 libra branch -l -a
+
+# Remote-tracking list includes the cached remote HEAD symlink
+# (e.g. remotes/origin/HEAD -> origin/main on -a; origin/HEAD -> origin/main on -r)
+libra branch -a
+libra branch -r
 
 # List branches with their tip sha and commit subject
 libra branch -v

@@ -3321,3 +3321,122 @@ fn test_branch_delete_refusal_exit_codes_matrix() {
         "B4 -D feat",
     );
 }
+
+/// M-BRA D1–D4 (issues/474 CL-15): after a full clone, `branch -a` / `-r`
+/// show the remote HEAD symlink line and keep HF-09 sorting/alignment.
+#[test]
+fn test_branch_all_and_remote_listing_format() {
+    use super::{assert_cli_success, create_gdeep_git_repo, run_libra_command};
+
+    let gdeep = create_gdeep_git_repo();
+    // Drop the notes/mr namespaces so the listing matches a simple two-branch
+    // clone (main + dev) with origin/HEAD -> origin/main.
+    super::git_success(gdeep.dir.path(), &["update-ref", "-d", "refs/mr/1"]);
+    let dest_root = tempdir().expect("m-bra dest");
+    let dest = dest_root.path().join("repo");
+    let out = run_libra_command(
+        &[
+            "clone",
+            &format!("file://{}", gdeep.dir.path().display()),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "clone for M-BRA");
+
+    let all = run_libra_command(&["branch", "-a"], &dest);
+    assert_cli_success(&all, "branch -a");
+    let all_out = String::from_utf8_lossy(&all.stdout);
+    let all_lines: Vec<&str> = all_out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(
+        all_lines
+            .iter()
+            .any(|l| *l == "* main" || l.ends_with(" main") && l.starts_with('*')),
+        "D1 current main: {all_out}"
+    );
+    assert!(
+        all_lines
+            .iter()
+            .any(|l| l.trim_start() == "remotes/origin/HEAD -> origin/main"),
+        "D1 HEAD line: {all_out}"
+    );
+    assert!(
+        all_lines
+            .iter()
+            .any(|l| l.trim_start() == "remotes/origin/dev"),
+        "D1 remotes/origin/dev: {all_out}"
+    );
+    assert!(
+        all_lines
+            .iter()
+            .any(|l| l.trim_start() == "remotes/origin/main"),
+        "D1 remotes/origin/main: {all_out}"
+    );
+    let head_idx = all_lines
+        .iter()
+        .position(|l| l.contains("HEAD ->"))
+        .expect("HEAD line");
+    let dev_idx = all_lines
+        .iter()
+        .position(|l| l.trim_start() == "remotes/origin/dev")
+        .expect("dev");
+    let main_idx = all_lines
+        .iter()
+        .position(|l| l.trim_start() == "remotes/origin/main")
+        .expect("main remote");
+    assert!(
+        head_idx < dev_idx && dev_idx < main_idx,
+        "D4 order: {all_out}"
+    );
+
+    let remotes = run_libra_command(&["branch", "-r"], &dest);
+    assert_cli_success(&remotes, "branch -r");
+    let remotes_out = String::from_utf8_lossy(&remotes.stdout);
+    let remotes_lines: Vec<&str> = remotes_out
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        remotes_lines,
+        ["origin/HEAD -> origin/main", "origin/dev", "origin/main"],
+        "D2 -r: {remotes_out}"
+    );
+    assert!(
+        !remotes_out.contains("remotes/origin/"),
+        "D2 omits remotes/ prefix: {remotes_out}"
+    );
+
+    let json = run_libra_command(&["--json", "branch", "-a"], &dest);
+    assert_cli_success(&json, "branch -a --json");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("parse branch json");
+    assert_eq!(parsed["data"]["action"], "list");
+    let names: Vec<&str> = parsed["data"]["branches"]
+        .as_array()
+        .expect("branches array")
+        .iter()
+        .map(|b| b["name"].as_str().expect("name"))
+        .collect();
+    assert!(
+        names.contains(&"refs/remotes/origin/HEAD"),
+        "D3 full HEAD ref: {names:?}"
+    );
+    assert!(
+        names.contains(&"refs/remotes/origin/main"),
+        "D3 full remote ref: {names:?}"
+    );
+    for branch in parsed["data"]["branches"].as_array().unwrap() {
+        assert!(branch.get("commit").is_some());
+        assert!(branch.get("current").is_some());
+        assert!(branch.get("name").is_some());
+        assert!(
+            branch.get("display_name").is_none() && branch.get("plain_name").is_none(),
+            "D3 fields unchanged: {branch}"
+        );
+    }
+}

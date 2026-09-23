@@ -50,6 +50,7 @@ use crate::{
 };
 
 /// Which branch namespace to enumerate during `libra branch -l`.
+#[derive(Clone, Copy)]
 pub enum BranchListMode {
     /// Only branches stored under `refs/heads/`.
     Local,
@@ -2180,21 +2181,55 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
             name: branch.name,
         });
     }
-    for branch in remote_branches {
+    for branch in &remote_branches {
         let plain_name = match list_mode {
-            BranchListMode::All => format!("remotes/{}", plain_branch_display_name(&branch)),
-            _ => plain_branch_display_name(&branch),
+            BranchListMode::All => format!("remotes/{}", plain_branch_display_name(branch)),
+            _ => plain_branch_display_name(branch),
         };
         entries.push(BranchListEntry {
             current: false,
             commit: branch.commit.to_string(),
             display_name: match list_mode {
                 BranchListMode::All => plain_name.clone().red().to_string(),
-                _ => format_branch_name(&branch),
+                _ => format_branch_name(branch),
             },
             plain_name,
-            name: branch.name,
+            name: branch.name.clone(),
         });
+    }
+
+    // Git `branch -a`/`-r` insert `[<remotes>/]<remote>/HEAD -> <remote>/<branch>`
+    // for each cached remote HEAD symref (issues/474 CL-15 / M-BRA D1–D2).
+    if matches!(list_mode, BranchListMode::Remote | BranchListMode::All) {
+        let db = get_db_conn_instance().await;
+        let remote_configs = ConfigKv::all_remote_configs_with_conn(&db)
+            .await
+            .map_err(|e| branch_config_read_error("remote configuration", e))?;
+        for remote in remote_configs {
+            match Head::remote_current_result_with_conn(&db, &remote.name).await {
+                Ok(Some(Head::Branch(target))) => {
+                    let target_ref = remote_tracking_refname(&remote.name, &target);
+                    let Some(target_branch) = remote_branches.iter().find(|branch| {
+                        remote_tracking_refname(&remote.name, &branch.name) == target_ref
+                    }) else {
+                        // Target was filtered out (--contains/--points-at/…) or is missing.
+                        continue;
+                    };
+                    let short_target = remote_tracking_short_name(&target);
+                    let plain_name =
+                        remote_head_symlink_plain_name(list_mode, &remote.name, &short_target);
+                    entries.push(BranchListEntry {
+                        current: false,
+                        commit: target_branch.commit.to_string(),
+                        display_name: plain_name.clone().red().to_string(),
+                        plain_name,
+                        name: format!("refs/remotes/{}/HEAD", remote.name),
+                    });
+                }
+                Ok(Some(Head::Detached(_)) | None) => {}
+                Err(error) => return Err(map_branch_store_error(error)),
+            }
+        }
     }
 
     let show_unborn_head = local_branches_empty
@@ -2588,7 +2623,9 @@ async fn render_branch_output(
                     println!("* {}{suffix}", name.green());
                 }
                 for branch in sorted {
-                    let suffix = if verbose >= 1 {
+                    // Remote HEAD symlinks never carry `-v`/`-vv` tip metadata
+                    // (matches `git branch -a -v`: `remotes/origin/HEAD -> …`).
+                    let suffix = if verbose >= 1 && !is_remote_head_symlink(&branch) {
                         branch_verbose_suffix(&branch.name, &branch.commit, verbose).await
                     } else {
                         String::new()
@@ -2895,6 +2932,48 @@ fn is_remote_list_entry(entry: &BranchListEntry) -> bool {
     entry.name.starts_with("refs/remotes/")
 }
 
+/// `refs/remotes/<remote>/HEAD` list rows render as `<…>/HEAD -> <remote>/<branch>`.
+fn is_remote_head_symlink(entry: &BranchListEntry) -> bool {
+    entry.name.ends_with("/HEAD") && entry.plain_name.contains(" -> ")
+}
+
+/// Full remote-tracking ref for a short or already-qualified branch name.
+fn remote_tracking_refname(remote: &str, branch_name: &str) -> String {
+    if branch_name.starts_with("refs/remotes/") {
+        return branch_name.to_string();
+    }
+    let short = branch_name
+        .strip_prefix("refs/heads/")
+        .unwrap_or(branch_name);
+    format!("refs/remotes/{remote}/{short}")
+}
+
+fn remote_tracking_short_name(branch_name: &str) -> String {
+    branch_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| {
+            branch_name
+                .strip_prefix("refs/remotes/")
+                .and_then(|rest| rest.split_once('/').map(|(_, name)| name))
+        })
+        .unwrap_or(branch_name)
+        .to_string()
+}
+
+/// Human label for a remote HEAD symlink (`-a` keeps the `remotes/` prefix).
+fn remote_head_symlink_plain_name(
+    list_mode: BranchListMode,
+    remote: &str,
+    short_target: &str,
+) -> String {
+    let arrow = format!("{remote}/HEAD -> {remote}/{short_target}");
+    match list_mode {
+        BranchListMode::All => format!("remotes/{arrow}"),
+        BranchListMode::Remote => arrow,
+        BranchListMode::Local => arrow,
+    }
+}
+
 fn sort_entries_default_refname(entries: &mut [BranchListEntry], ignore_case: bool) {
     entries.sort_by(
         |a, b| match (is_remote_list_entry(a), is_remote_list_entry(b)) {
@@ -3160,10 +3239,11 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        Branch, BranchArgs, BranchError, BranchListEntry, ResolvedUpstream,
+        Branch, BranchArgs, BranchError, BranchListEntry, BranchListMode, ResolvedUpstream,
         clean_branch_description, commit_contains, format_branch_name, format_list_name_column,
-        format_upstream_ref, list_name_column_width, load_remote_branches_with_conn,
-        map_head_commit_store_error, resolve_upstream_spec, set_upstream_impl,
+        format_upstream_ref, is_remote_head_symlink, list_name_column_width,
+        load_remote_branches_with_conn, map_head_commit_store_error,
+        remote_head_symlink_plain_name, resolve_upstream_spec, set_upstream_impl,
         sort_entries_default_refname,
     };
     use crate::utils::{
@@ -3554,6 +3634,10 @@ mod tests {
             list_entry("refs/remotes/origin/main", "remotes/origin/main"),
             list_entry("main", "main"),
             list_entry("refs/remotes/origin/dev", "remotes/origin/dev"),
+            list_entry(
+                "refs/remotes/origin/HEAD",
+                "remotes/origin/HEAD -> origin/main",
+            ),
             list_entry("alpha", "alpha"),
         ];
         sort_entries_default_refname(&mut entries, false);
@@ -3567,10 +3651,34 @@ mod tests {
                 "alpha",
                 "main",
                 "zeta",
+                "remotes/origin/HEAD -> origin/main",
                 "remotes/origin/dev",
                 "remotes/origin/main"
             ]
         );
+    }
+
+    #[test]
+    fn remote_head_symlink_plain_name_matches_git() {
+        assert_eq!(
+            remote_head_symlink_plain_name(BranchListMode::All, "origin", "main"),
+            "remotes/origin/HEAD -> origin/main"
+        );
+        assert_eq!(
+            remote_head_symlink_plain_name(BranchListMode::Remote, "origin", "main"),
+            "origin/HEAD -> origin/main"
+        );
+    }
+
+    #[test]
+    fn is_remote_head_symlink_detects_arrow_rows() {
+        let head = list_entry(
+            "refs/remotes/origin/HEAD",
+            "remotes/origin/HEAD -> origin/main",
+        );
+        let ordinary = list_entry("refs/remotes/origin/main", "remotes/origin/main");
+        assert!(is_remote_head_symlink(&head));
+        assert!(!is_remote_head_symlink(&ordinary));
     }
 
     #[test]

@@ -21,7 +21,7 @@ libra branch --show-current
 
 ## 说明
 
-`libra branch` 管理存储在 SQLite 数据库中的本地和远程跟踪分支引用。不带参数时，它按 refname 列出本地分支，并用 `*` 标记当前分支（不再置顶）。`-v` / `-vv` 按本次最长显示名对齐名称列，分离 HEAD 时首行为 `* (HEAD detached at <abbrev7>)`。`-a` 将远程跟踪名显示为 `remotes/<remote>/<branch>`，`-r` 省略 `remotes/` 前缀。给出位置参数 `<new_branch>` 时，它会创建一个指向 HEAD 的新分支；如果同时提供 `<commit_hash>`，则指向该提交。
+`libra branch` 管理存储在 SQLite 数据库中的本地和远程跟踪分支引用。不带参数时，它按 refname 列出本地分支，并用 `*` 标记当前分支（不再置顶）。`-v` / `-vv` 按本次最长显示名对齐名称列，分离 HEAD 时首行为 `* (HEAD detached at <abbrev7>)`。`-a` 将远程跟踪名显示为 `remotes/<remote>/<branch>`，`-r` 省略 `remotes/` 前缀。已缓存的远程 HEAD 在 `-a` 下显示为 `remotes/<remote>/HEAD -> <remote>/<branch>`，在 `-r` 下为 `<remote>/HEAD -> <remote>/<branch>`（JSON 仍使用完整名 `refs/remotes/<remote>/HEAD`）。给出位置参数 `<new_branch>` 时，它会创建一个指向 HEAD 的新分支；如果同时提供 `<commit_hash>`，则指向该提交。
 
 删除有两种形式：`-d` 执行安全删除，移除前会检查该分支是否已完全合并到当前分支；`-D` 无论合并状态如何都会强制删除。两者都拒绝删除你当前所在的分支。
 
