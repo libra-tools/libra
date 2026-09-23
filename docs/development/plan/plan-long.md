@@ -722,7 +722,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 
 | 日期计划 | 主要归属 | 当前状态 | 说明 |
 |---|---|---|---|
-| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | 执行中 | 把 AgentTraces ingest 的 `agent_session.state` 与 checkpoint 类别收成 `session_capture::decide`。OpenCode、Codex、Claude Code、Pi 计划已登记该前置。SCAP-02 已核对。SCAP-01 实现中 |
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | 执行中 | SCAP-02 / SCAP-01 `remote-pending`（PR #519 / `v0.23.55`）。D 组异步。下一卡已切到 B3-00 |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting CLI completion | 已排期 | Cover implemented Git-compatible and Libra-only capabilities; static acceptance before opt-in dynamic completion. CP-00..20 pending; capability inventory may add bounded cards. No implementation claimed. |
 | [`plan-20260708.md`](plan-20260708.md) | A（LR-04/05/09 相邻基础） | 已完成 | 主线记为历史完成，活跃残留另行排期；不关闭对应 LR |
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | 已完成 | 不覆盖 seal/preflight/capsule |
