@@ -197,7 +197,7 @@
 | CL-13 mirror-aware fetch/prune | `done`/`complete` | v0.23.61（#565） |
 | CL-14 depth 测试 + T5 live | `done`/`complete` | v0.23.62（#567） |
 | CL-15 branch -a/-r 远程显示 | `done`/`complete` | v0.23.63（#568 / `d00366b`） |
-| Closeout proxy hygiene | `in-progress` | v0.23.64（loopback `no_proxy`；DEFER-CL-ENV-*） |
+| Closeout proxy hygiene | `done`/`complete` | v0.23.64（#569 / `3554f1e`；DEFER-CL-ENV-*） |
 
 ### 3.6 issues/476（工作树命令族）
 
@@ -239,7 +239,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 - **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
-- **下一步：** `issues/474` CL-01..CL-15 已全部 merge+release；收口中（loopback `no_proxy` FIX + DEFER-CL-ENV-*）；DEP-CL-07 待用户确认。B3-00 另轨。
+- **下一步：** `issues/474` 仅剩 DEP-CL-07（用户确认后回复/关闭 #474）。B3-00 另轨。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---
