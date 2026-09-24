@@ -199,10 +199,15 @@ impl LFSClient {
         lfs_server.set_path(&format!("{}/", lfs_server.path().trim_end_matches('/')));
         let mut batch_url = lfs_server.clone();
         batch_url.set_path(&format!("{}objects/batch", lfs_server.path()));
-        let client = Client::builder()
+        // Same loopback/system-proxy guard as HttpsClient: feature unification
+        // re-enables reqwest `system-proxy`, which breaks localhost mock LFS.
+        let mut builder = Client::builder()
             .redirect(super::https_client::no_downgrade_redirect_policy())
-            .default_headers(lfs::LFS_HEADERS.clone())
-            .build()?;
+            .default_headers(lfs::LFS_HEADERS.clone());
+        if super::https_client::url_is_loopback(&lfs_server) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
         Ok(Self {
             batch_url,
             lfs_url: lfs_server,

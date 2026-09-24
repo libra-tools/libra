@@ -182,18 +182,22 @@
 
 | 卡 | 状态 | 发布 |
 |---|---|---|
-| CL-01 fsck 断链检测与 shallow 豁免 | `done`/`complete` | v0.23.47（CDN 200） |
-| CL-02 log/rev-list shallow helper | `done`/`complete` | v0.23.48（#511 / `c590840`；`release.yml` `35792749227` 8/8；CDN 200） |
-| **CL-03 其余历史遍历** | **`in-progress`/`locally-accepted`** | **v0.23.49（C 组进行中）** |
-| **CL-04 本地 Git 浅边界** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-03 发布窗口）** |
-| **CL-05 `--depth` 隐含单分支** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-04 发布窗口）** |
-| **CL-06 普通路径忽略浅化参数** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-05 发布窗口）** |
-| **CL-07 shallow Git 源克隆** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-06 发布窗口）** |
-| **CL-08 bundle create 写入 HEAD** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-07 发布窗口）** |
-| **CL-09 clone 接受 bundle 源** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-08 发布窗口）** |
-| **CL-10 以 bundle 为 remote 的 fetch/pull** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-09 发布窗口）** |
-| **CL-11 bare/mirror 默认目录名与 bare 布局** | **`in-progress`/`locally-accepted`** | **未 bump（等 CL-10 发布窗口）** |
-| CL-12..CL-15 | `pending` | 未 bump |
+| CL-01 fsck 断链检测与 shallow 豁免 | `done`/`complete` | v0.23.47（#510） |
+| CL-02 log/rev-list shallow helper | `done`/`complete` | v0.23.48（#511） |
+| CL-03 其余历史遍历 | `done`/`complete` | v0.23.49（#512） |
+| CL-04 本地 Git 浅边界 | `done`/`complete` | v0.23.50（#514） |
+| CL-05 `--depth` 隐含单分支 | `done`/`complete` | v0.23.51（#516） |
+| CL-06 普通路径忽略浅化参数 | `done`/`complete` | v0.23.52（#517） |
+| CL-07 shallow Git 源克隆 | `done`/`complete` | v0.23.53（#518） |
+| CL-08 bundle create 写入 HEAD | `done`/`complete` | v0.23.54（#520） |
+| CL-09 clone 接受 bundle 源 | `done`/`complete` | v0.23.57（#561） |
+| CL-10 以 bundle 为 remote 的 fetch/pull | `done`/`complete` | v0.23.58（#562） |
+| CL-11 bare/mirror 默认目录名与 bare 布局 | `done`/`complete` | v0.23.59（#563） |
+| CL-12 clone --mirror 全命名空间 | `done`/`complete` | v0.23.60（#564） |
+| CL-13 mirror-aware fetch/prune | `done`/`complete` | v0.23.61（#565） |
+| CL-14 depth 测试 + T5 live | `done`/`complete` | v0.23.62（#567） |
+| CL-15 branch -a/-r 远程显示 | `done`/`complete` | v0.23.63（#568 / `d00366b`） |
+| Closeout proxy hygiene | `in-progress` | v0.23.64（loopback `no_proxy`；DEFER-CL-ENV-*） |
 
 ### 3.6 issues/476（工作树命令族）
 
@@ -235,7 +239,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 - **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
-- **下一步：** 完成 B3-00 focused VER / T-1 全量与发布。`issues/474` 的 `CL-11`..`CL-15` 正按窗口发布（合并后即开下一卡，不等待 release CDN）。
+- **下一步：** `issues/474` CL-01..CL-15 已全部 merge+release；收口中（loopback `no_proxy` FIX + DEFER-CL-ENV-*）；DEP-CL-07 待用户确认。B3-00 另轨。
 - **并行窗口（不在本执行指针）：** `issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡、`plan-20260819` M2 仍登记为实施中，但不抢本卡的 `fsck.rs` 写集。
 
 ---

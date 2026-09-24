@@ -277,7 +277,7 @@ impl HttpsClient {
         read_timeout: Duration,
     ) -> Result<Self, String> {
         let url = normalize_url(url);
-        let client = build_client(connect_timeout, read_timeout)?;
+        let client = build_client(connect_timeout, read_timeout, url_is_loopback(&url))?;
         Ok(Self { url, client })
     }
 
@@ -286,7 +286,7 @@ impl HttpsClient {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, String> {
-        self.client = build_client(connect_timeout, read_timeout)?;
+        self.client = build_client(connect_timeout, read_timeout, url_is_loopback(&self.url))?;
         Ok(self)
     }
 
@@ -517,15 +517,35 @@ pub(crate) fn no_downgrade_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Loopback must bypass the OS/system HTTP proxy.
+///
+/// `Cargo.toml` sets `reqwest` `default-features = false`, but feature
+/// unification with other crates re-enables `system-proxy`. Without this
+/// guard, macOS system proxies (e.g. Clash/mihomo on `127.0.0.1:7897`)
+/// intercept mock-server tests and return `502 Bad Gateway`.
+pub(crate) fn url_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 fn build_client(
     connect_timeout: Duration,
     read_timeout: Duration,
+    bypass_proxy: bool,
 ) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .http1_only()
         .redirect(no_downgrade_redirect_policy())
         .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout)
+        .read_timeout(read_timeout);
+    if bypass_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|e| format!("failed to build HTTPS client: {e}"))
 }

@@ -42,6 +42,14 @@ impl Drop for ServiceGuard {
     }
 }
 
+/// Bypass OS/system HTTP proxy for loopback service fixtures.
+fn service_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("blocking reqwest client")
+}
+
 /// Spawn `libra service run --port 0` and wait for service.json + a live
 /// health endpoint. Returns (guard, base_url, token).
 fn spawn_service(p: &Path) -> (ServiceGuard, String, String) {
@@ -76,7 +84,7 @@ fn spawn_service_with_env(
     let guard = ServiceGuard(child);
     let info_path = p.join(".libra/service/service.json");
     let token_path = p.join(".libra/service/service-token");
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let Ok(text) = fs::read_to_string(&info_path) else {
@@ -134,7 +142,7 @@ fn service_end_to_end_events_marks_and_fault_recovery() {
     let repo = service_repo();
     let p = repo.path();
     let (guard, base_url, token) = spawn_service(p);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
 
     // status sees the live instance.
     let status = run_libra_command(&["--json", "service", "status"], p);
@@ -256,7 +264,7 @@ fn dirty_mark_rejected_in_multi_worktree_repo() {
         "worktree add",
     );
     let (_guard, base_url, token) = spawn_service(main);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
     let refused = client
         .post(format!("{base_url}/api/service/dirty/mark"))
         .header("x-libra-service-token", token.clone())
@@ -354,7 +362,7 @@ fn linked_service_dirty_mark_is_scoped() {
     std::fs::write(wt.join("scoped.txt"), "scoped\n").expect("write");
 
     let (_guard, base_url, token) = spawn_service(main);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
 
     // Scope-LESS in a multi-worktree repository: still refused.
     let ambiguous = client
@@ -453,7 +461,7 @@ fn linked_service_dirty_mark_is_scoped() {
         let token = token.clone();
         let barrier = std::sync::Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::new();
+            let client = service_http_client();
             barrier.wait();
             client
                 .post(format!("{base_url}/api/service/dirty/mark"))
@@ -571,7 +579,7 @@ fn service_dirty_mark_scope_mismatch_rejected() {
     fs::write(wt.join("m.txt"), "m\n").unwrap();
 
     let (_guard, base_url, token) = spawn_service(main);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
 
     for (label, scope) in [
         (
@@ -631,7 +639,7 @@ fn service_dirty_mark_requires_matching_repo_id() {
     let main = repo.path();
     std::fs::write(main.join("r.txt"), "r\n").expect("write");
     let (_guard, base_url, token) = spawn_service(main);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
 
     // Omitted entirely: the body does not deserialize, so it is a 4xx.
     let omitted = client
@@ -722,7 +730,7 @@ fn service_dirty_mark_stale_epoch_rejected() {
 
     fs::write(wt.join("fenced.txt"), "fenced\n").unwrap();
     let (_guard, base_url, token) = spawn_service(main);
-    let client = reqwest::blocking::Client::new();
+    let client = service_http_client();
 
     let stale = client
         .post(format!("{base_url}/api/service/dirty/mark"))
@@ -1363,7 +1371,7 @@ fn service_marks_survive_an_externally_held_registry_lock() {
         let token = token.clone();
         let repo_id = repo_id.clone();
         handles.push(std::thread::spawn(move || {
-            let response = reqwest::blocking::Client::new()
+            let response = service_http_client()
                 .post(format!("{base_url}/api/service/dirty/mark"))
                 .header("x-libra-service-token", token)
                 .json(&serde_json::json!({
@@ -1440,7 +1448,7 @@ fn service_reports_identity_read_failure_as_server_error() {
     std::fs::write(main.join("faulted.txt"), "x\n").expect("write");
 
     let (_guard, base_url, token) = spawn_service_with_fault(main, Some("service-repo-identity"));
-    let response = reqwest::blocking::Client::new()
+    let response = service_http_client()
         .post(format!("{base_url}/api/service/dirty/mark"))
         .header("x-libra-service-token", token)
         .json(&serde_json::json!({

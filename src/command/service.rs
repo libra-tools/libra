@@ -811,14 +811,16 @@ async fn service_status(output: &OutputConfig) -> CliResult<()> {
                     "stale".to_string()
                 } else {
                     let url = format!("{}/api/health", info.base_url);
-                    match reqwest::Client::new()
-                        .get(&url)
+                    let health_client = reqwest::Client::builder()
+                        .no_proxy()
                         .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(response) if response.status().is_success() => "ok".to_string(),
-                        _ => "unreachable".to_string(),
+                        .build();
+                    match health_client {
+                        Ok(client) => match client.get(&url).send().await {
+                            Ok(response) if response.status().is_success() => "ok".to_string(),
+                            _ => "unreachable".to_string(),
+                        },
+                        Err(_) => "unreachable".to_string(),
                     }
                 };
                 ServiceStatusReport {
@@ -871,7 +873,13 @@ async fn service_events(output: &OutputConfig) -> CliResult<()> {
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
     let url = format!("{}/api/service/events", info.base_url);
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| {
+            CliError::failure(format!("failed to build service HTTP client: {e}"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?
         .get(&url)
         .header(SERVICE_TOKEN_HEADER, token.trim())
         .send()
