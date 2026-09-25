@@ -3032,3 +3032,128 @@ async fn test_t5505_add_another_remote() {
         "A8: fetch did not rewrite the legacy remote's config"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_remote_rename_push_targets_matrix() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "old", "https://example.com/r.git"], p),
+        "remote add old",
+    );
+    // R5: a non-default fetch refspec (destination is rewritten on rename, as
+    // Git does, while the source is preserved).
+    ConfigKv::add(
+        "remote.old.fetch",
+        "+refs/heads/dev:refs/remotes/old/dev",
+        false,
+    )
+    .await
+    .expect("add custom fetch refspec");
+
+    // R1: repository-scoped `remote.pushDefault` names the old remote.
+    ConfigKv::set("remote.pushDefault", "old", false)
+        .await
+        .expect("set repo pushDefault");
+    // R3: branch `main` pushRemote names the old remote.
+    ConfigKv::set("branch.main.pushRemote", "old", false)
+        .await
+        .expect("set branch pushRemote");
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "rename", "old", "new"], p),
+        "remote rename old new",
+    );
+
+    // R1: the repository-scoped pushDefault is rewritten to the new name.
+    let push_default = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .expect("read pushDefault")
+        .map(|e| e.value);
+    assert_eq!(
+        push_default.as_deref(),
+        Some("new"),
+        "R1: pushDefault rewritten"
+    );
+
+    // R3: branch.pushRemote is rewritten to the new name.
+    let branch_push = ConfigKv::get_var_case_insensitive("branch.main.", "pushRemote")
+        .await
+        .expect("read branch pushRemote")
+        .map(|e| e.value);
+    assert_eq!(
+        branch_push.as_deref(),
+        Some("new"),
+        "R3: branch.main.pushRemote rewritten"
+    );
+
+    // R5: both the default and the non-default fetch refspec destinations are
+    // rewritten to the new name while sources are preserved.
+    let fetch_specs = ConfigKv::get_all("remote.new.fetch")
+        .await
+        .expect("read new fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fetch_specs,
+        vec![
+            "+refs/heads/*:refs/remotes/new/*",
+            "+refs/heads/dev:refs/remotes/new/dev",
+        ],
+        "R5: refspec destinations rewritten, sources preserved"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_remote_rename_global_push_default_warns_and_is_unchanged() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "old", "https://example.com/r.git"], p),
+        "remote add old",
+    );
+
+    // R2: only a global-scope pushDefault names the old remote; the repo has no
+    // local pushDefault. Git leaves the global value unchanged and warns. The
+    // global value is set in the subprocess's isolated global DB so the rename
+    // subprocess shares it.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--global", "remote.pushDefault", "old"],
+            p,
+        ),
+        "set global pushDefault",
+    );
+
+    let rename_out = run_libra_command(&["remote", "rename", "old", "new"], p);
+    assert_cli_success(&rename_out, "remote rename old new");
+    let stderr = String::from_utf8_lossy(&rename_out.stderr);
+    assert!(
+        stderr.contains("pushDefault") && stderr.contains("non-existent remote 'old'"),
+        "R2: global pushDefault warning emitted: {stderr}"
+    );
+
+    // The global value is unchanged (still names the old remote).
+    let global_pd = run_libra_command(&["config", "get", "--global", "remote.pushDefault"], p);
+    assert_cli_success(&global_pd, "read global pushDefault");
+    assert_eq!(
+        String::from_utf8_lossy(&global_pd.stdout).trim(),
+        "old",
+        "R2: global pushDefault unchanged"
+    );
+    // The repo has no local pushDefault introduced by the rename.
+    let local_pd = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .expect("read local pushDefault")
+        .map(|e| e.value);
+    assert!(local_pd.is_none(), "R2: no local pushDefault created");
+}

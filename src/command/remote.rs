@@ -15,7 +15,10 @@ use sea_orm::{
 use serde::Serialize;
 
 use crate::{
-    command::fetch,
+    command::{
+        config::{ConfigScope, ScopedConfig},
+        fetch,
+    },
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
@@ -841,6 +844,18 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
         return Err(RemoteError::SshKeyNamespaceExists { name: new });
     }
 
+    // Capture whether the repo-local `pushDefault` references the old remote
+    // BEFORE the transaction rewrites it: Git decides whether to warn based on
+    // the scope of the matching value prior to rewriting (a local value that
+    // names the old remote is rewritten and shadows any dangling global value).
+    let local_push_default_was_old = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .map_err(|e| RemoteError::ConfigRead {
+            detail: e.to_string(),
+        })?
+        .map(|e| e.value == old)
+        .unwrap_or(false);
+
     let db = get_db_conn_instance().await;
     let old_for_txn = old.clone();
     let new_for_txn = new.clone();
@@ -903,10 +918,42 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
             RemoteError::ConfigWrite { detail }
         }
     })?;
+
+    // Git parity: a global/system-scoped `remote.pushDefault` that names the
+    // renamed remote is left unchanged and warned about; only a local-scope
+    // value was rewritten above. This mirrors Git `handle_push_default`.
+    if !local_push_default_was_old {
+        warn_if_global_push_default_dangles(&old).await?;
+    }
+
     Ok(RemoteOutput::Rename {
         old_name: old,
         new_name: new,
     })
+}
+
+/// Warn (Git parity) when a global/system-scoped `remote.pushDefault` names a
+/// just-renamed remote that no longer exists. The global value is left
+/// unchanged; only the message is emitted, matching Git `handle_push_default`.
+async fn warn_if_global_push_default_dangles(old: &str) -> Result<(), RemoteError> {
+    let global_db = match ScopedConfig::get_connection(ConfigScope::Global).await {
+        Ok(db) => db,
+        // No global configuration database (or it is unreadable): nothing
+        // to warn about.
+        Err(_) => return Ok(()),
+    };
+    let global_pd =
+        ConfigKv::get_var_case_insensitive_with_conn(&global_db, "remote.", "pushDefault")
+            .await
+            .map_err(|e| RemoteError::ConfigRead {
+                detail: e.to_string(),
+            })?;
+    if global_pd.as_ref().map(|e| e.value.as_str()) == Some(old) {
+        emit_warning(format!(
+            "the global configuration remote.pushDefault now names the non-existent remote '{old}'"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_list_remotes(verbose: bool) -> Result<RemoteOutput, RemoteError> {

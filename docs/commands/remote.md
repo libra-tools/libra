@@ -91,9 +91,13 @@ Delete a remote and all its configuration keys.
 Rename an existing remote. The operation atomically migrates `remote.<old>.*`
 configuration (including fetch-refspec destinations), `branch.*.remote` values,
 the SSH key namespace, every `refs/remotes/<old>/*` tracking ref, the remote HEAD,
-and matching tracking-ref reflogs. A conflicting target namespace fails without
-leaving a partial rename. Remote and SSH subsections are matched by exact remote
-name, so renaming `corp` cannot capture a separate `corp.prod` remote.
+and matching tracking-ref reflogs. It also rewrites a repository-scoped
+`remote.pushDefault` and every `branch.<branch>.pushRemote` that names the old
+remote to the new name. A global/system-scoped `remote.pushDefault` naming the
+old remote is left unchanged and warned about (matching Git). A conflicting
+target namespace fails without leaving a partial rename. Remote and SSH
+subsections are matched by exact remote name, so renaming `corp` cannot capture
+a separate `corp.prod` remote.
 
 | Argument | Description | Example |
 |----------|-------------|---------|

@@ -67,7 +67,7 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`rename`
 
-重命名已有远程。该操作在一个事务中迁移 `remote.<old>.*` 配置（包括 fetch refspec 的目标）、`branch.*.remote` 值、SSH 密钥命名空间、所有 `refs/remotes/<old>/*` tracking ref、remote HEAD 以及对应 reflog。目标命名空间冲突时失败且不留下部分迁移。remote 与 SSH subsection 按完整远程名精确匹配，因此重命名 `corp` 不会捕获独立的 `corp.prod` 远程。
+重命名已有远程。该操作在一个事务中迁移 `remote.<old>.*` 配置（包括 fetch refspec 的目标）、`branch.*.remote` 值、SSH 密钥命名空间、所有 `refs/remotes/<old>/*` tracking ref、remote HEAD 以及对应 reflog。它还会把指向旧远程名的仓库级 `remote.pushDefault` 与每个 `branch.<branch>.pushRemote` 改写为新远程名。全局/系统级 `remote.pushDefault` 指向旧名时保持不变并输出警告（与 Git 一致）。目标命名空间冲突时失败且不留下部分迁移。remote 与 SSH subsection 按完整远程名精确匹配，因此重命名 `corp` 不会捕获独立的 `corp.prod` 远程。
 
 | 参数 | 说明 | 示例 |
 |----------|-------------|---------|

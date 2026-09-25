@@ -947,10 +947,19 @@ impl ConfigKv {
                 .context("failed to rename remote entry")?;
         }
 
-        // Update branch.*.remote values that reference the old name
+        // Update branch.*.remote and branch.*.pushRemote values that reference
+        // the old name (Git rewrites both; the pushRemote suffix is matched
+        // case-insensitively because `git config --list` lowercases it).
         let branch_entries = Self::get_by_prefix_with_conn(db, "branch.").await?;
         for be in branch_entries {
-            if be.key.ends_with(".remote") && be.value == old {
+            let is_upstream = be.key.ends_with(".remote");
+            let is_push_remote = be
+                .key
+                .strip_prefix("branch.")
+                .and_then(|k| k.rsplit_once('.'))
+                .map(|(_, var)| var.eq_ignore_ascii_case("pushRemote"))
+                .unwrap_or(false);
+            if (is_upstream || is_push_remote) && be.value == old {
                 let rows = config_kv::Entity::find()
                     .filter(config_kv::Column::Key.eq(&be.key))
                     .filter(config_kv::Column::Value.eq(old))
@@ -966,6 +975,32 @@ impl ConfigKv {
                         .context("failed to update branch remote")?;
                 }
             }
+        }
+
+        // Rewrite a repository-scoped `remote.pushDefault` that names the old
+        // remote (Git rewrites local-scope pushDefault; global/system are left
+        // for the caller to warn about).
+        let push_default_rows = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.starts_with("remote."))
+            .all(db)
+            .await
+            .context("failed to query pushDefault entries for rename")?
+            .into_iter()
+            .filter(|e| {
+                e.key
+                    .strip_prefix("remote.")
+                    .map(|var| var.eq_ignore_ascii_case("pushDefault"))
+                    .unwrap_or(false)
+                    && e.value == old
+            })
+            .collect::<Vec<_>>();
+        for row in push_default_rows {
+            let mut active: config_kv::ActiveModel = row.into();
+            active.value = Set(new.to_owned());
+            active
+                .update(db)
+                .await
+                .context("failed to update remote.pushDefault")?;
         }
 
         // Cascade SSH key rename: vault.ssh.old.* → vault.ssh.new.*
