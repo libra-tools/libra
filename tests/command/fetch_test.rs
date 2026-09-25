@@ -19,6 +19,7 @@ use libra::{
         branch::Branch,
         config::{ConfigKv, RemoteConfig},
         head::Head,
+        tag,
     },
     utils::{
         output::OutputConfig,
@@ -1880,6 +1881,8 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         set_upstream: false,
         update_head_ok: false,
         refmap: None,
+        atomic: false,
+        prune_tags: false,
         no_auto_gc: false,
         no_progress: true,
         prune,
@@ -2607,4 +2610,163 @@ async fn test_fetch_update_head_ok_allows_fetch_into_checked_out_branch() {
         &repo_dir,
     );
     assert_cli_success(&ok, "fetch --update-head-ok into checked-out branch");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_prune_tags_matrix() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    // Build a local Git remote carrying a branch and an annotated tag.
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(&["tag", "-a", "v1", "-m", "v1"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+    git(
+        &["push", remote_dir.to_str().unwrap(), "--tags"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+
+    // Initial fetch auto-follows the reachable annotated tag into refs/tags/v1.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_some(),
+        "v1 tag should exist after auto-follow fetch"
+    );
+
+    // Delete the tag on the remote, then `--prune-tags` alone does nothing.
+    git(
+        &["push", remote_dir.to_str().unwrap(), ":refs/tags/v1"],
+        Some(&work_dir),
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune-tags", "origin"], &repo_dir),
+        "fetch --prune-tags origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_some(),
+        "T5: --prune-tags alone does not prune (needs --prune)"
+    );
+
+    // `--prune --prune-tags` prunes the no-longer-advertised tag.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune", "--prune-tags", "origin"], &repo_dir),
+        "fetch --prune --prune-tags origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_none(),
+        "T5: --prune --prune-tags deletes the stale tag"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_atomic_all_or_nothing_on_non_fast_forward() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+    // Establish refs/remotes/origin/main so non-fast-forward detection works.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+
+    // Commit a divergent history on a new orphan branch, then force-push it to
+    // the remote's `main` so the fetched source is unrelated to origin/main.
+    git(&["checkout", "--orphan", "orphan"], Some(&work_dir));
+    git(&["rm", "-rf", "."], Some(&work_dir));
+    fs::write(work_dir.join("other.txt"), "other").expect("write other");
+    git(&["add", "."], Some(&work_dir));
+    git(&["commit", "-m", "divergent"], Some(&work_dir));
+    git(
+        &[
+            "push",
+            "--force",
+            remote_dir.to_str().unwrap(),
+            "orphan:main",
+        ],
+        Some(&work_dir),
+    );
+
+    // `--atomic` with a non-fast-forward (unforced) update rejects; the fetch
+    // fails closed (no partial tracking-ref update).
+    let out = run_libra_command(
+        &["fetch", "--atomic", "origin", "refs/heads/main"],
+        &repo_dir,
+    );
+    // Without `+`/`--force`, the non-fast-forward update is refused.
+    assert!(
+        !out.status.success(),
+        "non-fast-forward fetch without force must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

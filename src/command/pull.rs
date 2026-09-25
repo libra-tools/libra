@@ -419,6 +419,8 @@ pub(crate) async fn run_pull(
         false,
         // `pull` does not prune; use `fetch --prune` or `remote prune`.
         false,
+        // `pull` does not prune tags either.
+        false,
         args.notes,
         &child_output,
         false,

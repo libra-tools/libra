@@ -694,6 +694,19 @@ pub struct FetchArgs {
     #[clap(long = "refmap", value_name = "REFSPEC")]
     pub refmap: Option<String>,
 
+    /// Atomically update all fetched refs: any rejected (non-fast-forward)
+    /// update rolls back every ref, reflog, and FETCH_HEAD write. Libra's fetch
+    /// already updates refs in a single transaction, so this is accepted for
+    /// git parity and asserts the all-or-nothing behaviour.
+    #[clap(long = "atomic")]
+    pub atomic: bool,
+
+    /// Prune local tags that the remote no longer advertises. Only effective
+    /// together with `--prune` (or the `fetch.prune` / `remote.<name>.prune`
+    /// config defaults); ignored when an explicit refspec is given.
+    #[clap(long = "prune-tags", short = 'P')]
+    pub prune_tags: bool,
+
     /// Do not fetch any tags (not even tags reachable from fetched commits).
     /// Overrides the default auto-follow and an earlier `--tags`.
     #[clap(long = "no-tags", overrides_with = "tags")]
@@ -1311,6 +1324,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         set_upstream,
         update_head_ok,
         refmap,
+        atomic: _,
+        prune_tags,
         no_auto_gc: _,
         no_progress,
         prune,
@@ -1384,6 +1399,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 tag_cli,
                 force,
                 prune,
+                prune_tags,
                 notes,
                 output,
                 update_head_ok,
@@ -1472,6 +1488,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         tag_cli,
         force,
         prune,
+        prune_tags,
         notes,
         output,
         update_head_ok,
@@ -2123,6 +2140,7 @@ pub async fn fetch_repository_safe(
         false,
         false,
         false,
+        false,
         output,
         false,
         None,
@@ -2147,6 +2165,7 @@ pub(crate) async fn fetch_repository_with_result(
     tag_cli: Option<TagFetchMode>,
     force: bool,
     prune: bool,
+    prune_tags: bool,
     notes: bool,
     output: &OutputConfig,
     update_head_ok: bool,
@@ -2161,6 +2180,7 @@ pub(crate) async fn fetch_repository_with_result(
         tag_cli,
         force,
         prune,
+        prune_tags,
         notes,
         output,
         update_head_ok,
@@ -2180,6 +2200,7 @@ async fn fetch_repository_with_result_reusing(
     tag_cli: Option<TagFetchMode>,
     force: bool,
     prune: bool,
+    prune_tags: bool,
     notes: bool,
     output: &OutputConfig,
     update_head_ok: bool,
@@ -2579,7 +2600,7 @@ async fn fetch_repository_with_result_reusing(
         &ref_plans,
         &ref_heads,
         remote_head,
-        branch,
+        branch.clone(),
         discovery.capabilities.clone(),
         force,
         update_head_ok,
@@ -2649,6 +2670,21 @@ async fn fetch_repository_with_result_reusing(
     } else {
         Vec::new()
     };
+
+    // `--prune-tags`/`-P`: delete local tags the remote no longer advertises.
+    // Only effective when tracking prune is on (or enabled via
+    // `fetch.pruneTags` / `remote.<name>.pruneTags`) and no explicit refspec is
+    // given (Git parity).
+    let config_prune_tags = fetch_prune_tags_configured(&remote_config.name).await?;
+    let effective_prune_tags = (prune_tags || config_prune_tags) && prune && branch.is_none();
+    if effective_prune_tags {
+        let pruned_tags = prune_stale_tags(&remote_config.name, &discovery.refs, dry_run).await?;
+        if !pruned_tags.is_empty() && !crate::utils::output::structured_output_active() {
+            for name in &pruned_tags {
+                eprintln!(" - [deleted]         (none)     -> tag '{name}'");
+            }
+        }
+    }
 
     let new_sentinel = pack_pin.into_path();
     let (pack_keep_lock, keep_sentinel) = match keep_lock {
@@ -4705,6 +4741,77 @@ async fn resolve_prune_mode(remote_name: &str, prune_cli: Option<bool>) -> Resul
         return Ok(explicit);
     }
     Ok(configured_fetch_prune(remote_name).await?.unwrap_or(false))
+}
+
+/// Resolve the effective `--prune-tags` mode for a remote: the CLI flag wins;
+/// otherwise fall back to `remote.<name>.pruneTags`, then `fetch.pruneTags`
+/// (Git precedence). It is only ever consulted when tracking prune is also on.
+async fn fetch_prune_tags_configured(remote_name: &str) -> Result<bool, FetchError> {
+    for (prefix, variable) in [
+        (format!("remote.{remote_name}."), "pruneTags".to_string()),
+        ("fetch.".to_string(), "pruneTags".to_string()),
+    ] {
+        let entries = ConfigKv::get_var_all_case_insensitive(&prefix, &variable)
+            .await
+            .map_err(|e| FetchError::ConfigRead {
+                key: format!("{prefix}{variable}"),
+                message: e.to_string(),
+            })?;
+        if let Some(entry) = entries.into_iter().next() {
+            let v = entry.value.to_ascii_lowercase();
+            match v.as_str() {
+                "true" | "yes" | "on" | "1" => return Ok(true),
+                "false" | "no" | "off" | "0" => return Ok(false),
+                other => {
+                    return Err(FetchError::ConfigRead {
+                        key: format!("{prefix}{variable}"),
+                        message: format!("expected bool, got '{other}'"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Prune local tags that the remote no longer advertises. Only invoked when
+/// tracking prune is on AND `--prune-tags` (or `fetch.pruneTags` /
+/// `remote.<name>.pruneTags`) is effective AND no explicit refspec is given
+/// (matching Git). Returns the pruned tag names for reporting.
+async fn prune_stale_tags(
+    _remote_name: &str,
+    discovery_refs: &[DiscRef],
+    dry_run: bool,
+) -> Result<Vec<String>, FetchError> {
+    let advertised: HashSet<String> = discovery_refs
+        .iter()
+        .filter(|r| r._ref.starts_with("refs/tags/") && !r._ref.ends_with("^{}"))
+        .map(|r| {
+            r._ref
+                .strip_prefix("refs/tags/")
+                .unwrap_or(&r._ref)
+                .to_string()
+        })
+        .collect();
+    let local = tag::list().await.map_err(|e| FetchError::UpdateRefs {
+        message: format!("failed to list tags for --prune-tags: {e}"),
+    })?;
+    let stale = local
+        .into_iter()
+        .filter(|t| !advertised.contains(&t.name))
+        .map(|t| t.name)
+        .collect::<Vec<_>>();
+    if dry_run {
+        return Ok(stale);
+    }
+    for name in &stale {
+        tag::delete(name)
+            .await
+            .map_err(|e| FetchError::UpdateRefs {
+                message: format!("failed to prune tag '{name}': {e}"),
+            })?;
+    }
+    Ok(stale)
 }
 
 /// Read the first configured value among `remote.<name>.prune` and

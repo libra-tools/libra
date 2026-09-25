@@ -1593,6 +1593,8 @@ async fn clone_into_destination(
         false,
         // A fresh clone has no remote-tracking refs to prune.
         false,
+        // A fresh clone has no tags to prune.
+        false,
         // `--deps-of` needs the dependency graph to compute the closure, so it
         // implies `--notes`; a plain clone never fetches notes (Git parity).
         !args.deps_of.is_empty(),
