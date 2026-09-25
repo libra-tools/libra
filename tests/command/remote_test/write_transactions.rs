@@ -42,7 +42,7 @@ async fn test_remote_read_then_write_transactions_wait_for_existing_writer() {
             master: None,
             tags: false,
             no_tags: false,
-            mirror: false,
+            mirror: None,
         },
         &OutputConfig::default(),
     )

@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
 };
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use git_internal::hash::get_hash_kind;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
@@ -25,7 +25,7 @@ use crate::{
         protocol::{DiscRef, set_wire_hash_kind},
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, emit_json_data},
     },
 };
@@ -54,6 +54,19 @@ pub enum SetUrlMode {
     Add,
     Delete,
     Set,
+}
+
+/// Value accepted by `remote add --mirror[=MODE]`. `--mirror` may be given
+/// bare (treated as fetch+push and emitting Git's deprecation warning) or with
+/// an explicit mode. The enum only carries the explicit mode; the bare form is
+/// represented by the outer `Option` being `None` (see `Add.mirror`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteMirrorMode {
+    /// Fetch mirror: write a `+refs/*:refs/*` fetch refspec.
+    Fetch,
+    /// Push mirror: mark the remote as push-only, no fetch refspec.
+    Push,
 }
 
 impl std::fmt::Display for SetUrlMode {
@@ -85,7 +98,11 @@ EXAMPLES:
     libra remote add -t main --tags origin git@example.com:org/repo.git
                                                    Track only main and fetch all tags
     libra remote add --mirror backup git@example.com:org/repo.git
-                                                   Register a mirror remote (writes remote.<name>.mirror=true)
+                                                   Register a mirror remote (bare --mirror; also writes +refs/*:refs/*)
+    libra remote add --mirror=fetch mirror git@example.com:org/repo.git
+                                                   Register a fetch mirror (writes +refs/*:refs/*)
+    libra remote add --mirror=push mirror git@example.com:org/repo.git
+                                                   Register a push mirror (writes remote.<name>.mirror=true)
     libra remote rename origin upstream            Rename an existing remote
     libra remote remove upstream                   Drop a remote and its tracking refs
     libra remote get-url --all origin              Print every URL configured for origin
@@ -126,13 +143,20 @@ pub enum RemoteCmds {
         /// Configure `remote.<name>.tagOpt = --no-tags` (fetch no tags).
         #[clap(long = "no-tags")]
         no_tags: bool,
-        /// Mark the remote as a mirror: write the `remote.<name>.mirror=true`
-        /// marker (like Git's `remote add --mirror=fetch`). Incompatible with
-        /// `-t`/`--track`. NARROWING vs Git: the marker is informational —
-        /// Libra does not write a `+refs/*:refs/*` refspec because `libra fetch`
-        /// is not yet mirror-aware (matching `libra clone --mirror`).
-        #[clap(long = "mirror", conflicts_with = "track")]
-        mirror: bool,
+        /// Mark the remote as a mirror. Optional mode: `--mirror` (bare, emits
+        /// a deprecation warning), `--mirror=fetch`, or `--mirror=push`. A fetch
+        /// mirror writes a `+refs/*:refs/*` refspec; a push mirror writes only
+        /// the `remote.<name>.mirror=true` marker. `-t`/`--track` is allowed for
+        /// fetch mirrors but rejected for push mirrors; `-m`/`--master` is
+        /// rejected for every mirror (matching Git).
+        #[clap(
+            long = "mirror",
+            value_enum,
+            num_args(0..=1),
+            require_equals = true,
+            value_name = "MODE"
+        )]
+        mirror: Option<Option<RemoteMirrorMode>>,
     },
     /// Remove a remote
     Remove {
@@ -300,6 +324,12 @@ enum RemoteError {
     #[error("could not determine the default branch for remote '{remote}'")]
     NoRemoteHead { remote: String },
 
+    #[error("specifying a master branch makes no sense with --mirror")]
+    MirrorWithMaster,
+
+    #[error("specifying branches to track makes sense only with fetch mirrors")]
+    MirrorWithTrack,
+
     #[error(transparent)]
     Fetch(#[from] fetch::FetchError),
 }
@@ -379,6 +409,14 @@ impl From<RemoteError> for CliError {
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("the remote advertised no branches; specify a branch explicitly with 'libra remote set-head <name> <branch>'")
             }
+            RemoteError::MirrorWithMaster => CliError::fatal(
+                "specifying a master branch makes no sense with --mirror",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+            RemoteError::MirrorWithTrack => CliError::fatal(
+                "specifying branches to track makes sense only with fetch mirrors",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
             RemoteError::Fetch(source) => CliError::from(source),
         }
     }
@@ -627,7 +665,7 @@ struct AddRemoteArgs {
     master: Option<String>,
     tags: bool,
     no_tags: bool,
-    mirror: bool,
+    mirror: Option<Option<RemoteMirrorMode>>,
 }
 
 async fn run_add_remote(
@@ -657,24 +695,92 @@ async fn run_add_remote(
         .await
         .map_err(write_err)?;
 
-    // `--mirror`: record the informational `remote.<name>.mirror=true` marker
-    // (matching Git's `remote add --mirror=fetch` and `libra clone --mirror`).
-    // We deliberately do NOT write a `+refs/*:refs/*` fetch refspec: Libra's
-    // fetch is not yet mirror-aware, so the marker is informational only.
-    if mirror {
-        ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
-            .await
-            .map_err(write_err)?;
+    // Determine the mirror mode. The outer `Option` is `Some` only when
+    // `--mirror` was given; the inner `Option` carries the explicit mode
+    // (`None` means the bare `--mirror` form).
+    #[derive(Clone, Copy)]
+    enum MirrorKind {
+        Bare,
+        Fetch,
+        Push,
+    }
+    let mirror_kind = match mirror {
+        None => None,
+        Some(None) => Some(MirrorKind::Bare),
+        Some(Some(RemoteMirrorMode::Fetch)) => Some(MirrorKind::Fetch),
+        Some(Some(RemoteMirrorMode::Push)) => Some(MirrorKind::Push),
+    };
+
+    // Git parity: every `--mirror` rejects `-m`/`--master`; `-t`/`--track` is
+    // rejected only for push mirrors (bare and fetch mirrors allow it). Git
+    // emits the deprecation warning for the bare form before validating, and
+    // both combination failures are hard runtime errors (exit 128), not usage
+    // errors.
+    if let Some(kind) = mirror_kind {
+        if master.is_some() {
+            return Err(RemoteError::MirrorWithMaster);
+        }
+        if matches!(kind, MirrorKind::Push) && !track.is_empty() {
+            return Err(RemoteError::MirrorWithTrack);
+        }
+        if matches!(kind, MirrorKind::Bare) {
+            emit_warning(
+                "`--mirror` is dangerous and deprecated; please use `--mirror=fetch` or `--mirror=push` instead",
+            );
+        }
     }
 
-    // `-t <branch>`: track only the named branch(es) by writing a specific fetch
-    // refspec per branch instead of the default wildcard (same format as
-    // `remote set-branches`).
-    for branch in &track {
-        let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
-        ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
-            .await
-            .map_err(write_err)?;
+    // Write the fetch mapping.
+    //
+    //   * Non-mirror, no `-t`: the default `+refs/heads/*:refs/remotes/<name>/*`
+    //     (Git parity; previously Libra left it implicit).
+    //   * Non-mirror, `-t`: a specific refspec per branch.
+    //   * Fetch/bare mirror, no `-t`: the mirror `+refs/*:refs/*`.
+    //   * Fetch/bare mirror, `-t`: a `+refs/<branch>:refs/<branch>` spec per
+    //     branch (mirror refs mirror their source namespace).
+    //   * Push mirror: no fetch refspec, only the `mirror=true` marker below.
+    match mirror_kind {
+        Some(MirrorKind::Bare) | Some(MirrorKind::Fetch) => {
+            if track.is_empty() {
+                ConfigKv::set(&format!("remote.{name}.fetch"), "+refs/*:refs/*", false)
+                    .await
+                    .map_err(write_err)?;
+            } else {
+                for branch in &track {
+                    let spec = format!("+refs/{branch}:refs/{branch}");
+                    ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
+                        .await
+                        .map_err(write_err)?;
+                }
+            }
+            // The bare form additionally records the informational marker
+            // (Git's `--mirror=fetch` does not persist `mirror=true`).
+            if matches!(mirror_kind, Some(MirrorKind::Bare)) {
+                ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
+                    .await
+                    .map_err(write_err)?;
+            }
+        }
+        Some(MirrorKind::Push) => {
+            ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
+                .await
+                .map_err(write_err)?;
+        }
+        None => {
+            if track.is_empty() {
+                let spec = format!("+refs/heads/*:refs/remotes/{name}/*");
+                ConfigKv::set(&format!("remote.{name}.fetch"), &spec, false)
+                    .await
+                    .map_err(write_err)?;
+            } else {
+                for branch in &track {
+                    let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
+                    ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
+                        .await
+                        .map_err(write_err)?;
+                }
+            }
+        }
     }
 
     // `--tags`/`--no-tags`: record the tag-fetch preference as `remote.<name>.tagOpt`

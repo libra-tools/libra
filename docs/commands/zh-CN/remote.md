@@ -8,7 +8,7 @@
 libra remote <subcommand> [OPTIONS] [ARGS]
 libra remote show
 libra remote -v
-libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror] <name> <url>
+libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror[=fetch|push]] <name> <url>
 libra remote remove <name>
 libra remote rename <old> <new>
 libra remote get-url [--push] [--all] <name>
@@ -51,9 +51,11 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 | `<url>` | 远程的 fetch URL | `https://example.com/repo.git` |
 | `-f`, `--fetch` | 添加后立即从新远程 fetch | |
 | `-t`, `--track <branch>` | 只跟踪指定分支——写入特定的 `remote.<name>.fetch` refspec 取代默认通配。可重复。 | `-t main -t dev` |
-| `-m`, `--master <branch>` | 将远程 HEAD（`refs/remotes/<name>/HEAD`）指向 `<branch>`（即使跟踪 ref 尚不存在也会写入，与 Git 一致） | `-m main` |
+| `-m`, `--master <branch>` | 将远程 HEAD（`refs/remotes/<name>/HEAD`）指向 `<branch>`（即使跟踪 ref 尚不存在也会写入，与 Git 一致）；与任何 `--mirror` 形式互斥（exit 128） | `-m main` |
 | `--tags` / `--no-tags` | 设置 `remote.<name>.tagOpt` 为 fetch 全部/不 fetch 标签（互斥） | |
-| `--mirror` | 将远程标记为镜像——写入 `remote.<name>.mirror=true` 标记（类似 Git `remote add --mirror=fetch`）。与 `-t`/`--track` 互斥。该标记仅为信息性：Libra 不写 `+refs/*:refs/*` refspec，因为 `libra fetch` 尚不感知镜像（与 `libra clone --mirror` 一致）。 | `--mirror` |
+| `--mirror[=fetch\|push]` | 注册镜像。裸 `--mirror` 写 `+refs/*:refs/*` 与 `remote.<name>.mirror=true` 并输出弃用警告；`--mirror=fetch` 只写 `+refs/*:refs/*`；`--mirror=push` 只写 `remote.<name>.mirror=true` 标记。fetch 镜像允许 `-t`，push 镜像拒绝 `-t`（exit 128）。 | `--mirror=push` |
+
+不带 `-t` 时，`remote add` 写入默认 fetch refspec `+refs/heads/*:refs/remotes/<name>/*`（与 Git 一致）。fetch 镜像改写为 `+refs/*:refs/*`；push 镜像不写 fetch refspec，只写 `mirror=true` 标记。裸形式会附带 Git 的弃用警告，与 Git 2.55 一致。
 
 ### 子命令：`remove`
 
@@ -259,7 +261,7 @@ Git 重载 `git remote`（无子命令）列出远程名称，`git remote -v` �
 | 列出 URL | `libra remote -v` | `git remote -v` | `jj git remote list`（始终 verbose） |
 | 添加远程 | `libra remote add <n> <u>` | `git remote add <n> <u>` | `jj git remote add <n> <u>` |
 | 添加远程并 fetch | `libra remote add -f <n> <u>` | `git remote add -f <n> <u>` | N/A |
-| 添加镜像远程 | `libra remote add --mirror <n> <u>`（仅标记） | `git remote add --mirror=fetch <n> <u>` | N/A |
+| 添加镜像远程 | `libra remote add --mirror <n> <u>`（写 `+refs/*:refs/*` 与标记，并告警） | `git remote add --mirror=fetch <n> <u>` | N/A |
 | 移除远程 | `libra remote remove <n>` | `git remote remove <n>` | `jj git remote remove <n>` |
 | 重命名远程 | `libra remote rename <o> <n>` | `git remote rename <o> <n>` | `jj git remote rename <o> <n>` |
 | 获取 URL | `libra remote get-url <n>` | `git remote get-url <n>` | N/A |

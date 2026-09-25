@@ -8,7 +8,7 @@ Manage configured remotes: list, add, remove, rename, inspect and mutate URLs, a
 libra remote <subcommand> [OPTIONS] [ARGS]
 libra remote show
 libra remote -v
-libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror] <name> <url>
+libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror[=fetch|push]] <name> <url>
 libra remote remove <name>
 libra remote rename <old> <new>
 libra remote get-url [--push] [--all] <name>
@@ -72,11 +72,11 @@ Register a new remote.
 | `<url>` | Fetch URL for the remote | `https://example.com/repo.git` |
 | `-f`, `--fetch` | Fetch from the new remote immediately after adding it | |
 | `-t`, `--track <branch>` | Track only the given branch — writes a specific `remote.<name>.fetch` refspec instead of the default wildcard. Repeatable. | `-t main -t dev` |
-| `-m`, `--master <branch>` | Point the remote's HEAD (`refs/remotes/<name>/HEAD`) at `<branch>` (written even before the tracking ref exists, like Git) | `-m main` |
+| `-m`, `--master <branch>` | Point the remote's HEAD (`refs/remotes/<name>/HEAD`) at `<branch>` (written even before the tracking ref exists, like Git); rejected with every `--mirror` form | `-m main` |
 | `--tags` / `--no-tags` | Set `remote.<name>.tagOpt` to fetch all / no tags (mutually exclusive) | |
-| `--mirror` | Mark the remote as a mirror — writes the `remote.<name>.mirror=true` marker (like Git's `remote add --mirror=fetch`). Incompatible with `-t`/`--track`. | `--mirror` |
+| `--mirror[=fetch\|push]` | Register a mirror. Bare `--mirror` writes `+refs/*:refs/*` and `remote.<name>.mirror=true` and emits a deprecation warning; `--mirror=fetch` writes only `+refs/*:refs/*`; `--mirror=push` writes only the `remote.<name>.mirror=true` marker. `-t` is allowed for fetch mirrors but rejected for push mirrors (exit 128). | `--mirror=push` |
 
-The `--mirror` marker is informational: Libra does **not** write a `+refs/*:refs/*` fetch refspec because `libra fetch` is not yet mirror-aware (matching `libra clone --mirror`).
+Without `-t`, `remote add` writes the default fetch refspec `+refs/heads/*:refs/remotes/<name>/*` (Git parity). A fetch mirror writes `+refs/*:refs/*` instead; a push mirror writes no fetch refspec, only the `mirror=true` marker. Git's deprecation warning accompanies the bare form, matching Git 2.55.
 
 ### Subcommand: `remove`
 
