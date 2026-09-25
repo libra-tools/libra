@@ -179,6 +179,66 @@ fn test_cloud_sync_human_progress_json_emits_event_without_stdout_progress() {
     );
 }
 
+/// A zero batch cannot enter the object-sync loop or mark objects as synced.
+/// The CLI helper clears cloud credentials, so this also pins validation ahead
+/// of any remote preflight or D1/R2 side effect.
+#[test]
+fn test_cloud_sync_zero_batch_rejects_before_index_or_remote_write() {
+    let repo = create_committed_repo_via_cli();
+    let status_before = run_libra_command(&["--json", "cloud", "status"], repo.path());
+    assert_cli_success(&status_before, "cloud status before rejected sync failed");
+    let status_before = parse_json_stdout(&status_before);
+    assert!(
+        status_before["data"]["pending"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "committed fixture should contain unsynced objects: {status_before}"
+    );
+
+    let sync = run_libra_command(
+        &["--json=compact", "cloud", "sync", "--batch-size", "0"],
+        repo.path(),
+    );
+    assert_ne!(sync.status.code(), Some(0));
+    assert!(sync.stdout.is_empty(), "failed sync emitted success output");
+    let (human, report) = parse_cli_error_stderr(&sync.stderr);
+    assert!(
+        !human.contains("Starting cloud sync..."),
+        "rejected sync should not emit start progress: {human}"
+    );
+    assert!(
+        report.message.contains("Batch size must be at least 1"),
+        "unexpected error: {}",
+        report.message
+    );
+    assert_eq!(
+        report.details.get("operation"),
+        Some(&serde_json::json!("sync"))
+    );
+
+    let status_after = run_libra_command(&["--json", "cloud", "status"], repo.path());
+    assert_cli_success(&status_after, "cloud status after rejected sync failed");
+    let status_after = parse_json_stdout(&status_after);
+    assert_eq!(
+        status_after["data"]["repo_id"],
+        status_before["data"]["repo_id"]
+    );
+    assert_eq!(status_before["data"]["synced"], 0);
+    assert_eq!(
+        status_after["data"]["synced"], 0,
+        "rejected sync must not mark any local object as uploaded"
+    );
+    // Running CLI commands may capture additional pending Agent objects.
+    assert!(
+        status_after["data"]["pending"]
+            .as_u64()
+            .expect("pending count after rejected sync")
+            >= status_before["data"]["pending"]
+                .as_u64()
+                .expect("pending count before rejected sync")
+    );
+}
+
 /// `libra cloud --help` surfaces the EXAMPLES banner so users see the
 /// canonical invocation per sub-command (`status`, `sync`, `restore`)
 /// plus force-sync and JSON variants without reading the design doc.

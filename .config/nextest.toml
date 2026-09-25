@@ -11,6 +11,10 @@ max-threads = 1
 path = "junit.xml"
 
 [[profile.default.overrides]]
+filter = 'test(/(^|::)cloud_agent_capture_roundtrip$/)'
+test-group = 'external'
+
+[[profile.default.overrides]]
 filter = 'test(/(^|::)cloud_full_workflow_end_to_end$/)'
 test-group = 'external'
 

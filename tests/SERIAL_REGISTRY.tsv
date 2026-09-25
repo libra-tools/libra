@@ -36,6 +36,7 @@ checkpoint_restore_honours_the_fence_and_restores_the_worktree	lane:cwd+env+hash
 checkpoint_without_a_commit_cannot_be_restored	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 cherry_pick_state_roundtrip_persists_and_clears	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 chunking_large_transcript_splits_line_safe	lane:env	mutates process-wide environment via set_var/remove_var (composable env lane)
+cloud_agent_capture_roundtrip	lane:cloud_live	shares live D1/R2 catalog and object resources with other cloud tests
 cloud_full_workflow_end_to_end	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_sync_name_conflict	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_tombstone_propagates_for_agent_capture	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests

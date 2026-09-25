@@ -11,11 +11,13 @@
 //!
 //! **Layer:** Mock + error-path tests are L1. Live tests are L3 — require
 //! `--features test-live-cloud` plus `LIBRA_D1_*` and/or `LIBRA_STORAGE_*`.
-//! Most legacy live cases skip when the feature or credentials are unset; the
-//! feature-gated `cloud_live_preflight` fails on missing credentials. Run selected
-//! live cases through `tests/cloud_live_no_skip.sh` to reject silent skips.
-//! Live tests use `#[serial(cloud_live)]` to avoid shared D1/R2 collisions.
+//! Most legacy live cases skip when the feature or credentials are unset. The
+//! feature-gated `cloud_live_preflight` and `cloud_agent_capture_roundtrip`
+//! fail on missing credentials. Run selected live cases through
+//! `tests/cloud_live_no_skip.sh` and serialize shared D1/R2 access.
 
+#[cfg(feature = "test-live-cloud")]
+use std::time::{Duration, Instant};
 use std::{path::Path, process::Command, str::FromStr, sync::Arc};
 
 use git_internal::internal::object::{ObjectTrait, blob::Blob};
@@ -23,7 +25,26 @@ use libra::utils::{
     d1_client::{D1Client, D1Statement},
     storage::{Storage, local::LocalStorage, remote::RemoteStorage, tiered::TieredStorage},
 };
+#[cfg(feature = "test-live-cloud")]
+use libra::{
+    internal::{
+        ai::{
+            history::{
+                CheckpointCommitParams, CheckpointScope, HistoryManager, TracesInflightMarker,
+                clear_traces_inflight_marker_if_generation, register_traces_write_attempt,
+            },
+            observed_agents::Redactor,
+        },
+        branch::TRACES_BRANCH,
+    },
+    utils::{
+        client_storage::ClientStorage,
+        d1_client::{AgentCheckpointV2Row, AgentImportTombstoneRow, AgentSessionV2Row},
+    },
+};
 use object_store::memory::InMemory;
+#[cfg(feature = "test-live-cloud")]
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, Value};
 use serial_test::serial;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -605,6 +626,436 @@ fn init_repo() -> tempfile::TempDir {
         .unwrap();
     assert!(output.status.success());
     dir
+}
+
+#[cfg(feature = "test-live-cloud")]
+const REQUIRED_LIVE_CLOUD_ENV: [&str; 7] = [
+    "LIBRA_D1_ACCOUNT_ID",
+    "LIBRA_D1_API_TOKEN",
+    "LIBRA_D1_DATABASE_ID",
+    "LIBRA_STORAGE_ENDPOINT",
+    "LIBRA_STORAGE_BUCKET",
+    "LIBRA_STORAGE_ACCESS_KEY",
+    "LIBRA_STORAGE_SECRET_KEY",
+];
+
+#[cfg(feature = "test-live-cloud")]
+fn assert_live_cloud_env() {
+    let missing = REQUIRED_LIVE_CLOUD_ENV
+        .iter()
+        .copied()
+        .filter(|name| std::env::var(name).map_or(true, |value| value.trim().is_empty()))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "live cloud tests require nonempty D1/R2 environment variables: {}",
+        missing.join(", ")
+    );
+}
+
+#[cfg(feature = "test-live-cloud")]
+fn run_live_cloud_cli(dir: &Path, args: &[&str]) -> std::process::Output {
+    assert_live_cloud_env();
+    let home = dir.join(".home");
+    let mut command = isolated_libra_command(dir, &home);
+    command.args(args);
+    for name in REQUIRED_LIVE_CLOUD_ENV {
+        command.env(name, required_env(name));
+    }
+    command.env(
+        "LIBRA_STORAGE_REGION",
+        std::env::var("LIBRA_STORAGE_REGION")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "auto".to_string()),
+    );
+    let output = command
+        .output()
+        .expect("run isolated live cloud CLI command");
+    assert!(
+        output.status.success(),
+        "libra {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[cfg(feature = "test-live-cloud")]
+async fn connect_live_repo_db(repo: &Path) -> DatabaseConnection {
+    let db_path = repo.join(".libra/libra.db");
+    let mut options = ConnectOptions::new(format!("sqlite://{}", db_path.display()));
+    options
+        .sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(options)
+        .await
+        .expect("connect isolated live-cloud repository database")
+}
+
+#[cfg(feature = "test-live-cloud")]
+async fn seed_live_agent_session(conn: &DatabaseConnection, repo: &Path, session_id: &str) {
+    let source_fingerprint = session_id.replace('-', "").repeat(2);
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, stopped_at
+         ) VALUES (?, 'claude_code', ?, 'stopped', ?, ?, '{}', 10, 20, 30)",
+        vec![
+            Value::from(session_id),
+            Value::from(format!("provider-{session_id}")),
+            Value::from(repo.display().to_string()),
+            Value::from(serde_json::json!({"source_fingerprint": source_fingerprint}).to_string()),
+        ],
+    ))
+    .await
+    .expect("seed isolated agent session");
+}
+
+#[cfg(feature = "test-live-cloud")]
+async fn seed_live_agent_checkpoint(
+    conn: &DatabaseConnection,
+    repo: &Path,
+    session_id: &str,
+    checkpoint_id: &str,
+    created_at: i64,
+) {
+    let libra_dir = repo.join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+        libra_dir,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let redactor = Redactor::new_default();
+    let (transcript, _) = redactor.redact(format!("live catalog {checkpoint_id}").as_bytes());
+    let (metadata, _) =
+        redactor.redact(format!(r#"{{"checkpoint_id":"{checkpoint_id}"}}"#).as_bytes());
+    let (events, _) = redactor.redact(b"{}\n");
+    let (report, _) = redactor.redact(b"{}");
+    let marker = TracesInflightMarker::new(
+        session_id,
+        checkpoint_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    register_traces_write_attempt(conn, &marker, &[])
+        .await
+        .expect("register isolated checkpoint writer");
+    let written = history
+        .append_checkpoint_commit(CheckpointCommitParams {
+            checkpoint_id,
+            session_id,
+            marker_generation: marker.generation.as_deref().expect("writer generation"),
+            agent_kind: "claude_code",
+            parent_commit: None,
+            scope: CheckpointScope::Committed,
+            tool_use_id: None,
+            metadata_json: &metadata,
+            transcript_redacted: &transcript,
+            lifecycle_events_jsonl: &events,
+            redaction_report_json: &report,
+            txn_extra: None,
+            deadline: None,
+        })
+        .await
+        .expect("append real agent checkpoint commit");
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (
+            checkpoint_id, session_id, scope, parent_commit, tree_oid,
+            metadata_blob_oid, traces_commit, created_at
+         ) VALUES (?, ?, 'committed', NULL, ?, ?, ?, ?)",
+        vec![
+            Value::from(checkpoint_id),
+            Value::from(session_id),
+            Value::from(written.tree_oid.to_string()),
+            Value::from(written.metadata_blob_oid.to_string()),
+            Value::from(written.commit_hash.to_string()),
+            Value::from(created_at),
+        ],
+    ))
+    .await
+    .expect("seed real agent checkpoint catalog row");
+    clear_traces_inflight_marker_if_generation(
+        conn,
+        session_id,
+        checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
+    .expect("retire isolated checkpoint writer");
+    assert!(
+        ClientStorage::wait_for_background_tasks_until(Instant::now() + Duration::from_secs(10))
+            .await,
+        "seeded checkpoint object indexing did not finish"
+    );
+    let marker_dir = repo.join(".libra/object-index-repair");
+    let markers = match std::fs::read_dir(&marker_dir) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read seeded object-index repair markers")
+            .len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!(
+            "cannot inspect seeded object-index repair markers at {}: {error}",
+            marker_dir.display()
+        ),
+    };
+    assert_eq!(
+        markers, 0,
+        "seeded checkpoint left object-index repair markers"
+    );
+}
+
+#[cfg(feature = "test-live-cloud")]
+type LiveAgentCatalog = (
+    Vec<AgentSessionV2Row>,
+    Vec<AgentCheckpointV2Row>,
+    Vec<AgentImportTombstoneRow>,
+);
+
+#[cfg(feature = "test-live-cloud")]
+async fn live_agent_catalog(conn: &DatabaseConnection) -> LiveAgentCatalog {
+    let backend = conn.get_database_backend();
+    let sessions = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT session_id, agent_kind, provider_session_id, state, working_dir,
+                    worktree_id, parent_commit, parent_session_id, metadata_json,
+                    redaction_report, started_at, last_event_at, stopped_at,
+                    schema_version, sync_revision
+             FROM agent_session ORDER BY session_id"
+                .to_string(),
+        ))
+        .await
+        .expect("read local agent sessions")
+        .into_iter()
+        .map(|row| AgentSessionV2Row {
+            session_id: row.try_get_by("session_id").expect("session id"),
+            agent_kind: row.try_get_by("agent_kind").expect("agent kind"),
+            provider_session_id: row
+                .try_get_by("provider_session_id")
+                .expect("provider session id"),
+            state: row.try_get_by("state").expect("session state"),
+            working_dir: row.try_get_by("working_dir").expect("working directory"),
+            worktree_id: row.try_get_by("worktree_id").expect("worktree id"),
+            parent_commit: row
+                .try_get_by("parent_commit")
+                .expect("session parent commit"),
+            parent_session_id: row
+                .try_get_by("parent_session_id")
+                .expect("parent session id"),
+            metadata_json: row.try_get_by("metadata_json").expect("session metadata"),
+            redaction_report: row
+                .try_get_by("redaction_report")
+                .expect("redaction report"),
+            started_at: row.try_get_by("started_at").expect("session start time"),
+            last_event_at: row.try_get_by("last_event_at").expect("last event time"),
+            stopped_at: row.try_get_by("stopped_at").expect("session stop time"),
+            schema_version: row
+                .try_get_by("schema_version")
+                .expect("session schema version"),
+            sync_revision: row
+                .try_get_by("sync_revision")
+                .expect("session sync revision"),
+        })
+        .collect();
+    let checkpoints = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT checkpoint_id, session_id, parent_checkpoint_id, scope,
+                    parent_commit, tree_oid, metadata_blob_oid, traces_commit,
+                    tool_use_id, subagent_session_id, description, created_at,
+                    sync_revision
+             FROM agent_checkpoint ORDER BY checkpoint_id"
+                .to_string(),
+        ))
+        .await
+        .expect("read local agent checkpoints")
+        .into_iter()
+        .map(|row| AgentCheckpointV2Row {
+            checkpoint_id: row.try_get_by("checkpoint_id").expect("checkpoint id"),
+            session_id: row.try_get_by("session_id").expect("checkpoint session id"),
+            parent_checkpoint_id: row
+                .try_get_by("parent_checkpoint_id")
+                .expect("parent checkpoint id"),
+            scope: row.try_get_by("scope").expect("checkpoint scope"),
+            parent_commit: row
+                .try_get_by("parent_commit")
+                .expect("checkpoint parent commit"),
+            tree_oid: row.try_get_by("tree_oid").expect("checkpoint tree oid"),
+            metadata_blob_oid: row
+                .try_get_by("metadata_blob_oid")
+                .expect("checkpoint metadata oid"),
+            traces_commit: row.try_get_by("traces_commit").expect("traces commit"),
+            tool_use_id: row.try_get_by("tool_use_id").expect("tool use id"),
+            subagent_session_id: row
+                .try_get_by("subagent_session_id")
+                .expect("subagent session id"),
+            description: row
+                .try_get_by("description")
+                .expect("checkpoint description"),
+            created_at: row
+                .try_get_by("created_at")
+                .expect("checkpoint creation time"),
+            sync_revision: row
+                .try_get_by("sync_revision")
+                .expect("checkpoint sync revision"),
+        })
+        .collect();
+    let tombstones = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone ORDER BY agent_kind, provider_session_id"
+                .to_string(),
+        ))
+        .await
+        .expect("read local agent erasure tombstones")
+        .into_iter()
+        .map(|row| AgentImportTombstoneRow {
+            agent_kind: row.try_get_by("agent_kind").expect("tombstone agent kind"),
+            provider_session_id: row
+                .try_get_by("provider_session_id")
+                .expect("tombstone provider id"),
+            erased_session_id: row
+                .try_get_by("erased_session_id")
+                .expect("erased session id"),
+            source_fingerprint: row
+                .try_get_by("source_fingerprint")
+                .expect("tombstone fingerprint"),
+            erased_at: row.try_get_by("erased_at").expect("erasure time"),
+        })
+        .collect();
+    (sessions, checkpoints, tombstones)
+}
+
+/// Real CLI coverage for the fenced Agent Capture catalog. Two real traces
+/// checkpoint commits are mirrored through `libra cloud sync`, restored into
+/// an independent repository, and compared with the source catalog. After a
+/// local session erase, a second CLI sync and fresh CLI restore must retain
+/// the surviving session/checkpoint and the erasure fence without reviving the
+/// erased pair. UUID-scoped repository and cloud names isolate shared D1/R2.
+#[cfg(feature = "test-live-cloud")]
+#[tokio::test]
+#[serial(cloud_live)]
+async fn cloud_agent_capture_roundtrip() {
+    assert_live_cloud_env();
+    let source = init_repo();
+    let source_path = source.path();
+    let repo_id = Uuid::new_v4().to_string();
+    let cloud_name = format!("agent-catalog-live-{}", Uuid::new_v4());
+    run_live_cloud_cli(
+        source_path,
+        &["config", "--local", "user.name", "Libra Test"],
+    );
+    run_live_cloud_cli(
+        source_path,
+        &["config", "--local", "user.email", "libra@example.com"],
+    );
+    run_live_cloud_cli(
+        source_path,
+        &["config", "--local", "vault.signing", "false"],
+    );
+    run_live_cloud_cli(
+        source_path,
+        &["config", "--local", "libra.repoid", &repo_id],
+    );
+    run_live_cloud_cli(
+        source_path,
+        &["config", "--local", "cloud.name", &cloud_name],
+    );
+    std::fs::write(source_path.join("catalog.txt"), "isolated live catalog")
+        .expect("write source file");
+    run_live_cloud_cli(source_path, &["add", "catalog.txt"]);
+    run_live_cloud_cli(source_path, &["commit", "-m", "seed live agent catalog"]);
+
+    let conn = connect_live_repo_db(source_path).await;
+    let erased_session = Uuid::new_v4().to_string();
+    let retained_session = Uuid::new_v4().to_string();
+    let erased_checkpoint = Uuid::new_v4().to_string();
+    let retained_checkpoint = Uuid::new_v4().to_string();
+    seed_live_agent_session(&conn, source_path, &erased_session).await;
+    seed_live_agent_session(&conn, source_path, &retained_session).await;
+    seed_live_agent_checkpoint(&conn, source_path, &erased_session, &erased_checkpoint, 100).await;
+    seed_live_agent_checkpoint(
+        &conn,
+        source_path,
+        &retained_session,
+        &retained_checkpoint,
+        200,
+    )
+    .await;
+    let original_catalog = live_agent_catalog(&conn).await;
+    assert_eq!(original_catalog.0.len(), 2, "seeded two sessions");
+    assert_eq!(original_catalog.1.len(), 2, "seeded two checkpoints");
+    assert!(
+        original_catalog.2.is_empty(),
+        "no erasure fence before sync"
+    );
+
+    run_live_cloud_cli(source_path, &["cloud", "sync"]);
+    let first_restore = init_repo();
+    run_live_cloud_cli(
+        first_restore.path(),
+        &["cloud", "restore", "--repo-id", &repo_id],
+    );
+    let first_conn = connect_live_repo_db(first_restore.path()).await;
+    assert_eq!(
+        live_agent_catalog(&first_conn).await,
+        original_catalog,
+        "CLI restore must reproduce the session and checkpoint catalog"
+    );
+    drop(first_conn);
+    drop(first_restore);
+
+    let libra_dir = source_path.join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+        libra_dir,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let erased = history
+        .erase_session_local(&erased_session)
+        .await
+        .expect("erase one isolated local Agent session");
+    assert!(erased.session_deleted, "local session erase must complete");
+    assert_eq!(erased.removed_checkpoints, 1, "erase its checkpoint");
+    let post_erase_catalog = live_agent_catalog(&conn).await;
+    assert_eq!(post_erase_catalog.0.len(), 1, "one session survives");
+    assert_eq!(post_erase_catalog.1.len(), 1, "one checkpoint survives");
+    assert_eq!(post_erase_catalog.2.len(), 1, "one erasure fence survives");
+    let tombstone = &post_erase_catalog.2[0];
+    assert_eq!(tombstone.agent_kind, "claude_code");
+    assert_eq!(
+        tombstone.provider_session_id,
+        format!("provider-{erased_session}")
+    );
+    assert_eq!(tombstone.erased_session_id, erased_session);
+    let expected_fingerprint = erased_session.replace('-', "").repeat(2);
+    assert_eq!(
+        tombstone.source_fingerprint.as_deref(),
+        Some(expected_fingerprint.as_str())
+    );
+    assert!(tombstone.erased_at > 0, "erasure fence needs a timestamp");
+    assert_eq!(post_erase_catalog.0[0].session_id, retained_session);
+    assert_eq!(post_erase_catalog.1[0].checkpoint_id, retained_checkpoint);
+
+    run_live_cloud_cli(source_path, &["cloud", "sync"]);
+    let second_restore = init_repo();
+    run_live_cloud_cli(
+        second_restore.path(),
+        &["cloud", "restore", "--repo-id", &repo_id],
+    );
+    let second_conn = connect_live_repo_db(second_restore.path()).await;
+    assert_eq!(
+        live_agent_catalog(&second_conn).await,
+        post_erase_catalog,
+        "CLI restore must preserve the surviving catalog and erasure fence"
+    );
 }
 
 /// Scenario: store a single blob through `RemoteStorage` backed by an in-memory
