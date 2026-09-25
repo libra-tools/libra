@@ -2,7 +2,9 @@
 
 本文是 `docs/development/plan/` 下新建计划的标准模板。新计划应复制本文件结构，替换 `<...>` 占位符，并删除不适用的说明性文字；强制章节不得删除，不适用时写 `N/A` 和原因。
 
-**模板版本:** `v2.8`（2026-09-21 起生效；相对 v2.7 的规范性变更：**版本面集合改为以 `tests/compat/version_surface_sync.rs` / target `compat_version_surface_sync` 为唯一权威** —— `web/` 与 `worker/` 已在 0.23.x 拆除，当前实际版本面为三处（`Cargo.toml`、`install.sh`、`install.ps1`）；ER-04 C 组、ER-08、G-10、`Release write set` 字段与完成判据同步改用「版本面集合」表述，开工与每次 bump 前以该 target 报告的集合为准。同批删除已失效的 `LIBRA_SKIP_WEB_BUILD=1` 前缀，并补 ER-14 的环境文件提供要求。）
+**模板版本:** `v2.9`（2026-09-25 起生效；相对 v2.8 的规范性变更：ER-06/ER-06a 同卡必需文档门从 G-03 特有条目计数中排除，但逐文件写集、交付与验收仍强制；ER-06a 为干净且含无关超前提交的后端 Git `cf` 增加隔离克隆交付路径；ER-07 修正签名头与 DCO trailer 的同一提交校验命令。）
+
+**历史版本 — v2.8**（2026-09-21 起生效；相对 v2.7 的规范性变更：**版本面集合改为以 `tests/compat/version_surface_sync.rs` / target `compat_version_surface_sync` 为唯一权威** —— `web/` 与 `worker/` 已在 0.23.x 拆除，当前实际版本面为三处（`Cargo.toml`、`install.sh`、`install.ps1`）；ER-04 C 组、ER-08、G-10、`Release write set` 字段与完成判据同步改用「版本面集合」表述，开工与每次 bump 前以该 target 报告的集合为准。同批删除已失效的 `LIBRA_SKIP_WEB_BUILD=1` 前缀，并补 ER-14 的环境文件提供要求。）
 
 **历史版本 — v2.7**（2026-09-21 起生效；相对 v2.6 的规范性变更：新增 **ER-14 发布集成测试执行器** —— release 的集成测试/全量验收证据必须以 nextest 产生；`cargo test --all` 仅用于诊断，**不得**作为 release 的集成测试或通过证据。）
 
@@ -26,6 +28,7 @@
 - v2.6 的全量执行器迁移适用于尚未开工的任务卡：其 ER-13 触发门、计划完成门与重跑要求一律使用 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`。已执行卡的历史命令与结果保留为事实记录，不倒改为 nextest 结果；`cargo test --all` 不得再作为新卡或收口卡的通过替代。
 - v2.7 的 ER-14（发布集成测试执行器）自生效日起适用于一切尚未执行发布切片或收口门的计划：其 release 证据一律以 nextest 产生；已完成的 release 保留历史事实，不倒改。
 - v2.8 的版本面集合权威切换自生效日起适用于一切尚未执行 C 组的卡：其 `Release write set`、parity 预检与完成判据一律改为「以 `compat_version_surface_sync` 报告的集合为准」；已完成的 release 保留历史事实（当时五处），不倒改。
+- v2.9 的 ER-06/ER-06a 逐文件登记与 G-03 计数口径、后端 `cf` 安全交付例外、ER-07 同一提交签名/DCO 校验适用于自生效日起尚未执行的任务卡；已执行卡和历史发布的提交、文档及验收记录保持事实原状，不倒改。
 - 若某份存量计划因迁移成本暂时保留与本版冲突的口径（例如旧的 clippy 命令行、L/XL 卡），在该计划的「修订历史」登记一行例外与预期迁移时机即可。
 
 ## 使用规则
@@ -285,11 +288,13 @@
    「完成判据」的计划级门是最后一次总检查，不替代每张会推送的卡各自跑过的发布收口门。
 5. **ER-05 Codex review 闭环:** 实现和本地验收完成后进行代码 review；review 问题修复后重跑相关验收，直到 review 明确给出 PASS。P0/P1 必须关闭，不得以「residual risk 已接受」替代 PASS（仅 P2 可由具名责任人书面接受）。
 6. **ER-06 文档与兼容同步:** 涉及公开行为的任务必须同步用户文档 EN + zh、开发文档、兼容矩阵、错误码、help/examples、测试索引。
-   - **ER-06a 命令与网站文档同步（每张任务卡必判定）：** 每张卡的 `Docs and compatibility impact` 和 `Acceptance criteria` 必须明确列出受影响的命令文档，或写 `N/A` 并给出基于当前源码/用户表面的理由；不得因任务是内部实现、测试或文档卡而省略该判定。凡新增、删除或改变用户可见命令行为、参数、输出、错误、配置或示例，必须在**同一张任务卡**同步更新 `docs/commands/<cmd>.md`（EN）与 `docs/commands/zh-CN/<cmd>.md`（zh-CN），并同步更新相邻仓库 `../libra-backend/apps/tanstack-app/content/docs/` 下对应的网站文档（通常为 `commands/<cmd>.en.md`；以该仓库现有信息架构与语言文件为准）。不得用后续「补文档」卡拆开同一行为轴。
-   - **后端仓库与分支前置条件：** `libra-backend` 必须位于 Libra checkout 的同级目录，即 `../libra-backend`。在写入任何后端网站文档前，先检查其工作区与 VCS 类型：若存在 `.libra/`，使用 `cd ../libra-backend && libra status --short --branch`；若存在 `.git`（目录或文件），使用 `git -C ../libra-backend status --short --branch` 和 `git -C ../libra-backend branch --show-current`。两种元数据同时存在或两种元数据都不存在时，停止并报告，禁止猜测或写入。当前分支必须严格为 `cf`：Libra 仓库不是 `cf` 时执行 `cd ../libra-backend && libra switch cf`，Git 仓库不是 `cf` 时执行 `git -C ../libra-backend switch cf`，随后重新运行对应状态检查并记录 `cf` 证据；切换被脏工作区、缺失分支或其它状态阻止时，不得绕过、覆盖或写入，先报告。后端文档只允许在已验证的 `cf` 分支上更新。
+   - **ER-06a 命令与网站文档同步（每张任务卡必判定）：** 每张卡的 `Docs and compatibility impact` 与 `Implementation write set` 必须逐文件列出受影响的命令、网站、兼容及错误码文档，或在 `Docs and compatibility impact` 写 `N/A` 并给出基于当前源码/用户表面的理由；`Acceptance criteria` 可以引用这份逐文件清单的同卡完成门，不必重复列出每个文件。不得因任务是内部实现、测试或文档卡而省略该判定。凡新增、删除或改变用户可见命令行为、参数、输出、错误、配置或示例，必须在**同一张任务卡**同步更新 `docs/commands/<cmd>.md`（EN）与 `docs/commands/zh-CN/<cmd>.md`（zh-CN），并同步更新相邻仓库 `../libra-backend/apps/tanstack-app/content/docs/` 下对应的网站文档（通常为 `commands/<cmd>.en.md`；以该仓库现有信息架构与语言文件为准）。每个受影响文件必须有逐文件交付和验收证据；不得用后续「补文档」卡拆开同一行为轴。
+   - **ER-06/ER-06a 同卡文档门的计数：** 由本卡公开行为变更触发的必需文档与兼容同步，是所有适用卡的全局强制门；与 ER-04 的强制门一样，不计入 G-03 的任务卡特有 `Acceptance criteria` / `Verification` 条目上限。此计数口径只适用于必需同步，不豁免逐文件列写集、逐文件验收、同卡交付或本卡特有的文档语义判据；独立文档任务与本卡特有的判据仍按独立谓词计数。
+   - **后端仓库与分支前置条件：** 默认交付工作区是 Libra checkout 同级的 `../libra-backend`。在写入任何后端网站文档前，先检查其工作区与 VCS 类型：若存在 `.libra/`，使用 `cd ../libra-backend && libra status --short --branch`；若存在 `.git`（目录或文件），使用 `git -C ../libra-backend status --short --branch` 和 `git -C ../libra-backend branch --show-current`。两种元数据同时存在或两种元数据都不存在时，停止并报告，禁止猜测或写入。当前分支必须严格为 `cf`：Libra 仓库不是 `cf` 时执行 `cd ../libra-backend && libra switch cf`，Git 仓库不是 `cf` 时执行 `git -C ../libra-backend switch cf`，随后重新运行对应状态检查并记录 `cf` 证据；切换被脏工作区、缺失分支或其它状态阻止时，不得绕过、覆盖或写入，先报告。后端文档只允许在已验证的 `cf` 分支上更新。
+   - **干净但超前的 Git `cf` 安全例外：** 仅当上述检查确认相邻仓库是 Git、工作区干净、位于 `cf`，且本地 `cf` 相对远端 `cf` 含有与本卡无关、不得随本卡推送的未发布提交时，允许改用单独路径中的全新克隆；不得改写、重置、暂存、提交或推送原相邻工作区。先记录相邻仓库的 `origin` 地址（证据中遮蔽凭据）与 `git -C ../libra-backend rev-parse HEAD`；执行 `git -C ../libra-backend fetch origin cf` 刷新远端跟踪引用，再核对 `git -C ../libra-backend ls-remote origin refs/heads/cf` 返回的远端 SHA 等于 `git -C ../libra-backend rev-parse refs/remotes/origin/cf`，不等则停止；随后执行 `git -C ../libra-backend log --oneline origin/cf..cf`，确认超前提交与本卡无关。用该已验证的 `origin` 地址在单独路径执行 `git clone --branch cf --single-branch`；复核新克隆的 `origin` 地址、干净状态、分支 `cf` 与 `HEAD`，且 `HEAD` 必须等于刚记录的远端 SHA（远端已变化则停止、重新取证）。仅在新克隆修改对应网站文档，精确暂存该路径并核对 `git diff --cached --name-only`；按后端仓库 `AGENTS.md` 执行 typecheck/build 和签名要求，以 DCO 签名提交并验证提交签名及 `Signed-off-by`。推送前再次读取远端 `cf` SHA，必须仍等于克隆时的基线 SHA；确认其为本地提交祖先后，使用普通 `git push origin HEAD:refs/heads/cf`（禁止 force），再读取远端 SHA，必须等于本次提交 SHA。记录推送前后 SHA；任何检查失败均停止并报告，不得把原相邻工作区的无关提交混入交付。
 7. **ER-07 Libra-native 工作流与提交签名:** 本仓库使用 Libra 工作流：`libra status`、`libra add <相关路径>`、`libra commit -s -m "<scope>: <summary>"`、`libra push origin main`。不要把仓库当普通 Git 仓库处理。签名口径按 `AGENTS.md`「Commit & Pull Request Guidelines」执行 —— 提交需同时带 DCO 与 PGP 签名，并按仓库事实落地：`libra commit` **没有** `-S` 开关，`-s` 只添加 `Signed-off-by`；签名策略的优先级是 `--no-gpg-sign`（最高）> `commit.gpgSign`（Git 级联，`false` 直接关闭签名）> `vault.signing` 默认（为 `true` 且 vault unseal key 可用时签名），见 `src/command/commit.rs:215-224`、`src/command/history_config.rs:67-78`。因此：
    - 预检必须**先读 `commit.gpgSign`**（`libra config get commit.gpgSign`），未设置时再回退 `libra config get vault.signing`；`commit.gpgSign=false` 时不得当作「已启用签名」。
-   - 每次提交后强制校验：`libra cat-file -p HEAD | rg -q '^gpgsig'`（注意 `libra log` 不支持 `--show-signature`，没有 `verify-commit` 子命令）。校验失败不得推送。
+   - 每次提交后先用 `COMMIT_SHA="$(libra rev-parse HEAD)"` 固定一次提交 SHA，再用 `libra log -1 --pretty=raw "$COMMIT_SHA" | rg -q '^gpgsig '` 检查签名头，并用 `libra log -1 --only-trailers --trailer Signed-off-by "$COMMIT_SHA" | rg -q '^    Signed-off-by: '` 检查同一提交的 DCO trailer（`libra cat-file -p HEAD` 不输出签名头；`libra log` 不支持 `--show-signature`，也没有 `verify-commit` 子命令）。任一校验失败不得推送。
    - 只有在「字段全局默认与例外」的 waiver 表中存在 `豁免项 = ER-07 签名要求` 的 `EX-*`（含 Approver、Review round、证据、有效期）时，才允许以 sign-off-only 方式提交；「事实基线」最多链接该 `EX-*`，不构成独立授权路径。
    - **与 `AGENTS.md` 的已知漂移及优先级（必须按此执行）:** `AGENTS.md`「Commit & Pull Request Guidelines」示例写的是 `git commit -S -s`，「Workspace Notes」示例写的是 `libra commit -a -s`。两者在本仓库都不可照抄——本仓库没有 `.git`（必须用 `libra`），`libra commit` 没有 `-S`，而 `-a` 会把并发节点改动和带外删除一起提交（违反 GC-12 的精确暂存）。计划执行时**以 ER-07 + GC-12 为准**：`libra add <相关路径>` → `libra commit -s -m` →（按上两条做签名预检与提交后 `gpgsig` 校验）。该漂移应作为独立的文档修复项承接（更新 `AGENTS.md` 这两行），不得在计划执行中两套并行。
 8. **ER-08 版本与发布（每卡 patch bump + 版本面同步 + 工具链 lockfile + `gh` 发布）:** 版本权威源是 `Cargo.toml` 的 `[package].version`（形如 `MAJOR.MINOR.PATCH`）。
@@ -425,7 +430,7 @@
   - `compensating`：对外部服务已有副作用（发布、删除、远端写入），撤销靠补偿动作；必须写出补偿命令与幂等键。
   - `immutable-release`：已发布 artifact 不可撤回，只能发新版本；必须写出降级指引与兼容窗口。
 - **G-02 完整可交付（下限）:** 一张卡必须是一个自洽的可验收增量。同一行为轴的实现、测试、文档、兼容矩阵与索引同步是**同一张卡**的验收内容，禁止拆成「实现卡 / 补测试卡 / 补文档卡」。只有当被拆出的部分本身就是独立可恢复的行为轴（G-01 意义上：有单一已声明的恢复动作——独立迁移、独立 deprecation 收口、独立性能门、独立 UI 切面、跨计划移交）时才允许单独成卡。
-- **G-03 条目上限与计数口径:** 上限按 `Task type` 取值，计数按**独立判据**而非行数。ER-04 的强制门（fmt / clippy / 全量测试 / 表面门）**不计入**本条计数，`Verification` 只登记本卡特有的判据：
+- **G-03 条目上限与计数口径:** 上限按 `Task type` 取值，计数按**独立判据**而非行数。ER-04 的强制门（fmt / clippy / 全量测试 / 表面门）和 ER-06/ER-06a 由本卡公开行为变更触发的同卡必需文档同步门**不计入**本条的任务卡特有 `Acceptance criteria` / `Verification` 计数；每个受影响文件仍须在 `Docs and compatibility impact` 与 `Implementation write set` 逐文件列明并留下逐文件验收证据，独立文档任务与本卡特有的文档语义判据仍计数。`Verification` 的 G-03 计数只登记本卡特有的判据：
 
   | Task type | AC 上限 | Verification 上限 |
   |---|---|---|
@@ -581,7 +586,7 @@
 - [ ] `<用户可见或系统行为判据>`
 - [ ] `<机器输出/错误码/schema 判据>`
 - [ ] `<失败路径/边界条件判据>`
-- [ ] `<文档/兼容/索引同步判据>`
+- [ ] `<ER-06/ER-06a 同卡强制门：Docs and compatibility impact 清单中每个受影响文档均已交付并逐文件验收；不计入任务卡特有 AC 上限>`
 
 **Verification:**
 
@@ -595,13 +600,13 @@
 
 **Deliverables:** `<docs / audit / spike / handoff 卡必填：产物文件清单（G-03 的产物范围登记位置）。代码卡写 N/A 或 Inherited。>`
 
-**Implementation write set:** `<承载本卡行为的代码/测试/文档文件或目录。并发判定只看这一项：与并发在跑的卡不得相交，相交时只能补顺序边或合并到唯一集成卡>`（G-10）
+**Implementation write set:** `<承载本卡行为的代码/测试文件或目录；ER-06/ER-06a 命中的文档须逐文件列出。并发判定只看这一项：与并发在跑的卡不得相交，相交时只能补顺序边或合并到唯一集成卡>`（G-10）
 
 **Release write set:** `<Inherited（= ER-08 版本面集合（以 `compat_version_surface_sync` 为权威；当前三处）+ `Cargo.lock` + release artifact）/ N/A（family child / no-release 卡）>`（不用于实现阶段并发分组；进入发布窗口后按 G-10 的 I–R / R–R 规则串行化）
 
 **Files likely touched:** `<src/...>, <tests/...>, <docs/...>`（估计值；并发判定以 `Implementation write set` 为准）
 
-**Docs and compatibility impact:** `<每卡必填：docs/commands/<cmd>.md + docs/commands/zh-CN/<cmd>.md + ../libra-backend/apps/tanstack-app/content/docs/<对应文件>；或 N/A + 基于当前源码/用户表面的理由>`（ER-06a；后端写入前必须记录其 VCS 类型与已验证的 cf 分支）
+**Docs and compatibility impact:** `<每卡必填：逐文件列出 docs/commands/<cmd>.md、docs/commands/zh-CN/<cmd>.md、../libra-backend/apps/tanstack-app/content/docs/<对应文件> 及受影响的 COMPATIBILITY.md / docs/error-codes.md 等；或 N/A + 基于当前源码/用户表面的理由；逐文件交付验收证据>`（ER-06a；后端写入前必须记录其 VCS 类型与已验证的 cf 分支）
 
 **Rollback mode:** `<revert | forward-only | compensating | immutable-release>`（G-01）
 
@@ -621,7 +626,7 @@
 
 **Granularity:** `type=<Task type>; axis=<本卡唯一的行为轴>; recovery=<失败/撤回时的单一恢复动作与恢复后的自洽状态>; complete=<yes：实现+测试+文档+索引同步都在本卡内>; self-contained=<yes：不读其它卡正文即可执行>; AC=<n>/<上限>[@EX-ID]; VER=<n>/<上限>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|序列化于 TASK-ID>; release=<independent|batch-release child|batch-release point|family child|family release point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,EX-ID…]|N/A>`
 
-字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 的强制门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列，`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
+字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 强制门与由本卡公开行为变更触发的 ER-06/ER-06a 同卡必需文档同步门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列，`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
 
 ## 测试矩阵
 
