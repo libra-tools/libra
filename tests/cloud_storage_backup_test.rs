@@ -11,8 +11,10 @@
 //!
 //! **Layer:** Mock + error-path tests are L1. Live tests are L3 — require
 //! `--features test-live-cloud` plus `LIBRA_D1_*` and/or `LIBRA_STORAGE_*`.
-//! Skipped silently when the feature or credentials are unset. Live tests use
-//! `#[serial(cloud_live)]` to avoid trampling each other on shared D1/R2 resources.
+//! Most legacy live cases skip when the feature or credentials are unset; the
+//! feature-gated `cloud_live_preflight` fails on missing credentials. Run selected
+//! live cases through `tests/cloud_live_no_skip.sh` to reject silent skips.
+//! Live tests use `#[serial(cloud_live)]` to avoid shared D1/R2 collisions.
 
 use std::{path::Path, process::Command, str::FromStr, sync::Arc};
 
@@ -55,6 +57,437 @@ fn live_r2_tests_enabled() -> bool {
 
 fn live_cloud_tests_enabled() -> bool {
     live_d1_tests_enabled() && live_r2_tests_enabled()
+}
+
+#[cfg(feature = "test-live-cloud")]
+const CLOUD_LIVE_REQUIRED_ENV: [&str; 7] = [
+    "LIBRA_D1_ACCOUNT_ID",
+    "LIBRA_D1_API_TOKEN",
+    "LIBRA_D1_DATABASE_ID",
+    "LIBRA_STORAGE_ENDPOINT",
+    "LIBRA_STORAGE_BUCKET",
+    "LIBRA_STORAGE_ACCESS_KEY",
+    "LIBRA_STORAGE_SECRET_KEY",
+];
+
+#[cfg(feature = "test-live-cloud")]
+fn cloud_live_preflight_env() -> Result<(), String> {
+    for name in CLOUD_LIVE_REQUIRED_ENV {
+        let value =
+            std::env::var(name).map_err(|_| format!("cloud live preflight: missing {name}"))?;
+        if value.trim().is_empty() {
+            return Err(format!("cloud live preflight: empty {name}"));
+        }
+    }
+    Ok(())
+}
+
+/// Named L3 gate: run this alone before any cloud test that writes D1 or R2.
+#[cfg(feature = "test-live-cloud")]
+#[test]
+fn cloud_live_preflight() {
+    if let Err(message) = cloud_live_preflight_env() {
+        panic!("{message}");
+    }
+}
+
+#[cfg(feature = "test-live-cloud")]
+mod local_cloud_preflight_tests {
+    use std::{net::TcpListener, path::Path, process::Command};
+
+    use syn::{ExprCall, ExprMacro, ExprMethodCall, ExprStruct, ItemFn, StmtMacro, visit::Visit};
+
+    const FAKE_CLOUD_ENV: [(&str, &str); 7] = [
+        ("LIBRA_D1_ACCOUNT_ID", "fake-account"),
+        ("LIBRA_D1_API_TOKEN", "fake-token"),
+        ("LIBRA_D1_DATABASE_ID", "fake-database"),
+        ("LIBRA_STORAGE_ENDPOINT", "http://127.0.0.1:1"),
+        ("LIBRA_STORAGE_BUCKET", "fake-bucket"),
+        ("LIBRA_STORAGE_ACCESS_KEY", "fake-access"),
+        ("LIBRA_STORAGE_SECRET_KEY", "fake-secret"),
+    ];
+    const D1_REQUIRED_ENV: [&str; 3] = [
+        "LIBRA_D1_ACCOUNT_ID",
+        "LIBRA_D1_API_TOKEN",
+        "LIBRA_D1_DATABASE_ID",
+    ];
+    const R2_REQUIRED_ENV: [&str; 4] = [
+        "LIBRA_STORAGE_ENDPOINT",
+        "LIBRA_STORAGE_BUCKET",
+        "LIBRA_STORAGE_ACCESS_KEY",
+        "LIBRA_STORAGE_SECRET_KEY",
+    ];
+
+    #[derive(Clone, Copy)]
+    enum CloudVarOverride<'a> {
+        Missing(&'a str),
+        Empty(&'a str),
+    }
+
+    fn fake_environment(command: &mut Command, r2_endpoint: &str, fake_home: &Path) {
+        std::fs::create_dir_all(fake_home).expect("create fake cloud test home");
+        command.env_clear();
+        for (name, value) in FAKE_CLOUD_ENV {
+            command.env(name, value);
+        }
+        command.env("LIBRA_STORAGE_ENDPOINT", r2_endpoint);
+        command.env("HOME", fake_home);
+        command.env("USERPROFILE", fake_home);
+        command.env("XDG_CONFIG_HOME", fake_home.join(".config"));
+    }
+
+    fn preflight_child(
+        changed: Option<CloudVarOverride<'_>>,
+        endpoint: &str,
+        list_only: bool,
+    ) -> std::process::Output {
+        let isolation = tempfile::tempdir().expect("create fake preflight environment");
+        let executable = std::env::current_exe().expect("locate current test binary");
+        let mut command = Command::new(executable);
+        command.args(["--exact", "cloud_live_preflight"]);
+        if list_only {
+            command.arg("--list");
+        } else {
+            command.arg("--nocapture");
+        }
+        fake_environment(&mut command, endpoint, isolation.path());
+        command.current_dir(isolation.path());
+        match changed {
+            Some(CloudVarOverride::Missing(name)) => {
+                command.env_remove(name);
+            }
+            Some(CloudVarOverride::Empty(name)) => {
+                command.env(name, "");
+            }
+            None => {}
+        }
+        command.output().expect("run isolated cloud preflight")
+    }
+
+    fn combined_output(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    fn assert_key_failure_matrix(group: &str, names: &[&str]) {
+        assert_preflight_source_is_local();
+        let r2_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake R2 listener");
+        r2_listener
+            .set_nonblocking(true)
+            .expect("nonblocking fake R2 listener");
+        let endpoint = format!("http://{}", r2_listener.local_addr().expect("R2 address"));
+        let mut checked = 0;
+        for name in names {
+            for (kind, changed) in [
+                ("missing", CloudVarOverride::Missing(name)),
+                ("empty", CloudVarOverride::Empty(name)),
+            ] {
+                let output = preflight_child(Some(changed), &endpoint, false);
+                let text = combined_output(&output);
+                let expected_error = format!("cloud live preflight: {kind} {name}");
+                assert!(
+                    !output.status.success(),
+                    "{group} {name} {kind} must fail: {text}"
+                );
+                assert!(
+                    text.contains(&expected_error),
+                    "{group} {name} {kind} reported the wrong error: {text}"
+                );
+                assert_eq!(
+                    text.matches("cloud live preflight:").count(),
+                    1,
+                    "{group} {name} {kind} must identify only the changed key: {text}"
+                );
+                assert!(
+                    !text.contains("test result: ok."),
+                    "{group} {name} {kind}: {text}"
+                );
+                assert!(!text.to_ascii_lowercase().contains("skipped ("));
+                println!(
+                    "{group} {name} {kind} child_exit={:?} error={expected_error}",
+                    output.status.code()
+                );
+                checked += 1;
+            }
+        }
+        let network_calls = r2_listener
+            .incoming()
+            .take_while(|result| result.is_ok())
+            .count();
+        assert_eq!(network_calls, 0, "{group} preflight contacted fake R2");
+        assert_eq!(checked, names.len() * 2);
+        println!("{group} checked={checked} R2_loopback_calls={network_calls}");
+    }
+
+    #[test]
+    fn local_cloud_preflight_missing_d1_is_error() {
+        assert_key_failure_matrix("D1", &D1_REQUIRED_ENV);
+    }
+
+    #[test]
+    fn local_cloud_preflight_missing_r2_is_error() {
+        assert_key_failure_matrix("R2", &R2_REQUIRED_ENV);
+    }
+
+    #[test]
+    fn local_cloud_preflight_complete_fake_env_is_local_only() {
+        assert_preflight_source_is_local();
+        let r2_listener = TcpListener::bind("127.0.0.1:0").expect("bind fake R2 listener");
+        r2_listener
+            .set_nonblocking(true)
+            .expect("nonblocking fake R2 listener");
+
+        let r2_endpoint = format!("http://{}", r2_listener.local_addr().expect("R2 address"));
+        let feature_on_list = preflight_child(None, &r2_endpoint, true);
+        assert!(
+            feature_on_list.status.success(),
+            "feature-on list failed: {}",
+            combined_output(&feature_on_list)
+        );
+        let feature_on = preflight_child(None, &r2_endpoint, false);
+        let feature_on_text = combined_output(&feature_on);
+        assert!(
+            feature_on.status.success(),
+            "feature-on preflight failed: {feature_on_text}"
+        );
+        let selected_on = feature_on_list
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_suffix(b": test"))
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect::<Vec<_>>();
+        let exact_result = regex::Regex::new(
+            r"(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; (?P<filtered>[0-9]+) filtered out; finished in [0-9.]+s$",
+        )
+        .expect("compile exact libtest result expression");
+        let result_captures = exact_result.captures(&feature_on_text);
+        let run_pass_skip = if feature_on_text.contains("running 1 test")
+            && feature_on_text.contains("test cloud_live_preflight ... ok")
+            && result_captures.is_some()
+            && !feature_on_text.contains("skipped (set --features test-live-cloud")
+        {
+            (1, 1, 0)
+        } else {
+            (0, 0, 1)
+        };
+        // The D1 client has a fixed Cloudflare URL; the source guard above is
+        // the D1 no-client proof. This listener observes the injected R2 URL.
+        let network_calls = r2_listener
+            .incoming()
+            .take_while(|result| result.is_ok())
+            .count();
+        let observed = (selected_on, run_pass_skip, network_calls);
+        let expected = (vec!["cloud_live_preflight".to_string()], (1, 1, 0), 0);
+        let filtered_out = result_captures
+            .and_then(|capture| capture.name("filtered"))
+            .map(|value| value.as_str())
+            .unwrap_or("missing");
+        println!("preflight observed={observed:?}, libtest filtered_out={filtered_out}");
+        assert_eq!(
+            observed, expected,
+            "isolated preflight observation: {feature_on_text}"
+        );
+    }
+
+    #[derive(Default)]
+    struct PreflightCalls {
+        calls: Vec<String>,
+        methods: Vec<String>,
+        macros: Vec<String>,
+        structs: Vec<String>,
+    }
+
+    impl<'ast> Visit<'ast> for PreflightCalls {
+        fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+            if let syn::Expr::Path(path) = node.func.as_ref() {
+                self.calls.push(
+                    path.path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                );
+            } else {
+                self.calls.push("<indirect call>".to_string());
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+            self.methods.push(node.method.to_string());
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
+            self.macros.push(
+                node.mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            );
+            syn::visit::visit_expr_macro(self, node);
+        }
+
+        fn visit_stmt_macro(&mut self, node: &'ast StmtMacro) {
+            self.macros.push(
+                node.mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            );
+            syn::visit::visit_stmt_macro(self, node);
+        }
+
+        fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
+            self.structs.push(
+                node.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            );
+            syn::visit::visit_expr_struct(self, node);
+        }
+    }
+
+    fn audit_fn(
+        function: &ItemFn,
+        calls: &[&str],
+        methods: &[&str],
+        macros: &[&str],
+    ) -> Result<(), String> {
+        let mut observed = PreflightCalls::default();
+        observed.visit_block(&function.block);
+        observed.calls.sort();
+        observed.methods.sort();
+        observed.macros.sort();
+        observed.structs.sort();
+        let expected = (
+            calls
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            methods
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            macros
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+        );
+        let actual = (
+            observed.calls,
+            observed.methods,
+            observed.macros,
+            observed.structs,
+        );
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!("preflight call manifest changed: {actual:?}"))
+        }
+    }
+
+    fn assert_preflight_source_is_local() {
+        let source = include_str!("cloud_storage_backup_test.rs");
+        let file = syn::parse_file(source).expect("parse current cloud test source");
+        let find_fn = |name: &str| {
+            file.items.iter().find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+                _ => None,
+            })
+        };
+        let helper = find_fn("cloud_live_preflight_env").expect("preflight env helper exists");
+        let gate = find_fn("cloud_live_preflight").expect("preflight test exists");
+        audit_fn(
+            helper,
+            &["Err", "Ok", "std::env::var"],
+            &["is_empty", "map_err", "trim"],
+            &["format", "format"],
+        )
+        .expect("preflight env helper may only read environment");
+        audit_fn(gate, &["cloud_live_preflight_env"], &[], &["panic"])
+            .expect("preflight gate may only call env helper");
+    }
+
+    #[test]
+    fn local_cloud_preflight_has_no_remote_client_references() {
+        assert_preflight_source_is_local();
+        let source = include_str!("cloud_storage_backup_test.rs");
+        let file = syn::parse_file(source).expect("parse current cloud test source");
+        let baseline = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "cloud_live_preflight_env" => {
+                    Some(function.clone())
+                }
+                _ => None,
+            })
+            .expect("preflight env helper exists");
+        let mutants = [
+            (
+                "D1_client_constructor",
+                syn::parse_quote! {
+                    D1Client::new(account, token, database);
+                },
+                "D1Client::new",
+            ),
+            (
+                "R2_reachable_helper",
+                syn::parse_quote! {
+                    r2_storage_from_env("fake-repo");
+                },
+                "r2_storage_from_env",
+            ),
+            (
+                "direct_HTTP_send",
+                syn::parse_quote! {
+                    client.send();
+                },
+                "send",
+            ),
+        ];
+        let rejected = mutants
+            .into_iter()
+            .map(|(name, added_call, expected_sink)| {
+                let mut mutant = baseline.clone();
+                let before_return = mutant.block.stmts.len() - 1;
+                mutant.block.stmts.insert(before_return, added_call);
+                let diagnostic = audit_fn(
+                    &mutant,
+                    &["Err", "Ok", "std::env::var"],
+                    &["is_empty", "map_err", "trim"],
+                    &["format", "format"],
+                )
+                .expect_err("injected network sink must change the exact call manifest");
+                let rejected = diagnostic.contains(expected_sink);
+                println!("preflight mutant {name} rejected={rejected} sink={expected_sink}");
+                (name, rejected)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rejected,
+            vec![
+                ("D1_client_constructor", true),
+                ("R2_reachable_helper", true),
+                ("direct_HTTP_send", true),
+            ]
+        );
+    }
 }
 
 /// Read an env var or panic with a pointer to the file header for setup instructions.
