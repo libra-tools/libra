@@ -25,7 +25,8 @@ all advertised branches use the default `refs/remotes/<name>/*` mapping.
 A `<repository>` may also be an anonymous local repository spec — a `file://` URL,
 absolute path, or relative path — which fetches into `FETCH_HEAD` only (no tracking
 ref, no `remote.*` config), matching Git's unnamed-remote transport. A configured
-remote name always wins over a same-named directory.
+remote name always wins over a same-named directory. A requested remote ref that
+does not exist reports `couldn't find remote ref <name>`, matching Git.
 
 Fetch supports SSH, HTTPS, local file, Git v2 bundle files, and `git://`
 transports. A remote URL that points at a bundle is re-read on every fetch

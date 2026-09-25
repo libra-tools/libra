@@ -924,7 +924,7 @@ pub enum FetchError {
     IncompleteFetchedHistory { message: String },
     #[error("remote object format '{remote}' does not match local '{local}'")]
     ObjectFormatMismatch { remote: HashKind, local: HashKind },
-    #[error("remote branch {branch} not found in upstream {remote}")]
+    #[error("couldn't find remote ref {branch}")]
     RemoteBranchNotFound { branch: String, remote: String },
     #[error("invalid fetch refspec '{refspec}': {reason}")]
     InvalidRefspec { refspec: String, reason: String },
@@ -1738,6 +1738,12 @@ pub(crate) fn normalize_branch_ref(branch: &str) -> String {
     }
 }
 
+/// Strip a `refs/heads/` prefix for a missing-remote-ref diagnostic, matching
+/// Git's `couldn't find remote ref <name>` phrasing.
+fn short_remote_ref(branch: &str) -> &str {
+    branch.strip_prefix("refs/heads/").unwrap_or(branch)
+}
+
 fn refspec_ref_is_valid(value: &str) -> bool {
     let wildcard_count = value.matches('*').count();
     wildcard_count <= 1 && util::is_valid_refname(&value.replace('*', "wildcard"))
@@ -1938,7 +1944,7 @@ fn expand_refspec(
         });
     } else {
         return Err(FetchError::RemoteBranchNotFound {
-            branch: spec.source.clone(),
+            branch: short_remote_ref(&spec.source).to_string(),
             remote: remote.to_string(),
         });
     }
@@ -2035,7 +2041,7 @@ async fn single_branch_fetch_plans(
         .cloned()
     else {
         return Err(FetchError::RemoteBranchNotFound {
-            branch: parsed.source,
+            branch: short_remote_ref(&parsed.source).to_string(),
             remote: remote.to_string(),
         });
     };
@@ -6109,7 +6115,7 @@ mod tests {
                 remote: "origin".to_string(),
             }
             .to_string(),
-            "remote branch feature not found in upstream origin",
+            "couldn't find remote ref feature",
         );
         assert_eq!(
             FetchError::InvalidRefspec {

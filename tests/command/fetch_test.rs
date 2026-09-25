@@ -2906,3 +2906,93 @@ async fn test_fetch_negotiation_tip_accepts_commit_and_rejects_missing() {
         String::from_utf8_lossy(&missing.stderr)
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_repository_path_and_url_matrix() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // V1/V5: an anonymous local path fetches successfully and writes no tracking
+    // ref for the path (matching `git fetch <path> <branch>` FETCH_HEAD-only).
+    let out = run_libra_command(&["fetch", remote_dir.to_str().unwrap(), "main"], &repo_dir);
+    assert_cli_success(&out, "fetch <path> main");
+    let basename = remote_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        Branch::find_branch_result(&format!("refs/remotes/{basename}/main"), Some(&basename),)
+            .await
+            .expect("query tracking ref")
+            .is_none(),
+        "V1: anonymous fetch writes no refs/remotes/<name>/* tracking ref"
+    );
+    // FETCH_HEAD was written.
+    assert!(
+        repo_dir.join(".libra").join("FETCH_HEAD").exists(),
+        "V1: anonymous fetch writes FETCH_HEAD"
+    );
+
+    // V1: a `file://` URL form works the same way.
+    let file_url = format!("file://{}", remote_dir.to_str().unwrap());
+    let out2 = run_libra_command(&["fetch", file_url.as_str(), "main"], &repo_dir);
+    assert_cli_success(&out2, "fetch file://<path> main");
+
+    // V3: a non-repository path fails cleanly.
+    let missing = run_libra_command(&["fetch", "/tmp/definitely-not-a-repo", "main"], &repo_dir);
+    assert!(
+        !missing.status.success(),
+        "V3: fetching from a missing path must fail: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_missing_remote_ref_diagnostic() {
+    let (_temp, repo_dir, _branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let out = run_libra_command(&["fetch", "origin", "nosuchbranch"], &repo_dir);
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("couldn't find remote ref nosuchbranch"),
+        "M2: fetch diagnostic, got: {stderr}"
+    );
+}

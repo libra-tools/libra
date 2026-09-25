@@ -1855,3 +1855,91 @@ async fn test_pull_unrelated_histories_matrix() {
         "N2: the unrelated-histories pull produces a merge commit with two parents"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_repository_path_merges() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("remote.txt"), "remote").expect("write remote file");
+    git(&["add", "remote.txt"], &work_dir);
+    git(&["commit", "-m", "remote root"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+
+    // V2: an anonymous local-path pull merges the brought-down ref (unrelated
+    // histories, so it must be allowed explicitly).
+    let ok = run_libra_command(
+        &[
+            "pull",
+            "--allow-unrelated-histories",
+            remote_dir.to_str().unwrap(),
+            "main",
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "pull --allow-unrelated-histories <path> main");
+    let head = Head::current_commit_result()
+        .await
+        .expect("read HEAD commit")
+        .expect("HEAD should be a commit after pull");
+    let commit: Commit = load_object(&head).expect("load HEAD commit");
+    assert_eq!(
+        commit.parent_commit_ids.len(),
+        2,
+        "V2: the anonymous-path pull produces a merge commit"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_missing_remote_ref_diagnostic() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // Configure a remote pointing at a bare local repository so the fetch phase
+    // runs; requesting a nonexistent branch must stop in the fetch phase with a
+    // git-parity diagnostic rather than reaching the merge phase.
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("README.md"), "x").expect("write");
+    git(&["add", "."], &work_dir);
+    git(&["commit", "-m", "init"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+    libra::internal::config::ConfigKv::set(
+        "remote.origin.url",
+        remote_dir.to_str().unwrap(),
+        false,
+    )
+    .await
+    .expect("set remote url");
+
+    let out = run_libra_command(&["pull", "origin", "nosuchbranch"], &repo_dir);
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("couldn't find remote ref nosuchbranch"),
+        "M1: pull diagnostic, got: {stderr}"
+    );
+}

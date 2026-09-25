@@ -418,7 +418,10 @@ pub(crate) async fn run_pull(
     let fetch_result = fetch::fetch_repository_with_result(
         target.remote_config.clone(),
         Some(target.remote_branch.clone()),
-        false,
+        // `pull` integrates exactly the requested branch; a single-branch fetch
+        // errors with git-parity `couldn't find remote ref` when it is absent
+        // instead of silently fetching all refs (issues/480 HP-11).
+        true,
         args.depth,
         false,
         // `git pull` auto-follows tags (and honours remote.<name>.tagOpt).
