@@ -54,7 +54,7 @@ use crate::{
             https_client::HttpsClient,
             is_missing_shallow_capability, is_shallow_advertisement_changed,
             local_client::LocalClient,
-            set_wire_hash_kind,
+            repository_arg, set_wire_hash_kind,
             ssh_client::{SshClient, is_ssh_spec},
         },
         reflog::{HEAD, Reflog, ReflogAction, ReflogContext},
@@ -1435,6 +1435,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         });
     }
 
+    let has_repository = repository.is_some();
     let remote = match repository {
         Some(remote) => remote,
         None => match ConfigKv::get_current_remote().await {
@@ -1465,21 +1466,41 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         },
     };
 
-    let remote_config = ConfigKv::remote_config(&remote)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to read remote configuration: {error}"))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?
-        .ok_or_else(|| {
-            CliError::fatal(format!("remote '{remote}' not found"))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("use 'libra remote -v' to inspect configured remotes")
-        })?;
+    let configured_remote = ConfigKv::remote_config(&remote).await.map_err(|error| {
+        CliError::fatal(format!("failed to read remote configuration: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    // `fetch <path|file://url> <branch>`: an anonymous local-repo spec that is not
+    // a configured remote. It negotiates directly against the target, writes only
+    // `FETCH_HEAD` (no tracking ref), and records no `remote.*` config.
+    let anonymous = configured_remote.is_none()
+        && has_repository
+        && repository_arg::is_anonymous_repository_spec(&remote);
+    let remote_config = if let Some(cfg) = configured_remote {
+        cfg
+    } else if anonymous {
+        RemoteConfig {
+            name: repository_arg::anonymous_remote_name(&remote),
+            url: remote.clone(),
+        }
+    } else {
+        return Err(CliError::fatal(format!("remote '{remote}' not found"))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("use 'libra remote -v' to inspect configured remotes"));
+    };
+    // For an anonymous spec we suppress tracking-ref updates (matching
+    // `--refmap=`), so only `FETCH_HEAD` is written.
+    let effective_refmap = if anonymous && refmap.is_none() {
+        Some(String::new())
+    } else {
+        refmap
+    };
 
     if let Some(requested) = refspec.as_deref() {
         parse_fetch_refspec(requested, &remote_config.name).map_err(CliError::from)?;
-    } else {
+    } else if !effective_refmap.as_ref().is_some_and(|m| m.is_empty()) {
+        // For anonymous no-refspec fetches we do not validate a configured
+        // refset; the implicit default mapping applies.
         validate_configured_fetch_refspecs(&remote_config.name)
             .await
             .map_err(CliError::from)?;
@@ -1508,7 +1529,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         notes,
         output,
         update_head_ok,
-        refmap.as_deref(),
+        effective_refmap.as_deref(),
         &negotiation_tip,
         unshallow,
     )

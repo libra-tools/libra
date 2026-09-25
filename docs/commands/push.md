@@ -17,7 +17,7 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 remote. When invoked without arguments it pushes the current branch to its configured
 upstream remote. A configured local upstream (`branch.<name>.remote=.`) is refused
 before any network write (`LBR-CLI-003`, exit 129; Git `push` is 128 — intentional).
-Network support for local upstreams is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. When a `repository` and one or more `refspec` values are given, all
+Network support for local upstreams is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. The `repository` may be an anonymous local-path / `file://` URL spec, which is resolved as a remote and reaches the local-push target check (issues/480 HP-06). When a `repository` and one or more `refspec` values are given, all
 refspecs are validated before any network write and then sent in one receive-pack
 request. `--tags` pushes all local tags, and `--mirror` mirrors local branch/tag refs
 to the remote, including deletion of remote-only refs.

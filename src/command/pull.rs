@@ -12,6 +12,7 @@ use crate::{
     internal::{
         config::{ConfigKv, LocalIdentityTarget, RemoteConfig, read_cascaded_config_value_strict},
         head::Head,
+        protocol::repository_arg,
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -706,28 +707,25 @@ async fn resolve_pull_target(
     match (&args.repository, &args.refspec) {
         (Some(remote), Some(refspec)) => {
             let remote_branch = normalize_remote_branch_name(refspec);
-            let remote_config = ConfigKv::remote_config(remote)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| PullError::RemoteNotFound(remote.clone()))?;
+            let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            // Anonymous pulls still write a tracking ref under the sanitized
+            // single-component name; the plan's FETCH_HEAD semantic is equivalent
+            // to merging that ref (issues/480 HP-06).
+            let merge_target = format!("refs/remotes/{}/{remote_branch}", remote_config.name);
             Ok(ResolvedPullTarget {
                 branch,
                 upstream: format!("{remote}/{remote_branch}"),
-                merge_target: format!("refs/remotes/{remote}/{remote_branch}"),
+                merge_target,
                 remote_branch,
                 remote_config,
             })
         }
         (Some(remote), None) => {
-            let remote_config = ConfigKv::remote_config(remote)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| PullError::RemoteNotFound(remote.clone()))?;
+            let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            let merge_target = format!("refs/remotes/{}/{branch}", remote_config.name);
             Ok(ResolvedPullTarget {
                 upstream: format!("{remote}/{branch}"),
-                merge_target: format!("refs/remotes/{remote}/{branch}"),
+                merge_target,
                 remote_branch: branch.clone(),
                 branch,
                 remote_config,
@@ -760,6 +758,27 @@ async fn resolve_pull_target(
         }
         (None, Some(_)) => unreachable!("clap requires repository when refspec is provided"),
     }
+}
+
+/// Resolve a pull repository argument to a remote config. A configured remote
+/// wins; otherwise an anonymous local-path / URL spec yields a synthetic
+/// `RemoteConfig` (with a refname-safe single-component name), which makes the
+/// pull merge `FETCH_HEAD` instead of a tracking ref (issues/480 HP-06).
+async fn resolve_remote_config(remote: &str) -> Result<(RemoteConfig, bool), PullError> {
+    if let Some(cfg) = ConfigKv::remote_config(remote).await.ok().flatten() {
+        return Ok((cfg, false));
+    }
+    if repository_arg::is_anonymous_repository_spec(remote) {
+        let name = repository_arg::anonymous_remote_name(remote);
+        return Ok((
+            RemoteConfig {
+                name,
+                url: remote.to_string(),
+            },
+            true,
+        ));
+    }
+    Err(PullError::RemoteNotFound(remote.to_string()))
 }
 
 async fn no_tracking_error(branch: &str, rebase: bool) -> PullError {

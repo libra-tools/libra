@@ -936,12 +936,19 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     let repo_url = match ConfigKv::get_remote_url(&repository).await {
         Ok(url) => url,
         Err(_) => {
-            // Cross-Cutting F: fuzzy match for remote name suggestion
-            let suggestion = suggest_remote_name(&repository).await;
-            return Err(PushError::RemoteNotFound {
-                name: repository.clone(),
-                suggestion,
-            });
+            if crate::internal::protocol::repository_arg::is_anonymous_repository_spec(&repository)
+            {
+                // An anonymous local-path / URL remote is resolved directly;
+                // the local push target check below governs whether it is usable.
+                repository.clone()
+            } else {
+                // Cross-Cutting F: fuzzy match for remote name suggestion
+                let suggestion = suggest_remote_name(&repository).await;
+                return Err(PushError::RemoteNotFound {
+                    name: repository.clone(),
+                    suggestion,
+                });
+            }
         }
     };
 

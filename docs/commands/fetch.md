@@ -22,6 +22,11 @@ one source ref and may map it to an exact local destination (`<src>:<dst>`). Whe
 explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
 all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
+A `<repository>` may also be an anonymous local repository spec — a `file://` URL,
+absolute path, or relative path — which fetches into `FETCH_HEAD` only (no tracking
+ref, no `remote.*` config), matching Git's unnamed-remote transport. A configured
+remote name always wins over a same-named directory.
+
 Fetch supports SSH, HTTPS, local file, Git v2 bundle files, and `git://`
 transports. A remote URL that points at a bundle is re-read on every fetch
 (including `--prune` and `--dry-run`). When `remote.<name>.fetch` is

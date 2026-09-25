@@ -10,7 +10,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 ## Description
 
-`libra pull` combines `fetch` and the same merge engine used by `libra merge`. It downloads new objects, updates remote-tracking refs, and then integrates the selected upstream into the current branch. A remote URL that points at a Git v2 bundle is re-read on every pull, so replacing the bundle file can fast-forward the current branch.
+`libra pull` combines `fetch` and the same merge engine used by `libra merge`. It downloads new objects, updates remote-tracking refs, and then integrates the selected upstream into the current branch. A remote URL that points at a Git v2 bundle is re-read on every pull, so replacing the bundle file can fast-forward the current branch. The `<repository>` may be an anonymous local-path / `file://` URL spec, which is resolved as an unnamed remote and merges the brought-down ref (issues/480 HP-06).
 
 With `--rebase` (`-r`), the integration step instead replays local-only commits on top of the fetched upstream tip. This is equivalent to `libra fetch` followed by `libra rebase <upstream>`.
 
