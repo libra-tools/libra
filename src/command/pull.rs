@@ -425,6 +425,8 @@ pub(crate) async fn run_pull(
         &child_output,
         false,
         None,
+        &[],
+        false,
     )
     .await
     .map_err(PullError::Fetch)?;

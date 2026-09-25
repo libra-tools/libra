@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 | `<refspec>` | 源引用或精确 `<src>:<dst>` 映射。需要 `<repository>`。省略时使用 `remote.<name>.fetch`，再回退为所有远程分支。 | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
 | `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。网络 Git（`git://`）、HTTP(S) 和 SSH 服务端须通告 `shallow` 能力；进程内本地 Git 路径无需能力通告也支持 `--depth`。本地 Libra 远程以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra fetch origin --depth 1` |
+| `--unshallow` | 将浅仓库转换为完整仓库：抓取完整历史并删除浅边界记录。没有浅历史的仓库会报错，本地 Libra 源被拒绝（D20）。 | `libra fetch --unshallow origin main` |
+| `--negotiation-tip <commit>` | 把协商 `have` 集限制为从给定提交或 ref 可达的提交（可重复）。本地传输同样生效（以限定集计算可达对象差集）。缺失/无法解析的 tip 会报错。 | `libra fetch --negotiation-tip <oid> origin main` |
 | `--tags` | 从远程获取每个标签到本地 `refs/tags/*`（覆盖默认的 auto-follow 和 `remote.<name>.tagOpt`）。 | `libra fetch origin --tags` |
 | `--no-tags` | 完全不获取标签，连从已获取提交可达的标签也不获取（覆盖默认的 auto-follow）。 | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | fetch 后不运行 repack/gc。为对齐 Git 而接受的 no-op：Libra 的 fetch 从不触发自动 gc，故无可禁用。 | `libra fetch origin --no-auto-gc` |

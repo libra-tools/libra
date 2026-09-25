@@ -1883,6 +1883,8 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         refmap: None,
         atomic: false,
         prune_tags: false,
+        negotiation_tip: vec![],
+        unshallow: false,
         no_auto_gc: false,
         no_progress: true,
         prune,
@@ -2768,5 +2770,139 @@ async fn test_fetch_atomic_all_or_nothing_on_non_fast_forward() {
         !out.status.success(),
         "non-fast-forward fetch without force must fail: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_unshallow_from_local_git_source() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    for (i, name) in ["c1", "c2", "c3"].iter().enumerate() {
+        fs::write(work_dir.join(format!("{name}.txt")), name).expect("write");
+        git(&["add", "."], Some(&work_dir));
+        git(&["commit", "-m", name], Some(&work_dir));
+        if i == 0 {
+            git(&["branch", "-M", "main"], Some(&work_dir));
+        }
+    }
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+
+    // Shallow fetch: `--depth 1` records a shallow boundary.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--depth", "1", "origin", "main"], &repo_dir),
+        "fetch --depth 1 origin main",
+    );
+    assert!(
+        !libra::internal::shallow::boundary_oids()
+            .expect("read shallow boundaries")
+            .is_empty(),
+        "G2: --depth 1 records a shallow boundary"
+    );
+
+    // `--unshallow` completes the history and clears the shallow records.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--unshallow", "origin", "main"], &repo_dir),
+        "fetch --unshallow origin main",
+    );
+    assert!(
+        libra::internal::shallow::boundary_oids()
+            .expect("read shallow boundaries")
+            .is_empty(),
+        "G2: --unshallow clears the shallow boundary records"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_unshallow_non_shallow_errors() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // A repository without shallow history refuses `--unshallow`.
+    let out = run_libra_command(
+        &["fetch", "--unshallow", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "G3: --unshallow on a non-shallow repo must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("shallow"),
+        "G3: error should mention shallow"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_negotiation_tip_accepts_commit_and_rejects_missing() {
+    let (_temp, repo_dir, current_branch, oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    // Establish a tracking ref / local commit so a negotiation-tip can resolve.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+
+    // A commit-hash tip is accepted (have-set narrowing is an optimization).
+    let ok = run_libra_command(
+        &[
+            "fetch",
+            "--negotiation-tip",
+            oid.as_str(),
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "fetch --negotiation-tip <oid> origin <branch>");
+
+    // A missing tip errors.
+    let missing = run_libra_command(
+        &[
+            "fetch",
+            "--negotiation-tip",
+            "0000000000000000000000000000000000000000",
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert!(
+        !missing.status.success(),
+        "G1: an unresolvable --negotiation-tip must fail: {}",
+        String::from_utf8_lossy(&missing.stderr)
     );
 }

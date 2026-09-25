@@ -1601,6 +1601,8 @@ async fn clone_into_destination(
         &child_output,
         false,
         None,
+        &[],
+        false,
     )
     .await
     .map_err(|source| CloneError::FetchFailed { source })?;

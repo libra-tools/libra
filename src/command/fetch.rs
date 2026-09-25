@@ -707,6 +707,18 @@ pub struct FetchArgs {
     #[clap(long = "prune-tags", short = 'P')]
     pub prune_tags: bool,
 
+    /// Restrict the negotiation `have` set to commits reachable from the given
+    /// commit or ref (repeatable). Avoids sending irrelevant have refs; the
+    /// local transport computes the object difference from the narrowed set.
+    #[clap(long = "negotiation-tip", value_name = "COMMIT")]
+    pub negotiation_tip: Vec<String>,
+
+    /// Convert a shallow repository to a complete one: fetch the full history
+    /// and drop the shallow boundary records. A local Libra source is refused
+    /// (D20); a repository without shallow history errors (Git parity).
+    #[clap(long = "unshallow")]
+    pub unshallow: bool,
+
     /// Do not fetch any tags (not even tags reachable from fetched commits).
     /// Overrides the default auto-follow and an earlier `--tags`.
     #[clap(long = "no-tags", overrides_with = "tags")]
@@ -1326,6 +1338,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         refmap,
         atomic: _,
         prune_tags,
+        negotiation_tip,
+        unshallow,
         no_auto_gc: _,
         no_progress,
         prune,
@@ -1404,6 +1418,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 output,
                 update_head_ok,
                 refmap.as_deref(),
+                &negotiation_tip,
+                unshallow,
                 &results,
             )
             .await
@@ -1493,6 +1509,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         output,
         update_head_ok,
         refmap.as_deref(),
+        &negotiation_tip,
+        unshallow,
     )
     .await
     .map_err(CliError::from)?;
@@ -2144,6 +2162,8 @@ pub async fn fetch_repository_safe(
         output,
         false,
         None,
+        &[],
+        false,
     )
     .await
     .map(|result| {
@@ -2170,6 +2190,8 @@ pub(crate) async fn fetch_repository_with_result(
     output: &OutputConfig,
     update_head_ok: bool,
     refmap: Option<&str>,
+    negotiation_tip: &[String],
+    unshallow: bool,
 ) -> Result<FetchRepositoryResult, FetchError> {
     fetch_repository_with_result_reusing(
         remote_config,
@@ -2185,6 +2207,8 @@ pub(crate) async fn fetch_repository_with_result(
         output,
         update_head_ok,
         refmap,
+        negotiation_tip,
+        unshallow,
         &[],
     )
     .await
@@ -2205,6 +2229,8 @@ async fn fetch_repository_with_result_reusing(
     output: &OutputConfig,
     update_head_ok: bool,
     refmap: Option<&str>,
+    negotiation_tip: &[String],
+    unshallow: bool,
     prior_results: &[FetchRepositoryResult],
 ) -> Result<FetchRepositoryResult, FetchError> {
     if single_branch {
@@ -2220,7 +2246,7 @@ async fn fetch_repository_with_result_reusing(
     // prevent secret leakage in both human and JSON output.
     let normalized_url =
         redact_url_credentials(&normalize_remote_url(&remote_config.url, &remote_client));
-    if depth.is_some()
+    if (depth.is_some() || unshallow)
         && matches!(&remote_client, RemoteClient::Local(client) if client.is_libra_source())
     {
         return Err(FetchError::UnsupportedShallowLocalLibra);
@@ -2412,14 +2438,24 @@ async fn fetch_repository_with_result_reusing(
     want.sort();
     want.dedup();
     let have = current_have_safe(discovery.hash_kind).await?;
+    let have = narrow_have_by_negotiation_tips(have, negotiation_tip, discovery.hash_kind).await?;
     let shallow_boundaries = read_shallow_boundaries_for_kind(discovery.hash_kind)?;
+    // `--unshallow` requests the complete history: force a full (unlimited)
+    // depth, and refuse when the repository is not actually shallow.
+    if unshallow && shallow_boundaries.is_empty() {
+        return Err(FetchError::LocalState {
+            message: "--unshallow requires a shallow repository; no shallow history is recorded"
+                .to_string(),
+        });
+    }
+    let effective_depth = if unshallow { None } else { depth };
     let shallow = shallow_boundaries.iter().cloned().collect::<Vec<_>>();
     let mut result_stream = remote_client
         .fetch_objects(
             &have,
             &want,
             &shallow,
-            depth,
+            effective_depth,
             &discovery.capabilities,
             &discovery.shallow_boundaries,
         )
@@ -2591,7 +2627,10 @@ async fn fetch_repository_with_result_reusing(
             discovery.hash_kind,
         )?;
     }
-    if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
+    if unshallow {
+        // `--unshallow` drops the shallow boundary records entirely.
+        write_shallow_boundaries(&BTreeSet::new())?;
+    } else if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
         write_shallow_boundaries(&final_boundaries)?;
     }
 
@@ -4971,6 +5010,72 @@ const HAVE_HISTORY_LIMIT: usize = 256;
 /// Maximum chain length when peeling a (possibly tag-of-tag) annotated tag to
 /// its target while building the `have` set. Bounds runaway/cyclic tag chains.
 const MAX_TAG_PEEL_DEPTH: usize = 32;
+
+/// Restrict a computed `have` set to commits reachable from the given
+/// `--negotiation-tip` commits/refs (Git parity). Resolves each tip to a
+/// commit, walks its ancestors (bounded by `HAVE_HISTORY_LIMIT`), and returns
+/// only the `have` entries that are in that reachable set. A missing/unusable
+/// tip is an error; an empty tip set returns `have` unchanged.
+async fn narrow_have_by_negotiation_tips(
+    have: Vec<String>,
+    tips: &[String],
+    hash_kind: HashKind,
+) -> Result<Vec<String>, FetchError> {
+    if tips.is_empty() {
+        return Ok(have);
+    }
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    for tip in tips {
+        let oid = resolve_negotiation_tip(tip, hash_kind).await?;
+        if reachable.insert(oid.to_string()) {
+            queue.push_back(oid);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        if queue.len() > HAVE_HISTORY_LIMIT * 4 {
+            break;
+        }
+        let commit: Commit = load_object(&oid).map_err(|source| FetchError::LocalState {
+            message: format!(
+                "failed to load commit '{oid}' while narrowing --negotiation-tip: {source}"
+            ),
+        })?;
+        for parent in &commit.parent_commit_ids {
+            if reachable.insert(parent.to_string()) {
+                queue.push_back(*parent);
+            }
+        }
+    }
+    Ok(have.into_iter().filter(|h| reachable.contains(h)).collect())
+}
+
+/// Resolve a `--negotiation-tip` argument to a commit object id. Accepts a raw
+/// object id, a full/abbreviated ref, or a branch name. Errors when the tip
+/// cannot be resolved to a local commit.
+async fn resolve_negotiation_tip(
+    tip: &str,
+    _hash_kind: HashKind,
+) -> Result<ObjectHash, FetchError> {
+    // Try as a full object id first.
+    if let Ok(oid) = ObjectHash::from_str(tip) {
+        return Ok(oid);
+    }
+    // Try as a ref (full or branch short name).
+    let ref_candidates = [
+        tip.to_string(),
+        format!("refs/heads/{tip}"),
+        format!("refs/tags/{tip}"),
+    ];
+    for candidate in ref_candidates {
+        if let Ok(Some(branch)) = Branch::find_branch_result(&candidate, None).await {
+            return Ok(branch.commit);
+        }
+    }
+    Err(FetchError::LocalState {
+        message: format!("--negotiation-tip '{tip}' does not resolve to a local commit"),
+    })
+}
 
 async fn current_have_safe(hash_kind: HashKind) -> Result<Vec<String>, FetchError> {
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
