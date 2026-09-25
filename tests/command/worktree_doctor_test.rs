@@ -829,14 +829,12 @@ async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision()
 /// promise recovery as a side effect.
 #[test]
 fn worktree_doctor_hints_are_inspect_only() {
-    const SOURCES: [(&str, &str); 2] = [
-        (
-            "workspace.rs",
-            include_str!("../../src/internal/workspace.rs"),
-        ),
-        ("worktree.rs", include_str!("../../src/command/worktree.rs")),
-    ];
-    for (name, source) in SOURCES {
+    let mut sources = super::worktree_test::worktree_production_sources();
+    sources.push((
+        Path::new("src/internal/workspace.rs").to_path_buf(),
+        include_str!("../../src/internal/workspace.rs").to_owned(),
+    ));
+    for (name, source) in sources {
         for (index, line) in source.lines().enumerate() {
             if !line.contains("worktree doctor") {
                 continue;
@@ -868,8 +866,9 @@ fn worktree_doctor_hints_are_inspect_only() {
             for forbidden in ["reclaim", "adopt", "release"] {
                 assert!(
                     !line.contains(forbidden),
-                    "{name}:{} promises a `{forbidden}` action the bare `worktree doctor` \
+                    "{}:{} promises a `{forbidden}` action the bare `worktree doctor` \
                      cannot perform: {line}",
+                    name.display(),
                     index + 1
                 );
             }
@@ -906,18 +905,20 @@ fn worktree_repair_guidance_requires_confirmation() {
         );
     }
 
-    let source = include_str!("../../src/command/worktree.rs");
-    for stale_instruction in [
-        "`libra worktree repair` to heal it",
-        "`libra worktree repair` first",
-        "`libra worktree repair` retries it",
-        "`worktree repair --migrate-layout` from the MAIN worktree",
-        "rerun `worktree repair`",
-    ] {
-        assert!(
-            !source.contains(stale_instruction),
-            "worktree diagnostic still recommends a command that will be refused: {stale_instruction}"
-        );
+    for (path, source) in super::worktree_test::worktree_production_sources() {
+        for stale_instruction in [
+            "`libra worktree repair` to heal it",
+            "`libra worktree repair` first",
+            "`libra worktree repair` retries it",
+            "`worktree repair --migrate-layout` from the MAIN worktree",
+            "rerun `worktree repair`",
+        ] {
+            assert!(
+                !source.contains(stale_instruction),
+                "{} still recommends a command that will be refused: {stale_instruction}",
+                path.display()
+            );
+        }
     }
 }
 

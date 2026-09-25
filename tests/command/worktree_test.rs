@@ -2,9 +2,12 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use libra::{
@@ -20,12 +23,61 @@ use tempfile::tempdir;
 
 use super::*;
 
+/// Include the facade and every worktree implementation module in source guards.
+/// Discover files at test time so later splits cannot silently evade the guards.
+pub(super) fn worktree_production_sources() -> Vec<(PathBuf, String)> {
+    fn collect_rust_sources(dir: &Path, paths: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("read worktree source directory {}: {error}", dir.display())
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("read worktree source entry in {}: {error}", dir.display())
+            });
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap_or_else(|error| {
+                panic!("inspect worktree source {}: {error}", path.display())
+            });
+            if file_type.is_dir() {
+                collect_rust_sources(&path, paths);
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+
+    let command_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/command");
+    let mut paths = vec![command_dir.join("worktree.rs")];
+    collect_rust_sources(&command_dir.join("worktree"), &mut paths);
+    assert!(paths.len() > 1, "worktree source modules must be scanned");
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read worktree source {}: {error}", path.display()));
+            (path, source)
+        })
+        .collect()
+}
+
 #[test]
 fn test_worktree_move_cross_device_error_is_portable() {
-    let source = include_str!("../../src/command/worktree.rs");
-    let compact: String = source.split_whitespace().collect();
-    assert!(compact.contains("error.kind()!=io::ErrorKind::CrossesDevices"));
-    assert!(!source.contains("libc::EXDEV"));
+    let sources = worktree_production_sources();
+    assert!(
+        sources.iter().any(|(_, source)| {
+            let compact: String = source.split_whitespace().collect();
+            compact.contains("error.kind()!=io::ErrorKind::CrossesDevices")
+        }),
+        "worktree move must check io::ErrorKind::CrossesDevices"
+    );
+    for (path, source) in &sources {
+        assert!(
+            !source.contains("libc::EXDEV"),
+            "{} uses platform-specific libc::EXDEV",
+            path.display()
+        );
+    }
     #[cfg(unix)]
     let raw_error = libc::EXDEV;
     #[cfg(windows)]
