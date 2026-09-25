@@ -142,21 +142,6 @@ impl Head {
         message.contains("database is locked") || message.contains("database schema is locked")
     }
 
-    /// This scope's HEAD row, or `Ok(None)` when it genuinely has none yet.
-    ///
-    /// The distinction matters at the WRITE seam: an absent row means
-    /// "insert", while a corrupt or AMBIGUOUS one (two rows for one scope)
-    /// must abort. Collapsing them — as `Err(Corrupt) => None` did — turned
-    /// an ambiguous scope into a third row.
-    async fn query_local_head_optional_with_conn<C>(
-        db: &C,
-    ) -> Result<Option<reference::Model>, BranchStoreError>
-    where
-        C: ConnectionTrait,
-    {
-        Self::query_local_head_rows_with_conn(db).await
-    }
-
     /// This scope's HEAD row, or an actionable error when it has none.
     ///
     /// W0 §C.4.1/C.13: for a linked worktree whose identity the registry does
@@ -525,6 +510,22 @@ impl Head {
     where
         C: ConnectionTrait,
     {
+        let scope = WorktreeScope::current();
+        Self::update_for_scope_result_with_conn(db, new_head, remote, &scope).await
+    }
+
+    /// Write a local HEAD for an explicitly pinned worktree. Restore has a
+    /// pinned request even when its caller's cwd belongs to another worktree.
+    /// The existing `update_result_with_conn` keeps its ambient-cwd contract.
+    pub(crate) async fn update_for_scope_result_with_conn<C>(
+        db: &C,
+        new_head: Self,
+        remote: Option<&str>,
+        scope: &WorktreeScope,
+    ) -> Result<(), BranchStoreError>
+    where
+        C: ConnectionTrait,
+    {
         // §C.4.4: attaching THIS worktree's HEAD to a branch another worktree
         // already has checked out creates the duplicate checkout Libra
         // categorically refuses. The check lives at the seam, on the caller's
@@ -534,10 +535,13 @@ impl Head {
         // for the other worktree to attach in between.
         if remote.is_none()
             && let Head::Branch(branch_name) = &new_head
-            && let Some(other) =
-                Self::branch_checked_out_elsewhere_result_with_conn(db, branch_name)
-                    .await
-                    .map_err(|error| BranchStoreError::Query(error.to_string()))?
+            && let Some(other) = Self::branch_checked_out_elsewhere_for_scope_result_with_conn(
+                db,
+                branch_name,
+                scope,
+            )
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?
         {
             return Err(BranchStoreError::CheckedOutElsewhere {
                 name: branch_name.clone(),
@@ -556,7 +560,7 @@ impl Head {
                 // `Corrupt` here turned "this scope has two HEAD rows and I
                 // cannot tell which is yours" into "you have none", and
                 // inserted a third.
-                None => match Self::query_local_head_optional_with_conn(db).await {
+                None => match Self::query_local_head_rows_for_scope_with_conn(db, scope).await {
                     Ok(model) => model,
                     Err(e) => return Err(e),
                 },
@@ -592,7 +596,7 @@ impl Head {
                         // lore.md 2.1: a NEW local HEAD row is tagged with the
                         // current worktree id (NULL for main) so it is private
                         // to this worktree.
-                        head.worktree_id = Set(crate::utils::util::current_worktree_id());
+                        head.worktree_id = Set(scope.worktree_id().map(str::to_string));
                     }
                     match &new_head {
                         Head::Detached(commit_hash) => {
@@ -686,7 +690,21 @@ impl Head {
     where
         C: ConnectionTrait,
     {
-        let current = crate::utils::util::current_worktree_id();
+        let scope = WorktreeScope::current();
+        Self::branch_checked_out_elsewhere_for_scope_result_with_conn(db, branch, &scope).await
+    }
+
+    /// Fail-closed branch occupancy check relative to one explicitly pinned
+    /// worktree. Recovery must not infer its scope from the caller's cwd.
+    pub(crate) async fn branch_checked_out_elsewhere_for_scope_result_with_conn<C>(
+        db: &C,
+        branch: &str,
+        scope: &WorktreeScope,
+    ) -> Result<Option<String>, sea_orm::DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let current = scope.worktree_id().map(str::to_string);
         let rows = reference::Entity::find()
             .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
             .filter(reference::Column::Remote.is_null())
@@ -943,5 +961,279 @@ mod tests {
         reference::Entity::insert(row).exec(&db).await.unwrap();
 
         let _ = Head::remote_current_with_conn(&db, remote).await;
+    }
+
+    #[tokio::test]
+    async fn head_scoped_and_ambient_api_routes_are_distinct() {
+        const CHILD_MARKER: &str = "LIBRA_FIX_CM01_HEAD_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let cwd = tempdir().expect("non-repository child cwd");
+            let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("internal::head::tests::head_scoped_and_ambient_api_routes_are_distinct")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .current_dir(cwd.path())
+                .output()
+                .expect("isolated Head scope child");
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(
+                stdout.contains("running 1 test")
+                    && stdout.contains(
+                        "test internal::head::tests::head_scoped_and_ambient_api_routes_are_distinct"
+                    ),
+                "the scoped Head child must run exactly once; stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                child.status.success(),
+                "scoped Head child failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        assert_eq!(WorktreeScope::current(), WorktreeScope::Main);
+        let directory = tempdir().expect("Head database fixture");
+        let database_path = directory.path().join("head.db");
+        let db = crate::internal::db::create_database(
+            database_path.to_str().expect("database path is UTF-8"),
+        )
+        .await
+        .expect("Head database");
+        for (branch, worktree_id) in [("main", None), ("topic", Some("target"))] {
+            reference::ActiveModel {
+                kind: Set(reference::ConfigKind::Head),
+                name: Set(Some(branch.to_string())),
+                remote: Set(None),
+                worktree_id: Set(worktree_id.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .expect("fixture HEAD row");
+        }
+        let target = WorktreeScope::Linked("target".to_string());
+
+        assert_eq!(
+            Head::branch_checked_out_elsewhere_for_scope_result_with_conn(&db, "main", &target)
+                .await
+                .expect("scoped main occupancy"),
+            Some("(main)".to_string())
+        );
+        assert_eq!(
+            Head::branch_checked_out_elsewhere_for_scope_result_with_conn(&db, "topic", &target)
+                .await
+                .expect("scoped own occupancy"),
+            None
+        );
+        assert_eq!(
+            Head::branch_checked_out_elsewhere_result_with_conn(&db, "main")
+                .await
+                .expect("ambient main occupancy"),
+            None
+        );
+        assert_eq!(
+            Head::branch_checked_out_elsewhere_result_with_conn(&db, "topic")
+                .await
+                .expect("ambient linked occupancy"),
+            Some("target".to_string())
+        );
+
+        let scoped_error = Head::update_for_scope_result_with_conn(
+            &db,
+            Head::Branch("main".to_string()),
+            None,
+            &target,
+        )
+        .await
+        .expect_err("target must not attach a branch owned by main");
+        assert!(matches!(
+            scoped_error,
+            BranchStoreError::CheckedOutElsewhere { name, worktree }
+                if name == "main" && worktree == "(main)"
+        ));
+        let ambient_error =
+            Head::update_result_with_conn(&db, Head::Branch("topic".to_string()), None)
+                .await
+                .expect_err("ambient main must not attach target's branch");
+        assert!(matches!(
+            ambient_error,
+            BranchStoreError::CheckedOutElsewhere { name, worktree }
+                if name == "topic" && worktree == "target"
+        ));
+
+        Head::update_for_scope_result_with_conn(
+            &db,
+            Head::Branch("topic".to_string()),
+            None,
+            &target,
+        )
+        .await
+        .expect("target may retain its own branch");
+        let target_oid = ObjectHash::from_str(&"1".repeat(40)).expect("target oid");
+        let main_oid = ObjectHash::from_str(&"2".repeat(40)).expect("main oid");
+        Head::update_for_scope_result_with_conn(&db, Head::Detached(target_oid), None, &target)
+            .await
+            .expect("update only target HEAD");
+        let main_head = Head::current_for_scope_result_with_conn(&db, &WorktreeScope::Main)
+            .await
+            .expect("main HEAD after scoped update");
+        assert!(matches!(main_head, Head::Branch(name) if name == "main"));
+        let target_head = Head::current_for_scope_result_with_conn(&db, &target)
+            .await
+            .expect("target HEAD after scoped update");
+        assert!(matches!(target_head, Head::Detached(oid) if oid == target_oid));
+
+        Head::update_result_with_conn(&db, Head::Detached(main_oid), None)
+            .await
+            .expect("ambient update changes only main HEAD");
+        let main_head = Head::current_for_scope_result_with_conn(&db, &WorktreeScope::Main)
+            .await
+            .expect("main HEAD after ambient update");
+        assert!(matches!(main_head, Head::Detached(oid) if oid == main_oid));
+        let target_head = Head::current_for_scope_result_with_conn(&db, &target)
+            .await
+            .expect("target HEAD after ambient update");
+        assert!(matches!(target_head, Head::Detached(oid) if oid == target_oid));
+
+        let inserted = WorktreeScope::Linked("new-linked".to_string());
+        Head::update_for_scope_result_with_conn(
+            &db,
+            Head::Branch("fresh".to_string()),
+            None,
+            &inserted,
+        )
+        .await
+        .expect("insert HEAD for explicit linked scope");
+        let inserted_head = Head::current_for_scope_result_with_conn(&db, &inserted)
+            .await
+            .expect("inserted linked HEAD");
+        assert!(matches!(inserted_head, Head::Branch(name) if name == "fresh"));
+    }
+
+    #[tokio::test]
+    async fn head_scoped_insert_main_row_from_linked_ambient() {
+        const CHILD_DATABASE: &str = "LIBRA_FIX_CM01_INSERT_MAIN_DB";
+        if let Some(database_path) = std::env::var_os(CHILD_DATABASE) {
+            let ambient = WorktreeScope::current();
+            assert_eq!(ambient, WorktreeScope::Linked("ambient-linked".to_string()));
+            let database_path = std::path::PathBuf::from(database_path);
+            let db = crate::internal::db::get_db_conn_instance_for_path(&database_path)
+                .await
+                .expect("main database from linked cwd");
+            assert!(
+                Head::query_local_head_rows_for_scope_with_conn(&db, &WorktreeScope::Main)
+                    .await
+                    .expect("missing main HEAD query")
+                    .is_none(),
+                "the main HEAD must be absent before the scoped insert"
+            );
+            Head::update_for_scope_result_with_conn(
+                &db,
+                Head::Branch("new-main".to_string()),
+                None,
+                &WorktreeScope::Main,
+            )
+            .await
+            .expect("insert pinned main HEAD");
+            let rows = reference::Entity::find()
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+                .filter(reference::Column::Remote.is_null())
+                .all(&db)
+                .await
+                .expect("persisted HEAD rows");
+            assert_eq!(rows.len(), 1, "the insert must create exactly one HEAD row");
+            assert_eq!(rows[0].name.as_deref(), Some("new-main"));
+            assert_eq!(
+                rows[0].worktree_id, None,
+                "pinned main must persist worktree_id=NULL, not the linked cwd id"
+            );
+            assert!(
+                Head::query_local_head_rows_for_scope_with_conn(&db, &ambient)
+                    .await
+                    .expect("ambient linked HEAD query")
+                    .is_none(),
+                "the ambient linked worktree must not receive a HEAD row"
+            );
+            println!("scoped main INSERT from ambient linked cwd persisted NULL worktree_id");
+            return;
+        }
+
+        let fixture = tempdir().expect("isolated linked worktree fixture");
+        let main_gitdir = fixture.path().join("main").join(".libra");
+        let linked = fixture.path().join("linked");
+        let linked_gitdir = linked.join(".libra");
+        std::fs::create_dir_all(&main_gitdir).expect("main gitdir");
+        std::fs::create_dir_all(&linked_gitdir).expect("linked gitdir");
+        let database_path = main_gitdir.join("libra.db");
+        crate::internal::db::create_database(
+            database_path.to_str().expect("database path is UTF-8"),
+        )
+        .await
+        .expect("main database schema");
+        std::fs::write(
+            linked_gitdir.join("commondir"),
+            format!("{}\n", main_gitdir.display()),
+        )
+        .expect("linked commondir");
+        std::fs::write(linked_gitdir.join("worktree_id"), b"ambient-linked\n")
+            .expect("linked worktree id");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("internal::head::tests::head_scoped_insert_main_row_from_linked_ambient")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_DATABASE, &database_path)
+            .current_dir(&linked)
+            .output()
+            .expect("linked-cwd scoped insert child");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stdout.contains("running 1 test")
+                && stdout.contains(
+                    "scoped main INSERT from ambient linked cwd persisted NULL worktree_id"
+                ),
+            "scoped insert child must execute once; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            child.status.success(),
+            "scoped insert child failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn restore_pinned_head_callsite_map_guard() {
+        let source = include_str!("operation/restore.rs");
+        let compact = source
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")");
+        let expected = [
+            "Head::branch_checked_out_elsewhere_for_scope_result_with_conn(&txn,branch,&self.scope.scope)",
+            "Head::branch_checked_out_elsewhere_for_scope_result_with_conn(db,&name,&self.scope.scope)",
+            "Head::update_for_scope_result_with_conn(self.store.db(),head,None,&self.scope.scope)",
+        ];
+        for call in expected {
+            assert!(compact.contains(call), "missing pinned Head call: {call}");
+        }
+        assert_eq!(
+            compact
+                .matches("Head::branch_checked_out_elsewhere_for_scope_result_with_conn(")
+                .count(),
+            2,
+            "restore must contain exactly two scoped branch occupancy probes"
+        );
+        assert_eq!(
+            compact
+                .matches("Head::update_for_scope_result_with_conn(")
+                .count(),
+            1,
+            "restore must contain exactly one scoped HEAD write"
+        );
+        assert!(
+            !compact.contains("Head::branch_checked_out_elsewhere_result_with_conn(")
+                && !compact.contains("Head::update_result_with_conn("),
+            "restore must not reintroduce an ambient Head call"
+        );
     }
 }

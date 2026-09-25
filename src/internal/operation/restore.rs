@@ -1102,10 +1102,13 @@ impl RestoreEngine {
         let txn = begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        if let Some(other_worktree) =
-            Head::branch_checked_out_elsewhere_result_with_conn(&txn, branch)
-                .await
-                .map_err(|error| RestoreError::Storage(error.to_string()))?
+        if let Some(other_worktree) = Head::branch_checked_out_elsewhere_for_scope_result_with_conn(
+            &txn,
+            branch,
+            &self.scope.scope,
+        )
+        .await
+        .map_err(|error| RestoreError::Storage(error.to_string()))?
         {
             return Err(RestoreError::Storage(format!(
                 "cannot restore branch {branch:?}: it is checked out in worktree {other_worktree:?}"
@@ -1385,9 +1388,13 @@ impl RestoreEngine {
                 continue;
             }
             if let Some(other_worktree) =
-                Head::branch_checked_out_elsewhere_result_with_conn(db, &name)
-                    .await
-                    .map_err(|error| RestoreError::Storage(error.to_string()))?
+                Head::branch_checked_out_elsewhere_for_scope_result_with_conn(
+                    db,
+                    &name,
+                    &self.scope.scope,
+                )
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?
             {
                 return Err(RestoreError::Storage(format!(
                     "cannot restore branch '{name}': it is checked out in worktree '{other_worktree}'"
@@ -1796,7 +1803,7 @@ impl RestoreEngine {
                 ),
                 HeadState::Detached { oid } => Head::Detached(*oid),
             };
-            Head::update_result_with_conn(self.store.db(), head, None)
+            Head::update_for_scope_result_with_conn(self.store.db(), head, None, &self.scope.scope)
                 .await
                 .map_err(|error| RestoreError::Storage(error.to_string()))?;
             self.restore_symbolic_head_branch_tip(target_view, snapshot)

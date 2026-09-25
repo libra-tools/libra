@@ -8,6 +8,7 @@ use libra::{
     internal::{
         config::ConfigKv,
         db::{self, get_db_conn_instance_for_path},
+        model::reference,
         operation::{
             DoctorEngine, JournalEntry, JournalPhase, MutationClass, OperationError, OperationKind,
             OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2, RepoViewV2,
@@ -18,6 +19,7 @@ use libra::{
     },
     utils::{client_storage::ClientStorage, util},
 };
+use sea_orm::EntityTrait;
 use tempfile::tempdir;
 
 fn oid(label: &[u8]) -> ObjectHash {
@@ -467,6 +469,219 @@ async fn doctor_recovers_a_running_publish_journal_once() {
             .iter()
             .any(|item| item == "unfinished-journals"),
         "terminal journals must not trigger another recovery pass"
+    );
+}
+
+/// A caller may hold a pinned main-worktree request while its process cwd is
+/// another linked worktree of the same repository. Keep the mismatched cwd in
+/// a child process so this regression cannot perturb parallel tests.
+#[tokio::test]
+async fn doctor_recovery_uses_pinned_main_scope_from_linked_cwd() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let directory = tempdir().expect("repository fixture");
+    let main = directory.path().join("main");
+    let linked = directory.path().join("linked");
+    fs::create_dir(&main).expect("main worktree directory");
+    libra::utils::test::setup_with_new_libra_in(&main).await;
+    fs::write(main.join("a.txt"), b"one\n").expect("baseline file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(args)
+            .current_dir(&main)
+            .output()
+            .expect("baseline CLI command");
+        assert!(
+            output.status.success(),
+            "libra {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["worktree", "add", linked.to_str().expect("linked path")])
+        .current_dir(&main)
+        .output()
+        .expect("create linked worktree");
+    assert!(
+        output.status.success(),
+        "libra worktree add: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let linked_file = linked.join("a.txt");
+    assert_eq!(
+        fs::read(&linked_file).expect("linked checkout file"),
+        b"one\n"
+    );
+    fs::write(&linked_file, b"linked-only-state\n").expect("linked-only sentinel");
+
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .arg("doctor_recovery_linked_cwd_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("LIBRA_FIX_CM01_MAIN", &main)
+        .current_dir(&linked)
+        .output()
+        .expect("linked-cwd recovery child");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        stdout.contains("running 1 test")
+            && stdout.contains("test doctor_recovery_linked_cwd_child"),
+        "child test selection must execute exactly once; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        child.status.success(),
+        "pinned main recovery from linked cwd failed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_recovery_linked_cwd_child() {
+    let Some(main) = std::env::var_os("LIBRA_FIX_CM01_MAIN") else {
+        return;
+    };
+    let main = std::path::PathBuf::from(main);
+    let cwd = std::env::current_dir().expect("child cwd");
+    assert!(matches!(WorktreeScope::current(), WorktreeScope::Linked(_)));
+    let pinned = RequestScope::resolve(main.clone()).expect("pinned main scope");
+    assert_eq!(pinned.scope, WorktreeScope::Main);
+    println!("linked child cwd: {}", cwd.display());
+
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("main database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id query")
+        .expect("repo id")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let scope_key = pinned.scope.storage_key();
+    let baseline_heads = store
+        .read_heads(&repo_id, scope_key)
+        .await
+        .expect("baseline heads");
+    let baseline_id = baseline_heads.first().cloned().expect("baseline head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("baseline query")
+        .expect("baseline operation");
+    let interrupted_id = "linked-cwd-doctor-publish-interrupted";
+    store
+        .write_operation(&OperationV2 {
+            op_id: interrupted_id.to_string(),
+            parent_op_ids: baseline_heads.clone(),
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Undo,
+            status: OperationStatusV2::Running,
+            metadata: OperationMetaV2::default(),
+            restores_op_id: Some(baseline_id),
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("interrupted operation");
+    store
+        .append_journal(&JournalEntry {
+            journal_id: format!("journal-{interrupted_id}"),
+            op_id: interrupted_id.to_string(),
+            phase: JournalPhase::Publish,
+            pre_view_oid: Some(baseline.post_view_oid),
+            target_view_oid: Some(baseline.post_view_oid),
+            owner: "test".to_string(),
+            updated_at: 1,
+            recovery_payload: Some(
+                serde_json::json!({
+                    "kind": "restore",
+                    "restore_refs": false,
+                    "workspace_id": "main"
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("publish journal");
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            scope_key,
+            &baseline_heads,
+            &[interrupted_id.to_string()],
+        )
+        .await
+        .expect("published interrupted head");
+    fs::write(main.join("a.txt"), b"two\n").expect("interrupted physical state");
+
+    let mut references_before = reference::Entity::find()
+        .all(store.db())
+        .await
+        .expect("reference rows before recovery");
+    references_before.sort_by_key(|row| row.id);
+    let head_rows = references_before
+        .iter()
+        .filter(|row| row.kind == reference::ConfigKind::Head && row.remote.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        head_rows.len(),
+        2,
+        "main and linked must each own a HEAD row"
+    );
+    assert!(head_rows.iter().any(|row| row.worktree_id.is_none()));
+    let WorktreeScope::Linked(linked_id) = WorktreeScope::current() else {
+        panic!("child must remain in the linked worktree");
+    };
+    assert!(
+        head_rows
+            .iter()
+            .any(|row| row.worktree_id.as_deref() == Some(linked_id.as_str())),
+        "the linked HEAD row must exist before recovery"
+    );
+    let linked_file_before = fs::read(cwd.join("a.txt")).expect("linked file before recovery");
+    assert_eq!(linked_file_before, b"linked-only-state\n");
+
+    let engine = DoctorEngine::new(pinned.clone(), repo_id.clone(), store.clone());
+    engine.inspect(false, true).await.expect("doctor recovery");
+    assert_eq!(
+        fs::read(main.join("a.txt")).expect("recovered file"),
+        b"one\n",
+        "doctor must restore pinned main pre-view, independent of child cwd"
+    );
+    assert_eq!(
+        store
+            .read_heads(&repo_id, scope_key)
+            .await
+            .expect("recovered heads"),
+        baseline_heads,
+        "doctor must restore the pinned main operation head"
+    );
+    assert_eq!(
+        store
+            .load_operation(interrupted_id)
+            .await
+            .expect("recovered operation query")
+            .expect("recovered operation")
+            .status,
+        OperationStatusV2::Failed,
+        "doctor must mark the interrupted publish as failed"
+    );
+    let mut references_after = reference::Entity::find()
+        .all(store.db())
+        .await
+        .expect("reference rows after recovery");
+    references_after.sort_by_key(|row| row.id);
+    assert_eq!(
+        references_after, references_before,
+        "doctor must preserve complete main/linked HEAD rows and shared refs without adding rows"
+    );
+    assert_eq!(
+        fs::read(cwd.join("a.txt")).expect("linked file after recovery"),
+        linked_file_before,
+        "doctor must preserve linked worktree bytes"
     );
 }
 
