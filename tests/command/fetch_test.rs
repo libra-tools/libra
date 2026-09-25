@@ -18,6 +18,7 @@ use libra::{
     internal::{
         branch::Branch,
         config::{ConfigKv, RemoteConfig},
+        head::Head,
     },
     utils::{
         output::OutputConfig,
@@ -1876,6 +1877,9 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         force: false,
         tags: false,
         no_tags: false,
+        set_upstream: false,
+        update_head_ok: false,
+        refmap: None,
         no_auto_gc: false,
         no_progress: true,
         prune,
@@ -2387,4 +2391,220 @@ fn test_fetch_into_mirror_updates_and_prunes_all_refs() {
         extra,
         "Q4 non-mirror fetch still updates tracking"
     );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_set_upstream_writes_branch_config() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // U1: `fetch --set-upstream origin <branch>` records the current branch's
+    // upstream after a successful single-branch fetch.
+    let out = run_libra_command(
+        &["fetch", "--set-upstream", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "fetch --set-upstream origin main");
+
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "main".to_string(),
+    };
+    let remote = ConfigKv::get(&format!("branch.{current}.remote"))
+        .await
+        .expect("read branch remote")
+        .map(|e| e.value);
+    assert_eq!(
+        remote.as_deref(),
+        Some("origin"),
+        "U1: branch.{current}.remote = origin"
+    );
+    let merge = ConfigKv::get(&format!("branch.{current}.merge"))
+        .await
+        .expect("read branch merge")
+        .map(|e| e.value);
+    let expected_merge = format!("refs/heads/{current_branch}");
+    assert_eq!(
+        merge.as_deref(),
+        Some(expected_merge.as_str()),
+        "U1: branch.{current}.merge = source branch"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_set_upstream_no_branch_and_colon_forms() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // No branch argument: `--set-upstream` writes nothing.
+    let no_branch = run_libra_command(&["fetch", "--set-upstream", "origin"], &repo_dir);
+    assert_cli_success(&no_branch, "fetch --set-upstream origin");
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "main".to_string(),
+    };
+    assert!(
+        ConfigKv::get(&format!("branch.{current}.remote"))
+            .await
+            .expect("read branch remote")
+            .is_none(),
+        "no-branch --set-upstream writes no remote"
+    );
+
+    // Colon refspec `src:dst` has no single source branch: Git warns and writes
+    // nothing for the branch config.
+    let colon = run_libra_command(
+        &[
+            "fetch",
+            "--set-upstream",
+            "origin",
+            &format!("refs/heads/{current_branch}:refs/heads/other2"),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&colon, "fetch --set-upstream origin main:other2");
+    let stderr = String::from_utf8_lossy(&colon.stderr);
+    assert!(
+        stderr.contains("specify exactly one branch"),
+        "colon refspec warns: {stderr}"
+    );
+    assert!(
+        ConfigKv::get(&format!("branch.{current}.remote"))
+            .await
+            .expect("read branch remote")
+            .is_none(),
+        "colon refspec writes no remote"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_refmap_with_cli_refspec() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // U4: `--refmap=` (empty) suppresses tracking-ref updates; only FETCH_HEAD
+    // is written for the command-line refspec.
+    let from_scratch = run_libra_command(
+        &["fetch", "--refmap=", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&from_scratch, "fetch --refmap= origin main");
+    assert!(
+        Branch::find_branch_result(
+            &format!("refs/remotes/origin/{current_branch}"),
+            Some("origin"),
+        )
+        .await
+        .expect("query origin tracking")
+        .is_none(),
+        "U4: --refmap= creates no remote-tracking ref"
+    );
+
+    // A non-empty `--refmap=<spec>` drives the tracking destination instead of
+    // the configured mapping.
+    let refmap_spec = format!("+refs/heads/{current_branch}:refs/remotes/origin/other");
+    let mapped = run_libra_command(
+        &[
+            "fetch",
+            &format!("--refmap={refmap_spec}"),
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&mapped, "fetch --refmap spec origin main");
+    assert!(
+        Branch::find_branch_result("refs/remotes/origin/other", Some("origin"))
+            .await
+            .expect("query origin/other")
+            .is_some(),
+        "U4: --refmap spec drives the tracking destination"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_refmap_requires_refspec() {
+    let (_temp, repo_dir, _branch, _oid) = setup_local_fetch_cli_fixture().await;
+
+    // `--refmap` without a command-line refspec is a usage error.
+    let out = run_libra_command(&["fetch", "--refmap", "origin"], &repo_dir);
+    assert!(
+        !out.status.success(),
+        "--refmap without refspec must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_update_head_ok_allows_fetch_into_checked_out_branch() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => panic!("expected a checked-out branch"),
+    };
+
+    // Build a local Git remote carrying the same branch name (content is
+    // irrelevant: the checked-out-branch rejection fires on the destination,
+    // not on the commit, matching the existing guarded behaviour).
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", current.as_str()], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), current.as_str()],
+        Some(&work_dir),
+    );
+
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+    let full = format!("+refs/heads/{current}:refs/heads/{current}");
+
+    // Without `--update-head-ok`, fetching into the checked-out branch is
+    // refused (existing guarded behaviour).
+    let rejected = run_libra_command(&["fetch", "origin", full.as_str()], &repo_dir);
+    assert!(
+        !rejected.status.success(),
+        "fetch into checked-out branch without --update-head-ok must be rejected: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("checked-out"),
+        "rejection should mention the checked-out branch"
+    );
+
+    // With `--update-head-ok` the same fetch succeeds.
+    let ok = run_libra_command(
+        &["fetch", "--update-head-ok", "origin", full.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "fetch --update-head-ok into checked-out branch");
 }

@@ -421,6 +421,8 @@ pub(crate) async fn run_pull(
         false,
         args.notes,
         &child_output,
+        false,
+        None,
     )
     .await
     .map_err(PullError::Fetch)?;

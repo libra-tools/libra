@@ -2,11 +2,11 @@
 
 ## 命令实现目标
 
-`libra fetch` 的目标是从远端下载对象和 refs，并按 refspec、FETCH_HEAD、tag 策略、浅边界和 dry-run/porcelain 规则更新本地状态。实现需要支持 ref 更新原子回滚、prune、force、append 和远端诊断，同时避免网络/pack 流处理出现静默失败；独立的 `--atomic` / `--refmap` 选项仍为延后 surface。
+`libra fetch` 的目标是从远端下载对象和 refs，并按 refspec、FETCH_HEAD、tag 策略、浅边界和 dry-run/porcelain 规则更新本地状态。实现需要支持 ref 更新原子回滚、prune、force、append 和远端诊断，同时避免网络/pack 流处理出现静默失败；独立的 `--atomic` 选项仍为延后 surface（`--set-upstream`/`--update-head-ok`/`--refmap` 已公开，见下文）。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。repository/refspec（短 source、精确 `<src>:<dst>`、单通配符配置映射）与大小写不敏感的 `remote.<name>.fetch`、`--all`、`--depth`（Git shallow 协商路径支持；本地 Libra remote fail-closed，`LBR-REPO-002`）、`--dry-run`、`-v/--verbose`、`--porcelain`、`--tags`/`--no-tags`、`--prune`/`-p`/`--no-prune` 以及 `FETCH_HEAD` 写入与 `--append` 已公开；`--refmap`、`--atomic` 与 shallow 扩展参数（`--shallow-since` / `--shallow-exclude` / `--update-shallow`）仍未公开。`--prune`/`-p` 在 fetch 完成后按有效 refspec 展开的 tracking destination（一次性显式 refspec 也保留当前配置映射与普通 advertised 范围）分类并删除非存活的 `refs/remotes/<remote>/*`；删除 + 审计 reflog 在单事务内，失败回滚；`--dry-run` 只预览不写；远端 advertise 空 refs 时跳过；本地分支、tag、`refs/remotes/<remote>/HEAD` 与其它远端不受影响。`--prune`/`--no-prune` 为 last-one-wins toggle，并覆盖 Git 兼容的 `remote.<name>.prune` → `fetch.prune` 配置默认（严格 local→global→system 级联；未配置默认 false，与 Git 出厂一致；无效值 `LBR-CLI-002`、local/global 读取失败 `LBR-IO-001`，均在联网前 fail-closed，`--all` 时先校验所有远程再开始第一个 fetch）。
+- 兼容级别：`partial`。repository/refspec（短 source、精确 `<src>:<dst>`、单通配符配置映射）与大小写不敏感的 `remote.<name>.fetch`、`--all`、`--depth`（Git shallow 协商路径支持；本地 Libra remote fail-closed，`LBR-REPO-002`）、`--dry-run`、`-v/--verbose`、`--porcelain`、`--tags`/`--no-tags`、`--prune`/`-p`/`--no-prune` 以及 `FETCH_HEAD` 写入与 `--append` 已公开；`--refmap`、`--set-upstream`、`--update-head-ok` 已公开，shallow 扩展参数（`--shallow-since` / `--shallow-exclude` / `--update-shallow`）与 `--atomic` 仍未公开。`--prune`/`-p` 在 fetch 完成后按有效 refspec 展开的 tracking destination（一次性显式 refspec 也保留当前配置映射与普通 advertised 范围）分类并删除非存活的 `refs/remotes/<remote>/*`；删除 + 审计 reflog 在单事务内，失败回滚；`--dry-run` 只预览不写；远端 advertise 空 refs 时跳过；本地分支、tag、`refs/remotes/<remote>/HEAD` 与其它远端不受影响。`--prune`/`--no-prune` 为 last-one-wins toggle，并覆盖 Git 兼容的 `remote.<name>.prune` → `fetch.prune` 配置默认（严格 local→global→system 级联；未配置默认 false，与 Git 出厂一致；无效值 `LBR-CLI-002`、local/global 读取失败 `LBR-IO-001`，均在联网前 fail-closed，`--all` 时先校验所有远程再开始第一个 fetch）。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -41,7 +41,7 @@ flowchart TD
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-04-06 `30bed711`（`feat(remote): land batch-5 remote and fetch UX (#341)`）：基础实现节点：land batch-5 remote and fetch UX (#341)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-05 起 `a501ddd` / `2c2ad76` / `10d8744` / `470e275`（`feat(fetch): --dry-run` / `-v,--verbose` / `--porcelain` / `FETCH_HEAD + --append`）：这些本地（不依赖 shallow/tag/prune 子系统）的参数在一次 reconcile 中被误丢。2026-06-18 已在当前（已分叉、回退过的）fetch 代码上重新恢复：`--dry-run`（仅基于发现的 refs 预览 remote-tracking 更新，不下载、不写入）、`-v/--verbose`（stderr 公告远端）、`--porcelain`（拒绝与 `--json` 同用）、`FETCH_HEAD` 写入与 `--append`。
-- 2026-06-05 `7d75d886`（`feat(fetch): add --refmap to override fetched-ref destinations`）：历史节点：曾尝试新增 `--refmap`；当前 `FetchArgs` 仍未公开该参数——它依赖回退过的 `ShallowOptions`/refspec 映射基础设施，属于 deferred。
+- 2026-06-05 `7d75d886`（`feat(fetch): add --refmap to override fetched-ref destinations`）：历史节点：曾尝试新增 `--refmap`；`FetchArgs` 现已公开该参数（issues/480 HP-03）——仅允许配合命令行 refspec，空值抑制 tracking 更新（FETCH_HEAD only），非空映射替换用于推导跟踪目标的 `remote.<name>.fetch`。
 - 2026-06-05 `b005e9ee`（`feat(fetch): add --atomic with rollback pack cleanup`）：历史节点：曾尝试新增 `--atomic`；当前 `FetchArgs` 仍未公开该参数——它依赖回退过的多步事务/pack 回滚基础设施，属于 deferred。
 - 2026-06-05 起 `479cd0b` / `916edc2` / `5a05f0f`（`--shallow-since/--shallow-exclude` / `--update-shallow` / `-f,--force`）：历史节点；shallow 扩展仍未公开（依赖回退过的 `ShallowOptions` 浅边界基础设施）；`-f/--force` 与 `--tags`/`--no-tags` 此后均已重新落地（force 见「当前状态」`-f`/`--force` 条目；tags 见 PR-10a）：发现层保留 `refs/tags/*`，`current_have_safe` 把本地 tag（含 annotated peel）纳入 `have` 以避免重复下载，`update_references` 以 `kind=Tag` 落库（create-if-absent，不强制覆盖）。
 - 2026-06-07 `b21dc6fd`（`fix(fetch): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
@@ -68,7 +68,7 @@ flowchart TD
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | `--atomic` / `--refmap` | 原始对照：`git fetch --atomic` / `--refmap`；当前说明：不公开。普通 fetch 的本地多 ref 更新已事务化，但 pack/tag/prune 全流水线的 `--atomic` 回滚和命令行 `--refmap` 覆盖仍需独立设计。 |
+| 兼容差异项 | `--atomic` | 原始对照：`git fetch --atomic`；当前说明：不公开。普通 fetch 的本地多 ref 更新已事务化，但 pack/tag/prune 全流水线的 `--atomic` 回滚仍需独立设计；`--refmap` 已公开（issues/480 HP-03）。 |
 | 兼容差异项 | Git shallow 扩展参数 | 原始对照：`--deepen` / `--shallow-since` / `--shallow-exclude` / `--update-shallow` / `--unshallow` 等；当前说明：不支持——依赖回退过的 `ShallowOptions` 浅边界基础设施。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 
 ## 维护要求

@@ -130,6 +130,9 @@ libra config remote.origin.prune false  # but never for origin
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
 | `--dry-run` | Preview the remote-tracking ref updates the fetch would produce without downloading any objects or writing refs, reflog, or `FETCH_HEAD`. | `libra fetch origin --dry-run` |
 | `--append` | Append fetched ref records to `.libra/FETCH_HEAD` instead of overwriting it. (`-a` is reserved for `--all`.) | `libra fetch origin --append` |
+| `--set-upstream` | After a successful single-branch fetch from a named remote, record the current branch's upstream (`branch.<name>.remote` / `branch.<name>.merge`). A colon refspec (`src:dst`) or no branch argument writes nothing (Git warns for the colon form). | `libra fetch --set-upstream origin main` |
+| `--update-head-ok` | Allow an explicit refspec to update the currently checked-out branch (with `+` as needed for non-fast-forward). Without it, fetching into the checked-out branch is refused. | `libra fetch --update-head-ok origin master:master` |
+| `--refmap=<spec>` | Replace the configured `remote.<name>.fetch` mapping used to derive the tracking destination for a command-line refspec. An empty value (`--refmap=`) updates no tracking ref (FETCH_HEAD only). Requires a command-line refspec. | `libra fetch --refmap= origin main` |
 | `-v`, `--verbose` | Announce the remote being contacted on stderr; the stdout result contract is unchanged. | `libra fetch origin -v` |
 | `--porcelain` | Print a machine-readable `<flag> <old-oid> <new-oid> <local-ref>` line per ref update. Mutually exclusive with `--json`. | `libra fetch origin --porcelain` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra --json fetch origin` |

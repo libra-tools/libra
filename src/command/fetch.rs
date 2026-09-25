@@ -62,7 +62,7 @@ use crate::{
         vault::{decrypt_token, load_unseal_key},
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{
             OutputConfig, ProgressMode, ProgressPreference, ProgressReporter, emit_json_data,
         },
@@ -675,6 +675,25 @@ pub struct FetchArgs {
     #[clap(long, overrides_with = "no_tags")]
     pub tags: bool,
 
+    /// After a successful fetch of a single branch source from a named remote,
+    /// set the current branch's upstream (`branch.<name>.remote` /
+    /// `branch.<name>.merge`) to that remote and branch. The remote is written
+    /// as the configured name, or as the URL when the remote was given as a URL.
+    #[clap(long = "set-upstream")]
+    pub set_upstream: bool,
+
+    /// Allow an explicit refspec to update the currently checked-out branch
+    /// (`fetch <remote> <src>:<head>`), matching Git's `--update-head-ok`.
+    #[clap(long = "update-head-ok")]
+    pub update_head_ok: bool,
+
+    /// Replace the configured `remote.<name>.fetch` mapping used to derive the
+    /// tracking destination for a command-line refspec. An empty value
+    /// (`--refmap=`) updates no tracking ref (FETCH_HEAD only). Requires a
+    /// command-line refspec.
+    #[clap(long = "refmap", value_name = "REFSPEC")]
+    pub refmap: Option<String>,
+
     /// Do not fetch any tags (not even tags reachable from fetched commits).
     /// Overrides the default auto-follow and an earlier `--tags`.
     #[clap(long = "no-tags", overrides_with = "tags")]
@@ -1104,6 +1123,14 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         );
     }
+    // `--refmap` overrides the mapping for a command-line refspec; without one
+    // it is meaningless (Git errors).
+    if args.refmap.is_some() && args.refspec.is_none() {
+        return Err(
+            CliError::command_usage("--refmap requires a command-line refspec")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
     // Part C W1 (§C.4.2): `FETCH_HEAD` is now worktree-local (see
     // `fetch_head_path`), and fetch's other writes — the shared object store and
     // `refs/remotes/*` — are repository-scoped by design, so a standalone fetch
@@ -1194,6 +1221,62 @@ fn local_upstream_network_error(branch: &str) -> CliError {
     .with_hint("local-upstream network operations are tracked as issues/480 HP-16")
 }
 
+/// Git parity for `fetch --set-upstream <remote> <branch>`: after a successful
+/// single-branch fetch from a named remote, record the current branch's
+/// upstream (`branch.<name>.remote` / `branch.<name>.merge`). A colon refspec
+/// (`src:dst`) has no single source branch, so Git warns and writes nothing;
+/// omitting the branch writes nothing.
+async fn apply_fetch_set_upstream(
+    remote: &str,
+    refspec: Option<&str>,
+    _output: &OutputConfig,
+) -> CliResult<()> {
+    let Some(raw) = refspec else {
+        // No branch argument: Git does not set an upstream.
+        return Ok(());
+    };
+    if raw.contains(':') {
+        emit_warning(
+            "no source branch found; you need to specify exactly one branch with the --set-upstream option",
+        );
+        return Ok(());
+    }
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        // Detached HEAD has no branch to point upstream.
+        Head::Detached(_) => return Ok(()),
+    };
+    let merge = format!("refs/heads/{raw}");
+    ConfigKv::set(&format!("branch.{branch}.remote"), remote, false)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to set branch.{branch}.remote: {error}"))
+        })?;
+    ConfigKv::set(&format!("branch.{branch}.merge"), &merge, false)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to set branch.{branch}.merge: {error}"))
+        })?;
+
+    // Match git's status text, but keep stderr-clean under structured output.
+    if !crate::utils::output::structured_output_active() {
+        eprintln!(
+            "branch '{}' set up to track '{}'.",
+            branch,
+            format_remote_tracking(remote, raw)
+        );
+    }
+    Ok(())
+}
+
+fn format_remote_tracking(remote: &str, branch: &str) -> String {
+    if remote == "." {
+        branch.to_string()
+    } else {
+        format!("{remote}/{branch}")
+    }
+}
+
 /// Force progress reporting off when `--no-progress` is set (mirroring
 /// `git fetch --no-progress`), preserving every other output setting. Returns
 /// `Some(modified)` when something changed, or `None` when progress was already
@@ -1225,6 +1308,9 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         force,
         tags,
         no_tags,
+        set_upstream,
+        update_head_ok,
+        refmap,
         no_auto_gc: _,
         no_progress,
         prune,
@@ -1290,7 +1376,19 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 );
             }
             let fetched = fetch_repository_with_result_reusing(
-                remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output, &results,
+                remote,
+                None,
+                false,
+                depth,
+                dry_run,
+                tag_cli,
+                force,
+                prune,
+                notes,
+                output,
+                update_head_ok,
+                refmap.as_deref(),
+                &results,
             )
             .await
             .map_err(CliError::from)?;
@@ -1364,6 +1462,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     }
 
     let prune = resolve_prune_mode(&remote_config.name, prune_cli).await?;
+    let remote_name_for_set_upstream = remote_config.name.clone();
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),
@@ -1375,9 +1474,18 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         prune,
         notes,
         output,
+        update_head_ok,
+        refmap.as_deref(),
     )
     .await
     .map_err(CliError::from)?;
+
+    // `--set-upstream`: after a successful single-branch fetch from a named
+    // remote, record the current branch's upstream, matching Git's
+    // `fetch --set-upstream`. Writes are suppressed under `--dry-run`.
+    if set_upstream && !dry_run {
+        apply_fetch_set_upstream(&remote_name_for_set_upstream, refspec.as_deref(), output).await?;
+    }
 
     Ok(FetchOutput {
         all: false,
@@ -1786,9 +1894,10 @@ async fn build_fetch_ref_plans(
     refs: &[DiscRef],
     branch: Option<&str>,
     single_branch: bool,
+    refmap: Option<&str>,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
     if single_branch {
-        return single_branch_fetch_plans(remote, refs, branch).await;
+        return single_branch_fetch_plans(remote, refs, branch, refmap).await;
     }
     let specs = if branch.is_some() {
         Vec::new()
@@ -1828,17 +1937,41 @@ async fn single_branch_fetch_plans(
     remote: &str,
     refs: &[DiscRef],
     branch: Option<&str>,
+    refmap: Option<&str>,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
     let Some(raw) = branch else {
         return Ok(Vec::new());
     };
     let parsed = parse_fetch_refspec(raw, remote)?;
+    // `--refmap=` (empty) explicitly suppresses any tracking-ref update
+    // (FETCH_HEAD only), overriding the configured mapping.
+    let suppress_tracking = refmap == Some("");
     if raw.contains(':') {
-        return expand_refspec(&parsed, refs, remote);
+        let mut plans = expand_refspec(&parsed, refs, remote)?;
+        if suppress_tracking {
+            for plan in &mut plans {
+                plan.update_tracking = false;
+            }
+        }
+        return Ok(plans);
     }
-    let configured = configured_fetch_refspecs(remote).await?;
+    // `--refmap=<spec>` replaces the configured mapping used to derive the
+    // tracking destination for a command-line refspec. An empty value means no
+    // configured mapping (FETCH_HEAD only). Without `--refmap`, fall back to the
+    // configured `remote.<name>.fetch`.
+    let configured = match refmap {
+        Some(mapping) if !mapping.is_empty() => vec![parse_fetch_refspec(mapping, remote)?],
+        Some(_) => Vec::new(),
+        None => configured_fetch_refspecs(remote).await?,
+    };
     if configured.is_empty() {
-        return expand_refspec(&parsed, refs, remote);
+        let mut plans = expand_refspec(&parsed, refs, remote)?;
+        if suppress_tracking {
+            for plan in &mut plans {
+                plan.update_tracking = false;
+            }
+        }
+        return Ok(plans);
     }
     let Some(reference) = refs
         .iter()
@@ -1991,6 +2124,8 @@ pub async fn fetch_repository_safe(
         false,
         false,
         output,
+        false,
+        None,
     )
     .await
     .map(|result| {
@@ -2014,6 +2149,8 @@ pub(crate) async fn fetch_repository_with_result(
     prune: bool,
     notes: bool,
     output: &OutputConfig,
+    update_head_ok: bool,
+    refmap: Option<&str>,
 ) -> Result<FetchRepositoryResult, FetchError> {
     fetch_repository_with_result_reusing(
         remote_config,
@@ -2026,6 +2163,8 @@ pub(crate) async fn fetch_repository_with_result(
         prune,
         notes,
         output,
+        update_head_ok,
+        refmap,
         &[],
     )
     .await
@@ -2043,6 +2182,8 @@ async fn fetch_repository_with_result_reusing(
     prune: bool,
     notes: bool,
     output: &OutputConfig,
+    update_head_ok: bool,
+    refmap: Option<&str>,
     prior_results: &[FetchRepositoryResult],
 ) -> Result<FetchRepositoryResult, FetchError> {
     if single_branch {
@@ -2106,6 +2247,7 @@ async fn fetch_repository_with_result_reusing(
         &discovery.refs,
         branch.as_deref(),
         single_branch,
+        refmap,
     )
     .await?;
     let mut prune_branch_names =
@@ -2154,7 +2296,8 @@ async fn fetch_repository_with_result_reusing(
     // anything (no `.pack`/`.idx`, no shallow update, no ref/reflog writes, no
     // FETCH_HEAD).
     if dry_run {
-        let mut refs_updated = compute_fetch_ref_preview(&remote_config, &ref_plans, force).await?;
+        let mut refs_updated =
+            compute_fetch_ref_preview(&remote_config, &ref_plans, force, update_head_ok).await?;
         if tag_mode == TagFetchMode::All {
             for reference in &discovered_tags {
                 let Some(tag_name) = reference._ref.strip_prefix("refs/tags/") else {
@@ -2214,6 +2357,7 @@ async fn fetch_repository_with_result_reusing(
             branch,
             discovery.capabilities.clone(),
             force,
+            update_head_ok,
         )
         .await?;
         let pruned = if prune {
@@ -2438,6 +2582,7 @@ async fn fetch_repository_with_result_reusing(
         branch,
         discovery.capabilities.clone(),
         force,
+        update_head_ok,
     )
     .await?;
 
@@ -3872,6 +4017,7 @@ async fn compute_fetch_ref_preview(
     remote_config: &RemoteConfig,
     plans: &[FetchRefPlan],
     force_override: bool,
+    update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
     let db = crate::internal::sequencer::request_db_checked()
@@ -3898,7 +4044,12 @@ async fn compute_fetch_ref_preview(
             })?
             .map(|branch| branch.commit.to_string());
 
-        reject_checked_out_destination(plan, remote_scope.as_deref(), &checked_out_branches)?;
+        reject_checked_out_destination(
+            plan,
+            remote_scope.as_deref(),
+            &checked_out_branches,
+            update_head_ok,
+        )?;
         if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
             continue;
         }
@@ -3956,7 +4107,11 @@ fn reject_checked_out_destination(
     plan: &FetchRefPlan,
     remote_scope: Option<&str>,
     checked_out_branches: &HashSet<String>,
+    update_head_ok: bool,
 ) -> Result<(), FetchError> {
+    if update_head_ok {
+        return Ok(());
+    }
     if remote_scope.is_none()
         && let Some(local_branch) = plan.destination.strip_prefix("refs/heads/")
         && checked_out_branches.contains(local_branch)
@@ -4326,6 +4481,7 @@ async fn prune_stale_mirror_refs(
     Ok(pruned)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_references(
     remote_config: &RemoteConfig,
     plans: &[FetchRefPlan],
@@ -4334,6 +4490,7 @@ async fn update_references(
     branch: Option<String>,
     capabilities: Vec<String>,
     force_override: bool,
+    update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let db = crate::internal::sequencer::request_db_checked()
         .await
@@ -4374,6 +4531,7 @@ async fn update_references(
                     plan,
                     remote_scope.as_deref(),
                     &checked_out_branches,
+                    update_head_ok,
                 )?;
                 if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
                     continue;

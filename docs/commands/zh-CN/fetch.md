@@ -60,6 +60,9 @@ libra config set --add remote.origin.fetch \
 | `-f`, `--force` | 允许非快进更新，并覆盖（clobber）指向别处的本地标签。强制更新在 `--porcelain` 中标记为 `+`，在人类输出中标记为 `(forced update)`。 | `libra fetch origin --tags --force` |
 | `--dry-run` | 预览本次 fetch 将产生的远程跟踪引用更新，而不下载任何对象，也不写引用、reflog 或 `FETCH_HEAD`。 | `libra fetch origin --dry-run` |
 | `--append` | 将获取到的引用记录追加到 `.libra/FETCH_HEAD`，而不是覆盖它。（`-a` 保留给 `--all`。） | `libra fetch origin --append` |
+| `--set-upstream` | 成功从命名远端单分支 fetch 后，把当前分支的 upstream 记录为 `branch.<name>.remote` / `branch.<name>.merge`。带冒号的 refspec（`src:dst`）或不带分支参数时不写入（冒号形式 Git 会告警）。 | `libra fetch --set-upstream origin main` |
+| `--update-head-ok` | 允许显式 refspec 更新当前检出的分支（非快进时需 `+`）。不带它时，fetch 到检出分支会被拒绝。 | `libra fetch --update-head-ok origin master:master` |
+| `--refmap=<spec>` | 用给定映射替换用于推导命令行 refspec 跟踪目标的 `remote.<name>.fetch`。空值（`--refmap=`）不更新任何跟踪 ref（只写 FETCH_HEAD）。要求有命令行 refspec。 | `libra fetch --refmap= origin main` |
 | `-v`, `--verbose` | 在 stderr 上宣告正在联系的远程；stdout 的结果契约不变。 | `libra fetch origin -v` |
 | `--porcelain` | 对每个引用更新打印一行机器可读的 `<flag> <old-oid> <new-oid> <local-ref>`。与 `--json` 互斥。 | `libra fetch origin --porcelain` |
 | `--json` | 向 stdout 输出结构化 JSON 信封（全局标志）。 | `libra --json fetch origin` |

@@ -1597,6 +1597,8 @@ async fn clone_into_destination(
         // implies `--notes`; a plain clone never fetches notes (Git parity).
         !args.deps_of.is_empty(),
         &child_output,
+        false,
+        None,
     )
     .await
     .map_err(|source| CloneError::FetchFailed { source })?;
