@@ -108,6 +108,7 @@ these modes warn and are not authorization for remote synchronization.
 | `--depth <n>` | Limit the fetch phase to a shallow history of `n` commits per tip. Conflicts with `--rebase`. Local Libra upstreams fail closed with `LBR-REPO-002` because they cannot advertise shallow boundaries (accepted end state, decision D20). | `libra pull --depth 1` |
 | `-r`, `--rebase` | After fetching, rebase the current branch onto the upstream tip instead of merging. | `libra pull --rebase` |
 | `--no-rebase` | Merge instead of rebasing, countermanding an earlier `--rebase`/`-r` and overriding `pull.rebase` for this invocation. | `libra pull --no-rebase` |
+| `--allow-unrelated-histories` | Allow merging histories that have no common ancestor (Git parity), forwarded to the merge phase. Without it, pulling unrelated histories is refused with a hint pointing at this flag. | `libra pull --allow-unrelated-histories origin main` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra pull --json` |
 | `--machine` | Compact single-line JSON; suppresses progress (global flag). | `libra pull --machine` |
 | `--quiet` | Suppress all progress and merge summary output. | `libra pull --quiet` |

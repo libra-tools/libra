@@ -68,6 +68,7 @@ fast-forward 与 already-up-to-date 不读取该配置。任意 clean/smudge fil
 | `--depth <n>` | 将 fetch 阶段限制为每个 tip 的 `n` 个提交。与 `--rebase` 冲突；本地 Libra upstream 因不能声明 shallow boundary 以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra pull --depth 1` |
 | `-r`, `--rebase` | 获取后，将当前分支 rebase 到 upstream tip，而不是合并。 | `libra pull --rebase` |
 | `--no-rebase` | 合并而非 rebase，撤销先前的 `--rebase`/`-r`，并覆盖本次调用中的 `pull.rebase`（最后出现者生效）。 | `libra pull --no-rebase` |
+| `--allow-unrelated-histories` | 允许合并没有共同祖先的历史（Git parity），转发给合并阶段。不带它时，拉取无关历史会被拒绝并附指向该标志的 hint。 | `libra pull --allow-unrelated-histories origin main` |
 | `--json` | 向 stdout 输出结构化 JSON 信封（全局标志）。 | `libra pull --json` |
 | `--machine` | 紧凑单行 JSON；抑制进度（全局标志）。 | `libra pull --machine` |
 | `--quiet` | 抑制所有进度和合并摘要输出。 | `libra pull --quiet` |

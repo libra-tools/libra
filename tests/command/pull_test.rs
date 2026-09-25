@@ -1782,3 +1782,76 @@ fn test_pull_from_bundle_remote_fast_forward() {
     assert_eq!(got, expected, "H2 pull must fast-forward to the new tip");
     assert!(dest.join("next.txt").exists(), "H2 pull restores new file");
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_unrelated_histories_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // Build a remote whose history is unrelated to the local repo's commit.
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("remote.txt"), "remote").expect("write remote file");
+    git(&["add", "remote.txt"], &work_dir);
+    git(&["commit", "-m", "remote root"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+
+    // Configure the remote URL and attempt a merge of unrelated histories.
+    libra::internal::config::ConfigKv::set(
+        "remote.origin.url",
+        remote_dir.to_str().unwrap(),
+        false,
+    )
+    .await
+    .expect("set remote url");
+
+    // N1: without --allow-unrelated-histories, pull refuses and adds the hint.
+    let refused = run_libra_command(&["pull", "--no-rebase", "origin", "main"], &repo_dir);
+    assert!(
+        !refused.status.success(),
+        "pulling unrelated histories must be refused: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("unrelated histories"),
+        "N1: refusal mentions unrelated histories: {stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-unrelated-histories"),
+        "N1: refusal carries the --allow-unrelated-histories hint: {stderr}"
+    );
+
+    // N2: with the flag, pull creates a merge commit.
+    let ok = run_libra_command(
+        &[
+            "pull",
+            "--no-rebase",
+            "--allow-unrelated-histories",
+            "origin",
+            "main",
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "pull --allow-unrelated-histories origin main");
+    let head = Head::current_commit_result()
+        .await
+        .expect("read HEAD commit")
+        .expect("HEAD should point at a commit");
+    let commit: Commit = load_object(&head).expect("load HEAD commit");
+    assert_eq!(
+        commit.parent_commit_ids.len(),
+        2,
+        "N2: the unrelated-histories pull produces a merge commit with two parents"
+    );
+}

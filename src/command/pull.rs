@@ -94,6 +94,11 @@ pub struct PullArgs {
     #[clap(long, conflicts_with_all = ["rebase", "squash"], overrides_with = "no_commit")]
     commit: bool,
 
+    /// Allow merging histories that have no common ancestor, matching Git's
+    /// `pull --allow-unrelated-histories` (forwarded to the merge phase).
+    #[clap(long = "allow-unrelated-histories")]
+    allow_unrelated_histories: bool,
+
     /// Stash local (tracked) changes before integrating and re-apply them
     /// afterwards, so `pull` works on a dirty working tree.
     #[clap(long)]
@@ -337,6 +342,7 @@ impl PullArgs {
             autostash: false,
             no_progress: false,
             notes: false,
+            allow_unrelated_histories: false,
         }
     }
 }
@@ -508,12 +514,12 @@ pub(crate) async fn run_pull(
                 ff_only: effective.ff_only,
                 no_ff: effective.no_ff,
                 // `pull` does not expose merge strategies, strategy options,
-                // or unrelated-history override controls.
+                // or whitespace controls; unrelated-history override is exposed.
                 strategy: None,
                 favor: None,
                 whitespace: None,
                 renormalize: None,
-                allow_unrelated_histories: false,
+                allow_unrelated_histories: args.allow_unrelated_histories,
                 message: None,
                 into_name: None,
                 cleanup: None,
@@ -1113,7 +1119,11 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
         }
         merge::PullMergeError::UnrelatedHistories => {
-            CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint(
+                    "pass --allow-unrelated-histories to pull if the histories should be joined",
+                )
         }
         merge::PullMergeError::VirtualAncestorTooDeep
         | merge::PullMergeError::VirtualAncestorTooWide { .. } => CliError::failure(error.to_string())
