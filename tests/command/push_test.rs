@@ -2851,3 +2851,59 @@ async fn test_push_local_git_target_updates_pack_and_ref() {
         .expect("git fsck on target");
     assert!(fsck.status.success(), "target git fsck failed");
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_tags_and_delete() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create a tag in the source repo.
+    assert_cli_success(
+        &run_libra_command(&["tag", "v1"], &repo_dir),
+        "create v1 tag",
+    );
+
+    // Bare Libra target.
+    let target = tempfile::tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare"], target.path()),
+        "init bare libra target",
+    );
+
+    // Push the branch and all tags.
+    let out = run_libra_command(
+        &[
+            "push",
+            "--tags",
+            target.path().to_str().unwrap(),
+            branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push --tags to local Libra target");
+    let ls = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls, "ls-remote target");
+    let stdout = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        stdout.contains("refs/tags/v1"),
+        "target should advertise the pushed tag, got: {stdout}"
+    );
+
+    // Delete the tag on the local target (O5).
+    let del = run_libra_command(
+        &["push", target.path().to_str().unwrap(), ":refs/tags/v1"],
+        &repo_dir,
+    );
+    assert_cli_success(&del, "delete tag on local target");
+    let ls2 = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls2, "ls-remote after delete");
+    assert!(
+        !String::from_utf8_lossy(&ls2.stdout).contains("refs/tags/v1"),
+        "deleted tag should be gone from target"
+    );
+}

@@ -92,7 +92,7 @@ unsupported 子面。
 |---|---|---|---|
 | 命令接入治理 | `gc`、`package`、`prune`、`stats` 的开发文档或源码文件存在，但用户可见 CLI 与 `COMPATIBILITY.md` 未公开。 | `for-each-ref`、`ls-files`、`ls-tree`、`archive` 和 `notes` 已在 `src/cli.rs::Commands`、`COMPATIBILITY.md` 和命令开发文档中公开，不能再列为未公开命令。其余命令仍需按当前 CLI surface 核对是否返回 `LBR-CLI-001` 或应降级为内部资料。 | 作为全局未收口项保留；后续必须二选一：接入 CLI 并同步 `COMPATIBILITY.md`、命令文档和集成场景，或把对应命令文档降级为内部/历史资料。 |
 | 兼容证据治理 | 参数级缺口不能只停留在文字说明；需要在命令开发文档、用户文档和 compat/integration 测试之间闭环。 | 删除独立参数 YAML 后，不再存在 `test_evidence`/`last_verified` 字段；证据必须落到具体测试、脚本或 D 编号说明中。 | 不允许把未验证参数当作完成承诺；新增兼容项时补测试证据，或把状态改为拒绝、延后、有意差异并给出 D 编号。 |
-| 拒绝/延后决策 | submodule family（含三路合并中的 gitlink 内容合并，D24）、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。（clean pathspec 的共享 magic 已随 PD-07 落地，D-clean-pathspec 于 2026-08-08 收口，不再是活跃延后项。） | 对应 D1-D10、D15、D16、D17、D18、D24、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
+| 拒绝/延后决策 | submodule family（含三路合并中的 gitlink 内容合并，D24）、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄（本地路径 push 已实现，仅目标侧 `updateInstead`/hook 延后，见 D2）。（clean pathspec 的共享 magic 已随 PD-07 落地，D-clean-pathspec 于 2026-08-08 收口，不再是活跃延后项。） | 对应 D1-D10、D15、D16、D17、D18、D24、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
 | staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`checkout -p` 以及跨命令 patch mode。（`clean <pathspec>` 已随 PD-07 经共享 `PathspecSet` 落地；`reset --merge/--keep` 与 `restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
 | commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--rebase-merges/--empty=stop|ask`、sequencer strategy 扩展。 | `CommitArgs` 已公开并实现 identity/date/message-source、fixup/squash/cleanup/editor/verbose/porcelain/status/template/trailer 等常用面；`--allow-empty-message` 仍由 D-empty-message 拒绝。`RebaseArgs` 已支持 `--onto`、autosquash、reapply-cherry-picks、empty controls，以及 P1-07a 的 `--autostash`、可重复且 required-sandbox 的 `--exec`、captured-tip/checked-out-safe 的 `--update-refs`、reflog `--fork-point`（均含负向 toggle）；这些不能再列为缺口。`cherry-pick` / `revert` 已有完整非交互 sequencer 基础。注意 `pull --rebase` 已实现。 | 仅保留 interactive/todo/rebase-merges/halt-on-empty 与其余 sequencer strategy 缺口；不能把已实现的 rebase non-interactive controls 或 commit 常用面当作缺失。 |
 | merge/pull strategy surface | octopus merge、`ours` 以外 strategy、`ours/theirs` 以外 strategy option。 | `MergeArgs` 已实现 P1-07b 的 `-s ours`、重复 last-wins `-X ours/theirs`、`--allow-unrelated-histories`、`--log[=<n>]`/`--no-log`，以及既有 merge flags；`PullArgs` 不暴露这些 merge-only controls。 | 仅 octopus 和其它 strategy/option 仍为缺口；不能再把已实现的 P1-07b controls 或既有 merge/pull flags 当作缺失。 |
@@ -110,10 +110,10 @@ unsupported 子面。
 - 状态：拒绝。Libra 产品边界是单仓库/trunk-based，不维护 submodule 子命令族。
 - 重启条件：出现无法用 monorepo 或对象存储解决的多仓库依赖场景，并有明确 RFC。
 
-### D2：本地 file remote 的 `push`
+### D2：本地 Git 目标 push 的 `updateInstead` 与目标侧 hook
 
-- 状态：有意差异。`push` 面向网络 remote；本地路径 push 的并发和原子写入语义不纳入当前实现。
-- 重启条件：有明确本地多工作树协作场景，并完成 lock/恢复语义设计。
+- 状态：本地路径 push 本身已实现（issues/480 HP-07/HP-08：Libra 目标按路径打开、对象先写、ref 单事务 CAS；Git 目标写 pack + idx 并以 `<ref>.lock` 更新 ref）。D2 现在只延后**非裸目标上的 `receive.denyCurrentBranch=updateInstead`、`push-to-checkout` 与目标侧服务端 hook**（见 issues/480 DEFER-01）。非裸目标上更新当前检出分支默认拒绝（与 Git `denyCurrentBranch=refuse` 一致）。
+- 重启条件：明确本地部署到工作树并需要 updateInstead/目标侧 hook 的场景（见 issues/480 DEFER-01）。
 
 ### D3：Git hooks bridge 作为核心特性
 
