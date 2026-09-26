@@ -231,22 +231,48 @@ impl ConfigKv {
         value: &str,
         encrypted: bool,
     ) -> Result<()> {
-        // Git config variable names are case-insensitive, so `set` replaces
-        // ANY casing of the same logical key (e.g. a default `remote.<n>.fetch`
-        // written by `remote add` is superseded by `config set remote.<n>.Fetch`)
-        // and stores a single row with the exact key spelling supplied. SQLite
-        // `LIKE` matches ASCII case-insensitively; config keys never contain
-        // `%`/`_`.
-        let existing = config_kv::Entity::find()
-            .filter(config_kv::Column::Key.like(key))
+        // Exact-case matches first: a genuinely multi-valued key (built with
+        // `add`) refuses `set`, as before.
+        let exact = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.eq(key))
             .all(db)
             .await
             .context("failed to query config_kv for set")?;
-        let inherit_encrypted = existing.iter().any(|e| e.encrypted != 0);
-        for row in existing {
+        if exact.len() > 1 {
+            return Err(anyhow!(
+                "cannot set '{}': {} values exist for this key (use `unset-all` to clear)",
+                key,
+                exact.len()
+            ));
+        }
+        if let Some(row) = exact.into_iter().next() {
+            // Inherit encryption from the existing exact-case entry.
+            let effective_encrypted = encrypted || row.encrypted != 0;
+            let mut active: config_kv::ActiveModel = row.into();
+            active.value = Set(value.to_owned());
+            active.encrypted = Set(if effective_encrypted { 1 } else { 0 });
+            active
+                .update(db)
+                .await
+                .context("failed to update config_kv")?;
+            return Ok(());
+        }
+        // No exact-case row: Git config variable names are case-insensitive, so
+        // `set` to a different casing of the same logical key must replace the
+        // other-cased row(s) (e.g. a default `remote.<n>.fetch` written by
+        // `remote add` is superseded by `config set remote.<n>.Fetch`). SQLite
+        // `LIKE` matches ASCII case-insensitively; config keys never contain
+        // `%`/`_`.
+        let other_cased = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.like(key))
+            .all(db)
+            .await
+            .context("failed to query config_kv for case-insensitive set")?;
+        let inherit_encrypted = other_cased.iter().any(|e| e.encrypted != 0);
+        for row in other_cased {
             row.delete(db)
                 .await
-                .context("failed to remove superseded config_kv row")?;
+                .context("failed to remove other-cased config_kv row")?;
         }
         let entry = config_kv::ActiveModel {
             key: Set(key.to_owned()),
