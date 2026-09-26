@@ -55,6 +55,7 @@ pub const RERERE_EXAMPLES: &str = "\
 EXAMPLES:
     libra rerere                  Record preimages / replay resolutions for current conflicts
     libra rerere status           List the conflicts being tracked
+    libra rerere remaining        List the still-unresolved tracked conflicts
     libra rerere diff             Show what changed since each preimage was recorded
     libra rerere forget <path>    Drop the recorded resolution for a path
     libra rerere clear            Stop tracking the current conflicts
@@ -72,6 +73,8 @@ pub struct RerereArgs {
 pub enum RerereSubcommand {
     /// List the paths whose conflicts are currently being tracked.
     Status,
+    /// List the tracked conflict paths that are still unresolved (unmerged).
+    Remaining,
     /// Show the diff between each recorded preimage and the current file.
     Diff,
     /// Drop the recorded resolution(s) for the given paths.
@@ -104,6 +107,7 @@ pub async fn execute_safe(args: RerereArgs, _output: &OutputConfig) -> CliResult
         // only apply to the automatic merge/rebase/cherry-pick integration.
         None => apply(&scope, &rr_dir, false).await,
         Some(RerereSubcommand::Status) => status(&scope, &rr_dir),
+        Some(RerereSubcommand::Remaining) => remaining(&scope, &rr_dir),
         Some(RerereSubcommand::Diff) => diff(&scope, &rr_dir),
         Some(RerereSubcommand::Forget { paths }) => forget(&scope, &rr_dir, &paths).await,
         Some(RerereSubcommand::Clear) => clear(&scope, &rr_dir).await,
@@ -316,6 +320,33 @@ async fn stage_path(path: &str) -> CliResult<()> {
 fn status(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
     for (path, _) in read_merge_rr(scope, rr_dir)? {
         println!("{path}");
+    }
+    Ok(())
+}
+
+/// `rerere remaining`: list the tracked conflict paths that are still unresolved
+/// (the index still has unmerged stages, or the file still carries conflict
+/// markers). Resolved-in-worktree-but-not-staged paths are still listed because
+/// the index remains unmerged (Git parity, t4200 P4).
+fn remaining(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
+    let workdir = util::request_working_dir();
+    let index_file = scope.local_gitdir()?.join("index");
+    let index = Index::load(&index_file).ok();
+    for (path, _) in read_merge_rr(scope, rr_dir)? {
+        let unmerged = index
+            .as_ref()
+            .map(|ix| {
+                ix.get(&path, 1).is_some()
+                    || ix.get(&path, 2).is_some()
+                    || ix.get(&path, 3).is_some()
+            })
+            .unwrap_or(false);
+        let conflicted = read_or_empty(&workdir.join(&path))
+            .map(|bytes| is_conflicted(&bytes))
+            .unwrap_or(false);
+        if unmerged || conflicted {
+            println!("{path}");
+        }
     }
     Ok(())
 }

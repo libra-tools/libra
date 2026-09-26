@@ -33,6 +33,7 @@ are left in place; a miss is recorded under the normalized key.
 |------------|-------------|
 | (none) | Record preimages / replay resolutions / record postimages. |
 | `status` | List the paths whose conflicts are currently tracked. |
+| `remaining` | List the tracked conflict paths that are still unresolved (the index still has unmerged stages, or the file still carries conflict markers). A worktree-resolved-but-unstaged path is still listed, matching Git. |
 | `diff` | Show what changed in each tracked file since its preimage was recorded. |
 | `forget <path>...` | Drop the recorded resolution for the given paths. |
 | `clear` | Stop tracking the current conflicts (recorded resolutions are kept). |

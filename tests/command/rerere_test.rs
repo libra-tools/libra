@@ -492,3 +492,68 @@ fn legacy_merge_rr_migrates_for_single_main_and_stays_ambiguous_with_linked() {
         "the ambiguous legacy file is left untouched"
     );
 }
+
+#[test]
+fn rerere_remaining_lists_unresolved_and_clears_on_resolution() {
+    // A real merge conflict leaves unmerged index stages for rerere to track.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let cur = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&cur, "show current branch");
+    let cur = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+
+    // Create a divergent branch editing the same tracked path.
+    assert_cli_success(&run_libra_command(&["branch", "other"], p), "create other");
+    assert_cli_success(&run_libra_command(&["switch", "other"], p), "switch other");
+    fs::write(p.join("tracked.txt"), "other\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add other");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other", "--no-verify"], p),
+        "commit other",
+    );
+    assert_cli_success(&run_libra_command(&["switch", &cur], p), "switch back");
+    fs::write(p.join("tracked.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], p),
+        "commit main",
+    );
+
+    // Merge `other` (non-ff) -> conflict, leaving unmerged stages.
+    let merge = run_libra_command(&["merge", "other", "--no-edit"], p);
+    assert!(!merge.status.success(), "merge should conflict");
+    let merge_text = format!("{} {}", out(&merge), String::from_utf8_lossy(&merge.stderr));
+    assert!(
+        merge_text.to_lowercase().contains("conflict"),
+        "merge should report a conflict: {merge_text}"
+    );
+
+    // Record the preimage so the conflict is tracked.
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record preimage");
+    let remaining1 = run_libra_command(&["rerere", "remaining"], p);
+    assert!(
+        out(&remaining1).contains("tracked.txt"),
+        "remaining should list the unresolved conflict: {}",
+        out(&remaining1)
+    );
+
+    // Resolving in the worktree but NOT staging keeps the index unmerged, so Git
+    // still lists it (t4200 P4 / M-RERERE E2).
+    fs::write(p.join("tracked.txt"), "resolved\n").unwrap();
+    let remaining2 = run_libra_command(&["rerere", "remaining"], p);
+    assert!(
+        out(&remaining2).contains("tracked.txt"),
+        "remaining should still list a worktree-resolved-but-unstaged conflict: {}",
+        out(&remaining2)
+    );
+
+    // Staging clears the unmerged index, so remaining becomes empty.
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "stage");
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record resolution");
+    let remaining3 = run_libra_command(&["rerere", "remaining"], p);
+    assert!(
+        !out(&remaining3).contains("tracked.txt"),
+        "remaining should be empty once the conflict is staged: {}",
+        out(&remaining3)
+    );
+}
