@@ -7,20 +7,23 @@ repository vault — so credentials are never written to disk in clear text.
 ## Synopsis
 
 ```
-libra credential fill
+libra credential get
 libra credential store
 libra credential erase
 ```
 
-Each subcommand reads Git credential attributes (`key=value` lines, terminated
-by a blank line) from stdin.
+`get` is the Git helper protocol operation for a fill; `fill` is accepted as a
+legacy alias. Each subcommand reads Git credential attributes (`key=value`
+lines, terminated by a blank line) from stdin. An unknown operation is silently
+ignored (Git helper convention).
 
 ## Description
 
-- **`fill`** — print the stored `username`/`password` for the requested
-  `protocol`/`host`/`path`, or nothing. A miss (no entry, expired entry, wrong
-  username, or no vault) and a hit both exit 0 and look identical apart from the
-  output, so the exit code never reveals whether a credential exists.
+- **`get`** (alias **`fill`**) — print the stored `username`/`password` for the
+  requested `protocol`/`host`/`path`, or nothing. A miss (no entry, expired
+  entry, wrong username, or no vault) and a hit both exit 0 and look identical
+  apart from the output, so the exit code never reveals whether a credential
+  exists.
 - **`store`** — encrypt and persist the `username`/`password` from stdin. An
   optional `password_expiry_utc` is honoured; without one, the entry expires
   after 30 days. An already-expired `password_expiry_utc` is rejected.

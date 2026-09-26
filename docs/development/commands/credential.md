@@ -2,12 +2,12 @@
 
 ## 命令实现目标
 
-`libra credential fill|store|erase` 是 vault 支撑的 Git 凭证助手：讲 Git 凭证 key/value 协议，凭证经 vault AES-256-GCM 加密存储，绝不明文落盘、绝不泄露到日志/错误/trace。
+`libra credential get|store|erase`（`fill` 为 `get` 的 legacy 别名；未知操作静默忽略）是 vault 支撑的 Git 凭证助手：讲 Git 凭证 key/value 协议，凭证经 vault AES-256-GCM 加密存储，绝不明文落盘、绝不泄露到日志/错误/trace。
 
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`fill`/`store`/`erase` 的 Git 凭证 stdin/stdout 协议；`url=` 展开为 protocol/host/path；`password_expiry_utc` 过期（默认 30 天）；vault 加密存储。
+- 已支持：`get`（`fill` 别名）/`store`/`erase` 的 Git 凭证 stdin/stdout 协议；未知操作静默忽略（Git helper 约定，exit 0 无输出）；`url=` 展开为 protocol/host/path；`password_expiry_utc` 过期（默认 30 天）；vault 加密存储。
 - 退出码：0（fill 命中或空；store/erase 完成）；128（store 缺 username/password、过期时间戳、vault 未初始化，或请求不可读）。
 - **有意差异**：存储为 vault 加密（非明文 `~/.git-credentials`）且**仓库范围**（unseal key 按 repo-id）；每个 `protocol/host/path` 仅一条凭证。
 - 未公开（延后）：`credential-cache`；每 host 多用户名；**消费侧 `credential.helper` 链校验（拒绝 `!cmd`/相对路径）—— 那属于 fetch/push 调用助手的路径，本命令是「助手本身」，不调用外部助手，故有意不在此实现**。

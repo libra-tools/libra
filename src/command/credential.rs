@@ -19,7 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,7 +38,7 @@ const DEFAULT_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 pub const CREDENTIAL_EXAMPLES: &str = "\
 EXAMPLES:
-    printf 'protocol=https\\nhost=example.com\\n' | libra credential fill
+    printf 'protocol=https\\nhost=example.com\\n' | libra credential get
     printf 'protocol=https\\nhost=example.com\\nusername=u\\npassword=p\\n' | libra credential store
     printf 'protocol=https\\nhost=example.com\\n' | libra credential erase
 
@@ -48,18 +48,11 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = CREDENTIAL_EXAMPLES)]
 pub struct CredentialArgs {
-    #[command(subcommand)]
-    pub command: CredentialCommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum CredentialCommand {
-    /// Print the stored username/password for the requested context (if any).
-    Fill,
-    /// Store the username/password supplied on stdin.
-    Store,
-    /// Remove the credential for the requested context.
-    Erase,
+    /// The helper operation. Git calls `get`/`store`/`erase`; `fill` is the
+    /// legacy Libra name for `get`. An unknown or absent operation is silently
+    /// ignored (Git helper convention), exiting 0 with no output.
+    #[arg(value_name = "OPERATION")]
+    pub operation: Option<String>,
 }
 
 /// Parsed Git credential attributes (only the fields this helper uses).
@@ -96,10 +89,15 @@ pub async fn execute(args: CredentialArgs) {
 /// Git.
 pub async fn execute_safe(args: CredentialArgs, _output: &OutputConfig) -> CliResult<()> {
     let attrs = read_attrs(&read_request()?)?;
-    match args.command {
-        CredentialCommand::Fill => fill(&attrs).await,
-        CredentialCommand::Store => store(&attrs).await,
-        CredentialCommand::Erase => erase(&attrs).await,
+    match args.operation.as_deref() {
+        // Git's helper protocol operation for a fill is `get`; `fill` is the
+        // legacy Libra spelling and is accepted as an alias.
+        Some("get") | Some("fill") => fill(&attrs).await,
+        Some("store") => store(&attrs).await,
+        Some("erase") => erase(&attrs).await,
+        // An unknown or absent operation is silently ignored (Git helper
+        // convention) rather than treated as a usage error.
+        _ => Ok(()),
     }
 }
 
