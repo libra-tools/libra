@@ -1,0 +1,23 @@
+{
+  "skill_name": "libra-contribution-workflow",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "A contributor outside the project opened a new Issue: 'Make `libra agent status` easier to use.' I can't find a matching plan and the body gives no details. Help refine it through questions, then recommend a card or plan. Let me choose whether you draft comments for me to post or use `gh` on this Issue.",
+      "expected_output": "Confirm the Issue-specific Q&A mode before contacting anyone. Maintain a brief that separates known facts, assumptions, and open questions; ask only scope-changing questions. Search existing plans and dependencies, then recommend a template-compliant single card, multi-card plan, or audit/spike based on evidence. Do not label, assign, close, or post outside the explicitly chosen mode.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Can I start card WT-03 now? It looks like a zero-dependency card, but the status page mentions DEP-WT-08.",
+      "expected_output": "Inspect plan and status sources, distinguish internal indegree from external DEP blockers, identify the declared availability criterion, and state readiness based on evidence.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I'm already on branch `codex/my-feature`. Please implement task card ABC-02 from the current plan; the card does not specify a branch change.",
+      "expected_output": "Inspect Libra worktree status and the task card, preserve unrelated changes, and continue on the contributor's current branch unless repository policy or a specific instruction requires a branch change. Do not impose main as the base or switch branches by default.",
+      "files": []
+    }
+  ]
+}
