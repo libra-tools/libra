@@ -7,7 +7,7 @@ mod shallow_response_validation;
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::{self, Error as IoError, Read, Write},
+    io::{self, Error as IoError, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -3546,6 +3546,15 @@ fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
             path.display()
         ),
     })?;
+    let file_len =
+        file.metadata()
+            .map(|meta| meta.len())
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to inspect existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
     let mut header = [0_u8; 8];
     file.read_exact(&mut header)
         .map_err(|source| FetchError::LocalState {
@@ -3554,18 +3563,55 @@ fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
                 path.display()
             ),
         })?;
-    if header[..4] != [0xff, b't', b'O', b'c'] {
-        return Ok(false);
+    if header[..4] == [0xff, b't', b'O', b'c'] {
+        if header[4..] != 2_u32.to_be_bytes() {
+            return Err(FetchError::LocalState {
+                message: format!(
+                    "existing pack index '{}' uses an unsupported version; repair the object store before retrying",
+                    path.display()
+                ),
+            });
+        }
+        return Ok(true);
     }
-    if header[4..] != 2_u32.to_be_bytes() {
-        return Err(FetchError::LocalState {
-            message: format!(
-                "existing pack index '{}' uses an unsupported version; repair the object store before retrying",
-                path.display()
-            ),
-        });
+    // No v2 magic: it must be a well-formed legacy v1 index (256*4 fanout,
+    // `n` 24-byte `offset+sha1` entries, then the 40-byte trailer). Anything
+    // else is a damaged index; fail closed with `LocalState` so the caller
+    // reports a repairable object store instead of taking the v1 build path,
+    // where git-internal's `Pack::decode` dependency scan would read this same
+    // damaged file as a v1 index and abort with a misleading `InvalidPackFile`
+    // ("pack index v1 fanout table is not monotonic").
+    const FANOUT_BYTES: u64 = 256 * 4;
+    const V1_ENTRY_BYTES: u64 = 4 + 20;
+    const TRAILER_BYTES: u64 = 20 + 20;
+    if file_len >= FANOUT_BYTES + TRAILER_BYTES {
+        // `fanout[255]` (the object count) sits at the end of the fanout table.
+        file.seek(SeekFrom::Start(FANOUT_BYTES - 4))
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to inspect existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
+        let mut count = [0_u8; 4];
+        file.read_exact(&mut count)
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to read existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
+        let object_count = u32::from_be_bytes(count) as u64;
+        if file_len == FANOUT_BYTES + object_count * V1_ENTRY_BYTES + TRAILER_BYTES {
+            return Ok(false);
+        }
     }
-    Ok(true)
+    Err(FetchError::LocalState {
+        message: format!(
+            "existing pack index '{}' is corrupt or unreadable; repair the object store before retrying",
+            path.display()
+        ),
+    })
 }
 
 async fn write_pack_and_index(
