@@ -18,6 +18,10 @@ pub fn is_anonymous_repository_spec(spec: &str) -> bool {
     if super::ssh_client::is_ssh_spec(spec) || url::Url::parse(spec).is_ok() {
         return true;
     }
+    // `.` and `..` name the current / parent repository directory directly.
+    if matches!(spec, "." | "..") {
+        return true;
+    }
     let path = Path::new(spec);
     path.is_absolute()
         || spec.starts_with("./")
@@ -47,10 +51,14 @@ pub fn anonymous_remote_name(spec: &str) -> String {
         Some(i) => trimmed[i + 1..].to_string(),
         None => trimmed.to_string(),
     };
-    if candidate.is_empty() {
-        trimmed.to_string()
-    } else {
-        candidate
+    // `.`/`..` and an empty trailing component are not valid refname components,
+    // so use a refname-safe placeholder (tracking is suppressed for anonymous
+    // fetches, so the exact name is incidental).
+    match candidate.as_str() {
+        "." => "local".to_string(),
+        ".." => "upstream".to_string(),
+        _ if candidate.is_empty() => trimmed.to_string(),
+        _ => candidate,
     }
 }
 
@@ -87,5 +95,7 @@ mod tests {
         assert_eq!(anonymous_remote_name("file:///tmp/y/repo"), "repo");
         assert_eq!(anonymous_remote_name("git@host:path"), "path");
         assert_eq!(anonymous_remote_name("origin"), "origin");
+        assert_eq!(anonymous_remote_name("."), "local");
+        assert_eq!(anonymous_remote_name(".."), "upstream");
     }
 }

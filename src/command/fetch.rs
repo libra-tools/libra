@@ -1234,18 +1234,6 @@ fn format_fetch_porcelain(result: &FetchOutput) -> String {
     lines.join("\n")
 }
 
-fn local_upstream_network_error(branch: &str) -> CliError {
-    CliError::command_usage(format!(
-        "cannot fetch: branch '{branch}' tracks a local upstream; \
-         network commands do not operate on local upstreams (issues/480 HP-16)"
-    ))
-    .with_stable_code(StableErrorCode::CliInvalidTarget)
-    .with_detail("remote", ".")
-    .with_detail("upstream_kind", "local")
-    .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
-    .with_hint("local-upstream network operations are tracked as issues/480 HP-16")
-}
-
 /// Git parity for `fetch --set-upstream <remote> <branch>`: after a successful
 /// single-branch fetch from a named remote, record the current branch's
 /// upstream (`branch.<name>.remote` / `branch.<name>.merge`). A colon refspec
@@ -1435,21 +1423,12 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         });
     }
 
-    let has_repository = repository.is_some();
     let remote = match repository {
         Some(remote) => remote,
         None => match ConfigKv::get_current_remote().await {
-            Ok(Some(remote)) if remote == "." => {
-                let branch = match Head::current().await {
-                    Head::Branch(name) => name,
-                    Head::Detached(_) => {
-                        return Err(CliError::fatal("HEAD is detached")
-                            .with_stable_code(StableErrorCode::RepoStateInvalid)
-                            .with_hint("switch to a branch before fetching its upstream"));
-                    }
-                };
-                return Err(local_upstream_network_error(&branch));
-            }
+            // A local upstream (`branch.<b>.remote=.`) is treated as the
+            // current repository as an anonymous fetch source (issues/480
+            // HP-16), replacing the earlier fail-closed refusal.
             Ok(Some(remote)) => remote,
             Ok(None) => {
                 return Err(
@@ -1470,12 +1449,12 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         CliError::fatal(format!("failed to read remote configuration: {error}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
-    // `fetch <path|file://url> <branch>`: an anonymous local-repo spec that is not
-    // a configured remote. It negotiates directly against the target, writes only
-    // `FETCH_HEAD` (no tracking ref), and records no `remote.*` config.
-    let anonymous = configured_remote.is_none()
-        && has_repository
-        && repository_arg::is_anonymous_repository_spec(&remote);
+    // `fetch <path|file://url> <branch>` (or a local upstream `.`): an anonymous
+    // local-repo spec that is not a configured remote. It negotiates directly
+    // against the target, writes only `FETCH_HEAD` (no tracking ref), and
+    // records no `remote.*` config.
+    let anonymous =
+        configured_remote.is_none() && repository_arg::is_anonymous_repository_spec(&remote);
     let remote_config = if let Some(cfg) = configured_remote {
         cfg
     } else if anonymous {

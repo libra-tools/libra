@@ -926,11 +926,9 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         None => {
             let remote = ConfigKv::get_remote(&current_branch).await.ok().flatten();
             match remote {
-                Some(remote) if remote == "." => {
-                    return Err(PushError::LocalUpstream {
-                        branch: current_branch,
-                    });
-                }
+                // A local upstream (`branch.<b>.remote=.`) is treated as the
+                // current repository as an anonymous push target (issues/480
+                // HP-16), replacing the earlier fail-closed refusal.
                 Some(remote) => remote,
                 None => return Err(PushError::NoRemoteConfigured),
             }

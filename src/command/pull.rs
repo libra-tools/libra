@@ -213,6 +213,7 @@ pub(crate) enum PullError {
         "cannot pull: branch '{branch}' tracks a local upstream; \
          network commands do not operate on local upstreams (issues/480 HP-16)"
     )]
+    #[allow(dead_code)]
     LocalUpstream { branch: String },
 
     #[error("pull failed during fetch phase: {0}")]
@@ -739,8 +740,21 @@ async fn resolve_pull_target(
                 return Err(no_tracking_error(&branch, rebase).await);
             };
             if branch_config.remote == "." {
-                return Err(PullError::LocalUpstream {
-                    branch: branch.clone(),
+                // Local upstream (issues/480 HP-16): merge or rebase the local
+                // branch pointed to by `branch.<b>.merge` directly, without a
+                // network fetch.
+                let merge_short = branch_config
+                    .merge
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&branch_config.merge)
+                    .to_string();
+                let (remote_config, _) = resolve_remote_config(".").await?;
+                return Ok(ResolvedPullTarget {
+                    branch,
+                    upstream: format!("./{merge_short}"),
+                    merge_target: format!("refs/heads/{merge_short}"),
+                    remote_branch: merge_short.clone(),
+                    remote_config,
                 });
             }
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
