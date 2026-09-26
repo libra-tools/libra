@@ -279,6 +279,9 @@ pub enum PushError {
     #[error("authentication failed for '{url}'")]
     AuthenticationFailed { url: String },
 
+    #[error("SSH public-key authentication failed: Permission denied (publickey)")]
+    SshPublicKeyAuthenticationFailed,
+
     #[error("failed to discover references from '{url}': {detail}")]
     DiscoveryFailed { url: String, detail: String },
 
@@ -364,6 +367,13 @@ fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
         GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
             url: repo_url.to_string(),
         },
+        GitError::IOError(error)
+            if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(
+                &error,
+            ) =>
+        {
+            PushError::SshPublicKeyAuthenticationFailed
+        }
         GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
             PushError::Protocol { detail }
         }
@@ -444,6 +454,9 @@ impl From<PushError> for CliError {
                 .with_stable_code(StableErrorCode::AuthMissingCredentials)
                 .with_hint("check SSH key or HTTP credentials")
                 .with_hint("use 'libra config --list' to verify auth settings"),
+            PushError::SshPublicKeyAuthenticationFailed => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT),
             PushError::DiscoveryFailed { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check the remote URL and network connectivity"),
@@ -4713,6 +4726,10 @@ mod test {
             }
             .to_string(),
             "authentication failed for 'https://example.com/repo'",
+        );
+        assert_eq!(
+            PushError::SshPublicKeyAuthenticationFailed.to_string(),
+            crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE,
         );
         assert_eq!(
             PushError::DiscoveryFailed {

@@ -26,6 +26,46 @@ use super::*;
 
 mod write_transactions;
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_remote_ssh_publickey_auth_diagnostic() {
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    let remote_url = "git@fixture.invalid:repo";
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", remote_url], repo.path()),
+        "add SSH fixture remote",
+    );
+    let refs = snapshot_repo_refs(repo.path());
+
+    for args in [
+        vec!["remote", "show", "origin"],
+        vec!["remote", "update", "origin"],
+        vec!["remote", "prune", "origin"],
+        vec!["remote", "set-head", "origin", "--auto"],
+    ] {
+        for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+            assert_ssh_publickey_auth_failure(&args, repo.path(), &ssh, mode);
+            assert_repo_refs_unchanged(&refs, repo.path(), mode);
+        }
+    }
+
+    for (index, mode) in SSH_PUBLICKEY_AUTH_OUTPUT_MODES.into_iter().enumerate() {
+        let name = format!("added-{index}");
+        assert_ssh_publickey_auth_failure(
+            &["remote", "add", "-f", name.as_str(), remote_url],
+            repo.path(),
+            &ssh,
+            mode,
+        );
+        let get_url = run_libra_command(&["remote", "get-url", name.as_str()], repo.path());
+        assert_cli_success(&get_url, "remote add -f must retain the registered remote");
+        assert_eq!(String::from_utf8_lossy(&get_url.stdout).trim(), remote_url);
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
+}
+
 #[tokio::test]
 #[serial(cwd)]
 async fn test_remote_add_creates_entry() {

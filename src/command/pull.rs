@@ -1103,6 +1103,13 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
         }
+        GitError::IOError(error)
+            if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
         GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
             CliError::fatal(message)
                 .with_stable_code(StableErrorCode::NetworkProtocol)

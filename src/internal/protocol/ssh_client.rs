@@ -35,6 +35,9 @@ pub(crate) const SSH_HOST_KEY_UNCONFIRMED_SIGNAL: &str = "SSH host trust needs c
 pub(crate) const SSH_HOST_KEY_GUIDANCE: &str = "verify the host fingerprint through a trusted provider console or another trusted channel before manually updating ~/.ssh/known_hosts; alternatively make a separate interactive SSH connection using the repository SSH user, host and port, and compare the displayed fingerprint before accepting it; review ssh.strictHostKeyChecking";
 pub(crate) const SSH_HOST_KEY_CHANGED_SIGNAL: &str = "SSH host identity changed: ";
 pub(crate) const SSH_HOST_KEY_CHANGED_GUIDANCE: &str = "the SSH host identity has changed, which may indicate interception or a legitimate key rotation; verify the new fingerprint through a trusted channel before replacing any existing entry in ~/.ssh/known_hosts; do not bypass host-key checking";
+pub(crate) const SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE: &str =
+    "SSH public-key authentication failed: Permission denied (publickey)";
+pub(crate) const SSH_PUBLIC_KEY_AUTHENTICATION_HINT: &str = "Check the public key selected by Libra (inside a repository: libra config list --ssh-keys), your SSH agent, and repository access; for clone or URL-only ls-remote, inspect SSH configuration directly. Setup: https://libra.tools/en/docs/getting-started/ssh";
 
 struct SshCapturedBytes {
     bytes: Vec<u8>,
@@ -253,6 +256,23 @@ impl std::fmt::Display for SshHostKeyUnconfirmed {
 }
 impl std::error::Error for SshHostKeyUnconfirmed {}
 
+#[derive(Debug)]
+pub(crate) struct SshPublicKeyAuthenticationFailed;
+
+impl std::fmt::Display for SshPublicKeyAuthenticationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE)
+    }
+}
+
+impl std::error::Error for SshPublicKeyAuthenticationFailed {}
+
+pub(crate) fn is_ssh_public_key_authentication_failed(error: &IoError) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SshPublicKeyAuthenticationFailed>())
+}
+
 fn ssh_host_key_unconfirmed(
     status: &std::process::ExitStatus,
     stderr: Option<&SshCapturedBytes>,
@@ -283,12 +303,71 @@ fn ssh_host_key_unconfirmed(
     None
 }
 
+fn ssh_public_key_authentication_rejected(
+    status: &std::process::ExitStatus,
+    stderr: Option<&SshCapturedBytes>,
+) -> bool {
+    if status.code() != Some(255) {
+        return false;
+    }
+    let Some(stderr) = stderr else {
+        return false;
+    };
+    for line in stderr.bytes.split(|byte| matches!(*byte, b'\n' | b'\r')) {
+        let Some(methods) = ssh_permission_denied_methods(line) else {
+            continue;
+        };
+        if methods
+            .split(|byte| *byte == b',')
+            .map(trim_ascii_whitespace)
+            .any(|method| method == b"publickey")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn ssh_permission_denied_methods(line: &[u8]) -> Option<&[u8]> {
+    let line = trim_ascii_whitespace(line);
+    let needle = b"Permission denied (";
+    let methods = if let Some(methods) = line.strip_prefix(needle) {
+        methods
+    } else {
+        let offset = line
+            .windows(needle.len())
+            .position(|candidate| candidate == needle)?;
+        let authority = line[..offset].strip_suffix(b": ")?;
+        if authority.is_empty()
+            || !authority.contains(&b'@')
+            || authority.iter().any(u8::is_ascii_whitespace)
+        {
+            return None;
+        }
+        &line[offset + needle.len()..]
+    };
+    let close = methods.iter().position(|byte| *byte == b')')?;
+    Some(&methods[..close])
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
 fn ssh_discovery_read_error(error: IoError) -> GitError {
     if let Some(kind) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<SshHostKeyUnconfirmed>())
     {
         GitError::NetworkError(format!("{}{kind}", kind.signal()))
+    } else if is_ssh_public_key_authentication_failed(&error) {
+        GitError::IOError(error)
     } else {
         GitError::NetworkError(error.to_string())
     }
@@ -564,7 +643,8 @@ impl SshClient {
         let response = match response {
             Ok(response) => response,
             Err(read_err) => {
-                let error = finish_ssh_read_error(child, read_err, "SSH read failed").await;
+                let error =
+                    finish_ssh_discovery_read_error(child, read_err, "SSH read failed").await;
                 return Err(ssh_discovery_read_error(error));
             }
         };
@@ -926,6 +1006,23 @@ fn wrap_ssh_read_error(
     context: &'static str,
     output: Option<Result<SshProcessOutput, IoError>>,
 ) -> IoError {
+    wrap_ssh_read_error_with_auth_classification(read_error, context, output, false)
+}
+
+fn wrap_ssh_discovery_read_error(
+    read_error: IoError,
+    context: &'static str,
+    output: Option<Result<SshProcessOutput, IoError>>,
+) -> IoError {
+    wrap_ssh_read_error_with_auth_classification(read_error, context, output, true)
+}
+
+fn wrap_ssh_read_error_with_auth_classification(
+    read_error: IoError,
+    context: &'static str,
+    output: Option<Result<SshProcessOutput, IoError>>,
+    classify_public_key_authentication: bool,
+) -> IoError {
     if is_pkt_line_io_error(&read_error)
         && let Some(Ok(output)) = &output
     {
@@ -941,6 +1038,14 @@ fn wrap_ssh_read_error(
         && let Some(kind) = ssh_host_key_unconfirmed(&output.status, output.stderr.as_ref())
     {
         return IoError::other(kind);
+    }
+    if classify_public_key_authentication
+        && header_eof
+        && let Some(Ok(output)) = &output
+        && !output.stdout_observed
+        && ssh_public_key_authentication_rejected(&output.status, output.stderr.as_ref())
+    {
+        return IoError::other(SshPublicKeyAuthenticationFailed);
     }
     if is_pkt_line_io_error(&read_error) {
         if let Some(Ok(output)) = &output
@@ -976,9 +1081,26 @@ fn wrap_ssh_read_error(
 /// Bound the entire direct-child cleanup, including a short header-EOF window
 /// for SSH's own exit status. Other read failures request termination immediately.
 async fn finish_ssh_read_error(
+    child: SshProcess,
+    read_error: IoError,
+    context: &'static str,
+) -> IoError {
+    finish_ssh_read_error_with_auth_classification(child, read_error, context, false).await
+}
+
+async fn finish_ssh_discovery_read_error(
+    child: SshProcess,
+    read_error: IoError,
+    context: &'static str,
+) -> IoError {
+    finish_ssh_read_error_with_auth_classification(child, read_error, context, true).await
+}
+
+async fn finish_ssh_read_error_with_auth_classification(
     mut child: SshProcess,
     read_error: IoError,
     context: &'static str,
+    classify_public_key_authentication: bool,
 ) -> IoError {
     let deadline = tokio::time::Instant::now() + SSH_READ_ERROR_REAP_TIMEOUT;
     let header_eof = read_error
@@ -1023,16 +1145,59 @@ async fn finish_ssh_read_error(
     };
     // The primary protocol error survives even a cleanup failure. The child is
     // configured with kill_on_drop as a fallback; no remote output is rendered.
-    finish_ssh_read_result(read_error, context, output, cleanup_error)
+    finish_ssh_read_result_with_auth_classification(
+        read_error,
+        context,
+        output,
+        cleanup_error,
+        classify_public_key_authentication,
+    )
 }
 
+#[cfg(test)]
 fn finish_ssh_read_result(
     read_error: IoError,
     context: &'static str,
     output: Result<SshProcessOutput, IoError>,
     cleanup_error: Option<IoError>,
 ) -> IoError {
-    let error = wrap_ssh_read_error(read_error, context, Some(output));
+    finish_ssh_read_result_with_auth_classification(
+        read_error,
+        context,
+        output,
+        cleanup_error,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn finish_ssh_discovery_read_result(
+    read_error: IoError,
+    context: &'static str,
+    output: Result<SshProcessOutput, IoError>,
+    cleanup_error: Option<IoError>,
+) -> IoError {
+    finish_ssh_read_result_with_auth_classification(
+        read_error,
+        context,
+        output,
+        cleanup_error,
+        true,
+    )
+}
+
+fn finish_ssh_read_result_with_auth_classification(
+    read_error: IoError,
+    context: &'static str,
+    output: Result<SshProcessOutput, IoError>,
+    cleanup_error: Option<IoError>,
+    classify_public_key_authentication: bool,
+) -> IoError {
+    let error = if classify_public_key_authentication {
+        wrap_ssh_discovery_read_error(read_error, context, Some(output))
+    } else {
+        wrap_ssh_read_error(read_error, context, Some(output))
+    };
     if let Some(cleanup_error) = cleanup_error
         && !is_pkt_line_io_error(&error)
         && !is_missing_shallow_capability(&error)
@@ -1040,6 +1205,7 @@ fn finish_ssh_read_result(
         && !error
             .get_ref()
             .is_some_and(|inner| inner.is::<SshHostKeyUnconfirmed>())
+        && !is_ssh_public_key_authentication_failed(&error)
     {
         // Preserve typed protocol, shallow-negotiation, and host-trust errors.
         // An ordinary failure includes collected status and the cleanup warning.
@@ -1467,6 +1633,10 @@ pub(crate) mod tests {
                     args.iter().filter(|a| a.starts_with("BatchMode=")).count(),
                     1
                 );
+                assert!(
+                    !args.iter().any(|a| a.starts_with("IdentitiesOnly=")),
+                    "system fallback must keep the user's ordinary SSH identity selection"
+                );
                 assert_eq!(
                     args.iter().any(|a| a.starts_with("StrictHostKeyChecking=")),
                     mode != "ask"
@@ -1523,7 +1693,7 @@ pub(crate) mod tests {
                 describe_process_output(&output),
                 "exit status 255; SSH diagnostics withheld; check connectivity and repository access, and load or unlock the key in ssh-agent before retrying"
             );
-            let error = finish_ssh_read_result(
+            let error = finish_ssh_discovery_read_result(
                 pkt12_typed_error(),
                 "SSH read failed",
                 Ok(output),
@@ -2112,18 +2282,42 @@ pub(crate) mod tests {
         .unwrap()
         .unwrap_err()
         .to_string();
-        assert!(error.contains("SSH exited with status 255"), "{error}");
-        assert!(
-            error.contains("ssh-agent") && error.contains("load or unlock the key"),
-            "{error}"
+        assert_eq!(
+            error,
+            format!("IO Error: {SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE}")
         );
-        assert!(!error.contains("Permission denied (publickey)"));
         assert!(!error.contains("PKT11_REMOTE_SECRET"));
         assert!(!error.contains("pkt11-fixture-passphrase"));
         fixture.assert_reaped();
         let args = std::fs::read_to_string(&fixture.arguments).unwrap();
         assert!(args.contains("BatchMode=yes"));
+        assert!(!args.contains("IdentitiesOnly=yes"));
         assert!(args.lines().any(|arg| arg == "-i"));
+
+        for (phase, expected) in [
+            (
+                "fetch",
+                "SSH upload-pack failed: exit status 255; SSH diagnostics withheld",
+            ),
+            (
+                "push",
+                "SSH receive-pack failed: exit status 255; SSH diagnostics withheld",
+            ),
+        ] {
+            let fixture = Pkt11Fixture::new(
+                b"0000",
+                true,
+                format!("Permission denied (publickey). {PKT11_SENTINEL}").as_bytes(),
+                b"PACK-fixture",
+                255,
+            );
+            let (error, _) = pkt11_run_client(phase, &fixture).await;
+            assert!(error.contains(expected), "{phase}: {error}");
+            assert!(
+                !error.contains(SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE),
+                "{phase}: later SSH spawns must keep their transfer classification"
+            );
+        }
     }
 
     const PKT12_SENTINEL: &str = "PKT12_REMOTE_SECRET_0ec451";
@@ -2159,6 +2353,116 @@ pub(crate) mod tests {
 
     fn pkt12_typed_error() -> IoError {
         IoError::new(ErrorKind::InvalidData, PktLineError::TruncatedHeader)
+    }
+
+    #[test]
+    fn pkt_line_client_publickey_auth_classification() {
+        const FIXED_MESSAGE: &str =
+            "SSH public-key authentication failed: Permission denied (publickey)";
+
+        for stderr in [
+            "Permission denied (publickey).",
+            "git@github.com: Permission denied (publickey).",
+            "user@host: Permission denied (gssapi-keyex,gssapi-with-mic,publickey). retry",
+            "banner text\nPermission denied (keyboard-interactive, publickey)\ntrailer",
+            "Permission denied (incomplete\nPermission denied (publickey).",
+        ] {
+            let mut output = pkt12_output_with_code(255);
+            output.stderr = Some(SshCapturedBytes::from_fixture(
+                format!("{stderr} {PKT12_SENTINEL}").as_bytes(),
+                SSH_STDERR_LIMIT,
+            ));
+            let error = finish_ssh_discovery_read_result(
+                pkt12_typed_error(),
+                "SSH read failed",
+                Ok(output),
+                Some(IoError::other("fixture cleanup warning")),
+            );
+            assert_eq!(error.to_string(), FIXED_MESSAGE, "{stderr}");
+            assert!(!is_pkt_line_io_error(&error), "{stderr}");
+            let GitError::IOError(error) = ssh_discovery_read_error(error) else {
+                panic!("public-key rejection must retain a typed IO carrier: {stderr}")
+            };
+            assert_eq!(error.to_string(), FIXED_MESSAGE, "{stderr}");
+            assert!(!error.to_string().contains(PKT12_SENTINEL));
+            assert!(!error.to_string().contains("cleanup warning"));
+        }
+
+        for (stderr, code, stdout_observed, header_eof) in [
+            ("Permission denied (publickey).", 23, false, true),
+            ("Permission denied (publickey).", 255, true, true),
+            ("Permission denied (publickey).", 255, false, false),
+            ("Permission denied.", 255, false, true),
+            ("Permission denied (publickey-cert).", 255, false, true),
+            ("Permission denied (mypublickey).", 255, false, true),
+            ("Permission denied (publickey", 255, false, true),
+            ("publickey Permission denied", 255, false, true),
+            (
+                "remote banner says Permission denied (publickey).",
+                255,
+                false,
+                true,
+            ),
+            (
+                "github.com: Permission denied (publickey).",
+                255,
+                false,
+                true,
+            ),
+        ] {
+            let mut output = pkt12_output_with_code(code);
+            output.stdout_observed = stdout_observed;
+            output.stderr = Some(SshCapturedBytes::from_fixture(
+                stderr.as_bytes(),
+                SSH_STDERR_LIMIT,
+            ));
+            let read_error = if header_eof {
+                pkt12_typed_error()
+            } else {
+                IoError::new(ErrorKind::InvalidData, PktLineError::TruncatedPayload)
+            };
+            let error =
+                wrap_ssh_discovery_read_error(read_error, "SSH read failed", Some(Ok(output)));
+            assert_ne!(error.to_string(), FIXED_MESSAGE, "{stderr}");
+        }
+
+        let mut output = pkt12_output_with_code(255);
+        output.stderr = None;
+        let error =
+            wrap_ssh_discovery_read_error(pkt12_typed_error(), "SSH read failed", Some(Ok(output)));
+        assert_ne!(error.to_string(), FIXED_MESSAGE);
+
+        let mut output = pkt12_output_with_code(255);
+        output.stderr = Some(SshCapturedBytes::from_fixture(
+            b"REMOTE HOST IDENTIFICATION HAS CHANGED; Permission denied (publickey).",
+            SSH_STDERR_LIMIT,
+        ));
+        let error =
+            wrap_ssh_discovery_read_error(pkt12_typed_error(), "SSH read failed", Some(Ok(output)));
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<SshHostKeyUnconfirmed>()),
+            "host-key failures must take precedence over the public-key heuristic"
+        );
+
+        let mut output = pkt12_output_with_code(255);
+        output.stderr = Some(SshCapturedBytes::from_fixture(
+            b"Permission denied (publickey).",
+            SSH_STDERR_LIMIT,
+        ));
+        let error = wrap_ssh_read_error(
+            pkt12_typed_error(),
+            "SSH advertisement read failed",
+            Some(Ok(output)),
+        );
+        assert!(!is_ssh_public_key_authentication_failed(&error));
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<SshProtocolReadExit>())
+        );
+        assert!(error.to_string().contains("SSH exited with status 255"));
     }
 
     fn pkt12_assert_wrapper(context: &'static str) {
@@ -2428,7 +2732,19 @@ pub(crate) mod tests {
         assert_eq!(production.matches("fn wrap_ssh_read_error(").count(), 1);
         assert_eq!(production.matches("fn finish_ssh_read_error(").count(), 1);
         assert_eq!(production.matches("wrap_ssh_read_error(").count(), 4);
-        assert_eq!(production.matches("finish_ssh_read_error(").count(), 7);
+        assert_eq!(production.matches("finish_ssh_read_error(").count(), 6);
+        assert_eq!(
+            production
+                .matches("fn wrap_ssh_discovery_read_error(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("fn finish_ssh_discovery_read_error(")
+                .count(),
+            1
+        );
     }
 
     #[cfg(unix)]
@@ -2543,13 +2859,13 @@ pub(crate) mod tests {
             root: &std::path::Path,
             command: &str,
             malformed: &[u8],
-            native_exit: bool,
+            native_stderr: Option<&str>,
         ) -> Self {
             use std::os::unix::fs::PermissionsExt;
 
             use crate::git_protocol::add_pkt_line_string;
 
-            let successful_advertisements = if native_exit {
+            let successful_advertisements = if native_stderr.is_some() {
                 0
             } else {
                 match command {
@@ -2588,12 +2904,10 @@ pub(crate) mod tests {
             std::fs::write(&counter, "0\n").unwrap();
             let counter_arg = shell_single_quote(counter.to_str().unwrap());
             let log_arg = shell_single_quote(transcript.to_str().unwrap());
-            let stderr = if native_exit {
-                format!("Permission denied (publickey). {PKT12_SENTINEL}")
-            } else {
-                PKT12_SENTINEL.to_string()
-            };
-            let termination = if native_exit {
+            let stderr = native_stderr
+                .map(|message| format!("{message} {PKT12_SENTINEL}"))
+                .unwrap_or_else(|| PKT12_SENTINEL.to_string());
+            let termination = if native_stderr.is_some() {
                 "exit 255"
             } else {
                 "exec sleep 30"
@@ -2651,7 +2965,7 @@ pub(crate) mod tests {
         // Keyed lanes and per-test nextest processes follow existing env fixtures.
         let _storage = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
         let mut checked = 0;
-        for (malformed, native_exit) in [
+        for (malformed, native_stderr) in [
             b"0001".as_slice(),
             b"0002",
             b"0003",
@@ -2664,9 +2978,16 @@ pub(crate) mod tests {
             b"ffffabc",
         ]
         .into_iter()
-        .map(|wire| (wire, false))
-        .chain([(b"".as_slice(), true)])
-        {
+        .map(|wire| (wire, None))
+        .chain([
+            (b"".as_slice(), Some("Permission denied (publickey).")),
+            (
+                b"".as_slice(),
+                Some("SSH fixture failed without authentication diagnostic."),
+            ),
+        ]) {
+            let public_key_rejection = native_stderr
+                .is_some_and(|message| message.contains("Permission denied (publickey)"));
             let expected_reason = if matches!(malformed, b"0001" | b"0002" | b"0003") {
                 PktLineError::InvalidFrameLength(
                     crate::git_protocol::PktFrameError::LengthBelowHeader,
@@ -2680,7 +3001,8 @@ pub(crate) mod tests {
                 let repo = tempfile::tempdir().unwrap();
                 setup_with_new_libra_in(repo.path()).await;
                 let _cwd = ChangeDirGuard::new(repo.path());
-                let fixture = Pkt12SshFixture::write(repo.path(), command, malformed, native_exit);
+                let fixture =
+                    Pkt12SshFixture::write(repo.path(), command, malformed, native_stderr);
                 let _ssh = ScopedEnvVar::set("LIBRA_SSH_COMMAND", &fixture.script);
                 ConfigKv::set("remote.origin.url", "git@fixture.invalid:repo", false)
                     .await
@@ -2739,33 +3061,36 @@ pub(crate) mod tests {
                 })
                 .await
                 .expect("malformed SSH command must terminate");
-                assert_eq!(
-                    error.stable_code(),
-                    StableErrorCode::NetworkProtocol,
-                    "{command}: {error:?}"
-                );
-                assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
+                let expected_code = if public_key_rejection {
+                    StableErrorCode::AuthPermissionDenied
+                } else {
+                    StableErrorCode::NetworkProtocol
+                };
+                assert_eq!(error.stable_code(), expected_code, "{command}: {error:?}");
                 assert_eq!(error.stable_code().exit_code().as_i32(), 128);
-                assert!(
-                    error.message().contains(PKT_LINE_PROTOCOL_ERROR_PREFIX),
-                    "{command}: {error:?}"
-                );
-                assert!(
-                    error.message().contains(&expected_reason.to_string()),
-                    "{command}: {error:?}"
-                );
-                if native_exit {
+                if public_key_rejection {
+                    assert_eq!(error.stable_code().as_str(), "LBR-AUTH-002");
+                    assert_eq!(error.message(), SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE);
+                } else {
+                    assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
                     assert!(
-                        error.message().contains("SSH exited with status 255"),
+                        error.message().contains(PKT_LINE_PROTOCOL_ERROR_PREFIX),
                         "{command}: {error:?}"
                     );
                     assert!(
-                        error.message().contains("ssh-agent authentication"),
+                        error.message().contains(&expected_reason.to_string()),
                         "{command}: {error:?}"
                     );
-                    assert!(!error.message().contains("Permission denied (publickey)"));
+                    if native_stderr.is_some() {
+                        assert!(
+                            error.message().contains("SSH exited with status 255"),
+                            "{command}: {error:?}"
+                        );
+                    }
                 }
-                let hint = if command == "push" {
+                let hint = if public_key_rejection {
+                    SSH_PUBLIC_KEY_AUTHENTICATION_HINT
+                } else if command == "push" {
                     "check the remote Git service or proxy response and retry"
                 } else {
                     "check that the remote serves Git data and that a proxy has not altered the response"
@@ -2796,7 +3121,7 @@ pub(crate) mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 55);
+        assert_eq!(checked, 60);
     }
 
     pub(crate) async fn read_test_stream<R: AsyncRead + Unpin>(

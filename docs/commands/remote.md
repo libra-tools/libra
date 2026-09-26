@@ -386,3 +386,18 @@ for both fetch and push, matching Git's behavior.
 | Failed to prune remote-tracking branch | `LBR-IO-002` | 128 | -- |
 | Remote object format mismatch during prune | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Remote discovery / auth / network failure during prune | fetch-aligned network/auth codes | 128 | See `libra fetch` error table |
+| SSH public-key rejection during online `show`, `update`, `prune`, `set-head --auto`, or `add -f` discovery | `LBR-AUTH-002` | 128 | Check `libra config list --ssh-keys`, the SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
+
+The SSH classification requires a zero-byte first-header EOF, direct exit status
+255, no stdout and a complete `Permission denied (<method-list>)` diagnostic with
+an exact `publickey` method. Host-key failures keep priority. The message and hint
+are fixed and never expose raw stderr; since stderr can be forged, the code does
+not establish the underlying reason access was denied. Other malformed or missing
+advertisements retain their network/protocol codes. Failed `remote add -f` keeps
+the remote configuration that was added before its fetch began.
+The config command in the fixed hint must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept `LBR-AUTH-002` plus
+the legacy code for this SSH discovery failure: `LBR-NET-001` for online `show`
+and `set-head --auto`, or `LBR-NET-002` for `update`, `prune`, and `add -f`.

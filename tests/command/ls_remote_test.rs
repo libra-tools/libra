@@ -20,6 +20,22 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_ls_remote_ssh_publickey_auth_diagnostic() {
+    let outside = tempdir().expect("failed to create SSH auth fixture root");
+    let ssh = create_ssh_publickey_auth_failure_script(outside.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        assert_ssh_publickey_auth_failure(
+            &["ls-remote", "git@fixture.invalid:repo"],
+            outside.path(),
+            &ssh,
+            mode,
+        );
+    }
+}
+
 #[test]
 fn ls_remote_local_path_lists_head_and_branch_outside_repo() {
     let remote = create_committed_repo_via_cli();

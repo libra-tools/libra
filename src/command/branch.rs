@@ -3548,9 +3548,11 @@ mod tests {
             remote: None,
         };
         let mut targets = HashSet::new();
+        let repo_kind = git_internal::hash::get_hash_kind();
         targets.insert(
-            crate::internal::object_format::parse_repo_oid(
-                "1111111111111111111111111111111111111111111111111111111111111111",
+            crate::internal::object_format::parse_hex_for_kind(
+                repo_kind,
+                &"1".repeat(repo_kind.hex_len()),
             )
             .unwrap(),
         );

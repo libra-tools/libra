@@ -1,6 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [0.24.1] — 2026-09-27
+
+### SSH public-key authentication diagnostics (#577)
+
+- `clone`, `fetch`, `pull`, `push`, `ls-remote`, and online `remote` discovery
+  now report a strict SSH `Permission denied (publickey)` discovery failure as
+  `LBR-AUTH-002` (exit 128) with a fixed setup hint, instead of a misleading
+  `LBR-NET-001` or `LBR-NET-002` network/protocol error. Host-key failures keep higher priority, raw
+  SSH stderr remains hidden, and later upload-pack/receive-pack processes retain
+  their existing transfer classifications.
+- Automation should accept `LBR-AUTH-002` plus the legacy code for this failure:
+  `LBR-NET-001` for online `remote show` and `remote set-head --auto`, and
+  `LBR-NET-002` for the other listed command surfaces. Keep that compatibility
+  for at least 30 days after v0.24.1 is released and through at least the next
+  patch release, whichever is later.
 
 ### init / Convert / reinit object-format gates (B3-01)
 
@@ -52,13 +66,6 @@
 - blake3 repositories skip the `maintenance` `commit-graph` task (Git CGPH has no
   blake3 `hash_version`): warn on stderr / JSON task message, leave existing
   `objects/info/commit-graph*` untouched, and rely on object-walk `log` / `rev-list`.
-
-
-
-
-
-
-
 
 ## [0.23.67] — 2026-09-26
 

@@ -499,6 +499,7 @@ trigger a fuzzy match suggestion via edit distance.
 | Local file remote | `LBR-CLI-003` | 129 | "push supports network remotes only" |
 | Invalid remote URL | `LBR-CLI-002` | 129 | "check the remote URL" |
 | Authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
+| SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Discovery failed | `LBR-NET-001` | 128 | "check the remote URL and network connectivity" |
 | Network timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Non-fast-forward | `LBR-CONFLICT-002` | 128 | "pull first, or use --force (data loss risk)" |
@@ -551,19 +552,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -588,6 +590,15 @@ provider console or another trusted channel before manually updating
 and compare the displayed fingerprint before accepting it. For example,
 `ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
 port. Do not accept a fingerprint that has not been verified.
+
+For the strict discovery-only public-key rejection above, the fixed hint asks you
+to check `libra config list --ssh-keys`, your SSH agent and repository access, and
+links the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh).
+The config command must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept both `LBR-AUTH-002`
+and the legacy `LBR-NET-002` for this SSH discovery failure.
 
 `ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
 `no` values. `ask` leaves that SSH option to the user's SSH configuration;

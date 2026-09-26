@@ -515,16 +515,33 @@ mod tests {
     #[test]
     fn synthetic_legacy_predecessor_is_deterministic_and_format_separated() {
         let sha1_oid = "0123456789abcdef0123456789abcdef01234567";
-        let first = synthetic_change_id_for_legacy_predecessor(sha1_oid).expect("synthetic id");
-        let second = synthetic_change_id_for_legacy_predecessor(sha1_oid).expect("synthetic id");
+        let first = synthetic_change_id_for_legacy_predecessor_for_kind(
+            git_internal::hash::HashKind::Sha1,
+            sha1_oid,
+        )
+        .expect("synthetic id");
+        let second = synthetic_change_id_for_legacy_predecessor_for_kind(
+            git_internal::hash::HashKind::Sha1,
+            sha1_oid,
+        )
+        .expect("synthetic id");
         assert_eq!(first, second);
         // A 64-hex oid is a SHA-256 commit and must not alias the SHA-1
         // synthetic identity for the same bytes.
         let sha256_oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let sha256 =
-            synthetic_change_id_for_legacy_predecessor(sha256_oid).expect("sha256 synthetic");
+        let sha256 = synthetic_change_id_for_legacy_predecessor_for_kind(
+            git_internal::hash::HashKind::Sha256,
+            sha256_oid,
+        )
+        .expect("sha256 synthetic");
         assert_ne!(first, sha256);
-        assert!(synthetic_change_id_for_legacy_predecessor("not-hex").is_none());
+        assert!(
+            synthetic_change_id_for_legacy_predecessor_for_kind(
+                git_internal::hash::HashKind::Sha1,
+                "not-hex",
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -575,7 +592,17 @@ mod tests {
 /// no sidecar projection (ADR-OL-04). Returns `None` when the OID does not
 /// parse as an object hash.
 fn synthetic_change_id_for_legacy_predecessor(predecessor_oid: &str) -> Option<ChangeId> {
-    crate::internal::object_format::parse_repo_oid(predecessor_oid)
+    synthetic_change_id_for_legacy_predecessor_for_kind(
+        git_internal::hash::get_hash_kind(),
+        predecessor_oid,
+    )
+}
+
+fn synthetic_change_id_for_legacy_predecessor_for_kind(
+    kind: git_internal::hash::HashKind,
+    predecessor_oid: &str,
+) -> Option<ChangeId> {
+    crate::internal::object_format::parse_hex_for_kind(kind, predecessor_oid)
         .ok()
         .map(|hash| ChangeId::synthetic_for_commit(hash.kind().as_str(), hash.as_ref()))
 }

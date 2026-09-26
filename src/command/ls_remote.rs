@@ -216,6 +216,13 @@ impl From<LsRemoteError> for CliError {
                         .with_stable_code(StableErrorCode::NetworkProtocol)
                         .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
                 }
+                GitError::IOError(source)
+                    if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(source) =>
+                {
+                    CliError::fatal(source.to_string())
+                        .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                        .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+                }
                 GitError::IOError(source) if is_pkt_line_io_error(source) => {
                     CliError::fatal(error.to_string())
                         .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -270,9 +277,19 @@ async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteErr
     let discovery = client
         .discovery_reference(UploadPack)
         .await
-        .map_err(|source| LsRemoteError::Discovery {
-            remote: visible_remote.clone(),
-            source: sanitize_discovery_error(source, &remote_url),
+        .map_err(|source| {
+            let source = match &source {
+                GitError::IOError(error)
+                    if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+                {
+                    source
+                }
+                _ => sanitize_discovery_error(source, &remote_url),
+            };
+            LsRemoteError::Discovery {
+                remote: visible_remote.clone(),
+                source,
+            }
         })?;
     let patterns = compile_patterns(&args.patterns)?;
     let mut entries: Vec<LsRemoteEntry> = discovery

@@ -10,6 +10,8 @@ use std::{
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::{Condvar, LazyLock, Mutex},
 };
+#[cfg(unix)]
+use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
 use git_internal::{
     hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -64,6 +66,131 @@ pub(crate) struct CliErrorReport {
     pub(crate) hints: Vec<String>,
     #[serde(default)]
     pub(crate) details: BTreeMap<String, Value>,
+}
+
+#[cfg(unix)]
+pub(crate) const SSH_PUBLICKEY_AUTH_OUTPUT_MODES: [&str; 4] = ["human", "json", "machine", "debug"];
+#[cfg(unix)]
+const SSH_PUBLICKEY_AUTH_MESSAGE: &str =
+    "SSH public-key authentication failed: Permission denied (publickey)";
+#[cfg(unix)]
+const SSH_PUBLICKEY_AUTH_HINT: &str = "Check the public key selected by Libra (inside a repository: libra config list --ssh-keys), your SSH agent, and repository access; for clone or URL-only ls-remote, inspect SSH configuration directly. Setup: https://libra.tools/en/docs/getting-started/ssh";
+#[cfg(unix)]
+const SSH_PUBLICKEY_AUTH_SENTINEL: &str = "SSH_AUTH_REMOTE_SECRET_577";
+
+#[cfg(unix)]
+pub(crate) fn create_ssh_publickey_auth_failure_script(root: &Path) -> PathBuf {
+    let script = root.join("fake-ssh-publickey-auth");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' 'git@fixture.invalid: Permission denied (gssapi-keyex,gssapi-with-mic,publickey). {SSH_PUBLICKEY_AUTH_SENTINEL}' >&2\nexit 255\n"
+        ),
+    )
+    .expect("failed to write fake SSH authentication fixture");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("failed to make fake SSH authentication fixture executable");
+    script
+}
+
+#[cfg(unix)]
+pub(crate) fn assert_ssh_publickey_auth_failure(
+    args: &[&str],
+    cwd: &Path,
+    ssh_script: &Path,
+    output_mode: &str,
+) -> Output {
+    let mut command_args = Vec::with_capacity(args.len() + 1);
+    match output_mode {
+        "human" | "debug" => {}
+        "json" => command_args.push("--json"),
+        "machine" => command_args.push("--machine"),
+        other => panic!("unsupported SSH auth output mode: {other}"),
+    }
+    command_args.extend_from_slice(args);
+
+    let ssh_script = ssh_script
+        .to_str()
+        .expect("fake SSH authentication fixture path must be UTF-8");
+    let mut extra_env = vec![("LIBRA_SSH_COMMAND", ssh_script)];
+    if output_mode == "debug" {
+        extra_env.push(("RUST_LOG", "debug"));
+    }
+    let output = run_libra_command_with_env(&command_args, cwd, &extra_env);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "{}",
+        format_cli_failure(&output, &format!("{output_mode} {args:?}"))
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rendered = format!("{stdout}\n{stderr}");
+    assert!(
+        rendered.contains("LBR-AUTH-002"),
+        "{output_mode}: {rendered}"
+    );
+    assert!(
+        rendered.contains(SSH_PUBLICKEY_AUTH_MESSAGE),
+        "{output_mode}: {rendered}"
+    );
+    assert!(
+        rendered.contains(SSH_PUBLICKEY_AUTH_HINT),
+        "{output_mode}: {rendered}"
+    );
+    for forbidden_text in [
+        SSH_PUBLICKEY_AUTH_SENTINEL,
+        "gssapi-keyex",
+        "gssapi-with-mic",
+        "git@fixture.invalid: Permission denied",
+    ] {
+        assert!(
+            !rendered.contains(forbidden_text),
+            "{output_mode}: leaked forbidden SSH diagnostic"
+        );
+    }
+
+    if output_mode == "debug" {
+        assert!(
+            rendered.contains("SSH process diagnostics"),
+            "debug mode did not emit sanitized SSH diagnostics: {rendered}"
+        );
+    }
+
+    if matches!(output_mode, "json" | "machine") {
+        let (_, report) = parse_cli_error_stderr(&output.stderr);
+        assert_eq!(report.error_code, "LBR-AUTH-002");
+        assert_eq!(report.category, "auth");
+        assert_eq!(report.exit_code, 128);
+        assert_eq!(report.message, SSH_PUBLICKEY_AUTH_MESSAGE);
+        assert_eq!(report.hints, [SSH_PUBLICKEY_AUTH_HINT]);
+    }
+
+    output
+}
+
+#[cfg(unix)]
+pub(crate) fn snapshot_repo_refs(cwd: &Path) -> Vec<u8> {
+    let output = run_libra_command(&["show-ref"], cwd);
+    assert_cli_success(
+        &output,
+        "snapshot repository refs before SSH authentication failure",
+    );
+    output.stdout
+}
+
+#[cfg(unix)]
+pub(crate) fn assert_repo_refs_unchanged(expected: &[u8], cwd: &Path, context: &str) {
+    let output = run_libra_command(&["show-ref"], cwd);
+    assert_cli_success(
+        &output,
+        "inspect repository refs after SSH authentication failure",
+    );
+    assert_eq!(
+        output.stdout, expected,
+        "{context}: SSH discovery failure changed local refs"
+    );
 }
 
 /// Default process-local cap on live CLI children (plan-20260917 SP-00/SP-01).

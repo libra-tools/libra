@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="13" skipped="0" failures="0" errors="0" uuid="057bf549-8a3a-4a12-9a77-5cd46b5087f6" timestamp="2026-09-27T11:27:12.496+08:00" time="11.833">
+    <testsuite name="libra" tests="7" skipped="0" errors="0" failures="0">
+        <testcase name="utils::error::tests::stable_error_code_auth_permission_denied_description" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.019"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_publickey_auth_classification" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.022"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_ssh_read_error_no_hang" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.030"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_batch_mode_enforced" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.114"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_batch_mode_passphrase_error_points_to_agent" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.229"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_host_key_fail_closed_guidance" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="0.308"/>
+        <testcase name="internal::protocol::ssh_client::tests::pkt_line_client_ssh_frame_errors_end_to_end_net_002" classname="libra" timestamp="2026-09-27T11:27:12.504+08:00" time="11.825"/>
+    </testsuite>
+    <testsuite name="libra::command_test" tests="6" skipped="0" errors="0" failures="0">
+        <testcase name="command::clone_test::test_clone_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="0.271"/>
+        <testcase name="command::ls_remote_test::test_ls_remote_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="0.271"/>
+        <testcase name="command::pull_test::test_pull_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="1.496"/>
+        <testcase name="command::fetch_test::test_fetch_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="1.526"/>
+        <testcase name="command::push_test::test_push_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="1.584"/>
+        <testcase name="command::remote_test::test_remote_ssh_publickey_auth_diagnostic" classname="libra::command_test" timestamp="2026-09-27T11:27:12.504+08:00" time="2.950"/>
+    </testsuite>
+</testsuites>

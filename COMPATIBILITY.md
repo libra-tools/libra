@@ -572,19 +572,19 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit 255 returns fixed guidance and `LBR-NET-001`; this
+does not verify the fingerprint. A complete `Permission denied (<method-list>)`
+whose list contains the exact `publickey` token, with direct exit 255 and no stdout,
+returns a fixed message and `LBR-AUTH-002`. During migration, automation should accept that code
+plus legacy `LBR-NET-001` for online `remote show`/`set-head --auto` or legacy `LBR-NET-002` for the other affected surfaces,
+for at least 30 days after v0.24.1 is released and through the next patch, whichever is later. Forged stderr proves no cause; other missing advertisements stay `LBR-NET-002`, and raw diagnostics stay hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed
+host-trust and public-key authentication errors precede secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.

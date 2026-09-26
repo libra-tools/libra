@@ -167,19 +167,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -347,3 +348,14 @@ unchanged. This is framing validation, not a new advertisement content grammar:
 a missing final flush at a frame boundary and well-framed semantically unused
 tail data retain their existing treatment. Git/SSH readers already validate the
 framing of the advertisement buffer before calling the shared parser.
+
+## Issue #577 SSH 公钥拒绝诊断
+
+SSH discovery 在首个 pkt-line 标头零字节 EOF、直接 SSH 退出码255、无 stdout，
+且完整 `Permission denied (<method-list>)` 含精确 `publickey` 方法时，保留带类型
+错误并映射为 `LBR-AUTH-002`（exit 128）。host-key 分类优先；第二次
+fetch-objects/send-pack 进程与其它坏帧继续走原协议分类。命令只输出固定消息及
+固定 hint，指向 `https://libra.tools/en/docs/getting-started/ssh`，不输出原 stderr。
+该启发式可被 stderr 伪造，因此只表示远端拒绝认证或授权，不断言具体原因。
+迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
+自动化应同时接受该失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。

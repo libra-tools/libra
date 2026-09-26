@@ -208,7 +208,8 @@ On error:
 |--------|--------|
 | `LBR-REPO-*` | Repository state errors (not a repo, corrupt objects, missing refs) |
 | `LBR-CLI-*` | CLI argument validation errors (invalid flags, missing required args) |
-| `LBR-NET-*` | Network and transport errors (auth failure, timeout, DNS) |
+| `LBR-NET-*` | Network and transport errors (timeout, DNS, protocol failure) |
+| `LBR-AUTH-*` | Authentication, authorization, and credential errors |
 | `LBR-FS-*` | Filesystem errors (permission denied, disk full, path encoding) |
 | `LBR-IDX-*` | Index/staging area errors (corrupt index, lock contention) |
 | `LBR-OBJ-*` | Object storage errors (missing object, hash mismatch) |

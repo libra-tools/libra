@@ -174,6 +174,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "st_bare_z_emits_porcelain_v1",
     "staged_rename_then_delete_emits_rd",
     "staged_rename_then_modify_emits_rm",
+    "status_blake3_repo_smoke",
     "status_short_value_contains_s_not_short",
     "symlink_rename_hashes_target_bytes_not_referent",
     "symlink_worktree_exact_with_rename_untracked",

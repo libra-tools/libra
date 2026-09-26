@@ -289,3 +289,15 @@ Git 重载 `git remote`（无子命令）列出远程名称，`git remote -v` �
 | 无法修剪远程跟踪分支 | `LBR-IO-002` | 128 | -- |
 | Prune 期间远程对象格式不匹配 | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Prune 期间远程发现 / auth / 网络失败 | 与 fetch 对齐的网络/auth 代码 | 128 | 见 `libra fetch` 错误表 |
+| 在线 `show`、`update`、`prune`、`set-head --auto` 或 `add -f` discovery 遭 SSH 公钥拒绝 | `LBR-AUTH-002` | 128 | 检查 `libra config list --ssh-keys`、SSH agent 与仓库权限；参阅 [SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh) |
+
+该 SSH 分类只在首个标头零字节 EOF、直接退出码255、无 stdout，以及完整
+`Permission denied (<method-list>)` 含精确 `publickey` 方法时触发；host-key
+失败仍有更高优先级。固定消息和 hint 不显示原始 stderr。stderr 可被伪造，
+因此错误码不证明拒绝访问的具体原因。其它畸形或缺失广告保留原网络/协议错误码。
+`remote add -f` 的 fetch 失败时，仍保留 fetch 开始前已经添加的远程配置。
+固定 hint 中的 config 命令必须在已有 Libra 仓库内运行。
+
+从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚），自动化应接受
+`LBR-AUTH-002`，并兼容各入口的旧代码：在线 `show` 与 `set-head --auto` 为
+`LBR-NET-001`，`update`、`prune` 与 `add -f` 为 `LBR-NET-002`。

@@ -50,6 +50,32 @@ fn libra_command(cwd: &Path) -> Command {
     cmd
 }
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_fetch_ssh_publickey_auth_diagnostic() {
+    use super::{
+        SSH_PUBLICKEY_AUTH_OUTPUT_MODES, assert_repo_refs_unchanged,
+        assert_ssh_publickey_auth_failure, create_ssh_publickey_auth_failure_script,
+        snapshot_repo_refs,
+    };
+
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", "git@fixture.invalid:repo"],
+            repo.path(),
+        ),
+        "add SSH fixture remote",
+    );
+    let refs = snapshot_repo_refs(repo.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        assert_ssh_publickey_auth_failure(&["fetch", "origin"], repo.path(), &ssh, mode);
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
+}
+
 fn libra_tokio_command(cwd: &Path) -> TokioCommand {
     let home = cwd.join(".libra-test-home");
     let config_home = home.join(".config");

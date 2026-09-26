@@ -22,6 +22,33 @@ struct GitHubTestRepo {
     token: String,
 }
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_clone_ssh_publickey_auth_diagnostic() {
+    use super::{
+        SSH_PUBLICKEY_AUTH_OUTPUT_MODES, assert_ssh_publickey_auth_failure,
+        create_ssh_publickey_auth_failure_script,
+    };
+
+    let root = tempdir().expect("failed to create SSH auth fixture root");
+    let ssh = create_ssh_publickey_auth_failure_script(root.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        let destination = root.path().join(format!("clone-{mode}"));
+        let destination_arg = destination.to_string_lossy().to_string();
+        assert_ssh_publickey_auth_failure(
+            &["clone", "git@fixture.invalid:repo", &destination_arg],
+            root.path(),
+            &ssh,
+            mode,
+        );
+        assert!(
+            !destination.exists(),
+            "failed SSH authentication must clean the clone destination in {mode} mode"
+        );
+    }
+}
+
 impl Drop for GitHubTestRepo {
     fn drop(&mut self) {
         // Safety: only delete repos whose name starts with "libra-test-"

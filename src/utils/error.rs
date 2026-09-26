@@ -554,7 +554,7 @@ impl StableErrorCode {
                 "Required credentials, identity, key material, or tokens are missing."
             }
             Self::AuthPermissionDenied => {
-                "Credentials were present but the operation is not permitted."
+                "The remote rejected authentication or authorization; the exact cause is not established."
             }
             Self::IoReadFailed => "Filesystem or storage read failed.",
             Self::IoWriteFailed => "Filesystem or storage write failed.",
@@ -1809,6 +1809,14 @@ mod tests {
         stderr_render_mode,
     };
     use crate::utils::test::ScopedEnvVar;
+
+    #[test]
+    fn stable_error_code_auth_permission_denied_description() {
+        assert_eq!(
+            StableErrorCode::AuthPermissionDenied.description(),
+            "The remote rejected authentication or authorization; the exact cause is not established."
+        );
+    }
 
     /// W5-07: the hint fires only for the `code` subcommand carrying a removed
     /// Web alias (exact or `=value` form), never for other subcommands or

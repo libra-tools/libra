@@ -1,4 +1,11 @@
 test_fn	lane	reason
+test_clone_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated repository and fake SSH environment while exercising clone failure cleanup
+test_fetch_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated repository and fake SSH environment while exercising fetch discovery
+test_pull_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated repository and fake SSH environment while exercising pull discovery
+test_push_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated repository and fake SSH environment while exercising push discovery
+test_ls_remote_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated directory and fake SSH environment while exercising ls-remote discovery
+test_remote_ssh_publickey_auth_diagnostic	lane:cwd+env	uses an isolated repository and fake SSH environment across online remote subcommands
+maintenance_parse_object_hash_blake3	lane:hash_kind	sets the process-wide hash kind
 config_cascade_uses_explicit_role	lane:cwd+env	uses isolated global/system configuration paths and cwd to prove read-only role routing
 global_config_create_uses_global_role	lane:env	uses the shared configuration fixture and validates global writer cache isolation
 system_config_create_uses_system_role	lane:env	uses the shared configuration fixture and validates system writer cache isolation

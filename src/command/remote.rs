@@ -320,8 +320,11 @@ enum RemoteError {
     #[error("no such remote-tracking branch '{remote}/{branch}'")]
     RemoteTrackingBranchNotFound { remote: String, branch: String },
 
-    #[error("failed to query remote '{remote}': {detail}")]
-    Discovery { remote: String, detail: String },
+    #[error("failed to query remote '{remote}': {source}")]
+    Discovery {
+        remote: String,
+        source: fetch::FetchError,
+    },
 
     #[error("could not determine the default branch for remote '{remote}'")]
     NoRemoteHead { remote: String },
@@ -397,12 +400,23 @@ impl From<RemoteError> for CliError {
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
                     .with_hint("fetch the remote first, or run 'libra remote -v' to inspect remotes")
             }
-            RemoteError::Discovery { remote, detail } => {
-                CliError::fatal(format!("failed to query remote '{remote}': {detail}"))
-                    .with_stable_code(StableErrorCode::NetworkUnavailable)
-                    .with_hint(format!(
-                        "ensure the remote is reachable, or run 'libra remote show --no-query {remote}' to show cached data"
-                    ))
+            RemoteError::Discovery { remote, source } => {
+                let is_ssh_auth = matches!(
+                    &source,
+                    fetch::FetchError::Discovery {
+                        source: git_internal::errors::GitError::IOError(error),
+                        ..
+                    } if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error)
+                );
+                if is_ssh_auth {
+                    CliError::from(source)
+                } else {
+                    CliError::fatal(format!("failed to query remote '{remote}': {source}"))
+                        .with_stable_code(StableErrorCode::NetworkUnavailable)
+                        .with_hint(format!(
+                            "ensure the remote is reachable, or run 'libra remote show --no-query {remote}' to show cached data"
+                        ))
+                }
             }
             RemoteError::NoRemoteHead { remote } => {
                 CliError::fatal(format!(
@@ -1460,7 +1474,7 @@ async fn discover_remote_refs(
         .await
         .map_err(|error| RemoteError::Discovery {
             remote: name.to_string(),
-            detail: error.to_string(),
+            source: error,
         })?;
     let ref_heads = discovery
         .refs

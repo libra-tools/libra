@@ -69,3 +69,15 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #577 SSH 公钥拒绝诊断
+
+在线 `show`、`update`、`prune`、`set-head --auto` 与 `add -f` 保留 fetch discovery
+的带类型 SSH 公钥拒绝并映射 `LBR-AUTH-002`（exit 128）。分类要求首标头零字节
+EOF、直接退出码255、无 stdout 与完整方法列表中的精确 `publickey`；host-key
+优先，坏帧保留原代码。固定消息/hint 不输出原 stderr，并链接 SSH 设置指南。
+`add -f` 失败沿用既有状态转移，保留 fetch 前已登记的 remote。stderr 可被伪造，
+因此错误码不证明拒绝访问的具体原因。
+迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
+自动化应接受 `LBR-AUTH-002`，并兼容各入口的旧代码：在线 `show` 与
+`set-head --auto` 为 `LBR-NET-001`，`update`、`prune` 与 `add -f` 为 `LBR-NET-002`。
