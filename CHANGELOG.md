@@ -1,6 +1,33 @@
 # Changelog
 
-## [Unreleased]
+## [0.23.67] — 2026-09-26
+
+### remote / fetch / pull / push / credential / rerere Git alignment (issues/480)
+
+- `remote add` writes the default `+refs/heads/*:refs/remotes/<name>/*` fetch
+  refspec and supports `--mirror[=fetch|push]` (bare `--mirror` warns; a push
+  mirror writes only the `mirror=true` marker).
+- `remote rename` rewrites a repository-scoped `remote.pushDefault` and every
+  `branch.<name>.pushRemote`; a global-scoped `remote.pushDefault` is left
+  unchanged and warned about.
+- `fetch` gains `--set-upstream`, `--update-head-ok`, `--refmap=<spec>`,
+  `--atomic`, `--prune-tags`/`-P`, `--negotiation-tip`, and `--unshallow`.
+- `fetch`/`pull`/`push` accept a local path or `file://` URL as the repository
+  argument (an anonymous remote); a requested remote ref that does not exist
+  reports `couldn't find remote ref <name>`.
+- `push` supports local Libra and local Git targets, opened by path with no
+  working-directory switch, with compare-and-swap ref updates and checked-out
+  branch protection.
+- `pull` gains `--allow-unrelated-histories` (with an actionable hint when
+  refused); `rebase <upstream>` and `pull --rebase` replay unrelated histories
+  from their root instead of failing.
+- `credential` adds the Git helper `get` operation (an alias of `fill`),
+  silently ignores unknown operations, and stores credentials outside a
+  repository in a user-level encrypted store.
+- `rerere remaining` lists the tracked conflicts that are still unresolved.
+- The current repository is usable as a remote (`.` / `branch.<name>.remote=.`).
+- SSH host-key validation surfaces the actionable diagnostic for
+  clone/fetch/pull/push.
 
 ### Git conversion and shallow-source fetch
 
