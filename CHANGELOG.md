@@ -252,6 +252,21 @@ ER-06a fail-closed).
 
 ## [Unreleased]
 
+## [0.23.68] — 2026-09-26
+
+### Blake3 object-format baseline (B3-00)
+
+- Close plan-20260907 B3-00: shared `object_format` fact source and Blake3-capable
+  `git-internal` pin are accepted after a green T-1 C-gate.
+- `libra init --object-format blake3` remains closed until B3-01.
+
+### C-gate hardening
+
+- Object-index preflight warns on stderr only when a bounded replay made progress, so
+  silent Git-compatible status exits (e.g. `grep` with no matches) stay clean.
+- Subagent discovery reserves 20s for parent checkpoint persistence when the
+  discovery window is exhausted; late-child import budgets tolerate full nextest load.
+
 ### Changed: isolated agent tasks publish one main-workspace sync-back operation
 
 An isolated `libra code` DAG task no longer publishes an `agent.tool.*`

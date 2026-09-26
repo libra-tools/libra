@@ -2332,11 +2332,21 @@ async fn repair_pending_object_index_updates_before_command(
         ))
         .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
         .with_hint("rerun the command until the bounded repair queue is empty; if it does not shrink, inspect the repository database and repair-marker directory.")),
-        Ok(Some(outcome)) if outcome.remaining => {
+        // Only warn when this preflight made forward progress. A no-progress
+        // remaining queue is retried by the next command; warning on silent
+        // status exits (e.g. grep exit 1) would corrupt Git-compatible stderr.
+        Ok(Some(outcome)) if outcome.remaining && outcome.repaired > 0 => {
             utils::error::emit_warning(format!(
                 "replayed {} durable cloud object-index repair marker(s), but more remain for the next repository command; cloud operations and destructive agent cleanup stay fail-closed until the queue is empty",
                 outcome.repaired
             ));
+            Ok(())
+        }
+        Ok(Some(outcome)) if outcome.remaining => {
+            tracing::debug!(
+                repaired = outcome.repaired,
+                "object-index repair queue still pending after a no-progress preflight"
+            );
             Ok(())
         }
         Ok(Some(_)) => Ok(()),

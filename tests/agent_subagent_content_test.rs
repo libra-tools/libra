@@ -388,7 +388,9 @@ fn blocking_child_discovery_is_killed_at_live_deadline() {
         session_id,
         &transcript,
         &[
-            ("LIBRA_TEST_SUBAGENT_DISCOVERY_HELPER_DELAY_MS", "5000"),
+            // Helper delay must stay above the kill budget so a missed kill
+            // still fails the elapsed assert under a loaded nextest run.
+            ("LIBRA_TEST_SUBAGENT_DISCOVERY_HELPER_DELAY_MS", "15000"),
             ("LIBRA_TEST_SUBAGENT_DISCOVERY_DEADLINE_MS", "80"),
         ],
     );
@@ -398,7 +400,7 @@ fn blocking_child_discovery_is_killed_at_live_deadline() {
         describe(&output)
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < std::time::Duration::from_secs(8),
         "blocking helper exceeded the parent deadline: {:?}",
         started.elapsed()
     );

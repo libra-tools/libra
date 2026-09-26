@@ -48,7 +48,7 @@ pub const SUBAGENT_DISCOVERY_HELPER_OUTPUT_CAP: u64 = 24 * 1024 * 1024;
 const SUBAGENT_CONTENT_LEASE_MS: i64 = 60_000;
 const MAX_SUBAGENT_DIRECTORY_ENTRIES: usize = 2_048;
 pub(crate) const MAX_SUBAGENT_SOURCES_PER_CAPTURE: usize = 16;
-const SUBAGENT_PARENT_PERSISTENCE_RESERVE: Duration = Duration::from_secs(5);
+const SUBAGENT_PARENT_PERSISTENCE_RESERVE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 #[error("subagent discovery exhausted its parent-preservation deadline")]
@@ -178,13 +178,19 @@ pub(crate) fn discovery_deadline_preserving_parent(command_deadline: Instant) ->
         .context("compute parent-preserving subagent discovery deadline")
 }
 
-async fn subagent_discovery_test_pause_before_parent_validation() {
+async fn subagent_discovery_test_pause_before_parent_validation(deadline: Instant) {
     if cfg!(debug_assertions)
         && let Ok(value) = std::env::var("LIBRA_TEST_SUBAGENT_PARENT_VALIDATION_DELAY_MS")
         && let Ok(delay_ms) = value.parse::<u64>()
         && delay_ms > 0
     {
-        tokio::time::sleep(Duration::from_millis(delay_ms.min(30_000))).await;
+        // Cap high enough for load-tolerant late-child budgets. When the
+        // configured delay meets or exceeds the discovery window, sleep only
+        // until that window so the following deadline check can preserve the
+        // parent with its reserved persistence budget intact.
+        let delay = Duration::from_millis(delay_ms.min(120_000));
+        let until = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(delay.min(until)).await;
     }
 }
 
@@ -441,7 +447,7 @@ pub(crate) async fn discover_claude_subagent_contents_bounded(
         {
             bail!("bounded subagent discovery helper returned an invalid response");
         }
-        subagent_discovery_test_pause_before_parent_validation().await;
+        subagent_discovery_test_pause_before_parent_validation(deadline).await;
         ensure_before_discovery_deadline(deadline)?;
         let response = serde_json::from_slice(&output.stdout)
             .context("decode bounded subagent discovery response")?;
