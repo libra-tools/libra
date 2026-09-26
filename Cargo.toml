@@ -261,6 +261,10 @@ name = "compat_ledger_schema"
 path = "tests/compat/compat_ledger_schema.rs"
 
 [[test]]
+name = "compat_local_push_no_cwd_switch"
+path = "tests/compat/compat_local_push_no_cwd_switch.rs"
+
+[[test]]
 name = "compat_version_surface_sync"
 path = "tests/compat/version_surface_sync.rs"
 
