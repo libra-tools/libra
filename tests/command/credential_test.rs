@@ -251,3 +251,43 @@ fn credential_get_is_fill_alias_and_unknown_op_silent() {
     );
     assert!(stdout(&unknown).is_empty(), "unknown op produces no output");
 }
+
+#[test]
+fn credential_outside_repository_roundtrip() {
+    // A non-repository working directory: the helper must still store/fill/erase
+    // via the user-level (global) store (HP-14).
+    let outside = tempdir().unwrap();
+
+    let store = run_libra_command_with_stdin(&["credential", "store"], outside.path(), STORE_INPUT);
+    assert!(
+        store.status.success(),
+        "store outside repo: {}",
+        stderr(&store)
+    );
+
+    let get = run_libra_command_with_stdin(&["credential", "get"], outside.path(), FILL_INPUT);
+    assert!(get.status.success(), "get outside repo: {}", stderr(&get));
+    let out = stdout(&get);
+    assert!(
+        out.contains("username=alice"),
+        "get outside repo emits username: {out:?}"
+    );
+    assert!(
+        out.contains("password=s3cr3t-token"),
+        "get outside repo emits password: {out:?}"
+    );
+
+    let erase = run_libra_command_with_stdin(&["credential", "erase"], outside.path(), FILL_INPUT);
+    assert!(
+        erase.status.success(),
+        "erase outside repo: {}",
+        stderr(&erase)
+    );
+
+    let get2 = run_libra_command_with_stdin(&["credential", "get"], outside.path(), FILL_INPUT);
+    assert!(get2.status.success(), "get after erase: {}", stderr(&get2));
+    assert!(
+        !stdout(&get2).contains("username=alice"),
+        "erased credential should no longer fill"
+    );
+}

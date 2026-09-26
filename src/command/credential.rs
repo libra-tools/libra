@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    command::config::{ConfigScope, ScopedConfig},
     internal::{config::ConfigKv, vault},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -111,25 +112,35 @@ async fn fill(attrs: &CredentialAttrs) -> CliResult<()> {
             &stored.password,
             Some(stored.expires_at),
         ),
-        // Global-token fallback (lore.md 1.6, gh-style): https only, silent
-        // on every miss — store/erase never manage auth tokens.
-        None => {
-            if attrs.protocol == "https"
-                && !attrs.host.is_empty()
-                && let Ok(scope) = crate::internal::auth::HostScope::parse(&attrs.host)
-                && let crate::internal::auth::Lookup::Valid { username, token } =
-                    crate::internal::auth::lookup(&scope).await
-            {
-                // Username pinning applies to the fallback too.
-                if let Some(asked) = &attrs.username
-                    && asked != &username
+        // User-level store: available outside a repository (HP-14), so the
+        // helper is usable as a global `credential.helper`.
+        None => match user_scoped_credential(attrs).await {
+            Some(stored) => emit_fill(
+                attrs,
+                &stored.username,
+                &stored.password,
+                Some(stored.expires_at),
+            ),
+            // Global-token fallback (lore.md 1.6, gh-style): https only, silent
+            // on every miss — store/erase never manage auth tokens.
+            None => {
+                if attrs.protocol == "https"
+                    && !attrs.host.is_empty()
+                    && let Ok(scope) = crate::internal::auth::HostScope::parse(&attrs.host)
+                    && let crate::internal::auth::Lookup::Valid { username, token } =
+                        crate::internal::auth::lookup(&scope).await
                 {
-                    return Ok(());
+                    // Username pinning applies to the fallback too.
+                    if let Some(asked) = &attrs.username
+                        && asked != &username
+                    {
+                        return Ok(());
+                    }
+                    return emit_fill(attrs, &username, &token, None);
                 }
-                return emit_fill(attrs, &username, &token, None);
+                Ok(())
             }
-            Ok(())
-        }
+        },
     }
 }
 
@@ -155,6 +166,82 @@ async fn repo_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredent
         return None;
     }
     Some(stored)
+}
+
+/// Read a credential from the user-level store (HP-14). Available outside a
+/// repository so the helper can act as a global `credential.helper`. The
+/// record is vault-encrypted (global unseal key) and stored in the global
+/// config store; a miss/decrypt-failure returns `None` (not an error).
+async fn user_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredential> {
+    let db = ScopedConfig::get_connection(ConfigScope::Global)
+        .await
+        .ok()?;
+    let entry = ConfigKv::get_with_conn(&db, &credential_key(attrs))
+        .await
+        .ok()
+        .flatten()?;
+    let raw = hex::decode(entry.value).ok()?;
+    let unseal_key = vault::load_unseal_key_for_scope("global").await?;
+    let plaintext = vault::decrypt_token(&unseal_key, &raw).ok()?;
+    let stored = serde_json::from_str::<StoredCredential>(&plaintext).ok()?;
+    if stored.expires_at <= now_unix() {
+        return None;
+    }
+    if let Some(asked) = &attrs.username
+        && asked != &stored.username
+    {
+        return None;
+    }
+    Some(stored)
+}
+
+/// Encrypt and persist a credential to the user-level (global) store (HP-14).
+async fn user_store_encrypted(attrs: &CredentialAttrs, plaintext: &[u8]) -> CliResult<()> {
+    let db = ScopedConfig::get_connection(ConfigScope::Global)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("failed to open the global config store: {e}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    let unseal_key = vault::lazy_init_vault_for_scope("global")
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("failed to initialize the global vault: {e}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    let encrypted = vault::encrypt_token(&unseal_key, plaintext).map_err(|_| {
+        // The vault error never contains the secret.
+        CliError::fatal("failed to encrypt the credential")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::InternalInvariant)
+    })?;
+    ConfigKv::set_with_conn(&db, &credential_key(attrs), &hex::encode(encrypted), false)
+        .await
+        .map_err(|_| {
+            CliError::fatal("failed to persist the user-level credential")
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    Ok(())
+}
+
+/// Erase a credential from the user-level (global) store, idempotently (HP-14).
+async fn user_erase(attrs: &CredentialAttrs) -> CliResult<()> {
+    let db = match ScopedConfig::get_connection(ConfigScope::Global).await {
+        Ok(db) => db,
+        // No global config: nothing to erase.
+        Err(_) => return Ok(()),
+    };
+    ConfigKv::unset_with_conn(&db, &credential_key(attrs))
+        .await
+        .map_err(|_| {
+            CliError::fatal("failed to erase the user-level credential")
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    Ok(())
 }
 
 fn emit_fill(
@@ -204,19 +291,6 @@ async fn store(attrs: &CredentialAttrs) -> CliResult<()> {
         None => now.saturating_add(DEFAULT_TTL_SECONDS),
     };
 
-    if util::try_get_storage_path(None).is_err() {
-        return Err(CliError::fatal(
-            "not inside a repository; cannot store credentials (the vault is repository-scoped)",
-        )
-        .with_exit_code(128)
-        .with_stable_code(StableErrorCode::RepoNotFound));
-    }
-    let unseal_key = vault::load_unseal_key().await.ok_or_else(|| {
-        CliError::fatal("the repository vault is not initialized; cannot store credentials")
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
-
     let record = StoredCredential {
         username: username.clone(),
         password: password.clone(),
@@ -227,41 +301,52 @@ async fn store(attrs: &CredentialAttrs) -> CliResult<()> {
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::InternalInvariant)
     })?;
-    let encrypted = vault::encrypt_token(&unseal_key, &plaintext).map_err(|_| {
-        // The vault error never contains the secret.
-        CliError::fatal("failed to encrypt the credential")
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::InternalInvariant)
-    })?;
 
-    // Store the pre-encrypted hex as-is (secret = false, matching how the vault
-    // root token is stored).
-    ConfigKv::set(&credential_key(attrs), &hex::encode(encrypted), false)
-        .await
-        .map_err(|_| {
-            CliError::fatal("failed to persist the credential")
+    if util::try_get_storage_path(None).is_ok() {
+        let unseal_key = vault::load_unseal_key().await.ok_or_else(|| {
+            CliError::fatal("the repository vault is not initialized; cannot store credentials")
                 .with_exit_code(128)
-                .with_stable_code(StableErrorCode::IoWriteFailed)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
         })?;
+        let encrypted = vault::encrypt_token(&unseal_key, &plaintext).map_err(|_| {
+            // The vault error never contains the secret.
+            CliError::fatal("failed to encrypt the credential")
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::InternalInvariant)
+        })?;
+        // Store the pre-encrypted hex as-is (secret = false, matching how the
+        // vault root token is stored).
+        ConfigKv::set(&credential_key(attrs), &hex::encode(encrypted), false)
+            .await
+            .map_err(|_| {
+                CliError::fatal("failed to persist the credential")
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
+    } else {
+        // Outside a repository: user-level store (HP-14), so the helper is
+        // usable as a global `credential.helper` (Git parity).
+        user_store_encrypted(attrs, &plaintext).await?;
+    }
     Ok(())
 }
 
 /// `erase`: remove the credential for the requested context (idempotent).
 async fn erase(attrs: &CredentialAttrs) -> CliResult<()> {
-    // Idempotent: nothing to erase outside a repository.
-    if util::try_get_storage_path(None).is_err() {
-        return Ok(());
+    // Erase from the repository store if present (idempotent).
+    if util::try_get_storage_path(None).is_ok() {
+        // `unset_all` returns Ok(0) when there is nothing to delete (idempotent);
+        // a real storage error must surface rather than be silently swallowed.
+        ConfigKv::unset_all(&credential_key(attrs))
+            .await
+            .map_err(|_| {
+                CliError::fatal("failed to erase the credential")
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
     }
-    // `unset_all` returns Ok(0) when there is nothing to delete (idempotent);
-    // a real storage error must surface rather than be silently swallowed.
-    ConfigKv::unset_all(&credential_key(attrs))
-        .await
-        .map_err(|_| {
-            CliError::fatal("failed to erase the credential")
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
-    Ok(())
+    // Also erase from the user-level store (HP-14).
+    user_erase(attrs).await
 }
 
 /// Build a non-reversible config key from the routing fields so the stored

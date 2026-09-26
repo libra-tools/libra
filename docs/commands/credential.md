@@ -76,8 +76,10 @@ printf 'protocol=https\nhost=example.com\n' | libra credential erase
 | Erase | `libra credential erase` | `git credential-store erase` |
 
 Differences: storage is vault-encrypted (not the plaintext `~/.git-credentials`)
-and **repository-scoped** (the vault unseal key is per repository), entries carry
-an expiry (default 30 days), and there is one credential per
-`protocol/host/path`. Not exposed: `credential-cache`, multiple usernames per
-host, and the consumer-side `credential.helper` chain (Libra *is* a helper; it
-does not invoke external helpers).
+and entries carry an expiry (default 30 days) and one credential per
+`protocol/host/path`. Inside a repository the credential is repository-scoped;
+outside a repository (or when the repo is absent) `store`/`get`/`erase` use a
+user-level encrypted store in the global config (issues/480 HP-14), so the
+helper is usable as a global `credential.helper`. Not exposed: `credential-cache`,
+multiple usernames per host, and the consumer-side `credential.helper` chain
+(Libra *is* a helper; it does not invoke external helpers).

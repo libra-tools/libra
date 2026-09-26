@@ -14,7 +14,7 @@
 
 ## 设计方案
 
-- 入口与分发：`src/cli.rs::Commands::Credential` → `command::credential::execute_safe`。**加入 `command_preflight` 的 `none()` 组**：跳过 hash-kind preflight，`fill` 在仓库外也能干净未命中（exit 0 空），vault 延迟解析。
+- 入口与分发：`src/cli.rs::Commands::Credential` → `command::credential::execute_safe`。**加入 `command_preflight` 的 `none()` 组**：跳过 hash-kind preflight，`store`/`get`/`erase` 在仓库外也走用户级（global config）加密存储（HP-14），vault 延迟解析。
 - 源码分层：`src/command/credential.rs`：`CredentialArgs`（子命令 fill/store/erase）、`CredentialAttrs`（protocol/host/path/username/password/password_expiry_utc）、`StoredCredential`（serde，加密前的 {username,password,expires_at}）、`read_attrs`（key=value，空行终止；`url=` 展开，显式字段覆盖）。
 - 存储：`credential_key` = `credential.{sha256(v1\0protocol\0host\0path)}`（不可逆，config 不含明文 host/user）。值 = `hex(vault::encrypt_token(unseal_key, json))`，经 `ConfigKv::set(key, hex, false)`（预加密、按原样存，与 vault root token 一致）。`vault::load_unseal_key()` 取 key。
 - fill：load_unseal_key → ConfigKv::get（`.ok().flatten()`，缺仓库/缺条目=未命中）→ hex decode → decrypt_token（解密失败=轮换→未命中）→ serde → 过期检查 → username 匹配 → 输出 protocol/host/path/username/password/password_expiry_utc。**全路径任何分支都 exit 0**（无侧信道）。
@@ -30,7 +30,7 @@
 ## 当前状态
 
 - 公开状态：已公开（`Commands::Credential`）。
-- 测试：`tests/command/credential_test.rs`（store→fill round-trip、未知 host 空+exit0、erase、用户名不符未命中、过期时间戳拒绝 128、缺密码错误不泄露、`RUST_LOG=debug` 下密码不入 stderr、仓库外 fill 空）+ `credential.rs` 单测（url 解析、显式覆盖、key 哈希稳定且不含明文、空密码视为缺省）。
+- 测试：`tests/command/credential_test.rs`（store→get round-trip、get=fill 别名且未知操作静默、未知 host 空+exit0、erase、用户名不符未命中、过期时间戳拒绝 128、缺密码错误不泄露、`RUST_LOG=debug` 下密码不入 stderr、仓库外 store/get/erase round-trip）+ `credential.rs` 单测（url 解析、显式覆盖、key 哈希稳定且不含明文、空密码视为缺省）。
 - 用户文档：`docs/commands/credential.md`（EN + zh-CN）。
 
 ## 还未实现的功能
