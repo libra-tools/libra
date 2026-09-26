@@ -44,10 +44,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        protocol::{
-            ProtocolClient, get_wire_hash_kind, lfs_client::LFSClient, set_wire_hash_kind,
-            ssh_client::is_ssh_spec,
-        },
+        protocol::{ProtocolClient, get_wire_hash_kind, lfs_client::LFSClient, set_wire_hash_kind},
         reflog::{Reflog, ReflogAction, ReflogContext},
         tag,
     },
@@ -274,6 +271,9 @@ pub enum PushError {
     #[error("pushing to local file repositories is not supported")]
     UnsupportedLocalFileRemote,
 
+    #[error("local push failed: {0}")]
+    LocalPush(String),
+
     #[error("invalid remote URL '{url}': {detail}")]
     InvalidRemoteUrl { url: String, detail: String },
 
@@ -432,8 +432,12 @@ impl From<PushError> for CliError {
             PushError::UnsupportedLocalFileRemote => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
-                    "use fetch/clone for local-path repositories; push currently supports network remotes only",
+                    "push to a local Libra repository is supported; a local Git target is tracked as issues/480 HP-08",
                 ),
+            PushError::LocalPush(detail) => {
+                CliError::fatal(format!("local push failed: {detail}"))
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            }
             PushError::InvalidRemoteUrl { .. } => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("check the remote URL with 'libra remote get-url <name>'"),
@@ -953,14 +957,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     };
 
     // Local file path remotes are not supported for push
-    if is_local_file_remote(&repo_url) {
-        return Err(PushError::UnsupportedLocalFileRemote);
-    }
-
     validate_local_refspecs(&args, &current_branch).await?;
-
-    // Determine transport: SSH or HTTPS
-    let is_ssh = is_ssh_spec(&repo_url);
 
     let remote_client = RemoteClient::from_spec_with_remote(&repo_url, Some(&repository))
         .await
@@ -1232,7 +1229,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
 
     // Upload LFS files (only for HTTP remotes)
     let mut lfs_files_uploaded = 0;
-    if !is_ssh && !objs.is_empty() {
+    if matches!(&remote_client, RemoteClient::Http(_)) && !objs.is_empty() {
         let url = Url::parse(&repo_url).map_err(|e| PushError::InvalidRemoteUrl {
             url: repo_url.clone(),
             detail: e.to_string(),
@@ -1390,7 +1387,28 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             })?;
             validate_receive_pack_response(data, &plans)?;
         }
-        _ => {
+        RemoteClient::Local(local_client) => {
+            // Local path push (issues/480 HP-07/HP-08): write objects and refs to
+            // the target repo BY PATH (no process cwd switch). A Libra target is
+            // applied directly; a Git target falls through to Err below until
+            // HP-08.
+            let target_path = local_client.repo_path().to_path_buf();
+            let updates = plans
+                .iter()
+                .map(|plan| plan.update.clone())
+                .collect::<Vec<_>>();
+            crate::internal::protocol::local_push::apply_local_push_to_libra(
+                &target_path,
+                discovery.hash_kind,
+                &updates,
+                &objs,
+                args.dry_run,
+                args.force,
+            )
+            .await
+            .map_err(|e| PushError::LocalPush(e.to_string()))?;
+        }
+        RemoteClient::Git(_) | RemoteClient::Bundle(_) => {
             return Err(PushError::UnsupportedLocalFileRemote);
         }
     }
@@ -2837,6 +2855,7 @@ fn map_update_remote_tracking_branch_error(
     }
 }
 
+#[allow(dead_code)]
 fn is_local_file_remote(spec: &str) -> bool {
     if let Ok(url) = Url::parse(spec) {
         if url.scheme() == "file" || url.scheme().len() == 1 {

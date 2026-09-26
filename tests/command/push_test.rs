@@ -19,7 +19,9 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tokio::{process::Command as TokioCommand, time::timeout};
 
-use super::{create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command};
+use super::{
+    assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,
+};
 
 fn libra_command(cwd: &std::path::Path) -> Command {
     let home = cwd.join(".libra-test-home");
@@ -303,9 +305,15 @@ async fn test_push_force_flag_parsing() {
 #[tokio::test]
 #[serial(cwd)]
 async fn test_push_file_remote_fails_without_reflog() {
-    // local file remotes are not supported; ensure we fail loudly and avoid reflog writes
+    // local file remotes are supported (HP-07): push to a local Libra target and
+    // assert the push succeeds and records the remote-tracking reflog.
     let remote_dir = tempfile::tempdir().unwrap();
     let remote_path = remote_dir.path();
+    let init_remote = libra_command(remote_path)
+        .args(["init", "--bare"])
+        .output()
+        .expect("init remote");
+    assert!(init_remote.status.success(), "init remote failed");
 
     // local repo
     let local_dir = tempfile::tempdir().unwrap();
@@ -371,25 +379,25 @@ async fn test_push_file_remote_fails_without_reflog() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // push should fail with clear fatal message
+    // push should succeed against the local Libra target
     let out = libra_command(local_path)
         .args(["push", "origin", "main"])
         .output()
         .expect("push");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("pushing to local file repositories is not supported"),
-        "stderr should mention unsupported file:// push, got: {stderr}"
+        out.status.success(),
+        "push to a local Libra target should succeed, got: {stderr}"
     );
 
-    // ensure no reflog entry is written
+    // the remote-tracking ref reflog is now written
     let db = get_db_conn_instance().await;
-    let entry = Reflog::find_one(&db, "refs/remotes/origin/master")
+    let entry = Reflog::find_one(&db, "refs/remotes/origin/main")
         .await
         .expect("query reflog");
     assert!(
-        entry.is_none(),
-        "reflog should not be created when push fails"
+        entry.is_some(),
+        "remote-tracking reflog should be recorded after a successful local push"
     );
 }
 
@@ -2736,5 +2744,66 @@ fn run_ok(dir: &Path, argv: &[&str]) {
         out.status.success(),
         "{argv:?}: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_libra_target_updates_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create an empty local Libra target (bare, so no checked-out branch is
+    // protected against updates).
+    let target = tempfile::tempdir().unwrap();
+    let init = run_libra_command(&["init", "--bare"], target.path());
+    assert_cli_success(&init, "init bare target");
+
+    // Push the current branch directly to the local path (no configured remote).
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push local libra target");
+
+    // The target now advertises the pushed branch.
+    let ls = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls, "ls-remote local target");
+    let stdout = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        stdout.contains(&format!("refs/heads/{branch}")),
+        "target should advertise the pushed branch, got: {stdout}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_libra_nonbare_checked_out_branch_rejected() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // A non-bare target with the same branch checked out rejects the push (P7).
+    let target = tempfile::tempdir().unwrap();
+    libra::utils::test::setup_with_new_libra_in(target.path()).await;
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "pushing to a non-bare target's checked-out branch must be rejected: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked-out"),
+        "rejection should mention the checked-out branch"
     );
 }

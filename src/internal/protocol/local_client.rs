@@ -384,7 +384,7 @@ impl LocalClient {
         &self,
         service: ServiceType,
     ) -> Result<DiscoveryResult, GitError> {
-        if service != ServiceType::UploadPack {
+        if !matches!(service, ServiceType::UploadPack | ServiceType::ReceivePack) {
             return Err(GitError::NetworkError(
                 "Unsupported service type for local protocol".to_string(),
             ));

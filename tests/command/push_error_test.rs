@@ -174,7 +174,11 @@ fn test_push_source_ref_not_found_returns_cli_invalid_target() {
 fn test_push_local_file_remote_returns_cli_invalid_target() {
     let repo = create_committed_repo_via_cli();
     let remote_dir = tempfile::tempdir().unwrap();
-
+    // HP-07 supports pushing to a local Libra target; initialize one.
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare"], remote_dir.path()),
+        "init bare remote dir",
+    );
     let _ = run_libra_command(
         &[
             "remote",
@@ -184,12 +188,12 @@ fn test_push_local_file_remote_returns_cli_invalid_target() {
         ],
         repo.path(),
     );
+    let current = run_libra_command(&["branch", "--show-current"], repo.path());
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
 
-    let output = run_libra_command(&["push", "origin", "main"], repo.path());
-    let (_stderr, report) = parse_cli_error_stderr(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-003");
+    let output = run_libra_command(&["push", "origin", branch.as_str()], repo.path());
+    assert_cli_success(&output, "push to local Libra remote");
 }
 
 fn setup_local_upstream_current_branch() -> (tempfile::TempDir, String) {
@@ -311,16 +315,19 @@ fn test_push_refuses_local_upstream() {
 fn test_push_path_argument_reaches_local_target_check() {
     let repo = create_committed_repo_via_cli();
     let remote_dir = tempfile::tempdir().unwrap();
+    // Initialize a bare local Libra target so the anonymous path push succeeds
+    // (issues/480 HP-07).
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare"], remote_dir.path()),
+        "init bare target",
+    );
+    let current = run_libra_command(&["branch", "--show-current"], repo.path());
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
 
-    // Push directly to a local path with no configured remote: the anonymous
-    // local-path resolution reaches the local push target check (issues/480
-    // HP-06), which currently refuses with LBR-CLI-003 until HP-07 lands.
     let output = run_libra_command(
-        &["push", remote_dir.path().to_str().unwrap(), "main"],
+        &["push", remote_dir.path().to_str().unwrap(), branch.as_str()],
         repo.path(),
     );
-    let (_stderr, report) = parse_cli_error_stderr(&output.stderr);
-
-    assert_eq!(output.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert_cli_success(&output, "push to anonymous local path");
 }
