@@ -4879,6 +4879,14 @@ mod tests {
                 "the HEAD pointer file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
             ),
             (
+                "libra.db",
+                "the repository SQLite database; ref/object inventory lives in its tables, not in on-disk object files",
+            ),
+            (
+                "refs",
+                "foreign Git-target ref directory (issues/480 HP-08); ref OIDs live outside the Libra object store and are never a Libra GC root",
+            ),
+            (
                 "operation-v2.lock",
                 "the cross-process operation middleware lease; it contains no object ids and is never a GC root",
             ),

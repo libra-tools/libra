@@ -574,7 +574,6 @@ test_reflog_show_with_stat	lane:cwd	changes the process working directory (Chang
 test_remote_add_cold_config_flags	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_remote_add_creates_entry	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_remote_add_duplicate_name_returns_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_remote_add_mirror_writes_marker_and_conflicts_with_track	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_remote_prune_does_not_report_success_when_delete_fails	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_remote_prune_dry_run_previews_changes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_remote_prune_nonexistent_remote_returns_structured_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -843,3 +842,32 @@ import_sets_vault_signing_true_when_unset	lane:cwd	runs in an isolated temp repo
 import_keeps_signing_disabled_in_vault_false_repo	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 vault=false branch)
 generate_pgp_key_propagates_config_write_error	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14 config write failure propagation)
 import_partial_failure_rolls_back	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-02/03 partial import failure atomically rolls back)
+test_fetch_atomic_all_or_nothing_on_non_fast_forward	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_dot_reads_local_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_missing_remote_ref_diagnostic	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_negotiation_tip_accepts_commit_and_rejects_missing	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_prune_tags_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_refmap_requires_refspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_refmap_with_cli_refspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_repository_path_and_url_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_set_upstream_no_branch_and_colon_forms	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_set_upstream_writes_branch_config	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_unshallow_from_local_git_source	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_unshallow_non_shallow_errors	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_update_head_ok_allows_fetch_into_checked_out_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_pull_missing_remote_ref_diagnostic	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_pull_repository_dot_merges	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_pull_repository_path_merges	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_pull_unrelated_histories_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_pull_with_local_upstream_remote_dot	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_push_dot_updates_local_nondestructive_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_push_local_git_target_updates_pack_and_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_push_local_libra_nonbare_checked_out_branch_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_push_local_libra_target_updates_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_push_local_tags_and_delete	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_rebase_unrelated_histories_replays_from_root	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_remote_add_default_refspec_and_mirror_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_remote_add_mirror_fetch_track_allowed	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_remote_rename_global_push_default_warns_and_is_unchanged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_remote_rename_push_targets_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_t5505_add_another_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses

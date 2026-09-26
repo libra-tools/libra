@@ -231,41 +231,30 @@ impl ConfigKv {
         value: &str,
         encrypted: bool,
     ) -> Result<()> {
+        // Git config variable names are case-insensitive, so `set` replaces
+        // ANY casing of the same logical key (e.g. a default `remote.<n>.fetch`
+        // written by `remote add` is superseded by `config set remote.<n>.Fetch`)
+        // and stores a single row with the exact key spelling supplied. SQLite
+        // `LIKE` matches ASCII case-insensitively; config keys never contain
+        // `%`/`_`.
         let existing = config_kv::Entity::find()
-            .filter(config_kv::Column::Key.eq(key))
+            .filter(config_kv::Column::Key.like(key))
             .all(db)
             .await
             .context("failed to query config_kv for set")?;
-
-        if existing.len() > 1 {
-            return Err(anyhow!(
-                "cannot set '{}': {} values exist for this key",
-                key,
-                existing.len()
-            ));
-        }
-
-        if let Some(row) = existing.into_iter().next() {
-            // Inherit encryption from existing entry if not explicitly set
-            let effective_encrypted = encrypted || row.encrypted != 0;
-            // Update existing row
-            let mut active: config_kv::ActiveModel = row.into();
-            active.value = Set(value.to_owned());
-            active.encrypted = Set(if effective_encrypted { 1 } else { 0 });
-            active
-                .update(db)
+        let inherit_encrypted = existing.iter().any(|e| e.encrypted != 0);
+        for row in existing {
+            row.delete(db)
                 .await
-                .context("failed to update config_kv")?;
-        } else {
-            // Insert new row
-            let entry = config_kv::ActiveModel {
-                key: Set(key.to_owned()),
-                value: Set(value.to_owned()),
-                encrypted: Set(if encrypted { 1 } else { 0 }),
-                ..Default::default()
-            };
-            entry.save(db).await.context("failed to insert config_kv")?;
+                .context("failed to remove superseded config_kv row")?;
         }
+        let entry = config_kv::ActiveModel {
+            key: Set(key.to_owned()),
+            value: Set(value.to_owned()),
+            encrypted: Set(if encrypted || inherit_encrypted { 1 } else { 0 }),
+            ..Default::default()
+        };
+        entry.save(db).await.context("failed to insert config_kv")?;
         Ok(())
     }
 

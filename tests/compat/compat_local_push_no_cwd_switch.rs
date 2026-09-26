@@ -21,26 +21,33 @@ fn local_push_does_not_switch_cwd() {
     let source = root.path().join("source");
     let target = root.path().join("target");
     std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
 
+    assert!(libra(&source, &["init"]).status.success(), "init source");
     assert!(
-        libra(&source, &["init"]).status.success(),
-        "init source"
-    );
-    assert!(
-        libra(&source, &["config", "user.name", "T"]).status.success(),
+        libra(&source, &["config", "user.name", "T"])
+            .status
+            .success(),
         "user.name"
     );
     assert!(
-        libra(&source, &["config", "user.email", "t@t"]).status.success(),
+        libra(&source, &["config", "user.email", "t@t"])
+            .status
+            .success(),
         "user.email"
     );
     std::fs::write(source.join("f.txt"), "x").unwrap();
     assert!(libra(&source, &["add", "f.txt"]).status.success(), "add");
     assert!(
-        libra(&source, &["commit", "-m", "c", "--no-verify"]).status.success(),
+        libra(&source, &["commit", "-m", "c", "--no-verify"])
+            .status
+            .success(),
         "commit"
     );
-    assert!(libra(&target, &["init", "--bare"]).status.success(), "init target");
+    assert!(
+        libra(&target, &["init", "--bare"]).status.success(),
+        "init target"
+    );
 
     let branch = String::from_utf8(libra(&source, &["branch", "--show-current"]).stdout)
         .unwrap()
