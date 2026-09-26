@@ -433,20 +433,16 @@ restrictive stance: when you name a remote you must also name the ref. The bare
 This eliminates an entire class of "I accidentally pushed to production" mistakes without
 reducing the expressiveness of the command for scripted or agent-driven workflows.
 
-### Pushing to a local Libra repository
+### Pushing to a local repository
 
-`libra push <local-path> <branch>` (or a `file://` URL) pushes into a local Libra
-repository. The target is opened by path (no process cwd switch), missing objects
-are written to its object store, and each ref update is compare-and-swap guarded in
-a single transaction — a rejected update (checked-out branch on a non-bare target,
-non-fast-forward without `+`/`--force`) leaves the target untouched. Pushing to a
-local **Git** repository is tracked as issues/480 HP-08.
-
-### Why keep local Git file remotes rejected?
-
-Libra still treats local *Git* file remote push as an intentionally different surface.
-The C8 ref update expansion applies to network receive-pack transports (and now to
-local Libra targets); local-path Git remotes continue to fail closed until HP-08.
+`libra push <local-path> <branch>` (or a `file://` URL) pushes into a local
+repository (issues/480 HP-07/HP-08). The target is opened by path (no process
+cwd switch): for a **Libra** target, missing objects are written to its object
+store and refs are compare-and-swap guarded in a single transaction; for a
+**Git** target, objects are encoded into a self-contained pack + idx and refs are
+updated atomically via `<ref>.lock` + rename. A rejected update (checked-out
+branch on a non-bare target, non-fast-forward without `+`/`--force`) leaves the
+target untouched.
 
 ### Why integrated LFS push?
 

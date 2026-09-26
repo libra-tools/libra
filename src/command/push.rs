@@ -1389,24 +1389,35 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         }
         RemoteClient::Local(local_client) => {
             // Local path push (issues/480 HP-07/HP-08): write objects and refs to
-            // the target repo BY PATH (no process cwd switch). A Libra target is
-            // applied directly; a Git target falls through to Err below until
-            // HP-08.
+            // the target repo BY PATH (no process cwd switch).
             let target_path = local_client.repo_path().to_path_buf();
             let updates = plans
                 .iter()
                 .map(|plan| plan.update.clone())
                 .collect::<Vec<_>>();
-            crate::internal::protocol::local_push::apply_local_push_to_libra(
-                &target_path,
-                discovery.hash_kind,
-                &updates,
-                &objs,
-                args.dry_run,
-                args.force,
-            )
-            .await
-            .map_err(|e| PushError::LocalPush(e.to_string()))?;
+            if local_client.is_libra_source() {
+                crate::internal::protocol::local_push::apply_local_push_to_libra(
+                    &target_path,
+                    discovery.hash_kind,
+                    &updates,
+                    &objs,
+                    args.dry_run,
+                    args.force,
+                )
+                .await
+                .map_err(|e| PushError::LocalPush(e.to_string()))?;
+            } else {
+                crate::internal::protocol::local_push_git::apply_local_push_to_git(
+                    &target_path,
+                    discovery.hash_kind,
+                    &updates,
+                    &objs,
+                    args.dry_run,
+                    args.force,
+                )
+                .await
+                .map_err(|e| PushError::LocalPush(e.to_string()))?;
+            }
         }
         RemoteClient::Git(_) | RemoteClient::Bundle(_) => {
             return Err(PushError::UnsupportedLocalFileRemote);

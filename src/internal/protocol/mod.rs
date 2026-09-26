@@ -21,7 +21,8 @@ pub mod git_client; // to support git server protocol (git://) over TCP
 pub mod https_client;
 pub mod lfs_client;
 pub mod local_client;
-pub mod local_push; // issues/480 HP-07/HP-08: local path push target
+pub mod local_push; // issues/480 HP-07: local path push target (Libra)
+pub mod local_push_git; // issues/480 HP-08: local path push target (Git)
 pub mod mega2_auth; // plan-20260912 MB-04: mega2 write-token resolution (ADR-MB-03)
 pub mod mega2_entry; // plan-20260912 MB-04: bounded POST /api/v1/create-entry directory client
 pub mod mega2_mutate; // plan-20260912 MB-07: bounded delete-entry / move-entry client

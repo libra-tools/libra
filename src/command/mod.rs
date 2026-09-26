@@ -58,7 +58,7 @@ pub mod hydrate;
 pub mod index_pack;
 mod index_pack_support;
 mod index_pack_v1;
-mod index_pack_v2;
+pub mod index_pack_v2;
 pub mod init;
 pub mod layer;
 pub mod lfs;

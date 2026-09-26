@@ -2807,3 +2807,47 @@ async fn test_push_local_libra_nonbare_checked_out_branch_rejected() {
         "rejection should mention the checked-out branch"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_git_target_updates_pack_and_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create a bare Git target.
+    let target = tempfile::tempdir().unwrap();
+    let init = Command::new("git")
+        .args(["init", "--bare", target.path().to_str().unwrap()])
+        .status()
+        .expect("git init --bare");
+    assert!(init.success(), "git init --bare failed");
+
+    // Push the current branch directly to the bare Git target.
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push to bare Git target");
+
+    // The Git target accepts the pushed ref and its object store is clean.
+    let log = Command::new("git")
+        .args([
+            "-C",
+            target.path().to_str().unwrap(),
+            "log",
+            "--oneline",
+            branch.as_str(),
+        ])
+        .output()
+        .expect("git log on target");
+    assert!(log.status.success(), "target git log failed");
+    let fsck = Command::new("git")
+        .args(["-C", target.path().to_str().unwrap(), "fsck", "--full"])
+        .output()
+        .expect("git fsck on target");
+    assert!(fsck.status.success(), "target git fsck failed");
+}
