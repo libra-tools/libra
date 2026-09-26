@@ -481,7 +481,7 @@ Note: jj does not stop on conflicts during rebase. Instead, conflicts are materi
 | Exec failure, timeout, or unavailable required sandbox | `LBR-CONFLICT-002` (ConflictOperationBlocked) | 128 | Rebase remains resumable; fix and `--continue`, or `--skip` the remaining exec commands |
 | Autostash application conflict | warning; held object promoted to `stash@{0}` | 0 | Rebase completes without losing local changes; inspect the stash |
 | Update-refs branch moved concurrently | `LBR-IO-002` (IoWriteFailed) | 128 | Ref transaction rolls back and the rebase remains resumable |
-| No common ancestor found | pending typed mapping | 128 | Legacy text error refusing to rebase unrelated histories |
+| No common ancestor found | resolved (issues/480 HP-12) | 0 | `rebase <upstream>` / `pull --rebase` on unrelated histories replays the local history from its root onto the upstream (Git parity) instead of refusing |
 | Conflict during commit replay | pending typed mapping | 128 | Rebase stops, state is saved, user prompted to resolve |
 | Failed to create rebased commit | pending typed mapping | 128 | Legacy text error with commit details |
 | Failed to update branch reference | pending typed mapping | 128 | Legacy text error with ref update details |

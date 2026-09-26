@@ -7573,3 +7573,43 @@ fn test_rebase_clears_executable_bit_in_rewritten_commit() {
         "rebase must materialize the cleared execute bit"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_rebase_unrelated_histories_replays_from_root() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&current, "show current branch");
+    let cur = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create an unrelated root commit on an orphan branch.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--orphan", "orphan"], p),
+        "orphan checkout",
+    );
+    fs::write(p.join("orphan.txt"), "orphan").expect("write orphan file");
+    assert_cli_success(
+        &run_libra_command(&["add", "orphan.txt"], p),
+        "add orphan file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "orphan", "--no-verify"], p),
+        "orphan commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", &cur], p), "switch back");
+
+    // Rebase the current branch onto the unrelated orphan branch: no common
+    // ancestor, so the local history is replayed from the root (ADR-HP-08).
+    let out = run_libra_command(&["rebase", "orphan"], p);
+    assert_cli_success(&out, "rebase onto unrelated orphan branch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The rebase must replay (not fast-forward) the unrelated history.
+    assert!(
+        stdout.contains("Rebasing")
+            || stdout.contains("Applied")
+            || stdout.contains("Successfully rebased"),
+        "B1: unrelated-histories rebase should replay, got: {stdout}"
+    );
+}

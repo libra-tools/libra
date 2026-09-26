@@ -4282,35 +4282,61 @@ async fn run_rebase_start(
             }
         })?;
         let newbase_id = onto_id.unwrap_or(upstream_id);
-        let ordinary_base =
-            crate::internal::merge_base::merge_base(&head_to_rebase_id, &upstream_id)
-                .map_err(|error| RebaseError::CommitLoad {
+        let merge_base_result =
+            crate::internal::merge_base::merge_base(&head_to_rebase_id, &upstream_id).map_err(
+                |error| RebaseError::CommitLoad {
                     commit: head_to_rebase_id.to_string(),
                     detail: format!("computing merge base with {upstream_id}: {error}"),
-                })?
-                .ok_or(RebaseError::NoCommonAncestor)?;
-        let base_id = if fork_point {
-            reflog_fork_point(upstream, upstream_id, head_to_rebase_id)
-                .await?
-                .unwrap_or(ordinary_base)
-        } else {
-            ordinary_base
-        };
-        (
-            newbase_id,
-            base_id,
-            upstream_id,
-            Vec::new(),
-            upstream.to_string(),
-        )
+                },
+            )?;
+        match merge_base_result {
+            Some(ordinary_base) => {
+                let base_id = if fork_point {
+                    reflog_fork_point(upstream, upstream_id, head_to_rebase_id)
+                        .await?
+                        .unwrap_or(ordinary_base)
+                } else {
+                    ordinary_base
+                };
+                (
+                    newbase_id,
+                    base_id,
+                    upstream_id,
+                    Vec::new(),
+                    upstream.to_string(),
+                )
+            }
+            // No common ancestor (ADR-HP-08): replay the whole history from the
+            // root commit onto the upstream, equivalent to `rebase --root --onto
+            // <upstream>` (Git shows `unrelated, ...` in the replay log).
+            None => {
+                let commits = collect_commits_from_root(&head_to_rebase_id)
+                    .await
+                    .map_err(|detail| RebaseError::CommitLoad {
+                        commit: head_to_rebase_id.to_string(),
+                        detail,
+                    })?;
+                let root_id = *commits
+                    .first()
+                    .ok_or_else(|| RebaseError::BranchHasNoCommits {
+                        branch: current_branch_name.clone(),
+                    })?;
+                (
+                    newbase_id,
+                    root_id,
+                    upstream_id,
+                    commits,
+                    upstream.to_string(),
+                )
+            }
+        }
     };
 
     // Fast-forward and already-up-to-date short-circuits apply only to a plain
-    // rebase (no explicit --onto). With --onto, an explicit landing point must
-    // always replay <upstream>..HEAD onto <newbase>, even when upstream is an
-    // ancestor of HEAD (range non-empty) — otherwise the commits would never be
-    // moved onto the new base.
-    if !root && onto.is_none() && base_id == head_to_rebase_id {
+    // rebase (no explicit --onto), and only when the replay list was not already
+    // populated from an unrelated-history root replay (ADR-HP-08). With --onto,
+    // an explicit landing point must always replay <upstream>..HEAD onto <newbase>.
+    if !root && onto.is_none() && base_id == head_to_rebase_id && commits_to_replay.is_empty() {
         let upstream_commit: Commit =
             load_object(&upstream_id).map_err(|e| RebaseError::CommitLoad {
                 commit: upstream_id.to_string(),
@@ -4399,8 +4425,13 @@ async fn run_rebase_start(
 
     // Explicit `--autosquash` must still replay (and fold) when upstream is an
     // ancestor of HEAD. Without the flag, keep Git's already-up-to-date shortcut.
-    // `--root` never takes this shortcut: the range always includes the root.
-    if !root && onto.is_none() && base_id == upstream_id && !autosquash {
+    // `--root` and an unrelated-history replay never take this shortcut.
+    if !root
+        && onto.is_none()
+        && base_id == upstream_id
+        && !autosquash
+        && commits_to_replay.is_empty()
+    {
         return Ok(RebaseOutput {
             action: "start".to_string(),
             status: "already-up-to-date".to_string(),
@@ -4420,7 +4451,7 @@ async fn run_rebase_start(
         });
     }
 
-    if !root {
+    if !root && commits_to_replay.is_empty() {
         commits_to_replay = collect_commits_to_replay(&base_id, &head_to_rebase_id)
             .await
             .map_err(|detail| RebaseError::CommitLoad {
