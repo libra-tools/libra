@@ -2907,3 +2907,29 @@ async fn test_push_local_tags_and_delete() {
         "deleted tag should be gone from target"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_dot_updates_local_nondestructive_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // `push . <branch>:refs/heads/other` writes a non-checked-out local ref (D3).
+    let out = run_libra_command(
+        &["push", ".", &format!("{branch}:refs/heads/other")],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push . HEAD:refs/heads/other");
+    let ls = run_libra_command(&["ls-remote", "."], &repo_dir);
+    assert_cli_success(&ls, "ls-remote .");
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("refs/heads/other"),
+        "D3: push . should create refs/heads/other, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}
