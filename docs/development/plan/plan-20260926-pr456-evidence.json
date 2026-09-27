@@ -1,0 +1,111 @@
+{
+  "retrieved_at_utc": "2026-09-26 12:44:37 UTC",
+  "reader": "gh on task host; no PR mutation",
+  "commands": [
+    "gh pr view 456 --repo libra-tools/libra --json number,url,state,headRefName,headRefOid,baseRefName,baseRefOid,updatedAt,closedAt,mergedAt,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup --jq '{number,url,state,headRefName,headRefOid,baseRefName,baseRefOid,updatedAt,closedAt,mergedAt,mergeable,mergeStateStatus,reviewDecision,checks:[.statusCheckRollup[]|{name,status,conclusion,detailsUrl}]}'",
+    "gh api repos/libra-tools/libra/pulls/456/reviews --jq '[.[] | {id,state,submitted_at,commit_id}]'"
+  ],
+  "pr": {
+    "baseRefName": "main",
+    "baseRefOid": "a4d6ca6b11489e734571cca071dd3dd9aadc5c59",
+    "checks": [
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366307",
+        "name": "compat-rustfmt",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010800/job/107963289532",
+        "name": "security-codeql-actions",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010762/job/107963289257",
+        "name": "memory-fts5-probe (linux-amd64)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010800/job/107963289848",
+        "name": "security-codeql-rust",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010762/job/107963289461",
+        "name": "memory-fts5-probe (linux-arm64)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010762/job/107963289404",
+        "name": "memory-fts5-probe (macos-arm64)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010762/job/107963289430",
+        "name": "memory-fts5-probe (windows-amd64)",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366111",
+        "name": "compat-clippy",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366268",
+        "name": "compat-owner-liveness-macos",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366383",
+        "name": "compat-redundancy",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366309",
+        "name": "compat-offline-core",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366264",
+        "name": "compat-network-remotes",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/actions/runs/36101010761/job/107963366464",
+        "name": "opencode-export-linux",
+        "status": "COMPLETED"
+      },
+      {
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/libra-tools/libra/runs/107963434841",
+        "name": "CodeQL",
+        "status": "COMPLETED"
+      }
+    ],
+    "closedAt": "2026-09-25T07:45:18Z",
+    "headRefName": "codex/memory-m2-core-draft-pr",
+    "headRefOid": "fb37929a1d8c680b7692503d5467a9431319bb9b",
+    "mergeStateStatus": "UNSTABLE",
+    "mergeable": "MERGEABLE",
+    "mergedAt": null,
+    "number": 456,
+    "reviewDecision": "",
+    "state": "CLOSED",
+    "updatedAt": "2026-09-25T07:45:18Z",
+    "url": "https://github.com/libra-tools/libra/pull/456"
+  },
+  "reviews": [],
+  "interpretation": "PR head fb37929a is not the clean migration source cdeb5b44; closed PR baseRefOid is not a live upstream/main tip. This snapshot and old checks do not validate the migration target."
+}
