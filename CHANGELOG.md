@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.27.2] — 2026-09-28
+
+### Commit the deletion of the last tracked file (issue #497)
+
+- `libra commit` / `commit -a` no longer misreport `nothing to commit
+  (create/copy files and use 'libra add' to track)` when the LAST tracked file
+  is removed. A staged deletion that empties the index is still a real change
+  relative to `HEAD`, so `commit -a` and `libra add -A && libra commit` now
+  produce a deletion commit (matching Git's `git rm <last-file> && git commit`).
+- The empty-index refusal is now gated on there being nothing to commit relative
+  to `HEAD` (`tracked_entries.is_empty() && staged_changes.is_empty()` in
+  `src/command/commit.rs`, ADR-CD-01): a genuinely empty repository (no commit
+  and no staged changes) still reports `nothing to commit (create/copy files and
+  use 'libra add' to track)`, and a clean worktree still reports
+  `nothing to commit, working tree clean`.
+- Regression coverage: `tests/command/commit_test.rs` (delete-last-file via
+  `commit -a` and via `add -A && commit`) and
+  `tests/compat/commit_delete_last_tracked_file_test.rs` (Git upstream comparison
+  plus clean-repo refusal).
+
 ## [0.27.1] — 2026-09-27
 
 ### AI task-run tagged commit column (B3-16)

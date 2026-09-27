@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.27.1"
+version = "0.27.2"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -463,6 +463,10 @@ path = "tests/compat/commit_amend_no_edit_test.rs"
 [[test]]
 name = "compat_commit_identity_date"
 path = "tests/compat/commit_identity_date_test.rs"
+
+[[test]]
+name = "compat_commit_delete_last_tracked_file"
+path = "tests/compat/commit_delete_last_tracked_file_test.rs"
 
 [[test]]
 name = "compat_sequencer_message_author"

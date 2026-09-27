@@ -1130,16 +1130,28 @@ async fn run_commit_with_index(
                 .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
         }
 
-        // Skip empty commit check for --amend operations
-        if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
-            // No files have ever been staged — distinct from "staged but unchanged"
-            return Err(CommitError::NothingToCommitNoTracked);
-        }
-
-        // Verify staged changes relative to HEAD (skip for --amend)
+        // Verify staged changes relative to HEAD (skip for --amend). Computed
+        // before the empty-index check below because a staged deletion of the
+        // LAST tracked file leaves the index empty (`libra rm` / `add -A`)
+        // while still being a real change to commit (issue #497).
         let staged_changes = status::changes_to_be_committed_safe()
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+
+        // Skip empty commit check for --amend operations. "No files have ever
+        // been staged" must be distinguished from "staged but unchanged": the
+        // former is only true when the index is empty AND there is nothing to
+        // commit relative to HEAD. An empty index that still carries staged
+        // deletions (removing the final tracked file) must proceed to commit.
+        if tracked_entries.is_empty()
+            && staged_changes.is_empty()
+            && !args.allow_empty
+            && !is_amend
+            && !auto_stage_applied
+        {
+            return Err(CommitError::NothingToCommitNoTracked);
+        }
+
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
             return Err(classify_nothing_to_commit()?);
         }

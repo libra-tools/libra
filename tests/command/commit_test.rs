@@ -2612,3 +2612,85 @@ async fn commit_blake3_object_readback() {
         "log should show commit: {log_text}"
     );
 }
+
+/// Issue #497: deleting the LAST tracked file leaves the index empty, which
+/// must still produce a deletion commit rather than being misreported as
+/// "nothing to commit". This mirrors the Git upstream scenario
+/// `git rm <last-file> && git commit` and covers the `commit -a` path
+/// (the `libra rm` empty-index case).
+#[test]
+fn test_commit_delete_last_tracked_file_via_commit_all() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    // Track exactly one file so removing it empties the index (issue #497).
+    std::fs::write(root.join("only.txt"), "only\n").expect("write only.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "only.txt"], root),
+        "add only.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "baseline", "--no-verify"], root),
+        "baseline commit",
+    );
+
+    // Stage the deletion of the final tracked file; the index is now empty.
+    assert_cli_success(&run_libra_command(&["rm", "only.txt"], root), "rm only.txt");
+
+    // `commit -a` must commit the deletion instead of "nothing to commit".
+    let commit_all = run_libra_command(&["commit", "-a", "-m", "delete last", "--no-verify"], root);
+    assert_cli_success(&commit_all, "commit -a after deleting last tracked file");
+
+    let log = run_libra_command(&["log", "--oneline"], root);
+    assert_cli_success(&log, "log --oneline");
+    let log_text = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log_text.contains("delete last"),
+        "commit should land: {log_text}"
+    );
+
+    let ls_tree = run_libra_command(&["ls-tree", "HEAD"], root);
+    assert_cli_success(&ls_tree, "ls-tree HEAD");
+    assert!(
+        !String::from_utf8_lossy(&ls_tree.stdout).contains("only.txt"),
+        "only.txt must be removed from HEAD tree"
+    );
+}
+
+/// Issue #497, second path: `libra add -A && libra commit`. Removing the final
+/// tracked file and staging everything must produce a deletion commit, not
+/// "nothing to commit".
+#[test]
+fn test_commit_delete_last_tracked_file_via_add_all() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    std::fs::write(root.join("only.txt"), "only\n").expect("write only.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "only.txt"], root),
+        "add only.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "baseline", "--no-verify"], root),
+        "baseline commit",
+    );
+
+    // Remove the only tracked file from the worktree and stage everything.
+    std::fs::remove_file(root.join("only.txt")).expect("remove only.txt");
+    assert_cli_success(&run_libra_command(&["add", "-A"], root), "add -A");
+
+    let commit = run_libra_command(&["commit", "-m", "delete last", "--no-verify"], root);
+    assert_cli_success(&commit, "commit after add -A deleting last tracked file");
+
+    let log = run_libra_command(&["log", "--oneline"], root);
+    assert_cli_success(&log, "log --oneline");
+    let log_text = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log_text.contains("delete last"),
+        "commit should land: {log_text}"
+    );
+}

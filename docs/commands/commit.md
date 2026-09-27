@@ -194,6 +194,12 @@ File modes follow `core.filemode`: with `true` (the Unix default) a mode-only ch
 tracked regular file is committed too, while `false` ignores it (an invalid value fails the
 commit closed).
 
+Removing the LAST tracked file is still a real change to commit: even though the index
+becomes empty, `commit -a` (or `libra add -A && libra commit`) records the deletion rather
+than reporting `nothing to commit, working tree clean` (issue #497). A staged deletion is
+never confused with a genuinely empty repository, where `commit` still reports `nothing to
+commit (create/copy files and use 'libra add' to track)`.
+
 ```bash
 libra commit -a -m "Fix typo"
 ```

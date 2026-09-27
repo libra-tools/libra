@@ -107,6 +107,8 @@ libra commit -m "fix(auth): handle expired tokens" --conventional
 
 提交前自动暂存已修改或已删除的已跟踪文件。等价于在 `libra commit` 前运行 `libra add -u`。不会添加新的未跟踪文件。文件 mode 遵循 `core.filemode`：为 `true`（Unix 默认）时，仅 mode 变化也会被提交；为 `false` 时忽略该变化（非法值会使提交 fail-closed）。
 
+删除**最后一个**被跟踪文件仍是真实变更：即使索引因此变为空，`commit -a`（或 `libra add -A && libra commit`）也会记录该删除，而非报 `nothing to commit, working tree clean`（issue #497）。已暂存的删除永远不会被误判为“真正空的仓库”——后一种情形下 `commit` 仍会报 `nothing to commit (create/copy files and use 'libra add' to track)`。
+
 ```bash
 libra commit -a -m "Fix typo"
 ```
