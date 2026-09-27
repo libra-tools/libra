@@ -43,6 +43,31 @@ pub struct MutableStateSurface {
 
 /// The §C.4.1.1 mutable-state registry.
 pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
+    MutableStateSurface {
+        table: "memory_episode",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable deterministic projection of repository-local facts, not authority",
+    },
+    MutableStateSurface {
+        table: "memory_episode_evidence",
+        owner: StateOwner::Repository,
+        rationale: "typed derived evidence owned by repository-scoped memory episodes",
+    },
+    MutableStateSurface {
+        table: "memory_projection_state",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable per-repository source snapshot and freshness metadata",
+    },
+    MutableStateSurface {
+        table: "memory_episode_path",
+        owner: StateOwner::Repository,
+        rationale: "byte-faithful derived paths owned by repository-scoped memory episodes",
+    },
+    MutableStateSurface {
+        table: "memory_episode_search_doc",
+        owner: StateOwner::Repository,
+        rationale: "rebuildable deterministic search documents, not source facts",
+    },
     // ── Sequencer / operation state (W1) ─────────────────────────────────
     MutableStateSurface {
         table: "legacy_operation",

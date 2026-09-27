@@ -188,6 +188,8 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026090803` | `change_identity_prefix_index_repair` | `2026090803_change_identity_prefix_index_repair.sql` (CH-02 compatibility repair: adds the repository-scoped Change ID prefix index for databases that already recorded 0802 before that index was shipped; forward-only.) |
 | `2026091801` | `operation_v1_retirement` | `2026091801_operation_v1_retirement.sql` (OL-15 forward-only retirement of the isolated legacy operation namespace after the v2 runtime cutover.) |
 | `2026091802` | `operation_v2_dedup_index` | `2026091802_operation_v2_dedup_index.sql` (OL-15 follow-up repair for the v2 five-second duplicate-operation lookup.) |
+| `2026092601` | `memory_core` | `2026092601_memory_core{,_down}.sql` (DM-01: Repository-only deterministic Episode, typed evidence and source-state caches; strict lineage/shape preflight, no legacy M2 conversion.) |
+| `2026092602` | `memory_path_search` | `2026092602_memory_path_search{,_down}.sql` (DM-10: Repository-only byte-faithful paths and deterministic search documents; no FTS.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
@@ -223,6 +225,66 @@ above 0601 so older binaries reject the upgraded database as a future schema.
 Do not delete receipts to bypass that fence. To return to an older binary,
 restore the consistent pre-upgrade backup instead; retained `legacy_*` rows are
 not a down migration.
+
+## Deterministic Memory and legacy M2 boundary
+
+The Repository-only `2026092601_memory_core` migration creates
+`memory_episode`, `memory_episode_evidence` and `memory_projection_state`.
+These are rebuildable projections, not facts, ref roots or job queues.
+Global/System configuration databases receive neither these tables nor this
+receipt. The list index orders one repository by descending end time and then
+episode id. No path, search or FTS table is part of this migration.
+
+Before bootstrap/top-up or receipt-table DDL, repository upgrades and standalone
+migration runners reject legacy M2 receipts (`2026092501/02/03`), unreceipted
+Memory objects, and unknown same-name shapes. The runner rechecks under each
+claim's write lock before executing migration DDL. A current receipt is accepted
+only together with the exact registered table/index definitions, including
+constraints; `IF NOT EXISTS` is not used as evidence of compatibility.
+
+If refused, leave the old database, refs and objects intact. Stop writers and use
+the original binary to inspect the repository and make a consistent, restorable
+backup. No automatic conversion is provided. Do not delete receipts, rename old
+tables or clear Memory refs to force this upgrade; use a separate repository for
+the new projection until an explicit conversion contract is available.
+
+Deployed databases are forward-fix only. The down script exists for controlled
+tests/operations: it drops evidence before episodes and then source state, and
+does not alter any other table or ref. It is not permission to downgrade a user
+database or run an older binary on the new schema.
+
+### Memory path/search compatibility
+
+`2026092602_memory_path_search` adds `memory_episode_path` and
+`memory_episode_search_doc` only to Repository databases. Path bytes are BLOBs:
+nonempty, relative (no leading slash), and NUL-free; non-UTF-8 bytes and
+backslashes remain unchanged. Deleted paths carry neither an end OID nor an
+end mode. Other end modes are optional and, when present, limited to Git's
+regular, executable, symlink and gitlink modes. Paths are indexed by
+`(code_path, ended_at DESC, episode_id)`; documents have an explicit INTEGER
+rowid and one unique cascading Episode foreign key. Deterministic rowid
+derivation/collision handling belongs to the projection writer, not SQLite
+insertion order. These are rebuildable caches, not object reachability roots.
+No FTS table or trigger is created by this migration.
+
+| Reader / stored stage | Result |
+|---|---|
+| Current reader / canonical 2601 core-only | Upgrade to 2602 without rewriting the core rows or receipts |
+| Current reader / canonical 2602 full shape | Read normally; repeated migration is a no-op |
+| Reader capped at 2601 / 2602 ledger | Schema-managed open refuses as future before Memory inspection or writes |
+| Any current migration entry / missing, unknown or unreceipted Memory shape | Refuse and preserve the database, receipts, refs and rows |
+| Global/System config / either migration | Neither Memory tables nor Memory receipts are created |
+
+The strict shape fence accepts only complete committed stages; a winning
+2602 claim may temporarily observe core-only while holding the write lock.
+Post-up validation requires all five tables and both indexes. Controlled down
+removes only path/search tables and their index, preserving the three core
+tables, all older receipts and unrelated state. Each down step validates
+before deletion under its write lock and after DDL, so unknown same-name
+objects cannot be silently dropped. Deployed databases remain forward-fix
+only. Bare historical partial runners keep their existing semantics; the
+explicit supported-version check is a read-only policy probe shared with
+ordinary schema-managed open, not an alternative upgrade entry point.
 
 ## `include_str!` example
 

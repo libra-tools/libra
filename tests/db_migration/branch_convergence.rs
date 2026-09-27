@@ -21,7 +21,7 @@ use fixtures::{
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 65);
+    assert_eq!(migrations.len(), 67);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -41,9 +41,20 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
             (2026091801, "operation_v1_retirement"),
             (2026091802, "operation_v2_dedup_index"),
             (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
+            (2026092601, "memory_core"),
+            (2026092602, "memory_path_search"),
         ]
     );
-    assert!(migrations.last().unwrap().down.is_none());
+    assert!(
+        migrations
+            .iter()
+            .find(|migration| migration.version == BOUNDARY_CLAIM_COLUMNS)
+            .unwrap()
+            .down
+            .is_none()
+    );
+    assert_eq!(migrations.last().unwrap().version, 2026092602);
+    assert!(migrations.last().unwrap().down.is_some());
 }
 
 #[tokio::test]
@@ -76,6 +87,8 @@ async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
             2026091801,
             2026091802,
             BOUNDARY_CLAIM_COLUMNS,
+            2026092601,
+            2026092602,
         ]
     );
 
@@ -130,7 +143,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 65);
+    assert_eq!(after.len(), 67);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
@@ -142,6 +155,8 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
         (2026091801, "operation_v1_retirement"),
         (2026091802, "operation_v2_dedup_index"),
         (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
+        (2026092601, "memory_core"),
+        (2026092602, "memory_path_search"),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -151,7 +166,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, BOUNDARY_CLAIM_COLUMNS);
+    assert_eq!(after.last().unwrap().0, 2026092602);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -199,6 +214,8 @@ async fn operation_v2_branch_keeps_modern_rows_without_recopying() {
             2026091801,
             2026091802,
             BOUNDARY_CLAIM_COLUMNS,
+            2026092601,
+            2026092602,
         ]
     );
     assert_eq!(operation_rows_without_boundary_columns(&conn).await, modern);
@@ -307,7 +324,9 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
             2026091801,
             2026091802,
             BOUNDARY_CLAIM_COLUMNS,
+            2026092601,
+            2026092602,
         ]
     );
-    assert_eq!(receipts(&left).await.len(), 65);
+    assert_eq!(receipts(&left).await.len(), 67);
 }

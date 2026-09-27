@@ -152,7 +152,40 @@ async fn role_scoped_schema_writer_keeps_ledgers_disjoint() {
                 .unwrap(),
             Some(latest)
         );
+        let memory_tables: BTreeSet<String> = tables(&conn)
+            .await
+            .into_iter()
+            .filter(|name| name.starts_with("memory_"))
+            .collect();
+        let expected_memory_tables = if role == DatabaseRole::Repository {
+            [
+                "memory_episode",
+                "memory_episode_evidence",
+                "memory_episode_path",
+                "memory_episode_search_doc",
+                "memory_projection_state",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(memory_tables, expected_memory_tables, "{role}");
         let table = schema::ledger_for_role(role).unwrap().table_name();
+        assert_eq!(
+            text_rows(
+                &conn,
+                &format!("SELECT name FROM {table} WHERE version IN (2026092601,2026092602) ORDER BY version")
+            )
+            .await,
+            if role == DatabaseRole::Repository {
+                vec!["memory_core".to_owned(), "memory_path_search".to_owned()]
+            } else {
+                vec![]
+            },
+            "{role} Memory receipt isolation"
+        );
         let other = if role == DatabaseRole::Repository {
             "configuration_schema_versions"
         } else {
