@@ -2908,6 +2908,28 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
 pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
     GcObjectSource {
         origin: GcSourceOrigin::Column,
+        location: "memory_episode_path",
+        column: "blob_oid_at_end",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026092602_memory_path_search",
+        read_bound: "not scanned for reachability",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "rebuildable projection keeps no objects alive; missing objects remain unresolved and invalidate freshness",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "memory_episode",
+        column: "anchor_commit",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "2026092601_memory_core",
+        read_bound: "not scanned for reachability",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "rebuildable projection keeps no objects alive; missing objects remain unresolved and invalidate freshness",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
         location: "reference",
         column: "commit",
         status: GcSourceStatus::TracedRoot,

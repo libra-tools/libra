@@ -322,6 +322,20 @@ pub fn latest_schema_version_for_role(role: DatabaseRole) -> io::Result<Option<i
         .map_err(|error| io::Error::other(error.clone()))
 }
 
+/// Preserve the driver cause across the io::Error API so cached readers can
+/// distinguish contention from malformed ledgers without parsing Display text.
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {cause}")]
+pub(super) struct SchemaReadError {
+    context: String,
+    #[source]
+    pub(super) cause: DbErr,
+}
+
+pub(super) fn schema_read_error(context: String, cause: DbErr) -> io::Error {
+    io::Error::other(SchemaReadError { context, cause })
+}
+
 /// Metadata lookup and indexed MAX, with no DDL or configuration-value reads.
 pub async fn current_schema_version_for_role<C: ConnectionTrait>(
     conn: &C,
@@ -335,7 +349,7 @@ pub async fn current_schema_version_for_role<C: ConnectionTrait>(
             [table.into()],
         ))
         .await
-        .map_err(|error| io::Error::other(format!("failed to inspect {role} ledger: {error}")))?;
+        .map_err(|error| schema_read_error(format!("failed to inspect {role} ledger"), error))?;
     if exists.is_none() {
         return Ok(None);
     }
@@ -347,13 +361,13 @@ pub async fn current_schema_version_for_role<C: ConnectionTrait>(
         ))
         .await
         .map_err(|error| {
-            io::Error::other(format!("failed to read {role} schema version: {error}"))
+            schema_read_error(format!("failed to read {role} schema version"), error)
         })?;
     let row = row.ok_or_else(|| {
         io::Error::other(format!("{role} schema version query returned no result"))
     })?;
     row.try_get_by_index(0)
-        .map_err(|error| io::Error::other(format!("invalid {role} schema version: {error}")))
+        .map_err(|error| schema_read_error(format!("invalid {role} schema version"), error))
 }
 
 pub async fn inspect_schema_for_connection<C: ConnectionTrait>(
@@ -362,7 +376,30 @@ pub async fn inspect_schema_for_connection<C: ConnectionTrait>(
 ) -> io::Result<SchemaCompatibility> {
     let current = current_schema_version_for_role(conn, role).await?;
     let latest = latest_schema_version_for_role(role)?;
-    Ok(match (current, latest) {
+    Ok(classify_schema_versions(current, latest))
+}
+
+/// Check a reader's supported-version policy against the role's real ledger.
+///
+/// This is a read-only policy check, not an upgrade entry point: it neither
+/// opens nor returns a connection and never performs DDL. An explicit ceiling
+/// permits compatibility probes for older manifests without changing a
+/// partial migration runner's semantics. Schema-managed open always supplies
+/// its built-in manifest ceiling.
+#[doc(hidden)]
+pub async fn check_schema_support_for_connection<C: ConnectionTrait>(
+    conn: &C,
+    role: DatabaseRole,
+    latest_supported: Option<i64>,
+) -> io::Result<SchemaCompatibility> {
+    let current = current_schema_version_for_role(conn, role).await?;
+    let compatibility = classify_schema_versions(current, latest_supported);
+    reject_future(role, &compatibility)?;
+    Ok(compatibility)
+}
+
+fn classify_schema_versions(current: Option<i64>, latest: Option<i64>) -> SchemaCompatibility {
+    match (current, latest) {
         (Some(current), latest) if latest.is_none_or(|latest| current > latest) => {
             SchemaCompatibility::UnsupportedFuture {
                 current_version: current,
@@ -379,7 +416,7 @@ pub async fn inspect_schema_for_connection<C: ConnectionTrait>(
             current_version: current,
             latest_version: latest,
         },
-    })
+    }
 }
 
 fn reject_future(role: DatabaseRole, compatibility: &SchemaCompatibility) -> io::Result<()> {
@@ -788,8 +825,18 @@ pub async fn establish_connection_with_busy_timeout_for_role(
 ) -> io::Result<DatabaseConnection> {
     ledger_for_role(role)?;
     let conn = super::open_connection_without_schema_management(db_path, busy_timeout).await?;
-    let compatibility = inspect_schema_for_connection(&conn, role).await?;
-    reject_future(role, &compatibility)?;
+    let compatibility =
+        check_schema_support_for_connection(&conn, role, latest_schema_version_for_role(role)?)
+            .await?;
+    if role == DatabaseRole::Repository {
+        super::migration::preflight_memory_schema(&conn)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to validate Repository Memory storage: {error}"
+                ))
+            })?;
+    }
     if matches!(compatibility, SchemaCompatibility::UpgradeRequired { .. }) {
         upgrade_connection_for_role(&conn, role).await?;
     }

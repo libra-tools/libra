@@ -259,7 +259,29 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
         // damage there (a schema rebuild fails the old writer's statements
         // rather than accepting them).
         match inspect_database_schema_for_connection(&conn).await {
-            Ok(SchemaCompatibility::Compatible { .. }) => return Ok(conn),
+            Ok(SchemaCompatibility::Compatible { .. }) => {
+                // Keep domain incompatibility separate from transient reads.
+                // Never close a pool another task may hold in a transaction.
+                match migration::preflight_memory_schema(&conn).await {
+                    Ok(()) => {}
+                    Err(migration::MemorySchemaError::Database(error))
+                        if memory_preflight_is_contention(&error) =>
+                    {
+                        tracing::debug!(
+                            db_path = %db_path.display(),
+                            error = %error,
+                            "Memory schema re-check encountered temporary contention; retaining cached connection"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(IOError::other(format!(
+                            "Failed to revalidate cached Memory storage: {error}; \
+                             retry after concurrent writers finish, or inspect a consistent backup"
+                        )));
+                    }
+                }
+                return Ok(conn);
+            }
             // PROVEN incompatibility: evict, and CLOSE the shared pool so
             // every already-returned clone is refused too (W2 r7 #4). The
             // close is spawned: `Pool::close` marks the pool closed at once
@@ -290,18 +312,21 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
                 // Fall through: re-establish, which re-checks and either
                 // upgrades or reports the future schema with its hint.
             }
-            // A FAILED inspection is not evidence of incompatibility — a
-            // legitimate writer's open transaction makes this read report
-            // BUSY, and evicting (let alone closing) on that would tear the
-            // pool out from under the writer. Hand back the cached
-            // connection; the next acquisition re-checks.
-            Err(error) => {
+            // Only typed BUSY/LOCKED or pool waiting retains the old transient
+            // policy. Missing columns and version decode errors are not safe.
+            Err(error) if schema_inspection_is_contention(&error) => {
                 tracing::debug!(
                     db_path = %db_path.display(),
                     error = %error,
-                    "schema re-check on a cached connection failed transiently; keeping it"
+                    "schema re-check on a cached connection encountered temporary contention; keeping it"
                 );
                 return Ok(conn);
+            }
+            Err(error) => {
+                return Err(IOError::other(format!(
+                    "Failed to inspect cached repository schema before Memory access: {error}; \
+                     inspect the database with a compatible binary or restore a consistent backup"
+                )));
             }
         }
     } else {
@@ -316,6 +341,33 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
     }
     connections.insert(db_path, conn.clone());
     Ok(conn)
+}
+
+fn schema_inspection_is_contention(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<schema::SchemaReadError>())
+        .is_some_and(|source| memory_preflight_is_contention(&source.cause))
+}
+
+/// Only driver-confirmed lock contention or pool waiting may retain a cached
+/// handle after a failed Memory read. Missing columns, decode failures and
+/// closed pools are not evidence that a schema is compatible.
+fn memory_preflight_is_contention(error: &DbErr) -> bool {
+    match error {
+        DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout) => true,
+        DbErr::Conn(sea_orm::RuntimeErr::SqlxError(error))
+        | DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
+        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(error)) => match error.as_ref() {
+            sea_orm::sqlx::Error::PoolTimedOut => true,
+            sea_orm::sqlx::Error::Database(error) => error
+                .code()
+                .and_then(|code| code.parse::<u32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The one statement that turns SQLite's DEFERRED `BEGIN` into a write
@@ -573,6 +625,9 @@ const AI_PROJECTION_SCHEMA_END: &str = "-- END AI PROJECTION SCHEMA";
 /// Used by [`create_database`]. Existing databases use the idempotent
 /// `ensure_*` migrators instead.
 async fn setup_database_sql(conn: &DatabaseConnection) -> Result<(), TransactionError<DbErr>> {
+    migration::preflight_memory_schema(conn)
+        .await
+        .map_err(|error| TransactionError::Connection(error.into()))?;
     conn.transaction::<_, _, DbErr>(|txn| {
         Box::pin(async move {
             let backend = txn.get_database_backend();
@@ -582,6 +637,7 @@ async fn setup_database_sql(conn: &DatabaseConnection) -> Result<(), Transaction
                 txn.execute_raw(Statement::from_string(backend, bootstrap.sql))
                     .await?;
             }
+            migration::validate_memory_schema(txn, false).await?;
             Ok(())
         })
     })
@@ -644,6 +700,9 @@ pub(crate) async fn sqlite_schema_contains(
 /// Existing databases (created before this table was added) will have the table
 /// created on first connection, similar to the AI projection schema pattern.
 async fn ensure_config_kv_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
+    migration::preflight_memory_schema(conn)
+        .await
+        .map_err(|err| IOError::other(format!("Failed Memory lineage preflight: {err}")))?;
     if sqlite_schema_contains(conn, "table", "config_kv")
         .await
         .map_err(|err| IOError::other(format!("Failed to inspect config_kv schema: {err}")))?
@@ -651,20 +710,21 @@ async fn ensure_config_kv_schema(conn: &DatabaseConnection) -> Result<(), IOErro
         return Ok(());
     }
 
-    let backend = conn.get_database_backend();
-    conn.execute_raw(Statement::from_string(backend, schema::CONFIG_KV_SQL))
+    execute_repository_schema_ddl(conn, schema::CONFIG_KV_SQL, || async {})
         .await
         .map_err(|err| IOError::other(format!("Failed to create config_kv table: {err}")))?;
     Ok(())
 }
 
 async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
+    migration::preflight_memory_schema(conn)
+        .await
+        .map_err(|err| IOError::other(format!("Failed Memory lineage preflight: {err}")))?;
     if !sqlite_schema_contains(conn, "table", "object_index")
         .await
         .map_err(|err| IOError::other(format!("Failed to inspect core schema: {err}")))?
     {
-        let backend = conn.get_database_backend();
-        conn.execute_raw(Statement::from_string(backend, BOOTSTRAP_SQL))
+        execute_repository_schema_ddl(conn, BOOTSTRAP_SQL, || async {})
             .await
             .map_err(|err| IOError::other(format!("Failed to bootstrap SQLite schema: {err}")))?;
         return Ok(());
@@ -681,8 +741,7 @@ async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IO
         return Ok(());
     }
 
-    let backend = conn.get_database_backend();
-    conn.execute_raw(Statement::from_string(backend, ai_projection_sql()?))
+    execute_repository_schema_ddl(conn, ai_projection_sql()?, || async {})
         .await
         .map_err(|err| IOError::other(format!("Failed to apply AI projection schema: {err}")))?;
     Ok(())
@@ -694,14 +753,52 @@ async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IO
 /// from the bootstrap schema; deployed databases get the idempotent migration
 /// here on first connection.
 pub async fn ensure_ai_runtime_contract_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
-    let backend = conn.get_database_backend();
-    conn.execute_raw(Statement::from_string(
-        backend,
-        AI_RUNTIME_CONTRACT_MIGRATION_SQL,
-    ))
+    ensure_ai_runtime_contract_schema_with_post_preflight_gate(conn, || async {}).await
+}
+
+/// Test seam for the preflight-to-DDL race; production uses the wrapper above.
+#[doc(hidden)]
+pub async fn ensure_ai_runtime_contract_schema_with_post_preflight_gate<F, Fut>(
+    conn: &DatabaseConnection,
+    gate: F,
+) -> Result<(), IOError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    execute_repository_schema_ddl(conn, AI_RUNTIME_CONTRACT_MIGRATION_SQL, gate)
+        .await
+        .map_err(|err| IOError::other(format!("Failed to apply AI runtime contract schema: {err}")))
+}
+
+/// The first DDL takes SQLite's writer lock. Revalidate before committing it:
+/// a legacy writer that committed after our read-only preflight cannot make
+/// this transaction's top-up durable. Earlier valid transactions stay intact.
+async fn execute_repository_schema_ddl<F, Fut>(
+    conn: &DatabaseConnection,
+    sql: &'static str,
+    gate: F,
+) -> Result<(), DbErr>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    migration::preflight_memory_schema(conn)
+        .await
+        .map_err(DbErr::from)?;
+    gate().await;
+    conn.transaction::<_, _, DbErr>(|txn| {
+        Box::pin(async move {
+            txn.execute_raw(Statement::from_string(txn.get_database_backend(), sql))
+                .await?;
+            migration::validate_memory_schema(txn, false).await?;
+            Ok(())
+        })
+    })
     .await
-    .map_err(|err| IOError::other(format!("Failed to apply AI runtime contract schema: {err}")))?;
-    Ok(())
+    .map_err(|error| match error {
+        TransactionError::Connection(error) | TransactionError::Transaction(error) => error,
+    })
 }
 
 async fn connect_database(db_path: &str) -> io::Result<DatabaseConnection> {
@@ -717,6 +814,9 @@ async fn connect_database(db_path: &str) -> io::Result<DatabaseConnection> {
 async fn apply_database_schema_upgrades(
     conn: &DatabaseConnection,
 ) -> io::Result<SchemaUpgradeReport> {
+    migration::preflight_memory_schema(conn)
+        .await
+        .map_err(|err| IOError::other(format!("Failed Memory lineage preflight: {err}")))?;
     let previous_version = migration::current_builtin_schema_version_readonly(conn)
         .await
         .map_err(|err| IOError::other(format!("Failed to read schema version: {err}")))?;
@@ -767,6 +867,45 @@ pub async fn create_database(db_path: &str) -> io::Result<DatabaseConnection> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_schema_read_contention_is_typed() {
+        use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
+        assert!(super::memory_preflight_is_contention(
+            &DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)
+        ));
+        assert!(!super::memory_preflight_is_contention(
+            &DbErr::ConnectionAcquire(ConnAcquireErr::ConnectionClosed)
+        ));
+        let waiting = super::schema::schema_read_error(
+            "schema probe".to_owned(),
+            DbErr::ConnectionAcquire(ConnAcquireErr::Timeout),
+        );
+        assert!(super::schema_inspection_is_contention(&waiting));
+        assert_eq!(
+            waiting.to_string(),
+            "schema probe: Failed to acquire connection from pool: Connection pool timed out"
+        );
+        let malformed = super::schema::schema_read_error(
+            "schema probe".to_owned(),
+            DbErr::Type("invalid version".to_owned()),
+        );
+        assert!(!super::schema_inspection_is_contention(&malformed));
+        assert_eq!(
+            malformed.to_string(),
+            "schema probe: Type Error: invalid version"
+        );
+        assert!(!super::schema_inspection_is_contention(
+            &std::io::Error::other("database is locked")
+        ));
+        for error in [
+            DbErr::Query(RuntimeErr::Internal("database is locked".into())),
+            DbErr::Type("bad schema version".into()),
+            DbErr::Custom("no such column: version".into()),
+        ] {
+            assert!(!super::memory_preflight_is_contention(&error));
+        }
+    }
+
     use std::{fs, path::PathBuf, sync::Arc};
 
     use sea_orm::{

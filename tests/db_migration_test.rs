@@ -3831,13 +3831,45 @@ async fn sparse_down_migration_rejects_linked_rows() {
 /// collector) fails here instead of silently shipping un-traced.
 #[tokio::test]
 async fn gc_object_source_inventory_covers_every_oid_column() {
-    use libra::command::maintenance::GC_OBJECT_SOURCE_INVENTORY;
+    use libra::command::maintenance::{GC_OBJECT_SOURCE_INVENTORY, GcSourceStatus};
 
-    let (_dir, url, _path) = fresh_db_url();
-    let conn = connect(&url).await;
+    // Use the real current schema, not this target's historical down-test runner.
+    let (_dir, _path, conn) = memory_full_fixture().await;
     let backend = conn.get_database_backend();
-    run_builtin_migrations(&conn).await.expect("migrations");
+    assert!(
+        conn.query_one_raw(Statement::from_string(
+            backend,
+            "SELECT anchor_commit FROM memory_episode LIMIT 0"
+        ))
+        .await
+        .is_ok(),
+        "Memory anchor column must actually be materialized"
+    );
+    assert!(
+        GC_OBJECT_SOURCE_INVENTORY
+            .iter()
+            .any(|source| source.location == "memory_episode"
+                && source.column == "anchor_commit"
+                && source.status == GcSourceStatus::NonRoot),
+        "derived Memory anchors must not keep objects alive"
+    );
 
+    assert!(
+        conn.query_one_raw(Statement::from_string(
+            backend,
+            "SELECT blob_oid_at_end FROM memory_episode_path LIMIT 0"
+        ))
+        .await
+        .is_ok(),
+        "Memory path OID column must actually be materialized"
+    );
+    assert!(
+        GC_OBJECT_SOURCE_INVENTORY
+            .iter()
+            .any(|source| source.location == "memory_episode_path"
+                && source.column == "blob_oid_at_end"
+                && source.status == GcSourceStatus::NonRoot)
+    );
     let oid_keywords = ["oid", "commit", "blob", "tree", "sha", "hash"];
     // Table-level exemptions: stores whose OID-shaped columns are not
     // object-store OIDs at all (AI capture bookkeeping uses provider ids and
@@ -5310,4 +5342,1578 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         rendered.contains("2126081301"),
         "refusal must name the unsupported version: {rendered}"
     );
+}
+
+// DM-01: new root-level contract tests; fixture-owned files, no process state.
+fn memory_core_runner() -> MigrationRunner {
+    let mut runner = MigrationRunner::new();
+    runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= 2026092601),
+        )
+        .unwrap();
+    runner
+}
+
+async fn memory_core_fixture() -> (TempDir, PathBuf, DatabaseConnection) {
+    let (dir, url, path) = fresh_db_url();
+    let conn = connect(&url).await;
+    memory_core_runner().run_pending(&conn).await.unwrap();
+    (dir, path, conn)
+}
+
+async fn memory_full_fixture() -> (TempDir, PathBuf, DatabaseConnection) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+    let conn = libra::internal::db::create_database(path.to_str().unwrap())
+        .await
+        .unwrap();
+    (dir, path, conn)
+}
+
+async fn memory_text_rows(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
+    conn.query_all_raw(Statement::from_string(conn.get_database_backend(), sql))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get_by_index(0).unwrap())
+        .collect()
+}
+
+async fn memory_assert_columns(
+    conn: &DatabaseConnection,
+    table: &str,
+    expected: &[(&str, &str, i64, Option<&str>, i64)],
+) {
+    let actual: Vec<(String, String, i64, Option<String>, i64)> = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("PRAGMA table_info({table})"),
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(1).unwrap(),
+                row.try_get_by_index(2).unwrap(),
+                row.try_get_by_index(3).unwrap(),
+                row.try_get_by_index(4).unwrap(),
+                row.try_get_by_index(5).unwrap(),
+            )
+        })
+        .collect();
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(name, kind, required, default, pk)| {
+            (
+                (*name).to_owned(),
+                (*kind).to_owned(),
+                *required,
+                default.map(str::to_owned),
+                *pk,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected, "{table}");
+}
+
+async fn memory_seed_episode(conn: &DatabaseConnection) {
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode
+         (episode_id,repo_id,source_kind,source_key,outcome,started_at,ended_at,title,body,content_digest,rules_version)
+         VALUES ('episode-1','repo-1','commit','source-1','succeeded',10,20,'title','body',
+         '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',1)",
+    ).await.unwrap();
+}
+
+async fn memory_seed_all(conn: &DatabaseConnection) {
+    memory_seed_episode(conn).await;
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode_evidence VALUES
+         ('episode-1',0,'commit','oid-1','identity','resolved');
+         INSERT INTO memory_projection_state VALUES
+         ('repo-1','commit','{}',
+          '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+          1,1,0,123,NULL)",
+    )
+    .await
+    .unwrap();
+}
+
+async fn memory_reject_updates(conn: &DatabaseConnection, table: &str, updates: &[(&str, &str)]) {
+    for (column, expression) in updates {
+        assert!(
+            conn.execute_unprepared(&format!("UPDATE {table} SET {column} = {expression}"))
+                .await
+                .is_err(),
+            "{table}.{column} must reject {expression}"
+        );
+    }
+}
+
+/// Includes the schema and every user row, including ref/receipt rows.
+/// SQLite quote() preserves NULL and BLOB identity; ordering is explicit.
+async fn memory_snapshot(conn: &DatabaseConnection, include_memory: bool) -> Vec<String> {
+    let objects = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema ORDER BY type,name",
+        ))
+        .await
+        .unwrap();
+    let mut snapshot = Vec::new();
+    for object in objects {
+        let kind: String = object.try_get_by_index(0).unwrap();
+        let name: String = object.try_get_by_index(1).unwrap();
+        let table: String = object.try_get_by_index(2).unwrap();
+        let sql: String = object.try_get_by_index(3).unwrap();
+        if !include_memory && (table.starts_with("memory_") || table == "schema_versions") {
+            continue;
+        }
+        snapshot.push(format!("schema:{kind}:{name}:{table}:{sql}"));
+        if kind != "table" || name.starts_with("sqlite_") {
+            continue;
+        }
+        let quoted_table = format!("\"{}\"", name.replace('"', "\"\""));
+        let columns = conn
+            .query_all_raw(Statement::from_string(
+                conn.get_database_backend(),
+                format!("PRAGMA table_info({quoted_table})"),
+            ))
+            .await
+            .unwrap();
+        let expressions: Vec<String> = columns
+            .into_iter()
+            .map(|column| {
+                let column: String = column.try_get_by_index(1).unwrap();
+                format!("quote(\"{}\")", column.replace('"', "\"\""))
+            })
+            .collect();
+        let mut rows = memory_text_rows(
+            conn,
+            &format!(
+                "SELECT {} FROM {quoted_table}",
+                expressions.join(" || '|' || ")
+            ),
+        )
+        .await;
+        rows.sort();
+        snapshot.extend(rows.into_iter().map(|row| format!("row:{name}:{row}")));
+    }
+    snapshot
+}
+
+#[tokio::test]
+async fn memory_core_episode_schema() {
+    let (_dir, _path, conn) = memory_core_fixture().await;
+    memory_assert_columns(
+        &conn,
+        "memory_episode",
+        &[
+            ("episode_id", "TEXT", 1, None, 1),
+            ("repo_id", "TEXT", 1, None, 0),
+            ("source_kind", "TEXT", 1, None, 0),
+            ("source_key", "TEXT", 1, None, 0),
+            ("outcome", "TEXT", 1, None, 0),
+            ("actor", "TEXT", 0, None, 0),
+            ("started_at", "INTEGER", 1, None, 0),
+            ("ended_at", "INTEGER", 1, None, 0),
+            ("anchor_commit", "TEXT", 0, None, 0),
+            ("change_id", "TEXT", 0, None, 0),
+            ("title", "TEXT", 1, None, 0),
+            ("body", "TEXT", 1, None, 0),
+            ("content_digest", "TEXT", 1, None, 0),
+            ("producer", "TEXT", 1, Some("'derived-v1'"), 0),
+            ("rules_version", "INTEGER", 1, None, 0),
+        ],
+    )
+    .await;
+    memory_seed_episode(&conn).await;
+    assert_eq!(
+        memory_text_rows(&conn, "SELECT producer FROM memory_episode").await,
+        ["derived-v1"]
+    );
+    memory_reject_updates(
+        &conn,
+        "memory_episode",
+        &[
+            ("source_kind", "'other'"),
+            ("outcome", "'other'"),
+            ("rules_version", "0"),
+            ("rules_version", "-1"),
+            ("content_digest", "'short'"),
+            (
+                "content_digest",
+                "'ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'",
+            ),
+            (
+                "content_digest",
+                "'g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'",
+            ),
+        ],
+    )
+    .await;
+    for column in [
+        "episode_id",
+        "repo_id",
+        "source_kind",
+        "source_key",
+        "outcome",
+        "started_at",
+        "ended_at",
+        "title",
+        "body",
+        "content_digest",
+        "producer",
+        "rules_version",
+    ] {
+        memory_reject_updates(&conn, "memory_episode", &[(column, "NULL")]).await;
+    }
+    assert!(conn.execute_unprepared(
+        "INSERT INTO memory_episode SELECT 'episode-2',repo_id,source_kind,source_key,outcome,actor,
+         started_at,ended_at,anchor_commit,change_id,title,body,content_digest,producer,rules_version
+         FROM memory_episode"
+    ).await.is_err(), "source identity must be unique inside one repository");
+    assert!(conn.execute_unprepared(
+        "INSERT INTO memory_episode SELECT episode_id,'repo-2',source_kind,'source-2',outcome,actor,
+         started_at,ended_at,anchor_commit,change_id,title,body,content_digest,producer,rules_version
+         FROM memory_episode"
+    ).await.is_err(), "episode id is the primary key");
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode SELECT 'episode-2','repo-2',source_kind,source_key,outcome,actor,
+         started_at,ended_at,anchor_commit,change_id,title,body,content_digest,producer,rules_version
+         FROM memory_episode"
+    ).await.unwrap();
+    for source in ["commit", "agent_session", "agent_run", "bridge_operation"] {
+        for outcome in ["succeeded", "failed", "aborted", "partial", "unknown"] {
+            conn.execute_unprepared(&format!(
+                "UPDATE memory_episode SET source_kind='{source}',outcome='{outcome}'"
+            ))
+            .await
+            .unwrap();
+        }
+    }
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_core_evidence_schema() {
+    let (_dir, _path, conn) = memory_core_fixture().await;
+    memory_assert_columns(
+        &conn,
+        "memory_episode_evidence",
+        &[
+            ("episode_id", "TEXT", 1, None, 1),
+            ("ordinal", "INTEGER", 1, None, 2),
+            ("kind", "TEXT", 1, None, 0),
+            ("ref_id", "TEXT", 1, None, 0),
+            ("link_confidence", "TEXT", 1, None, 0),
+            ("resolution_status", "TEXT", 1, None, 0),
+        ],
+    )
+    .await;
+    memory_seed_all(&conn).await;
+    let foreign_keys = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "PRAGMA foreign_key_list(memory_episode_evidence)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys.len(), 1);
+    assert_eq!(
+        foreign_keys[0].try_get_by_index::<String>(2).unwrap(),
+        "memory_episode"
+    );
+    assert_eq!(
+        foreign_keys[0].try_get_by_index::<String>(3).unwrap(),
+        "episode_id"
+    );
+    assert_eq!(
+        foreign_keys[0].try_get_by_index::<String>(4).unwrap(),
+        "episode_id"
+    );
+    assert_eq!(
+        foreign_keys[0].try_get_by_index::<String>(6).unwrap(),
+        "CASCADE"
+    );
+    memory_reject_updates(
+        &conn,
+        "memory_episode_evidence",
+        &[
+            ("episode_id", "'missing'"),
+            ("ordinal", "-1"),
+            ("kind", "'task'"),
+            ("link_confidence", "'high'"),
+            ("resolution_status", "'assumed'"),
+        ],
+    )
+    .await;
+    for column in [
+        "episode_id",
+        "ordinal",
+        "kind",
+        "ref_id",
+        "link_confidence",
+        "resolution_status",
+    ] {
+        memory_reject_updates(&conn, "memory_episode_evidence", &[(column, "NULL")]).await;
+    }
+    assert!(
+        conn.execute_unprepared(
+            "INSERT INTO memory_episode_evidence SELECT * FROM memory_episode_evidence"
+        )
+        .await
+        .is_err()
+    );
+    for kind in ["commit", "checkpoint", "review_run", "operation"] {
+        for confidence in ["identity", "operation", "temporal"] {
+            for resolution in ["resolved", "unresolved"] {
+                conn.execute_unprepared(&format!(
+                    "UPDATE memory_episode_evidence SET kind='{kind}',link_confidence='{confidence}',resolution_status='{resolution}'"
+                )).await.unwrap();
+            }
+        }
+    }
+    conn.execute_unprepared("DELETE FROM memory_episode WHERE episode_id='episode-1'")
+        .await
+        .unwrap();
+    assert!(
+        memory_text_rows(&conn, "SELECT ref_id FROM memory_episode_evidence")
+            .await
+            .is_empty()
+    );
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_core_state_schema() {
+    let (_dir, _path, conn) = memory_core_fixture().await;
+    memory_assert_columns(
+        &conn,
+        "memory_projection_state",
+        &[
+            ("repo_id", "TEXT", 1, None, 1),
+            ("source_kind", "TEXT", 1, None, 2),
+            ("cursor_json", "TEXT", 1, None, 0),
+            ("fingerprint", "TEXT", 1, None, 0),
+            ("rules_version", "INTEGER", 1, None, 0),
+            ("schema_version", "INTEGER", 1, None, 0),
+            ("horizon_truncated", "INTEGER", 1, None, 0),
+            ("rebuilt_at", "INTEGER", 1, None, 0),
+            ("fts_synced_fingerprint", "TEXT", 0, None, 0),
+        ],
+    )
+    .await;
+    memory_seed_all(&conn).await;
+    memory_reject_updates(
+        &conn,
+        "memory_projection_state",
+        &[
+            ("source_kind", "'other'"),
+            ("cursor_json", "'{broken'"),
+            ("fingerprint", "'short'"),
+            (
+                "fingerprint",
+                "'ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'",
+            ),
+            ("rules_version", "0"),
+            ("rules_version", "-1"),
+            ("schema_version", "0"),
+            ("schema_version", "-1"),
+            ("horizon_truncated", "2"),
+            ("horizon_truncated", "-1"),
+            ("fts_synced_fingerprint", "'short'"),
+            (
+                "fts_synced_fingerprint",
+                "'ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'",
+            ),
+        ],
+    )
+    .await;
+    for column in [
+        "repo_id",
+        "source_kind",
+        "cursor_json",
+        "fingerprint",
+        "rules_version",
+        "schema_version",
+        "horizon_truncated",
+        "rebuilt_at",
+    ] {
+        memory_reject_updates(&conn, "memory_projection_state", &[(column, "NULL")]).await;
+    }
+    assert!(
+        conn.execute_unprepared(
+            "INSERT INTO memory_projection_state SELECT * FROM memory_projection_state"
+        )
+        .await
+        .is_err()
+    );
+    for source in ["commit", "agent_session", "agent_run", "bridge_operation"] {
+        conn.execute_unprepared(&format!(
+            "UPDATE memory_projection_state SET source_kind='{source}',horizon_truncated=1,fts_synced_fingerprint=fingerprint"
+        )).await.unwrap();
+    }
+    conn.execute_unprepared(
+        "UPDATE memory_projection_state SET fts_synced_fingerprint=NULL,horizon_truncated=0",
+    )
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_core_down_is_scoped() {
+    let (dir, _path, conn) = memory_core_fixture().await;
+    memory_seed_all(&conn).await;
+    conn.execute_unprepared("CREATE TABLE dm01_unrelated_fixture (value BLOB); INSERT INTO dm01_unrelated_fixture VALUES (x'00ff')").await.unwrap();
+    let ref_path = dir.path().join("memory-ref-fixture");
+    std::fs::write(&ref_path, b"retain-old-ref\0\xff").unwrap();
+    let before = memory_snapshot(&conn, false).await;
+    let before_receipts = memory_text_rows(&conn,
+        "SELECT version||':'||name||':'||applied_at FROM schema_versions WHERE version<>2026092601 ORDER BY version"
+    ).await;
+    assert_eq!(
+        memory_core_runner()
+            .rollback_to(&conn, 2026091901)
+            .await
+            .unwrap(),
+        [2026092601]
+    );
+    assert_eq!(memory_snapshot(&conn, false).await, before);
+    assert_eq!(
+        memory_text_rows(
+            &conn,
+            "SELECT version||':'||name||':'||applied_at FROM schema_versions ORDER BY version"
+        )
+        .await,
+        before_receipts
+    );
+    assert!(
+        memory_text_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'memory_*'"
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"retain-old-ref\0\xff");
+    assert_eq!(
+        memory_core_runner().run_pending(&conn).await.unwrap(),
+        [2026092601]
+    );
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_core_second_run_is_noop() {
+    let (_dir, path, conn) = memory_core_fixture().await;
+    memory_seed_all(&conn).await;
+    let before = memory_snapshot(&conn, true).await;
+    conn.close().await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let conn = connect(&format!("sqlite://{}", path.display())).await;
+    assert!(
+        memory_core_runner()
+            .run_pending(&conn)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        all_builtin_runner()
+            .unwrap()
+            .run_pending_up_to(&conn, 2026092601)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(memory_snapshot(&conn, true).await, before);
+    conn.close().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn memory_core_rejects_legacy_shape_without_mutation() {
+    const CORE: &str = include_str!("../sql/migrations/2026092601_memory_core.sql");
+    const PATH_SEARCH: &str = include_str!("../sql/migrations/2026092602_memory_path_search.sql");
+    let ledger = "CREATE TABLE schema_versions(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);";
+    let mut cases = vec![
+        ("legacy-note".to_owned(),"CREATE TABLE memory_note_index(note_id TEXT); INSERT INTO memory_note_index VALUES('keep');".to_owned()),
+        ("legacy-state".to_owned(),"CREATE TABLE memory_projection_state(scope_key TEXT,projected_ref_oid TEXT); INSERT INTO memory_projection_state VALUES('repo','keep');".to_owned()),
+        ("unknown-table".to_owned(),"CREATE TABLE memory_episode(unknown BLOB); INSERT INTO memory_episode VALUES(x'00ff');".to_owned()),
+        ("unknown-uppercase-table".to_owned(),"CREATE TABLE MEMORY_EPISODE(unknown BLOB); INSERT INTO MEMORY_EPISODE VALUES(x'00ff');".to_owned()),
+        ("legacy-uppercase-receipt".to_owned(),"CREATE TABLE SCHEMA_VERSIONS(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL); INSERT INTO SCHEMA_VERSIONS VALUES(2026092501,'legacy-memory','keep');".to_owned()),
+        ("unknown-view".to_owned(),"CREATE VIEW memory_episode AS SELECT 'keep' AS unknown;".to_owned()),
+        ("unreceipted-canonical".to_owned(),CORE.to_owned()),
+        ("receipted-wrong-name".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'test_missing_legacy_table','keep'); {CORE}")),
+        ("receipted-missing".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep');")),
+        ("receipted-constraint-drift".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep'); {}",
+            CORE.replace("CHECK (rules_version > 0)","CHECK (rules_version >= 0)"))),
+        ("receipted-quoted-default-drift".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep'); {}",
+            CORE.replace("'derived-v1'","'IFNOTEXISTSderived-v1'"))),
+        ("receipted-column-token-drift".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep'); {}",
+            CORE.replace("actor TEXT,","actorTEXT,"))),
+        ("receipted-index-drift".to_owned(),format!("{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep'); {CORE} DROP INDEX memory_episode_list; CREATE INDEX memory_episode_list ON memory_episode(repo_id,episode_id);")),
+    ];
+    let core_receipt = format!(
+        "{ledger} INSERT INTO schema_versions VALUES(2026092601,'memory_core','keep'); {CORE}"
+    );
+    let full_receipts = format!(
+        "{core_receipt} INSERT INTO schema_versions VALUES(2026092602,'memory_path_search','keep');"
+    );
+    cases.extend([
+        ("path-without-core-receipt".to_owned(), format!("{ledger} INSERT INTO schema_versions VALUES(2026092602,'memory_path_search','keep'); {CORE} {PATH_SEARCH}")),
+        ("unreceipted-path-search".to_owned(), format!("{core_receipt} {PATH_SEARCH}")),
+        ("receipted-path-search-missing".to_owned(), full_receipts.clone()),
+        ("path-search-wrong-name".to_owned(), format!("{core_receipt} INSERT INTO schema_versions VALUES(2026092602,'wrong-path-name','keep'); {PATH_SEARCH}")),
+        ("path-constraint-drift".to_owned(), format!("{full_receipts} {}", PATH_SEARCH.replace("length(code_path) > 0", "length(code_path) >= 0"))),
+        ("path-index-drift".to_owned(), format!("{full_receipts} {PATH_SEARCH} DROP INDEX memory_episode_path_lookup; CREATE INDEX memory_episode_path_lookup ON memory_episode_path(episode_id,code_path);")),
+        ("search-rowid-drift".to_owned(), format!("{full_receipts} {}", PATH_SEARCH.replace("rowid INTEGER PRIMARY KEY", "rowid TEXT PRIMARY KEY"))),
+    ]);
+    for version in [2026092501_i64, 2026092502, 2026092503] {
+        cases.push((format!("legacy-receipt-{version}"),format!(
+            "{ledger} INSERT INTO schema_versions VALUES({version},'legacy-memory','keep'); CREATE TABLE memory_note_index(note_id TEXT); INSERT INTO memory_note_index VALUES('keep');"
+        )));
+    }
+    for (label, sql) in &cases {
+        for entry in ["establish", "upgrade", "builtin", "runner", "up_to"] {
+            let (dir, url, path) = fresh_db_url();
+            let conn = connect(&url).await;
+            conn.execute_unprepared(sql).await.unwrap();
+            conn.execute_unprepared("CREATE TABLE reference(name TEXT PRIMARY KEY,oid BLOB); INSERT INTO reference VALUES('refs/notes/libra/memory',x'00ff10');").await.unwrap();
+            let ref_path = dir.path().join("old-memory-ref");
+            std::fs::write(&ref_path, b"old-ref\0\xff").unwrap();
+            let before = memory_snapshot(&conn, true).await;
+            conn.close().await.unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let error = match entry {
+                "establish" => libra::internal::db::establish_connection(path.to_str().unwrap())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "upgrade" => libra::internal::db::upgrade_database_schema_for_role(
+                    &path,
+                    libra::internal::db::DatabaseRole::Repository,
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                _ => {
+                    let conn = connect(&url).await;
+                    let error = match entry {
+                        "builtin" => {
+                            format!("{:#}", run_all_builtin_migrations(&conn).await.unwrap_err())
+                        }
+                        "runner" => all_builtin_runner()
+                            .unwrap()
+                            .run_pending(&conn)
+                            .await
+                            .unwrap_err()
+                            .to_string(),
+                        "up_to" => all_builtin_runner()
+                            .unwrap()
+                            .run_pending_up_to(&conn, 2026092601)
+                            .await
+                            .unwrap_err()
+                            .to_string(),
+                        _ => unreachable!("test-owned entry vocabulary"),
+                    };
+                    conn.close().await.unwrap();
+                    error
+                }
+            };
+            assert!(
+                error.contains("Memory")
+                    && error.contains("backup")
+                    && error.contains("original Libra binary"),
+                "{label}/{entry}: {error}"
+            );
+            let conn = connect(&url).await;
+            assert_eq!(
+                memory_snapshot(&conn, true).await,
+                before,
+                "{label}/{entry}"
+            );
+            conn.close().await.unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{label}/{entry} file changed"
+            );
+            assert_eq!(std::fs::read(&ref_path).unwrap(), b"old-ref\0\xff");
+        }
+    }
+
+    // A valid version receipt must not hide corruption behind the cached
+    // Compatible fast path; do not tear down the handle still held here.
+    for corruption in [
+        "DROP TABLE memory_episode_evidence",
+        "DROP TABLE memory_episode_search_doc",
+        "DROP INDEX memory_episode_path_lookup",
+        "UPDATE schema_versions SET name='wrong-path-name' WHERE version=2026092602",
+        "UPDATE schema_versions SET name=x'ff' WHERE version=2026092601",
+        "DROP INDEX memory_episode_list; CREATE INDEX memory_episode_list ON memory_episode(repo_id,episode_id)",
+        "ALTER TABLE schema_versions RENAME COLUMN version TO broken_version",
+        "ALTER TABLE schema_versions RENAME COLUMN version TO broken_version; DROP INDEX memory_episode_list",
+    ] {
+        let (_dir, path, conn) = memory_full_fixture().await;
+        conn.close().await.unwrap();
+        let cached = libra::internal::db::get_db_conn_instance_for_path(&path)
+            .await
+            .unwrap();
+        cached.execute_unprepared(corruption).await.unwrap();
+        let before = memory_snapshot(&cached, true).await;
+        let error = libra::internal::db::get_db_conn_instance_for_path(&path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Memory") && error.to_string().contains("backup"));
+        assert_eq!(memory_snapshot(&cached, true).await, before);
+        libra::internal::db::reset_db_conn_instance_for_path(&path).await;
+    }
+
+    // Version compatibility has priority over Memory shape on ordinary open.
+    let (_dir, path, conn) = memory_full_fixture().await;
+    let future = all_builtin_runner()
+        .unwrap()
+        .max_registered_version()
+        .unwrap()
+        + 1;
+    conn.execute_unprepared(&format!(
+        "DROP INDEX memory_episode_list;
+         INSERT INTO schema_versions VALUES({future},'future','preserved')",
+    ))
+    .await
+    .unwrap();
+    let before = memory_snapshot(&conn, true).await;
+    let error = libra::internal::db::establish_connection(path.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("newer than this Libra binary supports"),
+        "{error}"
+    );
+    assert_eq!(memory_snapshot(&conn, true).await, before);
+    conn.close().await.unwrap();
+
+    // A distinct, earlier race: an old writer commits after preflight but
+    // before our top-up/ledger/normalization DDL. Roll back only our own DDL,
+    // preserving the late writer's schema, data, receipts and reference bytes.
+    for entry in ["runtime-top-up", "ledger", "normalization"] {
+        let (dir, url, path) = fresh_db_url();
+        let first = connect(&url).await;
+        first
+            .execute_unprepared(
+                "CREATE TABLE reference(name TEXT PRIMARY KEY,oid BLOB);
+             INSERT INTO reference VALUES('refs/notes/libra/memory',x'00ff10');",
+            )
+            .await
+            .unwrap();
+        let ref_path = dir.path().join("pre-ddl-old-ref");
+        std::fs::write(&ref_path, b"retain-ref\0\xff").unwrap();
+        let second = connect(&url).await;
+        let runner = all_builtin_runner().unwrap();
+        let mut after_injection = None;
+        let mut bytes_after_injection = None;
+        let injected_snapshot = &mut after_injection;
+        let injected_bytes = &mut bytes_after_injection;
+        let injection_conn = &second;
+        let injection_path = &path;
+        let gate = move || async move {
+            injection_conn
+                .execute_unprepared(
+                    "CREATE TABLE memory_note_index(note_id TEXT);
+                 INSERT INTO memory_note_index VALUES('pre-ddl-old-writer');",
+                )
+                .await
+                .unwrap();
+            *injected_snapshot = Some(memory_snapshot(injection_conn, true).await);
+            *injected_bytes = Some(std::fs::read(injection_path).unwrap());
+        };
+        let error = match entry {
+            "runtime-top-up" => {
+                libra::internal::db::ensure_ai_runtime_contract_schema_with_post_preflight_gate(
+                    &first, gate,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+            }
+            "ledger" => runner
+                .run_pending_with_post_preflight_gate(&first, gate)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "normalization" => format!(
+                "{:#}",
+                libra::internal::db::migration::run_builtin_migrations_with_post_preflight_gate(
+                    &first, gate
+                )
+                .await
+                .unwrap_err()
+            ),
+            _ => unreachable!("test-owned DDL entry vocabulary"),
+        };
+        assert!(
+            error.contains("Memory") && error.contains("backup"),
+            "{entry}: {error}"
+        );
+        assert_eq!(
+            memory_snapshot(&first, true).await,
+            after_injection.unwrap(),
+            "{entry}"
+        );
+        assert!(!table_exists(&first, "schema_versions").await, "{entry}");
+        assert!(
+            !table_exists(&first, "ai_scheduler_selected_plan").await,
+            "{entry}"
+        );
+        assert!(!table_exists(&first, "rebase_state").await, "{entry}");
+        assert!(!table_exists(&first, "bisect_state").await, "{entry}");
+        first.close().await.unwrap();
+        second.close().await.unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_after_injection.unwrap(),
+            "{entry}"
+        );
+        assert_eq!(std::fs::read(&ref_path).unwrap(), b"retain-ref\0\xff");
+    }
+
+    // Down must validate after taking the write lock but before deleting the
+    // receipt: a late unknown same-name table is not ours to drop.
+    let (dir, path, first) = memory_core_fixture().await;
+    memory_seed_all(&first).await;
+    let ref_path = dir.path().join("down-old-ref");
+    std::fs::write(&ref_path, b"keep-down-ref\0\xff").unwrap();
+    let second = connect(&format!("sqlite://{}", path.display())).await;
+    let mut after_injection = None;
+    let mut bytes_after_injection = None;
+    let error = all_builtin_runner()
+        .unwrap()
+        .rollback_to_with_post_preflight_gate(&first, 2026091901, || async {
+            second
+                .execute_unprepared(
+                    "DROP TABLE memory_episode_evidence;
+                 CREATE TABLE memory_episode_evidence(unknown TEXT);
+                 INSERT INTO memory_episode_evidence VALUES('late-unknown-shape');",
+                )
+                .await
+                .unwrap();
+            after_injection = Some(memory_snapshot(&second, true).await);
+            bytes_after_injection = Some(std::fs::read(&path).unwrap());
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Memory"), "{error}");
+    assert_eq!(
+        memory_snapshot(&first, true).await,
+        after_injection.unwrap()
+    );
+    assert_eq!(
+        memory_text_rows(
+            &first,
+            "SELECT name FROM schema_versions WHERE version=2026092601"
+        )
+        .await,
+        ["memory_core"]
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes_after_injection.unwrap()
+    );
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"keep-down-ref\0\xff");
+
+    // Force the race after the read-only preflight but before the claim.
+    let (_dir, path, first) = memory_core_fixture().await;
+    let runner = all_builtin_runner().unwrap();
+    runner.rollback_to(&first, 2026091901).await.unwrap();
+    let second = connect(&format!("sqlite://{}", path.display())).await;
+    let mut after_injection = None;
+    let mut bytes_after_injection = None;
+    let error=runner.run_pending_with_post_read_gate(&first,||async {
+        second.execute_unprepared("CREATE TABLE memory_note_index(note_id TEXT); INSERT INTO memory_note_index VALUES('concurrent-old-writer');").await.unwrap();
+        after_injection=Some(memory_snapshot(&second,true).await);
+        bytes_after_injection=Some(std::fs::read(&path).unwrap());
+    }).await.unwrap_err();
+    assert!(error.to_string().contains("Memory"));
+    assert_eq!(
+        memory_snapshot(&first, true).await,
+        after_injection.unwrap()
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes_after_injection.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn memory_list_index_is_used() {
+    let (_dir, _path, conn) = memory_core_fixture().await;
+    memory_seed_episode(&conn).await;
+    for n in 0..100 {
+        conn.execute_unprepared(&format!(
+            "INSERT INTO memory_episode SELECT 'item-{n:03}',CASE WHEN {n}%2=0 THEN 'repo-1' ELSE 'repo-2' END,
+             source_kind,'source-{n}',outcome,actor,started_at,{n}/3,anchor_commit,change_id,title,body,
+             content_digest,producer,rules_version FROM memory_episode WHERE episode_id='episode-1'"
+        )).await.unwrap();
+    }
+    let plan=conn.query_all_raw(Statement::from_string(conn.get_database_backend(),
+        "EXPLAIN QUERY PLAN SELECT episode_id,ended_at FROM memory_episode WHERE repo_id='repo-1' ORDER BY ended_at DESC,episode_id LIMIT 20"
+    )).await.unwrap().into_iter().map(|row|row.try_get_by_index::<String>(3).unwrap()).collect::<Vec<_>>().join("\n");
+    assert!(plan.contains("memory_episode_list"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    let actual=memory_text_rows(&conn,
+        "SELECT episode_id FROM memory_episode WHERE repo_id='repo-1' ORDER BY ended_at DESC,episode_id LIMIT 20"
+    ).await;
+    let mut expected: Vec<(i64, String)> = (0..100)
+        .filter(|n| n % 2 == 0)
+        .map(|n| (n / 3, format!("item-{n:03}")))
+        .collect();
+    expected.push((20, "episode-1".into()));
+    expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(
+        actual,
+        expected
+            .into_iter()
+            .take(20)
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>()
+    );
+    conn.close().await.unwrap();
+}
+
+async fn memory_seed_paths_documents(conn: &DatabaseConnection) {
+    memory_seed_all(conn).await;
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode_path VALUES ('episode-1',x'7372632fff2e7273','modified','oid-1',33188,20);
+         INSERT INTO memory_episode_search_doc VALUES (19,'episode-1','title','body','src/%ff.rs')",
+    ).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_path_schema_is_byte_faithful() {
+    let (_dir, _path, conn) = memory_full_fixture().await;
+    memory_assert_columns(
+        &conn,
+        "memory_episode_path",
+        &[
+            ("episode_id", "TEXT", 1, None, 1),
+            ("code_path", "BLOB", 1, None, 2),
+            ("change_kind", "TEXT", 1, None, 0),
+            ("blob_oid_at_end", "TEXT", 0, None, 0),
+            ("mode_at_end", "INTEGER", 0, None, 0),
+            ("ended_at", "INTEGER", 1, None, 0),
+        ],
+    )
+    .await;
+    memory_seed_episode(&conn).await;
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode_path VALUES ('episode-1',x'7372632fff2e7273','modified','oid-1',33188,20)"
+    ).await.unwrap();
+    let bytes: Vec<u8> = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT code_path FROM memory_episode_path",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(bytes, b"src/\xff.rs");
+    for column in ["episode_id", "code_path", "change_kind", "ended_at"] {
+        memory_reject_updates(&conn, "memory_episode_path", &[(column, "NULL")]).await;
+    }
+    memory_reject_updates(
+        &conn,
+        "memory_episode_path",
+        &[
+            ("code_path", "x''"),
+            ("code_path", "x'2f737263'"),
+            ("code_path", "x'610062'"),
+            ("code_path", "'src/plain.rs'"),
+            ("code_path", "123"),
+            ("change_kind", "'copied'"),
+            ("episode_id", "'missing-parent'"),
+            ("mode_at_end", "0"),
+            ("mode_at_end", "33189"),
+            ("change_kind", "'deleted'"),
+        ],
+    )
+    .await;
+    assert!(
+        conn.execute_unprepared(
+            "INSERT INTO memory_episode_path SELECT * FROM memory_episode_path"
+        )
+        .await
+        .is_err(),
+        "the Episode/path pair is unique"
+    );
+    for mode in [33188, 33261, 40960, 57344] {
+        conn.execute_unprepared(&format!(
+            "UPDATE memory_episode_path SET mode_at_end={mode}"
+        ))
+        .await
+        .unwrap();
+    }
+    conn.execute_unprepared("UPDATE memory_episode_path SET blob_oid_at_end=NULL,mode_at_end=NULL")
+        .await
+        .unwrap();
+    for kind in ["added", "modified", "deleted", "renamed"] {
+        conn.execute_unprepared(&format!(
+            "UPDATE memory_episode_path SET change_kind='{kind}'"
+        ))
+        .await
+        .unwrap();
+    }
+    conn.execute_unprepared("UPDATE memory_episode_path SET change_kind='deleted'")
+        .await
+        .unwrap();
+    memory_reject_updates(
+        &conn,
+        "memory_episode_path",
+        &[
+            ("blob_oid_at_end", "'oid-for-deletion'"),
+            ("mode_at_end", "33188"),
+        ],
+    )
+    .await;
+    // Backslashes and invalid UTF-8 are bytes, not lossy or normalized text.
+    for path in [b"src\\windows.rs".to_vec(), vec![0xff, 0xfe]] {
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO memory_episode_path VALUES ('episode-1',?,'added',NULL,NULL,20)",
+            [path.clone().into()],
+        ))
+        .await
+        .unwrap();
+        let actual: Vec<u8> = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT code_path FROM memory_episode_path WHERE code_path=?",
+                [path.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        assert_eq!(actual, path);
+    }
+    conn.execute_unprepared("DELETE FROM memory_episode WHERE episode_id='episode-1'")
+        .await
+        .unwrap();
+    assert!(
+        memory_text_rows(&conn, "SELECT episode_id FROM memory_episode_path")
+            .await
+            .is_empty()
+    );
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_search_doc_schema() {
+    let (_dir, _path, conn) = memory_full_fixture().await;
+    memory_assert_columns(
+        &conn,
+        "memory_episode_search_doc",
+        &[
+            ("rowid", "INTEGER", 0, None, 1),
+            ("episode_id", "TEXT", 1, None, 0),
+            ("title", "TEXT", 1, None, 0),
+            ("body", "TEXT", 1, None, 0),
+            ("paths_text", "TEXT", 1, None, 0),
+        ],
+    )
+    .await;
+    memory_seed_episode(&conn).await;
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode SELECT 'episode-2',repo_id,source_kind,'source-2',outcome,actor,
+         started_at,ended_at,anchor_commit,change_id,title,body,content_digest,producer,rules_version
+         FROM memory_episode WHERE episode_id='episode-1';
+         INSERT INTO memory_episode_search_doc VALUES (19,'episode-1','first','body','path')",
+    ).await.unwrap();
+    for column in ["episode_id", "title", "body", "paths_text"] {
+        memory_reject_updates(&conn, "memory_episode_search_doc", &[(column, "NULL")]).await;
+    }
+    memory_reject_updates(
+        &conn,
+        "memory_episode_search_doc",
+        &[
+            ("rowid", "'not-an-integer'"),
+            ("episode_id", "'missing-parent'"),
+        ],
+    )
+    .await;
+    assert!(conn.execute_unprepared(
+        "INSERT INTO memory_episode_search_doc VALUES (20,'episode-1','duplicate','body','path')"
+    ).await.is_err(), "one document per Episode");
+    assert!(conn.execute_unprepared(
+        "INSERT INTO memory_episode_search_doc VALUES (19,'episode-2','collision','body','path')"
+    ).await.is_err(), "explicit rowids cannot overwrite another Episode");
+    conn.execute_unprepared(
+        "INSERT INTO memory_episode_search_doc VALUES (43,'episode-2','second','body','other')",
+    )
+    .await
+    .unwrap();
+    let before = memory_text_rows(
+        &conn,
+        "SELECT rowid||':'||episode_id||':'||title FROM memory_episode_search_doc ORDER BY rowid",
+    )
+    .await;
+    assert_eq!(before, ["19:episode-1:first", "43:episode-2:second"]);
+    // Storage preserves explicit identities regardless of insertion order;
+    // deriving the rowid and collision policy belongs to the DM-02 writer.
+    conn.execute_unprepared(
+        "DELETE FROM memory_episode_search_doc;
+         INSERT INTO memory_episode_search_doc VALUES (43,'episode-2','second','body','other');
+         INSERT INTO memory_episode_search_doc VALUES (19,'episode-1','first','body','path')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(memory_text_rows(&conn,
+        "SELECT rowid||':'||episode_id||':'||title FROM memory_episode_search_doc ORDER BY rowid"
+    ).await, before);
+    assert!(memory_text_rows(&conn,
+        "SELECT name FROM sqlite_schema WHERE name GLOB 'memory_*fts*' OR (tbl_name GLOB 'memory_*' AND type='trigger')"
+    ).await.is_empty(), "DM-10 creates neither FTS nor triggers");
+    conn.execute_unprepared("DELETE FROM memory_episode WHERE episode_id='episode-1'")
+        .await
+        .unwrap();
+    assert_eq!(
+        memory_text_rows(&conn, "SELECT episode_id FROM memory_episode_search_doc").await,
+        ["episode-2"]
+    );
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_path_index_is_used() {
+    let (_dir, _path, conn) = memory_full_fixture().await;
+    memory_seed_paths_documents(&conn).await;
+    for n in 0..100 {
+        conn.execute_unprepared(&format!(
+            "INSERT INTO memory_episode SELECT 'path-{n:03}',repo_id,source_kind,'path-source-{n}',
+             outcome,actor,started_at,{n}/3,anchor_commit,change_id,title,body,content_digest,producer,rules_version
+             FROM memory_episode WHERE episode_id='episode-1';
+             INSERT INTO memory_episode_path VALUES ('path-{n:03}',
+             CASE WHEN {n}%2=0 THEN x'7372632fff2e7273' ELSE x'6f74686572' END,
+             'modified',NULL,NULL,{n}/3)"
+        )).await.unwrap();
+    }
+    let plan = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "EXPLAIN QUERY PLAN SELECT episode_id,ended_at FROM memory_episode_path
+         WHERE code_path=x'7372632fff2e7273' ORDER BY ended_at DESC,episode_id LIMIT 20",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get_by_index::<String>(3).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("memory_episode_path_lookup"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    let actual = memory_text_rows(
+        &conn,
+        "SELECT episode_id FROM memory_episode_path WHERE code_path=x'7372632fff2e7273'
+         ORDER BY ended_at DESC,episode_id LIMIT 20",
+    )
+    .await;
+    let mut expected: Vec<(i64, String)> = (0..100)
+        .filter(|n| n % 2 == 0)
+        .map(|n| (n / 3, format!("path-{n:03}")))
+        .collect();
+    expected.push((20, "episode-1".to_owned()));
+    expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(
+        actual,
+        expected
+            .into_iter()
+            .take(20)
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>()
+    );
+    conn.close().await.unwrap();
+}
+
+// Remove only DM-10-owned objects/rows and its receipt from a full snapshot.
+fn memory_without_path_search(snapshot: Vec<String>) -> Vec<String> {
+    snapshot
+        .into_iter()
+        .filter(|entry| {
+            let fields: Vec<_> = entry.splitn(5, ':').collect();
+            let table = match fields.first().copied() {
+                Some("schema") => fields.get(3).copied(),
+                Some("row") => fields.get(1).copied(),
+                _ => None,
+            };
+            !matches!(
+                table,
+                Some("memory_episode_path" | "memory_episode_search_doc")
+            ) && !entry.starts_with("row:schema_versions:2026092602|")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn memory_path_search_down_is_scoped() {
+    let (dir, _path, conn) = memory_full_fixture().await;
+    memory_seed_paths_documents(&conn).await;
+    conn.execute_unprepared(
+        "CREATE TABLE dm10_unrelated_fixture(value BLOB);
+         INSERT INTO dm10_unrelated_fixture VALUES(x'00ff')",
+    )
+    .await
+    .unwrap();
+    let ref_path = dir.path().join("dm10-retained-ref");
+    std::fs::write(&ref_path, b"retain-ref\0\xff").unwrap();
+    let expected_core = memory_without_path_search(memory_snapshot(&conn, true).await);
+    assert_eq!(
+        all_builtin_runner()
+            .unwrap()
+            .rollback_to(&conn, 2026092601)
+            .await
+            .unwrap(),
+        [2026092602]
+    );
+    assert_eq!(memory_snapshot(&conn, true).await, expected_core);
+    assert!(!table_exists(&conn, "memory_episode_path").await);
+    assert!(!table_exists(&conn, "memory_episode_search_doc").await);
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"retain-ref\0\xff");
+    assert_eq!(
+        all_builtin_runner()
+            .unwrap()
+            .run_pending(&conn)
+            .await
+            .unwrap(),
+        [2026092602]
+    );
+    assert_eq!(
+        memory_without_path_search(memory_snapshot(&conn, true).await),
+        expected_core
+    );
+    assert!(
+        memory_text_rows(&conn, "SELECT episode_id FROM memory_episode_path")
+            .await
+            .is_empty()
+    );
+    assert!(
+        memory_text_rows(&conn, "SELECT episode_id FROM memory_episode_search_doc")
+            .await
+            .is_empty()
+    );
+    // Full -> core-only -> absent must remain legal under the same locked fence.
+    assert_eq!(
+        all_builtin_runner()
+            .unwrap()
+            .rollback_to(&conn, 2026091901)
+            .await
+            .unwrap(),
+        [2026092602, 2026092601]
+    );
+    assert!(
+        memory_text_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'memory_*'"
+        )
+        .await
+        .is_empty()
+    );
+    conn.close().await.unwrap();
+
+    // A late unknown table must not be dropped or lose its receipt.
+    let (dir, path, first) = memory_full_fixture().await;
+    memory_seed_paths_documents(&first).await;
+    let ref_path = dir.path().join("dm10-down-late-ref");
+    std::fs::write(&ref_path, b"keep-late-ref\0\xff").unwrap();
+    let second = connect(&format!("sqlite://{}", path.display())).await;
+    let mut after_injection = None;
+    let mut bytes_after_injection = None;
+    let error = all_builtin_runner()
+        .unwrap()
+        .rollback_to_with_post_preflight_gate(&first, 2026092601, || async {
+            second
+                .execute_unprepared(
+                    "DROP TABLE memory_episode_search_doc;
+                 CREATE TABLE memory_episode_search_doc(unknown BLOB);
+                 INSERT INTO memory_episode_search_doc VALUES(x'00ff')",
+                )
+                .await
+                .unwrap();
+            after_injection = Some(memory_snapshot(&second, true).await);
+            bytes_after_injection = Some(std::fs::read(&path).unwrap());
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Memory"), "{error}");
+    assert_eq!(
+        memory_snapshot(&first, true).await,
+        after_injection.unwrap()
+    );
+    assert_eq!(
+        memory_text_rows(
+            &first,
+            "SELECT name FROM schema_versions WHERE version=2026092602"
+        )
+        .await,
+        ["memory_path_search"]
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes_after_injection.unwrap()
+    );
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"keep-late-ref\0\xff");
+}
+
+#[tokio::test]
+async fn memory_path_search_second_run_is_noop() {
+    let (_dir, path, conn) = memory_full_fixture().await;
+    memory_seed_paths_documents(&conn).await;
+    let before = memory_snapshot(&conn, true).await;
+    conn.close().await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let conn = connect(&format!("sqlite://{}", path.display())).await;
+    assert!(
+        all_builtin_runner()
+            .unwrap()
+            .run_pending(&conn)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(run_all_builtin_migrations(&conn).await.unwrap().is_empty());
+    assert!(
+        all_builtin_runner()
+            .unwrap()
+            .run_pending_up_to(&conn, 2026092601)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(memory_snapshot(&conn, true).await, before);
+    conn.close().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn memory_old_runner_rejects_future_schema() {
+    use libra::internal::db::{self, DatabaseRole, SchemaCompatibility, schema};
+    let old = memory_core_runner();
+    let new = all_builtin_runner().unwrap();
+    let (_dir, _path, core) = memory_core_fixture().await;
+    let before = memory_snapshot(&core, true).await;
+    assert_eq!(
+        schema::check_schema_support_for_connection(
+            &core,
+            DatabaseRole::Repository,
+            old.max_registered_version()
+        )
+        .await
+        .unwrap(),
+        SchemaCompatibility::Compatible {
+            current_version: Some(2026092601),
+            latest_version: Some(2026092601),
+        }
+    );
+    assert_eq!(memory_snapshot(&core, true).await, before);
+    core.close().await.unwrap();
+
+    let (dir, path, full) = memory_full_fixture().await;
+    memory_seed_paths_documents(&full).await;
+    let ref_path = dir.path().join("old-reader-ref");
+    std::fs::write(&ref_path, b"old-reader-ref\0\xff").unwrap();
+    let before = memory_snapshot(&full, true).await;
+    full.close().await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let full = connect(&format!("sqlite://{}", path.display())).await;
+    // Exercise the same read/reject path as ordinary open, with a real
+    // truncated manifest ceiling; do not alter a partial runner's semantics.
+    let error = schema::check_schema_support_for_connection(
+        &full,
+        DatabaseRole::Repository,
+        old.max_registered_version(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "repository database schema version 2026092602 is newer than this Libra binary supports (latest supported: 2026092601); install a newer Libra binary"
+    );
+    assert_eq!(
+        schema::check_schema_support_for_connection(
+            &full,
+            DatabaseRole::Repository,
+            new.max_registered_version()
+        )
+        .await
+        .unwrap(),
+        SchemaCompatibility::Compatible {
+            current_version: Some(2026092602),
+            latest_version: Some(2026092602),
+        }
+    );
+    assert_eq!(memory_snapshot(&full, true).await, before);
+    full.close().await.unwrap();
+    let opened = db::establish_connection(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(memory_snapshot(&opened, true).await, before);
+    opened.close().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"old-reader-ref\0\xff");
+
+    // Classification still returns UnsupportedFuture, while managed open
+    // rejects it before attempting to diagnose/repair the damaged Memory index.
+    let full = connect(&format!("sqlite://{}", path.display())).await;
+    full.execute_unprepared(
+        "DROP INDEX memory_episode_path_lookup;
+         INSERT INTO schema_versions VALUES(2026092603,'future','keep')",
+    )
+    .await
+    .unwrap();
+    let before = memory_snapshot(&full, true).await;
+    assert_eq!(
+        schema::inspect_schema_for_connection(&full, DatabaseRole::Repository)
+            .await
+            .unwrap(),
+        SchemaCompatibility::UnsupportedFuture {
+            current_version: 2026092603,
+            latest_version: Some(2026092602),
+        }
+    );
+    full.close().await.unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let error = db::establish_connection(path.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "repository database schema version 2026092603 is newer than this Libra binary supports (latest supported: 2026092602); install a newer Libra binary"
+    );
+    let full = connect(&format!("sqlite://{}", path.display())).await;
+    assert_eq!(memory_snapshot(&full, true).await, before);
+    full.close().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"old-reader-ref\0\xff");
+}
+
+#[tokio::test]
+async fn memory_new_runner_upgrades_target_baseline() {
+    let (dir, url, path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = all_builtin_runner().unwrap();
+    assert_eq!(
+        runner
+            .run_pending_up_to(&conn, 2026091901)
+            .await
+            .unwrap()
+            .len(),
+        65
+    );
+    assert_eq!(
+        runner.current_version_readonly(&conn).await.unwrap(),
+        Some(2026091901)
+    );
+    assert!(
+        memory_text_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'memory_*'"
+        )
+        .await
+        .is_empty()
+    );
+    conn.execute_unprepared(
+        "CREATE TABLE dm10_old_payload(value BLOB);
+         INSERT INTO dm10_old_payload VALUES(x'00ff')",
+    )
+    .await
+    .unwrap();
+    let ref_path = dir.path().join("baseline-ref");
+    std::fs::write(&ref_path, b"baseline-ref\0\xff").unwrap();
+    let before = memory_snapshot(&conn, false).await;
+    let receipts = memory_text_rows(
+        &conn,
+        "SELECT version||':'||name||':'||applied_at FROM schema_versions ORDER BY version",
+    )
+    .await;
+    assert_eq!(
+        runner.run_pending(&conn).await.unwrap(),
+        [2026092601, 2026092602]
+    );
+    assert_eq!(memory_snapshot(&conn, false).await, before);
+    assert_eq!(memory_text_rows(&conn,
+        "SELECT version||':'||name||':'||applied_at FROM schema_versions WHERE version<2026092601 ORDER BY version"
+    ).await,receipts);
+    let after = memory_snapshot(&conn, true).await;
+    conn.close().await.unwrap();
+    let opened = libra::internal::db::establish_connection(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(memory_snapshot(&opened, true).await, after);
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"baseline-ref\0\xff");
+    opened.close().await.unwrap();
+
+    // A canonical 2601 Memory stage must upgrade through ordinary open,
+    // including its preflight/top-up path, not only through a naked runner.
+    let (dir, path, core) = memory_core_fixture().await;
+    memory_seed_all(&core).await;
+    core.execute_unprepared(
+        "CREATE TABLE dm10_open_payload(value BLOB);
+         INSERT INTO dm10_open_payload VALUES(x'00ff')",
+    )
+    .await
+    .unwrap();
+    let ref_path = dir.path().join("ordinary-open-ref");
+    std::fs::write(&ref_path, b"ordinary-open-ref\0\xff").unwrap();
+    let core_only = |snapshot: Vec<String>| {
+        snapshot
+            .into_iter()
+            .filter(|entry| {
+                let fields: Vec<_> = entry.splitn(5, ':').collect();
+                let table = match fields.first().copied() {
+                    Some("schema") => fields.get(3).copied(),
+                    Some("row") => fields.get(1).copied(),
+                    _ => None,
+                };
+                matches!(
+                    table,
+                    Some("memory_episode" | "memory_episode_evidence" | "memory_projection_state")
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_core = core_only(memory_snapshot(&core, true).await);
+    let before_receipts = memory_text_rows(
+        &core,
+        "SELECT version||':'||name||':'||applied_at FROM schema_versions ORDER BY version",
+    )
+    .await;
+    assert_eq!(
+        all_builtin_runner()
+            .unwrap()
+            .current_version_readonly(&core)
+            .await
+            .unwrap(),
+        Some(2026092601)
+    );
+    assert!(!table_exists(&core, "memory_episode_path").await);
+    assert!(!table_exists(&core, "memory_episode_search_doc").await);
+    core.close().await.unwrap();
+    let opened = libra::internal::db::establish_connection(path.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        all_builtin_runner()
+            .unwrap()
+            .current_version_readonly(&opened)
+            .await
+            .unwrap(),
+        Some(2026092602)
+    );
+    assert_eq!(core_only(memory_snapshot(&opened, true).await), before_core);
+    assert_eq!(memory_text_rows(&opened,
+        "SELECT version||':'||name||':'||applied_at FROM schema_versions WHERE version<2026092602 ORDER BY version"
+    ).await, before_receipts);
+    assert_eq!(memory_text_rows(&opened,
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name GLOB 'memory_*' ORDER BY name"
+    ).await, [
+        "memory_episode", "memory_episode_evidence", "memory_episode_path",
+        "memory_episode_search_doc", "memory_projection_state",
+    ]);
+    assert_eq!(
+        memory_text_rows(&opened, "SELECT hex(value) FROM dm10_open_payload").await,
+        ["00FF"]
+    );
+    assert_eq!(
+        std::fs::read(&ref_path).unwrap(),
+        b"ordinary-open-ref\0\xff"
+    );
+    opened.close().await.unwrap();
+
+    // Both callers observe the valid core-only stage before one wins 2602.
+    let (_dir, path, left) = memory_core_fixture().await;
+    memory_seed_all(&left).await;
+    let before = memory_snapshot(&left, true).await;
+    let right = connect(&format!("sqlite://{}", path.display())).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let first = all_builtin_runner().unwrap();
+    let second = all_builtin_runner().unwrap();
+    let (a, b) = tokio::join!(
+        first.run_pending_with_post_read_gate(&left, || async {
+            barrier.wait().await;
+        }),
+        second.run_pending_with_post_read_gate(&right, || async {
+            other.wait().await;
+        }),
+    );
+    let mut applied = a.unwrap();
+    applied.extend(b.unwrap());
+    assert_eq!(applied, [2026092602]);
+    assert_eq!(
+        memory_without_path_search(memory_snapshot(&left, true).await),
+        before
+    );
+    left.close().await.unwrap();
+    right.close().await.unwrap();
+
+    // The claiming writer must reject a late unreceipted path table and
+    // roll its own new receipt back without changing the late writer's data.
+    let (dir, path, first) = memory_core_fixture().await;
+    memory_seed_all(&first).await;
+    let ref_path = dir.path().join("path-claim-ref");
+    std::fs::write(&ref_path, b"path-claim-ref\0\xff").unwrap();
+    let second = connect(&format!("sqlite://{}", path.display())).await;
+    let mut after_injection = None;
+    let mut bytes_after_injection = None;
+    let error = all_builtin_runner()
+        .unwrap()
+        .run_pending_with_post_read_gate(&first, || async {
+            second
+                .execute_unprepared(
+                    "CREATE TABLE memory_episode_path(unknown BLOB);
+                 INSERT INTO memory_episode_path VALUES(x'00ff')",
+                )
+                .await
+                .unwrap();
+            after_injection = Some(memory_snapshot(&second, true).await);
+            bytes_after_injection = Some(std::fs::read(&path).unwrap());
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Memory"), "{error}");
+    assert_eq!(
+        memory_snapshot(&first, true).await,
+        after_injection.unwrap()
+    );
+    assert!(
+        memory_text_rows(
+            &first,
+            "SELECT name FROM schema_versions WHERE version=2026092602"
+        )
+        .await
+        .is_empty()
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes_after_injection.unwrap()
+    );
+    assert_eq!(std::fs::read(&ref_path).unwrap(), b"path-claim-ref\0\xff");
 }

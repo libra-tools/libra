@@ -293,6 +293,21 @@ impl MigrationRunner {
             .await
     }
 
+    /// Test seam before ledger DDL, distinct from the later version-claim gate.
+    #[doc(hidden)]
+    pub async fn run_pending_with_post_preflight_gate<F, Fut>(
+        &self,
+        conn: &DatabaseConnection,
+        gate: F,
+    ) -> Result<Vec<i64>, MigrationError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        ensure_schema_versions_with_preflight_gate(conn, gate).await?;
+        self.run_pending(conn).await
+    }
+
     /// Test seam for deterministic concurrency coverage: identical to
     /// [`Self::run_pending`], except `gate` runs once immediately AFTER the
     /// current-version read and BEFORE the first claim. Racing callers can
@@ -433,6 +448,22 @@ impl MigrationRunner {
         conn: &DatabaseConnection,
         target: i64,
     ) -> Result<Vec<i64>, MigrationError> {
+        self.rollback_to_with_post_preflight_gate(conn, target, || async {})
+            .await
+    }
+
+    /// Test seam after rollback plan validation, before the first write claim.
+    #[doc(hidden)]
+    pub async fn rollback_to_with_post_preflight_gate<F, Fut>(
+        &self,
+        conn: &DatabaseConnection,
+        target: i64,
+        gate: F,
+    ) -> Result<Vec<i64>, MigrationError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         ensure_schema_versions_table(conn).await?;
         let current = self
             .current_version(conn)
@@ -471,10 +502,12 @@ impl MigrationRunner {
             plan.push((migration, down));
         }
 
+        gate().await;
+
         // Phase 2: execute the validated plan in order. The
         // irreversible-migration class of error is no longer possible at
-        // this point; only SQL-level failures from the `down` DDL itself
-        // can surface here. `apply_down_migration` returns whether THIS
+        // this point; SQL failures or a late incompatible Memory writer can
+        // still refuse this transaction. `apply_down_migration` returns whether THIS
         // call owned the version (won the DELETE race); concurrent
         // rollback loser sees `false` and we skip pushing it to the
         // result Vec — symmetric to `run_pending`'s INSERT OR IGNORE
@@ -490,14 +523,281 @@ impl MigrationRunner {
     }
 }
 
+const MEMORY_CORE_VERSION: i64 = 2026092601;
+const MEMORY_CORE_SQL: &str = include_str!("../../../sql/migrations/2026092601_memory_core.sql");
+const MEMORY_PATH_SEARCH_VERSION: i64 = 2026092602;
+const MEMORY_PATH_SEARCH_SQL: &str =
+    include_str!("../../../sql/migrations/2026092602_memory_path_search.sql");
+
+#[derive(Debug, Error)]
+pub(crate) enum MemorySchemaError {
+    #[error("{0}")]
+    Incompatible(String),
+    #[error(transparent)]
+    Database(#[from] DbErr),
+}
+
+impl From<MemorySchemaError> for DbErr {
+    fn from(error: MemorySchemaError) -> Self {
+        match error {
+            MemorySchemaError::Incompatible(message) => Self::Custom(message),
+            MemorySchemaError::Database(error) => error,
+        }
+    }
+}
+
+fn incompatible_memory_schema(detail: &str) -> MemorySchemaError {
+    MemorySchemaError::Incompatible(format!(
+        "cannot automatically upgrade Memory storage: {detail}; keep the existing database, \
+         refs and object storage unchanged. Use the original Libra binary to inspect it and \
+         make a consistent backup. Legacy M2 conversion is not supported; use a separate \
+         repository for the deterministic Memory projection"
+    ))
+}
+
+/// Conservative attestation of our own DDL, not a general SQL equivalence test.
+/// SQLite removes IF NOT EXISTS from sqlite_schema. Collapse whitespace runs
+/// without erasing token boundaries or altering quoted CHECK/default text.
+fn canonical_memory_ddl(sql: &str) -> String {
+    let mut canonical = String::new();
+    let mut quoted = false;
+    let mut pending_space = false;
+    for character in sql.trim().trim_end_matches(';').chars() {
+        if !quoted && character.is_ascii_whitespace() {
+            pending_space = !canonical.is_empty();
+            continue;
+        }
+        if pending_space {
+            canonical.push(' ');
+            pending_space = false;
+        }
+        canonical.push(character);
+        if character == '\'' {
+            quoted = !quoted;
+        }
+    }
+    if let Some(rest) = canonical.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+        format!("CREATE TABLE {rest}")
+    } else if let Some(rest) = canonical.strip_prefix("CREATE INDEX IF NOT EXISTS ") {
+        format!("CREATE INDEX {rest}")
+    } else {
+        canonical
+    }
+}
+
+/// Read-only fence shared by bootstrap, top-ups and standalone runners.
+/// A receipt alone is insufficient: every Memory object must have the exact
+/// schema produced by this migration. Unreceipted or partial shapes are never
+/// adopted. The sole exception is our just-inserted claim before its up DDL.
+pub(crate) async fn preflight_memory_schema(
+    conn: &DatabaseConnection,
+) -> Result<(), MemorySchemaError> {
+    // A single read snapshot prevents a concurrent legitimate migration from
+    // looking like an unreceipted/partial schema between separate queries.
+    let txn = conn.begin().await?;
+    let result = validate_memory_schema(&txn, false).await;
+    match result {
+        Ok(()) => txn.commit().await.map_err(|error| {
+            MemorySchemaError::Database(DbErr::Custom(format!(
+                "could not finish the Memory read snapshot: {error}; retry the inspection"
+            )))
+        }),
+        Err(error) => match txn.rollback().await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(memory_preflight_cleanup_error(error, cleanup)),
+        },
+    }
+}
+
+fn memory_preflight_cleanup_error(
+    original: MemorySchemaError,
+    cleanup: DbErr,
+) -> MemorySchemaError {
+    let message = format!(
+        "{original}; could not roll back the Memory read snapshot: {cleanup}; retry the inspection"
+    );
+    match original {
+        MemorySchemaError::Incompatible(_) => MemorySchemaError::Incompatible(message),
+        // Cleanup failure is never a safe transient-read fallback, even if
+        // the driver's final error happens to be SQLITE_BUSY.
+        MemorySchemaError::Database(_) => MemorySchemaError::Database(DbErr::Custom(message)),
+    }
+}
+
+pub(super) async fn validate_memory_schema<C: ConnectionTrait>(
+    conn: &C,
+    claiming_core: bool,
+) -> Result<(), MemorySchemaError> {
+    validate_memory_schema_with_claim(conn, claiming_core.then_some(MEMORY_CORE_VERSION)).await
+}
+
+// Only the winning claim may attest its pre-DDL stage. All other callers
+// require the full object set associated with the committed receipts.
+async fn validate_memory_schema_with_claim<C: ConnectionTrait>(
+    conn: &C,
+    claiming: Option<i64>,
+) -> Result<(), MemorySchemaError> {
+    let backend = conn.get_database_backend();
+    let ledger_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_versions' COLLATE NOCASE",
+        ))
+        .await?
+        .is_some();
+    let mut has_core_receipt = false;
+    let mut has_path_search_receipt = false;
+    if ledger_exists {
+        let receipts = conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT version, name FROM schema_versions \
+                 WHERE version IN (2026092501,2026092502,2026092503,2026092601,2026092602)",
+            ))
+            .await?;
+        for row in receipts {
+            let version: i64 = row.try_get_by_index(0)?;
+            let name: String = row.try_get_by_index(1)?;
+            match (version, name.as_str()) {
+                (MEMORY_CORE_VERSION, "memory_core") => has_core_receipt = true,
+                (MEMORY_PATH_SEARCH_VERSION, "memory_path_search") => {
+                    has_path_search_receipt = true;
+                }
+                (MEMORY_CORE_VERSION | MEMORY_PATH_SEARCH_VERSION, _) => {
+                    return Err(incompatible_memory_schema(
+                        "unrecognized Memory migration receipt",
+                    ));
+                }
+                _ => {
+                    return Err(incompatible_memory_schema(
+                        "legacy M2 migration receipt found",
+                    ));
+                }
+            }
+        }
+    }
+    if has_path_search_receipt && !has_core_receipt {
+        return Err(incompatible_memory_schema(
+            "Memory path/search receipt is missing its core dependency",
+        ));
+    }
+    let objects = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT name, sql FROM sqlite_schema \
+             WHERE (lower(name) GLOB 'memory_*' OR lower(tbl_name) GLOB 'memory_*') \
+             AND name NOT GLOB 'sqlite_*' ORDER BY name",
+        ))
+        .await?;
+    if claiming == Some(MEMORY_CORE_VERSION) {
+        return if has_core_receipt && !has_path_search_receipt && objects.is_empty() {
+            Ok(())
+        } else {
+            Err(incompatible_memory_schema(
+                "unexpected Memory schema before the core claim DDL",
+            ))
+        };
+    }
+    if claiming == Some(MEMORY_PATH_SEARCH_VERSION)
+        && (!has_core_receipt || !has_path_search_receipt)
+    {
+        return Err(incompatible_memory_schema(
+            "Memory path/search claim is missing its core dependency",
+        ));
+    }
+    if objects.is_empty() {
+        return if !has_core_receipt {
+            Ok(())
+        } else {
+            Err(incompatible_memory_schema(
+                "receipted Memory schema is missing",
+            ))
+        };
+    }
+    if !has_core_receipt {
+        return Err(incompatible_memory_schema(
+            "legacy, unreceipted or unexpected same-name Memory schema found",
+        ));
+    }
+    let mut expected_names = vec![
+        "memory_episode",
+        "memory_episode_list",
+        "memory_episode_evidence",
+        "memory_projection_state",
+    ];
+    let mut expected_ddl: Vec<String> = MEMORY_CORE_SQL
+        .split(';')
+        .filter(|sql| !sql.trim().is_empty())
+        .map(canonical_memory_ddl)
+        .collect();
+    if has_path_search_receipt && claiming != Some(MEMORY_PATH_SEARCH_VERSION) {
+        expected_names.extend([
+            "memory_episode_path",
+            "memory_episode_path_lookup",
+            "memory_episode_search_doc",
+        ]);
+        expected_ddl.extend(
+            MEMORY_PATH_SEARCH_SQL
+                .split(';')
+                .filter(|sql| !sql.trim().is_empty())
+                .map(canonical_memory_ddl),
+        );
+    }
+    if objects.len() != expected_names.len() || expected_ddl.len() != expected_names.len() {
+        return Err(incompatible_memory_schema(
+            "Memory schema object set differs",
+        ));
+    }
+    for row in objects {
+        let name: String = row.try_get_by_index(0)?;
+        let sql: Option<String> = row.try_get_by_index(1)?;
+        let Some(position) = expected_names.iter().position(|expected| *expected == name) else {
+            return Err(incompatible_memory_schema(
+                "unknown Memory schema object found",
+            ));
+        };
+        if sql.as_deref().map(canonical_memory_ddl).as_ref() != expected_ddl.get(position) {
+            return Err(incompatible_memory_schema(
+                "Memory table, index or constraint shape differs",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Idempotent DDL for the `schema_versions` table; safe to call on every
 /// connect. The runner invokes this before any read or write of the
 /// version column.
 async fn ensure_schema_versions_table(conn: &DatabaseConnection) -> Result<(), MigrationError> {
-    let backend = conn.get_database_backend();
-    conn.execute_raw(Statement::from_string(backend, SCHEMA_VERSIONS_DDL))
-        .await?;
-    Ok(())
+    ensure_schema_versions_with_preflight_gate(conn, || async {}).await
+}
+
+async fn ensure_schema_versions_with_preflight_gate<F, Fut>(
+    conn: &DatabaseConnection,
+    gate: F,
+) -> Result<(), MigrationError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    preflight_memory_schema(conn).await.map_err(DbErr::from)?;
+    gate().await;
+    conn.transaction::<_, _, DbErr>(|txn| {
+        Box::pin(async move {
+            txn.execute_raw(Statement::from_string(
+                txn.get_database_backend(),
+                SCHEMA_VERSIONS_DDL,
+            ))
+            .await?;
+            validate_memory_schema(txn, false).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| match error {
+        sea_orm::TransactionError::Connection(error)
+        | sea_orm::TransactionError::Transaction(error) => MigrationError::Database(error),
+    })
 }
 
 async fn schema_versions_table_exists(conn: &DatabaseConnection) -> Result<bool, MigrationError> {
@@ -650,6 +950,12 @@ async fn apply_one_migration_guarded(
                 let changed: i64 = row
                     .try_get_by_index(0)
                     .map_err(|err| DbErr::Custom(format!("changes() decode failed: {err}")))?;
+                // The claim already holds SQLite's write lock. Recheck before
+                // ANY pending migration's DDL, not only the final Memory one.
+                let memory_claim = (changed != 0
+                    && matches!(version, MEMORY_CORE_VERSION | MEMORY_PATH_SEARCH_VERSION))
+                .then_some(version);
+                validate_memory_schema_with_claim(txn, memory_claim).await?;
                 if changed == 0 {
                     // Another process already applied this version; nothing
                     // to do and nothing to record.
@@ -691,6 +997,9 @@ async fn apply_one_migration_guarded(
                     operation_v2_branch_convergence::apply(txn, up).await?;
                 } else {
                     txn.execute_raw(Statement::from_string(backend, up)).await?;
+                }
+                if matches!(version, MEMORY_CORE_VERSION | MEMORY_PATH_SEARCH_VERSION) {
+                    validate_memory_schema(txn, false).await?;
                 }
                 if version == 2026072902 && history != RegistryLinkedHistory::Never {
                     // The registry witness the migration's SQL cannot see
@@ -1169,8 +1478,17 @@ async fn apply_down_migration(
         .transaction::<_, _, DbErr>(|txn| {
             Box::pin(async move {
                 let backend = txn.get_database_backend();
-                // DELETE first — the row's presence is our ownership
-                // claim for this rollback. SQLite's `changes()` reports
+                // Acquire the write lock without changing receipt values. The
+                // Memory receipt must remain present during strict validation;
+                // deleting it first would resemble an unreceipted legacy shape.
+                txn.execute_raw(Statement::from_string(
+                    backend,
+                    "UPDATE schema_versions SET version = version WHERE 0",
+                ))
+                .await?;
+                validate_memory_schema(txn, false).await?;
+                // DELETE is the ownership claim for this rollback. SQLite's
+                // `changes()` reports
                 // the rows affected by the LAST INSERT/UPDATE/DELETE on
                 // this connection, so we read it immediately after the
                 // delete, still inside the transaction.
@@ -1198,6 +1516,9 @@ async fn apply_down_migration(
                 // both the DELETE and the partial DDL back.
                 txn.execute_raw(Statement::from_string(backend, down))
                     .await?;
+                if matches!(version, MEMORY_CORE_VERSION | MEMORY_PATH_SEARCH_VERSION) {
+                    validate_memory_schema(txn, false).await?;
+                }
                 Ok::<bool, DbErr>(true)
             })
         })
@@ -1866,6 +2187,18 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             ),
             down: None,
         },
+        sql_migration(
+            MEMORY_CORE_VERSION,
+            "memory_core",
+            MEMORY_CORE_SQL,
+            include_str!("../../../sql/migrations/2026092601_memory_core_down.sql"),
+        ),
+        sql_migration(
+            MEMORY_PATH_SEARCH_VERSION,
+            "memory_path_search",
+            MEMORY_PATH_SEARCH_SQL,
+            include_str!("../../../sql/migrations/2026092602_memory_path_search_down.sql"),
+        ),
     ]
 }
 
@@ -2114,8 +2447,8 @@ const BISECT_STATE_SCOPE_MIGRATION: i64 = 2026072301;
 /// "duplicate column name" error (SQLite has no `ADD COLUMN IF NOT EXISTS`).
 /// It never touches `worktree_id`, so it is a no-op on an already-migrated
 /// table.
-async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+async fn normalize_rebase_state_shape<C: ConnectionTrait>(conn: &C) -> Result<()> {
+    use sea_orm::{DbBackend, Statement};
     conn.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         r#"
@@ -2169,8 +2502,8 @@ async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
 /// construction, and a no-op once 2026072301 has re-keyed the table (the
 /// rebuilt table has no `id` column, `CREATE IF NOT EXISTS` skips it, and
 /// every `ADD COLUMN` hits "duplicate column name").
-async fn normalize_bisect_state_shape(conn: &DatabaseConnection) -> Result<()> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+async fn normalize_bisect_state_shape<C: ConnectionTrait>(conn: &C) -> Result<()> {
+    use sea_orm::{DbBackend, Statement};
     conn.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         r#"
@@ -2218,6 +2551,23 @@ async fn normalize_bisect_state_shape(conn: &DatabaseConnection) -> Result<()> {
 /// build errors and per-migration apply errors are surfaced through
 /// `anyhow::Error` so the call site can attach its own context.
 pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>> {
+    run_builtin_migrations_with_post_preflight_gate(conn, || async {}).await
+}
+
+/// Test seam between the read-only preflight and normalization DDL.
+#[doc(hidden)]
+pub async fn run_builtin_migrations_with_post_preflight_gate<F, Fut>(
+    conn: &DatabaseConnection,
+    gate: F,
+) -> Result<Vec<i64>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    preflight_memory_schema(conn)
+        .await
+        .context("failed Memory lineage preflight before schema normalization")?;
+    gate().await;
     let runner =
         builtin_runner().with_context(|| "failed to build the built-in migration registry")?;
     // The rebase_state/bisect_state shape normalizations must precede the
@@ -2235,18 +2585,28 @@ pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64
         .await
         .with_context(|| "failed to read the current schema version")?;
     if applied.unwrap_or(0) < BISECT_STATE_SCOPE_MIGRATION {
-        for top_up in super::schema::top_ups_for_role(super::DatabaseRole::Repository) {
-            match top_up {
-                super::schema::SchemaTopUp::RebaseShape => {
-                    normalize_rebase_state_shape(conn).await?
+        conn.transaction::<_, _, anyhow::Error>(|txn| {
+            Box::pin(async move {
+                for top_up in super::schema::top_ups_for_role(super::DatabaseRole::Repository) {
+                    match top_up {
+                        super::schema::SchemaTopUp::RebaseShape => {
+                            normalize_rebase_state_shape(txn).await?
+                        }
+                        super::schema::SchemaTopUp::BisectShape => {
+                            normalize_bisect_state_shape(txn).await?
+                        }
+                        // The DB bootstrap layer owns the other top-ups.
+                        _ => {}
+                    }
                 }
-                super::schema::SchemaTopUp::BisectShape => {
-                    normalize_bisect_state_shape(conn).await?
-                }
-                // The DB bootstrap layer owns the other top-ups.
-                _ => {}
-            }
-        }
+                validate_memory_schema(txn, false).await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("schema normalization transaction rolled back: {error}")
+        })?;
     }
     runner
         .run_pending(conn)
@@ -2256,6 +2616,39 @@ pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_cleanup_failure_preserves_refusal() {
+        let error = super::memory_preflight_cleanup_error(
+            super::MemorySchemaError::Incompatible("incompatible".to_owned()),
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+        );
+        assert!(matches!(error, super::MemorySchemaError::Incompatible(_)));
+        assert_eq!(
+            error.to_string(),
+            "incompatible; could not roll back the Memory read snapshot: Failed to acquire connection from pool: Connection pool timed out; retry the inspection"
+        );
+        let error = super::memory_preflight_cleanup_error(
+            super::MemorySchemaError::Database(sea_orm::DbErr::Type("bad column".to_owned())),
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+        );
+        assert!(matches!(
+            error,
+            super::MemorySchemaError::Database(sea_orm::DbErr::Custom(_))
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Custom Error: Type Error: bad column; could not roll back the Memory read snapshot: Failed to acquire connection from pool: Connection pool timed out; retry the inspection"
+        );
+    }
+
+    #[test]
+    fn memory_schema_error_display_is_actionable() {
+        assert_eq!(
+            super::incompatible_memory_schema("legacy M2 migration receipt found").to_string(),
+            "cannot automatically upgrade Memory storage: legacy M2 migration receipt found; keep the existing database, refs and object storage unchanged. Use the original Libra binary to inspect it and make a consistent backup. Legacy M2 conversion is not supported; use a separate repository for the deterministic Memory projection"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2326,9 +2719,12 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 65);
+        assert_eq!(runner.len(), 67);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026091901));
+        assert_eq!(
+            runner.max_registered_version(),
+            Some(MEMORY_PATH_SEARCH_VERSION)
+        );
     }
 
     #[test]

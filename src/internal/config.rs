@@ -3417,20 +3417,39 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn legacy_config_fallback_tolerates_missing_table() {
+        async fn schema_receipts(conn: &DatabaseConnection) -> Vec<(i64, String, String)> {
+            conn.query_all_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT version, name, applied_at FROM schema_versions ORDER BY version",
+            ))
+            .await
+            .expect("read complete migration ledger")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get_by_index(0).expect("receipt version"),
+                    row.try_get_by_index(1).expect("receipt name"),
+                    row.try_get_by_index(2).expect("receipt applied_at"),
+                )
+            })
+            .collect()
+        }
+
         let temp = tempfile::tempdir().expect("create tempdir");
         let latest = crate::internal::db::migration::latest_builtin_schema_version()
             .expect("read latest schema version")
             .expect("built-in migrations have a latest version");
 
-        // A store whose bootstrap omitted the legacy table: full canonical DB,
-        // then `config` dropped and the schema version pinned at latest so the
-        // migrating open cannot silently re-create it.
+        // Keep the complete canonical ledger when removing the legacy table.
+        // A current store must not rerun migrations to recreate that table.
         let missing_table_db = temp.path().join("missing-legacy.db");
-        {
+        let receipts_before = {
             let conn =
                 crate::internal::db::create_database(missing_table_db.to_str().expect("utf8 path"))
                     .await
                     .expect("create config db");
+            let receipts = schema_receipts(&conn).await;
+            assert_eq!(receipts.last().map(|row| row.0), Some(latest));
             conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "DROP TABLE `config`",
@@ -3438,36 +3457,8 @@ mod tests {
             .await
             .expect("drop legacy table");
             conn.close().await.expect("close config db");
-        }
-        // Pin the schema version at latest IN PLACE (the db already exists, so
-        // `create_database` refuses it): the migrating open must not re-create
-        // the dropped table through the self-heal migration.
-        {
-            let conn = crate::internal::db::open_connection_without_schema_management(
-                missing_table_db.to_str().expect("utf8 path"),
-                std::time::Duration::from_millis(200),
-            )
-            .await
-            .expect("open db to pin schema version");
-            conn.execute_raw(Statement::from_string(
-                conn.get_database_backend(),
-                "DELETE FROM `schema_versions`",
-            ))
-            .await
-            .expect("clear schema versions");
-            conn.execute_raw(Statement::from_sql_and_values(
-                conn.get_database_backend(),
-                "INSERT INTO `schema_versions` (`version`, `name`, `applied_at`) VALUES (?, ?, ?)",
-                [
-                    latest.into(),
-                    "test_missing_legacy_table".into(),
-                    "2026-09-06T00:00:00Z".into(),
-                ],
-            ))
-            .await
-            .expect("pin schema version");
-            conn.close().await.expect("close db");
-        }
+            receipts
+        };
 
         let entry = read_config_entry_from_db_path_case_insensitive(
             &missing_table_db,
@@ -3477,6 +3468,30 @@ mod tests {
         .await
         .expect("a missing legacy table means no legacy rows, not a lookup failure");
         assert!(entry.is_none(), "no legacy table must read as no value");
+
+        // Inspect without schema management so the assertion cannot repair
+        // either the ledger or the deliberately absent legacy table.
+        {
+            let conn = crate::internal::db::open_connection_without_schema_management(
+                missing_table_db.to_str().expect("utf8 path"),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("open db to inspect unchanged legacy fixture");
+            assert_eq!(schema_receipts(&conn).await, receipts_before);
+            let legacy_table = conn
+                .query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'config'",
+                ))
+                .await
+                .expect("inspect absent legacy table");
+            assert!(
+                legacy_table.is_none(),
+                "reading must not recreate the legacy table"
+            );
+            conn.close().await.expect("close inspected config db");
+        }
 
         // Control: a store that still carries the legacy table keeps serving
         // legacy rows (NULL subsection matches Git's section.variable keys).
