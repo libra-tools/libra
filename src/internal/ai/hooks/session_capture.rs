@@ -179,10 +179,26 @@ mod tests {
     #[test]
     fn stale_session_end_only_comment_is_gone() {
         let src = include_str!("runtime.rs");
-        assert!(
-            !src.contains("(on `SessionEnd`) write an"),
-            "AgentTraces docs must not say checkpoints are SessionEnd-only"
-        );
+        for stale in [
+            "commit on `SessionEnd` (see [`ingest_agent_traces_payload`])",
+            "On `SessionEnd` it also writes an E4-libra checkpoint",
+            "checkpoint commit step on `SessionEnd` and only persists",
+        ] {
+            assert!(
+                !src.contains(stale),
+                "AgentTraces docs must not say checkpoints are SessionEnd-only: {stale}"
+            );
+        }
+        for expected in [
+            "commits on `TurnEnd`, `SessionEnd`, and subagent boundaries",
+            "On `TurnEnd`, `SessionEnd`, and subagent boundaries it",
+            "for `TurnEnd`, `SessionEnd`, and subagent-boundary\n/// events",
+        ] {
+            assert!(
+                src.contains(expected),
+                "AgentTraces docs must name every checkpoint trigger: {expected}"
+            );
+        }
     }
 
     #[tokio::test]

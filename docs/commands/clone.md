@@ -608,6 +608,8 @@ Wire kind is capability-first: discovery reads `object-format` (default `sha1`) 
 
 **Local Git sha256 reject (B3-12):** a local-path Git source with `extensions.objectformat=sha256` is refused before any destination write (`LBR-CLI-002`, exit 129); create SHA-256/BLAKE3 Libra repositories with a fresh `libra init --object-format` instead. Unknown/corrupt source `objectformat` → `LBR-REPO-002`; unreadable config → `LBR-IO-001`. Network Git sha256 sources remain deferred (DEFER-B3-10). Covered by `clone_rejects_sha256_git_source` and `clone_rejects_unknown_git_source_format`.
 
+**Cloud backup restore kind (B3-14):** `libra cloud restore` uses D1 `repositories.object_format` metadata only (never `o_id` length). See [`cloud.md`](cloud.md#object-format-b3-09--b3-14).
+
 Init errors are transparently forwarded through `InitError -> CliError`.
 
 ### Cleanup Failure Visibility

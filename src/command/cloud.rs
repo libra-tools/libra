@@ -49,9 +49,11 @@ use crate::{
 
 mod agent_capture;
 mod metadata;
+mod object_format;
 mod sync;
 
 use agent_capture::*;
+use object_format::{REBACKUP_HINT, resolve_cloud_repository_kind};
 pub(crate) use sync::run_cloud_sync;
 
 /// `--help` examples shown in `libra cloud --help` output.
@@ -672,6 +674,9 @@ pub(crate) enum CloudError {
     D1(String),
     /// R2 (object store) transport / reachability failure.
     R2(String),
+    /// Cloud catalog lacks authoritative `object_format` (or conflicts with
+    /// OID widths). Maps to `LBR-REPO-002` with a re-backup hint (B3-14).
+    AmbiguousObjectFormat(String),
     /// Anything else — kept as the original detail string.
     Generic(String),
 }
@@ -723,6 +728,7 @@ impl fmt::Display for CloudError {
             | CloudError::PartialTransfer(detail)
             | CloudError::D1(detail)
             | CloudError::R2(detail)
+            | CloudError::AmbiguousObjectFormat(detail)
             | CloudError::Generic(detail) => write!(f, "{detail}"),
         }
     }
@@ -764,6 +770,9 @@ impl CloudError {
             CloudError::R2(detail) => {
                 CliError::network(detail).with_stable_code(StableErrorCode::NetworkUnavailable)
             }
+            CloudError::AmbiguousObjectFormat(detail) => CliError::fatal(detail)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint(REBACKUP_HINT),
             CloudError::Generic(detail) => CliError::fatal(format!("{operation} failed: {detail}")),
         }
     }
@@ -918,26 +927,28 @@ pub(crate) async fn restore_indexed_objects_from_remote(
     indexes: &[ObjectIndexRow],
     r2_storage: &RemoteStorage,
     local_storage: &LocalStorage,
+    kind: git_internal::hash::HashKind,
 ) -> CloudResult<ObjectRestoreReport> {
     let mut report = ObjectRestoreReport::default();
 
     for idx in indexes {
         let decoded = hex::decode(&idx.o_id)
             .map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?;
-        let hash =
-            match ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &decoded) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    report
-                        .warnings
-                        .push(format!("error: invalid object hash '{}': {}", idx.o_id, e));
-                    report.failed += 1;
-                    continue;
-                }
-            };
+        let hash = match ObjectHash::from_bytes_for_kind(kind, &decoded) {
+            Ok(hash) => hash,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("error: invalid object hash '{}': {}", idx.o_id, e));
+                report.failed += 1;
+                continue;
+            }
+        };
 
         if let Ok((data, object_type)) = local_storage.get(&hash).await
-            && ObjectHash::from_type_and_data(object_type, &data) == hash
+            && ObjectHash::from_type_and_data_for_kind(kind, object_type, &data)
+                .ok()
+                .is_some_and(|computed| computed == hash)
         {
             report.skipped += 1;
             continue;
@@ -965,7 +976,18 @@ pub(crate) async fn restore_indexed_objects_from_remote(
 
         match r2_storage.get(&hash).await {
             Ok((data, obj_type)) => {
-                let computed = ObjectHash::from_type_and_data(obj_type, &data);
+                let computed = match ObjectHash::from_type_and_data_for_kind(kind, obj_type, &data)
+                {
+                    Ok(computed) => computed,
+                    Err(e) => {
+                        report.warnings.push(format!(
+                            "warning: failed to hash restored object {}: {e}",
+                            idx.o_id
+                        ));
+                        report.failed += 1;
+                        continue;
+                    }
+                };
                 if computed != hash {
                     report.warnings.push(format!(
                         "warning: hash mismatch for {}: expected {}, got {}",
@@ -1044,6 +1066,12 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
         .await
         .map_err(|e| CloudError::D1(format!("Failed to query D1: {}", e.message)))?;
 
+    // B3-14: refuse width inference; kind comes only from repository metadata
+    // (or the legacy all-40 → sha1 window when metadata is absent).
+    let repository_kind = resolve_cloud_repository_kind(object_format.as_deref(), &indexes)?;
+    let resolved_object_format = object_format
+        .unwrap_or_else(|| crate::internal::object_format::as_str(repository_kind).to_string());
+
     let db_conn = db::get_db_conn_instance().await;
     if !args.metadata_only {
         preflight_agent_capture_prune_fences(&db_conn, &d1_client, &repo_id).await?;
@@ -1084,7 +1112,7 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
     if args.metadata_only {
         return Ok(CloudRestoreOutput {
             repo_id,
-            object_format,
+            object_format: Some(resolved_object_format),
             metadata_only: true,
             total_objects: indexes.len(),
             indexes_restored: indexes.len(),
@@ -1104,7 +1132,8 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
     let local_storage = LocalStorage::new(objects_path);
 
     let object_report =
-        restore_indexed_objects_from_remote(&indexes, &r2_storage, &local_storage).await?;
+        restore_indexed_objects_from_remote(&indexes, &r2_storage, &local_storage, repository_kind)
+            .await?;
     for warning in &object_report.warnings {
         eprintln!("{warning}");
     }
@@ -1160,7 +1189,7 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
 
     Ok(CloudRestoreOutput {
         repo_id,
-        object_format,
+        object_format: Some(resolved_object_format),
         metadata_only: false,
         total_objects: indexes.len(),
         indexes_restored: indexes.len(),
@@ -1212,11 +1241,33 @@ async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
 
     println!("Starting restore for repo: {}", repo_id);
 
+    d1_client
+        .ensure_repositories_table()
+        .await
+        .map_err(|error| {
+            CloudError::D1(format!(
+                "Failed to ensure repositories table: {}",
+                error.message
+            ))
+        })?;
+    let object_format = d1_client
+        .find_repository(&repo_id)
+        .await
+        .map_err(|error| {
+            CloudError::D1(format!(
+                "Failed to load repository metadata: {}",
+                error.message
+            ))
+        })?
+        .and_then(|row| row.object_format);
+
     // Get object indexes from D1
     let indexes = d1_client
         .get_object_indexes(&repo_id)
         .await
         .map_err(|error| CloudError::D1(format!("Failed to query D1: {}", error.message)))?;
+
+    let repository_kind = resolve_cloud_repository_kind(object_format.as_deref(), &indexes)?;
 
     println!("Found {} objects in cloud for repo.", indexes.len());
 
@@ -1280,7 +1331,9 @@ async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
     let objects_path = path::objects();
     let local_storage = LocalStorage::new(objects_path);
 
-    let report = restore_indexed_objects_from_remote(&indexes, &r2_storage, &local_storage).await?;
+    let report =
+        restore_indexed_objects_from_remote(&indexes, &r2_storage, &local_storage, repository_kind)
+            .await?;
     for warning in &report.warnings {
         eprintln!("{warning}");
     }
@@ -3907,9 +3960,14 @@ mod tests {
             .await
             .expect("test object should upload to in-memory remote");
 
-        let report = restore_indexed_objects_from_remote(&[row], &remote, &local)
-            .await
-            .expect("restore should download a valid remote object");
+        let report = restore_indexed_objects_from_remote(
+            &[row],
+            &remote,
+            &local,
+            git_internal::hash::HashKind::Sha1,
+        )
+        .await
+        .expect("restore should download a valid remote object");
 
         assert_eq!(report.downloaded, 1);
         assert_eq!(report.skipped, 0);
@@ -3918,9 +3976,14 @@ mod tests {
         assert!(local.exist(&hash).await);
 
         let row = test_object_index_row(hash, data.len() as i64);
-        let report = restore_indexed_objects_from_remote(&[row], &remote, &local)
-            .await
-            .expect("restore should skip an existing local object");
+        let report = restore_indexed_objects_from_remote(
+            &[row],
+            &remote,
+            &local,
+            git_internal::hash::HashKind::Sha1,
+        )
+        .await
+        .expect("restore should skip an existing local object");
 
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.skipped, 1);
@@ -3945,9 +4008,14 @@ mod tests {
             .await
             .expect("test object should upload under the expected key");
 
-        let report = restore_indexed_objects_from_remote(&[row], &remote, &local)
-            .await
-            .expect("hash mismatch should be reported, not panic");
+        let report = restore_indexed_objects_from_remote(
+            &[row],
+            &remote,
+            &local,
+            git_internal::hash::HashKind::Sha1,
+        )
+        .await
+        .expect("hash mismatch should be reported, not panic");
 
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.skipped, 0);

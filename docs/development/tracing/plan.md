@@ -1710,7 +1710,7 @@ cargo test --lib cli::tests::root_after_help_lists_every_visible_command
 
 以下注释把已完成能力写成未完成，会误导后续执行者「重做已存在功能」，应做一次文档清理（非功能缺口）。**已全部清理（2026-07-08，Feature 2 codex PASS）**：
 
-- [x] `src/internal/ai/hooks/runtime.rs`（`HookTarget::AgentTraces` doc、`ingest_agent_traces` doc、`process_hook_event_with_target` doc）：原写 "Phase 1 stub / 'does NOT yet generate checkpoint commits — Phase 2 work'"，已改为准确描述——AgentTraces 完整 ingest 并在 SessionEnd 写 E4-libra `refs/libra/traces` checkpoint commit（`ingest_agent_traces_payload` 带 `Some(repo_path)`）。
+- [x] `src/internal/ai/hooks/runtime.rs`（`HookTarget::AgentTraces` doc、`ingest_agent_traces` doc、`process_hook_event_with_target` doc）：原写 "Phase 1 stub / 'does NOT yet generate checkpoint commits — Phase 2 work'"，已改为准确描述——AgentTraces 完整 ingest；`TurnEnd`/`SessionEnd` 在 `Some(repo_path)` 时写 E4-libra committed `refs/libra/traces` checkpoint，`SubagentStart`/`SubagentEnd` 写 subagent checkpoint（2026-09-28 按 SCAP-01 决策表更新）。
 - [x] `src/command/agent/mod.rs`（模块 doc + `execute_safe` doc + `refuse` helper doc）：原写 "V1 ships stub handlers that emit not-yet-implemented-in-this-phase"，已改为——每个子命令派发到真实 handler；`refuse` 标注为当前未用的保留 seam。
 - [x] `src/command/code.rs`（`build_placeholder_web_code_ui_runtime` 上游注释 + InfoNote content）：原注释/文案声称「非 codex provider 需去掉 --web-only」且误称 placeholder 是 bootstrap 失败兜底。已更正——C2 放宽后非 codex provider 走 headless web runtime；**构造错误经 `?` 传播**，placeholder 仅是 `Ok(None)`（未接线，今仅 Codex 且已提前改道）的防御兜底。`id: "web-ui-placeholder"`（被测试断言）保持不变，仅改人读文案/注释。
 

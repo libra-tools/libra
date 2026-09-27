@@ -200,9 +200,15 @@ newline_target_with_sentinel=$(printf 'libra\n_')
 newline_target=${newline_target_with_sentinel%_}
 ln -s "$newline_target" "$newline_dir/lba"
 run_installer foreign_newline_symlink 0
-readlink "$newline_dir/lba" >"$work/newline-target.actual"
-printf 'libra\n\n' >"$work/newline-target.expected"
-cmp "$work/newline-target.expected" "$work/newline-target.actual" \
+# GNU readlink prints a terminator while Darwin's does not, so compare the raw
+# link bytes. The sentinel also preserves the target's trailing newline across
+# command substitution.
+newline_actual_with_sentinel=$(
+    readlink -n "$newline_dir/lba" 2>/dev/null || true
+    printf '_'
+)
+newline_actual=${newline_actual_with_sentinel%_}
+[ "$newline_actual" = "$newline_target" ] \
     || fail "newline-suffixed foreign lba symlink was repointed"
 grep -q 'leaving it unchanged' "$last_log" || fail "newline foreign symlink emitted no warning"
 

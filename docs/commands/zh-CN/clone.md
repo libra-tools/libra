@@ -402,6 +402,8 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 **本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 源若 `extensions.objectformat=sha256`，在任何目标写入前拒绝（`LBR-CLI-002`，退出码 129）；SHA-256/BLAKE3 Libra 仓请用 `libra init --object-format` 新建。未知/损坏 `objectformat` → `LBR-REPO-002`；不可读 config → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`clone_rejects_sha256_git_source`、`clone_rejects_unknown_git_source_format`。
 
+**云备份恢复 kind（B3-14）：** `libra cloud restore` 只使用 D1 `repositories.object_format` 元数据（绝不按 `o_id` 长度推断）。见 [`cloud.md`](cloud.md#对象格式b3-09--b3-14)。
+
 Init 错误会通过 `InitError -> CliError` 透明转发。
 
 ### 清理失败可见性

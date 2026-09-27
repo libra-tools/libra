@@ -61,7 +61,7 @@ flowchart TD
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容矩阵说明 | Libra 云备份/恢复扩展, 不是 Git 命令 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| 兼容矩阵说明 | Libra 云备份/恢复扩展, 不是 Git 命令；B3-14 起 restore kind 仅来自 D1 `object_format` 元数据（禁止 OID 宽度推断；无元数据且含 64-hex → `LBR-REPO-002`） | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
 
 ## 维护要求
 

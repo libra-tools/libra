@@ -20,6 +20,10 @@ Each repository is identified by a UUID (`libra.repoid` config key) and optional
 
 Restore can target a repository by UUID (`--repo-id`) or project name (`--name`). It downloads the object index from D1, optionally downloads objects from R2, restores metadata (references), and populates the working directory from HEAD.
 
+### Object format (B3-09 / B3-14)
+
+Backup persists the repository `core.objectformat` into D1 `repositories.object_format` (and tags `object_index` rows). Restore treats that metadata as the only authority for sha1/sha256/blake3 — it never guesses from `o_id` length. Snapshots without metadata that contain any 64-hex object id fail closed with `LBR-REPO-002` (exit 128) and a hint to re-run `libra cloud sync` on the source; all-40-hex catalogs without metadata remain sha1 for legacy compatibility. Clients older than REL-B3-02 must not restore new metadata-bearing backups.
+
 ## Global Config Schema Guard
 
 Configuration schema compatibility is role-scoped. Before `libra cloud` trusts

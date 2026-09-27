@@ -3250,13 +3250,17 @@ async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<u
         })?
         .map(|entry| entry.value)
         .unwrap_or_else(|| "sha1".to_string());
-    match object_format.trim() {
-        "sha1" => Ok(40),
-        "sha256" => Ok(64),
-        other => Err(format!(
-            "unsupported core.objectformat '{other}' while validating object-index repair markers"
-        )),
-    }
+    let kind = crate::internal::object_format::parse_config_value(object_format.trim()).map_err(
+        |_| {
+            format!(
+                "unsupported core.objectformat '{object_format}' while validating object-index repair markers"
+            )
+        },
+    )?;
+    Ok(match kind {
+        git_internal::hash::HashKind::Sha1 => 40,
+        git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => 64,
+    })
 }
 
 /// Apply one loaded replay page to the object index, retiring each durable
@@ -6264,6 +6268,48 @@ mod tests {
             .expect_err("global config connection failure should surface");
         assert!(
             err.contains("failed to connect to global config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// B3-14: object-index repair OID width follows stored `core.objectformat`
+    /// via `object_format::parse_config_value` (blake3 → 64; unknown fail-closed).
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn object_index_repair_uses_stored_object_format() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let db = db::get_db_conn_instance().await;
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "blake3", false)
+            .await
+            .expect("set blake3");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("blake3 width"),
+            64
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "sha1", false)
+            .await
+            .expect("set sha1");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("sha1 width"),
+            40
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "not-a-format", false)
+            .await
+            .expect("set illegal");
+        let err = super::expected_index_repair_oid_len(&db)
+            .await
+            .expect_err("unknown format");
+        assert!(
+            err.contains("unsupported core.objectformat"),
             "unexpected error: {err}"
         );
     }

@@ -82,8 +82,9 @@ pub const AI_SESSION_SCHEMA: &str = "libra.ai_session.v2";
 ///   by `libra code` and the existing Claude/Gemini hook configs.
 /// - [`HookTarget::AgentTraces`] — the external-Agent capture writer that
 ///   lives on `refs/libra/traces`. Fully wired: the runtime ingests the
-///   lifecycle event into `agent_session` and writes an E4-libra checkpoint
-///   commit on `SessionEnd` (see [`ingest_agent_traces_payload`]).
+///   lifecycle event into `agent_session` and writes E4-libra checkpoint
+///   commits on `TurnEnd`, `SessionEnd`, and subagent boundaries when
+///   repository storage is available (see [`ingest_agent_traces_payload`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookTarget {
     AiIntent,
@@ -425,9 +426,10 @@ pub async fn process_hook_event_with_target(
 ///
 /// Reads the hook envelope from stdin, validates, parses to a
 /// [`LifecycleEvent`], redacts free-form fields, and upserts into
-/// `agent_session`. On `SessionEnd` it also writes an E4-libra checkpoint
-/// commit on `refs/libra/traces` (it resolves the storage path and calls
-/// [`ingest_agent_traces_payload`] with `Some(repo_path)`).
+/// `agent_session`. On `TurnEnd`, `SessionEnd`, and subagent boundaries it
+/// also writes E4-libra checkpoint commits on `refs/libra/traces` (it resolves
+/// the storage path and calls [`ingest_agent_traces_payload`] with
+/// `Some(repo_path)`).
 ///
 /// Boundary conditions:
 /// - Idempotent on repeated `SessionStart` for the same provider session
@@ -492,9 +494,9 @@ async fn ingest_agent_traces(
 ///
 /// `repo_path` is the `.libra` directory used to resolve the Git object
 /// store for checkpoint commit creation (Phase 2.1). Passing `None` skips
-/// the checkpoint commit step on `SessionEnd` and only persists the
-/// `agent_session` summary; tests use that path so they don't need a live
-/// `libra init` workspace.
+/// checkpoint commit steps for `TurnEnd`, `SessionEnd`, and subagent-boundary
+/// events, and only persists the `agent_session` summary; tests use that path
+/// so they don't need a live `libra init` workspace.
 pub async fn ingest_agent_traces_payload(
     payload: &[u8],
     command: super::provider::ProviderHookCommand,

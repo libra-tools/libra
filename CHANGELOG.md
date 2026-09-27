@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Cloud object-format metadata (B3-09 / B3-14; ships with REL-B3-02 / B3-17)
+
+- D1 `repositories` / `object_index` carry nullable `object_format`; backup
+  writes the repository kind; restore refuses OID-width inference.
+- Ambiguous 64-hex cloud snapshots without metadata fail closed with
+  `LBR-REPO-002` (exit 128) and a re-backup hint. Legacy all-40-hex catalogs
+  without metadata remain sha1.
+- **Minimum compatible client:** a Libra binary that includes B3-14 cloud
+  metadata consumption (REL-B3-02 / B3-17 and newer). Older clients must not
+  restore new metadata-bearing snapshots via width guessing.
+
 ## [0.27.2] — 2026-09-28
 
 ### Commit the deletion of the last tracked file (issue #497)

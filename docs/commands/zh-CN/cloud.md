@@ -20,6 +20,10 @@ libra cloud status [--verbose]
 
 恢复可以用 UUID（`--repo-id`）或项目名（`--name`）定位仓库。它会从 D1 下载对象索引，可选地从 R2 下载对象，恢复元数据（references），并从 HEAD 填充工作目录。
 
+### 对象格式（B3-09 / B3-14）
+
+备份会把仓库的 `core.objectformat` 写入 D1 `repositories.object_format`（并标记 `object_index` 行）。恢复只以该元数据作为 sha1/sha256/blake3 权威，绝不根据 `o_id` 长度猜测。缺少元数据且存在任意 64-hex 对象 id 的快照会以 `LBR-REPO-002`（退出码 128）fail-closed，并提示在源仓重跑 `libra cloud sync`；无元数据且全部为 40-hex 的旧快照仍按 sha1 兼容。早于 REL-B3-02 的客户端不得通过宽度猜测恢复带元数据的新备份。
+
 ## 全局配置 Schema 保护
 
 配置 schema 兼容性按角色判定。`libra cloud` 在信任配置前，以只读方式检查 GlobalConfig 与 SystemConfig 元数据。真正的配置 future schema，或未注册／名称不匹配的迁移 receipt，在命令需要该作用域时以 `LBR-CONFIG-001` fail-closed。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future，受支持的配置值仍可读取。本 build 能识别 configuration-owned legacy-reader barrier；详见[配置兼容性](config.md#配置-schema-兼容性)。

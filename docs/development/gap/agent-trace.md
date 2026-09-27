@@ -384,7 +384,7 @@ Libra 的 Intent→Plan→Task→Run→PatchSet→Provenance 对象链路不应�
 | `IntegrityHash::compute` 可用 | `git-internal-0.8.6/src/internal/object/integrity.rs:31`（2026-08-27 订正：原写 `0.7.4`；已对照 registry 源实读——恒 SHA-256，`to_hex` @ `:39`，`from_str` 强制 64 长度 @ `:64`，`serialize` 输出裸 hex @ `:75`，canonical-JSON 变体 @ `:94`） |
 | Cursor hook 采集 vs Libra apply_patch | `reference/trace-hook.ts:94`（PostToolUse 走 tool_input 回查）；Libra `apply_patch/handlers/apply_patch.rs:144`（只转 unified diff 给 UI projection，区间丢弃。2026-08-27 订正：原文此处写 `:145` 而 §7.5 写 `:144`，实际注释在 `:144`，两处统一） |
 | normalized event 丢区间 | `hooks/runtime.rs:3147`（`"has_tool_input": event.tool_input.is_some()`，原始内容已在 redaction 层前丢弃；2026-08-27 由 `:1118` 重定位） |
-| ~~`HookTarget::AgentTraces` 为 Phase-1 stub~~ → **已实现（2026-08-27 改判）** | `src/internal/ai/hooks/runtime.rs:82-86` doc 明写 "**Fully wired**"；分派 @ `:196` `return ingest_agent_traces(...)`；ingest 链 `ingest_agent_traces` @ `:436` → `ingest_agent_traces_payload` @ `:496` → `..._with_scope` @ `:520`（写 `agent_session`，`SessionEnd` 写 `refs/libra/traces` checkpoint）；测试 @ `:3751` |
+| ~~`HookTarget::AgentTraces` 为 Phase-1 stub~~ → **已实现（2026-08-27 改判）** | `src/internal/ai/hooks/runtime.rs` doc 明写 "**Fully wired**"；分派进入 `ingest_agent_traces(...)`，再进入 `ingest_agent_traces_payload_with_scope` 写 `agent_session`。`TurnEnd`/`SessionEnd` 写 committed `refs/libra/traces` checkpoint，`SubagentStart`/`SubagentEnd` 写 subagent checkpoint（2026-09-28 按 SCAP-01 决策表更新）。 |
 | worktree 布局已变，但 DB 仍共享 | `src/command/worktree.rs:2243`（真实 per-worktree gitdir + `commondir`，"**NOT** a symlink"）；legacy symlink 判定 `src/utils/util.rs:848`；`storage_path()` @ `util.rs:823` → `worktree_common_storage()` @ `util.rs:422`；`database()` @ `src/utils/path.rs:76`（2026-08-27 由 `path.rs:23` 重定位） |
 
 ---
@@ -588,7 +588,7 @@ Agent Trace 联盟成员（README 致谢）大致分两类采集/存储形态，
 **两条结论级改判**（原文上述两条告警均已作废）：
 
 - ✅ `git-internal::IntegrityHash::compute` **已可核验**，"唯一未能在树内自证的锚点"告警**撤销**——源在 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/git-internal-0.8.6/src/internal/object/integrity.rs`，`compute` @ `:31`，恒 SHA-256。同时订正版本号：依赖是 **`git-internal = "0.8.6"`**（`Cargo.toml:30`），原文 §4.2.1 写 `0.8.1`、§5 写 `0.7.4`，均已统一。
-- ✅ `HookTarget::AgentTraces` **不再是 Phase-1 stub**——`hooks/runtime.rs:82-86` 已标 "Fully wired"，`:196` 分派到 `ingest_agent_traces`，`SessionEnd` 写 `refs/libra/traces` checkpoint，测试 @ `:3751`。
+- ✅ `HookTarget::AgentTraces` **不再是 Phase-1 stub**——`hooks/runtime.rs` 已标 "Fully wired"，并分派到 `ingest_agent_traces`。2026-08-27 的快照只记录了 `SessionEnd`；SCAP-01 后，`TurnEnd`/`SessionEnd` 均写 committed `refs/libra/traces` checkpoint，`SubagentStart`/`SubagentEnd` 写 subagent checkpoint。
 - ✅ `vault` **已有 verify**——`pgp_verify` @ `src/internal/vault.rs:261`（详见 §4.2.5）。
 
 **锚点行号重定位**（结论均不变，仅位置漂移）：
@@ -640,7 +640,7 @@ Agent Trace 联盟成员（README 致谢）大致分两类采集/存储形态，
 
 1. **失效路径 2 处清理**（§5 锚点表、§8 参考）：`/Volumes/Data/cursor/agent-trace` → `/Volumes/Data/competition/cursor/agent-trace`（依据：`ls /Volumes/Data/cursor` → No such file or directory）。
 2. **§4.2.5 / §4.6 / §5 / §7.4 / §7.5 改判「Vault 无 verify」为已实现**：`src/internal/vault.rs:261` `pgp_verify` 已落地（`keys/verify` @ `:286`，解析 `{valid}` @ `:292-301`，模块 doc `:4` 含 "and verify"）。P3-10 工作量由 `M / 中` 下调为 `S–M / 低–中`，剩余净新工作仅密钥分发 / 信任模型。
-3. **§2 / §7.5 改判「`HookTarget::AgentTraces` Phase-1 stub」为已实现**：`hooks/runtime.rs:82-86` 标 "Fully wired"，`:196` 分派到 `ingest_agent_traces`（`:436` → `:496` → `:520`），`SessionEnd` 写 `refs/libra/traces` checkpoint，测试 @ `:3751`。同行顺带更新 `observed_agents/` 的文件盘点（3 → 15 个 `.rs`），并确认**仍成立的缺口只剩行区间与 model_id 规范化到 conversation 级**（`to_canonical_string` 在该目录零命中）。
+3. **§2 / §7.5 改判「`HookTarget::AgentTraces` Phase-1 stub」为已实现**：`hooks/runtime.rs` 标 "Fully wired"，并分派到 `ingest_agent_traces`。本 2026-08-27 刷新记录当时只记 `SessionEnd` checkpoint；2026-09-28 SCAP-01 已收口为 `TurnEnd`/`SessionEnd` 的 committed checkpoint 与 `SubagentStart`/`SubagentEnd` 的 subagent checkpoint。同行顺带更新 `observed_agents/` 的文件盘点（3 → 15 个 `.rs`），并确认**仍成立的缺口只剩行区间与 model_id 规范化到 conversation 级**（`to_canonical_string` 在该目录零命中）。
 4. **§4.2.3 / §4.4 / §7.1 改判「commit↔session 无耦合」为「落点已存在但只覆盖 bridge 一条路径」**：`plan-20260818`（**已完成**，`plan-long.md:122`）LB-05 的 `commit.create` 已按 commit oid 写 `agent_bridge_link` 关联（`src/internal/ai/agent_bridge/mutations.rs:283-343`，helper @ `:432`；schema `2026081801_agent_bridge_capture.sql` + `2026082401_agent_bridge_link_relations.sql`）；`src/command/commit.rs` 本身仍不感知 session。P1-6 的硬前提相应由「需先建耦合」改为「需推广到非 bridge 路径」。
 5. **新增硬约束 §4.2.8（LB-05 AC4）**：`mutations.rs:283-288` doc 明写 commit 对象**不携带** bridge 归属元数据，关联走 sidecar `agent_bridge_link`——即 Libra 已主动选择 sidecar 而非 commit trailer。P1-6 因此被限定为「config 默认关闭的 opt-in 例外」。
 6. **§4.2.7 / §7.2 保留结论、整体更换证据链**：linked worktree 的 `.libra` 已**不是** symlink 而是带 `commondir` 指针的真实 gitdir（`worktree.rs:2243`），symlink 降为 legacy 布局（`util.rs:848`，`worktree repair --migrate-layout` 迁移）；但 `storage_path()`（`util.rs:823`）经 `worktree_common_storage()`（`util.rs:422`）解析、`database()` @ `path.rs:76`，**物理 DB 仍单一共享**，故「回填必须按 `session_id` scope」的结论不变。§7.2 的 `worktree_id` 建议**升级为照抄 plan-20260714 W4 五列约定**（`repo_id`/`worktree_id`/`workspace_id`/`workspace_fence`/`scope_state`，`sql/migrations/2026080401_agent_capture_workspace_scope.sql`）。
