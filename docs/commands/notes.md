@@ -37,6 +37,8 @@ Notes are stored as blob objects under a notes ref (default
 
 Omitting a subcommand defaults to `list`.
 
+Bare `libra notes`, `list`, `show`, `get-ref`, and `prune --dry-run` do not record an Operation v2 entry. `add`, `append`, `edit`, `copy`, `remove`, `merge`, and `prune` without `--dry-run` still record one (`libra op log --command notes`).
+
 ## Options
 
 | Flag | Long | Value | Description |

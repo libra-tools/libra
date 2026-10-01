@@ -18,6 +18,8 @@ Reflog entries are stored in the SQLite `reflog` table, providing transactional 
 
 The `show` subcommand is the primary interface for inspecting reflog history, with filtering by time range, message content, and author. The `delete` subcommand removes specific entries, and `exists` is a plumbing command for scripts to check whether a reference has any reflog entries.
 
+Bare `libra reflog`, `reflog show`, `reflog exists`, and `reflog expire --dry-run` do not record an Operation v2 entry. `reflog delete` and `reflog expire` without `--dry-run` still record one (`libra op log --command reflog`). Bare `reflog expire --dry-run` without a ref or `--all` is still a usage error.
+
 ## Options
 
 ### Subcommand: `show`

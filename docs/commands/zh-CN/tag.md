@@ -18,6 +18,8 @@ libra tag -d <name>
 
 标签引用与分支引用一起存储在 SQLite 数据库中，提供相同的事务保证。
 
+列表形态（`-l`、`-n`、`--contains`、`--no-contains`、`--points-at`、`--merged`、`--no-merged`、`--sort`、`--column`、`--no-column`，含 `--no-column <pattern>`）以及 `--verify` / `-v` 不会写入 Operation v2 记录。创建或删除标签仍各记录一笔（`libra op log --command tag`）。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

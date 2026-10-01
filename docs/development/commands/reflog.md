@@ -17,6 +17,13 @@
 - 源码分层：主要实现文件为 `src/command/reflog.rs`。参数/子命令类型包括：`ReflogArgs`；输出、错误或状态类型包括：源码未暴露独立输出/错误类型，错误通过 `CliResult` 或上层命令错误统一传播；主要执行函数包括：`execute`、`execute_safe`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
 
+### 只读查询与 operation 分类（ADR-BRL-01 / #574 BRL-02）
+
+- `reflog_is_read_only_query` 与 `execute_safe` 共用 `default_reflog_command`：缺省子命令是 `show HEAD`。
+- `Show`、`Exists`，以及 `Expire { dry_run: true }` 为 `ReadOnly`。`Delete` 与非 dry-run `Expire` 保持 `RepoMutation`。
+- 不带 ref 或 `--all` 的 `expire --dry-run` 仍是用法错误（退出码 128）；分类为只读不改变该错误。
+- `cli.rs` 只调用该谓词；`command_scope` 仍为 `Repository`。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

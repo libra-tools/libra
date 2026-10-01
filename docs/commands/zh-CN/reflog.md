@@ -18,6 +18,8 @@ Reflog 条目存储在 SQLite `reflog` 表中，提供事务安全性和可查�
 
 `show` 子命令是检查 reflog 历史的主要接口，支持按时间范围、消息内容和作者过滤。`delete` 子命令移除特定条目，`exists` 是供脚本检查某个引用是否有 reflog 条目的 plumbing 命令。
 
+裸 `libra reflog`、`reflog show`、`reflog exists` 以及 `reflog expire --dry-run` 不会写入 Operation v2 记录。`reflog delete` 以及不带 `--dry-run` 的 `reflog expire` 仍各记录一笔（`libra op log --command reflog`）。不带 ref 或 `--all` 的裸 `reflog expire --dry-run` 仍是用法错误。
+
 ## 选项
 
 ### 子命令：`show`

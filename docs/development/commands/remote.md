@@ -18,6 +18,13 @@
 - 源码分层：主要实现文件为 `src/command/remote.rs`。参数/子命令类型包括：`RemoteCmds`；输出、错误或状态类型包括：`RemoteListEntry`、`RemotePruneEntry`、`RemoteBranchStatus`、`RemotePullConfig`、`SetHeadMode`、`RemoteOutput`；主要执行函数包括：`execute`、`execute_safe`、`run_remote`、`run_show_remote`、`run_set_branches`、`run_set_head`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据。
 
+### 只读查询与 operation 分类（ADR-BRL-01 / #574 BRL-02）
+
+- `remote_is_read_only_query` 覆盖 `List`（`remote -v`）、`Show`（有无名称、含 `--no-query` 与在线查询）、`GetUrl`，以及 `Prune { dry_run: true }`。
+- 2026-10-01 审计：`remote show <name>` 在线查询只读 config／tracking refs 并 discover 远端，不写本地 refs 或配置，因此归为 `ReadOnly`。
+- `Add` / `Remove` / `Rename` / `SetUrl` / 非 dry-run `Prune` / `SetHead` / `SetBranches` / `Update` 保持 `RepoMutation`。
+- `cli.rs` 只调用该谓词；`command_scope` 仍为 `Repository`。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

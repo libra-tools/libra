@@ -19,6 +19,8 @@ Without arguments (or with `-l`), the command lists all tags. When given a name,
 
 Tag references are stored in the SQLite database alongside branch references, providing the same transactional guarantees.
 
+List forms (`-l`, `-n`, `--contains`, `--no-contains`, `--points-at`, `--merged`, `--no-merged`, `--sort`, `--column`, `--no-column`, including `--no-column <pattern>`) and `--verify` / `-v` do not record an Operation v2 entry. Creating or deleting a tag still records one (`libra op log --command tag`).
+
 ## Options
 
 | Flag | Long | Value | Description |

@@ -17,6 +17,13 @@
 - 源码分层：主要实现文件为 `src/command/tag.rs`。参数/子命令类型包括：`TagArgs`；输出、错误或状态类型包括：`TagOutput`、`TagListEntry`、`TagError`（crate-private 错误枚举）；主要执行函数包括：`execute`、`execute_safe`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；创建路径经 `tag::create` 解析 HEAD 提交并写入轻量或附注标签对象；引用路径会读取或更新 SQLite refs（创建/删除标签 ref，不写 reflog，不解析 remote/网络）；数据库路径会通过 SeaORM/SQLite 持久化标签引用。
 
+### 只读查询与 operation 分类（ADR-BRL-01 / #574 BRL-02）
+
+- `tag_is_read_only_query` 与 `run_tag` 共用 `tag_is_list_mode`：`verify` 或列表模式为 `MutationClass::ReadOnly`。
+- 列表模式包含 `no_column`。旧条件只测试 `column.is_some()`，因此 `tag --no-column <pattern>` 会创建标签而不是列出。
+- `name.is_none()` 只让裸 `tag` 进入列表。`validate_message_source_create_only` 不把缺名当成非创建，所以裸 `tag -m` 仍是缺名用法错误；`--no-column` 经 `tag_requests_list` 算列表旗标，与 `-m` 组合仍是用法错误（`LBR-CLI-002`）。
+- `cli.rs` 只调用 `tag_is_read_only_query`；`command_scope` 仍为 `Repository`。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

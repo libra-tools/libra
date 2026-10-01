@@ -15,6 +15,12 @@
 - 源码分层：主要实现文件为 `src/command/notes.rs`。参数/子命令类型包括：`NotesArgs`、`NotesSubcommand`；输出、错误或状态类型包括：`NotesOutput`、`NotesListEntry`、`NotesRemovedEntry`；主要执行函数包括：`execute`、`execute_safe`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置。
 
+### 只读查询与 operation 分类（ADR-BRL-01 / #574 BRL-02）
+
+- `notes_is_read_only_query` 与 `execute_safe` 共用 `default_notes_subcommand`：缺省子命令是 `list`。
+- `List`、`Show`、`GetRef`，以及 `Prune { dry_run: true }` 为 `ReadOnly`。`Add` / `Append` / `Edit` / `Copy` / `Remove` / `Merge` 与非 dry-run `Prune` 保持 `RepoMutation`。
+- `cli.rs` 只调用该谓词；`command_scope` 仍为 `Repository`。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

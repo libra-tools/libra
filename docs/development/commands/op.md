@@ -79,6 +79,23 @@ and an already-configured idempotent `-u` (target = `new_branch` when present,
 else HEAD) skip Operation v2 persistence. `command_scope` remains
 `Repository` — only the operation class changes (ADR-BRL-01).
 
+### Tag / remote / reflog / notes read-only census (ADR-BRL-01 / #574 BRL-02)
+
+The same rule covers four more commands. Each predicate lives in the command
+module and is the mode decision `operation_class_for_command` and dispatch
+share. `command_scope` stays `Repository`.
+
+| Command | Predicate | Read-only | Still a mutation |
+|---|---|---|---|
+| tag | `tag_is_read_only_query` | `verify`, or list mode (`tag_is_list_mode`, including `--no-column <pattern>`) | create, delete |
+| remote | `remote_is_read_only_query` | `-v` / `show` (live query and `--no-query`) / `get-url` / `prune --dry-run` | add, remove, rename, set-url, non-dry prune, set-head, set-branches, update |
+| reflog | `reflog_is_read_only_query` | bare command (`show HEAD`), `show`, `exists`, `expire --dry-run` | `delete`, `expire` without `--dry-run` |
+| notes | `notes_is_read_only_query` | bare command (`list`), `list`, `show`, `get-ref`, `prune --dry-run` | add, append, edit, copy, remove, merge, non-dry prune |
+
+`remote show <name>` without `--no-query` contacts the remote and does not
+write local refs or config (2026-10-01 audit), so it is `ReadOnly`. Uncertain
+forms stay `RepoMutation`.
+
 ### Request context and scope lease
 
 `run_with_operation` binds a fresh operation-local request slot around the whole

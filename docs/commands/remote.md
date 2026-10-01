@@ -29,6 +29,8 @@ in the SQLite `config` table, rather than in a flat `.git/config` file. This pro
 transactional safety (no partial writes on crash) and makes remote metadata queryable
 by agents and tooling.
 
+`remote -v`, `remote show` (with or without a name, including a live query and `--no-query`), `remote get-url`, and `remote prune --dry-run` do not record an Operation v2 entry. A live `remote show <name>` contacts the remote and does not write local refs or config. `add`, `remove`, `rename`, `set-url`, non-dry-run `prune`, `set-head`, `set-branches`, and `update` still record one (`libra op log --command remote`).
+
 ## Options
 
 ### Subcommand: `show`

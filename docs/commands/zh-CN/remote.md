@@ -23,6 +23,8 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 远程配置存储为 SQLite `config` 表中的 `remote.<name>.url` 和 `remote.<name>.pushurl` 键，而不是扁平 `.git/config` 文件。这提供事务安全性（崩溃时不会部分写入），并让代理和工具可以查询远程元数据。
 
+`remote -v`、`remote show`（有无名称均可，含在线查询与 `--no-query`）、`remote get-url` 以及 `remote prune --dry-run` 不会写入 Operation v2 记录。在线的 `remote show <name>` 会联系远端，但不写入本地 refs 或配置。`add`、`remove`、`rename`、`set-url`、非 dry-run 的 `prune`、`set-head`、`set-branches` 与 `update` 仍各记录一笔（`libra op log --command remote`）。
+
 ## 选项
 
 ### 子命令：`show`
