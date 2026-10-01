@@ -1712,16 +1712,15 @@ fn repository_query_tag_no_column_with_pattern_records_no_operation() {
     // An existing tag makes a mistaken create fail. Success plus the tag name
     // in stdout is list mode (`--no-column` was missing from the old condition).
     let repo = create_committed_repo_via_cli();
-    assert_cli_success(
-        &run_libra_command(&["tag", "v1"], repo.path()),
-        "create v1",
-    );
+    assert_cli_success(&run_libra_command(&["tag", "v1"], repo.path()), "create v1");
     let before = repository_op_total(repo.path(), "tag");
     let output = run_libra_command(&["tag", "--no-column", "v1"], repo.path());
     assert_cli_success(&output, "tag --no-column v1");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.lines().any(|line| line.split_whitespace().next() == Some("v1")),
+        stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("v1")),
         "list mode must print v1, got {stdout:?}"
     );
     assert!(
@@ -2120,59 +2119,80 @@ fn normalize_repository_output(raw: &str, repo: &Path) -> String {
 
 fn strip_ansi(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
-            index += 2;
-            while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
-                index += 1;
-            }
-            if index < bytes.len() {
-                index += 1;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
             }
             continue;
         }
-        out.push(bytes[index] as char);
-        index += 1;
+        out.push(ch);
     }
     out
 }
 
 fn replace_json_number_field(raw: &str, field: &str, replacement: &str) -> String {
-    let needle = format!("\"{field}\": ");
+    // Pretty JSON is `"timestamp": 123`; `--machine` is `"timestamp":123`.
+    let needle = format!("\"{field}\":");
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(at) = rest.find(&needle) {
-        out.push_str(&rest[..at + needle.len()]);
-        rest = &rest[at + needle.len()..];
-        let end = rest
+        let after_key = at + needle.len();
+        let tail = &rest[after_key..];
+        let ws = tail.len() - tail.trim_start().len();
+        let digits = &tail[ws..];
+        let end = digits
             .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
-            .unwrap_or(rest.len());
+            .unwrap_or(digits.len());
+        if end == 0 {
+            out.push_str(&rest[..after_key]);
+            rest = &rest[after_key..];
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(&needle);
+        out.push_str(&tail[..ws]);
         out.push_str(replacement);
-        rest = &rest[end..];
+        rest = &digits[end..];
     }
     out.push_str(rest);
     out
 }
 
 fn replace_json_string_field_matching_datetime(raw: &str) -> String {
-    let needle = "\"datetime\": \"";
+    let needle = "\"datetime\":";
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(at) = rest.find(needle) {
-        out.push_str(&rest[..at]);
-        rest = &rest[at + needle.len()..];
-        let end = rest.find('"').unwrap_or(rest.len());
-        let value = &rest[..end];
-        if looks_like_reflog_datetime(value) {
-            out.push_str("\"datetime\": \"<DATETIME>\"");
-        } else {
-            out.push_str(needle);
-            out.push_str(value);
-            out.push('"');
+        let after_key = at + needle.len();
+        let tail = &rest[after_key..];
+        let ws = tail.len() - tail.trim_start().len();
+        let quoted = &tail[ws..];
+        if !quoted.starts_with('"') {
+            out.push_str(&rest[..after_key]);
+            rest = &rest[after_key..];
+            continue;
         }
-        rest = &rest[end + usize::from(end < rest.len())..];
+        let value_and_rest = &quoted[1..];
+        let end = value_and_rest.find('"').unwrap_or(value_and_rest.len());
+        let value = &value_and_rest[..end];
+        if looks_like_reflog_datetime(value) {
+            out.push_str(&rest[..at]);
+            out.push_str(needle);
+            out.push_str(&tail[..ws]);
+            out.push_str("\"<DATETIME>\"");
+        } else {
+            out.push_str(&rest[..after_key + ws + 1 + end]);
+            if end < value_and_rest.len() {
+                out.push('"');
+            }
+        }
+        let consumed = after_key + ws + 1 + end + usize::from(end < value_and_rest.len());
+        rest = &rest[consumed..];
     }
     out.push_str(rest);
     out
@@ -2329,6 +2349,8 @@ fn repository_output_notes_matches_inline_expected() {
     const EXPECTED_LIST_MACHINE: &str = "{\"command\":\"notes\",\"data\":{\"action\":\"list\",\"notes\":[{\"annotated_object\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"note_hash\":\"e5df6cee8ea5bf2847658b99ebccea657e698c61\"}],\"ref\":\"refs/notes/commits\"},\"ok\":true}\n";
     const EXPECTED_GET_REF_JSON: &str = "{\n  \"command\": \"notes\",\n  \"data\": {\n    \"action\": \"get-ref\",\n    \"ref\": \"refs/notes/commits\"\n  },\n  \"ok\": true\n}\n";
     const EXPECTED_GET_REF_MACHINE: &str = "{\"command\":\"notes\",\"data\":{\"action\":\"get-ref\",\"ref\":\"refs/notes/commits\"},\"ok\":true}\n";
+    const EXPECTED_SHOW_JSON: &str = "{\n  \"command\": \"notes\",\n  \"data\": {\n    \"action\": \"show\",\n    \"note_hash\": \"e5df6cee8ea5bf2847658b99ebccea657e698c61\",\n    \"object\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n    \"ref\": \"refs/notes/commits\",\n    \"text\": \"pinned\"\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_SHOW_MACHINE: &str = "{\"command\":\"notes\",\"data\":{\"action\":\"show\",\"note_hash\":\"e5df6cee8ea5bf2847658b99ebccea657e698c61\",\"object\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"ref\":\"refs/notes/commits\",\"text\":\"pinned\"},\"ok\":true}\n";
 
     let repo = create_deterministic_branch_query_fixture();
     let head = query_stdout(repo.path(), &["rev-parse", "HEAD"]);
@@ -2373,10 +2395,19 @@ fn repository_output_notes_matches_inline_expected() {
         EXPECTED_GET_REF_MACHINE,
         "machine notes get-ref"
     );
-    let show_json = query_stdout(repo.path(), &["--json", "notes", "show"]);
+    assert_eq!(
+        query_stdout(repo.path(), &["--json", "notes", "show"]),
+        EXPECTED_SHOW_JSON,
+        "json notes show"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--machine", "notes", "show"]),
+        EXPECTED_SHOW_MACHINE,
+        "machine notes show"
+    );
     assert!(
-        show_json.contains(NOTE_HASH) && show_json.contains("\"text\": \"pinned\""),
-        "json notes show drifted: {show_json}"
+        EXPECTED_SHOW_JSON.contains(NOTE_HASH),
+        "show expectation must pin the note blob"
     );
     assert_eq!(repository_op_total(repo.path(), "notes"), before);
 }

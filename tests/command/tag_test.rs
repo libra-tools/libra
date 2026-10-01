@@ -2083,3 +2083,52 @@ fn tag_column_uses_display_width_for_cjk() {
     // COLUMNS=20: the width-8 entry forces a single column (matching git).
     assert_eq!(tag_column_lines(p, "always", "20").len(), 4);
 }
+
+/// G55: a list-mode invocation is `ReadOnly`, but `validate_cli_args` still
+/// rejects it with LBR-CLI-002 before the operation boundary.
+#[test]
+fn tag_validate_cli_args_stable_code_unchanged_under_read_only() {
+    let repo = create_committed_repo_via_cli();
+    let cases = [
+        (
+            vec!["tag", "--column=bogus"],
+            "unsupported --column mode 'bogus'",
+        ),
+        (
+            vec!["tag", "-l", "-m", "msg"],
+            "-m/--message, -F/--file, -e/--edit, and -a/--annotate are only valid when creating a tag",
+        ),
+        (
+            vec!["tag", "--no-column", "-m", "msg", "v1"],
+            "-m/--message, -F/--file, -e/--edit, and -a/--annotate are only valid when creating a tag",
+        ),
+    ];
+
+    let before = tag_op_total(repo.path());
+    for (args, expected_message) in cases {
+        let output = run_libra_command(&args, repo.path());
+        let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+        assert_eq!(output.status.code(), Some(129), "args: {args:?}");
+        assert_eq!(report.error_code, "LBR-CLI-002", "args: {args:?}");
+        assert!(
+            stderr.contains(expected_message),
+            "expected stderr to contain '{expected_message}', got: {stderr}"
+        );
+    }
+    assert_eq!(
+        tag_op_total(repo.path()),
+        before,
+        "read-only validation failures must not record a tag operation"
+    );
+}
+
+fn tag_op_total(repo: &std::path::Path) -> u64 {
+    let output = run_libra_command(
+        &["--json", "op", "log", "-n", "5", "--command", "tag"],
+        repo,
+    );
+    assert_cli_success(&output, "op log --command tag");
+    parse_json_stdout(&output)["data"]["total"]
+        .as_u64()
+        .expect("tag op total")
+}
