@@ -1599,6 +1599,17 @@ fn assert_repository_query_records_no_operation(repo: &Path, command: &str, args
     );
 }
 
+fn assert_repository_mutating_records_one_operation(repo: &Path, command: &str, args: &[&str]) {
+    let before = repository_op_total(repo, command);
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &format!("{command} mutating {args:?}"));
+    assert_eq!(
+        repository_op_total(repo, command),
+        before + 1,
+        "mutating {args:?} must record exactly one operation"
+    );
+}
+
 /// Point `origin` at this repository so offline and local-discovery remote
 /// queries have a configured remote without leaving the machine.
 fn add_self_as_origin(repo: &Path) {
@@ -1698,11 +1709,29 @@ fn repository_query_tag_no_column_records_no_operation() {
 
 #[test]
 fn repository_query_tag_no_column_with_pattern_records_no_operation() {
+    // An existing tag makes a mistaken create fail. Success plus the tag name
+    // in stdout is list mode (`--no-column` was missing from the old condition).
     let repo = create_committed_repo_via_cli();
-    assert_repository_query_records_no_operation(
-        repo.path(),
-        "tag",
-        &["tag", "--no-column", "v1.*"],
+    assert_cli_success(
+        &run_libra_command(&["tag", "v1"], repo.path()),
+        "create v1",
+    );
+    let before = repository_op_total(repo.path(), "tag");
+    let output = run_libra_command(&["tag", "--no-column", "v1"], repo.path());
+    assert_cli_success(&output, "tag --no-column v1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line.split_whitespace().next() == Some("v1")),
+        "list mode must print v1, got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("Created"),
+        "must list rather than create, got {stdout:?}"
+    );
+    assert_eq!(
+        repository_op_total(repo.path(), "tag"),
+        before,
+        "tag --no-column v1 must not record an operation"
     );
 }
 
@@ -1836,4 +1865,518 @@ fn repository_query_notes_prune_dry_run_records_no_operation() {
         "notes",
         &["notes", "prune", "--dry-run"],
     );
+}
+
+#[test]
+fn repository_mutating_tag_create_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(repo.path(), "tag", &["tag", "v1.0"]);
+}
+
+#[test]
+fn repository_mutating_tag_delete_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["tag", "v1.0"], repo.path()),
+        "create tag",
+    );
+    assert_repository_mutating_records_one_operation(repo.path(), "tag", &["tag", "-d", "v1.0"]);
+}
+
+#[test]
+fn repository_mutating_remote_add_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    let url = repo.path().to_str().expect("utf-8 path");
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "add", "origin", url],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_remove_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "remove", "origin"],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_rename_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "rename", "origin", "upstream"],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_set_url_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/other.git",
+        ],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_prune_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "prune", "origin"],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_set_head_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    // Deleting an absent remote HEAD is a successful no-op write path.
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "set-head", "origin", "-d"],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_set_branches_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "remote",
+        &["remote", "set-branches", "origin", "main"],
+    );
+}
+
+#[test]
+fn repository_mutating_remote_update_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    // No configured remotes: update resolves an empty set and still records.
+    assert_repository_mutating_records_one_operation(repo.path(), "remote", &["remote", "update"]);
+}
+
+#[test]
+fn repository_mutating_reflog_delete_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "reflog",
+        &["reflog", "delete", "HEAD@{0}"],
+    );
+}
+
+#[test]
+fn repository_mutating_reflog_expire_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "reflog",
+        &["reflog", "expire", "--all", "--expire=never"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_add_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "notes",
+        &["notes", "add", "-m", "hello"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_append_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "notes",
+        &["notes", "append", "-m", "more"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_edit_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "notes",
+        &["notes", "edit", "-m", "edited"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_copy_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    std::fs::write(path.join("f.txt"), "x\n").expect("write f.txt");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], path), "add f.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], path),
+        "commit c2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "on head", "HEAD"], path),
+        "notes add",
+    );
+    assert_repository_mutating_records_one_operation(
+        path,
+        "notes",
+        &["notes", "copy", "HEAD", "HEAD~1"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_remove_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "hello"], repo.path()),
+        "notes add",
+    );
+    assert_repository_mutating_records_one_operation(
+        repo.path(),
+        "notes",
+        &["notes", "remove", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_merge_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    std::fs::write(path.join("f.txt"), "x\n").expect("write f.txt");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], path), "add f.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], path),
+        "commit c2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "from other",
+                "HEAD~1",
+            ],
+            path,
+        ),
+        "notes add on other ref",
+    );
+    assert_repository_mutating_records_one_operation(
+        path,
+        "notes",
+        &["notes", "merge", "refs/notes/other"],
+    );
+}
+
+#[test]
+fn repository_mutating_notes_prune_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_mutating_records_one_operation(repo.path(), "notes", &["notes", "prune"]);
+}
+
+fn query_stdout(repo: &Path, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &format!("query output {args:?}"));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Replace absolute repo paths and wall-clock reflog timestamps so inline
+/// expected text stays stable across machines.
+fn normalize_repository_output(raw: &str, repo: &Path) -> String {
+    let mut text = raw.to_string();
+    let mut paths = vec![repo.to_path_buf()];
+    if let Ok(canonical) = repo.canonicalize() {
+        paths.push(canonical);
+    }
+    for path in paths {
+        text = text.replace(&path.to_string_lossy().to_string(), "<REPO>");
+    }
+    text = strip_ansi(&text);
+    text = replace_json_number_field(&text, "timestamp", "0");
+    replace_json_string_field_matching_datetime(&text)
+}
+
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            index += 2;
+            while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
+                index += 1;
+            }
+            if index < bytes.len() {
+                index += 1;
+            }
+            continue;
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
+fn replace_json_number_field(raw: &str, field: &str, replacement: &str) -> String {
+    let needle = format!("\"{field}\": ");
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find(&needle) {
+        out.push_str(&rest[..at + needle.len()]);
+        rest = &rest[at + needle.len()..];
+        let end = rest
+            .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+            .unwrap_or(rest.len());
+        out.push_str(replacement);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn replace_json_string_field_matching_datetime(raw: &str) -> String {
+    let needle = "\"datetime\": \"";
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find(needle) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + needle.len()..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        let value = &rest[..end];
+        if looks_like_reflog_datetime(value) {
+            out.push_str("\"datetime\": \"<DATETIME>\"");
+        } else {
+            out.push_str(needle);
+            out.push_str(value);
+            out.push('"');
+        }
+        rest = &rest[end + usize::from(end < rest.len())..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn looks_like_reflog_datetime(value: &str) -> bool {
+    let mut parts = value.split_whitespace();
+    let Some(weekday) = parts.next() else {
+        return false;
+    };
+    matches!(
+        weekday,
+        "Sun" | "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat"
+    ) && parts.count() == 5
+}
+
+const DETERMINISTIC_OID: &str = "68dd00aaff58c2fb07743045a98a9828e6df6831";
+
+#[test]
+fn repository_output_tag_matches_inline_expected() {
+    // Captured from the deterministic fixture (GIT_*_DATE=1577836800 +0000,
+    // identity Test User / test@example.com, unsigned commit of tracked.txt)
+    // after `tag v1` (lightweight; list hash is the commit oid).
+    const EXPECTED_HUMAN: &str = "v1\n";
+    const EXPECTED_JSON: &str = "{\n  \"command\": \"tag\",\n  \"data\": {\n    \"action\": \"list\",\n    \"tags\": [\n      {\n        \"hash\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n        \"message\": null,\n        \"name\": \"v1\",\n        \"tag_type\": \"lightweight\"\n      }\n    ]\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_MACHINE: &str = "{\"command\":\"tag\",\"data\":{\"action\":\"list\",\"tags\":[{\"hash\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"message\":null,\"name\":\"v1\",\"tag_type\":\"lightweight\"}]},\"ok\":true}\n";
+
+    let repo = create_deterministic_branch_query_fixture();
+    let head = query_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        head.trim(),
+        DETERMINISTIC_OID,
+        "fixture commit oid drifted; re-capture inline expected values"
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "v1"], repo.path()),
+        "create lightweight v1",
+    );
+    let before = repository_op_total(repo.path(), "tag");
+    assert_eq!(
+        query_stdout(repo.path(), &["tag", "-l"]),
+        EXPECTED_HUMAN,
+        "human tag -l"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--json", "tag", "-l"]),
+        EXPECTED_JSON,
+        "json tag -l"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--machine", "tag", "-l"]),
+        EXPECTED_MACHINE,
+        "machine tag -l"
+    );
+    assert_eq!(repository_op_total(repo.path(), "tag"), before);
+}
+
+#[test]
+fn repository_output_remote_matches_inline_expected() {
+    // `user:s3cret` must not survive `remote -v` / `get-url`.
+    const SECRET_URL: &str = "https://user:s3cret@example.com/repo.git";
+    const EXPECTED_HUMAN: &str = "\
+origin\thttps://example.com/repo.git (fetch)
+origin\thttps://example.com/repo.git (push)
+";
+    const EXPECTED_JSON: &str = "{\n  \"command\": \"remote\",\n  \"data\": {\n    \"action\": \"list\",\n    \"remotes\": [\n      {\n        \"fetch_urls\": [\n          \"https://example.com/repo.git\"\n        ],\n        \"name\": \"origin\",\n        \"push_urls\": [\n          \"https://example.com/repo.git\"\n        ]\n      }\n    ],\n    \"verbose\": true\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_MACHINE: &str = "{\"command\":\"remote\",\"data\":{\"action\":\"list\",\"remotes\":[{\"fetch_urls\":[\"https://example.com/repo.git\"],\"name\":\"origin\",\"push_urls\":[\"https://example.com/repo.git\"]}],\"verbose\":true},\"ok\":true}\n";
+    const EXPECTED_GET_URL: &str = "https://example.com/repo.git\n";
+
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", SECRET_URL], repo.path()),
+        "remote add with credentials",
+    );
+    let before = repository_op_total(repo.path(), "remote");
+    for got in [
+        query_stdout(repo.path(), &["remote", "-v"]),
+        query_stdout(repo.path(), &["--json", "remote", "-v"]),
+        query_stdout(repo.path(), &["--machine", "remote", "-v"]),
+        query_stdout(repo.path(), &["remote", "get-url", "origin"]),
+    ] {
+        assert!(
+            !got.contains("s3cret") && !got.contains("user:"),
+            "credential leaked in remote query output: {got:?}"
+        );
+    }
+    assert_eq!(
+        query_stdout(repo.path(), &["remote", "-v"]),
+        EXPECTED_HUMAN,
+        "human remote -v"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--json", "remote", "-v"]),
+        EXPECTED_JSON,
+        "json remote -v"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--machine", "remote", "-v"]),
+        EXPECTED_MACHINE,
+        "machine remote -v"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["remote", "get-url", "origin"]),
+        EXPECTED_GET_URL,
+        "human remote get-url"
+    );
+    assert_eq!(repository_op_total(repo.path(), "remote"), before);
+}
+
+#[test]
+fn repository_output_reflog_matches_inline_expected() {
+    // Human oneline has no clock. JSON `timestamp` / `datetime` are wall-clock
+    // and are normalized before the inline compare.
+    const EXPECTED_HUMAN: &str = "68dd00a HEAD@{0}: commit: base\n\n";
+    const EXPECTED_JSON: &str = "{\n  \"command\": \"reflog.show\",\n  \"data\": {\n    \"count\": 1,\n    \"entries\": [\n      {\n        \"action\": \"commit\",\n        \"commit\": {\n          \"author\": {\n            \"email\": \"test@example.com\",\n            \"name\": \"Test User\"\n          },\n          \"message\": \"base\"\n        },\n        \"committer\": {\n          \"email\": \"test@example.com\",\n          \"name\": \"Test User\"\n        },\n        \"datetime\": \"<DATETIME>\",\n        \"index\": 0,\n        \"message\": \"base\",\n        \"new_oid\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n        \"old_oid\": \"0000000000000000000000000000000000000000\",\n        \"patch\": null,\n        \"ref_name\": \"HEAD\",\n        \"selector\": \"HEAD@{0}\",\n        \"short_new_oid\": \"68dd00a\",\n        \"stat\": null,\n        \"summary\": \"commit: base\",\n        \"timestamp\": 0\n      }\n    ],\n    \"filters\": {\n      \"author\": null,\n      \"grep\": null,\n      \"number\": null,\n      \"patch\": false,\n      \"since\": null,\n      \"stat\": false,\n      \"until\": null\n    },\n    \"pretty\": \"oneline\",\n    \"ref_name\": \"HEAD\",\n    \"total_count\": 1\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_MACHINE: &str = "{\"command\":\"reflog.show\",\"data\":{\"count\":1,\"entries\":[{\"action\":\"commit\",\"commit\":{\"author\":{\"email\":\"test@example.com\",\"name\":\"Test User\"},\"message\":\"base\"},\"committer\":{\"email\":\"test@example.com\",\"name\":\"Test User\"},\"datetime\":\"<DATETIME>\",\"index\":0,\"message\":\"base\",\"new_oid\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"old_oid\":\"0000000000000000000000000000000000000000\",\"patch\":null,\"ref_name\":\"HEAD\",\"selector\":\"HEAD@{0}\",\"short_new_oid\":\"68dd00a\",\"stat\":null,\"summary\":\"commit: base\",\"timestamp\":0}],\"filters\":{\"author\":null,\"grep\":null,\"number\":null,\"patch\":false,\"since\":null,\"stat\":false,\"until\":null},\"pretty\":\"oneline\",\"ref_name\":\"HEAD\",\"total_count\":1},\"ok\":true}\n";
+
+    let repo = create_deterministic_branch_query_fixture();
+    let head = query_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(head.trim(), DETERMINISTIC_OID);
+    let before = repository_op_total(repo.path(), "reflog");
+    assert_eq!(
+        normalize_repository_output(&query_stdout(repo.path(), &["reflog"]), repo.path()),
+        EXPECTED_HUMAN,
+        "human reflog"
+    );
+    assert_eq!(
+        normalize_repository_output(
+            &query_stdout(repo.path(), &["--json", "reflog", "show", "HEAD"]),
+            repo.path()
+        ),
+        EXPECTED_JSON,
+        "json reflog show"
+    );
+    assert_eq!(
+        normalize_repository_output(
+            &query_stdout(repo.path(), &["--machine", "reflog", "show", "HEAD"]),
+            repo.path()
+        ),
+        EXPECTED_MACHINE,
+        "machine reflog show"
+    );
+    assert_eq!(repository_op_total(repo.path(), "reflog"), before);
+}
+
+#[test]
+fn repository_output_notes_matches_inline_expected() {
+    // Note blob is `Blob::from_content("pinned")` on the deterministic commit.
+    const NOTE_HASH: &str = "e5df6cee8ea5bf2847658b99ebccea657e698c61";
+    const EXPECTED_LIST_HUMAN: &str = "e5df6ce 68dd00a\n";
+    const EXPECTED_SHOW_HUMAN: &str = "pinned";
+    const EXPECTED_GET_REF_HUMAN: &str = "refs/notes/commits\n";
+    const EXPECTED_LIST_JSON: &str = "{\n  \"command\": \"notes\",\n  \"data\": {\n    \"action\": \"list\",\n    \"notes\": [\n      {\n        \"annotated_object\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n        \"note_hash\": \"e5df6cee8ea5bf2847658b99ebccea657e698c61\"\n      }\n    ],\n    \"ref\": \"refs/notes/commits\"\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_LIST_MACHINE: &str = "{\"command\":\"notes\",\"data\":{\"action\":\"list\",\"notes\":[{\"annotated_object\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"note_hash\":\"e5df6cee8ea5bf2847658b99ebccea657e698c61\"}],\"ref\":\"refs/notes/commits\"},\"ok\":true}\n";
+    const EXPECTED_GET_REF_JSON: &str = "{\n  \"command\": \"notes\",\n  \"data\": {\n    \"action\": \"get-ref\",\n    \"ref\": \"refs/notes/commits\"\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_GET_REF_MACHINE: &str = "{\"command\":\"notes\",\"data\":{\"action\":\"get-ref\",\"ref\":\"refs/notes/commits\"},\"ok\":true}\n";
+
+    let repo = create_deterministic_branch_query_fixture();
+    let head = query_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(head.trim(), DETERMINISTIC_OID);
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "pinned"], repo.path()),
+        "notes add pinned",
+    );
+    let before = repository_op_total(repo.path(), "notes");
+    assert_eq!(
+        query_stdout(repo.path(), &["notes", "list"]),
+        EXPECTED_LIST_HUMAN,
+        "human notes list"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["notes", "show"]),
+        EXPECTED_SHOW_HUMAN,
+        "human notes show"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["notes", "get-ref"]),
+        EXPECTED_GET_REF_HUMAN,
+        "human notes get-ref"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--json", "notes", "list"]),
+        EXPECTED_LIST_JSON,
+        "json notes list"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--machine", "notes", "list"]),
+        EXPECTED_LIST_MACHINE,
+        "machine notes list"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--json", "notes", "get-ref"]),
+        EXPECTED_GET_REF_JSON,
+        "json notes get-ref"
+    );
+    assert_eq!(
+        query_stdout(repo.path(), &["--machine", "notes", "get-ref"]),
+        EXPECTED_GET_REF_MACHINE,
+        "machine notes get-ref"
+    );
+    let show_json = query_stdout(repo.path(), &["--json", "notes", "show"]);
+    assert!(
+        show_json.contains(NOTE_HASH) && show_json.contains("\"text\": \"pinned\""),
+        "json notes show drifted: {show_json}"
+    );
+    assert_eq!(repository_op_total(repo.path(), "notes"), before);
 }
