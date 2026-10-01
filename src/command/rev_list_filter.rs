@@ -1,3 +1,12 @@
+//! Per-commit filters for `rev-list`.
+//!
+//! Filters run **before** `--skip` / `--max-count` on the full-path pipeline.
+//! That is why BRL-04 eligibility is a whitelist: putting `--merges` (or any
+//! other filter) on the date-priority walker with early stop would truncate
+//! before filtering and emit fewer than `max_count` matching commits. Filtered
+//! and other full-path options stay on `sort_rev_list_commits` (ADR-BRL-02
+//! asymmetry vs `log`, which still walks date-priority when ineligible).
+
 use git_internal::internal::object::commit::Commit;
 use regex::Regex;
 

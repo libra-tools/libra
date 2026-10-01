@@ -27,7 +27,7 @@
 
 `A..B` 会先加载排除端的祖先闭包，再遍历展示集合。debug 计数钩子 `LIBRA_TEST_LOG_COMMITS_LOADED_PATH`（`#[cfg(debug_assertions)]`）统计这次历史遍历解析过的提交对象数，含闭包与入队父提交，因此大于 `rev-list A..B --count`，差额是闭包大小。单一正向修订上，该数等于 `rev-list --count`。`LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH` 记下缩写长度的输入提交数：合格限额用已打印集合（下限 7），其余调用用全部可达提交。
 
-与 `rev-list` 不对称：`log` 的不合格默认排序仍走 walker；`rev-list` 的过滤与全量选项路径在 BRL-04 之前仍用 `sort_rev_list_commits` 全局排序。带过滤的 `log` 与带过滤的 `rev-list` 在偏斜历史上的顺序可能不同。`get_reachable_commits` 保持集合语义，不计入该钩子。
+与 `rev-list` 不对称：`log` 的不合格默认排序仍走 walker；`rev-list` 仅白名单合格调用（单一正向 tip，选项 ⊆ `max_count`/`skip`/`first_parent`/`date_order`）走 walker，过滤与其它全量选项仍用 `sort_rev_list_commits` 全局排序。带过滤的 `log` 与带过滤的 `rev-list` 在偏斜历史上的顺序可能不同。`get_reachable_commits` 保持集合语义，不计入该钩子。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

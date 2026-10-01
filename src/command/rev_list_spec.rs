@@ -39,6 +39,45 @@ enum RevisionTerm<'a> {
     Symmetric { left: &'a str, right: &'a str },
 }
 
+/// Returns the single positive tip when `specs` is exactly one include term
+/// (or empty with `default_to_head`, which becomes `HEAD`). Ranges, exclusions,
+/// symmetric differences, and multi-tip inputs return `None`.
+pub(super) fn single_positive_tip_spec(specs: &[String], default_to_head: bool) -> Option<String> {
+    let inputs = normalized_inputs(specs, default_to_head);
+    if inputs.len() != 1 {
+        return None;
+    }
+    match parse_revision_term(&inputs[0]) {
+        RevisionTerm::Include(spec) => Some(spec.to_string()),
+        RevisionTerm::Exclude(_) | RevisionTerm::Range { .. } | RevisionTerm::Symmetric { .. } => {
+            None
+        }
+    }
+}
+
+/// Collect reachable commits via the shared date-priority walker (BRL-03 / BRL-04).
+///
+/// When `max_count` is set, the walk stops after yielding `skip + max_count`
+/// commits (parents of those yields are still enqueued). Unlimited walks run to
+/// completion so limited output stays a prefix of unlimited output.
+pub(super) async fn collect_date_priority_selection(
+    tip_spec: &str,
+    first_parent: bool,
+    skip: usize,
+    max_count: Option<usize>,
+) -> CliResult<RevListSelection> {
+    let tip = resolve_commit(tip_spec).await?;
+    let max_yield = max_count.map(|n| skip.saturating_add(n));
+    let commits = log::walk_date_priority(vec![tip], None, first_parent, max_yield)?;
+    Ok(RevListSelection {
+        input: tip_spec.to_string(),
+        inputs: vec![tip_spec.to_string()],
+        commits,
+        sides: HashMap::new(),
+        excluded: HashSet::new(),
+    })
+}
+
 pub(super) async fn resolve_revision_selection(
     specs: &[String],
     first_parent: bool,

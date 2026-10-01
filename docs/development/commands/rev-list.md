@@ -15,7 +15,18 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：入口与参数仍在 `src/command/rev_list.rs`；输出与帮助文本在 `src/command/rev_list_output.rs`；父提交数量、作者、提交者、message grep、path limitation 和时间过滤在 `src/command/rev_list_filter.rs`；multi-spec/range/exclusion 解析、symmetric-difference side 标记和 first-parent 可达集合在 `src/command/rev_list_spec.rs`；patch-equivalence 标记、`--left-only`/`--right-only` 和 `--cherry-pick`/`--cherry-mark`/`--cherry` 过滤在 `src/command/rev_list_cherry.rs`；`--children` 的 child map 在 `src/command/rev_list_children.rs` 中根据过滤前 traversal 构建。参数/子命令类型包括：`RevListArgs`；输出、错误或状态类型包括：crate 私有的命名输出结构体 `RevListOutput`（包含输入、提交列表、输出格式、作者/提交者/message/path 过滤、side/cherry 过滤、时间过滤、父提交过滤、child 输出、first-parent、limit/skip 等字段，由 `resolve_rev_list` 返回并供 `emit_json_data` 序列化），错误通过 `CliResult` 或上层命令错误统一传播；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象。合格的单一正向 tip（选项 ⊆ `max_count`/`-n`、`skip`、`first_parent`、`date_order`）走 `log::walk_date_priority`；有 `--max-count` 时在产出 `skip + max_count` 笔后停止。其余调用维持 `resolve_revision_selection` + `sort_rev_list_commits` 全量路径（先过滤再 `skip`/`take`）。
+
+## 日期优先 walker 合格条件（ADR-BRL-02 / BRL-04）
+
+白名单（fail-closed）：仅当修订输入恰好是一个正向 tip（缺省 `HEAD`），且未设置下表「全量路径」任一字段时，走 walker。`--date-order` 是 parity no-op（同一 committer 键）。无限额与有限额合格调用都走 walker，保证 `rev-list -n N HEAD` 是 `rev-list HEAD` 的前缀。
+
+| 归属 | `RevListArgs` 字段 |
+|---|---|
+| 走 walker（有 `max_count` 时可提前终止） | 无选項（裸 `rev-list <rev>`）、`max_count`／`-n`、`skip`、`first_parent`、`date_order` |
+| 维持全量路径（`sort_rev_list_commits`） | `count`、`objects`、`objects_edge`、`objects_edge_aggressive`、`parents`、`children`、`timestamp`、`boundary`、`reverse`、`all`、`left_right`、`left_only`、`right_only`、`cherry_pick`／`cherry_mark`／`cherry`、`author`、`committer`、`grep`、`since`／`until`、`merges`／`no_merges`、`min_parents`／`max_parents`／`no_min_parents`／`no_max_parents`、多个或带 `^`／范围的修订（`specs`）、pathspec（`pathspecs`） |
+
+与 `log` 不对称：`log` 的不合格默认排序仍走 walker（只关提前终止）；`rev-list` 的过滤／全量选项路径保留全局排序。debug 钩子 `LIBRA_TEST_LOG_COMMITS_LOADED_PATH` 与 `log` 共用，统计 walker 解析过的提交对象数。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

@@ -12,7 +12,7 @@ use git_internal::{
 };
 
 use crate::{
-    command::load_object,
+    command::{load_object, log},
     internal::{branch::Branch, config::ConfigKv, head::Head, tag},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -45,7 +45,9 @@ use rev_list_filter::{
 use rev_list_output::{
     REV_LIST_EXAMPLES, RevListEntry, RevListObject, RevListOutput, emit_human_rev_list,
 };
-use rev_list_spec::resolve_revision_selection;
+use rev_list_spec::{
+    collect_date_priority_selection, resolve_revision_selection, single_positive_tip_spec,
+};
 
 #[derive(Parser, Debug)]
 #[command(after_help = REV_LIST_EXAMPLES)]
@@ -231,6 +233,11 @@ pub async fn execute_safe(args: RevListArgs, output: &OutputConfig) -> CliResult
 }
 
 async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
+    // Reuse the BRL-03 load-count hook so eligible walker calls can assert
+    // exact fixture load counts via `LIBRA_TEST_LOG_COMMITS_LOADED_PATH`.
+    log::reset_log_debug_counters();
+    let _log_debug_hooks = log::LogDebugHookGuard;
+
     // `--all` seeds the walk with every ref tip; explicit specs (incl `^`
     // exclusions) are appended so they still apply.
     let specs = if args.all {
@@ -240,11 +247,20 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
     } else {
         args.specs.clone()
     };
-    // `--all` supplies the ref set as the input; don't fall back to HEAD when
-    // that set (plus explicit specs) is empty (e.g. an unborn repository).
-    let selection = resolve_revision_selection(&specs, args.first_parent, !args.all).await?;
-    let mut commits = selection.commits;
-    sort_rev_list_commits(&mut commits);
+
+    // Whitelist: only a bare single positive tip with options ⊆
+    // {max_count/-n, skip, first_parent, date_order} uses the date-priority
+    // walker. Everything else stays on the full collect + `sort_rev_list_commits`
+    // path so filters cannot early-stop before matching `max_count` results.
+    let selection = if let Some(tip) = date_priority_walker_tip(args) {
+        collect_date_priority_selection(&tip, args.first_parent, args.skip, args.max_count).await?
+    } else {
+        let mut selection =
+            resolve_revision_selection(&specs, args.first_parent, !args.all).await?;
+        sort_rev_list_commits(&mut selection.commits);
+        selection
+    };
+    let commits = selection.commits;
     let children = build_rev_list_children(&commits);
     let commits = filter_commits_by_pathspecs(commits, &args.pathspecs).await?;
     let commits = attach_cherry_metadata(commits, &selection.sides);
@@ -415,6 +431,48 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
         max_count: args.max_count,
         skip: args.skip,
     })
+}
+
+/// Whitelist tip for the date-priority walker (ADR-BRL-02 / BRL-04).
+///
+/// Returns `Some(tip)` only when options ⊆ {`max_count`/`-n`, `skip`,
+/// `first_parent`, `date_order`} and there is exactly one positive revision tip.
+/// Fail-closed: every other `RevListArgs` field keeps the full
+/// `sort_rev_list_commits` path so filter-then-limit cannot under-count.
+fn date_priority_walker_tip(args: &RevListArgs) -> Option<String> {
+    let disallowed = args.count
+        || args.objects
+        || args.objects_edge
+        || args.objects_edge_aggressive
+        || args.parents
+        || args.children
+        || args.timestamp
+        || args.boundary
+        || args.reverse
+        || args.all
+        || args.left_right
+        || args.left_only
+        || args.right_only
+        || args.cherry_pick
+        || args.cherry_mark
+        || args.cherry
+        || args.author.is_some()
+        || args.committer.is_some()
+        || !args.grep.is_empty()
+        || args.since.is_some()
+        || args.until.is_some()
+        || args.merges
+        || args.no_merges
+        || args.min_parents.is_some()
+        || args.max_parents.is_some()
+        || args.no_min_parents
+        || args.no_max_parents
+        || !args.pathspecs.is_empty();
+    if disallowed {
+        return None;
+    }
+    // `date_order`, `first_parent`, `max_count`, and `skip` are the whitelist.
+    single_positive_tip_spec(&args.specs, true)
 }
 
 /// Enumerate the tree and blob objects reachable from the printed commits for

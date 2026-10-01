@@ -215,7 +215,7 @@ fn test_rev_list_rejects_tag_object_that_points_to_tree() {
 #[tokio::test]
 #[serial(cwd)]
 async fn test_rev_list_accepts_fully_qualified_remote_tracking_ref() {
-    let repo = tempdir().expect("failed to create repository root");
+    let repo = tempfile::tempdir().expect("failed to create repository root");
     test::setup_with_new_libra_in(repo.path()).await;
     let _guard = ChangeDirGuard::new(repo.path());
 
@@ -382,7 +382,7 @@ fn test_rev_list_all_includes_tag_only_commits() {
 fn test_rev_list_all_on_unborn_repo_is_empty() {
     // `--all` supplies the ref set as input; with no refs the output is empty
     // (exit 0), not a fallback to an unborn HEAD error.
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     init_repo_via_cli(repo.path());
 
     let out = run_libra_command(&["rev-list", "--all"], repo.path());
@@ -839,7 +839,7 @@ fn test_rev_list_objects_edge_marks_boundary() {
 /// omitted (Git's object-closure semantics).
 #[test]
 fn test_rev_list_objects_excludes_unchanged_from_range() {
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
     configure_identity_via_cli(p);
@@ -883,7 +883,7 @@ fn test_rev_list_objects_excludes_unchanged_from_range() {
 /// blobs are dropped.
 #[test]
 fn test_rev_list_objects_pathspec_prunes_walk() {
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
     configure_identity_via_cli(p);
@@ -953,7 +953,7 @@ fn test_rev_list_objects_skips_gitlinks() {
     };
     use libra::utils::client_storage::ClientStorage;
 
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     init_repo_via_cli(repo.path());
     let _kind = set_hash_kind_for_test(HashKind::Sha1);
     let storage = ClientStorage::init(repo.path().join(".libra/objects"));
@@ -1021,7 +1021,7 @@ fn test_rev_list_objects_errors_on_corrupt_subtree() {
     };
     use libra::utils::client_storage::ClientStorage;
 
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     init_repo_via_cli(repo.path());
     let _kind = set_hash_kind_for_test(HashKind::Sha1);
     let storage = ClientStorage::init(repo.path().join(".libra/objects"));
@@ -1066,7 +1066,7 @@ fn test_rev_list_objects_errors_on_corrupt_subtree() {
 /// object closure, not just objects new since its parent.)
 #[test]
 fn test_rev_list_objects_n1_does_not_suppress_parent_objects() {
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
     configure_identity_via_cli(p);
@@ -1100,7 +1100,7 @@ fn test_rev_list_objects_n1_does_not_suppress_parent_objects() {
 /// objects must not prune a later, broader traversal of the same tree.
 #[test]
 fn test_rev_list_objects_shared_subtree_mixed_pathspecs() {
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
     configure_identity_via_cli(p);
@@ -1159,7 +1159,7 @@ fn test_rev_list_count_objects_rejects_marked_modes() {
 /// count, while `--objects-edge` itself prints the extra edge line.
 #[test]
 fn test_rev_list_count_objects_edge_excludes_edge_commits() {
-    let repo = tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
     configure_identity_via_cli(p);
@@ -1248,4 +1248,495 @@ fn test_rev_list_counts_shallow_history() {
             "{args:?} must count only the boundary commit"
         );
     }
+}
+
+// --- BRL-04: date-priority walker with max-count early stop (G1–G10) ---
+
+fn brl04_fresh_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    repo
+}
+
+fn brl04_commit_at(
+    repo: &std::path::Path,
+    path: &str,
+    body: &str,
+    message: &str,
+    committer: u64,
+    author: u64,
+) {
+    std::fs::write(repo.join(path), body).expect("write file");
+    assert_cli_success(&run_libra_command(&["add", path], repo), "add");
+    let committer_date = format!("{committer} +0000");
+    let author_date = format!("{author} +0000");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", message, "--no-verify"],
+            repo,
+            &[
+                ("GIT_COMMITTER_DATE", committer_date.as_str()),
+                ("GIT_AUTHOR_DATE", author_date.as_str()),
+            ],
+        ),
+        "commit",
+    );
+}
+
+fn brl04_rev_list_count(repo: &std::path::Path, specs: &[&str]) -> u64 {
+    let mut args = vec!["rev-list", "--count"];
+    args.extend_from_slice(specs);
+    let output = run_libra_command(&args, repo);
+    assert_cli_success(&output, "rev-list --count");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("rev-list count")
+}
+
+fn brl04_with_load_count(repo: &std::path::Path, args: &[&str]) -> (std::process::Output, u64) {
+    let loaded_path = repo.join(".commits-loaded");
+    let _ = std::fs::remove_file(&loaded_path);
+    let output = run_libra_command_with_env(
+        args,
+        repo,
+        &[(
+            "LIBRA_TEST_LOG_COMMITS_LOADED_PATH",
+            loaded_path.to_str().expect("loaded path"),
+        )],
+    );
+    assert_cli_success(&output, &args.join(" "));
+    let loaded = std::fs::read_to_string(&loaded_path)
+        .expect("load counter")
+        .trim()
+        .parse()
+        .expect("load counter integer");
+    (output, loaded)
+}
+
+fn brl04_lines(repo: &std::path::Path, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["rev-list"];
+    args.extend_from_slice(extra);
+    let output = run_libra_command(&args, repo);
+    assert_cli_success(&output, &args.join(" "));
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn brl04_linear_history(n: usize) -> tempfile::TempDir {
+    let repo = brl04_fresh_repo();
+    for i in 1..=n {
+        brl04_commit_at(
+            repo.path(),
+            "f.txt",
+            &format!("v{i}\n"),
+            &format!("m{i}"),
+            1_900_000_000 + i as u64,
+            1_900_000_000 + i as u64,
+        );
+    }
+    assert_eq!(brl04_rev_list_count(repo.path(), &["HEAD"]), n as u64);
+    repo
+}
+
+/// Clock-skewed history from ADR-BRL-02: M(10), P2(9), P1(5), B(5), A(5).
+fn brl04_skew_repo() -> tempfile::TempDir {
+    let repo = brl04_fresh_repo();
+    brl04_commit_at(
+        repo.path(),
+        "a.txt",
+        "a\n",
+        "A",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "side"], repo.path()),
+        "orphan side",
+    );
+    brl04_commit_at(
+        repo.path(),
+        "b.txt",
+        "b\n",
+        "B",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main",
+    );
+    brl04_commit_at(
+        repo.path(),
+        "p1.txt",
+        "p1\n",
+        "P1",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "side"], repo.path()),
+        "switch side",
+    );
+    brl04_commit_at(
+        repo.path(),
+        "p2.txt",
+        "p2\n",
+        "P2",
+        1_920_000_009,
+        1_920_000_009,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main for merge",
+    );
+    let stamp = "1920000010 +0000";
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "side",
+                "-m",
+                "M",
+                "--no-edit",
+                "--no-verify",
+                "--allow-unrelated-histories",
+            ],
+            repo.path(),
+            &[("GIT_COMMITTER_DATE", stamp), ("GIT_AUTHOR_DATE", stamp)],
+        ),
+        "merge unrelated side",
+    );
+    repo
+}
+
+fn brl04_subjects_from_hashes(repo: &std::path::Path, hashes: &[String]) -> Vec<String> {
+    hashes
+        .iter()
+        .map(|hash| {
+            let output = run_libra_command(&["log", "-1", "--format=%s", hash], repo);
+            assert_cli_success(&output, "subject for hash");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        })
+        .collect()
+}
+
+/// Deep merges under a long non-merge tip chain: early-stop would miss merges.
+fn brl04_merges_under_linear_tip() -> tempfile::TempDir {
+    let repo = brl04_fresh_repo();
+    brl04_commit_at(
+        repo.path(),
+        "base.txt",
+        "base\n",
+        "base",
+        1_930_000_001,
+        1_930_000_001,
+    );
+    for i in 1..=3 {
+        let branch = format!("side{i}");
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", &branch], repo.path()),
+            "create side",
+        );
+        brl04_commit_at(
+            repo.path(),
+            &format!("s{i}.txt"),
+            &format!("s{i}\n"),
+            &format!("S{i}"),
+            1_930_000_010 + i as u64,
+            1_930_000_010 + i as u64,
+        );
+        assert_cli_success(
+            &run_libra_command(&["switch", "main"], repo.path()),
+            "back main",
+        );
+        // Diverging commit on main so the merge is not a fast-forward.
+        brl04_commit_at(
+            repo.path(),
+            &format!("m{i}.txt"),
+            &format!("m{i}\n"),
+            &format!("Main{i}"),
+            1_930_000_015 + i as u64,
+            1_930_000_015 + i as u64,
+        );
+        let stamp = format!("{} +0000", 1_930_000_020 + i);
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &[
+                    "merge",
+                    &branch,
+                    "-m",
+                    &format!("Merge{i}"),
+                    "--no-edit",
+                    "--no-verify",
+                    "--no-ff",
+                ],
+                repo.path(),
+                &[
+                    ("GIT_COMMITTER_DATE", stamp.as_str()),
+                    ("GIT_AUTHOR_DATE", stamp.as_str()),
+                ],
+            ),
+            "merge side",
+        );
+    }
+    // Ten non-merge commits on tip so -n 5 never reaches the merges if early-stopped.
+    for i in 1..=10 {
+        brl04_commit_at(
+            repo.path(),
+            "tip.txt",
+            &format!("tip{i}\n"),
+            &format!("tip{i}"),
+            1_930_000_100 + i as u64,
+            1_930_000_100 + i as u64,
+        );
+    }
+    repo
+}
+
+#[test]
+fn rev_list_max_count_loads_bounded_commits() {
+    let repo = brl04_linear_history(8);
+    let (_output, loaded) = brl04_with_load_count(repo.path(), &["rev-list", "-n", "1", "HEAD"]);
+    assert_eq!(loaded, 2, "tip plus the parent enqueued on the frontier");
+    assert!(loaded < brl04_rev_list_count(repo.path(), &["HEAD"]));
+}
+
+#[test]
+fn rev_list_max_count_with_skip_loads_bounded_commits() {
+    let repo = brl04_linear_history(8);
+    let (_output, loaded) =
+        brl04_with_load_count(repo.path(), &["rev-list", "-n", "3", "--skip", "2", "HEAD"]);
+    assert_eq!(loaded, 6, "skip 2 + 3 yields, plus the next parent");
+    assert_eq!(brl04_rev_list_count(repo.path(), &["HEAD"]), 8);
+}
+
+#[test]
+fn rev_list_limited_output_is_prefix_of_unlimited() {
+    let repo = brl04_linear_history(8);
+    let full = brl04_lines(repo.path(), &["HEAD"]);
+    assert_eq!(full.len(), 8);
+    for n in [1usize, 5, full.len()] {
+        let limited = brl04_lines(repo.path(), &["-n", &n.to_string(), "HEAD"]);
+        assert_eq!(limited, full[..n]);
+    }
+    // Unlimited eligible path also uses the walker (date-order no-op).
+    let dated = brl04_lines(repo.path(), &["--date-order", "HEAD"]);
+    assert_eq!(dated, full);
+}
+
+#[test]
+fn rev_list_clock_skew_uses_date_priority_order() {
+    let repo = brl04_skew_repo();
+    let hashes = brl04_lines(repo.path(), &["HEAD"]);
+    assert_eq!(
+        brl04_subjects_from_hashes(repo.path(), &hashes),
+        vec!["M", "P2", "P1", "B", "A"]
+    );
+}
+
+#[test]
+fn rev_list_clock_skew_limited_is_prefix() {
+    let repo = brl04_skew_repo();
+    let full = brl04_lines(repo.path(), &["HEAD"]);
+    for n in [1usize, 3] {
+        let limited = brl04_lines(repo.path(), &["-n", &n.to_string(), "HEAD"]);
+        assert_eq!(limited, full[..n]);
+    }
+}
+
+#[test]
+fn rev_list_first_parent_limited_is_prefix() {
+    let repo = brl04_skew_repo();
+    let full = brl04_lines(repo.path(), &["--first-parent", "HEAD"]);
+    assert!(!full.is_empty());
+    for n in [1usize, full.len().min(2)] {
+        let limited = brl04_lines(
+            repo.path(),
+            &["--first-parent", "-n", &n.to_string(), "HEAD"],
+        );
+        assert_eq!(limited, full[..n]);
+    }
+}
+
+#[test]
+fn rev_list_json_machine_limited_is_prefix() {
+    let repo = brl04_linear_history(6);
+    let unlimited_json = run_libra_command(&["--json", "rev-list", "HEAD"], repo.path());
+    assert_cli_success(&unlimited_json, "json rev-list");
+    let all = parse_json_stdout(&unlimited_json)["data"]["commits"]
+        .as_array()
+        .expect("commits")
+        .clone();
+    let n = 2;
+    let limited_json = run_libra_command(
+        &["--json", "rev-list", "-n", &n.to_string(), "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&limited_json, "json rev-list -n");
+    let limited_json_value = parse_json_stdout(&limited_json);
+    let head = limited_json_value["data"]["commits"]
+        .as_array()
+        .expect("limited commits");
+    assert_eq!(head.len(), n);
+    assert_eq!(head.as_slice(), &all[..n]);
+
+    let unlimited_machine = run_libra_command(&["--machine", "rev-list", "HEAD"], repo.path());
+    assert_cli_success(&unlimited_machine, "machine rev-list");
+    let all_m = parse_json_stdout(&unlimited_machine)["data"]["commits"]
+        .as_array()
+        .expect("commits")
+        .clone();
+    let limited_machine = run_libra_command(
+        &["--machine", "rev-list", "-n", &n.to_string(), "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&limited_machine, "machine rev-list -n");
+    let limited_machine_value = parse_json_stdout(&limited_machine);
+    let head_m = limited_machine_value["data"]["commits"]
+        .as_array()
+        .expect("limited commits");
+    assert_eq!(head_m.len(), n);
+    assert_eq!(head_m.as_slice(), &all_m[..n]);
+}
+
+#[test]
+fn rev_list_merges_filter_with_max_count_is_ineligible() {
+    let repo = brl04_merges_under_linear_tip();
+    let merge_total = brl04_lines(repo.path(), &["--merges", "HEAD"]).len();
+    assert!(merge_total >= 3, "fixture needs several merges");
+
+    // Filter-then-limit: deep merges still appear. Early-stop-then-filter would
+    // yield an empty list because the tip chain is non-merge.
+    let limited = brl04_lines(repo.path(), &["--merges", "-n", "2", "HEAD"]);
+    assert_eq!(
+        limited.len(),
+        2,
+        "must still find merges beyond the tip window"
+    );
+
+    // Table-driven: each filter-chain representative still returns results under -n
+    // when matches exist deeper than an early-stop window.
+    for args in [
+        &["rev-list", "--no-merges", "-n", "5", "HEAD"][..],
+        &["rev-list", "--min-parents", "1", "-n", "5", "HEAD"][..],
+        &["rev-list", "--max-parents", "2", "-n", "5", "HEAD"][..],
+        &["rev-list", "--no-min-parents", "-n", "5", "HEAD"][..],
+        &["rev-list", "--no-max-parents", "-n", "5", "HEAD"][..],
+        &["rev-list", "--author", "Test", "-n", "5", "HEAD"][..],
+        &["rev-list", "--committer", "Test", "-n", "5", "HEAD"][..],
+        &["rev-list", "--grep", "tip", "-n", "5", "HEAD"][..],
+        &["rev-list", "--since", "2000-01-01", "-n", "5", "HEAD"][..],
+        &["rev-list", "--until", "2099-01-01", "-n", "5", "HEAD"][..],
+    ] {
+        let output = run_libra_command(args, repo.path());
+        assert_cli_success(&output, &args.join(" "));
+        let lines = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(lines, 5, "{args:?} must keep filter-then-limit semantics");
+    }
+}
+
+#[test]
+fn rev_list_objects_edge_flags_stay_on_full_path() {
+    let repo = brl04_linear_history(4);
+    for flag in ["--objects-edge", "--objects-edge-aggressive"] {
+        let unlimited = run_libra_command(&["rev-list", flag, "HEAD"], repo.path());
+        assert_cli_success(&unlimited, flag);
+        let unlimited_text = String::from_utf8_lossy(&unlimited.stdout);
+        assert!(
+            unlimited_text.contains(' '),
+            "{flag} must enumerate objects: {unlimited_text}"
+        );
+
+        let limited = run_libra_command(&["rev-list", flag, "-n", "1", "HEAD"], repo.path());
+        assert_cli_success(&limited, &format!("{flag} -n 1"));
+        let limited_text = String::from_utf8_lossy(&limited.stdout);
+        // Full path: limit applies after collect; edge frontier from the cut still prints.
+        let limited_lines: Vec<&str> = limited_text.lines().collect();
+        assert!(
+            limited_lines.iter().any(|line| line.starts_with('-')),
+            "{flag} -n 1 must keep edge markers from the full-path frontier: {limited_text}"
+        );
+        assert!(
+            limited_lines.iter().any(|line| line.contains(' ')),
+            "{flag} -n 1 must still list objects: {limited_text}"
+        );
+    }
+}
+
+#[test]
+fn rev_list_full_path_options_unchanged() {
+    let repo = brl04_linear_history(5);
+    let full_count = brl04_rev_list_count(repo.path(), &["HEAD"]);
+    assert_eq!(full_count, 5);
+
+    let counted = run_libra_command(&["rev-list", "--count", "-n", "2", "HEAD"], repo.path());
+    assert_cli_success(&counted, "--count -n 2");
+    assert_eq!(String::from_utf8_lossy(&counted.stdout).trim(), "2");
+
+    let reversed = brl04_lines(repo.path(), &["--reverse", "-n", "2", "HEAD"]);
+    let forward = brl04_lines(repo.path(), &["-n", "2", "HEAD"]);
+    assert_eq!(
+        reversed,
+        forward.iter().rev().cloned().collect::<Vec<_>>(),
+        "--reverse stays limit-then-reverse on the full path"
+    );
+
+    let all = run_libra_command(&["rev-list", "--all", "--count"], repo.path());
+    assert_cli_success(&all, "--all --count");
+    assert_eq!(
+        String::from_utf8_lossy(&all.stdout)
+            .trim()
+            .parse::<u64>()
+            .expect("count"),
+        full_count
+    );
+
+    let boundary = run_libra_command(&["rev-list", "--boundary", "-n", "1", "HEAD"], repo.path());
+    assert_cli_success(&boundary, "--boundary -n 1");
+    let boundary_text = String::from_utf8_lossy(&boundary.stdout);
+    assert!(
+        boundary_text.lines().any(|line| line.starts_with('-')),
+        "boundary marker retained: {boundary_text}"
+    );
+
+    // Pathspec stays on the full path and still filters.
+    let path_limited = brl04_lines(repo.path(), &["HEAD", "--", "f.txt"]);
+    assert_eq!(path_limited.len(), 5);
+
+    // left-right needs a symmetric difference; create a second tip.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "other"], repo.path()),
+        "branch other",
+    );
+    brl04_commit_at(
+        repo.path(),
+        "other.txt",
+        "o\n",
+        "other",
+        1_900_000_050,
+        1_900_000_050,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "back main",
+    );
+    let left_right = run_libra_command(
+        &["rev-list", "--left-right", "-n", "1", "main...other"],
+        repo.path(),
+    );
+    assert_cli_success(&left_right, "--left-right -n 1");
+    let lr = String::from_utf8_lossy(&left_right.stdout);
+    assert!(
+        lr.starts_with('<') || lr.starts_with('>'),
+        "left-right prefix retained: {lr}"
+    );
 }

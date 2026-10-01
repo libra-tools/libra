@@ -12,17 +12,19 @@ libra rev-list [OPTIONS] [SPEC]
 
 `libra rev-list` 会将修订输入解析为提交，遍历可达历史，应用可选的父提交数量过滤和计数/限制过滤，并按从新到旧的顺序打印提交 ID。省略 `<SPEC>` 时，命令默认为 `HEAD`。输出格式可以通过 `--parents` 增加父提交 ID，也可以通过 `--timestamp` 增加提交者时间戳。`--reverse` 将输出翻转为从旧到新（在提交限制之后应用）。
 
+裸的单一正向修订，且选项仅属于 `-n`/`--max-count`、`--skip`、`--first-parent`、`--date-order` 时，走与默认 `libra log` 相同的日期优先 walker；有限额与无限额同走 walker，因此 `rev-list -n N HEAD` 永远是 `rev-list HEAD` 的前缀。带过滤、范围、多 tip、`--count`、`--objects*`、`--boundary`、`--reverse`、`--all` 等全量选项的调用仍走「全量收集 + `sort_rev_list_commits`」（先过滤再限额），在偏斜历史上可能与带过滤的 `log` 顺序不同。
+
 浅克隆中，`.libra/shallow` 列出的提交会被当作根，因此 `--count HEAD` 只统计已获取的历史。损坏的 `.libra/shallow` 会 fail-closed（`LBR-REPO-002`）。`--parents` 仍打印对象里记录的父提交 ID。
 
 ## 选项
 
 | 标志 | 说明 |
 |------|-------------|
-| `-n <N>`, `--max-count <N>` | 排序后最多输出 `N` 个提交。 |
+| `-n <N>`, `--max-count <N>` | 遍历（或全量路径上过滤）后最多输出 `N` 个提交。合格的单一 tip 调用会在产出 `skip + N` 笔后停止载入。 |
 | `--skip <N>` | 输出或计数前跳过前 `N` 个提交。 |
 | `--reverse` | 反转所选提交的输出顺序。先应用提交限制（`--max-count`/`--skip`），再反转结果。 |
 | `--all` | 以所有 ref（分支、远程跟踪分支和标签）和当前 HEAD 为遍历起点，叠加于任何显式 `<SPEC>`。 |
-| `--date-order` | 按提交者日期顺序（最新优先）显示提交。作为 Libra 既有默认顺序的 no-op 接受。与 Git 不同，Libra 不额外施加 topo「父提交不先于其子提交」约束（仅在提交者日期发生偏斜时可观察到差异）。 |
+| `--date-order` | 按提交者日期优先顺序（最新优先）显示提交。作为默认单一 tip walker 的 parity no-op。与 Git 不同，Libra 不额外施加 topo「父提交不先于其子提交」约束（仅在提交者日期发生偏斜时可观察到差异）。 |
 | `--count` | 只打印过滤后的提交数量。 |
 | `--merges` | 只打印至少有两个父提交的 merge commit。 |
 | `--no-merges` | 排除至少有两个父提交的 merge commit。 |
@@ -148,7 +150,13 @@ def5678901234567890abcdef12345678abc1234
 | 父提交输出 | `--parents` | 相同 | revset/template 输出 |
 | 时间戳输出 | `--timestamp` | 相同 | template 输出 |
 | JSON 输出 | `--json` | 无 | 无 |
-| 排序 | 最新优先 | 可达性顺序 | 取决于 revset |
+| 排序 | 合格单一 tip 走日期优先 walker；其余走全局提交者日期排序 | 可达性 / date-order 遍历 | 取决于 revset |
+
+## 日期优先遍历
+
+合格的裸单一 tip 调用（选项 ⊆ `-n`/`--max-count`、`--skip`、`--first-parent`、`--date-order`）按 committer 时间优先队列遍历；同秒并列按发现序号。无偏斜历史上与全局最新优先一致；偏斜历史上与 Git 的 date-priority 一致，并可能与旧的全局排序不同。
+
+`rev-list -n N HEAD` 是无限额 `rev-list HEAD` 的前缀。存在 `--max-count` 时在产出 `skip + N` 笔后停止载入；无限额合格调用同走 walker、不提前终止。过滤、`--count`、`--objects*`、`--boundary`、`--reverse`、`--all`、范围/多 tip、pathspec 等维持全量收集 + 全局排序（先过滤再限额），与 `log` 过滤路径不对称。
 
 ## 错误处理
 

@@ -1220,7 +1220,7 @@ fn note_history_commit_loaded() {
     }
 }
 
-fn reset_log_debug_counters() {
+pub(crate) fn reset_log_debug_counters() {
     #[cfg(debug_assertions)]
     {
         LOG_COMMITS_LOADED.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1243,7 +1243,9 @@ fn flush_log_debug_hooks() {
 }
 
 /// Writes the debug load and abbreviation-basis counters when `execute_safe` returns.
-struct LogDebugHookGuard;
+///
+/// Shared with `rev-list` so eligible walker calls can assert the same load counts.
+pub(crate) struct LogDebugHookGuard;
 
 impl Drop for LogDebugHookGuard {
     fn drop(&mut self) {
@@ -1328,7 +1330,7 @@ impl Ord for QueuedCommit {
     }
 }
 
-/// Date-priority history walk shared by `log` and, later, `rev-list`.
+/// Date-priority history walk shared by `log` and `rev-list`.
 ///
 /// Parents are loaded when enqueued, which is when their committer time becomes
 /// known. A commit object is loaded once. `max_yield` stops after that many

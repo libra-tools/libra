@@ -12,6 +12,8 @@ libra rev-list [OPTIONS] [SPEC]... [-- <PATH>...]
 
 `libra rev-list` resolves one or more revision inputs to commits, walks the reachable history, applies optional exclusion/range, symmetric-difference side, cherry-equivalence, first-parent, author, committer, message grep, path, time-window, parent-count, and count/limit filters, and prints commit IDs newest first. When `<SPEC>` is omitted, the command defaults to `HEAD`. Output formatting can include parent commit IDs (`--parents`), child commit IDs (`--children`), committer timestamps (`--timestamp`), side markers (`--left-right`), and cherry-equivalence markers (`--cherry-mark` / `--cherry`). `--reverse` flips the output to oldest-first (applied after commit limiting).
 
+A bare single positive tip with options limited to `-n`/`--max-count`, `--skip`, `--first-parent`, and/or `--date-order` uses the shared date-priority walker (same as default `libra log`). Limited and unlimited eligible calls share that walk, so `rev-list -n N HEAD` is always a prefix of `rev-list HEAD`. Filtered calls, ranges, multi-tip input, `--count`, `--objects*`, `--boundary`, `--reverse`, `--all`, and other full-path options keep the previous collect-then-`sort_rev_list_commits` path (filter before limit), which can disagree with filtered `log` on skewed history.
+
 In a shallow clone, commits listed in `.libra/shallow` are treated as roots, so
 `--count HEAD` matches the fetched history. A corrupt `.libra/shallow` file
 fails closed (`LBR-REPO-002`). `--parents` still prints the ids recorded on
@@ -21,11 +23,11 @@ the commit object.
 
 | Flag | Description |
 |------|-------------|
-| `-n <N>`, `--max-count <N>` | Limit output to at most `N` commits after sorting. |
+| `-n <N>`, `--max-count <N>` | Limit output to at most `N` commits after the walk (or after filters on the full-path pipeline). On an eligible single-tip call, the date-priority walk stops after producing `skip + N` commits. |
 | `--skip <N>` | Skip the first `N` commits before output or counting. |
 | `--reverse` | Output the selected commits in reverse order. Commit limiting (`--max-count`/`--skip`) is applied first, then the result is reversed. |
 | `--all` | Seed the walk with every ref (branches, remote-tracking branches, and tags) and the current HEAD, in addition to any explicit `<SPEC>`. |
-| `--date-order` | Show commits in committer-date order (newest first). Accepted as a no-op for Libra's existing default ordering. Unlike Git, Libra does not add the topo "no parent before its children" constraint (only observable under committer-date skew). |
+| `--date-order` | Show commits in committer-date priority order (newest first). Accepted as a parity no-op for Libra's default single-tip walk. Unlike Git, Libra does not add the topo "no parent before its children" constraint (only observable under committer-date skew). |
 | `--count` | Print only the number of commits after filters. |
 | `--since <DATE>`, `--after <DATE>` | Print commits whose committer timestamp is at or after `DATE`. |
 | `--until <DATE>`, `--before <DATE>` | Print commits whose committer timestamp is at or before `DATE`. |
@@ -265,7 +267,15 @@ With `--children`, `entries[]` includes child commit IDs while `commits[]` remai
 | Child output | `--children` | Same | revset/template output |
 | Timestamp output | `--timestamp` | Same | template output |
 | JSON output | `--json` | No | No |
-| Ordering | Newest first | Reachability order | Revset-dependent |
+| Ordering | Date-priority walk for eligible single-tip calls; global committer-date sort otherwise | Reachability / date-order walk | Revset-dependent |
+
+## Date-priority walk
+
+Eligible bare single-tip calls (options ⊆ `-n`/`--max-count`, `--skip`, `--first-parent`, `--date-order`) walk history with a priority queue keyed by committer timestamp, newest first. Same-second ties use discovery ordinal. On histories without clock skew or same-second ties, that matches a global newest-first sort; on skewed history it matches Git's date-priority order and can differ from the old global sort (for example `M, P2, P1, B, A` instead of `M, P2, P1, A, B`).
+
+`rev-list -n N HEAD` is a prefix of unlimited `rev-list HEAD` for that walk. When `--max-count` is set, the walk stops after producing `skip + N` commits (parents of those yields are still enqueued). Unlimited eligible calls use the same walker without early stop.
+
+Everything else — filters (`--merges`, `--author`, `--grep`, `--since`, …), `--count`, `--objects` / `--objects-edge` / `--objects-edge-aggressive`, `--parents` / `--children` / `--timestamp` / `--boundary`, `--reverse`, `--all`, ranges / exclusions / multi-tip specs, and pathspecs — stays on the full collect + global sort path so filter-then-limit cannot under-count. That is an intentional asymmetry with `log`, whose filtered default-order calls still use the walker without early stop.
 
 ## Error Handling
 
