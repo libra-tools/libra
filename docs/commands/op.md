@@ -72,6 +72,27 @@ libra op log --command branch
 libra op log --command "op restore"
 ```
 
+### Read-only query forms do not record operations
+
+Some repository commands have query forms that inspect state without mutating
+refs or config. Those forms are classified `ReadOnly` and do **not** append an
+Operation v2 entry (so `op log --command <name>` totals stay unchanged).
+
+Branch query forms that do not record:
+
+- bare `libra branch` (list)
+- `libra branch -l` / `-r` / `-a`
+- `libra branch --show-current`
+- `libra branch -v` / `-vv`
+- list filters: `--contains`, `--no-contains`, `--merged`, `--no-merged`,
+  `--points-at`, `--sort`, `--format`, `--column`, `--no-column`, `--ignore-case`
+- idempotent `libra branch -u <upstream>` when the **target** branch already
+  tracks that upstream (the target is `<branch>` when given, otherwise HEAD)
+
+Mutating branch forms (create, delete, rename, copy, non-idempotent `-u`,
+`--unset-upstream`, `--edit-description`, `branch reset`, …) still record one
+operation each.
+
 ### `--verbose`
 
 Show one operation as a multi-line block with actor, status, and timestamp.

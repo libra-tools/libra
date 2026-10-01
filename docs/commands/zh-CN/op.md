@@ -67,6 +67,27 @@ libra op log --command branch
 libra op log --command "op restore"
 ```
 
+### 只读查询形态不记录 operation
+
+部分仓库命令具有只检查状态、不修改 refs／配置的查询形态。这些形态归类为
+`ReadOnly`，**不会**追加 Operation v2 记录（因此 `op log --command <name>` 的
+`total` 不变）。
+
+不记录的 branch 查询形态：
+
+- 裸 `libra branch`（列表）
+- `libra branch -l` / `-r` / `-a`
+- `libra branch --show-current`
+- `libra branch -v` / `-vv`
+- 列表过滤：`--contains`、`--no-contains`、`--merged`、`--no-merged`、
+  `--points-at`、`--sort`、`--format`、`--column`、`--no-column`、`--ignore-case`
+- 幂等的 `libra branch -u <upstream>`：当**目标**分支已经跟踪该 upstream 时
+  （目标为给出的 `<branch>`，否则为当前 HEAD 分支）
+
+会写入的 branch 形态（创建、删除、重命名、复制、非幂等 `-u`、
+`--unset-upstream`、`--edit-description`、`branch reset` 等）仍各记录一笔
+operation。
+
 ### `--verbose`
 
 将一个 operation 显示为包含 actor、status 和 timestamp 的多行块。

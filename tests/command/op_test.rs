@@ -1137,3 +1137,442 @@ async fn test_op_restore_json_records_new_operation_and_restores_head_and_branch
         "op restore"
     );
 }
+
+// ---------------------------------------------------------------------------
+// BRL-01 (#574): branch query forms must not record Operation v2 entries.
+// ---------------------------------------------------------------------------
+
+fn branch_op_total(repo: &Path) -> u64 {
+    run_json_op(repo, &["log", "-n", "20", "--command", "branch"])["data"]["total"]
+        .as_u64()
+        .expect("branch op total")
+}
+
+fn assert_branch_query_records_no_operation(repo: &Path, args: &[&str]) {
+    let before = branch_op_total(repo);
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &format!("branch query {:?}", args));
+    assert_eq!(
+        branch_op_total(repo),
+        before,
+        "query {:?} must not record an operation",
+        args
+    );
+}
+
+fn assert_branch_mutating_records_one_operation(repo: &Path, args: &[&str]) {
+    let before = branch_op_total(repo);
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &format!("branch mutating {:?}", args));
+    assert_eq!(
+        branch_op_total(repo),
+        before + 1,
+        "mutating {:?} must record exactly one operation",
+        args
+    );
+}
+
+#[test]
+fn branch_query_bare_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch"]);
+}
+
+#[test]
+fn branch_query_l_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "-l"]);
+}
+
+#[test]
+fn branch_query_r_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "-r"]);
+}
+
+#[test]
+fn branch_query_a_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "-a"]);
+}
+
+#[test]
+fn branch_query_show_current_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--show-current"]);
+}
+
+#[test]
+fn branch_query_verbose_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "-v"]);
+}
+
+#[test]
+fn branch_query_contains_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--contains", "HEAD"]);
+}
+
+#[test]
+fn branch_query_no_contains_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--no-contains", "HEAD"]);
+}
+
+#[test]
+fn branch_query_merged_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--merged", "HEAD"]);
+}
+
+#[test]
+fn branch_query_no_merged_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--no-merged", "HEAD"]);
+}
+
+#[test]
+fn branch_query_points_at_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--points-at", "HEAD"]);
+}
+
+#[test]
+fn branch_query_sort_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--sort=-committerdate"]);
+}
+
+#[test]
+fn branch_query_format_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--format=%(refname)"]);
+}
+
+#[test]
+fn branch_query_column_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--column=always"]);
+}
+
+#[test]
+fn branch_query_no_column_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--no-column"]);
+}
+
+#[test]
+fn branch_query_ignore_case_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_query_records_no_operation(repo.path(), &["branch", "--ignore-case"]);
+}
+
+/// Deterministic fixture for G17: fixed identity/dates, unsigned commit, one
+/// tracked file. Captured before BRL-01 against the current build; absolute
+/// paths do not appear in these outputs so no path normalisation is needed.
+fn create_deterministic_branch_query_fixture() -> tempfile::TempDir {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("tracked.txt");
+    let date_env = [
+        ("GIT_AUTHOR_NAME", "Test User"),
+        ("GIT_AUTHOR_EMAIL", "test@example.com"),
+        ("GIT_COMMITTER_NAME", "Test User"),
+        ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ("GIT_AUTHOR_DATE", "1577836800 +0000"),
+        ("GIT_COMMITTER_DATE", "1577836800 +0000"),
+    ];
+    let add = run_libra_command_with_env(&["add", "tracked.txt"], repo.path(), &date_env);
+    assert_cli_success(&add, "add tracked.txt");
+    let commit = run_libra_command_with_env(
+        &["commit", "-m", "base", "--no-verify", "--no-gpg-sign"],
+        repo.path(),
+        &date_env,
+    );
+    assert_cli_success(&commit, "deterministic commit");
+    repo
+}
+
+#[test]
+fn branch_query_output_matches_inline_expected() {
+    // Inline expected values captured from a deterministic fixture
+    // (GIT_*_DATE=1577836800 +0000, identity Test User / test@example.com,
+    // unsigned commit of tracked.txt only).
+    const EXPECTED_OID: &str = "68dd00aaff58c2fb07743045a98a9828e6df6831";
+    const EXPECTED_HUMAN_LIST: &str = "* main\n";
+    const EXPECTED_JSON_LIST: &str = "{\n  \"command\": \"branch\",\n  \"data\": {\n    \"action\": \"list\",\n    \"branches\": [\n      {\n        \"commit\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n        \"current\": true,\n        \"name\": \"main\"\n      }\n    ]\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_MACHINE_LIST: &str = "{\"command\":\"branch\",\"data\":{\"action\":\"list\",\"branches\":[{\"commit\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"current\":true,\"name\":\"main\"}]},\"ok\":true}\n";
+    const EXPECTED_HUMAN_SHOW: &str = "main\n";
+    const EXPECTED_JSON_SHOW: &str = "{\n  \"command\": \"branch\",\n  \"data\": {\n    \"action\": \"show-current\",\n    \"commit\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n    \"detached\": false,\n    \"name\": \"main\"\n  },\n  \"ok\": true\n}\n";
+    const EXPECTED_MACHINE_SHOW: &str = "{\"command\":\"branch\",\"data\":{\"action\":\"show-current\",\"commit\":\"68dd00aaff58c2fb07743045a98a9828e6df6831\",\"detached\":false,\"name\":\"main\"},\"ok\":true}\n";
+
+    let repo = create_deterministic_branch_query_fixture();
+    let head = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head, "rev-parse");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        EXPECTED_OID,
+        "fixture commit oid drifted; re-capture inline expected values"
+    );
+
+    let human = run_libra_command(&["branch", "-l"], repo.path());
+    assert_cli_success(&human, "branch -l");
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout),
+        EXPECTED_HUMAN_LIST,
+        "human list"
+    );
+
+    let json = run_libra_command(&["--json", "branch", "-l"], repo.path());
+    assert_cli_success(&json, "branch -l --json");
+    assert_eq!(
+        String::from_utf8_lossy(&json.stdout),
+        EXPECTED_JSON_LIST,
+        "json list"
+    );
+
+    let machine = run_libra_command(&["--machine", "branch", "-l"], repo.path());
+    assert_cli_success(&machine, "branch -l --machine");
+    assert_eq!(
+        String::from_utf8_lossy(&machine.stdout),
+        EXPECTED_MACHINE_LIST,
+        "machine list"
+    );
+
+    let show_human = run_libra_command(&["branch", "--show-current"], repo.path());
+    assert_cli_success(&show_human, "show-current");
+    assert_eq!(
+        String::from_utf8_lossy(&show_human.stdout),
+        EXPECTED_HUMAN_SHOW,
+        "human show-current"
+    );
+
+    let show_json = run_libra_command(&["--json", "branch", "--show-current"], repo.path());
+    assert_cli_success(&show_json, "show-current --json");
+    assert_eq!(
+        String::from_utf8_lossy(&show_json.stdout),
+        EXPECTED_JSON_SHOW,
+        "json show-current"
+    );
+
+    let show_machine = run_libra_command(&["--machine", "branch", "--show-current"], repo.path());
+    assert_cli_success(&show_machine, "show-current --machine");
+    assert_eq!(
+        String::from_utf8_lossy(&show_machine.stdout),
+        EXPECTED_MACHINE_SHOW,
+        "machine show-current"
+    );
+}
+
+#[test]
+fn branch_guard_diff_reserved_word_rejected_unchanged() {
+    let repo = create_committed_repo_via_cli();
+    let output = run_libra_command(&["branch", "-v", "diff"], repo.path());
+    assert_ne!(output.status.code(), Some(0));
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert!(
+        human.contains("reserved branch verb") || human.contains("`diff`"),
+        "stderr={human}"
+    );
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
+#[test]
+fn branch_guard_reset_reserved_word_rejected_unchanged() {
+    let repo = create_committed_repo_via_cli();
+    let output = run_libra_command(&["branch", "-v", "reset"], repo.path());
+    assert_ne!(output.status.code(), Some(0));
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert!(
+        human.contains("reserved branch verb") || human.contains("`reset`"),
+        "stderr={human}"
+    );
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
+#[test]
+fn branch_guard_invalid_column_error_unchanged() {
+    let repo = create_committed_repo_via_cli();
+    let output = run_libra_command(&["branch", "--column=bogus"], repo.path());
+    assert_ne!(output.status.code(), Some(0));
+    let (_human, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
+#[test]
+fn branch_mutating_create_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_branch_mutating_records_one_operation(repo.path(), &["branch", "feature"]);
+}
+
+#[test]
+fn branch_mutating_delete_safe_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    assert_branch_mutating_records_one_operation(repo.path(), &["branch", "-d", "feature"]);
+}
+
+#[test]
+fn branch_mutating_delete_force_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    assert_branch_mutating_records_one_operation(repo.path(), &["branch", "-D", "feature"]);
+}
+
+#[test]
+fn branch_mutating_rename_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    assert_branch_mutating_records_one_operation(
+        repo.path(),
+        &["branch", "-m", "feature", "topic"],
+    );
+}
+
+#[test]
+fn branch_mutating_copy_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    assert_branch_mutating_records_one_operation(
+        repo.path(),
+        &["branch", "-c", "feature", "topic"],
+    );
+}
+
+#[test]
+fn branch_mutating_copy_force_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "topic"], repo.path()),
+        "create topic",
+    );
+    assert_branch_mutating_records_one_operation(
+        repo.path(),
+        &["branch", "-C", "feature", "topic"],
+    );
+}
+
+#[test]
+fn branch_mutating_set_upstream_non_idempotent_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+            repo.path(),
+        ),
+        "remote add origin",
+    );
+    // First `-u origin/main` writes tracking config → must record an operation.
+    assert_branch_mutating_records_one_operation(repo.path(), &["branch", "-u", "origin/main"]);
+}
+
+#[test]
+fn branch_mutating_set_upstream_other_branch_records_operation() {
+    // G28 / pre-BRL-01 drift regression: when HEAD already tracks origin/main,
+    // `-u origin/main other` must still record — target is `other`, not HEAD.
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+            repo.path(),
+        ),
+        "remote add origin",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "other"], repo.path()),
+        "create other",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-u", "origin/main"], repo.path()),
+        "set current upstream to origin/main",
+    );
+    assert_branch_mutating_records_one_operation(
+        repo.path(),
+        &["branch", "-u", "origin/main", "other"],
+    );
+}
+
+#[test]
+fn branch_mutating_unset_upstream_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "upstream-tip"], repo.path()),
+        "create upstream-tip",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-u", "upstream-tip"], repo.path()),
+        "set upstream",
+    );
+    assert_branch_mutating_records_one_operation(repo.path(), &["branch", "--unset-upstream"]);
+}
+
+#[test]
+fn branch_mutating_edit_description_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    let editor = repo.path().join("fake-editor.sh");
+    std::fs::write(&editor, "#!/bin/sh\nprintf 'desc from test\\n' > \"$1\"\n")
+        .expect("write editor");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&editor).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&editor, perms).unwrap();
+    }
+    let before = branch_op_total(repo.path());
+    let output = run_libra_command_with_env(
+        &["branch", "--edit-description"],
+        repo.path(),
+        &[("GIT_EDITOR", editor.to_str().unwrap())],
+    );
+    assert_cli_success(&output, "edit-description");
+    assert_eq!(
+        branch_op_total(repo.path()),
+        before + 1,
+        "edit-description must record an operation"
+    );
+}
+
+#[test]
+fn branch_mutating_reset_records_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature",
+    );
+    let head = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head, "rev-parse");
+    let oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_branch_mutating_records_one_operation(
+        repo.path(),
+        &["branch", "reset", "feature", &oid],
+    );
+}

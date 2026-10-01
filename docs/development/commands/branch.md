@@ -18,6 +18,22 @@
 - 源码意图：源码模块注释说明该命令由 `run_branch` 分发到创建、删除、列表、重命名和上游跟踪 helper，并把 branch store 错误映射为命令级错误。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；核心领域逻辑集中在 `set_upstream_safe`、`create_branch_safe`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
 
+### BranchMode 与 operation 只读分类（ADR-BRL-01 / #574）
+
+- `BranchMode`（`src/command/branch.rs`）是 `execute_safe` / `run_branch` 与
+  `operation_class_for_command` 共用的模式判定：`Diff` / `Reset` / `SetUpstream`
+  / `Create` / `DeleteForce` / `DeleteSafe` / `ShowCurrent` / `UnsetUpstream` /
+  `EditDescription` / `Rename` / `Copy` / `CopyForce` / `List`。
+- `BranchMode::is_read_only()` 为真当且仅当 `ShowCurrent`、`List`，或
+  `SetUpstream { idempotent: true }`。
+- `resolve_branch_mode` / `branch_is_read_only_query` 对 `-u` 的目标分支与
+  `run_branch` 同源：`new_branch` 存在时用它，否则用当前 HEAD 分支；detached
+  且无 `new_branch` 时不视为幂等。这修正了旧 `set_upstream_is_idempotent`
+  只读 `Head::current()`、在「当前分支已跟踪同一 upstream」时误把
+  `-u <upstream> <他分支>` 判为只读的漂移。
+- `cli.rs` 仅调用 `branch_is_read_only_query`；`command_scope` 仍为
+  `Repository`（ADR-BRL-01：不调整 lease）。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid

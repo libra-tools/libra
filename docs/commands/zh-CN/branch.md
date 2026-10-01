@@ -27,6 +27,8 @@ libra branch --show-current
 
 `--contains` 和 `--no-contains` 过滤器（别名为 `--with` 和 `--without`）可将分支列表缩小到历史中包含或不包含某个提交的分支；省略提交参数时默认为 HEAD。`--points-at <object>` 只列出 tip 等于解析后提交的分支；附注标签名和完整 `refs/tags/...` 名会递归剥离到目标提交。`--merged [<commit>]` / `--no-merged [<commit>]` 列出已合并（或尚未合并）入某提交的分支——即 tip 是否可从该提交到达，缺省 HEAD，是 `--contains` 的反方向。`--sort <key>` 按 `refname`、`version:refname`（数值感知）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序，前导 `-` 反转。未传该标志时，Git 兼容的 `branch.sort` 配置默认生效（严格 local → global → system 级联；无效值在任何列表输出前以 `LBR-CLI-002` fail-closed，local/global 读取失败为 `LBR-IO-001`——例外：schema 比二进制新的全局配置库会在一次性警告后被跳过，见 `LBR-CONFIG-001`）。与标志不同，配置默认既不隐含 `--list` 也不抑制 unborn-HEAD 行，与 Git 一致。已记录收窄：Git 会把重复的 `branch.sort` 值叠成多键排序；Libra 只应用胜出 scope 的最后一个值。`--ignore-case` 仍按折叠后的名称排序。
 
+branch 的**查询**形态（裸列表、`-l`/`-r`/`-a`、`--show-current`、`-v`、`--contains`/`--merged`/`--sort`/`--format`/`--column` 等列表过滤，以及已配置且幂等的 `-u`）**不会**写入 Operation v2 记录，因此不再出现在 `libra op log` 中。写入形态（创建、删除、重命名、复制、非幂等 `-u`、`--unset-upstream`、`--edit-description`、`branch reset` 等）仍各记录一笔 operation。
+
 ## 选项
 
 | 标志 | 长选项 | 值 | 说明 |

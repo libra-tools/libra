@@ -69,6 +69,16 @@ Unknown classifications fail closed; read-only commands and internal workers
 do not create operations. Agent shell and external VCS tools must provide
 verified before/after evidence before they can be admitted.
 
+### Branch read-only census (ADR-BRL-01 / #574)
+
+`operation_class_for_command` treats a `Commands::Branch` invocation as
+`MutationClass::ReadOnly` when `command::branch::branch_is_read_only_query`
+is true. That predicate shares `BranchMode` with `run_branch` (see
+`docs/development/commands/branch.md`): list / `--show-current` / list filters
+and an already-configured idempotent `-u` (target = `new_branch` when present,
+else HEAD) skip Operation v2 persistence. `command_scope` remains
+`Repository` — only the operation class changes (ADR-BRL-01).
+
 ### Request context and scope lease
 
 `run_with_operation` binds a fresh operation-local request slot around the whole

@@ -1457,29 +1457,164 @@ async fn set_upstream_impl(
     Ok(SetUpstreamOutcome::Written { local })
 }
 
-/// An already configured upstream is a read-only branch invocation.  Keeping
-/// this small preflight outside the v2 mutation boundary preserves the
-/// idempotent path even when the repository database is read-only.
-pub(crate) async fn set_upstream_is_idempotent(args: &BranchArgs) -> bool {
-    let Some(upstream) = args.set_upstream_to.as_deref() else {
-        return false;
-    };
+/// Structural mode of a parsed `branch` invocation, shared by the CLI
+/// operation census and [`run_branch`] so classification cannot drift from
+/// dispatch (ADR-BRL-01 / issue #574).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchMode {
+    Diff,
+    Reset,
+    /// `-u` / `--set-upstream-to`. `branch` is the target local branch
+    /// (`new_branch` when present, otherwise the current HEAD branch name
+    /// when known). `idempotent` is true when that branch already tracks
+    /// `upstream` — a read-only no-op that must not enter the write boundary.
+    SetUpstream {
+        branch: Option<String>,
+        upstream: String,
+        idempotent: bool,
+    },
+    Create,
+    DeleteForce,
+    DeleteSafe,
+    ShowCurrent,
+    UnsetUpstream,
+    EditDescription,
+    Rename,
+    Copy,
+    CopyForce,
+    /// Default list / query fallthrough (`-l`/`-r`/`-a`/filters/`--format`/…).
+    List,
+}
+
+impl BranchMode {
+    /// Whether this mode must skip Operation v2 persistence.
+    pub(crate) fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::ShowCurrent
+                | Self::List
+                | Self::SetUpstream {
+                    idempotent: true,
+                    ..
+                }
+        )
+    }
+}
+
+/// Sync structural classification (no DB). Used by unit tables; `SetUpstream`
+/// always reports `idempotent: false` here — the async resolver fills that in.
+pub(crate) fn branch_mode_structural(args: &BranchArgs) -> BranchMode {
+    if args.subcommand.is_some() {
+        return match args.subcommand.as_ref() {
+            Some(BranchSubcommand::Diff(_)) => BranchMode::Diff,
+            Some(BranchSubcommand::Reset(_)) => BranchMode::Reset,
+            None => unreachable!("checked is_some"),
+        };
+    }
+    if let Some(upstream) = args.set_upstream_to.clone() {
+        return BranchMode::SetUpstream {
+            branch: args.new_branch.clone(),
+            upstream,
+            idempotent: false,
+        };
+    }
+    if args.new_branch.is_some() {
+        return BranchMode::Create;
+    }
+    if args.delete.is_some() {
+        return BranchMode::DeleteForce;
+    }
+    if args.delete_safe.is_some() {
+        return BranchMode::DeleteSafe;
+    }
+    if args.show_current {
+        return BranchMode::ShowCurrent;
+    }
+    if args.unset_upstream.is_some() {
+        return BranchMode::UnsetUpstream;
+    }
+    if args.edit_description.is_some() {
+        return BranchMode::EditDescription;
+    }
+    if !args.rename.is_empty() {
+        return BranchMode::Rename;
+    }
+    if !args.copy.is_empty() {
+        return BranchMode::Copy;
+    }
+    if !args.copy_force.is_empty() {
+        return BranchMode::CopyForce;
+    }
+    BranchMode::List
+}
+
+async fn upstream_matches_configured(branch: &str, upstream: &str) -> bool {
     let Some((remote, remote_branch)) = upstream.split_once('/') else {
         return false;
     };
     if remote.is_empty() || remote_branch.is_empty() {
         return false;
     }
-    let branch = match Head::current().await {
-        Head::Branch(name) => name,
-        Head::Detached(_) => return false,
-    };
     let database = get_db_conn_instance().await;
-    let config = match ConfigKv::branch_config_with_conn(&database, &branch).await {
+    let config = match ConfigKv::branch_config_with_conn(&database, branch).await {
         Ok(config) => config,
         Err(_) => return false,
     };
     config.is_some_and(|config| config.remote == remote && config.merge == remote_branch)
+}
+
+/// Resolve the mode used by both census and dispatch, including the
+/// idempotent `-u` check against the **same** target branch `run_branch` uses
+/// (`new_branch` when present, else current HEAD branch).
+pub(crate) async fn resolve_branch_mode(args: &BranchArgs) -> BranchMode {
+    let mut mode = branch_mode_structural(args);
+    if let BranchMode::SetUpstream {
+        branch,
+        upstream,
+        idempotent: _,
+    } = &mode
+    {
+        let target = match branch {
+            Some(name) => Some(name.clone()),
+            None => match Head::current().await {
+                Head::Branch(name) => Some(name),
+                Head::Detached(_) => None,
+            },
+        };
+        let idempotent = match &target {
+            Some(name) => upstream_matches_configured(name, upstream).await,
+            None => false,
+        };
+        mode = BranchMode::SetUpstream {
+            branch: target,
+            upstream: upstream.clone(),
+            idempotent,
+        };
+    }
+    mode
+}
+
+/// Census predicate: true when the invocation must be `MutationClass::ReadOnly`.
+pub(crate) async fn branch_is_read_only_query(args: &BranchArgs) -> bool {
+    resolve_branch_mode(args).await.is_read_only()
+}
+
+/// An already configured upstream is a read-only branch invocation.  Keeping
+/// this small preflight outside the v2 mutation boundary preserves the
+/// idempotent path even when the repository database is read-only.
+///
+/// Target branch matches [`run_branch`]: `new_branch` when present, else HEAD.
+/// Prefer [`branch_is_read_only_query`] for census; this remains for focused
+/// upstream-idempotency assertions.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn set_upstream_is_idempotent(args: &BranchArgs) -> bool {
+    matches!(
+        resolve_branch_mode(args).await,
+        BranchMode::SetUpstream {
+            idempotent: true,
+            ..
+        }
+    )
 }
 
 async fn unset_upstream_impl(branch: &str) -> Result<(), BranchError> {
@@ -2296,79 +2431,102 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
 async fn run_branch(args: &BranchArgs) -> Result<BranchOutput, BranchError> {
     require_repo().map_err(|_| BranchError::NotInRepo)?;
 
-    if let Some(upstream) = args.set_upstream_to.as_deref() {
-        if args.commit_hash.is_some() {
-            return Err(BranchError::TooManyUpstreamArgs);
+    // Shared with `branch_is_read_only_query` so census and dispatch agree.
+    match resolve_branch_mode(args).await {
+        BranchMode::Diff | BranchMode::Reset => {
+            // Subcommands are handled in `execute_safe` before `run_branch`.
+            unreachable!("branch subcommands must not reach run_branch");
         }
-        let branch = match args.new_branch.as_deref() {
-            Some(name) => name.to_string(),
-            None => match Head::current().await {
-                Head::Branch(name) => name,
-                Head::Detached(_) => return Err(detached_head_branch_error()),
-            },
-        };
-        match set_upstream_impl(&branch, upstream).await? {
-            SetUpstreamOutcome::Written { local } => Ok(BranchOutput::SetUpstream {
-                branch,
-                upstream: upstream.to_string(),
-                local,
-            }),
-            SetUpstreamOutcome::Unchanged => Ok(BranchOutput::SetUpstreamUnchanged { branch }),
+        BranchMode::SetUpstream {
+            branch,
+            upstream,
+            idempotent: _,
+        } => {
+            if args.commit_hash.is_some() {
+                return Err(BranchError::TooManyUpstreamArgs);
+            }
+            let branch = match branch {
+                Some(name) => name,
+                None => match Head::current().await {
+                    Head::Branch(name) => name,
+                    Head::Detached(_) => return Err(detached_head_branch_error()),
+                },
+            };
+            match set_upstream_impl(&branch, &upstream).await? {
+                SetUpstreamOutcome::Written { local } => Ok(BranchOutput::SetUpstream {
+                    branch,
+                    upstream,
+                    local,
+                }),
+                SetUpstreamOutcome::Unchanged => Ok(BranchOutput::SetUpstreamUnchanged { branch }),
+            }
         }
-    } else if let Some(new_branch) = args.new_branch.clone() {
-        create_branch_with_optional_track(new_branch, args).await
-    } else if let Some(branch_to_delete) = args.delete.clone() {
-        delete_branch_impl(branch_to_delete, true).await
-    } else if let Some(branch_to_delete) = args.delete_safe.clone() {
-        delete_branch_impl(branch_to_delete, false).await
-    } else if args.show_current {
-        let head = Head::current().await;
-        let output = match head {
-            Head::Branch(name) => BranchOutput::ShowCurrent {
-                name: Some(name),
-                detached: false,
-                commit: Head::current_commit_result()
-                    .await
-                    .map_err(map_head_commit_store_error)?
-                    .map(|hash| hash.to_string()),
-            },
-            Head::Detached(hash) => BranchOutput::ShowCurrent {
-                name: None,
-                detached: true,
-                commit: Some(hash.to_string()),
-            },
-        };
-        Ok(output)
-    } else if let Some(branch) = args.unset_upstream.as_deref() {
-        let branch = if branch.is_empty() {
-            match Head::current().await {
-                Head::Branch(name) => name,
-                Head::Detached(_) => return Err(detached_head_branch_error()),
-            }
-        } else {
-            branch.to_string()
-        };
-        unset_upstream_impl(&branch).await?;
-        Ok(BranchOutput::UnsetUpstream { branch })
-    } else if let Some(branch) = args.edit_description.as_deref() {
-        let branch = if branch.is_empty() {
-            match Head::current().await {
-                Head::Branch(name) => name,
-                Head::Detached(_) => return Err(detached_head_branch_error()),
-            }
-        } else {
-            branch.to_string()
-        };
-        let set = edit_description_impl(&branch).await?;
-        Ok(BranchOutput::EditDescription { branch, set })
-    } else if !args.rename.is_empty() {
-        rename_branch_impl(&args.rename).await
-    } else if !args.copy.is_empty() {
-        copy_branch_impl(&args.copy, false).await
-    } else if !args.copy_force.is_empty() {
-        copy_branch_impl(&args.copy_force, true).await
-    } else {
-        collect_branch_output(args).await
+        BranchMode::Create => {
+            let new_branch = args
+                .new_branch
+                .clone()
+                .expect("Create mode requires new_branch");
+            create_branch_with_optional_track(new_branch, args).await
+        }
+        BranchMode::DeleteForce => {
+            let branch_to_delete = args
+                .delete
+                .clone()
+                .expect("DeleteForce mode requires delete");
+            delete_branch_impl(branch_to_delete, true).await
+        }
+        BranchMode::DeleteSafe => {
+            let branch_to_delete = args
+                .delete_safe
+                .clone()
+                .expect("DeleteSafe mode requires delete_safe");
+            delete_branch_impl(branch_to_delete, false).await
+        }
+        BranchMode::ShowCurrent => {
+            let head = Head::current().await;
+            let output = match head {
+                Head::Branch(name) => BranchOutput::ShowCurrent {
+                    name: Some(name),
+                    detached: false,
+                    commit: Head::current_commit_result()
+                        .await
+                        .map_err(map_head_commit_store_error)?
+                        .map(|hash| hash.to_string()),
+                },
+                Head::Detached(hash) => BranchOutput::ShowCurrent {
+                    name: None,
+                    detached: true,
+                    commit: Some(hash.to_string()),
+                },
+            };
+            Ok(output)
+        }
+        BranchMode::UnsetUpstream => {
+            let branch = match args.unset_upstream.as_deref() {
+                Some("") | None => match Head::current().await {
+                    Head::Branch(name) => name,
+                    Head::Detached(_) => return Err(detached_head_branch_error()),
+                },
+                Some(branch) => branch.to_string(),
+            };
+            unset_upstream_impl(&branch).await?;
+            Ok(BranchOutput::UnsetUpstream { branch })
+        }
+        BranchMode::EditDescription => {
+            let branch = match args.edit_description.as_deref() {
+                Some("") | None => match Head::current().await {
+                    Head::Branch(name) => name,
+                    Head::Detached(_) => return Err(detached_head_branch_error()),
+                },
+                Some(branch) => branch.to_string(),
+            };
+            let set = edit_description_impl(&branch).await?;
+            Ok(BranchOutput::EditDescription { branch, set })
+        }
+        BranchMode::Rename => rename_branch_impl(&args.rename).await,
+        BranchMode::Copy => copy_branch_impl(&args.copy, false).await,
+        BranchMode::CopyForce => copy_branch_impl(&args.copy_force, true).await,
+        BranchMode::List => collect_branch_output(args).await,
     }
 }
 
@@ -3236,17 +3394,151 @@ mod tests {
     use serial_test::serial;
 
     use super::{
-        Branch, BranchArgs, BranchError, BranchListEntry, BranchListMode, ResolvedUpstream,
-        clean_branch_description, commit_contains, format_branch_name, format_list_name_column,
-        format_upstream_ref, is_remote_head_symlink, list_name_column_width,
-        load_remote_branches_with_conn, map_head_commit_store_error,
-        remote_head_symlink_plain_name, resolve_upstream_spec, set_upstream_impl,
-        sort_entries_default_refname,
+        Branch, BranchArgs, BranchError, BranchListEntry, BranchListMode, BranchMode,
+        ResolvedUpstream, branch_mode_structural, clean_branch_description, commit_contains,
+        format_branch_name, format_list_name_column, format_upstream_ref, is_remote_head_symlink,
+        list_name_column_width, load_remote_branches_with_conn, map_head_commit_store_error,
+        remote_head_symlink_plain_name, resolve_branch_mode, resolve_upstream_spec,
+        set_upstream_impl, set_upstream_is_idempotent, sort_entries_default_refname,
     };
     use crate::utils::{
         error::{CliError, StableErrorCode},
         test,
     };
+
+    #[tokio::test]
+    #[serial(cwd)]
+    async fn branch_mode_classification_table() {
+        // Structural table: every action field / subcommand variant maps to a
+        // single BranchMode shared with run_branch (ADR-BRL-01).
+        let cases: &[(&[&str], BranchMode, bool)] = &[
+            (&["branch"], BranchMode::List, true),
+            (&["branch", "-l"], BranchMode::List, true),
+            (&["branch", "-r"], BranchMode::List, true),
+            (&["branch", "-a"], BranchMode::List, true),
+            (&["branch", "-v"], BranchMode::List, true),
+            (&["branch", "--show-current"], BranchMode::ShowCurrent, true),
+            (&["branch", "--contains", "HEAD"], BranchMode::List, true),
+            (&["branch", "--no-contains", "HEAD"], BranchMode::List, true),
+            (&["branch", "--merged", "HEAD"], BranchMode::List, true),
+            (&["branch", "--no-merged", "HEAD"], BranchMode::List, true),
+            (&["branch", "--points-at", "HEAD"], BranchMode::List, true),
+            (&["branch", "--sort=-committerdate"], BranchMode::List, true),
+            (&["branch", "--format=%(refname)"], BranchMode::List, true),
+            (&["branch", "--column=always"], BranchMode::List, true),
+            (&["branch", "--no-column"], BranchMode::List, true),
+            (&["branch", "--ignore-case"], BranchMode::List, true),
+            (&["branch", "feature"], BranchMode::Create, false),
+            (&["branch", "-d", "feature"], BranchMode::DeleteSafe, false),
+            (&["branch", "-D", "feature"], BranchMode::DeleteForce, false),
+            (&["branch", "-m", "old", "new"], BranchMode::Rename, false),
+            (&["branch", "-c", "old", "new"], BranchMode::Copy, false),
+            (
+                &["branch", "-C", "old", "new"],
+                BranchMode::CopyForce,
+                false,
+            ),
+            (
+                &["branch", "-u", "origin/main"],
+                BranchMode::SetUpstream {
+                    branch: None,
+                    upstream: "origin/main".to_string(),
+                    idempotent: false,
+                },
+                false,
+            ),
+            (
+                &["branch", "-u", "origin/main", "other"],
+                BranchMode::SetUpstream {
+                    branch: Some("other".to_string()),
+                    upstream: "origin/main".to_string(),
+                    idempotent: false,
+                },
+                false,
+            ),
+            (
+                &["branch", "--unset-upstream"],
+                BranchMode::UnsetUpstream,
+                false,
+            ),
+            (
+                &["branch", "--edit-description"],
+                BranchMode::EditDescription,
+                false,
+            ),
+            (&["branch", "diff", "main"], BranchMode::Diff, false),
+            (
+                &["branch", "reset", "feature", "main"],
+                BranchMode::Reset,
+                false,
+            ),
+        ];
+
+        for (argv, expected_mode, expected_ro) in cases {
+            let args = BranchArgs::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {:?}: {e}", argv);
+            });
+            let mode = branch_mode_structural(&args);
+            assert_eq!(mode, *expected_mode, "mode for {argv:?}");
+            assert_eq!(
+                mode.is_read_only(),
+                *expected_ro,
+                "is_read_only for {argv:?}"
+            );
+        }
+
+        // Idempotent `-u` target-branch resolution (same source as run_branch):
+        // HEAD already tracking origin/main must not make `-u origin/main other`
+        // read-only.
+        let repo = tempfile::tempdir().expect("temp repo");
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        crate::command::commit::execute(crate::command::commit::CommitArgs {
+            message: Some("base".to_string()),
+            allow_empty: true,
+            disable_pre: true,
+            no_verify: true,
+            ..Default::default()
+        })
+        .await;
+
+        let current = match crate::internal::head::Head::current().await {
+            crate::internal::head::Head::Branch(name) => name,
+            crate::internal::head::Head::Detached(_) => panic!("expected a named branch"),
+        };
+
+        crate::internal::config::ConfigKv::set(
+            &format!("branch.{current}.remote"),
+            "origin",
+            false,
+        )
+        .await
+        .expect("set remote");
+        crate::internal::config::ConfigKv::set(&format!("branch.{current}.merge"), "main", false)
+            .await
+            .expect("set merge");
+
+        let other_args =
+            BranchArgs::try_parse_from(["branch", "-u", "origin/main", "other"]).unwrap();
+        let other_mode = resolve_branch_mode(&other_args).await;
+        assert!(
+            !other_mode.is_read_only(),
+            "other-branch -u must remain RepoMutation even when HEAD matches: {other_mode:?}"
+        );
+        assert!(
+            !set_upstream_is_idempotent(&other_args).await,
+            "other branch must not inherit HEAD idempotency"
+        );
+
+        let same_args = BranchArgs::try_parse_from(["branch", "-u", "origin/main"]).unwrap();
+        let same_mode = resolve_branch_mode(&same_args).await;
+        assert!(
+            same_mode.is_read_only(),
+            "current-branch matching upstream is read-only: {same_mode:?}"
+        );
+        assert!(set_upstream_is_idempotent(&same_args).await);
+    }
 
     #[test]
     fn clean_branch_description_uses_stripspace_semantics() {

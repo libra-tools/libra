@@ -2048,7 +2048,9 @@ async fn operation_class_for_command(
     }
     match command {
         Commands::Config(args) if config_command_is_read_only(args) => MutationClass::ReadOnly,
-        Commands::Branch(args) if command::branch::set_upstream_is_idempotent(args).await => {
+        // ADR-BRL-01 / #574: branch list / show-current / filter queries and
+        // idempotent `-u` share `BranchMode` with `run_branch`.
+        Commands::Branch(args) if command::branch::branch_is_read_only_query(args).await => {
             MutationClass::ReadOnly
         }
         Commands::Agent(args) if agent_command_is_read_only(args) => MutationClass::ReadOnly,
@@ -3759,6 +3761,156 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[tokio::test]
+    #[serial(cwd)]
+    async fn operation_class_for_command_branch_matrix() {
+        use crate::{internal::operation::MutationClass, utils::test};
+
+        let repo = tempfile::tempdir().expect("temp repo");
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        crate::command::commit::execute(crate::command::commit::CommitArgs {
+            message: Some("base".to_string()),
+            allow_empty: true,
+            disable_pre: true,
+            no_verify: true,
+            ..Default::default()
+        })
+        .await;
+
+        let current = match crate::internal::head::Head::current().await {
+            crate::internal::head::Head::Branch(name) => name,
+            crate::internal::head::Head::Detached(_) => panic!("expected a named branch"),
+        };
+        crate::internal::config::ConfigKv::set(
+            &format!("branch.{current}.remote"),
+            "origin",
+            false,
+        )
+        .await
+        .expect("set remote");
+        crate::internal::config::ConfigKv::set(&format!("branch.{current}.merge"), "main", false)
+            .await
+            .expect("set merge");
+        crate::internal::branch::Branch::update_branch(
+            "other",
+            &{
+                crate::internal::head::Head::current_commit()
+                    .await
+                    .expect("HEAD commit")
+                    .to_string()
+            },
+            None,
+        )
+        .await
+        .expect("create other");
+
+        let cases: &[(&[&str], MutationClass)] = &[
+            (&["libra", "branch"], MutationClass::ReadOnly),
+            (&["libra", "branch", "-l"], MutationClass::ReadOnly),
+            (&["libra", "branch", "-r"], MutationClass::ReadOnly),
+            (&["libra", "branch", "-a"], MutationClass::ReadOnly),
+            (&["libra", "branch", "-v"], MutationClass::ReadOnly),
+            (
+                &["libra", "branch", "--show-current"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--contains", "HEAD"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--no-contains", "HEAD"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--merged", "HEAD"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--no-merged", "HEAD"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--points-at", "HEAD"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--sort=-committerdate"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--format=%(refname)"],
+                MutationClass::ReadOnly,
+            ),
+            (
+                &["libra", "branch", "--column=always"],
+                MutationClass::ReadOnly,
+            ),
+            (&["libra", "branch", "--no-column"], MutationClass::ReadOnly),
+            (
+                &["libra", "branch", "--ignore-case"],
+                MutationClass::ReadOnly,
+            ),
+            // Idempotent `-u` on current branch (already tracks origin/main).
+            (
+                &["libra", "branch", "-u", "origin/main"],
+                MutationClass::ReadOnly,
+            ),
+            // Same upstream against another branch remains a mutation (drift fix).
+            (
+                &["libra", "branch", "-u", "origin/main", "other"],
+                MutationClass::RepoMutation,
+            ),
+            (&["libra", "branch", "feature"], MutationClass::RepoMutation),
+            (
+                &["libra", "branch", "-d", "feature"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "-D", "feature"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "-m", "a", "b"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "-c", "a", "b"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "-C", "a", "b"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "--unset-upstream"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "--edit-description"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "diff", "main"],
+                MutationClass::RepoMutation,
+            ),
+            (
+                &["libra", "branch", "reset", "feature", "HEAD"],
+                MutationClass::RepoMutation,
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {:?}: {e}", argv);
+            });
+            let got = operation_class_for_command(&cli.command).await;
+            assert_eq!(got, *expected, "operation class for {argv:?}");
+        }
+    }
 
     /// WT-08 (ADR-WT-06): an omitted `stash` subcommand is rewritten to
     /// `stash push`; known subcommands and other commands are untouched.
