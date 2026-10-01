@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-01 10:47:33 UTC（本时刻：issues/574 BRL-01/02 done；BRL-03 in-progress/remote-pending v0.30.11 PR #588；网站 cf@961ea3f；DEFER-BRL-03 仍挂。）
+> **当前快照：** 2026-10-01 11:03:44 UTC（issues/574 保留双评审通过的 BRL-01..05 计划；已并入 origin/main #585。BRL-01/02 done；BRL-03 in-progress/remote-pending v0.30.11 PR #588；#585 改写的 QP 窄范围稿不取代本卡。DEFER-BRL-03 仍挂。）
 
 ---
 
@@ -426,3 +426,4 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 日期计划：`plan-20260708`、`plan-20260713`、`plan-20260714`、`plan-20260715`（历史完成、Code 产品面已拆除）、`plan-20260818`、`plan-20260821`、`plan-20260824`（历史完成、Code 产品面已拆除）、`plan-20260825`（历史完成、PS 产品轴已拆除；TA 测试轴保留历史）、`plan-20260827`、`plan-20260901`、`plan-20260910`、`plan-20260917`、`plan-20260920`。
 
 Issue 计划：`issues/477`（31 卡，v0.22.49）、`issues/486`（AB-01，v0.22.31）。各自完成判据见对应计划文件。
+
