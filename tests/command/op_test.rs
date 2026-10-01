@@ -1576,3 +1576,264 @@ fn branch_mutating_reset_records_operation() {
         &["branch", "reset", "feature", &oid],
     );
 }
+
+// ---------------------------------------------------------------------------
+// BRL-02 (#574): tag / remote / reflog / notes query forms must not record
+// Operation v2 entries. Mutating forms still record exactly one.
+// ---------------------------------------------------------------------------
+
+fn repository_op_total(repo: &Path, command: &str) -> u64 {
+    run_json_op(repo, &["log", "-n", "50", "--command", command])["data"]["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{command} op total"))
+}
+
+fn assert_repository_query_records_no_operation(repo: &Path, command: &str, args: &[&str]) {
+    let before = repository_op_total(repo, command);
+    let output = run_libra_command(args, repo);
+    assert_cli_success(&output, &format!("{command} query {args:?}"));
+    assert_eq!(
+        repository_op_total(repo, command),
+        before,
+        "query {args:?} must not record an operation"
+    );
+}
+
+/// Point `origin` at this repository so offline and local-discovery remote
+/// queries have a configured remote without leaving the machine.
+fn add_self_as_origin(repo: &Path) {
+    let url = repo.to_str().expect("repo path is utf-8");
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", url], repo),
+        "remote add origin",
+    );
+}
+
+#[test]
+fn repository_query_tag_bare_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag"]);
+}
+
+#[test]
+fn repository_query_tag_l_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "-l"]);
+}
+
+#[test]
+fn repository_query_tag_n_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    // clap requires the line count; bare `tag -n` is a usage error.
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "-n", "1"]);
+}
+
+#[test]
+fn repository_query_tag_contains_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--contains", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_tag_no_contains_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--no-contains", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_tag_points_at_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--points-at", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_tag_merged_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "--merged", "HEAD"]);
+}
+
+#[test]
+fn repository_query_tag_no_merged_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--no-merged", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_tag_sort_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--sort=creatordate"],
+    );
+}
+
+#[test]
+fn repository_query_tag_column_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "--column=always"]);
+}
+
+#[test]
+fn repository_query_tag_no_column_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "--no-column"]);
+}
+
+#[test]
+fn repository_query_tag_no_column_with_pattern_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "tag",
+        &["tag", "--no-column", "v1.*"],
+    );
+}
+
+#[test]
+fn repository_query_tag_verify_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-s", "-m", "signed", "v1.0"], repo.path()),
+        "create signed tag",
+    );
+    assert_repository_query_records_no_operation(repo.path(), "tag", &["tag", "--verify", "v1.0"]);
+}
+
+#[test]
+fn repository_query_remote_v_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "remote", &["remote", "-v"]);
+}
+
+#[test]
+fn repository_query_remote_get_url_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "remote",
+        &["remote", "get-url", "origin"],
+    );
+}
+
+#[test]
+fn repository_query_remote_show_no_query_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "remote",
+        &["remote", "show", "--no-query", "origin"],
+    );
+}
+
+#[test]
+fn repository_query_remote_prune_dry_run_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "remote",
+        &["remote", "prune", "--dry-run", "origin"],
+    );
+}
+
+/// G21: `remote show origin` (network/local query) is ReadOnly per the
+/// 2026-10-01 audit. A self-remote keeps the query on this machine.
+#[test]
+fn repository_show_query_classification_matches_audit() {
+    let repo = create_committed_repo_via_cli();
+    add_self_as_origin(repo.path());
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "remote",
+        &["remote", "show", "origin"],
+    );
+}
+
+#[test]
+fn repository_query_reflog_show_bare_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "reflog", &["reflog"]);
+}
+
+#[test]
+fn repository_query_reflog_show_explicit_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "reflog",
+        &["reflog", "show", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_reflog_exists_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "reflog",
+        &["reflog", "exists", "HEAD"],
+    );
+}
+
+#[test]
+fn repository_query_reflog_expire_dry_run_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    // Bare `expire --dry-run` exits 128 ("no reflog specified"). `--all` is the
+    // successful dry-run of the same read-only mode.
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "reflog",
+        &["reflog", "expire", "--all", "--dry-run"],
+    );
+}
+
+#[test]
+fn repository_query_notes_list_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "notes", &["notes", "list"]);
+}
+
+#[test]
+fn repository_query_notes_show_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "hello"], repo.path()),
+        "notes add",
+    );
+    assert_repository_query_records_no_operation(repo.path(), "notes", &["notes", "show", "HEAD"]);
+}
+
+#[test]
+fn repository_query_notes_get_ref_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(repo.path(), "notes", &["notes", "get-ref"]);
+}
+
+#[test]
+fn repository_query_notes_prune_dry_run_records_no_operation() {
+    let repo = create_committed_repo_via_cli();
+    assert_repository_query_records_no_operation(
+        repo.path(),
+        "notes",
+        &["notes", "prune", "--dry-run"],
+    );
+}
