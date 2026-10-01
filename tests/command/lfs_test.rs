@@ -13,6 +13,11 @@ use serde_json::json;
 use tempfile::TempDir;
 
 /// Build a `Command` for the Libra binary with an isolated HOME.
+///
+/// Clears `LIBRA_READ_POLICY` so an ambient `offline`/`local` from the host
+/// shell (common when debugging tiered storage) cannot skip `lfs.lockEnforce`
+/// verification — that produced false T-1 failures under BRL-05 that focused
+/// runs without the polluted env did not reproduce.
 fn libra_command(cwd: &Path) -> Command {
     let home = cwd.join(".libra-test-home");
     let config_home = home.join(".config");
@@ -22,7 +27,8 @@ fn libra_command(cwd: &Path) -> Command {
     cmd.current_dir(cwd)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home)
-        .env("USERPROFILE", &home);
+        .env("USERPROFILE", &home)
+        .env_remove("LIBRA_READ_POLICY");
     cmd
 }
 

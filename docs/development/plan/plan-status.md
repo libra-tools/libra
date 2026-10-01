@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-01 16:07:24 UTC（issues/574：BRL-01..04 done/complete（v0.30.9..v0.30.12，release 36879702000 8/8）；BRL-05 in-progress/remote-pending v0.30.13 PR #590；T-1 8440 pass／18 fail＝DEFER-BRL-03＋codex＋4 LFS lock_enforce；DEFER-BRL-03 仍挂。）
+> **当前快照：** 2026-10-01 16:30:57 UTC（issues/574：BRL-01..04 done/complete；BRL-05 in-progress/remote-pending v0.30.13 PR #590；T-1 4× lock_enforce = ambient LIBRA_READ_POLICY isolation hole，FIX in lfs_test libra_command；DEFER-BRL-03 仍挂。）
 
 ---
 
