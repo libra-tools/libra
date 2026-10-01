@@ -402,20 +402,18 @@ pub(crate) fn verified_index_entry(
     Ok(entry)
 }
 
-/// Whether an entry's volatile stat triple equals `metadata`'s. Mirrors
-/// the comparison `status` performs (`index_stat_differs`), so a pairing
-/// this returns `true` for is exactly one status would trust.
+/// Whether an entry's volatile stat triple equals `metadata`'s. Adapts
+/// [`fs::Metadata`] into the shared [`crate::utils::stat_diff`] helper so a
+/// pairing this returns `true` for is exactly one status would trust.
 fn entry_stat_matches_metadata(
     entry: &git_internal::internal::index::IndexEntry,
     metadata: &fs::Metadata,
 ) -> bool {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    use git_internal::internal::index::Time;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(unix)]
     fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
-        use std::os::unix::fs::MetadataExt;
+        use std::{os::unix::fs::MetadataExt, time::Duration};
 
         fn at(seconds: i64, nanos: i64) -> SystemTime {
             if seconds < 0 {
@@ -434,7 +432,6 @@ fn entry_stat_matches_metadata(
     }
     #[cfg(not(unix))]
     fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
-        let _ = Duration::from_secs(0);
         (
             metadata
                 .created()
@@ -447,13 +444,8 @@ fn entry_stat_matches_metadata(
         )
     }
 
-    let Ok(size) = u32::try_from(metadata.len()) else {
-        return false;
-    };
     let (ctime, mtime) = stat_times(metadata);
-    entry.size == size
-        && entry.ctime == Time::from_system_time(ctime)
-        && entry.mtime == Time::from_system_time(mtime)
+    crate::utils::stat_diff::entry_stat_matches(entry, ctime, mtime, metadata.len())
 }
 
 #[cfg(unix)]

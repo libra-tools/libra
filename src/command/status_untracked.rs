@@ -149,6 +149,29 @@ fn path_to_current_preserving_directory_marker(path: PathBuf) -> PathBuf {
     directory_marker(&relative)
 }
 
+/// Adapt a worker `CapturedStat` into the SystemTime triple the shared
+/// [`crate::utils::stat_diff`] helper compares.
+fn captured_stat_times(
+    metadata: &crate::command::status_io_worker::CapturedStat,
+) -> (std::time::SystemTime, std::time::SystemTime) {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn at(seconds: i64, nanos: i64) -> SystemTime {
+        if seconds < 0 {
+            return UNIX_EPOCH;
+        }
+        let nanos = u32::try_from(nanos)
+            .ok()
+            .filter(|nanos| *nanos < 1_000_000_000)
+            .unwrap_or(0);
+        UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+    }
+    (
+        at(metadata.ctime_sec, metadata.ctime_nsec),
+        at(metadata.mtime_sec, metadata.mtime_nsec),
+    )
+}
+
 /// Whether the index entry's cached stat data disagrees with `metadata`
 /// (the `ctime`/`mtime`/`size` triple `Index::is_modified` compares). A path
 /// missing from the index counts as differing so the caller falls through to
@@ -159,62 +182,17 @@ fn index_stat_differs(
     metadata: &crate::command::status_io_worker::CapturedStat,
     index_file_mtime: Option<std::time::SystemTime>,
 ) -> bool {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    use git_internal::internal::index::Time;
-
-    // Mirrors git-internal's private `index_ctime`/`index_mtime`/
-    // `unix_metadata_time` so the comparison stays byte-identical to
-    // `Index::is_modified`; only the extra stat (and its `unwrap`) is gone.
-    fn stat_times(
-        metadata: &crate::command::status_io_worker::CapturedStat,
-    ) -> (SystemTime, SystemTime) {
-        fn at(seconds: i64, nanos: i64) -> SystemTime {
-            if seconds < 0 {
-                return UNIX_EPOCH;
-            }
-            let nanos = u32::try_from(nanos)
-                .ok()
-                .filter(|nanos| *nanos < 1_000_000_000)
-                .unwrap_or(0);
-            UNIX_EPOCH + Duration::new(seconds as u64, nanos)
-        }
-        (
-            at(metadata.ctime_sec, metadata.ctime_nsec),
-            at(metadata.mtime_sec, metadata.mtime_nsec),
-        )
-    }
-
     let Some(entry) = index.get(file, 0) else {
         return true;
     };
-    let Ok(stat_size) = u32::try_from(metadata.len()) else {
-        // A >4GiB stat size cannot be represented in the entry; the old
-        // truncating cast could collide with a smaller recorded size —
-        // always content-compare instead (2026-08-06 R0-8 review, the
-        // guarded comparison diff already used).
-        return true;
-    };
-    let (ctime, mtime) = stat_times(metadata);
-    let same = entry.ctime == Time::from_system_time(ctime)
-        && entry.mtime == Time::from_system_time(mtime)
-        && entry.size == stat_size;
-    if same {
-        // Racily-clean guard (Git parity, §B.6.0.1): a matching stat
-        // triple is trustworthy only when the file is strictly OLDER than
-        // the index snapshot itself. An entry written in the same instant
-        // the file changed can pair a post-edit stat with a pre-edit hash
-        // — the 2026-08-06 incident where plain status hid a modified
-        // CHANGELOG.md that diff's stricter shortcut still caught (the
-        // index writers stat AFTER hashing, and a concurrent node shares
-        // this worktree). In the match branch entry.mtime equals the
-        // worktree mtime, so the ordering runs on the worktree SystemTime
-        // (finer precision, conservative direction). An unknown index
-        // mtime never earns trust.
-        let trustworthy = index_file_mtime.is_some_and(|snapshot| mtime < snapshot);
-        return !trustworthy;
-    }
-    true
+    let (ctime, mtime) = captured_stat_times(metadata);
+    crate::utils::stat_diff::index_entry_stat_differs(
+        entry,
+        ctime,
+        mtime,
+        metadata.len(),
+        index_file_mtime,
+    )
 }
 
 fn collect_tracked_worktree_changes(

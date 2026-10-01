@@ -31,6 +31,7 @@ pub(crate) mod preview_scratch;
 pub mod read_policy;
 pub mod redact;
 pub mod resource_limits;
+pub mod stat_diff;
 pub mod storage;
 pub mod storage_ext;
 #[cfg(feature = "otlp")]

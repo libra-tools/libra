@@ -239,6 +239,28 @@ including ABA between checks. Listing may read ignore rules, so it is not
 metadata-only. The original scan deadline does not guarantee a 30-second hard
 limit spanning all capture phases, config prewarming or arbitrary filesystem I/O.
 
+### Snapshot stat short-circuit (ADR-BRL-04 / #574 BRL-05)
+
+For tracked regular files, `WorkspaceSnapshotter` may reuse the index entry
+oid instead of submitting a worker `FileBlobHash` and instead of
+`read_stable_file` / `put_blob` during persist. Every condition below must
+hold; otherwise the path stays on the full hash path (fail-closed):
+
+- stage 0, regular-file mode (not symlink / gitlink), worktree type agrees
+- shared `utils::stat_diff` triple matches (ctime / mtime / size) and is not
+  racily clean versus the index-file mtime (`mtime < index_file_mtime`)
+- no content conversion: `core.autocrlf` is not enabled, and the path has no
+  `text` / `eol` / `filter` / `working-tree-encoding` / `ident` attribute and
+  is not LFS-tracked; if conversion cannot be proven absent, hash
+- the index oid's blob already exists in the local object store
+
+Equivalence is the same trust level as status's index stat-cache, not a
+byte-identity proof. Symlinks, gitlinks, untracked files, and any path that
+fails a condition always hash; a test seam
+(`with_stat_short_circuit(false)`) disables the optimization for A/B
+manifest checks. Non-short-circuit persist retains the
+`oid == expected_oid` safety net.
+
 Command outcome, snapshot completeness, and restore capability are separate.
 Failure may still leave operation/pre-snapshot records, but never authorizes
 opaque nested-content capture. `Full` describes capture completeness within its

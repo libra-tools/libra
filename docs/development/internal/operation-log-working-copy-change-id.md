@@ -794,6 +794,8 @@ impl WorkspaceSnapshotter {
 
 对应 jj `TreeState::snapshot`（`jj/lib/src/local_working_copy.rs:1292-1423`）：jj 用 matcher（sparse × fsmonitor × force_tracking）限定访问范围、通道流式收集 tree entries/file states/untracked/deleted、最后 `MergedTreeBuilder::write_tree`。Libra 的差异点：扫描不重写 working-copy commit，而是（1）把变化文件写入现有 Git blob 并构建 `working_copy_tree_oid`；（2）byte-exact 保存 raw index；（3）HEAD/refs/sparse/sequencer/generation 写入各自 StateFacet；（4）把 facet 清单序列化为 `WorkspaceSnapshotV2` manifest 写入 `ClientStorage`；（5）发布 `ExternalSnapshot` 或 `Command` operation。扫描 I/O 全部走 `WorktreeIo`（从 `src/command/status_io_worker.rs` 抽取），协议带 root-relative capability 与 byte/frame 预算，helper 不持有 ODB/SQLite/refs 写权限。
 
+**pre / post scan 的 stat 短路（ADR-BRL-04）：** Operation middleware 在写命令前后各调用一次 `WorkspaceSnapshotter::capture`。对已追踪、stat 未变、且可证明无内容转换的常规文件，扫描阶段重用 index entry oid（不提交 worker 哈希），持久化阶段跳过 `read_stable_file`／`put_blob`（blob 存在性已在扫描验证）。racy、symlink／gitlink、未追踪、autocrlf／text／eol／filter／ident／LFS、缺 blob 等一律走哈希；未短路路径保留 `oid == expected_oid` 安全网。等价承诺限定于与 status 相同的 index stat-cache 信任等级。
+
 `WorkspaceStatePointer`（`working_copy.rs`）每次入口读取，用于 stale 检测：
 
 ```rust

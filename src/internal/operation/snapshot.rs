@@ -10,8 +10,11 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use git_internal::{
@@ -37,16 +40,22 @@ use super::{
     },
 };
 use crate::{
-    internal::worktree_io::{
-        default_worktree_io,
-        executor::WorktreeIo,
-        protocol::{
-            IoEvent, IoRequest, bytes_to_path, path_to_bytes, relative_worktree_path, unwrap_wire,
+    internal::{
+        config::ConfigKv,
+        worktree_io::{
+            default_worktree_io,
+            executor::WorktreeIo,
+            protocol::{
+                IoEvent, IoRequest, bytes_to_path, path_to_bytes, relative_worktree_path,
+                unwrap_wire,
+            },
         },
     },
     utils::{
+        attributes::{self, AttributeState},
         client_storage::ClientStorage,
         ignore::{self, IgnorePolicy},
+        stat_diff, util,
     },
 };
 
@@ -110,6 +119,9 @@ pub struct ScanResult {
     pub untracked: BTreeMap<String, ObjectHash>,
     pub completeness: Completeness,
     pub bytes: u64,
+    /// Tracked paths whose scan reused the index oid (blob verified present).
+    /// `persist_files` skips read/`put_blob` for these keys.
+    pub(crate) reused_index_oid: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +151,15 @@ pub struct WorkspaceSnapshotter {
     timeout: Duration,
     max_files: usize,
     max_bytes: u64,
+    /// ADR-BRL-04: reuse index oid for tracked files that pass every
+    /// equivalence check. Tests force-disable via [`Self::with_stat_short_circuit`].
+    stat_short_circuit: bool,
+    /// Debug counters for G7/G8: worker hash submissions during scan.
+    scan_hash_submissions: AtomicUsize,
+    /// Debug counters for G7/G8: `read_stable_file` calls during persist.
+    persist_reads: AtomicUsize,
+    /// Debug counters for G7/G8: content `put_blob` calls during persist.
+    persist_put_blobs: AtomicUsize,
 }
 
 impl WorkspaceSnapshotter {
@@ -152,6 +173,10 @@ impl WorkspaceSnapshotter {
             timeout: DEFAULT_TIMEOUT,
             max_files: DEFAULT_MAX_FILES,
             max_bytes: DEFAULT_MAX_BYTES,
+            stat_short_circuit: true,
+            scan_hash_submissions: AtomicUsize::new(0),
+            persist_reads: AtomicUsize::new(0),
+            persist_put_blobs: AtomicUsize::new(0),
         }
     }
 
@@ -166,11 +191,40 @@ impl WorkspaceSnapshotter {
         self
     }
 
+    /// Test seam: force-disable ADR-BRL-04 short-circuit for A/B equivalence.
+    #[allow(dead_code)]
+    pub(crate) fn with_stat_short_circuit(mut self, enabled: bool) -> Self {
+        self.stat_short_circuit = enabled;
+        self
+    }
+
     pub fn with_limits(mut self, timeout: Duration, max_files: usize, max_bytes: u64) -> Self {
         self.timeout = timeout;
         self.max_files = max_files;
         self.max_bytes = max_bytes;
         self
+    }
+
+    #[allow(dead_code)] // G7/G8 test counters
+    pub(crate) fn scan_hash_submission_count(&self) -> usize {
+        self.scan_hash_submissions.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)] // G7/G8 test counters
+    pub(crate) fn persist_read_count(&self) -> usize {
+        self.persist_reads.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)] // G7/G8 test counters
+    pub(crate) fn persist_put_blob_count(&self) -> usize {
+        self.persist_put_blobs.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)] // G7/G8 test counters
+    pub(crate) fn reset_stat_short_circuit_counters(&self) {
+        self.scan_hash_submissions.store(0, Ordering::Relaxed);
+        self.persist_reads.store(0, Ordering::Relaxed);
+        self.persist_put_blobs.store(0, Ordering::Relaxed);
     }
 
     /// Scan tracked and visible untracked files through the bounded worker.
@@ -181,6 +235,9 @@ impl WorkspaceSnapshotter {
 
     async fn scan_working_copy_until(&self, deadline: Instant) -> Result<ScanResult, ScanError> {
         let index_path = self.scope.gitdir.join("index");
+        let index_file_mtime = fs::metadata(&index_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         let (index, index_valid) = match fs::symlink_metadata(&index_path) {
             // Only an actually absent entry is a valid unborn index. A
             // dangling link or inaccessible entry cannot establish boundaries.
@@ -211,7 +268,13 @@ impl WorkspaceSnapshotter {
         };
         let mut tracked = BTreeMap::new();
         let mut untracked = BTreeMap::new();
+        let mut reused_index_oid = BTreeSet::new();
         let mut bytes = 0u64;
+        let storage = self
+            .storage
+            .clone()
+            .unwrap_or_else(|| ClientStorage::init_local(self.scope.storage.join("objects")));
+        let autocrlf = self.autocrlf_enabled().await;
 
         for entry in index.tracked_entries(0) {
             tracked_names.insert(entry.name.clone());
@@ -232,30 +295,54 @@ impl WorkspaceSnapshotter {
                 false,
             )?;
             let key = relative.to_string_lossy().replace('\\', "/");
-            let oid = match self.hash_file(&relative, deadline) {
-                Ok(oid) => oid,
-                Err(ScanError::Unstable(_)) => {
-                    complete = false;
-                    continue;
-                }
-                Err(ScanError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                    // The directory listing and the hash are a bounded
-                    // snapshot attempt, not a filesystem freeze.  A path
-                    // disappearing between them makes the capture partial;
-                    // it must not turn an otherwise valid command into an
-                    // unrelated fatal I/O error.
-                    complete = false;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let content_len = match fs::metadata(self.scope.worktree_root.join(&relative)) {
-                Ok(metadata) => metadata.len(),
+            let absolute = self.scope.worktree_root.join(&relative);
+            let metadata = match fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     complete = false;
                     continue;
                 }
                 Err(error) => return Err(ScanError::Io(error)),
+            };
+            let content_len = metadata.len();
+            let short_circuit_oid = if self.stat_short_circuit && tracked_names.contains(&key) {
+                try_reuse_index_oid(
+                    &ShortCircuitCtx {
+                        index: &index,
+                        index_file_mtime,
+                        autocrlf,
+                        worktree_root: &self.scope.worktree_root,
+                        storage: &storage,
+                    },
+                    &key,
+                    &relative,
+                    &metadata,
+                )
+            } else {
+                None
+            };
+            let (oid, reused) = if let Some(oid) = short_circuit_oid {
+                (oid, true)
+            } else {
+                self.scan_hash_submissions.fetch_add(1, Ordering::Relaxed);
+                let oid = match self.hash_file(&relative, deadline) {
+                    Ok(oid) => oid,
+                    Err(ScanError::Unstable(_)) => {
+                        complete = false;
+                        continue;
+                    }
+                    Err(ScanError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        // The directory listing and the hash are a bounded
+                        // snapshot attempt, not a filesystem freeze.  A path
+                        // disappearing between them makes the capture partial;
+                        // it must not turn an otherwise valid command into an
+                        // unrelated fatal I/O error.
+                        complete = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                (oid, false)
             };
             bytes = bytes.saturating_add(content_len);
             if bytes > self.max_bytes {
@@ -263,6 +350,9 @@ impl WorkspaceSnapshotter {
                 break;
             }
             if tracked_names.contains(&key) {
+                if reused {
+                    reused_index_oid.insert(key.clone());
+                }
                 tracked.insert(key, oid);
             } else if matches!(self.capture_policy, CapturePolicy::TrackedAndUntracked) {
                 untracked.insert(key, oid);
@@ -282,7 +372,21 @@ impl WorkspaceSnapshotter {
             untracked,
             completeness,
             bytes,
+            reused_index_oid,
         })
+    }
+
+    async fn autocrlf_enabled(&self) -> bool {
+        let db_path = self.scope.storage.join(util::DATABASE);
+        let Ok(db) = crate::internal::db::get_db_conn_instance_for_path(&db_path).await else {
+            // Fail closed: without a readable config we cannot prove conversion is off.
+            return true;
+        };
+        match ConfigKv::get_bool_with_conn(&db, "core.autocrlf").await {
+            Ok(Some(true)) => true,
+            Ok(Some(false)) | Ok(None) => false,
+            Err(_) => true,
+        }
     }
 
     /// Capture immutable blobs and a canonical `WorkspaceSnapshotV2` manifest.
@@ -401,9 +505,10 @@ impl WorkspaceSnapshotter {
         if !registry.is_fully_restorable(&captures) {
             completeness = Completeness::Partial;
         }
-        let (tracked, tracked_complete) = self.persist_files(&storage, &scan.tracked, deadline)?;
+        let (tracked, tracked_complete) =
+            self.persist_files(&storage, &scan.tracked, &scan.reused_index_oid, deadline)?;
         let (untracked, untracked_complete) =
-            self.persist_files(&storage, &scan.untracked, deadline)?;
+            self.persist_files(&storage, &scan.untracked, &BTreeSet::new(), deadline)?;
         if !tracked_complete || !untracked_complete {
             completeness = Completeness::Partial;
         }
@@ -459,6 +564,7 @@ impl WorkspaceSnapshotter {
         &self,
         storage: &ClientStorage,
         files: &BTreeMap<String, ObjectHash>,
+        reused_index_oid: &BTreeSet<String>,
         deadline: Instant,
     ) -> Result<(BTreeMap<String, ObjectHash>, bool), SnapshotError> {
         let mut persisted = BTreeMap::new();
@@ -468,8 +574,16 @@ impl WorkspaceSnapshotter {
                 complete = false;
                 break;
             }
+            if reused_index_oid.contains(path) {
+                // ADR-BRL-04: blob existence was verified at scan time; reuse
+                // the scan oid without a second full-file read / put_blob.
+                persisted.insert(path.clone(), *expected_oid);
+                continue;
+            }
+            self.persist_reads.fetch_add(1, Ordering::Relaxed);
             match self.read_stable_file(Path::new(path), deadline) {
                 Ok((oid, bytes)) if &oid == expected_oid => {
+                    self.persist_put_blobs.fetch_add(1, Ordering::Relaxed);
                     put_blob(storage, &bytes)?;
                     persisted.insert(path.clone(), oid);
                 }
@@ -708,6 +822,136 @@ fn put_blob(storage: &ClientStorage, bytes: &[u8]) -> Result<ObjectHash, Snapsho
     Ok(oid)
 }
 
+/// Inputs shared across one scan's ADR-BRL-04 short-circuit checks.
+struct ShortCircuitCtx<'a> {
+    index: &'a Index,
+    index_file_mtime: Option<SystemTime>,
+    autocrlf: bool,
+    worktree_root: &'a Path,
+    storage: &'a ClientStorage,
+}
+
+/// ADR-BRL-04: reuse the index oid when every equivalence condition holds.
+/// Returns `None` to fall through to the worker hash path (fail-closed).
+fn try_reuse_index_oid(
+    ctx: &ShortCircuitCtx<'_>,
+    key: &str,
+    relative: &Path,
+    metadata: &fs::Metadata,
+) -> Option<ObjectHash> {
+    let entry = ctx.index.get(key, 0)?;
+    if entry.flags.stage != 0 {
+        return None;
+    }
+    // Only regular files: symlinks and gitlinks always hash (G5/G6 equivalence
+    // still holds because both short-circuit modes take the hash path).
+    if !is_regular_index_mode(entry.mode) {
+        return None;
+    }
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || file_type.is_dir() || !metadata.is_file() {
+        return None;
+    }
+    let (ctime, mtime) = metadata_stat_times(metadata);
+    if stat_diff::index_entry_stat_differs(
+        entry,
+        ctime,
+        mtime,
+        metadata.len(),
+        ctx.index_file_mtime,
+    ) {
+        return None;
+    }
+    if path_has_content_conversion(relative, ctx.worktree_root, ctx.autocrlf) {
+        return None;
+    }
+    if !ctx.storage.exist(&entry.hash) {
+        return None;
+    }
+    Some(entry.hash)
+}
+
+fn is_regular_index_mode(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
+}
+
+fn metadata_stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        fn at(seconds: i64, nanos: i64) -> SystemTime {
+            if seconds < 0 {
+                return UNIX_EPOCH;
+            }
+            let nanos = u32::try_from(nanos)
+                .ok()
+                .filter(|nanos| *nanos < 1_000_000_000)
+                .unwrap_or(0);
+            UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+        }
+        (
+            at(metadata.ctime(), metadata.ctime_nsec()),
+            at(metadata.mtime(), metadata.mtime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        (
+            metadata
+                .created()
+                .or_else(|_| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+            metadata
+                .modified()
+                .or_else(|_| metadata.created())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    }
+}
+
+/// Fail-closed conversion gate (ADR-BRL-04): any autocrlf, text/eol/filter/
+/// working-tree-encoding/ident attribute, LFS path, or unprovable worktree
+/// attribute context forces the hash path.
+fn path_has_content_conversion(relative: &Path, worktree_root: &Path, autocrlf: bool) -> bool {
+    if autocrlf {
+        return true;
+    }
+    // LFS via the pinned-root beneath API (does not require process cwd).
+    match fs::File::open(worktree_root) {
+        Ok(root) => {
+            match attributes::is_lfs_tracked_beneath_session(worktree_root, &root, relative, None) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return true,
+            }
+        }
+        Err(_) => return true,
+    }
+    // Remaining conversion attrs need a workdir that matches this pin.
+    // If we cannot prove the process workdir is this worktree, fail closed.
+    let Ok(workdir) = util::try_working_dir() else {
+        return true;
+    };
+    let Ok(workdir_canon) = workdir.canonicalize() else {
+        return true;
+    };
+    let Ok(root_canon) = worktree_root.canonicalize() else {
+        return true;
+    };
+    if workdir_canon != root_canon {
+        return true;
+    }
+    const CONVERSION_ATTRS: &[&str] = &["text", "eol", "filter", "working-tree-encoding", "ident"];
+    for attr in CONVERSION_ATTRS {
+        match attributes::attribute_state_for_path(attr, relative) {
+            Some(AttributeState::Set | AttributeState::Value(_)) => return true,
+            Some(AttributeState::Unset | AttributeState::Unspecified) | None => {}
+        }
+    }
+    false
+}
+
 /// Store an immutable content-addressed object without repairing or replacing
 /// a pre-existing payload. A matching object is already complete; a mismatch
 /// is repository corruption and must stay visible to the caller.
@@ -920,6 +1164,8 @@ mod ignore_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("snapshot/stat_short_circuit_tests.rs");
 
     /// M-BATCH B4: snapshot object writes publish their markers through the
     /// batch interface — one generation lock for the whole batch, not one per
