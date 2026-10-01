@@ -200,19 +200,11 @@ pub(crate) fn validate_cli_args(args: &TagArgs) -> CliResult<()> {
     Ok(())
 }
 
-/// The message-source options `-m`/`--message` and `-F`/`--file` only make
-/// sense when creating a tag. Reject them when combined with list-mode,
-/// delete, verify, or any list filter so an invalid invocation is a usage
-/// error rather than silently ignoring the message (or performing a delete).
-fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
-    // `-e`/`--edit` and `-a`/`--annotate` are annotated-tag creation modes, so
-    // they are create-only options just like `-m`/`-F`.
-    if args.message.is_none() && args.file.is_none() && !args.edit && !args.annotate {
-        return Ok(());
-    }
-    let non_create = args.list
-        || args.delete
-        || args.verify
+/// Explicit list-mode flags, shared by [`tag_is_list_mode`] and create-only
+/// validation. Bare `tag` (no name) is a separate list fallthrough and is not
+/// one of these flags, so `tag -m` without a name still fails as a missing name.
+fn tag_requests_list(args: &TagArgs) -> bool {
+    args.list
         || args.n_lines.is_some()
         || args.points_at.is_some()
         || args.contains.is_some()
@@ -220,7 +212,37 @@ fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
         || args.merged.is_some()
         || args.no_merged.is_some()
         || args.sort.is_some()
-        || args.column.is_some();
+        || args.column.is_some()
+        || args.no_column
+}
+
+/// Whether [`run_tag`] dispatches to list mode.
+///
+/// Includes `no_column`. The previous condition only tested `column.is_some()`,
+/// so `tag --no-column <pattern>` created a tag instead of listing.
+pub(crate) fn tag_is_list_mode(args: &TagArgs) -> bool {
+    tag_requests_list(args) || args.name.is_none()
+}
+
+/// Census predicate: verify and list forms must be `MutationClass::ReadOnly`.
+pub(crate) fn tag_is_read_only_query(args: &TagArgs) -> bool {
+    args.verify || tag_is_list_mode(args)
+}
+
+/// The message-source options `-m`/`--message` and `-F`/`--file` only make
+/// sense when creating a tag. Reject them when combined with list-mode,
+/// delete, verify, or any list filter (including `--no-column`) so an invalid
+/// invocation is a usage error rather than silently ignoring the message (or
+/// performing a delete).
+fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
+    // `-e`/`--edit` and `-a`/`--annotate` are annotated-tag creation modes, so
+    // they are create-only options just like `-m`/`-F`.
+    if args.message.is_none() && args.file.is_none() && !args.edit && !args.annotate {
+        return Ok(());
+    }
+    // `name.is_none()` is intentionally absent: bare `tag -m` must stay a
+    // missing-name error. `--no-column` is a list flag via `tag_requests_list`.
+    let non_create = args.delete || args.verify || tag_requests_list(args);
     if non_create {
         return Err(TagError::MessageOptionRequiresCreate(
             "-m/--message, -F/--file, -e/--edit, and -a/--annotate are only valid when creating a tag"
@@ -635,17 +657,7 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
         });
     }
 
-    if args.list
-        || args.n_lines.is_some()
-        || args.points_at.is_some()
-        || args.contains.is_some()
-        || args.no_contains.is_some()
-        || args.merged.is_some()
-        || args.no_merged.is_some()
-        || args.sort.is_some()
-        || args.column.is_some()
-        || args.name.is_none()
-    {
+    if tag_is_list_mode(args) {
         // `--points-at` peels each tag to its commit and keeps only those that
         // resolve to the requested object, mirroring `git tag --points-at`.
         // Like `-n`, it forces list mode even when a name is also supplied.
@@ -1520,5 +1532,58 @@ mod tests {
             "SerializeAnnotatedTag must include the GitHub Issues URL hint, got hints: {:?}",
             err.hints()
         );
+    }
+
+    /// G50: every tag action flag shares list/verify classification with `run_tag`.
+    /// `--no-column <pattern>` must be list mode (the old `column.is_some()` gap).
+    #[test]
+    fn tag_read_only_classification_table() {
+        // (argv, list_mode, read_only)
+        let cases: &[(&[&str], bool, bool)] = &[
+            (&["tag"], true, true),
+            (&["tag", "-l"], true, true),
+            (&["tag", "-l", "v*"], true, true),
+            // `-n` requires a line count; bare `tag -n` is a clap usage error.
+            (&["tag", "-n", "1"], true, true),
+            (&["tag", "--contains", "HEAD"], true, true),
+            (&["tag", "--no-contains", "HEAD"], true, true),
+            (&["tag", "--points-at", "HEAD"], true, true),
+            (&["tag", "--merged", "HEAD"], true, true),
+            (&["tag", "--no-merged", "HEAD"], true, true),
+            (&["tag", "--sort=creatordate"], true, true),
+            (&["tag", "--column=always"], true, true),
+            (&["tag", "--column=always", "v*"], true, true),
+            (&["tag", "--no-column"], true, true),
+            (&["tag", "--no-column", "v*"], true, true),
+            (&["tag", "--verify", "v1.0"], false, true),
+            (&["tag", "-v", "v1.0"], false, true),
+            (&["tag", "v1.0"], false, false),
+            (&["tag", "-d", "v1.0"], false, false),
+            (&["tag", "-f", "v1.0"], false, false),
+            (&["tag", "-m", "msg", "v1.0"], false, false),
+            (&["tag", "-a", "-m", "msg", "v1.0"], false, false),
+            (&["tag", "-e", "v1.0"], false, false),
+            (&["tag", "-F", "notes.txt", "v1.0"], false, false),
+            (&["tag", "-s", "-m", "msg", "v1.0"], false, false),
+            (&["tag", "--no-sign", "v1.0"], false, false),
+            (&["tag", "--no-sign"], true, true),
+        ];
+
+        for (argv, expect_list, expect_ro) in cases {
+            let args = TagArgs::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {argv:?}: {e}");
+            });
+            assert_eq!(tag_is_list_mode(&args), *expect_list, "list mode {argv:?}");
+            assert_eq!(
+                tag_is_read_only_query(&args),
+                *expect_ro,
+                "read-only {argv:?}"
+            );
+            assert_eq!(
+                tag_is_read_only_query(&args),
+                args.verify || tag_is_list_mode(&args),
+                "read-only is verify or list for {argv:?}"
+            );
+        }
     }
 }

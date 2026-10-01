@@ -58,6 +58,24 @@ pub struct ReflogArgs {
     command: Option<Subcommands>,
 }
 
+fn reflog_subcommand_is_read_only(cmd: &Subcommands) -> bool {
+    match cmd {
+        Subcommands::Show { .. } | Subcommands::Exists { .. } => true,
+        // `--dry-run` prints the expire plan and leaves the database unchanged.
+        Subcommands::Expire { dry_run, .. } => *dry_run,
+        Subcommands::Delete { .. } => false,
+    }
+}
+
+/// Census predicate. Bare `libra reflog` uses [`default_reflog_command`]
+/// (`show HEAD`), the same default [`execute_safe`] dispatches.
+pub(crate) fn reflog_is_read_only_query(args: &ReflogArgs) -> bool {
+    match args.command.as_ref() {
+        Some(cmd) => reflog_subcommand_is_read_only(cmd),
+        None => reflog_subcommand_is_read_only(&default_reflog_command()),
+    }
+}
+
 /// Bare `libra reflog` (no subcommand) behaves like `libra reflog show HEAD`,
 /// matching Git's default.
 fn default_reflog_command() -> Subcommands {
@@ -160,6 +178,7 @@ pub async fn execute(args: ReflogArgs) {
 /// errors and exiting. Dispatches to the show, delete, or exists sub-command
 /// for reflog management.
 pub async fn execute_safe(args: ReflogArgs, output: &OutputConfig) -> CliResult<()> {
+    // Same default as [`reflog_is_read_only_query`]: bare reflog is `show HEAD`.
     match args.command.unwrap_or_else(default_reflog_command) {
         Subcommands::Show {
             ref_name,
@@ -1367,5 +1386,32 @@ mod tests {
         // Test case-insensitive matching
         let filter = ReflogFilter::new(None, None, None, Some("ALICE".to_string()));
         assert!(filter.passes(&entry1));
+    }
+
+    /// G52: bare reflog matches `show HEAD`; expire is read-only only with `--dry-run`.
+    #[test]
+    fn reflog_read_only_classification_table() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["reflog"], true),
+            (&["reflog", "show"], true),
+            (&["reflog", "show", "HEAD"], true),
+            (&["reflog", "show", "main", "--number", "20"], true),
+            (&["reflog", "exists", "HEAD"], true),
+            (&["reflog", "exists", "refs/heads/main"], true),
+            (&["reflog", "expire", "--dry-run"], true),
+            (&["reflog", "expire", "--all", "--dry-run"], true),
+            (&["reflog", "expire", "-n"], true),
+            (&["reflog", "delete", "HEAD@{1}"], false),
+            (&["reflog", "expire"], false),
+            (&["reflog", "expire", "--all"], false),
+            (&["reflog", "expire", "--expire=now", "--all"], false),
+        ];
+
+        for (argv, expected) in cases {
+            let args = ReflogArgs::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {argv:?}: {e}");
+            });
+            assert_eq!(reflog_is_read_only_query(&args), *expected, "{argv:?}");
+        }
     }
 }

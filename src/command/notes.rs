@@ -232,6 +232,36 @@ pub struct NotesRemovedEntry {
     pub note_hash: String,
 }
 
+/// Bare `libra notes` lists notes. [`execute_safe`] and the census share this
+/// default; a missing subcommand is not a usage error.
+fn default_notes_subcommand() -> NotesSubcommand {
+    NotesSubcommand::List { object: None }
+}
+
+fn notes_subcommand_is_read_only(cmd: &NotesSubcommand) -> bool {
+    match cmd {
+        NotesSubcommand::List { .. }
+        | NotesSubcommand::Show { .. }
+        | NotesSubcommand::GetRef
+        | NotesSubcommand::Prune { dry_run: true, .. } => true,
+        NotesSubcommand::Add { .. }
+        | NotesSubcommand::Append { .. }
+        | NotesSubcommand::Edit { .. }
+        | NotesSubcommand::Copy { .. }
+        | NotesSubcommand::Remove { .. }
+        | NotesSubcommand::Merge { .. }
+        | NotesSubcommand::Prune { dry_run: false, .. } => false,
+    }
+}
+
+/// Census predicate. `None` follows [`default_notes_subcommand`] (list).
+pub(crate) fn notes_is_read_only_query(args: &NotesArgs) -> bool {
+    match args.subcommand.as_ref() {
+        Some(cmd) => notes_subcommand_is_read_only(cmd),
+        None => notes_subcommand_is_read_only(&default_notes_subcommand()),
+    }
+}
+
 pub async fn execute(args: NotesArgs) {
     // `args_os`: `env::args()` panics on a non-UTF-8 argument, and a
     // pathspec that is not UTF-8 is ordinary on Unix. Only ASCII flags are
@@ -257,9 +287,7 @@ pub async fn execute_safe(
     let notes_ref = &notes::normalize_notes_ref(&args.ref_)
         .map_err(|e| CliError::from(NotesCliError::from(e)))?;
 
-    let subcommand = args
-        .subcommand
-        .unwrap_or(NotesSubcommand::List { object: None });
+    let subcommand = args.subcommand.unwrap_or_else(default_notes_subcommand);
 
     match subcommand {
         NotesSubcommand::Add {
@@ -814,5 +842,54 @@ impl From<NotesCliError> for CliError {
                     .with_hint("another writer changed the notes during the merge; re-run it"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G53: bare `notes` follows `execute_safe`'s list default. Prune is
+    /// read-only only with `--dry-run`.
+    #[test]
+    fn notes_read_only_classification_table() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["notes"], true),
+            (&["notes", "list"], true),
+            (&["notes", "list", "HEAD"], true),
+            (&["notes", "show"], true),
+            (&["notes", "show", "HEAD"], true),
+            (&["notes", "get-ref"], true),
+            (&["notes", "prune", "--dry-run"], true),
+            (&["notes", "prune", "-n"], true),
+            (&["notes", "prune", "-n", "-v"], true),
+            (&["notes", "--ref", "refs/notes/other", "list"], true),
+            (&["notes", "add", "-m", "hello"], false),
+            (&["notes", "append", "-m", "hello"], false),
+            (&["notes", "edit", "-m", "hello"], false),
+            (&["notes", "copy", "abc", "def"], false),
+            (&["notes", "remove"], false),
+            (&["notes", "remove", "HEAD"], false),
+            (&["notes", "merge", "refs/notes/other"], false),
+            (&["notes", "prune"], false),
+            (&["notes", "prune", "-v"], false),
+        ];
+
+        for (argv, expected) in cases {
+            let args = NotesArgs::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {argv:?}: {e}");
+            });
+            assert_eq!(notes_is_read_only_query(&args), *expected, "{argv:?}");
+        }
+
+        let bare = NotesArgs::try_parse_from(["notes"]).expect("bare notes");
+        let listed = NotesArgs::try_parse_from(["notes", "list"]).expect("notes list");
+        assert!(bare.subcommand.is_none());
+        assert!(notes_is_read_only_query(&bare));
+        assert_eq!(
+            notes_is_read_only_query(&bare),
+            notes_is_read_only_query(&listed),
+            "bare notes must classify like notes list"
+        );
     }
 }

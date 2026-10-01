@@ -547,6 +547,26 @@ pub enum RemoteOutput {
     },
 }
 
+/// Census predicate aligned with [`run_remote`]'s variant dispatch.
+///
+/// `show` is read-only with or without `--no-query` (the query path reads
+/// config, local tracking refs, and the network; it does not write local
+/// state). `prune --dry-run` only prints the deletion plan. Every other
+/// variant mutates config or refs.
+pub(crate) fn remote_is_read_only_query(cmd: &RemoteCmds) -> bool {
+    match cmd {
+        RemoteCmds::List | RemoteCmds::Show { .. } | RemoteCmds::GetUrl { .. } => true,
+        RemoteCmds::Prune { dry_run, .. } => *dry_run,
+        RemoteCmds::Add { .. }
+        | RemoteCmds::Remove { .. }
+        | RemoteCmds::Rename { .. }
+        | RemoteCmds::SetUrl { .. }
+        | RemoteCmds::Update { .. }
+        | RemoteCmds::SetBranches { .. }
+        | RemoteCmds::SetHead { .. } => false,
+    }
+}
+
 pub async fn execute(command: RemoteCmds) {
     if let Err(error) = execute_safe(command, &OutputConfig::default()).await {
         error.print_stderr();
@@ -2156,6 +2176,8 @@ fn render_remote_output(result: &RemoteOutput, output: &OutputConfig) -> CliResu
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     /// Pin the `Display` format for [`RemoteError`] variants whose
@@ -2267,5 +2289,88 @@ mod tests {
             .to_string(),
             "no such remote-tracking branch 'origin/dev'",
         );
+    }
+
+    /// G51: every `RemoteCmds` variant, including `show` with a network query
+    /// and `prune --dry-run`.
+    #[test]
+    fn remote_read_only_classification_table() {
+        #[derive(clap::Parser)]
+        #[command(name = "remote")]
+        struct RemoteInvoke {
+            #[command(subcommand)]
+            cmd: RemoteCmds,
+        }
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["remote", "-v"], true),
+            (&["remote", "show"], true),
+            (&["remote", "show", "origin"], true),
+            (&["remote", "show", "--no-query", "origin"], true),
+            (&["remote", "show", "-n", "--verbose", "origin"], true),
+            (&["remote", "get-url", "origin"], true),
+            (&["remote", "get-url", "--push", "origin"], true),
+            (&["remote", "get-url", "--all", "origin"], true),
+            (&["remote", "prune", "--dry-run", "origin"], true),
+            (
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/repo.git",
+                ],
+                false,
+            ),
+            (&["remote", "remove", "origin"], false),
+            (&["remote", "rename", "origin", "upstream"], false),
+            (
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://example.invalid/other.git",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "origin",
+                    "https://example.invalid/other.git",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "remote",
+                    "set-url",
+                    "--delete",
+                    "origin",
+                    "https://example.invalid/repo.git",
+                ],
+                false,
+            ),
+            (&["remote", "prune", "origin"], false),
+            (&["remote", "update"], false),
+            (&["remote", "update", "-p", "origin"], false),
+            (&["remote", "set-branches", "origin", "main"], false),
+            (&["remote", "set-branches", "--add", "origin", "dev"], false),
+            (&["remote", "set-head", "origin", "main"], false),
+            (&["remote", "set-head", "origin", "--auto"], false),
+            (&["remote", "set-head", "origin", "-d"], false),
+        ];
+
+        for (argv, expected) in cases {
+            let parsed = RemoteInvoke::try_parse_from(*argv).unwrap_or_else(|e| {
+                panic!("parse {argv:?}: {e}");
+            });
+            assert_eq!(
+                remote_is_read_only_query(&parsed.cmd),
+                *expected,
+                "{argv:?}"
+            );
+        }
     }
 }
