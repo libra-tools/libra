@@ -5,7 +5,7 @@ pub(crate) mod config;
 use std::{
     cell::RefCell,
     cmp::min,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     io::IsTerminal,
     path::{Path, PathBuf},
     rc::Rc,
@@ -307,14 +307,14 @@ pub struct LogArgs {
     pub reverse: bool,
 
     /// Order commits by author date instead of committer date (newest first).
-    /// Libra sorts by timestamp without Git's additional topological constraint.
+    /// This keeps the full-history global author-date sort and does not use the
+    /// default date-priority walk. Libra does not add Git's topological constraint.
     #[clap(long = "author-date-order")]
     pub author_date_order: bool,
 
-    /// Order commits by committer date (newest first). This is Libra's default,
-    /// so the flag is accepted for Git parity and selects the default ordering;
-    /// it conflicts with `--author-date-order`. Libra sorts purely by timestamp
-    /// (no topological constraint).
+    /// Order commits by committer date (newest first). This is Libra's default
+    /// date-priority walk, so the flag is a Git parity no-op and selects that
+    /// same walk; it conflicts with `--author-date-order`.
     #[clap(long = "date-order", conflicts_with = "author_date_order")]
     pub date_order: bool,
 
@@ -1161,18 +1161,8 @@ async fn get_reachable_commits_excluding(
     // `A..B` (or `^A B`) hides *everything reachable from A*, not just A itself,
     // so any commit reachable from an excluded tip must also be excluded. (The
     // closure ignores `--first-parent`/`depth`, which shape only the shown set.)
-    let mut excludes: HashSet<ObjectHash> = HashSet::new();
-    let mut exclude_queue: VecDeque<ObjectHash> = exclude_tips.into_iter().collect();
+    let excludes = expand_excluded_commits(exclude_tips)?;
     let shallow = load_walk_shallow()?;
-    while let Some(commit_id) = exclude_queue.pop_front() {
-        if !excludes.insert(commit_id) {
-            continue;
-        }
-        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
-        for parent_commit_id in history_parents(&shallow, &commit) {
-            exclude_queue.push_back(*parent_commit_id);
-        }
-    }
 
     for start in starts {
         queue.push_back((start, 0));
@@ -1183,7 +1173,7 @@ async fn get_reachable_commits_excluding(
             continue;
         }
 
-        let commit = load_object::<Commit>(&commit_id).map_err(log_missing_history_error)?;
+        let commit = load_history_commit(&commit_id)?;
 
         if let Some(max_depth) = depth
             && current_depth >= max_depth
@@ -1208,12 +1198,282 @@ async fn get_reachable_commits_excluding(
 /// Sort commits newest-first by committer date, or by author date when
 /// `--author-date-order` is requested. Libra sorts purely by timestamp and does
 /// not add Git's extra topological "no parent before its children" constraint.
+///
+/// The default log walk does not use this sort. `--author-date-order` keeps it.
 fn sort_commits_newest_first(commits: &mut [Commit], by_author_date: bool) {
     if by_author_date {
         commits.sort_by_key(|c| std::cmp::Reverse(c.author.timestamp));
     } else {
         commits.sort_by_key(|c| std::cmp::Reverse(c.committer.timestamp));
     }
+}
+
+#[cfg(debug_assertions)]
+static LOG_COMMITS_LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static LOG_ABBREV_BASIS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_history_commit_loaded() {
+    #[cfg(debug_assertions)]
+    {
+        LOG_COMMITS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn reset_log_debug_counters() {
+    #[cfg(debug_assertions)]
+    {
+        LOG_COMMITS_LOADED.store(0, std::sync::atomic::Ordering::Relaxed);
+        LOG_ABBREV_BASIS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn flush_log_debug_hooks() {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(path) = std::env::var("LIBRA_TEST_LOG_COMMITS_LOADED_PATH") {
+            let count = LOG_COMMITS_LOADED.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(path, count.to_string());
+        }
+        if let Ok(path) = std::env::var("LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH") {
+            let count = LOG_ABBREV_BASIS_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(path, count.to_string());
+        }
+    }
+}
+
+/// Writes the debug load and abbreviation-basis counters when `execute_safe` returns.
+struct LogDebugHookGuard;
+
+impl Drop for LogDebugHookGuard {
+    fn drop(&mut self) {
+        flush_log_debug_hooks();
+    }
+}
+
+#[cfg(all(debug_assertions, test))]
+pub(crate) fn debug_log_commits_loaded() -> u64 {
+    LOG_COMMITS_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(debug_assertions, test))]
+pub(crate) fn reset_debug_log_commits_loaded() {
+    LOG_COMMITS_LOADED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Load one commit for a history walk and count it under debug assertions.
+///
+/// `get_reachable_commits` stays uncounted: it is a set helper for other commands.
+fn load_history_commit(commit_id: &ObjectHash) -> Result<Commit, CliError> {
+    let commit = load_object::<Commit>(commit_id).map_err(log_missing_history_error)?;
+    note_history_commit_loaded();
+    Ok(commit)
+}
+
+fn abbrev_length_for(commits: &[Commit]) -> usize {
+    #[cfg(debug_assertions)]
+    {
+        LOG_ABBREV_BASIS_COUNT.store(
+            u64::try_from(commits.len()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    util::get_min_unique_hash_length(commits).max(7)
+}
+
+/// Load every commit reachable from `tips`, including the tips themselves.
+fn expand_excluded_commits(tips: HashSet<ObjectHash>) -> Result<HashSet<ObjectHash>, CliError> {
+    let mut excluded = HashSet::new();
+    let mut queue: VecDeque<ObjectHash> = tips.into_iter().collect();
+    let shallow = load_walk_shallow()?;
+    while let Some(commit_id) = queue.pop_front() {
+        if !excluded.insert(commit_id) {
+            continue;
+        }
+        let commit = load_history_commit(&commit_id)?;
+        for parent_commit_id in history_parents(&shallow, &commit) {
+            queue.push_back(*parent_commit_id);
+        }
+    }
+    Ok(excluded)
+}
+
+/// One queue entry. Higher committer time wins; an earlier discovery ordinal
+/// wins when the times are equal. The commit is already loaded.
+struct QueuedCommit {
+    timestamp: usize,
+    ordinal: u64,
+    commit: Commit,
+}
+
+impl PartialEq for QueuedCommit {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for QueuedCommit {}
+
+impl PartialOrd for QueuedCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedCommit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| other.ordinal.cmp(&self.ordinal))
+    }
+}
+
+/// Date-priority history walk shared by `log` and, later, `rev-list`.
+///
+/// Parents are loaded when enqueued, which is when their committer time becomes
+/// known. A commit object is loaded once. `max_yield` stops after that many
+/// commits have been produced; their parents are still loaded onto the frontier.
+/// `None` walks every commit reachable from `starts` outside the exclusion closure.
+///
+/// `--date-order` uses this same committer-time key. `--author-date-order` does not.
+pub(crate) fn walk_date_priority(
+    starts: Vec<ObjectHash>,
+    excludes: Option<HashSet<ObjectHash>>,
+    first_parent: bool,
+    max_yield: Option<usize>,
+) -> Result<Vec<Commit>, CliError> {
+    let excluded = expand_excluded_commits(excludes.unwrap_or_default())?;
+    let mut seen = excluded;
+    let shallow = load_walk_shallow()?;
+    let mut ordinal = 0u64;
+    let mut queue: BinaryHeap<QueuedCommit> = BinaryHeap::new();
+
+    let enqueue = |commit_id: ObjectHash,
+                   seen: &mut HashSet<ObjectHash>,
+                   queue: &mut BinaryHeap<QueuedCommit>,
+                   ordinal: &mut u64|
+     -> Result<(), CliError> {
+        if !seen.insert(commit_id) {
+            return Ok(());
+        }
+        let commit = load_history_commit(&commit_id)?;
+        let timestamp = commit.committer.timestamp;
+        let discovered = *ordinal;
+        *ordinal += 1;
+        queue.push(QueuedCommit {
+            timestamp,
+            ordinal: discovered,
+            commit,
+        });
+        Ok(())
+    };
+
+    for start in starts {
+        enqueue(start, &mut seen, &mut queue, &mut ordinal)?;
+    }
+
+    let mut yielded = Vec::new();
+    while max_yield.is_none_or(|limit| yielded.len() < limit) {
+        let Some(item) = queue.pop() else {
+            break;
+        };
+        let parent_ids: Vec<ObjectHash> = {
+            let parents = history_parents(&shallow, &item.commit);
+            let parents = if first_parent {
+                parents.get(..1).unwrap_or(&[])
+            } else {
+                parents
+            };
+            parents.to_vec()
+        };
+        for parent in parent_ids {
+            enqueue(parent, &mut seen, &mut queue, &mut ordinal)?;
+        }
+        yielded.push(item.commit);
+    }
+    Ok(yielded)
+}
+
+struct LogHistory {
+    commits: Vec<Commit>,
+    /// Eligible limited logs abbreviate from the commits actually printed.
+    abbrev_from_rendered: bool,
+}
+
+fn exclusion_is_present(excludes: &Option<HashSet<ObjectHash>>) -> bool {
+    excludes.as_ref().is_some_and(|ids| !ids.is_empty())
+}
+
+/// Early stop is only valid for a single positive tip and a plain date-priority
+/// walk. Anything that filters, reverses, draws a graph, or needs the full set
+/// returns `None` and the walker runs to completion.
+fn eligible_date_priority_yield(
+    args: &LogArgs,
+    path_count: usize,
+    configured_follow_active: bool,
+    start_count: usize,
+    has_excludes: bool,
+) -> Option<usize> {
+    let number = args.number?;
+    let ineligible = args.reverse
+        || args.graph
+        || args.children
+        || args.author_date_order
+        || args.follow.is_some()
+        || configured_follow_active
+        || !args.line_range.is_empty()
+        || path_count > 0
+        || args.author.is_some()
+        || args.committer.is_some()
+        || args.grep.is_some()
+        || args.since.is_some()
+        || args.until.is_some()
+        || args.pickaxe_string.is_some()
+        || args.pickaxe_regex.is_some()
+        || args.merges
+        || args.no_merges
+        || args.min_parents.is_some()
+        || args.max_parents.is_some()
+        || !args.trailers.is_empty()
+        || has_excludes
+        || args.all
+        || start_count != 1;
+    if ineligible {
+        return None;
+    }
+    Some(args.skip.unwrap_or(0).saturating_add(number))
+}
+
+async fn collect_log_history(
+    args: &LogArgs,
+    starts: Vec<ObjectHash>,
+    excludes: Option<HashSet<ObjectHash>>,
+    path_count: usize,
+    configured_follow_active: bool,
+) -> CliResult<LogHistory> {
+    if args.author_date_order {
+        let mut commits =
+            get_reachable_commits_excluding(starts, excludes, None, args.first_parent).await?;
+        sort_commits_newest_first(&mut commits, true);
+        return Ok(LogHistory {
+            commits,
+            abbrev_from_rendered: false,
+        });
+    }
+
+    let has_excludes = exclusion_is_present(&excludes);
+    let max_yield = eligible_date_priority_yield(
+        args,
+        path_count,
+        configured_follow_active,
+        starts.len(),
+        has_excludes,
+    );
+    let commits = walk_date_priority(starts, excludes, args.first_parent, max_yield)?;
+    Ok(LogHistory {
+        commits,
+        abbrev_from_rendered: max_yield.is_some(),
+    })
 }
 
 /// Parsed line-range specifier for `-L`.
@@ -1401,6 +1661,8 @@ async fn commit_affects_line_range(
 /// errors and exiting. Walks commit history applying filters (date range,
 /// author, path) and renders formatted log output.
 pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()> {
+    reset_log_debug_counters();
+    let _log_debug_hooks = LogDebugHookGuard;
     let log_config = resolve_log_config(&args, !output.is_json()).await?;
     let decorate_option = resolve_decorate_option(&args).await?;
 
@@ -1469,11 +1731,21 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         return Err(log_no_commits_error(branch_name.as_deref()));
     }
 
-    let mut reachable_commits =
-        get_reachable_commits_excluding(start_commits, excludes, None, args.first_parent).await?;
-    // newest first
-    sort_commits_newest_first(&mut reachable_commits, args.author_date_order);
-    let default_abbrev = util::get_min_unique_hash_length(&reachable_commits).max(7);
+    let history = collect_log_history(
+        &args,
+        start_commits,
+        excludes,
+        path_filters.len(),
+        configured_follow.is_some(),
+    )
+    .await?;
+    let abbrev_from_rendered = history.abbrev_from_rendered;
+    let reachable_commits = history.commits;
+    let full_set_abbrev = if abbrev_from_rendered {
+        None
+    } else {
+        Some(abbrev_length_for(&reachable_commits))
+    };
     let mut traversed_commits =
         apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
             .await?;
@@ -1492,6 +1764,15 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         reuse_changed_files,
     )
     .await?;
+    let default_abbrev = if let Some(length) = full_set_abbrev {
+        length
+    } else {
+        let rendered: Vec<Commit> = selected_commits
+            .iter()
+            .map(|item| item.commit.clone())
+            .collect();
+        abbrev_length_for(&rendered)
+    };
 
     if output.quiet {
         return validate_selected_log_commits(
@@ -1823,10 +2104,15 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
         return Err(log_no_commits_error(branch_name.as_deref()));
     }
 
-    let mut reachable_commits =
-        get_reachable_commits_excluding(start_commits, excludes, None, args.first_parent).await?;
-    // newest first
-    sort_commits_newest_first(&mut reachable_commits, args.author_date_order);
+    let history = collect_log_history(
+        args,
+        start_commits,
+        excludes,
+        path_filters.len(),
+        configured_follow.is_some(),
+    )
+    .await?;
+    let reachable_commits = history.commits;
     let mut traversed_commits =
         apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
             .await?;
@@ -3391,5 +3677,63 @@ mod tests {
         assert!(args.graph);
         assert_eq!(args.grep, Some("fix".to_string()));
         assert!(args.pathspec.is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, hash_kind)]
+    async fn date_priority_walker_orders_by_committer_time() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::utils::test::setup_with_new_libra_in(dir.path()).await;
+        let _cwd = crate::utils::test::ChangeDirGuard::new(dir.path());
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+
+        let save = |byte: u8, parents: Vec<ObjectHash>, message: &str, time: usize| -> Commit {
+            let mut commit = Commit::from_tree_id(
+                ObjectHash::new(&[byte; 20]),
+                parents,
+                &format!("{message}\n"),
+            );
+            commit.committer.timestamp = time;
+            commit.author.timestamp = time;
+            crate::command::save_object(&commit, &commit.id).expect("save commit");
+            commit
+        };
+
+        // M(10) parents P1(5) then P2(9); P1's parent is A(5); P2's parent is B(5).
+        let a = save(1, Vec::new(), "A", 5);
+        let b = save(2, Vec::new(), "B", 5);
+        let p1 = save(3, vec![a.id], "P1", 5);
+        let p2 = save(4, vec![b.id], "P2", 9);
+        let m = save(5, vec![p1.id, p2.id], "M", 10);
+
+        reset_debug_log_commits_loaded();
+        let full = walk_date_priority(vec![m.id], None, false, None).expect("full walk");
+        let subjects: Vec<&str> = full
+            .iter()
+            .map(|commit| commit.message.lines().next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            subjects,
+            ["M", "P2", "P1", "B", "A"],
+            "committer time descending, discovery ordinal ascending on ties"
+        );
+        assert_eq!(
+            debug_log_commits_loaded(),
+            5,
+            "each commit object is loaded once"
+        );
+
+        reset_debug_log_commits_loaded();
+        let limited = walk_date_priority(vec![m.id], None, false, Some(1)).expect("limited walk");
+        assert_eq!(limited.len(), 1);
+        assert!(limited[0].message.starts_with('M'));
+        assert_eq!(
+            debug_log_commits_loaded(),
+            3,
+            "parents are loaded when enqueued, including the unyielded frontier"
+        );
     }
 }

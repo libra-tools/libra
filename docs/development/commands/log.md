@@ -15,7 +15,19 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/log.rs`；P1-05 展示默认值集中在 `src/command/log/config.rs`。参数/子命令类型包括：`LogArgs`；输出、错误或状态类型包括：`LogCommitEntry`、`LogOutput`；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog。默认排序与 `--date-order` 走 `walk_date_priority`（`pub(crate)`，供 BRL-04 的 `rev-list` 复用）。`--author-date-order` 仍走 `get_reachable_commits_excluding` 加作者时间全局排序。
+
+## 日期优先 walker（ADR-BRL-02 / ADR-BRL-03）
+
+父提交在入队时加载，排序键用其 committer 时间。队列按（committer 时间降序、发现序号升序）出队。`seen` 集合保证同一提交只加载一次。`--first-parent` 与 shallow 边界沿用 `history_parents`。`--date-order` 与默认使用同一 committer 键，是 parity no-op。
+
+合格的 `-n` / `--max-count`（含 `--skip`）在产出 `skip + number` 笔后停止；停止前会把这些提交的父提交载入队列前沿。无限额与不合格但仍是默认排序的调用走同一 walker，只是不提前终止。`--author-date-order` 不走 walker。
+
+不合格（提前终止关闭，默认排序仍走 walker）的条件：`--reverse`、`--graph`、`--children`、`--follow` 或 `configured_follow_path` 为 `Some`、`-L`、pathspec、`--author` / `--committer` / `--grep` / `--since` / `--until`、pickaxe、`--merges` / `--no-merges` / `--min-parents` / `--max-parents`、`--trailer`、带排除端的范围、`--all`、多个修订起点。判定用解析后的有效值：没有 pathspec 时 `log.follow=true` 仍合格。
+
+`A..B` 会先加载排除端的祖先闭包，再遍历展示集合。debug 计数钩子 `LIBRA_TEST_LOG_COMMITS_LOADED_PATH`（`#[cfg(debug_assertions)]`）统计这次历史遍历解析过的提交对象数，含闭包与入队父提交，因此大于 `rev-list A..B --count`，差额是闭包大小。单一正向修订上，该数等于 `rev-list --count`。`LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH` 记下缩写长度的输入提交数：合格限额用已打印集合（下限 7），其余调用用全部可达提交。
+
+与 `rev-list` 不对称：`log` 的不合格默认排序仍走 walker；`rev-list` 的过滤与全量选项路径在 BRL-04 之前仍用 `sort_rev_list_commits` 全局排序。带过滤的 `log` 与带过滤的 `rev-list` 在偏斜历史上的顺序可能不同。`get_reachable_commits` 保持集合语义，不计入该钩子。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 

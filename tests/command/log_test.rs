@@ -3791,3 +3791,735 @@ fn test_log_complete_repo_still_walks_parents() {
         .count();
     assert_eq!(count, 2, "complete history must still list both commits");
 }
+
+fn fresh_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    repo
+}
+
+fn commit_at(
+    repo: &std::path::Path,
+    path: &str,
+    body: &str,
+    message: &str,
+    committer: u64,
+    author: u64,
+) {
+    fs::write(repo.join(path), body).expect("write file");
+    assert_cli_success(&run_libra_command(&["add", path], repo), "add");
+    let committer_date = format!("{committer} +0000");
+    let author_date = format!("{author} +0000");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", message, "--no-verify"],
+            repo,
+            &[
+                ("GIT_COMMITTER_DATE", committer_date.as_str()),
+                ("GIT_AUTHOR_DATE", author_date.as_str()),
+            ],
+        ),
+        "commit",
+    );
+}
+
+fn rev_list_count(repo: &std::path::Path, specs: &[&str]) -> u64 {
+    let mut args = vec!["rev-list", "--count"];
+    args.extend_from_slice(specs);
+    let output = run_libra_command(&args, repo);
+    assert_cli_success(&output, "rev-list --count");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("rev-list count")
+}
+
+fn log_with_counts(repo: &std::path::Path, args: &[&str]) -> (std::process::Output, u64, u64) {
+    let loaded_path = repo.join(".commits-loaded");
+    let basis_path = repo.join(".abbrev-basis");
+    let _ = fs::remove_file(&loaded_path);
+    let _ = fs::remove_file(&basis_path);
+    let output = run_libra_command_with_env(
+        args,
+        repo,
+        &[
+            (
+                "LIBRA_TEST_LOG_COMMITS_LOADED_PATH",
+                loaded_path.to_str().expect("loaded path"),
+            ),
+            (
+                "LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH",
+                basis_path.to_str().expect("basis path"),
+            ),
+        ],
+    );
+    assert_cli_success(&output, &args.join(" "));
+    let loaded = fs::read_to_string(&loaded_path)
+        .expect("load counter")
+        .trim()
+        .parse()
+        .expect("load counter integer");
+    let basis = fs::read_to_string(&basis_path)
+        .expect("abbrev basis counter")
+        .trim()
+        .parse()
+        .expect("abbrev basis integer");
+    (output, loaded, basis)
+}
+
+fn assert_loads(repo: &std::path::Path, args: &[&str], expected: u64) {
+    let (_output, loaded, _basis) = log_with_counts(repo, args);
+    assert_eq!(loaded, expected, "{args:?}");
+}
+
+fn log_subjects(repo: &std::path::Path, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["log", "--format=%s"];
+    args.extend_from_slice(extra);
+    let output = run_libra_command(&args, repo);
+    assert_cli_success(&output, "log subjects");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn linear_history(n: usize) -> tempfile::TempDir {
+    let repo = fresh_repo();
+    for i in 1..=n {
+        commit_at(
+            repo.path(),
+            "f.txt",
+            &format!("v{i}\nFINDME {i}\n"),
+            &format!("m{i}"),
+            1_900_000_000 + i as u64,
+            1_900_000_000 + i as u64,
+        );
+    }
+    assert_eq!(rev_list_count(repo.path(), &["HEAD"]), n as u64);
+    repo
+}
+
+/// Merge with strictly increasing committer times, so the date-priority walk
+/// matches a global newest-first sort. Subjects newest-first: G, M2, S, R.
+fn monotonic_merge_repo() -> tempfile::TempDir {
+    let repo = fresh_repo();
+    commit_at(
+        repo.path(),
+        "r.txt",
+        "r\n",
+        "R",
+        1_910_000_001,
+        1_910_000_001,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], repo.path()),
+        "switch side",
+    );
+    commit_at(
+        repo.path(),
+        "s.txt",
+        "s\n",
+        "S",
+        1_910_000_002,
+        1_910_000_002,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main",
+    );
+    commit_at(
+        repo.path(),
+        "m.txt",
+        "m\n",
+        "M2",
+        1_910_000_003,
+        1_910_000_003,
+    );
+    let stamp = "1910000004 +0000";
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["merge", "side", "-m", "G", "--no-edit", "--no-verify"],
+            repo.path(),
+            &[("GIT_COMMITTER_DATE", stamp), ("GIT_AUTHOR_DATE", stamp)],
+        ),
+        "merge side",
+    );
+    repo
+}
+
+/// Clock-skewed history from ADR-BRL-02: M(10), P2(9), P1(5), B(5), A(5).
+/// Same-second commits are ordered by discovery ordinal.
+fn skew_repo() -> tempfile::TempDir {
+    let repo = fresh_repo();
+    commit_at(
+        repo.path(),
+        "a.txt",
+        "a\n",
+        "A",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "side"], repo.path()),
+        "orphan side",
+    );
+    commit_at(
+        repo.path(),
+        "b.txt",
+        "b\n",
+        "B",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main",
+    );
+    commit_at(
+        repo.path(),
+        "p1.txt",
+        "p1\n",
+        "P1",
+        1_920_000_005,
+        1_920_000_005,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "side"], repo.path()),
+        "switch side",
+    );
+    commit_at(
+        repo.path(),
+        "p2.txt",
+        "p2\n",
+        "P2",
+        1_920_000_009,
+        1_920_000_009,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main for merge",
+    );
+    let stamp = "1920000010 +0000";
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "side",
+                "-m",
+                "M",
+                "--no-edit",
+                "--no-verify",
+                "--allow-unrelated-histories",
+            ],
+            repo.path(),
+            &[("GIT_COMMITTER_DATE", stamp), ("GIT_AUTHOR_DATE", stamp)],
+        ),
+        "merge unrelated side",
+    );
+    repo
+}
+
+fn oneline_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn prefix_bytes(text: &str, n: usize) -> String {
+    let mut out = String::new();
+    for line in text.lines().take(n) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn log_limit_loads_bounded_commits() {
+    let repo = linear_history(8);
+    let (_output, loaded, _basis) = log_with_counts(repo.path(), &["log", "--oneline", "-1"]);
+    assert_eq!(loaded, 2, "tip plus the parent enqueued on the frontier");
+    assert!(loaded < rev_list_count(repo.path(), &["HEAD"]));
+}
+
+#[test]
+fn log_limit_with_skip_loads_bounded_commits() {
+    let repo = linear_history(8);
+    let (_output, loaded, _basis) = log_with_counts(
+        repo.path(),
+        &["log", "-n", "3", "--skip", "2", "--format=%s"],
+    );
+    assert_eq!(loaded, 6, "skip 2 + 3 yields, plus the next parent");
+    assert_eq!(rev_list_count(repo.path(), &["HEAD"]), 8);
+}
+
+#[test]
+fn log_config_follow_without_pathspec_stays_eligible() {
+    let repo = linear_history(8);
+    assert_cli_success(
+        &run_libra_command(&["config", "log.follow", "true"], repo.path()),
+        "config log.follow",
+    );
+    let (_output, loaded, _basis) = log_with_counts(repo.path(), &["log", "--oneline", "-1"]);
+    assert_eq!(loaded, 2, "log.follow without a pathspec stays eligible");
+}
+
+#[test]
+fn log_prefix_human_is_unlimited_prefix() {
+    let repo = monotonic_merge_repo();
+    let full = run_libra_command(&["log", "--oneline"], repo.path());
+    assert_cli_success(&full, "log --oneline");
+    let full_text = String::from_utf8_lossy(&full.stdout);
+    let lines: Vec<&str> = full_text.lines().collect();
+    assert!(lines.len() >= 3, "merge history: {full_text}");
+    for line in &lines {
+        let hash = line.split_whitespace().next().expect("hash");
+        assert_eq!(hash.len(), 7, "7-character abbreviation: {line}");
+        assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+    for n in [1usize, 3, lines.len()] {
+        let limited = run_libra_command(&["log", "--oneline", "-n", &n.to_string()], repo.path());
+        assert_cli_success(&limited, "limited oneline");
+        let limited_text = String::from_utf8_lossy(&limited.stdout);
+        assert_eq!(limited_text.as_ref(), prefix_bytes(&full_text, n));
+    }
+}
+
+#[test]
+fn log_prefix_abbrev_from_output_set_min_7() {
+    let repo = linear_history(8);
+    let (limited, loaded, basis) = log_with_counts(repo.path(), &["log", "--oneline", "-1"]);
+    assert_eq!(loaded, 2);
+    assert_eq!(
+        basis, 1,
+        "abbreviation uses the printed commit, not the frontier"
+    );
+    let hash = oneline_lines(&limited.stdout)
+        .first()
+        .expect("line")
+        .split_whitespace()
+        .next()
+        .expect("hash")
+        .to_string();
+    assert_eq!(hash.len(), 7);
+
+    let (unlimited, _loaded, full_basis) = log_with_counts(repo.path(), &["log", "--oneline"]);
+    assert_eq!(
+        full_basis, 8,
+        "unlimited log abbreviates from every reachable commit"
+    );
+    let full_hash = oneline_lines(&unlimited.stdout)
+        .first()
+        .expect("line")
+        .split_whitespace()
+        .next()
+        .expect("hash")
+        .to_string();
+    assert_eq!(full_hash.len(), 7);
+    assert_eq!(hash, full_hash);
+}
+
+#[test]
+fn log_skew_uses_date_priority_order() {
+    let repo = skew_repo();
+    assert_eq!(
+        log_subjects(repo.path(), &[]),
+        vec!["M", "P2", "P1", "B", "A"]
+    );
+}
+
+#[test]
+fn log_skew_limited_is_prefix() {
+    let repo = skew_repo();
+    let full = log_subjects(repo.path(), &[]);
+    for n in [1usize, 3] {
+        let limited = log_subjects(repo.path(), &["-n", &n.to_string()]);
+        assert_eq!(limited, full[..n]);
+    }
+}
+
+#[test]
+fn log_skew_same_second_tie_deterministic() {
+    let repo = skew_repo();
+    let first = log_subjects(repo.path(), &[]);
+    let second = log_subjects(repo.path(), &[]);
+    assert_eq!(first, second);
+    assert_eq!(first, vec!["M", "P2", "P1", "B", "A"]);
+}
+
+#[test]
+fn log_prefix_json_is_unlimited_prefix() {
+    let repo = monotonic_merge_repo();
+    let unlimited = run_libra_command(&["--json", "log"], repo.path());
+    assert_cli_success(&unlimited, "json log");
+    let unlimited_json = parse_json_stdout(&unlimited);
+    let all = unlimited_json["data"]["commits"]
+        .as_array()
+        .expect("commits");
+    let n = 2;
+    let limited = run_libra_command(&["--json", "log", "-n", &n.to_string()], repo.path());
+    assert_cli_success(&limited, "json log -n");
+    let limited_json = parse_json_stdout(&limited);
+    let head = limited_json["data"]["commits"]
+        .as_array()
+        .expect("limited commits");
+    assert_eq!(head.len(), n);
+    assert_eq!(head.as_slice(), &all[..n]);
+}
+
+#[test]
+fn log_prefix_machine_is_unlimited_prefix() {
+    let repo = monotonic_merge_repo();
+    let unlimited = run_libra_command(&["--machine", "log"], repo.path());
+    assert_cli_success(&unlimited, "machine log");
+    let unlimited_json = parse_json_stdout(&unlimited);
+    let all = unlimited_json["data"]["commits"]
+        .as_array()
+        .expect("commits");
+    let n = 2;
+    let limited = run_libra_command(&["--machine", "log", "-n", &n.to_string()], repo.path());
+    assert_cli_success(&limited, "machine log -n");
+    let limited_json = parse_json_stdout(&limited);
+    let head = limited_json["data"]["commits"]
+        .as_array()
+        .expect("limited commits");
+    assert_eq!(head.len(), n);
+    assert_eq!(head.as_slice(), &all[..n]);
+}
+
+#[test]
+fn log_boundary_first_parent_shallow_unchanged() {
+    let repo = monotonic_merge_repo();
+    assert_eq!(
+        log_subjects(repo.path(), &["--first-parent"]),
+        vec!["G", "M2", "R"]
+    );
+
+    let (shallow_repo, child, parent) = two_commit_shallow_repo(true);
+    let output = run_libra_command(&["log", "--format=%s"], shallow_repo.path());
+    assert_cli_success(&output, "shallow log");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("second"), "{text}");
+    assert!(
+        !text.contains(&parent),
+        "must not print the hidden parent id"
+    );
+    assert!(text.lines().filter(|line| !line.trim().is_empty()).count() == 1);
+    let _ = (child, parent);
+}
+
+#[test]
+fn log_edge_skip_beyond_history() {
+    let repo = linear_history(3);
+    let output = run_libra_command(&["log", "--skip", "10", "--format=%s"], repo.path());
+    assert_cli_success(&output, "skip beyond history");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+}
+
+#[test]
+fn log_edge_empty_history() {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    let output = run_libra_command(&["log"], repo.path());
+    assert_eq!(output.status.code(), Some(128));
+    let (_stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(report.message.contains("does not have any commits yet"));
+}
+
+#[test]
+fn log_edge_multi_root() {
+    let repo = fresh_repo();
+    commit_at(
+        repo.path(),
+        "a.txt",
+        "a\n",
+        "A",
+        1_930_000_001,
+        1_930_000_001,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "other"], repo.path()),
+        "orphan",
+    );
+    commit_at(
+        repo.path(),
+        "b.txt",
+        "b\n",
+        "B",
+        1_930_000_003,
+        1_930_000_003,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main",
+    );
+    let stamp = "1930000004 +0000";
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "other",
+                "-m",
+                "M",
+                "--no-edit",
+                "--no-verify",
+                "--allow-unrelated-histories",
+            ],
+            repo.path(),
+            &[("GIT_COMMITTER_DATE", stamp), ("GIT_AUTHOR_DATE", stamp)],
+        ),
+        "merge roots",
+    );
+    assert_eq!(log_subjects(repo.path(), &[]), vec!["M", "B", "A"]);
+}
+
+#[test]
+fn log_edge_shallow_merge() {
+    let repo = monotonic_merge_repo();
+    let hashes = run_libra_command(&["log", "--format=%H"], repo.path());
+    assert_cli_success(&hashes, "hashes");
+    let ids: Vec<String> = String::from_utf8_lossy(&hashes.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(ids.len() >= 2, "{ids:?}");
+    let merge = &ids[0];
+    let parent = &ids[1];
+    fs::remove_file(loose_object_path(repo.path(), parent)).expect("delete parent");
+    fs::write(
+        repo.path().join(".libra").join("shallow"),
+        format!("{merge}\n"),
+    )
+    .expect("shallow");
+    let output = run_libra_command(&["log", "--format=%s"], repo.path());
+    assert_cli_success(&output, "shallow merge");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "G");
+}
+
+#[test]
+fn log_ineligible_graph_children_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    assert_loads(repo.path(), &["log", "--graph", "-n", "1"], total);
+    assert_loads(repo.path(), &["log", "--children", "-n", "1"], total);
+}
+
+#[test]
+fn log_ineligible_reverse_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    assert_loads(
+        repo.path(),
+        &["log", "--reverse", "-n", "1", "--format=%s"],
+        total,
+    );
+}
+
+#[test]
+fn log_ineligible_filters_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    for args in [
+        vec!["log", "--author", "Test", "-n", "1"],
+        vec!["log", "--committer", "Test", "-n", "1"],
+        vec!["log", "--grep", "m1", "-n", "1"],
+        vec!["log", "--since", "2000-01-01", "-n", "1"],
+        vec!["log", "--until", "2099-01-01", "-n", "1"],
+    ] {
+        let refs: Vec<&str> = args.to_vec();
+        assert_loads(repo.path(), &refs, total);
+    }
+}
+
+#[test]
+fn log_ineligible_pickaxe_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    assert_loads(repo.path(), &["log", "-S", "FINDME", "-n", "1"], total);
+    assert_loads(repo.path(), &["log", "-G", "FINDME", "-n", "1"], total);
+}
+
+#[test]
+fn log_ineligible_merge_parent_filters_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    for args in [
+        &["log", "--merges", "-n", "1"][..],
+        &["log", "--no-merges", "-n", "1"][..],
+        &["log", "--min-parents", "1", "-n", "1"][..],
+        &["log", "--max-parents", "2", "-n", "1"][..],
+        &["log", "--trailer", "Signed-off-by", "-n", "1"][..],
+    ] {
+        assert_loads(repo.path(), args, total);
+    }
+}
+
+#[test]
+fn log_ineligible_follow_line_range_pathspec_walk_full_history() {
+    let repo = linear_history(8);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    assert_loads(repo.path(), &["log", "--follow", "f.txt", "-n", "1"], total);
+    assert_loads(repo.path(), &["log", "-L", "1,1:f.txt", "-n", "1"], total);
+    assert_loads(repo.path(), &["log", "-n", "1", "--", "f.txt"], total);
+}
+
+#[test]
+fn log_ineligible_exclusion_range_walk_full_history() {
+    let repo = linear_history(8);
+    let hashes = run_libra_command(&["log", "--format=%H"], repo.path());
+    assert_cli_success(&hashes, "hashes");
+    let ids: Vec<String> = String::from_utf8_lossy(&hashes.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let exclude = &ids[4];
+    let range = format!("{exclude}..HEAD");
+    let shown = rev_list_count(repo.path(), &[&range]);
+    let total = rev_list_count(repo.path(), &["HEAD"]);
+    assert!(shown < total, "range must hide the exclusion closure");
+    let (_output, loaded, _basis) = log_with_counts(repo.path(), &["log", "-n", "1", &range]);
+    assert_eq!(
+        loaded, total,
+        "the hook counts the exclusion closure plus the shown commits"
+    );
+    assert_ne!(loaded, shown);
+}
+
+#[test]
+fn log_order_author_date_unlimited_stays_full_sort() {
+    let repo = fresh_repo();
+    commit_at(
+        repo.path(),
+        "c1.txt",
+        "1\n",
+        "C1",
+        1_940_000_100,
+        1_940_000_100,
+    );
+    commit_at(
+        repo.path(),
+        "c2.txt",
+        "2\n",
+        "C2",
+        1_940_000_200,
+        1_940_000_300,
+    );
+    commit_at(
+        repo.path(),
+        "c3.txt",
+        "3\n",
+        "C3",
+        1_940_000_300,
+        1_940_000_200,
+    );
+    assert_eq!(
+        log_subjects(repo.path(), &["--author-date-order"]),
+        vec!["C2", "C3", "C1"]
+    );
+    let (_output, loaded, _basis) =
+        log_with_counts(repo.path(), &["log", "--author-date-order", "--format=%s"]);
+    assert_eq!(loaded, 3);
+}
+
+#[test]
+fn log_order_author_date_limited_stays_full_sort() {
+    let repo = fresh_repo();
+    commit_at(
+        repo.path(),
+        "c1.txt",
+        "1\n",
+        "C1",
+        1_940_000_100,
+        1_940_000_100,
+    );
+    commit_at(
+        repo.path(),
+        "c2.txt",
+        "2\n",
+        "C2",
+        1_940_000_200,
+        1_940_000_300,
+    );
+    commit_at(
+        repo.path(),
+        "c3.txt",
+        "3\n",
+        "C3",
+        1_940_000_300,
+        1_940_000_200,
+    );
+    assert_eq!(
+        log_subjects(repo.path(), &["--author-date-order", "-n", "1"]),
+        vec!["C2"]
+    );
+    let (_output, loaded, _basis) = log_with_counts(
+        repo.path(),
+        &["log", "--author-date-order", "-n", "1", "--format=%s"],
+    );
+    assert_eq!(loaded, 3, "author-date order does not stop early");
+}
+
+#[test]
+fn log_order_date_order_matches_default() {
+    let repo = skew_repo();
+    let default = run_libra_command(&["log", "--format=%s"], repo.path());
+    let dated = run_libra_command(&["log", "--date-order", "--format=%s"], repo.path());
+    assert_cli_success(&default, "default");
+    assert_cli_success(&dated, "date-order");
+    assert_eq!(default.stdout, dated.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&default.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["M", "P2", "P1", "B", "A"]
+    );
+}
+
+#[test]
+fn log_pipe_head_equivalent_to_max_count() {
+    let repo = skew_repo();
+    let full = run_libra_command(&["log", "--format=%s"], repo.path());
+    assert_cli_success(&full, "full");
+    let text = String::from_utf8_lossy(&full.stdout);
+    for n in [1usize, 3] {
+        let limited = run_libra_command(&["log", "-n", &n.to_string(), "--format=%s"], repo.path());
+        assert_cli_success(&limited, "limited");
+        assert_eq!(
+            String::from_utf8_lossy(&limited.stdout).as_ref(),
+            prefix_bytes(&text, n)
+        );
+    }
+}
+
+#[test]
+fn log_ineligible_all_multiple_tips_walk_full_history() {
+    let repo = linear_history(8);
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], repo.path()),
+        "switch side",
+    );
+    commit_at(
+        repo.path(),
+        "side.txt",
+        "side\n",
+        "SIDE",
+        1_900_000_100,
+        1_900_000_100,
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], repo.path()),
+        "switch main",
+    );
+    let tips = rev_list_count(repo.path(), &["main", "side"]);
+    assert_eq!(tips, 9);
+    assert_loads(repo.path(), &["log", "-n", "1", "main", "side"], tips);
+    let all = rev_list_count(repo.path(), &["--all"]);
+    assert_loads(repo.path(), &["log", "--all", "-n", "1"], all);
+}

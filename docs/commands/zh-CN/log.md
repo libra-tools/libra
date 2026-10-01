@@ -294,7 +294,7 @@ libra log --reverse --oneline
 
 ### `--author-date-order`
 
-按作者日期而非提交者日期排序（最新在前）。Libra 仅按时间戳排序，不附加 Git 的拓扑（“父不先于子”）约束。相对 Libra 自身的提交者日期默认顺序，仅当作者日期与提交者日期不一致时才会不同；相对 Git，还会在拓扑约束本应重排提交的地方额外不同。
+按作者日期而非提交者日期排序（最新在前）。该标志保留全量收集后的作者日期全局排序，不走默认的日期优先遍历，因此限额不会提前停止遍历。Libra 仅按时间戳排序，不附加 Git 的拓扑（“父不先于子”）约束。相对 Libra 的提交者日期遍历，仅当作者日期与提交者日期不一致时才会不同；相对 Git，还会在拓扑约束本应重排提交的地方额外不同。
 
 ```bash
 libra log --author-date-order
@@ -303,7 +303,7 @@ libra log --author-date-order --oneline
 
 ### `--date-order`
 
-按提交者日期排序（最新在前）。这是 Libra 的默认顺序，故该标志为对齐 Git 而接受、显式选择默认顺序；与 `--author-date-order` 互斥。
+按提交者日期排序（最新在前）。这是 Libra 的默认日期优先遍历，故该标志是 Git 对齐 no-op，选择同一遍历；与 `--author-date-order` 互斥。
 
 ```bash
 libra log --date-order
@@ -483,11 +483,23 @@ Git 接受 `git log A..B` 这种位置修订表达式（其后可跟 pathspec）
 
 ### `--author-date-order`
 
-`--author-date-order` 按作者时间戳（最新在前）排序结果集，而非默认的提交者时间戳。排序仅按时间戳——Libra 不施加 Git 的拓扑约束——故仅当某提交的作者日期与提交者日期不同（如 rebase 或 cherry-pick 后）时才与默认不同。`--reverse` 仍会翻转最终顺序。
+`--author-date-order` 保留原先的全量收集，并按作者时间戳（最新在前）全局排序。它不走日期优先遍历，`-n` 也不会提前停止。排序仅按时间戳——Libra 不施加 Git 的拓扑约束——故仅当某提交的作者日期与提交者日期不同（如 rebase 或 cherry-pick 后）时才与默认不同。`--reverse` 仍会翻转最终顺序。
 
 ### `--date-order`
 
-`--date-order` 显式选择默认的提交者时间戳顺序。它是接受式 no-op（Libra 本就按提交者日期排序），与 `--author-date-order` 互斥。与 Libra 其它排序标志一样，排序仅按时间戳（无拓扑约束）。
+`--date-order` 选择默认的提交者日期优先遍历。它是 parity no-op（与不带该标志的 `libra log` 同一排序键、同一遍历），与 `--author-date-order` 互斥。
+
+### 日期优先遍历
+
+默认 `libra log` 与 `--date-order` 用优先队列遍历历史，键为提交者时间戳、新的在前。时间戳相同的提交，先被发现的排在前面。没有时钟偏斜、也没有同秒并列时，顺序与全局按时间倒序一致。有偏斜或同秒并列时，顺序与 Git 的日期优先遍历一致，可能不同于全局排序（例如 `M` 时间为 10，父提交 `P1` 为 5、`P2` 为 9，且 `P1` 的父 `A` 与 `P2` 的父 `B` 也是 5，输出为 `M, P2, P1, B, A`）。
+
+`log -n N` 是同一次序下无限额 `log` 的前缀。合格的限额（含 `--skip`）在产出 `skip + N` 笔后停止。下列调用不合格，仍遍历全部可达提交：`--graph`、`--children`、`--reverse`、`--author-date-order`、`--follow`（以及 `log.follow=true` 且恰好解析到一个已存在文件）、`-L`、pathspec、`--author` / `--committer` / `--grep` / `--since` / `--until`、pickaxe（`-S` / `-G`）、`--merges` / `--no-merges` / `--min-parents` / `--max-parents`、`--trailer`、带排除端的修订范围、`--all`，以及多个修订起点。没有 pathspec 时 `log.follow=true` 仍然合格。
+
+合格的 `log -n N` 在父提交入队时加载它们。若缺失的祖先比这个前沿更深，命令会打出已可达的前缀并成功。全量遍历在走到缺失对象时仍然失败。
+
+合格的有限额 log 用本次打印出的提交计算缩写长度，下限为 7。无限额与不合格调用仍用全部可达提交。若 7 位前缀在打印出的提交里唯一、但在全部历史里不唯一，`log --oneline -n N` 的缩写可能短于 `log --oneline`。
+
+`A..B` 这类范围会先遍历排除闭包，再遍历展示的提交。debug 构建把 `LIBRA_TEST_LOG_COMMITS_LOADED_PATH` 指到一个文件时，会记下这次遍历解析过的提交对象数；该数包含排除闭包，因此比 `rev-list A..B --count` 多出闭包的大小。`LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH` 记下参与缩写长度计算的提交数。
 
 ### `--follow`
 
@@ -537,8 +549,8 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 反向 grep | `git log --invert-grep --grep=<pat>` | N/A | `libra log --invert-grep --grep <pat>` |
 | 路径过滤 | `git log -- <paths>` | N/A（使用 revset） | `libra log -- <paths>` |
 | 反向顺序 | `git log --reverse` | `jj log --reversed` | `libra log --reverse` |
-| 作者日期顺序 | `git log --author-date-order` | N/A | `libra log --author-date-order`（仅时间戳） |
-| 日期顺序 | `git log --date-order` | N/A | `libra log --date-order`（接受式 no-op；默认） |
+| 作者日期顺序 | `git log --author-date-order` | N/A | `libra log --author-date-order`（全量作者日期排序） |
+| 日期顺序 | `git log --date-order` | N/A | `libra log --date-order`（parity no-op；提交者日期优先遍历） |
 | 追踪重命名 | `git log --follow <file>` | N/A | `libra log --follow <file>` |
 | 仅 merge commits | `git log --merges` | N/A | N/A |
 | 仅 first parent | `git log --first-parent` | N/A | `libra log --first-parent` |
@@ -565,7 +577,8 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 - `--follow` 使用 best-effort 重命名检测，可能遗漏复杂重命名
 - `-L` 已被接受，但尚未提供 blame 级行精度
 - `--reverse` 已支持
-- `--author-date-order` 已支持（仅时间戳；无拓扑约束）
-- `--date-order` 已支持（接受式 no-op；显式选择默认的提交者日期顺序）
+- `--author-date-order` 保留全量作者日期排序（仅时间戳；无拓扑约束；限额不提前停止）
+- `--date-order` 是默认提交者日期优先遍历的 parity no-op
+- 合格的 `log -n N` 是无限额 `log` 的前缀，缩写取自本次打印的提交（下限 7）。偏斜或同秒历史按发现顺序输出；比限额前沿更深的缺失祖先不再使该命令失败
 - jj 的 log 使用模板语言（`-T`）进行格式化；Libra 使用 Git 兼容的 `--pretty` 格式字符串
 - 在 JSON 模式中，`files` 包含结构化变更摘要；JSON 输出永远不包含 patch 文本

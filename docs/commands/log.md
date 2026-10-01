@@ -369,10 +369,12 @@ libra log --reverse --oneline
 
 ### `--author-date-order`
 
-Order commits by author date instead of committer date (newest first). Libra
-sorts purely by timestamp and does not add Git's extra topological ("no parent
-before its children") constraint. Relative to Libra's own committer-date default
-the order changes only when author and committer dates differ; relative to Git it
+Order commits by author date instead of committer date (newest first). This
+keeps a full-history global author-date sort and does not use the default
+date-priority walk, so a limit does not stop that walk early. Libra sorts
+purely by timestamp and does not add Git's extra topological ("no parent
+before its children") constraint. Relative to Libra's committer-date walk the
+order changes only when author and committer dates differ; relative to Git it
 can additionally differ wherever the topological constraint would reorder
 commits.
 
@@ -383,9 +385,9 @@ libra log --author-date-order --oneline
 
 ### `--date-order`
 
-Order commits by committer date (newest first). This is Libra's default, so the
-flag is accepted for Git parity and explicitly selects the default ordering; it
-conflicts with `--author-date-order`.
+Order commits by committer date (newest first). This is Libra's default
+date-priority walk, so the flag is a Git parity no-op and selects that same
+walk; it conflicts with `--author-date-order`.
 
 ```bash
 libra log --date-order
@@ -602,18 +604,57 @@ applies after all other filters, so `-n` still limits the result set.
 
 ### `--author-date-order`
 
-`--author-date-order` sorts the result set by author timestamp (newest first)
-instead of the default committer timestamp. The sort is purely by timestamp —
-Libra does not impose Git's topological constraint — so it diverges from the
-default only when a commit's author and committer dates differ (e.g. after a
-rebase or cherry-pick). `--reverse` still flips the final ordering.
+`--author-date-order` keeps the previous full collect and sorts that set by
+author timestamp (newest first). It does not use the date-priority walk, and
+`-n` does not stop the walk early. The sort is purely by timestamp — Libra does
+not impose Git's topological constraint — so it diverges from the default only
+when a commit's author and committer dates differ (e.g. after a rebase or
+cherry-pick). `--reverse` still flips the final ordering.
 
 ### `--date-order`
 
-`--date-order` selects the default committer-timestamp order explicitly. It is an
-accepted no-op (Libra already sorts by committer date) and conflicts with
-`--author-date-order`. Like Libra's other ordering flags, the sort is purely by
-timestamp (no topological constraint).
+`--date-order` selects the default committer-date priority walk. It is a parity
+no-op (the same key and the same walk as a plain `libra log`) and conflicts with
+`--author-date-order`.
+
+### Date-priority walk
+
+Default `libra log` and `--date-order` walk history with a priority queue keyed
+by committer timestamp, newest first. When two commits share a timestamp, the
+one discovered earlier is shown first. On histories with no clock skew and no
+same-second ties, that order matches a global newest-first sort. On skewed or
+same-second histories it matches Git's date-priority walk and can differ from a
+global sort (for example `M` at time 10 with parents `P1` at 5 and `P2` at 9,
+where `P1`'s parent `A` and `P2`'s parent `B` are also at time 5, prints
+`M, P2, P1, B, A`).
+
+`log -n N` is a prefix of unlimited `log` for that walk. An eligible limit,
+including `--skip`, stops after producing `skip + N` commits. These calls are
+not eligible and still walk the whole reachable history: `--graph`,
+`--children`, `--reverse`, `--author-date-order`, `--follow` (and
+`log.follow=true` when it resolves to exactly one existing file), `-L`, a
+pathspec, `--author` / `--committer` / `--grep` / `--since` / `--until`,
+pickaxe (`-S` / `-G`), `--merges` / `--no-merges` / `--min-parents` /
+`--max-parents`, `--trailer`, a revision range with an excluded side, `--all`,
+and more than one revision tip. `log.follow=true` with no pathspec stays
+eligible.
+
+An eligible `log -n N` loads parents when it enqueues them. If a missing
+ancestor is deeper than that frontier, the command prints the reachable prefix
+and succeeds. A full walk still fails when it reaches the missing object.
+
+Eligible limited logs choose the abbreviated hash length from the commits they
+print, with a minimum of 7. Unlimited logs and ineligible commands still use
+every reachable commit. In a repository where a 7-character prefix is unique
+among the printed commits but not among the whole history, `log --oneline -n N`
+can print a shorter abbreviation than `log --oneline`.
+
+A range such as `A..B` still walks the exclusion closure before the shown
+commits. Debug builds can record how many commit objects that walk parsed by
+setting `LIBRA_TEST_LOG_COMMITS_LOADED_PATH` to a file path. That count includes
+the exclusion closure, so it is larger than `rev-list A..B --count` by the size
+of the closure. `LIBRA_TEST_LOG_ABBREV_BASIS_COUNT_PATH` records how many commits
+were used to choose the abbreviation length.
 
 ### `--follow`
 
@@ -677,8 +718,8 @@ flag only affects the human rendering layer.
 | Invert grep | `git log --invert-grep --grep=<pat>` | N/A | `libra log --invert-grep --grep <pat>` |
 | Path filter | `git log -- <paths>` | N/A (use revset) | `libra log -- <paths>` |
 | Reverse order | `git log --reverse` | `jj log --reversed` | `libra log --reverse` |
-| Author-date order | `git log --author-date-order` | N/A | `libra log --author-date-order` (timestamp-only) |
-| Date order | `git log --date-order` | N/A | `libra log --date-order` (accepted no-op; default) |
+| Author-date order | `git log --author-date-order` | N/A | `libra log --author-date-order` (full-history author-date sort) |
+| Date order | `git log --date-order` | N/A | `libra log --date-order` (parity no-op; committer-date priority walk) |
 | Follow renames | `git log --follow <file>` | N/A | `libra log --follow <file>` |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
 | Error hints | Minimal | Minimal | Every error type has an actionable hint |
@@ -710,7 +751,8 @@ flag only affects the human rendering layer.
 - `--follow` uses best-effort rename detection and may miss complex renames
 - `-L` is accepted but does not yet provide blame-level line precision
 - `--reverse` is supported
-- `--author-date-order` is supported (timestamp-only; no topological constraint)
-- `--date-order` is supported (accepted no-op; selects the default committer-date order)
+- `--author-date-order` keeps a full-history author-date sort (timestamp-only; no topological constraint; a limit does not stop the walk early)
+- `--date-order` is a parity no-op for the default committer-date priority walk
+- Eligible `log -n N` is a prefix of unlimited `log` and abbreviates hashes from the printed commits (minimum 7). Skewed or same-second histories follow discovery order, and a missing ancestor beyond the limited frontier no longer fails the command
 - jj's log uses a template language (`-T`) for formatting; Libra uses Git-compatible `--pretty` format strings
 - In JSON mode, `files` contains structured change summaries; patch text is never included in JSON output
