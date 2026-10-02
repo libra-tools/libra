@@ -96,6 +96,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | `+` | `--create-dir <NAME>`（PATH 为父目录） | `POST /api/v1/create-entry` |
 | `d` | `--delete-dir <NAME>`（PATH 为父目录） | `POST /api/v1/delete-entry` |
 | `m` | `--move-dir <NAME> <PARENT-PATH>`（PATH 为 NAME 当前的父目录；名称不变） | `POST /api/v1/move-entry` |
+| `R` | `--rename-dir <NAME> <NEW-NAME>`（PATH 为父目录，保持不变） | `POST /api/v1/move-entry` |
 
 所有非交互调用遵守同一组规则：
 
@@ -208,6 +209,33 @@ payload 为：
 | HTTP 404：NAME、PATH 或 PARENT-PATH 不存在 | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
 
+`--rename-dir <NAME> <NEW-NAME>` 以一次同父目录的 `POST /api/v1/move-entry` 把 PATH 下的
+目录 NAME 改名为 NEW-NAME，之后不重新列出。纯文本摘要为
+`renamed directory <from> -> <to> (commit <commit_id>)`；带 `--json`/`--machine` 时
+payload 与 `--move-dir` 同形，`target.to.parent` 等于 `target.from.parent`：
+
+```json
+{
+  "operation": "rename-dir",
+  "server": "https://mega2.example.com",
+  "target": {
+    "from": { "parent": "/src", "name": "old", "path": "/src/old" },
+    "to": { "parent": "/src", "name": "new", "path": "/src/new" }
+  },
+  "receipt": { "commit_id": "…", "from_path": "/src/old", "to_path": "/src/new", "cl_link": null }
+}
+```
+
+错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 或 NEW-NAME 为 `.`/`..`、为空、过长，或含分隔符、控制字符 | `LBR-CLI-002` | 无（不发请求） |
+| 与另一个操作 flag 或 `--ref` 同用 | `LBR-CLI-002` | 无（不发请求） |
+| HTTP 400：NEW-NAME 与 NAME 相同、PATH 下已有名为 NEW-NAME 的条目、NAME 是文件、PATH 途经文件，或服务端拒绝该路径（例如 trunk 服务端上的顶层目录） | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 404：NAME 或 PATH 不存在 | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -261,6 +289,7 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
 | `--delete-dir <NAME>` | 不用终端删除 PATH 下的目录 NAME（一次 POST，无确认行，不重新列出）。 |
 | `--move-dir <NAME> <PARENT-PATH>` | 不用终端把 PATH 下的目录 NAME 移到 PARENT-PATH 下，名称不变（一次 POST，不重新列出）。 |
+| `--rename-dir <NAME> <NEW-NAME>` | 不用终端把 PATH 下的目录 NAME 改名为 NEW-NAME，父目录不变（一次 POST，不重新列出）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -329,6 +358,9 @@ libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /
 
 # 不用终端把 /src/pkg 移到 /lib/pkg
 libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /lib /src --token-file ~/.mega2-token
+
+# 不用终端把 /src/old 改名为 /src/new
+libra --json mega2 browser --server https://mega2.example.com --rename-dir old new /src --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

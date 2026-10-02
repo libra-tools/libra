@@ -1634,3 +1634,196 @@ fn move_dir_existing_destination_http_status() {
     assert!(!output.status.success());
     assert_eq!(error_envelope(&output)["details"]["http_status"], 400);
 }
+
+// ---- rename_dir (MN-12): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c ----
+
+/// The rule fixture's receipt carries an ESC in `commit_id`, so R2 proves the
+/// human summary sanitizes server strings.
+fn rename_dir_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        envelope(json!({
+            "commit_id": "commit-\u{1b}[31m-1",
+            "from_path": "/a",
+            "to_path": "/b",
+            "cl_link": null,
+        })),
+    )
+}
+
+fn rename_dir_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        envelope(json!({
+            "commit_id": "commit-1",
+            "from_path": "/src/old",
+            "to_path": "/src/new",
+            "cl_link": null,
+        })),
+    )
+}
+
+const RENAME_DIR_CASE: OpCase = OpCase {
+    op_args: &["--rename-dir", "a", "b", "/"],
+    method: "POST",
+    route: "/api/v1/move-entry",
+    path: "/api/v1/move-entry",
+    ok: rename_dir_ok,
+};
+
+op_rule!(op_rule_rename_dir_r1, rule_r1, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r1b, rule_r1b, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r2, rule_r2, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r3, rule_r3, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r4a, rule_r4a, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r4b, rule_r4b, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r7_code, rule_r7_code, RENAME_DIR_CASE);
+op_rule!(
+    op_rule_rename_dir_r7_no_request,
+    rule_r7_no_request,
+    RENAME_DIR_CASE
+);
+op_rule!(op_rule_rename_dir_r8_code, rule_r8_code, RENAME_DIR_CASE);
+op_rule!(
+    op_rule_rename_dir_r8_no_request,
+    rule_r8_no_request,
+    RENAME_DIR_CASE
+);
+op_rule!(op_rule_rename_dir_r9a, rule_r9a, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r9b, rule_r9b, RENAME_DIR_CASE);
+op_rule!(op_rule_rename_dir_r9c, rule_r9c, RENAME_DIR_CASE);
+
+// ---- rename_dir (MN-12): operation-specific behavior ----
+
+/// `--rename-dir NAME NEW-NAME PATH` plus `extra` against `mock`.
+fn rename_dir_output(mock: &MockMega2, name: &str, new_name: &str, extra: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = mock.url();
+    let mut args = vec![
+        "mega2",
+        "browser",
+        "--server",
+        &url,
+        "--rename-dir",
+        name,
+        new_name,
+    ];
+    args.extend_from_slice(extra);
+    run(dir.path(), &args, &[])
+}
+
+/// AC-1: one anonymous same-parent POST to move-entry.
+#[test]
+fn rename_dir_request_record() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "old", "new", &["/src/", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/move-entry".to_string(),
+            None,
+            Some(json!({
+                "from_path": "/src",
+                "from_name": "old",
+                "to_path": "/src",
+                "to_name": "new",
+                "skip_build": true,
+            })),
+        )]
+    );
+}
+
+/// AC-2: `target.to.parent` is `target.from.parent`; `receipt` is the
+/// server's receipt.
+#[test]
+fn rename_dir_json_payload() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "old", "new", &["/src", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "rename-dir",
+            "server": mock.url(),
+            "target": {
+                "from": {"parent": "/src", "name": "old", "path": "/src/old"},
+                "to": {"parent": "/src", "name": "new", "path": "/src/new"},
+            },
+            "receipt": {"commit_id": "commit-1", "from_path": "/src/old", "to_path": "/src/new", "cl_link": null},
+        })
+    );
+}
+
+/// AC-3: the human summary is one sanitized line.
+#[test]
+fn rename_dir_human_output() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "old", "new", &["/src"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "renamed directory /src/old -> /src/new (commit commit-1)\n"
+    );
+}
+
+/// G14: NAME `..` (delegated to `validate_entry_name`) fails with `LBR-CLI-002`.
+#[test]
+fn rename_dir_rejects_dotdot_name_code() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "..", "b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G15: the same refusal sends no request.
+#[test]
+fn rename_dir_rejects_dotdot_name_no_request() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "..", "b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G16: NEW-NAME `..` (delegated to `validate_entry_name`) fails with
+/// `LBR-CLI-002`.
+#[test]
+fn rename_dir_rejects_dotdot_new_name_code() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "a", "..", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G17: the same refusal sends no request.
+#[test]
+fn rename_dir_rejects_dotdot_new_name_no_request() {
+    let mock = MockMega2::start(rename_dir_clean_ok);
+    let output = rename_dir_output(&mock, "a", "..", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// mega2 refuses a move whose source and destination are the same (HTTP 400).
+const SAME_NAME: &str =
+    r#"{"req_result":false,"data":null,"err_message":"source and destination are the same: /a"}"#;
+
+/// G18: NEW-NAME equal to NAME (server 400) fails with `LBR-CLI-003`.
+#[test]
+fn rename_dir_same_name_code() {
+    let mock = MockMega2::start(fail_on(&RENAME_DIR_CASE, 400, SAME_NAME));
+    let output = rename_dir_output(&mock, "a", "a", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-003");
+}
+
+/// G19: the same failure carries `details.http_status` 400.
+#[test]
+fn rename_dir_same_name_http_status() {
+    let mock = MockMega2::start(fail_on(&RENAME_DIR_CASE, 400, SAME_NAME));
+    let output = rename_dir_output(&mock, "a", "a", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 400);
+}

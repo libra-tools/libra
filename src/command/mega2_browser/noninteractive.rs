@@ -108,6 +108,13 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Write,
         surface: Surface::Directory,
     },
+    OperationSpec {
+        name: "rename-dir",
+        flag: "--rename-dir",
+        endpoint: mega2_diag::MOVE_ENTRY,
+        access: Access::Write,
+        surface: Surface::Directory,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
@@ -125,6 +132,11 @@ pub enum Operation {
         name: String,
         to_parent: String,
     },
+    /// Rename NAME to `new_name`, keeping the parent PATH.
+    RenameDir {
+        name: String,
+        new_name: String,
+    },
 }
 
 impl Operation {
@@ -135,6 +147,7 @@ impl Operation {
             Operation::CreateDir { .. } => "create-dir",
             Operation::DeleteDir { .. } => "delete-dir",
             Operation::MoveDir { .. } => "move-dir",
+            Operation::RenameDir { .. } => "rename-dir",
         }
     }
 
@@ -260,6 +273,26 @@ pub async fn execute(
             );
             emit_write(spec, invocation, output, &target, &receipt, &summary)
         }
+        Operation::RenameDir { name, new_name } => {
+            // A rename is the same-parent form of the move request.
+            let client = Mega2MutateClient::new(invocation.server, token)?;
+            let receipt = MoveReceipt::from(
+                client
+                    .rename_directory(invocation.path, &name, &new_name, None)
+                    .await?,
+            );
+            let target = MoveTarget {
+                from: Target::new(invocation.path, &name),
+                to: Target::new(invocation.path, &new_name),
+            };
+            let summary = format!(
+                "renamed directory {} -> {} (commit {})\n",
+                sanitize(&target.from.path),
+                sanitize(&target.to.path),
+                sanitize(&receipt.commit_id)
+            );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
+        }
     }
 }
 
@@ -379,8 +412,8 @@ impl From<RemoteDeleteReceipt> for DeleteReceipt {
     }
 }
 
-/// What a move targeted: the source and destination entries, both built only
-/// from validated local input (ADR-MN-03).
+/// What a move or rename targeted: the source and destination entries, both
+/// built only from validated local input (ADR-MN-03).
 #[derive(Serialize, Debug, PartialEq, Eq)]
 struct MoveTarget {
     from: Target,
@@ -520,6 +553,14 @@ mod tests {
         .expect("move-dir is registered");
         assert_eq!(spec.name, "move-dir");
         assert_eq!(spec.endpoint, mega2_diag::MOVE_ENTRY);
+        let spec = Operation::RenameDir {
+            name: "x".to_string(),
+            new_name: "y".to_string(),
+        }
+        .spec()
+        .expect("rename-dir is registered");
+        assert_eq!(spec.name, "rename-dir");
+        assert_eq!(spec.endpoint, mega2_diag::MOVE_ENTRY);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -632,6 +673,40 @@ mod tests {
                     "to": {"parent": "/lib", "name": "pkg", "path": "/lib/pkg"},
                 },
                 "receipt": {"commit_id": "c1", "from_path": "/src/pkg", "to_path": "/lib/pkg", "cl_link": null},
+            })
+        );
+    }
+
+    /// MN-12: a rename keeps the parent, so `target.to.parent` is
+    /// `target.from.parent`.
+    #[test]
+    fn rename_payload_keeps_parent() {
+        let target = MoveTarget {
+            from: Target::new("/src", "old"),
+            to: Target::new("/src", "new"),
+        };
+        let receipt = MoveReceipt {
+            commit_id: "c1".to_string(),
+            from_path: Some("/src/old".to_string()),
+            to_path: Some("/src/new".to_string()),
+            cl_link: None,
+        };
+        let data = WriteData {
+            operation: "rename-dir",
+            server: "https://mega2.example.com",
+            target: &target,
+            receipt: &receipt,
+        };
+        assert_eq!(
+            serde_json::to_value(&data).expect("serialize"),
+            serde_json::json!({
+                "operation": "rename-dir",
+                "server": "https://mega2.example.com",
+                "target": {
+                    "from": {"parent": "/src", "name": "old", "path": "/src/old"},
+                    "to": {"parent": "/src", "name": "new", "path": "/src/new"},
+                },
+                "receipt": {"commit_id": "c1", "from_path": "/src/old", "to_path": "/src/new", "cl_link": null},
             })
         );
     }

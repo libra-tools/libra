@@ -111,6 +111,7 @@ the forms available in this release.
 | `+` | `--create-dir <NAME>` (PATH is the parent) | `POST /api/v1/create-entry` |
 | `d` | `--delete-dir <NAME>` (PATH is the parent) | `POST /api/v1/delete-entry` |
 | `m` | `--move-dir <NAME> <PARENT-PATH>` (PATH is NAME's current parent; the name is kept) | `POST /api/v1/move-entry` |
+| `R` | `--rename-dir <NAME> <NEW-NAME>` (PATH is the parent, which is kept) | `POST /api/v1/move-entry` |
 
 Every non-interactive call follows the same rules:
 
@@ -238,6 +239,34 @@ Errors:
 | HTTP 404: NAME, PATH or PARENT-PATH does not exist | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
 
+`--rename-dir <NAME> <NEW-NAME>` renames directory NAME under PATH to NEW-NAME
+with one same-parent `POST /api/v1/move-entry`, and does not reload. The
+plain-text summary is `renamed directory <from> -> <to> (commit <commit_id>)`;
+with `--json`/`--machine` the payload has the `--move-dir` shape, with
+`target.to.parent` equal to `target.from.parent`:
+
+```json
+{
+  "operation": "rename-dir",
+  "server": "https://mega2.example.com",
+  "target": {
+    "from": { "parent": "/src", "name": "old", "path": "/src/old" },
+    "to": { "parent": "/src", "name": "new", "path": "/src/new" }
+  },
+  "receipt": { "commit_id": "…", "from_path": "/src/old", "to_path": "/src/new", "cl_link": null }
+}
+```
+
+Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME or NEW-NAME is `.`/`..`, empty, too long, or has a separator or control character | `LBR-CLI-002` | none (no request) |
+| Combined with another operation flag or with `--ref` | `LBR-CLI-002` | none (no request) |
+| HTTP 400: NEW-NAME equals NAME, PATH already has an entry named NEW-NAME, NAME is a file, PATH runs through a file, or the server refuses the path (for example a top-level directory on a trunk server) | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 404: NAME or PATH does not exist | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -306,6 +335,7 @@ terminal. The panel operates root tags only.
 | `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
 | `--delete-dir <NAME>` | Delete directory NAME under PATH without a terminal (one POST, no confirmation, no reload). |
 | `--move-dir <NAME> <PARENT-PATH>` | Move directory NAME from PATH into PARENT-PATH, keeping its name, without a terminal (one POST, no reload). |
+| `--rename-dir <NAME> <NEW-NAME>` | Rename directory NAME under PATH to NEW-NAME, keeping its parent, without a terminal (one POST, no reload). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -379,6 +409,9 @@ libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /
 
 # Move /src/pkg to /lib/pkg without a terminal
 libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /lib /src --token-file ~/.mega2-token
+
+# Rename /src/old to /src/new without a terminal
+libra --json mega2 browser --server https://mega2.example.com --rename-dir old new /src --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

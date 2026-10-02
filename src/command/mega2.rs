@@ -133,6 +133,10 @@ pub struct OperationArgs {
     /// Move directory NAME from PATH into PARENT-PATH, keeping its name: one POST, no reload
     #[arg(long = "move-dir", num_args = 2, value_names = ["NAME", "PARENT-PATH"])]
     pub move_dir: Option<Vec<String>>,
+
+    /// Rename directory NAME under PATH to NEW-NAME, keeping its parent: one POST, no reload
+    #[arg(long = "rename-dir", num_args = 2, value_names = ["NAME", "NEW-NAME"])]
+    pub rename_dir: Option<Vec<String>>,
 }
 
 impl OperationArgs {
@@ -147,18 +151,27 @@ impl OperationArgs {
         if let Some(name) = &self.delete_dir {
             return Ok(Some(Operation::DeleteDir { name: name.clone() }));
         }
-        match self.move_dir.as_deref() {
-            None => Ok(None),
-            Some([name, to_parent]) => Ok(Some(Operation::MoveDir {
-                name: name.clone(),
-                to_parent: to_parent.clone(),
-            })),
-            // clap enforces `num_args = 2`; any other arity is a parser bug.
-            Some(values) => Err(CliError::internal(format!(
-                "mega2 browser: --move-dir expects 2 values, got {}",
-                values.len()
-            ))),
+        if let Some(values) = &self.move_dir {
+            let (name, to_parent) = value_pair("--move-dir", values)?;
+            return Ok(Some(Operation::MoveDir { name, to_parent }));
         }
+        if let Some(values) = &self.rename_dir {
+            let (name, new_name) = value_pair("--rename-dir", values)?;
+            return Ok(Some(Operation::RenameDir { name, new_name }));
+        }
+        Ok(None)
+    }
+}
+
+/// The two values of a `num_args = 2` operation flag. clap enforces the
+/// arity, so any other count is a parser bug, reported instead of panicking.
+fn value_pair(flag: &str, values: &[String]) -> CliResult<(String, String)> {
+    match values {
+        [first, second] => Ok((first.clone(), second.clone())),
+        _ => Err(CliError::internal(format!(
+            "mega2 browser: {flag} expects 2 values, got {}",
+            values.len()
+        ))),
     }
 }
 
