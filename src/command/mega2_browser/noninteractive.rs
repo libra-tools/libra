@@ -4,13 +4,13 @@
 //! selects it, the single HTTP endpoint it calls and its class (read or write,
 //! directory or tag). An operation reaches its row only through the registry,
 //! and the rules shared by a class are implemented once in this module, driven
-//! by the row's class, never per operation (ADR-MN-08, GC-MN-11): no terminal and no
-//! stdin; local validation first, then exactly one request with no reload,
-//! preflight or retry; token flags refused where the class takes none; write
-//! operations refuse `--ref`. Success prints
-//! the shared JSON envelope with `data.operation`, or a sanitized plain-text
-//! summary (nothing under `--quiet`); failures go through the shared error
-//! exit and leave stdout empty.
+//! by the row's class, never per operation (ADR-MN-08, GC-MN-11): no terminal
+//! and no stdin; local validation first, then exactly one request with no
+//! reload, preflight or retry; token flags refused where the class takes none;
+//! write operations refuse `--ref`. Success prints the shared JSON envelope
+//! with `data.operation`, or a sanitized plain-text summary (nothing under
+//! `--quiet`); failures go through the shared error exit and leave stdout
+//! empty.
 
 use std::{io::Write, path::Path};
 
@@ -23,6 +23,7 @@ use crate::{
         mega2_auth::{Mega2Token, resolve_token_from_process},
         mega2_diag::{self, Endpoint},
         mega2_entry::{Mega2EntryClient, RemoteCreateReceipt},
+        mega2_mutate::{DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient},
         mega2_tree::{ContentType, Listing, Mega2TreeSession},
     },
     utils::{
@@ -90,6 +91,13 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Write,
         surface: Surface::Directory,
     },
+    OperationSpec {
+        name: "delete-dir",
+        flag: "--delete-dir",
+        endpoint: mega2_diag::DELETE_ENTRY,
+        access: Access::Write,
+        surface: Surface::Directory,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
@@ -97,6 +105,7 @@ pub const OPERATIONS: &[OperationSpec] = &[
 pub enum Operation {
     List,
     CreateDir { name: String },
+    DeleteDir { name: String },
 }
 
 impl Operation {
@@ -105,6 +114,7 @@ impl Operation {
         match self {
             Operation::List => "list",
             Operation::CreateDir { .. } => "create-dir",
+            Operation::DeleteDir { .. } => "delete-dir",
         }
     }
 
@@ -184,25 +194,53 @@ pub async fn execute(
             let receipt =
                 CreateReceipt::from(client.create_directory(invocation.path, &name).await?);
             let target = Target::new(invocation.path, &name);
-            if output.is_json() {
-                let data = CreateDirData {
-                    operation: spec.name,
-                    server: invocation.server,
-                    target: &target,
-                    receipt: &receipt,
-                };
-                emit_json_data(COMMAND, &data, output)
-            } else {
-                write_human(
-                    output,
-                    &format!(
-                        "created directory {} (commit {})\n",
-                        sanitize(&target.path),
-                        sanitize(&receipt.commit_id)
-                    ),
-                )
-            }
+            let summary = format!(
+                "created directory {} (commit {})\n",
+                sanitize(&target.path),
+                sanitize(&receipt.commit_id)
+            );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
         }
+        Operation::DeleteDir { name } => {
+            // No preflight (ADR-MN-02): whether NAME exists and is a directory
+            // is the server's answer, so the listing type is not known here.
+            let client = Mega2MutateClient::new(invocation.server, token)?;
+            let receipt = DeleteReceipt::from(
+                client
+                    .delete_directory(invocation.path, &name, None)
+                    .await?,
+            );
+            let target = Target::new(invocation.path, &name);
+            let summary = format!(
+                "deleted directory {} (commit {})\n",
+                sanitize(&target.path),
+                sanitize(&receipt.commit_id)
+            );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
+        }
+    }
+}
+
+/// Prints a successful write: the machine payload, or the one-line human
+/// summary (already sanitized by the caller).
+fn emit_write<T: Serialize, R: Serialize>(
+    spec: &OperationSpec,
+    invocation: &Invocation<'_>,
+    output: &OutputConfig,
+    target: &T,
+    receipt: &R,
+    summary: &str,
+) -> CliResult<()> {
+    if output.is_json() {
+        let data = WriteData {
+            operation: spec.name,
+            server: invocation.server,
+            target,
+            receipt,
+        };
+        emit_json_data(COMMAND, &data, output)
+    } else {
+        write_human(output, summary)
     }
 }
 
@@ -281,14 +319,32 @@ impl From<RemoteCreateReceipt> for CreateReceipt {
     }
 }
 
-/// The `create-dir` machine payload: `target` (local input) and `receipt`
-/// (server answer) are kept apart.
+/// The server's delete-entry receipt, verbatim (`path`/`cl_link` may be null).
 #[derive(Serialize, Debug)]
-struct CreateDirData<'a> {
+struct DeleteReceipt {
+    commit_id: String,
+    path: Option<String>,
+    cl_link: Option<String>,
+}
+
+impl From<RemoteDeleteReceipt> for DeleteReceipt {
+    fn from(receipt: RemoteDeleteReceipt) -> Self {
+        Self {
+            commit_id: receipt.commit_id,
+            path: receipt.path,
+            cl_link: receipt.cl_link,
+        }
+    }
+}
+
+/// The machine payload of every write operation: `target` (local input) and
+/// `receipt` (server answer) are kept apart (ADR-MN-03).
+#[derive(Serialize, Debug)]
+struct WriteData<'a, T, R> {
     operation: &'static str,
     server: &'a str,
-    target: &'a Target,
-    receipt: &'a CreateReceipt,
+    target: &'a T,
+    receipt: &'a R,
 }
 
 /// One line per entry, `dir  <name>` or `file  <name>`, in listing order.
@@ -378,6 +434,13 @@ mod tests {
         .expect("create-dir is registered");
         assert_eq!(spec.name, "create-dir");
         assert_eq!(spec.endpoint, mega2_diag::CREATE_ENTRY);
+        let spec = Operation::DeleteDir {
+            name: "x".to_string(),
+        }
+        .spec()
+        .expect("delete-dir is registered");
+        assert_eq!(spec.name, "delete-dir");
+        assert_eq!(spec.endpoint, mega2_diag::DELETE_ENTRY);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -416,7 +479,7 @@ mod tests {
             path: None,
             cl_link: None,
         };
-        let data = CreateDirData {
+        let data = WriteData {
             operation: "create-dir",
             server: "https://mega2.example.com",
             target: &target,
@@ -429,6 +492,33 @@ mod tests {
                 "server": "https://mega2.example.com",
                 "target": {"parent": "/src", "name": "pkg", "path": "/src/pkg"},
                 "receipt": {"commit_id": "c1", "new_oid": "o1", "path": null, "cl_link": null},
+            })
+        );
+    }
+
+    /// MN-04: the `delete-dir` payload keeps local `target` and server
+    /// `receipt` apart.
+    #[test]
+    fn delete_dir_payload_separates_target_and_receipt() {
+        let target = Target::new("/src", "pkg");
+        let receipt = DeleteReceipt {
+            commit_id: "c1".to_string(),
+            path: Some("/src/pkg".to_string()),
+            cl_link: None,
+        };
+        let data = WriteData {
+            operation: "delete-dir",
+            server: "https://mega2.example.com",
+            target: &target,
+            receipt: &receipt,
+        };
+        assert_eq!(
+            serde_json::to_value(&data).expect("serialize"),
+            serde_json::json!({
+                "operation": "delete-dir",
+                "server": "https://mega2.example.com",
+                "target": {"parent": "/src", "name": "pkg", "path": "/src/pkg"},
+                "receipt": {"commit_id": "c1", "path": "/src/pkg", "cl_link": null},
             })
         );
     }

@@ -312,13 +312,18 @@ fn argv<'a>(
     args
 }
 
-/// 500 only for this operation's own method and path; anything else gets an
-/// unexpected 418, so a request to the wrong endpoint cannot satisfy R4a.
-fn fail_500_on(case: &OpCase) -> impl Fn(&str, &str) -> (u16, String) + Send + 'static {
+/// `status` with `body` only for this operation's own method and path;
+/// anything else gets an unexpected 418, so a request to the wrong endpoint
+/// cannot satisfy R4a or a server-failure fixture.
+fn fail_on(
+    case: &OpCase,
+    status: u16,
+    body: &'static str,
+) -> impl Fn(&str, &str) -> (u16, String) + Send + 'static {
     let (method, path) = (case.method, case.path);
     move |m: &str, p: &str| {
         if m == method && p == path {
-            (500, String::new())
+            (status, body.to_string())
         } else {
             (418, String::new())
         }
@@ -380,7 +385,7 @@ fn rule_r3(case: &OpCase) {
 
 /// R4a: a 500 on the operation's route yields `details` with its method and route.
 fn rule_r4a(case: &OpCase) {
-    let mock = MockMega2::start(fail_500_on(case));
+    let mock = MockMega2::start(fail_on(case, 500, ""));
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run(
         dir.path(),
@@ -396,7 +401,7 @@ fn rule_r4a(case: &OpCase) {
 
 /// R4b: a 500 is not retried — exactly one request.
 fn rule_r4b(case: &OpCase) {
-    let mock = MockMega2::start(fail_500_on(case));
+    let mock = MockMega2::start(fail_on(case, 500, ""));
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run(
         dir.path(),
@@ -732,7 +737,7 @@ fn list_bare_json_matches_list_json() {
 /// AC-7: a failed `--list --machine` leaves stdout empty.
 #[test]
 fn list_failure_leaves_stdout_empty() {
-    let mock = MockMega2::start(fail_500_on(&LIST_CASE));
+    let mock = MockMega2::start(fail_on(&LIST_CASE, 500, ""));
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run(
         dir.path(),
@@ -925,7 +930,7 @@ fn create_dir_rejects_dotdot_name_no_request() {
 
 /// mega2 answers a duplicate directory with HTTP 500 today.
 fn duplicate_output() -> Output {
-    let mock = MockMega2::start(fail_500_on(&CREATE_DIR_CASE));
+    let mock = MockMega2::start(fail_on(&CREATE_DIR_CASE, 500, ""));
     let dir = tempfile::tempdir().expect("tempdir");
     run(
         dir.path(),
@@ -1212,4 +1217,226 @@ fn create_dir_empty_token_file_sends_nothing() {
         "stderr: {}",
         text(&output.stderr)
     );
+}
+
+// ---- delete_dir (MN-04): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c ----
+
+fn delete_entry_receipt(commit_id: &str) -> String {
+    envelope(json!({
+        "commit_id": commit_id,
+        "path": "/sub",
+        "cl_link": null,
+    }))
+}
+
+/// The rule fixture's receipt carries an ESC in `commit_id`, so R2 proves the
+/// human summary sanitizes server strings.
+fn delete_dir_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, delete_entry_receipt("commit-\u{1b}[31m-1"))
+}
+
+fn delete_dir_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, delete_entry_receipt("commit-1"))
+}
+
+const DELETE_DIR_CASE: OpCase = OpCase {
+    op_args: &["--delete-dir", "sub", "/"],
+    method: "POST",
+    route: "/api/v1/delete-entry",
+    path: "/api/v1/delete-entry",
+    ok: delete_dir_ok,
+};
+
+op_rule!(op_rule_delete_dir_r1, rule_r1, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r1b, rule_r1b, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r2, rule_r2, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r3, rule_r3, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r4a, rule_r4a, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r4b, rule_r4b, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r7_code, rule_r7_code, DELETE_DIR_CASE);
+op_rule!(
+    op_rule_delete_dir_r7_no_request,
+    rule_r7_no_request,
+    DELETE_DIR_CASE
+);
+op_rule!(op_rule_delete_dir_r8_code, rule_r8_code, DELETE_DIR_CASE);
+op_rule!(
+    op_rule_delete_dir_r8_no_request,
+    rule_r8_no_request,
+    DELETE_DIR_CASE
+);
+op_rule!(op_rule_delete_dir_r9a, rule_r9a, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r9b, rule_r9b, DELETE_DIR_CASE);
+op_rule!(op_rule_delete_dir_r9c, rule_r9c, DELETE_DIR_CASE);
+
+// ---- delete_dir (MN-04): operation-specific behavior ----
+
+/// AC-1: one anonymous POST with the TUI's delete body: the normalized parent,
+/// the name and `skip_build`, without `is_directory` or `author_username`.
+#[test]
+fn delete_dir_request_record() {
+    let mock = MockMega2::start(delete_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--delete-dir",
+            "sub",
+            "/src/",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/delete-entry".to_string(),
+            None,
+            Some(json!({"path": "/src", "name": "sub", "skip_build": true})),
+        )]
+    );
+}
+
+/// AC-2: `target` comes from local input, `receipt` is the server's receipt.
+#[test]
+fn delete_dir_json_payload() {
+    let mock = MockMega2::start(delete_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--delete-dir",
+            "sub",
+            "/src",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "delete-dir",
+            "server": mock.url(),
+            "target": {"parent": "/src", "name": "sub", "path": "/src/sub"},
+            "receipt": {"commit_id": "commit-1", "path": "/sub", "cl_link": null},
+        })
+    );
+}
+
+/// AC-3: the human summary is one sanitized line.
+#[test]
+fn delete_dir_human_output() {
+    let mock = MockMega2::start(delete_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--delete-dir",
+            "sub",
+            "/src",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "deleted directory /src/sub (commit commit-1)\n"
+    );
+}
+
+/// `--delete-dir NAME /` under `--machine` against `mock`.
+fn delete_dir_machine_output(mock: &MockMega2, name: &str) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--delete-dir",
+            name,
+            "/",
+            "--machine",
+        ],
+        &[],
+    )
+}
+
+/// G14: NAME `..` (delegated to `validate_entry_name`) fails with `LBR-CLI-002`.
+#[test]
+fn delete_dir_rejects_dotdot_name_code() {
+    let mock = MockMega2::start(delete_dir_clean_ok);
+    let output = delete_dir_machine_output(&mock, "..");
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G15: the same refusal sends no request.
+#[test]
+fn delete_dir_rejects_dotdot_name_no_request() {
+    let mock = MockMega2::start(delete_dir_clean_ok);
+    let output = delete_dir_machine_output(&mock, "..");
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// mega2 matches a delete by mode: a file named NAME is HTTP 400.
+const FILE_TARGET: &str =
+    r#"{"req_result":false,"data":null,"err_message":"'sub' is not a directory"}"#;
+
+/// No entry named NAME under the parent is HTTP 404.
+const MISSING_TARGET: &str =
+    r#"{"req_result":false,"data":null,"err_message":"entry 'sub' not found under /"}"#;
+
+/// G16: a file target (server 400) fails with `LBR-CLI-003`.
+#[test]
+fn delete_dir_file_target_code() {
+    let mock = MockMega2::start(fail_on(&DELETE_DIR_CASE, 400, FILE_TARGET));
+    let output = delete_dir_machine_output(&mock, "sub");
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-003");
+}
+
+/// G17: the same failure carries `details.http_status` 400.
+#[test]
+fn delete_dir_file_target_http_status() {
+    let mock = MockMega2::start(fail_on(&DELETE_DIR_CASE, 400, FILE_TARGET));
+    let output = delete_dir_machine_output(&mock, "sub");
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 400);
+}
+
+/// G18: a missing target (server 404) fails with `LBR-NET-002`.
+#[test]
+fn delete_dir_missing_target_code() {
+    let mock = MockMega2::start(fail_on(&DELETE_DIR_CASE, 404, MISSING_TARGET));
+    let output = delete_dir_machine_output(&mock, "sub");
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-NET-002");
+}
+
+/// G19: the same failure carries `details.http_status` 404.
+#[test]
+fn delete_dir_missing_target_http_status() {
+    let mock = MockMega2::start(fail_on(&DELETE_DIR_CASE, 404, MISSING_TARGET));
+    let output = delete_dir_machine_output(&mock, "sub");
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 404);
 }

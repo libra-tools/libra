@@ -94,6 +94,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 |--------|------|------|
 | 启动、`Enter`、`Backspace`/`h`、`r` | `--list`（PATH 即目标目录；不带 flag 的 `--json` 与之相同） | `GET /api/v1/tree` |
 | `+` | `--create-dir <NAME>`（PATH 为父目录） | `POST /api/v1/create-entry` |
+| `d` | `--delete-dir <NAME>`（PATH 为父目录） | `POST /api/v1/delete-entry` |
 
 所有非交互调用遵守同一组规则：
 
@@ -152,6 +153,31 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | 收到响应之前超时或连接失败 | `LBR-NET-001` | `transport` |
 | 读取回执时连接中断（结果未知） | `LBR-NET-001` | `http_status` |
 
+`--delete-dir <NAME>` 以一次 `POST /api/v1/delete-entry` 删除 PATH 下的目录 NAME，
+之后不重新列出。没有确认行：flag 本身写明了确切目标。纯文本摘要为
+`deleted directory <path> (commit <commit_id>)`；带 `--json`/`--machine` 时 payload 为：
+
+```json
+{
+  "operation": "delete-dir",
+  "server": "https://mega2.example.com",
+  "target": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+  "receipt": { "commit_id": "…", "path": "/src/pkg", "cl_link": null }
+}
+```
+
+Libra 不预先检查 NAME 是否存在、是否为目录：两者都由服务端回答。目标是文件时为
+`LBR-CLI-003`；目标不存在时目前为 `LBR-NET-002`，以 `details.http_status` 与其它失败
+区分。错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 为 `.`/`..`、为空、过长，或含分隔符、控制字符 | `LBR-CLI-002` | 无（不发请求） |
+| 与另一个操作 flag 或 `--ref` 同用 | `LBR-CLI-002` | 无（不发请求） |
+| HTTP 400：NAME 是文件、PATH 途经文件，或服务端拒绝该路径（例如 trunk 服务端上的顶层目录） | `LBR-CLI-003` | `http_status: 400` |
+| NAME 或 PATH 本身不存在（HTTP 404） | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -203,6 +229,7 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
 | `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
 | `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
+| `--delete-dir <NAME>` | 不用终端删除 PATH 下的目录 NAME（一次 POST，无确认行，不重新列出）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -265,6 +292,9 @@ libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /
 
 # 同一写操作，从文件读取 token（受 token 保护的服务端）
 libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src --token-file ~/.mega2-token
+
+# 不用终端删除 /src/pkg（没有确认行：flag 写明了目标）
+libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /src --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

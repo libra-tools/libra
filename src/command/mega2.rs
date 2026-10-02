@@ -125,6 +125,10 @@ pub struct OperationArgs {
     /// Create directory NAME under PATH: one POST, no reload
     #[arg(long = "create-dir", value_name = "NAME")]
     pub create_dir: Option<String>,
+
+    /// Delete directory NAME under PATH: one POST, no confirmation, no reload
+    #[arg(long = "delete-dir", value_name = "NAME")]
+    pub delete_dir: Option<String>,
 }
 
 impl OperationArgs {
@@ -133,9 +137,12 @@ impl OperationArgs {
         if self.list {
             return Some(Operation::List);
         }
-        self.create_dir
+        if let Some(name) = &self.create_dir {
+            return Some(Operation::CreateDir { name: name.clone() });
+        }
+        self.delete_dir
             .as_ref()
-            .map(|name| Operation::CreateDir { name: name.clone() })
+            .map(|name| Operation::DeleteDir { name: name.clone() })
     }
 }
 

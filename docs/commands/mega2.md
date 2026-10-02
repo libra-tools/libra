@@ -109,6 +109,7 @@ the forms available in this release.
 |-----------------|------|---------|
 | start, `Enter`, `Backspace`/`h`, `r` | `--list` (PATH is the directory; `--json` without a flag is the same) | `GET /api/v1/tree` |
 | `+` | `--create-dir <NAME>` (PATH is the parent) | `POST /api/v1/create-entry` |
+| `d` | `--delete-dir <NAME>` (PATH is the parent) | `POST /api/v1/delete-entry` |
 
 Every non-interactive call follows the same rules:
 
@@ -177,6 +178,34 @@ receipt verbatim (`path` and `cl_link` may be `null`). Errors:
 | Timeout or connection failure before any response | `LBR-NET-001` | `transport` |
 | Connection drops while the receipt is read (outcome unknown) | `LBR-NET-001` | `http_status` |
 
+`--delete-dir <NAME>` deletes directory NAME under PATH with one
+`POST /api/v1/delete-entry` and does not reload. There is no confirmation
+line: the flag names the exact target. The plain-text summary is
+`deleted directory <path> (commit <commit_id>)`; with `--json`/`--machine` the
+payload is:
+
+```json
+{
+  "operation": "delete-dir",
+  "server": "https://mega2.example.com",
+  "target": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+  "receipt": { "commit_id": "…", "path": "/src/pkg", "cl_link": null }
+}
+```
+
+Libra does not check beforehand whether NAME exists or is a directory: the
+server answers both. A file target is `LBR-CLI-003`; a missing target is
+`LBR-NET-002` today, told apart from other failures by `details.http_status`.
+Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME is `.`/`..`, empty, too long, or has a separator or control character | `LBR-CLI-002` | none (no request) |
+| Combined with another operation flag or with `--ref` | `LBR-CLI-002` | none (no request) |
+| HTTP 400: NAME is a file, PATH runs through a file, or the server refuses the path (for example a top-level directory on a trunk server) | `LBR-CLI-003` | `http_status: 400` |
+| NAME, or PATH itself, does not exist (HTTP 404) | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -243,6 +272,7 @@ terminal. The panel operates root tags only.
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
 | `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
+| `--delete-dir <NAME>` | Delete directory NAME under PATH without a terminal (one POST, no confirmation, no reload). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -310,6 +340,9 @@ libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /
 
 # The same write with a token from a file (token-protected servers)
 libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src --token-file ~/.mega2-token
+
+# Delete /src/pkg without a terminal (no confirmation: the flag names the target)
+libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /src --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
