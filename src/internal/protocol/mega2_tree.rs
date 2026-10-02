@@ -14,6 +14,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use url::Url;
 
+use super::mega2_diag;
 use crate::utils::error::{CliError, CliResult, StableErrorCode};
 
 /// Fixed per-request deadline (connect and total request). MB-01 Performance budget.
@@ -314,6 +315,11 @@ impl Mega2TreeClient {
     /// One GET per listing: `{base}/api/v1/tree?path=<normalized>[&refs=<ref>]`.
     /// No Authorization header; response body bounded by [`MAX_RESPONSE_BYTES`].
     pub async fn fetch_listing(&self, path: &str, git_ref: Option<&str>) -> CliResult<Listing> {
+        mega2_diag::run(mega2_diag::TREE, self.fetch_listing_scoped(path, git_ref)).await
+    }
+
+    /// Body of [`Self::fetch_listing`]; runs inside its diagnostics scope.
+    async fn fetch_listing_scoped(&self, path: &str, git_ref: Option<&str>) -> CliResult<Listing> {
         let normalized = normalize_path(path)?;
         let mut url = self.base.join(TREE_ROUTE).map_err(|_| {
             CliError::fatal("cannot build the mega2 tree URL")
@@ -326,7 +332,7 @@ impl Mega2TreeClient {
             url.query_pairs_mut().append_pair("refs", git_ref);
         }
 
-        let response = self.http.get(url).send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
         let status = response.status();
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {

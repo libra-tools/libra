@@ -6,7 +6,7 @@
 //! POST-list rejection (405) proving the client only ever uses GET.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -405,4 +405,272 @@ async fn list_never_posts_and_wrong_method_405_is_a_stable_error() {
         .expect_err("405");
     assert_eq!(err.stable_code(), StableErrorCode::CliInvalidArguments);
     assert_eq!(server.requests(), 2);
+}
+
+// ---- plan-20261001 MN-01: machine-readable failure details ----
+//
+// One raw-socket fixture per gate. The client must annotate the error with the
+// fixed method and route template and with the status it actually received:
+// at the first status branch (500), while the body is read (a 200 whose body
+// is cut short) and at the last check on a 2xx response (201, so the detail
+// cannot be a fixed 200). Route gates also check the request line the mock
+// received, so the reported route is the route that was requested.
+
+/// Serves exactly one connection: reads the whole request, reports its request
+/// line, writes `response` verbatim and closes. A body shorter than its
+/// `Content-Length` makes the client's body read fail after the status arrived.
+fn serve_raw_once(response: String) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw mock");
+    let addr = listener.local_addr().expect("raw mock addr");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept()
+            && let Some(line) = read_request_line(&mut stream)
+        {
+            let _ = line_tx.send(line);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (addr, line_rx)
+}
+
+fn received_line(line_rx: &std::sync::mpsc::Receiver<String>) -> String {
+    line_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the mock received one request")
+}
+
+fn raw_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A 200 whose body stops 64 bytes short of its `Content-Length`.
+fn truncated_response(partial: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+        partial.len() + 64
+    )
+}
+
+fn expected_details(method: &str, route: &str, status: u16) -> BTreeMap<String, serde_json::Value> {
+    serde_json::json!({"method": method, "route": route, "http_status": status})
+        .as_object()
+        .expect("details object")
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn read_request_line(stream: &mut TcpStream) -> Option<String> {
+    read_request(stream).and_then(|raw| raw.lines().next().map(str::to_string))
+}
+
+/// Runs `call` against a tag client bound to one raw fixture; returns the
+/// error and the request line the mock received.
+async fn tag_error<F, Fut, T>(response: String, call: F) -> (libra::utils::error::CliError, String)
+where
+    F: FnOnce(Mega2TagClient) -> Fut,
+    Fut: std::future::Future<Output = libra::utils::error::CliResult<T>>,
+    T: std::fmt::Debug,
+{
+    let (addr, line_rx) = serve_raw_once(response);
+    let client = Mega2TagClient::new(&format!("http://{addr}"), None).expect("client");
+    let err = call(client).await.expect_err("fixture must fail");
+    (err, received_line(&line_rx))
+}
+
+async fn list_error(response: String) -> (libra::utils::error::CliError, String) {
+    tag_error(response, |client| async move {
+        client.list_tags(1, 20, "/").await
+    })
+    .await
+}
+
+async fn create_error(response: String) -> (libra::utils::error::CliError, String) {
+    tag_error(response, |client| async move {
+        client
+            .create_tag(&CreateTagOptions {
+                name: "v1",
+                target: None,
+                path_context: None,
+                tagger_name: None,
+                tagger_email: None,
+                message: None,
+            })
+            .await
+    })
+    .await
+}
+
+async fn get_error(response: String) -> (libra::utils::error::CliError, String) {
+    tag_error(
+        response,
+        |client| async move { client.get_tag("v1", "/").await },
+    )
+    .await
+}
+
+async fn delete_error(response: String) -> (libra::utils::error::CliError, String) {
+    tag_error(response, |client| async move {
+        client.delete_tag("v1", "/").await
+    })
+    .await
+}
+
+fn status_500() -> String {
+    raw_response("500 Internal Server Error", "")
+}
+
+/// A 201 whose `data` is not an object, so `finish` cannot parse it.
+fn data_not_object_201() -> String {
+    raw_response(
+        "201 Created",
+        r#"{"req_result":true,"data":"not-an-object"}"#,
+    )
+}
+
+const PARTIAL_TAG_BODY: &str = r#"{"req_result":true,"data":{"name":"#;
+
+/// MN-01 G11.
+#[tokio::test]
+async fn failure_details_list_tags_route() {
+    let (err, line) = list_error(status_500()).await;
+    assert!(
+        line.starts_with("GET /api/v1/tags/list?"),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/list", 500)
+    );
+}
+
+/// MN-01 G12.
+#[tokio::test]
+async fn failure_details_create_tag_route() {
+    let (err, line) = create_error(status_500()).await;
+    assert!(
+        line.starts_with("POST /api/v1/tags "),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/tags", 500)
+    );
+}
+
+/// MN-01 G13: the route is the template, never the tag name.
+#[tokio::test]
+async fn failure_details_get_tag_route() {
+    let (err, line) = get_error(status_500()).await;
+    assert!(
+        line.starts_with("GET /api/v1/tags/v1?"),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/{name}", 500)
+    );
+}
+
+/// MN-01 G14: the route is the template, never the tag name.
+#[tokio::test]
+async fn failure_details_delete_tag_route() {
+    let (err, line) = delete_error(status_500()).await;
+    assert!(
+        line.starts_with("DELETE /api/v1/tags/v1?"),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("DELETE", "/api/v1/tags/{name}", 500)
+    );
+}
+
+/// MN-01 G19.
+#[tokio::test]
+async fn failure_details_list_tags_last_stage() {
+    let (err, _) = list_error(data_not_object_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/list", 201)
+    );
+}
+
+/// MN-01 G20.
+#[tokio::test]
+async fn failure_details_create_tag_last_stage() {
+    let (err, _) = create_error(data_not_object_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/tags", 201)
+    );
+}
+
+/// MN-01 G21.
+#[tokio::test]
+async fn failure_details_get_tag_last_stage() {
+    let (err, _) = get_error(data_not_object_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/{name}", 201)
+    );
+}
+
+/// MN-01 G22.
+#[tokio::test]
+async fn failure_details_delete_tag_last_stage() {
+    let (err, _) = delete_error(data_not_object_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("DELETE", "/api/v1/tags/{name}", 201)
+    );
+}
+
+/// MN-01 G34: the body-read failure keeps its own stable code.
+#[tokio::test]
+async fn failure_details_list_tags_mid_stream() {
+    let (err, _) = list_error(truncated_response(PARTIAL_TAG_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/list", 200)
+    );
+}
+
+/// MN-01 G35.
+#[tokio::test]
+async fn failure_details_create_tag_mid_stream() {
+    let (err, _) = create_error(truncated_response(PARTIAL_TAG_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/tags", 200)
+    );
+}
+
+/// MN-01 G36.
+#[tokio::test]
+async fn failure_details_get_tag_mid_stream() {
+    let (err, _) = get_error(truncated_response(PARTIAL_TAG_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("GET", "/api/v1/tags/{name}", 200)
+    );
+}
+
+/// MN-01 G37.
+#[tokio::test]
+async fn failure_details_delete_tag_mid_stream() {
+    let (err, _) = delete_error(truncated_response(PARTIAL_TAG_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("DELETE", "/api/v1/tags/{name}", 200)
+    );
 }

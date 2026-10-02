@@ -174,6 +174,28 @@ terminal. The panel operates root tags only.
 Errors never echo server response bodies, credentials, tokens or unvalidated
 paths.
 
+### Machine error details
+
+Every failed Mega2 request adds `details` to the JSON error envelope (on stderr
+with `--json`/`--machine`, and on the trailing JSON line when stderr is not a
+terminal). The stable code and message stay as listed above; `details` lets
+automation tell HTTP statuses apart without parsing the message:
+
+| Key | Meaning |
+|-----|---------|
+| `method` | `GET`, `POST` or `DELETE` |
+| `route` | Route template, for example `/api/v1/tree` or `/api/v1/tags/{name}` |
+| `http_status` | Status received — also for a `2xx` whose body is invalid, or a connection that drops while the body is read |
+| `transport` | `timeout`, `connect` or `request` when no status was received |
+
+```json
+{"ok":false,"error_code":"LBR-NET-002","category":"network","exit_code":128,"severity":"fatal","message":"mega2 server returned HTTP 500 Internal Server Error","details":{"http_status":500,"method":"GET","route":"/api/v1/tree"}}
+```
+
+Invalid input rejected before any request carries no `details`. The values
+never include the response body, the server URL or a token; see
+[error codes](../error-codes.md#command-specific-details).
+
 ## Limits and boundaries
 
 - One request per navigation/reload; no recursion, no prefetch, no background

@@ -5,7 +5,7 @@
 //! destination that must be refused before any request.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -346,4 +346,169 @@ async fn traversal_destination_is_refused_before_any_request() {
     assert_eq!(err.stable_code(), StableErrorCode::CliInvalidArguments);
 
     assert_eq!(server.requests(), 0, "validation precedes the network");
+}
+
+// ---- plan-20261001 MN-01: machine-readable failure details ----
+//
+// One raw-socket fixture per gate. The client must annotate the error with the
+// fixed method and route template and with the status it actually received:
+// at the first status branch (500), while the body is read (a 200 whose body
+// is cut short) and at the last check on a 2xx response (201, so the detail
+// cannot be a fixed 200). Route gates also check the request line the mock
+// received, so the reported route is the route that was requested.
+
+/// Serves exactly one connection: reads the whole request, reports its request
+/// line, writes `response` verbatim and closes. A body shorter than its
+/// `Content-Length` makes the client's body read fail after the status arrived.
+fn serve_raw_once(response: String) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw mock");
+    let addr = listener.local_addr().expect("raw mock addr");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept()
+            && let Some(line) = read_request_line(&mut stream)
+        {
+            let _ = line_tx.send(line);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (addr, line_rx)
+}
+
+fn received_line(line_rx: &std::sync::mpsc::Receiver<String>) -> String {
+    line_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the mock received one request")
+}
+
+fn raw_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A 200 whose body stops 64 bytes short of its `Content-Length`.
+fn truncated_response(partial: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+        partial.len() + 64
+    )
+}
+
+fn expected_details(method: &str, route: &str, status: u16) -> BTreeMap<String, serde_json::Value> {
+    serde_json::json!({"method": method, "route": route, "http_status": status})
+        .as_object()
+        .expect("details object")
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn read_request_line(stream: &mut TcpStream) -> Option<String> {
+    read_request(stream).and_then(|raw| raw.lines().next().map(str::to_string))
+}
+
+/// Deletes `/sub` against one raw fixture; returns the error and the request line.
+async fn delete_error(response: String) -> (libra::utils::error::CliError, String) {
+    let (addr, line_rx) = serve_raw_once(response);
+    let err = Mega2MutateClient::new(&format!("http://{addr}"), None)
+        .expect("client")
+        .delete_directory("/", "sub", None)
+        .await
+        .expect_err("fixture must fail");
+    (err, received_line(&line_rx))
+}
+
+/// Moves `/sub` to `/dst/sub` against one raw fixture.
+async fn move_error(response: String) -> (libra::utils::error::CliError, String) {
+    let (addr, line_rx) = serve_raw_once(response);
+    let err = Mega2MutateClient::new(&format!("http://{addr}"), None)
+        .expect("client")
+        .move_entry("/", "sub", "/dst", "sub", None)
+        .await
+        .expect_err("fixture must fail");
+    (err, received_line(&line_rx))
+}
+
+fn empty_commit_201() -> String {
+    raw_response(
+        "201 Created",
+        &serde_json::json!({"req_result": true, "data": {"commit_id": ""}}).to_string(),
+    )
+}
+
+const PARTIAL_MUTATE_BODY: &str = r#"{"req_result":true,"data":{"commit_id":"#;
+
+/// MN-01 G9: the first status branch is annotated with the route requested.
+#[tokio::test]
+async fn failure_details_delete_entry_route() {
+    let (err, line) = delete_error(raw_response("500 Internal Server Error", "")).await;
+    assert!(
+        line.starts_with("POST /api/v1/delete-entry "),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/delete-entry", 500)
+    );
+}
+
+/// MN-01 G10: the first status branch is annotated with the route requested.
+#[tokio::test]
+async fn failure_details_move_entry_route() {
+    let (err, line) = move_error(raw_response("500 Internal Server Error", "")).await;
+    assert!(
+        line.starts_with("POST /api/v1/move-entry "),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/move-entry", 500)
+    );
+}
+
+/// MN-01 G17: `require_commit_id` runs after `post_json` returned and is still
+/// inside the scope; the detail is the status received.
+#[tokio::test]
+async fn failure_details_delete_entry_last_stage() {
+    let (err, _) = delete_error(empty_commit_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/delete-entry", 201)
+    );
+}
+
+/// MN-01 G18: same as G17 for move-entry.
+#[tokio::test]
+async fn failure_details_move_entry_last_stage() {
+    let (err, _) = move_error(empty_commit_201()).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/move-entry", 201)
+    );
+}
+
+/// MN-01 G32: a connection that drops while the body is read carries the
+/// status that arrived; the body-read failure keeps its own stable code.
+#[tokio::test]
+async fn failure_details_delete_entry_mid_stream() {
+    let (err, _) = delete_error(truncated_response(PARTIAL_MUTATE_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/delete-entry", 200)
+    );
+}
+
+/// MN-01 G33: same as G32 for move-entry.
+#[tokio::test]
+async fn failure_details_move_entry_mid_stream() {
+    let (err, _) = move_error(truncated_response(PARTIAL_MUTATE_BODY)).await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/move-entry", 200)
+    );
 }

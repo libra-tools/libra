@@ -146,6 +146,26 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 
 错误绝不回显服务端响应体、凭据、token 或未校验的路径。
 
+### 机器可读的错误细节
+
+每次失败的 Mega2 请求都会在 JSON 错误信封中加上 `details`（`--json`/`--machine`
+时写在 stderr；stderr 不是终端时写在末尾的 JSON 行）。stable code 与 message
+保持上表所列不变；`details` 让自动化不必解析 message 就能区分 HTTP 状态：
+
+| 键 | 含义 |
+|----|------|
+| `method` | `GET`、`POST` 或 `DELETE` |
+| `route` | 路由模板，例如 `/api/v1/tree`、`/api/v1/tags/{name}` |
+| `http_status` | 收到的状态码；`2xx` 但响应体不合规、或读取响应体时连接中断，也给出该值 |
+| `transport` | 没有收到状态码时的失败类别：`timeout`、`connect` 或 `request` |
+
+```json
+{"ok":false,"error_code":"LBR-NET-002","category":"network","exit_code":128,"severity":"fatal","message":"mega2 server returned HTTP 500 Internal Server Error","details":{"http_status":500,"method":"GET","route":"/api/v1/tree"}}
+```
+
+在发出请求之前就被拒绝的无效输入不带 `details`。这些值从不包含响应体、服务端 URL
+或 token；键的完整说明见 [错误码](../../error-codes.md#command-specific-details)。
+
 ## 限制与边界
 
 - 每次导航/刷新一个请求；无递归、无预取、无后台任务、无跨进程缓存。

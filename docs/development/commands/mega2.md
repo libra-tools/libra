@@ -52,6 +52,16 @@
 - 输出与错误：所有失败映射为稳定 `LBR-*` 码（用法 `LBR-CLI-002`、网络
   `LBR-NET-*`、协议 `LBR-NET-002`、不可用 `Unsupported`/`LBR-CLI-003` 等）；错误
   信息不回显响应体、URL credentials、token 或未校验路径。
+- 失败诊断（plan-20261001 MN-01）：四个协议客户端发请求的八个公开方法（tree 的
+  `fetch_listing`，create-entry 的 `create_directory`，mutate 的 `delete_directory`、
+  `move_entry`，tag 的 `list_tags`、`create_tag`、`get_tag`、`delete_tag`）都把原函数体放进
+  共享 helper `src/internal/protocol/mega2_diag.rs` 的 `run` 作用域（tokio `task_local!`），
+  唯一一次发送经 `mega2_diag::send`，它记录状态码或传输失败类别。作用域在请求发出后返回的
+  任何错误上附加 `details`：`method`、`route`（`mega2_diag` 中的路由模板常量），以及
+  `http_status`（收到状态码之后的失败，含 2xx 响应体不合规与读取响应体时断连）或
+  `transport`（`timeout`/`connect`/`request`）。发请求之前的本地校验错误原样返回；stable
+  code、message、hint 与退出码不变（错误构造代码原地保留）。键契约见 `docs/error-codes.md`
+  「Command-specific details」。
 - 流程图：
 
 ```mermaid
@@ -81,6 +91,13 @@ flowchart TD
   token flag 与 `--json` 互斥；`mega2_browser_tag` 覆盖 `t` 面板（第 1 页单次匿名 GET、显式翻页、create 名称+可选 message、delete 确认、敌意名不发请求、面板关闭恢复目录视图、渲染消毒）；`mega2_browser_mutate` 覆盖 `d`/`m`/`R`
   （确认行、Esc 取消零网络、文件惰性、改名=同层移动、敌意目标不发 POST、
   1 POST + 1 重载 GET、help 无 rmdir/mv）。
+- 失败诊断（MN-01）：`cargo test --lib internal::protocol::mega2_diag`（作用域的四种附加分支、
+  发请求前的错误原样返回、返回的仍是原错误）；`cargo test --test command_test --
+  mega2_tree_transport_test::failure_details_ mega2_entry_transport_test::failure_details_
+  mega2_mutate_transport_test::failure_details_ mega2_tag_transport_test::failure_details_`
+  在八个「方法 + 路由」上各验证起点（500）、中段（读取响应体时断连）与终点（2xx 上的最后一道
+  校验，用 201）；`mega2_browser_cli_test::json_error_envelope_carries_http_details` 以真实二进制
+  验证 stderr JSON 信封的 `details`。
 - 架构守衛：`compat_agent_architecture_guard` 保证不引入
   ratatui/crossterm/`internal::tui`；`compat_matrix_alignment` 保证
   `COMPATIBILITY.md` / `docs/development/commands/README.md` 与 CLI 同步；

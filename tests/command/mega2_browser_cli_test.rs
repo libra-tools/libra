@@ -340,6 +340,29 @@ fn malformed_server_url_is_not_echoed() {
     );
 }
 
+/// plan-20261001 MN-01 AC-2: a failed Mega2 request carries machine-readable
+/// details in the stderr JSON error envelope, so automation never has to parse
+/// the message to tell HTTP statuses apart.
+#[test]
+fn json_error_envelope_carries_http_details() {
+    let failing = MockTreeServer::start(500, "SECRET-BODY".to_string());
+    let workdir = tempfile::tempdir().expect("tempdir");
+
+    let output = libra(
+        workdir.path(),
+        &["mega2", "browser", "--server", &failing.url(), "--machine"],
+    );
+    assert!(!output.status.success(), "HTTP 500 must fail");
+    let err = stderr(&output);
+    let envelope: serde_json::Value = serde_json::from_str(err.trim())
+        .unwrap_or_else(|e| panic!("stderr is not one JSON envelope ({e}): {err}"));
+    assert_eq!(
+        envelope["details"],
+        serde_json::json!({"method": "GET", "route": "/api/v1/tree", "http_status": 500}),
+        "envelope: {envelope}"
+    );
+}
+
 #[test]
 fn http_and_schema_failures_are_reported_without_body_leakage() {
     let workdir = tempfile::tempdir().expect("tempdir");

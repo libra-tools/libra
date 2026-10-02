@@ -24,6 +24,7 @@ use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
+use super::mega2_diag;
 use crate::{
     internal::protocol::{
         mega2_auth::Mega2Token,
@@ -383,6 +384,15 @@ impl Mega2TagClient {
 
     /// One anonymous `GET /api/v1/tags/list` with all three required keys.
     pub async fn list_tags(&self, page: u64, per_page: u64, path: &str) -> CliResult<TagPage> {
+        mega2_diag::run(
+            mega2_diag::LIST_TAGS,
+            self.list_tags_scoped(page, per_page, path),
+        )
+        .await
+    }
+
+    /// Body of [`Self::list_tags`]; runs inside its diagnostics scope.
+    async fn list_tags_scoped(&self, page: u64, per_page: u64, path: &str) -> CliResult<TagPage> {
         validate_pagination(page, per_page)?;
         let path = normalize_path(path)?;
         let mut url = self.base.join(TAGS_LIST_ROUTE).map_err(|_| {
@@ -394,7 +404,7 @@ impl Mega2TagClient {
             .append_pair("per_page", &per_page.to_string())
             .append_pair("path", &path);
         // Anonymous: list never carries the write token.
-        let response = self.http.get(url).send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
         let page: WirePage<TagInfo> = self.finish(response, "list").await?;
         Ok(TagPage {
             total: page.total,
@@ -404,6 +414,11 @@ impl Mega2TagClient {
 
     /// One `POST /api/v1/tags`; any 2xx + `req_result=true` is success.
     pub async fn create_tag(&self, options: &CreateTagOptions<'_>) -> CliResult<TagInfo> {
+        mega2_diag::run(mega2_diag::CREATE_TAG, self.create_tag_scoped(options)).await
+    }
+
+    /// Body of [`Self::create_tag`]; runs inside its diagnostics scope.
+    async fn create_tag_scoped(&self, options: &CreateTagOptions<'_>) -> CliResult<TagInfo> {
         validate_tag_name(options.name)?;
         let url = self.base.join(TAGS_ROUTE).map_err(|_| {
             CliError::fatal("cannot build the mega2 tag URL")
@@ -413,22 +428,32 @@ impl Mega2TagClient {
         if let Some(token) = &self.token {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
         }
-        let response = request.send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(request, transport_error).await?;
         self.finish(response, "create").await
     }
 
     /// One anonymous `GET /api/v1/tags/{name}` (conflict diagnosis).
     pub async fn get_tag(&self, name: &str, path: &str) -> CliResult<TagInfo> {
+        mega2_diag::run(mega2_diag::GET_TAG, self.get_tag_scoped(name, path)).await
+    }
+
+    /// Body of [`Self::get_tag`]; runs inside its diagnostics scope.
+    async fn get_tag_scoped(&self, name: &str, path: &str) -> CliResult<TagInfo> {
         validate_tag_name(name)?;
         let path = normalize_path(path)?;
         let mut url = self.tag_url(name)?;
         url.query_pairs_mut().append_pair("path", &path);
-        let response = self.http.get(url).send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
         self.finish(response, "get").await
     }
 
     /// One `DELETE /api/v1/tags/{name}`; authorization path = the selector.
     pub async fn delete_tag(&self, name: &str, path: &str) -> CliResult<DeleteTagReceipt> {
+        mega2_diag::run(mega2_diag::DELETE_TAG, self.delete_tag_scoped(name, path)).await
+    }
+
+    /// Body of [`Self::delete_tag`]; runs inside its diagnostics scope.
+    async fn delete_tag_scoped(&self, name: &str, path: &str) -> CliResult<DeleteTagReceipt> {
         validate_tag_name(name)?;
         let path = normalize_path(path)?;
         let mut url = self.tag_url(name)?;
@@ -437,7 +462,7 @@ impl Mega2TagClient {
         if let Some(token) = &self.token {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
         }
-        let response = request.send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(request, transport_error).await?;
         let data: WireDeleteTag = self.finish(response, "delete").await?;
         Ok(DeleteTagReceipt {
             deleted_tag: data.deleted_tag,

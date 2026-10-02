@@ -428,6 +428,29 @@ Every structured failure report includes:
 | `hints` | `string[]` | Optional actionable hints |
 | `details` | `object` | Optional structured context |
 
+## Command-specific details
+
+Once a release ships a `details` key, the key is part of the public contract.
+Commands that populate `details` document their keys here.
+
+### `mega2 browser`
+
+Every failure of a Mega2 HTTP request adds these keys, so automation can tell
+HTTP statuses apart without parsing `message`. The stable code, message, hints
+and exit code of the failure do not change. Failures before any request is
+sent (an invalid URL, path or name) carry none of them.
+
+| Key | Type | Present when | Meaning |
+| --- | --- | --- | --- |
+| `method` | `string` | the request was sent | `GET`, `POST` or `DELETE` |
+| `route` | `string` | the request was sent | Route template such as `/api/v1/tree` or `/api/v1/tags/{name}`; never a concrete name, query or URL |
+| `http_status` | `number` | a response status arrived | The status received; also set when a `2xx` body is invalid and when the connection drops while the body is read |
+| `transport` | `string` | no response status arrived | `timeout`, `connect` or `request` |
+
+Each failure carries exactly one of `http_status` and `transport`. The values
+come only from fixed route templates and the status code; they never contain
+the response body, `err_message`, the server URL or a token.
+
 ## Architecture
 
 The design has four layers:

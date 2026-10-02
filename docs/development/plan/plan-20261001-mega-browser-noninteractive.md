@@ -2,7 +2,7 @@
 
 > **模板版本：** [`plan-template.md`](plan-template.md) `v2.12`（2026-09-29 15:35:39 UTC 起生效）。`GC-01..GC-13`、`ER-01..ER-14`、`G-01..G-11` 全部适用；本文只补充本计划特有的约束、决策与任务卡。
 >
-> **状态：** 实施中（2026-10-02 01:08:49 UTC 起按发布窗口顺序执行，发布者见修订历史）。MN-10 `in-progress` / `locally-accepted`，其余卡 `pending`；逐卡进度见各卡 `Lifecycle / Acceptance` 与「实施证据汇总」。计划级 Codex review 已取得 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文评审 `PASS`，R16 对其后改动的差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 对锚点复核的差异评审 `FAIL`（1×P1）已修订，R18 差异确认 `PASS`（见「Codex review log」）；各卡可按 ER-MN-03 与各自的开工前置条件进入 `in-progress`。
+> **状态：** 实施中（2026-10-02 01:08:49 UTC 起按发布窗口顺序执行，发布者见修订历史）。MN-10 `done` / `complete`（v0.30.14）；MN-01 `in-progress` / `locally-accepted`（0.30.15 候选）；其余卡 `pending`；逐卡进度见各卡 `Lifecycle / Acceptance` 与「实施证据汇总」。计划级 Codex review 已取得 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文评审 `PASS`，R16 对其后改动的差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 对锚点复核的差异评审 `FAIL`（1×P1）已修订，R18 差异确认 `PASS`（见「Codex review log」）；各卡可按 ER-MN-03 与各自的开工前置条件进入 `in-progress`。
 >
 > **文件名：** 模板 v2.11 规定后缀词只能是 `[a-z]+`，不能写 `mega2`，因此用 `mega-browser-noninteractive` 指代 `libra mega2 browser` 的非交互操作。
 
@@ -472,7 +472,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** `validate_server_url` 在 URL 无法解析时，把原始 `--server` 字符串写进错误消息（`src/internal/protocol/mega2_tree.rs:88-92`）；这一步早于凭据检查（`:110-115`），所以像 `https://user:secret@host:badport` 这样的输入会把凭据带进 stderr 与 JSON 错误信封，违背三处文档「错误不回显凭据」的承诺。本卡让解析失败的错误消息不再包含原始输入。唯一行为轴：URL 解析错误的回显边界。
 
@@ -542,7 +542,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / （空）
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
 
 **Description:** 为四个 mega2 协议客户端的每个失败出口（HTTP 非 2xx、2xx 但响应体不合规、传输失败）在 `CliError.details` 中附加 `method`、`route`，以及 `http_status` 或 `transport`，使黑盒断言不必解析 message 文本。按 ADR-MN-04，八个发出请求的公开方法的函数体一律放进共享 helper `mega2_diag::run` 的作用域，唯一的一次发送经作用域的 `send` 进行，`details` 只在 `run` 中附加（GC-02）。stable code、message、hint 与退出码全部不变：既有代码行原地保留（只允许缩进变化），`run` 只在原错误上附加 `details`，由 G23–G29 核对。唯一行为轴：mega2 HTTP 失败的机器可读诊断。
 
@@ -572,9 +572,9 @@
 
 **Acceptance criteria:**
 
-- [ ] AC-1：本卡之前已存在的 mega2 用例（`source .env.test && cargo test --test command_test mega2_` 选中者）不修改即全部通过。这些用例主要断言 stable code；message、hint 与退出码的不变由 G23–G29 证明，不归功于它们。
-- [ ] AC-2：真实二进制以 `--machine` 运行、tree 返回 500 时，stderr JSON 错误信封的 `details` 等于 `{method:"GET", route:"/api/v1/tree", http_status:500}`。
-- [ ] AC-F（门族，计 37 门，EX-MN-01）：下表 G1–G37 全部通过。
+- [x] AC-1：本卡之前已存在的 mega2 用例（`source .env.test && cargo test --test command_test mega2_` 选中者）不修改即全部通过。这些用例主要断言 stable code；message、hint 与退出码的不变由 G23–G29 证明，不归功于它们。
+- [x] AC-2：真实二进制以 `--machine` 运行、tree 返回 500 时，stderr JSON 错误信封的 `details` 等于 `{method:"GET", route:"/api/v1/tree", http_status:500}`。
+- [x] AC-F（门族，计 37 门，EX-MN-01）：下表 G1–G37 全部通过。
 - [ ] ER-06/ER-06a 同卡强制门（不计入上限）：「Docs and compatibility impact」中的每个文件逐文件交付并验收。
 
 **判据规范（非计数正文）— EX-MN-01，37 门：** 门的划分依据 ADR-MN-04 的结构约束：`details` 只在 `mega2_diag::run` 的作用域里附加——发送失败附 `transport`，收到状态码之后作用域返回的任何错误附 `http_status`，发送之前返回的错误原样返回。G1–G4 各验证 `run` 的一个附加分支，G29 验证发送之前的错误不被改动；G5、G6 证明客户端无法绕过 `run`；G7–G14 在每个「方法 + 路由」组合上验证收到响应之后的起点（状态分支，500）；G30–G37 在同一组合上验证中段（响应头已到、读取响应体中断）；G15–G22 在同一组合上验证终点（该请求函数在 2xx 响应上的最后一道校验；fixture 一律用 201 而非 200，证明附加的是实际状态码、不是写死的 200，也证明 delete/move 在 `post_json` 返回后的 `require_commit_id` 仍在作用域内）；三者共同证明从收到响应到返回结果的各段都在作用域内；G23–G26 证明本卡没有改动任何既有代码行与错误构造、没有新增错误构造或转换、每处发送仍使用本客户端的传输错误映射，且退出码映射未改动；G27、G28 证明 `run` 只在原错误上附加 `details`，返回的仍是原错误（不重建 `CliError`：`kind`、hint 的顺序与条数等全部字段不变）。其余状态分支与响应体校验点都位于起点与终点之间的同一作用域内，不是独立的附加点，因此不逐个设门。每个门只含一个 fixture、一个判据。G23、G24 比较工作区与 `HEAD`，因此必须在本卡改动提交之前运行（A 组与 C 组第 ④ 步都在提交之前，满足这一条件；期间合入上游后 `HEAD` 随之前移，比较对象仍只是本卡的改动）。
@@ -663,26 +663,26 @@ if [ -z "$n" ]; then echo "OK: error.rs unchanged"; else echo "FAIL: error.rs ch
 
 **Verification:**
 
-- [ ] `source .env.test && cargo test --lib internal::protocol::mega2_diag`（G1–G4、G27–G29，new）
-- [ ] G5（零命中判定）：
+- [x] `source .env.test && cargo test --lib internal::protocol::mega2_diag`（G1–G4、G27–G29，new）
+- [x] G5（零命中判定）：
 
   ```bash
   if rg -n '\.send\(\)' src/internal/protocol/mega2_tree.rs src/internal/protocol/mega2_entry.rs src/internal/protocol/mega2_mutate.rs src/internal/protocol/mega2_tag.rs; then echo "FAIL: direct send"; exit 1; elif [ $? -ne 1 ]; then echo "ERROR: rg failed"; exit 2; else echo "OK: zero hits"; fi
   ```
 
-- [ ] G6（零命中判定）：
+- [x] G6（零命中判定）：
 
   ```bash
   if rg -n 'with_detail' src/internal/protocol/mega2_tree.rs src/internal/protocol/mega2_entry.rs src/internal/protocol/mega2_mutate.rs src/internal/protocol/mega2_tag.rs; then echo "FAIL: direct detail"; exit 1; elif [ $? -ne 1 ]; then echo "ERROR: rg failed"; exit 2; else echo "OK: zero hits"; fi
   ```
 
-- [ ] `source .env.test && cargo test --test command_test -- mega2_tree_transport_test::failure_details_ mega2_entry_transport_test::failure_details_ mega2_mutate_transport_test::failure_details_ mega2_tag_transport_test::failure_details_`（G7–G22、G30–G37，new；libtest 对多个过滤器取并集，见事实基线「libtest 多过滤器」）
-- [ ] G23 命令（见上）
-- [ ] G24 命令（见上）
-- [ ] G25 命令（见上）
-- [ ] G26 命令（见上）
-- [ ] `source .env.test && cargo test --test command_test mega2_browser_cli_test::json_error_envelope_carries_http_details`（new，AC-2）
-- [ ] `source .env.test && cargo test --test command_test mega2_`（既有全部 mega2 用例不修改即全绿，AC-1）
+- [x] `source .env.test && cargo test --test command_test -- mega2_tree_transport_test::failure_details_ mega2_entry_transport_test::failure_details_ mega2_mutate_transport_test::failure_details_ mega2_tag_transport_test::failure_details_`（G7–G22、G30–G37，new；libtest 对多个过滤器取并集，见事实基线「libtest 多过滤器」）
+- [x] G23 命令（见上）
+- [x] G24 命令（见上）
+- [x] G25 命令（见上）
+- [x] G26 命令（见上）
+- [x] `source .env.test && cargo test --test command_test mega2_browser_cli_test::json_error_envelope_carries_http_details`（new，AC-2）
+- [x] `source .env.test && cargo test --test command_test mega2_`（既有全部 mega2 用例不修改即全绿，AC-1）
 
 **Full-suite trigger:** `T-1: 新建被四个 mega2 协议客户端共用的诊断 helper（GC-02 单一事实源），并修改 docs/error-codes.md`；C 组第 ④ 步跑全量 nextest，并原样重跑 G5、G6、G23、G24、G25、G26 六条结构命令。
 
@@ -2227,8 +2227,8 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目，并在�
 
 | 任务 | 开工核对（ER-01/ER-02/GC-MN-08） | A/B 门与门族 | C 组（版本、commit、PR、tag） | D 组（run ID、网站标记计数） | review | 更新时间 |
 |---|---|---|---|---|---|---|
-| MN-10 | 2026-10-02 01:08:49 UTC：`libra status --short --branch` 为 `## main...origin/main`、工作区干净，HEAD `f28dafc`；ER-02 锚点与卡一致：解析回显在 `mega2_tree.rs:88-92`，凭据检查在 `:110-115`，既有 URL 单元测试在 `:648-667`，三处文档承诺在 `docs/commands/mega2.md:174`、`docs/commands/zh-CN/mega2.md:147`、网站 `mega2.en.md:156`；分支 `mn-10-url-parse-no-echo` | A 组：`cargo test --lib internal::protocol::mega2_tree` 16/16（含新 `url_parse_error_does_not_echo_input`）；`cargo test --test command_test mega2_browser_cli` 10/10（含新 `malformed_server_url_is_not_echoed`）。负对照：已安装的官方 0.30.5 对同一输入在 stderr 与 JSON 信封中回显 `MARKER`。新消息为 `invalid mega2 server URL: <url::ParseError>`，`url` 2.5.8 的 `ParseError` 各变体都是固定文本（`parser.rs:88-99`）；B 组：`implementation` 无额外门 | ① `compat_version_surface_sync` 2/2（三处 0.30.13 一致）；② bump 至 0.30.14（`Cargo.toml`、`install.sh`、`install.ps1`）；③ `cargo build` 刷新 `Cargo.lock`，只改 libra 包的版本行；④ `cargo +nightly fmt --all --check` 0；`cargo clippy --all-targets --all-features -- -D warnings` 0；T-1 全量 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`（run `9386314d-4515-4c48-a791-635a1fe4a652`）8435 run：8435 passed（18 slow）、4 skipped、0 flaky，976.0 s；⑤ `cargo build --release` 2m 22s；⑥ 隔离安装 `cargo install --locked --path . --root <会话临时目录>/install --target-dir target`，安装后 `libra --version` 为 `libra 0.30.14`，对 `https://user:MARKER@mega2.example.com:notaport` 以 `--json` 运行得 `LBR-CLI-003`、退出码 129、消息 `invalid mega2 server URL: invalid port number`，不含 `MARKER`（不覆盖 `~/.libra/bin` 的官方签名安装，沿用 issues/577 的隔离安装做法）；⑦–⑨ 待执行 | 待执行 | Codex R1（`gpt-6-sol`、xhigh，2026-10-02 01:17:18 UTC 发起）`VERDICT: PASS`，无发现 | 2026-10-02 02:00:00 UTC |
-| MN-01 | 待执行 | 待执行 | 待执行 | 待执行 | 待执行 | — |
+| MN-10 | 2026-10-02 01:08:49 UTC：`libra status --short --branch` 为 `## main...origin/main`、工作区干净，HEAD `f28dafc`；ER-02 锚点与卡一致：解析回显在 `mega2_tree.rs:88-92`，凭据检查在 `:110-115`，既有 URL 单元测试在 `:648-667`，三处文档承诺在 `docs/commands/mega2.md:174`、`docs/commands/zh-CN/mega2.md:147`、网站 `mega2.en.md:156`；分支 `mn-10-url-parse-no-echo` | A 组：`cargo test --lib internal::protocol::mega2_tree` 16/16（含新 `url_parse_error_does_not_echo_input`）；`cargo test --test command_test mega2_browser_cli` 10/10（含新 `malformed_server_url_is_not_echoed`）。负对照：已安装的官方 0.30.5 对同一输入在 stderr 与 JSON 信封中回显 `MARKER`。新消息为 `invalid mega2 server URL: <url::ParseError>`，`url` 2.5.8 的 `ParseError` 各变体都是固定文本（`parser.rs:88-99`）；B 组：`implementation` 无额外门 | ① `compat_version_surface_sync` 2/2（三处 0.30.13 一致）；② bump 至 0.30.14（`Cargo.toml`、`install.sh`、`install.ps1`）；③ `cargo build` 刷新 `Cargo.lock`，只改 libra 包的版本行；④ `cargo +nightly fmt --all --check` 0；`cargo clippy --all-targets --all-features -- -D warnings` 0；T-1 全量 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`（run `9386314d-4515-4c48-a791-635a1fe4a652`）8435 run：8435 passed（18 slow）、4 skipped、0 flaky，976.0 s；⑤ `cargo build --release` 2m 22s；⑥ 隔离安装 `cargo install --locked --path . --root <会话临时目录>/install --target-dir target`，安装后 `libra --version` 为 `libra 0.30.14`，对 `https://user:MARKER@mega2.example.com:notaport` 以 `--json` 运行得 `LBR-CLI-003`、退出码 129、消息 `invalid mega2 server URL: invalid port number`，不含 `MARKER`（不覆盖 `~/.libra/bin` 的官方签名安装，沿用 issues/577 的隔离安装做法）；⑦ 提交 `7600cc3`（`gpgsig` 与 `Signed-off-by` 校验通过）；⑧ 推送 `mn-10-url-parse-no-echo`，PR #593，head `7600cc3` 上 `base.yml` 7 个 job 与 CodeQL 全绿（12/12 检查），2026-10-02 03:19 UTC squash merge 为 `80f58b4`（树与 `7600cc3` 相同）；⑨ `gh release create v0.30.14 --target 80f58b4`，tag 指向 `80f58b4` | ① `codeql.yml` run `36959660259`（push `main` `80f58b4`）success（security-codeql-rust、security-codeql-actions）；② `release.yml` run `36959675389`（push tag `v0.30.14`）8/8 success：build-and-upload ×4、upload-install-scripts、update-homebrew-tap、verify-homebrew-formula、request-stable-manifest；③ `https://download.libra.tools/libra/releases/v0.30.14/libra-linux-amd64` HTTP 200（2026-10-02 03:59:32 UTC）；④ 不写网站，N/A。回滚方式 `forward-only`：未发现缺陷，未触发前滚修复，恢复验证命令即本卡三条 Verification | Codex R1（`gpt-6-sol`、xhigh，2026-10-02 01:17:18 UTC 发起）`VERDICT: PASS`，无发现 | 2026-10-02 03:59:32 UTC |
+| MN-01 | 2026-10-02 02:06:30 UTC 开工：`libra status --short --branch` 为 `## mn-10-url-parse-no-echo`、工作区干净（MN-10 已提交 `7600cc3`，PR #593 CI 中），分支 `mn-01-http-failure-details` 叠在其上；`DEP-MN-02`：`../libra-backend` 只有 `.git`、分支 `cf`，`git fetch origin cf` 后落后 4 个提交、无超前，`git merge --ff-only origin/cf` 到 `83d620c`（= `ls-remote` 的远端 `cf`），未跟踪 `.teamx/` 不属本计划；ER-02：七处 `.send()` 在 `mega2_tree.rs:329`（MN-10 使其从 `:326` 下移 3 行）、`mega2_entry.rs:173`、`mega2_mutate.rs:376`、`mega2_tag.rs:397,416,426,440`，其余锚点不变 | 门族 37/37：G1–G4、G27–G29 与新增的模板钉住用例 `cargo test --lib internal::protocol::mega2_diag` 8/8；G5、G6、G23、G24、G25、G26 按卡内命令全部 OK；G7–G22、G30–G37 与 AC-2 `cargo test --test command_test -- mega2_tree_transport_test::failure_details_ … mega2_browser_cli_test::json_error_envelope_carries_http_details` 25/25；AC-1 `cargo test --test command_test mega2_` 83/83。实现：八个公开方法改为 `mega2_diag::run(<端点>, self.<方法>_scoped(..)).await`，原函数体原样移入私有 `<方法>_scoped`（不改缩进，满足 G23），七处发送改为 `mega2_diag::send(<请求>, transport_error)`；`mega2_diag` 的固定路由复用客户端路由常量。真实二进制对 500 mock：stderr `{"ok":false,"error_code":"LBR-NET-002",…,"details":{"http_status":500,"method":"GET","route":"/api/v1/tree"}}`、退出码 128。网站：`pnpm typecheck` 0、`pnpm build` 0、本地 `wrangler dev`（命令行传入仅本地有效的 `AUDIT_HASH_SECRET`，不写文件）页面 HTTP 200、标记计数 3；B 组：无 | MN-10 的 `gh release create` 触发后开始：`libra fetch` 后 `libra reset --mixed 80f58b4`（MN-10 的 squash 提交，树与 `7600cc3` 相同），工作区只剩本卡改动；① `compat_version_surface_sync` 2/2（三处 0.30.14）；② bump 至 0.30.15；③ `cargo build` 刷新 `Cargo.lock`，只改 libra 版本行；④ fmt 0；clippy `-D warnings` 0；在已 bump 的树上原样重跑 G5、G6、G23、G24、G25、G26，全部 OK；T-1 全量 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`（run `65205b33-94b3-4dd9-b300-f009cac51056`）8468 run：8468 passed（21 slow）、4 skipped、0 flaky，1125.7 s；⑤ `cargo build --release` 2m 30s；⑥ 隔离安装 `cargo install --locked --path . --root <会话临时目录>/install --target-dir target` 得 `libra 0.30.15`，对 500 mock 以 `--machine` 运行，stderr 信封带 `"details":{"http_status":500,"method":"GET","route":"/api/v1/tree"}`、退出码 128、stdout 为空；⑦–⑨ 待执行 | 待执行 | Codex R1（2026-10-02 02:13:17 UTC 发起）`PASS`，2×P2：诊断路由改为复用客户端路由常量并在路由门断言实际请求行；中段门另断言 `NetworkUnavailable` 以区分读取中断与解析失败——均已修复；R2 差异确认（02:21:31 UTC 发起）`PASS`，无发现 | 2026-10-02 02:24:10 UTC |
 | MN-02 | 待执行 | 待执行 | 待执行 | 待执行 | 待执行 | — |
 | MN-03 | 待执行 | 待执行 | 待执行 | 待执行 | 待执行 | — |
 | MN-11 | 待执行 | 待执行 | 待执行 | 待执行 | 待执行 | — |

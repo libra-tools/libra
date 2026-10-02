@@ -17,6 +17,7 @@ use reqwest::{StatusCode, header::AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use super::mega2_diag;
 use crate::{
     internal::protocol::{
         mega2_auth::Mega2Token,
@@ -150,6 +151,19 @@ impl Mega2EntryClient {
         parent_path: &str,
         name: &str,
     ) -> CliResult<RemoteCreateReceipt> {
+        mega2_diag::run(
+            mega2_diag::CREATE_ENTRY,
+            self.create_directory_scoped(parent_path, name),
+        )
+        .await
+    }
+
+    /// Body of [`Self::create_directory`]; runs inside its diagnostics scope.
+    async fn create_directory_scoped(
+        &self,
+        parent_path: &str,
+        name: &str,
+    ) -> CliResult<RemoteCreateReceipt> {
         let parent = normalize_path(parent_path)?;
         validate_entry_name(name)?;
 
@@ -170,7 +184,7 @@ impl Mega2EntryClient {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
         }
 
-        let response = request.send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(request, transport_error).await?;
         let status = response.status();
         match status {
             StatusCode::UNAUTHORIZED => {

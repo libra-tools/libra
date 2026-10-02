@@ -6,7 +6,7 @@
 //! redaction are all pinned.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
     sync::{
@@ -345,4 +345,145 @@ async fn invalid_server_urls_are_refused_before_any_request() {
         );
     }
     assert_eq!(server.requests(), 0);
+}
+
+// ---- plan-20261001 MN-01: machine-readable failure details ----
+//
+// One raw-socket fixture per gate. The client must annotate the error with the
+// fixed method and route template and with the status it actually received:
+// at the first status branch (500), while the body is read (a 200 whose body
+// is cut short) and at the last check on a 2xx response (201, so the detail
+// cannot be a fixed 200). Route gates also check the request line the mock
+// received, so the reported route is the route that was requested.
+
+/// Serves exactly one connection: reads the whole request, reports its request
+/// line, writes `response` verbatim and closes. A body shorter than its
+/// `Content-Length` makes the client's body read fail after the status arrived.
+fn serve_raw_once(response: String) -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw mock");
+    let addr = listener.local_addr().expect("raw mock addr");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept()
+            && let Some(line) = read_request_line(&mut stream)
+        {
+            let _ = line_tx.send(line);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (addr, line_rx)
+}
+
+fn received_line(line_rx: &std::sync::mpsc::Receiver<String>) -> String {
+    line_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the mock received one request")
+}
+
+fn raw_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A 200 whose body stops 64 bytes short of its `Content-Length`.
+fn truncated_response(partial: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+        partial.len() + 64
+    )
+}
+
+fn expected_details(method: &str, route: &str, status: u16) -> BTreeMap<String, serde_json::Value> {
+    serde_json::json!({"method": method, "route": route, "http_status": status})
+        .as_object()
+        .expect("details object")
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Reads one request head plus its `Content-Length` body and returns the
+/// request line; `None` on EOF or error.
+fn read_request_line(stream: &mut std::net::TcpStream) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        bytes.extend_from_slice(&chunk[..n]);
+        let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]).to_string();
+        let body_len = head
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if bytes.len() >= head_end + 4 + body_len {
+            return head.lines().next().map(str::to_string);
+        }
+    }
+}
+
+/// Creates `/sub` against one raw fixture; returns the error and the request line.
+async fn create_error(response: String) -> (libra::utils::error::CliError, String) {
+    let (addr, line_rx) = serve_raw_once(response);
+    let err = Mega2EntryClient::new(&format!("http://{addr}"), None)
+        .expect("client")
+        .create_directory("/", "sub")
+        .await
+        .expect_err("fixture must fail");
+    (err, received_line(&line_rx))
+}
+
+/// MN-01 G8: the first status branch is annotated with the route requested.
+#[tokio::test]
+async fn failure_details_create_entry_route() {
+    let (err, line) = create_error(raw_response("500 Internal Server Error", "")).await;
+    assert!(
+        line.starts_with("POST /api/v1/create-entry "),
+        "request line: {line}"
+    );
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/create-entry", 500)
+    );
+}
+
+/// MN-01 G16: the empty-`commit_id` check, the last check on a 2xx response,
+/// is annotated with the status received.
+#[tokio::test]
+async fn failure_details_create_entry_last_stage() {
+    let body = serde_json::json!({
+        "req_result": true,
+        "data": {"commit_id": "", "new_oid": "oid-1"},
+    })
+    .to_string();
+    let (err, _) = create_error(raw_response("201 Created", &body)).await;
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/create-entry", 201)
+    );
+}
+
+/// MN-01 G31: a connection that drops while the body is read carries the
+/// status that arrived; the body-read failure keeps its own stable code.
+#[tokio::test]
+async fn failure_details_create_entry_mid_stream() {
+    let (err, _) = create_error(truncated_response(
+        r#"{"req_result":true,"data":{"commit_id":"#,
+    ))
+    .await;
+    assert_eq!(err.stable_code(), StableErrorCode::NetworkUnavailable);
+    assert_eq!(
+        err.details(),
+        &expected_details("POST", "/api/v1/create-entry", 200)
+    );
 }

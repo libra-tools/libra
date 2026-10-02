@@ -24,6 +24,7 @@ use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
+use super::mega2_diag;
 use crate::{
     internal::protocol::{
         mega2_auth::Mega2Token,
@@ -373,7 +374,7 @@ impl Mega2MutateClient {
         if let Some(token) = &self.token {
             request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
         }
-        let response = request.send().await.map_err(transport_error)?;
+        let response = mega2_diag::send(request, transport_error).await?;
         let status = response.status();
         let raw = read_bounded(response).await?;
         parse_common_envelope(status.as_u16(), &raw, operation)
@@ -385,6 +386,20 @@ impl Mega2MutateClient {
     /// file target is refused locally, and a server type mismatch fails closed
     /// through the shared error mapping.
     pub async fn delete_directory(
+        &self,
+        parent_path: &str,
+        name: &str,
+        known_type: Option<ContentType>,
+    ) -> CliResult<DeleteReceipt> {
+        mega2_diag::run(
+            mega2_diag::DELETE_ENTRY,
+            self.delete_directory_scoped(parent_path, name, known_type),
+        )
+        .await
+    }
+
+    /// Body of [`Self::delete_directory`]; runs inside its diagnostics scope.
+    async fn delete_directory_scoped(
         &self,
         parent_path: &str,
         name: &str,
@@ -409,6 +424,22 @@ impl Mega2MutateClient {
     /// Moves/renames one directory child; exactly one request. Destination
     /// collisions are refused by the server (HTTP 400) and never overwrite.
     pub async fn move_entry(
+        &self,
+        from_parent: &str,
+        from_name: &str,
+        to_parent: &str,
+        to_name: &str,
+        known_type: Option<ContentType>,
+    ) -> CliResult<MoveReceipt> {
+        mega2_diag::run(
+            mega2_diag::MOVE_ENTRY,
+            self.move_entry_scoped(from_parent, from_name, to_parent, to_name, known_type),
+        )
+        .await
+    }
+
+    /// Body of [`Self::move_entry`]; runs inside its diagnostics scope.
+    async fn move_entry_scoped(
         &self,
         from_parent: &str,
         from_name: &str,
