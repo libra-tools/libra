@@ -35,10 +35,11 @@ libra tag -d <name>
 | `-n` | `--n-lines` | `<lines>` | 列出时显示的附注行数（0 = 只显示名称） |
 | | `--column` | `[options]` | 以多列布局列出标签。逗号/空格分隔的选项：启用 `always`/`auto`/`never`（缺省 = `always`）、填充顺序 `column`（自上而下，默认）/ `row`（自左而右）/ `plain`（单列）、列宽 `dense`（每列自适应）/ `nodense`（等宽，默认）。与 `git tag --column` 字节一致。不能与 `-n` 同用。 |
 | | `--no-column` | | 不以多列布局列出标签（等价于 `--column=never`），撤销先前的 `--column`（最后出现者生效）。标签默认每行一个，故单独使用时为 no-op。 |
-| | `--contains` | `<commit>` | 只列出 tip 以 `<commit>` 为祖先的标签 |
-| | `--no-contains` | `<commit>` | 只列出 tip 不以 `<commit>` 为祖先的标签 |
-| | `--merged` | `<commit>` | 只列出可从 `<commit>` 到达的标签 |
-| | `--no-merged` | `<commit>` | 只列出不可从 `<commit>` 到达的标签 |
+| | `--points-at` | `<object>` | 只列出指向给定对象（peel 到其提交）的标签；隐含列表模式。每个标签沿整条标签链完全 peel（标签的标签 peel 到最终提交）；链终点为 tree 或 blob 的标签不参与该过滤。 |
+| | `--contains` | `<commit>` | 只列出 tip 以 `<commit>` 为祖先的标签。每个标签沿整条标签链完全 peel（标签的标签 peel 到最终提交）；链终点为 tree 或 blob 的标签不参与该过滤。 |
+| | `--no-contains` | `<commit>` | 只列出 tip 不以 `<commit>` 为祖先的标签。每个标签沿整条标签链完全 peel（标签的标签 peel 到最终提交）；链终点为 tree 或 blob 的标签不参与该过滤。 |
+| | `--merged` | `<commit>` | 只列出可从 `<commit>` 到达的标签。每个标签沿整条标签链完全 peel（标签的标签 peel 到最终提交）；链终点为 tree 或 blob 的标签不参与该过滤。 |
+| | `--no-merged` | `<commit>` | 只列出不可从 `<commit>` 到达的标签。每个标签沿整条标签链完全 peel（标签的标签 peel 到最终提交）；链终点为 tree 或 blob 的标签不参与该过滤。 |
 | | `--sort` | `<key>` | 按键排序列表（`refname`、`-refname`、`creatordate`、`-creatordate`——`creatordate` 以对象哈希序近似）。优先于 `tag.sort` 配置默认（严格 local → global → system 级联；无效配置值以 `LBR-CLI-002`、local/global 配置库不可读以 `LBR-IO-001`，均在任何列表输出前 fail-closed——例外：schema 比二进制新的全局配置库会在一次性警告后被跳过（见 `LBR-CONFIG-001`）；重复配置值只应用胜出 scope 的最后一个——Git 会叠成多键排序）。标志与配置都未设置时按 `refname` 升序列出（Git 默认）。配置的 `tag.sort` 不会把创建标签变成列表操作 |
 | `-s` | `--sign` | | 用 vault PGP 密钥为附注标签签名（需要 `-m`；不与 Git GPG 互操作）。 |
 | | `--no-sign` | | 不签名标签，撤销先前的 `-s`/`--sign`（命令行最后出现者生效）。标签默认不签名，故单独使用时为 no-op。 |
@@ -218,3 +219,5 @@ Libra 保留 Git 的两层标签模型，以保持磁盘格式兼容。轻量标
 | 无法删除标签 | `LBR-IO-002` | -- |
 | 无法列出标签（DB 错误） | `LBR-IO-001` | -- |
 | 无法列出标签（对象损坏） | `LBR-REPO-002` | -- |
+| 过滤列表（`--points-at`/`--contains`/`--no-contains`/`--merged`/`--no-merged`）遇到无法 peel 的标签链（对象缺失或标签环）："tag '<name>' cannot be peeled to a commit: its tag chain is broken" | `LBR-REPO-002` | "run 'libra fsck' to inspect missing objects." |
+| 过滤列表无法读取某标签的标签链："failed to read the tag chain of '<name>'" | `LBR-IO-001` | "check that the repository is readable and retry." |

@@ -24,6 +24,15 @@
 - `name.is_none()` 只让裸 `tag` 进入列表。`validate_message_source_create_only` 不把缺名当成非创建，所以裸 `tag -m` 仍是缺名用法错误；`--no-column` 经 `tag_requests_list` 算列表旗标，与 `-m` 组合仍是用法错误（`LBR-CLI-002`）。
 - `cli.rs` 只调用 `tag_is_read_only_query`；`command_scope` 仍为 `Repository`。
 
+### 列表过滤器的标签链 peel（issues/498 TT-05）
+
+- `collect_tags` 只在 `--points-at`、`--contains`、`--no-contains`、`--merged`、`--no-merged` 之一生效时为每个标签求 peel 终点；不带这些过滤器的列表（含 `-n`、pattern、`--sort`、`--column`）不做深 peel，输出与读取次数不变。
+- `tag_filter_commit`：ref 直接指向 commit 时取该 commit；直接指向 tree / blob 时返回 `None`（不参与过滤）；指向 tag 对象时调用 `util::peel_to_non_tag_typed`。该包装委托 `src/utils/util.rs` 的私有 peel 循环（`peel_object_to_type_typed(id, None, ..)`，含环检测），再读取终点类型；tag 模块不再保留自有 peel 函数（旧的一层 peel `tag_peeled_commit` 已删除）。
+- 终点为 commit 的标签以该 commit 参与全部过滤（嵌套标签 `outer → ann → commit` 因而能被 `--points-at` / `--contains` 命中）；终点为 tree / blob 的标签从这五个过滤器的结果中排除（`--contains` / `--no-contains` / `--merged` / `--no-merged` 与 Git ref-filter 一致；此前 `--contains` 会把 tag 对象或 tree 当 commit 遍历而整体失败，`--no-merged` 会误列 tree / blob 标签）。`--points-at` 的参数侧仍经 `get_target_commit` peel 到 commit 再与各标签的终点 commit 比较；Git 以未 peel 的参数与链上每个对象比较，因此 tag / tree / blob 参数的结果不同——该参数侧差异由 #533（`issues/477b.md` HW-05）承接。链断裂时 Libra fail closed，而 Git 对四个可达性过滤器静默跳过该标签（`--points-at` 则报 `malformed object`），属有意差异。
+- 链断裂（中间对象缺失）或环 fail closed：`TagError::TagChainBroken` → `fatal: tag '<name>' cannot be peeled to a commit: its tag chain is broken`（`LBR-REPO-002`，exit 128，hint `run 'libra fsck' to inspect missing objects.`）；读失败：`TagError::TagChainRead` → `fatal: failed to read the tag chain of '<name>'`（`LBR-IO-001`，exit 128，hint `check that the repository is readable and retry.`）。stdout 不输出部分列表。文案为固定文本，不拼接底层存储错误（可能含本地对象路径）；底层细节只经 `tracing::warn!` 记入日志。
+- 测试 failpoint：同时设置 `LIBRA_TEST=1` 与 `LIBRA_TEST_TAG_FAIL_CHAIN_READ=<tag 名>` 时，只有名字等于该值、且 ref 指向 tag 对象的那个标签在调用包装之前得到 `CommitBaseError::ReadFailure`，其余标签照常处理（报错的标签与迭代顺序无关）。`tag_chain_read_failpoint` 只编译进 debug 构建（`#[cfg(debug_assertions)]`；release 构建为恒返回 `false` 的同名实现），release 二进制没有该路径。
+- 回归：`tests/command/tag_test.rs` 的 `tag_filter_*` / `tag_list_without_filters_*`（F5 夹具：`old`、`lw`、`ann`、嵌套 `outer`、终点为 tree / blob 的 `atree` / `ablob` / `ttree` / `tblob`，F5′ 为断链变体）与 `src/utils/util.rs` 的 `peel_to_non_tag_typed_*`。
+
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
 ```mermaid
@@ -49,6 +58,7 @@ flowchart TD
 - 2026-05-18 `b534c401`（`fix(commit,stash,index-pack,tag): restore Issues URL on internal-invariant paths`）：实现修正：restore Issues URL on internal-invariant paths；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-05-16 `fff9cbb0`（`test(tag): pin Display for 5 static-message TagError variants (v0.17.292)`）：测试契约：pin Display for 5 static-message TagError variants (v0.17.292)；相关行为已有回归守卫，后续变更需要继续满足。
 - 2026-07-11（plan-20260708 P1-05d，sort 片）：`tag.sort` 配置默认接入严格 local→global→system 级联（`configured_tag_sort`，`--sort` 优先）。配置在 list 模式判定之后解析，因而配置的排序不会把 `libra tag <name>`（创建）翻成列表。两者皆未设置时列表按 `refname` 升序（Git 默认；此前为 DB 插入序）。无效配置值 → `TagError::InvalidSortConfig`（`LBR-CLI-002`），读取失败 → `SortConfigRead`（`LBR-IO-001`），均在输出前。`creatordate` 仍为对象哈希近似（与 `--sort` 相同，文档已注明）。已记录收窄：重复配置值只应用胜出 scope 的最后一个（Git 叠成多键排序）。回归：`compat_config_defaults_semantics` 的 `tag_sort_config_orders_list_without_forcing_list_mode`（含多值 last-wins）、`sort_config_read_failure_is_io_error_before_listing`（不可读 global 库 → LBR-IO-001 点名键）。
+- 2026-10-02（issues/498 TT-05，v0.30.22）：`--points-at` / `--contains` / `--no-contains` / `--merged` / `--no-merged` 沿整条标签链 peel（新增 `util::peel_to_non_tag_typed`，删除只 peel 一层的 `tag_peeled_commit`），终点为 tree / blob 的标签被排除，断链 / 环 / 读失败 fail closed（`LBR-REPO-002` / `LBR-IO-001`）；新增 debug-only 测试 failpoint `LIBRA_TEST_TAG_FAIL_CHAIN_READ`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -62,7 +72,7 @@ flowchart TD
 - `-e, --edit`：打开编辑器撰写或编辑附注标签消息。编辑器缓冲以 `-m`/`-F` 的 base 消息（如有）加注释说明块预填，经 `editor::resolve_editor`（`GIT_EDITOR`→`core.editor`→`VISUAL`→`EDITOR`，无配置且有 TTY 时回退 `vi`，否则报 `TagError::NoEditor`→exit 128）→`editor::edit_message`（落 `TAG_EDITMSG`）打开。保存后用 `clean_tag_message`（`git stripspace` 语义：剥离整行注释、去行尾空白、折叠空行）清理；为空则报 `TagError::EmptyEditedMessage`→exit 128（`failure`+`RepoStateInvalid`，对齐 `commit` 空消息）。`-a` 单独使用走同一编辑器路径。
 - `-s, --sign`（clap `requires = "message"`，即要求 `-m`；`-e` 可进一步编辑该 `-m` 消息，但 `-s` 不接受 `-F` 或仅编辑器消息）：用 vault PGP 密钥对规范化的未签名标签内容（`object/type/tag/tagger/\n\n/message`）签名，并把 armored 签名块（`vault::signature_to_armored`）追加到标签消息后，对齐 Git 的 signed-tag 布局；tagger 仅构建一次以保证被签名字节与落库对象一致。无 unseal key 时报 `CreateTagError::VaultSign`→`TagError::VaultSign`。
 - `-v, --verify <name>`：`internal::tag::verify` 在签名标记处切分标签消息、重建未签名内容、`vault::armored_to_signature_hex` 还原签名后调用 `vault::pgp_verify`（进程内验证本仓库允许列表公钥：活动 → 生成 → 历史；**吊销与过期按签名自身的创建时刻判定**——`signature_creation_time_secs` 取 hashed `SignatureCreationTime`（缺失回退 now），`key_revoked_at`/`subkey_revoked_at` 取吊销签名时刻，`revocation_applies`/`expiry_applies` 决定是否拒收）。好签名打印 `Good signature for tag '<name>'`（exit 0）；坏签名 `TagError::BadSignature`（exit 1）；未签名/非 annotated/未找到/无密钥经 `map_verify_tag_error` 报错。
-- `--contains <commit>` / `--no-contains <commit>`：仅保留（或排除）其 peeled commit 以 `<commit>` 为祖先的标签（即 tag “包含”该 commit），隐含 list 模式；复用 `log::get_reachable_commits` 对每个 tag 的 peeled commit 做一次可达性遍历。
+- `--contains <commit>` / `--no-contains <commit>`：仅保留（或排除）其 peeled commit 以 `<commit>` 为祖先的标签（即 tag “包含”该 commit），隐含 list 模式；peeled commit 沿整条标签链求得，终点为 tree / blob 的标签不参与（见「列表过滤器的标签链 peel」）；复用 `log::get_reachable_commits` 对每个 tag 的 peeled commit 做一次可达性遍历。
 
 
 ## 还未实现的功能

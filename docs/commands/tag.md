@@ -34,14 +34,14 @@ List forms (`-l`, `-n`, `--contains`, `--no-contains`, `--points-at`, `--merged`
 | `-e` | `--edit` | | Open an editor to compose or edit the annotated-tag message. With `-m`/`-F` the editor is pre-filled with that message; without them it composes a new one. `-a` alone is the same editor path. Comment lines are stripped; an empty result aborts. |
 | `-f` | `--force` | | Overwrite an existing tag |
 | `-n` | `--n-lines` | `<lines>` | Number of annotation lines to display when listing (0 = names only) |
-| | `--points-at` | `<object>` | List only tags pointing at the given object (peeled to its commit); implies list mode |
+| | `--points-at` | `<object>` | List only tags pointing at the given object (peeled to its commit); implies list mode. Each tag is peeled through its whole tag chain (a tag of a tag peels to the final commit); a tag whose chain ends at a tree or blob never matches. |
 | `-s` | `--sign` | | Sign the annotated tag with a vault PGP key (requires `-m`; not Git GPG-interoperable) |
 | | `--no-sign` | | Do not sign the tag, countermanding an earlier `-s`/`--sign` (last one on the command line wins). Tags are unsigned by default, so on its own this is a no-op. |
 | `-v` | `--verify` | `<name>` | Verify a tag's PGP signature against the repository's configured public keys (active, generated, or historical; exit 0 good, exit 1 bad) |
-| | `--contains` | `<commit>` | List only tags whose tip has `<commit>` as an ancestor |
-| | `--no-contains` | `<commit>` | List only tags whose tip does not have `<commit>` as an ancestor |
-| | `--merged` | `<commit>` | List only tags reachable from `<commit>` |
-| | `--no-merged` | `<commit>` | List only tags not reachable from `<commit>` |
+| | `--contains` | `<commit>` | List only tags whose tip has `<commit>` as an ancestor. Each tag is peeled through its whole tag chain (a tag of a tag peels to the final commit); a tag whose chain ends at a tree or blob never matches. |
+| | `--no-contains` | `<commit>` | List only tags whose tip does not have `<commit>` as an ancestor. Each tag is peeled through its whole tag chain (a tag of a tag peels to the final commit); a tag whose chain ends at a tree or blob never matches. |
+| | `--merged` | `<commit>` | List only tags reachable from `<commit>`. Each tag is peeled through its whole tag chain (a tag of a tag peels to the final commit); a tag whose chain ends at a tree or blob never matches. |
+| | `--no-merged` | `<commit>` | List only tags not reachable from `<commit>`. Each tag is peeled through its whole tag chain (a tag of a tag peels to the final commit); a tag whose chain ends at a tree or blob never matches. |
 | | `--sort` | `<key>` | Sort the listing by key (`refname`, `-refname`, `creatordate`, `-creatordate` — `creatordate` is approximated by object-hash order). Overrides the `tag.sort` config default (strict local → global → system cascade; an invalid config value fails closed with `LBR-CLI-002` and an unreadable local/global config store with `LBR-IO-001`, both before any listing output — except a future-schema global store (newer than this binary), which is skipped with a one-time warning (see `LBR-CONFIG-001`); repeated config values apply only the last one of the winning scope — Git would stack them into a multi-key sort). When neither the flag nor the config is set, tags list in `refname`-ascending order (Git default). A configured `tag.sort` never turns tag creation into a listing |
 | | `--column` | `[options]` | Lay out the tag list in columns. Comma/space-separated options: enablement `always`/`auto`/`never` (bare = `always`), fill order `column` (top-to-bottom, default) / `row` (left-to-right) / `plain` (single column), and column widths `dense` (per-column) / `nodense` (uniform, default). Byte-compatible with `git tag --column`. Cannot be combined with `-n`. |
 | | `--no-column` | | Do not lay out the tag list in columns (equivalent to `--column=never`), countermanding an earlier `--column` (last one wins). Tags list one-per-line by default, so on its own this is a no-op. |
@@ -227,3 +227,5 @@ Libra preserves Git's two-tier tag model for on-disk format compatibility. Light
 | Failed to delete tag | `LBR-IO-002` | -- |
 | Failed to list tags (DB error) | `LBR-IO-001` | -- |
 | Failed to list tags (corrupt object) | `LBR-REPO-002` | -- |
+| A filtered listing (`--points-at`/`--contains`/`--no-contains`/`--merged`/`--no-merged`) meets a tag whose chain cannot be peeled (missing object or tag cycle): "tag '<name>' cannot be peeled to a commit: its tag chain is broken" | `LBR-REPO-002` | "run 'libra fsck' to inspect missing objects." |
+| A filtered listing cannot read a tag's chain: "failed to read the tag chain of '<name>'" | `LBR-IO-001` | "check that the repository is readable and retry." |

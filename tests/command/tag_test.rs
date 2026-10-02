@@ -12,13 +12,19 @@ use libra::utils::path;
 use libra::{
     command::tag::{self, TagArgs},
     internal::{
-        branch::Branch, config::ConfigKv, db::get_db_conn_instance, model::reference,
+        branch::Branch,
+        config::ConfigKv,
+        db::{
+            get_db_conn_instance, get_db_conn_instance_for_path, reset_db_conn_instance_for_path,
+        },
+        model::reference,
         tag as internal_tag,
     },
     utils::{
         error::StableErrorCode,
         output::OutputConfig,
         test::{ChangeDirGuard, setup_with_new_libra_in},
+        util::DATABASE,
     },
 };
 use sea_orm::{ActiveModelTrait, Set};
@@ -2131,4 +2137,495 @@ fn tag_op_total(repo: &std::path::Path) -> u64 {
     parse_json_stdout(&output)["data"]["total"]
         .as_u64()
         .expect("tag op total")
+}
+
+// ---------------------------------------------------------------------------
+// issues/498 TT-05: tag list filters peel the whole tag chain and exclude
+// tree / blob endpoints (gate family G1–G26, G31–G34; G27–G29 live in
+// `src/utils/util.rs`, G30 is a zero-hit guard).
+// ---------------------------------------------------------------------------
+
+/// Object id that no fixture ever writes (F5′ points `outer` at it).
+const TAG_CHAIN_MISSING_OBJECT: &str = "0123456789abcdef0123456789abcdef01234567";
+const TAG_CHAIN_TAGGER: &str = "Test User <test@example.com> 1767225600 +0000";
+
+/// F5: `A` (`base`) ← `B` with `old` → A, `lw` → B and the annotated `ann` → B,
+/// plus refs injected straight into the tag table: `outer` → a tag object of
+/// `ann` (nested tag), `atree` / `ablob` → annotated tags of B's tree and of
+/// `file.txt`'s blob, `ttree` / `tblob` → that tree and blob directly. F5′
+/// (`broken_outer`) points `outer`'s tag object at a missing object instead.
+struct TagChainFixture {
+    repo: tempfile::TempDir,
+    a: String,
+    b: String,
+}
+
+fn write_tag_object(repo: &Path, body: &str) -> String {
+    let output =
+        run_libra_command_with_stdin(&["hash-object", "-t", "tag", "-w", "--stdin"], repo, body);
+    assert_cli_success(&output, "hash-object -t tag");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Insert `refs/tags/<name>` → `target` straight into the fixture database:
+/// the CLI never creates tags of trees, blobs or raw tag objects.
+fn inject_tag_ref(repo: &Path, name: &str, target: &str) {
+    let db_path = repo.join(".libra").join(DATABASE);
+    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    runtime.block_on(async {
+        let db = get_db_conn_instance_for_path(&db_path)
+            .await
+            .expect("failed to open fixture database");
+        reference::ActiveModel {
+            name: Set(Some(ref_name(name))),
+            kind: Set(reference::ConfigKind::Tag),
+            commit: Set(Some(target.to_string())),
+            remote: Set(None),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("failed to inject tag reference");
+        reset_db_conn_instance_for_path(&db_path).await;
+    });
+}
+
+fn tag_chain_fixture(broken_outer: bool) -> TagChainFixture {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    let a = tag_rev_parse(path, "HEAD");
+    assert_cli_success(&run_libra_command(&["tag", "old"], path), "tag old");
+    fs::write(path.join("file.txt"), "b\n").expect("failed to write file.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "file.txt"], path),
+        "add file.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-verify"], path),
+        "commit B",
+    );
+    let b = tag_rev_parse(path, "HEAD");
+    assert_cli_success(&run_libra_command(&["tag", "lw"], path), "tag lw");
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "ann msg", "ann"], path),
+        "tag -m ann",
+    );
+    let ann = tag_rev_parse(path, "ann");
+    let tree = tag_rev_parse(path, "HEAD^{tree}");
+    let blob = tag_rev_parse(path, "HEAD:file.txt");
+    let (outer_object, outer_type) = if broken_outer {
+        (TAG_CHAIN_MISSING_OBJECT, "commit")
+    } else {
+        (ann.as_str(), "tag")
+    };
+    let outer = write_tag_object(
+        path,
+        &format!(
+            "object {outer_object}\ntype {outer_type}\ntag outer\ntagger {TAG_CHAIN_TAGGER}\n\nouter msg\n"
+        ),
+    );
+    let atree = write_tag_object(
+        path,
+        &format!("object {tree}\ntype tree\ntag atree\ntagger {TAG_CHAIN_TAGGER}\n\natree msg\n"),
+    );
+    let ablob = write_tag_object(
+        path,
+        &format!("object {blob}\ntype blob\ntag ablob\ntagger {TAG_CHAIN_TAGGER}\n\nablob msg\n"),
+    );
+    for (name, target) in [
+        ("outer", outer.as_str()),
+        ("atree", atree.as_str()),
+        ("ablob", ablob.as_str()),
+        ("ttree", tree.as_str()),
+        ("tblob", blob.as_str()),
+    ] {
+        inject_tag_ref(path, name, target);
+    }
+    TagChainFixture { repo, a, b }
+}
+
+/// Ordered `data.tags[].name` list of a `--json` / `--machine` tag envelope.
+fn tag_envelope_names(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let envelope: Value = serde_json::from_str(text.trim()).expect("expected a JSON envelope");
+    envelope["data"]["tags"]
+        .as_array()
+        .expect("expected tags array")
+        .iter()
+        .map(|entry| {
+            entry["name"]
+                .as_str()
+                .expect("tag entry missing name")
+                .to_string()
+        })
+        .collect()
+}
+
+/// `(error_code, exit_code, message)` of a structured CLI error report.
+fn error_triple(stderr: &[u8]) -> (String, i32, String) {
+    let (_, report) = parse_cli_error_stderr(stderr);
+    (report.error_code, report.exit_code, report.message)
+}
+
+/// Human block of a CLI error, with the trailing newline the CLI prints.
+fn error_human(stderr: &[u8]) -> String {
+    let (human, _) = parse_cli_error_stderr(stderr);
+    format!("{human}\n")
+}
+
+fn run_tag_filter(
+    repo: &Path,
+    output_flag: Option<&str>,
+    filter: &str,
+    commit: &str,
+    env: &[(&str, &str)],
+) -> Output {
+    let mut args: Vec<&str> = output_flag.into_iter().collect();
+    args.extend(["tag", filter, commit]);
+    run_libra_command_with_env(&args, repo, env)
+}
+
+const NO_ENV: &[(&str, &str)] = &[];
+const CHAIN_READ_FAILPOINT: &[(&str, &str)] = &[("LIBRA_TEST_TAG_FAIL_CHAIN_READ", "ann")];
+
+// G1–G4: `tag --points-at <B>` on F5.
+#[test]
+fn tag_filter_points_at_chain_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--points-at", &fx.b, NO_ENV);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ann\nlw\nouter\n");
+}
+
+#[test]
+fn tag_filter_points_at_chain_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), Some("--json"), "--points-at", &fx.b, NO_ENV);
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_points_at_chain_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--points-at",
+        &fx.b,
+        NO_ENV,
+    );
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_points_at_chain_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--points-at", &fx.b, NO_ENV);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+// G5–G8: `tag --contains <B>` on F5.
+#[test]
+fn tag_filter_contains_chain_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--contains", &fx.b, NO_ENV);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ann\nlw\nouter\n");
+}
+
+#[test]
+fn tag_filter_contains_chain_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), Some("--json"), "--contains", &fx.b, NO_ENV);
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_contains_chain_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--contains",
+        &fx.b,
+        NO_ENV,
+    );
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_contains_chain_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--contains", &fx.b, NO_ENV);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+// G9–G12: `tag --no-contains <B>` on F5.
+#[test]
+fn tag_filter_no_contains_chain_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--no-contains", &fx.b, NO_ENV);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "old\n");
+}
+
+#[test]
+fn tag_filter_no_contains_chain_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--json"),
+        "--no-contains",
+        &fx.b,
+        NO_ENV,
+    );
+    assert_eq!(tag_envelope_names(&output.stdout), vec!["old"]);
+}
+
+#[test]
+fn tag_filter_no_contains_chain_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--no-contains",
+        &fx.b,
+        NO_ENV,
+    );
+    assert_eq!(tag_envelope_names(&output.stdout), vec!["old"]);
+}
+
+#[test]
+fn tag_filter_no_contains_chain_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--no-contains", &fx.b, NO_ENV);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+// G13–G16: `tag --merged <B>` on F5.
+#[test]
+fn tag_filter_merged_chain_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--merged", &fx.b, NO_ENV);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "ann\nlw\nold\nouter\n"
+    );
+}
+
+#[test]
+fn tag_filter_merged_chain_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), Some("--json"), "--merged", &fx.b, NO_ENV);
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "old", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_merged_chain_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), Some("--machine"), "--merged", &fx.b, NO_ENV);
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "old", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_merged_chain_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--merged", &fx.b, NO_ENV);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+// G17–G20: `tag --no-merged <A>` on F5.
+#[test]
+fn tag_filter_no_merged_chain_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--no-merged", &fx.a, NO_ENV);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ann\nlw\nouter\n");
+}
+
+#[test]
+fn tag_filter_no_merged_chain_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), Some("--json"), "--no-merged", &fx.a, NO_ENV);
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_no_merged_chain_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--no-merged",
+        &fx.a,
+        NO_ENV,
+    );
+    assert_eq!(
+        tag_envelope_names(&output.stdout),
+        vec!["ann", "lw", "outer"]
+    );
+}
+
+#[test]
+fn tag_filter_no_merged_chain_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(fx.repo.path(), None, "--no-merged", &fx.a, NO_ENV);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+// G21–G24: `tag --contains <B>` on F5′.
+#[test]
+fn tag_filter_broken_chain_human() {
+    let fx = tag_chain_fixture(true);
+    let output = run_tag_filter(fx.repo.path(), None, "--contains", &fx.b, NO_ENV);
+    assert_eq!(
+        error_human(&output.stderr),
+        "fatal: tag 'outer' cannot be peeled to a commit: its tag chain is broken\nError-Code: LBR-REPO-002\n\nHint: run 'libra fsck' to inspect missing objects.\n"
+    );
+}
+
+#[test]
+fn tag_filter_broken_chain_json() {
+    let fx = tag_chain_fixture(true);
+    let output = run_tag_filter(fx.repo.path(), Some("--json"), "--contains", &fx.b, NO_ENV);
+    assert_eq!(
+        error_triple(&output.stderr),
+        (
+            "LBR-REPO-002".to_string(),
+            128,
+            "tag 'outer' cannot be peeled to a commit: its tag chain is broken".to_string()
+        )
+    );
+}
+
+#[test]
+fn tag_filter_broken_chain_machine() {
+    let fx = tag_chain_fixture(true);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--contains",
+        &fx.b,
+        NO_ENV,
+    );
+    assert_eq!(
+        error_triple(&output.stderr),
+        (
+            "LBR-REPO-002".to_string(),
+            128,
+            "tag 'outer' cannot be peeled to a commit: its tag chain is broken".to_string()
+        )
+    );
+}
+
+#[test]
+fn tag_filter_broken_chain_exit_code() {
+    let fx = tag_chain_fixture(true);
+    let output = run_tag_filter(fx.repo.path(), None, "--contains", &fx.b, NO_ENV);
+    assert_eq!(output.status.code(), Some(128));
+}
+
+// G31–G34: `tag --contains <B>` on F5 with the chain-read failpoint.
+#[test]
+fn tag_filter_chain_read_failure_human() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        None,
+        "--contains",
+        &fx.b,
+        CHAIN_READ_FAILPOINT,
+    );
+    assert_eq!(
+        error_human(&output.stderr),
+        "fatal: failed to read the tag chain of 'ann'\nError-Code: LBR-IO-001\n\nHint: check that the repository is readable and retry.\n"
+    );
+}
+
+#[test]
+fn tag_filter_chain_read_failure_json() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--json"),
+        "--contains",
+        &fx.b,
+        CHAIN_READ_FAILPOINT,
+    );
+    assert_eq!(
+        error_triple(&output.stderr),
+        (
+            "LBR-IO-001".to_string(),
+            128,
+            "failed to read the tag chain of 'ann'".to_string()
+        )
+    );
+}
+
+#[test]
+fn tag_filter_chain_read_failure_machine() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        Some("--machine"),
+        "--contains",
+        &fx.b,
+        CHAIN_READ_FAILPOINT,
+    );
+    assert_eq!(
+        error_triple(&output.stderr),
+        (
+            "LBR-IO-001".to_string(),
+            128,
+            "failed to read the tag chain of 'ann'".to_string()
+        )
+    );
+}
+
+#[test]
+fn tag_filter_chain_read_failure_exit_code() {
+    let fx = tag_chain_fixture(false);
+    let output = run_tag_filter(
+        fx.repo.path(),
+        None,
+        "--contains",
+        &fx.b,
+        CHAIN_READ_FAILPOINT,
+    );
+    assert_eq!(output.status.code(), Some(128));
+}
+
+// G25–G26: a filterless list does no deep peel and is unchanged.
+#[test]
+fn tag_list_without_filters_unchanged_with_chain_fixture() {
+    let fx = tag_chain_fixture(false);
+    let output = run_libra_command(&["tag", "-l"], fx.repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "ablob\nann\natree\nlw\nold\nouter\ntblob\nttree\n"
+    );
+}
+
+#[test]
+fn tag_list_without_filters_exit_code_with_chain_fixture() {
+    let fx = tag_chain_fixture(false);
+    let output = run_libra_command(&["tag", "-l"], fx.repo.path());
+    assert_eq!(output.status.code(), Some(0));
 }

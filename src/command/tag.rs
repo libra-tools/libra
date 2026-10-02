@@ -3,7 +3,7 @@
 use std::io;
 
 use clap::Parser;
-use git_internal::{errors::GitError, hash::ObjectHash};
+use git_internal::{errors::GitError, hash::ObjectHash, internal::object::types::ObjectType};
 use sea_orm::DbErr;
 use serde::Serialize;
 
@@ -13,7 +13,7 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         text::short_display_hash,
-        util,
+        util::{self, CommitBaseError},
     },
 };
 
@@ -327,6 +327,12 @@ enum TagError {
     )]
     Reachability(String),
 
+    #[error("tag '{name}' cannot be peeled to a commit: its tag chain is broken")]
+    TagChainBroken { name: String },
+
+    #[error("failed to read the tag chain of '{name}'")]
+    TagChainRead { name: String },
+
     #[error("unsupported tag sort key '{0}'")]
     InvalidSortKey(String),
 
@@ -448,6 +454,12 @@ impl From<TagError> for CliError {
             TagError::Reachability(_) => {
                 CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            TagError::TagChainBroken { .. } => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run 'libra fsck' to inspect missing objects."),
+            TagError::TagChainRead { .. } => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("check that the repository is readable and retry."),
             TagError::InvalidSortKey(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("supported sort keys: refname, -refname, creatordate, -creatordate"),
@@ -857,6 +869,13 @@ async fn collect_tags(
     no_merged: Option<&ObjectHash>,
 ) -> Result<Vec<TagListEntry>, TagError> {
     let tags = tag::list().await.map_err(TagError::ListFailed)?;
+    // The commit filters compare each tag's fully peeled commit; peeling only
+    // when one of them is active keeps a plain listing free of extra reads.
+    let commit_filters_active = points_at.is_some()
+        || contains.is_some()
+        || no_contains.is_some()
+        || merged.is_some()
+        || no_merged.is_some();
     let mut entries = Vec::with_capacity(tags.len());
     for tag in tags {
         // `tag -l <pattern>` keeps only tags whose name matches the fnmatch glob.
@@ -865,15 +884,24 @@ async fn collect_tags(
         {
             continue;
         }
+        if !commit_filters_active {
+            entries.push(tag_to_list_entry(tag, show_lines));
+            continue;
+        }
+        // A tag whose chain ends at a tree or blob matches none of the commit
+        // filters (Git's ref-filter drops such tags from the reachability
+        // filters too).
+        let Some(peeled) = tag_filter_commit(&tag)? else {
+            continue;
+        };
         if let Some(target) = points_at
-            && &tag_peeled_commit(&tag.object) != target
+            && &peeled != target
         {
             continue;
         }
         // `--contains`/`--no-contains`: walk the tag's peeled commit's history
         // and keep (or drop) tags that reach the requested commit.
         if contains.is_some() || no_contains.is_some() {
-            let peeled = tag_peeled_commit(&tag.object);
             let reachable = crate::command::log::get_reachable_commits(peeled.to_string(), None)
                 .await
                 .map_err(|error| TagError::Reachability(error.to_string()))?;
@@ -893,7 +921,6 @@ async fn collect_tags(
         // peeled commit is an ancestor (reachable from it).
         // `--no-merged <commit>`: drop tags whose peeled commit is reachable.
         if merged.is_some() || no_merged.is_some() {
-            let peeled = tag_peeled_commit(&tag.object);
             if let Some(target) = merged {
                 let target_reachable =
                     crate::command::log::get_reachable_commits(target.to_string(), None)
@@ -999,17 +1026,59 @@ async fn resolve_points_at_object(object: &str) -> Result<ObjectHash, TagError> 
         .map_err(|_| TagError::InvalidPointsAtObject(object.to_string()))
 }
 
-/// Peel a tag's target object down to the commit it ultimately references:
-/// lightweight tags point straight at a commit, annotated tags carry the
-/// commit in their `object_hash`, and tree/blob tags peel to themselves.
-/// Used by `--points-at` to compare against the requested object.
-fn tag_peeled_commit(object: &TagObject) -> ObjectHash {
-    match object {
-        TagObject::Commit(commit) => commit.id,
-        TagObject::Tag(tag_object) => tag_object.object_hash,
-        TagObject::Tree(tree) => tree.id,
-        TagObject::Blob(blob) => blob.id,
+/// Peel a listed tag to the commit that `--points-at`, `--contains`,
+/// `--no-contains`, `--merged` and `--no-merged` compare against.
+///
+/// A lightweight tag names its object directly; an annotated tag is peeled
+/// through its whole tag chain, so a tag of a tag of a commit yields that
+/// commit. `Ok(None)` means the chain ends at a tree or blob, which the
+/// filters exclude. A broken chain or a tag cycle fails closed instead of
+/// silently dropping the tag. The user-facing error never embeds the storage
+/// error, which can carry local object paths; that detail is only logged.
+fn tag_filter_commit(tag: &tag::Tag) -> Result<Option<ObjectHash>, TagError> {
+    let tag_object = match &tag.object {
+        TagObject::Commit(commit) => return Ok(Some(commit.id)),
+        TagObject::Tree(_) | TagObject::Blob(_) => return Ok(None),
+        TagObject::Tag(tag_object) => tag_object,
+    };
+    let peeled = if tag_chain_read_failpoint(&tag.name) {
+        Err(CommitBaseError::ReadFailure(
+            "LIBRA_TEST_TAG_FAIL_CHAIN_READ failpoint".to_string(),
+        ))
+    } else {
+        util::peel_to_non_tag_typed(tag_object.id, &tag.name)
+    };
+    match peeled {
+        Ok((commit, ObjectType::Commit)) => Ok(Some(commit)),
+        Ok(_) => Ok(None),
+        Err(CommitBaseError::ReadFailure(detail)) => {
+            tracing::warn!(tag = %tag.name, %detail, "failed to read tag chain");
+            Err(TagError::TagChainRead {
+                name: tag.name.clone(),
+            })
+        }
+        Err(error) => {
+            tracing::warn!(tag = %tag.name, detail = %error, "tag chain cannot be peeled");
+            Err(TagError::TagChainBroken {
+                name: tag.name.clone(),
+            })
+        }
     }
+}
+
+/// Test failpoint: `LIBRA_TEST=1` plus `LIBRA_TEST_TAG_FAIL_CHAIN_READ=<tag>`
+/// makes peeling that tag's chain report a read failure, so the read-failure
+/// rendering is exercised through the real CLI. Debug builds only — a
+/// release binary has no path to it.
+#[cfg(debug_assertions)]
+fn tag_chain_read_failpoint(name: &str) -> bool {
+    std::env::var(crate::utils::pager::LIBRA_TEST_ENV).is_ok_and(|value| value == "1")
+        && std::env::var("LIBRA_TEST_TAG_FAIL_CHAIN_READ").is_ok_and(|value| value == name)
+}
+
+#[cfg(not(debug_assertions))]
+fn tag_chain_read_failpoint(_name: &str) -> bool {
+    false
 }
 
 fn tag_to_list_entry(tag: tag::Tag, show_lines: usize) -> TagListEntry {

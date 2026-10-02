@@ -2236,6 +2236,24 @@ pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseE
     peel_object_to_type_typed(object_id, Some(ObjectType::Commit), name)
 }
 
+/// Peel `object_id` through any chain of annotated tags to the first non-tag
+/// object and report that object's type.
+///
+/// Delegates to the shared peel loop (including its cycle detection), so a
+/// nested tag — a tag of a tag of a commit — peels exactly like
+/// `rev-parse <tag>^{}`. A non-tag object is returned unchanged. A missing
+/// intermediate object or a tag cycle is reported as
+/// [`CommitBaseError::CorruptReference`]; an unreadable object store as
+/// [`CommitBaseError::ReadFailure`].
+pub fn peel_to_non_tag_typed(
+    object_id: ObjectHash,
+    display_name: &str,
+) -> Result<(ObjectHash, ObjectType), CommitBaseError> {
+    let end = peel_object_to_type_typed(object_id, None, display_name)?;
+    let end_type = object_type_typed(&objects_storage(), &end, display_name)?;
+    Ok((end, end_type))
+}
+
 /// Resolve a string to a commit [`ObjectHash`].
 /// The string can be a local branch name, a remote-tracking branch name
 /// (such as `origin/main`), a tag name, or a commit hash prefix.
@@ -3682,6 +3700,98 @@ mod test {
 
         assert!(matches!(error, CommitBaseError::CorruptReference(_)));
         assert!(error.to_string().contains("tag cycle detected"));
+    }
+
+    /// Commit `tracked.txt` in the current test repository and return HEAD.
+    async fn commit_tracked_file_for_peel_test() -> ObjectHash {
+        test::ensure_file("tracked.txt", Some("tracked\n"));
+        add::execute(AddArgs {
+            intent_to_add: false,
+            sparse: false,
+            pathspec: vec!["tracked.txt".into()],
+            all: false,
+            update: false,
+            refresh: false,
+            verbose: false,
+            force: false,
+            dry_run: false,
+            ignore_errors: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+            resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
+        })
+        .await;
+        commit::execute(CommitArgs {
+            message: Some("base".into()),
+            disable_pre: true,
+            no_verify: true,
+            ..Default::default()
+        })
+        .await;
+        Head::current_commit()
+            .await
+            .expect("expected committed HEAD")
+    }
+
+    /// issues/498 TT-05 G27: a tag of a tag of a commit peels to that commit.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn peel_to_non_tag_typed_follows_nested_chain() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+        let head_commit = commit_tracked_file_for_peel_test().await;
+        let inner = test_tag_object(head_commit, ObjectType::Commit, "inner");
+        let outer = test_tag_object(inner.id, ObjectType::Tag, "outer");
+        save_object(&inner, &inner.id).expect("failed to save inner tag object");
+        save_object(&outer, &outer.id).expect("failed to save outer tag object");
+
+        let peeled = peel_to_non_tag_typed(outer.id, "outer").expect("nested chain should peel");
+
+        assert_eq!(peeled, (head_commit, ObjectType::Commit));
+    }
+
+    /// issues/498 TT-05 G28: a tag whose chain ends at a tree reports the tree.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn peel_to_non_tag_typed_reports_tree_end() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+        let head_commit = commit_tracked_file_for_peel_test().await;
+        let commit: Commit = load_object(&head_commit).expect("failed to load HEAD commit");
+        let tree_tag = test_tag_object(commit.tree_id, ObjectType::Tree, "tree-tag");
+        save_object(&tree_tag, &tree_tag.id).expect("failed to save tree tag object");
+
+        let peeled =
+            peel_to_non_tag_typed(tree_tag.id, "tree-tag").expect("tree-ending chain should peel");
+
+        assert_eq!(peeled, (commit.tree_id, ObjectType::Tree));
+    }
+
+    /// issues/498 TT-05 G29: a tag cycle is corruption, not a peel result.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn peel_to_non_tag_typed_reports_cycle_as_corruption() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+        let head_commit = commit_tracked_file_for_peel_test().await;
+        let tag_a = test_tag_object(head_commit, ObjectType::Commit, "tag-a");
+        let tag_b = test_tag_object(tag_a.id, ObjectType::Tag, "tag-b");
+        let tag_a_cycle = test_tag_object(tag_b.id, ObjectType::Tag, "tag-a");
+        save_object(&tag_b, &tag_b.id).expect("failed to save tag-b");
+        save_object(&tag_a_cycle, &tag_a.id).expect("failed to save cyclic tag-a");
+
+        let error = peel_to_non_tag_typed(tag_a.id, "tag-a").expect_err("tag cycle should fail");
+
+        assert!(matches!(error, CommitBaseError::CorruptReference(_)));
     }
 
     #[tokio::test]

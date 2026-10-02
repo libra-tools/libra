@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-02 15:27:59 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md)：MN-10、MN-01、MN-02、MN-03、MN-11、MN-04 `done`/`complete`（v0.30.14–v0.30.19）；MN-08 `in-progress`/`remote-pending`（v0.30.20，PR #600 → `36e826a`，网站标记已上线，release/CodeQL 跟踪中）；MN-12（非交互改名目录 `--rename-dir`）`in-progress`/`locally-accepted`——C 组 ①–⑥（0.30.21）已过，提交与 PR 进行中；MN-05、MN-06、MN-09 已在叠加层预做并评审 `PASS`；MN-07 的 harness/live 门代码评审 `PASS`（R4），`DEP-MN-04` 隔离实例已起（live 证据在 MN-09 之后）；其余沿用 2026-10-02 01:04:02 UTC 快照。）
+> **当前快照：** 2026-10-02 16:40:07 UTC（[`issues/498.md`](issues/498.md)：按模板 v2.12 重写，Codex 计划评审 R6 `PASS`，EX-TT-01 已获批准，M0 达成；TT-05 `in-progress`/`locally-accepted`——34 门全绿，Codex 代码评审 CR1 / CR2 `PASS`，独立复核工作流发现的 `COMPATIBILITY.md` mega2 行误回退已修复，0.30.20 树全量 8600/8600 passed；因 MN-08 占用 v0.30.20、MN-12（#601）合并为 0.30.21，本卡重放到 `fb1cf80` 并改取 0.30.22（DEP-498-07）；TT-02 `pending`；其余沿用 2026-10-02 15:27:59 UTC 快照（其后 MN-12 #601 已于 16:37:35 UTC 合并）。）
 
 ---
 
@@ -81,7 +81,7 @@
 | [`issues/490.md`](issues/490.md) | skip-worktree 索引位与 `add` 稀疏路径诊断 | 未启动 | SW-01..SW-07（7 卡；SW-06 已迁至 plan-20260918） |
 | [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | **实施中（待 Codex 评审）** | CLH-01..04 `done`（根因 ADR-CLH-01：`local_client.rs` 旧 `encode_pack_bytes` 同任务先喂满有界输入通道再排空有界输出通道的循环等待；已复用 `pack_writer::encode_pack_bytes`，新增 pack_writer 单元回归 + clone 集成回归；文档/`COMPATIBILITY.md`/`../libra-backend` 同步；发布 `v0.30.1`） |
 | [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | **已收口** | CD-01..CD-04 全部 `done`/`complete`；`v0.27.2`（PR #581 squash merge `859d7fb`；PR head `base.yml` 7/7 + CodeQL 绿；`release.yml` 8/8 + stable manifest `0.27.2`）；ER-07 签名例外 EX-CD-01（仓库 vault 不可 unseal，操作者 2026-09-24 裁决维持未签名发布） |
-| [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | 未启动 | TT-01..TT-04（4 卡；与 #533/#478 协调） |
+| [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | **实施中** | 2026-10-02 按模板 v2.12 重写；Codex R1–R5 `FAIL` → R6 `PASS`（2026-10-02 10:15:38 UTC）；活动卡 TT-05（列表过滤器沿标签链完全 peel，34 门）`in-progress`/`locally-accepted`（34/34 门绿、CR1 `PASS`，C 组进行中）→ TT-02（tag 创建的显式目标：轻量 / 附注 / 签名 / 嵌套 + E1–E5 契约，108 门）`pending`；TT-01/03/04 废弃，TT-06/07 合并回 TT-02；门族以 EX-TT-01（G-03 门族型验收）承载，genedna 已于 2026-10-02 09:02:14 UTC 显式批准；DEP-498-01（477b HW-05/#533）、DEP-498-07（与 plan-20261001 MN 卡共用版本面与 release 序列）、DEFER-TT-01..07；全量门在 `umask 022` 下执行（基线 8458/8458 passed） |
 | [`issues/477b.md`](issues/477b.md) | 历史改写收口后续（#522/#523/#525/#526/#527/#533/#536；#528 并入 #495） | 未启动 | HW-01..HW-07（7 卡） |
 | [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
