@@ -788,7 +788,8 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
     }
 
     // The target is resolved before the message file is read, the editor
-    // opens, or anything is written, so a bad target leaves no trace.
+    // opens, or any tag ref or tag object is written, so a bad target
+    // leaves neither behind.
     let target = match args.target.as_deref() {
         Some(spec) => Some(resolve_tag_target(spec).await?),
         None => None,
