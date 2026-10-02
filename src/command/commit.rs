@@ -1,7 +1,7 @@
 //! Commit command that collects staged changes, builds tree and commit objects, validates messages (including GPG), and updates HEAD/refs.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{IsTerminal, Read, Write},
     path::PathBuf,
 };
@@ -2787,6 +2787,23 @@ async fn create_tree_with_persistence(
             return Err(CommitError::UnresolvedConflicts(unresolved.join(", ")));
         }
     }
+    // Reusing each directory's subset avoids scanning the full index at every tree node.
+    let path_entries = index
+        .tracked_entries(0)
+        .into_iter()
+        .map(|entry| PathBuf::from(&entry.name))
+        .filter(|path| path.starts_with(&current_root))
+        .collect::<Vec<_>>();
+    create_tree_subset(index, storage, current_root, &path_entries, persist).await
+}
+
+async fn create_tree_subset(
+    index: &Index,
+    storage: &ClientStorage,
+    current_root: PathBuf,
+    path_entries: &[PathBuf],
+    persist: bool,
+) -> Result<Tree, CommitError> {
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
         let name = util::path_to_string(path);
@@ -2811,55 +2828,45 @@ async fn create_tree_with_persistence(
         })
     };
 
-    let mut tree_items: Vec<TreeItem> = Vec::new();
-    let mut processed_path: HashSet<String> = HashSet::new();
-    let path_entries: Vec<PathBuf> = index
-        .tracked_entries(0)
-        .iter()
-        .map(|file| PathBuf::from(file.name.clone()))
-        .filter(|path| path.starts_with(&current_root))
-        .collect();
-    for path in path_entries.iter() {
-        let in_current_path = path
+    let mut tree_items = Vec::new();
+    let mut subtrees: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let root_depth = current_root.components().count();
+    for path in path_entries {
+        let parent = path
             .parent()
-            .ok_or_else(|| CommitError::TreeCreation(format!("invalid path: {:?}", path)))?
-            == current_root;
-        if in_current_path {
-            let item = get_blob_entry(path)?;
-            tree_items.push(item);
+            .ok_or_else(|| CommitError::TreeCreation(format!("invalid path: {:?}", path)))?;
+        if parent == current_root {
+            tree_items.push(get_blob_entry(path)?);
         } else {
-            if path.components().count() == 1 {
-                continue;
-            }
-            // next level tree
-            let process_path = path
+            let component = path
                 .components()
-                .nth(current_root.components().count())
+                .nth(root_depth)
                 .ok_or_else(|| {
                     CommitError::TreeCreation("failed to get next path component".to_string())
                 })?
                 .as_os_str()
                 .to_str()
                 .ok_or_else(|| CommitError::TreeCreation("invalid path component".to_string()))?;
-
-            if processed_path.contains(process_path) {
-                continue;
-            }
-            processed_path.insert(process_path.to_string());
-
-            let sub_tree = Box::pin(create_tree_with_persistence(
-                index,
-                storage,
-                current_root.clone().join(process_path),
-                persist,
-            ))
-            .await?;
-            tree_items.push(TreeItem {
-                name: process_path.to_string(),
-                mode: TreeItemMode::Tree,
-                id: sub_tree.id,
-            });
+            subtrees
+                .entry(component.to_string())
+                .or_default()
+                .push(path.clone());
         }
+    }
+    for (component, subset) in subtrees {
+        let sub_tree = Box::pin(create_tree_subset(
+            index,
+            storage,
+            current_root.join(&component),
+            &subset,
+            persist,
+        ))
+        .await?;
+        tree_items.push(TreeItem {
+            name: component,
+            mode: TreeItemMode::Tree,
+            id: sub_tree.id,
+        });
     }
     crate::utils::tree::sort_tree_items_for_git(&mut tree_items);
     let tree = {
@@ -4129,6 +4136,143 @@ mod test {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn test_create_tree_subset_preserves_modes_and_prefix_boundaries() {
+        use git_internal::internal::index::IndexEntry;
+
+        let temp_path = tempdir().unwrap();
+        setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = ChangeDirGuard::new(temp_path.path());
+        let storage = ClientStorage::init(temp_path.path().join("tree-subset-objects"));
+        let mut index = Index::new();
+        let mut insert = |name: &str, mode: u32| {
+            let id = ObjectHash::from_type_and_data(ObjectType::Blob, name.as_bytes());
+            let mut entry = IndexEntry::new_from_blob(name.to_string(), id, name.len() as u32);
+            entry.mode = mode;
+            index.update(entry);
+            id
+        };
+        let root_blob = insert("foo.c", 0o100644);
+        let executable = insert("foo/run", 0o100755);
+        let symlink = insert("foo/nested/link", 0o120000);
+        let gitlink = insert("foo/nested/vendor", 0o160000);
+        let neighbor = insert("foobar/file", 0o100644);
+
+        let nested = Tree::from_tree_items(vec![
+            TreeItem {
+                name: "link".into(),
+                mode: TreeItemMode::Link,
+                id: symlink,
+            },
+            TreeItem {
+                name: "vendor".into(),
+                mode: TreeItemMode::Commit,
+                id: gitlink,
+            },
+        ])
+        .unwrap();
+        let foo = Tree::from_tree_items(vec![
+            TreeItem {
+                name: "nested".into(),
+                mode: TreeItemMode::Tree,
+                id: nested.id,
+            },
+            TreeItem {
+                name: "run".into(),
+                mode: TreeItemMode::BlobExecutable,
+                id: executable,
+            },
+        ])
+        .unwrap();
+        let foobar = Tree::from_tree_items(vec![TreeItem {
+            name: "file".into(),
+            mode: TreeItemMode::Blob,
+            id: neighbor,
+        }])
+        .unwrap();
+        // Git sorts a tree entry as if its name ended with '/': foo.c precedes foo/.
+        let expected = Tree::from_tree_items(vec![
+            TreeItem {
+                name: "foo.c".into(),
+                mode: TreeItemMode::Blob,
+                id: root_blob,
+            },
+            TreeItem {
+                name: "foo".into(),
+                mode: TreeItemMode::Tree,
+                id: foo.id,
+            },
+            TreeItem {
+                name: "foobar".into(),
+                mode: TreeItemMode::Tree,
+                id: foobar.id,
+            },
+        ])
+        .unwrap();
+        let built = create_tree(&index, &storage, PathBuf::new()).await.unwrap();
+        assert_eq!(built.id, expected.id);
+        for tree in [&nested, &foo, &foobar, &expected] {
+            assert_eq!(storage.get(&tree.id).unwrap(), tree.to_data().unwrap());
+        }
+
+        let subtree = create_tree_with_persistence(&index, &storage, "foo".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(subtree.id, foo.id);
+        let missing = create_tree_with_persistence(&index, &storage, "missing".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            missing.id,
+            ObjectHash::from_type_and_data(ObjectType::Tree, &[])
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn test_create_tree_subset_rejects_unmerged_index_but_allows_preview() {
+        use git_internal::internal::index::IndexEntry;
+
+        let temp_path = tempdir().unwrap();
+        setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = ChangeDirGuard::new(temp_path.path());
+        let storage = ClientStorage::init(temp_path.path().join("conflict-tree-objects"));
+        let mut index = Index::new();
+        let blob_id = ObjectHash::from_type_and_data(ObjectType::Blob, b"conflict");
+        let mut entry = IndexEntry::new_from_blob("conflict.txt".into(), blob_id, 8);
+        entry.flags.stage = 1;
+        index.update(entry);
+
+        let error = create_tree(&index, &storage, PathBuf::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CommitError::UnresolvedConflicts(_)));
+        let preview = create_tree_with_persistence(&index, &storage, PathBuf::new(), false)
+            .await
+            .unwrap();
+        assert!(preview.tree_items.is_empty());
+        assert!(storage.get(&preview.id).is_err());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn test_create_tree_subset_empty_index() {
+        let temp_path = tempdir().unwrap();
+        setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = ChangeDirGuard::new(temp_path.path());
+        let storage = ClientStorage::init(temp_path.path().join("empty-tree-objects"));
+        let tree = create_tree(&Index::new(), &storage, PathBuf::new())
+            .await
+            .unwrap();
+        assert!(tree.tree_items.is_empty());
+        assert_eq!(
+            tree.id,
+            ObjectHash::from_type_and_data(ObjectType::Tree, &[])
+        );
+        assert_eq!(storage.get(&tree.id).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
