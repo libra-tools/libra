@@ -110,6 +110,7 @@ the forms available in this release.
 | start, `Enter`, `Backspace`/`h`, `r` | `--list` (PATH is the directory; `--json` without a flag is the same) | `GET /api/v1/tree` |
 | `+` | `--create-dir <NAME>` (PATH is the parent) | `POST /api/v1/create-entry` |
 | `d` | `--delete-dir <NAME>` (PATH is the parent) | `POST /api/v1/delete-entry` |
+| `m` | `--move-dir <NAME> <PARENT-PATH>` (PATH is NAME's current parent; the name is kept) | `POST /api/v1/move-entry` |
 
 Every non-interactive call follows the same rules:
 
@@ -206,6 +207,37 @@ Errors:
 | NAME, or PATH itself, does not exist (HTTP 404) | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
 
+`--move-dir <NAME> <PARENT-PATH>` moves directory NAME from PATH into the
+existing directory PARENT-PATH, keeping its name, with one
+`POST /api/v1/move-entry`, and does not reload. PARENT-PATH is validated like
+PATH before the request. The plain-text summary is
+`moved directory <from> -> <to> (commit <commit_id>)`; with `--json`/`--machine`
+the payload is:
+
+```json
+{
+  "operation": "move-dir",
+  "server": "https://mega2.example.com",
+  "target": {
+    "from": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+    "to": { "parent": "/lib", "name": "pkg", "path": "/lib/pkg" }
+  },
+  "receipt": { "commit_id": "…", "from_path": "/src/pkg", "to_path": "/lib/pkg", "cl_link": null }
+}
+```
+
+As with `--delete-dir`, the server answers whether the move is possible.
+Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME is `.`/`..`, empty, too long, or has a separator or control character | `LBR-CLI-002` | none (no request) |
+| PARENT-PATH is not rooted, or has `.`/`..` components, a `\` or a control character | `LBR-CLI-003` | none (no request) |
+| Combined with another operation flag or with `--ref` | `LBR-CLI-002` | none (no request) |
+| HTTP 400: PARENT-PATH already has an entry named NAME, PARENT-PATH is PATH itself or lies inside NAME, NAME is a file, PATH or PARENT-PATH runs through a file, or the server refuses the path (for example, on a trunk server, a move between two top-level directories) | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 404: NAME, PATH or PARENT-PATH does not exist | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -273,6 +305,7 @@ terminal. The panel operates root tags only.
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
 | `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
 | `--delete-dir <NAME>` | Delete directory NAME under PATH without a terminal (one POST, no confirmation, no reload). |
+| `--move-dir <NAME> <PARENT-PATH>` | Move directory NAME from PATH into PARENT-PATH, keeping its name, without a terminal (one POST, no reload). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -343,6 +376,9 @@ libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /
 
 # Delete /src/pkg without a terminal (no confirmation: the flag names the target)
 libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /src --token-file ~/.mega2-token
+
+# Move /src/pkg to /lib/pkg without a terminal
+libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /lib /src --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

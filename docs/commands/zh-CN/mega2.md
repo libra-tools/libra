@@ -95,6 +95,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | 启动、`Enter`、`Backspace`/`h`、`r` | `--list`（PATH 即目标目录；不带 flag 的 `--json` 与之相同） | `GET /api/v1/tree` |
 | `+` | `--create-dir <NAME>`（PATH 为父目录） | `POST /api/v1/create-entry` |
 | `d` | `--delete-dir <NAME>`（PATH 为父目录） | `POST /api/v1/delete-entry` |
+| `m` | `--move-dir <NAME> <PARENT-PATH>`（PATH 为 NAME 当前的父目录；名称不变） | `POST /api/v1/move-entry` |
 
 所有非交互调用遵守同一组规则：
 
@@ -178,6 +179,35 @@ Libra 不预先检查 NAME 是否存在、是否为目录：两者都由服务�
 | NAME 或 PATH 本身不存在（HTTP 404） | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
 
+`--move-dir <NAME> <PARENT-PATH>` 以一次 `POST /api/v1/move-entry` 把 PATH 下的目录
+NAME 移到已存在的目录 PARENT-PATH 下，名称不变，之后不重新列出。PARENT-PATH 在发请求
+之前按与 PATH 相同的规则校验。纯文本摘要为
+`moved directory <from> -> <to> (commit <commit_id>)`；带 `--json`/`--machine` 时
+payload 为：
+
+```json
+{
+  "operation": "move-dir",
+  "server": "https://mega2.example.com",
+  "target": {
+    "from": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+    "to": { "parent": "/lib", "name": "pkg", "path": "/lib/pkg" }
+  },
+  "receipt": { "commit_id": "…", "from_path": "/src/pkg", "to_path": "/lib/pkg", "cl_link": null }
+}
+```
+
+与 `--delete-dir` 相同，能否移动由服务端回答。错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 为 `.`/`..`、为空、过长，或含分隔符、控制字符 | `LBR-CLI-002` | 无（不发请求） |
+| PARENT-PATH 不是 rooted 路径，或含 `.`/`..` 组件、`\` 或控制字符 | `LBR-CLI-003` | 无（不发请求） |
+| 与另一个操作 flag 或 `--ref` 同用 | `LBR-CLI-002` | 无（不发请求） |
+| HTTP 400：PARENT-PATH 下已有名为 NAME 的条目、PARENT-PATH 就是 PATH 或位于 NAME 之内、NAME 是文件、PATH 或 PARENT-PATH 途经文件，或服务端拒绝该路径（例如 trunk 服务端上跨两个顶层目录的移动） | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 404：NAME、PATH 或 PARENT-PATH 不存在 | `LBR-NET-002` | `http_status: 404` |
+| HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -230,6 +260,7 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
 | `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
 | `--delete-dir <NAME>` | 不用终端删除 PATH 下的目录 NAME（一次 POST，无确认行，不重新列出）。 |
+| `--move-dir <NAME> <PARENT-PATH>` | 不用终端把 PATH 下的目录 NAME 移到 PARENT-PATH 下，名称不变（一次 POST，不重新列出）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -295,6 +326,9 @@ libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /
 
 # 不用终端删除 /src/pkg（没有确认行：flag 写明了目标）
 libra --json mega2 browser --server https://mega2.example.com --delete-dir pkg /src --token-file ~/.mega2-token
+
+# 不用终端把 /src/pkg 移到 /lib/pkg
+libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /lib /src --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

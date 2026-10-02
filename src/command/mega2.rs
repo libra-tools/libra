@@ -129,20 +129,36 @@ pub struct OperationArgs {
     /// Delete directory NAME under PATH: one POST, no confirmation, no reload
     #[arg(long = "delete-dir", value_name = "NAME")]
     pub delete_dir: Option<String>,
+
+    /// Move directory NAME from PATH into PARENT-PATH, keeping its name: one POST, no reload
+    #[arg(long = "move-dir", num_args = 2, value_names = ["NAME", "PARENT-PATH"])]
+    pub move_dir: Option<Vec<String>>,
 }
 
 impl OperationArgs {
     /// The selected operation, if any.
-    fn selected(&self) -> Option<Operation> {
+    fn selected(&self) -> CliResult<Option<Operation>> {
         if self.list {
-            return Some(Operation::List);
+            return Ok(Some(Operation::List));
         }
         if let Some(name) = &self.create_dir {
-            return Some(Operation::CreateDir { name: name.clone() });
+            return Ok(Some(Operation::CreateDir { name: name.clone() }));
         }
-        self.delete_dir
-            .as_ref()
-            .map(|name| Operation::DeleteDir { name: name.clone() })
+        if let Some(name) = &self.delete_dir {
+            return Ok(Some(Operation::DeleteDir { name: name.clone() }));
+        }
+        match self.move_dir.as_deref() {
+            None => Ok(None),
+            Some([name, to_parent]) => Ok(Some(Operation::MoveDir {
+                name: name.clone(),
+                to_parent: to_parent.clone(),
+            })),
+            // clap enforces `num_args = 2`; any other arity is a parser bug.
+            Some(values) => Err(CliError::internal(format!(
+                "mega2 browser: --move-dir expects 2 values, got {}",
+                values.len()
+            ))),
+        }
     }
 }
 
@@ -234,7 +250,7 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
     // the refusal of token flags — run there, before the one request.
     if let Some(operation) = args
         .operation
-        .selected()
+        .selected()?
         .or_else(|| output.is_json().then_some(Operation::List))
     {
         let invocation = Invocation {

@@ -23,8 +23,11 @@ use crate::{
         mega2_auth::{Mega2Token, resolve_token_from_process},
         mega2_diag::{self, Endpoint},
         mega2_entry::{Mega2EntryClient, RemoteCreateReceipt},
-        mega2_mutate::{DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient},
-        mega2_tree::{ContentType, Listing, Mega2TreeSession},
+        mega2_mutate::{
+            DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient,
+            MoveReceipt as RemoteMoveReceipt,
+        },
+        mega2_tree::{ContentType, Listing, Mega2TreeSession, normalize_path},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -98,14 +101,30 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Write,
         surface: Surface::Directory,
     },
+    OperationSpec {
+        name: "move-dir",
+        flag: "--move-dir",
+        endpoint: mega2_diag::MOVE_ENTRY,
+        access: Access::Write,
+        surface: Surface::Directory,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     List,
-    CreateDir { name: String },
-    DeleteDir { name: String },
+    CreateDir {
+        name: String,
+    },
+    DeleteDir {
+        name: String,
+    },
+    /// Move NAME from PATH into `to_parent`, keeping the name.
+    MoveDir {
+        name: String,
+        to_parent: String,
+    },
 }
 
 impl Operation {
@@ -115,6 +134,7 @@ impl Operation {
             Operation::List => "list",
             Operation::CreateDir { .. } => "create-dir",
             Operation::DeleteDir { .. } => "delete-dir",
+            Operation::MoveDir { .. } => "move-dir",
         }
     }
 
@@ -214,6 +234,28 @@ pub async fn execute(
             let summary = format!(
                 "deleted directory {} (commit {})\n",
                 sanitize(&target.path),
+                sanitize(&receipt.commit_id)
+            );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
+        }
+        Operation::MoveDir { name, to_parent } => {
+            // The destination parent is validated like PATH, as the TUI's `m`
+            // does, before the one request.
+            let to_parent = normalize_path(&to_parent)?;
+            let client = Mega2MutateClient::new(invocation.server, token)?;
+            let receipt = MoveReceipt::from(
+                client
+                    .move_entry(invocation.path, &name, &to_parent, &name, None)
+                    .await?,
+            );
+            let target = MoveTarget {
+                from: Target::new(invocation.path, &name),
+                to: Target::new(&to_parent, &name),
+            };
+            let summary = format!(
+                "moved directory {} -> {} (commit {})\n",
+                sanitize(&target.from.path),
+                sanitize(&target.to.path),
                 sanitize(&receipt.commit_id)
             );
             emit_write(spec, invocation, output, &target, &receipt, &summary)
@@ -337,6 +379,35 @@ impl From<RemoteDeleteReceipt> for DeleteReceipt {
     }
 }
 
+/// What a move targeted: the source and destination entries, both built only
+/// from validated local input (ADR-MN-03).
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct MoveTarget {
+    from: Target,
+    to: Target,
+}
+
+/// The server's move-entry receipt, verbatim (`from_path`, `to_path` and
+/// `cl_link` may be null).
+#[derive(Serialize, Debug)]
+struct MoveReceipt {
+    commit_id: String,
+    from_path: Option<String>,
+    to_path: Option<String>,
+    cl_link: Option<String>,
+}
+
+impl From<RemoteMoveReceipt> for MoveReceipt {
+    fn from(receipt: RemoteMoveReceipt) -> Self {
+        Self {
+            commit_id: receipt.commit_id,
+            from_path: receipt.from_path,
+            to_path: receipt.to_path,
+            cl_link: receipt.cl_link,
+        }
+    }
+}
+
 /// The machine payload of every write operation: `target` (local input) and
 /// `receipt` (server answer) are kept apart (ADR-MN-03).
 #[derive(Serialize, Debug)]
@@ -441,6 +512,14 @@ mod tests {
         .expect("delete-dir is registered");
         assert_eq!(spec.name, "delete-dir");
         assert_eq!(spec.endpoint, mega2_diag::DELETE_ENTRY);
+        let spec = Operation::MoveDir {
+            name: "x".to_string(),
+            to_parent: "/y".to_string(),
+        }
+        .spec()
+        .expect("move-dir is registered");
+        assert_eq!(spec.name, "move-dir");
+        assert_eq!(spec.endpoint, mega2_diag::MOVE_ENTRY);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -519,6 +598,40 @@ mod tests {
                 "server": "https://mega2.example.com",
                 "target": {"parent": "/src", "name": "pkg", "path": "/src/pkg"},
                 "receipt": {"commit_id": "c1", "path": "/src/pkg", "cl_link": null},
+            })
+        );
+    }
+
+    /// MN-08: the `move-dir` payload keeps local `target` (source and
+    /// destination) and server `receipt` apart.
+    #[test]
+    fn move_payload_separates_target_and_receipt() {
+        let target = MoveTarget {
+            from: Target::new("/src", "pkg"),
+            to: Target::new("/lib", "pkg"),
+        };
+        let receipt = MoveReceipt {
+            commit_id: "c1".to_string(),
+            from_path: Some("/src/pkg".to_string()),
+            to_path: Some("/lib/pkg".to_string()),
+            cl_link: None,
+        };
+        let data = WriteData {
+            operation: "move-dir",
+            server: "https://mega2.example.com",
+            target: &target,
+            receipt: &receipt,
+        };
+        assert_eq!(
+            serde_json::to_value(&data).expect("serialize"),
+            serde_json::json!({
+                "operation": "move-dir",
+                "server": "https://mega2.example.com",
+                "target": {
+                    "from": {"parent": "/src", "name": "pkg", "path": "/src/pkg"},
+                    "to": {"parent": "/lib", "name": "pkg", "path": "/lib/pkg"},
+                },
+                "receipt": {"commit_id": "c1", "from_path": "/src/pkg", "to_path": "/lib/pkg", "cl_link": null},
             })
         );
     }

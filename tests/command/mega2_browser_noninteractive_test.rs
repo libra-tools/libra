@@ -1440,3 +1440,197 @@ fn delete_dir_missing_target_http_status() {
     assert!(!output.status.success());
     assert_eq!(error_envelope(&output)["details"]["http_status"], 404);
 }
+
+// ---- move_dir (MN-08): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c ----
+
+fn move_entry_receipt(commit_id: &str) -> String {
+    envelope(json!({
+        "commit_id": commit_id,
+        "from_path": "/a",
+        "to_path": "/b/a",
+        "cl_link": null,
+    }))
+}
+
+/// The rule fixture's receipt carries an ESC in `commit_id`, so R2 proves the
+/// human summary sanitizes server strings.
+fn move_dir_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, move_entry_receipt("commit-\u{1b}[31m-1"))
+}
+
+fn move_dir_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        envelope(json!({
+            "commit_id": "commit-1",
+            "from_path": "/src/sub",
+            "to_path": "/dst/sub",
+            "cl_link": null,
+        })),
+    )
+}
+
+const MOVE_DIR_CASE: OpCase = OpCase {
+    op_args: &["--move-dir", "a", "/b", "/"],
+    method: "POST",
+    route: "/api/v1/move-entry",
+    path: "/api/v1/move-entry",
+    ok: move_dir_ok,
+};
+
+op_rule!(op_rule_move_dir_r1, rule_r1, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r1b, rule_r1b, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r2, rule_r2, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r3, rule_r3, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r4a, rule_r4a, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r4b, rule_r4b, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r7_code, rule_r7_code, MOVE_DIR_CASE);
+op_rule!(
+    op_rule_move_dir_r7_no_request,
+    rule_r7_no_request,
+    MOVE_DIR_CASE
+);
+op_rule!(op_rule_move_dir_r8_code, rule_r8_code, MOVE_DIR_CASE);
+op_rule!(
+    op_rule_move_dir_r8_no_request,
+    rule_r8_no_request,
+    MOVE_DIR_CASE
+);
+op_rule!(op_rule_move_dir_r9a, rule_r9a, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r9b, rule_r9b, MOVE_DIR_CASE);
+op_rule!(op_rule_move_dir_r9c, rule_r9c, MOVE_DIR_CASE);
+
+// ---- move_dir (MN-08): operation-specific behavior ----
+
+/// `--move-dir NAME PARENT-PATH PATH` plus `extra` against `mock`.
+fn move_dir_output(mock: &MockMega2, name: &str, to_parent: &str, extra: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = mock.url();
+    let mut args = vec![
+        "mega2",
+        "browser",
+        "--server",
+        &url,
+        "--move-dir",
+        name,
+        to_parent,
+    ];
+    args.extend_from_slice(extra);
+    run(dir.path(), &args, &[])
+}
+
+/// AC-1: one anonymous POST with both normalized parents and the kept name.
+#[test]
+fn move_dir_request_record() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "sub", "/dst//", &["/src/", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/move-entry".to_string(),
+            None,
+            Some(json!({
+                "from_path": "/src",
+                "from_name": "sub",
+                "to_path": "/dst",
+                "to_name": "sub",
+                "skip_build": true,
+            })),
+        )]
+    );
+}
+
+/// AC-2: `target` (source and destination) comes from local input, `receipt`
+/// is the server's receipt.
+#[test]
+fn move_dir_json_payload() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "sub", "/dst", &["/src", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "move-dir",
+            "server": mock.url(),
+            "target": {
+                "from": {"parent": "/src", "name": "sub", "path": "/src/sub"},
+                "to": {"parent": "/dst", "name": "sub", "path": "/dst/sub"},
+            },
+            "receipt": {"commit_id": "commit-1", "from_path": "/src/sub", "to_path": "/dst/sub", "cl_link": null},
+        })
+    );
+}
+
+/// AC-3: the human summary is one sanitized line.
+#[test]
+fn move_dir_human_output() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "sub", "/dst", &["/src"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "moved directory /src/sub -> /dst/sub (commit commit-1)\n"
+    );
+}
+
+/// G14: an unrooted PARENT-PATH (delegated to `normalize_path`) fails with
+/// `LBR-CLI-003`.
+#[test]
+fn move_dir_rejects_unrooted_parent_code() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "sub", "rel/dir", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-003");
+}
+
+/// G15: the same refusal sends no request.
+#[test]
+fn move_dir_rejects_unrooted_parent_no_request() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "sub", "rel/dir", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G16: NAME `..` (delegated to `validate_entry_name`) fails with `LBR-CLI-002`.
+#[test]
+fn move_dir_rejects_dotdot_name_code() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "..", "/b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G17: the same refusal sends no request.
+#[test]
+fn move_dir_rejects_dotdot_name_no_request() {
+    let mock = MockMega2::start(move_dir_clean_ok);
+    let output = move_dir_output(&mock, "..", "/b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// mega2 refuses a move onto an existing name (any mode) with HTTP 400.
+const EXISTING_DESTINATION: &str =
+    r#"{"req_result":false,"data":null,"err_message":"'a' already exists under /b"}"#;
+
+/// G18: an existing destination (server 400) fails with `LBR-CLI-003`.
+#[test]
+fn move_dir_existing_destination_code() {
+    let mock = MockMega2::start(fail_on(&MOVE_DIR_CASE, 400, EXISTING_DESTINATION));
+    let output = move_dir_output(&mock, "a", "/b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-003");
+}
+
+/// G19: the same failure carries `details.http_status` 400.
+#[test]
+fn move_dir_existing_destination_http_status() {
+    let mock = MockMega2::start(fail_on(&MOVE_DIR_CASE, 400, EXISTING_DESTINATION));
+    let output = move_dir_output(&mock, "a", "/b", &["/", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 400);
+}
