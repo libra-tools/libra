@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-02 01:04:02 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) 连同本文件与 `plan-long.md` 的登记一起提交：计划级 Codex review 已 `PASS`（R15 全文 `PASS`、R16 差异确认 `PASS`；提交前按上游 v0.30.11–v0.30.13 复核锚点，R17 `FAIL` 的 1 个 P1 已修订，R18 差异确认 `PASS`；R2 后已按使用者批准登记 G-03 门族型豁免 EX-MN-01/02/03）；MN-01..MN-12 仍全部 `pending`，已登记「计划一览」「未启动的计划与卡」、DEFER 与跨计划依赖（MN-03 经 `DEP-MN-06` 进入 `DEP-AD-12 / DEP-CLI-mirror`）；其余沿用 2026-10-01 19:26:56 UTC 快照：issues/574：**已收口**；BRL-01..05 `done`/`complete` v0.30.9..v0.30.13；BRL-05 PR #590 `ce2411d`，release 36910331385 8/8；DEFER-BRL-01..03 仍挂。）
+> **当前快照：** 2026-10-02 02:00:13 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) **开工**：发布者为 Claude Code 会话 `eb4841ea`；MN-10（URL 解析错误不回显）`in-progress`/`locally-accepted`——A 组、Codex R1 `PASS`、C 组 ①–④（0.30.14、fmt、clippy、T-1 全量 nextest 8435/8435）已过，提交与 PR 进行中；其余沿用 2026-10-02 01:04:02 UTC 快照。）
 
 ---
 
@@ -20,7 +20,7 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | 已排期 | 2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
+| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | **实施中** | **2026-10-02 02:00:13 UTC**：MN-10 `in-progress`/`locally-accepted`（0.30.14 候选；C 组 ①–④ 已过，提交、PR、`gh release create` 待完成）；MN-01..MN-09、MN-11、MN-12 `pending`。2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
 | [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
@@ -98,7 +98,6 @@
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
-| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | MN-01..MN-12（全串行：MN-10 → 01 → 02 → 03 → 11 → 04 → 08 → 12 → 05 → 06 → 09 → 07） | 计划级 Codex review 已 `PASS`（R15–R18，ER-MN-03）；`DEP-MN-02`（`../libra-backend` 为 Git 且在 `cf`）核对；MN-03 起按 GC-MN-08 重核 `DEP-MN-01`（mega2@`8ff880c`）；MN-03 另需 `DEP-MN-06`（`src/cli.rs` 注释改动的三态窗口）；MN-07 另需 `DEP-MN-04`（可写的真实 mega2 storage-only 实例） |
 | [`plan-20260924.md`](plan-20260924.md) | ACF-01..ACF-09 | Claude 字面 `VERDICT: PASS`；ACF-01 重核 Entire/Libra pin 與 shared files clean |
 | [`plan-20260926.md`](plan-20260926.md) | DM-00..DM-13（14 卡，全部 pending） | R11 字面 `VERDICT: PASS`（`P0=0` / `P1=0`）。`DM-00` 保持 `pending`。`DEP-DM-06` 仍阻塞 `DM-05`（等 plan-20260924 的 `CTR-ACF-DM06-v1` 或 ACF-08 收口） |
 | [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
@@ -120,6 +119,15 @@
 ## 三、实施中的计划、待退役的历史方案与当前卡
 
 按执行窗口排序；当前执行与并行工作树见「四、当前执行指针」。
+
+### plan-20261001-mega-browser-noninteractive（mega2 browser 非交互操作，12 卡全串行）
+
+发布窗口顺序 MN-10 → MN-01 → MN-02 → MN-03 → MN-11 → MN-04 → MN-08 → MN-12 → MN-05 → MN-06 → MN-09 → MN-07；单一发布者为 Claude Code 会话 `eb4841ea`（ER-12）。开工前置：`DEP-MN-02`（`../libra-backend` 为 Git 且在 `cf`，MN-01 起）；MN-03 起按 GC-MN-08 重核 `DEP-MN-01`（mega2@`8ff880c`）；MN-03 另需 `DEP-MN-06`；MN-07 另需 `DEP-MN-04`。
+
+| 卡 | Lifecycle / Acceptance | 版本 / 证据 |
+|---|---|---|
+| MN-10 | `in-progress` / `locally-accepted` | 0.30.14 候选；A 组 16/16 + 10/10；Codex R1 `PASS`；C 组 ①–④ 已过（T-1 全量 nextest 8435/8435，run `9386314d`）；2026-10-02 02:00:13 UTC |
+| MN-01..MN-09、MN-11、MN-12 | `pending` / （空） | — |
 
 ### issues/577（SSH 公钥认证拒绝诊断与设置指南）
 

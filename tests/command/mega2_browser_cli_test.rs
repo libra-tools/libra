@@ -313,6 +313,33 @@ fn server_url_rejections_are_stable_and_make_no_request() {
     assert_eq!(server.requests(), 0);
 }
 
+/// plan-20261001 MN-10: a `--server` value that does not parse is rejected
+/// before the credential check, so the JSON error envelope must not echo it.
+#[test]
+fn malformed_server_url_is_not_echoed() {
+    let workdir = tempfile::tempdir().expect("tempdir");
+
+    let output = libra(
+        workdir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            "https://user:MARKER@mega2.example.com:notaport",
+            "--json",
+        ],
+    );
+    assert!(!output.status.success(), "unparsable URL must be refused");
+    let err = stderr(&output);
+    assert!(!err.contains("MARKER"), "raw URL was echoed: {err}");
+    let envelope: serde_json::Value = serde_json::from_str(err.trim())
+        .unwrap_or_else(|e| panic!("stderr is not one JSON envelope ({e}): {err}"));
+    assert_eq!(
+        envelope["error_code"], "LBR-CLI-003",
+        "envelope: {envelope}"
+    );
+}
+
 #[test]
 fn http_and_schema_failures_are_reported_without_body_leakage() {
     let workdir = tempfile::tempdir().expect("tempdir");
