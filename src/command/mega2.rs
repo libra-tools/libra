@@ -1,6 +1,8 @@
 //! `libra mega2 browser` — the single public Mega2 surface (plan-20260912 MB-03).
 //!
-//! The command is a thin, read-only adapter over two already-verified layers:
+//! The command is a thin adapter over two already-verified layers; it reads
+//! by default and sends one remote write request only for a confirmed TUI
+//! action or a non-interactive write flag such as `--create-dir`:
 //! the bounded transport in [`crate::internal::protocol::mega2_tree`] (MB-01)
 //! and the resumable terminal state in [`crate::command::mega2_browser`]
 //! (MB-02). It never opens the repository database, never touches the index or
@@ -91,7 +93,7 @@ pub struct BrowserArgs {
     #[arg(long, value_name = "BASE-URL")]
     pub server: String,
 
-    /// Rooted directory path to list; never escapes above `/`
+    /// Rooted directory: the one to list, or the parent for a directory write; never escapes above `/`
     #[arg(value_name = "PATH", default_value = "/")]
     pub path: String,
 
@@ -119,12 +121,21 @@ pub struct OperationArgs {
     /// List PATH once and exit: one GET, plain text (or JSON with --json); no terminal needed
     #[arg(long)]
     pub list: bool,
+
+    /// Create directory NAME under PATH: one POST, no reload
+    #[arg(long = "create-dir", value_name = "NAME")]
+    pub create_dir: Option<String>,
 }
 
 impl OperationArgs {
     /// The selected operation, if any.
     fn selected(&self) -> Option<Operation> {
-        self.list.then_some(Operation::List)
+        if self.list {
+            return Some(Operation::List);
+        }
+        self.create_dir
+            .as_ref()
+            .map(|name| Operation::CreateDir { name: name.clone() })
     }
 }
 
@@ -187,9 +198,10 @@ pub(crate) fn browser_data<'a>(
 /// # Side Effects
 ///
 /// Reads one bounded remote listing (JSON/machine mode, or human `--list`) or
-/// drives the MB-02 TUI (human mode without an operation flag). It never opens
-/// the repository database, object store, index or configuration; no network
-/// request carries credentials.
+/// drives the MB-02 TUI (human mode without an operation flag). A
+/// non-interactive write flag sends exactly one remote write request. It never
+/// opens the repository database, object store, index or configuration; no
+/// network request carries credentials.
 ///
 /// # Errors
 ///

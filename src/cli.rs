@@ -2005,8 +2005,8 @@ async fn operation_class_for_command(
     }
     // `mega2 browser` keeps `CommandScope::ReadOnly` (it reads no repository
     // state and works outside a repository) but can create remote directories
-    // through the mega2 API once the TUI confirms. Classify the external write
-    // explicitly before the generic scope mapping.
+    // through the TUI after confirmation or through a non-interactive write
+    // flag. Classify the external write explicitly before the generic mapping.
     if matches!(command, Commands::Mega2(_)) {
         return MutationClass::ExternalOrUnknown;
     }

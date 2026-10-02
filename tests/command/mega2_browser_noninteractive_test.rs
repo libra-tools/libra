@@ -272,6 +272,33 @@ const LIST_CASE: OpCase = OpCase {
     ok: list_ok,
 };
 
+fn create_entry_receipt(commit_id: &str) -> String {
+    envelope(json!({
+        "commit_id": commit_id,
+        "new_oid": "oid-1",
+        "path": "/sub",
+        "cl_link": null,
+    }))
+}
+
+/// The rule fixture's receipt carries an ESC in `commit_id`, so R2 proves the
+/// human summary sanitizes server strings.
+fn create_dir_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, create_entry_receipt("commit-\u{1b}[31m-1"))
+}
+
+fn create_dir_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, create_entry_receipt("commit-1"))
+}
+
+const CREATE_DIR_CASE: OpCase = OpCase {
+    op_args: &["--create-dir", "sub", "/"],
+    method: "POST",
+    route: "/api/v1/create-entry",
+    path: "/api/v1/create-entry",
+    ok: create_dir_ok,
+};
+
 fn argv<'a>(
     server: &'a str,
     case: &'a OpCase,
@@ -451,6 +478,57 @@ fn rule_r6(case: &OpCase) {
     assert_eq!(authorizations, vec![None]);
 }
 
+fn r7_output(case: &OpCase, mock: &MockMega2) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &argv(&mock.url(), case, &["--machine"], &["--list"]),
+        &[],
+    )
+}
+
+/// R7 ①: combined with another operation flag (`--list`), the call fails
+/// with `LBR-CLI-002`.
+fn rule_r7_code(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r7_output(case, &mock);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// R7 ②: the refusal sends no request.
+fn rule_r7_no_request(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r7_output(case, &mock);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+fn r8_output(case: &OpCase, mock: &MockMega2) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &argv(&mock.url(), case, &["--machine"], &["--ref", "v1"]),
+        &[],
+    )
+}
+
+/// R8 ①: a write operation with `--ref` fails with `LBR-CLI-002`.
+fn rule_r8_code(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r8_output(case, &mock);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// R8 ②: the refusal sends no request.
+fn rule_r8_no_request(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r8_output(case, &mock);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
 /// One `op_rule_<op>_<rule>` test per applicable rule (ADR-MN-08).
 macro_rules! op_rule {
     ($name:ident, $rule:ident, $case:expr) => {
@@ -605,5 +683,310 @@ fn list_failure_leaves_stdout_empty() {
         output.stdout.is_empty(),
         "stdout: {:?}",
         text(&output.stdout)
+    );
+}
+
+// ---- create_dir (MN-03): R1, R1b, R2, R3, R4a, R4b, R5a, R5b, R7, R8 ----
+
+op_rule!(op_rule_create_dir_r1, rule_r1, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r1b, rule_r1b, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r2, rule_r2, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r3, rule_r3, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r4a, rule_r4a, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r4b, rule_r4b, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r5a_code, rule_r5a_code, CREATE_DIR_CASE);
+op_rule!(
+    op_rule_create_dir_r5a_no_request,
+    rule_r5a_no_request,
+    CREATE_DIR_CASE
+);
+op_rule!(op_rule_create_dir_r5b_code, rule_r5b_code, CREATE_DIR_CASE);
+op_rule!(
+    op_rule_create_dir_r5b_no_request,
+    rule_r5b_no_request,
+    CREATE_DIR_CASE
+);
+op_rule!(op_rule_create_dir_r7_code, rule_r7_code, CREATE_DIR_CASE);
+op_rule!(
+    op_rule_create_dir_r7_no_request,
+    rule_r7_no_request,
+    CREATE_DIR_CASE
+);
+op_rule!(op_rule_create_dir_r8_code, rule_r8_code, CREATE_DIR_CASE);
+op_rule!(
+    op_rule_create_dir_r8_no_request,
+    rule_r8_no_request,
+    CREATE_DIR_CASE
+);
+
+// ---- create_dir (MN-03): operation-specific behavior ----
+
+/// Requests as `(method, path and query, Authorization, parsed JSON body)`.
+fn request_tuples(mock: &MockMega2) -> Vec<(String, String, Option<String>, Option<Value>)> {
+    mock.records()
+        .into_iter()
+        .map(|record| {
+            let body = record
+                .body
+                .map(|body| serde_json::from_str(&body).expect("request body is JSON"));
+            (record.method, record.target, record.authorization, body)
+        })
+        .collect()
+}
+
+/// AC-1: one anonymous POST with the directory body.
+#[test]
+fn create_dir_request_record() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/src",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/create-entry".to_string(),
+            None,
+            Some(json!({
+                "is_directory": true,
+                "name": "sub",
+                "path": "/src",
+                "content": null,
+                "skip_build": true,
+            })),
+        )]
+    );
+}
+
+/// AC-2: `target` comes from local input, `receipt` is the server's receipt.
+#[test]
+fn create_dir_json_payload() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/src",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "create-dir",
+            "server": mock.url(),
+            "target": {"parent": "/src", "name": "sub", "path": "/src/sub"},
+            "receipt": {"commit_id": "commit-1", "new_oid": "oid-1", "path": "/sub", "cl_link": null},
+        })
+    );
+}
+
+/// AC-3: the human summary is one sanitized line.
+#[test]
+fn create_dir_human_output() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/src",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "created directory /src/sub (commit commit-1)\n"
+    );
+}
+
+fn dotdot_name_output(mock: &MockMega2) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "..",
+            "/",
+            "--machine",
+        ],
+        &[],
+    )
+}
+
+/// G15: NAME `..` (delegated to `validate_entry_name`) fails with `LBR-CLI-002`.
+#[test]
+fn create_dir_rejects_dotdot_name_code() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let output = dotdot_name_output(&mock);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G16: the same refusal sends no request.
+#[test]
+fn create_dir_rejects_dotdot_name_no_request() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let output = dotdot_name_output(&mock);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// mega2 answers a duplicate directory with HTTP 500 today.
+fn duplicate_output() -> Output {
+    let mock = MockMega2::start(fail_500_on(&CREATE_DIR_CASE));
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--machine",
+        ],
+        &[],
+    )
+}
+
+/// G17: a duplicate (server 500) fails with `LBR-NET-002`.
+#[test]
+fn create_dir_duplicate_code() {
+    let output = duplicate_output();
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-NET-002");
+}
+
+/// G18: the same failure carries `details.http_status` 500.
+#[test]
+fn create_dir_duplicate_http_status() {
+    let output = duplicate_output();
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 500);
+}
+
+/// Until write credentials arrive, a 401 on an anonymous non-interactive write
+/// keeps its code and details, but its hint names the paths that work instead
+/// of the token flags this call refuses.
+#[test]
+fn create_dir_anonymous_401_hint() {
+    let mock = MockMega2::start(|_method: &str, _path: &str| (401, String::new()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--machine",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    let envelope = error_envelope(&output);
+    assert_eq!(
+        (
+            &envelope["error_code"],
+            &envelope["details"],
+            &envelope["hints"]
+        ),
+        (
+            &json!("LBR-AUTH-001"),
+            &json!({"method": "POST", "route": "/api/v1/create-entry", "http_status": 401}),
+            &json!([
+                "non-interactive writes are anonymous for now: write through the interactive browser with --token-file, or use a server with push_auth=none"
+            ]),
+        )
+    );
+}
+
+/// Serves one connection: reads the request head, then answers 200 with a
+/// body cut short of its `Content-Length` and closes.
+fn serve_truncated_once() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw mock");
+    let addr = listener.local_addr().expect("raw mock addr");
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept()
+            && read_request(&mut stream).is_some()
+        {
+            let partial = r#"{"req_result":true,"data":{"commit_id":"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial}",
+                partial.len() + 64
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A connection that drops while the receipt is read leaves the write's
+/// outcome unknown; the envelope reports the status that arrived, not a
+/// transport class.
+#[test]
+fn create_dir_receipt_read_drop_reports_http_status() {
+    let server = serve_truncated_once();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &server,
+            "--create-dir",
+            "sub",
+            "/",
+            "--machine",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    let envelope = error_envelope(&output);
+    assert_eq!(
+        (&envelope["error_code"], &envelope["details"]),
+        (
+            &json!("LBR-NET-001"),
+            &json!({"method": "POST", "route": "/api/v1/create-entry", "http_status": 200}),
+        )
     );
 }

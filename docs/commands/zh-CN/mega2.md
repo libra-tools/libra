@@ -93,6 +93,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | 交互键 | Flag | 请求 |
 |--------|------|------|
 | 启动、`Enter`、`Backspace`/`h`、`r` | `--list`（PATH 即目标目录；不带 flag 的 `--json` 与之相同） | `GET /api/v1/tree` |
+| `+` | `--create-dir <NAME>`（PATH 为父目录） | `POST /api/v1/create-entry` |
 
 所有非交互调用遵守同一组规则：
 
@@ -104,13 +105,50 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
   （控制字符已替换；`--quiet` 时不输出）。失败时 stdout 为空，错误写到 stderr：
   `--json`/`--machine` 下是 JSON 错误信封（见「机器可读的错误细节」），否则是人读错误。
 - **凭据。** 读操作匿名：拒绝 `--token` 与 `--token-file`，也不读取
-  `LIBRA_MEGA2_TOKEN`。
+  `LIBRA_MEGA2_TOKEN`。写操作目前也不接受 token flag，一律匿名发送（适用于
+  `push_auth=none` 的服务端）。
+- **一次一个操作，写操作不带 `--ref`。** 同时给出两个操作 flag 是用法错误
+  （`LBR-CLI-002`），写操作带 `--ref` 也是（写入总是作用于服务端默认 revision）；
+  两者都不发请求。
+- **写请求不重试。** 结果未知的写请求 Libra 绝不重发。以下情形结果未知：在收到任何
+  响应之前超时或失败（`LBR-NET-001`，`details.transport` 为 `timeout` 或 `request`）；
+  读取回执时连接中断（`LBR-NET-001`，带 `details.http_status`）；`2xx` 但回执不合规
+  （`LBR-NET-002`，`details.http_status` 为 `2xx`）。重新调用之前先用 `--list` 核对。
+  `details.transport` 为 `connect` 表示请求根本没有到达服务端。
 - **退出码。** 成功为 `0`；失败时取 stable code 的退出码（用法错误如
   `LBR-CLI-002`、`LBR-CLI-003` 为 `129`，其余为 `128`），设置
   `LIBRA_FINE_EXIT_CODES=1` 时为类别码（`2`–`9`）。
 
 `--list` 每个条目输出一行，目录在前，格式为 `dir  <名称>` 或 `file  <名称>`；
 带 `--json`/`--machine` 时输出上面的 payload。
+
+`--create-dir <NAME>` 以一次 `POST /api/v1/create-entry` 在 PATH 下建立目录 NAME，
+之后不重新列出。纯文本摘要为 `created directory <path> (commit <commit_id>)`；
+带 `--json`/`--machine` 时，payload 把「请求了什么」与「服务端回答了什么」分开：
+
+```json
+{
+  "operation": "create-dir",
+  "server": "https://mega2.example.com",
+  "target": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+  "receipt": { "commit_id": "…", "new_oid": "…", "path": "/src/pkg", "cl_link": null }
+}
+```
+
+`target` 由已校验的本地输入组成；`receipt` 是服务端回执原样（`path` 与 `cl_link`
+可能为 `null`）。错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 为 `.`/`..`、为空、过长，或含分隔符、控制字符 | `LBR-CLI-002` | 无（不发请求） |
+| 与另一个操作 flag 或 `--ref` 同用 | `LBR-CLI-002` | 无（不发请求） |
+| 目录已存在（mega2 目前回 HTTP 500） | `LBR-NET-002` | `http_status: 500` |
+| HTTP 400（名称或父目录被拒） | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 401（服务端要求写 token）/ 403（token 无权写此处） | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 409 | `LBR-CONFLICT-002` | `http_status: 409` |
+| 其它非 2xx，或 2xx 但回执不合规 | `LBR-NET-002` | `http_status` |
+| 收到响应之前超时或连接失败 | `LBR-NET-001` | `transport` |
+| 读取回执时连接中断（结果未知） | `LBR-NET-001` | `http_status` |
 
 ### 建目录（`+`，仅交互模式）
 
@@ -126,8 +164,9 @@ NUL 与控制字符），通过后才发送**一次** `POST /api/v1/create-entry
 raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
 
 写入 token 的解析优先级：`--token-file <path>` → 环境变量 `LIBRA_MEGA2_TOKEN` →
-`--token`（会留在 shell history，建议用前两者）。token 相关 flag 仅在交互模式有
-效，与 `--json`/`--machine` 同时使用会被拒绝，机器模式永不 POST。
+`--token`（会留在 shell history，建议用前两者）。目前 token 相关 flag 仅在交互模式
+有效，与 `--json`/`--machine` 或任一操作 flag 同用都会被拒绝。非交互写操作（见上文）
+各发出一次写请求，在支持写凭据之前一律匿名发送。
 
 ### 删除、移动与改名（`d`、`m`、`R`，仅交互模式）
 
@@ -159,9 +198,10 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | 选项 | 说明 |
 |------|------|
 | `--server <BASE-URL>` | Mega2 服务端 base URL（必填）。HTTPS，或 loopback HTTP。 |
-| `[PATH]` | 要列出的 rooted 目录路径；默认 `/`。 |
+| `[PATH]` | 要列出的 rooted 目录，或目录写操作的父目录；默认 `/`。 |
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
 | `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
+| `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
 | `--token-file <PATH>` | 仅交互模式：从文件读取写入 token（优先级最高）。 |
 | `--token <TOKEN>` | 仅交互模式：内联写入 token（优先级最低；会留在 shell history）。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -218,6 +258,9 @@ libra mega2 browser --server https://mega2.example.com /src/pkg
 
 # 不用终端输出纯文本列表（脚本、CI）
 libra mega2 browser --server https://mega2.example.com --list /src/pkg
+
+# 不用终端建立 /src/pkg（匿名写，适用于 push_auth=none 的服务端）
+libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

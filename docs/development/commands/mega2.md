@@ -41,7 +41,10 @@
     维护唯一的操作登记表 `OPERATIONS`（每个操作一行：flag、`mega2_diag` 端点、读/写与
     目录/tag 类别），ADR-MN-08 的通用规则按类别实现一次（不碰终端、不读 stdin、本地校验后
     恰好一次请求、不 reload/preflight/重试、读操作拒绝 token flag 且不读 `LIBRA_MEGA2_TOKEN`）；
-    `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 只有 `--list`）。
+    `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 `--list`，MN-03 `--create-dir`）；
+    写类操作由类别规则拒绝 `--ref`（R8），在 MN-11 之前与读操作一样拒绝 token flag，
+    经 `Mega2EntryClient::create_directory` 匿名发一次 POST，`create-dir` payload 把本地
+    `target` 与服务端 `receipt` 分开。
 - 执行路径：
   1. `execute_safe` → `validate_server_url` + `normalize_path`（都在终端/网络之前）；
   2. 带操作 flag，或 `output.is_json()` 为真（等同 `--list`）→ `noninteractive::execute`：
@@ -105,6 +108,13 @@ flowchart TD
   在八个「方法 + 路由」上各验证起点（500）、中段（读取响应体时断连）与终点（2xx 上的最后一道
   校验，用 201）；`mega2_browser_cli_test::json_error_envelope_carries_http_details` 以真实二进制
   验证 stderr JSON 信封的 `details`。
+- 非交互操作（plan-20261001 MN-02 起）：`cargo test --test command_test
+  mega2_browser_noninteractive_test` 以真实二进制（清空环境、stdin 为 `/dev/null`）对 loopback
+  mock 断言请求记录；ADR-MN-08 的规则按函数写一次，由 `op_rule!` 宏展开为
+  `op_rule_<op>_<rule>`（`list`：R1–R6；`create_dir`：R1–R5b、R7、R8），另有各操作的请求记录、
+  payload、人读输出与本地拒绝/服务端失败 fixture；`cargo test --lib command::mega2` 覆盖登记表
+  与 CLI 操作 flag 一一对应、payload 形状，以及帮助、命令文档与网站页（`LIBRA_SITE_MEGA2_DOC`，
+  被忽略的测试需显式运行）示例的 PATH 都 rooted。
 - 架构守衛：`compat_agent_architecture_guard` 保证不引入
   ratatui/crossterm/`internal::tui`；`compat_matrix_alignment` 保证
   `COMPATIBILITY.md` / `docs/development/commands/README.md` 与 CLI 同步；
@@ -116,4 +126,4 @@ flowchart TD
 - 终端渲染不引入第三方 TUI 依赖（G-05）。
 - 目录删除/移动/tag 属后续卡（MB-07/08、MB-10/11）；不带操作 flag 的 `--json` 与
   `--list` 是「一次 GET」；写操作的非交互形式由 plan-20261001 MN-03 起各卡以操作 flag
-  加入，仍没有 `mega2 mkdir` 一类子命令。
+  加入（MN-03：`--create-dir`），仍没有 `mega2 mkdir` 一类子命令。

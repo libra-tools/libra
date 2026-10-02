@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-02 06:11:28 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md)：MN-10 `done`/`complete`（v0.30.14）；MN-01 `done`/`complete`（v0.30.15，PR #595 → `6e86578`；release `36968922078` 8/8、CodeQL `36968913909` 绿、下载 200、网站标记计数 3）；MN-02（非交互调度入口、操作登记表与 `--list`）`in-progress`/`locally-accepted`——Codex R1 `FAIL`→R2 `PASS`，C 组 ①–⑥（0.30.16、T-4 全量 nextest 8489/8489、网站示例检查 PASS）已过，提交与 PR 进行中；其余沿用 2026-10-02 01:04:02 UTC 快照。）
+> **当前快照：** 2026-10-02 07:50:04 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md)：MN-10、MN-01 `done`/`complete`（v0.30.14、v0.30.15）；MN-02 `in-progress`/`remote-pending`（v0.30.16，PR #596 → `36c05be`，网站标记已上线，release/CodeQL 跟踪中）；MN-03（非交互建目录 `--create-dir`）`in-progress`/`locally-accepted`——Codex R1 `FAIL`→R2 `PASS`，C 组 ①–⑥（0.30.17、卡内 nextest 命令全绿）已过，提交与 PR 进行中；其余沿用 2026-10-02 01:04:02 UTC 快照。）
 
 ---
 
@@ -20,7 +20,7 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | **实施中** | **2026-10-02 06:11:28 UTC**：MN-10 `done`/`complete`（v0.30.14）；MN-01 `done`/`complete`（v0.30.15）；MN-02 `in-progress`/`locally-accepted`（0.30.16 候选；C 组 ①–⑥ 已过，提交、PR、`gh release create` 待完成）；MN-03..MN-09、MN-11、MN-12 `pending`。2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
+| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | **实施中** | **2026-10-02 07:50:04 UTC**：MN-10、MN-01 `done`/`complete`（v0.30.14、v0.30.15）；MN-02 `in-progress`/`remote-pending`（v0.30.16）；MN-03 `in-progress`/`locally-accepted`（0.30.17 候选）；MN-04..MN-09、MN-11、MN-12 `pending`。2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
 | [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
@@ -128,8 +128,9 @@
 |---|---|---|
 | MN-10 | `done` / `complete` | v0.30.14；PR #593 squash `80f58b4`；release `36959675389` 8/8、CodeQL main `36959660259` 绿、下载 200；2026-10-02 04:00:07 UTC |
 | MN-01 | `done` / `complete` | v0.30.15；PR #595 squash `6e86578`；release `36968922078` 8/8、CodeQL main `36968913909` 绿、下载 200、网站标记计数 3（`cf@973f650`）；2026-10-02 06:11:28 UTC |
-| MN-02 | `in-progress` / `locally-accepted` | 0.30.16 候选；门族 11/11；Codex R1 `FAIL`→R2 `PASS`；C 组 ①–⑥ 已过（T-4 全量 nextest 8489/8489，run `d3f354ce`；网站示例检查 PASS）；2026-10-02 06:11:28 UTC |
-| MN-03..MN-09、MN-11、MN-12 | `pending` / （空） | — |
+| MN-02 | `in-progress` / `remote-pending` | v0.30.16；PR #596 squash `36c05be`；网站 `cf@23c21fc` 标记计数 4；release `36978760075`、CodeQL `36978751927` 跟踪中；2026-10-02 07:50:04 UTC |
+| MN-03 | `in-progress` / `locally-accepted` | 0.30.17 候选；门族 18/18；Codex R1 `FAIL`→R2 `PASS`；C 组 ①–⑥ 已过（卡内 nextest 命令全绿）；2026-10-02 07:50:04 UTC |
+| MN-04..MN-09、MN-11、MN-12 | `pending` / （空） | — |
 
 ### issues/577（SSH 公钥认证拒绝诊断与设置指南）
 

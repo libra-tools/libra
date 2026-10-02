@@ -108,6 +108,7 @@ the forms available in this release.
 | Interactive key | Flag | Request |
 |-----------------|------|---------|
 | start, `Enter`, `Backspace`/`h`, `r` | `--list` (PATH is the directory; `--json` without a flag is the same) | `GET /api/v1/tree` |
+| `+` | `--create-dir <NAME>` (PATH is the parent) | `POST /api/v1/create-entry` |
 
 Every non-interactive call follows the same rules:
 
@@ -123,13 +124,54 @@ Every non-interactive call follows the same rules:
   stderr: the JSON error envelope with `--json`/`--machine` (see
   [Machine error details](#machine-error-details)), the human error otherwise.
 - **Credentials.** Read operations are anonymous: they refuse `--token` and
-  `--token-file` and ignore `LIBRA_MEGA2_TOKEN`.
+  `--token-file` and ignore `LIBRA_MEGA2_TOKEN`. Write operations do not accept
+  token flags yet and are sent anonymously (for `push_auth=none` servers).
+- **One operation, no `--ref` on writes.** Combining two operation flags is a
+  usage error (`LBR-CLI-002`), and so is `--ref` with a write operation:
+  writes always target the server's default revision. Neither sends a request.
+- **Writes are not retried.** A write whose outcome is unknown is never
+  repeated by Libra. That happens when it times out or fails before any
+  response (`LBR-NET-001` with `details.transport` `timeout` or `request`),
+  when the connection drops while the receipt is read (`LBR-NET-001` with
+  `details.http_status`), or when a `2xx` carries an invalid receipt
+  (`LBR-NET-002` with a `2xx` `details.http_status`). Check the result with
+  `--list` before repeating the call. `details.transport` `connect` means the
+  request never reached the server.
 - **Exit codes.** `0` on success; on failure the stable code's exit code
   (`129` for usage errors such as `LBR-CLI-002` and `LBR-CLI-003`, `128`
   otherwise), or the category code (`2`–`9`) when `LIBRA_FINE_EXIT_CODES=1`.
 
 `--list` prints one line per entry, directories first, as `dir  <name>` or
 `file  <name>`; with `--json`/`--machine` it prints the payload shown above.
+
+`--create-dir <NAME>` creates directory NAME under PATH with one
+`POST /api/v1/create-entry` and does not reload. The plain-text summary is
+`created directory <path> (commit <commit_id>)`; with `--json`/`--machine` the
+payload separates what was asked from what the server answered:
+
+```json
+{
+  "operation": "create-dir",
+  "server": "https://mega2.example.com",
+  "target": { "parent": "/src", "name": "pkg", "path": "/src/pkg" },
+  "receipt": { "commit_id": "…", "new_oid": "…", "path": "/src/pkg", "cl_link": null }
+}
+```
+
+`target` is built from your validated input; `receipt` is the server's
+receipt verbatim (`path` and `cl_link` may be `null`). Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME is `.`/`..`, empty, too long, or has a separator or control character | `LBR-CLI-002` | none (no request) |
+| Combined with another operation flag or with `--ref` | `LBR-CLI-002` | none (no request) |
+| The directory already exists (mega2 answers HTTP 500 today) | `LBR-NET-002` | `http_status: 500` |
+| HTTP 400 (rejected name or parent) | `LBR-CLI-003` | `http_status: 400` |
+| HTTP 401 (server needs a write token) / 403 (token not allowed here) | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 409 | `LBR-CONFLICT-002` | `http_status: 409` |
+| Other non-2xx, or a 2xx whose receipt is invalid | `LBR-NET-002` | `http_status` |
+| Timeout or connection failure before any response | `LBR-NET-001` | `transport` |
+| Connection drops while the receipt is read (outcome unknown) | `LBR-NET-001` | `http_status` |
 
 ### Creating a directory (`+`, interactive only)
 
@@ -149,8 +191,10 @@ alternate screen.
 
 Write tokens are read, in order of precedence, from `--token-file <path>`,
 then the `LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in
-shell history — prefer the first two). Token flags are TUI-only: combining
-them with `--json`/`--machine` is refused, and machine mode never POSTs.
+shell history — prefer the first two). For now token flags are TUI-only: they
+are refused with `--json`/`--machine` or any operation flag. Non-interactive
+write operations (see above) each send one write request and are sent
+anonymously until write credentials are supported.
 
 ### Deleting, moving and renaming (`d`, `m`, `R`, interactive only)
 
@@ -191,12 +235,13 @@ terminal. The panel operates root tags only.
 | Option | Description |
 |--------|-------------|
 | `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS, or loopback HTTP. |
-| `[PATH]` | Rooted directory path to list; defaults to `/`. |
+| `[PATH]` | Rooted directory to list, or the parent for a directory write; defaults to `/`. |
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
+| `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
 | `--token-file <PATH>` | Interactive only: read the write token from a file (highest precedence). |
 | `--token <TOKEN>` | Interactive only: inline write token (lowest precedence; visible in shell history). |
-| `--json[=<FORMAT>]` | Global flag: one fetch, JSON envelope (`pretty`/`compact`/`ndjson`). |
+| `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
 | `--machine` | Global flag: strict NDJSON machine mode for automation. |
 
 ## Errors
@@ -255,6 +300,9 @@ libra mega2 browser --server https://mega2.example.com /src/pkg
 
 # Plain-text listing without a terminal (scripts, CI)
 libra mega2 browser --server https://mega2.example.com --list /src/pkg
+
+# Create /src/pkg without a terminal (anonymous write, push_auth=none servers)
+libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
