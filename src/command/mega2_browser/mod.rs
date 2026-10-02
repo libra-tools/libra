@@ -1,8 +1,11 @@
 //! plan-20260912 MB-02: human-readable directory browser TUI over the MB-01
 //! validated listing. Owns canonical current path, selection, history/cache and
 //! the terminal lifecycle; performs no prefetch and delegates every fetch to
-//! [`Mega2TreeSession`].
+//! [`Mega2TreeSession`]. The [`noninteractive`] submodule runs the same
+//! functions without a terminal: one operation flag, one request
+//! (plan-20261001 MN-02).
 
+pub mod noninteractive;
 pub mod tag_panel;
 pub mod terminal;
 

@@ -37,11 +37,18 @@
     `MAX_NAME_BYTES` 限制，`Esc` 取消零网络，文件与根均惰性）。
   - 有界传输与 wire 校验：`src/internal/protocol/mega2_tree.rs`（URL/path/name
     校验、`Mega2TreeClient`/`Mega2TreeSession`、`ListingCache`、上限常量）。
+  - 非交互执行（plan-20261001 MN-02 起）：`src/command/mega2_browser/noninteractive.rs`
+    维护唯一的操作登记表 `OPERATIONS`（每个操作一行：flag、`mega2_diag` 端点、读/写与
+    目录/tag 类别），ADR-MN-08 的通用规则按类别实现一次（不碰终端、不读 stdin、本地校验后
+    恰好一次请求、不 reload/preflight/重试、读操作拒绝 token flag 且不读 `LIBRA_MEGA2_TOKEN`）；
+    `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 只有 `--list`）。
 - 执行路径：
   1. `execute_safe` → `validate_server_url` + `normalize_path`（都在终端/网络之前）；
-  2. `output.is_json()` 为真 → `Mega2TreeSession::new` + `fetch`（恰好一个请求）→
-     `emit_json_data("mega2 browser", …)` 输出 `{ ok, command, data }`；
-  3. 否则 `mega2_browser::run`：`ensure_tty` → 终端 guard → 首屏 fetch → 事件循环
+  2. 带操作 flag，或 `output.is_json()` 为真（等同 `--list`）→ `noninteractive::execute`：
+     类别规则 → `Mega2TreeSession::new` + `fetch`（恰好一个请求）→ `--json`/`--machine` 经
+     `emit_json_data("mega2 browser", …)` 输出 `{ ok, command, data }`（`data.operation` 为
+     `list`），人读为每项一行 `dir  <name>`/`file  <name>`（经 `sanitize`，`--quiet` 不输出）；
+  3. 否则（人读且无操作 flag）`mega2_browser::run`：`ensure_tty` → 终端 guard → 首屏 fetch → 事件循环
      （每个导航动作恰好一个请求）→ 退出时强制还原终端；`+` 确认后经 MB-04
      `perform_create` 发一次 POST 并重载一次。
   4. Token 解析（ADR-MB-03）只在交互路径发生：`--token-file` →
@@ -107,6 +114,6 @@ flowchart TD
 
 - 不读 blob、不递归、不带 token（GET）、不持久化配置；不修改 mega2。
 - 终端渲染不引入第三方 TUI 依赖（G-05）。
-- 目录删除/移动/tag 属后续卡（MB-07/08、MB-10/11）；本命令的 `--json` 永远是
-  「一次 GET」，不会因后续卡变成写入面；建目录只作为 TUI 键存在，没有
-  `mega2 mkdir` 子命令。
+- 目录删除/移动/tag 属后续卡（MB-07/08、MB-10/11）；不带操作 flag 的 `--json` 与
+  `--list` 是「一次 GET」；写操作的非交互形式由 plan-20261001 MN-03 起各卡以操作 flag
+  加入，仍没有 `mega2 mkdir` 一类子命令。

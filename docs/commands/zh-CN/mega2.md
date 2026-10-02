@@ -11,6 +11,7 @@ Git 对象，浏览的是远端元数据而非本地 tree 对象。需要检查�
 
 ```
 libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|--machine]
+libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] --list [--json|--machine]
 ```
 
 ## 说明
@@ -57,13 +58,15 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|-
 ### 机器模式（`--json` / `--machine`）
 
 使用 `--json`（或 `--machine`，等价于 `--json=ndjson --no-pager --color=never
---quiet`）时执行**恰好一次**请求，并输出标准 Libra JSON envelope：
+--quiet`）且不带操作 flag 时，命令与 `--list` 一样列出 PATH（见「非交互操作」）：
+执行**恰好一次**请求，并输出标准 Libra JSON envelope：
 
 ```json
 {
   "ok": true,
   "command": "mega2 browser",
   "data": {
+    "operation": "list",
     "server": "https://mega2.example.com",
     "ref": "v1.2",
     "path": "/src",
@@ -78,7 +81,36 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|-
 `items` 顺序确定：目录优先，其后按名称升序。`server` 为校验后 URL 的规范
 scheme/host/port origin。
 
-`--quiet` 若不配合机器输出模式会被拒绝：抑制 stdout 会破坏交互渲染与机器消费。
+没有机器输出模式、也没有操作 flag 时，`--quiet` 会被拒绝（会破坏交互渲染）；带操作
+flag 时，`--quiet` 只是不输出纯文本摘要。
+
+### 非交互操作
+
+browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：每种形式是同一个
+`mega2 browser` 命令上的一个操作 flag，每次调用至多接受一个操作 flag。下表列出本版本
+已提供的形式。
+
+| 交互键 | Flag | 请求 |
+|--------|------|------|
+| 启动、`Enter`、`Backspace`/`h`、`r` | `--list`（PATH 即目标目录；不带 flag 的 `--json` 与之相同） | `GET /api/v1/tree` |
+
+所有非交互调用遵守同一组规则：
+
+- **不用终端、不读输入。** stdin 可以关闭或重定向，stdout/stderr 可以是管道；
+  从不读取 stdin、从不提示、从不改动终端状态。
+- **一次请求。** 先在本地校验输入；通过校验的调用恰好发出一次 HTTP 请求，未通过的
+  一次也不发。不 reload、不 preflight、不重试。
+- **输出。** 成功时 stdout 只有 JSON envelope（`--json`、`--machine`）或纯文本摘要
+  （控制字符已替换；`--quiet` 时不输出）。失败时 stdout 为空，错误写到 stderr：
+  `--json`/`--machine` 下是 JSON 错误信封（见「机器可读的错误细节」），否则是人读错误。
+- **凭据。** 读操作匿名：拒绝 `--token` 与 `--token-file`，也不读取
+  `LIBRA_MEGA2_TOKEN`。
+- **退出码。** 成功为 `0`；失败时取 stable code 的退出码（用法错误如
+  `LBR-CLI-002`、`LBR-CLI-003` 为 `129`，其余为 `128`），设置
+  `LIBRA_FINE_EXIT_CODES=1` 时为类别码（`2`–`9`）。
+
+`--list` 每个条目输出一行，目录在前，格式为 `dir  <名称>` 或 `file  <名称>`；
+带 `--json`/`--machine` 时输出上面的 payload。
 
 ### 建目录（`+`，仅交互模式）
 
@@ -129,6 +161,7 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--server <BASE-URL>` | Mega2 服务端 base URL（必填）。HTTPS，或 loopback HTTP。 |
 | `[PATH]` | 要列出的 rooted 目录路径；默认 `/`。 |
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
+| `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
 | `--token-file <PATH>` | 仅交互模式：从文件读取写入 token（优先级最高）。 |
 | `--token <TOKEN>` | 仅交互模式：内联写入 token（优先级最低；会留在 shell history）。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -181,7 +214,10 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 libra mega2 browser --server https://mega2.example.com
 
 # 直接打开某个 rooted 路径
-libra mega2 browser --server https://mega2.example.com src/pkg
+libra mega2 browser --server https://mega2.example.com /src/pkg
+
+# 不用终端输出纯文本列表（脚本、CI）
+libra mega2 browser --server https://mega2.example.com --list /src/pkg
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

@@ -13,6 +13,7 @@ than local tree objects. For local object inspection use
 
 ```
 libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|--machine]
+libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] --list [--json|--machine]
 ```
 
 ## Description
@@ -69,14 +70,16 @@ path, including errors and signals handled by the process.
 ### Machine mode (`--json` / `--machine`)
 
 With `--json` (or `--machine`, which implies `--json=ndjson --no-pager
---color=never --quiet`) the command performs exactly **one** fetch and prints
-the standard Libra JSON envelope:
+--color=never --quiet`) and no operation flag, the command lists PATH exactly
+like `--list` (see [Non-interactive operations](#non-interactive-operations)):
+**one** fetch, printed as the standard Libra JSON envelope:
 
 ```json
 {
   "ok": true,
   "command": "mega2 browser",
   "data": {
+    "operation": "list",
     "server": "https://mega2.example.com",
     "ref": "v1.2",
     "path": "/src",
@@ -91,8 +94,42 @@ the standard Libra JSON envelope:
 `items` is deterministic: directories first, then names in ascending order.
 `server` is the canonical scheme/host/port origin of the validated URL.
 
-`--quiet` without a machine output mode is rejected: suppressing stdout would
-break both interactive rendering and machine consumers.
+`--quiet` without a machine output mode or an operation flag is rejected:
+suppressing stdout would break interactive rendering. With an operation flag,
+`--quiet` suppresses the plain-text summary.
+
+### Non-interactive operations
+
+Browser functions also have non-interactive forms for scripts, CI and
+black-box tests: each is one operation flag on the same `mega2 browser`
+command, and at most one operation flag is accepted per call. The table lists
+the forms available in this release.
+
+| Interactive key | Flag | Request |
+|-----------------|------|---------|
+| start, `Enter`, `Backspace`/`h`, `r` | `--list` (PATH is the directory; `--json` without a flag is the same) | `GET /api/v1/tree` |
+
+Every non-interactive call follows the same rules:
+
+- **No terminal, no input.** It runs with stdin closed or redirected and
+  stdout/stderr piped; it never reads stdin, never prompts and never changes
+  terminal state.
+- **One request.** Input is validated locally first; a call that passes sends
+  exactly one HTTP request and a call that fails validation sends none. There
+  is no reload, preflight or retry.
+- **Output.** On success stdout holds only the JSON envelope (`--json`,
+  `--machine`) or a plain-text summary with control characters replaced
+  (nothing with `--quiet`). On failure stdout is empty and the error goes to
+  stderr: the JSON error envelope with `--json`/`--machine` (see
+  [Machine error details](#machine-error-details)), the human error otherwise.
+- **Credentials.** Read operations are anonymous: they refuse `--token` and
+  `--token-file` and ignore `LIBRA_MEGA2_TOKEN`.
+- **Exit codes.** `0` on success; on failure the stable code's exit code
+  (`129` for usage errors such as `LBR-CLI-002` and `LBR-CLI-003`, `128`
+  otherwise), or the category code (`2`–`9`) when `LIBRA_FINE_EXIT_CODES=1`.
+
+`--list` prints one line per entry, directories first, as `dir  <name>` or
+`file  <name>`; with `--json`/`--machine` it prints the payload shown above.
 
 ### Creating a directory (`+`, interactive only)
 
@@ -156,6 +193,7 @@ terminal. The panel operates root tags only.
 | `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS, or loopback HTTP. |
 | `[PATH]` | Rooted directory path to list; defaults to `/`. |
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
+| `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
 | `--token-file <PATH>` | Interactive only: read the write token from a file (highest precedence). |
 | `--token <TOKEN>` | Interactive only: inline write token (lowest precedence; visible in shell history). |
 | `--json[=<FORMAT>]` | Global flag: one fetch, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -213,7 +251,10 @@ never include the response body, the server URL or a token; see
 libra mega2 browser --server https://mega2.example.com
 
 # Open a rooted path directly
-libra mega2 browser --server https://mega2.example.com src/pkg
+libra mega2 browser --server https://mega2.example.com /src/pkg
+
+# Plain-text listing without a terminal (scripts, CI)
+libra mega2 browser --server https://mega2.example.com --list /src/pkg
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
