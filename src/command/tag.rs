@@ -25,6 +25,8 @@ const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 const TAG_EXAMPLES: &str = "\
 EXAMPLES:
     libra tag v1.0                        Create a lightweight tag at HEAD
+    libra tag v1.0 HEAD~1                 Tag a specific commit instead of HEAD
+    libra tag -m \"Release v1.1\" v1.1 side Annotated tag on the tip of branch side
     libra tag -a -m \"Release v1.1\" v1.1 Create an annotated tag
     libra tag -a v1.1                     Compose the annotated-tag message in an editor
     libra tag -m \"Release v1.1\" v1.1    Create an annotated tag
@@ -44,6 +46,13 @@ pub struct TagArgs {
     /// The name of the tag to create, show, or delete
     #[clap(required = false)]
     pub name: Option<String>,
+
+    /// The object the new tag points at (default: HEAD): any commit-ish. It
+    /// is recorded unpeeled, so naming an annotated tag points the new tag at
+    /// that tag object (use `<tag>^{}` for its commit); an object that
+    /// resolves to a tree or blob is refused. Only valid when creating a tag.
+    #[clap(required = false, value_name = "COMMIT")]
+    pub target: Option<String>,
 
     /// List all tags
     #[clap(short, long, group = "action")]
@@ -191,6 +200,7 @@ pub async fn execute_safe(args: TagArgs, output: &OutputConfig) -> CliResult<()>
 pub(crate) fn validate_cli_args(args: &TagArgs) -> CliResult<()> {
     validate_message_source_create_only(args).map_err(CliError::from)?;
     validate_named_tag_action(args).map_err(CliError::from)?;
+    validate_target_create_only(args).map_err(CliError::from)?;
     // Validate the `--column` mode up front so an invalid mode is rejected for
     // every output mode (including `--json`/`--quiet`, which skip the human
     // column renderer). The boolean enable decision is recomputed at render.
@@ -268,6 +278,21 @@ enum TagError {
 
     #[error("Cannot create tag: HEAD does not point to a commit")]
     HeadUnborn,
+
+    #[error("the <commit> argument '{0}' is only valid when creating a tag")]
+    TargetRequiresCreate(String),
+
+    #[error("Failed to resolve '{0}' as a valid ref.")]
+    InvalidTarget(String),
+
+    #[error("cannot tag '{spec}': it resolves to a {kind} object, not a commit")]
+    NonCommitTarget { spec: String, kind: String },
+
+    #[error("failed to resolve '{0}': the object store could not be read")]
+    TargetReadFailed(String),
+
+    #[error("failed to resolve '{0}': its object graph is corrupt or incomplete")]
+    TargetCorrupt(String),
 
     #[error("failed to resolve HEAD commit: {0}")]
     ResolveHead(#[source] branch::BranchStoreError),
@@ -412,6 +437,21 @@ impl From<TagError> for CliError {
             TagError::HeadUnborn => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("create a commit first before tagging HEAD."),
+            TagError::TargetRequiresCreate(_) => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("list, delete and verify take a single tag name or pattern."),
+            TagError::InvalidTarget(_) => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra log --oneline' to see available commits."),
+            TagError::NonCommitTarget { .. } => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("only a commit, or a tag that peels to a commit, can be tagged"),
+            TagError::TargetReadFailed(_) => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("check that the repository is readable and retry."),
+            TagError::TargetCorrupt(_) => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run 'libra fsck' to inspect missing objects."),
             TagError::ResolveHead(source) => {
                 let stable_code = match source {
                     branch::BranchStoreError::Query(_) => StableErrorCode::IoReadFailed,
@@ -585,6 +625,18 @@ fn clean_tag_message(raw: &str) -> String {
     out.join("\n")
 }
 
+/// `<commit>` names the object a new tag points at, so it only makes sense
+/// when creating a tag. List mode, `-d` and `-v` take a single tag name or
+/// pattern; without this check they would ignore the extra argument.
+fn validate_target_create_only(args: &TagArgs) -> Result<(), TagError> {
+    match args.target.as_deref() {
+        Some(target) if args.delete || args.verify || tag_requests_list(args) => {
+            Err(TagError::TargetRequiresCreate(target.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_named_tag_action(args: &TagArgs) -> Result<(), TagError> {
     if args.name.is_some() {
         return Ok(());
@@ -620,7 +672,7 @@ async fn create_tag(tag_name: &str, message: Option<String>, force: bool) {
 
 #[cfg(test)]
 async fn create_tag_safe(tag_name: &str, message: Option<String>, force: bool) -> CliResult<()> {
-    run_create_tag(tag_name, message, force, false)
+    run_create_tag(tag_name, message, force, false, None)
         .await
         .map(|_| ())
         .map_err(CliError::from)?;
@@ -653,6 +705,7 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
     // conflict (129) instead of a missing-name error.
     validate_message_source_create_only(args)?;
     validate_named_tag_action(args)?;
+    validate_target_create_only(args)?;
     util::require_repo().map_err(|_| TagError::NotInRepo)?;
 
     if args.verify {
@@ -734,6 +787,12 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
         return run_delete_tag(name).await;
     }
 
+    // The target is resolved before the message file is read, the editor
+    // opens, or anything is written, so a bad target leaves no trace.
+    let target = match args.target.as_deref() {
+        Some(spec) => Some(resolve_tag_target(spec).await?),
+        None => None,
+    };
     let base_message = resolve_tag_message(args)?;
     // `-e`/`--edit` opens an editor on the (optional) base message. `-a` alone
     // is the same editor path (ADR-HF-11). Combined with `-m`/`-F` the base
@@ -746,7 +805,83 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
     } else {
         base_message
     };
-    run_create_tag(name, message, args.force, args.sign).await
+    run_create_tag(name, message, args.force, args.sign, target).await
+}
+
+/// Resolve `tag <name> <commit>`'s target the way `git tag` does: any
+/// commit-ish, recorded unpeeled, so naming an annotated tag points the new
+/// tag at that tag object. An object whose tag chain ends at a tree or blob
+/// is refused: Libra cannot transfer tags of trees or blobs yet. The messages
+/// never embed the storage error, which can carry local object paths; that
+/// detail is only logged.
+async fn resolve_tag_target(spec: &str) -> Result<tag::TagTarget, TagError> {
+    let resolved = if tag_target_read_failpoint() {
+        Err(CommitBaseError::ReadFailure(
+            "LIBRA_TEST_TAG_FAIL_TARGET_READ failpoint".to_string(),
+        ))
+    } else {
+        resolve_and_peel_tag_target(spec).await
+    };
+    let (id, end, end_type) = resolved.map_err(|error| match error {
+        CommitBaseError::HeadUnborn => TagError::HeadUnborn,
+        CommitBaseError::InvalidReference(detail) => {
+            tracing::debug!(tag_target = %spec, %detail, "tag target does not resolve");
+            TagError::InvalidTarget(spec.to_string())
+        }
+        CommitBaseError::ReadFailure(detail) => {
+            tracing::warn!(tag_target = %spec, %detail, "failed to read tag target");
+            TagError::TargetReadFailed(spec.to_string())
+        }
+        CommitBaseError::CorruptReference(detail) => {
+            tracing::warn!(tag_target = %spec, %detail, "tag target object graph is corrupt");
+            TagError::TargetCorrupt(spec.to_string())
+        }
+    })?;
+    if end_type != ObjectType::Commit {
+        return Err(TagError::NonCommitTarget {
+            spec: spec.to_string(),
+            kind: end_type.to_string(),
+        });
+    }
+    // A target that peels to a commit through tags is itself a tag object.
+    let kind = if end == id {
+        ObjectType::Commit
+    } else {
+        ObjectType::Tag
+    };
+    Ok(tag::TagTarget { id, kind })
+}
+
+/// Resolve `spec` without peeling, prove the object exists (a full-length id
+/// is otherwise accepted as written), then peel it through any tag chain:
+/// `(resolved id, first non-tag object, its type)`.
+async fn resolve_and_peel_tag_target(
+    spec: &str,
+) -> Result<(ObjectHash, ObjectHash, ObjectType), CommitBaseError> {
+    let id = util::resolve_object_spec_typed(spec).await?;
+    let id = util::require_object_exists_typed(id, spec)?;
+    // The object was just proven to exist, so a peel-stage "missing object"
+    // means the graph behind it is broken, not that the name is wrong.
+    let (end, end_type) = util::peel_to_non_tag_typed(id, spec).map_err(|error| match error {
+        CommitBaseError::InvalidReference(detail) => CommitBaseError::CorruptReference(detail),
+        other => other,
+    })?;
+    Ok((id, end, end_type))
+}
+
+/// Test failpoint: `LIBRA_TEST=1` plus `LIBRA_TEST_TAG_FAIL_TARGET_READ=1`
+/// makes resolving `tag <name> <commit>`'s target report a read failure, so
+/// the read-failure rendering is exercised through the real CLI. Debug
+/// builds only — a release binary has no path to it.
+#[cfg(debug_assertions)]
+fn tag_target_read_failpoint() -> bool {
+    std::env::var(crate::utils::pager::LIBRA_TEST_ENV).is_ok_and(|value| value == "1")
+        && std::env::var("LIBRA_TEST_TAG_FAIL_TARGET_READ").is_ok_and(|value| value == "1")
+}
+
+#[cfg(not(debug_assertions))]
+fn tag_target_read_failpoint() -> bool {
+    false
 }
 
 fn render_tag_output(
@@ -829,8 +964,9 @@ async fn run_create_tag(
     message: Option<String>,
     force: bool,
     sign: bool,
+    target: Option<tag::TagTarget>,
 ) -> Result<TagOutput, TagError> {
-    let created = tag::create(tag_name, message, force, sign)
+    let created = tag::create_with_target(tag_name, message, force, sign, target)
         .await
         .map_err(|error| map_create_tag_error(tag_name, error))?;
     Ok(TagOutput::Create {

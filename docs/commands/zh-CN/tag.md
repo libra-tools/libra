@@ -5,16 +5,16 @@
 ## 概要
 
 ```
-libra tag [<name>] [-a] [-m <message> | -F <file>] [-e] [-f]
+libra tag [<name> [<commit>]] [-a] [-m <message> | -F <file>] [-e] [-f]
 libra tag -l [-n <lines>] [--column[=<mode>]]
 libra tag -d <name>
 ```
 
 ## 说明
 
-`libra tag` 管理轻量标签和附注标签。轻量标签只是指向提交的具名指针，而附注标签会存储带有消息、打标签者身份和时间戳的完整标签对象。
+`libra tag` 管理轻量标签和附注标签。轻量标签只是指向对象（通常是提交）的具名指针，而附注标签会存储带有消息、打标签者身份和时间戳的完整标签对象。
 
-不带参数（或带 `-l`）时，命令列出所有标签。给出名称时，它会在 HEAD 处创建新标签。添加 `-a`/`--annotate`、`-m <message>` 或 `-F <file>`（从文件或 `-` 表示 stdin 读取消息）会创建附注标签，而不是轻量标签；单独使用 `-a` 会打开编辑器，`-e`/`--edit` 在编辑器中撰写消息（有 `-m`/`-F` 时预填）。与 `-d`/`-l`/`-v` 组合时，`-a` 为用法错误。`-f` 标志允许覆盖同名已有标签。
+不带参数（或带 `-l`）时，命令列出所有标签。给出名称时，它会在 HEAD 处创建新标签；同时给出 `<commit>` 时则在该对象上创建（`libra tag v1.0 HEAD~1`）。`<commit>` 接受任意 commit-ish——分支、提交 id、`HEAD~2` 之类的表达式或另一个标签——并与 Git 一样**不 peel** 地记录：给出附注标签名时，新标签指向该标签对象——附注或签名标签由此成为嵌套标签（标签的标签），轻量标签则只是该标签对象的另一个名字。若要标记附注标签所指的提交，用 `<tag>^{}`（`libra tag v1.0-commit 'v1.0^{}'`）。解析到 tree 或 blob 的目标会被拒绝（Libra 目前无法传输 tree / blob 的标签）。给出 `<commit>` 时不读取 HEAD，因此在未诞生的分支上也能打标签。目标在读取 `-F` 文件、打开编辑器和任何写入之前解析，无效目标不会留下新的标签引用或标签对象。添加 `-a`/`--annotate`、`-m <message>` 或 `-F <file>`（从文件或 `-` 表示 stdin 读取消息）会创建附注标签，而不是轻量标签；单独使用 `-a` 会打开编辑器，`-e`/`--edit` 在编辑器中撰写消息（有 `-m`/`-F` 时预填）。与 `-d`/`-l`/`-v` 组合时，`-a` 为用法错误。`-f` 标志允许覆盖同名已有标签。
 
 标签引用与分支引用一起存储在 SQLite 数据库中，提供相同的事务保证。
 
@@ -25,6 +25,7 @@ libra tag -d <name>
 | 标志 | 长选项 | 值 | 说明 |
 |------|------|-------|-------------|
 | | `<name>` | 位置参数（可选） | 要创建、显示或删除的标签名 |
+| | `<commit>` | 位置参数（可选） | 新标签指向的对象（默认 HEAD）：任意 commit-ish，不 peel 地记录——给出附注标签名时新标签指向该标签对象（要其提交用 `<tag>^{}`）；解析到 tree / blob 的目标被拒绝。只在创建标签时有效 |
 | `-l` | `--list` | | 列出所有标签 |
 | `-d` | `--delete` | | 删除具名标签 |
 | `-a` | `--annotate` | | 创建附注标签。单独使用时打开编辑器（清理后为空则中止且不写 ref）。与 `-m`/`-F`/`-e` 组合时创建附注标签；与 `-d`/`-l`/`-v` 组合为用法错误。 |
@@ -51,6 +52,12 @@ libra tag -d <name>
 # 在 HEAD 创建轻量标签
 libra tag v1.0
 
+# 在指定提交（而非 HEAD）上打标签
+libra tag v1.0 HEAD~1
+
+# 在另一分支的顶端创建附注标签
+libra tag -m "Release v1.1" v1.1 side
+
 # 创建带消息的附注标签
 libra tag -a -m "Release v1.1" v1.1
 libra tag -m "Release v1.1" v1.1
@@ -61,6 +68,12 @@ libra log -1 --format=%B | libra tag -F - v1.1
 
 # 强制覆盖已有标签
 libra tag -f v1.0
+
+# 把已有标签移到另一个提交
+libra tag -f v1.0 HEAD~1
+
+# 标记附注标签所指的提交，而不是标签对象
+libra tag v1.0-commit 'v1.0^{}'
 
 # 列出所有标签
 libra tag -l
@@ -79,6 +92,9 @@ libra tag --json v1.0
 
 ```bash
 libra tag v1.0                        # 在 HEAD 创建轻量标签
+libra tag v1.0 HEAD~1                 # 在指定提交（而非 HEAD）上打标签
+libra tag -m "Release v1.1" v1.1 side  # 在分支 side 的顶端创建附注标签
+libra tag -f v1.0 HEAD~1              # 把已有标签移到另一个提交
 libra tag -a -m "Release v1.1" v1.1   # 创建附注标签
 libra tag -m "Release v1.1" v1.1      # 创建附注标签
 libra tag -l -n 2                     # 列出标签，最多显示 2 行附注
@@ -90,6 +106,7 @@ libra tag --json v1.0                 # 面向代理的结构化 JSON 输出
 
 - `libra tag -l`：打印标签列表，每行一个；使用 `-n` 时缩进显示附注行
 - `libra tag v1.0`：`Created lightweight tag 'v1.0' at abc1234`
+- `libra tag v1.0 HEAD~1`：`Created lightweight tag 'v1.0' at <HEAD~1 的短 id>`
 - `libra tag -m "msg" v1.0`：`Created annotated tag 'v1.0' at abc1234`
 - `libra tag -d v1.0`：`Deleted tag 'v1.0' (was abc1234)`
 - 默认创建路径保留当前人类可读输出
@@ -113,6 +130,8 @@ libra tag --json v1.0                 # 面向代理的结构化 JSON 输出
   }
 }
 ```
+
+显式给出目标时（`libra tag --json v1.0 HEAD~1`）信封相同：轻量标签的 `hash` 为目标对象，附注标签的 `hash` 为新标签对象。
 
 创建附注标签：
 
@@ -189,6 +208,7 @@ Libra 保留 Git 的两层标签模型，以保持磁盘格式兼容。轻量标
 | 功能 | Git | Libra | jj |
 |---------|-----|-------|----|
 | 创建轻量标签 | `git tag <name>` | `libra tag <name>` | `jj tag create <name>` |
+| 在指定提交上打标签 | `git tag <name> <commit>` | `libra tag <name> <commit>`（不 peel；tree / blob 目标被拒绝） | `jj tag set <name> -r <rev>` |
 | 创建附注标签 | `git tag -a -m "msg" <name>` | `libra tag -a -m "msg" <name>`（或 `-m` / `-F` / `-e`） | 不支持（仅轻量） |
 | 从文件读取附注消息 | `git tag -F <file> <name>` | `libra tag -F <file> <name>`（`-` 表示 stdin） | N/A |
 | 编辑器编辑消息 | `git tag -e <name>`（配合 `-a`/`-m`/`-F`） | `libra tag -a <name>` 或 `libra tag -e <name>`（撰写附注消息；`-m`/`-F` 预填） | N/A |
@@ -207,6 +227,13 @@ Libra 保留 Git 的两层标签模型，以保持磁盘格式兼容。轻量标
 |----------|-----------|------|
 | 标签已存在 | `LBR-CONFLICT-002` | "delete it first with 'libra tag -d <name>'." |
 | HEAD 没有可打标签的提交 | `LBR-REPO-003` | "create a commit first before tagging HEAD." |
+| `<commit>` 无法解析（名字不存在、短 id 有歧义，或完整 id 对应的对象不存在）："Failed to resolve '<commit>' as a valid ref." | `LBR-CLI-003` | "use 'libra log --oneline' to see available commits."（退出码 129；Git 退出 128——名字不存在时文案相同，短 id 歧义时先列出候选再给同一行，完整 id 对应的对象不存在时则在之后以 `cannot update ref … nonexistent object` 或 `bad object type.` 失败） |
+| `<commit>` 解析到 tree 或 blob："cannot tag '<commit>': it resolves to a tree object, not a commit"（或 `blob`） | `LBR-CLI-003` | "only a commit, or a tag that peels to a commit, can be tagged"（退出码 129） |
+| `<commit>` 与 `-l`/`-d`/`-v` 或任一列表模式旗标（`-n`、`--points-at`、`--contains`、`--no-contains`、`--merged`、`--no-merged`、`--sort`、`--column`、`--no-column`）同用："the <commit> argument '<x>' is only valid when creating a tag" | `LBR-CLI-002` | "list, delete and verify take a single tag name or pattern."（退出码 129，在打开仓库之前检查） |
+| 第三个位置参数（`libra tag a b c`）："unexpected argument 'c' found" | `LBR-CLI-002` | clap 用法文本（退出码 129；Git 报 "too many arguments"） |
+| `<commit>` 经由未诞生的 HEAD（`HEAD`、`@`、`HEAD~1`）："Cannot create tag: HEAD does not point to a commit" | `LBR-REPO-003` | "create a commit first before tagging HEAD."（退出码 128，与 Git 相同） |
+| `<commit>` 无法读取："failed to resolve '<commit>': the object store could not be read" | `LBR-IO-001` | "check that the repository is readable and retry."（退出码 128） |
+| `<commit>` 的对象图损坏（如标签的目标缺失）："failed to resolve '<commit>': its object graph is corrupt or incomplete" | `LBR-REPO-002` | "run 'libra fsck' to inspect missing objects."（退出码 128） |
 | 标签未找到（delete/show） | `LBR-CLI-003` | "use 'libra tag -l' to list available tags." |
 | --delete/--message/--file/--edit/--force 缺少标签名 | `LBR-CLI-002` | "use 'libra tag <name>' to create or update a tag"（`--edit` 为 "tag name is required when using --edit"） |
 | `-m`/`-F`/`-e` 与非创建模式（list/delete/verify/过滤）组合 | `LBR-CLI-002` | "-m/--message, -F/--file, and -e/--edit are only valid when creating a tag" |

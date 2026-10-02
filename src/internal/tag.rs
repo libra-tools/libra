@@ -98,6 +98,15 @@ pub enum CreateTagError {
     VaultSign(String),
 }
 
+/// The object a new tag points at, unpeeled, together with its actual type:
+/// a commit, or an annotated tag whose chain peels to a commit (the new tag is
+/// then a nested tag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagTarget {
+    pub id: ObjectHash,
+    pub kind: ObjectType,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateTagResult {
     pub name: String,
@@ -116,10 +125,32 @@ pub async fn create(
     force: bool,
     sign: bool,
 ) -> Result<CreateTagResult, CreateTagError> {
-    let head_commit_id = match Head::current_commit_result().await {
-        Ok(Some(head_commit_id)) => head_commit_id,
-        Ok(None) => return Err(CreateTagError::HeadUnborn),
-        Err(source) => return Err(CreateTagError::ResolveHead(source)),
+    create_with_target(name, message, force, sign, None).await
+}
+
+/// Like [`create`], but points the tag at `target` instead of HEAD when one is
+/// given (`libra tag <name> <commit>`). A lightweight tag's ref stores
+/// `target.id`; an annotated or signed tag object records `object <target.id>`
+/// and `type <target.kind>`, and a signature covers exactly those header
+/// values, so `tag -v` verifies what is stored. HEAD is not read at all when a
+/// target is given, so tagging works on an unborn branch.
+pub async fn create_with_target(
+    name: &str,
+    message: Option<String>,
+    force: bool,
+    sign: bool,
+    target: Option<TagTarget>,
+) -> Result<CreateTagResult, CreateTagError> {
+    let target = match target {
+        Some(target) => target,
+        None => match Head::current_commit_result().await {
+            Ok(Some(head_commit_id)) => TagTarget {
+                id: head_commit_id,
+                kind: ObjectType::Commit,
+            },
+            Ok(None) => return Err(CreateTagError::HeadUnborn),
+            Err(source) => return Err(CreateTagError::ResolveHead(source)),
+        },
     };
 
     let db = get_db_conn_instance().await;
@@ -166,11 +197,7 @@ pub async fn create(
                 })?;
             let unsigned_content = format!(
                 "object {}\ntype {}\ntag {}\ntagger {}\n\n{}",
-                head_commit_id,
-                ObjectType::Commit,
-                name,
-                tagger_signature,
-                msg
+                target.id, target.kind, name, tagger_signature, msg
             );
             let root_dir = util::storage_path();
             let sig_hex = crate::internal::vault::pgp_sign(
@@ -189,8 +216,8 @@ pub async fn create(
         };
 
         let git_internal_tag = git_internalTag::new(
-            head_commit_id,
-            ObjectType::Commit,
+            target.id,
+            target.kind,
             name.to_string(),
             tagger_signature,
             msg,
@@ -207,8 +234,8 @@ pub async fn create(
 
         ref_target_id = git_internal_tag.id;
     } else {
-        // For lightweight tags, the target is the commit itself
-        ref_target_id = head_commit_id;
+        // A lightweight tag's ref stores the target object itself.
+        ref_target_id = target.id;
     };
 
     // Save the reference in the database
