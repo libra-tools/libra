@@ -104,9 +104,11 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 - **输出。** 成功时 stdout 只有 JSON envelope（`--json`、`--machine`）或纯文本摘要
   （控制字符已替换；`--quiet` 时不输出）。失败时 stdout 为空，错误写到 stderr：
   `--json`/`--machine` 下是 JSON 错误信封（见「机器可读的错误细节」），否则是人读错误。
-- **凭据。** 读操作匿名：拒绝 `--token` 与 `--token-file`，也不读取
-  `LIBRA_MEGA2_TOKEN`。写操作目前也不接受 token flag，一律匿名发送（适用于
-  `push_auth=none` 的服务端）。
+- **凭据。** 读操作拒绝 token flag：读操作匿名，拒绝 `--token` 与 `--token-file`
+  （`LBR-CLI-002`，不发请求），也不读取 `LIBRA_MEGA2_TOKEN`。写操作在人读与机器模式下
+  都至多取一个 token——依次为 `--token-file`、`LIBRA_MEGA2_TOKEN`、`--token`——并以一个
+  `Authorization: Bearer` 头发送；没有任何来源时匿名写入（适用于 `push_auth=none` 的
+  服务端）。token 从不持久化、从不输出，服务端拒绝它时也不例外。
 - **一次一个操作，写操作不带 `--ref`。** 同时给出两个操作 flag 是用法错误
   （`LBR-CLI-002`），写操作带 `--ref` 也是（写入总是作用于服务端默认 revision）；
   两者都不发请求。
@@ -164,9 +166,8 @@ NUL 与控制字符），通过后才发送**一次** `POST /api/v1/create-entry
 raw mode，TUI 也永不要求你在备用屏幕上输入原始 token。
 
 写入 token 的解析优先级：`--token-file <path>` → 环境变量 `LIBRA_MEGA2_TOKEN` →
-`--token`（会留在 shell history，建议用前两者）。目前 token 相关 flag 仅在交互模式
-有效，与 `--json`/`--machine` 或任一操作 flag 同用都会被拒绝。非交互写操作（见上文）
-各发出一次写请求，在支持写凭据之前一律匿名发送。
+`--token`（会留在 shell history，建议用前两者）。非交互写操作（见上文）遵守同一规则。
+读操作拒绝 token flag：不带写操作 flag 的 `--json`/`--machine` 与 `--list` 都不接受凭据。
 
 ### 删除、移动与改名（`d`、`m`、`R`，仅交互模式）
 
@@ -202,8 +203,8 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
 | `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
 | `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
-| `--token-file <PATH>` | 仅交互模式：从文件读取写入 token（优先级最高）。 |
-| `--token <TOKEN>` | 仅交互模式：内联写入 token（优先级最低；会留在 shell history）。 |
+| `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
+| `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
 | `--machine` | 全局标志：严格 NDJSON 机器模式，供自动化使用。 |
 
@@ -261,6 +262,9 @@ libra mega2 browser --server https://mega2.example.com --list /src/pkg
 
 # 不用终端建立 /src/pkg（匿名写，适用于 push_auth=none 的服务端）
 libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src
+
+# 同一写操作，从文件读取 token（受 token 保护的服务端）
+libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

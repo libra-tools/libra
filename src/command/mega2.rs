@@ -200,8 +200,9 @@ pub(crate) fn browser_data<'a>(
 /// Reads one bounded remote listing (JSON/machine mode, or human `--list`) or
 /// drives the MB-02 TUI (human mode without an operation flag). A
 /// non-interactive write flag sends exactly one remote write request. It never
-/// opens the repository database, object store, index or configuration; no
-/// network request carries credentials.
+/// opens the repository database, object store, index or configuration. Read
+/// requests carry no credentials; a write request carries at most one Bearer
+/// token, taken from `--token-file` → `LIBRA_MEGA2_TOKEN` → `--token`.
 ///
 /// # Errors
 ///
@@ -233,7 +234,8 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
             server: &server,
             path: &path,
             git_ref,
-            token_flags: args.token_file.is_some() || args.token.is_some(),
+            token_file: args.token_file.as_deref(),
+            token: args.token.as_deref(),
         };
         return noninteractive::execute(operation, &invocation, output).await;
     }

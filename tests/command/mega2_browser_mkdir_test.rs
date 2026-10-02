@@ -3,8 +3,8 @@
 //! Pins the editor contract (sanitized input, Esc cancel with zero network,
 //! hostile names refused before POST), the success path (exactly one POST +
 //! one reload GET), error handling that keeps the last safe listing with a
-//! secret-free status, and the CLI boundary (token flags are TUI-only,
-//! `--json` never POSTs, help has no `mkdir` subcommand).
+//! secret-free status, and the CLI boundary (read operations refuse token
+//! flags and never echo them, help has no `mkdir` subcommand).
 
 use std::{
     io::{Read, Write},
@@ -309,7 +309,7 @@ fn libra(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn token_flags_are_tui_only_and_json_never_posts() {
+fn token_flags_are_refused_for_reads_and_never_echoed() {
     let workdir = tempfile::tempdir().expect("tempdir");
 
     let json = libra(
@@ -326,7 +326,7 @@ fn token_flags_are_tui_only_and_json_never_posts() {
     );
     assert!(!json.status.success(), "token + --json must be refused");
     let err = String::from_utf8_lossy(&json.stderr).to_string();
-    assert!(err.contains("TUI-only"), "unexpected stderr: {err}");
+    assert!(err.contains("no credentials"), "unexpected stderr: {err}");
     assert!(!err.contains("secret"), "token leaked: {err}");
 
     // In human mode the token flag is accepted; the failure is the TTY gate.

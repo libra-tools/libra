@@ -14,8 +14,9 @@
 
 - 兼容级别：`intentionally-different`。远端 Mega2 metadata browser，Git 无等价
   契约；本地对象检视请使用 `libra ls-tree`。
-- 浏览只读且匿名：`GET /api/v1/tree` 不携带 `Authorization`；写入（建目录/删除/
-  移动/tag）属于后续卡（MB-04/05、MB-07/08、MB-10/11），不在此命令。
+- 浏览只读且匿名：`GET /api/v1/tree` 不携带 `Authorization`；写入（TUI 的建目录/删除/
+  移动/tag，与 plan-20261001 起的非交互写操作 flag）至多带一个按 `--token-file` →
+  `LIBRA_MEGA2_TOKEN` → `--token` 取得的 Bearer token，没有来源时匿名。
 - `COMPATIBILITY.md` 与 `docs/development/commands/_compatibility.md` 均登记为
   Libra-only、无 Git 等价面。
 
@@ -42,8 +43,9 @@
     目录/tag 类别），ADR-MN-08 的通用规则按类别实现一次（不碰终端、不读 stdin、本地校验后
     恰好一次请求、不 reload/preflight/重试、读操作拒绝 token flag 且不读 `LIBRA_MEGA2_TOKEN`）；
     `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 `--list`，MN-03 `--create-dir`）；
-    写类操作由类别规则拒绝 `--ref`（R8），在 MN-11 之前与读操作一样拒绝 token flag，
-    经 `Mega2EntryClient::create_directory` 匿名发一次 POST，`create-dir` payload 把本地
+    写类操作由类别规则拒绝 `--ref`（R8），并按 ADR-MN-05（MN-11）取凭据：读类拒绝 token flag、
+    不读 `LIBRA_MEGA2_TOKEN`，写类以 `resolve_token_from_process` 取至多一个 token，
+    经 `Mega2EntryClient::create_directory` 发一次 POST（无 token 来源时匿名），`create-dir` payload 把本地
     `target` 与服务端 `receipt` 分开。
 - 执行路径：
   1. `execute_safe` → `validate_server_url` + `normalize_path`（都在终端/网络之前）；
@@ -54,9 +56,10 @@
   3. 否则（人读且无操作 flag）`mega2_browser::run`：`ensure_tty` → 终端 guard → 首屏 fetch → 事件循环
      （每个导航动作恰好一个请求）→ 退出时强制还原终端；`+` 确认后经 MB-04
      `perform_create` 发一次 POST 并重载一次。
-  4. Token 解析（ADR-MB-03）只在交互路径发生：`--token-file` →
-     `LIBRA_MEGA2_TOKEN` → `--token`；与 `--json`/`--machine` 组合会以
-     `StableErrorCode::CliInvalidArguments` 拒绝（机器模式永不 POST）。
+  4. Token 解析（ADR-MB-03 / ADR-MN-05）：TUI 与非交互写操作按 `--token-file` →
+     `LIBRA_MEGA2_TOKEN` → `--token` 取至多一个 token；读操作（不带写操作 flag 的
+     `--json`/`--machine`、`--list`）带 token flag 时以 `StableErrorCode::CliInvalidArguments`
+     拒绝，消息为 `mega2 browser: read operations take no credentials; --token/--token-file only apply to write operations`。
   4. `--quiet` 与交互模式组合被视为不相容调用（会破坏交互/机器消费），以
      `StableErrorCode::CliInvalidArguments` 拒绝并给出 `--machine` 提示。
 - 输出与错误：所有失败映射为稳定 `LBR-*` 码（用法 `LBR-CLI-002`、网络
@@ -98,7 +101,7 @@ flowchart TD
   仓库外零本地写入、help 面（仅 `browser`，无 mkdir）；`mega2_browser_mkdir` 覆盖
   `+` 编辑器（文件选择拒绝、`Esc` 零网络、敌意名称不发 POST）、成功路径
   （1 POST + 1 重载 GET）、401/400/403/409 保持最后安全列表且无 token/响应体泄漏、
-  token flag 与 `--json` 互斥；`mega2_browser_tag` 覆盖 `t` 面板（第 1 页单次匿名 GET、显式翻页、create 名称+可选 message、delete 确认、敌意名不发请求、面板关闭恢复目录视图、渲染消毒）；`mega2_browser_mutate` 覆盖 `d`/`m`/`R`
+  读操作的 token flag 被拒绝且不回显（`token_flags_are_refused_for_reads_and_never_echoed`）；`mega2_browser_tag` 覆盖 `t` 面板（第 1 页单次匿名 GET、显式翻页、create 名称+可选 message、delete 确认、敌意名不发请求、面板关闭恢复目录视图、渲染消毒）；`mega2_browser_mutate` 覆盖 `d`/`m`/`R`
   （确认行、Esc 取消零网络、文件惰性、改名=同层移动、敌意目标不发 POST、
   1 POST + 1 重载 GET、help 无 rmdir/mv）。
 - 失败诊断（MN-01）：`cargo test --lib internal::protocol::mega2_diag`（作用域的四种附加分支、

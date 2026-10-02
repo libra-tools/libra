@@ -123,9 +123,13 @@ Every non-interactive call follows the same rules:
   (nothing with `--quiet`). On failure stdout is empty and the error goes to
   stderr: the JSON error envelope with `--json`/`--machine` (see
   [Machine error details](#machine-error-details)), the human error otherwise.
-- **Credentials.** Read operations are anonymous: they refuse `--token` and
-  `--token-file` and ignore `LIBRA_MEGA2_TOKEN`. Write operations do not accept
-  token flags yet and are sent anonymously (for `push_auth=none` servers).
+- **Credentials.** Read operations refuse token flags: they are anonymous,
+  reject `--token` and `--token-file` (`LBR-CLI-002`, no request) and ignore
+  `LIBRA_MEGA2_TOKEN`. Write operations, in human and machine mode alike, take
+  at most one token — `--token-file`, then `LIBRA_MEGA2_TOKEN`, then `--token`
+  — and send it as one `Authorization: Bearer` header; with no source they
+  write anonymously (for `push_auth=none` servers). The token is never
+  persisted or printed, not even when the server rejects it.
 - **One operation, no `--ref` on writes.** Combining two operation flags is a
   usage error (`LBR-CLI-002`), and so is `--ref` with a write operation:
   writes always target the server's default revision. Neither sends a request.
@@ -191,10 +195,10 @@ alternate screen.
 
 Write tokens are read, in order of precedence, from `--token-file <path>`,
 then the `LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in
-shell history — prefer the first two). For now token flags are TUI-only: they
-are refused with `--json`/`--machine` or any operation flag. Non-interactive
-write operations (see above) each send one write request and are sent
-anonymously until write credentials are supported.
+shell history — prefer the first two). The same rule applies to the
+non-interactive write operations (see above). Read operations refuse token
+flags: `--json`/`--machine` without a write flag and `--list` take no
+credentials.
 
 ### Deleting, moving and renaming (`d`, `m`, `R`, interactive only)
 
@@ -239,8 +243,8 @@ terminal. The panel operates root tags only.
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
 | `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
-| `--token-file <PATH>` | Interactive only: read the write token from a file (highest precedence). |
-| `--token <TOKEN>` | Interactive only: inline write token (lowest precedence; visible in shell history). |
+| `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
+| `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
 | `--machine` | Global flag: strict NDJSON machine mode for automation. |
 
@@ -303,6 +307,9 @@ libra mega2 browser --server https://mega2.example.com --list /src/pkg
 
 # Create /src/pkg without a terminal (anonymous write, push_auth=none servers)
 libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src
+
+# The same write with a token from a file (token-protected servers)
+libra --json mega2 browser --server https://mega2.example.com --create-dir pkg /src --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

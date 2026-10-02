@@ -529,6 +529,74 @@ fn rule_r8_no_request(case: &OpCase) {
     assert!(mock.records().is_empty(), "records: {:?}", mock.records());
 }
 
+/// Writes `content` to a token file in `dir` and returns its path.
+fn token_file(dir: &Path, content: &str) -> String {
+    let path = dir.join("token");
+    std::fs::write(&path, content).expect("write token file");
+    path.to_string_lossy().to_string()
+}
+
+fn authorizations(mock: &MockMega2) -> Vec<Option<String>> {
+    mock.records()
+        .into_iter()
+        .map(|record| record.authorization)
+        .collect()
+}
+
+/// R9a: with `--token-file`, `LIBRA_MEGA2_TOKEN` and `--token` all set, the
+/// one request carries exactly one `Bearer` with the token file's content.
+fn rule_r9a(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = token_file(dir.path(), "filetok");
+    let output = run(
+        dir.path(),
+        &argv(
+            &mock.url(),
+            case,
+            &["--json"],
+            &["--token-file", &file, "--token", "flagtok"],
+        ),
+        &[("LIBRA_MEGA2_TOKEN", "envtok")],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        authorizations(&mock),
+        vec![Some("Bearer filetok".to_string())]
+    );
+}
+
+/// R9b: with no token source the write is anonymous.
+fn rule_r9b(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(dir.path(), &argv(&mock.url(), case, &["--json"], &[]), &[]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(authorizations(&mock), vec![None]);
+}
+
+/// R9c: a rejected token (401) never appears in stdout or stderr.
+fn rule_r9c(case: &OpCase) {
+    let mock = MockMega2::start(|_method: &str, _path: &str| (401, String::new()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &argv(
+            &mock.url(),
+            case,
+            &["--json"],
+            &["--token", "r9c-secret-token"],
+        ),
+        &[],
+    );
+    assert!(!output.status.success());
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        !combined.contains("r9c-secret-token"),
+        "token echoed: {combined}"
+    );
+}
+
 /// One `op_rule_<op>_<rule>` test per applicable rule (ADR-MN-08).
 macro_rules! op_rule {
     ($name:ident, $rule:ident, $case:expr) => {
@@ -686,7 +754,7 @@ fn list_failure_leaves_stdout_empty() {
     );
 }
 
-// ---- create_dir (MN-03): R1, R1b, R2, R3, R4a, R4b, R5a, R5b, R7, R8 ----
+// ---- create_dir (MN-03, MN-11): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c ----
 
 op_rule!(op_rule_create_dir_r1, rule_r1, CREATE_DIR_CASE);
 op_rule!(op_rule_create_dir_r1b, rule_r1b, CREATE_DIR_CASE);
@@ -694,18 +762,6 @@ op_rule!(op_rule_create_dir_r2, rule_r2, CREATE_DIR_CASE);
 op_rule!(op_rule_create_dir_r3, rule_r3, CREATE_DIR_CASE);
 op_rule!(op_rule_create_dir_r4a, rule_r4a, CREATE_DIR_CASE);
 op_rule!(op_rule_create_dir_r4b, rule_r4b, CREATE_DIR_CASE);
-op_rule!(op_rule_create_dir_r5a_code, rule_r5a_code, CREATE_DIR_CASE);
-op_rule!(
-    op_rule_create_dir_r5a_no_request,
-    rule_r5a_no_request,
-    CREATE_DIR_CASE
-);
-op_rule!(op_rule_create_dir_r5b_code, rule_r5b_code, CREATE_DIR_CASE);
-op_rule!(
-    op_rule_create_dir_r5b_no_request,
-    rule_r5b_no_request,
-    CREATE_DIR_CASE
-);
 op_rule!(op_rule_create_dir_r7_code, rule_r7_code, CREATE_DIR_CASE);
 op_rule!(
     op_rule_create_dir_r7_no_request,
@@ -718,6 +774,9 @@ op_rule!(
     rule_r8_no_request,
     CREATE_DIR_CASE
 );
+op_rule!(op_rule_create_dir_r9a, rule_r9a, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r9b, rule_r9b, CREATE_DIR_CASE);
+op_rule!(op_rule_create_dir_r9c, rule_r9c, CREATE_DIR_CASE);
 
 // ---- create_dir (MN-03): operation-specific behavior ----
 
@@ -900,45 +959,6 @@ fn create_dir_duplicate_http_status() {
     assert_eq!(error_envelope(&output)["details"]["http_status"], 500);
 }
 
-/// Until write credentials arrive, a 401 on an anonymous non-interactive write
-/// keeps its code and details, but its hint names the paths that work instead
-/// of the token flags this call refuses.
-#[test]
-fn create_dir_anonymous_401_hint() {
-    let mock = MockMega2::start(|_method: &str, _path: &str| (401, String::new()));
-    let dir = tempfile::tempdir().expect("tempdir");
-    let output = run(
-        dir.path(),
-        &[
-            "mega2",
-            "browser",
-            "--server",
-            &mock.url(),
-            "--create-dir",
-            "sub",
-            "/",
-            "--machine",
-        ],
-        &[],
-    );
-    assert!(!output.status.success());
-    let envelope = error_envelope(&output);
-    assert_eq!(
-        (
-            &envelope["error_code"],
-            &envelope["details"],
-            &envelope["hints"]
-        ),
-        (
-            &json!("LBR-AUTH-001"),
-            &json!({"method": "POST", "route": "/api/v1/create-entry", "http_status": 401}),
-            &json!([
-                "non-interactive writes are anonymous for now: write through the interactive browser with --token-file, or use a server with push_auth=none"
-            ]),
-        )
-    );
-}
-
 /// Serves one connection: reads the request head, then answers 200 with a
 /// body cut short of its `Content-Length` and closes.
 fn serve_truncated_once() -> String {
@@ -988,5 +1008,208 @@ fn create_dir_receipt_read_drop_reports_http_status() {
             &json!("LBR-NET-001"),
             &json!({"method": "POST", "route": "/api/v1/create-entry", "http_status": 200}),
         )
+    );
+}
+
+// ---- write credentials (MN-11): source matrix on create_dir ----
+
+/// G4: only `LIBRA_MEGA2_TOKEN` set.
+#[test]
+fn create_dir_token_from_env_only() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--json",
+        ],
+        &[("LIBRA_MEGA2_TOKEN", "envtok")],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        authorizations(&mock),
+        vec![Some("Bearer envtok".to_string())]
+    );
+}
+
+/// G5: only `--token` given.
+#[test]
+fn create_dir_token_from_flag_only() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--json",
+            "--token",
+            "flagtok",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        authorizations(&mock),
+        vec![Some("Bearer flagtok".to_string())]
+    );
+}
+
+/// G6: human mode with `--token-file` sends the file's token.
+#[test]
+fn create_dir_token_human_mode_sends_token_file() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = token_file(dir.path(), "filetok");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--token-file",
+            &file,
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        authorizations(&mock),
+        vec![Some("Bearer filetok".to_string())]
+    );
+}
+
+/// G7: human mode, same token file, server 401 — the token never appears.
+#[test]
+fn create_dir_token_human_mode_401_never_echoes() {
+    let mock = MockMega2::start(|_method: &str, _path: &str| (401, String::new()));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = token_file(dir.path(), "filetok");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--token-file",
+            &file,
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(!combined.contains("filetok"), "token echoed: {combined}");
+}
+
+/// AC-1: a read operation refuses token flags with the credentials message.
+#[test]
+fn list_token_refusal_message() {
+    let mock = MockMega2::start(list_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--json",
+            "--list",
+            "/",
+            "--token",
+            "secret",
+        ],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        error_envelope(&output)["message"],
+        "mega2 browser: read operations take no credentials; --token/--token-file only apply to write operations"
+    );
+}
+
+/// A missing `--token-file` fails before any request and never falls back to
+/// `LIBRA_MEGA2_TOKEN`.
+#[test]
+fn create_dir_missing_token_file_sends_nothing() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir
+        .path()
+        .join("no-such-token")
+        .to_string_lossy()
+        .to_string();
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--json",
+            "--token-file",
+            &missing,
+        ],
+        &[("LIBRA_MEGA2_TOKEN", "envtok")],
+    );
+    assert_eq!(
+        (output.status.success(), mock.records()),
+        (false, Vec::new()),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+}
+
+/// An empty `--token-file` fails before any request and never falls back to
+/// `LIBRA_MEGA2_TOKEN`.
+#[test]
+fn create_dir_empty_token_file_sends_nothing() {
+    let mock = MockMega2::start(create_dir_clean_ok);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = token_file(dir.path(), "");
+    let output = run(
+        dir.path(),
+        &[
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--create-dir",
+            "sub",
+            "/",
+            "--json",
+            "--token-file",
+            &empty,
+        ],
+        &[("LIBRA_MEGA2_TOKEN", "envtok")],
+    );
+    assert_eq!(
+        (output.status.success(), mock.records()),
+        (false, Vec::new()),
+        "stderr: {}",
+        text(&output.stderr)
     );
 }
