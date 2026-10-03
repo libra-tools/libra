@@ -36,6 +36,37 @@ const CODEX_FORWARDED_EVENTS: &[(&str, &str)] = &[
     ("SubagentStop", "subagent-end"),
 ];
 
+const CODEX_DEFAULT_TIMEOUT_SECS: u64 = 30;
+const CODEX_DEFAULT_CAPTURE_BUDGET_MILLIS: u64 = 29_000;
+const CODEX_SESSION_END_TIMEOUT_SECS: u64 = 3;
+const CODEX_SESSION_END_CAPTURE_BUDGET_MILLIS: u64 = 2_000;
+
+fn codex_installed_timing(event: &str) -> (u64, u64) {
+    if event == "SessionEnd" {
+        (
+            CODEX_SESSION_END_TIMEOUT_SECS,
+            CODEX_SESSION_END_CAPTURE_BUDGET_MILLIS,
+        )
+    } else {
+        (
+            CODEX_DEFAULT_TIMEOUT_SECS,
+            CODEX_DEFAULT_CAPTURE_BUDGET_MILLIS,
+        )
+    }
+}
+
+/// The six Claude events the installer forwards. Kept local to the
+/// end-to-end uninstall regression so a legacy command is seeded for every
+/// provider-owned handler, not just one representative event.
+const CLAUDE_FORWARDED_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
+    ("PostToolUse", "tool-use"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
+];
+
 /// First line of every Libra-managed OpenCode plugin file (pins
 /// `LIBRA_MANAGED_MARKER` in opencode/settings.rs).
 const OPENCODE_MANAGED_MARKER: &str =
@@ -205,7 +236,7 @@ fn opencode_enable_writes_canonical_binary_path() {
 /// stable installed surface is the top-level `libra hooks codex <verb>`
 /// entry, which routes to AgentTraces; `agent hooks codex` is the legacy
 /// hidden spelling), plus one `[hooks.state."…"]` trust section per
-/// forwarded event (6) with a `sha256:` trusted_hash. A trusted install
+/// forwarded event (11) with a `sha256:` trusted_hash. A trusted install
 /// ingests session-start with no trust-gap banner; tampering one hash
 /// makes the banner name exactly one gap; disable removes the Libra
 /// hooks.json entries and config.toml state sections.
@@ -235,7 +266,10 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
         .as_object()
         .unwrap_or_else(|| panic!("hooks.json has no hooks object: {hooks_json}"));
     for (event, verb) in CODEX_FORWARDED_EVENTS {
-        let expected = format!("{canonical} hooks codex {verb}");
+        let (expected_timeout, expected_capture_budget_millis) = codex_installed_timing(event);
+        let expected = format!(
+            "{canonical} hooks codex {verb} --capture-budget-ms {expected_capture_budget_millis}"
+        );
         let found = events
             .get(*event)
             .and_then(Value::as_array)
@@ -245,6 +279,7 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
                         handlers.iter().any(|handler| {
                             handler["type"] == json!("command")
                                 && handler["command"] == json!(expected.clone())
+                                && handler["timeout"] == json!(expected_timeout)
                         })
                     })
                 })
@@ -295,7 +330,13 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
     })
     .to_string();
     let out = repo.run(
-        &["hooks", "codex", "session-start"],
+        &[
+            "hooks",
+            "codex",
+            "session-start",
+            "--capture-budget-ms",
+            "29000",
+        ],
         Some(&envelope),
         codex_env,
     );
@@ -319,7 +360,13 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
     std::fs::write(&config_path, &tampered).expect("write tampered config.toml");
 
     let out = repo.run(
-        &["hooks", "codex", "session-start"],
+        &[
+            "hooks",
+            "codex",
+            "session-start",
+            "--capture-budget-ms",
+            "29000",
+        ],
         Some(&envelope),
         codex_env,
     );
@@ -335,19 +382,49 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
         describe(&out)
     );
 
-    // Repair trust before disabling: `hooks_are_installed` fails closed on
-    // trust gaps ("installed but untrusted" reads as not installed), so a
-    // disable issued against the tampered config would skip the uninstall.
-    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
-    assert!(out.status.success(), "re-enable codex: {}", describe(&out));
+    // The tampered trust state makes strict status fail closed. Keep a user
+    // handler alongside the still-canonical Libra entries as the preservation
+    // control: disable must remove only handlers with durable ownership proof
+    // and their matching trust sections without first repairing trust.
+    let mut hooks_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&hooks_path)
+            .unwrap_or_else(|err| panic!("read hooks.json to seed user handler: {err}")),
+    )
+    .expect("installed hooks.json still parses");
+    let events = hooks_json["hooks"]
+        .as_object_mut()
+        .expect("hooks.json has mutable hooks object");
+    events
+        .get_mut("SessionStart")
+        .and_then(Value::as_array_mut)
+        .expect("SessionStart groups")
+        .push(json!({
+            "matcher": "user-owned",
+            "hooks": [{"type": "command", "command": "echo keep-codex-user"}],
+        }));
+    std::fs::write(
+        &hooks_path,
+        serde_json::to_string_pretty(&hooks_json).expect("render hooks.json with user handler"),
+    )
+    .expect("seed canonical Codex commands and user hook");
 
-    // Disable removes the Libra hooks.json entries and every trust section.
+    // Disable removes stale, untrusted but durably-owned Libra entries and
+    // every matching trust section without touching the user-owned handler.
     let out = repo.run(&["agent", "disable", "--agent", "codex"], None, codex_env);
     assert!(out.status.success(), "disable codex: {}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hooks not installed or stale"),
+        "the tampered config must fail strict status before cleanup: {}",
+        describe(&out)
+    );
     let hooks_after = std::fs::read_to_string(&hooks_path).expect("hooks.json is never deleted");
     assert!(
         !hooks_after.contains(" hooks codex "),
-        "disable must remove every Libra-managed handler:\n{hooks_after}"
+        "disable must remove every durably-owned Libra handler:\n{hooks_after}"
+    );
+    assert!(
+        hooks_after.contains("echo keep-codex-user"),
+        "disable must preserve the user-owned handler:\n{hooks_after}"
     );
     let config_after = std::fs::read_to_string(&config_path).expect("config.toml still readable");
     assert!(
@@ -357,5 +434,345 @@ fn codex_enable_writes_canonical_binary_path_and_trust_entries() {
     assert!(
         !config_after.contains("libra-managed codex hook trust entry"),
         "disable must remove the Libra marker comments:\n{config_after}"
+    );
+}
+
+/// A failed installation-state probe is not the same as a valid stale
+/// configuration. In particular, Codex removal edits `hooks.json` before its
+/// separate `config.toml` trust-state rewrite, so `agent disable` must reject
+/// malformed trust state before either file is changed. The preceding Codex
+/// regression keeps the complementary valid-but-stale cleanup case pinned.
+#[test]
+fn codex_disable_rejects_malformed_trust_config_without_partial_mutation() {
+    let repo = HookRepo::init();
+    let codex_home = repo.home.join(".codex");
+    let codex_home_str = codex_home.display().to_string();
+    let codex_env: &[(&str, &str)] = &[("CODEX_HOME", codex_home_str.as_str())];
+    let hooks_path = codex_home.join("hooks.json");
+    let config_path = codex_home.join("config.toml");
+
+    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
+    assert!(out.status.success(), "enable Codex: {}", describe(&out));
+    let hooks_before = std::fs::read_to_string(&hooks_path).expect("read installed hooks.json");
+    let malformed_config = "[hooks.state\ntrusted_hash = \"unterminated table\"\n";
+    std::fs::write(&config_path, malformed_config).expect("seed malformed Codex config.toml");
+
+    let out = repo.run(&["agent", "disable", "--agent", "codex"], None, codex_env);
+    assert!(
+        !out.status.success(),
+        "malformed Codex trust state must fail before cleanup: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to inspect 'codex' hook installation state before disabling")
+            && stderr.contains("invalid Codex config TOML"),
+        "the error must identify the failed preflight, not claim cleanup: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hooks_path).expect("read hooks after failed disable"),
+        hooks_before,
+        "hooks.json must remain byte-stable when config preflight fails"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config after failed disable"),
+        malformed_config,
+        "config.toml must remain byte-stable when preflight fails"
+    );
+}
+
+/// Enable is the same coupled two-file operation as disable. A malformed
+/// pre-existing trust config must therefore reject the command before it can
+/// add any managed handler to an otherwise valid user hooks.json.
+#[test]
+fn codex_enable_rejects_malformed_trust_config_without_partial_mutation() {
+    let repo = HookRepo::init();
+    let codex_home = repo.home.join(".codex");
+    let codex_home_str = codex_home.display().to_string();
+    let codex_env: &[(&str, &str)] = &[("CODEX_HOME", codex_home_str.as_str())];
+    let hooks_path = codex_home.join("hooks.json");
+    let config_path = codex_home.join("config.toml");
+    std::fs::create_dir_all(&codex_home).expect("create Codex home");
+    let user_hooks = b"{\n  \"hooks\": {\n    \"SessionStart\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo keep-user-hook\"}]}]\n  }\n}\n";
+    let malformed_config = b"[hooks.state\ntrusted_hash = \"unterminated table\"\n";
+    std::fs::write(&hooks_path, user_hooks).expect("seed user hooks.json");
+    std::fs::write(&config_path, malformed_config).expect("seed malformed config.toml");
+
+    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
+    assert!(
+        !out.status.success(),
+        "malformed Codex config must reject enable before publishing hooks: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid Codex config TOML"),
+        "the error must identify the configuration preflight: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        std::fs::read(&hooks_path).expect("read hooks after failed enable"),
+        user_hooks,
+        "hooks.json must remain byte-stable after failed enable",
+    );
+    assert_eq!(
+        std::fs::read(&config_path).expect("read config after failed enable"),
+        malformed_config,
+        "config.toml must remain byte-stable after failed enable",
+    );
+}
+
+/// A marker-owned command with an old executable is valid cleanup input but
+/// intentionally reads as status-stale. That `Ok(false)` status must not
+/// bypass Codex's own two-file preflight: malformed trust config still has to
+/// stop removal before `hooks.json` is published.
+#[test]
+fn codex_disable_keeps_stale_managed_hooks_when_trust_config_is_malformed() {
+    let repo = HookRepo::init();
+    let codex_home = repo.home.join(".codex");
+    let codex_home_str = codex_home.display().to_string();
+    let codex_env: &[(&str, &str)] = &[("CODEX_HOME", codex_home_str.as_str())];
+    let hooks_path = codex_home.join("hooks.json");
+    let config_path = codex_home.join("config.toml");
+
+    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
+    assert!(out.status.success(), "enable Codex: {}", describe(&out));
+    let mut hooks: Value = serde_json::from_str(
+        &std::fs::read_to_string(&hooks_path).expect("read installed hooks.json"),
+    )
+    .expect("parse installed hooks.json");
+    let stale_handler = &mut hooks["hooks"]["SessionStart"][0]["hooks"][0];
+    assert_eq!(stale_handler["statusMessage"], json!("libra capture"));
+    stale_handler["command"] =
+        json!("/stale/libra hooks codex session-start --capture-budget-ms 29000");
+    std::fs::write(
+        &hooks_path,
+        serde_json::to_string_pretty(&hooks).expect("render stale managed hooks.json"),
+    )
+    .expect("seed stale managed handler");
+    let hooks_before = std::fs::read_to_string(&hooks_path).expect("read stale hooks.json");
+    let malformed_config = "[hooks.state\ntrusted_hash = \"unterminated table\"\n";
+    std::fs::write(&config_path, malformed_config).expect("seed malformed Codex config.toml");
+
+    let out = repo.run(&["agent", "disable", "--agent", "codex"], None, codex_env);
+    assert!(
+        !out.status.success(),
+        "stale Codex cleanup with malformed config must fail before mutation: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to disable 'codex'")
+            && stderr.contains("invalid Codex config TOML"),
+        "provider-local config preflight must surface its error: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hooks_path).expect("read hooks after failed disable"),
+        hooks_before,
+        "the stale, marker-owned handler must remain when config preparation fails"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config after failed disable"),
+        malformed_config,
+        "config.toml must remain byte-stable when preparation fails"
+    );
+}
+
+/// A Claude settings file that resembles a pre-capture-budget installer does
+/// not carry the timeout/budget ownership proof required by current cleanup.
+/// Strict status reports it as stale, but `agent disable` must preserve those
+/// unverified entries as well as a neighbouring user hook.
+#[test]
+fn claude_disable_preserves_unverified_legacy_commands_and_user_hook() {
+    let repo = HookRepo::init();
+    let settings_path = repo.repo.join(".claude/settings.json");
+
+    let out = repo.run(&["agent", "enable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "enable Claude: {}", describe(&out));
+
+    let mut settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(&settings_path)
+            .unwrap_or_else(|err| panic!("read installed Claude settings: {err}")),
+    )
+    .expect("installed Claude settings parse");
+    {
+        let hooks = settings["hooks"]
+            .as_object_mut()
+            .expect("Claude settings have mutable hooks object");
+        let mut legacy_commands = 0;
+        for matchers in hooks.values_mut() {
+            for matcher in matchers.as_array_mut().into_iter().flatten() {
+                for hook in matcher["hooks"].as_array_mut().into_iter().flatten() {
+                    let Some(command) = hook["command"].as_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if command.contains(" hooks claude ") {
+                        let legacy = command
+                            .strip_suffix(" --capture-budget-ms 9000")
+                            .unwrap_or_else(|| {
+                                panic!("expected current Claude capture budget in '{command}'")
+                            });
+                        hook["command"] = json!(legacy);
+                        legacy_commands += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            legacy_commands,
+            CLAUDE_FORWARDED_EVENTS.len(),
+            "every managed Claude command must exercise the no-budget legacy shape"
+        );
+        hooks
+            .get_mut("SessionStart")
+            .and_then(Value::as_array_mut)
+            .expect("Claude SessionStart matchers")
+            .push(json!({
+                "matcher": "user-owned",
+                "hooks": [{"type": "command", "command": "echo keep-claude-user", "timeout": 1}],
+            }));
+    }
+    let seeded_settings =
+        serde_json::to_string_pretty(&settings).expect("render legacy Claude settings");
+    std::fs::write(&settings_path, &seeded_settings)
+        .expect("seed legacy Claude commands and user hook");
+
+    let out = repo.run(&["agent", "disable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "disable Claude: {}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hooks not installed or stale"),
+        "the no-budget Claude config must fail strict status before cleanup: {}",
+        describe(&out)
+    );
+    let settings_after =
+        std::fs::read_to_string(&settings_path).expect("Claude settings remain readable");
+    assert!(
+        settings_after.contains(" hooks claude "),
+        "disable must not claim legacy Claude handlers without a budget proof:\n{settings_after}"
+    );
+    assert!(
+        settings_after.contains("echo keep-claude-user"),
+        "disable must preserve the user-owned Claude hook:\n{settings_after}"
+    );
+    assert_eq!(
+        settings_after, seeded_settings,
+        "disable must not rewrite settings containing only unverified legacy and user hooks"
+    );
+}
+
+/// The exact hook command is a public surface, so it alone cannot prove
+/// ownership. Re-enable and disable must preserve a user-scoped Claude
+/// handler and an unmarked *renamed* Codex handler lacking persistent
+/// installer provenance.
+#[test]
+fn enable_and_disable_preserve_scoped_or_unmarked_renamed_user_hook_commands() {
+    let repo = HookRepo::init();
+    let canonical = canonical_binary_path();
+
+    let claude_path = repo.repo.join(".claude/settings.json");
+    let claude_command = format!("{canonical} hooks claude session-start --capture-budget-ms 9000");
+    let out = repo.run(&["agent", "enable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "enable Claude: {}", describe(&out));
+    let mut claude_settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(&claude_path)
+            .unwrap_or_else(|err| panic!("read Claude settings: {err}")),
+    )
+    .expect("Claude settings parse");
+    claude_settings["hooks"]["SessionStart"]
+        .as_array_mut()
+        .expect("Claude SessionStart matchers")
+        .push(json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": claude_command.clone(), "timeout": 10}],
+        }));
+    std::fs::write(
+        &claude_path,
+        serde_json::to_string_pretty(&claude_settings).expect("render Claude settings"),
+    )
+    .expect("seed scoped Claude user hook");
+    let out = repo.run(&["agent", "enable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "re-enable Claude: {}", describe(&out));
+    let out = repo.run(&["agent", "disable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "disable Claude: {}", describe(&out));
+    let claude_after = std::fs::read_to_string(&claude_path).expect("read Claude settings");
+    assert!(
+        claude_after.contains("\"matcher\": \"Bash\"") && claude_after.contains(&claude_command),
+        "enable/disable must preserve the scoped Claude user hook:\n{claude_after}"
+    );
+
+    let codex_home = repo.home.join(".codex");
+    let codex_home_str = codex_home.display().to_string();
+    let codex_env: &[(&str, &str)] = &[("CODEX_HOME", codex_home_str.as_str())];
+    let hooks_path = codex_home.join("hooks.json");
+    let codex_command = format!("{canonical} hooks codex session-start --capture-budget-ms 29000");
+    let unmarked_renamed_codex_command =
+        "/opt/user-capture-hook hooks codex session-start --capture-budget-ms 29000";
+    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
+    assert!(out.status.success(), "enable Codex: {}", describe(&out));
+    let mut codex_hooks: Value = serde_json::from_str(
+        &std::fs::read_to_string(&hooks_path)
+            .unwrap_or_else(|err| panic!("read Codex hooks: {err}")),
+    )
+    .expect("Codex hooks parse");
+    let session_start = codex_hooks["hooks"]["SessionStart"]
+        .as_array_mut()
+        .expect("Codex SessionStart groups");
+    session_start.push(json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": codex_command.clone(),
+            "timeout": 30,
+            "statusMessage": "libra capture",
+        }],
+    }));
+    session_start.push(json!({
+        "hooks": [{
+            "type": "command",
+            "command": unmarked_renamed_codex_command,
+            "timeout": 30,
+        }],
+    }));
+    std::fs::write(
+        &hooks_path,
+        serde_json::to_string_pretty(&codex_hooks).expect("render Codex hooks"),
+    )
+    .expect("seed Codex user hooks");
+    let out = repo.run(&["agent", "enable", "--agent", "codex"], None, codex_env);
+    assert!(out.status.success(), "re-enable Codex: {}", describe(&out));
+    let out = repo.run(&["agent", "disable", "--agent", "codex"], None, codex_env);
+    assert!(out.status.success(), "disable Codex: {}", describe(&out));
+    let codex_after: Value = serde_json::from_str(
+        &std::fs::read_to_string(&hooks_path)
+            .unwrap_or_else(|err| panic!("read Codex hooks after disable: {err}")),
+    )
+    .expect("Codex hooks remain valid JSON");
+    let surviving_groups = codex_after["hooks"]["SessionStart"]
+        .as_array()
+        .expect("Codex SessionStart groups remain");
+    assert!(
+        surviving_groups.iter().any(|group| {
+            group["matcher"] == json!("Bash")
+                && group["hooks"].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook["command"] == json!(codex_command.clone())
+                            && hook["statusMessage"] == json!("libra capture")
+                    })
+                })
+        }),
+        "enable/disable must preserve the scoped Codex user hook: {codex_after}"
+    );
+    assert!(
+        surviving_groups.iter().any(|group| {
+            group.get("matcher").is_none()
+                && group["hooks"].as_array().is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook["command"] == json!(unmarked_renamed_codex_command)
+                            && hook.get("statusMessage").is_none()
+                    })
+                })
+        }),
+        "enable/disable must preserve the unmarked Codex user hook: {codex_after}"
     );
 }

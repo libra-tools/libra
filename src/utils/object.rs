@@ -10,13 +10,30 @@ use std::{
 };
 
 use flate2::read::ZlibDecoder;
-use git_internal::{errors::GitError, hash::ObjectHash};
+use git_internal::{errors::GitError, hash::ObjectHash, utils::HashAlgorithm};
 
 use crate::utils::atomic_write::{self, ensure_dir_exists};
 
 const STALE_LOOSE_OBJECT_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(target_os = "linux")]
 const MAX_STALE_LOOSE_OBJECT_TEMPS_PER_WRITE: usize = 64;
+
+/// macOS exposes a few fixed system paths through root-level aliases.  The
+/// descriptor-relative walkers below must not follow repository-controlled
+/// symlinks, but rejecting these OS-owned aliases would make an ordinary
+/// repository under `/tmp` unusable (`/tmp` is `/private/tmp` on macOS).
+#[cfg(target_os = "macos")]
+fn normalize_macos_system_directory_alias(path: &Path) -> std::path::PathBuf {
+    for (alias, canonical) in [
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+        (Path::new("/var"), Path::new("/private/var")),
+    ] {
+        if let Ok(suffix) = path.strip_prefix(alias) {
+            return canonical.join(suffix);
+        }
+    }
+    path.to_path_buf()
+}
 
 #[cfg(target_os = "linux")]
 fn loose_object_temp_name_is_valid(name: &str) -> bool {
@@ -95,22 +112,17 @@ fn prepare_loose_object_temp_dir(
 }
 
 #[cfg(unix)]
-fn open_directory_tree_no_follow(path: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn open_directory_tree_no_follow(path: &Path) -> std::io::Result<fs::File> {
     use std::{
         ffi::CString,
         os::{fd::AsRawFd, unix::ffi::OsStrExt},
         path::Component,
     };
 
-    // macOS exposes the system temporary directory through `/var`, which is
-    // a symlink to `/private/var`. Keep the no-follow walk strict for every
-    // repository-controlled component, but normalize this fixed OS alias so
-    // descriptor-relative checkpoint writes work with `tempfile::TempDir`.
+    // Keep the no-follow walk strict for every repository-controlled
+    // component, but normalize fixed macOS system aliases first.
     #[cfg(target_os = "macos")]
-    let path = path
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| path.to_path_buf());
+    let path = normalize_macos_system_directory_alias(path);
 
     let start = if path.is_absolute() { "/" } else { "." };
     let start = CString::new(start).map_err(|_| {
@@ -161,6 +173,123 @@ fn open_directory_tree_no_follow(path: &Path) -> std::io::Result<fs::File> {
         current = unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(next) };
     }
     Ok(current)
+}
+
+/// Open a direct child directory from a descriptor-pinned parent without
+/// following a symlink. Diagnostic readers use this after enumerating names
+/// so an attacker cannot replace a listed entry before its contents are read.
+#[cfg(unix)]
+pub(crate) fn open_directory_at_no_follow(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory name contains NUL",
+        )
+    })?;
+    // SAFETY: parent is a live directory descriptor and name is a
+    // NUL-terminated single path component.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is freshly returned by openat and transferred once.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "directory entry changed type while opening",
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a direct child regular file from a descriptor-pinned parent without
+/// following a symlink. `O_NONBLOCK` prevents a hostile FIFO from stalling a
+/// foreground diagnostic if an OS/filesystem does not reject it at open.
+#[cfg(unix)]
+pub(crate) fn open_regular_file_at_no_follow(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name contains NUL")
+    })?;
+    // SAFETY: parent is a live directory descriptor and name is a
+    // NUL-terminated single path component.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is freshly returned by openat and transferred once.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file entry is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_directory_tree_no_follow(_path: &Path) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure descriptor-relative reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_directory_at_no_follow(
+    _parent: &fs::File,
+    _name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure descriptor-relative reads are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_regular_file_at_no_follow(
+    _parent: &fs::File,
+    _name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure descriptor-relative reads are unavailable on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -223,10 +352,7 @@ fn open_or_create_directory_tree_no_follow(
     use std::path::Component;
 
     #[cfg(target_os = "macos")]
-    let path = path
-        .strip_prefix("/var")
-        .map(|suffix| Path::new("/private/var").join(suffix))
-        .unwrap_or_else(|_| path.to_path_buf());
+    let path = normalize_macos_system_directory_alias(path);
 
     let mut current = open_directory_tree_no_follow(if path.is_absolute() {
         Path::new("/")
@@ -544,13 +670,25 @@ pub(crate) fn read_git_object_bounded_validated(
     hash: &ObjectHash,
     max_content_bytes: u64,
 ) -> Result<(String, Vec<u8>), GitError> {
-    const HEADER_MAX: usize = 64;
     let hash_str = hash.to_string();
     let object_path = git_dir
         .join("objects")
         .join(&hash_str[..2])
         .join(&hash_str[2..]);
     let file = fs::File::open(object_path)?;
+    read_git_object_bounded_validated_file(file, hash, max_content_bytes)
+}
+
+/// Validate and decode a bounded loose object that was already opened by a
+/// caller. Keeping the descriptor lets a security-sensitive caller perform
+/// its own no-follow directory walk and prevents a pathname swap between the
+/// ownership check and decompression.
+pub(crate) fn read_git_object_bounded_validated_file(
+    file: fs::File,
+    hash: &ObjectHash,
+    max_content_bytes: u64,
+) -> Result<(String, Vec<u8>), GitError> {
+    const HEADER_MAX: usize = 64;
     let mut decoder = ZlibDecoder::new(file);
     let mut header = Vec::with_capacity(HEADER_MAX);
     let mut byte = [0_u8; 1];
@@ -610,6 +748,179 @@ pub(crate) fn read_git_object_bounded_validated(
         )));
     }
     Ok((object_type.to_string(), content))
+}
+
+/// Stream-validate an already-opened loose object without materializing its
+/// payload. This is for metadata-only callers that still need an
+/// object-index size they can trust: the declared loose-object header is
+/// bounded, the payload is streamed under `max_content_bytes`, and the
+/// complete canonical object hash must match `hash` before the size is
+/// returned.
+///
+/// Keeping the caller's descriptor is important for security-sensitive
+/// diagnostics: no pathname is re-opened between a no-follow ownership check
+/// and the integrity check, and a transcript never becomes an in-memory
+/// buffer just because doctor needs to repair its index row.
+pub(crate) fn validate_git_object_streaming_file(
+    file: fs::File,
+    hash: &ObjectHash,
+    max_content_bytes: u64,
+) -> Result<(String, u64), GitError> {
+    const HEADER_MAX: usize = 64;
+    const STREAM_BUFFER_BYTES: usize = 32 * 1024;
+
+    let mut decoder = ZlibDecoder::new(file);
+    let mut header = Vec::with_capacity(HEADER_MAX);
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = decoder.read(&mut byte)?;
+        if read == 0 {
+            return Err(GitError::InvalidObjectInfo(
+                "object stream ended before the header terminator".to_string(),
+            ));
+        }
+        if byte[0] == 0 {
+            break;
+        }
+        if header.len() == HEADER_MAX {
+            return Err(GitError::InvalidObjectInfo(
+                "object header exceeds the maximum size (corrupt object)".to_string(),
+            ));
+        }
+        header.push(byte[0]);
+    }
+    let header_text = std::str::from_utf8(&header).map_err(|error| {
+        GitError::InvalidObjectInfo(format!("object header is not UTF-8: {error}"))
+    })?;
+    let (object_type, declared_size) = header_text.split_once(' ').ok_or_else(|| {
+        GitError::InvalidObjectInfo("object header is missing type/size".to_string())
+    })?;
+    let declared_size = declared_size.parse::<u64>().map_err(|error| {
+        GitError::InvalidObjectInfo(format!("object header has invalid size: {error}"))
+    })?;
+    if declared_size > max_content_bytes {
+        return Err(GitError::InvalidObjectInfo(format!(
+            "object declares {declared_size} bytes, exceeding the {max_content_bytes}-byte streaming validation limit"
+        )));
+    }
+
+    let mut hasher = HashAlgorithm::new_for_kind(hash.kind());
+    hasher.update(&header);
+    hasher.update(&[0]);
+    let mut remaining = declared_size;
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    while remaining > 0 {
+        let to_read = usize::try_from(remaining.min(STREAM_BUFFER_BYTES as u64)).map_err(|_| {
+            GitError::InvalidObjectInfo("object size exceeds this platform".to_string())
+        })?;
+        let read = decoder.read(&mut buffer[..to_read])?;
+        if read == 0 {
+            return Err(GitError::InvalidObjectInfo(
+                "object payload ended before its declared size".to_string(),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if decoder.read(&mut extra)? != 0 {
+        return Err(GitError::InvalidObjectInfo(
+            "object payload exceeds its declared size".to_string(),
+        ));
+    }
+    let actual_hash = hasher.finalize_object_hash();
+    if &actual_hash != hash {
+        return Err(GitError::InvalidObjectInfo(format!(
+            "loose object content hashes to {actual_hash}, expected {hash}"
+        )));
+    }
+    Ok((object_type.to_string(), declared_size))
+}
+
+/// Open a local loose object without following any repository-controlled
+/// directory or final-file symlink. This is intentionally separate from the
+/// ordinary object reader: most Git operations retain compatibility with
+/// existing storage layouts, while diagnostics that may later repair/index an
+/// object need a provenance-tight descriptor.
+#[cfg(unix)]
+pub(crate) fn open_local_loose_object_no_follow(
+    git_dir: &Path,
+    hash: &ObjectHash,
+) -> std::io::Result<fs::File> {
+    use std::{
+        ffi::{CString, OsStr},
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let object_root = open_directory_tree_no_follow(&git_dir.join("objects"))?;
+    let hash = hash.to_string();
+    // INVARIANT: ObjectHash formatting is lowercase ASCII hex, so both
+    // descriptor-relative path components are fixed safe names.
+    let shard = CString::new(OsStr::new(&hash[..2]).as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid loose-object shard",
+        )
+    })?;
+    // SAFETY: object_root is a live directory descriptor and shard is a
+    // NUL-terminated component with no slash or traversal syntax.
+    let shard_fd = unsafe {
+        libc::openat(
+            object_root.as_raw_fd(),
+            shard.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if shard_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: shard_fd is freshly returned by openat and transferred once.
+    let shard = unsafe { fs::File::from_raw_fd(shard_fd) };
+    let leaf = CString::new(OsStr::new(&hash[2..]).as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid loose-object name",
+        )
+    })?;
+    // O_NONBLOCK ensures a malicious replacement cannot make a diagnostic
+    // block on a FIFO even if the filesystem ignores O_NOFOLLOW semantics.
+    // SAFETY: shard is live and leaf is a NUL-terminated safe component.
+    let object_fd = unsafe {
+        libc::openat(
+            shard.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if object_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: object_fd is freshly returned by openat and transferred once.
+    let file = unsafe { fs::File::from_raw_fd(object_fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "loose object is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// There is no cross-platform descriptor-relative no-follow primitive in the
+/// standard library. A doctor scan must fail closed rather than use a
+/// path-check-then-open sequence that a local attacker can race.
+#[cfg(not(unix))]
+pub(crate) fn open_local_loose_object_no_follow(
+    _git_dir: &Path,
+    _hash: &ObjectHash,
+) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure loose-object reads are unavailable on this platform",
+    ))
 }
 
 /// Helper function to write a git object to the object database.
@@ -1005,8 +1316,8 @@ mod bounded_read_tests {
     use super::scavenge_stale_loose_object_temps_in_dir;
     use super::{
         git_object_hash, read_git_object_bounded, reset_test_loose_object_sync_calls,
-        test_loose_object_sync_calls, write_git_object, write_git_object_with_status,
-        write_git_object_with_status_inner,
+        test_loose_object_sync_calls, validate_git_object_streaming_file, write_git_object,
+        write_git_object_with_status, write_git_object_with_status_inner,
     };
 
     /// Bounded reads never return more than the cap, flag truncation only
@@ -1045,6 +1356,29 @@ mod bounded_read_tests {
         assert_eq!(got.len(), 100);
     }
 
+    #[test]
+    fn streaming_validation_proves_held_object_size_without_materializing_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git_dir = dir.path();
+        std::fs::create_dir_all(git_dir.join("objects")).expect("objects directory");
+        let content = vec![b'x'; 96 * 1024];
+        let oid = write_git_object(git_dir, "blob", &content).expect("write loose object");
+        let oid_text = oid.to_string();
+        let file = std::fs::File::open(
+            git_dir
+                .join("objects")
+                .join(&oid_text[..2])
+                .join(&oid_text[2..]),
+        )
+        .expect("open loose object");
+
+        assert_eq!(
+            validate_git_object_streaming_file(file, &oid, content.len() as u64)
+                .expect("stream-validate held object"),
+            ("blob".to_string(), content.len() as u64)
+        );
+    }
+
     /// Zero-cap reads flag truncation for any non-empty object and never
     /// allocate content.
     #[test]
@@ -1078,6 +1412,33 @@ mod bounded_read_tests {
         assert!(
             error.to_string().contains("corrupt or does not match"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writer_accepts_the_fixed_tmp_system_alias_without_following_repo_paths() {
+        // macOS implements /tmp as the OS-owned /private/tmp symlink. A
+        // descriptor-relative walk must normalize that one fixed alias while
+        // continuing to reject symlinks below the repository root.
+        let dir = tempfile::Builder::new()
+            .prefix("libra-object-tmp-alias-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let alias = std::path::Path::new("/tmp").join(dir.path().file_name().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(&alias).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+
+        let (hash, created) = write_git_object_with_status(&alias, "blob", b"tmp alias").unwrap();
+        assert!(created);
+        assert!(
+            alias
+                .join("objects")
+                .join(&hash.to_string()[..2])
+                .join(&hash.to_string()[2..])
+                .is_file()
         );
     }
 

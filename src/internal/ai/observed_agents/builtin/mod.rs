@@ -13,8 +13,8 @@ pub mod stable_promoted;
 
 pub use claude_code::{
     ClaudeCodeObservedAgent, FlushOutcome, claude_project_slug, claude_session_dir,
-    claude_session_id_is_safe_path_component, flush_wait, resolve_session_file,
-    rfc3339_boundary_for_unix_seconds, write_truncated_transcript,
+    claude_session_file_candidate, claude_session_id_is_safe_path_component, flush_wait,
+    resolve_session_file, rfc3339_boundary_for_unix_seconds, write_truncated_transcript,
 };
 pub use gemini::GeminiObservedAgent;
 pub use stable_promoted::{

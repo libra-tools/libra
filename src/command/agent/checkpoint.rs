@@ -1,6 +1,7 @@
 //! `libra agent checkpoint …` subcommands. V1 ships read-only `list` /
-//! `show`; `rewind --apply` restores the worktree and dispatches optional
-//! transcript truncation for agent kinds that implement `TranscriptTruncator`.
+//! `show`; `rewind --apply` restores the worktree. Provider transcript
+//! rewinding is intentionally disabled until it has an atomic,
+//! identity-checked replacement primitive.
 
 use std::path::Path;
 
@@ -15,10 +16,13 @@ use git_internal::{
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
 
-use super::{CheckpointListArgs, CheckpointRewindArgs, CheckpointShowArgs, CheckpointSubcommand};
+use super::{
+    CheckpointListArgs, CheckpointRewindArgs, CheckpointShowArgs, CheckpointSubcommand,
+    capture_source::{DerivedTranscriptSource, resolve_derived_transcript_source},
+};
 use crate::{
     command::load_object,
-    internal::{ai::traces::parse_content_hash, db::get_db_conn_instance},
+    internal::db::get_db_conn_instance,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         object::read_git_object_bounded,
@@ -50,6 +54,51 @@ struct CheckpointRow {
     metadata_blob_oid: String,
     traces_commit: String,
     created_at: i64,
+}
+
+/// The deliberately narrow default representation returned by `checkpoint
+/// show`.  The catalog row contains object identifiers and the metadata blob
+/// can contain provider-derived, redaction, or recovery details; neither is a
+/// safe default-display contract.  Keep this as an explicit whitelist rather
+/// than serializing a `CheckpointRow` and trying to redact fields afterwards.
+#[derive(Debug, Serialize)]
+struct CheckpointShowSummary {
+    checkpoint_id: String,
+    scope: CheckpointShowScope,
+    created_at: i64,
+    parent_snapshot_recorded: bool,
+}
+
+/// `agent_checkpoint.scope` is constrained by the current schema, but old or
+/// damaged local databases must not turn an arbitrary stored string into
+/// default CLI output.  Preserve only the closed public vocabulary.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointShowScope {
+    Temporary,
+    Committed,
+    Subagent,
+    Unknown,
+}
+
+impl CheckpointShowScope {
+    fn from_catalog(value: Option<&str>) -> Self {
+        match value {
+            Some("temporary") => Self::Temporary,
+            Some("committed") => Self::Committed,
+            Some("subagent") => Self::Subagent,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Temporary => "temporary",
+            Self::Committed => "committed",
+            Self::Subagent => "subagent",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,8 +288,7 @@ async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> 
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             backend,
-            "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
-                    metadata_blob_oid, traces_commit, created_at \
+            "SELECT scope, parent_commit, created_at \
              FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
             [args.checkpoint_id.clone().into()],
         ))
@@ -248,27 +296,28 @@ async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> 
         .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
     match row {
         Some(row) => {
-            let payload = CheckpointRow {
-                checkpoint_id: row.try_get_by("checkpoint_id").unwrap_or_default(),
-                session_id: row.try_get_by("session_id").unwrap_or_default(),
-                scope: row.try_get_by("scope").unwrap_or_default(),
-                parent_commit: row.try_get_by("parent_commit").ok().flatten(),
-                tree_oid: row.try_get_by("tree_oid").unwrap_or_default(),
-                metadata_blob_oid: row.try_get_by("metadata_blob_oid").unwrap_or_default(),
-                traces_commit: row.try_get_by("traces_commit").unwrap_or_default(),
-                created_at: row.try_get_by("created_at").unwrap_or_default(),
+            let parent_commit: Option<String> = row
+                .try_get_by("parent_commit")
+                .map_err(|_| checkpoint_show_store_inconsistent())?;
+            let created_at: i64 = row
+                .try_get_by("created_at")
+                .map_err(|_| checkpoint_show_store_inconsistent())?;
+            let scope: String = row
+                .try_get_by("scope")
+                .map_err(|_| checkpoint_show_store_inconsistent())?;
+            let summary = CheckpointShowSummary {
+                // The command's positional identifier is the only identity
+                // deliberately echoed by this read operation.  Do not take
+                // additional arbitrary identity strings from the catalog.
+                checkpoint_id: args.checkpoint_id,
+                // An unknown *textual* scope is deliberately projected into
+                // the closed `unknown` vocabulary; a failed DB decode is a
+                // store inconsistency and must not look like that safe case.
+                scope: CheckpointShowScope::from_catalog(Some(&scope)),
+                created_at,
+                parent_snapshot_recorded: parent_commit.is_some_and(|value| !value.is_empty()),
             };
-            // Best-effort metadata blob load: if the user is in a libra
-            // workspace, read the metadata.json blob and surface it; if
-            // path resolution fails (e.g. running from outside any libra
-            // repo), fall back to the row-only render rather than erroring.
-            let metadata = load_metadata_blob(&payload.metadata_blob_oid).ok();
-            // Metadata-first layout classification (AG-20): walk the
-            // checkpoint tree + manifest only — transcript blob bodies are
-            // NEVER read here. Any resolution failure degrades to layout
-            // "unknown" instead of failing the show.
-            let layout = summarize_checkpoint_layout(&payload);
-            emit_one(&payload, metadata.as_deref(), &layout, output)
+            emit_one(&summary, output)
         }
         None => Err(CliError::fatal(format!(
             "no checkpoint matches id '{}'",
@@ -277,14 +326,21 @@ async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> 
     }
 }
 
+fn checkpoint_show_store_inconsistent() -> CliError {
+    CliError::fatal(
+        "checkpoint catalog row is inconsistent; run `libra agent doctor` to inspect the store",
+    )
+    .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
+}
+
 /// `libra agent checkpoint rewind <id> [--dry-run|--apply]`.
 ///
 /// `dry-run` (the default when neither flag is set) lists the files the
 /// checkpoint's `parent_commit` snapshot would restore, without touching the
 /// worktree. `--apply` actually runs the worktree restore (delegating to the
-/// existing `restore --source <parent_commit>` path), truncates supported
-/// agent transcripts when possible, and leaves HEAD plus `refs/heads/*`
-/// untouched per `docs/development/commands/_general.md` §7.3.
+/// existing `restore --source <parent_commit>` path), leaves provider
+/// transcripts untouched, and leaves HEAD plus `refs/heads/*` untouched per
+/// `docs/development/commands/_general.md` §7.3.
 async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<()> {
     let conn = get_db_conn_instance().await;
     if !table_exists(&conn, "agent_checkpoint").await? {
@@ -352,11 +408,9 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
             .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
     })?;
 
-    // Codex round-2 follow-up: report `transcript_truncation_supported`
-    // based on the actual `agent_kind` for this checkpoint, not a flat
-    // `true`. Only `claude_code` has a TranscriptTruncator adapter today;
-    // other kinds dispatch to `SkippedUnsupportedKind` at apply time, so
-    // dry-run should mirror that.
+    // Report whether `--apply` can safely rewrite the provider transcript.
+    // The answer is deliberately false until an identity-checked atomic
+    // replacement primitive exists; dry-run must mirror that apply policy.
     let truncation_supported = lookup_truncation_support(&conn, &args.checkpoint_id)
         .await
         .unwrap_or(false);
@@ -392,10 +446,9 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
             println!("  - {path}");
         }
         println!(
-            "Re-run with --apply to restore the working tree. For Claude \
-             Code sessions the agent's transcript will be truncated to \
-             the checkpoint boundary; other agent kinds keep the transcript \
-             untouched."
+            "Re-run with --apply to restore the working tree. Provider \
+             transcripts will remain untouched because secure, atomic \
+             identity-checked rewinding is not available."
         );
         return Ok(());
     }
@@ -425,11 +478,9 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
         .await
         .map_err(|e| CliError::fatal(format!("rewind --apply failed: {e}")))?;
 
-    // Phase 4.1 (entire.md §14.4 item 1): if the captured agent has a
-    // `TranscriptTruncator` adapter, call it to drop transcript lines
-    // whose timestamp is strictly after the checkpoint boundary. This
-    // closes the v1 caveat that the agent's local transcript was left
-    // dangling after a worktree rewind.
+    // Preserve an explicit transcript outcome alongside the successful
+    // worktree restore. The source check is read-only: provider transcript
+    // rewinding remains disabled until a secure atomic replacement exists.
     let truncation_outcome = truncate_agent_transcript_for_checkpoint(&args.checkpoint_id).await;
 
     if output.is_json() {
@@ -451,37 +502,28 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
             plan.delete.len()
         );
         match &truncation_outcome {
-            TranscriptTruncationOutcome::Truncated {
-                path,
-                lines_dropped,
-            } => {
+            TranscriptTruncationOutcome::SkippedNoDerivedSource => {
                 println!(
-                    "Truncated transcript {}: {} line(s) past the checkpoint dropped.",
-                    path, lines_dropped
+                    "Note: no verified provider transcript source is available for this \
+                     captured session; the agent's local transcript was left untouched."
                 );
             }
-            TranscriptTruncationOutcome::NoChange { path } => {
+            TranscriptTruncationOutcome::SkippedUnsafeMutation => {
                 println!(
-                    "Transcript {} already aligned with the checkpoint — no changes.",
-                    path
+                    "Note: verified provider transcript rewinding is disabled because this \
+                     platform has no atomic identity-checked replacement primitive; the \
+                     agent's local transcript was left untouched."
                 );
             }
-            TranscriptTruncationOutcome::SkippedNoPath => {
+            TranscriptTruncationOutcome::SkippedUnsupportedKind => {
                 println!(
-                    "Note: agent_session.metadata_json has no transcript_path; \
-                     the agent's local transcript was left untouched."
-                );
-            }
-            TranscriptTruncationOutcome::SkippedUnsupportedKind { agent_kind } => {
-                println!(
-                    "Note: agent_kind '{}' has no TranscriptTruncator adapter yet; \
+                    "Note: the captured agent kind has no TranscriptTruncator adapter yet; \
                      the agent's local transcript was left untouched.",
-                    agent_kind
                 );
             }
-            TranscriptTruncationOutcome::Failed { reason } => {
+            TranscriptTruncationOutcome::Failed => {
                 eprintln!(
-                    "warning: transcript truncation failed: {reason}. \
+                    "warning: transcript truncation could not inspect the captured source safely. \
                      The worktree restore succeeded; the agent's transcript file \
                      was left as-is."
                 );
@@ -496,11 +538,10 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
 /// load-bearing operation; transcript truncation is informational and a
 /// failure here should not roll back the user's tree.
 enum TranscriptTruncationOutcome {
-    Truncated { path: String, lines_dropped: usize },
-    NoChange { path: String },
-    SkippedNoPath,
-    SkippedUnsupportedKind { agent_kind: String },
-    Failed { reason: String },
+    SkippedNoDerivedSource,
+    SkippedUnsafeMutation,
+    SkippedUnsupportedKind,
+    Failed,
 }
 
 impl TranscriptTruncationOutcome {
@@ -509,54 +550,40 @@ impl TranscriptTruncationOutcome {
         // dry-run and apply outputs. `supported` here means "did the
         // truncator actually run end-to-end on this checkpoint?" — same
         // contract as `lookup_truncation_support` in the dry-run path.
-        // Skipped paths therefore report `supported: false`; only
-        // Truncated/NoChange (which exercised the adapter) and Failed
-        // (which started the adapter) report `supported: true`.
+        // Skipped paths therefore report `supported: false`. This build
+        // never writes a provider transcript without a true
+        // identity-checked atomic replacement primitive, so all normal
+        // outcomes report `supported: false`. `Failed` means catalog/source
+        // derivation could not be completed safely.
         match self {
-            Self::Truncated {
-                path,
-                lines_dropped,
-            } => serde_json::json!({
-                "supported": true,
-                "applied": true,
-                "transcript_path": path,
-                "lines_dropped": lines_dropped,
-            }),
-            Self::NoChange { path } => serde_json::json!({
-                "supported": true,
-                "applied": false,
-                "transcript_path": path,
-                "reason": "transcript already aligned with checkpoint boundary",
-            }),
-            Self::SkippedNoPath => serde_json::json!({
+            Self::SkippedNoDerivedSource => serde_json::json!({
                 "supported": false,
                 "applied": false,
-                "reason": "agent_session.metadata_json has no transcript_path",
+                "reason": "no verified provider transcript source is available for this captured session",
             }),
-            Self::SkippedUnsupportedKind { agent_kind } => serde_json::json!({
+            Self::SkippedUnsafeMutation => serde_json::json!({
                 "supported": false,
                 "applied": false,
-                "agent_kind": agent_kind,
-                "reason": "no TranscriptTruncator adapter for this agent_kind",
+                "reason": "verified provider transcript rewinding is disabled: no atomic identity-checked replacement primitive is available",
             }),
-            Self::Failed { reason } => serde_json::json!({
-                // Adapter was selected and started running but failed
-                // mid-stream (e.g. concurrent writer, bad created_at).
-                // Adapter IS supported; the apply just did not
-                // succeed.
-                "supported": true,
+            Self::SkippedUnsupportedKind => serde_json::json!({
+                "supported": false,
                 "applied": false,
-                "error": reason,
+                "reason": "no TranscriptTruncator adapter for the captured agent kind",
+            }),
+            Self::Failed => serde_json::json!({
+                "supported": false,
+                "applied": false,
+                "error": "captured session source could not be inspected safely",
             }),
         }
     }
 }
 
-/// Look up the `agent_session` row paired with `checkpoint_id`, decide
-/// whether we have an adapter for its `agent_kind`, then invoke the
-/// truncator with a boundary derived from `agent_checkpoint.created_at`.
-/// Returns the outcome rather than an error so the caller can surface a
-/// uniform message no matter the path taken.
+/// Look up the `agent_session` row paired with `checkpoint_id` and determine
+/// whether its source can be safely considered for a rewind. Returns an
+/// outcome rather than a hard error because worktree restoration remains the
+/// load-bearing operation.
 async fn truncate_agent_transcript_for_checkpoint(
     checkpoint_id: &str,
 ) -> TranscriptTruncationOutcome {
@@ -569,55 +596,15 @@ async fn truncate_agent_transcript_for_checkpoint(
 /// `transcript_truncation_supported` flag matches what `--apply` will
 /// actually do.
 ///
-/// Codex round-3 follow-up: this now considers BOTH conditions —
-/// `agent_kind == "claude_code"` AND a non-empty `transcript_path`
-/// in `metadata_json`. Previously a Claude Code session whose
-/// `metadata_json` lacked `transcript_path` would report `supported:
-/// true` but apply would short-circuit to `SkippedNoPath`,
-/// contradicting the dry-run preview.
+/// Provider transcript rewinding is deliberately disabled until the platform
+/// exposes an atomic replacement primitive that can bind the expected target
+/// identity.  Returning false here keeps dry-run faithful to `--apply` and
+/// avoids ever treating `metadata_json.transcript_path` as authority.
 async fn lookup_truncation_support(
-    conn: &sea_orm::DatabaseConnection,
-    checkpoint_id: &str,
+    _conn: &sea_orm::DatabaseConnection,
+    _checkpoint_id: &str,
 ) -> Result<bool, sea_orm::DbErr> {
-    let backend = conn.get_database_backend();
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            "SELECT s.agent_kind AS agent_kind, \
-                    COALESCE(s.metadata_json, '{}') AS metadata_json \
-             FROM agent_checkpoint cp \
-             JOIN agent_session s ON s.session_id = cp.session_id \
-             WHERE cp.checkpoint_id = ? LIMIT 1",
-            [checkpoint_id.into()],
-        ))
-        .await?;
-    let Some(r) = row else {
-        return Ok(false);
-    };
-    let kind: String = r.try_get_by("agent_kind").unwrap_or_default();
-    let metadata_json: String = r.try_get_by("metadata_json").unwrap_or_default();
-    // Dispatch the truncator-support probe through the v0.17.677
-    // capability registry instead of a literal "claude_code" match.
-    // Mirrors the dispatch path in
-    // `truncate_agent_transcript_for_checkpoint_with_conn` — both
-    // sites must answer "would the truncator fire?" the same way so
-    // the dry-run preview matches what `--apply` actually does.
-    use crate::internal::ai::observed_agents::{AgentKind, truncator_for};
-    let truncator_available = AgentKind::from_db_str(&kind)
-        .and_then(truncator_for)
-        .is_some();
-    if !truncator_available {
-        return Ok(false);
-    }
-    let has_transcript_path = serde_json::from_str::<serde_json::Value>(&metadata_json)
-        .ok()
-        .and_then(|v| {
-            v.get("transcript_path")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        })
-        .is_some_and(|s| !s.is_empty());
-    Ok(has_transcript_path)
+    Ok(false)
 }
 
 /// Connection-bound core of [`truncate_agent_transcript_for_checkpoint`].
@@ -627,24 +614,17 @@ async fn truncate_agent_transcript_for_checkpoint_with_conn(
     conn: &sea_orm::DatabaseConnection,
     checkpoint_id: &str,
 ) -> TranscriptTruncationOutcome {
-    use crate::internal::ai::observed_agents::{
-        rfc3339_boundary_for_unix_seconds, write_truncated_transcript,
-    };
-
     let backend = conn.get_database_backend();
 
-    // Pull the session join for this checkpoint. We need:
-    //  - agent_kind (to dispatch),
-    //  - metadata_json (to find transcript_path) — coalesced to '{}'
-    //    so legacy rows with NULL values don't error the SELECT
-    //    (Codex round-1 P4 follow-up),
-    //  - created_at on the checkpoint (the boundary).
+    // Pull the session join for this checkpoint.  Source authority comes from
+    // the durable identity fields written after ingress scope validation; do
+    // not read a raw transcript locator out of metadata_json here.
     let row = match conn
         .query_one_raw(Statement::from_sql_and_values(
             backend,
-            "SELECT s.agent_kind AS agent_kind, \
-                    COALESCE(s.metadata_json, '{}') AS metadata_json, \
-                    cp.created_at AS created_at \
+            "SELECT s.session_id AS session_id, s.agent_kind AS agent_kind, \
+                    s.provider_session_id AS provider_session_id, \
+                    s.working_dir AS working_dir \
              FROM agent_checkpoint cp \
              JOIN agent_session s ON s.session_id = cp.session_id \
              WHERE cp.checkpoint_id = ? LIMIT 1",
@@ -654,126 +634,78 @@ async fn truncate_agent_transcript_for_checkpoint_with_conn(
     {
         Ok(Some(row)) => row,
         Ok(None) => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!(
-                    "no agent_session join for checkpoint '{checkpoint_id}' \
-                     (catalog row missing or schema mismatch)"
-                ),
-            };
+            return TranscriptTruncationOutcome::Failed;
         }
-        Err(err) => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!("agent_session lookup failed: {err}"),
-            };
+        Err(_) => {
+            return TranscriptTruncationOutcome::Failed;
         }
     };
-    let agent_kind: String = row.try_get_by("agent_kind").unwrap_or_default();
-    let metadata_json: String = row.try_get_by("metadata_json").unwrap_or_default();
-    let created_at: i64 = row.try_get_by("created_at").unwrap_or(0);
-
-    let transcript_path: Option<String> = serde_json::from_str::<serde_json::Value>(&metadata_json)
-        .ok()
-        .and_then(|v| {
-            v.get("transcript_path")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        });
-    let Some(path_str) = transcript_path else {
-        return TranscriptTruncationOutcome::SkippedNoPath;
+    // A failed decode here means the durable identity is corrupt or the
+    // selected schema does not match the catalog.  Never silently substitute
+    // an empty component: that could make a malformed row look like a safe
+    // no-source/unsupported case and hide an operator-visible catalog fault.
+    let session_id: String = match row.try_get_by("session_id") {
+        Ok(value) => value,
+        Err(_) => {
+            return TranscriptTruncationOutcome::Failed;
+        }
     };
-    let path = std::path::PathBuf::from(&path_str);
+    let agent_kind: String = match row.try_get_by("agent_kind") {
+        Ok(value) => value,
+        Err(_) => {
+            return TranscriptTruncationOutcome::Failed;
+        }
+    };
+    let provider_session_id: String = match row.try_get_by("provider_session_id") {
+        Ok(value) => value,
+        Err(_) => {
+            return TranscriptTruncationOutcome::Failed;
+        }
+    };
+    let working_dir: String = match row.try_get_by("working_dir") {
+        Ok(value) => value,
+        Err(_) => {
+            return TranscriptTruncationOutcome::Failed;
+        }
+    };
 
-    // Dispatch the truncator through the v0.17.677 capability registry
-    // instead of a hard-coded `kind == "claude_code"` literal. The
-    // registry handles three failure shapes:
+    // Retain the capability registry for accurate reporting rather than a
+    // hard-coded `kind == "claude_code"` literal. The registry handles three
+    // failure shapes:
     //   * `AgentKind::from_db_str` fails for unknown tags (schema
     //     mismatch — unsupported kind for this row).
-    //   * `truncator_for` returns `None` for kinds whose adapter
-    //     doesn't implement `TranscriptTruncator` (the six non-Claude
-    //     kinds today). Adding a second truncator implementation is a
-    //     single-arm change in `observed_agents::mod.rs::truncator_for`
-    //     and the new kind is dispatched here automatically.
+    //   * `truncator_for` returns `None` for kinds whose adapter does not
+    //     implement `TranscriptTruncator`; those remain explicitly
+    //     unsupported even if atomic rewriting becomes available later.
     use crate::internal::ai::observed_agents::{AgentKind, truncator_for};
     let Some(parsed_kind) = AgentKind::from_db_str(&agent_kind) else {
-        return TranscriptTruncationOutcome::SkippedUnsupportedKind { agent_kind };
+        return TranscriptTruncationOutcome::SkippedUnsupportedKind;
     };
-    let Some(agent) = truncator_for(parsed_kind) else {
-        return TranscriptTruncationOutcome::SkippedUnsupportedKind { agent_kind };
+    let Some(_) = truncator_for(parsed_kind) else {
+        return TranscriptTruncationOutcome::SkippedUnsupportedKind;
     };
-    // Capture the file size at read time so `write_truncated_transcript`
-    // (and the NoChange early-return below) can detect a concurrent
-    // writer that grew the file before our rename. Codex round-1 P2 +
-    // round-2 follow-up.
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!("transcript file '{path_str}' not found"),
-            };
+    match resolve_derived_transcript_source(
+        &agent_kind,
+        &session_id,
+        &working_dir,
+        &provider_session_id,
+    ) {
+        // A safe descriptor-pinned read exists, but POSIX does not expose a
+        // target-identity compare-and-swap for an atomic replacement. Do not
+        // trade transcript integrity for rewind convenience: leave it alone.
+        Ok(DerivedTranscriptSource::Available(_)) => {
+            TranscriptTruncationOutcome::SkippedUnsafeMutation
         }
-        Err(err) => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!("read transcript '{path_str}': {err}"),
-            };
+        Ok(DerivedTranscriptSource::Unavailable) => {
+            TranscriptTruncationOutcome::SkippedNoDerivedSource
         }
-    };
-    let size_at_read = bytes.len() as u64;
-    // Codex round-2 follow-up: invalid `created_at` propagates as a
-    // `Failed` outcome rather than silently degrading to the Unix epoch
-    // (which would erase the whole transcript next time around).
-    let boundary = match rfc3339_boundary_for_unix_seconds(created_at) {
-        Ok(b) => b,
-        Err(err) => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!("rfc3339_boundary_for_unix_seconds: {err}"),
-            };
+        // This should be unreachable because `parsed_kind` has a truncator,
+        // but preserve the explicit unsupported result if a future adapter
+        // gains one before it gains an independently-verifiable layout.
+        Ok(DerivedTranscriptSource::UnsupportedKind) => {
+            TranscriptTruncationOutcome::SkippedUnsupportedKind
         }
-    };
-    let truncated = match agent.truncate_transcript(&bytes, &boundary) {
-        Ok(t) => t,
-        Err(err) => {
-            return TranscriptTruncationOutcome::Failed {
-                reason: format!("truncate_transcript: {err}"),
-            };
-        }
-    };
-    if truncated == bytes {
-        // Codex round-2 follow-up: even on the no-change path, re-stat
-        // the original to make sure no concurrent writer appended new
-        // bytes between our read and now. If the file grew, we still
-        // should not return "already aligned" — those new bytes might
-        // be post-boundary and the user expects them dropped.
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() != size_at_read => {
-                return TranscriptTruncationOutcome::Failed {
-                    reason: format!(
-                        "transcript '{path_str}' grew from {} to {} bytes during \
-                         truncation (concurrent writer); rerun once the agent is idle",
-                        size_at_read,
-                        meta.len()
-                    ),
-                };
-            }
-            Ok(_) => {}
-            Err(err) => {
-                return TranscriptTruncationOutcome::Failed {
-                    reason: format!("re-stat transcript '{path_str}': {err}"),
-                };
-            }
-        }
-        return TranscriptTruncationOutcome::NoChange { path: path_str };
-    }
-    let lines_before = bytes.iter().filter(|&&b| b == b'\n').count();
-    let lines_after = truncated.iter().filter(|&&b| b == b'\n').count();
-    let lines_dropped = lines_before.saturating_sub(lines_after);
-    if let Err(err) = write_truncated_transcript(&path, &truncated, Some(size_at_read)) {
-        return TranscriptTruncationOutcome::Failed {
-            reason: format!("write_truncated_transcript: {err}"),
-        };
-    }
-    TranscriptTruncationOutcome::Truncated {
-        path: path_str,
-        lines_dropped,
+        Err(_) => TranscriptTruncationOutcome::Failed,
     }
 }
 
@@ -866,378 +798,6 @@ pub(crate) fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, a
     delete.sort();
 
     Ok(RewindPlan { restore, delete })
-}
-
-// ---------------------------------------------------------------------------
-// AG-20 metadata-first `show` layout summary (E4-libra + legacy-v1 fallback)
-// ---------------------------------------------------------------------------
-
-/// AG-20 E4-libra layout: manifest-first summary.
-const LAYOUT_E4_LIBRA: &str = "e4-libra";
-/// Pre-AG-20 writer layout (`metadata.json` + `transcript/<provider>`, no
-/// manifest). A first-class readable layout — NOT an inconsistency.
-const LAYOUT_LEGACY_V1: &str = "legacy-v1";
-/// Layout could not be resolved from the local object store.
-const LAYOUT_UNKNOWN: &str = "unknown";
-
-const TRANSCRIPT_PRESENT: &str = "present";
-const TRANSCRIPT_MISSING: &str = "missing";
-const TRANSCRIPT_UNKNOWN: &str = "unknown";
-
-/// Metadata-first layout summary for one checkpoint. Serialized additively
-/// into the `checkpoint show --json` payload under `layout`; the
-/// pre-existing `checkpoint` / `metadata` keys are unchanged.
-#[derive(Debug, Serialize)]
-struct CheckpointLayoutSummary {
-    /// `e4-libra`, `legacy-v1`, or `unknown`.
-    kind: &'static str,
-    /// Logical roles: manifest entries for E4-libra, tree entries for v1.
-    roles: Vec<CheckpointRoleSummary>,
-    transcript: TranscriptSummary,
-    /// `content_hash.txt` summary (E4-libra only; `null` for legacy-v1).
-    content_hash: Option<ContentHashSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
-}
-
-impl CheckpointLayoutSummary {
-    fn unknown(reason: String) -> Self {
-        Self {
-            kind: LAYOUT_UNKNOWN,
-            roles: Vec::new(),
-            transcript: TranscriptSummary {
-                availability: TRANSCRIPT_UNKNOWN,
-                chunked: false,
-                parts: Vec::new(),
-            },
-            content_hash: None,
-            note: Some(reason),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct CheckpointRoleSummary {
-    role: String,
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    byte_len: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    media_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    redaction: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schema_version: Option<u64>,
-}
-
-/// Transcript summary derived without ever opening a transcript blob:
-/// part identities come from the manifest (E4-libra) or the tree (v1) and
-/// presence is a stat on the loose-object path.
-#[derive(Debug, Serialize)]
-struct TranscriptSummary {
-    /// `present` (every declared part's object file exists locally),
-    /// `missing` (at least one is absent), or `unknown` (parts could not
-    /// be enumerated).
-    availability: &'static str,
-    chunked: bool,
-    /// Physical transcript files in manifest/tree order (one entry for an
-    /// unchunked transcript). `byte_len` is manifest-declared and thus
-    /// absent for legacy-v1 parts (reading the blob to size it would
-    /// violate the metadata-first contract).
-    parts: Vec<TranscriptPartSummary>,
-}
-
-#[derive(Debug, Serialize)]
-struct TranscriptPartSummary {
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    byte_len: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct ContentHashSummary {
-    /// Raw `content_hash.txt` text (trimmed, bounded) — writer format is
-    /// `sha256:<64-lowercase-hex>`.
-    value: String,
-    /// Whether [`parse_content_hash`] accepted the value (it also
-    /// tolerates legacy bare hex).
-    format_valid: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    digest: Option<String>,
-}
-
-/// Classify the checkpoint layout, degrading every failure to
-/// `unknown` + note (the catalog row and metadata blob are the
-/// load-bearing outputs of `show`; the layout walk is best-effort).
-fn summarize_checkpoint_layout(row: &CheckpointRow) -> CheckpointLayoutSummary {
-    match try_summarize_checkpoint_layout(row) {
-        Ok(summary) => summary,
-        Err(reason) => CheckpointLayoutSummary::unknown(reason),
-    }
-}
-
-fn try_summarize_checkpoint_layout(row: &CheckpointRow) -> Result<CheckpointLayoutSummary, String> {
-    let storage = util::try_get_storage_path(None)
-        .map_err(|e| format!("not in a libra repository ({e}); layout not classified"))?;
-    let root = read_tree_object(&storage, &row.tree_oid)?;
-    let checkpoint_tree = subtree(&storage, &root, "checkpoint")?;
-    let prefix = row
-        .checkpoint_id
-        .get(..2)
-        .ok_or_else(|| format!("checkpoint id '{}' is too short", row.checkpoint_id))?;
-    let prefix_tree = subtree(&storage, &checkpoint_tree, prefix)?;
-    let inner = subtree(&storage, &prefix_tree, &row.checkpoint_id[2..])?;
-
-    if let Some(manifest_item) = tree_entry(&inner, "manifest.json") {
-        summarize_e4_libra(&storage, &inner, &manifest_item.id.to_string())
-    } else if tree_entry(&inner, "metadata.json").is_some() {
-        summarize_legacy_v1(&storage, &inner)
-    } else {
-        Err(format!(
-            "checkpoint tree {} carries neither manifest.json (E4-libra) nor \
-             metadata.json (legacy-v1); layout not classified",
-            row.tree_oid
-        ))
-    }
-}
-
-/// E4-libra: everything comes from `manifest.json` — roles, transcript
-/// parts (in manifest order, per the E5 "resolve chunks only through the
-/// manifest" rule), and the `content_hash.txt` format check. Transcript
-/// blob bodies are never read.
-fn summarize_e4_libra(
-    storage: &Path,
-    inner: &Tree,
-    manifest_oid: &str,
-) -> Result<CheckpointLayoutSummary, String> {
-    let manifest_hash = crate::internal::object_format::parse_repo_oid(manifest_oid)
-        .map_err(|e| format!("invalid manifest.json oid '{manifest_oid}': {e}"))?;
-    let (manifest_bytes, manifest_truncated) =
-        read_git_object_bounded(storage, &manifest_hash, CHECKPOINT_METADATA_READ_MAX_BYTES)
-            .map_err(|e| {
-                format!("manifest.json blob {manifest_oid} is not readable locally: {e}")
-            })?;
-    if manifest_truncated {
-        return Err(format!(
-            "manifest.json blob {manifest_oid} exceeds the metadata size cap; \
-             refusing (corrupt or hostile checkpoint)"
-        ));
-    }
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("manifest.json blob {manifest_oid} is not valid JSON: {e}"))?;
-
-    let entries = manifest.get("entries").and_then(|v| v.as_object());
-    let mut roles = Vec::new();
-    if let Some(entries) = entries {
-        for (role, declared) in entries {
-            roles.push(CheckpointRoleSummary {
-                role: role.clone(),
-                path: declared
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                oid: declared
-                    .get("oid")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                byte_len: declared.get("byte_len").and_then(|v| v.as_u64()),
-                media_type: declared
-                    .get("media_type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                redaction: declared
-                    .get("redaction")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                schema_version: declared.get("schema_version").and_then(|v| v.as_u64()),
-            });
-        }
-    }
-
-    let transcript_decl = entries.and_then(|entries| entries.get("transcript"));
-    let mut chunked = false;
-    let mut parts = Vec::new();
-    if let Some(declared) = transcript_decl {
-        chunked = declared
-            .get("chunked")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if chunked {
-            for part in declared
-                .get("parts")
-                .and_then(|v| v.as_array())
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                parts.push(TranscriptPartSummary {
-                    path: part
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    oid: part.get("oid").and_then(|v| v.as_str()).map(str::to_string),
-                    byte_len: part.get("byte_len").and_then(|v| v.as_u64()),
-                });
-            }
-        } else {
-            parts.push(TranscriptPartSummary {
-                path: declared
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                oid: declared
-                    .get("oid")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                byte_len: declared.get("byte_len").and_then(|v| v.as_u64()),
-            });
-        }
-    }
-    let availability = transcript_availability(storage, &parts);
-
-    // content_hash.txt is a derived, fixed-size artifact — reading it is
-    // part of the metadata surface, not transcript IO.
-    let content_hash = tree_entry(inner, "content_hash.txt").map(|item| {
-        match read_git_object_bounded(storage, &item.id, CHECKPOINT_METADATA_READ_MAX_BYTES) {
-            // A truncated (oversized) content_hash.txt is treated as
-            // unreadable — never report a `format_valid` digest parsed from
-            // a partial object (a valid prefix + huge padding would
-            // otherwise pass `parse_content_hash`).
-            Ok((_, true)) => ContentHashSummary {
-                value: "(unreadable: exceeds metadata size cap)".to_string(),
-                format_valid: false,
-                digest: None,
-            },
-            Ok((bytes, false)) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let digest = parse_content_hash(&text);
-                ContentHashSummary {
-                    value: text.trim().chars().take(96).collect(),
-                    format_valid: digest.is_some(),
-                    digest,
-                }
-            }
-            Err(e) => ContentHashSummary {
-                value: format!("(unreadable: {e})"),
-                format_valid: false,
-                digest: None,
-            },
-        }
-    });
-
-    Ok(CheckpointLayoutSummary {
-        kind: LAYOUT_E4_LIBRA,
-        roles,
-        transcript: TranscriptSummary {
-            availability,
-            chunked,
-            parts,
-        },
-        content_hash,
-        note: None,
-    })
-}
-
-/// Legacy-v1 (pre-AG-20 writer): no manifest — roles are derived from the
-/// tree itself (`metadata.json`, `transcript/<provider>` without
-/// extension, optionally `events/<provider>.jsonl`). Byte lengths are
-/// unknown by design: sizing them would require reading the blobs.
-fn summarize_legacy_v1(storage: &Path, inner: &Tree) -> Result<CheckpointLayoutSummary, String> {
-    let mut roles = Vec::new();
-    let mut parts = Vec::new();
-    for item in &inner.tree_items {
-        match (item.name.as_str(), item.mode) {
-            ("transcript", TreeItemMode::Tree) => {
-                let transcript_tree = read_tree_object(storage, &item.id.to_string())?;
-                for file in &transcript_tree.tree_items {
-                    let path = format!("transcript/{}", file.name);
-                    roles.push(plain_role("transcript", &path, &file.id.to_string()));
-                    parts.push(TranscriptPartSummary {
-                        path,
-                        oid: Some(file.id.to_string()),
-                        byte_len: None,
-                    });
-                }
-            }
-            ("events", TreeItemMode::Tree) => {
-                let events_tree = read_tree_object(storage, &item.id.to_string())?;
-                for file in &events_tree.tree_items {
-                    let path = format!("events/{}", file.name);
-                    roles.push(plain_role("events", &path, &file.id.to_string()));
-                }
-            }
-            (name, _) => {
-                let role = if name == "metadata.json" {
-                    "metadata"
-                } else {
-                    name
-                };
-                roles.push(plain_role(role, name, &item.id.to_string()));
-            }
-        }
-    }
-    let availability = transcript_availability(storage, &parts);
-    Ok(CheckpointLayoutSummary {
-        kind: LAYOUT_LEGACY_V1,
-        roles,
-        transcript: TranscriptSummary {
-            availability,
-            chunked: false,
-            parts,
-        },
-        content_hash: None,
-        note: Some(
-            "pre-AG-20 legacy-v1 layout (no manifest.json); \
-             metadata-first fallback parse"
-                .to_string(),
-        ),
-    })
-}
-
-fn plain_role(role: &str, path: &str, oid: &str) -> CheckpointRoleSummary {
-    CheckpointRoleSummary {
-        role: role.to_string(),
-        path: path.to_string(),
-        oid: Some(oid.to_string()),
-        byte_len: None,
-        media_type: None,
-        redaction: None,
-        schema_version: None,
-    }
-}
-
-/// Stat-only presence probe over the loose-object store: blob bodies are
-/// never opened (metadata-first discipline). `unknown` when a part lacks
-/// a parseable OID; `missing` when any declared part's object file is
-/// absent locally.
-fn transcript_availability(storage: &Path, parts: &[TranscriptPartSummary]) -> &'static str {
-    if parts.is_empty() {
-        return TRANSCRIPT_UNKNOWN;
-    }
-    let mut all_present = true;
-    for part in parts {
-        let Some(oid) = part.oid.as_deref() else {
-            return TRANSCRIPT_UNKNOWN;
-        };
-        if crate::internal::object_format::parse_repo_oid(oid).is_err() {
-            return TRANSCRIPT_UNKNOWN;
-        }
-        let object_path = storage.join("objects").join(&oid[..2]).join(&oid[2..]);
-        if !object_path.exists() {
-            all_present = false;
-        }
-    }
-    if all_present {
-        TRANSCRIPT_PRESENT
-    } else {
-        TRANSCRIPT_MISSING
-    }
 }
 
 /// Upper bound on the inflated size of checkpoint metadata objects (trees
@@ -1746,95 +1306,27 @@ fn emit_list(page: &CheckpointListPage, output: &OutputConfig) -> CliResult<()> 
     Ok(())
 }
 
-fn emit_one(
-    row: &CheckpointRow,
-    metadata_blob: Option<&str>,
-    layout: &CheckpointLayoutSummary,
-    output: &OutputConfig,
-) -> CliResult<()> {
+fn emit_one(summary: &CheckpointShowSummary, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
-        // Inline the metadata content as parsed JSON so JSON consumers can
-        // join on it without doing a second blob fetch.
-        let metadata_json = metadata_blob
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .unwrap_or(serde_json::Value::Null);
         let payload = serde_json::json!({
-            "checkpoint": row,
-            "metadata": metadata_json,
-            "layout": layout,
+            "checkpoint": summary,
         });
         return emit_json_data("agent_checkpoint", &payload, output);
     }
     if output.quiet {
         return Ok(());
     }
-    println!("checkpoint_id     : {}", row.checkpoint_id);
-    println!("session_id        : {}", row.session_id);
-    println!("scope             : {}", row.scope);
-    let parent_display = match row.parent_commit.as_deref() {
-        Some(commit) if !commit.is_empty() => commit,
-        _ => "(none — unborn HEAD or pre-commit ingest)",
-    };
-    println!("parent_commit     : {parent_display}");
-    println!("tree_oid          : {}", row.tree_oid);
-    println!("metadata_blob_oid : {}", row.metadata_blob_oid);
-    println!("traces_commit     : {}", row.traces_commit);
-    println!("created_at        : {}", row.created_at);
-    println!("layout            : {}", layout.kind);
-    if let Some(note) = &layout.note {
-        println!("layout_note       : {note}");
-    }
-    let transcript = &layout.transcript;
-    match (transcript.chunked, transcript.parts.as_slice()) {
-        (false, [only]) => {
-            println!(
-                "transcript        : {} ({}{})",
-                transcript.availability,
-                only.path,
-                only.byte_len
-                    .map(|n| format!(", {n} bytes"))
-                    .unwrap_or_default()
-            );
+    println!("checkpoint_id             : {}", summary.checkpoint_id);
+    println!("scope                     : {}", summary.scope.as_str());
+    println!("created_at                : {}", summary.created_at);
+    println!(
+        "parent_snapshot_recorded  : {}",
+        if summary.parent_snapshot_recorded {
+            "yes"
+        } else {
+            "no"
         }
-        (_, []) => println!("transcript        : {}", transcript.availability),
-        (_, parts) => {
-            println!(
-                "transcript        : {} (chunked, {} parts in manifest order)",
-                transcript.availability,
-                parts.len()
-            );
-            for part in parts {
-                println!(
-                    "  - {}{}",
-                    part.path,
-                    part.byte_len
-                        .map(|n| format!(" ({n} bytes)"))
-                        .unwrap_or_default()
-                );
-            }
-        }
-    }
-    if let Some(hash) = &layout.content_hash {
-        println!(
-            "content_hash      : {} ({})",
-            hash.value,
-            if hash.format_valid {
-                "well-formed"
-            } else {
-                "MALFORMED"
-            }
-        );
-    }
-    if !layout.roles.is_empty() {
-        let mut role_names: Vec<&str> = layout.roles.iter().map(|r| r.role.as_str()).collect();
-        role_names.dedup();
-        println!("roles             : {}", role_names.join(", "));
-    }
-    if let Some(metadata) = metadata_blob {
-        println!("---");
-        println!("metadata.json:");
-        println!("{metadata}");
-    }
+    );
     Ok(())
 }
 
@@ -1868,6 +1360,37 @@ mod tests {
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../sql/sqlite_20260309_init.sql");
 
+    /// Isolate Claude's provider-root lookup for tests that exercise the
+    /// durable-identity source resolver.  The production resolver consults
+    /// `LIBRA_TEST_HOME` only in tests; the named env lane prevents another
+    /// test from observing this temporary provider root.
+    struct TestHomeGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl TestHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let prior = std::env::var_os("LIBRA_TEST_HOME");
+            // SAFETY: test-only process environment mutation, restored by
+            // Drop; each caller holds the serial `env` lane.
+            unsafe { std::env::set_var("LIBRA_TEST_HOME", path) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for TestHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with `set`; this test-only guard restores the
+            // prior process environment value before releasing the env lane.
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var("LIBRA_TEST_HOME", value),
+                    None => std::env::remove_var("LIBRA_TEST_HOME"),
+                }
+            }
+        }
+    }
+
     /// Spin up a freshly-migrated SQLite at `<dir>/libra.db`. Mirrors the
     /// fixture used by the hook runtime tests so the schema is identical
     /// to production (legacy bootstrap → AI runtime contract → registered
@@ -1896,32 +1419,55 @@ mod tests {
         (dir, conn)
     }
 
-    /// Phase 4.1 acceptance: when the fixture has a Claude Code session
-    /// with a `transcript_path` in `metadata_json` and a checkpoint
-    /// timestamped between two transcript lines, the truncator must
-    /// drop the post-boundary lines.
+    #[test]
+    fn unsafe_provider_rewind_is_explicitly_unsupported_in_json() {
+        let outcome = super::TranscriptTruncationOutcome::SkippedUnsafeMutation;
+        let json = outcome.as_json();
+        assert_eq!(json["supported"], false);
+        assert_eq!(json["applied"], false);
+        assert!(
+            json["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("identity-checked replacement")),
+            "the output names why the provider transcript was left untouched: {json}"
+        );
+    }
+
+    /// Rewind must derive the Claude source from durable identity, ignoring a
+    /// conflicting legacy metadata pointer, then fail closed because no safe
+    /// atomic identity-checked provider rewrite primitive is available.
     #[tokio::test]
-    async fn rewind_truncate_drops_post_boundary_lines_for_claude_code() {
+    #[serial_test::serial(env)]
+    async fn rewind_truncate_refuses_derived_claude_source_without_safe_rewrite() {
         let (dir, conn) = fresh_db().await;
-        // Create the on-disk transcript with two lines straddling the
-        // boundary. The checkpoint lives at 10:30; the second line at
-        // 11:00 must be dropped.
-        let transcript_path = dir.path().join("session.jsonl");
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let _home = TestHomeGuard::set(&home);
+        let working_dir = dir.path().join("workspace");
+        fs::create_dir(&working_dir).unwrap();
+        // Create an on-disk transcript whose later line would have been
+        // dropped by the retired rewrite path. It must remain intact.
+        let transcript_dir = crate::internal::ai::observed_agents::claude_session_dir(&working_dir)
+            .expect("LIBRA_TEST_HOME provides a Claude session directory");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("p-1.jsonl");
         fs::write(
             &transcript_path,
             b"{\"timestamp\":\"2026-05-05T10:00:00Z\",\"text\":\"keep\"}\n\
               {\"timestamp\":\"2026-05-05T11:00:00Z\",\"text\":\"drop\"}\n",
         )
         .unwrap();
+        let forged_pointer = dir.path().join("unrelated.jsonl");
+        fs::write(
+            &forged_pointer,
+            b"{\"timestamp\":\"2099-01-01T00:00:00Z\",\"text\":\"forged\"}\n",
+        )
+        .unwrap();
         let metadata_json = serde_json::json!({
-            "transcript_path": transcript_path.to_str().unwrap(),
+            "transcript_path": forged_pointer,
         })
         .to_string();
-        // Boundary at 2026-05-05T10:30:00Z so the 10:00 line is kept and
-        // the 11:00 line is dropped.
-        let created_at: i64 = chrono::DateTime::parse_from_rfc3339("2026-05-05T10:30:00Z")
-            .unwrap()
-            .timestamp();
+        let created_at = 0i64;
 
         let backend = conn.get_database_backend();
         conn.execute_raw(Statement::from_sql_and_values(
@@ -1929,8 +1475,11 @@ mod tests {
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
                 metadata_json, redaction_report, started_at, last_event_at
-             ) VALUES ('s-1', 'claude_code', 'p-1', 'stopped', '/tmp', ?, '{}', 0, 0)",
-            [metadata_json.into()],
+             ) VALUES ('s-1', 'claude_code', 'p-1', 'stopped', ?, ?, '{}', 0, 0)",
+            [
+                working_dir.to_string_lossy().to_string().into(),
+                metadata_json.into(),
+            ],
         ))
         .await
         .unwrap();
@@ -1947,31 +1496,41 @@ mod tests {
 
         let outcome =
             super::truncate_agent_transcript_for_checkpoint_with_conn(&conn, "cp-1").await;
-        match outcome {
-            super::TranscriptTruncationOutcome::Truncated { lines_dropped, .. } => {
-                assert_eq!(lines_dropped, 1, "exactly one line removed");
-            }
-            other => panic!("expected Truncated, got {:?}", other.as_json()),
-        }
+        assert!(matches!(
+            outcome,
+            super::TranscriptTruncationOutcome::SkippedUnsafeMutation
+        ));
 
         let after = fs::read_to_string(&transcript_path).unwrap();
         assert!(after.contains("\"keep\""));
-        assert!(!after.contains("\"drop\""));
+        assert!(after.contains("\"drop\""));
+        assert!(
+            fs::read_to_string(&forged_pointer)
+                .unwrap()
+                .contains("\"forged\""),
+            "the untrusted metadata pointer must never be used or mutated"
+        );
     }
 
-    /// When `metadata_json` lacks a transcript_path, the helper must
-    /// surface `SkippedNoPath` rather than failing.
+    /// A valid durable session whose provider file is absent must surface a
+    /// no-source outcome rather than reviving a metadata pointer fallback.
     #[tokio::test]
-    async fn rewind_truncate_skips_when_no_transcript_path_in_metadata() {
-        let (_dir, conn) = fresh_db().await;
+    #[serial_test::serial(env)]
+    async fn rewind_truncate_skips_when_no_derived_source_is_available() {
+        let (dir, conn) = fresh_db().await;
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let _home = TestHomeGuard::set(&home);
+        let working_dir = dir.path().join("workspace");
+        fs::create_dir(&working_dir).unwrap();
         let backend = conn.get_database_backend();
         conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
                 metadata_json, redaction_report, started_at, last_event_at
-             ) VALUES ('s-2', 'claude_code', 'p-2', 'stopped', '/tmp', '{}', '{}', 0, 0)",
-            [],
+             ) VALUES ('s-2', 'claude_code', 'p-2', 'stopped', ?, '{}', '{}', 0, 0)",
+            [working_dir.to_string_lossy().to_string().into()],
         ))
         .await
         .unwrap();
@@ -1990,30 +1549,38 @@ mod tests {
             super::truncate_agent_transcript_for_checkpoint_with_conn(&conn, "cp-2").await;
         assert!(matches!(
             outcome,
-            super::TranscriptTruncationOutcome::SkippedNoPath
+            super::TranscriptTruncationOutcome::SkippedNoDerivedSource
         ));
     }
 
-    /// Codex round-3 follow-up: the dry-run `transcript_truncation_supported`
-    /// flag must match the apply path's actual decision. We test all four
-    /// quadrants (kind × has_transcript_path) against
-    /// `lookup_truncation_support`.
+    /// Dry-run must remain faithful to the fail-closed apply policy even when
+    /// a derived Claude source exists and legacy metadata names another file.
     #[tokio::test]
-    async fn lookup_truncation_support_matches_apply_decision() {
+    #[serial_test::serial(env)]
+    async fn lookup_truncation_support_is_false_without_safe_mutation_primitive() {
         let (dir, conn) = fresh_db().await;
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let _home = TestHomeGuard::set(&home);
+        let working_dir = dir.path().join("workspace");
+        fs::create_dir(&working_dir).unwrap();
         let backend = conn.get_database_backend();
 
-        let transcript_path = dir.path().join("session.jsonl");
+        let transcript_dir = crate::internal::ai::observed_agents::claude_session_dir(&working_dir)
+            .expect("LIBRA_TEST_HOME provides a Claude session directory");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("p-0.jsonl");
         fs::write(&transcript_path, b"").unwrap();
         let path_meta = serde_json::json!({
-            "transcript_path": transcript_path.to_str().unwrap(),
+            "transcript_path": dir.path().join("forged.jsonl"),
         })
         .to_string();
 
-        // Claude Code + transcript_path → supported.
+        // Even Claude Code plus a valid derived source cannot report support
+        // until an atomic identity-checked rewrite primitive exists.
         for (idx, (kind, meta)) in [
-            ("claude_code", path_meta.as_str()), // supported
-            ("claude_code", "{}"),               // skipped (no path)
+            ("claude_code", path_meta.as_str()), // derived source exists
+            ("claude_code", "{}"),               // skipped (no derived file)
             ("cursor", path_meta.as_str()),      // skipped (kind)
             ("cursor", "{}"),                    // skipped (both)
         ]
@@ -2028,11 +1595,12 @@ mod tests {
                 "INSERT INTO agent_session (
                     session_id, agent_kind, provider_session_id, state, working_dir,
                     metadata_json, redaction_report, started_at, last_event_at
-                 ) VALUES (?, ?, ?, 'stopped', '/tmp', ?, '{}', 0, 0)",
+                 ) VALUES (?, ?, ?, 'stopped', ?, ?, '{}', 0, 0)",
                 [
                     session_id.clone().into(),
                     (*kind).into(),
                     provider_session_id.into(),
+                    working_dir.to_string_lossy().to_string().into(),
                     (*meta).into(),
                 ],
             ))
@@ -2052,7 +1620,7 @@ mod tests {
             let supported = super::lookup_truncation_support(&conn, &checkpoint_id)
                 .await
                 .unwrap();
-            let expected = idx == 0;
+            let expected = false;
             assert_eq!(
                 supported, expected,
                 "case {idx} (kind={kind}, meta={meta}) supported={supported}, expected={expected}"
@@ -2066,13 +1634,7 @@ mod tests {
     /// was deliberately not touched.
     #[tokio::test]
     async fn rewind_truncate_skips_unsupported_agent_kind() {
-        let (dir, conn) = fresh_db().await;
-        let transcript_path = dir.path().join("session.jsonl");
-        fs::write(&transcript_path, b"{}\n").unwrap();
-        let metadata_json = serde_json::json!({
-            "transcript_path": transcript_path.to_str().unwrap(),
-        })
-        .to_string();
+        let (_dir, conn) = fresh_db().await;
 
         let backend = conn.get_database_backend();
         conn.execute_raw(Statement::from_sql_and_values(
@@ -2080,8 +1642,8 @@ mod tests {
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
                 metadata_json, redaction_report, started_at, last_event_at
-             ) VALUES ('s-3', 'cursor', 'p-3', 'stopped', '/tmp', ?, '{}', 0, 0)",
-            [metadata_json.into()],
+             ) VALUES ('s-3', 'cursor', 'p-3', 'stopped', '/tmp', '{}', '{}', 0, 0)",
+            [],
         ))
         .await
         .unwrap();
@@ -2099,10 +1661,54 @@ mod tests {
         let outcome =
             super::truncate_agent_transcript_for_checkpoint_with_conn(&conn, "cp-3").await;
         match outcome {
-            super::TranscriptTruncationOutcome::SkippedUnsupportedKind { agent_kind } => {
-                assert_eq!(agent_kind, "cursor");
-            }
+            super::TranscriptTruncationOutcome::SkippedUnsupportedKind => {}
             other => panic!("expected SkippedUnsupportedKind, got {:?}", other.as_json()),
+        }
+    }
+
+    /// A corrupt catalog identity must be surfaced as a failed truncation,
+    /// not silently decoded as an empty path/source and reported as a safe
+    /// skip. SQLite permits a BLOB in a TEXT-affinity column, which models a
+    /// malformed durable row from a damaged or manually edited catalog.
+    #[tokio::test]
+    async fn rewind_truncate_reports_corrupt_durable_identity_field() {
+        let (_dir, conn) = fresh_db().await;
+        let backend = conn.get_database_backend();
+
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at
+             ) VALUES (
+                's-corrupt', 'claude_code', 'p-corrupt', 'stopped', X'FF',
+                '{}', '{}', 0, 0
+             )"
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                metadata_blob_oid, traces_commit, created_at
+             ) VALUES (
+                'cp-corrupt', 's-corrupt', 'committed', NULL, 't', 'm', 'c', 0
+             )"
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let outcome =
+            super::truncate_agent_transcript_for_checkpoint_with_conn(&conn, "cp-corrupt").await;
+        match outcome {
+            super::TranscriptTruncationOutcome::Failed => {}
+            other => panic!(
+                "expected corrupt catalog failure, got {:?}",
+                other.as_json()
+            ),
         }
     }
 

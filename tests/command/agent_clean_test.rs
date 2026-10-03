@@ -27,8 +27,29 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Sta
 
 use super::{
     assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command,
-    run_libra_command_with_stdin_and_env,
+    run_libra_command_with_stdin,
 };
+
+const OBJECT_INDEX_REJECTION_TRIGGER: &str = "test_reject_object_index_write";
+
+async fn set_object_index_write_rejection(repo: &Path, enabled: bool) {
+    let conn = connect_repo_db(repo).await;
+    let sql = if enabled {
+        format!(
+            "CREATE TRIGGER {OBJECT_INDEX_REJECTION_TRIGGER} \
+             BEFORE INSERT ON object_index BEGIN \
+             SELECT RAISE(ABORT, 'test object-index write rejection'); END"
+        )
+    } else {
+        format!("DROP TRIGGER IF EXISTS {OBJECT_INDEX_REJECTION_TRIGGER}")
+    };
+    conn.execute_raw(Statement::from_string(conn.get_database_backend(), sql))
+        .await
+        .expect("install object-index rejection fixture");
+    conn.close()
+        .await
+        .expect("close object-index fixture connection");
+}
 
 async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     let db_path = repo.join(".libra").join("libra.db");
@@ -136,6 +157,7 @@ async fn seed_checkpoint_commit(
             checkpoint_id,
             session_id,
             marker_generation: marker.generation.as_deref().expect("new marker generation"),
+            capture_scope: None,
             agent_kind: "claude_code",
             parent_commit: None,
             scope,
@@ -940,7 +962,7 @@ async fn agent_clean_drops_object_index_rows_only_for_removed_checkpoints() {
 }
 
 #[tokio::test]
-async fn agent_clean_fails_closed_until_pending_index_marker_can_retire() {
+async fn agent_clean_fails_closed_until_pending_index_marker_repairs() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
     let checkpoint_id = "cc110000-0000-4000-8000-000000000003";
@@ -959,11 +981,11 @@ async fn agent_clean_fails_closed_until_pending_index_marker_can_retire() {
     ClientStorage::wait_for_background_tasks();
     conn.close().await.expect("close seed connection");
 
-    let indexed = run_libra_command_with_stdin_and_env(
+    set_object_index_write_rejection(repo.path(), true).await;
+    let indexed = run_libra_command_with_stdin(
         &["hash-object", "--stdin", "-w"],
         repo.path(),
         "marker retirement must fence cleanup",
-        &[("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1")],
     );
     assert_cli_success(
         &indexed,
@@ -975,12 +997,7 @@ async fn agent_clean_fails_closed_until_pending_index_marker_can_retire() {
         String::from_utf8_lossy(&indexed.stderr)
     );
 
-    let blocked = run_libra_command_with_stdin_and_env(
-        &["agent", "clean", "--all"],
-        repo.path(),
-        "",
-        &[("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1")],
-    );
+    let blocked = run_libra_command(&["agent", "clean", "--all"], repo.path());
     assert!(
         !blocked.status.success(),
         "destructive cleanup must not run while a repair marker cannot retire"
@@ -999,6 +1016,7 @@ async fn agent_clean_fails_closed_until_pending_index_marker_can_retire() {
     );
     conn.close().await.expect("close blocked-state connection");
 
+    set_object_index_write_rejection(repo.path(), false).await;
     let repaired = run_libra_command(&["status", "--short"], repo.path());
     assert_cli_success(
         &repaired,

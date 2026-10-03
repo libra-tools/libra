@@ -456,12 +456,10 @@ async fn store_record_file(scope: &HostScope, record: &StoredAuthToken) -> Resul
 }
 
 async fn read_record(scope: &HostScope) -> Result<Option<Result<StoredAuthToken, ()>>> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let entry = ConfigKv::get_with_conn(&conn, &scope.storage_key())
-        .await
-        .map_err(|error| anyhow!("failed to read the token record: {error}"))?;
+    let entry =
+        crate::internal::config::read_global_config_entry_without_creation(&scope.storage_key())
+            .await
+            .map_err(|error| anyhow!("failed to read the token record: {error}"))?;
     let Some(entry) = entry else {
         return Ok(None);
     };
@@ -887,6 +885,67 @@ mod tests {
         assert_eq!(
             HostScope::parse("h.example:8443").unwrap().display(),
             "h.example:8443"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn lookup_miss_does_not_create_global_config_database() {
+        let fixture = crate::utils::test::ConfigDbFixture::new()
+            .expect("create isolated global config fixture");
+        assert!(
+            !fixture.global_db().exists(),
+            "the fixture must start without a global config database"
+        );
+
+        let scope = HostScope::parse("https://no-token.example").expect("parse token scope");
+        assert!(matches!(lookup(&scope).await, Lookup::Miss));
+        assert!(
+            !fixture.global_db().exists(),
+            "an auth lookup miss must not materialize the global config database"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn lookup_never_falls_back_to_legacy_when_new_global_path_is_uninspectable() {
+        use crate::utils::test::ScopedEnvVar;
+
+        let root = tempfile::tempdir().expect("create global config fixture root");
+        let home = root.path().join("home");
+        let xdg = root.path().join("xdg");
+        let legacy = home.join(".libra").join("config.db");
+        std::fs::create_dir_all(legacy.parent().expect("legacy config parent"))
+            .expect("create legacy config parent");
+
+        let legacy_conn = crate::internal::db::create_database(
+            legacy.to_str().expect("legacy config path is UTF-8"),
+        )
+        .await
+        .expect("create legacy config database");
+        let scope =
+            HostScope::parse("https://stale-legacy-token.example").expect("parse token scope");
+        ConfigKv::set_with_conn(&legacy_conn, &scope.storage_key(), KEYRING_MARKER, false)
+            .await
+            .expect("seed stale legacy auth marker");
+        drop(legacy_conn);
+
+        std::fs::create_dir_all(&xdg).expect("create XDG root");
+        // A non-directory at the XDG layout's `libra` component makes the
+        // final `config.db` lookup fail with metadata I/O rather than prove
+        // that the new store is absent. `Path::exists()` used to collapse
+        // that error to false and attach the stale legacy credential.
+        std::fs::write(xdg.join("libra"), b"not a directory")
+            .expect("make XDG config component uninspectable");
+
+        let _override = ScopedEnvVar::unset("LIBRA_CONFIG_GLOBAL_DB");
+        let _home = ScopedEnvVar::set("HOME", &home);
+        let _profile = ScopedEnvVar::set("USERPROFILE", &home);
+        let _xdg = ScopedEnvVar::set("XDG_CONFIG_HOME", &xdg);
+
+        assert!(
+            matches!(lookup(&scope).await, Lookup::Miss),
+            "an uninspectable new global store must not fall back to the stale legacy token"
         );
     }
 }

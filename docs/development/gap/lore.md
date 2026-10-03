@@ -32,7 +32,7 @@ Libra 基线：`main` HEAD `edd9ebab2`，`Cargo.toml:3` version `0.22.5`
 | [`#459`](https://github.com/libra-tools/libra/pull/459) `fix(code): register task completion tool` | OPEN | 与 lore 无关 |
 | [`#455`](https://github.com/libra-tools/libra/pull/455) `[OL-00]` Change ID sidecar | MERGED | LR-03 spike 已冻；`get_resolved` 外键语义等 Change ID 稳定后再评估 |
 | `plan-20260822.md` Operation Log v2 + Change ID | 已排期，实现未开始 | 现有 A 类顺序不因 0.9.0 改道 |
-| `plan-20260830.md` OpenCode macOS Seatbelt | 本地已提交 | 与 lore 无关 |
+| `plan-20260830.md` OpenCode macOS Seatbelt | 历史本地已提交，现已安全退役 | 与 lore 无关；后续取消收束审计确认 Seatbelt 不能可靠收束可 fork exporter，当前 macOS 内容导出 fail-closed/metadata-only，Linux Required bwrap 为唯一内容导出路径 |
 
 ### 0.9.0 / nightly 对照（用户可见能力 → Libra 处置）
 

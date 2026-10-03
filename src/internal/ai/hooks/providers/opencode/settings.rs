@@ -253,17 +253,18 @@ pub(super) fn uninstall_opencode_hooks() -> Result<()> {
 /// Whether the Libra-managed plugin file exists at the canonical location
 /// (`.opencode/plugin/libra-hooks.js`) with its marker intact.
 ///
-/// Also warns on stderr when a stray Libra-managed duplicate exists under
-/// `.opencode/plugins/` — opencode loads both directories, so a duplicate
-/// double-forwards every event until it is cleaned up.
+/// A status probe is deliberately silent even when a stray managed duplicate
+/// exists under `.opencode/plugins/`: probes run inside structured commands
+/// such as `agent doctor`, where an unsolicited path-bearing stderr warning
+/// would break the JSON boundary. Install/uninstall continues to clean the
+/// duplicate deterministically.
 pub(super) fn opencode_hooks_are_installed() -> Result<bool> {
     let legacy_path = opencode_legacy_plugin_path()?;
-    if legacy_path.exists() && is_libra_managed(&read_plugin_file(&legacy_path)?) {
-        eprintln!(
-            "warning: stray Libra-managed OpenCode plugin duplicate at {} (opencode loads both \
-             'plugin/' and 'plugins/'); re-run the OpenCode hook install or uninstall to clean it",
-            legacy_path.display()
-        );
+    if legacy_path.exists() {
+        // Preserve the read/error behavior (a corrupt managed duplicate is a
+        // real status-probe failure), but retain no path in this read-only
+        // predicate's output channel.
+        let _ = is_libra_managed(&read_plugin_file(&legacy_path)?);
     }
 
     let plugin_path = opencode_plugin_path()?;

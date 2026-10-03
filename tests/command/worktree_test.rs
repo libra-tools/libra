@@ -1337,11 +1337,13 @@ async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
         .await
         .expect("worktree move command should complete across filesystems");
 
+    let canonical_repo = repo_dir.path().canonicalize().unwrap();
+    let canonical_destination = dest_path.canonicalize().unwrap();
     let after_paths = worktree_paths();
     assert_eq!(
         vec![
-            repo_dir.path().to_string_lossy().to_string(),
-            dest_path.to_string_lossy().to_string(),
+            canonical_repo.to_string_lossy().to_string(),
+            canonical_destination.to_string_lossy().to_string(),
         ],
         after_paths,
         "cross-filesystem move should update the worktree registry"

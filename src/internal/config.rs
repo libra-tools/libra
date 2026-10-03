@@ -1475,6 +1475,50 @@ pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
     global_config_resolution().map(|resolution| resolution.path)
 }
 
+/// Resolve a global configuration database for a non-mutating probe.
+///
+/// This deliberately does not run the legacy migration. Unlike
+/// [`global_config_path`], it preserves metadata errors while deciding whether
+/// the XDG database exists: treating an inaccessible new path as absent would
+/// incorrectly revive the legacy downgrade backup. Callers that intentionally
+/// degrade storage failures to a miss must do so *after* this function returns
+/// the error, never by falling back to the legacy path.
+pub(crate) fn global_config_path_without_creation() -> Result<Option<std::path::PathBuf>> {
+    if let Some(raw) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB")
+        && !raw.is_empty()
+    {
+        // An explicit override is authoritative and has never participated in
+        // legacy migration or fallback.
+        return Ok(Some(std::path::PathBuf::from(raw)));
+    }
+
+    let Some((dir, _)) = global_config_dir_with_source() else {
+        return Ok(None);
+    };
+    let new_path = dir.join("config.db");
+    match new_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", new_path.display()))?
+    {
+        true => Ok(Some(new_path)),
+        false => {
+            let Some(legacy_path) = legacy_global_config_path() else {
+                return Ok(Some(new_path));
+            };
+            if legacy_path.try_exists().with_context(|| {
+                format!(
+                    "failed to inspect legacy config database '{}'",
+                    legacy_path.display()
+                )
+            })? {
+                Ok(Some(legacy_path))
+            } else {
+                Ok(Some(new_path))
+            }
+        }
+    }
+}
+
 /// Why the global configuration database is being resolved.
 ///
 /// The distinction only matters when the one-time legacy migration (GCX-02)
@@ -2381,6 +2425,23 @@ async fn global_config_value(key: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     global_config_value_at(&db_path, key).await
+}
+
+/// Read a raw global config entry without materializing or migrating the
+/// global configuration database.
+///
+/// Request-time probes such as HTTP authentication must treat an absent
+/// configuration store as a cheap miss. In particular, they must not create a
+/// database merely because an unauthenticated request was made. The pure path
+/// resolver preserves a legacy store as a readable source without triggering
+/// its one-time migration.
+pub(crate) async fn read_global_config_entry_without_creation(
+    key: &str,
+) -> Result<Option<ConfigKvEntry>> {
+    let Some(db_path) = global_config_path_without_creation()? else {
+        return Ok(None);
+    };
+    read_config_entry_from_db_path(&db_path, key, DatabaseRole::GlobalConfig).await
 }
 
 /// Path-parameterised body of [`global_config_value`] so the P0-12

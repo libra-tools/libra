@@ -21,6 +21,9 @@
 //! - [`redaction`]: the [`redaction::Redactor`] engine and the
 //!   [`redaction::RedactedBytes`] compile-time contract — only redacted bytes
 //!   may flow into checkpoint storage.
+//! - `live_capture` (crate-internal): the provider-owned live-capture policy
+//!   port (`LiveCaptureProvider`) consumed by the provider-neutral capture
+//!   pipeline, reached only through `live_capture_for` (ADR-ACF-10).
 //!
 //! Phase 1 (this module's first cut) only ships traits, the redaction engine,
 //! and the migration that backs the catalog. Phase 2 wires checkpoint
@@ -33,6 +36,7 @@ pub mod compliance;
 pub mod coverage;
 pub mod derived;
 pub mod extract;
+pub(crate) mod live_capture;
 pub mod opencode_export;
 pub mod preview;
 pub mod redaction;
@@ -52,7 +56,7 @@ use builtin::stable_promoted::{
 };
 pub use builtin::{
     ClaudeCodeObservedAgent, FlushOutcome, GeminiObservedAgent, STABLE_PROMOTED_SPECS,
-    StablePromotedAgent, claude_project_slug, claude_session_dir,
+    StablePromotedAgent, claude_project_slug, claude_session_dir, claude_session_file_candidate,
     claude_session_id_is_safe_path_component, find_codex_rollout, flush_wait, resolve_session_file,
     rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for, write_truncated_transcript,
 };
@@ -75,7 +79,8 @@ pub(crate) use coverage::{
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
 pub use redaction::{
-    RedactedBytes, RedactedSink, RedactionMatch, RedactionReport, RedactionRule, Redactor,
+    MAX_REDACTION_MATCH_SAMPLES, RedactedBytes, RedactedSink, RedactionMatch, RedactionReport,
+    RedactionRule, Redactor,
 };
 pub use registry::{
     AgentRegistration, FIRST_BATCH_WAVE, SlugLookup, launchable_investigate_slugs,
@@ -96,12 +101,14 @@ pub use skill_projection::{
 pub(crate) use transcript_source::read_dir_pinned_provider_directory;
 pub use transcript_source::{
     AuthorizedTranscriptFile, ExportAuthorized, ProviderRootAuthorized,
-    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, resolve_import_transcript_source,
-    resolve_transcript_source, transcript_path_within_provider_root,
+    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptReadError, TranscriptSource,
+    resolve_import_transcript_source, resolve_transcript_source,
+    transcript_path_within_provider_root,
 };
 pub(crate) use transcript_source::{
-    open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-    resolve_import_transcript_source_until,
+    TranscriptSourceResolution, open_file_beneath_pinned_provider_directory,
+    open_provider_directory_for_discovery, resolve_import_transcript_source_until,
+    resolve_live_transcript_source_until,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY,
@@ -178,6 +185,31 @@ pub fn truncator_for(kind: AgentKind) -> Option<&'static dyn TranscriptTruncator
         | AgentKind::OpenCode
         | AgentKind::Copilot
         | AgentKind::FactoryAi => None,
+    }
+}
+
+/// Return the static live-capture capability for a hook-installable kind, or
+/// `None` for a kind whose callbacks are captured with the neutral,
+/// source-absent defaults.
+///
+/// Companion to [`agent_for`] / [`truncator_for`] for the live hook path
+/// (ADR-ACF-10): this is the only lookup of a `LiveCaptureProvider`, and the
+/// hook runtime reaches it once per callback through
+/// `LiveCaptureBinding::resolve`. The exhaustive `match` (no `_` arm) makes a
+/// new [`AgentKind`] variant decide its live capability in the same patch;
+/// `Some` must stay exactly the registry's `hook_installable` rows.
+pub(crate) fn live_capture_for(
+    kind: AgentKind,
+) -> Option<&'static dyn live_capture::LiveCaptureProvider> {
+    static CLAUDE_CODE_LIVE: live_capture::ClaudeLiveCapture = live_capture::ClaudeLiveCapture;
+    static CODEX_LIVE: live_capture::CodexLiveCapture = live_capture::CodexLiveCapture;
+    static OPENCODE_LIVE: live_capture::OpenCodeLiveCapture = live_capture::OpenCodeLiveCapture;
+
+    match kind {
+        AgentKind::ClaudeCode => Some(&CLAUDE_CODE_LIVE),
+        AgentKind::Codex => Some(&CODEX_LIVE),
+        AgentKind::OpenCode => Some(&OPENCODE_LIVE),
+        AgentKind::Cursor | AgentKind::Gemini | AgentKind::Copilot | AgentKind::FactoryAi => None,
     }
 }
 

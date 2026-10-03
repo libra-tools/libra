@@ -20,10 +20,11 @@
 //!   (`coverage_gate_db_error_does_not_append`).
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output, Stdio},
 };
 
+use libra::internal::ai::observed_agents::claude_project_slug;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -41,10 +42,13 @@ impl HookRepo {
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        // The verified hook cwd is canonicalized before Claude's project
+        // slug is derived. Canonical fixture paths avoid the macOS
+        // `/var -> /private/var` alias yielding a different source root.
         let this = Self {
             _tmp: tmp,
-            repo,
-            home,
+            repo: repo.canonicalize().expect("canonical repo dir"),
+            home: home.canonicalize().expect("canonical fake home"),
         };
         let out = this.run(&["init"], None);
         assert!(
@@ -89,24 +93,6 @@ impl HookRepo {
         self.run(&["agent", "hooks", "claude-code", "stop"], Some(envelope))
     }
 
-    fn hook_with_env(&self, envelope: &str, key: &str, value: &str) -> Output {
-        let mut cmd = self.command();
-        cmd.env(key, value)
-            .args(["agent", "hooks", "claude-code", "stop"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn hook with test environment");
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin piped")
-            .write_all(envelope.as_bytes())
-            .expect("write hook envelope");
-        child.wait_with_output().expect("wait hook")
-    }
-
     fn spawn_hook(&self) -> std::process::Child {
         let mut cmd = self.command();
         cmd.args(["agent", "hooks", "claude-code", "stop"])
@@ -127,24 +113,42 @@ impl HookRepo {
             .clone()
     }
 
-    fn envelope(&self, session_id: &str, transcript_path: &Path) -> String {
+    fn envelope(&self, hook_event_name: &str, session_id: &str) -> String {
         json!({
-            "hook_event_name": "Stop",
+            "hook_event_name": hook_event_name,
             "session_id": session_id,
             "cwd": self.repo.to_string_lossy(),
-            "transcript_path": transcript_path.to_string_lossy(),
+            // The hook-provided locator is deliberately false: capture must
+            // derive Claude's source from the verified cwd and session id.
+            "transcript_path": self.home.join("untrusted-hook-pointer.jsonl").to_string_lossy(),
         })
         .to_string()
     }
 
-    /// Write a coverage-v1-parseable Claude transcript under the fake
-    /// `~/.claude` (provider-root trust gate accepts it).
-    fn write_transcript(&self, name: &str, content: &str) -> PathBuf {
-        let dir = self.home.join(".claude").join("projects").join("x");
+    /// Write a coverage-v1-parseable Claude transcript at the native path
+    /// `claude_session_dir(verified_cwd)/<session_id>.jsonl`. The child hook
+    /// process maps this fake home through `LIBRA_TEST_HOME`.
+    fn write_transcript(&self, session_id: &str, content: &str) {
+        let dir = self
+            .home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(&self.repo));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
+        let path = dir.join(format!("{session_id}.jsonl"));
         std::fs::write(&path, content).unwrap();
-        path
+    }
+
+    /// Make object publication fail after the checkpoint writer has acquired
+    /// its marker. This is a real filesystem condition, rather than a
+    /// production-binary test environment switch.
+    fn block_object_directory(&self) {
+        let objects = self.repo.join(".libra").join("objects");
+        let preserved = self.repo.join(".libra").join("objects-preserved");
+        if objects.exists() {
+            std::fs::rename(&objects, &preserved).expect("preserve objects directory");
+        }
+        std::fs::write(&objects, "not a directory").expect("block objects directory");
     }
 
     async fn db(&self) -> DatabaseConnection {
@@ -193,8 +197,8 @@ const TURN_TRUNCATED: &str = concat!(
 #[tokio::test]
 async fn live_repeat_turn_noops_via_coverage_gate() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s1.jsonl", TURN_COMPLETE);
-    let envelope = repo.envelope("sess-repeat", &transcript);
+    repo.write_transcript("sess-repeat", TURN_COMPLETE);
+    let envelope = repo.envelope("Stop", "sess-repeat");
 
     let first = repo.hook(&envelope);
     assert!(first.status.success(), "first stop: {}", describe(&first));
@@ -234,15 +238,15 @@ async fn live_repeat_turn_noops_via_coverage_gate() {
 #[tokio::test]
 async fn coverage_same_turn_truncated_then_complete_single_current_revision() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s2.jsonl", TURN_TRUNCATED);
-    let envelope = repo.envelope("sess-upgrade", &transcript);
+    repo.write_transcript("sess-upgrade", TURN_TRUNCATED);
+    let envelope = repo.envelope("Stop", "sess-upgrade");
 
     let first = repo.hook(&envelope);
     assert!(first.status.success(), "first stop: {}", describe(&first));
     assert_eq!(repo.checkpoints().len(), 1);
 
     // The agent finishes flushing: same logical turn, now complete.
-    repo.write_transcript("s2.jsonl", TURN_COMPLETE);
+    repo.write_transcript("sess-upgrade", TURN_COMPLETE);
     let second = repo.hook(&envelope);
     assert!(
         second.status.success(),
@@ -292,16 +296,10 @@ async fn coverage_same_turn_truncated_then_complete_single_current_revision() {
 #[tokio::test]
 async fn coverage_gate_concurrent_writers_single_append() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s3.jsonl", TURN_COMPLETE);
+    repo.write_transcript("sess-race", TURN_COMPLETE);
     // Session must exist before the race so both writers contend on the
     // claim gate rather than on session creation.
-    let start_envelope = json!({
-        "hook_event_name": "SessionStart",
-        "session_id": "sess-race",
-        "cwd": repo.repo.to_string_lossy(),
-        "transcript_path": transcript.to_string_lossy(),
-    })
-    .to_string();
+    let start_envelope = repo.envelope("SessionStart", "sess-race");
     let start = repo.run(
         &["agent", "hooks", "claude-code", "session-start"],
         Some(&start_envelope),
@@ -312,7 +310,7 @@ async fn coverage_gate_concurrent_writers_single_append() {
         describe(&start)
     );
 
-    let envelope = repo.envelope("sess-race", &transcript);
+    let envelope = repo.envelope("Stop", "sess-race");
     let mut children = Vec::new();
     for _ in 0..2 {
         let mut child = repo.spawn_hook();
@@ -332,9 +330,17 @@ async fn coverage_gate_concurrent_writers_single_append() {
         if out.status.success() {
             successes += 1;
         } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                String::from_utf8_lossy(&out.stderr).contains("another live writer"),
-                "loser must fail with a replayable in-flight diagnostic: {}",
+                stderr.contains(
+                    "capture could not be completed; retry the hook or inspect the local repository"
+                ),
+                "loser must fail with the sanitized retry direction: {}",
+                describe(&out)
+            );
+            assert!(
+                !stderr.contains("foreign-owner") && !stderr.contains("foreign-digest"),
+                "foreign reservation details must not escape the capture boundary: {}",
                 describe(&out)
             );
         }
@@ -357,14 +363,8 @@ async fn coverage_gate_concurrent_writers_single_append() {
 #[tokio::test]
 async fn coverage_gate_inflight_only_fails_visibly() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s-inflight.jsonl", TURN_COMPLETE);
-    let start_envelope = json!({
-        "hook_event_name": "SessionStart",
-        "session_id": "sess-inflight",
-        "cwd": repo.repo.to_string_lossy(),
-        "transcript_path": transcript.to_string_lossy(),
-    })
-    .to_string();
+    repo.write_transcript("sess-inflight", TURN_COMPLETE);
+    let start_envelope = repo.envelope("SessionStart", "sess-inflight");
     let start = repo.run(
         &["agent", "hooks", "claude-code", "session-start"],
         Some(&start_envelope),
@@ -396,15 +396,23 @@ async fn coverage_gate_inflight_only_fails_visibly() {
         .expect("insert foreign reservation");
     assert_eq!(inserted.rows_affected(), 1);
 
-    let blocked = repo.hook(&repo.envelope("sess-inflight", &transcript));
+    let blocked = repo.hook(&repo.envelope("Stop", "sess-inflight"));
     assert!(
         !blocked.status.success(),
         "an uncovered in-flight turn must not report success: {}",
         describe(&blocked)
     );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
     assert!(
-        String::from_utf8_lossy(&blocked.stderr).contains("another live writer"),
-        "failure must tell the caller to retry: {}",
+        stderr.contains(
+            "capture could not be completed; retry the hook or inspect the local repository"
+        ),
+        "failure must give the caller the sanitized retry direction: {}",
+        describe(&blocked)
+    );
+    assert!(
+        !stderr.contains("foreign-owner") && !stderr.contains("foreign-digest"),
+        "foreign reservation details must not escape the capture boundary: {}",
         describe(&blocked)
     );
     assert!(
@@ -419,14 +427,8 @@ async fn coverage_gate_inflight_only_fails_visibly() {
 #[tokio::test]
 async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s-import-preempt.jsonl", TURN_COMPLETE);
-    let start_envelope = json!({
-        "hook_event_name": "SessionStart",
-        "session_id": "sess-import-preempt",
-        "cwd": repo.repo.to_string_lossy(),
-        "transcript_path": transcript.to_string_lossy(),
-    })
-    .to_string();
+    repo.write_transcript("sess-import-preempt", TURN_COMPLETE);
+    let start_envelope = repo.envelope("SessionStart", "sess-import-preempt");
     let start = repo.run(
         &["agent", "hooks", "claude-code", "session-start"],
         Some(&start_envelope),
@@ -459,7 +461,7 @@ async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
     assert_eq!(inserted.rows_affected(), 1);
     drop(conn);
 
-    let live = repo.hook(&repo.envelope("sess-import-preempt", &transcript));
+    let live = repo.hook(&repo.envelope("Stop", "sess-import-preempt"));
     assert!(
         live.status.success(),
         "live preemption: {}",
@@ -487,8 +489,8 @@ async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
 #[tokio::test]
 async fn coverage_gate_db_error_does_not_append() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("s4.jsonl", TURN_COMPLETE);
-    let envelope = repo.envelope("sess-failclosed", &transcript);
+    repo.write_transcript("sess-failclosed", TURN_COMPLETE);
+    let envelope = repo.envelope("Stop", "sess-failclosed");
 
     // Healthy first write.
     let first = repo.hook(&envelope);
@@ -513,7 +515,7 @@ async fn coverage_gate_db_error_does_not_append() {
     }
 
     let new_content = TURN_COMPLETE.replace("run it", "run it again");
-    repo.write_transcript("s4.jsonl", &new_content);
+    repo.write_transcript("sess-failclosed", &new_content);
     let broken = repo.hook(&envelope);
     assert!(
         !broken.status.success(),
@@ -528,15 +530,12 @@ async fn coverage_gate_db_error_does_not_append() {
 }
 
 #[tokio::test]
-async fn live_failure_after_marker_registration_releases_claim_and_marker() {
+async fn live_object_store_failure_after_marker_registration_releases_claim_and_marker() {
     let repo = HookRepo::init();
-    let transcript = repo.write_transcript("registered-failure.jsonl", TURN_COMPLETE);
-    let envelope = repo.envelope("sess-registered-failure", &transcript);
-    let failed = repo.hook_with_env(
-        &envelope,
-        "LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION",
-        "1",
-    );
+    repo.write_transcript("sess-registered-failure", TURN_COMPLETE);
+    let envelope = repo.envelope("Stop", "sess-registered-failure");
+    repo.block_object_directory();
+    let failed = repo.hook(&envelope);
     assert!(!failed.status.success(), "{}", describe(&failed));
     assert!(repo.checkpoints().is_empty());
     let claims = repo

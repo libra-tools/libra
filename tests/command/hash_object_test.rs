@@ -1,12 +1,38 @@
 //! Tests for `hash-object`, covering Git-compatible blob hashing, stdin input,
 //! object writes, and structured output.
 
-use std::fs;
+use std::{fs, path::Path};
+
+use sea_orm::{ConnectionTrait, Database, Statement};
 
 use super::{
     assert_cli_success, init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
+    run_libra_command, run_libra_command_with_stdin,
 };
+
+const OBJECT_INDEX_REJECTION_TRIGGER: &str = "test_reject_object_index_write";
+
+async fn set_object_index_write_rejection(repo: &Path, enabled: bool) {
+    let db_path = repo.join(".libra/libra.db");
+    let conn = Database::connect(format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("open repository database for object-index fixture");
+    let sql = if enabled {
+        format!(
+            "CREATE TRIGGER {OBJECT_INDEX_REJECTION_TRIGGER} \
+             BEFORE INSERT ON object_index BEGIN \
+             SELECT RAISE(ABORT, 'test object-index write rejection'); END"
+        )
+    } else {
+        format!("DROP TRIGGER IF EXISTS {OBJECT_INDEX_REJECTION_TRIGGER}")
+    };
+    conn.execute_raw(Statement::from_string(conn.get_database_backend(), sql))
+        .await
+        .expect("install object-index rejection fixture");
+    conn.close()
+        .await
+        .expect("close object-index fixture connection");
+}
 
 #[tokio::test]
 async fn hash_object_file_matches_git_blob_hash() {
@@ -198,12 +224,12 @@ async fn hash_object_write_persists_blob_for_cat_file() {
 async fn hash_object_write_retains_terminal_index_failure_for_next_command_repair() {
     let repo = tempfile::tempdir().expect("create temp repo");
     init_repo_via_cli(repo.path());
+    set_object_index_write_rejection(repo.path(), true).await;
 
-    let output = run_libra_command_with_stdin_and_env(
+    let output = run_libra_command_with_stdin(
         &["hash-object", "--stdin", "-w", "--json"],
         repo.path(),
         "persist despite index failure",
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
     );
     assert_cli_success(
         &output,
@@ -230,12 +256,7 @@ async fn hash_object_write_retains_terminal_index_failure_for_next_command_repai
         "terminal failure must retain its identity"
     );
 
-    let blocked_sync = run_libra_command_with_stdin_and_env(
-        &["cloud", "sync"],
-        repo.path(),
-        "",
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
-    );
+    let blocked_sync = run_libra_command(&["cloud", "sync"], repo.path());
     assert_eq!(blocked_sync.status.code(), Some(128));
     let (human, report) = parse_cli_error_stderr(&blocked_sync.stderr);
     assert_eq!(report.error_code, "LBR-IO-002");
@@ -246,6 +267,8 @@ async fn hash_object_write_retains_terminal_index_failure_for_next_command_repai
         "cloud sync must fail before credentials or uploads: {human}"
     );
     assert!(marker.is_file(), "failed repair must retain its marker");
+
+    set_object_index_write_rejection(repo.path(), false).await;
 
     let persisted = run_libra_command(&["cat-file", "-p", &oid], repo.path());
     assert_cli_success(&persisted, "object payload should remain readable");
@@ -263,8 +286,9 @@ async fn hash_object_write_retains_terminal_index_failure_for_next_command_repai
 async fn hash_object_pending_index_honors_exit_code_on_warning_and_keeps_success_payload() {
     let repo = tempfile::tempdir().expect("create temp repo");
     init_repo_via_cli(repo.path());
+    set_object_index_write_rejection(repo.path(), true).await;
 
-    let output = run_libra_command_with_stdin_and_env(
+    let output = run_libra_command_with_stdin(
         &[
             "--json",
             "--exit-code-on-warning",
@@ -274,13 +298,14 @@ async fn hash_object_pending_index_honors_exit_code_on_warning_and_keeps_success
         ],
         repo.path(),
         "warning exit payload",
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
     );
     assert_eq!(output.status.code(), Some(9));
     assert_eq!(parse_json_stdout(&output)["ok"], true);
     let (human, report) = parse_cli_error_stderr(&output.stderr);
     assert_eq!(report.error_code, "LBR-WARN-001");
     assert!(human.contains("durable repair queue"));
+
+    set_object_index_write_rejection(repo.path(), false).await;
 
     assert_cli_success(
         &run_libra_command(&["status", "--short"], repo.path()),
@@ -318,12 +343,12 @@ async fn hash_object_partial_write_failure_still_reports_pending_index_repair() 
     let repo = tempfile::tempdir().expect("create temp repo");
     init_repo_via_cli(repo.path());
     fs::write(repo.path().join("first.txt"), b"first").expect("write fixture");
+    set_object_index_write_rejection(repo.path(), true).await;
 
-    let output = run_libra_command_with_stdin_and_env(
+    let output = run_libra_command_with_stdin(
         &["hash-object", "-w", "first.txt", "missing.txt"],
         repo.path(),
         "",
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
     );
 
     assert_eq!(output.status.code(), Some(128));
@@ -344,6 +369,7 @@ async fn hash_object_partial_write_failure_still_reports_pending_index_repair() 
         .join(".libra/object-index-repair")
         .join("fe4f02ad058b43f6ed467fdf65b935107529564b.blob.json");
     assert!(marker.is_file(), "failed indexing must remain repairable");
+    set_object_index_write_rejection(repo.path(), false).await;
     assert_cli_success(
         &run_libra_command(&["status", "--short"], repo.path()),
         "a later command should repair the partial write",

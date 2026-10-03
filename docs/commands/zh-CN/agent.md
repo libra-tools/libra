@@ -40,6 +40,13 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 
 支持的 roster 为 `claude-code`、`codex`、`opencode`（首批），三者均可安装 hook：`claude-code` 写 `.claude/settings.json`；`codex` 写用户级 `$CODEX_HOME/hooks.json` 并在 `$CODEX_HOME/config.toml` 写入 Libra 托管的 trust 条目（未受信的 Codex hook 会被静默跳过，trust 条目是安装的一部分）；`opencode` 写 Libra 托管插件 `.opencode/plugin/libra-hooks.js`（注意：`opencode --pure` 会禁用包括捕获在内的全部外部插件）。`gemini` 已从支持 roster 降级为仅卸载通道：`libra agent remove gemini` 可移除历史安装的 Libra 托管 hook（幂等），已捕获会话保持可读；对它或其它非 roster 代理执行 `add`/`enable` 会返回可操作的 unsupported 错误。
 
+对 Codex，`enable` 与 `disable` 会在协作式 Libra 进程锁下更新耦合的
+`$CODEX_HOME/hooks.json` 与 `config.toml`。它们会先准备两个文件，并拒绝在替换前可观察到的
+编辑；但任意编辑器无法被可移植的原子“比较并替换”覆盖。命令运行期间请不要编辑这两个文件。
+若报告非明文完整性恢复日志路径，说明继续自动覆盖已不安全；请保留该日志，先手动解决编辑冲突，
+移除所报告的日志后再重试。日志只记录有限的事务元数据（schema 版本、操作、阶段和恢复围栏）
+以及域隔离的文件指纹，不含原始 hook 或 config 内容；未知指纹状态会刻意保持零写入，而非自动修复。
+
 ## 子命令
 
 | 子命令 | 说明 |
@@ -58,17 +65,17 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `session resume <id>` | 将已停止的已捕获会话重新标记为 active |
 | `session derive-tool-calls <id>` | 从已捕获会话推导工具调用记录 |
 | `checkpoint list` | 列出已捕获 checkpoint |
-| `checkpoint show <id>` | 显示 checkpoint 元数据 |
+| `checkpoint show <id>` | 显示安全的 checkpoint 结构摘要（隐藏 metadata 和内部对象 ID） |
 | `checkpoint rewind <id>` | 检查或应用某个 checkpoint 的工作树回退 |
 | `checkpoint export <id>` | 导出 checkpoint transcript：默认脱敏（无需授权）；raw（未脱敏）导出须 `--allow-raw --raw` 并写入 append-only `agent_audit_log`（缺失授权时拒绝并返回 `LBR-AGENT-013`） |
 | `skill search` | 按 `--skill`、`--provider`、`--session`、RFC3339 `--since`/`--until` 搜索捕获的 skill events（`--limit`/`--cursor` keyset 分页、`--json`）。基于 checkpoint metadata 的读时投影，无独立表 |
 | `skill list` | `skill search` 的别名（同过滤项） |
 | `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入、traces 引用可达但无 catalog 行的提交、或仍有耐久 object-index repair 待处理时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
-| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
+| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。对象检查刻意只读取本仓库的本地对象目录：不可用的 alternate/remote 对象会保守地报告为不可用，而不会在产生诊断时解析外部可控的 alternate 路径。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
-| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in |
+| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in。来源 sha256 以单次流式读取计算、不设固定大小上限，因此大型单文件 provider CLI（OpenCode Bun 构建约 171 MiB）仍可受信；计算期间读出字节超过其报告大小的文件会被拒绝（`LBR-AGENT-005`） |
 | `rpc trust --dir <path>` | 注册一个受信目录（`agent.external_agents.trusted_dirs`，默认 `~/.libra/agents`）：外部二进制的 canonical path 必须位于其中之一才可被信任。路径会被 canonicalize，且必须是存在且非 world-writable 的目录 |
 | `rpc untrust <slug>` | 撤销信任；二进制回到隔离状态（始终可用，不受开关限制） |
 | `rpc invoke` | 在**已信任**的 `libra-agent-*` 二进制上调用一个 JSON-RPC 方法 |
@@ -87,7 +94,7 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `--repo <path>` | `graph` | 从另一个 Libra 仓库读取捕获元数据，而不是从当前目录发现仓库 |
 | `--limit <n>` | `session list`, `checkpoint list` | 每页最大行数（默认 50，硬上限 500——超过时钳制并在 stderr 提示；`0` 按 `1` 处理） |
 | `--cursor <cursor>` | `session list`, `checkpoint list` | 上一页 `next_cursor` 返回的不透明 keyset 游标；不要手工构造 |
-| `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
+| `--extract-transcript <path>` | `session show` | 从当前已验证的 Claude Code transcript 来源重新派生并最多复制 16 MiB 到一个新的本地文件；绝不回退使用已捕获的 metadata 路径，也绝不覆盖已有路径，超限时不发布输出，代理不受支持或当前来源不可用时会失败。使用 `--json` 时，结果为安全 envelope：`{ "session": <session row>, "extracted_transcript": { "output_path": <path>, "bytes": <count> } }`；提取块只包含目标路径和字节数。JSON 和人类输出都不暴露 provider 来源路径。 |
 | `--allow-raw` / `--raw` | `checkpoint export` | 授权并请求 raw（未脱敏）导出；缺少 `--allow-raw` 时 `--raw` 请求会被拒绝（`LBR-AGENT-013`）并记入审计 |
 | `--justification <text>` / `-o <path>` | `checkpoint export` | raw 导出的审计理由与输出文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
@@ -124,11 +131,13 @@ exporter 与 sandbox。
 保存 core 文件；系统日志仍可能记录信号事件。Libra 保留退出状态及有界 stderr
 诊断。该设置只作用于子程序，不修改 Libra 父程序限制或系统配置。
 
-macOS 经 seatbelt（`sandbox-exec`）启用内容捕获（store 可写、主机写与网络被拒）；seatbelt 存在弃用风险。读隔离不对称（macOS 不限制读，与 Linux bwrap 默认拒绝读不同）。`sandbox-exec` 不可用时 fail-closed 降级 metadata-only。启用该 exporter 的方式：先注册包含已核验 `opencode`
+macOS 不支持 OpenCode 内容导出：Seatbelt 无法为可 fork 的 exporter 提供可随 hook 取消安全收束的后代进程隔离，因此 Libra 会在启动 `sandbox-exec` 或 exporter **之前** fail-closed，hook 捕获保持 metadata-only。Linux 使用 Required bubblewrap containment。启用 Linux exporter 的方式：先注册包含已核验 `opencode`
 二进制的目录，再固定它——`libra agent rpc trust --dir <path>`，然后
 `libra agent rpc trust opencode`。两步都不会打开 external-RPC 表面
 （`agent.external_agents.enabled` 保持不变）；二进制只从已注册受信目录解析，
-绝不扫描 `$PATH`。不支持的 schema version 以 usage 错误（exit 129、category
+绝不扫描 `$PATH`。Linux 内容导出还要求受信的 `bwrap` 通过 Libra 的 descriptor-native
+`--bind-fd` 安全探测；不支持或过旧的 `bwrap` 会报告 unavailable 并 fail-closed 为
+metadata-only 捕获。应安装或升级系统 `bwrap` 包，绝不启用未沙箱化回退。不支持的 schema version 以 usage 错误（exit 129、category
 `cli`）返回 `LBR-AGENT-017`。当平台无法提供 Libra 的 provider-root 安全打开
 原语时，Claude/Codex 的发现与导入会如实报告为 unavailable。
 
@@ -159,7 +168,7 @@ subagents，且不会重建；session 与 tombstone 均不存在时返回 `LBR-A
 `results` 仅含完整成功项；发生耐久 turn 进度但最终
 失败的 selection 进入 `partial_results`，不会计入 `succeeded`。批次部分成功时以 `LBR-AGENT-018` 非零退出；结构化错误详情
 保留成功摘要及逐项失败，失败 session id 使用哈希脱敏。单项归属、cwd、
-已擦除与源授权失败分别保留 `LBR-AGENT-015`、`016`、`019`、`020`；失败详情
+已擦除与源授权失败分别保留 `LBR-AGENT-015`、`016`、`019`、`020`；provider 时间戳（含推导的 turn 时间）若超出导入主机时钟五分钟以上，会在影响 session 时序前被拒绝：该 selection 以固定消息 `the transcript contains timestamps beyond the permitted clock skew`（`LBR-AGENT-018`）失败且不写入任何耐久状态；失败详情
 仍携带 `schema_version`，并原样保留 nullable `next_cursor`，不会把 `null` 改成 0。
 成功与 partial 摘要分别用 `checkpoints_written` 报告父 turn 写入、用
 `subagent_checkpoints_written` 报告独立发现的 child-content 写入；只有 child
@@ -187,6 +196,18 @@ payload 声明同一逻辑 turn，claim 会停在 `conflicted`，并在
 写耐久防复活 tombstone，再删除 catalog；自动发现和在途 writer 都不能重建。
 唯一的本地绕过是经审计的 `--restore-erased --yes`。
 
+新的 V2 导入只把来源保留为 repository-keyed、domain-separated 的
+`source/hmac-v2/<64 lower-hex>` commitment。新的 V2 subagent content 则使用其独立
+domain 的 `source/subagent-hmac-v2/<64-lower-hex>` commitment。raw source locator
+或未加钥的 source SHA-256 不得进入 import/subagent 的 catalog metadata、claim、marker、
+diagnostic 或 cloud record。可选的 V2 snapshot digest 是对脱敏 snapshot content
+使用独立 domain 的 repository-keyed `source/hmac-v2/<64 lower-hex>` commitment；
+helper 的瞬态 SHA-256 绝不持久化。bare 或带标签的未加钥 SHA-256 只可作为不可变
+legacy evidence，不能写入新的 V2 或 cloud state。V1 行只可读作 proof，不能当作转换捷径：只有 exact
+scoped proof 匹配且 identity、catalog 与可迁移 repair marker 都已 committed、
+quiescent 时，Libra 才在同一原子事务中迁移它们。active、partial 或
+repair-pending 的 V1 state 保持 V1，绝不创建并行 V2 record。
+
 首次读取内容或执行 export 前，交互确认会显示 agent 范围、仅当前仓库边界、
 候选数/上限、脱敏写入，以及后续 `libra agent push` 可能上传脱敏 traces 的
 提示。`--yes` 只确认该隐私影响，不放宽 provider root、仓库、大小、deadline
@@ -195,23 +216,29 @@ payload 声明同一逻辑 turn，claim 会停在 `conflicted`，并在
 成功、格式错误、未授权及超限候选均计费，也包括授权后文件继续增长的部分。
 如果有界 child discovery 在返回可信字节数前失败，Libra 会保守地计入该 child
 剩余的全部每源 allowance；重试不能利用 helper 失败绕过批次 cap。
-120 秒绝对 deadline 在 discovery 前开始，并在遍历、解析、分批 reservation、
-对象构造与 CAS 中强制。SQLite commit 一旦开始就不会被超时取消：Libra 在每次
+120 秒绝对 deadline 在 discovery 前开始，并在 helper 阶段、遍历、解析、分批
+reservation、对象构造与 CAS 前后检查。SQLite commit 一旦开始就不会被超时取消：Libra 在每次
 commit 前立即检查 deadline，再等待该 commit 得到确定结果；因此最终 turn 已完整
 提交时，即使等待结果期间越过 deadline 也仍报告成功。deadline 失败会 abandon
 当前 owner 的全部未提交 lease/marker；若该恢复事务自身失败，命令会连同原错误
 报告 cleanup 失败和可执行的 `agent doctor --repair` 提示，而不是静默吞掉。
-discovery 遍历/打开与已授权 fd 读取都在可于超时杀死的私有 helper 进程中完成
-（读取 helper 消费同一个已打开 descriptor），并由同一个绝对 deadline 包裹；
-阻塞文件系统操作不能静默突破 120 秒命令预算。
-child discovery 使用较短的子 deadline，为独立有效的父 checkpoint 预留提交时间；
-父进程在遍历有界响应时也会持续复核该子 deadline。因此，迟到或过大的 child
-结果只会令父结果降级为 partial evidence，不会吞掉父 checkpoint。
-consent 之后的 provider preparation（secure open、parse、redaction、cwd/storage
-归属复核）、checkpoint loose-object 写入，以及 traces ref 拼接所需的 commit/tree
-读取也全部位于可杀 helper 边界。对象读取只接受请求的 `commit`/`tree` 类型，校验
-完整 OID 与声明长度，并在分配前执行 16 MiB 解压 payload 上限；恶意压缩对象不能把
-命令 deadline 转化为无界内存占用。
+discovery 和已授权 fd 读取 helper 都是可于超时杀死的私有进程。读取 helper 消费
+父进程已经打开的同一 descriptor；其 control wire 只有固定的安全上限和 commitment，
+绝不包含 locator、路径、provider session 值或 raw bytes。这些 helper 阶段共享该绝对
+deadline。当前命令进程仍会在交接前同步执行 source 分类、canonicalize、安全打开和
+rewind；此处 NFS/FUSE stall 无法被强制取消，因此 120 秒设置不是严格的端到端
+wall-clock deadline。child discovery 使用较短的子 deadline，为独立有效的父
+checkpoint 预留提交时间；父进程在遍历有界响应时也会持续复核该子 deadline。因此，
+迟到或过大的 child 结果只会令父结果降级为 partial evidence，不会吞掉父 checkpoint。
+consent 之后，持有 descriptor 的 preparation 阶段在可杀 helper 中完成 parse 和
+redaction，且不能按 locator 重新打开 source。source-root 授权和初始安全打开在该
+交接之前发生。checkpoint loose-object 写入以及 traces ref 拼接所需的 commit/tree
+读取保留各自的有界路径。此设计保留 descriptor-bound raw read，却尚不能在单个
+command/hook 进程中同时提供 strict deadline、FD-only wire 和 timeout 后的
+autonomous replay；该组合需要 long-lived owner 或由 provider ABI 提供
+pre-authorized descriptor，见 [Session Capture 计划](../../development/plan/plan-20260924.md)。
+对象读取只接受请求的 `commit`/`tree` 类型，校验完整 OID 与声明长度，并在分配前执行
+16 MiB 解压 payload 上限；恶意压缩对象不能把有界 helper 工作转化为无界内存占用。
 
 批量 import 在进入下一个候选前，会等待当前已完成候选排队的 object-index 写入
 落入 SQLite。若 drain 耗尽命令 deadline，partial 进度归属于当前候选，绝不错误
@@ -279,17 +306,41 @@ tombstone 优先**——在 restore 事务内同时过滤带远端 tombstone 的
 tombstone 的另一台机器仍可取回。所以 `agent erase` 应视为对**本仓库**不可逆，
 而不是「所有副本都已消失」的跨机保证。
 
+私有 capture recovery 证据只保存在本仓库。local erase 先提交防复活 tombstone，
+再 prune checkpoint history，最后在同一 catalog 删除事务清除可归属的 recovery
+headers/chunks 和 session aliases。删除依据本地 catalog PK/incarnation 归属，
+不依赖 recovery MAC 或可被淘汰的 receipt；缺 key 不阻止可归属清理。foreign 或
+无法归属的损坏证据保留，提交后只记录不含内容的 lost-capacity 诊断；它仍占用容量，
+并可能阻止创建新关联。没有一致性的原 repository DB 备份时，这部分容量明确 lost，
+doctor/retry 不提供 force-discard。整份 DB-copy 备份含敏感 alias 关联，不是匿名化
+备份；恢复旧完整 DB 备份可能撤销删除及 tombstone。正常 receipt Complete 则在同一
+事务回收对应 artifact，只有无剩余引用时才删除 alias。
+
+pending 与 quarantine header 若冲突于同一 checkpoint key，清理只删除已确认
+属于本 session 的 header；未知/外来 header 及共享 chunks 原样保留。explicit
+erase 会报告保留容量，不证明每一份私有副本都已删除。
+
+session incarnation 不可读，或同 PK 存在其他 incarnation 的已知 alias 时，最终
+删除会拒绝：恢复一致的 session/alias metadata 后重试；第一阶段 tombstone 仍生效。
+只要保留一份不可解码 header，就会阻断本仓库所有新建/重投 recovery artifact 及
+destructive GC/root-walking maintenance，而不只是损失其自己的槽位。该 header
+阻止证明无引用时，Complete 也会保留 alias；可归属的 explicit erase 仍可执行。
+out-of-band 超容量状态最多读 17 份 header 和 17 份关联；未检查部分可能仍含本
+session 的内容。警告不是「所有私有副本已删除」的证明。
+
 `agent session list --json` 与 `agent checkpoint list --json` 每次返回一页：`data` 携带 `schema_version`、位于 `sessions` / `checkpoints` 下的行（单行结构不变），以及 `next_cursor`——传回 `--cursor` 的不透明游标，列表耗尽时为 `null`。页序为最新在前（`started_at` / `created_at` 降序，行 id 作为并列时的次序键）。
 
 人类可读的 `agent session list` 表格会把 `started_at` 按当前机器时钟显示为相对时间（例如 `2 hours ago`）；JSON 输出仍保留原始 Unix 时间戳，供自动化使用。
 
-每个 checkpoint 行携带 `scope`。`committed` checkpoint 在 turn/session 边界（`Stop` / `SessionEnd`）写入，携带脱敏的 transcript 快照。`subagent` 下有两类刻意分离的证据：Codex 的 `SubagentStart` / `SubagentEnd` hook 写空 transcript 的 **boundary checkpoint**，并以 `parent_checkpoint_id` 表达结构归属；Claude `<session>/subagents/*.jsonl` 则逐文件写独立的 **content checkpoint**，其 `parent_checkpoint_id` 保持 null，通过由安全打开的 provider-root-relative source 派生的 opaque SHA-256 claim 与 append-only revision 选出唯一 current content leaf；本地 project slug/文件名不落库，物理历史也不改写。Claude 当前不提供能与 boundary 对齐的稳定 ID，因此常态是 `link_state=unresolved`；`agent doctor` 会报告但不会猜测。只有 provider 给出稳定 ID 且唯一匹配时，才在独立 association 行中关联 boundary，不修改不可变 traces commit。两类证据均可 list/show/export/prune，且 doctor 可见。
+`agent checkpoint show <id>` 刻意不是 metadata dump。默认的人类与 JSON 输出只含固定的 checkpoint 摘要：`checkpoint_id`、受限词表中的 `scope`、Unix `created_at`，以及是否记录了 parent snapshot。它绝不读取或渲染 `metadata.json`、session 标识、source locator 或 commitment、redaction 细节或 catalog 对象 ID。transcript 内容只能走显式的 checkpoint export 路径，并由该路径执行自己的授权和脱敏策略；不要把默认 `show` 输出当作内部 metadata 接口。
 
-Codex 捕获会安装当前文档定义的全部生命周期事件：`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PreCompact`、`PostCompact`、`Stop`、`SubagentStart` 与 `SubagentStop`。checkpoint 的事件投影会保留 `turn_id`、`tool_use_id`、`agent_id`、`agent_type`、压缩触发原因、权限模式、工具输入和工具输出等关联字段。Codex 的加密 reasoning 只记录为加密/不可用状态；Hook 不会提供解密密钥，也不能还原明文内部 reasoning。
+每个 checkpoint 行携带 `scope`。`committed` checkpoint 在 turn/session 边界（`Stop` / `SessionEnd`）写入，携带脱敏的 transcript 快照。`subagent` 下有两类刻意分离的证据：Codex 的 `SubagentStart` / `SubagentEnd` hook 写空 transcript 的 **boundary checkpoint**，并以 `parent_checkpoint_id` 表达结构归属；Claude `<session>/subagents/*.jsonl` 则逐文件写独立的 **content checkpoint**，其 `parent_checkpoint_id` 保持 null。新的 content claim 只会在安全打开 source 并重新核验 root、storage 绑定、scope 与 workspace fence 后，写入仓库密钥、域隔离的 HMAC V2 commitment（`source/subagent-hmac-v2/<64-lower-hex>`）；append-only revision 据此选出唯一 current content leaf，本地 project slug/文件名不落库，物理历史也不改写。历史 V1 `source/sha256/...` claim、revision 与 checkpoint metadata 是不可变、只读证据；命中同一 legacy claim 时不会静默创建并行 V2 行，必须继续走 recovery/`agent doctor` 路径。Claude 当前不提供能与 boundary 对齐的稳定 ID，因此常态是 `link_state=unresolved`；`agent doctor` 会报告但不会猜测。只有 provider 给出稳定 ID 且唯一匹配时，才在独立 association 行中关联 boundary，不修改不可变 traces commit。两类证据均可 list/show/export/prune，且 doctor 可见。
 
-云端镜像在 token-fenced generation 下按依赖顺序发布 catalog 批次（`session → checkpoint → revision → link → claim`）。session、checkpoint、link 与可变 claim 投影各自使用独立单调 sync generation，因此 prune 回退 current 子节点时不会制造同代冲突，retained traces 链的重写也不会被旧 clone 写回。显式 `--restore-erased` import 会为 session 与 opaque child-source namespace 启动新的耐久复制 incarnation；远端删除传播仍 deferred 时也不会复用旧 key。generation 同时绑定远端 object index 的 canonical digest；sync 会在 D1 与 R2 复验每个 checkpoint 对象，restore 只有在读取前后 manifest 与 object-index digest 均未变化时才接受 catalog。当前客户端只使用版本化的 v2 远端 session/checkpoint 表；v2 激活后，D1 trigger 会以升级提示拒绝旧客户端的无 fence 写入，避免其破坏一致恢复快照。
+Codex 捕获会安装当前文档定义的全部生命周期事件：`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PreCompact`、`PostCompact`、`Stop`、`SubagentStart` 与 `SubagentStop`。checkpoint 的事件投影会保留 `turn_id`、`tool_use_id`、`agent_id`、`agent_type`、压缩触发原因、权限模式、工具输入和工具输出等关联字段。Codex 的 `encrypted_content` / 加密 reasoning payload 会被刻意从 capture projection 丢弃：Hook 没有解密密钥，Libra 在该路径既不保留加密占位，也不保留明文内部 reasoning。
 
-`agent checkpoint show --json` 额外报告 `layout` 摘要（`e4-libra`、`legacy-v1` 表示 AG-20 之前的存量 checkpoint、`unknown` 表示 checkpoint tree 本地不可读），包含 manifest 角色、按 manifest 顺序列出的 transcript 分片、`content_hash` 格式校验，以及 transcript `availability` 标志（`present`/`missing`/`unknown`）——全程不读取 transcript blob 内容。
+持久化的 checkpoint 元数据只保留 Libra 能安全分类的字段。live hook capture 在任何持久化之前就会丢弃 provider 提供的 `model`、`source`、`tool_name` 与 session-reference（transcript 指针）字段，因此读取 `checkpoint export` 输出或 `refs/libra/traces` sidecar 的消费者不应再期待这些字段：在 hook 捕获的 checkpoint 中，`metadata.json` 始终记录 `"model": "unknown"`，其 `events/lifecycle.jsonl` 行从不包含 `model` 或 `tool_name` 且记录 `"source": null`，Codex subagent 边界元数据中的 `subagent.tool` / `subagent.source` 为 null。hook 捕获的 lifecycle 行的 `provenance.hook_event_name` 是 canonical snake_case lifecycle kind（例如 `tool_use` 或 `turn_end`，与 `kind` 一致），而不是 provider 的原生事件名。`events/lifecycle.jsonl` 为 schema v2：每行都带必填的 `identity_scheme`（`native_replay_hmac_v2`、`fallback_action_hmac_v1`、`generic_lifecycle_uuid_v5` 或 `import_uuid_v5`），声明其 `event_id` 的派生方式；它只是声明，而不是可验证的 replay 凭据。
+
+云端镜像在 token-fenced generation 下按依赖顺序发布 catalog 批次（`session → checkpoint → revision → link → claim`）。session、checkpoint、link 与可变 claim 投影各自使用独立单调 sync generation，因此 prune 回退 current 子节点时不会制造同代冲突，retained traces 链的重写也不会被旧 clone 写回。显式 `--restore-erased` import 会为 session 与 opaque child-source namespace 启动新的耐久复制 incarnation；仅 R2 payload 物理删除仍 deferred 时也不会复用旧 key；D1 tombstone 传播已生效。generation 同时绑定远端 object index 的 canonical digest；sync 会在 D1 与 R2 复验每个 checkpoint 对象，restore 只有在读取前后 manifest 与 object-index digest 均未变化时才接受 catalog。当前客户端只使用版本化的 v2 远端 session/checkpoint 表；v2 激活后，D1 trigger 会以升级提示拒绝旧客户端的无 fence 写入，避免其破坏一致恢复快照。
 
 ## 示例
 
@@ -336,7 +387,7 @@ libra agent disable --agent claude
 # 列出已捕获会话
 libra agent session list
 
-# 显示一个会话并复制其已捕获 transcript
+# 显示一个会话并复制其当前已验证的 Claude Code transcript 来源
 libra agent session show <session-id> --extract-transcript /tmp/session.jsonl
 
 # 停止一个已捕获会话
@@ -352,7 +403,7 @@ libra agent checkpoint list
 libra agent checkpoint list --limit 100
 libra agent checkpoint list --cursor <next_cursor>
 
-# 按 id 显示单个 checkpoint
+# 显示 checkpoint 的安全结构摘要
 libra agent checkpoint show <id>
 
 # 将 checkpoint 回放为 JSONL transcript
@@ -406,7 +457,8 @@ libra agent --json status
 
 - 外部 `libra-agent-*` 代理**默认禁用**。使用 `libra config set agent.external_agents.enabled true`（仓库级）显式开启；开启前 `rpc list`/`libra-agent-*` 的 `rpc trust`/`rpc invoke` 会以 `LBR-AGENT-002` 拒绝（`rpc untrust` 始终可用——撤销信任只会收紧安全面；`rpc trust --dir <path>` 与 provider-exporter 信任如 `rpc trust opencode` 属纯准备动作——不扫描 `$PATH`、本身不启用任何东西，因此门控下亦可用）。已发现的二进制在 `rpc trust <slug>` 记录来源前保持隔离（world-writable 目录中的二进制拒绝信任）；每次 invoke 都会复验来源（漂移即撤销信任，`LBR-AGENT-005`）；子进程环境被清空为白名单注入，stderr 被捕获/限长/脱敏——绝不继承。invoke 超时、broken pipe、malformed frame 映射 `LBR-AGENT-012`；IO 硬上限超限映射 `LBR-AGENT-007`。
 
-- 顶层 `agent hooks` 入口是隐藏的，面向由 `libra agent enable` 安装的 hook 配置；用户通常不会直接调用它。若 hook envelope 未通过大小 / UTF-8 / JSON / schema / transcript 路径校验，会以 `LBR-AGENT-008`（退出码 128）fail-closed 拒绝——绝不回显 raw stdin。对不一致 store 执行 checkpoint 操作（如 `checkpoint rewind`）——catalog 行的 `parent_commit` 非法或指向缺失的 traces 对象——会以 `LBR-AGENT-009`（退出码 128）失败；运行 `libra agent doctor` 检查 store。
+- `libra agent enable` 为 Claude Code 与 Codex 安装的 hook 配置调用顶层 `libra hooks claude|codex <verb>`，并带有 installer 根据 handler timeout 生成的受限隐藏 `--capture-budget-ms` 参数（默认 Claude `10s → 9000`、Codex 普通事件 `30s → 29000`；Codex `SessionEnd` 因宿主三秒上限为 `3s → 2000`；一秒的历史 handler 仍保留可用的 `500ms` capture 切片，另保留最多 1000ms 用于 terminal finalizer 清理）。重跑 enable 会刷新旧配置，隐藏别名也接受该参数以兼容历史已安装命令。已安装的 OpenCode plugin（`.opencode/plugin/libra-hooks.js`）则通过隐藏的 `libra agent hooks opencode <verb>` 入口转发所有事件，不带 installer budget；其 capture deadline 为 OpenCode export deadline。Claude 与隐藏别名在 hook envelope 未通过大小 / UTF-8 / JSON / schema / reported cwd / transcript 路径校验时，会以 `LBR-AGENT-008`（退出码 128）fail-closed 拒绝，且绝不回显 raw stdin。两个路径类字段会在存储解析前限制为 4096 字节。已安装的 Codex 表面会有意确认 malformed/unbound callback 与辅助性的 nonterminal 捕获失败，以免失败阻断宿主任务：通用 ingress、scope 和存储失败只输出经净化诊断且不创建 capture 行。在任何 Libra 仓库之外触发、格式正确的回调没有可绑定的 scope：已安装的 Codex hook 会确认它（退出码 `0`，包括 `SessionEnd`），而 Claude 与隐藏别名返回固定、不含路径的仓库未找到错误 `LBR-REPO-001`（退出码 128）。已损坏的活动仓库不视为“仓库之外”：Claude、隐藏别名（Claude Code / OpenCode / Codex）、gemini 入口以及已安装 Codex 的 `SessionEnd`（仍以非零退出）返回与其他所有仓库命令相同、不含路径的 `LBR-REPO-003`（无法解析的 linked worktree storage，附 `libra worktree repair --confirm <worktree-path>` 修复建议）、`LBR-REPO-002`（数据库缺失或 object format 不受支持）或 `LBR-IO-001`（数据库无法打开——包括由更新版本 Libra 写入——或 object format 无法读取），绝不返回通用的 `LBR-INTERNAL-001` capture 失败（见 `libra hooks`）。与其他所有仓库命令一样，这些入口打开数据库时会自动应用待处理的仓库 schema 迁移。但已校验且已绑定 scope 的 `SessionEnd` 必须持久化或观察到 durable terminal completion/pending receipt；在该证据存在前发生的有界数据库/finalizer 失败会以非零退出，而不会被静默确认。已有 catalog reservation 后的狭义 checkpoint 或 maintenance-lock 失败，才可能仅持久化一条不含敏感内容、可重试的 catalog 诊断。该预算约束可杀 helper、数据库和其它 deadline-aware 阶段；它不是严格的 whole-process host deadline，因为 source 分类、canonicalize、安全打开和 rewind 当前仍在 descriptor 交接前同步发生。NFS/FUSE stall 因而无法被强制取消，这条路径也不承诺 timeout 后的 FD-only autonomous replay。对不一致 store 执行 checkpoint 操作（如 `checkpoint rewind`）——catalog 行的 `parent_commit` 非法或指向缺失的 traces 对象——会以 `LBR-AGENT-009`（退出码 128）失败；运行 `libra agent doctor` 检查 store。
+- 受管 Session Capture 当前要求 Unix 才能安全初始化 repository-private deduplication key。non-Unix platform 会在创建 key file 前 fail-closed 并给出可操作的诊断，而不会使用较弱的 path-based publication fallback。该固定能力诊断会显式到达两个 Codex 入口：nonterminal `hooks codex` callback（包括隐藏历史 alias）向 stderr 输出不含路径的 Unix-host remedy 但以 `0` 退出；`SessionEnd` 以同一 remedy 非零退出。fail-closed 的已安装 Claude 表面与隐藏的 `agent hooks` Claude Code / OpenCode 别名对每个事件都携带同一 remedy 与 `LBR-UNSUPPORTED-001` 非零退出。这个例外不改变 alias 对 malformed envelope 的 fail-closed 契约。它只适用于在 Libra 仓库内触发的回调：在任何 Libra 仓库之外触发的回调在所有平台（无论是否为 Unix）上都遵循上文的仓库外契约。
 - `checkpoint rewind --apply` 只恢复工作树文件；代理自身的 transcript 文件不会被重写。
 - Hook 和捕获诊断采用 best-effort 方式，设计目标是报告可操作的安装状态，而不是静默忽略缺失的提供商。
 
@@ -417,19 +469,26 @@ libra agent --json status
 | `inconsistency_type` | 含义 | `--repair` 动作 |
 |----------------------|------|----------------|
 | `stale_catalog_row` | `agent_checkpoint` 行的 `traces_commit`/`tree_oid`/`metadata_blob_oid` 与仍可从 `refs/libra/traces` 到达的 checkpoint 不一致 | 从 ref 重建该行的 OID 列（幂等 UPDATE） |
-| `missing_objects` | checkpoint 对象在对象库中真正缺失（且无法从 ref 重建）——检查覆盖完整 E4 树：`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`（含分片）、`redaction_report.json`、`content_hash.txt`、中间 tree，以及 manifest 声明的全部 blob | 无——标记 `manual_required`；doctor 绝不执行破坏性动作（可尝试 `libra fsck --heal` 或从云端/备份恢复） |
+| `missing_objects` | checkpoint 对象在对象库中真正缺失（且无法从 ref 重建）——best-effort 的对象/manifest 枚举覆盖 E4 协议树：`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`（含分片）、`redaction_report.json`、`content_hash.txt` 与中间 tree。它只下钻协议拥有的 `events`/`transcript` 子树，并限制 tree 条目、对象总数和 manifest 声明数；命中上限即标记 `manual_required`，绝不做部分修复。它不解析或验证 lifecycle 行 schema、UUID 派生或 `identity_scheme` 值。 | 无——标记 `manual_required`；doctor 绝不执行破坏性动作（可尝试 `libra fsck --heal` 或从云端/备份恢复） |
 | `missing_catalog_row` | ref 可达的 checkpoint 没有 catalog 行（崩溃窗口 B 残留） | 通过 writer 同款「先探测再插入」的幂等路径重插该行，字段从 commit 的 `metadata.json` 重建（v1 与 v2 两种 shape 均可解析） |
-| `missing_object_index` | checkpoint 对象在 `object_index` 中缺行（`libra cloud sync` 看不到）——覆盖 traces commit 加完整 E4 对象集 | 按 writer 行语义幂等补插（tree 记 `tree`，transcript blob 记 `agent_transcript`，sidecar 记 `blob`） |
+| `missing_object_index` | checkpoint 对象在 `object_index` 中缺行（`libra cloud sync` 看不到）——覆盖 traces commit 加有界的 E4 协议对象集 | 按 writer 行语义幂等补插（tree 记 `tree`，transcript blob 记 `agent_transcript`，sidecar 记 `blob`）。修复大小前 doctor 会在 transcript cap 内流式完整性校验已持有的本地 loose object；绝不采用 manifest `byte_len`，也不渲染 payload。 |
 | `expired_inflight_marker` | 有效 traces writer marker 已过 TTL，包括 provisional preclaim 与已确认新建 loose-object OID 的崩溃残留 | 在最终 ref 事务中 fence 过期 writer，执行串行化的全仓库 root 证明并退役 marker；inline recovery 不 unlink 共享 payload、不删除 `object_index`，物理回收交给仓库 GC |
 | `invalid_inflight_marker` | marker JSON、行身份、commit 或 OID 损坏 | 无——标记 `manual_required`；无法解码所有权时自动删除不安全 |
-| `conflicted_coverage_claim` | 两个不同的完整 payload 声明了同一逻辑 turn；doctor 只报告哈希化 turn 身份、incumbent revision/digest，以及保留的首个 challenger 的 digest/source/time/redaction 证据 | 无——标记 `manual_required`；检查两份耐久脱敏候选并显式选择恢复方案，不能静默丢弃 provenance；`--repair` 绝不替 operator 选择 winner |
+| `conflicted_coverage_claim` | 两个不同的完整 payload 声明了同一逻辑 turn；doctor 只报告每次报告内的不透明序号、受限的 schema/revision/completeness 事实，以及已保留 challenger 脱敏证据这一事实 | 无——标记 `manual_required`；检查耐久脱敏候选并显式选择恢复方案，不能静默丢弃 provenance；`--repair` 绝不替 operator 选择 winner |
 | `inconsistent_subagent_content` | current 子代理 content claim 与其不可变 revision、checkpoint catalog 行或 association link 缺失或不一致 | 无——标记 `manual_required`；在 companion 关系及 checkpoint 对象/ref 可达性恢复前，unchanged replay 一律 fail-closed |
 | `unresolved_subagent_link` | current 子代理 content checkpoint 没有唯一、provider-stable 的 boundary 匹配（Claude 的常态） | 无——标记 `manual_required`；content 与 boundary 证据分别保留，doctor 绝不猜测关联 |
 
 补充规则：
 
+- 仓库与数据库失败沿用共享的仓库契约（exit 128）。在仓库之外运行时，doctor 以 `LBR-REPO-001` 失败，并给出与其他仓库命令相同的 `libra init` / Git 转换提示；已脱离（detached）、迁移中或损坏的 linked worktree 以 `LBR-REPO-003` 失败，并原样给出该 worktree 的修复指引。doctor 自行打开仓库数据库：数据库缺失为 `LBR-REPO-002`，无法打开（包括由更新版本 Libra 写入）为 `LBR-IO-001`，不支持的 `core.objectformat` 为 `LBR-REPO-002`。这些数据库错误消息不包含数据库路径，也不回显存储的 object format 值。
 - **legacy-v1 checkpoint**（升级前布局，无 `manifest.json`）计入 `legacy_v1_checkpoints`，永不进入 checkpoint 对象修复类别，也永不被 `--repair` 改写。
+- pending terminal-finalizer 诊断使用只读 **keyset pagination**：每页 32 个 session，每次最多扫描 512 个 session、返回 128 个 receipt finding，receipt metadata 在解码前限制为 1 MiB。坏行通过固定、无敏感内容的 note 报告，并继续扫描后续有效行；跳过坏 key 或达到上限意味着报告不完整，不能认为未列出的 receipt 健康或已修复。
+- 没有 durable artifact 的 receipt 属于 **`pending_source`** 证据；doctor 不会重开 provider source 或制造可重放 snapshot。后续 stop/resume 使 receipt superseded 后，它仍标为 `manual_required`，session-quarantined receipt 也是如此；即使 `--repair` 也不改写当前 session 或原 receipt，quarantine 不代表成功捕获。有 artifact 的 receipt 达到原始重试上限时，quarantine routing 只移动私有 artifact header，保留原 receipt 的 revision、status、counter、generation 和 source fence。符合条件的 authenticated artifact 只有在 alias、receipt、marker 和 coverage fences 全部复核后才会本地重放。单次 `doctor --repair` 最多计入五次重放尝试；自动重放共享一个 2 秒 cooperative deadline，每次 audited 人工尝试各自取得新的 2 秒 deadline；因上限或 retry-later 而延期的 finding 不计数、保持未修复，重新运行命令可继续有界队列。只有 checkpoint durable 写入且原 terminal receipt 完成后，finding 才标记为已修复。过期 artifact 隔离后仅允许一次 audited manual replay；失败或 fence 过期的尝试仍需人工恢复。永久拒绝的自动 replay 只把 artifact header 停放到 quarantine；原始重试/时间上限到期前，doctor 不会自动重试该 header，也不会让它消耗后续 replay 配额。
+- schema-v1 lifecycle JSONL 行没有类型化 `identity_scheme`，始终是 opaque legacy evidence。`doctor`、`checkpoint show` 与 `checkpoint export` 不会从这类行或 event UUID 推断 HMAC/replay 信任。
 - 被**存活的 traces in-flight marker** 覆盖的 checkpoint 是写入中的 writer，不算不一致，会被跳过。
+- finding 标识保持可操作，但绝不回显损坏输入：checkpoint-store finding 携带规范 checkpoint UUID（in-flight marker 类别为 writer attempt 的 checkpoint id，该 checkpoint 可能从未发布），`findings_store` finding 携带可用于 `libra review show` / `libra investigate show` 的 review/investigate `run_id`。存储的 checkpoint 标识若不是规范 UUID，只显示为 `checkpoint-id-redacted` 或每次报告内的不透明标签；`conflicted_coverage_claim` 始终使用每次报告内的序号。
+- **过期的 terminal writer marker** 不授权将后来的 transcript 重绑到其 pending receipt。`--repair` 只退役陈旧 marker 的所有权，绝不改变 receipt 的 source 或 marker fence。只有原来的已授权 source 仍可用时，才可重跑原 hook/replay；同一 native terminal 事件若携带变更后的 source，会以 `source_digest_conflict` 隔离并要求人工恢复，绝不发布 checkpoint、traces ref 或 stopped 状态。
 - **没有 checkpoint 的 session 是合法中间态**（active session 尚未产生首个 stop），绝不被标记；只有 checkpoint-without-session 才算 orphan。
 - 已捕获的 **gemini 行保持可读**且绝不被标记；残留的 gemini hook **配置**会得到指向仅卸载通道（`libra agent remove gemini`）的提示。
+- 对属于 **scoped** captured session 的 catalog 行修复，会把该 session 的 durable workspace lease 复核放在最终数据库写入处。若 lease 已 release、过期或被重新 fence，doctor 保持 finding 未修复并标为 `manual_required`；只有显式 `legacy_unknown` 行继续走历史上的无 fence 兼容修复路径。
 - 所有修复均幂等——连续两次运行 `doctor --repair`，第二次不会做任何事。带 `--repair` 时，每次修复尝试发出一个 `agent.doctor.repair` tracing span（`inconsistency_type`、`repaired`、`manual_required`），transcript 内容绝不进入日志。

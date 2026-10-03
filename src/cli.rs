@@ -1574,12 +1574,15 @@ fn repair_invocation_refused_without_confirmation(
 
 fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {
     match command {
-        // Codex invokes this user-level callback in every trusted working
-        // directory. Resolve storage lazily in the handler so an unrelated
-        // callback cannot fail before it is acknowledged because the current
-        // directory is outside a Libra repository or its storage is busy.
-        Commands::Hooks(command::hooks::HooksArgs {
-            command: command::hooks::HooksProviderSubcommand::Codex { .. },
+        // Hook frames are untrusted input. All installed `libra hooks` and
+        // legacy hidden `libra agent hooks` entries resolve storage lazily,
+        // after ingress validation, so malformed input receives the stable
+        // envelope error rather than an unrelated repository/lease failure.
+        // Codex additionally needs this outside a Libra repository so it can
+        // acknowledge advisory callbacks without blocking the host task.
+        Commands::Hooks(_) | Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Hooks(_),
+            ..
         }) => Ok(CommandPreflight::none()),
         // `mega2 browser` reads one bounded remote listing (or drives the TUI)
         // and touches no repository object, index or configuration state; it
@@ -1697,8 +1700,25 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
         }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system || command::config::is_schema_doctor_request(cfg) => Ok(CommandPreflight::none()),
+        // `agent doctor` opens the repository database itself so a missing
+        // or damaged database is reported without its resolved filesystem
+        // path, and it pins the hash kind only after that open succeeds.
+        // Repository discovery still runs here: outside a repository, or in
+        // a detached/migrating/corrupt linked worktree, doctor keeps the
+        // shared `LBR-REPO-001` / `LBR-REPO-003` contract (including the
+        // `libra init`, Git-conversion and worktree remedies) of every other
+        // repository command.
+        Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Doctor(_),
+            ..
+        }) => {
+            utils::util::try_get_storage_path(None)
+                .map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::none())
+        }
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Graph(graph_args),
+            ..
         }) => {
             // W5-08: bare (non-JSON) `libra agent graph` is the removed
             // interactive entry. Skip repository preflight so the
@@ -2301,6 +2321,7 @@ fn command_requires_complete_object_index(command: &Commands) -> bool {
             command,
             Commands::Agent(command::agent::AgentArgs {
                 command: command::agent::AgentSubcommand::Clean(args),
+                ..
             }) if !args.dry_run
         )
 }
@@ -2410,10 +2431,12 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
     let read_policy = if args.offline {
         utils::read_policy::ReadPolicy::LocalOnly
     } else {
-        utils::read_policy::read_policy_from_env().map_err(|message| {
-            CliError::command_usage(format!("invalid LIBRA_READ_POLICY: {message}"))
-                .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
-                .with_exit_code(128)
+        utils::read_policy::read_policy_from_env().map_err(|_| {
+            CliError::command_usage(
+                "invalid LIBRA_READ_POLICY value; use auto, offline, local, or remote",
+            )
+            .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
+            .with_exit_code(128)
         })?
     };
     utils::read_policy::set_read_policy(read_policy);
@@ -2424,20 +2447,22 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
     let max_connections = match args.max_connections {
         Some(limit) => limit,
         None => utils::resource_limits::max_connections_from_env()
-            .map_err(|message| {
-                CliError::command_usage(format!("invalid LIBRA_MAX_CONNECTIONS: {message}"))
-                    .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
-                    .with_exit_code(128)
+            .map_err(|_| {
+                CliError::command_usage(
+                    "invalid LIBRA_MAX_CONNECTIONS value; use a positive integer",
+                )
+                .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
+                .with_exit_code(128)
             })?
             .unwrap_or(utils::resource_limits::DEFAULT_MAX_CONNECTIONS),
     };
     utils::resource_limits::set_max_connections(max_connections);
 
     let (env_literal, invalid_literal) = utils::pathspec::literal_pathspecs_from_env();
-    if let Some(raw) = invalid_literal {
-        crate::utils::error::emit_warning(format!(
-            "ignoring unrecognized GIT_LITERAL_PATHSPECS value '{raw}'"
-        ));
+    if invalid_literal.is_some() {
+        crate::utils::error::emit_warning(
+            "ignoring unrecognized GIT_LITERAL_PATHSPECS value".to_string(),
+        );
     }
     let literal = if args.no_literal_pathspecs {
         false
@@ -2962,17 +2987,41 @@ fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliEr
 /// with the Libra installation on a read-only filesystem (immutable
 /// container, CI sandbox, read-only mount). A hook callback must stay
 /// bounded and must not depend on the install directory being writable, so
-/// hook entries skip both the auto-upgrade startup recovery gate and the
-/// `upgrade.mode=auto` check (issue #502); the next normal command still
-/// runs both.
+/// [`parse_async`] dispatches hook entries immediately after argv parsing.
+/// They therefore skip the auto-upgrade startup recovery gate and the
+/// `upgrade.mode=auto` check (issue #502), the global configuration schema
+/// policy, the worktree-scope pin and the central operation boundary (a
+/// callback records no `libra op log` entry; capture state lives in the
+/// capture catalog and `refs/libra/traces`). The next normal command still
+/// runs every one of those steps.
 fn command_is_agent_hook_entry(command: &Commands) -> bool {
     matches!(
         command,
         Commands::Hooks(_)
             | Commands::Agent(command::agent::AgentArgs {
                 command: command::agent::AgentSubcommand::Hooks(_),
+                ..
             })
     )
+}
+
+/// Extract the installer-owned hook budget from one already-parsed hook
+/// command and establish its deadline before normal CLI preflight begins.
+/// The match is intentionally coupled to [`command_is_agent_hook_entry`], so
+/// a new hook spelling cannot accidentally take the slow general dispatcher.
+fn hook_capture_deadline_for_command(
+    command: &Commands,
+) -> CliResult<Option<crate::internal::ai::capture::ingress::CaptureDeadline>> {
+    match command {
+        Commands::Hooks(args) => {
+            command::hooks::capture_deadline_from_budget_ms(args.capture_budget_ms)
+        }
+        Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Hooks(args),
+            ..
+        }) => command::hooks::capture_deadline_from_budget_ms(args.capture_budget_ms),
+        _ => Ok(None),
+    }
 }
 
 /// Kick off the `upgrade.mode=auto` check (§A.8) without ever blocking the
@@ -3051,6 +3100,16 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         == Some(crate::internal::upgrade::orchestrator::BACKGROUND_UPGRADE_TOKEN)
     {
         return crate::internal::upgrade::orchestrator::run_background_upgrade_worker().await;
+    }
+    if argv.get(1).and_then(|arg| arg.to_str())
+        == Some(crate::internal::ai::capture::worker::WORKER_ARG)
+    {
+        if argv.len() != 2 {
+            return Err(CliError::fatal(
+                "capture recovery worker does not accept arguments".to_string(),
+            ));
+        }
+        return command::agent::run_capture_recovery_worker().await;
     }
     let _invocation_guard = CLI_INVOCATION_LOCK.lock().await;
     // Keep the large dispatcher out of the generic task-local wrapper's state
@@ -3139,7 +3198,6 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
     reject_unsupported_single_dash_control(&utf8_argv)?;
-    let _invocation_scope = pin_invocation_scope();
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
@@ -3158,12 +3216,62 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    // Managed hook callbacks run beneath their provider's short timeout.
+    // Establish the dual-clock deadline immediately after argv parsing, then
+    // take the deliberately narrow dispatch below before global config,
+    // operation-log, worktree-pin, or repository preflight work can consume
+    // that host budget.
+    let is_agent_hook_entry = command_is_agent_hook_entry(&args.command);
+    let hook_deadline = if is_agent_hook_entry {
+        hook_capture_deadline_for_command(&args.command)?
+    } else {
+        None
+    };
+    // Declare structured output as soon as clap has established the global
+    // intent. `apply_global_runtime_flags` can emit validation warnings (for
+    // example for a malformed environment value), and a JSON/machine caller
+    // must never receive one of those diagnostics on stderr before the
+    // command has a chance to render its structured envelope.
+    utils::output::set_structured_output(args.json.is_some() || args.machine);
+    if is_agent_hook_entry {
+        apply_global_runtime_flags(&args)?;
+        let color = if args.no_color {
+            "never"
+        } else {
+            args.color.as_str()
+        };
+        let output = OutputConfig::resolve(
+            args.json.as_deref(),
+            args.machine,
+            args.no_pager,
+            color,
+            args.quiet,
+            args.exit_code_on_warning,
+            &args.progress,
+        );
+        output.apply_color_override();
+        utils::output::set_structured_output(output.is_json());
+        return match args.command {
+            Commands::Hooks(cmd_args) => {
+                command::hooks::execute_safe(cmd_args, &output, hook_deadline).await
+            }
+            Commands::Agent(cmd_args) => {
+                command::agent::execute_safe(cmd_args, &output, hook_deadline).await
+            }
+            _ => Err(CliError::fatal(
+                "internal error: hook dispatcher received a non-hook command",
+            )),
+        };
+    }
+    let _invocation_scope = pin_invocation_scope();
     // OL-09 census seam: every concrete CLI command is classified before any
     // dispatch-specific mutation code runs. The actual operation transaction
     // is owned by the command/Agent boundary; keeping this call at the
     // central parse seam prevents a new surface from bypassing classification.
     let schema_doctor = matches!(&args.command, Commands::Config(cfg) if command::config::is_schema_doctor_request(cfg));
     let operation_class = operation_class_for_command(&args.command).await;
+    // Hook callbacks never reach this point: they were dispatched above,
+    // before the central operation boundary could open the operation log.
     let use_central_operation_boundary = !command_has_existing_operation_boundary(&args.command);
     // Read-only commands must not charge their census diagnostic to the
     // active logfile; `logfile info` reports rolled-file sizes exactly.
@@ -3180,12 +3288,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }
     apply_global_runtime_flags(&args)?;
-    // Declare the output mode BEFORE anything that can raise a warning. The
-    // repository preflight below runs ahead of `OutputConfig::resolve`, so
-    // setting the flag there would let a preflight warning reach stderr
-    // milliseconds before the JSON envelope that is supposed to carry it —
-    // the stderr-only channel §B.5 forbids.
-    utils::output::set_structured_output(args.json.is_some() || args.machine);
+    // The output mode was declared immediately after parsing, before global
+    // runtime validation. Keep it in place through preflight, whose warnings
+    // must likewise stay inside the structured envelope.
     // Debug-only seam: the delivery matrix for PREFLIGHT warnings (raised
     // before any command runs) is otherwise only reachable by corrupting a
     // repository, so tests inject one here instead.
@@ -3201,14 +3306,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // transaction exits here rather than running the user's command.
     // Diagnosis must not mutate the installation or inspect other DB scopes,
     // including when its own argument validation will reject the invocation.
-    // Agent hook entries skip the gate (issue #502): the recovery lock lives
-    // in the install directory, which may be a read-only mount in hook host
-    // sandboxes, and a callback must not pay for or warn about unrelated
-    // self-update work.
+    // Agent hook entries never reach the gate (issue #502): they were
+    // dispatched above, because the recovery lock lives in the install
+    // directory, which may be a read-only mount in hook host sandboxes, and a
+    // callback must not pay for or warn about unrelated self-update work.
     if !schema_doctor {
-        if !command_is_agent_hook_entry(&args.command) {
-            crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
-        }
+        crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
         enforce_global_config_schema_policy(&args.command).await?;
     }
     if let Commands::Tag(tag_args) = &args.command {
@@ -3341,6 +3444,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         &args.command,
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Import(_),
+            ..
         })
     );
 
@@ -3351,13 +3455,10 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // is inert (no I/O) until keys are provisioned. The explicit `libra
     // upgrade` command is exempt: it runs the same pipeline itself, and a
     // background install racing the interactive one would be confusing.
-    // Agent hook entries are exempt too (issue #502): a host-invoked
-    // callback must stay within its timeout and must not touch the install
-    // directory, which may be mounted read-only.
-    if !schema_doctor
-        && !matches!(args.command, Commands::Upgrade(_))
-        && !command_is_agent_hook_entry(&args.command)
-    {
+    // Agent hook entries are exempt too (issue #502) and were dispatched
+    // above: a host-invoked callback must stay within its timeout and must
+    // not touch the install directory, which may be mounted read-only.
+    if !schema_doctor && !matches!(args.command, Commands::Upgrade(_)) {
         run_auto_upgrade_check_hook();
     }
 
@@ -3625,14 +3726,18 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             }
             Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
             Commands::Mega2(cmd_args) => command::mega2::execute_safe(cmd_args, &output).await?,
-            Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
+            Commands::Agent(cmd_args) => {
+                command::agent::execute_safe(cmd_args, &output, None).await?
+            }
             Commands::Review(cmd_args) => {
                 command::agent::review::execute_safe(cmd_args, &output).await?
             }
             Commands::Investigate(cmd_args) => {
                 command::agent::investigate::execute_safe(cmd_args, &output).await?
             }
-            Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
+            Commands::Hooks(cmd_args) => {
+                command::hooks::execute_safe(cmd_args, &output, None).await?
+            }
             Commands::Bisect(bisect_cmd) => {
                 command::bisect::execute_safe(bisect_cmd, &output).await?
             }
@@ -4285,7 +4390,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(cwd, env)]
+    #[serial(cwd, env, warning_tracker)]
     fn background_index_failures_warn_unless_command_owns_stricter_barrier() {
         output::reset_warning_tracker();
         report_background_index_update_outcome(4, 6, false);
@@ -4519,7 +4624,7 @@ mod tests {
     /// `--exit-code-on-warning`. This test seeds a stale warning, then verifies that
     /// [`prepare_cli_invocation_state`] clears it before dispatch.
     #[test]
-    #[serial]
+    #[serial(env, warning_tracker)]
     fn parse_async_resets_warning_tracker_before_dispatch() {
         output::record_warning();
         assert!(output::warning_was_emitted());

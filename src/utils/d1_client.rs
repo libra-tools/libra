@@ -2037,7 +2037,7 @@ impl D1Client {
     ) -> Result<Vec<AgentImportTombstoneRow>, D1Error> {
         self.collect_agent_capture_pages_with_budget(
             "SELECT agent_kind, provider_session_id, erased_session_id,
-                    source_fingerprint, erased_at
+                    NULL AS source_fingerprint, erased_at
              FROM agent_import_tombstone WHERE repo_id = ?1
              ORDER BY agent_kind, provider_session_id LIMIT ?2 OFFSET ?3",
             repo_id,
@@ -2660,13 +2660,15 @@ impl D1Client {
     /// PD-03: publish session-erasure tombstones under the generation
     /// fence, then cascade-delete every mirror row of each erased
     /// session (claims -> revisions -> links -> checkpoints -> the
-    /// session itself). Idempotent: replays keep the newest `erased_at`.
+    /// session itself). Idempotent: replays keep the newest `erased_at` and
+    /// scrub the retired legacy source fingerprint.
     pub async fn sync_agent_import_tombstones_batch(
         &self,
         repo_id: &str,
         publish_token: &str,
         rows: &[AgentImportTombstoneRow],
     ) -> Result<(), D1Error> {
+        let wire_rows = agent_import_tombstone_wire_rows(rows);
         self.execute_agent_capture_json_batch(
             r#"
             WITH incoming(value) AS (SELECT value FROM json_each(?2))
@@ -2677,7 +2679,7 @@ impl D1Client {
             SELECT ?1, json_extract(value, '$.agent_kind'),
                    json_extract(value, '$.provider_session_id'),
                    json_extract(value, '$.erased_session_id'),
-                   json_extract(value, '$.source_fingerprint'),
+                   NULL,
                    CAST(json_extract(value, '$.erased_at') AS INTEGER),
                    CAST(strftime('%s', 'now') AS INTEGER)
             FROM incoming
@@ -2687,16 +2689,13 @@ impl D1Client {
             )
             ON CONFLICT(repo_id, agent_kind, provider_session_id) DO UPDATE SET
                 erased_session_id = excluded.erased_session_id,
-                source_fingerprint = COALESCE(
-                    excluded.source_fingerprint,
-                    agent_import_tombstone.source_fingerprint
-                ),
+                source_fingerprint = NULL,
                 erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at),
                 synced_at = CAST(strftime('%s', 'now') AS INTEGER)
             "#,
             repo_id,
             publish_token,
-            rows,
+            &wire_rows,
             "agent import tombstone",
         )
         .await?;
@@ -2767,7 +2766,7 @@ impl D1Client {
                 sql,
                 repo_id,
                 publish_token,
-                rows,
+                &wire_rows,
                 "agent import tombstone cascade",
             )?;
             // Cascade deletes remove however many mirror rows exist (often
@@ -3414,8 +3413,29 @@ pub struct AgentImportTombstoneRow {
     pub agent_kind: String,
     pub provider_session_id: String,
     pub erased_session_id: String,
+    // This field remains deserializable for legacy D1/local rows, but no
+    // batch payload may serialize it. Tombstone identity is sufficient for
+    // replay, and a legacy fingerprint is not cloud-safe metadata.
+    #[serde(default, skip_serializing)]
     pub source_fingerprint: Option<String>,
     pub erased_at: i64,
+}
+
+/// Project tombstones into the cloud wire schema. The local compatibility
+/// column may still contain a V1 fingerprint, but sending it in the JSON batch
+/// would disclose it before the SQL INSERT can replace the column with NULL.
+fn agent_import_tombstone_wire_rows(
+    rows: &[AgentImportTombstoneRow],
+) -> Vec<AgentImportTombstoneRow> {
+    rows.iter()
+        .map(|row| AgentImportTombstoneRow {
+            agent_kind: row.agent_kind.clone(),
+            provider_session_id: row.provider_session_id.clone(),
+            erased_session_id: row.erased_session_id.clone(),
+            source_fingerprint: None,
+            erased_at: row.erased_at,
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3562,7 +3582,7 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    use super::*;
+    use super::{test_support::MockD1, *};
     use crate::{
         internal::config::ConfigKv,
         utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
@@ -3731,6 +3751,42 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
         assert_eq!(sizes, [128, 128, 1]);
+    }
+
+    #[test]
+    fn agent_import_tombstone_wire_payload_omits_retired_fingerprint() {
+        let legacy_fingerprint = "legacy-fingerprint-must-not-leave-local";
+        let rows = agent_import_tombstone_wire_rows(&[AgentImportTombstoneRow {
+            agent_kind: "claude_code".to_string(),
+            provider_session_id: "provider".to_string(),
+            erased_session_id: "erased-session".to_string(),
+            source_fingerprint: Some(legacy_fingerprint.to_string()),
+            erased_at: 7,
+        }]);
+        let statement = D1Client::agent_capture_json_batch_statement(
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2)) SELECT value FROM incoming",
+            "repo",
+            "writer",
+            &rows,
+            "agent import tombstone",
+        )
+        .expect("build redacted tombstone batch statement");
+        let wire = serde_json::to_value(statement).expect("serialize redacted tombstone statement");
+        let payload = wire["params"][1]
+            .as_str()
+            .expect("tombstone batch payload is JSON text");
+        assert!(
+            !payload.contains(legacy_fingerprint),
+            "the retired fingerprint must not appear in the D1 request body"
+        );
+        assert!(
+            !payload.contains("\"source_fingerprint\""),
+            "the retired fingerprint field must not appear in the D1 request body"
+        );
+        let decoded: Vec<AgentImportTombstoneRow> =
+            serde_json::from_str(payload).expect("decode redacted tombstone batch payload");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].source_fingerprint, None);
     }
 
     #[tokio::test]
@@ -4608,243 +4664,6 @@ mod tests {
         );
     }
 
-    /// Deterministic Cloudflare D1 `/query` mock backed by an in-memory SQLite
-    /// database. Used by B3-09 migration tests so ensure-column paths never
-    /// touch live Cloudflare credentials.
-    struct MockD1 {
-        base_url: String,
-        fail_alter_object_format_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        _task: tokio::task::JoinHandle<()>,
-    }
-
-    impl MockD1 {
-        async fn spawn() -> Self {
-            use std::sync::{
-                Arc,
-                atomic::{AtomicBool, Ordering},
-            };
-
-            use axum::{Json, Router, routing::post};
-            use sea_orm::{ConnectionTrait, Database, Statement};
-            use tokio::sync::Mutex;
-
-            // One connection owns the in-memory DB for the lifetime of the mock.
-            let db = Database::connect("sqlite::memory:")
-                .await
-                .expect("open mock D1 sqlite");
-            db.execute_raw(Statement::from_string(
-                db.get_database_backend(),
-                "SELECT 1".to_string(),
-            ))
-            .await
-            .expect("ping mock D1 sqlite");
-            let db = Arc::new(Mutex::new(db));
-            let fail_alter_object_format_once = Arc::new(AtomicBool::new(false));
-            let fail_flag = fail_alter_object_format_once.clone();
-            let db_for_handler = db.clone();
-
-            let app = Router::new().route(
-                "/client/v4/accounts/{account}/d1/database/{database}/query",
-                post(move |Json(body): Json<serde_json::Value>| {
-                    let db = db_for_handler.clone();
-                    let fail_flag = fail_flag.clone();
-                    async move {
-                        let sql = body
-                            .get("sql")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let params = body
-                            .get("params")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-
-                        if sql.contains("ADD COLUMN object_format")
-                            && fail_flag.swap(false, Ordering::SeqCst)
-                        {
-                            return Json(serde_json::json!({
-                                "success": false,
-                                "errors": [{
-                                    "code": 7500,
-                                    "message": "injected ALTER failure for object_format"
-                                }],
-                                "messages": [],
-                                "result": null
-                            }));
-                        }
-
-                        let rendered = substitute_d1_params(&sql, &params);
-                        let conn = db.lock().await;
-                        match run_mock_d1_sql(&conn, &rendered).await {
-                            Ok((rows, changes)) => Json(serde_json::json!({
-                                "success": true,
-                                "errors": [],
-                                "messages": [],
-                                "result": [{
-                                    "results": rows,
-                                    "success": true,
-                                    "meta": {
-                                        "changes": changes,
-                                        "duration": 0.0,
-                                        "last_row_id": 0,
-                                        "rows_read": rows.len() as i64,
-                                        "rows_written": changes
-                                    }
-                                }]
-                            })),
-                            Err(message) => Json(serde_json::json!({
-                                "success": false,
-                                "errors": [{ "code": 7501, "message": message }],
-                                "messages": [],
-                                "result": null
-                            })),
-                        }
-                    }
-                }),
-            );
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind mock D1");
-            let addr = listener.local_addr().expect("mock D1 addr");
-            let task = tokio::spawn(async move {
-                axum::serve(listener, app).await.expect("serve mock D1");
-            });
-
-            Self {
-                base_url: format!("http://{addr}/client/v4"),
-                fail_alter_object_format_once,
-                _task: task,
-            }
-        }
-
-        fn client(&self) -> D1Client {
-            D1Client::new_with_api_base_url(
-                "account".into(),
-                "token".into(),
-                "database".into(),
-                &self.base_url,
-            )
-            .expect("mock D1 client")
-        }
-
-        fn fail_next_object_format_alter(&self) {
-            self.fail_alter_object_format_once
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    fn substitute_d1_params(sql: &str, params: &[serde_json::Value]) -> String {
-        let mut out = sql.to_string();
-        for (index, value) in params.iter().enumerate().rev() {
-            let placeholder = format!("?{}", index + 1);
-            let literal = match value {
-                serde_json::Value::Null => "NULL".to_string(),
-                serde_json::Value::Bool(flag) => {
-                    if *flag {
-                        "1".to_string()
-                    } else {
-                        "0".to_string()
-                    }
-                }
-                serde_json::Value::Number(number) => number.to_string(),
-                serde_json::Value::String(text) => {
-                    format!("'{}'", text.replace('\'', "''"))
-                }
-                other => format!("'{}'", other.to_string().replace('\'', "''")),
-            };
-            out = out.replace(&placeholder, &literal);
-        }
-        out
-    }
-
-    async fn run_mock_d1_sql(
-        conn: &sea_orm::DatabaseConnection,
-        sql: &str,
-    ) -> Result<(Vec<serde_json::Value>, i64), String> {
-        use sea_orm::{ConnectionTrait, Statement};
-
-        let trimmed = sql.trim_start();
-        let upper = trimmed.to_ascii_uppercase();
-        let returns_rows = upper.starts_with("SELECT")
-            || upper.starts_with("PRAGMA")
-            || upper.contains(" RETURNING ");
-
-        if returns_rows {
-            let rows = conn
-                .query_all_raw(Statement::from_string(
-                    conn.get_database_backend(),
-                    sql.to_string(),
-                ))
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                out.push(mock_d1_row_to_json(&row)?);
-            }
-            Ok((out, 0))
-        } else {
-            let result = conn
-                .execute_raw(Statement::from_string(
-                    conn.get_database_backend(),
-                    sql.to_string(),
-                ))
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok((Vec::new(), result.rows_affected() as i64))
-        }
-    }
-
-    fn mock_d1_row_to_json(row: &sea_orm::QueryResult) -> Result<serde_json::Value, String> {
-        use sea_orm::sqlx::{Column, Row, TypeInfo, ValueRef};
-
-        let sqlx_row = row
-            .try_as_sqlite_row()
-            .ok_or_else(|| "mock D1 row is not a SqliteRow".to_string())?;
-        let mut map = serde_json::Map::new();
-        for column in sqlx_row.columns() {
-            let name = column.name();
-            let raw = sqlx_row
-                .try_get_raw(name)
-                .map_err(|error| error.to_string())?;
-            let value = if raw.is_null() {
-                serde_json::Value::Null
-            } else {
-                match column.type_info().name() {
-                    "TEXT" | "DATETIME" | "VARCHAR" => {
-                        let text: String =
-                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
-                        serde_json::Value::String(text)
-                    }
-                    "INTEGER" | "BIGINT" | "INT" => {
-                        let number: i64 =
-                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
-                        serde_json::json!(number)
-                    }
-                    "REAL" | "FLOAT" | "DOUBLE" => {
-                        let number: f64 =
-                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
-                        serde_json::json!(number)
-                    }
-                    _ => {
-                        if let Ok(text) = sqlx_row.try_get::<String, _>(name) {
-                            serde_json::Value::String(text)
-                        } else if let Ok(number) = sqlx_row.try_get::<i64, _>(name) {
-                            serde_json::json!(number)
-                        } else if let Ok(number) = sqlx_row.try_get::<f64, _>(name) {
-                            serde_json::json!(number)
-                        } else {
-                            serde_json::Value::Null
-                        }
-                    }
-                }
-            };
-            map.insert(name.to_string(), value);
-        }
-        Ok(serde_json::Value::Object(map))
-    }
-
     async fn assert_remote_column(client: &D1Client, table: &str, column: &str) {
         #[derive(Deserialize)]
         struct Col {
@@ -4858,6 +4677,134 @@ mod tests {
             rows.iter().any(|row| row.name == column),
             "{table}.{column} missing after ensure"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_import_tombstone_sync_scrubs_legacy_fingerprints_before_restore() {
+        #[derive(Deserialize)]
+        struct StoredTombstone {
+            erased_session_id: String,
+            source_fingerprint: Option<String>,
+            erased_at: i64,
+        }
+
+        let mock = MockD1::spawn().await;
+        let client = mock.client();
+        for sql in [
+            "CREATE TABLE agent_capture_generation (
+                repo_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                writer_token TEXT
+             )",
+            "CREATE TABLE agent_subagent_content_claim (
+                repo_id TEXT NOT NULL, parent_session_id TEXT NOT NULL
+             )",
+            "CREATE TABLE agent_capture_checkpoint_v2 (
+                repo_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+                session_id TEXT NOT NULL
+             )",
+            "CREATE TABLE agent_subagent_content_revision (
+                repo_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL
+             )",
+            "CREATE TABLE agent_subagent_link (
+                repo_id TEXT NOT NULL, content_checkpoint_id TEXT NOT NULL
+             )",
+            "CREATE TABLE agent_capture_session_v2 (
+                repo_id TEXT NOT NULL, session_id TEXT NOT NULL
+             )",
+            "INSERT INTO agent_capture_generation VALUES ('repo', 'publishing', 'writer')",
+        ] {
+            client
+                .execute(sql, None)
+                .await
+                .expect("prepare D1 tombstone fixture");
+        }
+        client
+            .ensure_agent_import_tombstone_table()
+            .await
+            .expect("create D1 tombstone table");
+        client
+            .execute(
+                "INSERT INTO agent_import_tombstone VALUES (
+                    'repo', 'claude_code', 'provider', 'old-session',
+                    'legacy-remote-fingerprint', 3, 1
+                 )",
+                None,
+            )
+            .await
+            .expect("seed a legacy remote fingerprint");
+
+        client
+            .sync_agent_import_tombstones_batch(
+                "repo",
+                "writer",
+                &[AgentImportTombstoneRow {
+                    agent_kind: "claude_code".to_string(),
+                    provider_session_id: "provider".to_string(),
+                    erased_session_id: "restored-session".to_string(),
+                    source_fingerprint: Some("incoming-legacy-fingerprint".to_string()),
+                    erased_at: 7,
+                }],
+            )
+            .await
+            .expect("sync tombstone while scrubbing retired metadata");
+
+        let incoming_payloads = mock
+            .request_bodies()
+            .await
+            .into_iter()
+            .filter_map(|request| {
+                let sql = request.get("sql")?.as_str()?;
+                sql.contains("WITH incoming(value) AS (SELECT value FROM json_each(?2))")
+                    .then(|| {
+                        request
+                            .get("params")?
+                            .as_array()?
+                            .get(1)?
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            incoming_payloads.len(),
+            6,
+            "the upsert plus every fenced cascade must carry an incoming batch"
+        );
+        for payload in incoming_payloads {
+            assert!(
+                !payload.contains("incoming-legacy-fingerprint"),
+                "no fenced tombstone request may disclose the incoming legacy fingerprint"
+            );
+            assert!(
+                !payload.contains("\"source_fingerprint\""),
+                "no fenced tombstone request may serialize the retired fingerprint field"
+            );
+        }
+
+        let stored: Vec<StoredTombstone> = client
+            .query(
+                "SELECT erased_session_id, source_fingerprint, erased_at
+                 FROM agent_import_tombstone
+                 WHERE repo_id = 'repo' AND agent_kind = 'claude_code'
+                   AND provider_session_id = 'provider'",
+                None,
+            )
+            .await
+            .expect("read physical D1 tombstone row");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].erased_session_id, "restored-session");
+        assert_eq!(stored[0].source_fingerprint, None);
+        assert_eq!(stored[0].erased_at, 7);
+
+        let mut remaining_rows = 10;
+        let restored = client
+            .list_agent_import_tombstones_with_budget("repo", &mut remaining_rows)
+            .await
+            .expect("read D1 tombstones for restore");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].source_fingerprint, None);
     }
 
     /// B3-09: D1 ensure-column for `object_format` is idempotent across
@@ -5030,5 +4977,275 @@ mod tests {
         assert_eq!(rebuilt[0].o_type, "commit");
         assert_eq!(rebuilt[0].o_size, 7);
         assert_eq!(rebuilt[0].object_format, None);
+    }
+}
+
+/// Test-only D1 doubles shared by the client tests and the cloud command
+/// tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::D1Client;
+
+    /// One-shot injected D1 failure: the first statement whose SQL contains
+    /// `needle` fails with `message` instead of executing.
+    type InjectedFailure = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+    /// Deterministic Cloudflare D1 `/query` mock backed by an in-memory SQLite
+    /// database. Used by B3-09 migration tests and the cloud agent-capture
+    /// pipeline tests so D1 paths never touch live Cloudflare credentials.
+    pub(crate) struct MockD1 {
+        base_url: String,
+        fail_once: InjectedFailure,
+        request_bodies: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockD1 {
+        pub(crate) async fn spawn() -> Self {
+            use std::sync::Arc;
+
+            use axum::{Json, Router, routing::post};
+            use sea_orm::{ConnectionTrait, Database, Statement};
+            use tokio::sync::Mutex;
+
+            // One connection owns the in-memory DB for the lifetime of the mock.
+            let db = Database::connect("sqlite::memory:")
+                .await
+                .expect("open mock D1 sqlite");
+            db.execute_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT 1".to_string(),
+            ))
+            .await
+            .expect("ping mock D1 sqlite");
+            let db = Arc::new(Mutex::new(db));
+            let fail_once: InjectedFailure = Arc::new(std::sync::Mutex::new(None));
+            let request_bodies = Arc::new(Mutex::new(Vec::new()));
+            let fail_flag = fail_once.clone();
+            let db_for_handler = db.clone();
+            let request_bodies_for_handler = request_bodies.clone();
+
+            let app = Router::new().route(
+                "/client/v4/accounts/{account}/d1/database/{database}/query",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let db = db_for_handler.clone();
+                    let fail_flag = fail_flag.clone();
+                    let request_bodies = request_bodies_for_handler.clone();
+                    async move {
+                        request_bodies.lock().await.push(body.clone());
+                        let sql = body
+                            .get("sql")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let params = body
+                            .get("params")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let injected =
+                            fail_flag
+                                .lock()
+                                .ok()
+                                .and_then(|mut slot| match slot.as_ref() {
+                                    Some((needle, _)) if sql.contains(needle.as_str()) => {
+                                        slot.take()
+                                    }
+                                    _ => None,
+                                });
+                        if let Some((_, message)) = injected {
+                            return Json(serde_json::json!({
+                                "success": false,
+                                "errors": [{ "code": 7500, "message": message }],
+                                "messages": [],
+                                "result": null
+                            }));
+                        }
+
+                        let rendered = substitute_d1_params(&sql, &params);
+                        let conn = db.lock().await;
+                        match run_mock_d1_sql(&conn, &rendered).await {
+                            Ok((rows, changes)) => Json(serde_json::json!({
+                                "success": true,
+                                "errors": [],
+                                "messages": [],
+                                "result": [{
+                                    "results": rows,
+                                    "success": true,
+                                    "meta": {
+                                        "changes": changes,
+                                        "duration": 0.0,
+                                        "last_row_id": 0,
+                                        "rows_read": rows.len() as i64,
+                                        "rows_written": changes
+                                    }
+                                }]
+                            })),
+                            Err(message) => Json(serde_json::json!({
+                                "success": false,
+                                "errors": [{ "code": 7501, "message": message }],
+                                "messages": [],
+                                "result": null
+                            })),
+                        }
+                    }
+                }),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock D1");
+            let addr = listener.local_addr().expect("mock D1 addr");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve mock D1");
+            });
+
+            Self {
+                base_url: format!("http://{addr}/client/v4"),
+                fail_once,
+                request_bodies,
+                _task: task,
+            }
+        }
+
+        pub(crate) fn client(&self) -> D1Client {
+            D1Client::new_with_api_base_url(
+                "account".into(),
+                "token".into(),
+                "database".into(),
+                &self.base_url,
+            )
+            .expect("mock D1 client")
+        }
+
+        /// Fail the next statement whose SQL contains `needle` with `message`
+        /// (D1 error code 7500); later matching statements execute normally.
+        pub(crate) fn fail_once_when_sql_contains(&self, needle: &str, message: &str) {
+            if let Ok(mut slot) = self.fail_once.lock() {
+                *slot = Some((needle.to_string(), message.to_string()));
+            }
+        }
+
+        pub(crate) fn fail_next_object_format_alter(&self) {
+            self.fail_once_when_sql_contains(
+                "ADD COLUMN object_format",
+                "injected ALTER failure for object_format",
+            );
+        }
+
+        pub(crate) async fn request_bodies(&self) -> Vec<serde_json::Value> {
+            self.request_bodies.lock().await.clone()
+        }
+    }
+
+    fn substitute_d1_params(sql: &str, params: &[serde_json::Value]) -> String {
+        let mut out = sql.to_string();
+        for (index, value) in params.iter().enumerate().rev() {
+            let placeholder = format!("?{}", index + 1);
+            let literal = match value {
+                serde_json::Value::Null => "NULL".to_string(),
+                serde_json::Value::Bool(flag) => {
+                    if *flag {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    }
+                }
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::String(text) => {
+                    format!("'{}'", text.replace('\'', "''"))
+                }
+                other => format!("'{}'", other.to_string().replace('\'', "''")),
+            };
+            out = out.replace(&placeholder, &literal);
+        }
+        out
+    }
+
+    async fn run_mock_d1_sql(
+        conn: &sea_orm::DatabaseConnection,
+        sql: &str,
+    ) -> Result<(Vec<serde_json::Value>, i64), String> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let trimmed = sql.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        let returns_rows = upper.starts_with("SELECT")
+            || upper.starts_with("PRAGMA")
+            || upper.contains(" RETURNING ");
+
+        if returns_rows {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                out.push(mock_d1_row_to_json(&row)?);
+            }
+            Ok((out, 0))
+        } else {
+            let result = conn
+                .execute_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((Vec::new(), result.rows_affected() as i64))
+        }
+    }
+
+    fn mock_d1_row_to_json(row: &sea_orm::QueryResult) -> Result<serde_json::Value, String> {
+        use sea_orm::sqlx::{Column, Row, TypeInfo, ValueRef};
+
+        let sqlx_row = row
+            .try_as_sqlite_row()
+            .ok_or_else(|| "mock D1 row is not a SqliteRow".to_string())?;
+        let mut map = serde_json::Map::new();
+        for column in sqlx_row.columns() {
+            let name = column.name();
+            let raw = sqlx_row
+                .try_get_raw(name)
+                .map_err(|error| error.to_string())?;
+            let value = if raw.is_null() {
+                serde_json::Value::Null
+            } else {
+                match column.type_info().name() {
+                    "TEXT" | "DATETIME" | "VARCHAR" => {
+                        let text: String =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::Value::String(text)
+                    }
+                    "INTEGER" | "BIGINT" | "INT" => {
+                        let number: i64 =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::json!(number)
+                    }
+                    "REAL" | "FLOAT" | "DOUBLE" => {
+                        let number: f64 =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::json!(number)
+                    }
+                    _ => {
+                        if let Ok(text) = sqlx_row.try_get::<String, _>(name) {
+                            serde_json::Value::String(text)
+                        } else if let Ok(number) = sqlx_row.try_get::<i64, _>(name) {
+                            serde_json::json!(number)
+                        } else if let Ok(number) = sqlx_row.try_get::<f64, _>(name) {
+                            serde_json::json!(number)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                }
+            };
+            map.insert(name.to_string(), value);
+        }
+        Ok(serde_json::Value::Object(map))
     }
 }

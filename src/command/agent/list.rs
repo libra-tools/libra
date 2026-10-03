@@ -205,7 +205,8 @@ pub async fn execute_safe(args: ListArgs, output: &OutputConfig) -> CliResult<()
             let opencode_available = crate::internal::ai::observed_agents::opencode_export::trusted_opencode_binary()
                 .await
                 .is_ok()
-                && crate::internal::ai::observed_agents::opencode_export::trusted_bwrap_available();
+                && crate::internal::ai::observed_agents::opencode_export::trusted_bwrap_available()
+                    .await;
             let agents = payload
                 .agents
                 .iter()

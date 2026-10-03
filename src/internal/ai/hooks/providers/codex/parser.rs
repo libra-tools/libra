@@ -42,18 +42,6 @@ use super::super::super::lifecycle::{
     LifecycleEvent, LifecycleEventKind, SessionHookEnvelope, build_lifecycle_event,
 };
 
-/// Codex event names that should fall back to `session_id` when no canonical
-/// identity field (event_id, request_id, …) is present in the payload. These
-/// are the Codex session-scoped events for which a missing identity falls back
-/// to the provider session id.
-pub(super) const CODEX_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "Stop",
-    "PreCompact",
-    "PostCompact",
-    "SessionEnd",
-];
-
 /// Every Codex hook event name [`parse_codex_hook_event`] understands
 /// (the full current 11-event taxonomy). Keep in sync with its
 /// `match`; the dispatcher consults this via `HookProvider::recognizes_event`
@@ -181,18 +169,6 @@ mod tests {
             );
         }
         assert_eq!(CODEX_HOOK_EVENT_NAMES.len(), 11);
-    }
-
-    // Scenario: fallback events are a subset of the advertised name table so
-    // the dispatcher never falls back for an event the parser would reject.
-    #[test]
-    fn fallback_events_are_a_subset_of_advertised_names() {
-        for name in CODEX_LIFECYCLE_FALLBACK_EVENTS {
-            assert!(
-                CODEX_HOOK_EVENT_NAMES.contains(name),
-                "fallback event '{name}' must be an advertised event name",
-            );
-        }
     }
 
     // Scenario: Codex's Claude Code-compatible payload keys flow through

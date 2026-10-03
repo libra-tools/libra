@@ -11,16 +11,6 @@ use super::super::super::lifecycle::{
     LifecycleEvent, LifecycleEventKind, SessionHookEnvelope, build_lifecycle_event,
 };
 
-/// Claude event names that should fall back to `session_id` when no canonical
-/// identity field (event_id, request_id, …) is present in the payload.
-pub(super) const CLAUDE_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "Stop",
-    "SessionStop",
-    "SessionEnd",
-    "Compaction",
-];
-
 /// Every Claude hook event name [`parse_claude_hook_event`] understands.
 /// Keep in sync with its `match`; the dispatcher consults this via
 /// `HookProvider::recognizes_event` to skip-and-log names a newer Claude

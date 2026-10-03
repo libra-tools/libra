@@ -65,10 +65,6 @@ impl HookProvider for ClaudeProvider {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }
 
-    fn lifecycle_fallback_events(&self) -> &'static [&'static str] {
-        parser::CLAUDE_LIFECYCLE_FALLBACK_EVENTS
-    }
-
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
         settings::install_claude_hooks(options)
     }

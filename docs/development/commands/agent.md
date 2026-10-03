@@ -3,11 +3,15 @@
 `libra agent` is an intentionally different external-agent capture extension,
 not a Git-compatible command.
 
-OpenCode content capture on **macOS** is assembled through seatbelt
-(`sandbox-exec`) via `SandboxManager::transform`; the seatbelt backend carries
-a deprecation (**弃用**) risk if Apple removes `sandbox-exec`. See
-[`../tracing/agent.md`](../tracing/agent.md) §5 for the read-isolation
-asymmetry and fail-closed metadata-only degrade when the backend is missing.
+OpenCode **content export is unsupported on macOS**. A forking exporter can
+escape Seatbelt's direct-child lifecycle, so Libra fails closed before it
+spawns either `sandbox-exec` or the exporter; hook capture remains
+metadata-only. Linux uses the required bwrap containment backend. See
+[`../tracing/agent.md`](../tracing/agent.md) §5 for the platform boundary.
+Linux content export is available only when the trusted system `bwrap` passes
+Libra's descriptor-native `--bind-fd`/`--ro-bind-fd` safety probe; unsupported
+or legacy bwrap is unavailable and remains metadata-only. Install or upgrade
+the system bwrap package—there is no unsandboxed fallback.
 
 The shared `run_bounded_exporter` Unix `pre_exec` sets both soft and hard
 `RLIMIT_CORE` to zero next to the existing per-platform `RLIMIT_FSIZE`.
@@ -55,6 +59,57 @@ the 「还未实现的功能」 table of [`../tracing/agent.md`](../tracing/agen
    registry classification stays pinned by
    `tests/compat/agent_capability_matrix_pin.rs`.
 
+## Private capture erasure
+
+Doctor's terminal-finalizer cold scan uses keyset pagination in one read-only
+snapshot: 32 sessions/page, 512 sessions and 128 receipt findings/run, with a
+1 MiB SQL byte cap on each metadata ledger before hydration. Bad ledger rows
+do not abort later valid rows. Fixed content-free notes disclose skipped keys
+or bounded truncation; neither is evidence that unlisted receipts are clean.
+`pending_source` survives later stop/resume as superseded manual-only evidence.
+Session-quarantined receipts also remain visible; repair never overwrites a
+newer session or calls quarantine successful terminal capture. Artifact-bound
+budget exhaustion moves only the header, preserving the original receipt.
+Eligible artifacts use the same bounded doctor executor: alias, receipt,
+marker, and coverage fences are revalidated before local checkpoint replay.
+Each `doctor --repair` invocation counts at most five replay attempts.
+Automatic replays of eligible artifacts share one 2-second cooperative
+deadline; each audited manual attempt gets its own fresh 2-second deadline.
+Deferred findings (batch cap or retry-later) are not counted and require
+another bounded invocation. Success requires both a durable checkpoint and strict
+completion of the original receipt. An expired artifact gets one audited
+manual attempt after quarantine; failures remain visible and do not reset the
+original receipt policy.
+
+Private recovery erasure uses the existing two-stage tombstone/catalog workflow:
+tombstone commit and checkpoint prune precede one transaction deleting the
+session plus attributable headers/chunks/aliases. Attribution is the local
+canonical-repo catalog PK and capture incarnation; no key or receipt-ledger
+proof is required, and old worktree/workspace scope does not block deletion.
+Foreign/ambiguous corrupt evidence is retained; a content-free lost-capacity
+warning is logged after commit. Without a consistent original DB backup the
+capacity is lost, not repairable through a force-discard option. DB-copy backups
+retain sensitive associations and can undo the local tombstone on restoration.
+Receipt completion instead removes the exact artifact and only unreferenced
+aliases in that same writer transaction. A trusted `SessionEnd` whose budget
+expires after a complete redacted snapshot persists this artifact (ACF-13); a
+later `SessionStart` may launch the bounded detached recovery worker (ACF-11)
+and `libra agent doctor --repair` replays it (ACF-12).
+
+Same-checkpoint pending/quarantine collisions are not broad deletion authority:
+only owner-attributed headers are removed. Unknown/foreign headers and shared
+chunks survive; explicit erase reports retained capacity, not complete removal
+of every private copy.
+
+Unknown or mismatched incarnation for a known alias refuses final deletion;
+restore consistent session/alias metadata before retrying. The earlier
+tombstone remains committed. One undecodable retained header blocks all
+new/re-delivered recovery artifacts and destructive GC/root-walking
+maintenance, and can conservatively retain completion aliases. Explicit
+attributable erase still works. Out-of-band reads are capped at 17 headers and
+17 associations; unexamined data may include the erased session's content,
+so the warning does not certify removal of every private copy.
+
 ## Historical import contract
 
 The active DR-05/M4 contract is implemented by `libra agent import` and is
@@ -70,15 +125,31 @@ owned uncommitted import lease on expiry. Transaction commit awaits are not
 cancelled: the deadline is checked immediately before commit and the resulting
 success is authoritative even if observation finishes after the deadline. A
 failed abandonment is chained into the surfaced error with a doctor-repair hint.
+New V2 import records retain a source only as the repository-keyed,
+domain-separated `source/hmac-v2/<64 lower-hex>` commitment. New V2 subagent
+content records use their separately domain-separated
+`source/subagent-hmac-v2/<64-lower-hex>` commitment. Raw locators and unkeyed
+source SHA-256 values are not durable metadata, claims, markers, logs, errors,
+or cloud fields. A V2 snapshot digest is a distinct-domain, repository-keyed
+`source/hmac-v2/<64 lower-hex>` commitment over redacted snapshot content; the
+helper's transient SHA-256 is never durable. A tagged unkeyed SHA-256 remains read-only immutable V1 proof; a bare unkeyed SHA-256 has the same legacy-only status. The migration path verifies the exact scoped legacy proof and atomically moves only committed, quiescent
+identity/catalog/repair-marker state. Live, partial, or repair-pending V1
+state remains V1 rather than creating parallel V2 state.
 Repository ownership is the canonical shared Libra
 storage identity, so sibling linked worktrees are accepted while cross-repo
 sources remain rejected. Import attempt markers are created in the reservation
 transaction; live, export, and subagent writers use the same fail-closed
 pre-object registration. The effective per-source read cap is
 `min(agent.max_transcript_read_bytes, 16 MiB)`; explicit larger settings emit
-the actual effective value. Discovery traversal/open and held-descriptor file
-reads run in private, kill-on-timeout helper processes wrapped by the command's
-absolute deadline. Provider roots are
+the actual effective value. Discovery and held-descriptor read helper phases
+run in private, kill-on-timeout processes under the command's absolute
+deadline; the reader receives the already-pinned descriptor and no locator.
+The command process still synchronously classifies, canonicalizes, opens, and
+rewinds a source before that handoff. Thus these are helper-phase bounds, not a
+strict end-to-end wall-clock deadline when NFS/FUSE stalls. A strict deadline,
+FD-only wire, and autonomous timeout replay together require a long-lived owner
+or a provider ABI that supplies a pre-authorized descriptor; that remains the
+unresolved blocker in [`plan-20260924.md`](../plan/plan-20260924.md). Provider roots are
 opened component-by-component; Claude sources and each nested Codex date
 directory are opened relative to pinned no-follow descriptors before consent. Each new OID is added
 as a durable provisional preclaim before its loose-object write, but becomes

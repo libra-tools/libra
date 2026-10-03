@@ -10,11 +10,7 @@
 //! traversal in `session_id`, capping `transcript_path` length) and produce stable
 //! dedup keys so duplicate hook deliveries can be filtered out at ingestion time.
 
-use std::{
-    collections::{BTreeMap, hash_map::DefaultHasher},
-    fmt,
-    hash::{Hash, Hasher},
-};
+use std::{collections::BTreeMap, fmt};
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -233,52 +229,6 @@ pub fn validate_session_hook_envelope(
     Ok(())
 }
 
-/// Append normalized raw event fragments for audit/debug.
-///
-/// Functional scope:
-/// - Stashes a JSON snapshot of the inbound envelope into
-///   `session.metadata["raw_hook_events"]`, preserving the on-the-wire shape for
-///   later inspection.
-/// - Bounds the array to `max_raw_hook_events`, dropping the oldest entries once
-///   the cap is reached.
-///
-/// Boundary conditions:
-/// - If the metadata slot exists but is not a JSON array (schema drift from an
-///   older session), it is overwritten with a fresh single-element array rather
-///   than panicking.
-pub fn append_raw_hook_event(
-    session: &mut SessionState,
-    envelope: &SessionHookEnvelope,
-    max_raw_hook_events: usize,
-) {
-    let entry = session
-        .metadata
-        .entry("raw_hook_events".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-
-    let raw = json!({
-        "hook_event_name": envelope.hook_event_name,
-        "session_id": envelope.session_id,
-        "cwd": envelope.cwd,
-        "transcript_path": envelope.transcript_path,
-        "extra": envelope.extra,
-        "timestamp": Utc::now().to_rfc3339(),
-    });
-
-    let Value::Array(items) = entry else {
-        session
-            .metadata
-            .insert("raw_hook_events".to_string(), Value::Array(vec![raw]));
-        return;
-    };
-
-    items.push(raw);
-    if items.len() > max_raw_hook_events {
-        let drop_n = items.len() - max_raw_hook_events;
-        items.drain(0..drop_n);
-    }
-}
-
 /// Apply a normalized lifecycle event to the in-memory session state.
 ///
 /// Functional scope:
@@ -291,8 +241,8 @@ pub fn append_raw_hook_event(
 ///   - `SessionEnd` is a no-op marker (state is flushed by the caller).
 ///
 /// Boundary conditions:
-/// - The `tool_events` array uses the same defensive overwrite path as
-///   [`append_raw_hook_event`] when the slot is the wrong JSON shape.
+/// - The `tool_events` array defensively overwrites a malformed metadata slot
+///   rather than panicking.
 /// - `tool_events` is capped at `max_tool_events`; oldest entries are dropped to
 ///   keep memory and persistence size bounded.
 pub fn apply_lifecycle_event(
@@ -424,50 +374,6 @@ pub fn apply_lifecycle_event(
     }
 }
 
-/// Build a dedup key using provider-configured identity fields and lifecycle fallbacks.
-///
-/// Functional scope:
-/// - Walks `identity_keys` in order; the first non-null match becomes the
-///   primary identity for the event and is hashed together with the envelope.
-/// - When no identity field is found but the event name is in
-///   `lifecycle_fallback_events`, falls back to `session_id` so events that
-///   genuinely repeat per-session (e.g. SessionStart) still produce a stable key.
-///
-/// Boundary conditions:
-/// - Returns `None` when no identity key matches and the event is not in the
-///   fallback list — callers may then choose to forward the event without dedup.
-/// - The hash mixes in `session_id`, `cwd`, `transcript_path`, and the full
-///   `extra` map so that semantically distinct payloads never collide.
-pub fn make_dedup_key(
-    identity_keys: &[&str],
-    lifecycle_fallback_events: &[&str],
-    envelope: &SessionHookEnvelope,
-) -> Option<String> {
-    for key in identity_keys {
-        if let Some(value) = envelope.extra.get(*key)
-            && !value.is_null()
-        {
-            return Some(make_event_key(
-                &envelope.hook_event_name,
-                key,
-                value,
-                envelope,
-            ));
-        }
-    }
-
-    if lifecycle_fallback_events.contains(&envelope.hook_event_name.as_str()) {
-        return Some(make_event_key(
-            &envelope.hook_event_name,
-            "session_id",
-            &Value::String(envelope.session_id.clone()),
-            envelope,
-        ));
-    }
-
-    None
-}
-
 /// Canonicalize JSON for deterministic blob generation.
 ///
 /// Functional scope:
@@ -508,7 +414,13 @@ pub(crate) fn build_lifecycle_event(
     LifecycleEvent {
         kind,
         session_id: envelope.session_id.clone(),
-        session_ref: envelope.transcript_path.clone(),
+        // A provider-declared transcript location is only an untrusted
+        // ingress hint.  It is deliberately not a lifecycle fact: keeping it
+        // out of the canonical event prevents an arbitrary provider-home
+        // pathname from reaching session state, event sidecars, or history.
+        // Provenance-aware snapshot resolution derives a source separately
+        // from the verified worktree and provider session id.
+        session_ref: None,
         prompt: find_string(&envelope.extra, &["prompt", "message", "user_prompt"]),
         model: extract_model(&envelope.extra),
         source: envelope.extra.get("source").cloned(),
@@ -529,32 +441,6 @@ pub(crate) fn build_lifecycle_event(
         ),
         timestamp: Utc::now(),
     }
-}
-
-/// Hash an event into a stable dedup key.
-///
-/// The textual prefix `event:key:` is preserved so logs remain human-readable;
-/// the trailing hex digest is the deterministic `DefaultHasher` digest of the
-/// canonicalised payload.
-fn make_event_key(
-    event_name: &str,
-    key_name: &str,
-    value: &Value,
-    envelope: &SessionHookEnvelope,
-) -> String {
-    let mut hasher = DefaultHasher::new();
-    event_name.hash(&mut hasher);
-    key_name.hash(&mut hasher);
-    normalize_json_value(value.clone())
-        .to_string()
-        .hash(&mut hasher);
-    envelope.session_id.hash(&mut hasher);
-    envelope.cwd.hash(&mut hasher);
-    envelope.transcript_path.hash(&mut hasher);
-    normalize_json_value(Value::Object(envelope.extra.clone()))
-        .to_string()
-        .hash(&mut hasher);
-    format!("{event_name}:{key_name}:{:x}", hasher.finish())
 }
 
 /// Reject session IDs that are too long or contain unsafe characters.
@@ -625,8 +511,106 @@ fn extract_model(payload: &Map<String, Value>) -> Option<Value> {
 /// Schema version stamped on every canonical lifecycle JSONL line
 /// (`events/lifecycle.jsonl` inside an E4-libra checkpoint tree and the
 /// session-level append-only log share this schema — E3-JSONL in
-/// `docs/development/tracing/agent.md`). Bump only additively.
-pub const LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION: u32 = 1;
+/// `docs/development/tracing/agent.md`).
+///
+/// v2 makes `identity_scheme` mandatory.  It is deliberately a per-line
+/// field: an event UUID alone cannot say whether it is a native replay HMAC,
+/// a fallback action HMAC, or one of the deterministic UUIDv5 forms.
+pub const LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION: u32 = 2;
+
+/// The derivation class declared by a v2 canonical lifecycle line.
+///
+/// These strings are an external JSON contract.  They describe how the
+/// writer obtained `event_id`; they do not themselves authenticate a stored
+/// line.  In particular, a reader without the repository key cannot promote
+/// a declared HMAC form into a verified replay receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleIdentityScheme {
+    /// A provider-native scalar replay key was present and was converted to
+    /// the repository-keyed `capture-dedup-v2` HMAC identity.
+    NativeReplayHmacV2,
+    /// No provider-native replay key was available; the action UUID comes
+    /// from the repository-keyed `capture-event-v1` HMAC identity.
+    FallbackActionHmacV1,
+    /// The generic lifecycle serializer used `LifecycleEvent::event_id()`.
+    GenericLifecycleUuidV5,
+    /// Historical import derives one UUIDv5 per logical imported turn.
+    ImportUuidV5,
+}
+
+impl LifecycleIdentityScheme {
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::NativeReplayHmacV2 => "native_replay_hmac_v2",
+            Self::FallbackActionHmacV1 => "fallback_action_hmac_v1",
+            Self::GenericLifecycleUuidV5 => "generic_lifecycle_uuid_v5",
+            Self::ImportUuidV5 => "import_uuid_v5",
+        }
+    }
+
+    #[cfg(test)]
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "native_replay_hmac_v2" => Some(Self::NativeReplayHmacV2),
+            "fallback_action_hmac_v1" => Some(Self::FallbackActionHmacV1),
+            "generic_lifecycle_uuid_v5" => Some(Self::GenericLifecycleUuidV5),
+            "import_uuid_v5" => Some(Self::ImportUuidV5),
+            _ => None,
+        }
+    }
+}
+
+/// The safe interpretation of a lifecycle line's identity declaration.
+///
+/// Legacy schema-v1 lines had no typed derivation field.  Their UUIDs are
+/// intentionally opaque: even if a malformed v1 line carries a string named
+/// `identity_scheme`, readers must not infer an HMAC/replay guarantee from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) enum ParsedLifecycleIdentityScheme {
+    /// A v2 line explicitly declared one current writer scheme.  This is a
+    /// classification, not independent cryptographic verification.
+    Declared(LifecycleIdentityScheme),
+    /// A schema-v1 line has no trustworthy derivation metadata.
+    LegacyV1Opaque,
+}
+
+/// Classify the declared identity scheme of one canonical lifecycle line.
+///
+/// This deliberately performs only narrow schema interpretation.  It is not
+/// a full lifecycle JSONL reader or a verifier for checkpoint/export/doctor;
+/// those commands currently use object/manifest checks and must not treat a
+/// line's `event_id` as a replay credential.
+#[cfg(test)]
+pub(crate) fn parse_canonical_lifecycle_identity_scheme(
+    line: &Value,
+) -> Result<ParsedLifecycleIdentityScheme> {
+    let object = line
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("canonical lifecycle line must be a JSON object"))?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("canonical lifecycle line has no numeric schema_version"))?;
+
+    // Do this before inspecting `identity_scheme`: v1 never defined that
+    // field, so accepting an injected label would create phantom HMAC trust.
+    if schema_version == 1 {
+        return Ok(ParsedLifecycleIdentityScheme::LegacyV1Opaque);
+    }
+    if schema_version != u64::from(LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION) {
+        bail!("canonical lifecycle line has an unsupported schema version");
+    }
+
+    let identity_scheme = object
+        .get("identity_scheme")
+        .and_then(Value::as_str)
+        .and_then(LifecycleIdentityScheme::from_wire)
+        .ok_or_else(|| {
+            anyhow::anyhow!("canonical lifecycle line has an invalid identity_scheme")
+        })?;
+    Ok(ParsedLifecycleIdentityScheme::Declared(identity_scheme))
+}
 
 /// Identity fields shared by every canonical lifecycle JSONL line for one
 /// (session, ingest) context. Split out so multi-event batches serialise
@@ -639,15 +623,19 @@ pub struct CanonicalEventContext<'a> {
     pub session_id: &'a str,
     /// The provider's native session id, preserved verbatim.
     pub provider_session_id: &'a str,
+    /// Mandatory v2 declaration of the derivation used for every event in
+    /// this writer context.  Keeping it typed prevents a call site from
+    /// silently omitting or free-forming the external wire value.
+    pub identity_scheme: LifecycleIdentityScheme,
     /// Free-form provenance object (e.g. `{"channel":"hook",
     /// "hook_event_name":"Stop"}`). Never carries raw envelope payload.
     pub provenance: Value,
 }
 
 /// Serialise one **already-redacted** [`LifecycleEvent`] into the canonical
-/// E3-JSONL object (`schema_version`, `event_id`, `kind`, `agent_kind`,
-/// `session_id`, `provider_session_id`, `timestamp`, `source`, `partial`,
-/// `provenance` + per-kind optional fields).
+/// E3-JSONL object (`schema_version`, `event_id`, `identity_scheme`, `kind`,
+/// `agent_kind`, `session_id`, `provider_session_id`, `timestamp`, `source`,
+/// `partial`, `provenance` + per-kind optional fields).
 ///
 /// The caller owns redaction: this function performs none, so it must only
 /// ever see events that already passed the ingest redaction pass.
@@ -673,6 +661,10 @@ pub(crate) fn lifecycle_event_canonical_json_with_identity(
         json!(LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION),
     );
     obj.insert("event_id".to_string(), json!(event_id.to_string()));
+    obj.insert(
+        "identity_scheme".to_string(),
+        json!(ctx.identity_scheme.as_wire()),
+    );
     obj.insert("kind".to_string(), json!(event.event_kind()));
     obj.insert("agent_kind".to_string(), json!(ctx.agent_kind));
     obj.insert("session_id".to_string(), json!(ctx.session_id));
@@ -709,9 +701,9 @@ pub(crate) fn lifecycle_event_canonical_json_with_identity(
     if let Some(message) = &event.assistant_message {
         obj.insert("assistant_message".to_string(), json!(message));
     }
-    if let Some(session_ref) = &event.session_ref {
-        obj.insert("session_ref".to_string(), json!(session_ref));
-    }
+    // `session_ref` is deliberately excluded. It historically carried a
+    // provider-supplied transcript path, which is a provenance input rather
+    // than syncable lifecycle evidence.
     Value::Object(obj)
 }
 
@@ -816,66 +808,6 @@ mod tests {
         assert!(validate_session_hook_envelope(&envelope, 4096).is_err());
     }
 
-    // Scenario: when an identity field is present it wins; otherwise the lifecycle
-    // fallback kicks in for events listed as fallback-eligible.
-    #[test]
-    fn make_dedup_key_identity_then_lifecycle_fallback() {
-        let with_identity = SessionHookEnvelope {
-            hook_event_name: "UserPromptSubmit".to_string(),
-            session_id: "s1".to_string(),
-            cwd: "/tmp".to_string(),
-            transcript_path: None,
-            extra: {
-                let mut map = Map::new();
-                map.insert("event_id".to_string(), Value::String("evt-1".to_string()));
-                map
-            },
-        };
-        assert!(make_dedup_key(&["event_id"], &["SessionStart"], &with_identity).is_some());
-
-        let lifecycle_no_identity = SessionHookEnvelope {
-            hook_event_name: "SessionStart".to_string(),
-            session_id: "s1".to_string(),
-            cwd: "/tmp".to_string(),
-            transcript_path: None,
-            extra: Map::new(),
-        };
-        assert!(make_dedup_key(&["event_id"], &["SessionStart"], &lifecycle_no_identity).is_some());
-    }
-
-    // Scenario: payload differences must produce different dedup keys, otherwise
-    // distinct events would be silently merged.
-    #[test]
-    fn make_dedup_key_changes_when_payload_changes() {
-        let first = SessionHookEnvelope {
-            hook_event_name: "Compaction".to_string(),
-            session_id: "s1".to_string(),
-            cwd: "/tmp".to_string(),
-            transcript_path: None,
-            extra: {
-                let mut map = Map::new();
-                map.insert("message".to_string(), Value::String("one".to_string()));
-                map
-            },
-        };
-        let second = SessionHookEnvelope {
-            hook_event_name: "Compaction".to_string(),
-            session_id: "s1".to_string(),
-            cwd: "/tmp".to_string(),
-            transcript_path: None,
-            extra: {
-                let mut map = Map::new();
-                map.insert("message".to_string(), Value::String("two".to_string()));
-                map
-            },
-        };
-
-        assert_ne!(
-            make_dedup_key(&["event_id"], &["Compaction"], &first),
-            make_dedup_key(&["event_id"], &["Compaction"], &second)
-        );
-    }
-
     // Scenario: object keys are sorted recursively so canonical JSON is stable.
     #[test]
     fn normalize_value_sorts_object_keys() {
@@ -944,6 +876,7 @@ mod tests {
             agent_kind: "claude_code",
             session_id: "claude__provider-sess-1",
             provider_session_id: "provider-sess-1",
+            identity_scheme: LifecycleIdentityScheme::GenericLifecycleUuidV5,
             provenance: json!({"channel": "hook", "hook_event_name": "Stop"}),
         }
     }
@@ -964,6 +897,7 @@ mod tests {
         assert_eq!(line["agent_kind"], json!("claude_code"));
         assert_eq!(line["session_id"], json!("claude__provider-sess-1"));
         assert_eq!(line["provider_session_id"], json!("provider-sess-1"));
+        assert_eq!(line["identity_scheme"], json!("generic_lifecycle_uuid_v5"));
         assert_eq!(line["partial"], json!(false));
         assert_eq!(line["provenance"]["channel"], json!("hook"));
         assert_eq!(line["source"], json!("startup"));
@@ -999,5 +933,67 @@ mod tests {
         let second: Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(first["kind"], json!("session_start"));
         assert_eq!(second["kind"], json!("session_end"));
+    }
+
+    /// Schema-v2 writers always emit a fixed typed identity declaration, and
+    /// the narrow reader preserves that declaration without claiming to
+    /// independently verify its HMAC material.
+    #[test]
+    fn canonical_v2_identity_scheme_is_typed_and_mandatory() {
+        let event = canonical_test_event(LifecycleEventKind::SessionStart);
+        let line = lifecycle_event_canonical_json(&event, &canonical_test_ctx());
+        assert_eq!(
+            parse_canonical_lifecycle_identity_scheme(&line).expect("parse v2 declaration"),
+            ParsedLifecycleIdentityScheme::Declared(
+                LifecycleIdentityScheme::GenericLifecycleUuidV5
+            )
+        );
+
+        let mut missing_scheme = line;
+        missing_scheme
+            .as_object_mut()
+            .expect("canonical line is an object")
+            .remove("identity_scheme");
+        assert!(
+            parse_canonical_lifecycle_identity_scheme(&missing_scheme).is_err(),
+            "schema-v2 lines must not silently omit their identity scheme"
+        );
+    }
+
+    /// v1 did not define `identity_scheme`. Even a hostile or hand-edited
+    /// v1 record which adds the current HMAC spelling remains opaque, so no
+    /// consumer can manufacture replay trust from historical data.
+    #[test]
+    fn legacy_v1_identity_scheme_is_always_opaque_not_hmac() {
+        let legacy = json!({
+            "schema_version": 1,
+            "event_id": "4de63a6b-8a12-4f77-9c4b-050206011005",
+            "identity_scheme": "native_replay_hmac_v2",
+        });
+        assert_eq!(
+            parse_canonical_lifecycle_identity_scheme(&legacy)
+                .expect("legacy schema must remain parseable"),
+            ParsedLifecycleIdentityScheme::LegacyV1Opaque,
+        );
+    }
+
+    #[test]
+    fn lifecycle_identity_scheme_wire_values_are_pinned() {
+        assert_eq!(
+            LifecycleIdentityScheme::NativeReplayHmacV2.as_wire(),
+            "native_replay_hmac_v2"
+        );
+        assert_eq!(
+            LifecycleIdentityScheme::FallbackActionHmacV1.as_wire(),
+            "fallback_action_hmac_v1"
+        );
+        assert_eq!(
+            LifecycleIdentityScheme::GenericLifecycleUuidV5.as_wire(),
+            "generic_lifecycle_uuid_v5"
+        );
+        assert_eq!(
+            LifecycleIdentityScheme::ImportUuidV5.as_wire(),
+            "import_uuid_v5"
+        );
     }
 }

@@ -3862,7 +3862,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_format_branch_name_with_full_remote_ref() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(false);
@@ -3876,7 +3876,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_format_branch_name_with_short_remote_ref() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(false);

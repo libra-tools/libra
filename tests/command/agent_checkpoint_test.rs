@@ -91,6 +91,11 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
     let json = parse_json_stdout(&output);
     assert_eq!(json["command"], "agent_checkpoint_rewind");
     assert_eq!(json["data"]["applied"], false);
+    assert_eq!(json["data"]["transcript_truncation_supported"], false);
+    assert!(
+        json["data"].get("transcript_truncation_reason").is_none(),
+        "dry-run must not add a new JSON field for a disabled transcript rewind"
+    );
     assert_eq!(json["data"]["parent_commit"], base);
     let restore_paths = json["data"]["would_restore_paths"].as_array().unwrap();
     assert!(restore_paths.iter().any(|path| path == "tracked.txt"));
@@ -130,6 +135,58 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
     assert_eq!(
         Head::current_commit().await.unwrap().to_string(),
         head_before_rewind
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn agent_session_show_extract_transcript_rejects_corrupt_identity_without_output() {
+    let repo = create_committed_repo_via_cli();
+    let _guard = ChangeDirGuard::new(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, stopped_at
+         ) VALUES (
+            'session-corrupt-extract', 'claude_code', X'00FF', 'stopped',
+            '/tmp/libra-agent-corrupt-identity', '{}', '{}', 10, 20, 30
+         )",
+        [],
+    ))
+    .await
+    .expect("insert corrupt agent_session fixture");
+
+    let output_path = repo.path().join("must-not-be-created.jsonl");
+    let output = run_libra_command(
+        &[
+            "agent",
+            "session",
+            "show",
+            "session-corrupt-extract",
+            "--extract-transcript",
+            output_path.to_str().expect("UTF-8 output path"),
+        ],
+        repo.path(),
+    );
+    assert!(
+        !output.status.success(),
+        "corrupt extraction identity must fail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent_session.provider_session_id"),
+        "error must identify the corrupt column: {stderr}"
+    );
+    assert!(
+        stderr.contains("session-corrupt-extract"),
+        "error must identify the requested session: {stderr}"
+    );
+    assert!(
+        !output_path.exists(),
+        "a corrupt session identity must not create an extraction output"
     );
 }
 

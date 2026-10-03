@@ -1,7 +1,6 @@
 //! AG-20 reader-slice tests (plan.md Task A5): keyset pagination for
-//! `agent checkpoint list` / `agent session list`, the metadata-first
-//! `checkpoint show` layout summary (E4-libra manifest-first plus the
-//! legacy-v1 manifest-less fallback), and the index-hit validation for the
+//! `agent checkpoint list` / `agent session list`, the stable safe-summary
+//! `checkpoint show` response, and the index-hit validation for the
 //! `2026070802_agent_checkpoint_paging` migration.
 //!
 //! Follows the E2E harness conventions of `tests/agent_lifecycle_event_test.rs`:
@@ -18,13 +17,9 @@
 //! - opaque keyset cursor (base64 `v1:<ts>:<id>`) walks pages with no
 //!   overlap and no gap; `next_cursor` is `null` exactly when exhausted;
 //!   malformed cursors fail closed with an actionable `--cursor` error;
-//! - `checkpoint show` classifies BOTH layouts: E4-libra (manifest-first
-//!   role/part summary, `content_hash` format check via the bare-hex
-//!   tolerant parser) and the committed pre-AG-20 v1 fixture
-//!   (`legacy-v1`, metadata-only fallback);
-//! - metadata-first discipline: `show` never reads transcript bodies, so
-//!   deleting a transcript blob from the object store flips availability
-//!   to `missing` instead of erroring;
+//! - `checkpoint show` returns only its fixed safe structural summary for
+//!   both current and pre-AG-20 checkpoint trees; it never reads or renders
+//!   arbitrary metadata JSON or catalog object identifiers;
 //! - EXPLAIN QUERY PLAN on the paginated queries against a real
 //!   `libra init` repository database hits the
 //!   `idx_agent_checkpoint_created_paging` /
@@ -39,6 +34,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+use libra::internal::ai::observed_agents::claude_project_slug;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use serde_json::{Value, json};
 
@@ -62,10 +58,13 @@ impl ReaderRepo {
         let repo = tempdir.path().join("repo");
         std::fs::create_dir_all(&home).expect("create fake home");
         std::fs::create_dir_all(&repo).expect("create repo dir");
+        // Hook ingress canonicalizes cwd before deriving the provider-native
+        // Claude source. Retain the same spelling in the fixture on macOS,
+        // where `/var` is commonly an alias for `/private/var`.
         let this = Self {
             _tempdir: tempdir,
-            repo,
-            home,
+            repo: repo.canonicalize().expect("canonical repo dir"),
+            home: home.canonicalize().expect("canonical fake home"),
         };
         let out = this.run(&["init"], None, &[]);
         assert!(
@@ -77,8 +76,7 @@ impl ReaderRepo {
     }
 
     /// Run the built `libra` binary inside the repo with a clean
-    /// environment plus `extra_envs` (e.g. the E5 chunk-threshold test
-    /// override for the writer).
+    /// environment plus explicitly requested fixture variables.
     fn run(&self, args: &[&str], stdin: Option<&str>, extra_envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
         cmd.args(args)
@@ -141,10 +139,14 @@ impl ReaderRepo {
     /// Write a transcript under the fake home's `~/.claude` (the Claude
     /// Code provider's protected dir) so the checkpoint writer's
     /// provider-root trust gate accepts it.
-    fn write_claude_transcript(&self, content: &[u8]) -> PathBuf {
-        let dir = self.home.join(".claude").join("projects").join("x");
+    fn write_claude_transcript(&self, session_id: &str, content: &[u8]) -> PathBuf {
+        let dir = self
+            .home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(&self.repo));
         std::fs::create_dir_all(&dir).expect("create ~/.claude transcript dir");
-        let path = dir.join("transcript.jsonl");
+        let path = dir.join(format!("{session_id}.jsonl"));
         std::fs::write(&path, content).expect("write transcript fixture");
         path
     }
@@ -450,18 +452,17 @@ async fn session_list_walks_keyset_pages() {
 }
 
 // ---------------------------------------------------------------------------
-// `checkpoint show`: legacy-v1 fixture classification
+// `checkpoint show`: legacy-v1 safe-summary compatibility
 // ---------------------------------------------------------------------------
 
 /// Reconstruct the committed pre-AG-20 fixture
 /// (`tests/fixtures/agent_checkpoints/v1_claude_code/`) inside a fresh
 /// repo — byte-identical blobs (OIDs re-verified against the fixture
-/// README) plus the v1 tree chain — and assert `checkpoint show`
-/// classifies it as `legacy-v1` with a metadata-only fallback summary,
-/// never an E4-libra inconsistency. Deleting the transcript blob must
-/// flip availability to `missing` without failing the show.
+/// README) plus the v1 tree chain — and assert `checkpoint show` remains
+/// readable without exposing the legacy metadata body or an object-layout
+/// JSON contract.
 #[tokio::test]
-async fn v1_fixture_show_classifies_legacy_layout() {
+async fn v1_fixture_show_preserves_safe_summary_without_layout_contract() {
     let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join(
         "tests/fixtures/agent_checkpoints/v1_claude_code/85/ae75d2-4c53-465a-b890-a9f861a50cc7",
     );
@@ -532,52 +533,17 @@ async fn v1_fixture_show_classifies_legacy_layout() {
     );
     let data = json_data(&show);
     assert_eq!(data["checkpoint"]["checkpoint_id"], json!(checkpoint_id));
-    assert_eq!(
-        data["metadata"]["schema_version"],
-        json!(1),
-        "v1 metadata must surface unchanged"
-    );
-    let layout = &data["layout"];
-    assert_eq!(
-        layout["kind"],
-        json!("legacy-v1"),
-        "manifest-less v1 tree must classify as legacy-v1, got: {layout}"
-    );
-    assert_eq!(layout["transcript"]["availability"], json!("present"));
-    assert_eq!(layout["transcript"]["chunked"], json!(false));
-    assert_eq!(
-        layout["transcript"]["parts"][0]["path"],
-        json!("transcript/claude_code"),
-        "v1 transcript keeps its extension-less provider path"
+    assert!(
+        data.get("layout").is_none(),
+        "checkpoint show must not add an unversioned object-layout schema: {data}"
     );
     assert!(
-        layout["transcript"]["parts"][0]["byte_len"].is_null(),
-        "v1 part sizes are unknown by design (sizing would read the blob)"
-    );
-    assert!(
-        layout["content_hash"].is_null(),
-        "v1 has no content_hash.txt — must be null, not an error"
-    );
-    let roles: Vec<&str> = layout["roles"]
-        .as_array()
-        .expect("roles array")
-        .iter()
-        .filter_map(|role| role["role"].as_str())
-        .collect();
-    assert!(roles.contains(&"metadata"), "roles: {roles:?}");
-    assert!(roles.contains(&"transcript"), "roles: {roles:?}");
-
-    // Human output names the layout too.
-    let human = repo.run(&["agent", "checkpoint", "show", checkpoint_id], None, &[]);
-    assert!(human.status.success(), "{}", describe(&human));
-    let stdout = String::from_utf8_lossy(&human.stdout);
-    assert!(
-        stdout.contains("legacy-v1"),
-        "human show must name the layout: {stdout}"
+        data.get("metadata").is_none(),
+        "checkpoint show must not surface arbitrary v1 metadata: {data}"
     );
 
-    // Metadata-first discipline: a missing transcript blob degrades
-    // availability, never the command.
+    // The safe summary remains readable even if an unrelated legacy
+    // transcript blob has disappeared: default show never reads it.
     repo.delete_loose_object(&transcript_oid);
     let show = repo.run(
         &["agent", "checkpoint", "show", checkpoint_id, "--json"],
@@ -585,16 +551,218 @@ async fn v1_fixture_show_classifies_legacy_layout() {
         &[],
     );
     let data = json_data(&show);
-    assert_eq!(data["layout"]["kind"], json!("legacy-v1"));
     assert_eq!(
-        data["layout"]["transcript"]["availability"],
-        json!("missing"),
-        "absent transcript blob → availability missing, not an error"
+        data["checkpoint"]["checkpoint_id"],
+        json!(checkpoint_id),
+        "safe summary must survive the missing transcript"
     );
+}
+
+/// `checkpoint show` is a deliberately narrow public read surface.  A local
+/// catalog or legacy metadata blob may contain source locators, commitments,
+/// redaction details, or internal object identities; neither human nor JSON
+/// output may serialize any of them by default.
+#[tokio::test]
+async fn checkpoint_show_hides_catalog_internals_and_metadata_in_human_and_json() {
+    const CHECKPOINT_ID: &str = "show-safe-summary-0000-0000-0000-000000000001";
+    const SESSION_ID: &str = "session-private-sentinel";
+    const LOCATOR_SENTINEL: &str = "provider-locator-sentinel";
+    const COMMITMENT_SENTINEL: &str = "source-commitment-sentinel";
+    const DIGEST_SENTINEL: &str = "content-digest-sentinel";
+    const REDACTION_SENTINEL: &str = "redaction-detail-sentinel";
+
+    let repo = ReaderRepo::init();
+    let metadata = json!({
+        "source_locator": LOCATOR_SENTINEL,
+        "source_commitment": COMMITMENT_SENTINEL,
+        "content_hash": DIGEST_SENTINEL,
+        "redaction_report": { "detail": REDACTION_SENTINEL },
+    })
+    .to_string();
+    let metadata_oid =
+        libra::utils::object::write_git_object(&repo.libra_dir(), "blob", metadata.as_bytes())
+            .expect("write sensitive metadata fixture")
+            .to_string();
+    let tree_oid = "a".repeat(40);
+    let traces_commit = "c".repeat(40);
+    let parent_commit = "d".repeat(40);
+    let conn = repo.db().await;
+    seed_session(&conn, SESSION_ID, 42).await;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
+         tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES (?, ?, 'committed', ?, ?, ?, ?, 42)",
+        [
+            CHECKPOINT_ID.into(),
+            SESSION_ID.into(),
+            parent_commit.clone().into(),
+            tree_oid.clone().into(),
+            metadata_oid.clone().into(),
+            traces_commit.clone().into(),
+        ],
+    ))
+    .await
+    .expect("seed private checkpoint catalog row");
+    drop(conn);
+
+    let json_output = repo.run(
+        &["agent", "checkpoint", "show", CHECKPOINT_ID, "--json"],
+        None,
+        &[],
+    );
+    let data = json_data(&json_output);
+    let data_object = data.as_object().expect("checkpoint show data object");
+    let checkpoint = data["checkpoint"]
+        .as_object()
+        .expect("checkpoint safe summary object");
+    let mut data_keys = data_object.keys().map(String::as_str).collect::<Vec<_>>();
+    data_keys.sort_unstable();
     assert_eq!(
-        data["metadata"]["schema_version"],
-        json!(1),
-        "metadata summary must survive the missing transcript"
+        data_keys,
+        ["checkpoint"],
+        "show JSON must retain only its documented top-level summary: {data}"
+    );
+    let mut keys = checkpoint.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "checkpoint_id",
+            "created_at",
+            "parent_snapshot_recorded",
+            "scope",
+        ],
+        "show JSON must retain only its documented whitelist: {data}"
+    );
+    assert_eq!(checkpoint["checkpoint_id"], json!(CHECKPOINT_ID));
+    assert_eq!(checkpoint["scope"], json!("committed"));
+    assert_eq!(checkpoint["created_at"], json!(42));
+    assert_eq!(checkpoint["parent_snapshot_recorded"], json!(true));
+    assert!(
+        data.get("metadata").is_none(),
+        "metadata must be withheld: {data}"
+    );
+
+    let human_output = repo.run(&["agent", "checkpoint", "show", CHECKPOINT_ID], None, &[]);
+    assert!(
+        human_output.status.success(),
+        "human checkpoint show failed: {}",
+        describe(&human_output)
+    );
+    let json_text = String::from_utf8_lossy(&json_output.stdout);
+    let human_text = String::from_utf8_lossy(&human_output.stdout);
+    assert_eq!(
+        human_text,
+        format!(
+            "checkpoint_id             : {CHECKPOINT_ID}\n\
+             scope                     : committed\n\
+             created_at                : 42\n\
+             parent_snapshot_recorded  : yes\n"
+        ),
+        "human show must retain only its documented fixed summary"
+    );
+    for private_value in [
+        SESSION_ID,
+        LOCATOR_SENTINEL,
+        COMMITMENT_SENTINEL,
+        DIGEST_SENTINEL,
+        REDACTION_SENTINEL,
+        tree_oid.as_str(),
+        metadata_oid.as_str(),
+        traces_commit.as_str(),
+        parent_commit.as_str(),
+    ] {
+        assert!(
+            !json_text.contains(private_value) && !human_text.contains(private_value),
+            "checkpoint show leaked private catalog or metadata value {private_value:?}; \
+             json={json_text}; human={human_text}"
+        );
+    }
+}
+
+/// A safe summary must fail closed when its mandatory catalog fields are
+/// corrupt. Substituting `0` or `false` would make damaged data look like a
+/// plausible 1970 checkpoint without a parent snapshot.
+#[tokio::test]
+async fn checkpoint_show_rejects_corrupt_summary_columns_without_echoing_them() {
+    const CHECKPOINT_ID: &str = "show-corrupt-summary-0000-0000-000000000001";
+    const SESSION_ID: &str = "show-corrupt-summary-session";
+    const CREATED_AT_SENTINEL: &str = "not-a-unix-timestamp";
+
+    let repo = ReaderRepo::init();
+    let conn = repo.db().await;
+    seed_session(&conn, SESSION_ID, 42).await;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
+         tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES (?, ?, 'committed', NULL, ?, ?, ?, 42)",
+        [
+            CHECKPOINT_ID.into(),
+            SESSION_ID.into(),
+            "a".repeat(40).into(),
+            "b".repeat(40).into(),
+            "c".repeat(40).into(),
+        ],
+    ))
+    .await
+    .expect("seed checkpoint summary row");
+
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        format!(
+            "UPDATE agent_checkpoint SET parent_commit = X'0102' WHERE checkpoint_id = '{CHECKPOINT_ID}'"
+        ),
+    ))
+    .await
+    .expect("corrupt nullable parent summary column");
+    drop(conn);
+
+    let parent_output = repo.run(
+        &["agent", "checkpoint", "show", CHECKPOINT_ID, "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        !parent_output.status.success(),
+        "corrupt parent column must fail closed: {}",
+        describe(&parent_output)
+    );
+    let parent_stderr = String::from_utf8_lossy(&parent_output.stderr);
+    assert!(parent_stderr.contains("LBR-AGENT-009"));
+    assert!(
+        !parent_stderr.contains("0102"),
+        "safe corruption diagnostic must not echo the raw parent value: {parent_stderr}"
+    );
+
+    let conn = repo.db().await;
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        format!(
+            "UPDATE agent_checkpoint SET parent_commit = NULL, created_at = '{CREATED_AT_SENTINEL}' \
+             WHERE checkpoint_id = '{CHECKPOINT_ID}'"
+        ),
+    ))
+    .await
+    .expect("corrupt mandatory timestamp summary column");
+    drop(conn);
+
+    let timestamp_output = repo.run(
+        &["agent", "checkpoint", "show", CHECKPOINT_ID, "--json"],
+        None,
+        &[],
+    );
+    assert!(
+        !timestamp_output.status.success(),
+        "corrupt timestamp column must fail closed: {}",
+        describe(&timestamp_output)
+    );
+    let timestamp_stderr = String::from_utf8_lossy(&timestamp_output.stderr);
+    assert!(timestamp_stderr.contains("LBR-AGENT-009"));
+    assert!(
+        !timestamp_stderr.contains(CREATED_AT_SENTINEL),
+        "safe corruption diagnostic must not echo the raw timestamp: {timestamp_stderr}"
     );
 }
 
@@ -621,8 +789,8 @@ fn write_tree(libra_dir: &Path, entries: &[(&str, &str, &str)]) -> String {
 /// Run one real hook ingest (SessionStart + Stop) and return the resulting
 /// checkpoint id from `checkpoint list --json`.
 fn ingest_one_checkpoint(repo: &ReaderRepo, transcript: &[u8], envs: &[(&str, &str)]) -> String {
-    let transcript_path = repo.write_claude_transcript(transcript);
     let session = "sess-reader-e4";
+    let transcript_path = repo.write_claude_transcript(session, transcript);
     let out = repo.hook(
         "claude-code",
         "session-start",
@@ -647,12 +815,105 @@ fn ingest_one_checkpoint(repo: &ReaderRepo, transcript: &[u8], envs: &[(&str, &s
         .to_string()
 }
 
-/// A chunked E4-libra checkpoint (written under the E5 test threshold
-/// override) shows its parts in manifest order without loading them, and
-/// a deleted chunk flips availability to `missing` while the manifest
-/// summary keeps rendering.
-#[test]
-fn chunked_show_lists_parts_in_manifest_order_without_loading() {
+/// Seed a small, production-shaped E4 chunked tree directly. The writer's
+/// small-threshold chunking behavior is exercised in the in-crate history
+/// test; this fixture keeps the CLI reader contract independent of any
+/// process environment override.
+async fn seed_chunked_e4_checkpoint(repo: &ReaderRepo, transcript: &[u8]) -> String {
+    let checkpoint_id = "e5reader-0000-0000-0000-000000000001";
+    let libra_dir = repo.libra_dir();
+    let metadata = json!({
+        "schema_version": 2,
+        "checkpoint_id": checkpoint_id,
+        "session_id": "claude__reader-e5",
+        "agent_kind": "claude_code"
+    })
+    .to_string();
+    let metadata_oid =
+        libra::utils::object::write_git_object(&libra_dir, "blob", metadata.as_bytes())
+            .expect("write chunked fixture metadata")
+            .to_string();
+
+    let chunks = libra::internal::ai::history::chunk_transcript_line_safe(transcript, 256)
+        .expect("split deterministic chunked reader fixture");
+    assert!(chunks.len() > 1, "fixture must contain multiple chunks");
+    let mut part_tree_entries = Vec::with_capacity(chunks.len());
+    let mut manifest_parts = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let name = format!("claude_code.jsonl.{:03}", index + 1);
+        let oid = libra::utils::object::write_git_object(&libra_dir, "blob", chunk)
+            .expect("write chunked fixture transcript part")
+            .to_string();
+        part_tree_entries.push(("100644".to_string(), name.clone(), oid.clone()));
+        manifest_parts.push(json!({
+            "path": format!("transcript/{name}"),
+            "oid": oid,
+            "byte_len": chunk.len(),
+        }));
+    }
+    let part_tree_refs = part_tree_entries
+        .iter()
+        .map(|(mode, name, oid)| (mode.as_str(), name.as_str(), oid.as_str()))
+        .collect::<Vec<_>>();
+    let transcript_tree = write_tree(&libra_dir, &part_tree_refs);
+    let content_hash = format!("sha256:{}", "a".repeat(64));
+    let content_hash_oid =
+        libra::utils::object::write_git_object(&libra_dir, "blob", content_hash.as_bytes())
+            .expect("write chunked fixture content hash")
+            .to_string();
+    let manifest = json!({
+        "schema_version": 1,
+        "entries": {
+            "metadata": {
+                "path": "metadata.json",
+                "oid": metadata_oid.clone(),
+                "byte_len": metadata.len(),
+            },
+            "transcript": {
+                "path": "transcript/claude_code.jsonl",
+                "chunked": true,
+                "parts": manifest_parts,
+                "byte_len": transcript.len(),
+            }
+        }
+    })
+    .to_string();
+    let manifest_oid =
+        libra::utils::object::write_git_object(&libra_dir, "blob", manifest.as_bytes())
+            .expect("write chunked fixture manifest")
+            .to_string();
+    let inner_tree = write_tree(
+        &libra_dir,
+        &[
+            ("100644", "content_hash.txt", &content_hash_oid),
+            ("100644", "manifest.json", &manifest_oid),
+            ("100644", "metadata.json", &metadata_oid),
+            ("40000", "transcript", &transcript_tree),
+        ],
+    );
+    let prefix_tree = write_tree(&libra_dir, &[("40000", &checkpoint_id[2..], &inner_tree)]);
+    let checkpoint_tree = write_tree(&libra_dir, &[("40000", &checkpoint_id[..2], &prefix_tree)]);
+    let root_tree = write_tree(&libra_dir, &[("40000", "checkpoint", &checkpoint_tree)]);
+
+    let conn = repo.db().await;
+    seed_session(&conn, "claude__reader-e5", 1).await;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
+         tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES (?, 'claude__reader-e5', 'committed', NULL, ?, ?, 'fixture-commit', 1)",
+        [checkpoint_id.into(), root_tree.into(), metadata_oid.into()],
+    ))
+    .await
+    .expect("seed chunked checkpoint catalog row");
+    checkpoint_id.to_string()
+}
+
+/// `checkpoint show` does not turn manifest-derived layout details or
+/// metadata contents into a public JSON contract, even for a chunked
+/// checkpoint.
+#[tokio::test]
+async fn chunked_show_keeps_safe_summary_json_contract() {
     // ~40 bytes per line × 40 lines ≈ 1.5 KiB; threshold 256 → ≥ 6 parts.
     let mut transcript = Vec::new();
     for index in 0..40 {
@@ -661,8 +922,7 @@ fn chunked_show_lists_parts_in_manifest_order_without_loading() {
         );
     }
     let repo = ReaderRepo::init();
-    let envs = [("LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD", "256")];
-    let checkpoint_id = ingest_one_checkpoint(&repo, &transcript, &envs);
+    let checkpoint_id = seed_chunked_e4_checkpoint(&repo, &transcript).await;
 
     let show = repo.run(
         &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
@@ -670,66 +930,25 @@ fn chunked_show_lists_parts_in_manifest_order_without_loading() {
         &[],
     );
     let data = json_data(&show);
-    let layout = &data["layout"];
-    assert_eq!(layout["kind"], json!("e4-libra"));
-    assert_eq!(layout["transcript"]["chunked"], json!(true));
-    assert_eq!(layout["transcript"]["availability"], json!("present"));
-    let parts = layout["transcript"]["parts"].as_array().expect("parts");
-    assert!(parts.len() > 1, "chunked transcript must list >1 part");
-    let mut total_len = 0u64;
-    for (index, part) in parts.iter().enumerate() {
-        assert_eq!(
-            part["path"],
-            json!(format!("transcript/claude_code.jsonl.{:03}", index + 1)),
-            "parts must surface in manifest (.%03d) order"
-        );
-        assert!(part["oid"].as_str().is_some(), "part carries its oid");
-        total_len += part["byte_len"].as_u64().expect("declared byte_len");
-    }
-    assert_eq!(
-        total_len,
-        transcript.len() as u64,
-        "declared part lengths must add up to the logical transcript"
+    assert_eq!(data["checkpoint"]["checkpoint_id"], json!(checkpoint_id));
+    assert!(
+        data.get("metadata").is_none(),
+        "metadata must remain outside default show JSON: {data}"
     );
-    assert_eq!(
-        layout["content_hash"]["format_valid"],
-        json!(true),
-        "content_hash.txt must parse via the sha256:/bare-hex reader"
+    assert!(
+        data.get("layout").is_none(),
+        "manifest paths, object IDs, and hashes must not become default show JSON: {data}"
     );
-    let digest = layout["content_hash"]["digest"].as_str().expect("digest");
-    assert_eq!(digest.len(), 64);
-
-    // Metadata-first discipline for the chunked path: delete ONE chunk —
-    // show still succeeds from the manifest, availability flips.
-    let deleted_oid = parts[1]["oid"].as_str().expect("part oid").to_string();
-    repo.delete_loose_object(&deleted_oid);
-    let show = repo.run(
-        &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
-        None,
-        &[],
-    );
-    let data = json_data(&show);
-    assert_eq!(data["layout"]["kind"], json!("e4-libra"));
-    assert_eq!(
-        data["layout"]["transcript"]["availability"],
-        json!("missing")
-    );
-    assert_eq!(
-        data["layout"]["transcript"]["parts"]
-            .as_array()
-            .expect("parts")
-            .len(),
-        parts.len(),
-        "part listing comes from the manifest, not from surviving blobs"
+    assert!(
+        !data.to_string().contains("chunk me"),
+        "show must not expose transcript content"
     );
 }
 
-/// Single-file E4-libra checkpoint: `show` summarizes the manifest roles,
-/// and an intentionally deleted transcript blob is reported as `missing`
-/// (with metadata/manifest still rendered) rather than erroring — the
-/// direct assertion that `show` never reads the transcript body.
+/// Single-file E4-libra checkpoint: `show` exposes only the fixed safe
+/// summary, not metadata or transcript-derived layout details.
 #[test]
-fn show_survives_missing_transcript_blob() {
+fn show_does_not_expose_transcript_layout() {
     let transcript =
         b"{\"role\":\"user\",\"text\":\"kick off\"}\n{\"role\":\"assistant\",\"text\":\"done\"}\n";
     let repo = ReaderRepo::init();
@@ -741,54 +960,17 @@ fn show_survives_missing_transcript_blob() {
         &[],
     );
     let data = json_data(&show);
-    let layout = &data["layout"];
-    assert_eq!(layout["kind"], json!("e4-libra"));
-    assert_eq!(layout["transcript"]["chunked"], json!(false));
-    assert_eq!(layout["transcript"]["availability"], json!("present"));
-    let roles: Vec<&str> = layout["roles"]
-        .as_array()
-        .expect("roles")
-        .iter()
-        .filter_map(|role| role["role"].as_str())
-        .collect();
-    for role in [
-        "content_hash",
-        "lifecycle_events",
-        "metadata",
-        "redaction_report",
-        "transcript",
-    ] {
-        assert!(roles.contains(&role), "role {role} missing from {roles:?}");
-    }
-    let transcript_oid = layout["transcript"]["parts"][0]["oid"]
-        .as_str()
-        .expect("transcript oid")
-        .to_string();
-
-    repo.delete_loose_object(&transcript_oid);
-    let show = repo.run(
-        &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
-        None,
-        &[],
+    assert!(
+        data.get("metadata").is_none(),
+        "metadata.json must not be exposed by default show"
     );
     assert!(
-        show.status.success(),
-        "show must not fail on a missing transcript blob: {}",
-        describe(&show)
-    );
-    let data = json_data(&show);
-    assert_eq!(
-        data["layout"]["transcript"]["availability"],
-        json!("missing")
-    );
-    assert_eq!(
-        data["layout"]["content_hash"]["format_valid"],
-        json!(true),
-        "manifest-side summary survives the missing transcript"
+        data.get("layout").is_none(),
+        "default show JSON must remain schema-stable: {data}"
     );
     assert!(
-        data["metadata"].is_object(),
-        "metadata.json summary survives the missing transcript"
+        !data.to_string().contains("kick off") && !data.to_string().contains("done"),
+        "show must not expose transcript body"
     );
 }
 

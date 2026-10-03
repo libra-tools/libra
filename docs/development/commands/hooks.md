@@ -29,9 +29,21 @@ flowchart TD
     E --> G["副作用边界<br/>写 session JSONL、写 Git blob、追加 AI history ref，并 UPSERT agent_session 行"]
 ```
 
+- AgentTraces 分层（ADR-ACF-10 / ACF-19）：hook entry `src/internal/ai/hooks/runtime.rs`（ingress 校验、期限建立、目标分派、终止错误分类）→ live pipeline `src/internal/ai/capture/live_pipeline.rs`（`ingest_agent_traces`）→ checkpoint writers `src/internal/ai/capture/live_checkpoint.rs` → capture coordinator 与 catalog/checkpoint store ports；scoped 只读 probe 与 ingest span 位于 `src/internal/ai/capture/live.rs`。`capture/**` 生产代码不得反向 import `hooks::{runtime,intent,providers}`。
+
+```mermaid
+flowchart LR
+    R["hooks/runtime.rs<br/>entry + dispatch"] --> P["capture/live_pipeline.rs<br/>ingest_agent_traces"]
+    P --> K["capture/live_checkpoint.rs<br/>checkpoint writers"]
+    P --> L["capture/live.rs<br/>read probes + ingest span"]
+    K --> L
+    P --> C["capture/coordinator.rs<br/>catalog / checkpoint ports"]
+    K --> C
+```
+
 - 底层操作对象：Agent profile / runtime 对象（外部代理、hook、权限和运行状态）；session/thread store（AI 会话、线程、事件和恢复状态）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
-- 副作用边界：当前实现是写密集型路径（`process_hook_event_from_stdin`，`src/internal/ai/hooks/runtime.rs:157`）：通过 `SessionStore::save` 写 session JSONL 文件（runtime.rs:402-404），通过 `write_git_object` 写内容寻址的 Git blob（runtime.rs:1225），通过 `HistoryManager::append` 追加到 AI history ref（runtime.rs:1226-1228）；AgentTraces 路径还会 UPSERT `agent_session` 表中的行（runtime.rs:586-623）。任何持久化对象、回滚语义和测试证据的变更都要同步设计。
+- 副作用边界：当前实现是写密集型路径（入口 `process_hook_event_from_stdin` / `process_hook_event_with_target`，`src/internal/ai/hooks/runtime.rs`）：legacy AiIntent 目标由 `src/internal/ai/hooks/intent.rs` 的 `process_ai_intent_ingress` 通过 `SessionStore::save` 写 session JSON 文件，并经 `persist_session_history` 用 `write_git_object` 写内容寻址的 Git blob、再经 `history::persist_ai_session` 追加到 AI history ref；AgentTraces 路径由 runtime 分派到 `src/internal/ai/capture/live_pipeline.rs` 的 `ingest_agent_traces`，其 checkpoint writers（`src/internal/ai/capture/live_checkpoint.rs`）经 capture coordinator 的 catalog/checkpoint store ports UPSERT `agent_session` 并写 `refs/libra/traces` checkpoint。受管 hook 的 cwd/replay-key 绑定在可杀 helper（`src/internal/ai/capture/scope_binding.rs`）中执行，共享执行期限、session id、只读期限辅助、ingest span 与 scoped 只读 probe（`agent_session` / `agent_checkpoint` SELECT）位于 `src/internal/ai/capture/live.rs`。任何持久化对象、回滚语义和测试证据的变更都要同步设计。
 
 ## 实现历史
 

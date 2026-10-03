@@ -1254,6 +1254,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd, env)]
     async fn the_binding_refuses_another_repositorys_main_worktree() {
+        // The final explicit restore below is process-global, so use the same
+        // lock as ChangeDirGuard before sampling the original directory.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
         let original = std::env::current_dir().expect("cwd");

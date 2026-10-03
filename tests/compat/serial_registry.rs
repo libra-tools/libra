@@ -1970,7 +1970,8 @@ test-group = 'external'
 /// artifact — regenerating it from `tests/SERIAL_REGISTRY.tsv` must reproduce
 /// the committed file byte for byte, and the `external` union group must hold
 /// exactly the registry-derived membership: every fn row whose lane keys
-/// include an external key (cloud_live / workspace_failpoints) as an
+/// include an external named key (for example cloud_live, service, or
+/// workspace_failpoints) as an
 /// anchored last-segment regex filter `test(/(^|::)<fn>$/)` — full nextest
 /// names in aggregated binaries carry module paths, and fn names are
 /// tree-unique, so the anchor is exact — plus every pure-global site row's
@@ -2046,7 +2047,7 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     assert_eq!(
         toml_fns, expected_fns,
         "external group test(/(^|::)fn$/) members must equal the registry-derived \
-         union of cloud_live/workspace_failpoints fn rows"
+         union of fn rows with an external named lane"
     );
     assert_eq!(
         toml_bins, expected_bins,
@@ -2056,11 +2057,12 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     // DEFER-NP-02 (executed 2026-09-17, user-directed): the TA-03 fail-closed
     // expansions carry only the in-process closed set {cwd, env, hash_kind},
     // so the union group holds exactly the genuinely external rows — the
-    // hand-keyed cloud_live (10 after CM-10 added the Agent catalog roundtrip) and
-    // workspace_failpoints (1) tests. A count drift here means a new test was
-    // keyed with an external resource (fine, but deliberate) or a fail-closed
-    // body was re-widened by hand (not fine).
-    assert_eq!(toml_fns.len(), 11, "union fn member count drifted");
+    // hand-keyed cloud_live (10 after CM-10 added the Agent catalog roundtrip),
+    // workspace_failpoints (1), and long-lived service-fixture (10) tests. A
+    // count drift here means a new test was keyed with an external resource
+    // (fine, but deliberate) or a fail-closed body was re-widened by hand (not
+    // fine).
+    assert_eq!(toml_fns.len(), 21, "union fn member count drifted");
     // RC-23 deleted the seven Code UI matrix binaries that used to host
     // pure-global macro site rows. The external group now has no binary filters.
     assert_eq!(toml_bins.len(), 0, "site host target count drifted");

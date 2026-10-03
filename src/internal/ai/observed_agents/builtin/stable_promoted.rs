@@ -34,6 +34,74 @@ use super::super::{
 
 const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 
+#[cfg(all(test, unix))]
+mod test_support {
+    use std::{
+        sync::{Mutex, OnceLock, mpsc},
+        time::Duration,
+    };
+
+    use anyhow::{Result, anyhow};
+
+    struct DiscoveryOpenPause {
+        reached: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    fn pause_slot() -> &'static Mutex<Option<DiscoveryOpenPause>> {
+        static PAUSE: OnceLock<Mutex<Option<DiscoveryOpenPause>>> = OnceLock::new();
+        PAUSE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) struct PauseReset;
+
+    impl Drop for PauseReset {
+        fn drop(&mut self) {
+            let mut pause = pause_slot()
+                .lock()
+                .expect("Codex discovery test pause lock is not poisoned");
+            pause.take();
+        }
+    }
+
+    pub(super) fn install_codex_discovery_open_pause()
+    -> (mpsc::Receiver<()>, mpsc::Sender<()>, PauseReset) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut pause = pause_slot()
+            .lock()
+            .expect("Codex discovery test pause lock is not poisoned");
+        assert!(
+            pause.is_none(),
+            "a Codex discovery test pause is already installed"
+        );
+        *pause = Some(DiscoveryOpenPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx, PauseReset)
+    }
+
+    pub(super) fn pause_codex_discovery_open() -> Result<()> {
+        let pause = pause_slot()
+            .lock()
+            .expect("Codex discovery test pause lock is not poisoned")
+            .take();
+        let Some(pause) = pause else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow!("Codex discovery test lost its pause observer"))?;
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow!("Codex discovery test pause was not resumed"))?;
+        Ok(())
+    }
+}
+
 /// Static description of a Phase 4.4 stable-promoted adapter. Stays
 /// `Copy + 'static` so the registry can hand out cheap references.
 #[derive(Clone, Copy)]
@@ -464,21 +532,13 @@ fn inspect_rollout_entry_at(
     Ok(Some(mode))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn pause_codex_discovery_before_open_for_test() -> Result<()> {
-    let Ok(ready_path) = std::env::var("LIBRA_TEST_CODEX_DISCOVERY_OPEN_READY_FILE") else {
-        return Ok(());
-    };
-    let continue_path = std::env::var("LIBRA_TEST_CODEX_DISCOVERY_OPEN_CONTINUE_FILE")
-        .context("Codex discovery open failpoint requires a continue-file path")?;
-    fs::write(&ready_path, b"ready").context("write Codex discovery open ready file")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !std::path::Path::new(&continue_path).exists() {
-        if Instant::now() >= deadline {
-            return Err(anyhow!("timed out waiting to resume Codex discovery open"));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    test_support::pause_codex_discovery_open()
+}
+
+#[cfg(all(unix, not(test)))]
+fn pause_codex_discovery_before_open_for_test() -> Result<()> {
     Ok(())
 }
 
@@ -809,7 +869,7 @@ mod tests {
         fn set(home: &std::path::Path, codex_home: &std::path::Path) -> Self {
             let prior_home = std::env::var_os("LIBRA_TEST_HOME");
             let prior_codex = std::env::var_os("CODEX_HOME");
-            // SAFETY: test-only env mutation, restored on drop; #[serial].
+            // SAFETY: test-only env mutation, restored on drop; #[serial(env)].
             unsafe {
                 std::env::set_var("LIBRA_TEST_HOME", home);
                 std::env::set_var("CODEX_HOME", codex_home);
@@ -838,7 +898,7 @@ mod tests {
     /// R1 follow-ups: absolute $CODEX_HOME needs no home; junk lexically-high
     /// dirs never win; I/O errors surface instead of reading "not found".
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn codex_rollout_discovery_hardening() {
         let tmp = tempfile::tempdir().unwrap();
         let codex_home = tmp.path().join("codex-abs");
@@ -917,7 +977,7 @@ mod tests {
     /// oversized file fan-out, and an expired deadline all error through
     /// `find_codex_rollout_bounded`, never returning a silent Ok(None).
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn codex_rollout_discovery_bounds_fail_loudly() {
         let tmp = tempfile::tempdir().unwrap();
         let codex_home = tmp.path().join("codex-abs");
@@ -982,7 +1042,7 @@ mod tests {
     /// wins, invalid ids and symlinks fail closed, absence is Ok(None), and
     /// the walk stays bounded.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn codex_rollout_discovery() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
@@ -1055,7 +1115,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn codex_rollout_discovery_rejects_symlinked_sessions_root() {
         let tmp = tempfile::tempdir().unwrap();
         let codex_home = tmp.path().join("codex-home");
@@ -1076,6 +1136,39 @@ mod tests {
         assert!(
             format!("{error:#}").contains("no-follow"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_discovery_open_pause_rechecks_a_swapped_directory_without_env() {
+        let root = tempfile::tempdir().expect("create pinned-parent fixture");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        let parent = root.path().join("sessions");
+        let candidate = parent.join("2026");
+        std::fs::create_dir_all(&candidate).expect("create original candidate directory");
+        let directory = std::fs::File::open(&parent).expect("open pinned parent directory");
+        let worker_candidate = candidate.clone();
+        let (reached, resume, _pause_reset) =
+            super::test_support::install_codex_discovery_open_pause();
+
+        let worker = std::thread::spawn(move || {
+            open_rollout_directory_at(&directory, std::ffi::OsStr::new("2026"), &worker_candidate)
+        });
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("open must pause after its no-follow inspection");
+
+        let original = parent.join("2026-original");
+        std::fs::rename(&candidate, &original).expect("move checked directory");
+        std::os::unix::fs::symlink(outside.path(), &candidate)
+            .expect("replace checked directory with symlink");
+        resume.send(()).expect("resume protected open");
+
+        let result = worker.join().expect("join protected-open worker");
+        assert!(
+            result.is_err(),
+            "openat with O_NOFOLLOW must reject a component swapped after inspection"
         );
     }
 

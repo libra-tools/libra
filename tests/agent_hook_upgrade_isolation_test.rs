@@ -34,9 +34,11 @@ use std::{
 use serde_json::{Value, json};
 
 const LOCK_FILE_NAME: &str = ".libra-upgrade.lock";
-/// The issue's hook config carries `timeout: 30` (Codex host budget); a
-/// hook that detours into upgrade recovery/check work cannot reliably stay
-/// inside it. The assertion is deliberately generous for slow CI.
+/// Ordinary Codex hook configs carry `timeout: 30`; `SessionEnd` is capped at
+/// the provider's shorter three-second limit. A hook that detours into upgrade
+/// recovery/check work cannot reliably stay inside either provider window.
+/// This assertion is deliberately generous because it tests only that the
+/// upgrade gate was bypassed, not the installed handler deadline.
 const HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The nine installed Codex hook events (issue #502 acceptance criteria).

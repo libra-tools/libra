@@ -137,7 +137,7 @@ fn service_rejects_non_loopback_hosts_and_outside_repo() {
 }
 
 #[test]
-#[serial(cwd, env, hash_kind)]
+#[serial(cwd, env, hash_kind, service)]
 fn service_end_to_end_events_marks_and_fault_recovery() {
     let repo = service_repo();
     let p = repo.path();
@@ -253,7 +253,7 @@ fn service_end_to_end_events_marks_and_fault_recovery() {
 /// multi-worktree repository — the dirty cache is per-worktree and the
 /// caller's scope is unknown. A corrupt registry rejects too (fail closed).
 #[test]
-#[serial(cwd, env, hash_kind)]
+#[serial(cwd, env, hash_kind, service)]
 fn dirty_mark_rejected_in_multi_worktree_repo() {
     let repo = service_repo();
     let main = repo.path();
@@ -344,6 +344,7 @@ fn dirty_mark_rejected_in_multi_worktree_repo() {
 /// would tell the wrong worktree its files changed while leaving the real one
 /// stale — the reason a scope-less request is still refused here.
 #[test]
+#[serial(service)]
 fn linked_service_dirty_mark_is_scoped() {
     let repo = service_repo();
     let main = repo.path();
@@ -567,6 +568,7 @@ fn linked_check_dirty_does_not_prune_other_scope() {
 /// wrong path (ids are path-derived and reused, so the path is what catches a
 /// client that has drifted onto a different worktree).
 #[test]
+#[serial(service)]
 fn service_dirty_mark_scope_mismatch_rejected() {
     let (repo, _parent, wt) = repo_with_linked("mismatch-wt");
     let main = repo.path();
@@ -634,6 +636,7 @@ fn service_dirty_mark_scope_mismatch_rejected() {
 /// repository it never looked at. `repo_id` is required, not optional: an
 /// optional proof is no proof.
 #[test]
+#[serial(service)]
 fn service_dirty_mark_requires_matching_repo_id() {
     let repo = service_repo();
     let main = repo.path();
@@ -700,6 +703,7 @@ fn service_dirty_mark_requires_matching_repo_id() {
 /// across the re-add marks the successor's cache — reporting files dirty in a
 /// worktree that never touched them.
 #[test]
+#[serial(service)]
 fn service_dirty_mark_stale_epoch_rejected() {
     let (repo, _parent, wt) = repo_with_linked("fence-wt");
     let main = repo.path();
@@ -1332,6 +1336,7 @@ fn linked_hydrate_sparse_gate_uses_current_scope() {
 /// external holder owns the lock for a fixed window, so both requests must
 /// wait for it and then succeed.
 #[test]
+#[serial(service)]
 fn service_marks_survive_an_externally_held_registry_lock() {
     let repo = service_repo();
     let main = repo.path();
@@ -1441,6 +1446,7 @@ fn service_marks_survive_an_externally_held_registry_lock() {
 /// unreadable for weeks. The fault seam exists precisely because every
 /// fixture has a healthy database, so this branch is otherwise untestable.
 #[test]
+#[serial(service)]
 fn service_reports_identity_read_failure_as_server_error() {
     let repo = service_repo();
     let main = repo.path();
@@ -1488,6 +1494,7 @@ fn service_reports_identity_read_failure_as_server_error() {
 /// repository policy needs. A working dir belonging elsewhere proves nothing
 /// and must still be refused.
 #[test]
+#[serial(service)]
 fn service_restarts_over_its_own_legacy_record_in_a_linked_repository() {
     let repo = service_repo();
     let main = repo.path();
@@ -1564,6 +1571,7 @@ fn service_restarts_over_its_own_legacy_record_in_a_linked_repository() {
 /// repository's service was silently overwritten — the advisory lock
 /// arbitrates liveness, not ownership.
 #[test]
+#[serial(service)]
 fn service_startup_refuses_a_foreign_stale_control_file() {
     let repo = service_repo();
     let main = repo.path();

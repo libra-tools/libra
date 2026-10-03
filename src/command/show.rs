@@ -673,8 +673,15 @@ fn build_raw_lines(
     const ZERO_MODE: &str = "000000";
     let zero_sha = "0".repeat(7);
     let absent = || (ZERO_MODE.to_string(), zero_sha.clone());
+    // Both sides are paths within the commit tree, not paths in the caller's
+    // worktree.  Keep this comparison lexical: `util::is_sub_path` resolves
+    // relative inputs through the process CWD, which is both unnecessary for
+    // tree paths and can make a renderer depend on an unrelated CWD change.
     let matches_filter = |path: &Path| {
-        paths.is_empty() || paths.iter().any(|filter| util::is_sub_path(path, filter))
+        paths.is_empty()
+            || paths
+                .iter()
+                .any(|filter| path == filter || path.starts_with(filter))
     };
 
     let mut all_paths: BTreeSet<&PathBuf> = BTreeSet::new();

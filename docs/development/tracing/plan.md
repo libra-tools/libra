@@ -36,7 +36,7 @@ Agent 第一期本地采集验收规则：
 
 - 第一期完成口径必须覆盖本地三种真实 agent：`codex`、`claude`（Claude Code，对应 Libra slug `claude-code`）和 `opencode`。fake fixtures 只用于 CI/确定性回归，不能替代这三条本地采集验收。
 - 本地验收必须先记录 `command -v codex`、`command -v claude`、`command -v opencode` 和各自版本/路径；`opencode` 要特别记录实际命中的 PATH，避免 Homebrew 与 `~/.opencode/bin/opencode` 影子路径导致误判。
-- 三个 agent 都必须在临时 Libra 仓库中完成 hook 安装、一次最小会话运行、lifecycle ingest、session/checkpoint catalog 写入、`refs/libra/traces` checkpoint 写入、metadata-first show/list 和 redaction 验证。
+- 三个 agent 都必须在临时 Libra 仓库中完成 hook 安装、一次最小会话运行、lifecycle ingest、session/checkpoint catalog 写入、`refs/libra/traces` checkpoint 写入、metadata-first list 与 safe-summary `checkpoint show` 和 redaction 验证。
 - 缺少任一二进制、登录态、hook provider 或 transcript 读取能力时，Agent 第一期不得标记完成；只能标记为 blocked，并写明缺失项与恢复步骤。
 - 本地三 agent 验收不得打印 prompt、token、provider credential、raw transcript 或 `.env.test` 内容；默认输出只能使用 redacted summary / metadata。
 
@@ -56,7 +56,7 @@ Agent 第一期本地采集验收规则：
 | 安全性 | 已识别 secrets、stderr、raw transcript、external binary 仿冒和 `.env.test` 泄露风险。 | `.env.test` 只能由测试进程读取，不得打印；外部二进制必须 `env_clear` + allowlist；stderr/stdout/raw hook input 先 cap + redaction，再进入任何用户输出、JSON、DB 或对象存储。外部 agent 的一切输出（findings/stances/transcript）均视为不可信输入，进入后续 prompt、用户终端或持久化前必须 provenance 标注 + redaction + 控制序列剥离；`env_clear` + allowlist 原则同样适用于 §0.3 直启的真实 agent CLI（登录态所需基础变量除外）。 |
 | 功能正确性与接口兼容性 | alias、capability matrix、RPC v1/v2、Code mode/provider 参数互斥是最容易漂移的接口面。 | 所有 alias 必须同语义、同退出码、同 JSON shape；RPC v2 `info` 不破坏 v1 `capabilities` 一个 release window；`libra code` 参数互斥先由 C1 源码复核后再改。 |
 | 数据流与控制流正确性 | 正确边界是 `hook/RPC -> LifecycleEvent -> validation -> redaction -> checkpoint writer`；`review/investigate -> evidence -> optional internal fix bridge`。 | Provider hook 和 external binary parser 不得直接写 checkpoint；read-only workflow 不得直接修改工作树；mutating path 只能进入内部 AgentRuntime serialized queue。 |
-| 性能与效率 | transcript、review output、checkpoint catalog 和 session list 都可能放大到高成本路径。 | 默认 list/show 只读 metadata；transcript/detail 必须显式开启并 streaming/chunked；分页默认 `--limit 50`、cap 500；review sink 和 RPC stderr 设定 bounded buffer。 |
+| 性能与效率 | transcript、review output、checkpoint catalog 和 session list 都可能放大到高成本路径。 | 默认 list 与 `session show` 只读 metadata；默认 `checkpoint show` 只读固定安全 catalog 摘要；transcript/detail 必须显式开启并 streaming/chunked；分页默认 `--limit 50`、cap 500；review sink 和 RPC stderr 设定 bounded buffer。 |
 | 可靠性与容错性 | checkpoint 写序、prune 并发、review/investigate cancel/timeout 是主要可靠性风险。 | A5 必测 ref/DB/object_index crash matrix、UPSERT/重试、doctor repair、prune A/B；A7/A8 必测 terminal state 和 process/reader/lock/lease cleanup。 |
 | 兼容性与互操作性 | `libra agent` 是 Libra extension，不是 Git 命令；外部 agent 配置文件和 MCP/code-control 边界必须可互操作但不混同。 | `status/enable/disable` 保持 canonical；`list/add/remove` 只是 alias；MCP stdio 不得成为 turn control plane；首批外 agent 配置只写 Libra-managed hook entry 并保留用户配置。 |
 | 可扩展性与可维护性 | first-batch roster 限制合理，但后续扩展必须避免散点状态字段和测试缺口。 | 新增 agent 必须更新 `agent.md` first-batch/roster 规则、E9、registry matrix、docs/commands、compat schema pin、tests/INDEX；新增 test target 必须同时注册 `Cargo.toml`。 |
@@ -346,7 +346,7 @@ opencode run \
 - `agent_session.agent_kind` 分别出现 `claude_code`、`codex`、`opencode`。
 - 每个 agent 至少有一次 session start、一次 user turn / prompt boundary、一次 stop/session end 或等价 terminal lifecycle event。
 - 每个 agent 至少写出一个 checkpoint，且 checkpoint 能关联到 `refs/libra/traces`、manifest、redaction report 和 content hash。
-- 默认 `session list` / `checkpoint list` / `checkpoint show` 不读取 raw transcript body；只有显式 detail/transcript 路径才允许读取 body。
+- 默认 `session list` / `checkpoint list` 不读取 raw transcript body；`checkpoint show` 还只读取 catalog 的固定安全摘要，不读取 metadata/object。只有显式 detail/transcript 路径才允许读取 body。
 - `doctor --json` 不报告 ref/DB/object_index 不一致；若报告 warning，必须分类为已知非阻断项并写入 evidence summary。
 - summary 区证据与任何随 PR 提交的内容中不得出现 `.env.test` 值、API key、provider token 或 raw transcript 大段内容；hook 捕获的 transcript 与 checkpoint 内容中也不得出现 `.env.test` 内任何未注入 key 的值（违反按 §0.3.6 归类为安全阻断）。路径脱敏规则具体化：`$HOME` 前缀替换为 `~`、用户名替换为固定占位符；§0.3.2 要求记录的 binary path/version 属允许白名单（记录时同样做 `$HOME`→`~` 归一化）。
 
@@ -765,7 +765,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [x] redaction-before-persist 类型级接入，raw hook input 不进入 session log、checkpoint tree、stdout/JSON。**（redaction 扩展到 prompt/assistant_message/tool_input/tool_response 四字段；E2E 断言 AKIA 令牌不出现在任何 CLI JSON 输出与 DB 字节中。）**
 - [x] 安装器写入的每个 Libra-managed hook entry command 必须是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径（`--binary-path` 或 `current_exe`，解析失败硬错误，禁止回退裸 `libra`），安装后有断言（覆盖非 smoke 常规安装路径，与 §0.3.3/A6.5 口径一致）。**（`tests/agent_enable_install_path_test.rs`：opencode plugin 与 codex hooks.json 双向 E2E，含 trust-gap banner 触发/修复与卸载还原；注意「先 enable 修复 trust 再 disable」的顺序约束——`hooks_are_installed` 对 trust gap fail-closed，篡改态下 disable 为 no-op。）**
 - [x] 按 `agent.md` 补充规格 §6 落地 `agent.hook.ingest`、`agent.redaction.apply` span/metric，tracing fake sink 断言必带/禁止字段。**（`tests/agent_hook_span_test.rs` 独立二进制 3 用例：必带字段/partial+unknown_event_type/validated=false，raw prompt 与 AKIA 令牌不得进 sink；`ingest_agent_traces_payload` 为此升为 pub（注明非稳定 API、不从 crate root 再导出）。）**
-- [x] 按 `agent.md` 强制补强项 #10 落地 `libra hooks <provider> <verb>` 崩溃行为回归（panic 与被 kill 两路径）：断言无半截 checkpoint/DB 写入、退出码非零、stderr 不回显 raw stdin。**（`tests/agent_hook_crash_test.rs` 3 用例：SIGKILL 半途/panic 注入（`LIBRA_TEST_HOOK_PANIC_AFTER_READ` 测试旋钮，置于读取+校验后、任何 DB 写入前）/stop 竞态 kill 五连发后 checkpoint 行完整性不变式。）**
+- [x] 按 `agent.md` 强制补强项 #10 落地 `libra hooks <provider> <verb>` 崩溃行为回归（panic 与被 kill 两路径）：断言无半截 checkpoint/DB 写入、退出码非零、stderr 不回显 raw stdin。**（`tests/agent_hook_crash_test.rs` 3 用例：SIGKILL 半途/panic 注入（原 `LIBRA_TEST_HOOK_PANIC_AFTER_READ` 测试旋钮置于读取+校验后、任何 DB 写入前；plan-20260924 起该旋钮已退役，hook 二进制不再读取它，崩溃回归改由真实 post-registration 失败与 replay 覆盖）/stop 竞态 kill 五连发后 checkpoint 行完整性不变式。）**
 
 **验证**：
 
@@ -797,7 +797,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 ### Task A5：AG-20 E4-libra checkpoint export, lazy transcript IO, doctor and prune safety
 
-**描述**：把 external-agent checkpoint/export writer 固定到 E4-libra layout，同时补默认 metadata-first 读取、E4-entire legacy import、crash recovery、doctor repair 和 prune 并发保护。
+**描述**：把 external-agent checkpoint/export writer 固定到 E4-libra layout，同时补 metadata-first list 与固定安全摘要 `checkpoint show`、E4-entire legacy import、crash recovery、doctor repair 和 prune 并发保护。
 
 **关联设计文档**：[`agent.md`](agent.md)。执行时遵循 AG-20、E4-libra、E4-entire reader、E5、doctor repair、object_index 和 prune A/B 窗口约束。
 
@@ -806,13 +806,13 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [x] Writer 输出 E4-libra tree：`metadata.json`、`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`、`redaction_report.json`、`content_hash.txt`。**（metadata schema v2 增 `model`（缺省 "unknown"）；E3 canonical JSONL 序列化器支持多事件批；manifest 自描述 content_hash coverage。）**
 - [x] `content_hash.txt` writer 使用 `sha256:<64-hex>`；reader 兼容 legacy bare hex。**（覆盖域固定为 metadata,lifecycle_events,transcript,redaction_report 按序拼接、无尾换行、transcript 取逻辑重组流（分块不变量）；定义已回写 agent.md E4-libra 节；`history::parse_content_hash`。）**
 - [x] E4-entire fixture 只作为 import/legacy reader，不作为 writer 默认。
-- [x] 大 transcript 走 E5 line-safe chunking，manifest-relative 路径；默认 `list/show` 不读取 transcript body。**（50MiB 阈值 + `LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD` 测试旋钮、`.001` 起始后缀、单行超限硬错误；show 对 transcript 只做 loose-object stat，不加载 body——缺 blob 时 show 仍成功并标 missing。）**
+- [x] 大 transcript 走 E5 line-safe chunking，manifest-relative 路径；默认 `list` 不读取 transcript body，`checkpoint show` 只返回 catalog 的固定安全摘要。**（固定 50MiB 阈值；小阈值覆盖仅通过 `cfg(test)` 的任务局部 typed control 在 writer 单元测试中运行，hook 二进制不读取环境变量改变 durable layout；`.001` 起始后缀、单行超限硬错误；默认 show 不读取 metadata/manifest/transcript，缺失对象不影响摘要。）**
 - [x] `session list`、`checkpoint list` 默认 `--limit 50`，cap 500，使用 keyset cursor 和索引。**（cursor=base64 "v1:<ts>:<id>" 不透明串；排序按新索引形态 `(ts DESC, id ASC)`（(DESC,DESC) 实测触发 TEMP B-TREE，已按 EXPLAIN 证据修正任务文本假定）；JSON 加 `schema_version`+`next_cursor` 信封；>500 clamp 带 stderr 提示。）**
 - [x] `agent_checkpoint` INSERT 改为幂等 UPSERT 或先探测 `traces_commit`，崩溃重试不主键冲突。**（build→CAS→probe(`agent_checkpoint_id_for_traces_commit`)→INSERT + `ON CONFLICT(checkpoint_id) DO NOTHING` 兜底，抽为 pub `insert_agent_checkpoint_row_idempotent` 供 doctor class-2 复用。）**
 - [x] doctor 检测并修复三类不一致：DB 指向缺失对象、ref 可达但无 catalog 行、`object_index` 缺失。**（`--repair` 净新建：class-1 ref 可达则按 ref 重建行、真缺失标 manual_required 零破坏；class-2 first-parent 走链 + metadata v1/v2 双形态解析 + in-flight marker 豁免 + 幂等插入；class-3 幂等直插镜像 `update_object_index_once` 语义；全部二跑无操作。）**
 - [x] prune 窗口 A/B 关闭：writer lease、临时保护 ref 或 ref-vs-catalog fail-closed 必须覆盖到 DB INSERT/UPSERT 完成。**（writer 侧 metadata_kv in-flight marker（TTL 10min）覆盖 stage (a)→(d)；prune 侧任一 live marker 全局 fail-closed（整链重写语义下按 session 放行不安全，已注记）+ ref-vs-catalog 比对失败拒绝并提示 doctor --repair；CAS 重试逐次复查。）**
 - [x] `CheckpointCommit.commit_hash` 与 DB 列 `traces_commit` 命名不混用。
-- [x] reader（metadata-first list/show/detail/transcript）与 doctor 兼容识别**升级前 Libra v1 布局的存量 checkpoint**（无 manifest.json/redaction_report.json/content_hash.txt，事件文件为 `events/<provider>.jsonl`、transcript 为 `transcript/<provider>`）：doctor 将其归类为 legacy-v1 而非三类不一致，不得误报缺 manifest 或触发 repair 改写；v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析。`tests/fixtures/agent_checkpoints/` 必须包含一个由当前（改造前）writer 生成的 v1 布局 fixture 供回归——本卡第一步须在改动任何 writer 代码前先生成并提交该 fixture。`agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only），doctor 对残留 gemini hooks 配置给出指向卸载通道的 actionable 提示。
+- [x] reader（metadata-first list、safe-summary show、detail/transcript）与 doctor 兼容识别**升级前 Libra v1 布局的存量 checkpoint**（无 manifest.json/redaction_report.json/content_hash.txt，事件文件为 `events/<provider>.jsonl`、transcript 为 `transcript/<provider>`）：doctor 将其归类为 legacy-v1 而非三类不一致，不得误报缺 manifest 或触发 repair 改写；v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析。`tests/fixtures/agent_checkpoints/` 必须包含一个由当前（改造前）writer 生成的 v1 布局 fixture 供回归——本卡第一步须在改动任何 writer 代码前先生成并提交该 fixture。`agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only），doctor 对残留 gemini hooks 配置给出指向卸载通道的 actionable 提示。
 - [x] 提供 v1→E4-libra 的 migration notes 与 schema pin test；reader fallback 为主路径，backfill 不做——v1 checkpoint 长期以 legacy 形态可读（fixture + README 溯源清单 + show/doctor 分类测试即 pin；prune 重建对 v1 inner tree 字节级保持）。
 - [x] **选定方案 (a)**（force-with-lease 等价，无新错误码）——定义并测试 prune/rewrite 之后 `libra agent push` 的行为：`refs/libra/traces` 是 Libra 托管、prune 即整链重写的 ref，二选一——(a) agent push 对该 ref 采用 force-with-lease 等价语义（lease 基于 tracking ref，复用 push 既有机制，无需新错误码）；或 (b) 非快进时报 `ERR_AGENT_TRACES_PUSH_DIVERGED` 对应的稳定错误码（语义键须同 PR 补入/对齐 `agent.md` E10 表已预留的条件行；真实 `LBR-*` 编号沿用 A3 建立的分配规则，在本卡自己的 slice 内于 `docs/error-codes.md` 分配，无需回到 A3）+ actionable 指引，并提供重推出口（当前 `PushArgs` 仅有 `--remote`，需新增 force 类参数）；配套回归测试覆盖 clean/prune 重写后 push 到本地 file remote 的场景。
 - [x]（2026070802_agent_checkpoint_paging，注意编号须超过既存 max 2026070801 而非按日历日；traces_commit 索引取非唯一以免历史重复行 brick 存量库，幂等由代码探测保证）新增迁移遵循 `sql/migrations/README.md` 规范：`YYYYMMDDNN` 命名（版本号严格递增）、forward DDL 幂等（`IF NOT EXISTS`）、配套 `_down.sql`（仓库现存迁移全部成对）、在 `builtin_migrations()` 注册，并补 run_pending 幂等 + 升级→回滚→再升级 round-trip 测试。
@@ -885,7 +885,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **描述**：用本机真实 `codex`、`claude`、`opencode` 验证 Agent 第一期采集闭环。该任务是第一期完成门禁：deterministic fixtures 必须继续存在，但不能替代真实本地 agent 的端到端采集证据。
 
-**关联设计文档**：[`agent.md`](agent.md)。执行时遵循第一批 supported roster、hook install、session/checkpoint/traces、metadata-first 与 redaction 约束。
+**关联设计文档**：[`agent.md`](agent.md)。执行时遵循第一批 supported roster、hook install、session/checkpoint/traces、metadata-first list、safe-summary show 与 redaction 约束。
 
 **验收标准**：
 
@@ -895,9 +895,9 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [x] 分别启动本地 `claude`、`codex`、`opencode` 的最小非破坏性会话，触发至少一个 `SessionStart`、一个 turn boundary、一个 `SessionEnd` 或等价 stop event；如果某 agent 的 CLI 无稳定非交互模式，测试 harness 必须明确记录手动/PTY 驱动步骤，并把该 agent 标为需要本地 smoke 而非 CI-only。
 - [x] `libra agent list --json` 对三者均显示 `supported=true`、`support_wave="first_batch"`、`registered=true`、`transcript_readable=true`、`hook_installable=true`、`installed=true`。
 - [x] `libra agent session list --json` 能看到 `agent_kind` 分别为 `claude_code`、`codex`、`opencode` 的 session；`libra agent checkpoint list --json` 至少各有一个对应 checkpoint。
-- [x] `libra agent checkpoint show <id> --json` 默认只展示 metadata/redaction/content hash/token summary，不读取或打印完整 transcript；显式 detail/transcript 路径另测。
+- [x] `libra agent checkpoint show <id> --json` 默认只展示固定安全结构摘要：`checkpoint_id`、受限 `scope`、Unix `created_at`、`parent_snapshot_recorded`；不读取或打印 metadata、redaction/content-hash/token/source 详情、catalog object OID 或完整 transcript；显式 detail/transcript 路径另测。
 - [x] `libra agent doctor --json` 对三条本地采集链路不报告 missing hook、missing object、missing catalog row 或 redaction failure。
-- [x] 三条 smoke 的产物都进入 `refs/libra/traces`，并能由 `checkpoint show` / `session show` 通过 OID 指针读取 metadata。
+- [x] 三条 smoke 的产物都进入 `refs/libra/traces`；`session show` 可通过 OID 指针读取其需要的 metadata，而 `checkpoint show` 保持只读 catalog 的安全摘要。
 - [x] Preflight 完成 §0.3.2 登录态只读检查（`codex login status` / `claude auth status` / `opencode providers list`），evidence 只保留 redacted 布尔判定与退出码；任一未登录即按 §0 规则标记 blocked，不发起真实付费会话。
 - [x] Preflight 记录 §0.3.2 pinned `$LIBRA_BIN` 副本的 sha256，安装断言确认各 hook entry command 以该 pinned 绝对路径开头（与 A3 的 provenance 口径对齐）。
 - [x] 采集断言完成后执行 §0.3.5 卸载 smoke：`agent remove <slug>` 后 provider 配置回到安装前语义状态（与 `preinstall.snapshot` 对比）、`installed=false`、二次 remove 幂等；已捕获数据不删除。
@@ -1041,7 +1041,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 **验收标准**：
 
 - [x] sql/migrations 新增 `agent_audit_log` append-only 表：仅 INSERT/SELECT，触发器或代码层拒绝 UPDATE/DELETE；按 `agent.md` 约束，`_down.sql` 不得删除审计数据，只能停止新写入（不得简单 DROP TABLE）。
-- [x] checkpoint show/export 的 **raw（未脱敏）访问/导出**要求显式 `--allow-raw`（或等价 approval），每次访问写一条 audit 记录（who/when/checkpoint/scope/justification，字段对齐 `agent.md`）；未经授权的 raw 访问 fail-closed 拒绝并写 audit。redacted 的显式 `--detail`/`--transcript` 路径**不**要求 `--allow-raw`，只受 size cap、streaming/chunk 与 redaction 约束（与 `agent.md`「读取 pipeline」及 A5/A6.5 metadata-first 断言同口径）。
+- [x] checkpoint export 的 **raw（未脱敏）访问/导出**要求显式 `--allow-raw`（或等价 approval），每次访问写一条 audit 记录（who/when/checkpoint/scope/justification，字段对齐 `agent.md`）；未经授权的 raw 访问 fail-closed 拒绝并写 audit。默认 `checkpoint show` 从不访问 raw 或 metadata。redacted 的显式 `--detail`/`--transcript` 路径**不**要求 `--allow-raw`，只受 size cap、streaming/chunk 与 redaction 约束（与 `agent.md`「读取 pipeline」及 A5/A6.5 安全摘要断言同口径）。
 - [x] `libra agent clean --gc` 实现 `agent.retention.transcript_days`（默认 90）/`agent.retention.stderr_days`（默认 30）窗口清理；`clean --all`/GC 不触碰 `agent_audit_log`，有测试。
 - [x] review/investigate run 目录状态（`.libra/sessions/agent-runs/<run_id>/`：findings.md/manifest/state/reviewer 日志）按 `agent.retention.findings_days`（默认 90）窗口清理（并入 `libra agent clean --gc`），有测试。**安全约束（A0-09 codex R1+R2 P1）**：对象化 findings blob 与其 `object_index` 行是内容寻址、可能与 branch/index/reflog/其它 run 可达对象共享，per-run retention **不**按 oid 删除 loose object / drop object_index 行；对象化 blob 的安全回收 deferred 至未来仓库级 object GC（可达性分析）。
 - [x] 本地 erasure 三面一致：重写 `refs/libra/traces` + 删除 agent_session/agent_checkpoint 行 + 清理 `object_index`，配一致性测试；D1/R2 deletion propagation 维持 explicitly deferred（由 A9 release notes 说明）。
@@ -1471,7 +1471,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 | external binary 继承 secrets 或冒用内置 slug | API key 泄露、供应链风险 | A3 `env_clear`、trust/quarantine/provenance、built-in slug skip |
 | redaction 只靠散点调用 | raw prompt/stderr/transcript 落盘 | A4/A5 类型级 `RedactedBytes` sink，redaction failure fail-closed |
 | checkpoint ref/DB/object_index 不一致 | restore/doctor/show 找不到对象，cloud sync 缺数据 | A5 crash matrix、doctor repair、UPSERT、prune A/B tests |
-| 大 transcript 默认读取 | 内存暴涨、TUI/Web 卡死 | A5 metadata-first + chunked streaming + cap |
+| 大 transcript 默认读取 | 内存暴涨、TUI/Web 卡死 | A5 metadata-first list / safe-summary show + chunked streaming + cap |
 | A6.5 本地 smoke 被 fake fixture 替代 | 第一期声称支持 `codex`/`claude`/`opencode`，但真实用户环境无法采集 | A6.5 必须使用本机真实 binary 与临时 repo；fake fixture 只作为 deterministic regression |
 | `.env.test` 或外部 binary 输出泄露 secret | API key、provider token、D1/R2 key 或 prompt 泄露到日志/JSON/对象 | `.env.test` 不得回显；live 命令前关闭 shell xtrace；external RPC `env_clear`，stderr/stdout cap + redaction |
 | public JSON / RPC / DB schema 无版本 | 外部脚本、Web UI、legacy reader 或 external binary 升级后不兼容 | 所有 public wire 增加 `schema_version`/`protocol_version`，新增 snapshot/compat test，release notes 写兼容窗口 |

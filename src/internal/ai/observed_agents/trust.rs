@@ -17,6 +17,7 @@
 
 use std::{
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -91,15 +92,49 @@ pub async fn external_agents_enabled() -> Result<bool> {
 }
 
 /// Compute the provenance markers for `path` (canonicalizes first).
+///
+/// The bytes are hashed in one streaming pass over the opened descriptor, so
+/// memory use does not grow with the binary and the digest equals a
+/// whole-file sha256 (records written by earlier releases stay valid). There
+/// is deliberately no fixed size cap: real provider CLIs are large single
+/// files (the OpenCode Bun build is ~171 MiB) and must stay trustable. The
+/// read is bounded by the descriptor's own stat length instead, so a file
+/// that yields more bytes than it reported (one being appended to, or a
+/// device such as `/dev/zero`) is refused rather than hashed without end.
 pub fn compute_provenance(path: &Path) -> Result<Provenance> {
     let canonical_path = path
         .canonicalize()
         .with_context(|| format!("canonicalize external agent binary {}", path.display()))?;
-    let bytes = std::fs::read(&canonical_path)
-        .with_context(|| format!("read external agent binary {}", canonical_path.display()))?;
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    let meta = std::fs::metadata(&canonical_path)
+    let mut file = fs::File::open(&canonical_path)
+        .with_context(|| format!("open external agent binary {}", canonical_path.display()))?;
+    // Stat the opened file, not the pathname again: a concurrent replacement
+    // cannot make the provenance markers describe bytes other than the bytes
+    // we actually hash below.
+    let meta = file
+        .metadata()
         .with_context(|| format!("stat external agent binary {}", canonical_path.display()))?;
+    let reported_len = meta.len();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 32 * 1024];
+    let mut read_total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read external agent binary {}", canonical_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total.saturating_add(read as u64);
+        if read_total > reported_len {
+            bail!(
+                "external agent binary yielded more than the {reported_len} bytes it reported \
+                 while being hashed; refusing to trust it (it must be a regular file that is \
+                 not being modified — stop the writer, then trust it again)"
+            );
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let sha256 = hex::encode(hasher.finalize());
     #[cfg(unix)]
     let (device, inode, mtime) = {
         use std::os::unix::fs::MetadataExt;
@@ -401,15 +436,28 @@ pub fn provenance_drifted(provenance: &Provenance, record: &TrustRecord) -> bool
 /// revokes the record and fails closed — the binary returns to quarantine
 /// until the operator re-trusts it (E2 / `LBR-AGENT-005`).
 pub async fn revalidate_trust(slug: &str, record: &TrustRecord) -> Result<Provenance> {
-    let provenance = match compute_provenance(&record.path) {
-        Ok(p) => p,
-        Err(err) => {
-            let _ = revoke_trust(slug).await;
-            return Err(err.context(format!(
-                "trusted binary for '{slug}' is no longer readable; trust revoked"
-            )));
-        }
-    };
+    // Hashing/stat-ing an operator-selected executable may block on a slow
+    // filesystem (including FUSE). Keep that synchronous work off Tokio's
+    // executor; callers with a stricter operation deadline can cancel their
+    // await without ever reaching a spawn boundary. A detached blocking task
+    // owns only local file handles and drops them when it eventually returns.
+    let record_path = record.path.clone();
+    let provenance =
+        match tokio::task::spawn_blocking(move || compute_provenance(&record_path)).await {
+            Ok(Ok(provenance)) => provenance,
+            Ok(Err(err)) => {
+                let _ = revoke_trust(slug).await;
+                return Err(err.context(format!(
+                    "trusted binary for '{slug}' is no longer readable; trust revoked"
+                )));
+            }
+            Err(err) => {
+                let _ = revoke_trust(slug).await;
+                return Err(anyhow::Error::new(err).context(format!(
+                    "trusted binary for '{slug}' could not complete revalidation; trust revoked"
+                )));
+            }
+        };
     if provenance_drifted(&provenance, record) {
         let _ = revoke_trust(slug).await;
         bail!(
@@ -448,6 +496,53 @@ mod tests {
         {
             assert_ne!(p.inode, 0);
         }
+    }
+
+    /// R85: a realistic single-file provider CLI must stay trustable. The
+    /// stock OpenCode CLI is a ~171 MiB Bun binary, so a 200 MiB (sparse)
+    /// exporter is hashed, matches the whole-file sha256 that earlier
+    /// releases recorded, and revalidates without drift. Any size cap below
+    /// real binaries (the former 64 MiB one refused and revoked OpenCode
+    /// trust) fails this test.
+    #[test]
+    fn compute_provenance_hashes_large_single_file_exporter_without_size_cap() {
+        const LARGE_EXPORTER_BYTES: u64 = 200 * 1024 * 1024;
+        // `printf '#!/bin/sh\nexit 0\n'` zero-extended to 200 MiB, digested
+        // independently with `shasum -a 256`.
+        const LARGE_EXPORTER_SHA256: &str =
+            "4e045ec6b0ef4cdc8c82e9d87983f6bafb0e2950c0c8ad971d391657589ec0c4";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(LARGE_EXPORTER_BYTES))
+            .expect("extend exporter sparsely past the real OpenCode size");
+
+        let trusted = compute_provenance(&path).expect("large exporter must be trustable");
+        assert_eq!(trusted.sha256, LARGE_EXPORTER_SHA256);
+        let revalidated = compute_provenance(&path).expect("large exporter must revalidate");
+        assert!(
+            !provenance_drifted(&revalidated, &record_from(&trusted)),
+            "re-hashing an unchanged large exporter must not drift"
+        );
+    }
+
+    /// Without a size cap the read is still bounded by the descriptor's own
+    /// stat length: a stream that keeps producing bytes past it fails closed
+    /// promptly instead of being hashed without end.
+    #[cfg(unix)]
+    #[test]
+    fn compute_provenance_refuses_stream_longer_than_its_stat_length() {
+        let error = compute_provenance(Path::new("/dev/zero"))
+            .expect_err("an endless device stream must not be trusted");
+        assert!(
+            error
+                .to_string()
+                .contains("more than the 0 bytes it reported"),
+            "unexpected endless-stream error: {error:#}"
+        );
     }
 
     #[cfg(unix)]

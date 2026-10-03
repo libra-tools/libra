@@ -11,15 +11,6 @@ use super::super::super::lifecycle::{
     LifecycleEvent, LifecycleEventKind, SessionHookEnvelope, build_lifecycle_event,
 };
 
-pub(super) const GEMINI_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "Stop",
-    "SessionStop",
-    "SessionEnd",
-    "PreCompress",
-    "Compaction",
-];
-
 /// Every Gemini hook event name [`parse_gemini_hook_event`] understands.
 /// Keep in sync with its `match`; consulted via
 /// `HookProvider::recognizes_event` (AG-19 skip-and-log for unknown

@@ -158,7 +158,7 @@ async fn live_opencode_sandboxed_export_normalizes_real_session() {
         record_trust,
     };
 
-    if !trusted_bwrap_available() {
+    if !trusted_bwrap_available().await {
         eprintln!("skipped (trusted bwrap cannot create the required namespaces)");
         return;
     }
@@ -341,7 +341,7 @@ async fn live_m4_historical_import_three_provider_acceptance() {
         .expect("live M4 gate requires a real Codex rollout for this repository");
 
     assert!(
-        trusted_bwrap_available(),
+        trusted_bwrap_available().await,
         "live M4 gate requires a trusted bwrap with usable namespaces"
     );
     let opencode_binary = home.join(".opencode/bin/opencode");
@@ -548,7 +548,8 @@ async fn live_m5_subagent_boundary_content_attribution() {
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            "SELECT c.current_revision, c.source_key, cp.parent_checkpoint_id,
+            "SELECT c.current_revision, c.source_key, c.content_schema_version,
+                    cp.parent_checkpoint_id,
                     l.link_state, l.boundary_checkpoint_id
              FROM agent_subagent_content_claim c
              JOIN agent_checkpoint cp ON cp.checkpoint_id = c.current_checkpoint_id
@@ -568,8 +569,13 @@ async fn live_m5_subagent_boundary_content_attribution() {
         );
         let source_key: String = row.try_get_by("source_key").expect("source key");
         assert!(!Path::new(&source_key).is_absolute());
-        assert!(source_key.starts_with("source/sha256/"));
-        assert_eq!(source_key.len(), "source/sha256/".len() + 64);
+        assert!(source_key.starts_with("source/subagent-hmac-v2/"));
+        assert_eq!(source_key.len(), "source/subagent-hmac-v2/".len() + 64);
+        assert_eq!(
+            row.try_get_by::<i64, _>("content_schema_version")
+                .expect("subagent content schema version"),
+            2,
+        );
         assert!(!source_key.contains(&claude_sid));
         assert_eq!(
             row.try_get_by::<Option<String>, _>("parent_checkpoint_id")

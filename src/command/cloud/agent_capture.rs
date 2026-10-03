@@ -1,5 +1,113 @@
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use super::*;
+    use crate::internal::{
+        config::ConfigKv,
+        metadata::{MetadataKv, MetadataScope, MetadataValueType},
+    };
+
+    fn snapshot_wire_bytes(snapshot: &AgentCaptureSnapshot) -> Vec<u8> {
+        let mut required_oids = snapshot.required_oids.iter().collect::<Vec<_>>();
+        required_oids.sort();
+        serde_json::to_vec(&serde_json::json!({
+            "sessions": snapshot.sessions, "checkpoints": snapshot.checkpoints,
+            "claims": snapshot.claims, "revisions": snapshot.revisions,
+            "links": snapshot.links, "prune_tombstones": snapshot.prune_tombstones,
+            "import_tombstones": snapshot.import_tombstones,
+            "required_oids": required_oids, "traces_head": snapshot.traces_head,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn private_capture_scopes_do_not_enter_closed_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("repository.db");
+        let conn = crate::internal::db::create_database(path.to_str().unwrap())
+            .await
+            .unwrap();
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "cloud-private-repo", false)
+            .await
+            .unwrap();
+        let existing_pk = "claude__native-session";
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (session_id, agent_kind, provider_session_id,
+              state, working_dir, started_at, last_event_at, metadata_json,
+              redaction_report, sync_revision, repo_id, worktree_id, scope_state)
+             VALUES (?, 'claude_code', 'native-session', 'active', '/existing/catalog/path',
+               1, 1, '{}', '{}', 1, 'cloud-private-repo', '', 'scoped')",
+            [existing_pk.into()],
+        ))
+        .await
+        .unwrap();
+        let before = load_agent_capture_catalog_snapshot(&conn, "cloud-private-repo", true)
+            .await
+            .unwrap();
+        let before_bytes = snapshot_wire_bytes(&before);
+        let alias = uuid::Uuid::new_v4().to_string();
+        let mac = format!("pending-alias/hmac-v1/{}", "b".repeat(64));
+        let body = serde_json::json!({"alias": alias, "mac": mac,
+            "session_id": existing_pk, "private_canary": "private-only-association"})
+        .to_string();
+        for (scope, value) in [
+            (MetadataScope::AgentCaptureSessionAlias, body.as_str()),
+            (MetadataScope::AgentCapturePending, "private-only-header"),
+            (
+                MetadataScope::AgentCaptureQuarantine,
+                "private-only-quarantine",
+            ),
+            (
+                MetadataScope::AgentCapturePendingChunk,
+                "private-only-chunk",
+            ),
+        ] {
+            MetadataKv::set_with_conn(
+                &conn,
+                scope,
+                "cloud-private-repo",
+                &alias,
+                value,
+                MetadataValueType::Text,
+            )
+            .await
+            .unwrap();
+        }
+        let after = load_agent_capture_catalog_snapshot(&conn, "cloud-private-repo", true)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let after_bytes = snapshot_wire_bytes(&after);
+        assert_eq!(before_bytes, after_bytes);
+        let wire = String::from_utf8(after_bytes).unwrap();
+        assert!(
+            wire.contains(existing_pk),
+            "existing catalog wire is intentionally unchanged"
+        );
+        for canary in [
+            &alias,
+            &mac,
+            "private-only-association",
+            "private-only-header",
+            "private-only-quarantine",
+            "private-only-chunk",
+            "agent_capture_session_alias",
+            "agent_capture_pending",
+            "agent_capture_quarantine",
+            "agent_capture_pending_chunk",
+        ] {
+            assert!(
+                !wire.contains(canary),
+                "private canary entered closed cloud snapshot"
+            );
+        }
+    }
+}
+
 const AGENT_CAPTURE_LOCAL_PAGE_SIZE: usize = 256;
 pub(super) const AGENT_CAPTURE_MAX_ROWS_PER_TABLE: usize = 100_000;
 pub(super) const AGENT_CAPTURE_RESTORE_MAX_ROWS: usize = 100_000;
@@ -7,6 +115,38 @@ const AGENT_CAPTURE_D1_BATCH_SIZE: usize = 128;
 const AGENT_CAPTURE_OBJECT_VERIFY_CONCURRENCY: usize = 32;
 pub(super) const AGENT_CAPTURE_CLOUD_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(120);
+
+/// Map local catalog/SQLite failures to a fixed diagnostic. Database drivers
+/// can include SQL fragments or decoded values in their Display output, and
+/// a restored catalog may contain remote-controlled capture identifiers.
+/// Keep that material out of CloudError and tracing alike.
+pub(super) fn local_agent_capture_failure(
+    operation: &'static str,
+    _error: impl std::fmt::Display,
+) -> CloudError {
+    tracing::warn!(
+        agent_capture_operation = operation,
+        "local agent-capture catalog operation failed"
+    );
+    CloudError::Generic(format!(
+        "local agent-capture catalog {operation} failed; run `libra agent doctor --repair` and retry cloud sync"
+    ))
+}
+
+/// Restore-side counterpart of [`local_agent_capture_failure`]: the same
+/// fixed diagnostic, pointing back at `libra cloud restore`.
+pub(super) fn local_agent_capture_restore_failure(
+    operation: &'static str,
+    _error: impl std::fmt::Display,
+) -> CloudError {
+    tracing::warn!(
+        agent_capture_operation = operation,
+        "local agent-capture catalog operation failed during cloud restore"
+    );
+    CloudError::Generic(format!(
+        "local agent-capture catalog {operation} failed during cloud restore; run `libra agent doctor --repair` and retry `libra cloud restore`"
+    ))
+}
 
 pub(super) fn agent_capture_batches<T>(rows: &[T]) -> std::slice::Chunks<'_, T> {
     rows.chunks(AGENT_CAPTURE_D1_BATCH_SIZE)
@@ -33,9 +173,7 @@ pub(super) async fn load_local_agent_capture_cloud_base(
             [],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!("probe local agent-capture cloud base: {error}"))
-        })?
+        .map_err(|error| local_agent_capture_failure("probe local cloud base", error))?
         .is_some();
     if !table_present {
         return Ok(None);
@@ -47,13 +185,10 @@ pub(super) async fn load_local_agent_capture_cloud_base(
             [repo_id.into()],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!("read local agent-capture cloud base: {error}"))
-        })?
+        .map_err(|error| local_agent_capture_failure("read local cloud base", error))?
         .map(|row| {
-            row.try_get_by("remote_generation").map_err(|error| {
-                CloudError::Generic(format!("decode local agent-capture cloud base: {error}"))
-            })
+            row.try_get_by("remote_generation")
+                .map_err(|error| local_agent_capture_failure("decode local cloud base", error))
         })
         .transpose()
 }
@@ -81,9 +216,7 @@ pub(super) async fn store_local_agent_capture_cloud_base(
             ],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!("record local agent-capture cloud base: {error}"))
-        })?;
+        .map_err(|error| local_agent_capture_failure("record local cloud base", error))?;
     Ok(())
 }
 
@@ -103,8 +236,9 @@ pub(super) struct AgentCaptureSnapshot {
 }
 
 /// PD-03: union local and remote session tombstones, keeping the newest
-/// `erased_at` (and any known fingerprint) per provider identity —
-/// delete/restore replays stay idempotent.
+/// `erased_at` per provider identity. `source_fingerprint` is retired and
+/// deliberately omitted from the merged wire state; delete/restore replays
+/// stay idempotent without retaining legacy source metadata.
 pub(super) fn merge_import_tombstones(
     local: &[AgentImportTombstoneRow],
     remote: &[AgentImportTombstoneRow],
@@ -113,20 +247,15 @@ pub(super) fn merge_import_tombstones(
         std::collections::BTreeMap::new();
     for row in remote.iter().chain(local.iter()) {
         let key = (row.agent_kind.clone(), row.provider_session_id.clone());
+        let mut sanitized = row.clone();
+        sanitized.source_fingerprint = None;
         match merged.get_mut(&key) {
             None => {
-                merged.insert(key, row.clone());
+                merged.insert(key, sanitized);
             }
             Some(existing) => {
-                if row.erased_at > existing.erased_at {
-                    let fingerprint = existing
-                        .source_fingerprint
-                        .clone()
-                        .or_else(|| row.source_fingerprint.clone());
-                    *existing = row.clone();
-                    existing.source_fingerprint = row.source_fingerprint.clone().or(fingerprint);
-                } else if existing.source_fingerprint.is_none() {
-                    existing.source_fingerprint = row.source_fingerprint.clone();
+                if sanitized.erased_at > existing.erased_at {
+                    *existing = sanitized;
                 }
             }
         }
@@ -222,10 +351,10 @@ pub(super) fn agent_capture_object_index_digest(
     let mut digest = Sha256::new();
     for row in rows {
         if previous == Some(row.o_id.as_str()) {
-            return Err(CloudError::Generic(format!(
-                "remote object index contains duplicate oid {}",
-                row.o_id
-            )));
+            return Err(CloudError::PartialTransfer(
+                "remote agent-capture object index contains duplicate object ids; run `libra cloud sync` and retry"
+                    .to_string(),
+            ));
         }
         previous = Some(row.o_id.as_str());
         for value in [row.o_id.as_bytes(), row.o_type.as_bytes()] {
@@ -235,7 +364,7 @@ pub(super) fn agent_capture_object_index_digest(
         digest.update(row.o_size.to_be_bytes());
     }
     let count = i64::try_from(indexes.len()).map_err(|error| {
-        CloudError::Generic(format!("object-index count cannot be represented: {error}"))
+        local_agent_capture_failure("encode object-index manifest count", error)
     })?;
     Ok((hex::encode(digest.finalize()), count))
 }
@@ -243,23 +372,23 @@ pub(super) fn agent_capture_object_index_digest(
 pub(super) fn validate_checkpoint_object_index_roots(
     checkpoints: &[AgentCheckpointV2Row],
     indexes: &[ObjectIndexRow],
-    side: &str,
+    _side: &str,
 ) -> CloudResult<()> {
     let indexed_oids = indexes
         .iter()
         .map(|row| row.o_id.as_str())
         .collect::<HashSet<_>>();
     for checkpoint in checkpoints {
-        for (label, oid) in [
-            ("traces commit", checkpoint.traces_commit.as_str()),
-            ("tree", checkpoint.tree_oid.as_str()),
-            ("metadata blob", checkpoint.metadata_blob_oid.as_str()),
+        for oid in [
+            checkpoint.traces_commit.as_str(),
+            checkpoint.tree_oid.as_str(),
+            checkpoint.metadata_blob_oid.as_str(),
         ] {
             if !indexed_oids.contains(oid) {
-                return Err(CloudError::PartialTransfer(format!(
-                    "{side} checkpoint {} references {label} object {oid}, but the fenced object index does not contain it",
-                    checkpoint.checkpoint_id
-                )));
+                return Err(CloudError::PartialTransfer(
+                    "remote agent-capture checkpoint references an object absent from the fenced object index; run `libra cloud sync` and retry"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -282,11 +411,13 @@ pub(super) async fn load_local_capture_pages<C: ConnectionTrait>(
         let mut page_values = values.clone();
         page_values.extend([
             i64::try_from(page_limit)
-                .map_err(|error| CloudError::Generic(format!("encode {label} page size: {error}")))?
+                .map_err(|error| {
+                    local_agent_capture_failure("encode local catalog page size", error)
+                })?
                 .into(),
             i64::try_from(offset)
                 .map_err(|error| {
-                    CloudError::Generic(format!("encode {label} page offset: {error}"))
+                    local_agent_capture_failure("encode local catalog page offset", error)
                 })?
                 .into(),
         ]);
@@ -297,7 +428,7 @@ pub(super) async fn load_local_capture_pages<C: ConnectionTrait>(
                 page_values,
             ))
             .await
-            .map_err(|error| CloudError::Generic(format!("query {label} page: {error}")))?;
+            .map_err(|error| local_agent_capture_failure("read local catalog page", error))?;
         let page_len = page.len();
         if page_len > *remaining_rows {
             return Err(CloudError::PartialTransfer(format!(
@@ -345,15 +476,11 @@ pub(super) async fn load_synced_required_object_oids<C: ConnectionTrait>(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!(
-                    "query checkpoint-reachable synced object indexes: {error}"
-                ))
+                local_agent_capture_failure("read checkpoint-reachable object indexes", error)
             })?;
         for row in rows {
             synced.insert(row.try_get_by::<String, _>("o_id").map_err(|error| {
-                CloudError::Generic(format!(
-                    "decode checkpoint-reachable synced object index: {error}"
-                ))
+                local_agent_capture_failure("decode checkpoint-reachable object index", error)
             })?);
         }
     }
@@ -381,9 +508,7 @@ async fn load_required_local_object_indexes(
             .all(db_conn)
             .await
             .map_err(|error| {
-                CloudError::Generic(format!(
-                    "load checkpoint-reachable local object indexes: {error}"
-                ))
+                local_agent_capture_failure("load checkpoint-reachable local object indexes", error)
             })?;
         rows.extend(models.into_iter().map(|model| (model.o_id.clone(), model)));
     }
@@ -400,7 +525,7 @@ async fn load_agent_capture_catalog_snapshot(
     let txn = db_conn
         .begin()
         .await
-        .map_err(|error| CloudError::Generic(format!("begin agent capture snapshot: {error}")))?;
+        .map_err(|error| local_agent_capture_failure("begin local catalog snapshot", error))?;
     let backend = txn.get_database_backend();
     let unsynced = txn
         .query_one_raw(Statement::from_sql_and_values(
@@ -410,12 +535,10 @@ async fn load_agent_capture_catalog_snapshot(
             [repo_id.into()],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!("verify agent capture object generation: {error}"))
-        })?
+        .map_err(|error| local_agent_capture_failure("verify local object generation", error))?
         .ok_or_else(|| CloudError::Generic("object generation count returned no row".into()))?
         .try_get_by::<i64, _>("n")
-        .map_err(|error| CloudError::Generic(format!("decode unsynced object count: {error}")))?;
+        .map_err(|error| local_agent_capture_failure("decode unsynced object count", error))?;
     if unsynced != 0 {
         return Err(CloudError::PartialTransfer(format!(
             "agent capture snapshot found {unsynced} object(s) outside the completed object upload generation; retry `libra cloud sync`"
@@ -457,7 +580,9 @@ async fn load_agent_capture_catalog_snapshot(
             })
         })
         .collect::<Result<_, sea_orm::DbErr>>()
-        .map_err(|error| CloudError::Generic(format!("decode agent session snapshot: {error}")))?;
+        .map_err(|error| {
+            local_agent_capture_failure("decode local agent-session snapshot", error)
+        })?;
 
     let checkpoint_rows = load_local_capture_pages(
         &txn,
@@ -490,9 +615,7 @@ async fn load_agent_capture_catalog_snapshot(
             })
         })
         .collect::<Result<_, sea_orm::DbErr>>()
-        .map_err(|error| {
-            CloudError::Generic(format!("decode agent checkpoint snapshot: {error}"))
-        })?;
+        .map_err(|error| local_agent_capture_failure("decode local checkpoint snapshot", error))?;
 
     let prune_tombstones = if subagent_content_present {
         let tombstone_rows = load_local_capture_pages(
@@ -514,7 +637,9 @@ async fn load_agent_capture_catalog_snapshot(
                 })
             })
             .collect::<Result<Vec<_>, sea_orm::DbErr>>()
-            .map_err(|error| CloudError::Generic(format!("decode prune tombstones: {error}")))?
+            .map_err(|error| {
+                local_agent_capture_failure("decode local checkpoint-prune tombstones", error)
+            })?
     } else {
         Vec::new()
     };
@@ -526,10 +651,10 @@ async fn load_agent_capture_catalog_snapshot(
             [crate::internal::branch::TRACES_BRANCH.into()],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("resolve traces snapshot head: {error}")))?
+        .map_err(|error| local_agent_capture_failure("read local traces snapshot head", error))?
         .map(|row| row.try_get_by::<Option<String>, _>("commit"))
         .transpose()
-        .map_err(|error| CloudError::Generic(format!("decode traces snapshot head: {error}")))?
+        .map_err(|error| local_agent_capture_failure("decode local traces snapshot head", error))?
         .flatten();
 
     let import_tombstone_present = txn
@@ -540,13 +665,12 @@ async fn load_agent_capture_catalog_snapshot(
                 .to_string(),
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("query import-tombstone schema: {error}")))?
+        .map_err(|error| local_agent_capture_failure("probe local import-tombstone schema", error))?
         .is_some();
     let import_tombstones = if import_tombstone_present {
         let tombstone_rows = load_local_capture_pages(
             &txn,
-            "SELECT agent_kind, provider_session_id, erased_session_id,
-                    source_fingerprint, erased_at
+            "SELECT agent_kind, provider_session_id, erased_session_id, erased_at
              FROM agent_import_tombstone ORDER BY agent_kind, provider_session_id",
             Vec::new(),
             "agent import tombstone",
@@ -560,12 +684,14 @@ async fn load_agent_capture_catalog_snapshot(
                     agent_kind: row.try_get_by("agent_kind")?,
                     provider_session_id: row.try_get_by("provider_session_id")?,
                     erased_session_id: row.try_get_by("erased_session_id")?,
-                    source_fingerprint: row.try_get_by("source_fingerprint")?,
+                    // Legacy local databases can still contain this retired
+                    // column. It must not escape in a capture snapshot.
+                    source_fingerprint: None,
                     erased_at: row.try_get_by("erased_at")?,
                 })
             })
             .collect::<Result<Vec<_>, sea_orm::DbErr>>()
-            .map_err(|error| CloudError::Generic(format!("decode import tombstones: {error}")))?
+            .map_err(|error| local_agent_capture_failure("decode local import tombstones", error))?
     } else {
         Vec::new()
     };
@@ -610,7 +736,7 @@ async fn load_agent_capture_catalog_snapshot(
             })
             .collect::<Result<_, sea_orm::DbErr>>()
             .map_err(|error| {
-                CloudError::Generic(format!("decode subagent claim snapshot: {error}"))
+                local_agent_capture_failure("decode local subagent-claim snapshot", error)
             })?;
         let revision_rows = load_local_capture_pages(
             &txn,
@@ -643,7 +769,7 @@ async fn load_agent_capture_catalog_snapshot(
             })
             .collect::<Result<_, sea_orm::DbErr>>()
             .map_err(|error| {
-                CloudError::Generic(format!("decode subagent revision snapshot: {error}"))
+                local_agent_capture_failure("decode local subagent-revision snapshot", error)
             })?;
         let link_rows = load_local_capture_pages(
             &txn,
@@ -672,10 +798,13 @@ async fn load_agent_capture_catalog_snapshot(
             })
             .collect::<Result<_, sea_orm::DbErr>>()
             .map_err(|error| {
-                CloudError::Generic(format!("decode subagent link snapshot: {error}"))
+                local_agent_capture_failure("decode local subagent-link snapshot", error)
             })?;
     }
 
+    for session in &mut snapshot.sessions {
+        *session = project_agent_session_for_cloud(session, "local")?;
+    }
     validate_agent_capture_companions(
         &snapshot.checkpoints,
         &snapshot.claims,
@@ -692,7 +821,7 @@ async fn load_agent_capture_catalog_snapshot(
     )?;
     txn.commit()
         .await
-        .map_err(|error| CloudError::Generic(format!("commit agent capture snapshot: {error}")))?;
+        .map_err(|error| local_agent_capture_failure("commit local catalog snapshot", error))?;
     Ok(snapshot)
 }
 
@@ -769,18 +898,20 @@ pub(super) async fn load_agent_capture_snapshot(
             std::time::Instant::now().checked_add(std::time::Duration::from_secs(110)),
         )
         .await
-        .map_err(|error| {
-            CloudError::PartialTransfer(format!(
-                "agent checkpoint snapshot is not fully reachable and durable: {error:#}; run `libra agent doctor --repair`, then retry cloud sync"
-            ))
+        .map_err(|_| {
+            CloudError::PartialTransfer(
+                "agent checkpoint snapshot is not fully reachable and durable; run `libra agent doctor --repair`, then retry cloud sync"
+                    .to_string(),
+            )
         })?
     };
     let synced_oids = load_synced_required_object_oids(db_conn, repo_id, &required_oids).await?;
     for oid in &required_oids {
         if !synced_oids.contains(oid) {
-            return Err(CloudError::PartialTransfer(format!(
-                "agent capture cannot be published because reachable object {oid} is not in the completed local object upload generation; run `libra agent doctor --repair`, then retry cloud sync"
-            )));
+            return Err(CloudError::PartialTransfer(
+                "agent capture cannot be published because a reachable object is not in the completed local object upload generation; run `libra agent doctor --repair`, then retry cloud sync"
+                    .to_string(),
+            ));
         }
     }
     validate_agent_capture_restore_row_budget(&snapshot, required_oids.len())?;
@@ -810,19 +941,24 @@ async fn ensure_agent_capture_objects_remote(
     let mut hashes = Vec::with_capacity(required.len());
     for oid in &required {
         if !local_map.contains_key(oid.as_str()) {
-            return Err(CloudError::PartialTransfer(format!(
-                "agent capture requires object {oid}, but its local object_index row is missing; run `libra agent doctor --repair`, then retry cloud sync"
-            )));
+            return Err(CloudError::PartialTransfer(
+                "agent capture requires an object whose local object-index row is missing; run `libra agent doctor --repair`, then retry cloud sync"
+                    .to_string(),
+            ));
         }
-        let bytes = hex::decode(oid).map_err(|error| {
-            CloudError::Generic(format!("invalid required agent-capture oid {oid}: {error}"))
+        let bytes = hex::decode(oid).map_err(|_| {
+            CloudError::PartialTransfer(
+                "agent capture contains an invalid required object id; run `libra agent doctor --repair`, then retry cloud sync"
+                    .to_string(),
+            )
         })?;
         hashes.push(
             ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes).map_err(
-                |error| {
-                    CloudError::Generic(format!(
-                        "invalid required agent-capture oid {oid}: {error}"
-                    ))
+                |_| {
+                    CloudError::PartialTransfer(
+                        "agent capture contains an invalid required object id; run `libra agent doctor --repair`, then retry cloud sync"
+                            .to_string(),
+                    )
                 },
             )?,
         );
@@ -831,73 +967,71 @@ async fn ensure_agent_capture_objects_remote(
     let remote_rows = d1_client
         .get_object_indexes_by_oids(repo_id, &required)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "list remote object indexes for agent capture: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("list object indexes for agent capture", &error))?;
     let remote_map = remote_rows
         .iter()
         .map(|row| (row.o_id.as_str(), row))
         .collect::<HashMap<_, _>>();
-    let local_storage = LocalStorage::new(path::objects());
-    let verification_rows = required.iter().zip(&hashes).collect::<Vec<_>>();
-    for page in agent_capture_object_verification_batches(&verification_rows) {
-        // Full content verification remains mandatory, but a fixed-size page
-        // overlaps R2 latency without allowing an unbounded fan-out for large
-        // histories. Each page completes before the next one starts.
-        futures::future::try_join_all(page.iter().map(|(oid, hash)| {
-            let local_map = &local_map;
-            let remote_map = &remote_map;
-            let local_storage = &local_storage;
-            async move {
-                let local = local_map.get(oid.as_str()).ok_or_else(|| {
-                    CloudError::Generic(format!(
-                        "local object index {oid} disappeared during cloud sync"
-                    ))
-                })?;
-                let remote_index_matches = remote_map.get(oid.as_str()).is_some_and(|remote| {
-                    remote.o_type == local.o_type
-                        && remote.o_size == local.o_size
-                        && remote.is_synced == 1
-                });
-                publish_validated_agent_capture_object(local_storage, r2_storage, oid, hash)
-                    .await?;
-                if !remote_index_matches {
-                    let object_format =
-                        crate::internal::object_format::as_str(git_internal::hash::get_hash_kind());
-                    d1_client
-                        .upsert_object_index_with_format(
-                            &local.o_id,
-                            &local.o_type,
-                            local.o_size,
-                            &local.repo_id,
-                            local.created_at,
-                            Some(object_format),
+    // Resolve the repository object store only when an object must be
+    // verified; an empty checkpoint projection needs no local storage.
+    if !required.is_empty() {
+        let local_storage =
+            LocalStorage::new(path::try_objects().map_err(|error| {
+                local_agent_capture_failure("resolve local object store", error)
+            })?);
+        let verification_rows = required.iter().zip(&hashes).collect::<Vec<_>>();
+        for page in agent_capture_object_verification_batches(&verification_rows) {
+            // Full content verification remains mandatory, but a fixed-size page
+            // overlaps R2 latency without allowing an unbounded fan-out for large
+            // histories. Each page completes before the next one starts.
+            futures::future::try_join_all(page.iter().map(|(oid, hash)| {
+                let local_map = &local_map;
+                let remote_map = &remote_map;
+                let local_storage = &local_storage;
+                async move {
+                    let local = local_map.get(oid.as_str()).ok_or_else(|| {
+                        CloudError::Generic(
+                            "a local object-index row disappeared during cloud sync".to_string(),
                         )
-                        .await
-                        .map_err(|error| {
-                            CloudError::D1(format!(
-                                "publish required agent-capture object index {oid}: {}",
-                                error.message
-                            ))
-                        })?;
+                    })?;
+                    let remote_index_matches = remote_map.get(oid.as_str()).is_some_and(|remote| {
+                        remote.o_type == local.o_type
+                            && remote.o_size == local.o_size
+                            && remote.is_synced == 1
+                    });
+                    publish_validated_agent_capture_object(local_storage, r2_storage, oid, hash)
+                        .await?;
+                    if !remote_index_matches {
+                        let object_format = crate::internal::object_format::as_str(
+                            git_internal::hash::get_hash_kind(),
+                        );
+                        d1_client
+                            .upsert_object_index_with_format(
+                                &local.o_id,
+                                &local.o_type,
+                                local.o_size,
+                                &local.repo_id,
+                                local.created_at,
+                                Some(object_format),
+                            )
+                            .await
+                            .map_err(|error| {
+                                cloud_d1_failure(
+                                    "publish required agent-capture object index",
+                                    &error,
+                                )
+                            })?;
+                    }
+                    Ok::<(), CloudError>(())
                 }
-                Ok::<(), CloudError>(())
-            }
-        }))
-        .await?;
+            }))
+            .await?;
+        }
     }
     let verified_rows = d1_client
         .get_object_indexes_by_oids_with_generation(repo_id, &required)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "verify remote object indexes for agent capture: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("verify object indexes for agent capture", &error))?;
     let verified_map = verified_rows
         .0
         .iter()
@@ -905,17 +1039,18 @@ async fn ensure_agent_capture_objects_remote(
         .collect::<HashMap<_, _>>();
     for oid in &required {
         let local = local_map.get(oid.as_str()).ok_or_else(|| {
-            CloudError::Generic(format!(
-                "local object index {oid} disappeared during verification"
-            ))
+            CloudError::Generic(
+                "a local object-index row disappeared during verification".to_string(),
+            )
         })?;
         let valid = verified_map.get(oid.as_str()).is_some_and(|remote| {
             remote.o_type == local.o_type && remote.o_size == local.o_size && remote.is_synced == 1
         });
         if !valid {
-            return Err(CloudError::PartialTransfer(format!(
-                "required agent-capture object index {oid} is absent or inconsistent in D1"
-            )));
+            return Err(CloudError::PartialTransfer(
+                "a required agent-capture object index is absent or inconsistent in D1; retry `libra cloud sync`"
+                    .to_string(),
+            ));
         }
     }
     Ok(verified_rows)
@@ -930,7 +1065,7 @@ async fn ensure_agent_capture_objects_remote(
 pub(super) async fn publish_validated_agent_capture_object(
     local_storage: &LocalStorage,
     r2_storage: &RemoteStorage,
-    oid: &str,
+    _oid: &str,
     hash: &ObjectHash,
 ) -> CloudResult<()> {
     if let Ok((remote_bytes, remote_type)) = r2_storage.get(hash).await
@@ -938,35 +1073,40 @@ pub(super) async fn publish_validated_agent_capture_object(
     {
         return Ok(());
     }
-    let (bytes, object_type) = local_storage.get(hash).await.map_err(|error| {
-        CloudError::PartialTransfer(format!(
-            "read required agent-capture object {oid} for cloud publication: {error}"
-        ))
+    let (bytes, object_type) = local_storage.get(hash).await.map_err(|_| {
+        CloudError::PartialTransfer(
+            "failed to read a required agent-capture object for cloud publication; retry after repairing the local object store"
+                .to_string(),
+        )
     })?;
     let local_hash = ObjectHash::from_type_and_data(object_type, &bytes);
     if local_hash != *hash {
-        return Err(CloudError::PartialTransfer(format!(
-            "required local agent-capture object {oid} failed content verification: computed {local_hash}"
-        )));
+        return Err(CloudError::PartialTransfer(
+            "a required local agent-capture object failed content verification; retry after repairing the local object store"
+                .to_string(),
+        ));
     }
     r2_storage
         .put(hash, &bytes, object_type)
         .await
-        .map_err(|error| {
-            CloudError::R2(format!(
-                "upload required agent-capture object {oid}: {error}"
-            ))
+        .map_err(|_| {
+            CloudError::R2(
+                "failed to upload a required agent-capture object; verify cloud storage connectivity and retry"
+                    .to_string(),
+            )
         })?;
-    let (remote_bytes, remote_type) = r2_storage.get(hash).await.map_err(|error| {
-        CloudError::R2(format!(
-            "read back required agent-capture object {oid}: {error}"
-        ))
+    let (remote_bytes, remote_type) = r2_storage.get(hash).await.map_err(|_| {
+        CloudError::R2(
+            "failed to read back a required agent-capture object; verify cloud storage connectivity and retry"
+                .to_string(),
+        )
     })?;
     let remote_hash = ObjectHash::from_type_and_data(remote_type, &remote_bytes);
     if remote_hash != *hash {
-        return Err(CloudError::PartialTransfer(format!(
-            "required remote agent-capture object {oid} failed post-upload verification: computed {remote_hash}"
-        )));
+        return Err(CloudError::PartialTransfer(
+            "a required remote agent-capture object failed post-upload verification; retry `libra cloud sync`"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -979,43 +1119,38 @@ async fn load_full_remote_object_manifest(
     let (rows, generation) = d1_client
         .get_object_indexes_bounded_with_generation(repo_id, AGENT_CAPTURE_MAX_ROWS_PER_TABLE)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "read full retained agent-capture object manifest: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("read retained agent-capture object manifest", &error))?;
     for page in rows.chunks(AGENT_CAPTURE_LOCAL_PAGE_SIZE) {
         let mut hashes = Vec::with_capacity(page.len());
         for row in page {
             if row.is_synced != 1 {
-                return Err(CloudError::PartialTransfer(format!(
-                    "retained remote object {} is not marked synced",
-                    row.o_id
-                )));
+                return Err(CloudError::PartialTransfer(
+                    "retained remote object is not marked synced; run `libra cloud sync` and retry"
+                        .to_string(),
+                ));
             }
-            let bytes = hex::decode(&row.o_id).map_err(|error| {
-                CloudError::Generic(format!(
-                    "invalid retained remote object id {}: {error}",
-                    row.o_id
-                ))
+            let bytes = hex::decode(&row.o_id).map_err(|_| {
+                CloudError::PartialTransfer(
+                    "retained remote object has an invalid object id; run `libra cloud sync` and retry"
+                        .to_string(),
+                )
             })?;
             hashes.push(
                 ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
-                    .map_err(|error| {
-                        CloudError::Generic(format!(
-                            "invalid retained remote object id {}: {error}",
-                            row.o_id
-                        ))
+                    .map_err(|_| {
+                        CloudError::PartialTransfer(
+                            "retained remote object has an invalid object id; run `libra cloud sync` and retry"
+                                .to_string(),
+                        )
                     })?,
             );
         }
         let exists = r2_storage.exist_batch(&hashes).await;
-        if let Some((missing, _)) = page.iter().zip(exists).find(|(_, exists)| !*exists) {
-            return Err(CloudError::PartialTransfer(format!(
-                "retained remote object {} is absent from remote storage",
-                missing.o_id
-            )));
+        if page.iter().zip(exists).any(|(_, exists)| !exists) {
+            return Err(CloudError::PartialTransfer(
+                "a retained remote object is absent from remote storage; run `libra cloud sync` and retry"
+                    .to_string(),
+            ));
         }
     }
     Ok((rows, generation))
@@ -1031,9 +1166,10 @@ pub(super) async fn project_agent_capture_object_indexes(
     let mut projected = Vec::with_capacity(required_oids.len());
     for oid in required_oids {
         let local = local_map.get(oid.as_str()).ok_or_else(|| {
-            CloudError::PartialTransfer(format!(
-                "agent capture requires object {oid}, but its local object_index row is missing; run `libra agent doctor --repair`, then retry cloud sync"
-            ))
+            CloudError::PartialTransfer(
+                "agent capture requires an object whose local object-index row is missing; run `libra agent doctor --repair`, then retry cloud sync"
+                    .to_string(),
+            )
         })?;
         let row = ObjectIndexRow {
             o_id: local.o_id.clone(),
@@ -1059,6 +1195,73 @@ pub(super) fn claim_key(row: &AgentSubagentContentClaimRow) -> SubagentSourceKey
         row.source_key.clone(),
         row.content_schema_version,
     )
+}
+
+fn revision_source_key(row: &AgentSubagentContentRevisionRow) -> SubagentSourceKey {
+    (
+        row.parent_session_id.clone(),
+        row.provider_kind.clone(),
+        row.source_key.clone(),
+        row.content_schema_version,
+    )
+}
+
+/// Subagent companion rows selected for one fenced publication.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct PendingSubagentRows {
+    pub(super) claims: Vec<AgentSubagentContentClaimRow>,
+    pub(super) revisions: Vec<AgentSubagentContentRevisionRow>,
+    pub(super) links: Vec<AgentSubagentLinkRow>,
+    pub(super) pre_prune_links: Vec<AgentSubagentLinkRow>,
+}
+
+impl PendingSubagentRows {
+    /// Keep never-mirrored legacy V1 subagent evidence local-only.
+    ///
+    /// V1 claims and revisions are keyed by an unkeyed source digest, which
+    /// must never become a new cloud value (ADR-ACF-03). A source identity the
+    /// remote catalog already holds keeps publishing so that copy stays
+    /// consistent; any other V1 claim, its revisions, and the association
+    /// links of those revisions' content checkpoints are withheld. Content
+    /// checkpoints still publish because restore requires every traces commit
+    /// to be catalogued. Returns the number of withheld rows.
+    pub(super) fn withhold_unmirrored_legacy(
+        &mut self,
+        local_revisions: &[AgentSubagentContentRevisionRow],
+        remote_claims: &[AgentSubagentContentClaimRow],
+        remote_revisions: &[AgentSubagentContentRevisionRow],
+    ) -> usize {
+        let mirrored = remote_claims
+            .iter()
+            .map(claim_key)
+            .chain(remote_revisions.iter().map(revision_source_key))
+            .filter(|key| key.3 == SUBAGENT_CONTENT_SCHEMA_VERSION_V1)
+            .collect::<HashSet<_>>();
+        let local_only = |key: &SubagentSourceKey| {
+            key.3 == SUBAGENT_CONTENT_SCHEMA_VERSION_V1 && !mirrored.contains(key)
+        };
+        let withheld_checkpoints = local_revisions
+            .iter()
+            .filter(|row| local_only(&revision_source_key(row)))
+            .map(|row| row.checkpoint_id.as_str())
+            .collect::<HashSet<_>>();
+        let before = self.row_count();
+        self.claims.retain(|row| !local_only(&claim_key(row)));
+        self.revisions
+            .retain(|row| !local_only(&revision_source_key(row)));
+        for links in [&mut self.links, &mut self.pre_prune_links] {
+            links.retain(|row| !withheld_checkpoints.contains(row.content_checkpoint_id.as_str()));
+        }
+        before.saturating_sub(self.row_count())
+    }
+
+    fn row_count(&self) -> usize {
+        self.claims
+            .len()
+            .saturating_add(self.revisions.len())
+            .saturating_add(self.links.len())
+            .saturating_add(self.pre_prune_links.len())
+    }
 }
 
 fn revision_key(row: &AgentSubagentContentRevisionRow) -> SubagentRevisionKey {
@@ -1132,18 +1335,18 @@ pub(super) fn should_publish_session(
         return Ok(false);
     }
     if !remote_is_known_ancestor {
-        return Err(CloudError::Generic(format!(
-            "agent session {} differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing",
-            local.session_id
-        )));
+        return Err(CloudError::Generic(
+            "agent session differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing"
+                .to_string(),
+        ));
     }
     if remote.sync_revision < local.sync_revision {
         return Ok(true);
     }
-    Err(CloudError::Generic(format!(
-        "agent session {} does not descend monotonically from its recorded remote ancestor",
-        local.session_id
-    )))
+    Err(CloudError::Generic(
+        "agent session does not descend monotonically from its recorded remote ancestor"
+            .to_string(),
+    ))
 }
 
 pub(super) fn remote_catalog_is_legacy_generation_zero_bootstrap(
@@ -1194,18 +1397,18 @@ pub(super) fn should_publish_link(
         return Ok(false);
     }
     if !remote_is_known_ancestor {
-        return Err(CloudError::Generic(format!(
-            "subagent link {} differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing",
-            local.content_checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "subagent link differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing"
+                .to_string(),
+        ));
     }
     if remote.sync_revision < local.sync_revision {
         return Ok(true);
     }
-    Err(CloudError::Generic(format!(
-        "subagent link {} does not descend monotonically from its recorded remote ancestor",
-        local.content_checkpoint_id
-    )))
+    Err(CloudError::Generic(
+        "subagent link does not descend monotonically from its recorded remote ancestor"
+            .to_string(),
+    ))
 }
 
 pub(super) fn checkpoint_rewrite_compatible(
@@ -1235,22 +1438,20 @@ pub(super) fn should_publish_checkpoint(
         if remote == local {
             return Ok(false);
         }
-        return Err(CloudError::Generic(format!(
-            "agent checkpoint {} diverges from the remote at the same sync generation",
-            local.checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "agent checkpoint diverges from the remote at the same sync generation".to_string(),
+        ));
     }
     if !checkpoint_rewrite_compatible(local, remote) {
-        return Err(CloudError::Generic(format!(
-            "agent checkpoint {} conflicts with the remote immutable identity",
-            local.checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "agent checkpoint conflicts with the remote immutable identity".to_string(),
+        ));
     }
     if local.sync_revision > remote.sync_revision && !remote_is_known_ancestor {
-        return Err(CloudError::Generic(format!(
-            "agent checkpoint {} differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing",
-            local.checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "agent checkpoint differs from a remote generation that is not this clone's known ancestor; restore the current cloud snapshot before syncing"
+                .to_string(),
+        ));
     }
     Ok(local.sync_revision > remote.sync_revision)
 }
@@ -1261,6 +1462,48 @@ pub(super) enum CompanionValidationMode {
     Publishing,
 }
 
+const SUBAGENT_CONTENT_SCHEMA_VERSION_V1: i64 = 1;
+const SUBAGENT_SOURCE_KEY_V1_PREFIX: &str = "source/sha256/";
+const SUBAGENT_SOURCE_KEY_V2_PREFIX: &str = "source/subagent-hmac-v2/";
+const IMPORT_SOURCE_SCHEMA_VERSION_V1: i64 = 1;
+
+/// Validate the only source-key forms that may cross the cloud companion
+/// boundary. V1 is immutable historical evidence; new V2 rows must carry the
+/// repository-keyed commitment, never a locator or an unkeyed digest.
+fn validate_subagent_companion_source_key(
+    content_schema_version: i64,
+    source_key: &str,
+    side: &str,
+) -> CloudResult<()> {
+    let prefix = match content_schema_version {
+        SUBAGENT_CONTENT_SCHEMA_VERSION_V1 => SUBAGENT_SOURCE_KEY_V1_PREFIX,
+        crate::internal::ai::subagent_content::SUBAGENT_CONTENT_SCHEMA_VERSION => {
+            SUBAGENT_SOURCE_KEY_V2_PREFIX
+        }
+        _ => {
+            return Err(CloudError::Generic(format!(
+                "{side} subagent companion uses an unsupported content schema"
+            )));
+        }
+    };
+    let valid = source_key.strip_prefix(prefix).is_some_and(|commitment| {
+        commitment.len() == 64
+            && commitment
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if valid {
+        Ok(())
+    } else {
+        // The source key can be a raw provider-relative path in a malicious
+        // remote row. Keep diagnostics content-free so validation cannot
+        // become another locator disclosure sink.
+        Err(CloudError::Generic(format!(
+            "{side} subagent companion has an invalid source commitment"
+        )))
+    }
+}
+
 pub(super) fn validate_agent_capture_companions(
     checkpoints: &[AgentCheckpointV2Row],
     claims: &[AgentSubagentContentClaimRow],
@@ -1269,6 +1512,20 @@ pub(super) fn validate_agent_capture_companions(
     side: &str,
     mode: CompanionValidationMode,
 ) -> CloudResult<()> {
+    for claim in claims {
+        validate_subagent_companion_source_key(
+            claim.content_schema_version,
+            &claim.source_key,
+            side,
+        )?;
+    }
+    for revision in revisions {
+        validate_subagent_companion_source_key(
+            revision.content_schema_version,
+            &revision.source_key,
+            side,
+        )?;
+    }
     let checkpoint_map: HashMap<&str, &AgentCheckpointV2Row> = checkpoints
         .iter()
         .map(|row| (row.checkpoint_id.as_str(), row))
@@ -1295,26 +1552,22 @@ pub(super) fn validate_agent_capture_companions(
         );
         if !claim_keys.contains(&source_key) && mode == CompanionValidationMode::Complete {
             return Err(CloudError::Generic(format!(
-                "{side} subagent revision {} has no source claim dependency",
-                revision.checkpoint_id
+                "{side} subagent revision has no source claim dependency"
             )));
         }
         let Some(checkpoint) = checkpoint_map.get(revision.checkpoint_id.as_str()) else {
             return Err(CloudError::Generic(format!(
-                "{side} subagent revision {} has no checkpoint dependency",
-                revision.checkpoint_id
+                "{side} subagent revision has no checkpoint dependency"
             )));
         };
         if checkpoint.session_id != revision.parent_session_id {
             return Err(CloudError::Generic(format!(
-                "{side} subagent revision {} disagrees with its checkpoint parent",
-                revision.checkpoint_id
+                "{side} subagent revision disagrees with its checkpoint parent"
             )));
         }
         if checkpoint.scope != "subagent" {
             return Err(CloudError::Generic(format!(
-                "{side} subagent revision {} references a non-subagent checkpoint",
-                revision.checkpoint_id
+                "{side} subagent revision references a non-subagent checkpoint"
             )));
         }
         if mode == CompanionValidationMode::Complete {
@@ -1322,14 +1575,12 @@ pub(super) fn validate_agent_capture_companions(
                 .get(revision.checkpoint_id.as_str())
                 .ok_or_else(|| {
                     CloudError::Generic(format!(
-                        "{side} subagent revision {} has no association link dependency",
-                        revision.checkpoint_id
+                        "{side} subagent revision has no association link dependency"
                     ))
                 })?;
             if link.parent_session_id != revision.parent_session_id {
                 return Err(CloudError::Generic(format!(
-                    "{side} subagent revision {} disagrees with its association parent",
-                    revision.checkpoint_id
+                    "{side} subagent revision disagrees with its association parent"
                 )));
             }
         }
@@ -1338,43 +1589,37 @@ pub(super) fn validate_agent_capture_companions(
             && revision.revision > claim.revision_cursor
         {
             return Err(CloudError::Generic(format!(
-                "{side} subagent revision {} is newer than its completed source claim",
-                revision.checkpoint_id
+                "{side} subagent revision is newer than its completed source claim"
             )));
         }
     }
     for link in links {
         let Some(checkpoint) = checkpoint_map.get(link.content_checkpoint_id.as_str()) else {
             return Err(CloudError::Generic(format!(
-                "{side} subagent link {} has no checkpoint dependency",
-                link.content_checkpoint_id
+                "{side} subagent link has no checkpoint dependency"
             )));
         };
         if checkpoint.session_id != link.parent_session_id {
             return Err(CloudError::Generic(format!(
-                "{side} subagent link {} disagrees with its checkpoint parent",
-                link.content_checkpoint_id
+                "{side} subagent link disagrees with its checkpoint parent"
             )));
         }
         if checkpoint.scope != "subagent" {
             return Err(CloudError::Generic(format!(
-                "{side} subagent link {} references a non-subagent content checkpoint",
-                link.content_checkpoint_id
+                "{side} subagent link references a non-subagent content checkpoint"
             )));
         }
         if mode == CompanionValidationMode::Complete
             && !revision_checkpoint_ids.contains(link.content_checkpoint_id.as_str())
         {
             return Err(CloudError::Generic(format!(
-                "{side} subagent link {} has no immutable revision dependency",
-                link.content_checkpoint_id
+                "{side} subagent link has no immutable revision dependency"
             )));
         }
         if let Some(boundary) = link.boundary_checkpoint_id.as_deref() {
             let boundary_checkpoint = checkpoint_map.get(boundary).ok_or_else(|| {
                 CloudError::Generic(format!(
-                    "{side} resolved subagent link {} has no boundary checkpoint dependency",
-                    link.content_checkpoint_id
+                    "{side} resolved subagent link has no boundary checkpoint dependency"
                 ))
             })?;
             if boundary_checkpoint.scope != "subagent"
@@ -1382,8 +1627,7 @@ pub(super) fn validate_agent_capture_companions(
                 || revision_checkpoint_ids.contains(boundary)
             {
                 return Err(CloudError::Generic(format!(
-                    "{side} resolved subagent link {} references an invalid boundary checkpoint",
-                    link.content_checkpoint_id
+                    "{side} resolved subagent link references an invalid boundary checkpoint"
                 )));
             }
         }
@@ -1453,8 +1697,7 @@ pub(super) fn validate_agent_capture_session_dependencies(
     for checkpoint in checkpoints {
         if !session_ids.contains(checkpoint.session_id.as_str()) {
             return Err(CloudError::Generic(format!(
-                "{side} checkpoint {} has no session dependency",
-                checkpoint.checkpoint_id
+                "{side} checkpoint has no session dependency"
             )));
         }
     }
@@ -1466,6 +1709,88 @@ pub(super) fn validate_agent_capture_session_dependencies(
         }
     }
     Ok(())
+}
+
+/// Import-ownership members of a session's `metadata_json`. Every member of
+/// this closed family is ownership-bearing: even one pre-versioned field can
+/// carry a provider-root-relative source locator or an unkeyed identity.
+const IMPORT_OWNERSHIP_METADATA_FIELDS: &[&str] = &[
+    "repository_identity",
+    "source_kind",
+    "source_id",
+    "source_fingerprint",
+    "import_source_schema_version",
+    "import_provisional",
+    "imported",
+    "transcript_snapshot",
+];
+
+/// Project a session row onto the cloud boundary (sync and restore alike).
+///
+/// Live rows and complete V2 import records cross byte-identically; the
+/// catalog's closed parser validates V2 so cloud never accepts a shape the
+/// catalog would not persist. Legacy (unversioned or V1) ownership is
+/// immutable local evidence whose locator and unkeyed digests must never
+/// become a new cloud or restored value, so every ownership member is
+/// omitted and the remaining metadata crosses unchanged. Duplicate keys,
+/// non-object metadata, unknown schemas and invalid V2 records stay fixed,
+/// content-free errors.
+pub(super) fn project_agent_session_for_cloud(
+    row: &AgentSessionV2Row,
+    side: &str,
+) -> CloudResult<AgentSessionV2Row> {
+    let malformed = || {
+        CloudError::Generic(format!(
+            "{side} agent session has malformed import ownership metadata"
+        ))
+    };
+    let unsupported = || {
+        CloudError::Generic(format!(
+            "{side} agent session uses an unsupported import ownership schema"
+        ))
+    };
+    crate::internal::ai::capture::catalog::validate_json_object_keys_are_unique(&row.metadata_json)
+        .map_err(|_| malformed())?;
+    let serde_json::Value::Object(mut metadata) =
+        serde_json::from_str(&row.metadata_json).map_err(|_| malformed())?
+    else {
+        return Err(malformed());
+    };
+    if !IMPORT_OWNERSHIP_METADATA_FIELDS
+        .iter()
+        .any(|field| metadata.contains_key(*field))
+    {
+        return Ok(row.clone());
+    }
+    let legacy = match metadata.get("import_source_schema_version") {
+        None => true,
+        Some(value) => match value.as_i64().ok_or_else(unsupported)? {
+            IMPORT_SOURCE_SCHEMA_VERSION_V1 => true,
+            crate::internal::ai::agent_import::IMPORT_IDENTITY_SCHEMA_VERSION_V2 => false,
+            _ => return Err(unsupported()),
+        },
+    };
+    if !legacy {
+        crate::internal::ai::capture::catalog::validate_v2_import_session_record(
+            &row.metadata_json,
+            &row.redaction_report,
+        )
+        .map_err(|_| {
+            CloudError::Generic(format!(
+                "{side} agent session has invalid V2 import ownership metadata"
+            ))
+        })?;
+        return Ok(row.clone());
+    }
+    for field in IMPORT_OWNERSHIP_METADATA_FIELDS {
+        metadata.remove(*field);
+    }
+    let metadata_json =
+        serde_json::to_string(&serde_json::Value::Object(metadata)).map_err(|_| malformed())?;
+    Ok(AgentSessionV2Row {
+        metadata_json,
+        ..row.clone()
+    })
 }
 
 pub(super) fn object_manifest_scope_for_remote_catalog(
@@ -1510,14 +1835,14 @@ pub(super) fn build_effective_checkpoint_catalog(
         .map(|row| row.checkpoint_id.as_str())
         .collect::<HashSet<_>>();
 
-    if let Some(row) = local
+    if local
         .iter()
-        .find(|row| remote_tombstone_ids.contains(row.checkpoint_id.as_str()))
+        .any(|row| remote_tombstone_ids.contains(row.checkpoint_id.as_str()))
     {
-        return Err(CloudError::Generic(format!(
-            "agent checkpoint {} was already pruned by another cloud writer; restore the current cloud snapshot before syncing this stale clone",
-            row.checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "an agent checkpoint was already pruned by another cloud writer; restore the current cloud snapshot before syncing this stale clone"
+                .to_string(),
+        ));
     }
 
     let mut pending = Vec::new();
@@ -1527,16 +1852,15 @@ pub(super) fn build_effective_checkpoint_catalog(
             continue;
         }
         let Some(local_row) = local_map.get(remote_row.checkpoint_id.as_str()).copied() else {
-            return Err(CloudError::Generic(format!(
-                "remote checkpoint {} is absent locally without an ordinary-prune tombstone; cloud session-erasure propagation is deferred, so restore or purge the remote capture before publishing a new generation",
-                remote_row.checkpoint_id
-            )));
+            return Err(CloudError::Generic(
+                "remote capture contains a checkpoint absent from this local catalog without an ordinary-prune tombstone; restore the current cloud capture or retry after reconciling the local checkpoint catalog before publishing a new generation".to_string(),
+            ));
         };
         if remote_row.sync_revision > local_row.sync_revision {
-            return Err(CloudError::Generic(format!(
-                "remote checkpoint {} is newer than this clone's traces history; restore the current cloud snapshot before syncing",
-                remote_row.checkpoint_id
-            )));
+            return Err(CloudError::Generic(
+                "remote checkpoint is newer than this clone's traces history; restore the current cloud snapshot before syncing"
+                    .to_string(),
+            ));
         }
         if should_publish_checkpoint(local_row, Some(remote_row), remote_is_known_ancestor)? {
             pending.push(local_row.clone());
@@ -1612,7 +1936,7 @@ async fn sync_agent_capture_tables_inner(
             [],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("query sqlite_master: {error}")))?
+        .map_err(|error| local_agent_capture_failure("probe local session schema", error))?
         .is_some();
     if !session_present {
         return Ok(AgentCaptureSyncOutcome::SkippedLegacySchema);
@@ -1625,7 +1949,7 @@ async fn sync_agent_capture_tables_inner(
             [],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("query subagent-content schema: {error}")))?
+        .map_err(|error| local_agent_capture_failure("probe local subagent schema", error))?
         .is_some();
 
     progress.on_agent_capture_starting();
@@ -1634,60 +1958,34 @@ async fn sync_agent_capture_tables_inner(
     d1_client
         .ensure_agent_session_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!("ensure_agent_session_table: {}", error.message))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure agent-session table", &error))?;
     d1_client
         .ensure_agent_checkpoint_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!("ensure_agent_checkpoint_table: {}", error.message))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure agent-checkpoint table", &error))?;
     d1_client
         .ensure_agent_capture_generation_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "ensure_agent_capture_generation_table: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure agent-capture generation table", &error))?;
     d1_client
         .ensure_agent_checkpoint_prune_tombstone_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "ensure checkpoint prune tombstones: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure checkpoint prune tombstones", &error))?;
     d1_client
         .ensure_agent_import_tombstone_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!("ensure agent import tombstones: {}", error.message))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure agent import tombstones", &error))?;
     if subagent_content_present {
         d1_client
             .ensure_agent_subagent_content_tables()
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "ensure_agent_subagent_content_tables: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("ensure subagent-content tables", &error))?;
     }
 
     let remote_generation = d1_client
         .get_agent_capture_generation(repo_id)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "read agent-capture generation before sync: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("read agent-capture generation before sync", &error))?;
     let local_cloud_base = load_local_agent_capture_cloud_base(db_conn, repo_id).await?;
     let remote_catalog = d1_client
         .list_agent_capture_restore_catalog_rows(
@@ -1696,12 +1994,7 @@ async fn sync_agent_capture_tables_inner(
             AGENT_CAPTURE_RESTORE_MAX_ROWS,
         )
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "list aggregate-bounded remote agent-capture catalog before sync: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("list agent-capture catalog before sync", &error))?;
     // The one-time legacy adoption copies only session/checkpoint rows at
     // generation zero and deliberately has no completed generation manifest.
     // Treat that exact projection as the bootstrap ancestor so the first
@@ -1761,6 +2054,13 @@ async fn sync_agent_capture_tables_inner(
         .into_iter()
         .filter(|row| !erased_checkpoint_ids.contains(row.content_checkpoint_id.as_str()))
         .collect();
+    // Earlier releases mirrored legacy ownership verbatim. Compare projected
+    // rows so an already mirrored legacy session is not republished, while a
+    // newer local row replaces it only with its projection.
+    let remote_sessions = remote_sessions
+        .iter()
+        .map(|row| project_agent_session_for_cloud(row, "remote"))
+        .collect::<CloudResult<Vec<_>>>()?;
     validate_agent_capture_companions(
         &remote_checkpoints,
         &remote_claims,
@@ -1836,10 +2136,10 @@ async fn sync_agent_capture_tables_inner(
             None => pending_revisions.push(row.clone()),
             Some(remote) if *remote == row => {}
             Some(_) => {
-                return Err(CloudError::Generic(format!(
-                    "immutable subagent revision {} conflicts with the remote",
-                    row.checkpoint_id
-                )));
+                return Err(CloudError::Generic(
+                    "an immutable subagent revision conflicts with the remote; restore the current cloud snapshot before syncing"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -1874,7 +2174,7 @@ async fn sync_agent_capture_tables_inner(
                     .and_then(|remote| remote.boundary_checkpoint_id.as_deref())
                     .is_some_and(|boundary| prune_ids.contains(boundary))
         });
-    if let Some(link) = remote_links.iter().find(|remote| {
+    if remote_links.iter().any(|remote| {
         !prune_ids.contains(remote.content_checkpoint_id.as_str())
             && remote
                 .boundary_checkpoint_id
@@ -1884,10 +2184,10 @@ async fn sync_agent_capture_tables_inner(
                 .iter()
                 .any(|local| local.content_checkpoint_id == remote.content_checkpoint_id)
     }) {
-        return Err(CloudError::Generic(format!(
-            "remote subagent link {} still resolves through a checkpoint being pruned, but this clone has no newer unresolved link generation; restore the current cloud snapshot before syncing",
-            link.content_checkpoint_id
-        )));
+        return Err(CloudError::Generic(
+            "a remote subagent link still resolves through a checkpoint being pruned, but this clone has no newer unresolved link generation; restore the current cloud snapshot before syncing"
+                .to_string(),
+        ));
     }
 
     let remote_claim_map: HashMap<SubagentSourceKey, &AgentSubagentContentClaimRow> = remote_claims
@@ -1904,6 +2204,23 @@ async fn sync_agent_capture_tables_inner(
             pending_claims.push(row.clone());
         }
     }
+    let mut pending_subagent = PendingSubagentRows {
+        claims: pending_claims,
+        revisions: pending_revisions,
+        links: pending_links,
+        pre_prune_links,
+    };
+    let withheld_legacy_rows = pending_subagent.withhold_unmirrored_legacy(
+        &snapshot.revisions,
+        &remote_claims,
+        &remote_revisions,
+    );
+    let PendingSubagentRows {
+        claims: pending_claims,
+        revisions: pending_revisions,
+        links: pending_links,
+        pre_prune_links,
+    } = pending_subagent;
 
     // All remote conflict and object-durability checks happen before this
     // transition. A transient preflight failure therefore leaves the last
@@ -1926,21 +2243,12 @@ async fn sync_agent_capture_tables_inner(
             },
         )
         .await
-        .map_err(|error| {
-            CloudError::D1(format!("begin agent capture generation: {}", error.message))
-        })?;
+        .map_err(|error| cloud_d1_failure("begin agent-capture generation", &error))?;
     for rows in agent_capture_batches(&pending_sessions) {
         d1_client
             .sync_agent_sessions_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                let row_id = rows
-                    .first()
-                    .map(|row| row.session_id.as_str())
-                    .unwrap_or("agent-session-batch");
-                progress.on_agent_capture_session_warning(row_id, &error.message);
-                CloudError::D1(format!("sync agent session batch: {}", error.message))
-            })?;
+            .map_err(|error| agent_capture_row_failure("sync agent-session batch", &error))?;
     }
     // Boundary associations must become unresolved before their boundary
     // checkpoint is deleted. This preserves a Publishing-valid graph at every
@@ -1949,71 +2257,37 @@ async fn sync_agent_capture_tables_inner(
         d1_client
             .sync_agent_subagent_links_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "sync pre-prune subagent link batch: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("sync pre-prune subagent-link batch", &error))?;
     }
     for rows in agent_capture_batches(&snapshot.prune_tombstones) {
         d1_client
             .sync_agent_checkpoint_prune_tombstones_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "sync checkpoint prune tombstones: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("sync checkpoint prune tombstones", &error))?;
     }
     for rows in agent_capture_batches(&pending_checkpoints) {
         d1_client
             .sync_agent_checkpoints_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                let row_id = rows
-                    .first()
-                    .map(|row| row.checkpoint_id.as_str())
-                    .unwrap_or("agent-checkpoint-batch");
-                progress.on_agent_capture_checkpoint_warning(row_id, &error.message);
-                CloudError::D1(format!("sync agent checkpoint batch: {}", error.message))
-            })?;
+            .map_err(|error| agent_capture_row_failure("sync agent-checkpoint batch", &error))?;
     }
     for rows in agent_capture_batches(&pending_revisions) {
         d1_client
             .sync_agent_subagent_revisions_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                let row_id = rows
-                    .first()
-                    .map(|row| row.checkpoint_id.as_str())
-                    .unwrap_or("subagent-revision-batch");
-                progress.on_agent_capture_checkpoint_warning(row_id, &error.message);
-                CloudError::D1(format!("sync subagent revision batch: {}", error.message))
-            })?;
+            .map_err(|error| agent_capture_row_failure("sync subagent-revision batch", &error))?;
     }
     for rows in agent_capture_batches(&pending_links) {
         d1_client
             .sync_agent_subagent_links_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                let row_id = rows
-                    .first()
-                    .map(|row| row.content_checkpoint_id.as_str())
-                    .unwrap_or("subagent-link-batch");
-                progress.on_agent_capture_checkpoint_warning(row_id, &error.message);
-                CloudError::D1(format!("sync subagent link batch: {}", error.message))
-            })?;
+            .map_err(|error| agent_capture_row_failure("sync subagent-link batch", &error))?;
     }
     for rows in agent_capture_batches(&pending_claims) {
         d1_client
             .sync_agent_subagent_claims_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                progress.on_agent_capture_warning(&error.message);
-                CloudError::D1(format!("sync subagent claim batch: {}", error.message))
-            })?;
+            .map_err(|error| agent_capture_row_failure("sync subagent-claim batch", &error))?;
     }
     // PD-03: the session tombstones publish LAST so their cascade delete
     // is final regardless of what earlier batches upserted.
@@ -2021,9 +2295,7 @@ async fn sync_agent_capture_tables_inner(
         d1_client
             .sync_agent_import_tombstones_batch(repo_id, &publish_token, rows)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!("sync agent import tombstones: {}", error.message))
-            })?;
+            .map_err(|error| cloud_d1_failure("sync agent import tombstones", &error))?;
     }
 
     let AgentCaptureRestoreCatalogRows {
@@ -2042,17 +2314,15 @@ async fn sync_agent_capture_tables_inner(
             AGENT_CAPTURE_RESTORE_MAX_ROWS,
         )
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "verify aggregate-bounded agent-capture catalog: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("verify agent-capture catalog", &error))?;
     if !checkpoint_catalog_matches(&completed_checkpoints, &effective_checkpoints) {
         return Err(CloudError::PartialTransfer(
             "remote checkpoint catalog changed during agent-capture publication; retry cloud sync"
                 .to_string(),
         ));
+    }
+    for session in &completed_sessions {
+        project_agent_session_for_cloud(session, "completed remote")?;
     }
     validate_agent_capture_companions(
         &completed_checkpoints,
@@ -2090,20 +2360,14 @@ async fn sync_agent_capture_tables_inner(
                 .get_object_indexes_by_oids_with_generation(repo_id, &required_oids)
                 .await
                 .map_err(|error| {
-                    CloudError::D1(format!(
-                        "verify fenced agent-capture object indexes: {}",
-                        error.message
-                    ))
+                    cloud_d1_failure("verify fenced agent-capture object indexes", &error)
                 })?
         }
         AgentCaptureObjectManifestScope::FullRemoteIndex => d1_client
             .get_object_indexes_bounded_with_generation(repo_id, completed_remaining_rows)
             .await
             .map_err(|error| {
-                CloudError::D1(format!(
-                    "verify full agent-capture object manifest within the aggregate row budget: {}",
-                    error.message
-                ))
+                cloud_d1_failure("verify retained agent-capture object manifest", &error)
             })?,
     };
     completed_remaining_rows
@@ -2131,13 +2395,11 @@ async fn sync_agent_capture_tables_inner(
     let completed_generation = d1_client
         .complete_agent_capture_generation(repo_id, &publish_token, object_index_generation)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "complete agent capture generation: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("complete agent-capture generation", &error))?;
     store_local_agent_capture_cloud_base(db_conn, repo_id, completed_generation.generation).await?;
+    if withheld_legacy_rows > 0 {
+        progress.on_agent_capture_warning(AGENT_CAPTURE_LEGACY_LOCAL_ONLY_MESSAGE);
+    }
 
     let sessions_synced = pending_sessions.len();
     let checkpoints_synced = pending_checkpoints.len();

@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     internal::ai::{
+        capture::ingress::CaptureDeadline,
         hooks::provider::{HookProvider, ProviderInstallOptions},
         observed_agents::{AgentKind, agent_for, registration_for, supported_slugs},
     },
@@ -20,9 +21,12 @@ use crate::{
 };
 
 pub mod bridge;
+mod capture_source;
 pub(crate) mod checkpoint;
 mod clean;
 mod doctor;
+#[cfg(test)]
+pub(crate) use doctor::scan_checkpoint_store_with_replay_budget_for_test;
 mod graph;
 mod hooks;
 mod import;
@@ -42,12 +46,36 @@ mod session;
 mod skill;
 mod status;
 
+/// Entry for the hidden detached recovery child, recognized before normal
+/// command startup. It is intentionally silent and content-free.
+pub(crate) async fn run_capture_recovery_worker() -> CliResult<()> {
+    let storage = crate::utils::util::try_get_storage_path(None).map_err(|_| {
+        CliError::fatal("capture recovery worker could not resolve repository storage".to_string())
+    })?;
+    let lock_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let _lock = loop {
+        match crate::internal::ai::capture::worker::try_lock(&storage).map_err(|_| {
+            CliError::fatal("capture recovery worker lock is unavailable".to_string())
+        })? {
+            Some(lock) => break lock,
+            None if tokio::time::Instant::now() < lock_deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            None => return Ok(()),
+        }
+    };
+    #[cfg(debug_assertions)]
+    crate::internal::ai::capture::worker::hold_for_test().await;
+    doctor::run_pending_artifact_worker().await
+}
+
 #[doc(hidden)]
 pub use import::{
     IMPORT_DISCOVERY_HELPER_ARG, IMPORT_DISCOVERY_HELPER_FRAME_CAP, IMPORT_INDEX_REPAIR_HELPER_ARG,
-    IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP, IMPORT_PREPARATION_HELPER_ARG,
-    IMPORT_PREPARATION_HELPER_INPUT_CAP, IMPORT_PREPARATION_HELPER_OUTPUT_CAP,
-    run_import_discovery_helper, run_import_index_repair_helper, run_import_preparation_helper,
+    IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP, IMPORT_PREPARATION_DESCRIPTOR_CONTROL_ENV,
+    IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG, IMPORT_PREPARATION_HELPER_OUTPUT_CAP,
+    run_import_discovery_helper, run_import_index_repair_helper,
+    run_import_preparation_descriptor_helper_from_stdin,
 };
 
 /// A0-06: derive a safe display/record name from a `review/investigate attach`
@@ -93,7 +121,7 @@ EXAMPLES:
     libra agent disable --agent claude              Disable Claude Code capture and uninstall its hooks
     libra agent session list                        List captured sessions
     libra agent checkpoint list                     List captured checkpoints
-    libra agent checkpoint show <id>                Show a single checkpoint by id
+    libra agent checkpoint show <id>                Show a checkpoint's safe structural summary
     libra agent checkpoint rewind <id>              Preview/apply checkpoint rewind
     libra agent checkpoint export <id>              Export the redacted transcript (no authorization needed)
     libra agent checkpoint export <id> --allow-raw --raw  Export the raw transcript (audited; requires --allow-raw)
@@ -188,8 +216,8 @@ pub enum AgentSubcommand {
     Workspace(workspace::WorkspaceSubcommand),
 
     /// Internal hook entry point (called by hook configs installed by `enable`).
-    #[command(subcommand, about = "Hook entry point", hide = true)]
-    Hooks(hooks::AgentHooksSubcommand),
+    #[command(about = "Hook entry point", hide = true)]
+    Hooks(AgentHooksArgs),
 
     /// Discover and invoke external `libra-agent-<name>` RPC binaries.
     /// Phase 4.5 (entire.md §14.4 item 5).
@@ -202,6 +230,28 @@ pub enum AgentSubcommand {
     /// and is a plain JSON-RPC 2.0 NDJSON transport.
     #[command(about = "Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)")]
     Bridge(bridge::BridgeArgs),
+}
+
+/// Arguments scoped exclusively to the hidden legacy hook alias.
+///
+/// Clap requires a subcommand-bearing `Subcommand` enum variant to be a
+/// newtype. Keeping the budget and nested provider command in this `Args`
+/// wrapper prevents `--capture-budget-ms` from becoming an `agent`-global
+/// option while preserving the installed legacy grammar.
+#[derive(Args, Debug)]
+pub struct AgentHooksArgs {
+    /// Installer-owned deadline for this legacy hook alias. It is scoped
+    /// to hook entrypoints so unrelated `agent` subcommands cannot accept
+    /// or silently ignore it.
+    #[arg(
+            long,
+            hide = true,
+            value_name = "MILLISECONDS",
+            value_parser = crate::command::hooks::parse_capture_budget_ms
+        )]
+    pub capture_budget_ms: Option<u64>,
+    #[command(subcommand)]
+    pub command: hooks::AgentHooksSubcommand,
 }
 
 #[derive(Args, Debug)]
@@ -281,14 +331,13 @@ pub enum CheckpointSubcommand {
     /// List captured checkpoints, newest first.
     #[command(about = "List captured checkpoints")]
     List(CheckpointListArgs),
-    /// Show a single checkpoint's metadata and tree summary.
-    #[command(about = "Show checkpoint metadata")]
+    /// Show a checkpoint's safe structural summary.
+    #[command(about = "Show a safe checkpoint summary")]
     Show(CheckpointShowArgs),
     /// Inspect what `rewind` would do (`--apply` to actually run). Apply
-    /// restores the working tree and truncates supported agent transcripts
-    /// (currently Claude Code) when metadata includes a transcript path.
+    /// restores the working tree; provider transcripts remain unchanged.
     #[command(
-        about = "Rewind a checkpoint (dry-run by default; --apply restores worktree and supported transcripts)"
+        about = "Rewind a checkpoint (dry-run by default; --apply restores the worktree only)"
     )]
     Rewind(CheckpointRewindArgs),
     /// Export a checkpoint's transcript. Redacted by default; raw
@@ -358,8 +407,7 @@ pub struct CheckpointRewindArgs {
     /// Show the impact without modifying anything (default)
     #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
-    /// Actually restore the working tree and truncate supported agent transcripts
-    /// (currently Claude Code) when metadata includes a transcript path
+    /// Actually restore the working tree; provider transcripts remain unchanged
     #[arg(long)]
     pub apply: bool,
 }
@@ -367,8 +415,13 @@ pub struct CheckpointRewindArgs {
 /// Run an `agent` subcommand. Every variant routes to its implemented
 /// handler; unsupported *inputs* (e.g. a non-first-batch agent slug) still
 /// return an actionable error rather than panicking.
-pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<()> {
-    match args.command {
+pub async fn execute_safe(
+    args: AgentArgs,
+    output: &OutputConfig,
+    hook_deadline: Option<CaptureDeadline>,
+) -> CliResult<()> {
+    let AgentArgs { command } = args;
+    match command {
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
         AgentSubcommand::List(args) => list::execute_safe(args, output).await,
         AgentSubcommand::Import(args) => import::execute_safe(args, output).await,
@@ -384,7 +437,9 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Doctor(cmd) => doctor::execute_safe(cmd, output).await,
         AgentSubcommand::Push(cmd) => push::execute_safe(cmd, output).await,
         AgentSubcommand::Workspace(cmd) => workspace::execute_safe(cmd, output).await,
-        AgentSubcommand::Hooks(cmd) => hooks::execute_safe(cmd, output).await,
+        AgentSubcommand::Hooks(args) => {
+            hooks::execute_safe(args.command, output, hook_deadline).await
+        }
         AgentSubcommand::Rpc(cmd) => rpc::execute_safe(cmd, output).await,
         AgentSubcommand::Bridge(args) => bridge::execute_safe(args, output).await,
     }
@@ -481,22 +536,30 @@ fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool)
                 }
                 continue;
             };
+            // A stale managed command is intentionally not "installed" in
+            // the status sense (for example, it lacks a newly required
+            // capture-budget argument), but it is still ours to remove.
+            // Only a successful `false` result proves that stale-cleanup
+            // case. An inspection error (such as malformed Codex trust
+            // state) must stop before uninstall: some providers update more
+            // than one settings file, and proceeding could leave a partial
+            // mutation behind.
             let installed = provider.hooks_are_installed().map_err(|err| {
                 CliError::fatal(format!(
-                    "failed to inspect '{slug}' hook installation state: {err}"
+                    "failed to inspect '{slug}' hook installation state before disabling: {err}"
                 ))
             })?;
-            if !installed {
-                if !output.quiet {
-                    println!("libra agent disable: '{slug}' hooks not installed; nothing to do");
-                }
-                continue;
-            }
             provider
                 .uninstall_hooks()
                 .map_err(|err| CliError::fatal(format!("failed to disable '{slug}': {err}")))?;
             if !output.quiet {
-                println!("libra agent disable: disabled '{slug}' (provider hooks removed)");
+                if installed {
+                    println!("libra agent disable: disabled '{slug}' (provider hooks removed)");
+                } else {
+                    println!(
+                        "libra agent disable: '{slug}' hooks not installed or stale; removed any managed entries"
+                    );
+                }
             }
         }
     }

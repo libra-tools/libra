@@ -452,7 +452,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 | ID | 任务 | 优先级 | 状态 | 一句话缺口 |
 |---|---|---:|---|---|
-| **SB-02** | 统一外部 Agent ingress / bridge / sandbox 信任边界 | P1 | 实施中 | 确定性权限引擎已落地（`src/internal/ai/permission/` Allow/Deny/Ask + wildcard + 持久 approvals + `sandbox`/`run_admission` fail-closed）；SBX-01..05 已合入（共享 SandboxManager transform、macOS seatbelt，plan-20260830）；剩余外部入口授权、跨源凭据作用域、URL 脱敏、写重定向 fail-closed 与团队发布门禁 |
+| **SB-02** | 统一外部 Agent ingress / bridge / sandbox 信任边界 | P1 | 实施中 | 确定性权限引擎已落地（`src/internal/ai/permission/` Allow/Deny/Ask + wildcard + 持久 approvals + `sandbox`/`run_admission` fail-closed）；SBX-01..05 的共享 SandboxManager transform 已合入；其中历史 macOS Seatbelt OpenCode 内容导出已因取消收束安全风险退役，当前 macOS fail-closed 且 metadata-only，Linux Required bwrap 是唯一内容导出路径（见 `plan-20260830` 顶部后继说明）；剩余外部入口授权、跨源凭据作用域、URL 脱敏、写重定向 fail-closed 与团队发布门禁 |
 | **SB-04** | 测试与子进程资源生命周期隔离 | P1/P2 | 实施中 | nextest CI 与序列注册已落地（`a8218ac`、`315132a`）；child scope（ProcessScope 同类：closed-scope / late-spawn kill / PID-reuse 防护）、shutdown 后调用语义与阻塞任务后台化未统一 |
 | **LR-06** | Intent Seal、Intent-Commit Pin、安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 有；seal/pin/白名单 publication 无 |
 | **LR-07** | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | 缺团队 intent projection、确定性 overlap receipt、pre-edit gate |
@@ -742,25 +742,25 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260824.md`](plan-20260824.md) | B（历史：RT-01 延后项收口） | **历史完成/封存** | DF-01..DF-09 的完成/评审/发布证据保留；其 fix bridge、Code SSE、skill activation 消费面与 Code 专属 DEFER 已由 plan-20260920 拆除或墓碑化 |
 | [`plan-20260825.md`](plan-20260825.md) | B（历史：Code provider）+ 横切测试 | **历史完成/封存** | PS provider/凭据/provenance 产品轴的完成证据保留但产品面已拆除；TA-03/06/07 的测试并行度成果仍有效并由 plan-20260827 承接，通用测试 DEFER 只可另立计划 |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度与序列注册） | 已完成 | NP-00..05 六卡全部 complete（nextest 离线 CI face `a8218ac`、串行注册 `315132a`、TA-03/06/07 承接）；D 组 CI 证据环境受阻部分按 backfill 窗口记录 |
-| [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | 已完成 | SBX-01..05 五卡 done/locally-accepted（共享 SandboxManager transform、macOS seatbelt OpenCode export）；ER-13 全量收口门绿（2026-09-01）；DEFER-SBX-06 发布步延后 |
+| [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | 已完成（历史） | SBX-01..05 五卡的共享 SandboxManager transform 与当时 locally-accepted 证据保留；原 macOS Seatbelt OpenCode 内容导出已由后续取消收束安全审计退役，当前 macOS fail-closed/metadata-only，Linux Required bwrap 为唯一内容导出路径（以该计划顶部后继说明为准）；ER-13 历史门绿（2026-09-01）；DEFER-SBX-06 发布步延后 |
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | 已完成 | 原PKT01..14及FIX-PKT01..05全部done/complete；十六实际发布C/D完整，家族02/03/04由05覆盖，最新v0.22.47。所有卡D后新的无过滤默认全量10221/10221（231 binaries、零失败/重试）和原113具名门及FIX05四新增门通过，Codex/Claude最终PASS；同步/异步协议与CLI分类、SSH诊断/BatchMode、push ng净化、空仓库尾部帧校验及五恢复修复全部交付。失败历史与全部DEFER条目/具名P2如计划，不冒称历史SIGKILL根因已查明或已本地安装。 |
-| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 已排期 | OG-00/OG-04 可先行；其余 production 卡受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
+| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 已排期 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；所有卡仍为 `pending`，并须通过各自 review/acceptance 门。 |
 | [`plan-20260903.md`](plan-20260903.md) | A（LR-05 merge） | 实施中 | MG-01..MG-21 已有代码、测试与发布提交；最终计划收口与 deferred 差异仍待完成 |
-| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 已排期 | CX-00/CX-12 audit 可先行；RG 與 CX production 卡受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
-| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 已排期 | CC-00 source probe 可先行；CC-01..06 受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
+| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 已排期 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；RG 与 CX 卡仍为 `pending`，受各自 Phase 0/review 门控。 |
+| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 已排期 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；CC 卡仍为 `pending`，受各自 review/reasoning 门控。 |
 | [`plan-20260906.md`](plan-20260906.md) | 横切（安全扫描） | 已排期 | 设计计划，任务卡尚未完成 |
 | [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 已排期 | 设计计划，任务卡尚未执行；与 Media 计划的边界见其关系表 |
 | [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | 已排期 | 设计计划，任务卡尚未执行 |
-| [`plan-20260911.md`](plan-20260911.md) | B（Pi hook/capture boundary） | 已排期 | 只讀 Pi pin/source 重核可先行；PI-01..06 受 plan-20260924 `DEP-ACF-MIRROR` 阻塞 |
+| [`plan-20260911.md`](plan-20260911.md) | B（Pi hook/capture boundary） | 已排期 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；PI-01..06 仍为 `pending`，且保留自身 pin/source/review 门。 |
 | [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 已排期 | 设计计划，任务卡尚未执行 |
 | [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 已排期 | 设计计划，任务卡尚未执行；Libra 侧以前置 `plan-20260907` 完整收口为准 |
-| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | CAP-01..06 HTTP client 可先行；CAP-07 local orchestration 受 plan-20260924 `DEP-ACF-CAP` 阻塞 |
+| [`plan-20260916.md`](plan-20260916.md) | B（Mega agent capture-push） | 已排期 | `DEP-ACF-CAP` 的 ACF 侧必要条件已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；此为必要而非充分条件。CAP-01..03 仍为 `pending`，仅可 zero-raw-persistence 重核；CAP-04..07 为 `blocked` / 空，须独立 security/privacy RFC。 |
 | [`plan-20260917.md`](plan-20260917.md) | 横切（cargo-test 进程内剥落） | 已排期 | 收口与 nextest 分组无关的 `--lib` 串行锁对齐 + `command_test` 高并行 spawn；禁止改 nextest 成员 |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | 已完成 | 合并原 issues/469、484、489、491-494 及 490/476/470 的 add 卡。23/25 卡 `done`/`complete`；WT-06/WT-07 因 DEP-AD-11（[`issues/476.md`](issues/476.md) 全部 `pending`）按依赖失败策略保持 `blocked`。`add -p` 仍由 477 Phase 4 交付 |
 | [`plan-20260920.md`](plan-20260920.md) | 横切（拆除 `libra code` / Publish / Worker） | **已完成** | RC-00..RC-36 全部 `done/complete`（closeout `1e74d0c`）；公开 Code/Publish 表面已随 0.23.0 删除，内部 SCC、leftover、Code UI 测试面与 `worker/` 已删除，三份 RT-01/Code provider 计划转为历史封存 |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁到 XDG） | 实施中 | 用户 2026-09-19 裁决：global config DB + 全域 vault unseal key 迁到 `<XDG_CONFIG_HOME\|~/.config>/libra`（macOS 同）；旧库首次使用自动迁移并保留备份；`~/.libra` 仍为 `LIBRA_HOME`；四个 `independent` 卡、`patch` 发布。**进度**：GCX-01 `done`（2026-09-19，`v0.23.1`）；GCX-02（首次使用自动迁移）/ GCX-03（全域 vault key 随迁）/ GCX-04（用户级 hooks 路径对齐）于 2026-09-22 完成实现+测试+文档，三卡 `locally-accepted`，版本 bump 与发布未执行。版本面本轮重核为**三处**（`web/package.json` 已随 `web/` 拆除）；DEP-GCX-01（`../libra-backend`）与 DEP-GCX-03（`.env.test`/`.env.live-test`）在本机均不满足 |
 | [`plan-20260921.md`](plan-20260921.md) | 横切（GnuPG HOME 密钥导入仓库 vault） | **已完成** | 2026-09-21 由 `plan-20260919-gpg-import.md` 改名；R29 同版双 `PASS`。**2026-09-24 收口：** 15/15 卡 `done`/`complete`；按操作者裁决 decision (ii)，家族面（导入/签名/验证/redaction）与管理面（`export-gpg-key`、`remove-gpg-key`、`list --gpg-keys`、版本化生成键名）合并发布为 **`v0.23.65`**（run `35993926394` 8/8 success、CDN gate PASS、安装冒烟 PASS）；`../libra-backend` 五页已同步（`cf` `1bb46c0`）。遗留：本仓 vault 签名未恢复（未签名发布，操作者裁决）。 |
-| [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | 對標 Entire `main@9c06bfb13`；ACF-01..09 建立 validated ingress、純 reducer、snapshot、catalog/checkpoint store、coordinator、bounded finalizer 與獨立 handoff；是 0902/04/05/11 production、CAP-07 與 0923 DM-05 session consumer contract 前置 |
+| [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | **已收口** | 2026-10-03 14:56:26 UTC：ACF-01..20 与 FIX-ACF-01 `done`/`complete`；R91 `VERDICT: PASS`；ACF-09 已交接 `DEP-ACF-MIRROR`／ACF 侧 `DEP-ACF-CAP`／`DEP-ACF-DM06`。CAP-04..07 仍受独立 RFC `blocked`；DM-05 仍 `pending`。 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

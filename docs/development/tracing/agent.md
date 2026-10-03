@@ -8,7 +8,7 @@
 
 ## 捕获概念结构图（Session / turn / checkpoint / transcript）
 
-下图说明外部 Agent 捕获各概念之间的关联：生命周期事件如何驱动写入、`agent_session` 与 `agent_checkpoint` 的从属关系、checkpoint 如何落到 `refs/libra/traces` 上的 commit/tree/blob，以及 transcript 快照、usage、辅助日志和 cloud 可见性的位置。事实源：schema `sql/migrations/2026050303_agent_capture.sql`、写入器 `src/internal/ai/hooks/runtime.rs`（`ingest_agent_traces_payload` / `write_committed_checkpoint`）。
+下图说明外部 Agent 捕获各概念之间的关联：生命周期事件如何驱动写入、`agent_session` 与 `agent_checkpoint` 的从属关系、checkpoint 如何落到 `refs/libra/traces` 上的 commit/tree/blob，以及 transcript 快照、usage、辅助日志和 cloud 可见性的位置。事实源：schema `sql/migrations/2026050303_agent_capture.sql`、写入器 `src/internal/ai/capture/live_pipeline.rs`（`ingest_agent_traces_payload_with_scope`）与 `src/internal/ai/capture/live_checkpoint.rs`（`write_committed_checkpoint`），hook 入口 `src/internal/ai/hooks/runtime.rs`。
 
 ```mermaid
 flowchart TD
@@ -74,7 +74,7 @@ flowchart TD
 - **Agent 集成管理**：列出 registered / available / installed agents；安装与移除 hook；保留 `status` / `enable` / `disable` canonical 入口，并新增 `list` / `add` / `remove` 兼容别名。输出必须区分 `registered`、`hook_installable`、`transcript_readable`、`launchable_review`、`launchable_investigate`、`external_binary`，不得把“可注册”误报为“可安装 hook”或“可启动 reviewer”。
 - **能力声明与 registry**：以 `DeclaredAgentCaps` / capability-gated helper 表达 hooks、transcript analyzer/preparer、token calculator、text generator、compaction、hook response、subagent-aware extractor 等可选能力。built-in adapter 可通过 trait/impl 直接声明；external binary 必须先通过协议声明能力，未声明的方法 fail-closed。
 - **Hook 与 lifecycle 捕获**：已安装 provider hook、隐藏 `agent hooks` 入口和 external RPC parser 只能产出 provider-neutral lifecycle event，经统一校验、owner filtering、path/session validation、redaction 后再写入 checkpoint。事件边界包括 `SessionStart`、`TurnStart`、`TurnEnd`、`Compaction`、`SessionEnd`、`SubagentStart`、`SubagentEnd`、`ModelUpdate`、`ToolUse`。
-- **Session / checkpoint 捕获与诊断**：`agent_session`、`agent_checkpoint`、`agent_usage_stats`、`.libra/sessions/agent/`、`refs/libra/traces` 和 `object_index` 共同构成外部捕获事实源。`session list/show` 与 `checkpoint list/show` 默认 metadata-first；读取 redacted transcript、prompt、context、stderr 必须走显式 `--detail`/`--transcript` 路径，受 size cap、streaming/chunk、redaction 约束（无需授权门）；未脱敏 raw payload 仅经显式 `--allow-raw` 授权访问/导出，每次写 append-only audit（见「读取 pipeline」与合规规格）。`clean`、`doctor`、`push`、`rewind` 只处理这些外部捕获对象，不扩大为通用 Git/工作区维护命令。
+- **Session / checkpoint 捕获与诊断**：`agent_session`、`agent_checkpoint`、`agent_usage_stats`、`.libra/sessions/agent/`、`refs/libra/traces` 和 `object_index` 共同构成外部捕获事实源。`session list/show` 与 `checkpoint list` 默认走 metadata-first catalog 读取；`checkpoint show` 则只输出固定安全结构摘要，绝不读取或回显 metadata/object OID。读取 redacted transcript、prompt、context、stderr 必须走显式 `--detail`/`--transcript` 路径，受 size cap、streaming/chunk、redaction 约束（无需授权门）；未脱敏 raw payload 仅经显式 `--allow-raw` 授权访问/导出，每次写 append-only audit（见「读取 pipeline」与合规规格）。SessionEnd pending recovery 仅使用已认证的本地 sealed artifact，不重开 provider path；doctor 在重放前复验 alias、原 receipt、marker 与 coverage fences，单次 `doctor --repair` 最多五次 artifact replay、共享 2 秒 cooperative deadline，只有 durable checkpoint 与原 receipt strict completion 均成功才报告修复。永久拒绝的自动 replay 会将 header 停放到 quarantine，未到原始重试/时间上限前不自动重试，也不消耗后续 replay 配额。没有 artifact 的 `pending_source`、superseded 或 session-quarantined receipt 仍为 manual-only；SessionStart detached worker 已接线并使用同一有界 executor（ownership 与 live handoff 契约见 ACF-11／ACF-13）。`clean`、`doctor`、`push`、`rewind` 只处理这些外部捕获对象，不扩大为通用 Git/工作区维护命令。
 - **External `libra-agent-<name>` 协议**：保留 Libra 的 JSON-RPC 传输，能力面与 entire external protocol 对齐：`info`、`protocol_version`、8-bool capability schema、repo-root/env 注入、timeout、IO cap、settings gate、provenance、内置 slug 仿冒防护、stderr capture/redaction。它不是 MCP stdio，也不是内部 AgentRuntime turn 控制面。
 - **Transcript intelligence 与 skill event**：允许按 capability 做 transcript 准备、文件/模型/token/prompt/skill/subagent 提取和 native transcript chunk/reassemble；extractor 缺失或可选字段缺失可 fail-open 并标 `partial`，但 redaction、path 安全、UTF-8/JSON envelope、写入、rewind apply、hook install/uninstall、external launch/fix 一律 fail-closed。
 - **Review / investigate 相邻工作流**：review / investigate 可以消费 `libra agent` 的 registry、capability、checkpoint、transcript 和 findings/provenance 数据；但 mutating fix/action 必须桥接内部 `libra code` AgentRuntime serialized queue、approval、sandbox 和 tool gate。observed external agent 只能提供 transcript、hook event、findings、manual attach/provenance，不能直接成为 Libra 的受控 mutating executor。
@@ -137,7 +137,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude session-start",
+               "command": "<canonicalized-libra-abs-path> hooks claude session-start --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -149,7 +149,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude prompt",
+               "command": "<canonicalized-libra-abs-path> hooks claude prompt --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -161,7 +161,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude tool-use",
+               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -173,7 +173,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude tool-use",
+               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -185,7 +185,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude stop",
+               "command": "<canonicalized-libra-abs-path> hooks claude stop --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -197,7 +197,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude session-end",
+               "command": "<canonicalized-libra-abs-path> hooks claude session-end --capture-budget-ms 9000",
                "timeout": 10
              }
            ]
@@ -207,13 +207,13 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
    }
    ```
 
-   示例中 `<canonicalized-libra-abs-path>` 为占位符：实际写入值是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径。绝对路径是**必须形态**——schema/snapshot test 断言 command 以绝对路径开头、以 `hooks claude <verb>` 结尾，不允许裸 `libra` PATH 查找（与 plan.md §0.3.3/A6.5 安装断言互引）。
+   示例中 `<canonicalized-libra-abs-path>` 为占位符：实际写入值是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径。绝对路径是**必须形态**——schema/snapshot test 断言 command 以绝对路径开头、由 `hooks claude <verb>` 与 installer-owned `--capture-budget-ms <N>` 组成，不允许裸 `libra` PATH 查找（与 plan.md §0.3.3/A6.5 安装断言互引）。当前 handler 同时写入 provider 支持的 `statusMessage: "libra capture"`；只有该标记、直接绝对 command-path grammar、verb 与 timeout/budget 对均精确匹配才属于 Libra。无标记 command（包括 `libra`/`libra.exe`、标准绝对路径或重命名路径）在 disable 时必须保留；仅 explicit enable 可把 matcher-less、executable 与本次选择 binary path 完全相同的直接绝对 legacy/canonical command 迁移为带标记形态。`N` 从 handler `timeout` 推导，保留最多 1000ms 给 terminal finalization（默认 `10s → 9000`；历史 `1s → 500`，以保留可用的 capture slice），不是用户应手动调节的公开 flag；重跑 `libra agent enable --agent claude-code` 会把旧配置原位刷新为当前命令。
 
    `ModelUpdate`、`Compaction` 等 parser 能力可以存在，但当前 Claude Code 安装器只写入上表 6 个 forward events（DR-00 起 `PreToolUse` 与 `PostToolUse` 一并转发到 `hooks claude tool-use`，二者都映射 `LifecycleEventKind::ToolUse`）；`ToolUse` 事件走 AgentTraces 采集路径，只更新 `agent_session` 活跃状态（`last_event_at` / `sync_revision`），**不**物化 checkpoint（committed checkpoint 仅在 `Stop`/`SessionEnd` 落盘）。若未来增删安装事件，必须同步本节、`docs/development/commands/hooks.md`、schema tests 和 uninstall 规则。
 
 4. **停用与移除**
 
-   `libra agent disable --agent claude-code` / `remove claude-code` 只能删除 Libra-managed hook entries（command 以安装时写入的 libra 绝对路径开头、以 `hooks claude <verb>` 结尾）；不得删除用户自定义 hook、`.claude/settings.json` 中其它配置或已捕获的 `agent_session` / `agent_checkpoint` / `refs/libra/traces` 数据。停用后 capability matrix 必须显示 `supported=true`、`hook_installable=true`、`installed=false`。
+   `libra agent disable --agent claude-code` / `remove claude-code` 只能删除带 `statusMessage: "libra capture"` 且与直接 command grammar/timeout/budget 精确匹配的 Libra-managed hook entries。无标记 legacy/旧 canonical command（即使 executable 恰好等于当前 binary）必须保留；用户可先显式 enable 使其带标记后再停用。不得删除用户自定义 hook、`.claude/settings.json` 中其它配置或已捕获的 `agent_session` / `agent_checkpoint` / `refs/libra/traces` 数据。停用后 capability matrix 必须显示 `supported=true`、`hook_installable=true`、`installed=false`。
 
 ### OpenCode 安装流程契约（第一批必须满足）
 
@@ -242,7 +242,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 5. **采集完成态（默认 lifecycle-only，A6.5 实测固定；DR-04b 后可升级为内容捕获）**
 
-   OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。未注册 exporter 信任时，hook 采集产生的 checkpoint 以**空 transcript 快照**为合法（降级）完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源，其环境不注册 exporter 信任）。**DR-04b 落地后**：当操作者已固定受信 `opencode` exporter（`libra agent rpc trust --dir <path>` + `libra agent rpc trust opencode`）且 Required sandbox 可用时，`session.idle` hook 路径经沙箱化 `opencode export <session>` bridge 取得授权 Bytes（seam → normalize → redact → claim），产生携带内容的 checkpoint；exporter 不可信/不可用时保持上述降级完成态并告警。装配层已收敛到 `SandboxManager::transform`（`SandboxEnforcement::Required`，Linux 经 `trusted_bwrap_exe` 注入受信 bwrap；macOS 经 `select_initial` 选 seatbelt `/usr/bin/sandbox-exec`）；执行模型不变（仍走 `run_bounded_exporter`：文件备份 stdout、`RLIMIT_FSIZE`、进程组、3s 墙钟、16 MiB）。**macOS 支持**内容捕获：store 目录可写（WAL SQLite 例外）、其余主机路径写被拒、网络被拒。seatbelt 存在 **弃用** 风险（Apple 可能移除 `sandbox-exec`）。**读隔离**不对称：macOS seatbelt 全局 `(allow file-read*)`，**不限制读**（可读调用用户可读的任意主机文件），与 Linux bwrap 默认拒绝读不同（ADR-SBX-03）。`sandbox-exec` 不可用时 fail-closed 降级 **metadata-only**，绝无 unsandboxed 回落。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`）。
+OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。未注册 exporter 信任时，hook 采集产生的 checkpoint 以**空 transcript 快照**为合法（降级）完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源，其环境不注册 exporter 信任）。**DR-04b 落地后（Linux）**：当操作者已固定受信 `opencode` exporter（`libra agent rpc trust --dir <path>` + `libra agent rpc trust opencode`）且 Required bwrap sandbox 可用时，`session.idle` hook 路径经沙箱化 `opencode export <session>` bridge 取得授权 Bytes（seam → normalize → redact → claim），产生携带内容的 checkpoint；exporter 不可信/不可用时保持上述降级完成态并告警。这里的 `bwrap` 必须是受信实现且通过 descriptor-native `--bind-fd` 运行时安全探测；不支持该能力的旧版/受限安装一律报告 unavailable，操作者应安装或升级系统 `bwrap`，不得降级为未沙箱化 exporter。装配层经 `SandboxManager::transform` 以 `trusted_bwrap_exe` 注入受信 bwrap；执行仍走 `run_bounded_exporter`（文件备份 stdout、`RLIMIT_FSIZE`、进程组、3s 墙钟、16 MiB）。exporter 本体在同一 capture deadline 内先复验 trust record 的 sha256/device/inode/mtime，再以 `O_NOFOLLOW` 打开、核对该 descriptor 的 device/inode/mtime 后流式复制进 Libra 私有的只读匿名 descriptor（复制字节再核对 sha256），bwrap 只经 `--ro-bind-fd` 映射该副本；受信 binary 不设固定大小上限（真实 OpenCode Bun 单文件约 171 MiB），hash 与复制均以该 descriptor 自身 stat 长度为界，读出超过报告长度即 fail-closed。**macOS 不支持 OpenCode 内容导出**：Seatbelt 无法对可 fork 的 exporter 提供外层 hook 取消后的安全后代收束，因此 Libra 会在启动 `sandbox-exec` 或 exporter **之前** fail-closed，capture 始终保持 **metadata-only**，绝无 unsandboxed 回落。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`）。
 
 ### Codex 捕获目标契约（AG-19 已落地）
 
@@ -275,10 +275,10 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
 
    安装成功后的副作用只允许是 Libra 管理的 Codex hook 配置（0.142.4 实测固定）：
 
-   - **写入目标是用户级** `$CODEX_HOME/hooks.json`（`CODEX_HOME` env 缺省 `~/.codex`）：形如 `{"hooks": {"<EventName>": [{"hooks": [{"type": "command", "command": "<canonical binary> hooks codex <verb>", "timeout": 30, "statusMessage": "libra capture"}]}]}}`（顶层 key 必须是 `hooks`，handler 字段 `deny_unknown_fields`）。project 级 `.codex/hooks.json` 是真实加载路径，但只对用户 config 中 `[projects."<abs>"] trust_level = "trusted"` 的项目生效（且 bypass flag 也不解锁未受信项目层），Libra 因此不写 project 级。
+   - **写入目标是用户级** `$CODEX_HOME/hooks.json`（`CODEX_HOME` env 缺省 `~/.codex`）：普通事件形如 `{"hooks": {"<EventName>": [{"hooks": [{"type": "command", "command": "<canonical binary> hooks codex <verb> --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}]}}`（顶层 key 必须是 `hooks`，handler 字段 `deny_unknown_fields`）。`--capture-budget-ms` 是 installer 从实际 handler timeout 减 1000ms 写入的受限隐藏参数（普通事件默认 `30s → 29000`）；**`SessionEnd` 受 Codex 宿主三秒上限，必须写 `3s → 2000`**。hook runtime 在读 stdin 前将其换算为一次性绝对 deadline，terminal 事件即使预算已耗尽也只落 durable pending 而不伪造 stopped。project 级 `.codex/hooks.json` 是真实加载路径，但只对用户 config 中 `[projects."<abs>"] trust_level = "trusted"` 的项目生效（且 bypass flag 也不解锁未受信项目层），Libra 因此不写 project 级。
    - hooks feature 在 0.142.4 默认启用（Stage::Stable），无需也不得写 `[features] hooks = true`。
    - **trust 双重门控（实测 + 源码核对）**：用户级 `$CODEX_HOME/config.toml` `[hooks.state."<hooks.json 绝对路径>:<event_snake>:<group_idx>:<handler_idx>"]`，字段 `enabled`（缺省 true）+ `trusted_hash = "sha256:" + sha256(紧凑、键递归排序的 JSON {"event_name","matcher"?,"hooks":[{"type","command","timeout"(生效值,缺省600),"async":false,"statusMessage"?}]})`。installer 自算 hash 只增删 Libra 自有 entry（带 `# libra-managed codex hook trust entry (AG-19)` 标记注释行），其余字节原样保留（byte-for-byte pin 测试）。**未受信 hook 在 `codex exec` 下静默不执行**（零 stderr 信号），故 `hooks_are_installed` 要求零 trust gap；state key 是位置型（上游 TODO durable id），重装必须按最终文件重算 index 并清理指向本文件的陈旧 Libra key。
-   - 安装 canonical provider events：`SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop`、**`SubagentStart`、`SubagentStop`**（Codex 原生 subagent 生命周期 hook，映射 Libra `SubagentStart`/`SubagentEnd`）。`PreToolUse`/`PreCompact`/`PostCompact`/`PermissionRequest` 可解析（`recognizes_event` 全表 10 名）但默认不安装转发。
+   - 安装全部 11 个 canonical provider events：`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PermissionRequest`、`PreCompact`、`PostCompact`、`Stop`、`SessionEnd`、**`SubagentStart`、`SubagentStop`**。其中 `PreToolUse`/`PostToolUse` 共用 `tool-use` verb，`PreCompact`/`PostCompact` 共用 `compaction` verb，Codex 原生 subagent 生命周期分别映射 Libra `SubagentStart`/`SubagentEnd`。安装映射必须与 `CODEX_HOOK_FORWARD_MAP`、用户 hook 文档和 uninstall 规则保持同步。
    - **trust-gap banner（AG-19）**：Codex `SessionStart` ingest 成功后，结构性比较 hooks.json 中 Libra-managed handler 与 `[hooks.state]` 当前 hash，仅当存在未批准 entry 时向 stderr 输出一条 banner（提示 `libra agent enable --agent codex` 刷新）；`enabled=false` 且 hash 匹配是刻意停用，不算 gap。
    - `--force` / `--local-dev` 当前没有公开 CLI surface；不得出现在用户示例中。若未来实现，必须同时挂在 canonical `enable`/`disable` 与 alias `add`/`remove` 上，且只能重写 Libra-managed Codex hook entries，不得删除用户自定义 hook。
 
@@ -286,7 +286,7 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
 
    - Codex CLI 版本 `codex-cli 0.142.4`；smoke 入口 `codex exec -C <repo> --skip-git-repo-check --sandbox read-only "<短 prompt>" </dev/null`（**stdin 必须重定向**：非 tty 打开的 stdin 会让 exec 永久等待）。hook 触发时 exec transcript 打印 `hook: <EventName>` / `hook: <EventName> Completed`。
    - hook 收到的 stdin payload 为 Claude Code 兼容单行 JSON：`session_id`、`transcript_path`（`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`）、`cwd`、`hook_event_name`、`model`、`permission_mode`，事件特有字段 `prompt`/`turn_id`（UserPromptSubmit）、`tool_name`/`tool_input`/`tool_response`/`tool_use_id`（Pre/PostToolUse）、`stop_hook_active`/`last_assistant_message`（Stop）、`source`（SessionStart：`startup|resume|clear|compact`）。
-   - Libra-managed entry 识别规则：handler `command` 含子串 `" hooks codex "`（兼容旧拼写 `agent hooks codex`）；卸载按该规则反向匹配，只删自有 handler/state，group 清空才删除，文件永不删除。trusted_hash 算法已用两个已知向量外部复现逐字节命中（探测记录：`session_start` 向量 `sha256:11a16641…f6195`）。
+   - Libra-managed entry 识别规则：必须是 `type: "command"`、已知 forwarded verb 与精确 `hooks codex`（兼容旧 `agent hooks codex`）grammar、`statusMessage: "libra capture"` 标记及精确 timeout/budget 对。卸载和 `[hooks.state]` trust 清理只删这些有持久证据的 handler/state，group 清空才删除，文件永不删除；无标记 legacy/旧 canonical command（包括 `libra`/`libra.exe`）均保留且绝不获得 Libra trust，只有 explicit enable 选择完全相同 binary path 的 matcher-less direct command 时才可迁移。trusted_hash 算法已用两个已知向量外部复现逐字节命中（探测记录：`session_start` 向量 `sha256:11a16641…f6195`）。
    - 保留用户配置断言均有 pin 测试：用户 hooks.json group/handler 结构保留、config.toml 用户字节做前缀精确保留、卸载后 byte-for-byte 还原。
 
 4. **运行 Codex 并自动捕获（已落地）**
@@ -297,19 +297,29 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
    libra hooks codex session-start
    libra hooks codex prompt
    libra hooks codex tool-use
+   libra hooks codex permission-request
+   libra hooks codex compaction
    libra hooks codex stop
+   libra hooks codex session-end
    libra hooks codex subagent-start
    libra hooks codex subagent-end
    ```
 
-   hook 文件写出的稳定调用面是 `libra hooks codex <verb>`（路由到 AgentTraces 捕获路径 `refs/libra/traces`）；`libra agent hooks codex <verb>` 保留为同一路径的内部入口。provider event 到 Libra lifecycle event 的映射（已固定）：
+   所有 hook 入口（`libra hooks <provider> <verb>` 与隐藏的 `libra agent hooks …`）在 `cli.rs` 完成 argv 解析与 capture deadline 建立后立即分派：跳过 worktree-scope pin、中央 operation 边界（不写 `libra op log`，也不是 `op undo`/`op restore` 目标）、global config schema 策略、auto-upgrade recovery/check 与通用仓库 preflight（durable object-index repair 重放留给下一次普通仓库命令）；capture 打开仓库数据库时与普通仓库命令一致：自动套用待处理 schema migrations（逐版本 claim-first 事务；带 `--capture-budget-ms` deadline 时锁等待受 ≤200ms busy 切片约束，无 deadline 的旧命令仍为 30s；DDL 本身不可被 hook deadline 抢占），并以无路径 `LBR-IO-001` 拒绝较新 Libra 写入的 schema（gemini 拒绝入口的数据库探测同样如此）；capture 状态记录在 capture catalog 与 `refs/libra/traces`。Operation view 仍快照 `reference` 表（含 `traces`），但 `RestoreEngine::restore_references`（`op undo`/`op redo`/`op revert`/`op restore` 及其失败回滚）按 `is_restore_preserved_branch`（`traces`、旧名 `agent-traces`、`intent`、`libra/intent`）保留这些分支的当前行，不回退、不 prune、不从 view 重建；被保留分支与 view 不一致时，发布的 post-view 改用实际 refs facet。
+
+   hook 文件写出的稳定调用面是 `libra hooks codex <verb>`（路由到 AgentTraces 捕获路径 `refs/libra/traces`）；安装器额外写入其受管 `--capture-budget-ms` 参数，`libra agent hooks codex <verb>` 保留为同一路径的内部入口并兼容该参数。provider event 到 Libra lifecycle event 的映射（已固定）：
 
    | Codex 事件 | Hook 命令 | Libra lifecycle | 最小捕获字段 | 写入边界 |
    |---|---|---|---|---|
    | `SessionStart` | `session-start` | `SessionStart` | `session_id`、`transcript_path`、`cwd`、`model` | upsert `agent_session`，记录 owner/model/transcript path |
    | `UserPromptSubmit` | `prompt` | `TurnStart` | `session_id`、`turn_id`、`prompt`、`transcript_path` | 追加 session event，允许 prompt 摘要进入 metadata |
+   | `PreToolUse` | `tool-use` | `ToolUse` | `tool_name`、`tool_input`、`tool_use_id`、`cwd` | 进入共同 capture coordinator，刷新 tool-use lifecycle |
    | `PostToolUse` | `tool-use` | `ToolUse` | `tool_name`、`tool_use_id`、`tool_input`、`cwd` | 只把 `apply_patch` / `Write` / `Edit` 归入文件变更集 |
+   | `PermissionRequest` | `permission-request` | `PermissionRequest` | `session_id`、`cwd`、`permission_mode` | 进入共同 capture coordinator，记录 permission lifecycle |
+   | `PreCompact` | `compaction` | `Compaction` | `session_id`、`transcript_path`、`cwd` | 进入共同 capture coordinator，记录 compaction lifecycle |
+   | `PostCompact` | `compaction` | `CompactionCompleted` | `session_id`、`transcript_path`、`cwd` | 进入共同 capture coordinator，记录 compaction completion |
    | `Stop` | `stop` | `TurnEnd` | `session_id`、`turn_id`、`transcript_path` | 形成 checkpoint 边界，触发 transcript 增量读取 |
+   | `SessionEnd` | `session-end` | `SessionEnd` | `session_id`、`transcript_path`、`cwd` | 形成 terminal checkpoint/pending-finalizer 边界 |
    | `SubagentStart` | `subagent-start` | `SubagentStart` | `session_id`、`cwd` | 记入 session `subagent_events` metadata（capped） |
    | `SubagentStop` | `subagent-end` | `SubagentEnd` | `session_id`、`cwd` | 记入 session `subagent_events` metadata 并**（A0-02 已实现）**物化独立 `scope='subagent'` checkpoint（`parent_checkpoint_id` 链回最近 committed checkpoint） |
 
@@ -332,7 +342,7 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
    libra agent push
    ```
 
-   默认 `list/show` 只展示 metadata，不自动展示 raw prompt、context、stderr 或完整 transcript；需要 redacted detail 的命令必须显式声明（受 cap/streaming/redaction 约束）；需要未脱敏 raw 的命令必须 `--allow-raw` 并写 audit log。
+   默认 `session list/show` 与 `checkpoint list` 只展示 metadata 摘要；默认 `checkpoint show` 只展示固定安全结构摘要，不读取 metadata 或 object OID。两者都不自动展示 raw prompt、context、stderr 或完整 transcript；需要 redacted detail 的命令必须显式声明（受 cap/streaming/redaction 约束）；需要未脱敏 raw 的命令必须 `--allow-raw` 并写 audit log。
 
 7. **停用与移除（已落地）**
 
@@ -343,7 +353,7 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
    libra agent remove codex
    ```
 
-   停用只移除 Libra-managed Codex hook entry（`$CODEX_HOME/hooks.json` 中 command 匹配 `" hooks codex "` 的 handler）并清理 Libra 写入的 `[hooks.state]` trust 记录（带标记注释的自有 section）；不删除用户自定义 Codex 配置（byte-for-byte pin 测试），也不删除已经捕获的 `agent_session`、`agent_checkpoint`、`refs/libra/traces` 数据。停用后 `libra agent list --json` 显示 `registered=true`、`hook_installable=true`、`installed=false`。历史数据清理仍走 `libra agent clean` / retention / GC 策略。
+   停用只移除拥有上述持久证据的 Libra-managed Codex hook entry（以及 Libra 写入的 `[hooks.state]` trust 记录，带标记注释的自有 section）；不以 command substring 认领，也不删除未标记 custom command、其它用户 Codex 配置（byte-for-byte pin 测试），更不删除已经捕获的 `agent_session`、`agent_checkpoint`、`refs/libra/traces` 数据。停用后 `libra agent list --json` 显示 `registered=true`、`hook_installable=true`、`installed=false`。历史数据清理仍走 `libra agent clean` / retention / GC 策略。
 
 8. **消费与执行边界**
 
@@ -375,7 +385,7 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
 |---|---|---|---|---|
 | 合理性 | ✅ 合理 | 目标与现有命令分工一致：外部 Agent 捕获、hook、transcript 和 checkpoint 归 `libra agent`；受控执行、approval、sandbox 和 workspace mutation 归 `libra code`。因此方向成立，风险主要是实现时把 observed external agent 边界外扩。 | `libra agent` 继续做外部 Agent 捕获，`libra code` 继续做内部受控 AgentRuntime，边界符合当前源码和 Gate 8 方向；observed external agent 只能提供 transcript、hook event、findings、provenance。 | Gate 8 任何任务不得把 observed external agent 变成 mutating executor；fix、workspace mutation、tool approval、sandbox 执行只能桥接内部 AgentRuntime。 |
 | 可行性 | ✅ 合理 | 已有基础设施支撑分阶段交付；关键安全、修复、并发和 workflow 能力虽仍是净新建，但本文已把它们拆成独立 AG 卡、前置依赖和降级形态。执行 `libra agent` 外部捕获计划不要求先完成完整内部 AgentRuntime / Web-only 迁移；真正的硬前置只出现在 AG-22 / AG-23 的 mutating fix/action 路径。 | 已有 `AgentKind`、`ObservedAgent`、hook dispatcher、RPC v1、checkpoint writer；settings gate、stderr 捕获、doctor repair、prune 并发保护、review / investigate 命令层按 AG-18/AG-20/AG-22/AG-23 净新建交付。AG-22 / AG-23 拆成 read-only workflow 与 mutating fix bridge 两层：read-only review/investigate 启动的是**外部 agent 进程**（Claude Code/Codex/OpenCode），其并发 fan-out 依赖 AG-18 external RPC spawn 能力 + workspace 隔离，**不是**内部 `SubAgentDispatcher::dispatch_batch`；`materialize_isolated_workspace`（`sub_agent_dispatcher.rs:738`）可作为 workspace 隔离 helper 复用候选，但须在 AG-22/AG-23 中明确抽取边界。fix/action 必须等待内部 serialized fix 入口经源码确认。 | 分阶段落地：AG-16 / AG-18 先冻结 capability 与安全 contract，AG-19 / AG-20 再接 writer。AG-22 / AG-23 若 fix bridge 未就绪，只能发布 read-only findings/provenance/manual attach；不得暗示 `--fix` 可用。完整 `docs/development/internal/code-agent-runtime.md` 内部迁移计划不是本文整体前置，只在 mutating fix/action 桥接时成为硬前置。 |
-| 完整性 | ✅ 合理 | 主流程覆盖面足够支撑方案拆分；本文已把版本、迁移、崩溃恢复、分页、资源预算、超时重试、合规、测试 target、DoD、settings、migration、错误码、release/rollback 固化为强制门禁。门禁是落地输入，不等同于当前代码已满足。 | 主路径覆盖 capability contract、CLI、RPC、lifecycle、checkpoint/export、review/investigate；schema versioning、migration/backfill/rollback、crash recovery、分页、资源预算、超时重试和索引门禁均已在本文冻结为 AG-18/AG-20/AG-24a/AG-24 输入。D1/R2 agent capture mirror 本身**已生效**（`libra cloud sync`/`restore`）；普通 checkpoint retention 的 D1 prune tombstone/catalog 删除也已生效。仍待建的是 session erasure 的 cloud tombstone/catalog 删除以及 R2 物理删除。 | 保留已补的 `AgentKind` 命名映射、资源预算、超时重试、分页复合索引、DoD、settings、migration、错误码和 release/rollback 要求；AG-20 必须有 crash recovery 矩阵、分页契约、migration/backfill/rollback 证据；AG-24a 必须落地合规实现与测试，AG-24 必须逐项证明本文门禁已有测试/文档/延后说明。 |
+| 完整性 | ✅ 合理 | 主流程覆盖面足够支撑方案拆分；本文已把版本、迁移、崩溃恢复、分页、资源预算、超时重试、合规、测试 target、DoD、settings、migration、错误码、release/rollback 固化为强制门禁。门禁是落地输入，不等同于当前代码已满足。 | 主路径覆盖 capability contract、CLI、RPC、lifecycle、checkpoint/export、review/investigate；schema versioning、migration/backfill/rollback、crash recovery、分页、资源预算、超时重试和索引门禁均已在本文冻结为 AG-18/AG-20/AG-24a/AG-24 输入。D1/R2 agent capture mirror 本身**已生效**（`libra cloud sync`/`restore`）；普通 checkpoint retention 的 D1 prune tombstone/catalog 删除和 session erasure tombstone/catalog 删除均已生效（plan-20260714 PD-03，restore 双向 tombstone 优先）。仍 deferred 的只有 R2 payload 物理删除。 | 保留已补的 `AgentKind` 命名映射、资源预算、超时重试、分页复合索引、DoD、settings、migration、错误码和 release/rollback 要求；AG-20 必须有 crash recovery 矩阵、分页契约、migration/backfill/rollback 证据；AG-24a 必须落地合规实现与测试，AG-24 必须逐项证明本文门禁已有测试/文档/延后说明。 |
 | 安全性 | ✅ 合理 | 2026-06-17 基线曾存在外部 binary PATH 信任、env/stderr 继承、provenance 缺失和 redaction 绕过风险；AG-18/AG-19/AG-20 已把这些风险收束为 fail-closed 安全门禁。 | 当前 `libra-agent-*` external RPC 默认受 settings gate 保护，spawn 使用 `env_clear` + allowlist，stderr 捕获后 cap/redaction，内置 slug 仿冒 skip/fail-closed，provenance 记录 sha256/device/inode/mtime 并在 spawn 前复验；hook ingest 在写入前 redaction，checkpoint/export 读取 raw 时走 `--allow-raw` + append-only audit。 | env 默认 fail-closed：`env_clear` + allowlist；stderr 捕获、截断、redaction；provenance 使用受信目录或 sha256 登记并缓解 TOCTOU；内置 slug skip-and-log；raw hook input 不得落盘；checkpoint/raw export 必须保留 audit 与 bounded read。exec-bit 已实现，勿重做。 |
 | 功能正确性与接口兼容性 | ✅ 合理 | 命名和 wire 形状差异已被明确列为契约问题，而不是隐含假设：返回字段、DB 列、RPC v1/v2 capability 形状、CLI slug 和 SQL enum 的差异都已有映射、版本轴、alias parity 与 schema pin 要求。 | `append_checkpoint_commit` 返回字段是 `commit_hash`，写 DB 列时才对应 `traces_commit`；RPC v1 `capabilities` method 与 v2 `info.capabilities` 同名异构；SQL `agent_kind` 用 snake_case，CLI slug 用 kebab-case，转换由 `AgentKind` 四个 match 函数负责。 | `list` / `add` / `remove` 只是 `status` / `enable` / `disable` alias，必须同语义、同退出码、同 JSON；RPC v1/v2 协商和错误语义见版本兼容矩阵；所有 `--json` 字段加 schema pin test；命名映射必须满足 CLI、DB、JSON、docs、测试 round-trip。 |
 | 数据流与控制流正确性 | ✅ 合理 | parser -> normalized event -> validation/redaction -> writer 的分层方向正确；非原子写序带来的 ref/catalog 窗口已被固化为 5 阶段 crash window、幂等重试、doctor repair 和 prune 并发保护要求。 | 真实 checkpoint 写序是 blob/tree -> `object_index` enqueue -> ref CAS -> `agent_checkpoint` INSERT -> 用户输出，其中 ref 已提升但 DB 行未 INSERT 是高风险窗口。本文已把窗口 A（loose object）和窗口 B（catalog-vs-ref）分别纳入 AG-20 并发测试与修复策略。 | 固化 5 阶段 crash window；doctor repair 覆盖 DB 行缺对象、ref 可达无 catalog、`object_index` 缺索引三类；ref CAS 冲突必须可重试；prune 并发保护区分 loose-object 窗口和 catalog-vs-ref 窗口；redaction 失败必须 fail-closed。 |
@@ -421,7 +431,7 @@ Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结�
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/agent/checkpoint.rs`、`src/command/agent/clean.rs`、`src/command/agent/doctor.rs`、`src/command/agent/hooks.rs`、`src/command/agent/list.rs`、`src/command/agent/mod.rs`、`src/command/agent/push.rs`、`src/command/agent/rpc.rs`、`src/command/agent/session.rs`、`src/command/agent/status.rs`，以及顶层 `review` / `investigate` 命令实现 `src/command/agent/review.rs`、`src/command/agent/investigate.rs`。参数/子命令类型包括：`AgentHooksSubcommand`、`AgentArgs`、`AgentSubcommand`、`ListArgs`、`StatusArgs`、`EnableArgs`、`DisableArgs`、`AddRemoveArgs`、`CleanArgs`、`DoctorArgs`、`PushArgs`、`CheckpointSubcommand`、`CheckpointListArgs`、`CheckpointShowArgs`、`CheckpointExportArgs`、`CheckpointRewindArgs`、`SessionSubcommand`、`SessionListArgs`、`SessionShowArgs`、`SessionStopArgs`、`SessionResumeArgs`、`SessionPromoteArgs`、`SessionDeriveToolCallsArgs`、`AgentRpcSubcommand`、`AgentRpcListArgs`、`AgentRpcInvokeArgs`、`AgentRpcTrustArgs`；输出、错误或状态类型包括：`HookCommandKind`；主要执行函数包括：`execute_safe`。
-- 捕获实现分层：观测 adapter 在 `src/internal/ai/observed_agents/`（`adapter.rs` 的 `ObservedAgent`、能力访问器、`TranscriptTruncator`/`TranscriptChunker` optional traits、`AgentKind`；`capability.rs` 的 `DeclaredAgentCaps`；`registry.rs` 的 first-batch matrix；`rpc.rs` 的 external `libra-agent-*`；`redaction.rs`；`compliance.rs`；`builtin/`）；hook 生命周期在 `src/internal/ai/hooks/`（`lifecycle.rs` 的 `LifecycleEventKind`、`runtime.rs`、`providers/{claude,codex,opencode}` 第一批 provider，`gemini` 仅保留 legacy uninstall/data 兼容）；checkpoint 写入在 `src/internal/ai/history.rs`（`HistoryManager::append_checkpoint_commit`、`prune_checkpoint_commits`、`erase_session_local`）。
+- 捕获实现分层：观测 adapter 在 `src/internal/ai/observed_agents/`（`adapter.rs` 的 `ObservedAgent`、能力访问器、`live_capture.rs` 的 crate-internal `LiveCaptureProvider` live-capture policy port（经 `live_capture_for` 唯一 lookup）、`TranscriptTruncator`/`TranscriptChunker` optional traits、`AgentKind`；`capability.rs` 的 `DeclaredAgentCaps`；`registry.rs` 的 first-batch matrix；`rpc.rs` 的 external `libra-agent-*`；`redaction.rs`；`compliance.rs`；`builtin/`）；hook 生命周期在 `src/internal/ai/hooks/`（`lifecycle.rs` 的 `LifecycleEventKind`、`runtime.rs` 的共享入口与目标分派、`intent.rs` 的 legacy AiIntent writer、`providers/{claude,codex,opencode}` 第一批 provider，`gemini` 仅保留 legacy uninstall/data 兼容）；AgentTraces 管线在 `capture/live_pipeline.rs`，committed／subagent checkpoint writers 在 `capture/live_checkpoint.rs`；受管 hook 的 cwd/replay-key 绑定 helper 在 `capture/scope_binding.rs`，共享 live 边界（执行期限、session id、只读期限、窄化 envelope、hash-kind preflight、ingest span 与 scoped 只读 probe）在 `capture/live.rs`；checkpoint 写入在 `src/internal/ai/history.rs`（`HistoryManager::append_checkpoint_commit`、`prune_checkpoint_commits`、`erase_session_local`）。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据；AI 路径会读写 session、checkpoint、thread graph 或 agent profile 状态。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
@@ -458,7 +468,103 @@ flowchart TD
 - 公开参数/子命令包括：`status`、`list`、`enable [--agent <NAME>...]`、`add <NAME>...`、`disable [--agent <NAME>...]`、`remove <NAME>...`、`session <list|show|stop|resume|promote|derive-tool-calls>`、`checkpoint <list|show|export|rewind>`、`clean [--all|--gc] [--retention-days <DAYS>]`、`doctor [--repair]`、`push [--remote <NAME>] [--force-rewrite]`、`rpc <list|invoke|trust|untrust>`（隐藏的 `hooks` 子命令供已安装的 provider hook 内部调用）。
 - 当前源码已注册 `AgentKind`：`ClaudeCode`、`Cursor`、`Codex`、`Gemini`、`OpenCode`、`Copilot`、`FactoryAi`（7 类，`observed_agents/adapter.rs`），这是实现基线和迁移事实，不等于本文第一批 supported roster。当前 public supported roster 由 `observed_agents/registry.rs::supported_slugs()` 派生为 `claude-code` / `codex` / `opencode`；三者均为 hook-installable、transcript-readable、launchable review/investigate。`gemini`、`cursor`、`copilot`、`factory-ai` 在 capability matrix 中保持 unsupported / not hook-installable / not launchable；`gemini` 仅保留 remove/disable 的 uninstall-only 兼容通道。
 
-> **当前安全现状（AG-18/AG-19/AG-20/AG-24a 后）**：external RPC 默认受 `agent.external_agents.enabled` settings gate 保护；`libra-agent-*` spawn 使用 `env_clear()` + allowlist，stderr/stdout 被捕获、cap、redact，内置 slug 仿冒被 skip/fail-closed，受信 binary 以 sha256/device/inode/mtime provenance 复验。hook ingest 只经 provider parser -> normalized lifecycle event -> validation/owner filtering/redaction -> checkpoint writer；raw checkpoint export 必须 `--allow-raw --raw` 并写入 append-only `agent_audit_log`。fd-based exec 仍是显式延期的 TOCTOU 强化项；当前实现采用 canonical path + 父目录权限 + hash/device/inode/mtime 复验 + absolute-path spawn 的 best-effort mitigation。
+> **当前安全现状（AG-18/AG-19/AG-20/AG-24a 后）**：external RPC 默认受 `agent.external_agents.enabled` settings gate 保护；`libra-agent-*` spawn 使用 `env_clear()` + allowlist，stderr/stdout 被捕获、cap、redact，内置 slug 仿冒被 skip/fail-closed，受信 binary 以 sha256/device/inode/mtime provenance 复验。hook ingest 先经 `capture::ingress::CaptureIngressCommand` 执行 1 MiB、UTF-8、空输入、JSON、envelope 校验，并将 reported cwd 与 transcript path 分别限制为 4096 bytes，再由 provider parser 降为 normalized lifecycle event；随后才进入 owner filtering/redaction/checkpoint writer。ingress 在任何 catalog/checkpoint side effect 前完成且不持有 DB/ref/store。raw checkpoint export 必须 `--allow-raw --raw` 并写入 append-only `agent_audit_log`。fd-based exec 仍是显式延期的 TOCTOU 强化项；当前实现采用 canonical path + 父目录权限 + hash/device/inode/mtime 复验 + absolute-path spawn 的 best-effort mitigation。
+
+### Session Capture 通用协调层（ACF）
+
+Agent Capture 的唯一持久化路径按下列边界流动；这是 live hook 与 historical
+import 共同消费的实现约束，而不是新的 provider framework：
+
+```text
+provider adapter
+  → validated ingress + pure lifecycle reducer
+  → CaptureCoordinator
+  → authorized snapshot / catalog port / checkpoint-store port
+```
+
+- provider adapter 只做来源探测、原生事件解析、原生 transcript source 能力投影；它不得直接写 SQL、ref、`HistoryManager` 或 doctor 状态。ingress 先完成有界 frame/envelope 校验；replay identity 仅来自 provider-native scalar id 的 keyed HMAC，缺 id 时不作语义 payload fallback。
+- reducer 只从 durable state、normalized event 与注入的时间/政策产生 typed action。它不读 clock、文件系统、DB、ref 或 provider identity；Unix-seconds deadline 比较只是 advisory guard，runtime 的 monotonic `CaptureDeadline` 才是 I/O/mutation 边界的权威期限。catalog 的 scope/fence、receipt 和 revision precondition 在任何 store side effect 前验证。
+- 旧 `HookTarget::AiIntent` session JSON 仍有 `transition_phase` 作为 UI `SessionPhase` 投影；它不决定 durable `agent_session` state/checkpoint action，不属于第二套 capture reducer。
+- snapshot 只从已授权的 `TranscriptSource` 读取。historical import 的 descriptor-pinned helper 以持有的 source FD 作为 stdin capability；其有界、可取消并可 reap 的 control 只含固定 enum、上限和固定长度 commitment，绝不携带 locator、provider/session ID、repository/storage path、现有 metadata 或 raw bytes。它只作一次有界读取，立即把 bytes 交给共享 snapshot，绝不 reopen 或第二次完整读取；它不是第二条 catalog/checkpoint 持久化路径。父端完成 root/storage/scope/workspace-fence 复核后，才把瞬态 source preimage 变成 repository-keyed、domain-separated `source/hmac-v2/<64 lower-hex>` commitment；raw source 与未加钥 SHA 只可在受限本地读取/脱敏边界中存在。V2 可携带的 snapshot digest 是对 redacted snapshot content 使用独立 domain 的 repository-keyed `source/hmac-v2/<64 lower-hex>` commitment；helper 的瞬态 SHA-256 绝不持久化。bare 或带标签的未加钥 SHA 只可作为不可变 legacy proof 读取，绝不进入 V2 或 cloud。V1 仅在 exact scoped proof、committed/quiescent identity/catalog/repair marker 同时成立时原子迁移，否则保持 V1 且不创建并行 V2。catalog、checkpoint、marker、日志和诊断只接收 `RedactedBytes`、安全投影、该 commitment 或固定枚举的阶段信息。
+- `CheckpointStore` façade（`capture/checkpoint.rs`）只接受 sealed `CheckpointWriteRequest`（redacted snapshot、scope、marker generation、`TracesTxnExtra`、deadline），返回 typed `CheckpointWriteOutcome`，不暴露 ref topology。`HistoryManager` 的 append 失败以 typed cause 分类（`CheckpointAppendConflict::{RefCasExhausted, MarkerFenced}`、`CheckpointCompanionTransactionFailed`），不靠错误文字匹配；ref CAS 与 catalog/coverage companion 在同一 transaction 中回滚。objects 已写入后的失败（CAS、companion、cleanup）恢复路径固定为 cleanup_pending marker → `libra agent doctor --repair` → replay；只有 objects 尚未写入的失败才走普通 marker retirement。coverage 已全覆盖的 no-op replay（live 与 OpenCode）不经 `write`，而经 `TracesCheckpointStore::settle_committed_replay_without_write` 退役本 action 的 ordinary marker：无 durable row 时不触碰（可能属于在途 writer），`cleanup_pending` marker 保留并返回可重试错误直到 `libra agent doctor --repair`，因此最终状态不再取决于是否存在 provider transcript。runtime 不直接调用 append 或 marker 注册／清理／prune。
+- `CaptureCoordinator` 固定 catalog reservation → checkpoint store → terminal receipt 的顺序；snapshot 由 live/import 入口经 `CaptureSnapshotService` 取得并以 sealed payload 交给 checkpoint store，coordinator 本身不读取 provider source。`CaptureFinalizePolicy` 只携带绝对 deadline、sync/deferrable mode 与 stable replay key；provider 可注入该 policy，但不得私建 ledger/finalizer。
+- live 与 historical import 的 descriptor-pinned helper 都以持有的 source FD 作为 stdin capability；helper 子进程先 `env_clear()`、切到 `/`，之后只接收闭合且经过验证的固定控制字段，不继承 HOME、调用 cwd 或 provider/session 环境。live read helper 的控制项是固定 mode/cap；historical raw-read helper 只接收固定 read cap；import-preparation 控制另含有界的 agent/source enum、opaque provider commitment 与剩余预算（见上方 import wire 契约），不含 locator、provider/session ID、仓库路径、现有 metadata 或 raw bytes。live deadline-bound preparation、bounded read 与 redaction 在 helper 中协作式执行；操作期限不是主机级硬实时保证。snapshot source 的 `Debug` 省略 identity 与 digest；snapshot-content 的 repository-keyed HMAC-v2 domain 由 `capture/key.rs` 的 typed helper 唯一选择。序列化提取字段失败必须将投影标记为 partial 并省略该字段，不能用 `null` 伪装为成功结果。
+- repository-private capture key 的唯一 owner 是 `capture/key.rs`，runtime 只委派；保留 `private/agent-capture-dedup-v1.key` 原位置、32-byte key 和既有 source HMAC domains，不旋转身份。`CaptureScope` 在 key I/O 前验证 root/storage/scope/workspace fence/deadline。pending envelope MAC 使用独立 `pending-envelope/hmac-v1/` domain，绑定 canonical envelope 的 transient SHA-256 preimage；只有 MAC 可持久化，未加钥 preimage 不进 codec/cloud/diagnostics。签发和验证 pending MAC 都只读已建立 key：不 mkdir、chmod、创建 lock 或清理 staging，missing/insecure key 为可诊断失败，绝不 mint replacement。Unix pinned/no-follow、owner-only 和 staging crash recovery 保留；non-Unix 仍明确 fail-closed。
+- terminal checkpoint 未耐久时 session 不得成为 `stopped`。无 repository path、崩溃或可重试 store fault 都留下 content-free pending receipt；doctor 可重放有证据的操作。最多 5 次且 30 分钟的重放预算耗尽后转为 repair-required/quarantined，绝不以 exit success 或虚假 stopped 掩盖失败。
+
+### 私有恢复会话关联（ACF-15）
+
+`capture/pending_identity.rs` 提供版本化 closed alias registry codec。Repository `metadata_kv` 的 `agent_capture_session_alias` scope 以 canonical `libra.repoid` 为 target、UUIDv4 为 key；单条 ≤8 KiB，反向选择最多读取17条、正常容量16条。它持有敏感的既有 catalog PK、stable repo/worktree/workspace 及 capture incarnation，用于 indexed DB association，**不是 source locator 或读取授权，也未加密或匿名化**。禁止把这些关联复制到 artifact 控制字段、诊断、log、argv、Cloud/export；operator 整份 Repository DB-copy backup 仍含敏感关联，不能视为匿名化备份。
+
+关联 MAC 使用现有 key owner 的独立 `pending-alias/hmac-v1/` domain；原 source/envelope HMAC bytes/domain 不变。key 丢失时 replay/resolve fail-closed，不创建 replacement。catalog 返回不可 Debug/Serialize、字段私有的 `PendingSessionContext`，校验 current PK/scope/incarnation/tombstone/lease；MAC 不替代这些 current fences。选择和发布在 writer lock 下复核，签署在 writer transaction 外；新 alias 只与首份 artifact 在同一 transaction 发布，INSERT-only，竞争 mint 返回 conflict/retry，不能留下 alias-only orphan。
+
+GC 在 SQL hydration 前排除 registry/chunk scopes，仅检查 private targets 属于唯一 persisted repo ID，不能读 alias value、加载 key 或把 PK 当 OID。既有 selective Cloud snapshot 保持 byte-identical：新增 private registry/header/chunk 数据不进入 snapshot，但既有 `agent_session` wire 的 session/provider ID/working_dir 不变，不承诺它们从 Cloud 消失。checkpoint export 仍只读 committed checkpoint tree，不能消费 private pending/alias scopes。
+
+explicit erase 是已授权的 deletion，不是 replay；关联归属按同一 canonical repo 的 PK+incarnation，缺 key 或 evicted ledger 不阻归属清理，不因旧 worktree/workspace 关联阻止擦除。它直接移除有界读取内全部已确认归属 aliases，不使用 completion 的保守 unreferenced 检查；否则另一份损坏 header 会使敏感 PK 在 session 删除后残留。无法归属的损坏/foreign rows 保留并给 content-free note，不阻其他可归属 session erase；正常16条容量外的损坏仍只读最多17条，超出部分无法证明清理，ACF-10 必须消费 `has_unassigned()` 产生 content-free note，不声称全部私有数据已擦除。永久损坏且无一致性原 DB 备份时，其容量明确 lost，不承诺 doctor/retry 释放，不提供本计划内 force/discard 出口。live reverse lookup 为避免不明关联破坏 uniqueness，对任一 invalid registry row fail-closed：这不仅占一个槽，也会阻止新 alias mint/reuse，需恢复一致性 DB 关联后才能继续。所有 Complete/erase writers 的 artifact/alias 同 transaction 集成属于 ACF-10。live SessionEnd producer 经 `persist_pending_artifact` 准备并发布 alias，doctor／SessionStart worker 的 replay 经 lookup/resolve 消费；失去 mint 竞争时返回可重试的 typed conflict，不覆写既有 alias。卡片验收以计划收口为准。
+
+### 私有恢复 payload 投影（ACF-16）
+
+`capture::pending_payload` 的 closed projection 仅从 sealed checkpoint payload 建立。它移除 metadata 顶层 session/provider identity、working_dir 和 E3 顶层 session/provider identity；未知顶层控制字段、locator、重复键、超限深度或字节拒绝，已知 redacted data slots 内的 nested tool/user 字段不是 source opener，保持原内容。transcript/snapshot/source HMAC 与 closed redaction report exact bytes 保留；错误固定为 content-free doctor remedy；sidecar MAC 签署与验证中 typed transient（数据库、lease、deadline、可重试 I/O）原样保留以便延后重试，其余失败一律映射为该固定 remedy。live SessionEnd producer 在 seal 时调用此投影，doctor／worker replay 经 `load_verified_payload` 调用 rehydrate；不改变正常 checkpoint wire。
+
+恢复必须同时持有 ACF-15 verified alias/context 与 `checkpoint::AuthenticatedPendingEnvelope` 的 immutable MAC witness，且 witness body 的 payload 必须精确对应该 projection。seal 时按原格式重建并整文件 redaction，逐字节核对原 sealed sidecars；私有 purpose-framed sidecar MAC 复用 ACF-14 readonly local key owner，恢复时核对重建字节，避免当前 catalog provider/working_dir 或 redactor 变化悄悄改写 checkpoint。它不是 unkeyed native-id digest，不创建另一 key/source authority，不改变 provenance；ACF-10 仍须先检查 closed outer artifact/binding/receipt，ACF-12 仍须重验 source/coverage fences。
+
+sidecar MAC body 固定为 binary purpose framing，首 byte 与 canonical JSON-object envelope 的 `{` 不同；`AuthenticatedPendingEnvelope::verify` 在签发 witness 前强制该格式边界。sidecar body/tag 即使 MAC 正确也不能换成 envelope witness。signed `/payload` membership 比较双方 canonical JSON bytes，保留 u64 整数精度，不借用 CanonValue 的有损 numeric equality。两行 E3/cross-line policy fixture 与覆盖声明负例验证了上述边界。
+
+`PortablePendingCoverage` 只持久化 owner、时间与 semantic claims，不保存原 catalog PK；原 PK 由 verified context 在内存中重建，logical turn key、fence、revision、digest 保持不变。cross-line changed-policy 测试只是 MAC proxy；端到端 source-free SessionEnd replay 由 ACF-10/12/13 的真实 producer 与 doctor 测试覆盖。
+
+### 私有 durable artifact（ACF-10）
+
+`pending.rs` 的 closed envelope 现消费 ACF-15 verified alias 和 ACF-16 portable
+payload/coverage；私有 `binding.session_id` 字段的值是 canonical UUIDv4 alias，
+不是原 catalog PK。writer transaction 内 coverage 按内存 real PK 校验 owner/fence/
+revision，header/chunks 和 alias 同事务发布，catalog context/terminal binding 再验；
+key/MAC IO 在 writer transaction 外。HMAC witness、closed exact outer encoding 和
+payload membership 校验后才重建 sidecars，禁止 source reopen。
+
+Complete cleanup 删除 artifact 后保守检查 alias 是否仍有 header 引用。explicit
+erase 在已有 tombstone/prune 后的最后 catalog transaction 内，以 PK+incarnation
+归属清理。15 erasure descriptor 的 other-incarnation flag 不扩删除权限：若已知
+same-PK association 但当前 row/incarnation 缺失、不可读或不匹配，拒绝最终删除并
+保留 row/alias/chunks；第一阶段 tombstone 仍生效，需恢复一致性 catalog metadata。
+foreign/unassigned 损坏证据保留，提交后记录 content-free note。一份不可解码 header
+会阻断全仓新建/重投 artifact 与 destructive GC/root-walking maintenance，并使
+completion 保守保留 alias；不只是占一个槽。超容量仍只读17 headers/17 associations，
+未检查部分可能含 own session 内容，不声称所有私有副本已删除。
+
+explicit erase 遇到无法解码、或 alias 无 registry 行的非本 session header 时，设置 unassigned（容量丢失）诊断并保留证据，不静默忽略。live SessionEnd producer 在 marker／ref CAS 前持久化 artifact；doctor `--repair` 与 SessionStart one-shot worker 经同一 bounded executor 重放。各卡执行证据与测试数据只记录在计划文件 `plan-20260924.md`，本节只描述设计边界。
+
+#### 一次性恢复 worker 边界（ACF-11）
+
+SessionStart 只做 indexed `LIMIT 1` hint 与非阻塞 repo 锁探测，命中时 detached 启动固定隐藏 argv token `__capture-recovery-worker`；该入口在 `cli.rs` raw argv 最前置分派，拒绝任何额外 argv（固定文字 `capture recovery worker does not accept arguments`），跳过 startup recovery、global config/schema 与 auto-upgrade 副作用。子进程 `env_clear`、stdin/stdout/stderr 全为 null、cwd 为已验证 worktree root、Unix 下 `setsid` 新会话，source FD 均 CLOEXEC 不被继承；父进程不 wait。仅 debug 构建会把 `LIBRA_TEST` 与测试 hold 路径 `LIBRA_TEST_CAPTURE_WORKER_HOLD_PATH` 转发给子进程，release 子进程环境为空。已知限制：hook 进程从其上游继承的非 CLOEXEC 描述符仍可能传给 detached child（不是 source descriptor；在 `pre_exec` 中逐一关闭风险过高，未做）。子进程自持 `storage/private` 下 owner-only（目录 0700、文件 0600）、no-follow 的 OS advisory 锁，覆盖整批，handoff 时最多重试 500 ms；锁由进程退出自动释放，不用 PID 文件或 TTL。Windows 以 `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` 启动，锁文件以不跟随 reparse point 的方式打开；capture key 与 replay 在 non-Unix 仍 fail-closed，仅留 content-free advisory，durable receipt 不消失。
+
+#### doctor 重放期限（ACF-12）
+
+自动重放（SessionStart worker 与 doctor 对未过期 artifact）共享单次调用的一个 2 秒 cooperative deadline；每个 audited 人工 attempt（过期／超限 artifact 的一次性重放）各自取得独立的 2 秒 deadline。单次 `doctor --repair` 最多计入 5 次 attempt；`RetryLater` 与批次上限导致的延后不计数。期限只约束可取消工作，不是任意 syscall 的硬上界。
+
+Provider 后续工作必须遵守此贡献清单：只新增 adapter/parser/projector 或 policy 注入；复用 ingress、snapshot、catalog、checkpoint 与 coordinator ports；为 native-id、scope、redaction、失败/重放补契约测试；若需要共同 contract 新能力，先修订 foundation 卡，而不是在 provider 路径私建持久化状态。
+
+### live runtime 分解（ACF-17/ACF-19/ACF-18/ACF-20）
+
+ADR-ACF-10 把 `hooks/runtime.rs` 拆为按层落位的模块，行为与公开契约不变（exit code、stdout/stderr、错误码、durable bytes、structured `reason=` 均保持）。AgentTraces 分层为 hook entry（`hooks/runtime.rs`）→ live pipeline（`capture/live_pipeline.rs`）→ checkpoint writers（`capture/live_checkpoint.rs`）→ capture coordinator 与 catalog/checkpoint store ports；`capture/**` 生产代码不得反向 import `hooks::{runtime,intent,providers}`（由 `compat_agent_architecture_guard::capture_modules_do_not_import_hook_entry_layers` 守护）：
+
+- `hooks/runtime.rs`：hook entry——stdin ingress 校验、每个 callback 唯一一次 provider lookup（`LiveCaptureBinding::resolve`）、AgentTraces 期限建立、目标分派与终止错误分类；不含 SQL 字面量。ACF-20 冻结其 thin runtime inventory（`compat_agent_architecture_guard::coordinator_is_provider_neutral_and_runtime_is_thin` 精确相等）：non-test 函数只有 `process_hook_event_from_stdin`、`process_hook_event_with_target`、`await_hook_capture_with_deadline`、`classify_capture_ingress_for_target`、`effective_hook_capture_deadline`、`validate_capture_ingress_from_stdin`、`advisory_no_evidence_error`、`terminal_persistence_failure_error`，型别只有 `HookTarget`、`HookAdvisoryNoEvidence`、`HookTerminalPersistenceFailure`（`impl` 只针对这三者），无其他 const／static／trait／`macro_rules!`／non-test mod；`pub use`／`pub(crate) use` 兼容 re-export 集合冻结（checkpoint row helpers、`HookEnvelopeInvalid`、`build_ai_session_id`、scope-binding helper 入口、`AI_SESSION_SCHEMA`／`AI_SESSION_TYPE`、capture key commitment helpers，外加 cfg(test) `append_normalized_event`）。非 test top-level item 按「首个外层 attribute／doc 或首 token 之行至 syn span 末行」计行，总和 ≤480；依赖禁令以 syn path segment／identifier 精确比对 `sea_orm`、`DatabaseConnection`、`ConnectionTrait`、`Statement`、`internal::db`、`history`、`traces`、`coverage_gate`、`export_job`、`subagent_content`、`SessionStore`、`ClientStorage`、`write_git_object`、`CaptureCoordinator*`、`CaptureCatalog*`、`TracesCheckpointStore`、`CheckpointWriteRequest`、`CaptureSnapshotService`、`reduce_lifecycle`、`authorized_read`、`tokio::process`、`hooks::providers`、`AgentKind`、`agent_for`、`live_capture_for` 与 SQL 形字面量（doc／attribute 不扫描）；`process_hook_event_with_target` 依序 ingest span → 唯一一次 resolve → 有效期限 → ingress 校验 → 分类 → `await_hook_capture_with_deadline`。
+
+- `hooks/intent.rs`：legacy AiIntent writer（`process_ai_intent_ingress`，session store、`ai_session` blob 与 AI history 追加）。runtime 仍在 ingress 校验后才分派到它，并保留 `AI_SESSION_TYPE` / `AI_SESSION_SCHEMA` 的兼容 re-export。
+- `capture/scope_binding.rs`：受管 hook 的可杀 scope-binding helper（`bind_capture_scope_cwd_bounded`、私有 helper 协议、U/N/T scope proof（`N` = 在任何 Libra 仓库之外调用，属 unverified/advisory，绝不视为可信终态；non-Unix 不启动 helper，但先以同一分类函数做只读仓库探测：仓库之外得到同一 unverified no-repository 结果，仓库之内或探测失败才返回固定 unsupported-platform 结果）、cwd resolver），以及唯一的 scope-binding readiness 测试 seam。`main.rs` 的私有 helper 入口经 runtime 的兼容 re-export 调用，外部协议不变。
+- `capture/live.rs`：在原有 live catalog 适配之外，承接共享 live 边界子集——`HookExecutionDeadline`、`build_ai_session_id` / `redact_session_id`、AgentTraces 只读期限、窄化 runtime envelope 与仓库 hash-kind preflight（ACF-17）；以及 sanitized ingest span（`new_ingest_span`）与 scoped 只读 probe（ACF-19）：`agent_session_table_exists`（`sqlite_master` 检查）、`scoped_owner_agent_kind`（两个 owner-claim SELECT，各自保留原 `.context` 文字）、`load_capture_state`、`session_concurrent_active`、`terminal_session_identity_changed` 与 `latest_committed_checkpoint_id`。它是 live 路径中唯一含 SQL 字面量的模块，且只含 SELECT。
+- `capture/live_pipeline.rs`（ACF-19）：AgentTraces 管线 `ingest_agent_traces` → `ingest_agent_traces_payload_with_scope`（有界 hook DB、scope 解析、过期终止的 content-free pending 结算、redaction、catalog reservation 与 coordinator 交接），进程内测试入口与 live 测试 seam；其单元测试位于 `capture/live_pipeline_tests.rs`，仅期限与 scope-proof 分类的四个入口测试留在 runtime。
+- `capture/live_checkpoint.rs`（ACF-19）：committed／subagent checkpoint writers、coverage claim 清理、无 checkpoint 结算、终止 recovery artifact 判定与 extraction／redaction metadata 辅助；ACF-20 起 committed writer 分为 live source／coverage、export（`run_export_stage`）与 checkpoint（`run_checkpoint_stage`）三段，export-job lease 不再由 `CheckpointReservationCleanup` 携带（该结构只剩 coverage claim 字段，`claim_owner` 仍是放弃 claims 的唯一依据）。
+- typed provider identity（ACF-18）：`hooks/provider.rs` 的 `pub trait HookProviderIdentity { fn agent_kind(&self) -> AgentKind; }` 是 `HookProvider` 的 supertrait（`HookProvider: HookProviderIdentity + Sync`）；4 个 builtin 实作集中在 `hooks/providers/mod.rs`（Claude→`ClaudeCode`、Codex→`Codex`、Gemini→`Gemini`、OpenCode→`OpenCode`），测试 provider 亦各自声明（`agent_lifecycle_event_test::MatrixHookProvider` 维持 `codex` catalog kind）。原 `capture_agent_kind` provider-name→`agent_kind` 字符串桥已删除：durable `agent_session.agent_kind` 取自 `AgentKind::as_db_str()`，session id 仍为 `{hook_name}__{provider_session_id}`，两者字节不变。
+- `LiveCaptureProvider` capability（ACF-18）：`observed_agents/live_capture.rs`（crate-internal，沿 `truncator_for` 先例，不是第二个 registry）定义 `LiveCaptureContext { libra_session_id, provider_session_id, verified_cwd }`（scope 已验证事实）、`LiveCandidateUnavailable`、`trait LiveCaptureProvider`（`missing_host_capture_budget`／`live_transcript_candidate`／`live_coverage_normalizer`／`subagent_discovery`，默认皆为中性 source-absent 行为）、`#[async_trait] trait LiveSubagentDiscovery`、`LiveCaptureBinding { hook_name, kind, observed, live }` 与 `NeutralLiveCapture`；Claude（candidate、normalizer、子 transcript discovery）、Codex（rollout normalizer）、OpenCode（ACF-18 时仅 missing-host budget = export subprocess deadline；ACF-20 起另实作 `transcript_exporter`，见下文 `LiveTranscriptExporter`）实作只在 `observed_agents/`。`observed_agents::live_capture_for(AgentKind)` 是唯一回传 `LiveCaptureProvider` 的 lookup（穷举 `match`、无 `_` arm），恰对 registry `hook_installable` 的 kinds 回 `Some`；其余 kinds 经 binding 使用 `NeutralLiveCapture`。`LiveCaptureBinding::resolve(&dyn HookProvider)` 无错误、无配置，只在 `hooks/runtime.rs::process_hook_event_with_target` 与进程内 harness `capture::test_support::ingest_agent_traces_ingress_outcome_for_test` 各调用一次，并原样向下传递。provider port 不接触 SQL／ref／`CaptureScope`／`CaptureCommitDeadline`／store，`subagent_content` 只用 `SubagentDiscovery`、`discover_claude_subagent_contents_bounded`、`MAX_SUBAGENT_SOURCES_PER_CAPTURE`。
+- 行为等价替换（ACF-18）：missing-host budget 由 `capture::live::effective_capture_deadline(binding.missing_host_capture_budget(), deadline)` 在 hook entry 与 live pipeline 两处建立（host 已给 pair 时为恒等）；transcript candidate 经 `capture::live_checkpoint::acquire_live_snapshot`；live coverage normalizer 经 `capture::live_checkpoint::reserve_live_coverage`（deadline 检查仍在 normalize 之前，normalize／`redact_turns` 后的复检与 abandon→settle 顺序不变）；子 transcript discovery 经 `capture::live_pipeline::discover_subagents`（非 Claude 仍为空 discovery，`reason=` 值与 durable `SubagentDiscovery.warning` 字符串不变）。OpenCode export 分支（`if agent_kind == "opencode"` 及其 `"opencode"` 字面量）、`release_failed_opencode_export_runner`／`release_checkpoint_export_lease` 与 post-outcome `export_release` advance 区块在 ACF-18 时原样保留，ACF-20 以 export lease port 取代（见下）；`compat_agent_architecture_guard::live_capture_port_and_store_boundaries` 的 syn 定位豁免区域随之移除，`capture/{live,live_pipeline,live_checkpoint}.rs` 不再有任何豁免。
+- `LiveTranscriptExporter` capability（ACF-20，Port ownership）：`observed_agents/live_capture.rs` 新增 `#[async_trait] trait LiveTranscriptExporter { async fn export(&self, &LiveCaptureContext, deadline: Instant) -> Result<TranscriptSource>; fn export_coverage_normalizer(&self) -> fn(&RedactedBytes) -> Vec<NormalizedTurn>; }` 与 `LiveCaptureProvider::transcript_exporter()`（默认 `None`）。只有 OpenCode 回 `Some`：其实作经可信 sandboxed bridge（`authorized_trusted_sandboxed_export_until`）回传授权 `TranscriptSource::Bytes`，bridge 失败时在 provider 层自行发出 `reason="opencode_export_bridge_unavailable"`（文字不变），coverage normalizer 为 `normalize_opencode_export`。exporter 不取得 DB、`CaptureScope`、commit deadline 或 lease，只在 capture 持有 runner lease 时被呼叫；共享 live 模块不再直接呼叫 `opencode_export::*`。
+- export-job lease port 与 runner token（ACF-20）：`capture/live.rs` 定义 `LiveExportTarget`、`LiveExportAdmission`、`trait LiveExportLeasePort`（`observe_idle`／`release_failed`／`release_dirty`／`advance_and_release`，无任何 claim 方法，以泛型参数静态分派）与唯一生产实作 `ExportJobLeaseStore`——capture 层唯一引用 `export_job` 的代码，lease SQL、owner `export:{pid}:{uuid}`、state 与 `LBR-AGENT-005` 均不变。runner admission 产生非 `Clone`／非 `Copy` 的 `LiveExportRunner` token，唯一 terminal method `settle(self, LeaseDisposition, reason, LeaseLogContext) -> Result<()>`：`Failed`（`failed` + `LBR-AGENT-005`）、`Dirty`（lease-only）、`AdvanceAndRelease`（primary deadline；advance 失败时于方法内以 recovery grace 转 lease-only `dirty` 后回 Err）、`LeaveToExpiry`（不写 DB）；release 一律 recovery grace、永不发布 `idle`，失败只以呼叫点传入的 `reason=` 与 `LeaseLogContext`（checkpoint stage 的 `Dirty` 记 `checkpoint_id`，其余记 redacted `session_id`）发出 warning。port 的 release／advance 只在 `settle` 内呼叫；debug build 中未 settle 的 token 在 `Drop`（非 unwinding）时 panic，release build 无此检查。
+- 两个 settlement site（ACF-20）：`run_export_stage` 的出口为封闭 `ExportStageExit`（`BridgeUnavailable`／`SourceRejected` → `Failed`；`CoverageFailed`／`InflightOnly`／`CoveredReplayFailed` → `Dirty`；`CoveredNoop` → `AdvanceAndRelease`），`run_checkpoint_stage` 的出口为封闭 `CheckpointStageExit`（(a) `UncommittedSettle`／`Uncommitted` 与 (b) `PostCheckpoint` → `Dirty`；(c) `Authorized` → `AdvanceAndRelease`；(d) `Expire` → `LeaveToExpiry`），分别经穷举映射 `export_stage_lease_disposition`／`checkpoint_stage_lease_disposition` 得到 `(LeaseDisposition, reason, LeaseLogContext)`；`CheckpointStageExit` 只由类别 helper（`uncommitted`、`uncommitted_settle`、`post_checkpoint`、`authorized`、`expire`）建构，helper 同时执行依 `claim_owner` 的 claim cleanup（直接 store 失败另记 retryable diagnostic）。coordinator Err 只经 `capture/coordinator.rs` 的唯一穷举分类器 `CaptureCoordinatorError::reservation_class() -> CoordinatorReservationClass { Uncommitted { diagnostic }, PostCheckpoint, Unclassified }` 判定（取代已删除的 `is_checkpoint_write_failure`／`must_release_uncommitted_reservations`／`must_release_post_checkpoint_export_lease`）。每个 site 顺序固定：产生出口的 inner future（`execute_preapplied`、durable-replay completion 与 covered no-op 的 `settle_committed_replay_without_write` 都在其内）→ `settle` → continuation（`settle_preapplied_*` catalog 结算或回传保存的结果）；`settle` 回 Err 时跳过 continuation，以 `settle no-op export job within its capture deadline`／`settle completed export job within its capture deadline` 回传。token 只经 `ExportStage::Proceed` 由 export stage 交给 writer 再移入 checkpoint stage；bridge 失败先 settle `Failed` 再以无 token 的 metadata-only checkpoint 续行。持有 token 的 future 链（hook 命令 → `process_hook_event_with_target` → `ingest_agent_traces` → `ingest_agent_traces_payload_with_scope` → `write_committed_checkpoint` → 两个 stage）每一层都是直接 `.await` 运算元，只有 AiIntent 目标使用 timeout；`compat_agent_architecture_guard::capture_export_runner_token_settles_at_two_sites` 守护上述规则。
+- 可观测性细节（ACF-20，DB 效果顺序不变）：`LeaveToExpiry` 不写 DB 也不记录事件，映射中的 `export_job_left_to_expiry` reason 因此从不发出；(a) 类中 DurableReplay `FinalizerQuarantined` 与 retained-artifact 两处警告现于 claim 释放后、lease 释放前发出；terminal attempt `Quarantined`（已 repair-required）的警告仍在 claim 释放前发出，与 ACF-20 前相同；`agent.checkpoint.write` span 只用于 `record`，现随 checkpoint stage inner future 在 `settle` 前关闭。
+- provider-neutral 共享 runtime（ACF-20）：`compat_agent_architecture_guard::live_capture_shared_runtime_is_provider_neutral` 对 `hooks/{runtime,intent}.rs` 与 `capture/{coordinator,live,scope_binding,live_pipeline,live_checkpoint}.rs` 的非 test 代码执行 ADR-ACF-10 规则（provider token 字面量、provider 名 identifier、`AgentKind`／`agent_for`／`live_capture_for`／`from_db_str`／`from_cli_slug`、以字串字面量比较或匹配 kind／provider／agent 运算元），attribute 与 doc 不扫描、macro token 递归、违规以行计；`capture/snapshot.rs`（1）与 `capture/extraction.rs`（19）的 non-test `AgentKind::` 路径为只可下降的冻结基线（DEFER-ACF-06）。
+- 中性化的内部 free-text（不到达 hook stderr：`map_capture_ingest_error` 只输出固定文字，tracing 为 opt-in；`reason=` 值不变）：anyhow context `OpenCode export capture deadline exceeds the hook budget range` → `provider-owned capture budget exceeds the hook budget range`、`establish OpenCode export capture deadline` → `establish provider-owned capture deadline`；tracing 消息 `Claude child discovery failed closed; …` → `child discovery failed closed; …`（`reason="bounded_subagent_discovery_failed"`）、`Claude child capture reached its reserved slice; …` → `child capture reached its reserved slice; …`（`reason="bounded_subagent_capture_deadline"`）。移入 `discover_subagents`／`acquire_live_snapshot`／`reserve_live_coverage` 的 callsite 仍在原模块，默认 tracing target 不变。ACF-20 另去除 export 路径的 provider 名称（structured `reason=` 值不变）：anyhow 文字 `OpenCode export capture deadline was not established at runtime ingress` → `export capture deadline was not established at runtime ingress`、`opencode export job gate unavailable; …` → `export job gate unavailable; …`、`LBR-AGENT-005: opencode export bridge returned a File source …`／`… opencode export snapshot is incomplete …`／`… opencode export source commitment unavailable …`／`complete opencode export snapshot lost its redacted transcript` → 去掉 `opencode`、`settle no-op opencode export job …`／`settle completed opencode export job …` → `settle no-op export job …`／`settle completed export job …`、`OpenCode export runner completed without its ingress capture deadline` → `export runner completed without its ingress capture deadline`；tracing 消息 `opencode idle recorded; …` → `export idle recorded; …`、`opencode export: …` → `transcript export: …`，以及各 lease 释放失败警告（`failed to release unsuccessful export job`、`failed to release export job after coverage error`／`after in-flight skip`／`after covered replay settlement`、`failed to retire timed-out no-op export job`／`completed export job`）去掉 `opencode`，字段与 `reason=` 不变。
+
+tracing target 随模块路径改变：被移动的函数中只有 legacy intent writer 的 session-subdir adoption 警告（`reason="legacy_session_subdir_adoption_failed"`）未显式指定 `target:`，其默认 target 由 `libra::internal::ai::hooks::runtime` 变为 `libra::internal::ai::hooks::intent`，按模块过滤的 `LIBRA_LOG` 需同步调整；scope-binding 与共享 live 边界子集不发出 tracing，显式 target（如 `agent.hook.ingest`、`agent.capture.*`）不变。ACF-19 移动的未显式指定 `target:` 的 callsite 同理：`agent.redaction.apply` span 与 subagent discovery/capture 警告的默认 target 变为 `libra::internal::ai::capture::live_pipeline`，`agent.checkpoint.write` span 与 claim/export-lease 释放、source commitment、OpenCode export 等 checkpoint 警告以及 coverage-gate／OpenCode no-op 的 `info` 事件变为 `libra::internal::ai::capture::live_checkpoint`，`agent.hook.ingest` span 变为 `libra::internal::ai::capture::live`；span 名称、字段、`reason=` 值与显式 target 均不变。ACF-20 起 export-job lease 释放失败警告由 `LiveExportRunner::settle` 发出，默认 target 由 `libra::internal::ai::capture::live_checkpoint` 变为 `libra::internal::ai::capture::live`；`reason="opencode_export_bridge_unavailable"` 警告由 OpenCode exporter 发出，默认 target 变为 `libra::internal::ai::observed_agents::live_capture`。三个行为 oracle（`agent_lifecycle_event_test::hook_public_contract_byte_compat_matrix`、`agent_hook_crash_test::capture_coordinator_native_replay_matrix`、`capture/live_oracle_tests.rs::live_checkpoint_metadata_shape_is_stable`）在任何移动前落地，并由 `compat_agent_architecture_guard::capture_runtime_extraction_oracles_are_frozen` 以 token 指纹冻结。其中 live checkpoint oracle 只在 Unix 上编译（非 Unix 上仓库 capture key 及其 source-commitment HMAC fail-closed，OpenCode 分支借用的 checkpoint object-I/O helper 也是 Unix-only），非 Unix 上同名 stub 只输出 `skipped`；它借用与单元测试可执行文件同目录的 `libra` 二进制，而 `cargo test --lib` 不构建 bin target，因此须先 `cargo build --bin libra`，或经 `cargo test --all` / `cargo nextest run` 运行——二进制缺失时会显式失败，但过期的二进制不会被检测。
 
 ## 历史实现基线（2026-06-17 ground-truth 核对）
 
@@ -522,11 +628,11 @@ flowchart TD
    - **stderr**：不得长期继承到用户终端，必须捕获、cap、redact 后按 error/debug 输出。
 3. **Checkpoint 原子性与恢复**：按真实写序固化 crash window 表（5 阶段，注意 DB INSERT 在 ref CAS **之后**且在 `append_checkpoint_commit` **之外**）——(a) blob/tree 已写；(b) `object_index` 已 enqueue（`history.rs:914`）；(c) ref CAS 已提升（`history.rs:307/749`）；(d) `agent_checkpoint` INSERT（`runtime.rs:900`，`commit_hash`→`traces_commit` 列）；(e) 用户输出。重点标注 (c)→(d) 之间崩溃会留下「ref 指向合法 commit 但 catalog 无行」的状态，且对依赖 catalog 的 prune/clean/doctor 不可见。baseline：`doctor` 当前只读、仅检一类 FK-orphan（`doctor.rs:66`），**无 repair**。AG-20 必须把 doctor 从单一只读检测扩展为覆盖 (i) DB 行指向缺失 commit/tree/blob 对象、(ii) ref 可达 checkpoint commit 但无 catalog 行（insert-pending 残留）、(iii) `object_index` 缺该对象索引 三类检测，并给出 repair 或可操作的人工处理建议（区分幂等重建与需人工）。
 4. **Prune 并发保护（两个窗口）**：prune（`libra agent clean` → `prune_checkpoint_commits`，`history.rs:1066`）是 **catalog-driven 重建**——`load_checkpoint_history_rows`（`history.rs:1136`）读 `agent_checkpoint`，再由 `rebuild_checkpoint_history`（`history.rs:1157`）完全从 catalog 行重写整条 `refs/libra/traces`，**不是**「把 ref 移到祖先」。因此有两个并发窗口：**窗口 A（loose-object）** writer 写完 blob/tree、`object_index` 后、ref CAS 前，loose object 不可达，并发 prune 误删 loose object；**窗口 B（catalog-vs-ref，此前漏写）** ref CAS 已提升但 `agent_checkpoint` INSERT 未完成，prune 的 catalog 扫描看不到该 checkpoint，rebuild 重写 ref 时把这个**已可达、合法**的 checkpoint 直接从历史抹掉。AG-20 的保护（临时保护 ref / writer lease / in-progress marker）必须覆盖到 **DB INSERT 完成为止**，仅保护 loose object 不够；或要求 prune 在重建前对比「ref 可达 commit 集」与「catalog」，ref 多于 catalog 时 fail-closed 拒绝重建。并发 prune 测试须拆为窗口 A、窗口 B 两个用例。
-5. **列表与大对象性能（固定数值，不留口子）**：baseline——`session list` 当前硬编码 `ORDER BY started_at DESC LIMIT 200`（`session.rs:297`），无 cursor，须替换。统一分页契约：默认 `--limit 50`、上限 cap 500；keyset cursor（cursor 不透明）；`--json` 输出 page envelope，并加回归测试。`session list`、`checkpoint list`、`review list`、`investigate list`（run 枚举入口，命令面见「落地执行补充规格 §5」）一律走该契约。**实现现状（2026-07-08 核对）**：排序键 tiebreaker 为 `session_id`/`checkpoint_id` 升序（非 `id DESC`）；`session list`/`checkpoint list` envelope 为 `{schema_version, <rows>, next_cursor}`（**不含** `has_more`），`review list`/`investigate list` envelope 含 `has_more`——字段名/tiebreaker 方向在各族间尚未完全统一，属已知低优先偏差。**数据库索引**：keyset cursor 的排序键必须对应复合索引（实测 `idx_agent_session_started_paging(started_at DESC, session_id)`、`idx_agent_checkpoint_created_paging(created_at DESC, checkpoint_id)`），否则分页在大表上退化为全表排序，违反 cap 500 的性能预期。migration 中补索引并加 `EXPLAIN QUERY PLAN` 回归测试验证索引命中。默认 `show` 只读 metadata/content hash/token usage/summary；读取 `full.jsonl`、chunks、`.zst` 或 raw context/prompt 只能走显式 detail/flag，并有 size cap、streaming reader 和 redaction（instrumented 测试证明默认路径不触碰 transcript body）。
+5. **列表与大对象性能（固定数值，不留口子）**：baseline——`session list` 当前硬编码 `ORDER BY started_at DESC LIMIT 200`（`session.rs:297`），无 cursor，须替换。统一分页契约：默认 `--limit 50`、上限 cap 500；keyset cursor（cursor 不透明）；`--json` 输出 page envelope，并加回归测试。`session list`、`checkpoint list`、`review list`、`investigate list`（run 枚举入口，命令面见「落地执行补充规格 §5」）一律走该契约。**实现现状（2026-07-08 核对）**：排序键 tiebreaker 为 `session_id`/`checkpoint_id` 升序（非 `id DESC`）；`session list`/`checkpoint list` envelope 为 `{schema_version, <rows>, next_cursor}`（**不含** `has_more`），`review list`/`investigate list` envelope 含 `has_more`——字段名/tiebreaker 方向在各族间尚未完全统一，属已知低优先偏差。**数据库索引**：keyset cursor 的排序键必须对应复合索引（实测 `idx_agent_session_started_paging(started_at DESC, session_id)`、`idx_agent_checkpoint_created_paging(created_at DESC, checkpoint_id)`），否则分页在大表上退化为全表排序，违反 cap 500 的性能预期。migration 中补索引并加 `EXPLAIN QUERY PLAN` 回归测试验证索引命中。默认 `session show` 只读 metadata/content hash/token usage/summary；默认 `checkpoint show` 只读固定安全 catalog 摘要。读取 `full.jsonl`、chunks、`.zst` 或 raw context/prompt 只能走显式 detail/flag，并有 size cap、streaming reader 和 redaction（instrumented 测试证明默认路径不触碰 transcript body）。
 6. **Fail-open / fail-closed 分类**：可 fail-open（warning + partial metadata）——extractor、model/token/skill 解析、optional context/prompt 缺失。必须 fail-closed——hook install/uninstall、RPC protocol mismatch、unknown mutating method、rewind apply、fix/mutation、DB/ref/object 写失败，**外加**：(a) **redaction 执行失败 / size-cap 命中后无法安全截断 / transcript 路径校验（symlink canonicalize 后须落在 adapter home-relative roots）失败 / UTF-8·JSON envelope 解码失败**——一律 fail-closed，绝不退化为写入未脱敏 raw bytes（redaction 失败＝写失败）；(b) **untrusted seed**（issue-link / seed prompt 间接 prompt-injection）进入任何 mutating / 高权限 workflow（fix、tool 调用、AgentRuntime turn）默认拒绝，非交互须显式 flag/approval，且 seed 文本进入 prompt 前须 redaction 并标 `provenance=untrusted`。关键区分：metadata 字段缺失→fail-open 标 partial；内容脱敏/路径安全失败→fail-closed。
 7. **合规与保留策略（可执行门禁，非口号）**：外部 transcript、prompt、context、stderr、review findings 都按潜在 PII 处理。AG-24a 必须落地实现面，AG-24 负责同步文档、compat 守卫与 release notes：
    - **保留期**：给出 transcript/prompt/context 的默认 retention（如 stopped-session checkpoint 默认保留 N 天，可由 settings 覆盖），到期由 GC 清理。
-   - **删除一致性矩阵**：`refs/libra/traces` 是 GC root（`history.rs`），单删对象不可达；删除/被遗忘权（erasure）必须**重写 traces ref**（catalog 重建剔除目标 checkpoint）+ 删 `agent_checkpoint`/`agent_session` 行 + 删 `object_index`。普通 checkpoint retention 已传播 D1 prune fence 并删除 capture catalog 行。session erasure tombstone/catalog 删除和 R2 物理删除仍未实现：本地 session erasure 只保证本地对象/SQLite/ref 删除一致性，`cloud restore` 会复活该 session；文档不得把 checkpoint catalog fence 声称为 session erasure 或 R2 删除已覆盖。
+   - **删除一致性矩阵**：`refs/libra/traces` 是 GC root（`history.rs`），单删对象不可达；删除/被遗忘权（erasure）必须**重写 traces ref**（catalog 重建剔除目标 checkpoint）+ 删 `agent_checkpoint`/`agent_session` 行 + 删 `object_index`。普通 checkpoint retention 已传播 D1 prune fence 并删除 capture catalog 行。session erasure tombstone/catalog 删除已随 plan-20260714 PD-03 落地：`libra cloud sync` 发布 tombstone 并级联删除 D1 mirror 行，`libra cloud restore` 双向 tombstone 优先，已擦除 session 不会复活；仍 deferred 的只有 R2 payload 物理删除。文档不得把 tombstone/catalog 删除误写成 R2 删除已覆盖。
    - **redaction report**：schema 化、带版本、可审计（命中规则计数、是否触发 size-cap、是否 fail-closed），不含原文。
    - **raw 显式授权**：读取/导出未脱敏原文仅经显式 `--allow-raw`（或等价 approval），且每次写一条 audit 记录（who/when/which checkpoint/scope）。**审计日志不可变性**：audit 记录必须是 append-only（写入后不可修改或删除），存储在单独 SQLite 表或 append-only 日志文件；1 年保留期（见合规保留期表），到期前不得 truncate 或 single-row delete ——删除整表或整文件须走合规审批流程，非常规 GC。
    - **前置**：`RedactedSink` 类型级 wiring（强制补强项见 #2/持久化第 5 条）未完成前，不得宣称 raw-input-never-persisted。
@@ -597,12 +703,12 @@ flowchart TD
 | AG-17 `list/add/remove` alias | 否 | 否 | 无降级；只管理外部捕获能力 |
 | AG-18 external RPC v2 security | 否 | 否 | 无降级；不得通过 MCP 或 Code UI 替代 |
 | AG-19 lifecycle dispatcher / hook ingest | 否 | 否 | 无降级；只写 observed-agent capture artifacts |
-| AG-20 checkpoint/export/doctor/pagination | 否 | 否 | 本地对象/SQLite/ref 一致性与普通 checkpoint D1 prune fence/catalog 删除已落地；session erasure 与 R2 物理删除为后续扩展 |
+| AG-20 checkpoint/export/doctor/pagination | 否 | 否 | 本地对象/SQLite/ref 一致性、普通 checkpoint D1 prune fence/catalog 删除与 session erasure tombstone/catalog 删除已落地；仅 R2 payload 物理删除为后续扩展 |
 | AG-21 transcript intelligence / skill events | 否 | 否 | extractor 缺失按 `partial` fail-open |
 | AG-22 review workflow read-only | 否 | 否（依赖 AG-18 external RPC spawn，不依赖 AG-13 `dispatch_batch`） | findings manifest + provenance + manual attach |
 | AG-23 investigate workflow read-only | 否 | 否（同 AG-22，依赖 AG-18 external RPC spawn） | state.json + findings_doc + manual attach |
 | AG-22/AG-23 `--fix` / mutating action | 不要求完整内部迁移 | **是**：需要 serialized fix bridge、approval/sandbox/tool gate 源码锚点并已实现 | 未就绪时隐藏/拒绝 `--fix`，错误提示 read-only 可用与重启条件 |
-| AG-24a retention/erasure/audit 实现 | 否 | 否 | 本地对象/SQLite/ref/audit 一致性及普通 checkpoint D1 prune fence/catalog 删除已落地；session erasure tombstone/catalog 删除与 R2 物理删除是待建强制面 |
+| AG-24a retention/erasure/audit 实现 | 否 | 否 | 本地对象/SQLite/ref/audit 一致性、普通 checkpoint D1 prune fence/catalog 删除与 session erasure tombstone/catalog 删除均已落地；仅 R2 payload 物理删除仍是待建强制面 |
 | AG-24 docs/tests/compat closeout | 否 | 仅在发布 fix/action 时需要同步 code-agent-runtime 状态 | release notes 明确哪些能力 read-only、哪些延后 |
 
 结论：本文的外部捕获面不等待完整内部 AgentRuntime / Web-only 迁移；只有会修改工作区或调用内部工具的路径才依赖内部 AgentRuntime fix bridge。任何实现 PR 若无法证明 fix bridge 已存在，必须把 review/investigate 标为 read-only 并阻止 `--fix` 成功执行。
@@ -621,7 +727,7 @@ flowchart TD
 2. `HookTarget::AgentTraces` 使用 `SessionStore::from_storage_path_with_subdir(storage_path, "agent")`，外部捕获日志与内部 `libra code` session lock 隔离。
 3. `agent_session` / `agent_checkpoint` / `agent_usage_stats` 无 SeaORM entity（走 raw SQL）。**D1 mirror 现状**：`agent_session`、`agent_checkpoint` 以及 M5 `agent_subagent_content_claim` / `agent_subagent_content_revision` / `agent_subagent_link` companion **已有** D1 mirror 表与同步（`libra cloud sync`/`restore`，见 `src/command/cloud.rs` 与 `src/utils/d1_client.rs`）；`agent_usage_stats` 仍无 mirror。扩字段时同步写 raw SQL migration、D1 mirror schema、测试和本文表格。普通 checkpoint retention 已传播 D1 prune tombstone 并删除远端 capture catalog 行。session erasure tombstone 传播已落地（PD-03：sync 发布 `agent_import_tombstone` 到 D1 并级联删除镜像行，restore tombstone 优先且把 fence 落回本机）；**剩余缺口**：R2 payload 不物理删除，`agent_usage_stats` 仍无 mirror。
 4. `HistoryManager::append_checkpoint_commit`（`history.rs:880`）是 checkpoint 对象写入唯一封装：依次写 redacted transcript / metadata / events blob、build tree、`enqueue_agent_blob_object_index_update` 写 `object_index`（**关键**：无此步则 cloud restore 看不到 transcript blob）、再做 `refs/libra/traces` 的 CAS 提升（`update_ref_if_matches`），返回 `CheckpointCommit { commit_hash, tree_oid, metadata_blob_oid }`（`history.rs:1560`）。**注意**：返回结构体字段名是 `commit_hash`，**不是** `traces_commit`；`agent_checkpoint` 行的 INSERT **不在本函数内**，由调用方 `hooks/runtime.rs`（`runtime.rs:900`）在函数成功返回、ref 已提升之后执行，并把 `commit_hash` 写入 `agent_checkpoint.traces_commit` **列**。全文 `traces_commit` 一律指该 DB 列名，与返回字段 `commit_hash` 不得混用。**现状 INSERT 为普通 INSERT（无 ON CONFLICT/UPSERT）**，同一 checkpoint_id 重放或崩溃重试会触发主键冲突（见可靠性与 AG-20）。
-5. 现状：redaction 仅在 `hooks/runtime.rs` 手工调用 `Redactor::redact`，类型级 `RedactedSink`（`redaction.rs:219`）仍是 Phase-1 placeholder，**未对 checkpoint writer / cloud uploader 生效**——任何新增持久化路径都可能绕过 redaction。目标（AG-19/AG-20 必做）：把 `append_checkpoint_commit` 与 cloud-sync uploader 改为只接受 `RedactedBytes`（impl `RedactedSink`），使 `&[u8]` 在类型层面无法进入持久化 sink；redaction 失败＝写失败（fail-closed），不得 fall back 到写 raw transcript。校验和 redaction 必须在任何持久化之前完成；不得走“先 insert DB 再补对象”的新路径，否则会产生 DB 指向不存在对象、cloud restore 缺 blob 或 prune 删除未挂 ref 对象的窗口。
+5. 2026-06-17 历史现状（已被 ACF-03/05/19 取代：redaction 现由 `capture/snapshot.rs`、`capture/live_pipeline.rs`、`capture/live_checkpoint.rs` 经 typed `RedactedBytes` 执行，checkpoint store 只接受 sealed redacted payload）：redaction 仅在 `hooks/runtime.rs` 手工调用 `Redactor::redact`，类型级 `RedactedSink`（`redaction.rs:219`）仍是 Phase-1 placeholder，**未对 checkpoint writer / cloud uploader 生效**——任何新增持久化路径都可能绕过 redaction。目标（AG-19/AG-20 必做）：把 `append_checkpoint_commit` 与 cloud-sync uploader 改为只接受 `RedactedBytes`（impl `RedactedSink`），使 `&[u8]` 在类型层面无法进入持久化 sink；redaction 失败＝写失败（fail-closed），不得 fall back 到写 raw transcript。校验和 redaction 必须在任何持久化之前完成；不得走“先 insert DB 再补对象”的新路径，否则会产生 DB 指向不存在对象、cloud restore 缺 blob 或 prune 删除未挂 ref 对象的窗口。
 
 ### 外部 Agent 持久化详细设计
 
@@ -651,8 +757,8 @@ checkpoint/<checkpoint_id[0..2]>/<checkpoint_id[2..]>/
 ```
 
 - `metadata.json`：checkpoint-level 摘要，包含 `schema_version`、`checkpoint_id`、`session_id`、`agent_kind`、`provider_session_id`、`scope`、`working_dir`、`parent_commit`、`created_at`、`model`、`token_usage`、`files_touched`、`partial`、`redaction_report_oid`、`events_oid`、`transcript_oid`、`content_hash`。
-- `manifest.json`：对象清单，列出每个文件的 logical role、OID、byte length、media type、compression、redaction state、schema_version。`doctor` 和 export 以该文件作为 object/tree 自校验入口。
-- `events/lifecycle.jsonl`：只存 provider-neutral lifecycle event，不存 provider 原始 envelope。每行必须带 `schema_version`、`event_id`、`kind`、`agent_kind`、`session_id`、`provider_session_id`、`timestamp`、`source`、`partial`、`provenance`。
+- `manifest.json`：对象清单，列出每个文件的 logical role、OID、byte length、media type、compression、redaction state、schema_version。当前 `doctor` 和 export 只把它用作对象/tree 的 best-effort 枚举与定位；它们不会解析或密码学验证 `events/lifecycle.jsonl` 的 event identity。
+- `events/lifecycle.jsonl`：只存 provider-neutral lifecycle event，不存 provider 原始 envelope。当前 writer 输出 schema v2；每行必须带 `schema_version`、`event_id`、`identity_scheme`、`kind`、`agent_kind`、`session_id`、`provider_session_id`、`timestamp`、`source`、`partial`、`provenance`。schema v1 行没有 `identity_scheme`，必须按 legacy opaque identity 处理，绝不能从 UUID 形状或附加字段推断 HMAC/replay 信任。
 - `transcript/<agent_kind>.jsonl`：redacted transcript bytes。若源格式不是 JSONL，仍可保留原始扩展名或写 `transcript/<agent_kind>.bin`，但 manifest 必须声明 `media_type` 和 `format`；默认 `show/list` 不读取该 blob。
 - `redaction_report.json`：只含 redaction 统计和规则命中，不含原文。
 - `content_hash.txt`：`sha256:<64-hex>`，用于导出/恢复校验；兼容 legacy bare hex 读取，但 writer 只输出 prefixed form。
@@ -661,39 +767,35 @@ checkpoint/<checkpoint_id[0..2]>/<checkpoint_id[2..]>/
 
 ```json
 {
-  "schema_version": 1,
-  "event_id": "uuid-v5-or-provider-dedup-id",
+  "schema_version": 2,
+  "event_id": "opaque-or-uuid-v5-id",
+  "identity_scheme": "native_replay_hmac_v2",
   "kind": "tool_use",
   "agent_kind": "codex",
-  "session_id": "codex::provider-session-id",
+  "session_id": "codex__provider-session-id",
   "provider_session_id": "provider-session-id",
-  "turn_id": "optional-turn-id",
-  "tool_use_id": "optional-tool-use-id",
-  "subagent_session_id": null,
   "timestamp": "2026-06-22T00:00:00Z",
-  "cwd": "/repo",
-  "model": "optional-model",
-  "prompt_summary": "redacted-or-omitted",
-  "tool_name": "apply_patch",
-  "modified_files": ["src/lib.rs"],
-  "new_files": [],
-  "deleted_files": [],
+  "source": null,
   "partial": false,
   "provenance": {
-    "source": "hook",
-    "provider": "codex",
-    "hook_command": "tool-use"
+    "channel": "hook",
+    "hook_event_name": "tool_use"
   }
 }
 ```
 
+live hook writer 的字段口径（以 `capture/live_pipeline.rs` 的 redaction pass、`hooks/lifecycle.rs::lifecycle_event_canonical_json_with_identity` 与 `capture/live_checkpoint.rs` 为准）：
+
+- `provenance.hook_event_name` 是 canonical `LifecycleEventKind` 的 snake_case wire 名（与 `kind` 同一词表，如 `tool_use`、`turn_end`、`session_end`），由已验证的 ingress command 重建；provider 原始事件名（如 `PreToolUse`、`Stop`）**不**落盘。
+- provider 提供的 `model`、`source`、`tool_name`、`session_ref` 无法被 pattern redactor 安全分类，live pipeline 在持久化前直接丢弃：live hook 写出的 lifecycle 行**不含** `model` / `tool_name` 键（`session_ref` 从不序列化），`source` 恒为 `null`；subagent 边界 `metadata.json` 的 `subagent.tool` / `subagent.source` 同样为 `null`。
+- 可选字段只剩已脱敏的 `prompt`、`tool_input`、`tool_response`、`assistant_message`（按 kind 出现；subagent 边界行不写 `prompt`）。
+
 实现约束：
 
-1. `event_id` 必须稳定可重放：优先使用 provider identity key（`event_id` / `request_id` / `turn_id` / `message_id` / `tool_use_id` / `sequence` / `timestamp`），缺失时按 `(agent_kind, provider_session_id, kind, canonicalized payload)` 派生 UUID v5。不得使用 `DefaultHasher` 产出需要跨版本持久化的 ID。
-2. `prompt_summary` 只能是 redacted 摘要或省略；完整 prompt 只能进入 redacted transcript 或 explicit raw export 路径。
-3. `tool_input` / `tool_response` 默认不进入 event JSONL。若为了文件变更推导必须保留结构化摘要，只允许写 redacted、bounded、schema 化字段，例如 `modified_files`、`new_files`、`deleted_files`、`tool_name`。
-4. provider-native envelope 可在测试 fixture 中保留，但生产持久化默认禁止。需要 redacted detail 时走显式 detail/transcript 路径（无需授权门）；需要未脱敏 raw 时必须走 `--allow-raw` + audit log，且 raw export 不写回 `traces`。
-5. `events/lifecycle.jsonl` 是 checkpoint 证据源；`agent_session.metadata_json` 只能缓存小摘要和 OID，不得成为唯一事实源。
+1. `identity_scheme` 是 v2 的固定 enum：`native_replay_hmac_v2`（provider-native replay key 经 repository HMAC）、`fallback_action_hmac_v1`（无 native replay key 的 action HMAC）、`generic_lifecycle_uuid_v5` 与 `import_uuid_v5`。它说明 writer 的 derivation，不是离线可验证的凭据；schema-v1 缺该字段时一律是 legacy opaque，绝不能推断为任一 HMAC 形式。
+2. optional prompt、tool input/response、assistant message 只能在已脱敏后出现；provider 提供的 model / tool_name / source / session_ref 由 live hook writer 丢弃而非保留（见上方字段口径）；完整 prompt 只能进入 redacted transcript 或 explicit raw export 路径。
+3. provider-native envelope 可在测试 fixture 中保留，但生产持久化默认禁止。需要 redacted detail 时走显式 detail/transcript 路径（无需授权门）；需要未脱敏 raw 时必须走 `--allow-raw` + audit log，且 raw export 不写回 `traces`。
+4. `events/lifecycle.jsonl` 是 checkpoint 的记录 sidecar；`agent_session.metadata_json` 只能缓存小摘要和 OID，不得成为唯一事实源。当前 checkpoint/export/doctor 没有 canonical lifecycle JSONL parser，因此不得把这些命令的对象存在性检查表述为 identity 或 replay 验证。
 
 **写入 pipeline**：
 
@@ -717,9 +819,10 @@ provider hook/RPC stdin
 **读取 pipeline**：
 
 - `session list` / `checkpoint list`：只读 SQLite catalog，分页使用 keyset cursor；不得 touch transcript blob。
-- `session show` / `checkpoint show` 默认：读 SQLite + `metadata.json` 小 blob，显示 summary、status、content hash、token usage、files touched、partial/redaction 状态。
-- `--detail`：可读 `events/lifecycle.jsonl` 和 `manifest.json`，仍不读 transcript body，除非显式 `--transcript`。
-- `--transcript` / export：按 manifest 读取 transcript blob，streaming + cap + redaction verification；若 blob 缺失，显示 `missing_object` 并建议 `doctor repair` 或重新同步。
+- `session show` 默认：读 SQLite + `metadata.json` 小 blob，显示 summary、status、content hash、token usage、files touched、partial/redaction 状态。
+- `checkpoint show` 默认：只读 SQLite catalog，并且只输出固定白名单结构摘要：`checkpoint_id`、受限 `scope` 词表、Unix `created_at`、以及是否记录 parent snapshot。它不读取 `metadata.json` / manifest / transcript，也不渲染 session 标识、source locator 或 commitment、redaction detail、content hash 或任何 catalog object OID。
+- `--detail`：可读 `events/lifecycle.jsonl` 和 `manifest.json`，仍不读 transcript body，除非显式 `--transcript`。这不是 lifecycle line 的语义/identity 验证路径。
+- `--transcript` / export：按 manifest 读取 transcript blob，streaming + cap + redaction verification；若 blob 缺失，显示 `missing_object` 并建议 `doctor repair` 或重新同步。export 不解析或验证 lifecycle JSONL 的 `identity_scheme`。
 - `--allow-raw`：只导出到用户指定路径，不写入 traces；必须写 append-only audit log。
 
 **DB ↔ object 映射**：
@@ -732,13 +835,13 @@ provider hook/RPC stdin
 | `agent_session.metadata_json.transcript_path` | manifest source hint | 只能作为 hint；实际 checkpoint 读取以 manifest/OID 为准 |
 | `agent_checkpoint.checkpoint_id` | `checkpoint/<shard>/<rest>/` | checkpoint stable id |
 | `agent_checkpoint.tree_oid` | checkpoint root tree OID | doctor 必须验证存在且可解析 |
-| `agent_checkpoint.metadata_blob_oid` | `metadata.json` blob OID | 小摘要，可用于 list/show detail |
+| `agent_checkpoint.metadata_blob_oid` | `metadata.json` blob OID | 私有 checkpoint artifact；只供显式授权的 reader/export 使用，绝不进入默认 `checkpoint show` |
 | `agent_checkpoint.traces_commit` | `refs/libra/traces` commit hash | 来自 `CheckpointCommit.commit_hash` |
 
 **schema versioning**：
 
 - DB row `schema_version` 只描述 SQLite row shape。
-- `metadata.json` / `manifest.json` / `events/lifecycle.jsonl` 各自带 external JSON `schema_version`，同一 checkpoint 内必须一致或在 manifest 中声明 per-file version。
+- `metadata.json` / `manifest.json` / `events/lifecycle.jsonl` 各自带 external JSON `schema_version`；manifest 的 `lifecycle_events` role 记录 JSONL line schema（当前为 v2）。writer 与 fixture 维护这些版本契约；当前 checkpoint/export/doctor 不会交叉解析 sidecar 来强制验证同一 checkpoint 的 schema 或 identity 一致性。
 - RPC `protocol_version` 只描述 external binary wire protocol，不得与 DB/external JSON 混用。
 - AG-20 若新增 object layout 字段，只能 additive；删除/重命名必须提供 reader fallback、migration notes、schema pin test。
 
@@ -817,7 +920,7 @@ provider hook/RPC stdin
 
 #### E3-JSONL（checkpoint/session 持久化 wire）
 
-- Libra writer 的 canonical lifecycle 证据源是 `events/lifecycle.jsonl`（见「外部 Agent 持久化详细设计」），每行 JSON 带 `schema_version`、`event_id`、`kind`（snake_case，对齐 `LifecycleEventKind` wire 名）、`agent_kind`、`session_id`、`provider_session_id`、`timestamp`、`source`、`partial`、`provenance` 及按 kind 的可选字段。
+- Libra writer 的 canonical lifecycle 证据源是 `events/lifecycle.jsonl`（见「外部 Agent 持久化详细设计」）。当前 writer 输出 schema v2；每行 JSON 带 `schema_version`、`event_id`、必填的类型化 `identity_scheme`、`kind`（snake_case，对齐 `LifecycleEventKind` wire 名）、`agent_kind`、`session_id`、`provider_session_id`、`timestamp`、`source`、`partial`、`provenance` 及按 kind 的可选字段。schema v1 缺少 `identity_scheme` 时永远是 opaque legacy data，不能从 UUID 或附加字段推断 HMAC/replay；checkpoint/export/doctor 目前只做 best-effort 对象/manifest 检查，不把该 sidecar 当作 identity verifier。
 - provider-native hook envelope **不得**直接落盘；parser 只产 `LifecycleEvent`，writer 只写 redacted canonical JSONL。
 - session 级 append-only log（`.libra/sessions/agent/<session_id>/events.jsonl`）与 checkpoint 内 `events/lifecycle.jsonl` 使用同一 canonical schema。
 - invalid envelope / path / UTF-8 校验失败 fail-closed（`ERR_AGENT_HOOK_ENVELOPE_INVALID`），不回显 raw stdin。
@@ -861,7 +964,7 @@ provider hook/RPC stdin
 - `transcript/<agent_kind>.jsonl`：redacted transcript bytes；非 JSONL 源格式可写 `.bin`，manifest 声明 `media_type`/`format`。
 - `redaction_report.json`：规则命中统计，不含原文。
 - `content_hash.txt`（AG-20 冻结定义，writer 实现 `history::checkpoint_content_hash`）：`sha256:<64-lowercase-hex>`、无换行；对 manifest `content_hash.coverage` 声明顺序（`metadata`、`lifecycle_events`、`transcript`、`redaction_report`）下各 entry 字节的**串联**做 sha256。transcript 取逻辑（分片重组后）字节流，因此 hash 对 E5 分片不变；`manifest.json`（在 hash 之后写入、声明包括 content_hash 在内的全部 entry）与 `content_hash.txt` 自身不在覆盖内（自引用不可能）。reader 兼容 legacy 裸 hex（与 E4-entire 表同口径，helper `history::parse_content_hash`）。
-- `metadata.json` external schema v2（AG-20，additive）：v1 全字段保留，新增 `model`（取触发 lifecycle event 的 model，缺失时写 `"unknown"`，镜像 E4-entire 容忍）。
+- `metadata.json` external schema v2（AG-20，additive）：v1 全字段保留，新增 `model`。字段始终存在，但 live hook writer 在持久化前已丢弃 provider 提供的 model（不可信、无法安全 redaction），因此 live hook checkpoint 的 `model` 恒为字面量 `"unknown"`（`tests/agent_checkpoint_export_test.rs::metadata_model_field_drops_untrusted_event_model`）；writer 仍容忍事件携带的 string/object model 形态（`checkpoint_model_field`），以镜像 E4-entire 容忍口径。
 - 仍保留 `refs/libra/traces`、SQLite `agent_*` catalog 与 Libra object 存储。
 - import/reader：须能读 E4-entire fixture 并映射到 Libra canonical layout；export 默认输出 E4-libra。
 
@@ -878,7 +981,7 @@ checkpoint/<checkpoint_id[0..2]>/<checkpoint_id[2..]>/
 
 无 `manifest.json`、`redaction_report.json`、`content_hash.txt`。兼容承诺（与 plan.md Task A5 同口径）：
 
-- reader（metadata-first list/show/detail/transcript）与 doctor 必须把该布局识别为 **legacy-v1**，而不是 AG-20 的三类不一致；不得误报缺 manifest，不得触发 repair 改写。
+- reader（metadata-first list、safe-summary show、detail/transcript）与 doctor 必须把该布局识别为 **legacy-v1**，而不是 AG-20 的三类不一致；不得误报缺 manifest，不得触发 repair 改写。
 - v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析；writer 只输出 E4-libra，新写入不得再产生 v1 布局。
 - `tests/fixtures/agent_checkpoints/` 必须包含一个由改造前 writer 生成的 v1 布局 fixture 供回归。
 - `agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only）；doctor 对残留 gemini hooks 配置给出指向卸载通道（AG-17 gemini uninstall-only 契约）的 actionable 提示。
@@ -947,7 +1050,7 @@ entire 当前是 1 stable（`claude-code`）+ 7 preview（`codex`、`copilot-cli
 | `ERR_AGENT_PROVENANCE_REJECTED` | `LBR-AGENT-005` | provenance 拒绝或 hash 变化 | AG-18 |
 | `ERR_AGENT_BUILTIN_SLUG_IMPERSONATION` | `LBR-AGENT-006` | built-in slug impersonation | AG-18 |
 | `ERR_AGENT_IO_REDACTION_SECURITY_FAILURE` | `LBR-AGENT-007` | env/stderr/redaction 安全失败 | AG-18/AG-19 |
-| `ERR_AGENT_HOOK_ENVELOPE_INVALID` | `LBR-AGENT-008` | hook envelope size/UTF-8/JSON/schema/path 校验失败 **（A0-03 已 emit）**：`runtime.rs` 的 envelope 校验点统一携带 `HookEnvelopeInvalid` marker，`command/agent/hooks.rs::map_ingest_error` 据此附加该码（exit 128，`--json` 带 `error_code`）；DB/存储/redaction 等运行时失败保持裸 fatal 以免误标 | AG-19 |
+| `ERR_AGENT_HOOK_ENVELOPE_INVALID` | `LBR-AGENT-008` | hook envelope size/UTF-8/JSON/schema/path 校验失败 **（A0-03 已 emit，ACF-01 已集中 ingress）**：`capture::ingress` 的校验点统一携带 `HookEnvelopeInvalid` marker，`command/hooks.rs::map_capture_ingest_error` 为安装的 Claude 与隐藏的 agent 入口附加该码（exit 128，`--json` 带 `error_code`）；DB/存储/redaction 等运行时失败保持裸 fatal 以免误标。Codex 安装入口按 host policy 保持 sanitized fail-open acknowledgement，绝不写入无效 frame。 | AG-19 / ACF-01 |
 | `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT` | `LBR-AGENT-009` | checkpoint ref/DB/object 恢复/操作失败 **（A0-03 已 emit）**：`command/agent/checkpoint.rs` 的 rewind 在 `parent_commit` OID 非法或其 commit/tree 对象缺失时附加该码（exit 128）。`doctor` 保持「报告 + exit 0」诊断契约（把错误 envelope 混入报告会破坏 `--json` 消费者），store 不一致由 checkpoint 操作侧 fail-closed 暴露 | AG-20 |
 | `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` | `LBR-AGENT-010` | `review --fix` 或 `investigate fix` 无法发现或授权活跃的 `libra code --control write` runtime | DF-03 / DF-04 |
 | `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION` | `LBR-AGENT-011` | `ReviewFixInput::UntrustedSeed` 在 control discovery 之前拒绝，任何外部 finding/issue/transcript 都不能经 DF-03/DF-04 admission 进入运行时 | DF-03 / DF-04 |
@@ -971,7 +1074,7 @@ entire 当前是 1 stable（`claude-code`）+ 7 preview（`codex`、`copilot-cli
 | RPC v1 `capabilities` method | 至少保留一个 release window | RPC `protocol_version` | v2 binary 必须继续应答 |
 | RPC v2 `info` method | 字段 additive；`protocol_version` 显式 | RPC `protocol_version` | 与 v1 协商语义加 snapshot test |
 | E4-libra `metadata.json` / `manifest.json` | additive only；key 重命名需 migration + backfill | external-JSON `schema_version` | fixture 覆盖旧格式 |
-| E3-JSONL `events/lifecycle.jsonl` 行 shape | `kind` additive；删除/重命名 kind 需 migration notes | per-line `schema_version` | event schema pin test |
+| E3-JSONL `events/lifecycle.jsonl` 行 shape | v2 writer 必带 typed `identity_scheme`；`kind` additive；删除/重命名 kind 或 scheme 需 migration notes。v1 缺 scheme 永远是 opaque legacy data | per-line `schema_version` | event schema pin test；checkpoint/export/doctor 当前不把它当作 replay-verification parser |
 | `redaction_report.json` | additive only | external-JSON `schema_version` | redaction fixture |
 | E8-libra review/investigate `manifest.json` | additive only | external-JSON `schema_version` | workflow fixture |
 | `AgentKind` enum / SQL CHECK | 新增变体需 migration + 文档 roster + architecture guard | DB `schema_version` + roster | 三者一致守卫 |
@@ -1105,7 +1208,7 @@ entire `cmd/entire/cli/agent/agent.go` 定义核心 `Agent`（identity 6 + trans
 |---|---|---|
 | `ChunkTranscript`/`ReassembleTranscript` + `ChunkJSONL`/`ReassembleJSONL`，阈值 `MaxChunkSize = 50 MiB` | AG-20 writer 已按 manifest-relative transcript chunks 落地；`TranscriptChunker` trait 仍无 provider-specific impl | 第一批 writer/export 路径已覆盖大 transcript 分片；provider-specific chunk/reassemble trait 仍为后续 parity 扩展 |
 | Rewind preview / cleanup / condensation / shadow branches / manual-commit strategy | `checkpoint rewind --dry-run/--apply` 是 **worktree restore**（`checkpoint.rs:142`，委派 `restore --source <parent_commit>`，与 prune 无关）；`libra agent clean [--all]` → `prune_checkpoint_commits`（`history.rs:1066`）**已提供 cleanup/prune**（按 catalog 重建 `refs/libra/traces`） | 缺 rewind preview、condensation、shadow branch 等高级策略；**cleanup/prune 已实现**，不要误标为缺而重复造轮子（rewind ≠ prune） |
-| checkpoint 元数据含 entire-style root/session export（E4-entire import）与 E4-libra writer tree | `checkpoint show` 只展示部分元数据 | 须支持 E4-entire import reader + E4-libra export/manifest + lazy 大 transcript 读取 |
+| checkpoint 元数据含 entire-style root/session export（E4-entire import）与 E4-libra writer tree | `checkpoint show` 只展示固定安全结构摘要，隐藏 metadata 和内部 object OID | 须支持 E4-entire import reader + E4-libra export/manifest + lazy 大 transcript 读取，默认 show 不把其内部字段形成公开契约 |
 
 ### 5. 外部插件 / RPC 差距（→ AG-18，契约 E2）
 
@@ -1152,7 +1255,7 @@ entire `cmd/entire/cli/agent/agent.go` 定义核心 `Agent`（identity 6 + trans
 
 libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metadata_blob_oid`、`traces_commit`，对上述用户可读上下文文件缺直接导出。建议：
 
-1. `libra agent checkpoint show` 支持 `--format=full` 展示/导出 `context.md`、`prompt.txt` 摘要（默认 lazy，不读 MB 级 transcript）。
+1. 如需展示/导出 `context.md`、`prompt.txt` 摘要，应另行设计显式授权的 export/read 路径；不得扩张默认 `libra agent checkpoint show` 的安全摘要契约（仍不得读 MB 级 transcript）。
 2. `libra agent session show` 在 `--extract-transcript` 之外增加 `--extract-context` / `--extract-prompt`。
 3. metadata blob 中规范存储 transcript/context/prompt 的 OID 指针（无 Sea-ORM entity，走 raw SQL / blob）；**import reader** 须兼容 E4-entire fixture，**writer** 输出 E4-libra tree（见「外部 Agent 持久化详细设计」），不得把 entire per-session 目录当作 writer 默认。
 
@@ -1193,14 +1296,14 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 - 建立 owner filtering：根据 transcript path/session owner/provider session id 判定事件归属，避免多 adapter 重复 checkpoint。
 - Hook providers 和 external binary parser 只返回 `LifecycleEvent` 或 provider-neutral builder；checkpoint writer 只消费 validated/redacted event，写入 **E3-JSONL** `events/lifecycle.jsonl` 与 session log（见「外部 Agent 持久化详细设计」）。
 - **Writer 输出 E4-libra tree**（`metadata.json`、`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`、`redaction_report.json`、`content_hash.txt`），保留 `refs/libra/traces`、raw SQL `agent_*` 表和 Libra 对象存储。**E4-entire** 仅用于 import fixture 与 legacy reader，不得作为 writer 默认布局。
-- `checkpoint list/show` 默认只读 metadata、manifest、`redaction_report`、content hash、token usage 和 session summary；显式 `--transcript` / `--detail` 才读取大 transcript 或 lifecycle JSONL，且必须 redaction + size cap。
+- `checkpoint list` 默认只读 catalog metadata；`checkpoint show` 默认只读 catalog 的固定安全摘要（不读 metadata、manifest、redaction report、content hash 或 object OID）。显式 `--transcript` / `--detail` 或 export 路径才可读取大 transcript 或 lifecycle JSONL，且必须 redaction + size cap。
 - 大 transcript 分片按 **E5 manifest-relative** 路径声明；写入协议必须记录 crash recovery matrix，按**真实写序**（注意 `agent_checkpoint` INSERT 在 ref CAS 之后、`append_checkpoint_commit` 之外）：(a) blob/tree 写入 → (b) `object_index` enqueue → (c) ref CAS 提升 → (d) `agent_checkpoint` INSERT/UPSERT（`runtime.rs:900`）→ (e) 用户输出，逐阶段失败后的可观测状态、`doctor` 修复动作和幂等重试规则；重点标注 (c)→(d) 崩溃残留「ref 有 commit、catalog 无行」（`ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT` 对应的真实编号）。`doctor` repair 为净新建（baseline 只读、仅一类 FK-orphan）。
 - 关闭 prune 两类并发窗口（A loose-object：ref CAS 前 loose object 不可达被误删；B catalog-vs-ref：ref 已提升但 DB 行未 INSERT，catalog-driven `rebuild_checkpoint_history` 会丢弃已可达 checkpoint）：实现的临时保护 ref / writer lease / in-progress marker **必须覆盖到 DB INSERT 完成为止**；或 prune 重建前对比 ref 可达 commit 集与 catalog，ref 多于 catalog 时 fail-closed。
 
 验收：
 
 - **Writer fixture** 断言 E4-libra tree（`manifest.json`、`events/lifecycle.jsonl`、`redaction_report.json`）；**Reader fixture** 另覆盖 E4-entire import（multi-session、缺失 optional、裸 hash、Codex JSONL envelope、OpenCode whole-JSON、`full.jsonl.zst`）。
-- `checkpoint show` 对 49 MiB 级 transcript 默认不一次性读取；instrumented reader 证明默认路径只访问 metadata/manifest。
+- `checkpoint show` 对 49 MiB 级 transcript 默认不一次性读取；instrumented reader 证明默认路径只访问 catalog 的安全摘要，绝不读取 metadata/manifest/transcript 对象。
 - redaction 测试覆盖 `events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`、`redaction_report.json`；raw bytes 不能进入默认 stdout/JSON。
 - invalid session id、path traversal、unknown agent kind、duplicated owner event fail closed 或 quarantine，且不 panic。
 - checkpoint writer crash/retry 测试覆盖 DB 行缺失、ref 缺失、object_index 缺失、CAS conflict，且 **concurrent prune 拆成窗口 A（loose-object）与窗口 B（ref 已提升 / DB 未 INSERT）两个用例**；`agent_checkpoint` INSERT 当前非幂等（无 `ON CONFLICT`），重试前须探测 `traces_commit` 是否已存在或改 UPSERT，须有回归测试；`doctor` 输出必须能定位三类缺口并给出修复或人工处理建议。
@@ -1239,7 +1342,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 - 更新 `tests/INDEX.md`：新增/重命名的 `agent_*`、`observed_agents_*`、`agent_review_*`、`agent_investigate_*` 测试 target 必须有 wave、purpose、source mapping。
 - 旧 d0a714 分析关闭表必须保留：每个旧 phase 映射到 AG-16~AG-24a 或说明因当前架构变化废弃（例如 `claudecode` provider）。
 - release notes / migration notes 明确 `enable/disable` 仍可用，`list/add/remove` 是 alias；external binary protocol version bump 的兼容窗口和错误提示要写清；**E4-libra writer 与 E4-entire import** 的差异须在 release notes 说明。
-- 补合规实现与 closeout：transcript/prompt/context/stderr/review findings 的 retention、GC、本地删除一致性、raw export 显式授权、append-only `agent_audit_log`、**redaction_report** 可审计字段必须先由 AG-24a 进入实现和测试，再由 AG-24 同步用户文档或运维文档；D1/R2 mirror 已生效（`cloud sync`/`restore`），待 delete/tombstone 传播落地后，才把 cloud restore/delete tombstone 尊重作为发布门禁。
+- 补合规实现与 closeout：transcript/prompt/context/stderr/review findings 的 retention、GC、本地删除一致性、raw export 显式授权、append-only `agent_audit_log`、**redaction_report** 可审计字段必须先由 AG-24a 进入实现和测试，再由 AG-24 同步用户文档或运维文档；D1/R2 mirror 已生效（`cloud sync`/`restore`），session erasure tombstone 传播和 `cloud restore` 双向 tombstone 优先已是当前发布契约；仅 R2 payload 物理删除仍 deferred。
 - 交付前复核上文「独立分析结论（11 维度）」唯一表与 **「评级门禁闭环核对」** 证据清单；所有「必须落到实施的门禁 / 证据」要么有测试和文档证据，要么在 release notes 中明确延后原因和重启条件；AG-24a 须提供合规实现证据，AG-24 须逐行核对「落地执行补充规格」§1~§10。
 
 ## 任务卡（AG-16~AG-24a）
@@ -1250,9 +1353,9 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | AG-17 CLI alias parity | AG-16 | `src/command/agent/*`、`docs/commands/agent.md`、compat tests | `list/add/remove` 兼容别名；stable/preview/read-only/launchable 字段；enable/disable 旧入口不破坏；gemini 降级为 **uninstall-only 通道**（`remove/disable` 可卸载已安装的 Libra-managed hooks、幂等、卸载后 `add/enable` 返回 actionable unsupported、存量捕获数据只读保留） | 不删除 `status/enable/disable`；不把 add/remove 解释成内部 AgentRuntime 管理；卸载不得删除用户自有 hook entry 或已捕获数据 |
 | AG-18 External `libra-agent-<name>` protocol v2 | AG-16 | `observed_agents/rpc.rs`、`command/agent/rpc.rs`、external protocol docs | versioned `libra-agent-<name>` protocol、fake binary fixtures、timeout/IO/conflict/settings gate、`env_clear`+allowlist（secret 不泄露）、provenance、内置 slug 仿冒防护、stderr capture/redaction、RPC 版本兼容矩阵 snapshot、terminal-state 枚举 + idempotent-retry 测试 | 不用 MCP；不调用未声明能力；不继承或泄露 stderr/secrets；不重做已实现的 exec-bit |
 | AG-19 Normalized observed-agent lifecycle dispatcher | AG-16；AG-18 可并行 | hooks runtime、lifecycle dispatcher、SessionStore/SQLite 写入边界 | `LifecycleEvent` 扩展、central validation、owner filtering、redaction-before-persist、tool/subagent/model/skill event tests | 不让 provider hook 直接写 checkpoint；不让 invalid session/tool id fail-open |
-| AG-20 E4-libra checkpoint export and lazy transcript IO | AG-16、AG-19 writer contract | `history.rs`、`command/agent/checkpoint.rs`、objects/DB/Web detail | E4-libra root/manifest/events/transcript/redaction_report payload、E4-entire import reader、content_hash、E5 manifest-relative chunking/zstd、metadata-first list/show（`--limit 50`/cap 500/keyset cursor）、大 transcript fixture、按真实写序的 crash recovery matrix、doctor 三类检测+repair（净新建）、prune 窗口 A/B 并发测试、`agent_checkpoint` INSERT 幂等、E4-libra-v1 存量布局 legacy reader/doctor 分类（见 E4-libra-v1 节）、prune/rewrite 后 `agent push` 非快进语义（force-with-lease 等价或 `ERR_AGENT_TRACES_PUSH_DIVERGED` + 重推出口，plan.md A5 二选一） | 默认路径不读完整 transcript；不把大 payload 存 SQLite；不留下 ref/DB/object_index 不一致却返回成功；不把 `commit_hash`（返回字段）与 `traces_commit`（DB 列）混用；writer 不得输出 entire per-session 目录为默认 |
+| AG-20 E4-libra checkpoint export and lazy transcript IO | AG-16、AG-19 writer contract | `history.rs`、`command/agent/checkpoint.rs`、objects/DB/Web detail | E4-libra root/manifest/events/transcript/redaction_report payload、E4-entire import reader、content_hash、E5 manifest-relative chunking/zstd、metadata-first list + safe-summary show（`--limit 50`/cap 500/keyset cursor）、大 transcript fixture、按真实写序的 crash recovery matrix、doctor 三类检测+repair（净新建）、prune 窗口 A/B 并发测试、`agent_checkpoint` INSERT 幂等、E4-libra-v1 存量布局 legacy reader/doctor 分类（见 E4-libra-v1 节）、prune/rewrite 后 `agent push` 非快进语义（force-with-lease 等价或 `ERR_AGENT_TRACES_PUSH_DIVERGED` + 重推出口，plan.md A5 二选一） | 默认路径不读完整 transcript；`checkpoint show` 还不得读 metadata/manifest 或输出内部 object OID；不把大 payload 存 SQLite；不留下 ref/DB/object_index 不一致却返回成功；不把 `commit_hash`（返回字段）与 `traces_commit`（DB 列）混用；writer 不得输出 entire per-session 目录为默认 |
 | AG-21 Transcript intelligence and skill-event extraction | AG-16、AG-18、AG-20 | transcript analyzer/preparer/token/model/subagent/skill traits | optional extractor traits、fallback semantics、Claude/Codex/OpenCode fixture、missing optional file tests | 不让 extractor error 阻断 checkpoint；mutating path 不允许 silent fallback |
-| A6.5 本地三 Agent 采集 smoke（plan.md §0.3/§3，第一期硬门禁） | AG-17、AG-19、AG-20、AG-21 | `tests/agent_local_capture_smoke_test.rs`、`tests/harness/agent_local_capture.rs`、`Cargo.toml`、`tests/INDEX.md` | `agent_local_capture_smoke_test`（`LIBRA_RUN_LOCAL_AGENTS=1` env-gate + `#[ignore]`，串行）：本机真实 `codex`/`claude`/`opencode` 各自完成 hook install → 最小非破坏会话 → lifecycle/session/checkpoint/`refs/libra/traces` 采集 → metadata-first/redaction 断言 → 卸载 smoke；evidence 仅 redacted summary | 不得以 fake fixture 或单 agent 通过替代；不得在 CI 默认启用；任一 agent 缺 binary/登录态/HookProvider 时只能标 blocked，不得声称第一期完成 |
+| A6.5 本地三 Agent 采集 smoke（plan.md §0.3/§3，第一期硬门禁） | AG-17、AG-19、AG-20、AG-21 | `tests/agent_local_capture_smoke_test.rs`、`tests/harness/agent_local_capture.rs`、`Cargo.toml`、`tests/INDEX.md` | `agent_local_capture_smoke_test`（`LIBRA_RUN_LOCAL_AGENTS=1` env-gate + `#[ignore]`，串行）：本机真实 `codex`/`claude`/`opencode` 各自完成 hook install → 最小非破坏会话 → lifecycle/session/checkpoint/`refs/libra/traces` 采集 → safe-summary/redaction 断言 → 卸载 smoke；evidence 仅 redacted summary | 不得以 fake fixture 或单 agent 通过替代；不得在 CI 默认启用；任一 agent 缺 binary/登录态/HookProvider 时只能标 blocked，不得声称第一期完成 |
 | AG-22 Agent review workflow parity | read-only: AG-16、AG-18（external RPC spawn）、AG-21；reviewer 是外部 agent 进程，fan-out 机制是 external RPC 并发 spawn + workspace 隔离，**不是**内部 `SubAgentDispatcher::dispatch_batch`（后者服务内部 sub-agent）；`materialize_isolated_workspace`（`sub_agent_dispatcher.rs:738`）可作为 reviewer worktree 隔离 helper 复用候选，须在 AG-22 中显式抽取为 public seam；fix 路径另需 AgentRuntime serialized fix 入口**经源码确认存在** | review workflow、findings manifest、可选 AgentRuntime fix bridge | read-only: multi-agent review fan-in、bounded sinks、findings schema、terminal states({success,error,cancelled,timeout,partial})、manual attach/provenance、`review list` 分页 + `review cancel` 清理、最小权限只读 spawn 断言 + 隔离 workspace（public seam）、findings 注入前 provenance=untrusted + redaction + spotlighting、`show` 渲染前 ANSI 剥离；fix-ready: `review --fix` 等价路径进入 AgentRuntime；fix-not-ready: `--fix` 稳定 unsupported 错误 | 不把 reviewer stdout 当 canonical result；不绕过 approval/sandbox 执行 fix；不让 cancel/timeout 泄漏进程或锁；不以 in-place 工作目录运行 reviewer（默认拒绝）；**fix 入口未经源码确认存在时不得声称 `review --fix` 可用**（先交付 read-only） |
 | AG-23 Agent investigate workflow parity | read-only: AG-16、AG-18（external RPC spawn）、AG-21；与 AG-22 同理，investigate 的 multi-agent round-robin 启动外部 agent 进程，不依赖 AG-13 `dispatch_batch`；fix 路径同 AG-22 前置 | investigate workflow、run state、quorum/stall、可选 fix | read-only: strict round-robin、state.json、pending turn/stance、quorum/max-turns/continue/show/clean fixtures、`investigate list` 分页、并发 run-id lock、terminal-state 释放进程·reader·lock·lease·pending-turn、复用 AG-22 的隔离 workspace seam + 最小权限只读 spawn 断言、stances/findings 注入下一轮 turn 前 provenance=untrusted + redaction + spotlighting、`show` 渲染前 ANSI 剥离；fix-not-ready: fix 返回稳定 unsupported 错误 | 不并发写 findings；不默认信任 issue-link seed；不把 review 并发模型套到 investigate；不以 in-place 工作目录运行 investigator（默认拒绝）；**fix 入口未确认存在时不得声称 investigate fix 可用** |
 | AG-24a / A8.5 合规实现面 | AG-20、AG-21 | `agent_audit_log`、raw 访问授权（`--allow-raw`）、retention GC、erasure | append-only audit、`--allow-raw` gate（仅未脱敏 raw；redacted detail/transcript 无需授权门）、`agent.retention.*` settings（含 `findings_days`）、本地三面删除一致性、`agent_audit_log_test` | 不把合规实现降级为 A9/AG-24 文档同步；不让 `clean --all` 或 GC 删除 audit log |
@@ -1274,7 +1377,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | AG-21 | transcript/token/model/subagent/skill extractor 接入首批 provider | E6 token mapping、E7 skill event、missing optional file partial 测试 | provider 无上游能力时的 empty registry 解释 |
 | AG-22 | read-only review workflow、findings manifest、terminal states、cancel/timeout resource release，以及 DF-03/DF-09 受控 `review --fix` | fake reviewer fan-in、sink backpressure、四类 review-fix outcome + no-runtime `LBR-AGENT-010` 回归测试 | 无 DF-04 残留；后续 findings-driven mutation 需另立安全设计 |
 | AG-23 | read-only investigate workflow、round-robin state、continue/show/clean、run-id lock，以及 DF-04 受控 `investigate fix` | quorum/max-turns/stall/pause/resume、pending-turn cleanup、fixed-admission/repair/no-runtime fix 测试 | findings-driven mutation 不在当前固定请求范围内 |
-| AG-24a / A8.5 | `agent_audit_log`、raw 访问授权（`--allow-raw`）、retention GC（transcript/stderr/findings 三窗口）、erasure 本地一致性 | `agent_audit_log_test`、raw gate、GC 不删 audit、erasure 三面一致测试 | session erasure 的 D1 tombstone/catalog 删除与 R2 物理删除（普通 checkpoint D1 prune fence/catalog 删除已生效；restore 仍会复活被 erase 的 session） |
+| AG-24a / A8.5 | `agent_audit_log`、raw 访问授权（`--allow-raw`）、retention GC（transcript/stderr/findings 三窗口）、erasure 本地一致性 | `agent_audit_log_test`、raw gate、GC 不删 audit、erasure 三面一致测试 | R2 payload 物理删除；session erasure 的 D1 tombstone/catalog 删除已落地，restore tombstone 优先且不会复活被 erase 的 session |
 | AG-24 | docs/compat/release notes/tests/INDEX/source-of-truth 全部收敛 | drift guards、release notes、retention/raw export docs、compat matrix | 未实现项必须有延后原因、重启条件和用户可见限制 |
 
 每张卡的 PR 描述必须包含：变更边界、未触碰项、测试命令、稳定错误码变更、migration/backfill 状态、用户可见行为、回滚路径。若只交付 read-only 降级形态，PR 标题或正文必须明确 `read-only`，不得让用户误以为 mutating fix 已可用。
@@ -1310,8 +1413,8 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | AG-18 trusted binary provenance | 新增 `agent_external_binary_trust`（slug、path、sha256、device、inode、mtime、approved_at、approved_by、schema_version）或明确使用 config KV | 不适用 | 删除表或回滚 config keys | secret env fixture + provenance mismatch 测试 |
 | AG-20 pagination | 新增 `idx_agent_session_started_paging` on `agent_session(started_at DESC, session_id)`；新增 `idx_agent_checkpoint_created_paging` on `agent_checkpoint(created_at DESC, checkpoint_id)`（tiebreaker 为 `session_id`/`checkpoint_id` 升序，非 `id DESC`；实测见 `sql/migrations/2026070802_agent_checkpoint_paging.sql`） | D1 mirror 已生效；同步 D1 同名索引 | drop index | `EXPLAIN QUERY PLAN` 命中索引 |
 | AG-20 checkpoint idempotency | `agent_checkpoint` INSERT 改 UPSERT/探测；必要时新增 unique guard | D1 mirror 同步 UPSERT 语义（`cloud sync`） | 保留旧 reader；down 不得删除数据 | crash replay 不主键冲突 |
-| AG-20 doctor repair | 视实现需要新增 `agent_checkpoint_repair_log` | D1 mirror 已生效；repair 同步 + tombstone 传播待建 | repair log 可保留不回滚 | 三类不一致可诊断/修复 |
-| DR-05/M4 import tombstone | `agent_import_identity` + `agent_import_tombstone` + anti-resurrection triggers | 删除传播待建 | identity 可在测试中 down；tombstone 仅在表为空时可 down，已有 erase 记录则事务性拒绝，必须前滚 | empty up/down/up + non-empty rollback refusal |
+| AG-20 doctor repair | 视实现需要新增 `agent_checkpoint_repair_log` | D1 mirror 已生效；repair 同步范围按具体 repair 交付验证；session tombstone 传播已落地，仅 R2 payload 物理删除 deferred | repair log 可保留不回滚 | 三类不一致可诊断/修复 |
+| DR-05/M4 import tombstone | `agent_import_identity` + `agent_import_tombstone` + anti-resurrection triggers | session tombstone 传播已落地（D1 发布、mirror 级联删除、restore tombstone 优先）；R2 payload 物理删除 deferred | identity 可在测试中 down；tombstone 仅在表为空时可 down，已有 erase 记录则事务性拒绝，必须前滚 | empty up/down/up + non-empty rollback refusal |
 | AG-24a audit | 新增 `agent_audit_log` append-only 表 | D1 mirror 已生效；不可变 audit 摘要同步待建 | down 不得删除审计数据；只能停止新写入 | raw export 写 audit；clean/GC 不删 audit |
 
 Forward DDL 默认必须 idempotent（RENAME-rebuild 例外由 runner 的 claim-first 事务保证单次执行，见 `sql/migrations/README.md`）；每个 forward migration 如有 `_down.sql`，不得删除用户 transcript/checkpoint/audit 数据。涉及 `agent_session`、`agent_checkpoint`、`agent_usage_stats` 行 shape 的变更必须 bump DB row `schema_version` 并提供 backfill SQL；external JSON `schema_version` 与 RPC `protocol_version` 不随 DB migration 自动变化。
@@ -1412,7 +1515,7 @@ Run state 最小布局：
 |---|---:|---|---|
 | `agent session list` | 10,000 sessions | 默认 `--limit 50` 不读 transcript；查询命中 `(started_at, id)` 索引 | `EXPLAIN QUERY PLAN` + instrumented reader |
 | `agent checkpoint list` | 50,000 checkpoints | 默认 `--limit 50`，cap 500；cursor 稳定无重复/遗漏 | pagination property test |
-| large transcript show | 49 MiB JSONL + `.zst` | 默认 show 只读 metadata；`--transcript` streaming，不一次性保留完整 Vec | reader byte-count 断言 |
+| large transcript show | 49 MiB JSONL + `.zst` | 默认 `checkpoint show` 只读 catalog 安全摘要；`--transcript` streaming，不一次性保留完整 Vec | reader byte-count 断言 |
 | RPC stderr flood | 10 MiB stderr | 捕获 64 KiB cap + redaction + `stderr_truncated:true` | fake binary fixture |
 | review sink | 4 reviewers 高频输出 | 单 reviewer flood 不阻塞其它 reviewer；内存缓冲不超过 64 KiB per sink | stress test + timeout |
 | concurrent prune/write | writer 窗口 A/B | prune 不删除 in-flight objects；ref 多于 catalog 时 fail-closed | deterministic interleaving test |
@@ -1768,10 +1871,10 @@ Special cases：
 - 改 `hooks/runtime.rs:557`：删 `"claude"/"gemini"` provider_name→agent_kind 字符串桥，改用 `hooks_for(AgentKind)`；同步删 `providers/mod.rs::find_provider` 字符串注册表（或保留 thin shim 标 deprecated）。
 - 新增 Codex / OpenCode `HookProvider`（新 builtin adapter + `as_hooks()`）：Codex 和 OpenCode 的配置入口必须按真实上游 CLI 版本实测固定（Codex 需处理用户级 `[hooks.state]` trust/enabled 门控；OpenCode 预期为 plugin/config 入口），不得默认写未证实的 `.codex/hooks.json` / `.opencode/hooks.json` / `[features] hooks=true`。gemini `HookProvider` 不再列 supported/installable。
 - central validation + owner filtering（first-writer-wins，`SessionStart`/`TurnStart` 豁免）+ redaction-before-persist：所有写入只接受 `RedactedBytes`（接 `RedactedSink`，`redaction.rs:219`），provider parser 仍只产 `LifecycleEvent`、不直接写 checkpoint。
-- 测试：`agent_lifecycle_event_test::{invalid_hook_envelopes_are_rejected_before_checkpoint, owner_claim_prevents_duplicate_checkpoint, subagent_end_materializes_distinct_subagent_scope_checkpoint, codex_trust_gap_banner_only_for_unapproved_hooks}`；`agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`。
+- 测试：`agent_lifecycle_event_test::{capture_ingress_validation_matrix, owner_claim_prevents_duplicate_checkpoint, subagent_end_materializes_distinct_subagent_scope_checkpoint}`；trust 配置见 `agent_enable_install_path_test::{codex_enable_writes_canonical_binary_path_and_trust_entries, codex_enable_rejects_malformed_trust_config_without_partial_mutation}`；`agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`。
 
 **AG-20 — checkpoint export / lazy IO（存储面，保持 bespoke）**
-- 改 `history.rs:880` `append_checkpoint_commit` / `command/agent/checkpoint.rs`：E4 root/session payload、`content_hash`（`sha256:` 前缀）、chunking/zstd（落地 `TranscriptChunker`，`adapter.rs:251` 现无 impl）、metadata-first list/show（`--limit 50`/cap 500/keyset cursor）。
+- 改 `history.rs:880` `append_checkpoint_commit` / `command/agent/checkpoint.rs`：E4 root/session payload、`content_hash`（`sha256:` 前缀）、chunking/zstd（落地 `TranscriptChunker`，`adapter.rs:251` 现无 impl）、metadata-first list + fixed safe-summary show（`--limit 50`/cap 500/keyset cursor）。
 - 改 `runtime.rs:900` `agent_checkpoint` INSERT → 幂等（UPSERT/探测 `traces_commit`），消除窗口 B；doctor 三类检测+repair（见「doctor repair 矩阵」）；prune 窗口 A/B 并发保护。
 - **存储不变量**：继续写 `blob/tree/commit` + catalog 行，**不**构造 git-internal `is_ai_object()` 类型；返回字段 `commit_hash` 不与 DB 列 `traces_commit` 混用。
 - 测试：`agent_checkpoint_export_test::*`（见测试矩阵）。
@@ -1815,16 +1918,16 @@ Special cases：
 | AG-24 partial（已交付） | `compat_agent_run_non_exhaustive_guard`：已注册 | （见 `agent_run/` 下 `#[non_exhaustive]` 各 enum） | Wave 1；守卫内部 agent run 类型演进 |
 | AG-17 | `command_test`：已注册 target；AG-17 五个测试已实现（2026-07-04，`tests/command/agent_roster_test.rs`） | `command_test::agent_list_add_remove_aliases_parse`; `command_test::agent_list_json_contains_capability_fields`; `command_test::agent_add_non_hook_installable_returns_actionable_unsupported`; `command_test::agent_remove_gemini_uninstalls_legacy_hooks_idempotent`; `command_test::agent_remove_preserves_user_hook_entries` | `list` / `add` / `remove` alias 落地时补测试；未补前不得声称 AG-17 有 command coverage |
 | AG-18 / E2 | `agent_rpc_external_test`：已注册（2026-07-04，A3 落地；顶层 tests/ 自动发现无需 [[test]]；`agent.rpc.invoke` span 断言独立于 `agent_rpc_span_test`——单测试二进制规避 tracing callsite-cache 并发竞态） | `agent_rpc_external_test::info_success_registers_binary`; `agent_rpc_external_test::version_mismatch_is_skipped_with_reason`; `agent_rpc_external_test::timeout_and_oversize_are_fail_closed`; `agent_rpc_external_test::undeclared_capability_method_is_rejected`; `agent_rpc_external_test::stderr_is_capped_redacted_and_not_inherited` | Wave 1/2；原场景名 `agent_external_protocol_v2_matrix` 只作为目的说明，不再作为命令名 |
-| AG-19 / E3 | `agent_lifecycle_event_test`：已注册（顶层 target，Cargo 自动发现） | `agent_lifecycle_event_test::invalid_hook_envelopes_are_rejected_before_checkpoint`; `agent_lifecycle_event_test::owner_claim_prevents_duplicate_checkpoint`; `agent_lifecycle_event_test::unknown_event_type_is_skipped_not_fatal`; `agent_lifecycle_event_test::kind_mismatch_still_fails_closed`; `agent_lifecycle_event_test::simultaneous_stop_race_yields_single_owner_checkpoints`; `agent_lifecycle_event_test::subagent_end_materializes_distinct_subagent_scope_checkpoint` | Wave 1；覆盖 owner claim、unknown event、kind mismatch、race closure、Gemini uninstall-only；**A0-02**：SubagentStart/End 物化独立 `scope='subagent'` checkpoint |
+| AG-19 / E3 | `agent_lifecycle_event_test`：已注册（顶层 target，Cargo 自动发现） | `agent_lifecycle_event_test::capture_ingress_validation_matrix`; `agent_lifecycle_event_test::owner_claim_prevents_duplicate_checkpoint`; `agent_lifecycle_event_test::unknown_event_type_is_skipped_not_fatal`; `agent_lifecycle_event_test::kind_mismatch_still_fails_closed`; `agent_lifecycle_event_test::simultaneous_stop_race_yields_single_owner_checkpoints`; `agent_lifecycle_event_test::subagent_end_materializes_distinct_subagent_scope_checkpoint` | Wave 1；覆盖 owner claim、unknown event、kind mismatch、race closure、Gemini uninstall-only；**A0-02**：SubagentStart/End 物化独立 `scope='subagent'` checkpoint |
 | AG-19 redaction | `agent_checkpoint_redaction_test`：已注册（顶层 target，Cargo 自动发现） | `agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`; `agent_checkpoint_redaction_test::tool_response_is_redacted_too`; `agent_checkpoint_redaction_test::assistant_message_is_redacted_too`; `agent_checkpoint_redaction_test::extractor_warning_does_not_include_secret_owner_or_prompt`; `agent_checkpoint_redaction_test::extraction_derived_strings_are_redacted_in_metadata` | Wave 1；与 lifecycle/checkpoint writer 同步，覆盖 prompt/tool_response/assistant/derived metadata redaction |
-| AG-20 / E4 / E5 | `agent_checkpoint_export_test` / `agent_checkpoint_reader_test` / `agent_doctor_repair_test` / `command_test` agent clean/push/checkpoint slices：已注册 | `agent_checkpoint_export_test::writer_emits_all_six_e4_libra_entries`; `agent_checkpoint_export_test::content_hash_format_and_recompute`; `agent_checkpoint_export_test::chunking_large_transcript_splits_line_safe`; `agent_checkpoint_reader_test::checkpoint_list_walks_keyset_pages_without_overlap_or_gap`; `agent_checkpoint_reader_test::show_survives_missing_transcript_blob`; `agent_doctor_repair_test::class2_missing_catalog_row_detected_and_repaired`; `command_test::agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only` | Wave 1；E4 writer/export、metadata-first reader, pagination, doctor repair, prune/rewrite and push force-with-lease are split across focused targets in `tests/INDEX.md` |
+| AG-20 / E4 / E5 | `agent_checkpoint_export_test` / `agent_checkpoint_reader_test` / `agent_doctor_repair_test` / `command_test` agent clean/push/checkpoint slices：已注册 | `agent_checkpoint_export_test::writer_emits_all_six_e4_libra_entries`; `agent_checkpoint_export_test::content_hash_format_and_recompute`; `history::tests::checkpoint_writer_chunks_transcript_with_task_scoped_test_threshold`（lib）; `agent_checkpoint_export_test::chunking_oversize_single_line_is_hard_error`; `agent_checkpoint_reader_test::checkpoint_list_walks_keyset_pages_without_overlap_or_gap`; `agent_checkpoint_reader_test::checkpoint_show_hides_catalog_internals_and_metadata_in_human_and_json`; `agent_doctor_repair_test::class2_missing_catalog_row_detected_and_repaired`; `command_test::agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only` | Wave 1；E4 writer/export、metadata-first list + safe-summary show、pagination、doctor repair、prune/rewrite and push force-with-lease are split across focused targets in `tests/INDEX.md` |
 | AG-20 existing rewind guard | `command_test`：已接入 | `command::agent_checkpoint_test::agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only` | `tests/command/agent_checkpoint_test.rs` 已在 `tests/command/mod.rs` 中 re-export；用 `cargo test --test command_test agent_checkpoint_rewind` 验证 |
 | AG-21 | `agent_transcript_intelligence_test`：已注册（2026-07-05，A6 落地；顶层 tests/ 自动发现） | `agent_transcript_intelligence_test::claude_codex_opencode_fixtures_extract_metadata_or_partial`; `agent_transcript_intelligence_test::token_usage_mapping_uses_e6_wire_keys`; `agent_transcript_intelligence_test::missing_optional_files_return_partial_not_panic`; `agent_transcript_intelligence_test::skill_events_project_for_claude_and_codex` | Wave 2；新增时同步 `tests/INDEX.md`；若拆 target，矩阵必须同步 |
 | A6.5 本地三 Agent 采集 smoke（plan.md §0.3） | `agent_local_capture_smoke_test`：已注册（2026-07-05，A6.5 落地；顶层 tests/ 自动发现无需 `[[test]]`，driver 在 `tests/harness/agent_local_capture.rs`） | `agent_local_capture_smoke_test::local_capture_smoke_codex`; `agent_local_capture_smoke_test::local_capture_smoke_claude_code`; `agent_local_capture_smoke_test::local_capture_smoke_opencode` — 每个均 `#[ignore]` + `#[serial]` + `LIBRA_RUN_LOCAL_AGENTS=1` env-gate；harness 固化 plan.md §0.3.2~§0.3.6 全流程（preflight/只读登录检查/pinned `$LIBRA_BIN` sha256/hook install 断言/真实会话（进程组超时 kill）/Libra 侧 session/checkpoint/traces/doctor 断言/卸载 smoke/redacted evidence） | Wave local-only（`tests/INDEX.md` Wave 7）；CI 默认必须 skip；缺 binary/登录态时不发起付费会话、redacted 阻断原因落盘 summary.json，且（门控已显式开启时）测试以 BLOCKED panic 失败——blocked 与真实绿跑在退出码/通过数上机械可区分（2026-07-12 收敛，见 plan.md §0.3.6 失败分层）；不得以 fake fixture 替代 |
 | AG-22 / E8 | `agent_review_workflow_test`：已注册（顶层 target，Cargo 自动发现） | `agent_review_workflow_test::fake_reviewers_cover_success_error_cancel_and_slow_output`; `agent_review_workflow_test::review_sink_is_not_blocked_by_high_frequency_reviewer`; `agent_review_workflow_test::review_read_only_emits_findings_manifest_and_manual_attach`; `agent_review_workflow_test::review_fix_bridge_admission`; `agent_review_workflow_test::review_fix_bridge_{approval_denied,sandbox_denied,tool_failure,success_patch}`; `agent_review_workflow_test::review_fix_returns_unsupported_until_bridge_ready`; `agent_review_workflow_test::cancel_releases_reviewer_processes_and_locks`; `agent_review_workflow_test::review_list_cli_paginates_with_keyset_cursor_envelope` | Wave 1；DF-03 锚定 token/controller admission，DF-09 锚定四类 controlled outcome；固定请求不含 external findings，不新建 mutation queue。无 runtime 的 mandatory fallback 仍是 `LBR-AGENT-010`。 |
 | AG-23 / E8 | `agent_investigate_workflow_test`：已注册（顶层 target，Cargo 自动发现） | `agent_investigate_workflow_test::round_robin_reaches_quorum_and_max_turns`; `agent_investigate_workflow_test::stalled_cancelled_paused_and_continue_resume_are_pinned`; `agent_investigate_workflow_test::investigate_read_only_persists_state_and_findings_doc`; `agent_investigate_workflow_test::investigate_fix_bridge`; `agent_investigate_workflow_test::investigate_fix_returns_unavailable_without_runtime`; `agent_investigate_workflow_test::concurrent_same_run_id_fails_closed`; `agent_investigate_workflow_test::investigate_list_cli_paginates_with_keyset_cursor_envelope` | Wave 1；DF-04 锚定共享 controller/runtime helper、固定请求不含 run id/topic/findings、repair/no-patch 结果，以及 mandatory `LBR-AGENT-010` no-runtime fallback。 |
 | AG-24a / A8.5 compliance | `agent_audit_log_test` + command slices：已注册 | `agent_audit_log_test::audit_log_rejects_update_and_delete_but_allows_insert_select`; `agent_audit_log_test::denied_access_is_recorded`; `agent_audit_log_test::retention_defaults_are_documented_values`; `command_test::allow_raw_gate`; `command_test::agent_clean_gc_drops_expired_all_scopes_and_keeps_audit_log`; `command_test::erase_session_local_removes_rows_and_preserves_audit_log`; `command_test::agent_erasure_local_tombstone`; `command_test::agent_clean_findings_retention_gc` | Wave 1/3；raw export audit, retention defaults, transcript/stderr/findings run-dir GC, and local erasure are implemented；**A0-09**：findings run-dir GC 已落地；**PD-04** 起对象化 findings blob 亦随过期 run 回收——仅回收无幸存 run manifest 引用、且 refs 不可达的 oid（内容寻址可能与历史中的普通 blob 撞 oid，删之即损坏仓库）；`object_index` 行无条件回收，`agent doctor` 可据 manifest 重建 |
-| A0-10 cloud tombstone deferral | `compat_agent_docs_contract` doc-guard + `agent_cloud_tombstone_test`（L3）：已注册 | `compat_agent_docs_contract::agent_doc_declares_cloud_tombstone_deferred`; `agent_cloud_tombstone_test::cloud_tombstone_propagation_is_deferred_for_agent_capture`（无 `test-live-cloud` + `LIBRA_D1_*` 时 skipped） | Wave 1/5；D1/R2 mirror、普通 checkpoint D1 prune fence/catalog 删除、session erasure tombstone 传播与 catalog 删除均已生效；`cloud restore` 双向 tombstone 优先（远端 + 本机 `agent_import_tombstone`），本地 erase 后 restore 不再复活 session；**仍 deferred 的只有 R2 物理删除**；doc-guard 钉住此真相不可漂移 |
+| A0-10 cloud tombstone propagation / R2 deferral | `compat_agent_docs_contract` doc-guard + `agent_cloud_tombstone_test`（L3）：已注册 | `compat_agent_docs_contract::agent_doc_declares_cloud_tombstone_deferred`; `agent_cloud_tombstone_test::cloud_tombstone_propagates_for_agent_capture`（无 `test-live-cloud` + `LIBRA_D1_*` 时 skipped） | Wave 1/5；D1/R2 mirror、普通 checkpoint D1 prune fence/catalog 删除、session erasure tombstone 传播与 catalog 删除均已生效；`cloud restore` 双向 tombstone 优先（远端 + 本机 `agent_import_tombstone`），本地 erase 后 restore 不再复活 session；**仍 deferred 的只有 R2 物理删除**；doc-guard 钉住此真相不可漂移 |
 
 AG-24a/AG-24 交付时必须逐行核对：没有 target、没有具体 test function、没有 `Cargo.toml` / `tests/INDEX.md` 注册、或验收命令未覆盖，均视为测试方案未闭环。
 
@@ -1889,8 +1992,12 @@ reservation 与 marker；恢复事务自身失败时必须把 cleanup error 与 
 链入原错误，禁止静默丢弃。事务 commit 不使用可取消的外层 timeout：每次 commit 前
 立即检查 deadline，随后等待明确提交结果；最终 ref/catalog/claim/identity 已原子
 提交时，即使结果返回时越过 deadline，也必须报告成功，不能伪报 partial。
-discovery 遍历/打开与 held-fd 读取分别在可由同一绝对 deadline 杀死的私有 helper
-进程中执行，阻塞的 provider filesystem syscall 不能突破命令总预算。
+discovery 的 helper 阶段与 held-fd 读取分别受同一绝对 deadline 的私有 helper
+进程约束；不过命令进程仍会在 descriptor 交接前同步完成 source 分类、
+canonicalize、安全打开与 rewind。因而 NFS/FUSE 等处的阻塞 provider filesystem
+syscall 仍可突破命令总预算：该设置是 helper/deadline-aware 阶段的边界，而不是严格的
+端到端 host deadline。要与 FD-only wire 及 timeout 后 autonomous replay 一起提供
+后者，仍需 long-lived owner 或由 provider ABI 交付 pre-authorized descriptor。
 checkpoint persistence 前先在 `metadata_kv(scope=agent_import_index_repair)` 取得
 session 级耐久 barrier marker；value 固定携带 owner、generation、identity_id、
 source identity、state 与 lease，活跃 lease 串行化跨进程 import，只有精确
@@ -1998,7 +2105,7 @@ marker。live/export/subagent 在 marker 注册后的任一失败都必须运行
 仍归属本 owner 的 claim/export job，并仅清普通 marker，保留 cleanup job；
 只有 `--restore-erased --yes` 会在确认原 session catalog 已删除后，于同一事务追加
 `restore_erased_import` audit 并移除本地 tombstone。D1/R2 mirror 的
-session erasure tombstone/catalog 删除与 R2 物理删除仍 deferred，cloud restore 的 session 复活风险保持下表记账；普通 checkpoint D1 prune fence/catalog 删除已实现。
+session erasure tombstone/catalog 删除已随 plan-20260714 PD-03 落地，`cloud restore` 双向 tombstone 优先且不复活已擦除 session；仅 R2 payload 物理删除仍 deferred。普通 checkpoint D1 prune fence/catalog 删除亦已实现。
 
 Machine negotiation：`agent list --json` 默认冻结 schema v1；显式
 `--schema-version 2` 才增加 versioned `methods[]`（`transcript_discoverable`、
@@ -2009,7 +2116,11 @@ Machine negotiation：`agent list --json` 默认冻结 schema v1；显式
 部分进度单列且不计入 `succeeded`。OpenCode 的 batch discovery 明确 unsupported，只有显式 session export
 可 import。unsupported schema 是 exit 129/category `cli`。partial 非零退出并保留
 `schema_version`、nullable `next_cursor` 与逐项脱敏 stable-code detail；若同一 session 的后续 turn 失败，已耐久提交的 turn
-数量也作为 partial summary 返回。retention prune 在同一事务删除/回退相关 coverage
+数量也作为 partial summary 返回。逐项 `skipped`/`failures` 的 `session_id` 是 provider
+session id 的 `sha256:<12 hex>` 短哈希，绝不取自 source locator、digest 或 commitment。
+discovery helper 只以封闭 reason enum 回报失败，由父进程渲染固定可操作消息；仅依赖 argv
+的 selector（`--limit`、`--agent`、`--path`、session id 语法、OpenCode batch、`--since`）
+在 spawn helper 前由父进程校验。retention prune 在同一事务删除/回退相关 coverage
 revision/current claim，并清理 import checkpoint cursor，避免 dangling current pointer。
 最终 coverage 消失后，对应终态、无 owner 的 `agent_import_identity` 必须物理删除；
 `agent clean --gc` 也会收走零 checkpoint identity，不能重置为 `discovered` 导致复活。
@@ -2030,10 +2141,12 @@ Claude capture 在 live `Stop`/`SessionEnd` 与历史 import 的父会话写入�
 bytes 共用 16 MiB hard cap 与调用方绝对 deadline。历史 import 不另开预算旁路：child
 bytes 与父 transcript 共用 `agent.max_transcript_read_bytes` 配置上限和 64 MiB batch
 累计原始输入上限，失败读取已经消耗的 bytes 仍计入预算；若 helper 无法返回可信计数，
-则按剩余的全部每源 allowance 保守计费。稳定 source key 是安全打开后
-Claude projects root-relative 原始身份的 SHA-256，持久化形式固定为
-`source/sha256/<64-lower-hex>`；project slug、provider session 目录名、文件名、绝对路径与
-basename-only 身份都禁止持久化。
+则按剩余的全部每源 allowance 保守计费。安全打开后的 provider-root-relative
+身份只用于构造固定长度的瞬态 preimage；父端在重新核验授权 root、storage binding、
+capture scope 与 workspace fence 后，才以 repository key 和 subagent 专属 domain 产生
+新 content 的耐久 key：`source/subagent-hmac-v2/<64-lower-hex>`。project slug、provider
+session 目录名、文件名、绝对路径、basename-only 身份以及未经密钥保护的 SHA 都禁止进入
+claim、revision、checkpoint metadata、trace 或 cloud mirror。
 
 每个文件 normalize 为 typed Claude turn，逐字段 redaction 后只序列化 allowlist
 projection。损坏 JSONL 行被跳过但将 source 标为 `partial` 并产生不含原文的 warning；
@@ -2046,10 +2159,11 @@ child transcript 加总。父 transcript 中出现 `Task` 不再把父 session �
 
 - `agent_subagent_content_claim` 以
   `(parent_session_id, provider_kind, opaque_source_key, content_schema_version)`
-  唯一；`opaque_source_key` 是安全打开后 provider-root-relative identity 的 SHA-256，
-  不持久化本地 project slug/文件名；空或仅 metadata 的 child source 没有 normalized
-  turn evidence，必须标成 `partial`；claim 保存单调 `revision_cursor`、独立单调
-  `sync_revision`、current revision/leaf 与短 lease/fence reservation；
+  唯一；新写入的 `content_schema_version=2` 的 `opaque_source_key` 必须是上述
+  repository-keyed V2 HMAC，不持久化本地 project slug/文件名；空或仅 metadata 的 child
+  source 没有 normalized turn evidence，必须标成 `partial`；claim 保存单调
+  `revision_cursor`、独立单调 `sync_revision`、current revision/leaf 与短 lease/fence
+  reservation；
 - `agent_subagent_content_revision` append-only 保存每个已提交 content revision；
   byte-identical 重复发现 no-op，内容变化只前推该 source，不写
   `agent_checkpoint.parent_checkpoint_id`，也不存在 checkpoint-global supersede；
@@ -2057,6 +2171,19 @@ child transcript 加总。父 transcript 中出现 `Task` 不再把父 session �
   只有 provider 给出稳定 child/tool ID 且恰好匹配一个 boundary 时才 `resolved`；否则
   `unresolved`。boundary 后到时可只更新 association，不改 metadata/traces commit 或
   revision 历史。
+
+`content_schema_version=1` 的 `source/sha256/...` claim、其 revision 和已经写出的
+checkpoint/trace metadata 是旧版本的不可变兼容证据，不能通过更新复合主键或复制 revision
+来“迁移”：revision 对 claim 有外键且 checkpoint ID 也必须保持唯一。新 capture 不会写
+V1；发现同一 source 的 V1 claim 时会拒绝制造平行 V2 历史，并保留为 read-only
+recovery/doctor 输入。若将来需要物理改写，必须另立带 DDL/data-migration、cloud 和
+immutable-artifact 证明的计划，不能把它作为普通 capture 的副作用。
+cloud 边界对升级仓库保持相容（plan-20260924 R85）：sync 与 restore 把 session 行的 legacy（未版本化或 V1）
+import-ownership 字段投影省略、其它 metadata 原样；远端 catalog 尚未持有的 V1 claim/revision 及其 content
+checkpoint 的 link 只留本地（checkpoint 照常镜像），每次成功 sync 输出一个固定
+`cloud_sync.agent_capture.warning`；旧版本已镜像的 V1 行原样保留且仍可 restore。sync 失败只输出一个带固定
+具体原因的 warning 并以 `LBR-CONFLICT-002`（`agent capture mirror failed: <reason>`）结束，restore 失败保持
+`LBR-NET-002`（`agent capture restore failed: <reason>`）。
 
 content checkpoint、source revision/current leaf、link association 与 traces ref CAS 在
 同一事务提交；tombstone、provider/session owner 与 reservation fence 均在最终事务复核。
@@ -2136,7 +2263,7 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 | 陷阱 | 风险 | 纠偏 |
 |---|---|---|
 | 把 observed external agent 当成内部受控 AgentRuntime | review/investigate fix 绕过 approval/sandbox/tool gate，产生不可审计 mutation | observed agent 只提供 transcript、hook event、findings、manual attach/provenance；fix/mutation 必须桥接回内部 AgentRuntime |
-| 默认读取或展示完整 transcript | 接近 50 MiB 的真实 transcript 造成延迟/OOM，并泄露 prompt、stdout、owner email | list/show/Web summary 默认只读 metadata/content hash；body 只在显式 detail 路径读取，按 chunk/stream 处理并 redaction |
+| 默认读取或展示完整 transcript | 接近 50 MiB 的真实 transcript 造成延迟/OOM，并泄露 prompt、stdout、owner email | list 与 session/Web summary 默认只读 metadata/content hash；`checkpoint show` 只读 catalog 安全摘要；body 只在显式 detail 路径读取，按 chunk/stream 处理并 redaction |
 | 把 registered、hook-installable、launchable 混成一个状态 | 用户看到非首批 agent 或 HookProvider 未落地的 Codex/OpenCode 就误以为可 `add` 或可自动 spawn reviewer | capability matrix 单独声明 `supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`launchable_review`、`launchable_investigate`；非首批路径返回 actionable unsupported 或 manual attach fallback |
 | external binary 能力未声明就被调用 | 恶意或旧版本 `libra-agent-*` 可触发未验证方法、挂起或写入错误数据 | AG-16/AG-18 要求 declared caps + protocol version + settings gate + timeout/IO cap；未声明 fail closed |
 | unknown agent kind 直接写 DB enum | Pi/Vogon/custom external 导入失败或破坏 `agent_session.agent_kind` CHECK | unknown/quarantine policy，不强插 DB enum |
@@ -2147,7 +2274,7 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 | 外部二进制冒用内置 slug | PATH 上的 `libra-agent-claude-code`/`libra-agent-codex`/`libra-agent-opencode` 被注册为内置身份，对用户/JSON 呈现为可信内置 agent（仿冒） | discovery 对 slug ∈ 第一批 supported roster / built-in `AgentKind` 的外部二进制 skip-and-log；external agent JSON 带 `external_binary:true`+绝对路径；回归测试钉死 |
 | 把 redaction-before-persist 当作已生效不变量 | `RedactedSink` **trait**（`redaction.rs:219`）仍是 Phase-1 placeholder（未接生产路径） | G4 已把 checkpoint writer 入口（`CheckpointCommitParams` 四 blob 入参）改为只收 `RedactedBytes` newtype，类型层面挡 `&[u8]`；uploader 依赖 writer 保证；未来新增独立持久化 sink 仍须保持类型/测试门禁，不得绕过 redaction |
 | 发布 public JSON 但没有 schema/version | 后续字段重命名或删除破坏脚本、Web UI 和外部 binary | 所有 `--json`、RPC `info`、checkpoint export、review/investigate state 都带 schema/protocol version 和 snapshot/schema pin test |
-| 没有 retention/GC/raw export 规则 | redacted 或 raw transcript、prompt/context、review findings 在本地或 cloud-enabled 部署中无限期保留，难以满足隐私删除要求 | AG-24a 必须实现 retention（transcript/stderr/findings 三窗口）、GC、本地删除一致性、raw 访问授权（`--allow-raw`）和 append-only audit；AG-24 再同步用户文档、delete/tombstone 传播落地前的 restore 复活限制（D1 mirror 已生效）和 release notes |
+| 没有 retention/GC/raw export 规则 | redacted 或 raw transcript、prompt/context、review findings 在本地或 cloud-enabled 部署中无限期保留，难以满足隐私删除要求 | AG-24a 必须实现 retention（transcript/stderr/findings 三窗口）、GC、本地删除一致性、raw 访问授权（`--allow-raw`）和 append-only audit；AG-24 再同步用户文档、已落地的 session tombstone 传播 / restore tombstone-first 边界，以及仅 R2 payload 物理删除仍 deferred 的 release notes |
 | 把完整内部 AgentRuntime / Web-only 迁移当作 `libra agent` 外部捕获前置 | AG-16~AG-21 被错误阻塞，或实现者把外部捕获能力塞进内部 Code UI runtime | 按前置依赖决策矩阵执行：外部捕获/read-only review 可独立推进；只有 mutating fix/action 依赖内部 AgentRuntime serialized fix bridge |
 | 把 AG-13 `dispatch_batch` 当作 review/investigate 的 multi-agent fan-out 机制 | reviewer 是外部 agent 进程（Claude Code/Codex/OpenCode），fan-out 依赖 AG-18 external RPC spawn；`dispatch_batch` 是内部 `SubAgentDispatcher` 方法，服务内部 sub-agent，两者是不同机制；误用会导致 review 无法启动外部 reviewer 或被迫先实现不相关的内部 batch dispatch | AG-22/AG-23 read-only 依赖 AG-18 external RPC spawn + AG-16/AG-21，不依赖 AG-13 `dispatch_batch`；`materialize_isolated_workspace` 可复用作 reviewer worktree 隔离，但须显式抽取 |
 
@@ -2170,7 +2297,7 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 | 命令面 | 按 agent 动态注册的顶层 `libra hooks <agent> <verb>` | 当前可用面是隐藏 `libra agent hooks <provider> <verb>` 与 legacy `libra hooks <provider> <verb>`，已满足已安装 provider hook 调用；dynamic top-level `libra hooks <agent>` 不作为 Gate 8 public surface。 | entire `hook_registry.go` / deferred public-surface decision |
 | 能力模型 | provider-specific `ProtectedFilesProvider`、`TranscriptCompactor`、`HookResponseWriter`、`RestoredSessionPathResolver` 等 optional parity traits | E1 `DeclaredAgentCaps`、capability-gated helper、TranscriptAnalyzer/PromptExtractor/TokenCalculator/ModelExtractor/SubagentAwareExtractor/SkillEventExtractor 已落地；剩余 optional traits 暂无 public behavior。 | entire `agent/agent.go`,`capabilities.go` / future parity |
 | Transcript | provider-specific transcript compaction/reassemble trait | AG-20 writer 已按 manifest-relative chunks 支持大 transcript 分片，AG-21 已覆盖 Claude/Codex/OpenCode fixture、token/model/skill/subagent 提取；provider-specific compaction/reassemble trait 仍是后续 parity。 | entire `agent/chunking.go` / future parity |
-| Checkpoint | condensation / shadow branch / entire per-session sidecar writer | E4-libra writer/export、metadata-first list/show、legacy-v1 reader、doctor repair、prune/rewrite、push force-with-lease 已落地；writer 不输出 entire `context.md` / `prompt.txt` / `full.jsonl` sidecar 形态，按 E4-libra manifest 设计保留差异。 | entire `checkpoint/`,`strategy/` / deliberate difference + future parity |
+| Checkpoint | condensation / shadow branch / entire per-session sidecar writer | E4-libra writer/export、metadata-first list + safe-summary show、legacy-v1 reader、doctor repair、prune/rewrite、push force-with-lease 已落地；writer 不输出 entire `context.md` / `prompt.txt` / `full.jsonl` sidecar 形态，按 E4-libra manifest 设计保留差异。 | entire `checkpoint/`,`strategy/` / deliberate difference + future parity |
 | 外部插件 | external RPC 扩展 method family beyond current v2 info/capability gate | AG-18 `info`/protocol version/settings gate/provenance/`env_clear`+allowlist/stderr capture/redaction/内置 slug 防护已落地；未声明能力继续 fail-closed。 | entire `agent/external/` / future external protocol extension |
 | 多 Agent | findings-driven mutating fix | DF-09/DF-04 已让 `review --fix` 与 `investigate fix` 通过 active Code control session 进入同一串行 AgentRuntime：各自固定请求均不转发 external findings，用户决定逐项经过既有 plan/approval/sandbox/network/ACL gate，patch/repair 结局按 runtime projection 如实返回。无 session/无授权仍为 `LBR-AGENT-010`，untrusted seed 为 `LBR-AGENT-011`。未来若允许 findings 驱动 mutation，必须另立安全设计。 | `runtime::fix_bridge` + `runtime::fix_execution` / DF-09 / DF-04 |
 | Skill | 物化 `ai_index_skill_event` 表（可选升级） | **A0-07 已落地** searchable projection + registry：`SkillEventProjection`（`observed_agents/skill_projection.rs`，ingest/dedup/search by skill/provider/session/RFC3339 time，`SKILL_PROJECTION_SCHEMA_VERSION=1`）、公开 `skill_registry_for(kind)` + `discover_skills(kind)`（SkillDiscoverer 面）、`libra agent skill search/list/registry` 命令（读时投影 over checkpoint metadata，keyset 分页 JSON）。**有意保留 deferred**：读时投影而非物化 `ai_index_skill_event` 表（skill events 已存于不可变 checkpoint metadata blob；schema 已版本化，busy repo 可后续无损升级）。 | future: `ai_index_skill_event` 物化 |
@@ -2276,7 +2403,8 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 | fail-closed | 安全关键路径出错时拒绝继续并不写入状态，例如 hook 安装、redaction、path 校验、writer、rewind apply、external launch/fix。 |
 | fail-open partial | 非关键 extractor 或可选字段缺失时允许继续，但结果必须标记为 `partial`，例如 transcript intelligence 缺少 token/model/skill 片段。 |
 | redaction | 持久化或展示前的脱敏流程，用于移除 token、secret、PII、路径或 prompt 片段等敏感信息。写 checkpoint、stderr 诊断、raw hook 输入前必须先 redaction；redaction 失败属于 fail-closed。 |
-| metadata-first | `session list/show`、`checkpoint list/show` 的默认读取策略：先展示 ID、时间、agent、scope、hash、大小、摘要等元数据，不默认加载完整 transcript/prompt/context/stderr。 |
+| metadata-first | `session list/show`、`checkpoint list` 的默认读取策略：先展示 ID、时间、agent、scope、hash、大小、摘要等元数据，不默认加载完整 transcript/prompt/context/stderr。 |
+| safe checkpoint show summary | `checkpoint show` 的默认读取策略：只输出固定白名单 `checkpoint_id`、受限 `scope`、Unix `created_at` 与 `parent_snapshot_recorded`；不读取或输出 `metadata.json`、session/source 详情、digest/redaction 详情或 catalog object OID。 |
 | raw / detail 路径 | 用户显式读取完整正文的两级路径，均不能作为默认输出。detail/transcript（redacted）：显式 flag 触发，受 size cap、streaming/chunk、redaction 约束，无需授权门；raw（未脱敏）：仅经 `--allow-raw` 授权访问/导出，每次写 append-only audit 记录。 |
 | owner filtering | 捕获写入时的归属过滤策略，防止不同用户、进程或并发 hook 抢写同一 session/checkpoint。除规定豁免外，重复或不匹配 owner 必须被拒绝或跳过。 |
 | provenance | 数据来源证明，说明 checkpoint、finding、event 或 metadata 来自 hook、transcript、RPC、manual attach、reviewer 等哪条路径。用于审计、debug 和信任边界判断。 |

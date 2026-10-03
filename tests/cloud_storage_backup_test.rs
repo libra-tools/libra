@@ -695,7 +695,6 @@ async fn connect_live_repo_db(repo: &Path) -> DatabaseConnection {
 
 #[cfg(feature = "test-live-cloud")]
 async fn seed_live_agent_session(conn: &DatabaseConnection, repo: &Path, session_id: &str) {
-    let source_fingerprint = session_id.replace('-', "").repeat(2);
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
@@ -706,7 +705,10 @@ async fn seed_live_agent_session(conn: &DatabaseConnection, repo: &Path, session
             Value::from(session_id),
             Value::from(format!("provider-{session_id}")),
             Value::from(repo.display().to_string()),
-            Value::from(serde_json::json!({"source_fingerprint": source_fingerprint}).to_string()),
+            // Cloud fixtures must use ordinary live metadata. Any member of
+            // the import-ownership field family is intentionally rejected at
+            // the cloud boundary unless it is a complete validated V2 record.
+            Value::from(serde_json::json!({"event":"SessionEnd","live":true}).to_string()),
         ],
     ))
     .await
@@ -747,6 +749,7 @@ async fn seed_live_agent_checkpoint(
             checkpoint_id,
             session_id,
             marker_generation: marker.generation.as_deref().expect("writer generation"),
+            capture_scope: None,
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Committed,
@@ -1035,10 +1038,9 @@ async fn cloud_agent_capture_roundtrip() {
         format!("provider-{erased_session}")
     );
     assert_eq!(tombstone.erased_session_id, erased_session);
-    let expected_fingerprint = erased_session.replace('-', "").repeat(2);
     assert_eq!(
-        tombstone.source_fingerprint.as_deref(),
-        Some(expected_fingerprint.as_str())
+        tombstone.source_fingerprint, None,
+        "session erasure must not propagate the legacy unkeyed source fingerprint from metadata"
     );
     assert!(tombstone.erased_at > 0, "erasure fence needs a timestamp");
     assert_eq!(post_erase_catalog.0[0].session_id, retained_session);

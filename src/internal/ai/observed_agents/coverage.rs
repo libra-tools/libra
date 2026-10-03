@@ -249,7 +249,7 @@ fn write_canon_value(out: &mut Vec<u8>, value: &CanonValue) {
 /// digest allowlist — provenance (model/usage/timestamps/paths) never appears
 /// here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SemanticRecord {
     User {
         text: String,
@@ -360,6 +360,7 @@ impl Completeness {
 
 /// One normalized logical turn (coverage-v1.md §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedTurn {
     pub logical_turn_key: String,
     pub ordinal: usize,
@@ -1282,7 +1283,18 @@ pub fn redact_turns_with_report(
         aggregate.bytes_redacted = aggregate
             .bytes_redacted
             .saturating_add(report.bytes_redacted);
-        aggregate.matches.extend(report.matches);
+        aggregate.dropped_matches = aggregate
+            .dropped_matches
+            .saturating_add(report.dropped_matches);
+        for matched in report.matches {
+            if aggregate.matches.len()
+                < crate::internal::ai::observed_agents::MAX_REDACTION_MATCH_SAMPLES
+            {
+                aggregate.matches.push(matched);
+            } else {
+                aggregate.dropped_matches = aggregate.dropped_matches.saturating_add(1);
+            }
+        }
     }
     fn redact_string(
         s: &mut String,
@@ -1991,6 +2003,68 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(first_report, second_report);
+    }
+
+    #[test]
+    fn aggregate_redaction_report_caps_samples_across_turns_and_keeps_exact_count() {
+        const TOKEN: &str = "AKIAIOSFODNN7EXAMPLE";
+        let per_field_overflow = 3;
+        let aggregate_overflow = 5;
+        let dense_secret_field = std::iter::repeat_n(
+            TOKEN,
+            crate::internal::ai::observed_agents::MAX_REDACTION_MATCH_SAMPLES
+                .saturating_add(per_field_overflow),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+        let mut turns = vec![NormalizedTurn {
+            logical_turn_key: "dense-secret-turn".to_string(),
+            ordinal: 0,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: vec![SemanticRecord::User {
+                text: dense_secret_field,
+            }],
+        }];
+        for ordinal in 1..=aggregate_overflow {
+            turns.push(NormalizedTurn {
+                logical_turn_key: format!("secret-turn-{ordinal}"),
+                ordinal,
+                completeness: Completeness::Complete,
+                started_at: None,
+                ended_at: None,
+                records: vec![SemanticRecord::User {
+                    text: format!("{TOKEN} record {ordinal}"),
+                }],
+            });
+        }
+
+        let report = redact_turns_with_report(&mut turns);
+        assert_eq!(
+            report.matches.len(),
+            crate::internal::ai::observed_agents::MAX_REDACTION_MATCH_SAMPLES,
+            "durable aggregate detail must remain globally bounded"
+        );
+        assert_eq!(
+            report.dropped_matches,
+            per_field_overflow + aggregate_overflow,
+            "include both per-field and aggregate-level omitted samples"
+        );
+        assert_eq!(
+            report.match_count(),
+            crate::internal::ai::observed_agents::MAX_REDACTION_MATCH_SAMPLES
+                .saturating_add(per_field_overflow)
+                .saturating_add(aggregate_overflow),
+            "the capped report must retain the exact redaction count"
+        );
+        assert!(report.matches_truncated());
+        assert!(turns.iter().all(|turn| {
+            turn.records.iter().all(|record| match record {
+                SemanticRecord::User { text } => !text.contains(TOKEN),
+                _ => true,
+            })
+        }));
     }
 
     #[test]

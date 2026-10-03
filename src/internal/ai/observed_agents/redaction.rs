@@ -25,7 +25,15 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use regex::bytes::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Maximum detailed rule-hit samples retained in one redaction report.
+///
+/// Reports are durable diagnostics, not a transcript index.  Keeping every
+/// hit lets a cap-sized adversarial transcript turn a small report into an
+/// unbounded allocation and checkpoint blob.  Counts remain exact while this
+/// bounded prefix provides enough detail to diagnose the rules involved.
+pub const MAX_REDACTION_MATCH_SAMPLES: usize = 256;
 
 /// Bytes that have passed through a [`Redactor`].
 ///
@@ -96,6 +104,19 @@ impl RedactedBytes {
     }
 }
 
+impl RedactionReport {
+    /// Exact number of redaction matches, including bounded samples omitted
+    /// from `matches` for capacity control.
+    pub fn match_count(&self) -> usize {
+        self.matches.len().saturating_add(self.dropped_matches)
+    }
+
+    /// Whether the detailed match sample was truncated.
+    pub fn matches_truncated(&self) -> bool {
+        self.dropped_matches != 0
+    }
+}
+
 impl AsRef<[u8]> for RedactedBytes {
     fn as_ref(&self) -> &[u8] {
         &self.data
@@ -111,7 +132,7 @@ pub struct RedactionRule {
 }
 
 /// Where a rule fired in the input.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RedactionMatch {
     pub rule_id: String,
     pub start: usize,
@@ -121,39 +142,94 @@ pub struct RedactionMatch {
 /// Aggregate report returned alongside [`RedactedBytes`] so callers can stamp
 /// it onto `agent_session.redaction_report` and the per-checkpoint metadata
 /// blob.
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RedactionReport {
     pub matches: Vec<RedactionMatch>,
+    /// Number of matches omitted after [`MAX_REDACTION_MATCH_SAMPLES`].
+    /// Omitted when zero to retain the existing report wire shape for normal
+    /// captures.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_matches: usize,
     pub bytes_scanned: usize,
     pub bytes_redacted: usize,
 }
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone)]
+enum RedactionRuleSet {
+    Compiled(Arc<Vec<RedactionRule>>),
+    /// A malformed built-in rule must never turn a privacy boundary into a
+    /// process panic or an unredacted pass-through. The fallback replaces the
+    /// whole input with a content-free placeholder until the shipped rule set
+    /// is repaired.
+    FailClosed,
+}
+
+const DEFAULT_RULE_INIT_FAILURE_ID: &str = "default-rule-initialization";
+const DEFAULT_RULE_INIT_FAILURE_PLACEHOLDER: &[u8] = b"<REDACTED:default-rule-initialization>";
 
 /// Redaction engine. Cheap to clone (the rules are `Arc`-shared) so the
 /// runtime can keep one instance per session without paying per-rule rebuild
 /// costs.
 #[derive(Debug, Clone)]
 pub struct Redactor {
-    rules: Arc<Vec<RedactionRule>>,
+    rules: RedactionRuleSet,
+}
+
+/// Limits used only by the deadline-bound helper path.  The normal in-process
+/// redactor keeps its existing behavior; the helper must fail closed instead
+/// of allowing a replacement-heavy transcript to exceed its capture-memory
+/// budget while it is still waiting on the parent deadline.
+#[derive(Clone, Copy)]
+struct RedactionLimits {
+    max_output_bytes: usize,
+    max_working_set_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RedactionLimitExceeded {
+    bytes_scanned: usize,
+}
+
+/// Compute the next buffer allocation while the preceding rule pass is still
+/// alive.  The bound is deliberately expressed in terms of `Vec::capacity`,
+/// not its logical length: a prior matching pass may retain the full output
+/// reservation even when replacements shortened the transcript.
+fn bounded_next_redaction_capacity(
+    limits: RedactionLimits,
+    live_buffer_capacity: usize,
+) -> Option<usize> {
+    limits
+        .max_working_set_bytes
+        .checked_sub(live_buffer_capacity)
+        .map(|remaining| remaining.min(limits.max_output_bytes))
+        .filter(|remaining| *remaining > 0)
 }
 
 impl Redactor {
     /// Build a redactor with the v1 default rule set.
     pub fn new_default() -> Self {
         Self {
-            rules: Arc::clone(&DEFAULT_RULES),
+            rules: (*DEFAULT_RULES).clone(),
         }
     }
 
     /// Build a redactor with a caller-supplied rule set. Useful for tests.
     pub fn with_rules(rules: Vec<RedactionRule>) -> Self {
         Self {
-            rules: Arc::new(rules),
+            rules: RedactionRuleSet::Compiled(Arc::new(rules)),
         }
     }
 
     /// Number of rules registered. Mostly useful for tests / diagnostics.
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        match &self.rules {
+            RedactionRuleSet::Compiled(rules) => rules.len(),
+            RedactionRuleSet::FailClosed => 0,
+        }
     }
 
     /// Walk every rule across `input` and return the redacted bytes plus a
@@ -161,19 +237,129 @@ impl Redactor {
     /// [`DEFAULT_RULES`]) and replacements are non-overlapping — once a span
     /// has been replaced, later rules don't re-scan the placeholder.
     pub fn redact(&self, input: &[u8]) -> (RedactedBytes, RedactionReport) {
-        let mut output = input.to_vec();
+        self.redact_owned(input.to_vec())
+    }
+
+    /// Redact an owned buffer without retaining a second full raw copy.
+    ///
+    /// Capture snapshots pass their bounded source buffer here directly.  At
+    /// each rule boundary the old buffer is moved into the scanner and then
+    /// dropped after the new redacted buffer is built, rather than cloned.
+    /// This keeps the snapshot redaction working set to the current buffer,
+    /// next buffer, and a bounded report — not raw + cloned buffer + next
+    /// buffer for every rule.
+    pub fn redact_owned(&self, output: Vec<u8>) -> (RedactedBytes, RedactionReport) {
+        // `None` never imposes a limit, so the fallback is defensive only.
+        // It remains fail-closed rather than panicking if this implementation
+        // is ever changed to report a limit error on the ordinary path.
+        self.redact_owned_limited(output, None)
+            .unwrap_or_else(|error| redact_limit_fail_closed(error.bytes_scanned))
+    }
+
+    /// Redact owned bytes while bounding both the final redacted output and
+    /// the two-buffer working set used by each rule pass.  `None` is a safe
+    /// fail-closed result for the helper: it must not emit a frame that the
+    /// parent cannot drain within the agreed memory budget.
+    pub(crate) fn redact_owned_bounded(
+        &self,
+        output: Vec<u8>,
+        max_output_bytes: usize,
+        max_working_set_bytes: usize,
+    ) -> Option<(RedactedBytes, RedactionReport)> {
+        // Callers may hand over a logically bounded `Vec` whose allocator
+        // growth left non-semantic spare capacity (for example, formatter
+        // output).  There is no successor redaction buffer yet, so discard
+        // that slack before establishing the two-buffer budget.  Every rule
+        // pass below still accounts against the actual live `Vec::capacity`,
+        // rather than treating a retained allocation as its logical length.
+        let output = if output.capacity() > output.len() {
+            output.into_boxed_slice().into_vec()
+        } else {
+            output
+        };
+        self.redact_owned_limited(
+            output,
+            Some(RedactionLimits {
+                max_output_bytes,
+                max_working_set_bytes,
+            }),
+        )
+        .ok()
+    }
+
+    fn redact_owned_limited(
+        &self,
+        mut output: Vec<u8>,
+        limits: Option<RedactionLimits>,
+    ) -> Result<(RedactedBytes, RedactionReport), RedactionLimitExceeded> {
+        let bytes_scanned = output.len();
+        let rules = match &self.rules {
+            RedactionRuleSet::Compiled(rules) => rules,
+            RedactionRuleSet::FailClosed => {
+                let result = redact_all_fail_closed(output);
+                return if limits.is_none_or(|limits| {
+                    result.0.len() <= limits.max_output_bytes
+                        && result.0.len() <= limits.max_working_set_bytes
+                }) {
+                    Ok(result)
+                } else {
+                    Err(RedactionLimitExceeded { bytes_scanned })
+                };
+            }
+        };
         let mut report = RedactionReport {
-            bytes_scanned: input.len(),
+            bytes_scanned,
             ..Default::default()
         };
 
-        for rule in self.rules.iter() {
+        for rule in rules.iter() {
             // Re-scan after each rule because earlier replacements can shift
             // byte offsets. The cost is bounded — typical transcripts are
             // <16 MiB and the rule set is small.
-            let buffer = output.clone();
+            let buffer = output;
+            let buffer_capacity = buffer.capacity();
+            if limits.is_some_and(|limits| {
+                buffer.len() > limits.max_output_bytes
+                    || buffer.len() > limits.max_working_set_bytes
+                    || buffer_capacity > limits.max_working_set_bytes
+            }) {
+                return Err(RedactionLimitExceeded { bytes_scanned });
+            }
+
+            // Most rules do not match a typical transcript. Avoid allocating
+            // a second full-capacity buffer for those passes; besides saving
+            // work, this preserves the helper's two-buffer memory bound after
+            // an earlier replacement expanded the current output.
+            let has_match = rule
+                .regex
+                .find_iter(&buffer)
+                .any(|matched| !buffer[matched.start()..matched.end()].starts_with(b"<REDACTED:"));
+            if !has_match {
+                output = buffer;
+                continue;
+            }
+
+            let next_capacity = match limits {
+                Some(limits) => bounded_next_redaction_capacity(limits, buffer_capacity)
+                    .ok_or(RedactionLimitExceeded { bytes_scanned })?,
+                None => buffer.len(),
+            };
             let mut last_end = 0usize;
-            let mut new_output = Vec::with_capacity(buffer.len());
+            let mut new_output = if limits.is_some() {
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(next_capacity)
+                    .map_err(|_| RedactionLimitExceeded { bytes_scanned })?;
+                // `try_reserve_exact` may legally grant more than requested.
+                // Do not copy a provider transcript if that allocation would
+                // exceed the two-buffer budget while `buffer` remains live.
+                if output.capacity() > next_capacity {
+                    return Err(RedactionLimitExceeded { bytes_scanned });
+                }
+                output
+            } else {
+                Vec::with_capacity(next_capacity)
+            };
             let placeholder = format!("<REDACTED:{}>", rule.id);
             let placeholder_bytes = placeholder.as_bytes();
 
@@ -186,22 +372,54 @@ impl Redactor {
                 if buffer[start..end].starts_with(b"<REDACTED:") {
                     continue;
                 }
-                new_output.extend_from_slice(&buffer[last_end..start]);
-                new_output.extend_from_slice(placeholder_bytes);
-                report.matches.push(RedactionMatch {
-                    rule_id: rule.id.to_string(),
-                    start,
-                    end,
-                });
+                if !extend_redacted_with_limit(
+                    &mut new_output,
+                    &buffer[last_end..start],
+                    limits.map(|_| next_capacity),
+                ) || !extend_redacted_with_limit(
+                    &mut new_output,
+                    placeholder_bytes,
+                    limits.map(|_| next_capacity),
+                ) {
+                    return Err(RedactionLimitExceeded { bytes_scanned });
+                }
+                if report.matches.len() < MAX_REDACTION_MATCH_SAMPLES {
+                    report.matches.push(RedactionMatch {
+                        rule_id: rule.id.to_string(),
+                        start,
+                        end,
+                    });
+                } else {
+                    report.dropped_matches = report.dropped_matches.saturating_add(1);
+                }
                 report.bytes_redacted += end - start;
                 last_end = end;
             }
-            new_output.extend_from_slice(&buffer[last_end..]);
+            if !extend_redacted_with_limit(
+                &mut new_output,
+                &buffer[last_end..],
+                limits.map(|_| next_capacity),
+            ) {
+                return Err(RedactionLimitExceeded { bytes_scanned });
+            }
             output = new_output;
         }
 
-        (RedactedBytes::new_unchecked(output), report)
+        Ok((RedactedBytes::new_unchecked(output), report))
     }
+}
+
+fn extend_redacted_with_limit(output: &mut Vec<u8>, bytes: &[u8], limit: Option<usize>) -> bool {
+    if let Some(limit) = limit {
+        let Some(next_len) = output.len().checked_add(bytes.len()) else {
+            return false;
+        };
+        if next_len > limit {
+            return false;
+        }
+    }
+    output.extend_from_slice(bytes);
+    true
 }
 
 impl Default for Redactor {
@@ -229,7 +447,7 @@ pub trait RedactedSink {
 /// Default rule set. Conservative on purpose — false positives on
 /// transcripts are very expensive (they make sessions unreadable) so each
 /// rule below is anchored to a high-signal prefix.
-static DEFAULT_RULES: Lazy<Arc<Vec<RedactionRule>>> = Lazy::new(|| {
+static DEFAULT_RULES: Lazy<RedactionRuleSet> = Lazy::new(|| {
     let raw: &[(&'static str, &'static str)] = &[
         // AWS access keys: the `AKIA` / `ASIA` / `AGPA` family.
         (
@@ -364,16 +582,65 @@ static DEFAULT_RULES: Lazy<Arc<Vec<RedactionRule>>> = Lazy::new(|| {
         ),
     ];
 
-    Arc::new(
-        raw.iter()
-            .map(|(id, pattern)| RedactionRule {
+    // A malformed future literal must fail closed rather than poison this
+    // process-wide Lazy (or let raw transcript bytes reach a durable sink).
+    compile_redaction_rule_set(raw).unwrap_or(RedactionRuleSet::FailClosed)
+});
+
+/// Whether an identifier may appear in a durable import redaction report.
+/// Import/catalog sync accepts report samples from another machine, so this
+/// must be a closed vocabulary rather than merely a bounded arbitrary string:
+/// otherwise a malicious report field would be a second raw-source locator
+/// channel. The fail-closed placeholder is a valid durable diagnostic even
+/// when the compiled default rules are unavailable.
+pub(crate) fn is_durable_default_rule_id(rule_id: &str) -> bool {
+    rule_id == DEFAULT_RULE_INIT_FAILURE_ID
+        || matches!(
+            &*DEFAULT_RULES,
+            RedactionRuleSet::Compiled(rules) if rules.iter().any(|rule| rule.id == rule_id)
+        )
+}
+
+fn compile_redaction_rule_set(
+    raw: &[(&'static str, &'static str)],
+) -> Result<RedactionRuleSet, regex::Error> {
+    raw.iter()
+        .map(|&(id, pattern)| {
+            Regex::new(pattern).map(|regex| RedactionRule {
                 id,
-                regex: Regex::new(pattern).expect("default redaction pattern must compile"),
+                regex,
                 replacement: id,
             })
-            .collect(),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|rules| RedactionRuleSet::Compiled(Arc::new(rules)))
+}
+
+fn redact_all_fail_closed(input: Vec<u8>) -> (RedactedBytes, RedactionReport) {
+    redact_limit_fail_closed(input.len())
+}
+
+fn redact_limit_fail_closed(input_len: usize) -> (RedactedBytes, RedactionReport) {
+    if input_len == 0 {
+        return (
+            RedactedBytes::new_unchecked(Vec::new()),
+            RedactionReport::default(),
+        );
+    }
+    (
+        RedactedBytes::new_unchecked(DEFAULT_RULE_INIT_FAILURE_PLACEHOLDER.to_vec()),
+        RedactionReport {
+            matches: vec![RedactionMatch {
+                rule_id: DEFAULT_RULE_INIT_FAILURE_ID.to_string(),
+                start: 0,
+                end: input_len,
+            }],
+            dropped_matches: 0,
+            bytes_scanned: input_len,
+            bytes_redacted: input_len,
+        },
     )
-});
+}
 
 #[cfg(test)]
 mod tests {
@@ -528,6 +795,130 @@ mod tests {
         assert_eq!(first, second);
         // No new matches on the placeholder.
         assert!(second_report.matches.is_empty());
+    }
+
+    #[test]
+    fn owned_cap_sized_input_has_bounded_match_report() {
+        // One 12-byte input unit turns into the same-size replacement. This
+        // exercises the maximum snapshot source size without relying on a
+        // giant diagnostic allocation: the report retains samples only.
+        const TOKEN: &[u8] = b"SECRETVALUE";
+        let input_limit =
+            crate::internal::ai::observed_agents::TRANSCRIPT_READ_HARD_CAP_BYTES as usize;
+        let units = input_limit / (TOKEN.len() + 1);
+        let mut input = Vec::with_capacity(units * (TOKEN.len() + 1));
+        for _ in 0..units {
+            input.extend_from_slice(TOKEN);
+            input.push(b' ');
+        }
+        let redactor = Redactor::with_rules(vec![RedactionRule {
+            id: "x",
+            regex: Regex::new("SECRETVALUE").expect("compile bounded test rule"),
+            replacement: "x",
+        }]);
+
+        let (redacted, report) = redactor.redact_owned(input);
+        assert!(
+            !redacted
+                .bytes()
+                .windows(TOKEN.len())
+                .any(|window| window == TOKEN)
+        );
+        assert_eq!(report.matches.len(), MAX_REDACTION_MATCH_SAMPLES);
+        assert_eq!(report.dropped_matches, units - MAX_REDACTION_MATCH_SAMPLES);
+        assert_eq!(report.bytes_redacted, units * TOKEN.len());
+    }
+
+    #[test]
+    fn bounded_redaction_accounts_for_the_live_buffer_capacity_between_rules() {
+        // A first matching rule may reserve the full redacted-output limit
+        // while retaining a much shorter logical transcript. A second rule
+        // must budget against that live allocation, not `buffer.len()`, or a
+        // cap-sized source can transiently hold three full buffers.
+        let limits = RedactionLimits {
+            max_output_bytes: 24 * 1024 * 1024,
+            max_working_set_bytes: 40 * 1024 * 1024,
+        };
+        let raw_capacity = 16 * 1024 * 1024;
+        let first_capacity = bounded_next_redaction_capacity(limits, raw_capacity)
+            .expect("first bounded replacement capacity");
+        assert_eq!(first_capacity, limits.max_output_bytes);
+        assert_eq!(
+            bounded_next_redaction_capacity(limits, first_capacity),
+            Some(raw_capacity),
+            "the next rule receives only the capacity left after the prior live allocation"
+        );
+        assert!(
+            first_capacity + raw_capacity <= limits.max_working_set_bytes,
+            "two concurrently live redaction buffers stay within the declared budget"
+        );
+    }
+
+    #[test]
+    fn bounded_redaction_compacts_input_slack_before_capacity_accounting() {
+        const TOKEN: &str = "TOKEN-12345678901234567890";
+        let mut input = Vec::with_capacity(1024);
+        input.extend_from_slice(TOKEN.as_bytes());
+        assert!(
+            input.capacity() > input.len(),
+            "fixture must carry allocator slack that is not transcript content"
+        );
+        let raw_bytes = input.len();
+        let redactor = Redactor::with_rules(vec![RedactionRule {
+            id: "token",
+            regex: Regex::new(TOKEN).expect("compile bounded test rule"),
+            replacement: "x",
+        }]);
+
+        let (redacted, report) = redactor
+            .redact_owned_bounded(input, raw_bytes * 2, raw_bytes * 5 / 2)
+            .expect("allocator slack alone must not make a bounded source partial");
+        assert_eq!(report.match_count(), 1);
+        assert_eq!(redacted.bytes(), b"<REDACTED:token>");
+    }
+
+    #[test]
+    fn bounded_redaction_keeps_two_matching_rule_passes_within_the_allocation_budget() {
+        // Keep each replacement the same width as its token so this exercises
+        // allocation accounting rather than output-growth rejection.
+        let mut input = Vec::with_capacity(128);
+        input.resize(128, b'x');
+        input[..12].copy_from_slice(b"FIRST_TOKEN1");
+        input[64..76].copy_from_slice(b"SECOND_TOKEN");
+        let raw_capacity = input.capacity();
+        let output_cap = raw_capacity * 2;
+        let working_set_cap = raw_capacity + output_cap;
+        let redactor = Redactor::with_rules(vec![
+            RedactionRule {
+                id: "a",
+                regex: Regex::new("FIRST_TOKEN1").expect("compile first bounded rule"),
+                replacement: "a",
+            },
+            RedactionRule {
+                id: "b",
+                regex: Regex::new("SECOND_TOKEN").expect("compile second bounded rule"),
+                replacement: "b",
+            },
+        ]);
+
+        let (redacted, report) = redactor
+            .redact_owned_bounded(input, output_cap, working_set_cap)
+            .expect("same-width bounded redaction should succeed");
+        assert_eq!(report.match_count(), 2);
+        let output = redacted.into_inner();
+        assert!(
+            output.capacity() <= raw_capacity,
+            "the second matching pass may reserve only the budget left after the first output buffer"
+        );
+        assert!(
+            output
+                .windows("FIRST_TOKEN1".len())
+                .all(|window| window != b"FIRST_TOKEN1")
+                && output
+                    .windows("SECOND_TOKEN".len())
+                    .all(|window| window != b"SECOND_TOKEN"),
+            "both matching tokens must be redacted"
+        );
     }
 
     #[test]
@@ -833,20 +1224,40 @@ mod tests {
         assert!(report.matches.is_empty());
     }
 
-    /// Belt-and-suspenders test: the `DEFAULT_RULES` `Lazy` static is
-    /// initialized via `Regex::new(...).expect(...)` and a single bad
-    /// pattern would poison every subsequent caller (we hit this exact
-    /// failure mode in CEX-EntireIO Phase 3.2 with a `(?=...)` lookahead
-    /// pattern). This test forces the Lazy to evaluate eagerly so any
-    /// future bad regex turns into a localised, named failure rather than
-    /// a "Lazy instance has previously been poisoned" cascade.
+    /// The shipped default rule set must compile to the normal selective
+    /// redactor rather than the fail-closed fallback.
     #[test]
-    fn default_rules_initialize_without_poisoning_lazy() {
+    fn default_rules_initialize_to_compiled_rule_set() {
         let r = Redactor::new_default();
         assert!(
             r.rule_count() >= 8,
             "default redactor must register at least the v1 rule set; got {}",
             r.rule_count()
         );
+    }
+
+    /// A malformed future built-in regex must not panic or poison the global
+    /// initializer. It must redact the complete payload, because silently
+    /// skipping a broken secret rule would weaken the durable privacy gate.
+    #[test]
+    fn malformed_default_rule_fails_closed_without_exposing_input() {
+        // A valid rule before the malformed future rule must not leave a
+        // partially compiled, selectively-redacting set in service.
+        let rules =
+            compile_redaction_rule_set(&[("valid", r"harmless"), ("invalid", r"(?=unsupported)")])
+                .unwrap_or(RedactionRuleSet::FailClosed);
+        assert!(matches!(rules, RedactionRuleSet::FailClosed));
+        let redactor = Redactor { rules };
+        let secret = "harmless never-persist-this-secret";
+        let (output, report) = redact_str(&redactor, secret);
+
+        assert_eq!(output, "<REDACTED:default-rule-initialization>");
+        assert!(!output.contains(secret));
+        assert_eq!(report.bytes_scanned, secret.len());
+        assert_eq!(report.bytes_redacted, secret.len());
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].rule_id, DEFAULT_RULE_INIT_FAILURE_ID);
+        assert_eq!(report.matches[0].start, 0);
+        assert_eq!(report.matches[0].end, secret.len());
     }
 }

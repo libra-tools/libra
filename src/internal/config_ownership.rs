@@ -94,6 +94,22 @@ pub struct ConfigSurface {
     pub consumer: ConfigConsumerKind,
 }
 
+/// One process-local synchronization/cache cell covered by the Code/Agent
+/// ownership inventory.
+///
+/// A Rust static name is only unique within its module, so its repository-
+/// relative source path is part of the identity. This prevents independent
+/// test controls such as `CONTROLS` and `PAUSE` from hiding each other in the
+/// forward/reverse inventory guard.
+pub struct ProcessCacheSurface {
+    /// Repository-relative Rust source path, using `/` separators.
+    pub source_path: &'static str,
+    /// Rust static identifier declared in [`Self::source_path`].
+    pub static_name: &'static str,
+    /// Why this process-local surface is safe and how it is scoped.
+    pub discipline: &'static str,
+}
+
 /// The §C.4.1.1 registry. Rows mirror plan-20260714 lines 2268/2272/2274.
 pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
     ConfigSurface {
@@ -305,35 +321,104 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
 ];
 
 /// §C.4.1.1 process-cache inventory: every `static` synchronization/cache
-/// cell in the Code/Agent namespaces, with its key discipline. The forward
-/// guard scans for `static NAME: …OnceLock|LazyLock|Mutex|RwLock` in those
-/// namespaces and fails when a new one is missing here.
-pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
-    (
-        "CLEANUP_HELPER_REAPER",
-        "process-lifetime reaper thread handle; holds no repository state",
-    ),
-    (
-        "DEFAULT_RULES",
-        "compiled built-in redaction rule set; input-independent constant",
-    ),
-    (
-        "CURRENT_PROCESS_OWNER_IDENTITY",
-        "process-lifetime own pid/starttime/boot_id identity for the session \
-         writer-lease liveness probe; holds no repository state",
-    ),
-    (
-        "BRIDGE_LIVE_REVIEW_RUNS",
-        "not a cache: the live-run registry `libra agent bridge --stdio` uses to \
-         cancel and drain the review runs IT started when the stdio loop ends \
-         (GC-LB-10). Keyed by run id, holds only cancel/join handles for this \
-         process's own runs, and is emptied by the shutdown drain",
-    ),
+/// cell in the Code/Agent namespaces, keyed by its repository-relative source
+/// path and static name. The forward guard scans for
+/// `static NAME: …OnceLock|LazyLock|Mutex|RwLock` and fails when a new cell is
+/// missing here.
+pub const CODE_AGENT_PROCESS_CACHES: &[ProcessCacheSurface] = &[
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/history.rs",
+        static_name: "CLEANUP_HELPER_REAPER",
+        discipline: "process-lifetime reaper thread handle; holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/authorized_read.rs",
+        static_name: "RUNNING_LIBRA_PROGRAM",
+        discipline: "process-lifetime executable path registered only by Libra's main entrypoint; \
+                     identifies the fixed-argument authorized-read helper and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/observed_agents/redaction.rs",
+        static_name: "DEFAULT_RULES",
+        discipline: "compiled built-in redaction rule set; input-independent constant",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/session/jsonl.rs",
+        static_name: "CURRENT_PROCESS_OWNER_IDENTITY",
+        discipline: "process-lifetime own pid/starttime/boot_id identity for the session \
+                     writer-lease liveness probe; holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs.rs",
+        static_name: "BRIDGE_LIVE_REVIEW_RUNS",
+        discipline: "not a cache: the live-run registry `libra agent bridge --stdio` uses to \
+                     cancel and drain the review runs it started when the stdio loop ends \
+                     (GC-LB-10). Keyed by run id, holds only cancel/join handles for this \
+                     process's own runs, and is emptied by the shutdown drain",
+    },
+    ProcessCacheSurface {
+        source_path: "src/main.rs",
+        static_name: "CONTROLS",
+        discipline: "test-only private-helper fault controls; process-local and restored by \
+                     ControlsReset",
+    },
+    ProcessCacheSurface {
+        source_path: "src/command/agent/import.rs",
+        static_name: "CONTROLS",
+        discipline: "test-only agent-import fault controls; process-local and restored by \
+                     ControlsReset",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/test_support.rs",
+        static_name: "DELETE_RESERVED_SESSIONS",
+        discipline: "test-only capture reservation-erase fault control; keyed by full session id and \
+                     consumed by the matching in-process capture test",
+    },
+    ProcessCacheSurface {
+        source_path: "src/command/agent/doctor.rs",
+        static_name: "PAUSE",
+        discipline: "test-only agent-doctor index-repair rendezvous; process-local and consumed \
+                     or restored by its test guard",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/observed_agents/builtin/stable_promoted.rs",
+        static_name: "PAUSE",
+        discipline: "test-only observed-agent discovery rendezvous; process-local and consumed \
+                     or restored by its test guard",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/observed_agents/transcript_source.rs",
+        static_name: "PAUSE",
+        discipline: "test-only secure transcript-open rendezvous; process-local and consumed \
+                     or restored by its test guard",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/checkpoint.rs",
+        static_name: "PRE_REGISTRATION_PAUSE",
+        discipline: "test-only pre-registration checkpoint rendezvous; process-local and \
+                     consumed by the scoped pause guard",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/checkpoint.rs",
+        static_name: "REGISTRATION_PAUSE",
+        discipline: "test-only checkpoint-registration rendezvous; process-local and \
+                     consumed by the scoped pause guard",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/subagent_content.rs",
+        static_name: "TEST_SUBAGENT_FINAL_APPEND_DEADLINE",
+        discipline: "test-only task-local observation mutex for the final subagent history append deadline; \
+                     scoped to one regression test and holds no repository state",
+    },
 ];
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::Path};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::*;
 
@@ -412,14 +497,107 @@ mod tests {
     /// Code/Agent namespaces without a registry row (or a reviewed allowlist
     /// entry) fails this test. This is the fail-closed half of "新增 mutable
     /// state/cache 未登记则测试失败".
-    /// Namespaces hosting Code/Agent configuration reads (the retired TUI
-    /// module was removed in W5-03; its config reads died with it);
-    /// `agent`/`code_control` are the remaining runtime command surfaces.
+    /// Namespaces and entrypoint files hosting Code/Agent configuration reads
+    /// or process-local cells (the retired TUI module was removed in W5-03;
+    /// its config reads died with it). `src/main.rs` owns private helper test
+    /// controls and must remain in the cache inventory scan.
     const SCANNED_NAMESPACES: &[&str] = &[
         "src/internal/ai",
         "src/command/agent",
         "src/command/automation.rs",
+        "src/main.rs",
     ];
+
+    /// A scanned cache identity. Static identifiers are scoped to their
+    /// module, so a source path is required to distinguish two independent
+    /// `CONTROLS` or `PAUSE` cells.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct ProcessCacheKey {
+        source_path: PathBuf,
+        static_name: String,
+    }
+
+    impl ProcessCacheKey {
+        fn new(source_path: impl Into<PathBuf>, static_name: impl Into<String>) -> Self {
+            Self {
+                source_path: source_path.into(),
+                static_name: static_name.into(),
+            }
+        }
+    }
+
+    fn inventory_process_cache_keys() -> BTreeSet<ProcessCacheKey> {
+        CODE_AGENT_PROCESS_CACHES
+            .iter()
+            .map(|surface| ProcessCacheKey::new(surface.source_path, surface.static_name))
+            .collect()
+    }
+
+    fn extract_process_cache_statics(
+        source_path: &Path,
+        source: &str,
+        found: &mut BTreeSet<ProcessCacheKey>,
+    ) {
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // Every visibility spelling: `static`, `pub static`,
+            // `pub(crate) static`, `pub(super) static`, ...
+            let after_vis = trimmed
+                .strip_prefix("pub")
+                .map(|rest| {
+                    rest.strip_prefix('(')
+                        .and_then(|inner| inner.split_once(')'))
+                        .map(|(_, tail)| tail)
+                        .unwrap_or(rest)
+                        .trim_start()
+                })
+                .unwrap_or(trimmed);
+            let Some(rest) = after_vis.strip_prefix("static ") else {
+                continue;
+            };
+            let Some((name, ty)) = rest.split_once(':') else {
+                continue;
+            };
+            if ["OnceLock", "LazyLock", "RwLock", "Mutex", "Once", "Lazy"]
+                .iter()
+                .any(|marker| ty.contains(marker))
+            {
+                found.insert(ProcessCacheKey::new(source_path, name.trim().to_string()));
+            }
+        }
+    }
+
+    fn scan_process_cache_statics(
+        manifest_dir: &Path,
+        path: &Path,
+        found: &mut BTreeSet<ProcessCacheKey>,
+    ) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).expect("source dir must be readable") {
+                scan_process_cache_statics(manifest_dir, &entry.expect("dir entry").path(), found);
+            }
+            return;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            return;
+        }
+        let relative_path = path
+            .strip_prefix(manifest_dir)
+            .expect("scanned source must remain inside the repository root");
+        extract_process_cache_statics(
+            relative_path,
+            &fs::read_to_string(path).expect("readable source"),
+            found,
+        );
+    }
+
+    fn scanned_process_cache_statics(manifest_dir: &Path) -> BTreeSet<ProcessCacheKey> {
+        let mut statics = BTreeSet::new();
+        for namespace in SCANNED_NAMESPACES {
+            scan_process_cache_statics(manifest_dir, &manifest_dir.join(namespace), &mut statics);
+        }
+        statics
+    }
 
     #[test]
     fn every_code_agent_config_file_read_is_registered() {
@@ -672,83 +850,94 @@ mod tests {
         // sources carry cfg-gated items mid-file, and missing a production
         // static is the real risk; a test-only static costing an inventory
         // row is noise worth paying.
-        fn extract_statics(source: &str, found: &mut BTreeSet<String>) {
-            for line in source.lines() {
-                let trimmed = line.trim_start();
-                // Every visibility spelling: `static`, `pub static`,
-                // `pub(crate) static`, `pub(super) static`, ...
-                let after_vis = trimmed
-                    .strip_prefix("pub")
-                    .map(|rest| {
-                        rest.strip_prefix('(')
-                            .and_then(|inner| inner.split_once(')'))
-                            .map(|(_, tail)| tail)
-                            .unwrap_or(rest)
-                            .trim_start()
-                    })
-                    .unwrap_or(trimmed);
-                let Some(rest) = after_vis.strip_prefix("static ") else {
-                    continue;
-                };
-                let Some((name, ty)) = rest.split_once(':') else {
-                    continue;
-                };
-                if ["OnceLock", "LazyLock", "RwLock", "Mutex", "Once", "Lazy"]
-                    .iter()
-                    .any(|marker| ty.contains(marker))
-                {
-                    found.insert(name.trim().to_string());
-                }
-            }
-        }
-        let mut statics: BTreeSet<String> = BTreeSet::new();
-        fn scan_statics(dir: &Path, found: &mut BTreeSet<String>) {
-            for entry in fs::read_dir(dir).expect("source dir must be readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    scan_statics(&path, found);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    extract_statics(&fs::read_to_string(&path).expect("readable source"), found);
-                }
-            }
-        }
-        for namespace in SCANNED_NAMESPACES {
-            let path = manifest_dir.join(namespace);
-            if path.is_dir() {
-                scan_statics(&path, &mut statics);
-            } else {
-                extract_statics(
-                    &fs::read_to_string(&path).expect("readable source"),
-                    &mut statics,
-                );
-            }
-        }
+        let statics = scanned_process_cache_statics(manifest_dir);
         // Scanner SELF-TEST: a known live static must be visible — an empty
         // or broken scan must fail here, not silently pass the inventory.
         assert!(
-            statics.contains("CLEANUP_HELPER_REAPER"),
+            statics.contains(&ProcessCacheKey::new(
+                "src/internal/ai/history.rs",
+                "CLEANUP_HELPER_REAPER",
+            )),
             "static scanner self-check failed: the known CLEANUP_HELPER_REAPER \
              declaration was not found"
         );
-        let cache_inventory: BTreeSet<&str> = CODE_AGENT_PROCESS_CACHES
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        for name in &statics {
+        let cache_inventory = inventory_process_cache_keys();
+        assert_eq!(
+            cache_inventory.len(),
+            CODE_AGENT_PROCESS_CACHES.len(),
+            "duplicate repository-relative process-cache inventory key hides a stale row"
+        );
+        for cache in &statics {
             assert!(
-                cache_inventory.contains(name.as_str()),
-                "new Code/Agent process static '{name}' is not in \
+                cache_inventory.contains(cache),
+                "new Code/Agent process static '{}::{}' is not in \
                  CODE_AGENT_PROCESS_CACHES — classify its key discipline \
-                 (plan-20260714 §C.4.1.1 process-cache rules)"
+                 (plan-20260714 §C.4.1.1 process-cache rules)",
+                cache.source_path.display(),
+                cache.static_name,
             );
         }
-        for (name, _) in CODE_AGENT_PROCESS_CACHES {
+        for cache in &cache_inventory {
             assert!(
-                statics.contains(*name),
-                "inventoried process static '{name}' no longer exists — \
-                 stale inventory rows hide real drift"
+                statics.contains(cache),
+                "inventoried process static '{}::{}' no longer exists — \
+                 stale inventory rows hide real drift",
+                cache.source_path.display(),
+                cache.static_name,
             );
         }
+    }
+
+    /// Regression guard for duplicate Rust static identifiers: `CONTROLS`
+    /// and `PAUSE` occur in independent modules, and each must retain its own
+    /// repository-relative inventory key. A name-only `BTreeSet` would let
+    /// one entry make all of these cells appear classified.
+    #[test]
+    fn process_cache_inventory_distinguishes_duplicate_static_names_by_source_path() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let statics = scanned_process_cache_statics(manifest_dir);
+        let inventory = inventory_process_cache_keys();
+
+        let expected = [
+            ("src/main.rs", "CONTROLS"),
+            ("src/command/agent/import.rs", "CONTROLS"),
+            ("src/command/agent/doctor.rs", "PAUSE"),
+            (
+                "src/internal/ai/observed_agents/builtin/stable_promoted.rs",
+                "PAUSE",
+            ),
+            (
+                "src/internal/ai/observed_agents/transcript_source.rs",
+                "PAUSE",
+            ),
+        ];
+        for (source_path, static_name) in expected {
+            let key = ProcessCacheKey::new(source_path, static_name);
+            assert!(
+                statics.contains(&key),
+                "duplicate static scanner missed {source_path}::{static_name}"
+            );
+            assert!(
+                inventory.contains(&key),
+                "duplicate static inventory missed {source_path}::{static_name}"
+            );
+        }
+        assert_eq!(
+            statics
+                .iter()
+                .filter(|cache| cache.static_name == "CONTROLS")
+                .count(),
+            2,
+            "both independent CONTROLS cells must retain distinct inventory keys"
+        );
+        assert_eq!(
+            statics
+                .iter()
+                .filter(|cache| cache.static_name == "PAUSE")
+                .count(),
+            3,
+            "all independent PAUSE cells must retain distinct inventory keys"
+        );
     }
 
     /// The registry itself stays well-formed: unique locations, and the two

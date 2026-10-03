@@ -586,13 +586,21 @@ pub fn flush_wait_file(file: &fs::File, budget: Duration, poll: Duration) -> Flu
     }
 }
 
+/// Run Claude's bounded flush probe against an already-open source held by a
+/// killable capture helper. The helper, not the hook parent, owns every
+/// metadata/clone/seek/read operation in this probe; it rewinds the same held
+/// descriptor before its bounded reader consumes it.
+pub(crate) fn prepare_held_file_for_capture(file: &fs::File) {
+    let _ = flush_wait_file(file, FLUSH_WAIT_BUDGET, FLUSH_POLL_INTERVAL);
+}
+
 impl TranscriptPreparer for ClaudeCodeObservedAgent {
     /// DR-01: bounded flush-wait before the seam opens the transcript.
     /// Always `Ok` — a budget-exhausted tail is read anyway and its final
     /// turn parses `incomplete` (upgradeable later; ADR-DR-07).
     fn prepare_transcript(
         &self,
-        session: &AgentSessionCtx,
+        _session: &AgentSessionCtx,
         file: &fs::File,
         deadline: Option<Instant>,
     ) -> Result<()> {
@@ -603,7 +611,7 @@ impl TranscriptPreparer for ClaudeCodeObservedAgent {
         let outcome = flush_wait_file(file, budget, FLUSH_POLL_INTERVAL);
         if outcome == FlushOutcome::BudgetExhausted {
             tracing::warn!(
-                session_id = %session.session_id,
+                reason = "flush_wait_budget_exhausted",
                 "transcript flush-wait budget exhausted; reading a possibly \
                  in-flight tail (final turn will parse incomplete)"
             );
@@ -657,64 +665,53 @@ pub fn claude_session_id_is_safe_path_component(session_id: &str) -> bool {
         })
 }
 
-/// Locate the on-disk session JSONL for `(cwd, session_id)` without a hook
-/// pointer (DR-02 `resolve_session_file`). Fail-closed: an invalid id, a
-/// symlink, or a path escaping the projects root is an error; an absent
-/// file is `Ok(None)`.
-pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+/// Derive Claude's expected session filename without touching the filesystem.
+/// Deadline-bound live capture must hand this lexical candidate to its
+/// killable helper, which performs the provider-root no-follow open itself;
+/// calling `resolve_session_file` here would add a parent-side directory scan
+/// outside the capture deadline boundary.
+pub fn claude_session_file_candidate(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
     if !claude_session_id_is_safe_path_component(session_id) {
         return Err(anyhow!(
             "invalid Claude session id (expected alphanumeric/dot/dash/underscore, at most 128 characters)"
         ));
     }
-    let Some(dir) = claude_session_dir(cwd) else {
+    Ok(claude_session_dir(cwd).map(|dir| dir.join(format!("{session_id}.jsonl"))))
+}
+
+/// Locate the on-disk session JSONL for `(cwd, session_id)` without a hook
+/// pointer (DR-02 `resolve_session_file`). Fail-closed: an invalid id, a
+/// symlink, or a path escaping the projects root is an error; an absent
+/// file is `Ok(None)`.
+pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    let Some(candidate) = claude_session_file_candidate(cwd, session_id)? else {
         return Ok(None);
     };
-    let candidate = dir.join(format!("{session_id}.jsonl"));
+    let Some(dir) = candidate.parent() else {
+        return Ok(None);
+    };
     let adapter = ClaudeCodeObservedAgent::new();
     let Some(directory) =
-        super::super::transcript_source::open_provider_directory_for_discovery(&adapter, &dir)?
+        super::super::transcript_source::open_provider_directory_for_discovery(&adapter, dir)?
     else {
         return Ok(None);
     };
-    let expected_name = format!("{session_id}.jsonl");
-    #[cfg(unix)]
-    {
-        for entry in super::super::transcript_source::read_dir_pinned_provider_directory(&directory)
-            .context("read pinned Claude session directory")?
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| anyhow!("derived Claude session candidate lacks a filename"))?;
+    match super::super::transcript_source::open_file_beneath_pinned_provider_directory(
+        &directory,
+        Path::new(name),
+    ) {
+        Ok(_) => Ok(Some(candidate)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
-            let entry = entry.context("read pinned Claude session directory entry")?;
-            if entry.file_name != std::ffi::OsStr::new(&expected_name) {
-                continue;
-            }
-            if entry.file_type.is_symlink() || !entry.file_type.is_file() {
-                return Err(anyhow!(
-                    "refusing non-regular or symlinked Claude session file (fail-closed)"
-                ));
-            }
-            return Ok(Some(candidate));
+            Ok(None)
         }
-        Ok(None)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = &directory;
-        for entry in fs::read_dir(&dir).context("read pinned Claude session directory")? {
-            let entry = entry.context("read pinned Claude session directory entry")?;
-            if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
-                continue;
-            }
-            let file_type = entry
-                .file_type()
-                .context("inspect pinned Claude session source type")?;
-            if file_type.is_symlink() || !file_type.is_file() {
-                return Err(anyhow!(
-                    "refusing non-regular or symlinked Claude session file (fail-closed)"
-                ));
-            }
-            return Ok(Some(candidate));
-        }
-        Ok(None)
+        Err(error) => Err(error).context("open pinned Claude session file (no-follow)"),
     }
 }
 
@@ -729,7 +726,7 @@ mod tests {
     impl HomeGuard {
         fn set(path: &Path) -> Self {
             let prior = std::env::var_os("LIBRA_TEST_HOME");
-            // SAFETY: test-only env mutation, restored on drop; #[serial].
+            // SAFETY: test-only env mutation, restored on drop; #[serial(env)].
             unsafe { std::env::set_var("LIBRA_TEST_HOME", path) };
             Self { prior }
         }
@@ -747,7 +744,7 @@ mod tests {
 
     /// DR-02 pinned slug vectors + session-file resolution semantics.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn claude_session_dir_resolve() {
         // Pinned slug vectors (probe: Claude Code 2.1.207 layout).
         assert_eq!(

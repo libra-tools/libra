@@ -364,6 +364,8 @@ mod tests {
     #[test]
     #[serial_test::serial(cwd, env)]
     fn a_pinned_scope_survives_a_cwd_change() {
+        // Coordinate manual cwd changes with ChangeDirGuard-based tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         {
             let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
@@ -417,6 +419,8 @@ mod tests {
     #[test]
     #[serial_test::serial(cwd, env)]
     fn a_pinned_workdir_keeps_sidecars_in_their_own_gitdir() {
+        // Coordinate manual cwd changes with ChangeDirGuard-based tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         // A real repository, so the resolver has a storage root to find.
@@ -469,6 +473,8 @@ mod tests {
     #[test]
     #[serial_test::serial(cwd, env)]
     fn a_pinned_request_resolves_storage_and_worktree_root_once() {
+        // Coordinate manual cwd changes with ChangeDirGuard-based tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         {
@@ -517,6 +523,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd, env)]
     async fn the_request_database_follows_the_pin_not_the_cwd() {
+        // Coordinate manual cwd changes with ChangeDirGuard-based tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo_a = tempfile::tempdir().expect("repo a");
         let repo_b = tempfile::tempdir().expect("repo b");
         let original = std::env::current_dir().expect("cwd");
@@ -569,6 +577,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd, env)]
     async fn an_unresolvable_pin_installs_nothing_and_never_inherits() {
+        // Coordinate manual cwd changes with ChangeDirGuard-based tests.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let outer = tempfile::tempdir().expect("the enclosing repository");
         let ambient = tempfile::tempdir().expect("the repository the cwd is in");
         let nowhere = tempfile::tempdir().expect("not a repository");

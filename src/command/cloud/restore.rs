@@ -22,7 +22,6 @@ use uuid::Uuid;
 
 use super::*;
 use crate::{
-    cli_error,
     command::restore::{self as restore_cmd, RestoreArgs as RestoreWorktreeArgs},
     internal::{
         branch::Branch,
@@ -56,6 +55,24 @@ pub(crate) fn render_cloud_restore_output(
     Ok(())
 }
 
+/// D1 name lookups are a trust boundary: the returned id is later used in
+/// output, local config, and as the remote-storage namespace prefix.
+/// Accept only Libra's canonical UUID representation before any of those
+/// sinks can observe it.
+fn validate_remote_repository_id(repo_id: String) -> CloudResult<String> {
+    let valid = Uuid::parse_str(&repo_id)
+        .ok()
+        .is_some_and(|parsed| parsed.hyphenated().to_string() == repo_id);
+    if valid {
+        Ok(repo_id)
+    } else {
+        Err(CloudError::NameNotFound(
+            "cloud repository lookup returned an invalid repository id; verify the cloud catalog or retry with an explicit repository id"
+                .to_string(),
+        ))
+    }
+}
+
 pub(crate) async fn restore_indexed_objects_from_remote(
     indexes: &[ObjectIndexRow],
     r2_storage: &RemoteStorage,
@@ -65,14 +82,15 @@ pub(crate) async fn restore_indexed_objects_from_remote(
     let mut report = ObjectRestoreReport::default();
 
     for idx in indexes {
-        let decoded = hex::decode(&idx.o_id)
-            .map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?;
+        let decoded = hex::decode(&idx.o_id).map_err(|_| {
+            CloudError::Generic("cloud object index contains an invalid object id".to_string())
+        })?;
         let hash = match ObjectHash::from_bytes_for_kind(kind, &decoded) {
             Ok(hash) => hash,
-            Err(e) => {
+            Err(_) => {
                 report
                     .warnings
-                    .push(format!("error: invalid object hash '{}': {}", idx.o_id, e));
+                    .push("error: cloud object index contains an invalid object id".to_string());
                 report.failed += 1;
                 continue;
             }
@@ -99,8 +117,7 @@ pub(crate) async fn restore_indexed_objects_from_remote(
             Ok(None) => {}
             Err(e) => {
                 report.warnings.push(format!(
-                    "warning: cannot verify obliteration tombstone for {}; not restoring: {e}",
-                    idx.o_id
+                    "warning: cannot verify obliteration tombstone; not restoring: {e}"
                 ));
                 report.skipped += 1;
                 continue;
@@ -113,19 +130,18 @@ pub(crate) async fn restore_indexed_objects_from_remote(
                 {
                     Ok(computed) => computed,
                     Err(e) => {
-                        report.warnings.push(format!(
-                            "warning: failed to hash restored object {}: {e}",
-                            idx.o_id
-                        ));
+                        report
+                            .warnings
+                            .push(format!("warning: failed to hash restored object: {e}"));
                         report.failed += 1;
                         continue;
                     }
                 };
                 if computed != hash {
-                    report.warnings.push(format!(
-                        "warning: hash mismatch for {}: expected {}, got {}",
-                        idx.o_id, hash, computed
-                    ));
+                    report.warnings.push(
+                        "warning: restored object hash does not match the cloud object index"
+                            .to_string(),
+                    );
                     report.failed += 1;
                     continue;
                 }
@@ -133,7 +149,7 @@ pub(crate) async fn restore_indexed_objects_from_remote(
                 if let Err(e) = local_storage.put(&hash, &data, obj_type).await {
                     report
                         .warnings
-                        .push(format!("error: failed to save object {}: {}", idx.o_id, e));
+                        .push(format!("error: failed to save restored object: {e}"));
                     report.failed += 1;
                     continue;
                 }
@@ -142,7 +158,7 @@ pub(crate) async fn restore_indexed_objects_from_remote(
             Err(e) => {
                 report
                     .warnings
-                    .push(format!("error: failed to download {}: {}", idx.o_id, e));
+                    .push(format!("error: failed to download a cloud object: {e}"));
                 report.failed += 1;
             }
         }
@@ -156,23 +172,22 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
 
     let d1_client = D1Client::from_env()
         .await
-        .map_err(|e| CloudError::D1(format!("D1 client error: {}", e.message)))?;
+        .map_err(|error| cloud_d1_failure("initialize cloud client", &error))?;
 
     let repo_id = if let Some(name) = &args.name {
-        d1_client.ensure_repositories_table().await.map_err(|e| {
-            CloudError::D1(format!(
-                "Failed to ensure repositories table: {}",
-                e.message
-            ))
-        })?;
+        d1_client
+            .ensure_repositories_table()
+            .await
+            .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
 
         let id = d1_client
             .get_repo_id_by_name(name)
             .await
-            .map_err(|e| CloudError::D1(format!("Failed to resolve repo name: {}", e.message)))?;
-        id.ok_or_else(|| {
+            .map_err(|error| cloud_d1_failure("resolve repository name", &error))?;
+        let id = id.ok_or_else(|| {
             CloudError::NameNotFound(format!("Repository with name '{}' not found", name))
-        })?
+        })?;
+        validate_remote_repository_id(id)?
     } else {
         args.repo_id
             .clone()
@@ -182,28 +197,29 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
     // Converge repositories schema and read the authoritative object-format
     // written by backup (B3-09 restore plan field). Missing/NULL stays None
     // for B3-14 fail-closed consumers.
-    d1_client.ensure_repositories_table().await.map_err(|e| {
-        CloudError::D1(format!(
-            "Failed to ensure repositories table: {}",
-            e.message
-        ))
-    })?;
+    d1_client
+        .ensure_repositories_table()
+        .await
+        .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
     let object_format = d1_client
         .find_repository(&repo_id)
         .await
-        .map_err(|e| CloudError::D1(format!("Failed to load repository metadata: {}", e.message)))?
+        .map_err(|error| cloud_d1_failure("load repository metadata", &error))?
         .and_then(|row| row.object_format);
 
     let indexes = d1_client
         .get_object_indexes(&repo_id)
         .await
-        .map_err(|e| CloudError::D1(format!("Failed to query D1: {}", e.message)))?;
+        .map_err(|error| cloud_d1_failure("list object indexes", &error))?;
 
     // B3-14: refuse width inference; kind comes only from repository metadata
     // (or the legacy all-40 → sha1 window when metadata is absent).
     let repository_kind = resolve_cloud_repository_kind(object_format.as_deref(), &indexes)?;
-    let resolved_object_format = object_format
-        .unwrap_or_else(|| crate::internal::object_format::as_str(repository_kind).to_string());
+    // Only emit the parser's canonical enum spelling; the D1 value itself is
+    // untrusted input even after validation (for example it may include
+    // surrounding whitespace).
+    let resolved_object_format =
+        crate::internal::object_format::as_str(repository_kind).to_string();
 
     let db_conn = db::get_db_conn_instance().await;
     if !args.metadata_only {
@@ -215,13 +231,18 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
             .filter(object_index::Column::RepoId.eq(&idx.repo_id))
             .one(&db_conn)
             .await
-            .map_err(|e| CloudError::Generic(format!("DB error: {}", e)))?;
+            .map_err(|_| {
+                CloudError::Generic(
+                    "failed to query local object-index state while restoring cloud metadata"
+                        .to_string(),
+                )
+            })?;
 
         if let Some(existing_model) = existing {
             let mut active: object_index::ActiveModel = existing_model.into();
             active.is_synced = Set(1);
-            if let Err(e) = active.update(&db_conn).await {
-                cli_error!(e, "warning: failed to update index for {}", idx.o_id);
+            if active.update(&db_conn).await.is_err() {
+                emit_warning("failed to update a cloud object index".to_string());
             }
         } else {
             let entry = object_index::ActiveModel {
@@ -234,8 +255,8 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
                 ..Default::default()
             };
 
-            if let Err(e) = entry.insert(&db_conn).await {
-                cli_error!(e, "warning: failed to insert index for {}", idx.o_id);
+            if entry.insert(&db_conn).await.is_err() {
+                emit_warning("failed to insert a cloud object index".to_string());
             }
         }
     }
@@ -316,7 +337,7 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
 
     let capture_outcome = restore_agent_capture_from_d1(&db_conn, &d1_client, &repo_id, false)
         .await
-        .map_err(|error| CloudError::D1(format!("agent capture restore failed: {error}")))?;
+        .map_err(agent_capture_restore_failure)?;
     restore_legacy_capture_refs_if_unowned(&db_conn, deferred_capture_refs, capture_outcome)
         .await?;
 
@@ -344,7 +365,7 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
     // Initialize D1 client
     let d1_client = D1Client::from_env()
         .await
-        .map_err(|error| CloudError::D1(format!("D1 client error: {}", error.message)))?;
+        .map_err(|error| cloud_d1_failure("initialize cloud client", &error))?;
 
     let repo_id = if let Some(name) = &args.name {
         // Ensure repositories table exists before resolving name
@@ -352,19 +373,16 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
         d1_client
             .ensure_repositories_table()
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "Failed to ensure repositories table: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
 
-        let id = d1_client.get_repo_id_by_name(name).await.map_err(|error| {
-            CloudError::D1(format!("Failed to resolve repo name: {}", error.message))
-        })?;
-        id.ok_or_else(|| {
+        let id = d1_client
+            .get_repo_id_by_name(name)
+            .await
+            .map_err(|error| cloud_d1_failure("resolve repository name", &error))?;
+        let id = id.ok_or_else(|| {
             CloudError::NameNotFound(format!("Repository with name '{}' not found", name))
-        })?
+        })?;
+        validate_remote_repository_id(id)?
     } else {
         args.repo_id
             .clone()
@@ -376,28 +394,18 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
     d1_client
         .ensure_repositories_table()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "Failed to ensure repositories table: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
     let object_format = d1_client
         .find_repository(&repo_id)
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "Failed to load repository metadata: {}",
-                error.message
-            ))
-        })?
+        .map_err(|error| cloud_d1_failure("load repository metadata", &error))?
         .and_then(|row| row.object_format);
 
     // Get object indexes from D1
     let indexes = d1_client
         .get_object_indexes(&repo_id)
         .await
-        .map_err(|error| CloudError::D1(format!("Failed to query D1: {}", error.message)))?;
+        .map_err(|error| cloud_d1_failure("list object indexes", &error))?;
 
     let repository_kind = resolve_cloud_repository_kind(object_format.as_deref(), &indexes)?;
 
@@ -420,13 +428,18 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
             .filter(object_index::Column::RepoId.eq(&idx.repo_id))
             .one(&db_conn)
             .await
-            .map_err(|error| CloudError::Generic(format!("DB error: {error}")))?;
+            .map_err(|_| {
+                CloudError::Generic(
+                    "failed to query local object-index state while restoring cloud metadata"
+                        .to_string(),
+                )
+            })?;
 
         if let Some(existing_model) = existing {
             let mut active: object_index::ActiveModel = existing_model.into();
             active.is_synced = Set(1);
-            if let Err(e) = active.update(&db_conn).await {
-                cli_error!(e, "warning: failed to update index for {}", idx.o_id);
+            if active.update(&db_conn).await.is_err() {
+                emit_warning("failed to update a cloud object index".to_string());
             }
         } else {
             let entry = object_index::ActiveModel {
@@ -439,8 +452,8 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
                 ..Default::default()
             };
 
-            if let Err(e) = entry.insert(&db_conn).await {
-                cli_error!(e, "warning: failed to insert index for {}", idx.o_id);
+            if entry.insert(&db_conn).await.is_err() {
+                emit_warning("failed to insert a cloud object index".to_string());
             }
         }
     }
@@ -538,7 +551,7 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
         // worktree materialization that runs above.
         let capture_outcome = restore_agent_capture_from_d1(&db_conn, &d1_client, &repo_id, true)
             .await
-            .map_err(|e| CloudError::D1(format!("agent capture restore failed: {}", e)))?;
+            .map_err(agent_capture_restore_failure)?;
         restore_legacy_capture_refs_if_unowned(&db_conn, deferred_capture_refs, capture_outcome)
             .await?;
 
@@ -618,7 +631,7 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
             [],
         ))
         .await
-        .map_err(|e| CloudError::Generic(format!("query sqlite_master: {e}")))?
+        .map_err(|e| local_agent_capture_restore_failure("probe local capture schema", e))?
         .is_some();
     let checkpoint_present = db_conn
         .query_one_raw(Statement::from_sql_and_values(
@@ -627,7 +640,7 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
             [],
         ))
         .await
-        .map_err(|e| CloudError::Generic(format!("query sqlite_master: {e}")))?
+        .map_err(|e| local_agent_capture_restore_failure("probe local capture schema", e))?
         .is_some();
     if !session_present || !checkpoint_present {
         // Codex review Q4: emit an actionable hint instead of silently
@@ -655,22 +668,12 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
     let generation_table_present = d1_client
         .agent_capture_generation_table_exists()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "probe agent-capture generation schema: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("probe agent-capture generation schema", &error))?;
     if !generation_table_present {
         let has_capture_rows = d1_client
             .agent_capture_catalog_has_rows(repo_id)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "probe legacy agent-capture catalog: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("probe legacy agent-capture catalog", &error))?;
         validate_missing_capture_manifest(has_capture_rows)?;
         if render_human {
             println!("Agent capture restore: remote catalog is empty (skipped).");
@@ -680,12 +683,7 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
     let subagent_content_present = d1_client
         .agent_subagent_content_tables_exist()
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "probe remote subagent-content schema: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("probe subagent-content schema", &error))?;
 
     let local_cloud_base = load_local_agent_capture_cloud_base(db_conn, repo_id).await?;
     let mut coherent = None;
@@ -693,18 +691,13 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
         let before = d1_client
             .get_agent_capture_generation(repo_id)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!("read agent capture generation: {}", error.message))
-            })?;
+            .map_err(|error| cloud_d1_failure("read agent-capture generation", &error))?;
         let Some(before) = before else {
             let has_capture_rows = d1_client
                 .agent_capture_catalog_has_rows(repo_id)
                 .await
                 .map_err(|error| {
-                    CloudError::D1(format!(
-                        "probe unmanifested agent-capture catalog: {}",
-                        error.message
-                    ))
+                    cloud_d1_failure("probe unmanifested agent-capture catalog", &error)
                 })?;
             validate_missing_capture_manifest(has_capture_rows)?;
             if render_human {
@@ -738,8 +731,9 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
                     .to_string(),
             )
         })?;
-        let (rows, remaining_restore_rows) =
+        let (mut rows, remaining_restore_rows) =
             load_remote_agent_capture_rows(d1_client, repo_id, subagent_content_present).await?;
+        rows.sessions = project_agent_capture_restore_sessions(&rows.sessions, "remote restore")?;
         validate_agent_capture_traces_shape(
             &rows.checkpoints,
             before.traces_head.as_deref(),
@@ -795,10 +789,11 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
                 durability_deadline,
             )
             .await
-            .map_err(|error| {
-                CloudError::PartialTransfer(format!(
-                    "restored agent-capture objects failed content and reachability validation: {error:#}; retry cloud restore, or run `libra agent doctor --repair` if the local object store remains damaged"
-                ))
+            .map_err(|_| {
+                CloudError::PartialTransfer(
+                    "restored agent-capture objects failed content or reachability validation; retry cloud restore, or run `libra agent doctor --repair` if the local object store remains damaged"
+                        .to_string(),
+                )
             })?
         };
         let mut required_oids = durable_oids.iter().cloned().collect::<Vec<_>>();
@@ -815,20 +810,14 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
                     .get_object_indexes_by_oids_with_generation(repo_id, &required_oids)
                     .await
                     .map_err(|error| {
-                        CloudError::D1(format!(
-                            "read fenced agent-capture object indexes: {}",
-                            error.message
-                        ))
+                        cloud_d1_failure("read fenced agent-capture object indexes", &error)
                     })?
             }
             AgentCaptureObjectManifestScope::FullRemoteIndex => d1_client
                 .get_object_indexes_bounded_with_generation(repo_id, remaining_restore_rows)
                 .await
                 .map_err(|error| {
-                    CloudError::D1(format!(
-                        "read full retained agent-capture object manifest within the aggregate restore row budget: {}",
-                        error.message
-                    ))
+                    cloud_d1_failure("read retained agent-capture object manifest", &error)
                 })?,
         };
         remaining_restore_rows
@@ -844,30 +833,27 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
             .map(|index| index.o_id.as_str())
             .collect::<HashSet<_>>();
         if let Some(unsynced) = object_indexes.iter().find(|index| index.is_synced != 1) {
-            return Err(CloudError::PartialTransfer(format!(
-                "agent-capture manifest includes object {} that is not marked synced",
-                unsynced.o_id
-            )));
+            let _ = unsynced;
+            return Err(CloudError::PartialTransfer(
+                "agent-capture manifest includes an object that is not marked synced".to_string(),
+            ));
         }
         if let Some(missing) = durable_oids
             .iter()
             .find(|oid| !fenced_oids.contains(oid.as_str()))
         {
-            return Err(CloudError::PartialTransfer(format!(
-                "agent-capture generation requires object {missing}, but its fenced object-index row is missing; retry `libra cloud sync`, then restore"
-            )));
+            let _ = missing;
+            return Err(CloudError::PartialTransfer(
+                "agent-capture generation requires an object whose fenced index row is missing; retry `libra cloud sync`, then restore"
+                    .to_string(),
+            ));
         }
         let (observed_object_digest, observed_object_count) =
             agent_capture_object_index_digest(&object_indexes)?;
         let after = d1_client
             .get_agent_capture_generation(repo_id)
             .await
-            .map_err(|error| {
-                CloudError::D1(format!(
-                    "recheck agent capture generation: {}",
-                    error.message
-                ))
-            })?;
+            .map_err(|error| cloud_d1_failure("recheck agent-capture generation", &error))?;
         if after.as_ref() == Some(&before)
             && observed_object_digest == expected_object_digest
             && observed_object_count == expected_object_count
@@ -945,6 +931,8 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         remote_is_known_ancestor,
     } = rows;
 
+    let session_rows = project_agent_capture_restore_sessions(session_rows, "restored remote")?;
+    let session_rows = &session_rows[..];
     validate_agent_capture_companions(
         checkpoint_rows,
         claim_rows,
@@ -964,7 +952,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
     let txn = crate::internal::db::begin_write_transaction(db_conn)
         .await
         .map_err(|error| {
-            CloudError::Generic(format!("begin atomic agent capture restore: {error}"))
+            local_agent_capture_restore_failure("begin atomic agent capture restore", error)
         })?;
     let backend = txn.get_database_backend();
 
@@ -984,9 +972,10 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!(
-                    "inspect local checkpoint prune tombstones before restore: {error}"
-                ))
+                local_agent_capture_restore_failure(
+                    "inspect local checkpoint prune tombstones before restore",
+                    error,
+                )
             })?;
         if tombstone_rows.len() > AGENT_CAPTURE_MAX_ROWS_PER_TABLE {
             return Err(CloudError::Generic(format!(
@@ -1003,14 +992,16 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             let checkpoint_id = row
                 .try_get_by::<String, _>("checkpoint_id")
                 .map_err(|error| {
-                    CloudError::Generic(format!(
-                        "decode local checkpoint prune tombstone before restore: {error}"
-                    ))
+                    local_agent_capture_restore_failure(
+                        "decode local checkpoint prune tombstone before restore",
+                        error,
+                    )
                 })?;
             if remote_checkpoint_ids.contains(checkpoint_id.as_str()) {
-                return Err(CloudError::PartialTransfer(format!(
-                    "remote checkpoint {checkpoint_id} was already pruned locally; run `libra cloud sync` to publish the prune tombstone before restoring"
-                )));
+                return Err(CloudError::PartialTransfer(
+                    "a remote checkpoint was already pruned locally; run `libra cloud sync` to publish the prune tombstone before restoring"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -1023,12 +1014,12 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             [crate::internal::branch::TRACES_BRANCH.into()],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("inspect local traces ref: {error}")))?;
+        .map_err(|error| local_agent_capture_restore_failure("inspect local traces ref", error))?;
     let existing_head = existing_traces_ref
         .as_ref()
         .map(|row| row.try_get_by::<Option<String>, _>("commit"))
         .transpose()
-        .map_err(|error| CloudError::Generic(format!("decode local traces ref: {error}")))?
+        .map_err(|error| local_agent_capture_restore_failure("decode local traces ref", error))?
         .flatten();
     if existing_head.as_deref() != traces_head {
         let local_checkpoint_count = txn
@@ -1038,13 +1029,15 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("count local checkpoints before restore: {error}"))
+                local_agent_capture_restore_failure("count local checkpoints before restore", error)
             })?
             .ok_or_else(|| {
                 CloudError::Generic("local checkpoint count returned no row".to_string())
             })?
             .try_get_by::<i64, _>("n")
-            .map_err(|error| CloudError::Generic(format!("decode checkpoint count: {error}")))?;
+            .map_err(|error| {
+                local_agent_capture_restore_failure("decode checkpoint count", error)
+            })?;
         if local_checkpoint_count != 0 {
             return Err(CloudError::Generic(
                 "the fenced cloud traces head conflicts with existing local checkpoint history; restore into an empty repository or sync the newer local history first"
@@ -1055,14 +1048,14 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
     if let Some(row) = existing_traces_ref {
         let ref_id: i64 = row
             .try_get_by("id")
-            .map_err(|error| CloudError::Generic(format!("decode traces ref id: {error}")))?;
+            .map_err(|error| local_agent_capture_restore_failure("decode traces ref id", error))?;
         txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "UPDATE reference SET `commit` = ? WHERE id = ?",
             [traces_head.map(str::to_string).into(), ref_id.into()],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("restore fenced traces ref: {error}")))?;
+        .map_err(|error| local_agent_capture_restore_failure("restore fenced traces ref", error))?;
     } else {
         txn.execute_raw(Statement::from_sql_and_values(
             backend,
@@ -1074,7 +1067,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("create fenced traces ref: {error}")))?;
+        .map_err(|error| local_agent_capture_restore_failure("create fenced traces ref", error))?;
     }
 
     // PD-03 tombstone-first, LOCAL side. The remote catalog is filtered by
@@ -1094,17 +1087,20 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
              FROM agent_import_tombstone",
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("read local erasure tombstones: {error}")))?
+        .map_err(|error| {
+            local_agent_capture_restore_failure("read local erasure tombstones", error)
+        })?
     {
-        let agent_kind: String = row
-            .try_get_by("agent_kind")
-            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
-        let provider_session_id: String = row
-            .try_get_by("provider_session_id")
-            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
-        let erased_session_id: String = row
-            .try_get_by("erased_session_id")
-            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        let agent_kind: String = row.try_get_by("agent_kind").map_err(|error| {
+            local_agent_capture_restore_failure("decode local tombstone", error)
+        })?;
+        let provider_session_id: String =
+            row.try_get_by("provider_session_id").map_err(|error| {
+                local_agent_capture_restore_failure("decode local tombstone", error)
+            })?;
+        let erased_session_id: String = row.try_get_by("erased_session_id").map_err(|error| {
+            local_agent_capture_restore_failure("decode local tombstone", error)
+        })?;
         locally_erased_sessions.insert((agent_kind, provider_session_id));
         locally_erased_session_ids.insert(erased_session_id);
     }
@@ -1158,75 +1154,80 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("inspect local agent session: {error}"))
+                local_agent_capture_restore_failure("inspect local agent session", error)
             })?;
         if let Some(existing) = existing {
             let local = AgentSessionV2Row {
-                session_id: existing
-                    .try_get_by("session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                agent_kind: existing
-                    .try_get_by("agent_kind")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                provider_session_id: existing
-                    .try_get_by("provider_session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                state: existing
-                    .try_get_by("state")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                working_dir: existing
-                    .try_get_by("working_dir")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                worktree_id: existing
-                    .try_get_by("worktree_id")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                parent_commit: existing
-                    .try_get_by("parent_commit")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                parent_session_id: existing
-                    .try_get_by("parent_session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                metadata_json: existing
-                    .try_get_by("metadata_json")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                redaction_report: existing
-                    .try_get_by("redaction_report")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                started_at: existing
-                    .try_get_by("started_at")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                last_event_at: existing
-                    .try_get_by("last_event_at")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                stopped_at: existing
-                    .try_get_by("stopped_at")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                schema_version: existing
-                    .try_get_by("schema_version")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
-                sync_revision: existing
-                    .try_get_by("sync_revision")
-                    .map_err(|error| CloudError::Generic(format!("decode session: {error}")))?,
+                session_id: existing.try_get_by("session_id").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                agent_kind: existing.try_get_by("agent_kind").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                provider_session_id: existing.try_get_by("provider_session_id").map_err(
+                    |error| local_agent_capture_restore_failure("decode session", error),
+                )?,
+                state: existing.try_get_by("state").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                working_dir: existing.try_get_by("working_dir").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                worktree_id: existing.try_get_by("worktree_id").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                parent_commit: existing.try_get_by("parent_commit").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                parent_session_id: existing.try_get_by("parent_session_id").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                metadata_json: existing.try_get_by("metadata_json").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                redaction_report: existing.try_get_by("redaction_report").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                started_at: existing.try_get_by("started_at").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                last_event_at: existing.try_get_by("last_event_at").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                stopped_at: existing.try_get_by("stopped_at").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                schema_version: existing.try_get_by("schema_version").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
+                sync_revision: existing.try_get_by("sync_revision").map_err(|error| {
+                    local_agent_capture_restore_failure("decode session", error)
+                })?,
             };
             if local.sync_revision > row.sync_revision {
                 if !remote_is_known_ancestor {
-                    return Err(CloudError::Generic(format!(
-                        "local agent session {} has a larger divergent sync revision without a recorded cloud ancestor; sync or restore from the clone that owns the current cloud lineage",
-                        local.session_id
-                    )));
+                    return Err(CloudError::Generic(
+                        "a local agent session has a larger divergent sync revision without a recorded cloud ancestor; sync or restore from the clone that owns the current cloud lineage"
+                            .to_string(),
+                    ));
                 }
                 newer_local_sessions
                     .insert((row.agent_kind.clone(), row.provider_session_id.clone()));
-            } else if local.sync_revision == row.sync_revision && local != *row {
-                return Err(CloudError::Generic(format!(
-                    "restored agent session {} conflicts with local state at the same sync generation",
-                    row.session_id
-                )));
+            } else if local.sync_revision == row.sync_revision
+                // The remote copy is a projection, so compare like with like;
+                // the upsert below leaves equal-generation local evidence
+                // (including legacy ownership) untouched.
+                && !project_agent_session_for_cloud(&local, "local")
+                    .is_ok_and(|projected| projected == *row)
+            {
+                return Err(CloudError::Generic(
+                    "restored agent session conflicts with local state at the same sync generation"
+                        .to_string(),
+                ));
             } else if local.session_id != row.session_id {
-                return Err(CloudError::Generic(format!(
-                    "restored agent session {} conflicts with local provider ownership",
-                    row.session_id
-                )));
+                return Err(CloudError::Generic(
+                    "restored agent session conflicts with local provider ownership".to_string(),
+                ));
             }
         }
     }
@@ -1241,66 +1242,67 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
                 [row.checkpoint_id.clone().into()],
             ))
             .await
-            .map_err(|error| CloudError::Generic(format!("inspect local checkpoint: {error}")))?;
+            .map_err(|error| {
+                local_agent_capture_restore_failure("inspect local checkpoint", error)
+            })?;
         if let Some(existing) = existing {
             let local = AgentCheckpointV2Row {
                 checkpoint_id: row.checkpoint_id.clone(),
-                session_id: existing
-                    .try_get_by("session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                parent_checkpoint_id: existing
-                    .try_get_by("parent_checkpoint_id")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                scope: existing
-                    .try_get_by("scope")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                parent_commit: existing
-                    .try_get_by("parent_commit")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                tree_oid: existing
-                    .try_get_by("tree_oid")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                metadata_blob_oid: existing
-                    .try_get_by("metadata_blob_oid")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                traces_commit: existing
-                    .try_get_by("traces_commit")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                tool_use_id: existing
-                    .try_get_by("tool_use_id")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                subagent_session_id: existing
-                    .try_get_by("subagent_session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                description: existing
-                    .try_get_by("description")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                created_at: existing
-                    .try_get_by("created_at")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
-                sync_revision: existing
-                    .try_get_by("sync_revision")
-                    .map_err(|error| CloudError::Generic(format!("decode checkpoint: {error}")))?,
+                session_id: existing.try_get_by("session_id").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                parent_checkpoint_id: existing.try_get_by("parent_checkpoint_id").map_err(
+                    |error| local_agent_capture_restore_failure("decode checkpoint", error),
+                )?,
+                scope: existing.try_get_by("scope").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                parent_commit: existing.try_get_by("parent_commit").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                tree_oid: existing.try_get_by("tree_oid").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                metadata_blob_oid: existing.try_get_by("metadata_blob_oid").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                traces_commit: existing.try_get_by("traces_commit").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                tool_use_id: existing.try_get_by("tool_use_id").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                subagent_session_id: existing.try_get_by("subagent_session_id").map_err(
+                    |error| local_agent_capture_restore_failure("decode checkpoint", error),
+                )?,
+                description: existing.try_get_by("description").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                created_at: existing.try_get_by("created_at").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
+                sync_revision: existing.try_get_by("sync_revision").map_err(|error| {
+                    local_agent_capture_restore_failure("decode checkpoint", error)
+                })?,
             };
             if local.sync_revision == row.sync_revision && local != *row {
-                return Err(CloudError::Generic(format!(
-                    "restored checkpoint {} conflicts with local history at the same sync generation",
-                    row.checkpoint_id
-                )));
+                return Err(CloudError::Generic(
+                    "restored checkpoint conflicts with local history at the same sync generation"
+                        .to_string(),
+                ));
             }
             if local.sync_revision > row.sync_revision && !remote_is_known_ancestor {
-                return Err(CloudError::Generic(format!(
-                    "local checkpoint {} has a larger divergent sync revision without a recorded cloud ancestor; sync or restore from the clone that owns the current cloud lineage",
-                    row.checkpoint_id
-                )));
+                return Err(CloudError::Generic(
+                    "a local checkpoint has a larger divergent sync revision without a recorded cloud ancestor; sync or restore from the clone that owns the current cloud lineage"
+                        .to_string(),
+                ));
             }
             if local.sync_revision != row.sync_revision
                 && !checkpoint_rewrite_compatible(&local, row)
             {
-                return Err(CloudError::Generic(format!(
-                    "restored checkpoint {} conflicts with immutable local history",
-                    row.checkpoint_id
-                )));
+                return Err(CloudError::Generic(
+                    "restored checkpoint conflicts with immutable local history".to_string(),
+                ));
             }
         }
     }
@@ -1323,34 +1325,38 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("inspect local subagent revision: {error}"))
+                local_agent_capture_restore_failure("inspect local subagent revision", error)
             })?;
         if let Some(existing) = existing {
             let exact = existing
                 .try_get_by::<String, _>("checkpoint_id")
-                .map_err(|error| CloudError::Generic(format!("decode revision: {error}")))?
+                .map_err(|error| local_agent_capture_restore_failure("decode revision", error))?
                 == row.checkpoint_id
                 && existing
                     .try_get_by::<String, _>("content_digest")
-                    .map_err(|error| CloudError::Generic(format!("decode revision: {error}")))?
+                    .map_err(|error| {
+                        local_agent_capture_restore_failure("decode revision", error)
+                    })?
                     == row.content_digest
                 && existing
                     .try_get_by::<String, _>("source_channel")
-                    .map_err(|error| CloudError::Generic(format!("decode revision: {error}")))?
+                    .map_err(|error| {
+                        local_agent_capture_restore_failure("decode revision", error)
+                    })?
                     == row.source_channel
-                && existing
-                    .try_get_by::<i64, _>("partial")
-                    .map_err(|error| CloudError::Generic(format!("decode revision: {error}")))?
-                    == row.partial
+                && existing.try_get_by::<i64, _>("partial").map_err(|error| {
+                    local_agent_capture_restore_failure("decode revision", error)
+                })? == row.partial
                 && existing
                     .try_get_by::<i64, _>("created_at")
-                    .map_err(|error| CloudError::Generic(format!("decode revision: {error}")))?
+                    .map_err(|error| {
+                        local_agent_capture_restore_failure("decode revision", error)
+                    })?
                     == row.created_at;
             if !exact {
-                return Err(CloudError::Generic(format!(
-                    "restored subagent revision {} conflicts with immutable local history",
-                    row.checkpoint_id
-                )));
+                return Err(CloudError::Generic(
+                    "restored subagent revision conflicts with immutable local history".to_string(),
+                ));
             }
         }
     }
@@ -1372,12 +1378,12 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("inspect local subagent claim: {error}"))
+                local_agent_capture_restore_failure("inspect local subagent claim", error)
             })?;
         if let Some(existing) = existing {
-            let state: String = existing
-                .try_get_by("state")
-                .map_err(|error| CloudError::Generic(format!("decode claim state: {error}")))?;
+            let state: String = existing.try_get_by("state").map_err(|error| {
+                local_agent_capture_restore_failure("decode claim state", error)
+            })?;
             if state != "idle" {
                 return Err(CloudError::Generic(
                     "cannot restore a subagent claim while a local writer reservation is active"
@@ -1385,39 +1391,39 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
                 ));
             }
             let sync_revision: i64 = existing.try_get_by("sync_revision").map_err(|error| {
-                CloudError::Generic(format!("decode claim sync generation: {error}"))
+                local_agent_capture_restore_failure("decode claim sync generation", error)
             })?;
             if sync_revision > row.sync_revision {
                 if !remote_is_known_ancestor {
-                    return Err(CloudError::Generic(format!(
-                        "local subagent claim for {} has a larger divergent sync revision without a recorded cloud ancestor",
-                        row.source_key
-                    )));
+                    return Err(CloudError::Generic(
+                        "a local subagent claim has a larger divergent sync revision without a recorded cloud ancestor; restore the current cloud snapshot before retrying"
+                            .to_string(),
+                    ));
                 }
                 newer_local_claims.insert(claim_key(row));
             } else if sync_revision == row.sync_revision {
                 let exact = existing
                     .try_get_by::<i64, _>("revision_cursor")
                     .map_err(|error| {
-                        CloudError::Generic(format!("decode claim cursor: {error}"))
+                        local_agent_capture_restore_failure("decode claim cursor", error)
                     })?
                     == row.revision_cursor
                     && existing
                         .try_get_by::<i64, _>("current_revision")
                         .map_err(|error| {
-                            CloudError::Generic(format!("decode claim revision: {error}"))
+                            local_agent_capture_restore_failure("decode claim revision", error)
                         })?
                         == row.current_revision
                     && existing
                         .try_get_by::<Option<String>, _>("current_checkpoint_id")
                         .map_err(|error| {
-                            CloudError::Generic(format!("decode claim checkpoint: {error}"))
+                            local_agent_capture_restore_failure("decode claim checkpoint", error)
                         })?
                         == row.current_checkpoint_id
                     && existing
                         .try_get_by::<Option<String>, _>("current_digest")
                         .map_err(|error| {
-                            CloudError::Generic(format!("decode claim digest: {error}"))
+                            local_agent_capture_restore_failure("decode claim digest", error)
                         })?
                         == row.current_digest;
                 if !exact {
@@ -1441,50 +1447,60 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("inspect local subagent link: {error}"))
+                local_agent_capture_restore_failure("inspect local subagent link", error)
             })?;
         if let Some(existing) = existing {
-            let sync_revision: i64 = existing
-                .try_get_by("sync_revision")
-                .map_err(|error| CloudError::Generic(format!("decode link revision: {error}")))?;
+            let sync_revision: i64 = existing.try_get_by("sync_revision").map_err(|error| {
+                local_agent_capture_restore_failure("decode link revision", error)
+            })?;
             if sync_revision > row.sync_revision {
                 if !remote_is_known_ancestor {
-                    return Err(CloudError::Generic(format!(
-                        "local subagent link {} has a larger divergent sync revision without a recorded cloud ancestor",
-                        row.content_checkpoint_id
-                    )));
+                    return Err(CloudError::Generic(
+                        "a local subagent link has a larger divergent sync revision without a recorded cloud ancestor"
+                            .to_string(),
+                    ));
                 }
                 newer_local_links.insert(row.content_checkpoint_id.clone());
             } else if sync_revision == row.sync_revision {
                 let exact = existing
                     .try_get_by::<String, _>("parent_session_id")
-                    .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                    .map_err(|error| local_agent_capture_restore_failure("decode link", error))?
                     == row.parent_session_id
                     && existing
                         .try_get_by::<String, _>("link_state")
-                        .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                        .map_err(|error| {
+                            local_agent_capture_restore_failure("decode link", error)
+                        })?
                         == row.link_state
                     && existing
                         .try_get_by::<Option<String>, _>("boundary_checkpoint_id")
-                        .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                        .map_err(|error| {
+                            local_agent_capture_restore_failure("decode link", error)
+                        })?
                         == row.boundary_checkpoint_id
                     && existing
                         .try_get_by::<Option<String>, _>("stable_subagent_id")
-                        .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                        .map_err(|error| {
+                            local_agent_capture_restore_failure("decode link", error)
+                        })?
                         == row.stable_subagent_id
                     && existing
                         .try_get_by::<i64, _>("created_at")
-                        .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                        .map_err(|error| {
+                            local_agent_capture_restore_failure("decode link", error)
+                        })?
                         == row.created_at
                     && existing
                         .try_get_by::<i64, _>("updated_at")
-                        .map_err(|error| CloudError::Generic(format!("decode link: {error}")))?
+                        .map_err(|error| {
+                            local_agent_capture_restore_failure("decode link", error)
+                        })?
                         == row.updated_at;
                 if !exact {
-                    return Err(CloudError::Generic(format!(
-                        "restored subagent link {} conflicts with local state at the same generation",
-                        row.content_checkpoint_id
-                    )));
+                    return Err(CloudError::Generic(
+                        "restored subagent link conflicts with local state at the same generation"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -1515,7 +1531,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ))
             .await
             .map_err(|error| {
-                CloudError::Generic(format!("probe scoped session conflict: {error}"))
+                local_agent_capture_restore_failure("probe scoped session conflict", error)
             })?
             .is_some();
         if scoped_conflict {
@@ -1561,9 +1577,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!("restore agent session {}: {error}", row.session_id))
-        })?;
+        .map_err(|_| CloudError::Generic("failed to restore an agent session".to_string()))?;
     }
     if skipped_scoped_sessions > 0 {
         emit_warning(format!(
@@ -1603,12 +1617,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!(
-                "restore agent checkpoint {}: {error}",
-                row.checkpoint_id
-            ))
-        })?;
+        .map_err(|_| CloudError::Generic("failed to restore an agent checkpoint".to_string()))?;
     }
 
     // Skeleton claims satisfy the revision FK but remain invisible outside the
@@ -1636,7 +1645,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| CloudError::Generic(format!("stage restored claim: {error}")))?;
+        .map_err(|error| local_agent_capture_restore_failure("stage restored claim", error))?;
     }
     for row in revision_rows {
         txn.execute_raw(Statement::from_sql_and_values(
@@ -1661,12 +1670,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!(
-                "restore subagent revision {}: {error}",
-                row.checkpoint_id
-            ))
-        })?;
+        .map_err(|_| CloudError::Generic("failed to restore a subagent revision".to_string()))?;
     }
     for row in link_rows {
         if newer_local_links.contains(&row.content_checkpoint_id) {
@@ -1699,12 +1703,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
             ],
         ))
         .await
-        .map_err(|error| {
-            CloudError::Generic(format!(
-                "restore subagent link {}: {error}",
-                row.content_checkpoint_id
-            ))
-        })?;
+        .map_err(|_| CloudError::Generic("failed to restore a subagent link".to_string()))?;
     }
     for row in claim_rows {
         if newer_local_claims.contains(&claim_key(row)) {
@@ -1744,7 +1743,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
                 ],
             ))
             .await
-            .map_err(|error| CloudError::Generic(format!("advance restored claim: {error}")))?;
+            .map_err(|error| local_agent_capture_restore_failure("advance restored claim", error))?;
         if result.rows_affected() != 1 {
             return Err(CloudError::Generic(
                 "restored subagent claim lost its atomic monotonic update fence".to_string(),
@@ -1753,7 +1752,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
     }
 
     txn.commit().await.map_err(|error| {
-        CloudError::Generic(format!("commit atomic agent capture restore: {error}"))
+        local_agent_capture_restore_failure("commit atomic agent capture restore", error)
     })?;
     if render_human {
         println!(
@@ -1771,6 +1770,30 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         );
     }
     Ok(())
+}
+
+/// Project restored session rows through the cloud ownership boundary before
+/// a restore path can create a local transaction or copy either JSON column
+/// into the catalog: malformed or invalid V2 records are rejected, and legacy
+/// ownership never becomes a new local value. The direct row helper is used
+/// by tests and recovery callers, so it needs the same boundary as the
+/// D1-backed restore path.
+fn project_agent_capture_restore_sessions(
+    session_rows: &[AgentSessionV2Row],
+    side: &str,
+) -> CloudResult<Vec<AgentSessionV2Row>> {
+    session_rows
+        .iter()
+        .map(|session| project_agent_session_for_cloud(session, side))
+        .collect()
+}
+
+/// Report an agent-capture restore failure with the shipped network-class
+/// contract (`LBR-NET-002`). Every inner reason is a fixed diagnostic: D1 and
+/// local driver text is redacted where each error is built, so the remedy
+/// (prune tombstone, bounded reads, deadline, connectivity) stays visible.
+fn agent_capture_restore_failure(error: CloudError) -> CloudError {
+    CloudError::D1(format!("agent capture restore failed: {error}"))
 }
 
 pub(crate) async fn restore_metadata(
@@ -1806,4 +1829,115 @@ pub(crate) async fn restore_metadata_models(
     strict: bool,
 ) -> CloudResult<Vec<reference::Model>> {
     restore_metadata_models_with_capture_policy(db_conn, references, strict, true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::error::StableErrorCode;
+
+    #[test]
+    fn remote_repository_id_boundary_rejects_and_redacts_untrusted_text() {
+        const REMOTE_SENTINEL: &str =
+            "REMOTE_REPOSITORY_ID=/private/provider/session-capture.jsonl";
+
+        let error = validate_remote_repository_id(REMOTE_SENTINEL.to_string())
+            .expect_err("remote repository id must be canonical UUID");
+        let detail = error.to_string();
+        let cli = error.into_cli_error("restore");
+        assert!(detail.contains("invalid repository id"));
+        assert!(
+            !detail.contains(REMOTE_SENTINEL),
+            "CloudError must not echo remote repository id: {detail}"
+        );
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo remote repository id"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain remote repository id"
+        );
+        assert_eq!(cli.stable_code(), StableErrorCode::CliInvalidTarget);
+    }
+
+    #[test]
+    fn agent_capture_restore_failure_keeps_head_network_contract() {
+        const REMOTE_SENTINEL: &str =
+            "REMOTE_PRUNED_CHECKPOINT=/private/provider/session-capture.jsonl";
+        let prune_conflict = reject_local_prune_conflicts(
+            &[REMOTE_SENTINEL.to_string()],
+            &HashSet::from([REMOTE_SENTINEL.to_string()]),
+        )
+        .expect_err("a locally pruned remote checkpoint must fail restore");
+        let d1_failure = cloud_d1_failure(
+            "read agent-capture generation",
+            &D1Error {
+                code: 7500,
+                message: REMOTE_SENTINEL.to_string(),
+            },
+        );
+        let local_failure = local_agent_capture_restore_failure(
+            "decode session",
+            std::io::Error::other(REMOTE_SENTINEL),
+        );
+        let unstable = CloudError::PartialTransfer(
+            "remote agent capture changed during three bounded restore reads; retry when cloud sync is idle"
+                .to_string(),
+        );
+        for (inner, remedy) in [
+            (
+                prune_conflict,
+                "run `libra cloud sync` to publish the prune tombstone before restoring",
+            ),
+            (d1_failure, "verify cloud connectivity and credentials"),
+            (local_failure, "retry `libra cloud restore`"),
+            (unstable, "retry when cloud sync is idle"),
+        ] {
+            let inner_detail = inner.to_string();
+            let cli = agent_capture_restore_failure(inner).into_cli_error("restore");
+            assert_eq!(
+                cli.stable_code(),
+                StableErrorCode::NetworkProtocol,
+                "agent-capture restore failures keep the shipped LBR-NET-002 contract"
+            );
+            assert_eq!(
+                cli.message(),
+                format!("agent capture restore failed: {inner_detail}")
+            );
+            assert!(
+                cli.message().contains(remedy),
+                "the specific remedy must survive: {}",
+                cli.message()
+            );
+            assert!(!cli.message().contains(REMOTE_SENTINEL));
+            assert!(!format!("{:?}", cli.details()).contains(REMOTE_SENTINEL));
+        }
+    }
+
+    #[test]
+    fn local_agent_capture_restore_failure_redacts_driver_text() {
+        const LOCAL_SENTINEL: &str = "LOCAL_SQLITE_ROW=/private/provider/session-capture.jsonl";
+        let failure = local_agent_capture_restore_failure(
+            "inspect local agent session",
+            std::io::Error::other(LOCAL_SENTINEL),
+        );
+        let detail = failure.to_string();
+        assert_eq!(
+            detail,
+            "local agent-capture catalog inspect local agent session failed during cloud restore; run `libra agent doctor --repair` and retry `libra cloud restore`"
+        );
+        assert!(!detail.contains(LOCAL_SENTINEL));
+    }
+
+    #[test]
+    fn remote_repository_id_boundary_accepts_only_canonical_uuid() {
+        let canonical = "5eec7796-ced5-4a49-8e26-68b0326a8c70";
+        assert_eq!(
+            validate_remote_repository_id(canonical.to_string()).expect("canonical UUID"),
+            canonical
+        );
+        assert!(validate_remote_repository_id(canonical.to_uppercase()).is_err());
+        assert!(validate_remote_repository_id(format!(" {canonical}")).is_err());
+    }
 }

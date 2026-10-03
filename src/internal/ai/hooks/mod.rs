@@ -19,18 +19,22 @@
 //! - [`runner`]: spawns hook commands and translates their exit codes into
 //!   [`event::HookAction`].
 //! - [`runtime`]: turns stdin envelopes into recorded session updates.
-//! - `session_capture`: pure AgentTraces state and checkpoint decision.
+//! - `intent`: the legacy `AiIntent` session-store / AI-history writer the
+//!   runtime dispatches to after validated ingress.
+//! - [`crate::internal::ai::capture::ingress`]: bounded raw-frame validation
+//!   and canonical ingress handoff; `capture::state` owns pure lifecycle
+//!   reduction and checkpoint decisions.
 //! - `setup`: helper for materialising hook scripts on disk during `libra code`
 //!   bootstrap.
 
 pub mod config;
 pub mod event;
+mod intent;
 pub mod lifecycle;
 pub mod provider;
 pub mod providers;
 pub mod runner;
 pub mod runtime;
-mod session_capture;
 mod setup;
 
 pub use config::{HookConfig, HookDefinition, load_hook_config};
@@ -40,6 +44,7 @@ pub use provider::{HookProvider, ProviderHookCommand, ProviderInstallOptions};
 pub use providers::{claude_provider, gemini_provider};
 pub use runner::HookRunner;
 pub use runtime::{
-    AI_SESSION_SCHEMA, AI_SESSION_TYPE, HookEnvelopeInvalid, HookTarget, build_ai_session_id,
-    process_hook_event_from_stdin, process_hook_event_with_target,
+    AI_SESSION_SCHEMA, AI_SESSION_TYPE, HookAdvisoryNoEvidence, HookEnvelopeInvalid, HookTarget,
+    HookTerminalPersistenceFailure, build_ai_session_id, process_hook_event_from_stdin,
+    process_hook_event_with_target,
 };

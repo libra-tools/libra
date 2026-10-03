@@ -126,10 +126,6 @@ impl HookProvider for CodexProvider {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }
 
-    fn lifecycle_fallback_events(&self) -> &'static [&'static str] {
-        parser::CODEX_LIFECYCLE_FALLBACK_EVENTS
-    }
-
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
         settings::install_codex_hooks(options)
     }

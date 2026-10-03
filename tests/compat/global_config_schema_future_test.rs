@@ -716,11 +716,375 @@ fn config_doctor_uses_global_role() {
         serde_json::json!(fixture.home.join(".libra/config.db").to_str().unwrap())
     );
 
+    // The global-schema doctor must stay diagnosable with a newer global
+    // store: it skips the auto-upgrade recovery gate, the schema policy and
+    // the auto-upgrade check. Agent hook entries are dispatched before this
+    // point; their bypass is pinned behaviourally below.
     let cli = include_str!("../../src/cli.rs")
         .split_whitespace()
         .collect::<String>();
-    assert!(cli.contains("if!schema_doctor{if!command_is_agent_hook_entry(&args.command){crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;}enforce_global_config_schema_policy(&args.command).await?;}"));
-    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_))&&!command_is_agent_hook_entry(&args.command)"));
+    assert!(cli.contains("if!schema_doctor{crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;enforce_global_config_schema_policy(&args.command).await?;}"));
+    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_)){run_auto_upgrade_check_hook();}"));
+}
+
+/// Pipe one synthetic provider hook frame into a hook entry of the fixture's
+/// isolated binary, from inside the fixture repository.
+#[cfg(unix)]
+fn run_hook(
+    fixture: &CliFixture,
+    args: &[&str],
+    hook_event_name: &str,
+    session_id: &str,
+) -> Output {
+    use std::io::Write as _;
+
+    let repo = fixture.repo.canonicalize().expect("canonical repo dir");
+    let envelope = serde_json::json!({
+        "hook_event_name": hook_event_name,
+        "session_id": session_id,
+        "cwd": repo.to_str().expect("utf8 repo"),
+        "prompt": "hook dispatch boundary fixture",
+    })
+    .to_string();
+    let mut child = fixture
+        .command(&repo, args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn libra hook entry");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin is piped")
+        .write_all(envelope.as_bytes())
+        .expect("write hook envelope");
+    child.wait_with_output().expect("wait for libra hook entry")
+}
+
+/// Every hook spelling exercised by the dispatch-boundary tests: the
+/// installed Claude and Codex surfaces plus the hidden legacy alias, each
+/// with a nonterminal start and an object-writing `Stop` checkpoint.
+#[cfg(unix)]
+const HOOK_ENTRY_CASES: &[(&[&str], &str, &str)] = &[
+    (
+        &["hooks", "claude", "session-start"],
+        "SessionStart",
+        "boundary-claude",
+    ),
+    (&["hooks", "claude", "stop"], "Stop", "boundary-claude"),
+    (
+        &["agent", "hooks", "claude-code", "session-start"],
+        "SessionStart",
+        "boundary-alias",
+    ),
+    (
+        &["agent", "hooks", "claude-code", "stop"],
+        "Stop",
+        "boundary-alias",
+    ),
+    (
+        &["hooks", "codex", "session-start"],
+        "SessionStart",
+        "boundary-codex",
+    ),
+    (&["hooks", "codex", "stop"], "Stop", "boundary-codex"),
+];
+
+#[cfg(unix)]
+fn operation_rows(fixture: &CliFixture) -> serde_json::Value {
+    let output = fixture.success(&fixture.repo, &["--json", "op", "log", "-n", "100"]);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("op log JSON envelope");
+    envelope["data"]["operations"].clone()
+}
+
+/// Agent hook entries are dispatched before the central operation boundary:
+/// a callback inside a repository records no `libra op log` entry (so it is
+/// never an `op undo` / `op restore` target), even though it does write
+/// capture state. `op undo` / `op restore` keep that capture state (see
+/// `op_undo_keeps_traces_ref_advanced_by_agent_hooks`). The fixture is
+/// sensitive: an ordinary mutation in the same repository is recorded.
+#[cfg(unix)]
+#[test]
+fn agent_hook_entries_bypass_operation_boundary() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fs::write(fixture.repo.join("tracked.txt"), "tracked\n").expect("write tracked file");
+    fixture.success(&fixture.repo, &["add", "tracked.txt"]);
+    let before = operation_rows(&fixture);
+    let recorded = before.as_array().expect("op log operations array");
+    assert!(
+        recorded.len() == 1 && recorded[0]["command_name"] == "add",
+        "fixture precondition: an ordinary mutation must be recorded: {before}"
+    );
+
+    for (args, event, session) in HOOK_ENTRY_CASES {
+        let output = run_hook(&fixture, args, event, session);
+        assert_success(args, &output);
+    }
+
+    let sessions = fixture.success(&fixture.repo, &["--json", "agent", "session", "list"]);
+    let sessions: serde_json::Value =
+        serde_json::from_slice(&sessions.stdout).expect("session list JSON envelope");
+    let ids = sessions["data"]["sessions"]
+        .as_array()
+        .expect("session list rows")
+        .iter()
+        .filter_map(|row| row["session_id"].as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "claude__boundary-claude",
+        "claude__boundary-alias",
+        "codex__boundary-codex",
+    ] {
+        assert!(
+            ids.contains(&expected),
+            "hook callbacks must still capture {expected}: {sessions}"
+        );
+    }
+
+    let after = operation_rows(&fixture);
+    assert_eq!(
+        after, before,
+        "agent hook callbacks must not record operations in libra op log"
+    );
+}
+
+/// The live commit of one local branch row in the fixture repository.
+#[cfg(unix)]
+fn local_branch_tip(fixture: &CliFixture, name: &str) -> Option<String> {
+    let db_path = fixture.repo.join(".libra").join("libra.db");
+    let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    runtime.block_on(async {
+        let conn = libra::internal::db::establish_connection(
+            db_path.to_str().expect("utf8 repository database path"),
+        )
+        .await
+        .expect("open repository database");
+        let rows = conn
+            .query_all_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT `commit` FROM reference \
+                 WHERE kind = 'Branch' AND name = ? AND remote IS NULL",
+                [name.into()],
+            ))
+            .await
+            .expect("query branch row");
+        let tip = rows.first().and_then(|row| {
+            row.try_get_by_index::<Option<String>>(0)
+                .expect("decode branch tip")
+        });
+        conn.close().await.expect("close repository database");
+        tip
+    })
+}
+
+/// `(catalog_rows, ref_reachable_checkpoints)` from `agent doctor --json`.
+#[cfg(unix)]
+fn checkpoint_store_counts(fixture: &CliFixture) -> (i64, i64) {
+    let output = fixture.success(&fixture.repo, &["--json", "agent", "doctor"]);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("agent doctor JSON envelope");
+    let store = &envelope["data"]["checkpoint_store"];
+    (
+        store["catalog_rows"].as_i64().expect("catalog row count"),
+        store["ref_reachable_checkpoints"]
+            .as_i64()
+            .expect("ref-reachable checkpoint count"),
+    )
+}
+
+/// `op undo` keeps the Libra-owned capture refs that agent hook callbacks
+/// advance outside the operation log. Undoing the latest ordinary operation
+/// (the hooks recorded none, so it is still the unique head) rewinds the user
+/// branch but leaves `refs/libra/traces` at its live tip, so every catalogued
+/// checkpoint stays reachable and a later callback extends the same chain.
+/// Before this guarantee the undo restored the pre-hook placeholder, leaving
+/// the hook's checkpoint catalogued but unreachable from the ref.
+#[cfg(unix)]
+#[test]
+fn op_undo_keeps_traces_ref_advanced_by_agent_hooks() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.success(
+        &fixture.repo,
+        &["config", "set", "user.name", "Hook Fixture"],
+    );
+    fixture.success(
+        &fixture.repo,
+        &[
+            "config",
+            "set",
+            "user.email",
+            "hook-fixture@example.invalid",
+        ],
+    );
+    let mut tips = Vec::new();
+    for (index, content) in ["first\n", "second\n"].into_iter().enumerate() {
+        fs::write(fixture.repo.join("tracked.txt"), content).expect("write tracked file");
+        // `init` writes `.libraignore`; tracking it keeps the tree clean.
+        fixture.success(&fixture.repo, &["add", "tracked.txt", ".libraignore"]);
+        let message = format!("commit {index}");
+        fixture.success(
+            &fixture.repo,
+            &["commit", "-m", message.as_str(), "--no-verify"],
+        );
+        tips.push(local_branch_tip(&fixture, "main").expect("main branch tip after commit"));
+    }
+    let operations = operation_rows(&fixture);
+    let latest = &operations.as_array().expect("op log operations array")[0];
+    assert_eq!(
+        latest["command_name"], "commit",
+        "fixture precondition: the latest operation is the second commit: {operations}"
+    );
+    let latest_op = latest["op_id"].as_str().expect("latest op id").to_string();
+
+    for (args, event) in [
+        (&["hooks", "claude", "session-start"][..], "SessionStart"),
+        (&["hooks", "claude", "stop"][..], "Stop"),
+    ] {
+        let output = run_hook(&fixture, args, event, "undo-keeps-traces");
+        assert_success(args, &output);
+    }
+    let traces = local_branch_tip(&fixture, "traces")
+        .expect("a hook Stop checkpoint must advance refs/libra/traces");
+    let (catalog_rows, reachable) = checkpoint_store_counts(&fixture);
+    assert!(
+        catalog_rows >= 1 && reachable == catalog_rows,
+        "fixture precondition: every checkpoint is ref-reachable before the undo \
+         (catalog {catalog_rows}, reachable {reachable})"
+    );
+
+    // The human restore preview reports the capture ref as kept, not restored.
+    let preview = fixture.success(
+        &fixture.repo,
+        &["op", "restore", latest_op.as_str(), "--dry-run"],
+    );
+    let preview = String::from_utf8_lossy(&preview.stdout);
+    let (restored, kept) = preview
+        .split_once("Libra-owned capture refs kept at their current values:")
+        .unwrap_or_else(|| panic!("restore preview must list kept capture refs:\n{preview}"));
+    assert!(
+        restored.contains("Refs that would be restored:")
+            && restored.contains("Branch main")
+            && !restored.contains("Branch traces")
+            && kept.contains("Branch traces"),
+        "restore preview must keep traces out of the restored refs:\n{preview}"
+    );
+
+    fixture.success(&fixture.repo, &["op", "undo", latest_op.as_str()]);
+    assert_eq!(
+        local_branch_tip(&fixture, "main").as_ref(),
+        Some(&tips[0]),
+        "fixture sensitivity: the undo must rewind the user branch to the first commit"
+    );
+    assert_eq!(
+        local_branch_tip(&fixture, "traces").as_ref(),
+        Some(&traces),
+        "op undo must keep refs/libra/traces at its live tip"
+    );
+    assert_eq!(
+        checkpoint_store_counts(&fixture),
+        (catalog_rows, catalog_rows),
+        "every catalogued checkpoint must stay reachable from refs/libra/traces after op undo"
+    );
+
+    let output = run_hook(
+        &fixture,
+        &["hooks", "claude", "stop"],
+        "Stop",
+        "undo-keeps-traces",
+    );
+    assert_success(&["hooks", "claude", "stop"], &output);
+    let (catalog_after, reachable_after) = checkpoint_store_counts(&fixture);
+    assert!(
+        catalog_after > catalog_rows && reachable_after == catalog_after,
+        "a later callback must extend the same traces chain \
+         (catalog {catalog_after}, reachable {reachable_after})"
+    );
+}
+
+/// Agent hook entries are dispatched before the global configuration schema
+/// policy: a newer global config store never blocks a callback and the
+/// dispatcher emits no policy warning for it. A callback that writes objects
+/// (`Stop`) may still print the storage layer's one fallback warning (newer
+/// global storage config ignored, local storage used), but never the
+/// dispatcher's policy action. The fixture is sensitive: `status` in the same
+/// repository reports the policy warning.
+#[cfg(unix)]
+#[test]
+fn agent_hook_entries_bypass_global_config_schema_policy() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.write_future_global_config();
+    const POLICY_ACTION: &str = "command does not require remote config defaults; ignoring unsupported config and continuing";
+
+    let status = fixture.success(&fixture.repo, &["status", "--short"]);
+    let status_stderr = stderr_text(&status);
+    assert_schema_future_diagnostic(&fixture, &status_stderr);
+    assert!(
+        status_stderr.contains(POLICY_ACTION),
+        "fixture precondition: an ordinary command must run the schema policy:\n{status_stderr}"
+    );
+
+    for (args, event, session) in HOOK_ENTRY_CASES {
+        let output = run_hook(&fixture, args, event, session);
+        assert_success(args, &output);
+        let stderr = stderr_text(&output);
+        assert!(
+            !stderr.contains(POLICY_ACTION) && !stderr.contains("LBR-CONFIG-001"),
+            "{args:?}: hook entries must not run the global config schema policy:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(SECRET_VALUE)
+                && !String::from_utf8_lossy(&output.stdout).contains(SECRET_VALUE),
+            "{args:?}: hook output must not expose global configuration values"
+        );
+        let warnings = stderr
+            .matches("global config database schema is newer")
+            .count();
+        if *event == "SessionStart" {
+            assert_eq!(
+                warnings, 0,
+                "{args:?}: a nonterminal start reads no storage config and must not warn:\n{stderr}"
+            );
+        } else {
+            assert!(
+                warnings <= 1
+                    && (warnings == 0
+                        || stderr.contains(
+                            "ignoring global storage config and falling back to local storage"
+                        )),
+                "{args:?}: only the storage layer's single fallback warning may appear:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// `agent doctor` is an ordinary local repository command for the global
+/// configuration schema policy: a newer global config store neither blocks it
+/// nor is silently skipped. It runs the shared startup gates, reports the
+/// one deduplicated schema warning like `status`, and continues to its local
+/// diagnosis without exposing global configuration values.
+#[test]
+fn agent_doctor_warns_once_and_continues_with_future_global_config() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.write_future_global_config();
+
+    let output = fixture.success(&fixture.repo, &["agent", "doctor"]);
+    let stderr = stderr_text(&output);
+    assert_schema_future_diagnostic(&fixture, &stderr);
+    let count = stderr
+        .matches("global config database schema is newer")
+        .count();
+    assert_eq!(count, 1, "schema warning should be deduplicated:\n{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(SECRET_VALUE),
+        "agent doctor must not expose global configuration values: {stdout}"
+    );
 }
 
 #[test]

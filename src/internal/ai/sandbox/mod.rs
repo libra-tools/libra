@@ -1313,11 +1313,32 @@ async fn run_built_command(
         proxy_evidence_sink,
     )
     .await?;
+    #[cfg(test)]
+    if let Some(proxy) = allowlist_proxy.as_ref() {
+        // The test-only std::process fallback must execute the same command
+        // environment as the Tokio path, including the allowlist proxy.
+        inject_allowlist_proxy_env_into_exec_env(&mut built.exec_env, proxy);
+    }
     let timeout_override = built.timeout_ms;
-    repair_missing_process_cwd(&built.process_cwd)?;
     let mut cmd = built.command;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match spawn_shell_command(&mut cmd, &built.process_cwd) {
+    // In tests, probing/repairing the process cwd and spawning must be one
+    // transaction. A test can deliberately remove its cwd to exercise the
+    // recovery path; releasing the lock after the probe would let another
+    // command reach `spawn` while that cwd is absent and take a fallback path
+    // with different command environment construction.
+    #[cfg(test)]
+    let child = {
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
+        repair_missing_process_cwd(&built.process_cwd)?;
+        spawn_shell_command(&mut cmd, &built.process_cwd)
+    };
+    #[cfg(not(test))]
+    let child = {
+        repair_missing_process_cwd(&built.process_cwd)?;
+        spawn_shell_command(&mut cmd, &built.process_cwd)
+    };
+    let mut child = match child {
         Ok(child) => child,
         Err(error) => {
             #[cfg(test)]
@@ -1966,6 +1987,10 @@ fn repair_missing_process_cwd(fallback: &Path) -> Result<(), String> {
 }
 
 fn restore_process_cwd(fallback: &Path) -> std::io::Result<()> {
+    // In tests, this is a process-global mutation. Coordinate the recovery
+    // path with ChangeDirGuard even when it was reached from a command helper.
+    #[cfg(test)]
+    let _cwd_lock = crate::utils::test::cwd_lock_guard();
     let fallback = fallback
         .canonicalize()
         .unwrap_or_else(|_| fallback.to_path_buf());
@@ -2001,6 +2026,25 @@ fn inject_allowlist_proxy_env(
     command: &mut tokio::process::Command,
     proxy: &proxy_runtime::RunningAllowlistProxy,
 ) {
+    for_each_allowlist_proxy_env(proxy, |name, value| {
+        command.env(name, value);
+    });
+}
+
+#[cfg(test)]
+fn inject_allowlist_proxy_env_into_exec_env(
+    exec_env: &mut ExecEnv,
+    proxy: &proxy_runtime::RunningAllowlistProxy,
+) {
+    for_each_allowlist_proxy_env(proxy, |name, value| {
+        exec_env.env.insert(name.to_string(), value.to_string());
+    });
+}
+
+fn for_each_allowlist_proxy_env(
+    proxy: &proxy_runtime::RunningAllowlistProxy,
+    mut apply: impl FnMut(&str, &str),
+) {
     let proxy_url = proxy.local_http_proxy_url();
     for name in [
         "HTTP_PROXY",
@@ -2010,13 +2054,13 @@ fn inject_allowlist_proxy_env(
         "https_proxy",
         "all_proxy",
     ] {
-        command.env(name, &proxy_url);
+        apply(name, &proxy_url);
     }
     // Force proxy-aware tools through Libra's allowlist proxy even when the
     // parent shell has broad NO_PROXY defaults for loopback or local domains.
-    command.env("NO_PROXY", "");
-    command.env("no_proxy", "");
-    command.env("LIBRA_SANDBOX_ALLOWLIST_PROXY", proxy_url);
+    apply("NO_PROXY", "");
+    apply("no_proxy", "");
+    apply("LIBRA_SANDBOX_ALLOWLIST_PROXY", &proxy_url);
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3044,9 +3088,11 @@ mod tests {
     /// an empty string sentinel. Pins the contract that env-var
     /// seccomp opt-in is the lowest-friction path for users who
     /// don't customise `SandboxRuntimeConfig` directly.
-    #[cfg_attr(target_os = "linux", serial)]
+    // The later (Linux-only) bare attribute wraps the named one, taking the
+    // legacy lock before `env` like the sibling bridges in this module.
     #[test]
     #[serial_test::serial(env)]
+    #[cfg_attr(target_os = "linux", serial)]
     fn seccomp_policy_env_resolves_path_only_when_non_empty() {
         // SAFETY: test-only env mutation.
         let prior = std::env::var_os(SANDBOX_SECCOMP_POLICY_ENV);
@@ -3082,10 +3128,10 @@ mod tests {
         );
     }
 
-    // Bridge default and env groups (env alone misses default), in that order.
-    #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
     #[test]
     #[serial_test::serial(env)]
+    // Default wraps env so concurrent bridges cannot form a default/env ABBA.
+    #[serial_test::serial]
     fn seccomp_policy_path_falls_back_to_default_and_obeys_explicit_disable() {
         let temp = tempfile::tempdir().expect("tempdir for default seccomp path test");
         let _home = ScopedEnvVar::set("HOME", temp.path());
@@ -4483,6 +4529,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env)]
     async fn allow_all_policy_runs_dangerous_shell_without_prompt() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let store = Arc::new(tokio::sync::Mutex::new(ApprovalStore::default()));

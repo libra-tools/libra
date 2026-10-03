@@ -9826,7 +9826,7 @@ mod driver {
     }
 
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn recursive_binary_driver_uses_the_original_for_the_virtual_ancestor() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         // `merge_virtual_items` obtains the attribute source from the ambient
@@ -11434,7 +11434,7 @@ mod recursive {
     /// Git's `merged_merge_bases = merge(merged_merge_bases, next)` loop
     /// (`merge-ort.c` `merge_ort_internal`, lines 5353-5385 at git@`3cb9185f6`).
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn folds_three_ancestors_pairwise_into_one_tree() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11467,7 +11467,7 @@ mod recursive {
     /// conflicted text the same way. The markers carry the depth's width and
     /// Git's temporary-branch labels.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn records_conflicting_ancestor_content_with_labelled_widened_markers() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11493,7 +11493,7 @@ mod recursive {
     /// loads the virtual ancestor's content BY OBJECT ID — so a `--dry-run`
     /// has to keep it addressable in memory too, not only the conflicted ones.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn cleanly_merged_ancestor_content_stays_addressable_without_being_written() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11527,7 +11527,7 @@ mod recursive {
     /// version (`merge-ort.c` `process_entry`, lines 4374-4381 at
     /// git@`3cb9185f6`).
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn change_delete_inside_an_ancestor_keeps_the_base_version() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11548,7 +11548,7 @@ mod recursive {
     /// steals the ORIGINAL buffer for a virtual ancestor, so a conflicting
     /// binary keeps the base's content — never a side's.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn binary_conflict_inside_an_ancestor_keeps_the_original_content() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11574,7 +11574,7 @@ mod recursive {
     /// Recording nothing instead would turn the outer merge's add/add into a
     /// one-sided add and silently drop a side.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn binary_add_add_inside_an_ancestor_records_the_empty_blob() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11619,7 +11619,7 @@ mod recursive {
     /// Binary-ness follows Git's `buffer_is_binary` — a NUL byte in the first
     /// 8000 — not UTF-8 validity. Valid UTF-8 carrying a NUL is binary…
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn utf8_content_containing_a_nul_is_binary_like_git() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11648,7 +11648,7 @@ mod recursive {
     /// must survive the merge byte for byte (a lossy string round-trip would
     /// rewrite those bytes as U+FFFD).
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn non_utf8_content_without_a_nul_merges_as_text_like_git() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11679,7 +11679,7 @@ mod recursive {
     /// Symlinks are not content-merged: `merge-ort.c` keeps the ORIGINAL under
     /// `call_depth`, which is NOTHING when there is no original.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn symlink_conflict_inside_an_ancestor_keeps_the_original() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();
@@ -11710,7 +11710,7 @@ mod recursive {
     /// (`handle_content_merge` asserts equal `S_IFMT`); the ancestor keeps the
     /// original.
     #[test]
-    #[serial_test::serial(cwd)]
+    #[serial_test::serial(cwd, env)]
     fn mixed_kinds_inside_an_ancestor_keep_the_original() {
         let _repository = super::repository_fixture::MergeTestRepository::new();
         let mut blobs = VirtualBlobs::new();

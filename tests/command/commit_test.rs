@@ -2,10 +2,13 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
+use std::path::Path;
+
 use libra::{
     command::commit::CleanupMode,
     utils::{object_ext::TreeExt, output::OutputConfig},
 };
+use sea_orm::{ConnectionTrait, Database, Statement};
 use serial_test::serial;
 use tempfile::tempdir;
 
@@ -13,6 +16,30 @@ use super::*;
 mod env_restore_tests;
 
 mod unmerged;
+
+const OBJECT_INDEX_REJECTION_TRIGGER: &str = "test_reject_object_index_write";
+
+async fn set_object_index_write_rejection(repo: &Path, enabled: bool) {
+    let db_path = repo.join(".libra/libra.db");
+    let conn = Database::connect(format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("open repository database for object-index fixture");
+    let sql = if enabled {
+        format!(
+            "CREATE TRIGGER {OBJECT_INDEX_REJECTION_TRIGGER} \
+             BEFORE INSERT ON object_index BEGIN \
+             SELECT RAISE(ABORT, 'test object-index write rejection'); END"
+        )
+    } else {
+        format!("DROP TRIGGER IF EXISTS {OBJECT_INDEX_REJECTION_TRIGGER}")
+    };
+    conn.execute_raw(Statement::from_string(conn.get_database_backend(), sql))
+        .await
+        .expect("install object-index rejection fixture");
+    conn.close()
+        .await
+        .expect("close object-index fixture connection");
+}
 
 #[tokio::test]
 #[serial(cwd)]
@@ -1988,8 +2015,8 @@ fn test_commit_amend_no_edit_signed_parent_does_not_leak_gpgsig() {
     );
 }
 
-#[test]
-fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
+#[tokio::test]
+async fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
     let repo = tempdir().expect("create temp repo");
     let p = repo.path();
     init_repo_via_cli(p);
@@ -2000,11 +2027,11 @@ fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
         "stage fixture",
     );
 
-    let committed = run_libra_command_with_stdin_and_env(
+    set_object_index_write_rejection(p, true).await;
+    let committed = run_libra_command_with_stdin(
         &["commit", "-m", "durable index repair", "--no-verify"],
         p,
         "",
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
     );
     assert_cli_success(
         &committed,
@@ -2028,6 +2055,8 @@ fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
         pending >= 2,
         "commit and tree updates should remain repairable"
     );
+
+    set_object_index_write_rejection(p, false).await;
 
     let status = run_libra_command(&["status", "--short"], p);
     assert_cli_success(&status, "the next command should repair pending index rows");

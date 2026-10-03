@@ -16,13 +16,34 @@
 use std::sync::Mutex;
 
 use libra::internal::{
-    ai::hooks::{
-        LifecycleEventKind, ProviderHookCommand, claude_provider,
-        runtime::ingest_agent_traces_payload,
+    ai::{
+        capture::{
+            ingress::lower_in_process_capture_frame_for_test,
+            test_support::ingest_agent_traces_ingress_outcome_for_test,
+        },
+        hooks::{LifecycleEventKind, ProviderHookCommand, claude_provider},
     },
     config::ConfigKv,
 };
 use serde_json::json;
+
+async fn ingest_agent_traces_payload(
+    payload: &[u8],
+    command: ProviderHookCommand,
+    expected_kind: LifecycleEventKind,
+    provider: &dyn libra::internal::ai::hooks::HookProvider,
+    conn: &sea_orm::DatabaseConnection,
+    repo_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let outcome = lower_in_process_capture_frame_for_test(
+        payload,
+        command,
+        expected_kind,
+        provider,
+        repo_path,
+    );
+    ingest_agent_traces_ingress_outcome_for_test(outcome, command, provider, conn, repo_path).await
+}
 
 /// Shared in-memory sink handed to the fmt subscriber (identical to the
 /// pattern in `tests/agent_hook_span_test.rs`).
@@ -106,10 +127,11 @@ fn checkpoint_write_span_carries_required_fields_without_transcript_body() {
     // back to the redacted prompt as the transcript body — so the marker
     // reaching the sink would mean the span leaked transcript content.
     let body_marker = "TRANSCRIPT-BODY-MARKER-77aa";
-    let start = envelope("SessionStart", "sess-cp-span", json!({}));
+    let session_marker = "sess-cp-span-private-session-token";
+    let start = envelope("SessionStart", session_marker, json!({}));
     let end = envelope(
         "SessionEnd",
-        "sess-cp-span",
+        session_marker,
         json!({ "prompt": format!("{body_marker} finish with AKIAIOSFODNN7EXAMPLE") }),
     );
 
@@ -144,7 +166,7 @@ fn checkpoint_write_span_carries_required_fields_without_transcript_body() {
     );
     for field in [
         "checkpoint_id=",
-        "session_id=claude__sess-cp-span",
+        "session_id=***",
         // Stage progression: recorded values are quoted by the fmt layer.
         "stage=\"marker\"",
         "stage=\"append\"",
@@ -173,4 +195,14 @@ fn checkpoint_write_span_carries_required_fields_without_transcript_body() {
         !captured.contains("AKIAIOSFODNN7EXAMPLE"),
         "the raw secret must never reach the span sink: {captured}"
     );
+    assert!(
+        !captured.contains(session_marker),
+        "the raw provider session ID must never reach the span sink: {captured}"
+    );
+    for forbidden_fragment in ["claude__", "codex__", "pi__"] {
+        assert!(
+            !captured.contains(forbidden_fragment),
+            "no provider/native session-identity fragment may reach the span sink: {captured}"
+        );
+    }
 }

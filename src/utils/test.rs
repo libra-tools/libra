@@ -458,5 +458,8 @@ pub fn ensure_file(path: impl AsRef<Path>, content: Option<&str>) {
 
 /// reset working directory to the root of the module
 pub fn reset_working_dir() {
+    // Keep this legacy helper in the same process-wide CWD protocol as
+    // ChangeDirGuard, so a future caller cannot race another test's guard.
+    let _cwd_lock = cwd_lock();
     env::set_current_dir(env!("CARGO_MANIFEST_DIR")).unwrap();
 }

@@ -35,9 +35,9 @@ pub(super) fn resolve_cloud_repository_kind(
     let widths = collect_oid_widths(indexes)?;
     if let Some(raw) = meta {
         let kind = crate::internal::object_format::parse_config_value(raw).map_err(|_| {
-            ambiguous_format(format!(
-                "unsupported object format '{raw}' in cloud repository metadata"
-            ))
+            ambiguous_format(
+                "cloud repository metadata contains an unsupported object_format".to_string(),
+            )
         })?;
         validate_widths_for_kind(kind, &widths)?;
         validate_row_formats_against_kind(kind, indexes)?;
@@ -67,9 +67,9 @@ pub(super) fn resolve_cloud_repository_kind(
                 .to_string(),
         ));
     }
-    Err(ambiguous_format(format!(
-        "cloud object index has unsupported o_id widths {widths:?} without object_format metadata"
-    )))
+    Err(ambiguous_format(
+        "cloud object index has unsupported o_id widths without object_format metadata".to_string(),
+    ))
 }
 
 fn ambiguous_format(detail: String) -> CloudError {
@@ -86,9 +86,9 @@ fn collect_oid_widths(indexes: &[ObjectIndexRow]) -> Result<Vec<usize>, CloudErr
             ));
         }
         if !oid.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return Err(ambiguous_format(format!(
-                "cloud object index o_id '{oid}' is not hexadecimal"
-            )));
+            return Err(ambiguous_format(
+                "cloud object index contains a non-hexadecimal o_id".to_string(),
+            ));
         }
         widths.push(oid.len());
     }
@@ -106,10 +106,10 @@ fn validate_widths_for_kind(kind: HashKind, widths: &[usize]) -> Result<(), Clou
     let expected = expected_width(kind);
     for width in widths {
         if *width != expected {
-            return Err(ambiguous_format(format!(
-                "cloud object_format '{}' expects {expected}-hex o_id but found {width}-hex",
-                crate::internal::object_format::as_str(kind)
-            )));
+            return Err(ambiguous_format(
+                "cloud repository object_format conflicts with an object-index o_id width"
+                    .to_string(),
+            ));
         }
     }
     Ok(())
@@ -119,7 +119,6 @@ fn validate_row_formats_against_kind(
     kind: HashKind,
     indexes: &[ObjectIndexRow],
 ) -> Result<(), CloudError> {
-    let expected = crate::internal::object_format::as_str(kind);
     for row in indexes {
         if let Some(raw) = row
             .object_format
@@ -129,16 +128,15 @@ fn validate_row_formats_against_kind(
         {
             let row_kind =
                 crate::internal::object_format::parse_config_value(raw).map_err(|_| {
-                    ambiguous_format(format!(
-                        "unsupported object_format '{raw}' on object-index row {}",
-                        row.o_id
-                    ))
+                    ambiguous_format(
+                        "cloud object-index row contains an unsupported object_format".to_string(),
+                    )
                 })?;
             if row_kind != kind {
-                return Err(ambiguous_format(format!(
-                    "object-index row {} has object_format '{}' which conflicts with repository metadata '{expected}'",
-                    row.o_id, raw
-                )));
+                return Err(ambiguous_format(
+                    "cloud object-index row object_format conflicts with repository metadata"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -231,6 +229,39 @@ mod tests {
         let err = resolve_cloud_repository_kind(Some("blake3"), &[row(&oid64(), Some("sha256"))])
             .expect_err("row format conflict");
         assert!(matches!(err, CloudError::AmbiguousObjectFormat(_)));
+    }
+
+    #[test]
+    fn cloud_object_format_errors_redact_untrusted_remote_metadata() {
+        const REMOTE_SENTINEL: &str = "REMOTE_OBJECT_METADATA=/private/provider/session.jsonl";
+        let malformed_oid = format!("a{REMOTE_SENTINEL}");
+        let errors = [
+            resolve_cloud_repository_kind(Some(REMOTE_SENTINEL), &[row(&oid64(), None)])
+                .expect_err("unsupported remote repository metadata must fail"),
+            resolve_cloud_repository_kind(Some("sha256"), &[row(&malformed_oid, None)])
+                .expect_err("malformed remote object id must fail"),
+            resolve_cloud_repository_kind(Some("sha256"), &[row(&oid64(), Some(REMOTE_SENTINEL))])
+                .expect_err("unsupported remote row metadata must fail"),
+        ];
+
+        for error in errors {
+            let detail = error.to_string();
+            let cli = error.into_cli_error("restore");
+            assert!(
+                !detail.contains(REMOTE_SENTINEL),
+                "CloudError must not echo remote metadata: {detail}"
+            );
+            assert!(
+                !cli.message().contains(REMOTE_SENTINEL),
+                "CLI message must not echo remote metadata: {}",
+                cli.message()
+            );
+            assert!(
+                !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+                "structured CLI details must not retain remote metadata"
+            );
+            assert_eq!(cli.stable_code(), StableErrorCode::RepoCorrupt);
+        }
     }
 
     #[test]

@@ -10,23 +10,43 @@
 //! a subscriber; otherwise one sibling can disable a callsite while another
 //! is capturing it.
 //!
-//! Spans do not cross process boundaries, so these tests drive
-//! `libra::internal::ai::hooks::runtime::ingest_agent_traces_payload`
-//! in-process (exported `pub` for exactly this purpose; not a stable API)
-//! against a fresh on-disk SQLite database bootstrapped through the same
-//! `create_database` path `libra init` uses.
+//! Spans do not cross process boundaries, so these tests lower frames in the
+//! capture ingress and drive the typed in-process runtime against a fresh
+//! on-disk SQLite database bootstrapped through the same `create_database`
+//! path `libra init` uses.
 
 use std::sync::Mutex;
 
 use libra::internal::{
-    ai::hooks::{
-        LifecycleEventKind, ProviderHookCommand, claude_provider,
-        runtime::ingest_agent_traces_payload,
+    ai::{
+        capture::{
+            ingress::lower_in_process_capture_frame_for_test,
+            test_support::ingest_agent_traces_ingress_outcome_for_test,
+        },
+        hooks::{LifecycleEventKind, ProviderHookCommand, claude_provider},
     },
     config::ConfigKv,
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde_json::json;
+
+async fn ingest_agent_traces_payload(
+    payload: &[u8],
+    command: ProviderHookCommand,
+    expected_kind: LifecycleEventKind,
+    provider: &dyn libra::internal::ai::hooks::HookProvider,
+    conn: &sea_orm::DatabaseConnection,
+    repo_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let outcome = lower_in_process_capture_frame_for_test(
+        payload,
+        command,
+        expected_kind,
+        provider,
+        repo_path,
+    );
+    ingest_agent_traces_ingress_outcome_for_test(outcome, command, provider, conn, repo_path).await
+}
 
 /// Shared in-memory sink handed to the fmt subscriber (identical to the
 /// pattern in `tests/agent_rpc_span_test.rs`).
@@ -197,7 +217,8 @@ fn ingest_span_carries_required_fields_without_raw_input() {
 
 /// An event name this build does not recognize is skipped-and-logged: the
 /// ingest span records `partial=true` and a warn event carries
-/// `reason="unknown_event_type"` — no error, no panic.
+/// `reason="unknown_event_type"` — no error, no panic. The arbitrary raw
+/// event name is replaced by bounded length and a digest before logging.
 #[test]
 fn unknown_event_records_partial_true_with_warn_reason() {
     let rt = runtime();
@@ -227,7 +248,7 @@ fn unknown_event_records_partial_true_with_warn_reason() {
         "partial=true",
         "WARN",
         "reason=\"unknown_event_type\"",
-        "hook_event_name=FutureFancyEvent",
+        "event_name_len=16",
     ] {
         assert!(
             captured.contains(field),
@@ -237,6 +258,10 @@ fn unknown_event_records_partial_true_with_warn_reason() {
     assert!(
         !captured.contains("partial=false"),
         "the skipped ingest must not also record partial=false: {captured}"
+    );
+    assert!(
+        !captured.contains("FutureFancyEvent"),
+        "unrecognized raw event names must not reach the tracing sink: {captured}"
     );
 }
 
@@ -339,4 +364,75 @@ fn foreign_export_claim_blocks_hook_capture() {
     });
     assert!(captured.contains("agent.hook.ingest"), "{captured}");
     assert!(captured.contains("agent.redaction.apply"), "{captured}");
+}
+
+/// A terminal hook without a repository checkpoint store persists a bounded,
+/// replayable finalizer receipt. Its observability is deliberately limited to
+/// typed outcome/stage/attempt fields and the UUID-derived action key: neither
+/// the hook frame, a source path, transcript content, nor a redacted secret
+/// may be copied into the finalizer diagnostic.
+#[test]
+fn finalizer_diagnostics_are_content_free() {
+    let rt = runtime();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = rt.block_on(fresh_conn(dir.path()));
+    let session = "sess-finalizer-content-free";
+    let raw_marker = "FINALIZER-RAW-MARKER-9c319f";
+    let source_path_marker = "FINALIZER-SOURCE-PATH-1e7b4c";
+    let raw_secret = "AKIAIOSFODNN7EXAMPLE";
+
+    let captured = capture_spans(|| {
+        rt.block_on(async {
+            ingest_agent_traces_payload(
+                &envelope("SessionStart", session, json!({})),
+                ProviderHookCommand::SessionStart,
+                LifecycleEventKind::SessionStart,
+                claude_provider(),
+                &conn,
+                None,
+            )
+            .await
+            .expect("session start succeeds");
+            ingest_agent_traces_payload(
+                &envelope(
+                    "SessionEnd",
+                    session,
+                    json!({
+                        "event_id": "finalizer-span-event-v1",
+                        "prompt": format!("{raw_marker} {raw_secret}"),
+                        "last_assistant_message": raw_marker,
+                        "transcript_path": format!("/private/{source_path_marker}/session.jsonl"),
+                    }),
+                ),
+                ProviderHookCommand::SessionEnd,
+                LifecycleEventKind::SessionEnd,
+                claude_provider(),
+                &conn,
+                // No repository path deliberately selects the durable
+                // pending-finalizer path rather than a checkpoint write.
+                None,
+            )
+            .await
+            .expect("terminal capture without a repository stays pending");
+        });
+    });
+
+    assert!(captured.contains("agent.capture.finalize"), "{captured}");
+    for field in [
+        "finalizer_outcome=\"pending\"",
+        "finalizer_stage=Snapshot",
+        "finalizer_attempts=1",
+        "replay_key=capture-lifecycle-v1:",
+    ] {
+        assert!(
+            captured.contains(field),
+            "finalizer diagnostic missing `{field}`: {captured}"
+        );
+    }
+    for forbidden in [raw_marker, raw_secret, source_path_marker] {
+        assert!(
+            !captured.contains(forbidden),
+            "finalizer diagnostic must not contain raw hook/source content `{forbidden}`: {captured}"
+        );
+    }
 }

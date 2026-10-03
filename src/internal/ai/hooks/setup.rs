@@ -68,17 +68,20 @@ pub(super) fn resolve_hook_binary_path(input: Option<&str>) -> Result<String> {
 
 /// Quote a path for safe inclusion in a shell command stored on disk.
 ///
-/// Functional scope: on Windows the path is wrapped in double quotes when it
-/// contains whitespace or quote characters. On Unix-likes the path is left
-/// unquoted when it consists solely of the conservative alphabet
-/// `[A-Za-z0-9/._\-:]`, otherwise it is single-quoted with embedded apostrophes
-/// escaped using the standard `'\''` form.
+/// Functional scope: on every platform, an unquoted path uses only the
+/// conservative alphabet `[A-Za-z0-9/\\._\-:]`. Other Windows paths are
+/// double-quoted and other Unix paths are single-quoted with embedded
+/// apostrophes escaped using the standard `'\''` form. Keeping the emitted
+/// grammar small lets provider cleanup recognize only direct command paths,
+/// never shell expressions.
 fn quote_command_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
 
     #[cfg(windows)]
     {
-        if rendered.contains([' ', '\t', '"']) {
+        if !rendered.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '\\' | '.' | '_' | '-' | ':')
+        }) {
             return format!("\"{}\"", rendered.replace('"', "\\\""));
         }
         rendered.into_owned()

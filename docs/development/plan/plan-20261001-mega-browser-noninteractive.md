@@ -159,6 +159,7 @@
 | 2026-10-03 13:05:47 UTC | MN-07 发布/D 组完成与跨仓交付登记 | 12 卡全部 `done`/`complete`；v0.30.27 stable、12/12 pinned-source live 与清理已核实；`DEP-MN-03` 登记已交付。后续收口只同步计划、状态和日期索引三个文档路径，继承 MN-07 发布点，不新增实现卡或 patch；全量门和最终审查仍待执行 | 无 | 本计划、`plan-status.md`、`plan-long.md` |
 | 2026-10-03 13:38:39 UTC | 全量收口门完成 | 原定全量 nextest 8839/8839、网站示例 1/1、fmt / Clippy 全绿，无失败/重试/泄漏；恢复验证限制如实登记，未将未演练的生产恢复发布记为通过。12 卡判据与 D 组、跨仓交付和日期索引已同步；最后仅执行只读 Codex 审查与三个计划文档路径的签名提交/PR 交付，不新增产品能力或 artifact | 无 | 本计划、`plan-status.md`、`plan-long.md` |
 | 2026-10-03 13:50:01 UTC | Codex R19 最终收口审查 `PASS` | P0/P1 无；P2 状态词修复为既有 `已收口`；14 条完成判据全部勾选，12 卡状态与计划索引同步；本次行政交付仅包含三个计划文档，继承 MN-07 发布，不再 bump / tag / artifact | 无 | 本计划、`plan-status.md`、`plan-long.md` |
+| 2026-10-03 15:45:47 UTC | 行政收口 PR #609 交付期间上游前移 | 原 head `6531b0f` 的 12/12 checks 全绿；合并前发现 `origin/main` 前移到 `721fec9`（Agent Capture 基础交接），暂停合入并整合。状态表以 incoming 为底，只更新本计划的三行与快照中的 Mega2 片段，保留 ACF 交接、security/privacy RFC 边界及其他计划登记；日期索引保留双方各自的行。Mega2 实现、live 测试与双语命令文档共 10 路径相对 MN-07 发布点逐字节一致；既有本地全量/live 证据仍绑定 `faae20c`，整合后的收口 head 必须重新通过 CI，不能以旧 head 的 checks 替代 | 无 | 本计划、`plan-status.md`、`plan-long.md`；PR #609 |
 
 ## 已决议设计决策
 
@@ -2195,6 +2196,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目，并在�
 | R17 | 提交前上游前移（`main@7f810da`）后的差异确认：锚点与版本事实复核、`DEP-QP-01` 删除的跟进、`plan-status.md` 合并到上游 | FAIL | P0 无；P1×1：九张卡写集中的「`_compatibility.md`（只改第 55 行）」未随锚点刷新，`7f810da` 上第 55 行是 `log` 行 → 改为第 57 行。其余刷新的锚点与版本面、`DEP-QP-01` 的跟进、R15/R16 记录与 `plan-status.md` 的合并确认无误，`plan-long.md` 只加一行索引，任务卡的门、规则与计数未变 | 无 P2 | 输入为 2026-10-02 00:54:48 UTC 时的版本（计划文件 SHA-256 `a5a85d72dea75922bba9586cf9860d891e758c0bbff6024d4bf9ae342b9628ff`），评审范围为相对 R16 输入版本的差异，以及 `plan-status.md`、`plan-long.md` 相对 `7f810da` 的差异；修订见修订历史中由 R17 触发的一行 |
 | R18 | R17 修订后的差异确认 | PASS | P0 无；P1 无。R17 的 P1 确认关闭：12 处 `:57` 锚点与九张卡写集都指向 `7f810da` 上第 57 行的 mega2 行；修订历史与 R17/R18 日志行一致，旧行号只出现在描述移动或修复的文字中 | 无 P2 | 输入为 2026-10-02 01:00:30 UTC 时的版本（计划文件 SHA-256 `30f8e4daacae24227c8f0eb7cca13d65b92192ba8f15c48fe8e1685cddbcdb6c`），评审范围为相对 R17 输入版本的差异 |
 | R19 | 全计划最终收口审查：12 卡已发布/D 组、pinned-source live、全量/网站门、三个文档的收口差异与同步 | PASS | P0 无；P1 无。无正确性、范围、同步或证据问题阻止完成审查记录和行政交付后的收口；只读审查，未重跑测试 | P2×1 已修复：状态表允许值未含临时 `收口中` → 最终状态统一采用既有 `已收口`，不增加新状态值；无遗留 P2 | `gpt-6-sol` / `xhigh`；2026-10-03 13:40:11 UTC 输入，计划 SHA-256 `538f5ac3be5849762c4d905506d4337f0f53fbf862f152e9194d3f6f377a2d85`；exit 0，字面 `VERDICT: PASS`；审查输出只以内联摘要记录，无新输出文件 |
+| R20 | 行政收口相对 incoming main `721fec9` 的三个文档差异与冲突整合 | PASS | P0 无；P1 无。ACF 交接与 security/privacy 边界保留，MN-07 / DEP-MN-03 / 日期索引一致；`faae20c` 与旧 head 的证据和整合后待跑 CI 已明确分开 | P2 无 | `gpt-6-sol` / `xhigh`；2026-10-03 16:18:56 UTC 完成；输入计划 SHA-256 `c6bfa914ccab216fa9b7cd1f65a5e3272fddb812f32d0faac7d0b74c2986b162`；exit 0，字面 `VERDICT: PASS`；只读差异审查、未跑测试、无新输出文件 |
 
 ## 非目标与延后项
 

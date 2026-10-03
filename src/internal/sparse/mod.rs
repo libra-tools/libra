@@ -433,6 +433,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cwd, env)]
     async fn a_compiled_view_matches_the_pinned_worktree_not_the_cwd() {
+        // `serial_test` keeps peer scope tests ordered, but ChangeDirGuard
+        // users share this process-wide lock too.
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
         let repo = tempfile::tempdir().expect("repo");
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         let original = std::env::current_dir().expect("cwd");

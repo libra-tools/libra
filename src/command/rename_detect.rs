@@ -2446,11 +2446,17 @@ mod tests {
     /// read only the remainder; reusing the entry window would let a 5s
     /// batch run to a multiple of itself while every individual operation
     /// looked compliant.
+    #[cfg(debug_assertions)]
     #[test]
-    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd, env)]
     fn sequential_ops_share_the_batch_deadline() {
         use std::time::Duration;
 
+        // LFS attribute lookup is scoped to the process worktree. Hold the
+        // same lock as ChangeDirGuard so another test cannot make this
+        // regular-file deadline witness take an unrelated repository's LFS
+        // branch between the delayed stat and content read.
+        let _cwd = crate::utils::test::cwd_lock_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("slow.txt");
         std::fs::write(&path, b"content").expect("write fixture");
@@ -2480,11 +2486,13 @@ mod tests {
     /// must cost the candidate (`IoTimeout`), not hang the command past
     /// the batch deadline. The seam stands in for a FIFO/hung-mount
     /// attributes file.
+    #[cfg(debug_assertions)]
     #[test]
-    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd, env)]
     fn lfs_classification_is_bounded_by_the_batch_deadline() {
         use std::time::Duration;
 
+        let _cwd = crate::utils::test::cwd_lock_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("classified.txt");
         std::fs::write(&path, b"content").expect("write fixture");
@@ -2509,11 +2517,13 @@ mod tests {
     /// Mirror of the pin above for the exact-stage reader: the
     /// `worktree_blob_oid_and_size` path used by status's exact gate must
     /// bound its LFS classification by the batch deadline too.
+    #[cfg(debug_assertions)]
     #[test]
-    #[serial_test::serial(env)]
+    #[serial_test::serial(cwd, env)]
     fn lfs_classification_is_bounded_on_the_oid_path_too() {
         use std::time::Duration;
 
+        let _cwd = crate::utils::test::cwd_lock_guard();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("classified.txt");
         std::fs::write(&path, b"content").expect("write fixture");

@@ -311,6 +311,17 @@ agent-capture phases, for example:
 {"event":"cloud_sync.agent_capture.complete","sessions_synced":2,"sessions_failed":0,"checkpoints_synced":6,"checkpoints_failed":0,"subagent_rows_synced":3,"subagent_rows_failed":0}
 ```
 
+An agent-capture row failure is reported as
+`{"event":"cloud_sync.agent_capture.warning","error":"agent-capture catalog sync failed; inspect the local capture catalog and retry `libra cloud sync`"}`:
+the message is fixed and carries no session or checkpoint id and no remote D1
+text (earlier releases emitted per-id `cloud_sync.agent_capture.session_warning`
+/ `checkpoint_warning` events that echoed them). Any other agent-capture
+failure is also reported as exactly one such event, whose `error` is that
+failure's fixed, content-free reason — for example a D1 request failure with
+its D1 code and a connectivity remedy, or the specific rejected local catalog
+shape. Every agent-capture failure then ends with the `LBR-CONFLICT-002` error
+`agent capture mirror failed: <reason>` carrying the same reason.
+
 The completed counts report only rows actually sent by that incremental sync;
 the subagent companion count covers durable source claims, append-only source
 revisions, and boundary/content link rows. Agent catalog publication takes a
@@ -351,6 +362,21 @@ dependencies publish before the monotonic claim high-water. Every D1 request
 has a 30-second timeout and the complete agent-capture phase has a 120-second
 deadline. Any agent-capture mirror failure makes `cloud sync` exit nonzero and
 machine output emits no preceding success envelope.
+
+Repositories upgraded from earlier releases keep syncing and restoring. Legacy
+(unversioned or V1) import-ownership fields are omitted from every session row
+that sync mirrors or restore writes, while all other session metadata is kept
+unchanged; rows earlier releases already mirrored are left as they are and
+remain restorable. Legacy V1 `source/sha256/...` subagent claims and revisions
+that the remote catalog does not already hold, together with the association
+links of their content checkpoints, stay local-only because their unkeyed
+source digest must not be added to new cloud catalog rows; their checkpoints
+are still mirrored, and the immutable checkpoint metadata blob that restore
+needs still carries that digest. While such evidence exists, each successful
+sync also emits one
+fixed warning,
+`{"event":"cloud_sync.agent_capture.warning","error":"legacy V1 subagent evidence keyed by an unkeyed source digest stays local-only and was not mirrored; its checkpoints and all other agent-capture rows were synced"}`,
+and still exits 0.
 
 Ordinary `agent clean` checkpoint retention records a durable prune tombstone in
 the same local transaction as the ref/catalog rewrite. Cloud sync publishes that
@@ -411,7 +437,11 @@ fail closed; current publication uses only writer-token-fenced batches. Restore 
 reads the object index through a generation-stable snapshot and rejects catalog
 state whose fenced projection no longer matches the manifest digest. Later
 unrelated object-index additions do not invalidate an otherwise unchanged
-checkpoint projection.
+checkpoint projection. Any agent-capture restore failure exits with
+`LBR-NET-002` and `agent capture restore failed: <reason>`; the fixed reason
+keeps its specific remedy (publish a prune tombstone with `libra cloud sync`,
+retry when cloud sync is idle, the 120-second deadline, or verify cloud
+connectivity and credentials) and never echoes remote rows or D1 text.
 It validates reachability from the manifest-bound traces head and restores that
 head atomically with the catalog rather than trusting separately uploaded generic
 reference metadata. Existing local objects are
@@ -549,6 +579,8 @@ Note: Neither Git nor jj have a built-in cloud backup command. They rely on push
 | `LBR-CLI-002` | Neither `--repo-id` nor `--name` provided for restore |
 | `LBR-CLI-003` | Repository with given name not found in D1 |
 | `LBR-CONFLICT-002` | Project name already taken by another repository |
+| `LBR-CONFLICT-002` | Agent-capture mirror failed during sync (`agent capture mirror failed: <reason>`) |
+| `LBR-NET-002` | Agent-capture restore failed (`agent capture restore failed: <reason>`) |
 | `LBR-IO-001` | D1 client initialization failure |
 | `LBR-IO-001` | Failed to create D1 tables |
 | `LBR-IO-001` | Database query failure |

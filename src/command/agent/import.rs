@@ -1,7 +1,7 @@
 //! `libra agent import` — consented historical transcript backfill (M4).
 
 use std::{
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant, SystemTime},
@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -18,22 +18,36 @@ use crate::{
     internal::{
         ai::{
             agent_import::{
-                DetailedImportSummary, ExistingSessionOwnershipSnapshot, ImportError,
-                ImportPreparationContext, ImportProgressError, ImportRequest, ImportSummary,
-                identity_id as import_identity_id, import_prepared_with_subagent_discovery,
-                load_existing_session_ownership_in_scope, prepare_import_request,
-                read_import_source, restore_tombstone, session_is_tombstoned,
-                validate_prepared_existing_session,
+                DetailedImportSummary, IMPORT_INDEX_REPAIR_MARKER_KEY,
+                IMPORT_INDEX_REPAIR_MARKER_SCHEMA_V2, ImportError, ImportIndexRepairMarker,
+                ImportProgressError, ImportRequest, ImportSummary, LegacyImportMigrationRequest,
+                PreparedImportProjection, identity_id as import_identity_id,
+                import_prepared_with_subagent_discovery, import_provider_commitment,
+                import_request_from_projection, import_source_preimage, import_storage_commitment,
+                is_import_source_commitment_v2, load_existing_session_ownership_in_scope,
+                migrate_legacy_import_ownership_in_scope_until, prepare_import_projection,
+                restore_tombstone, session_is_tombstoned, validate_import_index_repair_marker,
+                validate_scoped_prepared_existing_session,
             },
-            capture_scope::CaptureScope,
+            authorized_read::{
+                CancellationSafeChild, RegisteredHelperOutput, StrictBoundedRead,
+                read_async_strictly_bounded, read_strictly_bounded, registered_helper_command,
+                run_registered_bounded_helper_until,
+            },
+            capture_scope::{
+                CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
+                authorize_final_capture_commit,
+            },
+            hooks::runtime::{
+                CaptureSourceCommitmentDomain, derive_capture_source_commitment_in_scope_until,
+                derive_snapshot_content_commitment_in_scope_until,
+            },
             observed_agents::{
                 AgentKind, AgentSessionCtx, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
                 agent_for, claude_session_dir, claude_session_id_is_safe_path_component,
                 compliance::{MAX_TRANSCRIPT_READ_BYTES_KEY, max_transcript_read_bytes_setting},
                 find_codex_rollout, open_provider_directory_for_discovery,
-                opencode_export::{
-                    ExportLimits, authorized_sandboxed_export, trusted_opencode_binary,
-                },
+                opencode_export::{ExportLimits, authorized_trusted_sandboxed_export_until},
                 resolve_import_transcript_source_until, resolve_session_file,
             },
         },
@@ -65,26 +79,140 @@ pub const IMPORT_DISCOVERY_HELPER_ARG: &str = "--libra-internal-agent-import-dis
 /// Compact base64 path frames keep a full public 100-result page (including
 /// near-`PATH_MAX` Unix paths) below this deliberately derived 2 MiB ceiling.
 pub const IMPORT_DISCOVERY_HELPER_FRAME_CAP: u64 = 2 * 1024 * 1024;
-pub const IMPORT_PREPARATION_HELPER_ARG: &str = "--libra-internal-agent-import-preparation-helper";
-pub const IMPORT_PREPARATION_HELPER_INPUT_CAP: u64 = 2 * 1024 * 1024;
 pub const IMPORT_PREPARATION_HELPER_OUTPUT_CAP: u64 = 128 * 1024 * 1024;
+/// Descriptor-capability preparation protocol. Its stdin is the already
+/// authorized transcript descriptor (or an anonymous bounded export file),
+/// never a JSON envelope containing a provider locator or session id.
+pub const IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG: &str =
+    "--libra-internal-agent-import-preparation-descriptor-helper";
+pub const IMPORT_PREPARATION_DESCRIPTOR_CONTROL_ENV: &str =
+    "LIBRA_INTERNAL_IMPORT_PREPARATION_DESCRIPTOR_CONTROL";
 pub const IMPORT_INDEX_REPAIR_HELPER_ARG: &str =
     "--libra-internal-agent-import-index-repair-helper";
 pub const IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP: u64 = 64 * 1024;
-const IMPORT_INDEX_REPAIR_MARKER_KEY: &str = "object-index-v1";
 /// Longer than the command's absolute deadline so a healthy importer cannot
 /// be preempted while it is finishing a final SQLite commit or index drain.
 /// Normal failures explicitly release the lease into `repair_pending`, so
 /// only a process crash requires waiting for this TTL.
 const IMPORT_INDEX_BARRIER_LEASE_MS: i64 = 180_000;
 
+// Test controls deliberately live behind `cfg(test)`: `cargo build` uses a
+// debug profile by default, so `cfg!(debug_assertions)` is not a safe boundary
+// for fault injection or filesystem rendezvous hooks.
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    use super::*;
+
+    #[derive(Default)]
+    pub(super) struct ImportTestControls {
+        pub(super) total_deadline: Option<Duration>,
+        pub(super) batch_raw_byte_cap: Option<u64>,
+        pub(super) codex_home: Option<PathBuf>,
+        pub(super) fail_index_tombstone_lookup: bool,
+        pub(super) preparation_response_read_delay: Option<Duration>,
+        pub(super) source_open_pause: Option<TestPause>,
+        pub(super) index_barrier_pause: Option<TestPause>,
+        /// Test-only deterministic window between persisting a barrier value
+        /// and its final deadline/fence checks. Production never sleeps here.
+        pub(super) index_barrier_persist_delay: Option<Duration>,
+    }
+
+    pub(super) struct TestPause {
+        pub(super) reached: mpsc::Sender<()>,
+        pub(super) resume: mpsc::Receiver<()>,
+    }
+
+    impl TestPause {
+        fn wait(self, deadline: Instant, stage: &'static str) -> Result<()> {
+            let _ = self.reached.send(());
+            self.resume
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| anyhow::anyhow!("test {stage} pause exceeded the import deadline"))
+        }
+    }
+
+    static CONTROLS: OnceLock<Mutex<ImportTestControls>> = OnceLock::new();
+
+    fn controls() -> &'static Mutex<ImportTestControls> {
+        CONTROLS.get_or_init(|| Mutex::new(ImportTestControls::default()))
+    }
+
+    fn lock_controls() -> std::sync::MutexGuard<'static, ImportTestControls> {
+        controls()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) struct ControlsReset(Option<ImportTestControls>);
+
+    pub(super) fn install(controls: ImportTestControls) -> ControlsReset {
+        let previous = std::mem::replace(&mut *lock_controls(), controls);
+        ControlsReset(Some(previous))
+    }
+
+    impl Drop for ControlsReset {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = std::mem::replace(&mut *lock_controls(), previous);
+            }
+        }
+    }
+
+    pub(super) fn total_deadline() -> Option<Duration> {
+        lock_controls().total_deadline
+    }
+
+    pub(super) fn batch_raw_byte_cap() -> Option<u64> {
+        lock_controls().batch_raw_byte_cap
+    }
+
+    pub(super) fn codex_home() -> Option<PathBuf> {
+        lock_controls().codex_home.clone()
+    }
+
+    pub(super) fn fail_index_tombstone_lookup() -> bool {
+        lock_controls().fail_index_tombstone_lookup
+    }
+
+    pub(super) fn preparation_response_read_delay() -> Option<Duration> {
+        lock_controls().preparation_response_read_delay
+    }
+
+    pub(super) fn take_source_open_pause() -> Option<TestPause> {
+        lock_controls().source_open_pause.take()
+    }
+
+    pub(super) fn take_index_barrier_pause() -> Option<TestPause> {
+        lock_controls().index_barrier_pause.take()
+    }
+
+    pub(super) fn wait_source_open_pause(deadline: Instant) -> Result<()> {
+        match take_source_open_pause() {
+            Some(pause) => pause.wait(deadline, "source-open"),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn wait_index_barrier_pause(deadline: Instant) -> Result<()> {
+        match take_index_barrier_pause() {
+            Some(pause) => pause.wait(deadline, "index-barrier"),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn index_barrier_persist_delay() -> Option<Duration> {
+        lock_controls().index_barrier_persist_delay
+    }
+}
+
 fn import_total_deadline() -> Duration {
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_DEADLINE_MS")
-        && let Ok(parsed) = value.parse::<u64>()
-        && parsed > 0
+    #[cfg(test)]
+    if let Some(deadline) = test_support::total_deadline()
+        && !deadline.is_zero()
     {
-        return Duration::from_millis(parsed).min(IMPORT_TOTAL_DEADLINE);
+        return deadline.min(IMPORT_TOTAL_DEADLINE);
     }
     IMPORT_TOTAL_DEADLINE
 }
@@ -96,48 +224,77 @@ fn ensure_before_deadline(deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+/// Bound only a read-only import preflight. A dispatched mutation, final
+/// authorization, and COMMIT acknowledgement must remain outside this helper:
+/// cancelling any of those futures can leave the durable outcome unknowable.
+async fn await_import_precommit_read_until<T>(
+    deadline: Instant,
+    read: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    ensure_before_deadline(deadline)?;
+    let value = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read)
+        .await
+        .map_err(|_| anyhow::Error::from(ImportError::DeadlineExceeded))??;
+    ensure_before_deadline(deadline)?;
+    Ok(value)
+}
+
+fn import_commitment_failure(error: anyhow::Error, deadline: Instant) -> ImportError {
+    let authorization_deadline = error
+        .downcast_ref::<CaptureFinalCommitAuthorizationError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                &CaptureFinalCommitAuthorizationError::DeadlineElapsed
+            )
+        });
+    if Instant::now() >= deadline || authorization_deadline {
+        ImportError::DeadlineExceeded
+    } else {
+        ImportError::AuthorizedReaderFailed
+    }
+}
+
+#[cfg(test)]
 fn import_test_pause_after_source_open(deadline: Instant) -> Result<()> {
-    if !cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_SOURCE_READY_FILE") else {
-        return Ok(());
-    };
-    let continue_path = std::env::var("LIBRA_TEST_IMPORT_SOURCE_CONTINUE_FILE")
-        .context("source-open pause requires a continue-file path")?;
-    std::fs::write(&ready_path, b"ready").context("publish test-only source-open import pause")?;
-    while !Path::new(&continue_path).exists() {
-        ensure_before_deadline(deadline)?;
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    test_support::wait_source_open_pause(deadline)
+}
+
+#[cfg(not(test))]
+fn import_test_pause_after_source_open(_deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn import_test_pause_after_index_barrier(deadline: Instant) -> Result<()> {
-    if !cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_INDEX_BARRIER_READY_FILE") else {
-        return Ok(());
-    };
-    let continue_path = std::env::var("LIBRA_TEST_IMPORT_INDEX_BARRIER_CONTINUE_FILE")
-        .context("index-barrier pause requires a continue-file path")?;
-    std::fs::write(&ready_path, b"ready")
-        .context("publish test-only import index-barrier pause")?;
-    while !Path::new(&continue_path).exists() {
-        ensure_before_deadline(deadline)?;
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    test_support::wait_index_barrier_pause(deadline)
+}
+
+#[cfg(not(test))]
+fn import_test_pause_after_index_barrier(_deadline: Instant) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+fn import_test_delay_after_index_barrier_persist() {
+    if let Some(delay) = test_support::index_barrier_persist_delay() {
+        // Keep this synchronous in the test seam. The production timeout
+        // still bounds SQLite waits, while this deterministic post-DML pause
+        // proves that the explicit pre-commit deadline gate rolls the
+        // transaction back rather than relying on task cancellation.
+        std::thread::sleep(delay);
+    }
+}
+
+#[cfg(not(test))]
+fn import_test_delay_after_index_barrier_persist() {}
 
 fn batch_raw_byte_cap() -> u64 {
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_BATCH_CAP_BYTES")
-        && let Ok(parsed) = value.parse::<u64>()
-        && parsed > 0
+    #[cfg(test)]
+    if let Some(cap) = test_support::batch_raw_byte_cap()
+        && cap > 0
     {
-        return parsed.min(MAX_BATCH_RAW_BYTES);
+        return cap.min(MAX_BATCH_RAW_BYTES);
     }
     MAX_BATCH_RAW_BYTES
 }
@@ -277,29 +434,95 @@ struct DiscoveryCandidateWire {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum DiscoveryHelperResponse {
     Ok {
         candidates: Vec<DiscoveryCandidateWire>,
         next_cursor: Option<usize>,
     },
     Error {
-        stable_code: String,
-        message: String,
+        reason: DiscoveryRejection,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PreparationHelperRequest {
-    candidate: DiscoveryCandidateWire,
-    repo_root: WirePath,
-    storage_root: WirePath,
-    read_cap: u64,
-    remaining_ms: u64,
-    existing_session: Option<ExistingSessionOwnershipSnapshot>,
+/// Closed reason a discovery helper reports to its parent. Only this fixed
+/// enum crosses the process boundary; the parent renders the matching
+/// actionable message, so no provider path or error chain is reflected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiscoveryRejection {
+    /// The helper rejected argv the parent already validated; reachable only
+    /// if the two copies disagree, e.g. after a working-directory change.
+    SelectorRejected,
+    AmbiguousSession,
+    SessionNotFound,
+    CursorOutOfRange,
+    ClaudeProviderRoot,
+    CodexProviderRoot,
+    DeadlineExceeded,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+impl DiscoveryRejection {
+    /// Classify a provider discovery failure without retaining its chain.
+    fn from_provider_error(error: &anyhow::Error, fallback: Self) -> Self {
+        if matches!(
+            error.downcast_ref::<ImportError>(),
+            Some(ImportError::DeadlineExceeded)
+        ) {
+            Self::DeadlineExceeded
+        } else {
+            fallback
+        }
+    }
+
+    fn into_cli_error(self) -> CliError {
+        match self {
+            Self::SelectorRejected => {
+                CliError::command_usage("agent import discovery rejected the supplied selector")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            }
+            Self::AmbiguousSession => {
+                CliError::command_usage("the session id matches multiple providers; add --agent")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            }
+            Self::SessionNotFound => CliError::fatal(
+                "no authorized local transcript matched the session id; use --agent opencode for an export-only OpenCode session",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidTarget),
+            Self::CursorOutOfRange => {
+                CliError::command_usage("--cursor is outside the discovery result set")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            }
+            Self::ClaudeProviderRoot => CliError::fatal(
+                "Claude session discovery failed within its configured provider root",
+            )
+            .with_stable_code(StableErrorCode::AgentTranscriptAuthorizationMissing),
+            Self::CodexProviderRoot => CliError::fatal(
+                "Codex session discovery failed within its configured provider root",
+            )
+            .with_stable_code(StableErrorCode::AgentTranscriptAuthorizationMissing),
+            Self::DeadlineExceeded => {
+                CliError::fatal("agent import discovery exceeded its total execution deadline")
+                    .with_stable_code(StableErrorCode::AgentImportPartialBatch)
+            }
+        }
+    }
+}
+
+/// Safe control for the descriptor-owning helper. Every field is either a
+/// fixed enum/bound or a fixed-size commitment; raw provider IDs, source
+/// locators, repository paths, and transcript bytes are deliberately absent.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparationDescriptorControl {
+    agent_kind: String,
+    source_kind: String,
+    provider_commitment: [u8; 32],
+    read_cap: u64,
+    remaining_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PreparationImportErrorKind {
     WorkingDirMissingOrAmbiguous,
@@ -311,13 +534,14 @@ enum PreparationImportErrorKind {
     NoImportableTurns,
     BatchInputLimit,
     DeadlineExceeded,
+    FutureTimestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum PreparationHelperResponse {
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum PreparationDescriptorHelperResponse {
     Ok {
-        request: Box<ImportRequest>,
+        projection: Box<PreparedImportProjection>,
         raw_bytes: u64,
     },
     Error {
@@ -334,36 +558,21 @@ struct IndexRepairHelperRequest {
     marker_generation: String,
     agent_kind: String,
     provider_session_id: String,
+    capture_scope: CaptureScope,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum IndexRepairHelperResponse {
     Ok { repaired_rows: usize },
-    Error { message: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ImportIndexBarrierMarker {
-    schema_version: u32,
-    owner: String,
-    generation: String,
-    identity_id: String,
-    agent_kind: String,
-    provider_session_id: String,
-    source_kind: String,
-    source_id: String,
-    state: String,
-    lease_expires_at: i64,
-    created_at: i64,
-    #[serde(default)]
-    fence_token: Option<i64>,
+    Error {},
 }
 
 #[derive(Debug, Clone)]
 struct ImportIndexBarrier {
     session_id: String,
-    marker: ImportIndexBarrierMarker,
+    marker: ImportIndexRepairMarker,
+    capture_scope: CaptureScope,
 }
 
 #[derive(Debug, Clone)]
@@ -438,14 +647,42 @@ struct BatchFailure {
     error_code: StableErrorCode,
 }
 
-fn importable_kind(slug: &str) -> CliResult<AgentKind> {
+fn importable_kind_from_slug(slug: &str) -> Option<AgentKind> {
     match AgentKind::from_cli_slug(slug) {
-        Some(kind @ (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode)) => Ok(kind),
-        _ => Err(CliError::command_usage(format!(
-            "agent import supports claude-code, codex, or opencode; got '{slug}'"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidArguments)),
+        Some(kind @ (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode)) => Some(kind),
+        _ => None,
     }
+}
+
+/// Parse the user's own `--agent` argv. The echo is bounded and has control
+/// characters replaced so an oversized value cannot flood or drive a terminal.
+fn importable_kind(slug: &str) -> CliResult<AgentKind> {
+    importable_kind_from_slug(slug).ok_or_else(|| {
+        CliError::command_usage(format!(
+            "agent import supports claude-code, codex, or opencode; got '{}'",
+            bounded_argv_echo(slug)
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
+}
+
+fn bounded_argv_echo(value: &str) -> String {
+    const MAX_ECHO_CHARS: usize = 64;
+    let mut echo = value
+        .chars()
+        .take(MAX_ECHO_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if value.chars().nth(MAX_ECHO_CHARS).is_some() {
+        echo.push('…');
+    }
+    echo
 }
 
 fn provider_name(kind: AgentKind) -> &'static str {
@@ -784,10 +1021,11 @@ fn codex_sessions_root() -> Option<PathBuf> {
     {
         return Some(home.join("sessions"));
     }
-    std::env::var_os("LIBRA_TEST_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .map(|home| home.join(".codex").join("sessions"))
+    #[cfg(test)]
+    if let Some(home) = test_support::codex_home() {
+        return Some(home.join(".codex").join("sessions"));
+    }
+    dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
 }
 
 fn discover_codex(since: Option<i64>, deadline: Instant) -> Result<Vec<Candidate>> {
@@ -1044,30 +1282,24 @@ fn parse_since(value: Option<&str>) -> CliResult<Option<i64>> {
         .transpose()
 }
 
-fn discovery_error(error: anyhow::Error, message: &'static str) -> CliError {
-    if matches!(
-        error.downcast_ref::<ImportError>(),
-        Some(ImportError::DeadlineExceeded)
-    ) {
-        CliError::fatal("agent import discovery exceeded its total execution deadline")
-            .with_stable_code(StableErrorCode::AgentImportPartialBatch)
-    } else {
-        CliError::fatal(message)
-            .with_stable_code(StableErrorCode::AgentTranscriptAuthorizationMissing)
-    }
+/// Argument-only selector, validated before any provider filesystem access.
+#[derive(Debug)]
+enum DiscoverySelector {
+    Path(Candidate),
+    Session {
+        session_id: String,
+        filter: Option<AgentKind>,
+    },
+    Batch {
+        filter: Option<AgentKind>,
+        since: Option<i64>,
+    },
 }
 
-fn discover(
-    args: &ImportArgs,
-    repo_root: &Path,
-    deadline: Instant,
-) -> CliResult<(Vec<Candidate>, Option<usize>)> {
-    ensure_before_deadline(deadline).map_err(|error| {
-        discovery_error(
-            error,
-            "agent import discovery exceeded its execution deadline",
-        )
-    })?;
+/// Validate argv in the documented order. The parent runs this before it
+/// spawns the discovery helper so each argv error keeps its fixed actionable
+/// message, and the helper re-runs the same function so they cannot drift.
+fn validate_discovery_selector(args: &ImportArgs) -> CliResult<DiscoverySelector> {
     if args.limit == 0 || args.limit > MAX_IMPORT_LIMIT {
         return Err(CliError::command_usage("--limit must be between 1 and 100")
             .with_stable_code(StableErrorCode::CliInvalidArguments));
@@ -1078,7 +1310,7 @@ fn discover(
             CliError::command_usage("--path requires --agent")
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         })?;
-        return Ok((vec![path_candidate(path, kind)?], None));
+        return Ok(DiscoverySelector::Path(path_candidate(path, kind)?));
     }
     if let Some(session_id) = args.session.as_deref() {
         if let Some(kind) = filter {
@@ -1091,80 +1323,11 @@ fn discover(
             )
             .with_stable_code(StableErrorCode::CliInvalidArguments));
         }
-        if filter == Some(AgentKind::OpenCode) {
-            return Ok((
-                vec![Candidate {
-                    kind: AgentKind::OpenCode,
-                    provider_session_id: session_id.to_string(),
-                    path: None,
-                }],
-                None,
-            ));
-        }
-        let kinds = filter
-            .map(|kind| vec![kind])
-            .unwrap_or_else(|| vec![AgentKind::ClaudeCode, AgentKind::Codex]);
-        let mut candidates = Vec::new();
-        for kind in kinds {
-            if !session_id_is_valid_for_kind(session_id, kind) {
-                continue;
-            }
-            let path = match kind {
-                AgentKind::ClaudeCode => {
-                    let found = resolve_session_file(repo_root, session_id).map_err(|error| {
-                        discovery_error(
-                            error,
-                            "Claude session discovery failed within its configured provider root",
-                        )
-                    })?;
-                    ensure_before_deadline(deadline).map_err(|error| {
-                        discovery_error(
-                            error,
-                            "Claude session discovery exceeded its execution deadline",
-                        )
-                    })?;
-                    found
-                }
-                AgentKind::Codex => {
-                    let found = find_codex_rollout(session_id).map_err(|error| {
-                        discovery_error(
-                            error,
-                            "Codex session discovery failed within its configured provider root",
-                        )
-                    })?;
-                    ensure_before_deadline(deadline).map_err(|error| {
-                        discovery_error(
-                            error,
-                            "Codex session discovery exceeded its execution deadline",
-                        )
-                    })?;
-                    found
-                }
-                _ => None,
-            };
-            if let Some(path) = path {
-                candidates.push(Candidate {
-                    kind,
-                    provider_session_id: session_id.to_string(),
-                    path: Some(path),
-                });
-            }
-        }
-        if candidates.len() > 1 {
-            return Err(CliError::command_usage(
-                "the session id matches multiple providers; add --agent",
-            )
-            .with_stable_code(StableErrorCode::CliInvalidArguments));
-        }
-        if candidates.is_empty() {
-            return Err(CliError::fatal(
-                "no authorized local transcript matched the session id; use --agent opencode for an export-only OpenCode session",
-            )
-            .with_stable_code(StableErrorCode::CliInvalidTarget));
-        }
-        return Ok((candidates, None));
+        return Ok(DiscoverySelector::Session {
+            session_id: session_id.to_string(),
+            filter,
+        });
     }
-
     if filter == Some(AgentKind::OpenCode) {
         return Err(CliError::command_usage(
             "OpenCode batch discovery is unavailable; select a session explicitly with --session",
@@ -1172,31 +1335,46 @@ fn discover(
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
     let since = parse_since(args.since.as_deref())?;
+    Ok(DiscoverySelector::Batch { filter, since })
+}
+
+fn ensure_discovery_before_deadline(deadline: Instant) -> Result<(), DiscoveryRejection> {
+    ensure_before_deadline(deadline).map_err(|_| DiscoveryRejection::DeadlineExceeded)
+}
+
+fn discover(
+    args: &ImportArgs,
+    repo_root: &Path,
+    deadline: Instant,
+) -> Result<(Vec<Candidate>, Option<usize>), DiscoveryRejection> {
+    ensure_discovery_before_deadline(deadline)?;
+    let (filter, since) = match validate_discovery_selector(args)
+        .map_err(|_| DiscoveryRejection::SelectorRejected)?
+    {
+        DiscoverySelector::Path(candidate) => return Ok((vec![candidate], None)),
+        DiscoverySelector::Session { session_id, filter } => {
+            return discover_session(&session_id, filter, repo_root, deadline)
+                .map(|candidates| (candidates, None));
+        }
+        DiscoverySelector::Batch { filter, since } => (filter, since),
+    };
     let mut candidates = Vec::new();
     if filter.is_none() || filter == Some(AgentKind::ClaudeCode) {
         candidates.extend(
             discover_claude(repo_root, since, deadline).map_err(|error| {
-                discovery_error(
-                    error,
-                    "Claude session discovery failed within its configured provider root",
+                DiscoveryRejection::from_provider_error(
+                    &error,
+                    DiscoveryRejection::ClaudeProviderRoot,
                 )
             })?,
         );
     }
     if filter.is_none() || filter == Some(AgentKind::Codex) {
         candidates.extend(discover_codex(since, deadline).map_err(|error| {
-            discovery_error(
-                error,
-                "Codex session discovery failed within its configured provider root",
-            )
+            DiscoveryRejection::from_provider_error(&error, DiscoveryRejection::CodexProviderRoot)
         })?);
     }
-    ensure_before_deadline(deadline).map_err(|error| {
-        discovery_error(
-            error,
-            "agent import discovery exceeded its execution deadline",
-        )
-    })?;
+    ensure_discovery_before_deadline(deadline)?;
     candidates.sort_by(|left, right| {
         (left.kind.as_db_str(), left.provider_session_id.as_str())
             .cmp(&(right.kind.as_db_str(), right.provider_session_id.as_str()))
@@ -1204,22 +1382,75 @@ fn discover(
     candidates.dedup_by(|left, right| {
         left.kind == right.kind && left.provider_session_id == right.provider_session_id
     });
-    ensure_before_deadline(deadline).map_err(|error| {
-        discovery_error(
-            error,
-            "agent import discovery exceeded its execution deadline",
-        )
-    })?;
+    ensure_discovery_before_deadline(deadline)?;
     let offset = args.cursor.unwrap_or(0);
     if offset > candidates.len() {
-        return Err(
-            CliError::command_usage("--cursor is outside the discovery result set")
-                .with_stable_code(StableErrorCode::CliInvalidArguments),
-        );
+        return Err(DiscoveryRejection::CursorOutOfRange);
     }
     let end = offset.saturating_add(args.limit).min(candidates.len());
     let next_cursor = (end < candidates.len()).then_some(end);
     Ok((candidates[offset..end].to_vec(), next_cursor))
+}
+
+fn discover_session(
+    session_id: &str,
+    filter: Option<AgentKind>,
+    repo_root: &Path,
+    deadline: Instant,
+) -> Result<Vec<Candidate>, DiscoveryRejection> {
+    if filter == Some(AgentKind::OpenCode) {
+        return Ok(vec![Candidate {
+            kind: AgentKind::OpenCode,
+            provider_session_id: session_id.to_string(),
+            path: None,
+        }]);
+    }
+    let kinds = filter
+        .map(|kind| vec![kind])
+        .unwrap_or_else(|| vec![AgentKind::ClaudeCode, AgentKind::Codex]);
+    let mut candidates = Vec::new();
+    for kind in kinds {
+        if !session_id_is_valid_for_kind(session_id, kind) {
+            continue;
+        }
+        let path = match kind {
+            AgentKind::ClaudeCode => {
+                let found = resolve_session_file(repo_root, session_id).map_err(|error| {
+                    DiscoveryRejection::from_provider_error(
+                        &error,
+                        DiscoveryRejection::ClaudeProviderRoot,
+                    )
+                })?;
+                ensure_discovery_before_deadline(deadline)?;
+                found
+            }
+            AgentKind::Codex => {
+                let found = find_codex_rollout(session_id).map_err(|error| {
+                    DiscoveryRejection::from_provider_error(
+                        &error,
+                        DiscoveryRejection::CodexProviderRoot,
+                    )
+                })?;
+                ensure_discovery_before_deadline(deadline)?;
+                found
+            }
+            _ => None,
+        };
+        if let Some(path) = path {
+            candidates.push(Candidate {
+                kind,
+                provider_session_id: session_id.to_string(),
+                path: Some(path),
+            });
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(DiscoveryRejection::AmbiguousSession);
+    }
+    if candidates.is_empty() {
+        return Err(DiscoveryRejection::SessionNotFound);
+    }
+    Ok(candidates)
 }
 
 /// Private subprocess entry used to make provider discovery killable at the
@@ -1259,10 +1490,10 @@ pub fn run_import_discovery_helper(input: &[u8]) -> Result<Vec<u8>> {
                 .collect(),
             next_cursor,
         },
-        Err(error) => DiscoveryHelperResponse::Error {
-            stable_code: error.stable_code().as_str().to_string(),
-            message: error.message().to_string(),
-        },
+        // The helper crosses a process boundary specifically to contain
+        // provider filesystem work. Only the closed reason crosses it; never
+        // an error chain from that process.
+        Err(reason) => DiscoveryHelperResponse::Error { reason },
     };
     serde_json::to_vec(&response).context("encode internal import discovery response")
 }
@@ -1272,14 +1503,10 @@ async fn discover_bounded(
     repo_root: &Path,
     deadline: Instant,
 ) -> CliResult<(Vec<Candidate>, Option<usize>)> {
-    use tokio::io::AsyncWriteExt;
-
-    ensure_before_deadline(deadline).map_err(|error| {
-        discovery_error(
-            error,
-            "agent import discovery exceeded its execution deadline",
-        )
-    })?;
+    ensure_discovery_before_deadline(deadline).map_err(DiscoveryRejection::into_cli_error)?;
+    // Reject argv-only selector errors here, with their actionable messages,
+    // before a helper is spawned; the helper re-validates the same argv.
+    validate_discovery_selector(args)?;
     let remaining_ms = u64::try_from(
         deadline
             .saturating_duration_since(Instant::now())
@@ -1308,48 +1535,41 @@ async fn discover_bounded(
         )
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
-    let program = std::env::current_exe().map_err(|error| {
-        CliError::fatal(format!("failed to resolve Libra discovery helper: {error}"))
+    let command = require_registered_import_helper_command(registered_helper_command(
+        IMPORT_DISCOVERY_HELPER_ARG,
+    ))
+    .map_err(|_| {
+        CliError::fatal("agent import discovery helper is unavailable in this host")
+            .with_stable_code(StableErrorCode::AgentTranscriptAuthorizationMissing)
     })?;
-    let mut child = tokio::process::Command::new(program)
-        .arg(IMPORT_DISCOVERY_HELPER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| CliError::fatal(format!("failed to start import discovery: {error}")))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| CliError::fatal("bounded import discovery helper has no stdin pipe"))?;
-    stdin.write_all(&request).await.map_err(|error| {
-        CliError::fatal(format!(
-            "failed to send bounded import discovery request: {error}"
-        ))
-    })?;
-    drop(stdin);
-    let output = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        child.wait_with_output(),
+    let output = match run_registered_bounded_helper_until(
+        command,
+        &[&request],
+        IMPORT_DISCOVERY_HELPER_FRAME_CAP,
+        deadline,
     )
     .await
-    .map_err(|_| {
-        CliError::fatal("agent import discovery exceeded its total execution deadline")
+    {
+        RegisteredHelperOutput::Output(output) => output,
+        RegisteredHelperOutput::DeadlineExceeded => {
+            return Err(CliError::fatal(
+                "agent import discovery exceeded its total execution deadline",
+            )
+            .with_stable_code(StableErrorCode::AgentImportPartialBatch));
+        }
+        RegisteredHelperOutput::Failed => {
+            return Err(CliError::fatal(
+                "bounded import discovery helper did not return a usable response",
+            )
+            .with_stable_code(StableErrorCode::AgentImportPartialBatch));
+        }
+    };
+    let invalid_response = || {
+        CliError::fatal("bounded import discovery helper returned an invalid response")
             .with_stable_code(StableErrorCode::AgentImportPartialBatch)
-    })?
-    .map_err(|error| CliError::fatal(format!("bounded import discovery failed: {error}")))?;
-    if !output.status.success() || output.stdout.len() as u64 > IMPORT_DISCOVERY_HELPER_FRAME_CAP {
-        return Err(CliError::fatal(
-            "bounded import discovery helper returned an invalid response",
-        ));
-    }
+    };
     let response: DiscoveryHelperResponse =
-        serde_json::from_slice(&output.stdout).map_err(|error| {
-            CliError::fatal(format!(
-                "bounded import discovery returned invalid JSON: {error}"
-            ))
-        })?;
+        serde_json::from_slice(&output).map_err(|_| invalid_response())?;
     match response {
         DiscoveryHelperResponse::Ok {
             candidates,
@@ -1358,7 +1578,8 @@ async fn discover_bounded(
             let candidates = candidates
                 .into_iter()
                 .map(|candidate| {
-                    let kind = importable_kind(&candidate.kind)?;
+                    let kind =
+                        importable_kind_from_slug(&candidate.kind).ok_or_else(invalid_response)?;
                     Ok(Candidate {
                         kind,
                         provider_session_id: candidate.provider_session_id,
@@ -1368,24 +1589,7 @@ async fn discover_bounded(
                 .collect::<CliResult<Vec<_>>>()?;
             Ok((candidates, next_cursor))
         }
-        DiscoveryHelperResponse::Error {
-            stable_code,
-            message,
-        } => {
-            let error = match stable_code.as_str() {
-                "LBR-CLI-002" => CliError::command_usage(message)
-                    .with_stable_code(StableErrorCode::CliInvalidArguments),
-                "LBR-CLI-003" => {
-                    CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidTarget)
-                }
-                "LBR-AGENT-018" => CliError::fatal(message)
-                    .with_stable_code(StableErrorCode::AgentImportPartialBatch),
-                "LBR-AGENT-020" => CliError::fatal(message)
-                    .with_stable_code(StableErrorCode::AgentTranscriptAuthorizationMissing),
-                _ => CliError::fatal("bounded import discovery returned an unknown error code"),
-            };
-            Err(error)
-        }
+        DiscoveryHelperResponse::Error { reason } => Err(reason.into_cli_error()),
     }
 }
 
@@ -1489,16 +1693,16 @@ async fn resolve_candidate_source(
     deadline: Instant,
 ) -> Result<(TranscriptSource, String, String)> {
     if candidate.kind == AgentKind::OpenCode {
-        let binary = trusted_opencode_binary().await?;
         let session_id = crate::internal::ai::hooks::runtime::build_ai_session_id(
             "opencode",
             &candidate.provider_session_id,
         );
-        let source = authorized_sandboxed_export(
-            &binary,
+        let source = authorized_trusted_sandboxed_export_until(
             &candidate.provider_session_id,
             &session_id,
+            repo_root,
             ExportLimits::default(),
+            deadline,
         )
         .await?;
         return Ok((
@@ -1544,9 +1748,13 @@ fn preparation_error_kind(error: &anyhow::Error) -> Option<PreparationImportErro
         ImportError::Erased => Some(PreparationImportErrorKind::Erased),
         ImportError::LeaseBusy => Some(PreparationImportErrorKind::LeaseBusy),
         ImportError::SourceAuthorization => Some(PreparationImportErrorKind::SourceAuthorization),
+        ImportError::AuthorizedReaderUnavailable | ImportError::AuthorizedReaderFailed => {
+            Some(PreparationImportErrorKind::SourceAuthorization)
+        }
         ImportError::NoImportableTurns => Some(PreparationImportErrorKind::NoImportableTurns),
         ImportError::BatchInputLimit => Some(PreparationImportErrorKind::BatchInputLimit),
         ImportError::DeadlineExceeded => Some(PreparationImportErrorKind::DeadlineExceeded),
+        ImportError::FutureTimestamp => Some(PreparationImportErrorKind::FutureTimestamp),
     }
 }
 
@@ -1563,131 +1771,75 @@ fn preparation_error(kind: PreparationImportErrorKind) -> ImportError {
         PreparationImportErrorKind::NoImportableTurns => ImportError::NoImportableTurns,
         PreparationImportErrorKind::BatchInputLimit => ImportError::BatchInputLimit,
         PreparationImportErrorKind::DeadlineExceeded => ImportError::DeadlineExceeded,
+        PreparationImportErrorKind::FutureTimestamp => ImportError::FutureTimestamp,
     }
 }
 
-async fn prepare_candidate_in_helper(
-    candidate: &Candidate,
-    repo_root: &Path,
-    storage_root: &Path,
-    read_cap: u64,
-    existing_session: Option<&ExistingSessionOwnershipSnapshot>,
-    deadline: Instant,
-) -> PreparedCandidateOutcome {
-    let resolved = resolve_candidate_source(candidate, repo_root, deadline).await;
-    let (source, source_kind, source_id) = match resolved {
-        Ok(source) => source,
-        Err(error) => {
-            return PreparedCandidateOutcome {
-                request: Err(error),
-                raw_bytes: 0,
-            };
-        }
-    };
-    if let Err(error) = import_test_pause_after_source_open(deadline) {
-        return PreparedCandidateOutcome {
-            request: Err(error),
-            raw_bytes: 0,
-        };
+fn descriptor_preparation_control_from_environment() -> Result<PreparationDescriptorControl> {
+    let encoded = std::env::var(IMPORT_PREPARATION_DESCRIPTOR_CONTROL_ENV)
+        .context("read internal descriptor preparation control")?;
+    if encoded.len() > 4 * 1024 {
+        anyhow::bail!("internal descriptor preparation control exceeds its frame limit");
     }
-    let read = read_import_source(
-        candidate.kind,
-        &candidate.provider_session_id,
-        source,
-        read_cap,
-        deadline,
-    )
-    .await;
-    let raw_bytes = read.raw_bytes;
-    let content = match read.content {
-        Ok(content) => content,
-        Err(error) => {
-            return PreparedCandidateOutcome {
-                request: Err(error),
-                raw_bytes,
-            };
-        }
-    };
-    let prepared = prepare_import_request(
-        candidate.kind,
-        &candidate.provider_session_id,
-        &source_kind,
-        &source_id,
-        content,
-        ImportPreparationContext {
-            current_repo_root: repo_root,
-            current_storage_root: storage_root,
-            deadline,
-        },
-    )
-    .and_then(|mut prepared| {
-        validate_prepared_existing_session(&mut prepared, existing_session)?;
-        Ok(prepared)
-    });
-    PreparedCandidateOutcome {
-        request: prepared,
-        raw_bytes,
-    }
-}
-
-async fn run_import_preparation_helper_async(input: &[u8]) -> Result<Vec<u8>> {
-    let request: PreparationHelperRequest =
-        serde_json::from_slice(input).context("decode internal import preparation request")?;
-    if request.read_cap > TRANSCRIPT_READ_HARD_CAP_BYTES || request.remaining_ms == 0 {
-        anyhow::bail!("invalid internal import preparation bounds");
-    }
-    let kind = AgentKind::from_cli_slug(&request.candidate.kind)
-        .filter(|kind| {
-            matches!(
+    let control: PreparationDescriptorControl =
+        serde_json::from_str(&encoded).context("decode internal descriptor preparation control")?;
+    if control.read_cap > TRANSCRIPT_READ_HARD_CAP_BYTES
+        || control.remaining_ms == 0
+        || !matches!(control.source_kind.as_str(), "file" | "export")
+        || AgentKind::from_cli_slug(&control.agent_kind).is_none_or(|kind| {
+            !matches!(
                 kind,
                 AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode
             )
         })
-        .context("invalid internal import preparation agent kind")?;
-    let candidate = Candidate {
-        kind,
-        provider_session_id: request.candidate.provider_session_id.clone(),
-        path: request.candidate.path.clone().map(WirePath::into_path_buf),
+    {
+        anyhow::bail!("invalid internal descriptor preparation control");
+    }
+    Ok(control)
+}
+
+/// Private descriptor helper entrypoint. `stdin` is a held source capability,
+/// not a request frame. The only request-like material lives in the strictly
+/// safe environment control parsed above.
+#[doc(hidden)]
+pub fn run_import_preparation_descriptor_helper_from_stdin() -> Result<Vec<u8>> {
+    let control = descriptor_preparation_control_from_environment()?;
+    let kind = AgentKind::from_cli_slug(&control.agent_kind)
+        .context("invalid internal descriptor preparation agent kind")?;
+    let mut stdin = std::io::stdin().lock();
+    let (bytes, raw_bytes) = match read_strictly_bounded(&mut stdin, control.read_cap) {
+        StrictBoundedRead::Complete(bytes) => {
+            let raw_bytes =
+                u64::try_from(bytes.len()).context("descriptor read length exceeds u64")?;
+            (bytes, raw_bytes)
+        }
+        StrictBoundedRead::Oversize { observed_bytes } => (Vec::new(), observed_bytes),
+        StrictBoundedRead::Failed { error, .. } => {
+            return Err(error).context("read held descriptor for internal import preparation");
+        }
     };
-    let repo_root = request.repo_root.clone().into_path_buf();
-    let storage_root = request.storage_root.clone().into_path_buf();
     let deadline = Instant::now()
         + Duration::from_millis(
-            request
+            control
                 .remaining_ms
                 .min(IMPORT_TOTAL_DEADLINE.as_millis() as u64),
         );
-    let outcome = prepare_candidate_in_helper(
-        &candidate,
-        &repo_root,
-        &storage_root,
-        request.read_cap,
-        request.existing_session.as_ref(),
-        deadline,
-    )
-    .await;
-    let response = match outcome.request {
-        Ok(prepared) => PreparationHelperResponse::Ok {
-            request: Box::new(prepared),
-            raw_bytes: outcome.raw_bytes,
+    let outcome = if raw_bytes > control.read_cap {
+        Err(ImportError::BatchInputLimit.into())
+    } else {
+        prepare_import_projection(kind, control.provider_commitment, bytes, deadline)
+    };
+    let response = match outcome {
+        Ok(projection) => PreparationDescriptorHelperResponse::Ok {
+            projection: Box::new(projection),
+            raw_bytes,
         },
-        Err(error) => PreparationHelperResponse::Error {
+        Err(error) => PreparationDescriptorHelperResponse::Error {
             error_kind: preparation_error_kind(&error),
-            raw_bytes: outcome.raw_bytes,
+            raw_bytes,
         },
     };
-    serde_json::to_vec(&response).context("encode internal import preparation response")
-}
-
-/// Private subprocess entry for the complete post-consent filesystem and
-/// normalization boundary. It returns only typed, redacted import state.
-#[doc(hidden)]
-pub fn run_import_preparation_helper(input: &[u8]) -> Result<Vec<u8>> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("start internal import preparation runtime")?;
-    runtime.block_on(run_import_preparation_helper_async(input))
+    serde_json::to_vec(&response).context("encode internal descriptor preparation response")
 }
 
 /// Private subprocess entry for a durable import replay's foreground
@@ -1717,18 +1869,19 @@ pub fn run_import_index_repair_helper(input: &[u8]) -> Result<Vec<u8>> {
             match super::doctor::repair_session_object_index(
                 &conn,
                 &storage_root,
-                &request.session_id,
-                &request.marker_owner,
-                &request.marker_generation,
-                &request.agent_kind,
-                &request.provider_session_id,
+                super::doctor::SessionObjectIndexRepairRequest {
+                    session_id: &request.session_id,
+                    marker_owner: &request.marker_owner,
+                    marker_generation: &request.marker_generation,
+                    agent_kind: &request.agent_kind,
+                    provider_session_id: &request.provider_session_id,
+                    capture_scope: &request.capture_scope,
+                },
             )
             .await
             {
                 Ok(repaired_rows) => IndexRepairHelperResponse::Ok { repaired_rows },
-                Err(error) => IndexRepairHelperResponse::Error {
-                    message: format!("{error:#}"),
-                },
+                Err(_) => IndexRepairHelperResponse::Error {},
             },
         )
     })?;
@@ -1740,8 +1893,6 @@ async fn invoke_import_index_repair_helper(
     barrier: &ImportIndexBarrier,
     deadline: Instant,
 ) -> Result<usize> {
-    use tokio::io::AsyncWriteExt;
-
     ensure_before_deadline(deadline)?;
     let frame = serde_json::to_vec(&IndexRepairHelperRequest {
         storage_root: WirePath::from_path(storage_root),
@@ -1750,75 +1901,56 @@ async fn invoke_import_index_repair_helper(
         marker_generation: barrier.marker.generation.clone(),
         agent_kind: barrier.marker.agent_kind.clone(),
         provider_session_id: barrier.marker.provider_session_id.clone(),
+        capture_scope: barrier.capture_scope.clone(),
     })
     .context("encode bounded import index repair request")?;
     if frame.len() as u64 > IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP {
         anyhow::bail!("bounded import index repair request exceeds its frame limit");
     }
-    let program = std::env::current_exe().context("resolve Libra import index repair helper")?;
-    let mut child = tokio::process::Command::new(program)
-        .arg(IMPORT_INDEX_REPAIR_HELPER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start bounded import index repair helper")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("bounded import index repair helper has no stdin pipe")?;
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-        stdin.write_all(&frame).await?;
-        stdin.shutdown().await
-    })
-    .await
-    .map_err(|_| ImportError::DeadlineExceeded)?
-    .context("send bounded import index repair request")?;
-    drop(stdin);
-    let output = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        child.wait_with_output(),
+    let command = require_registered_import_helper_command(registered_helper_command(
+        IMPORT_INDEX_REPAIR_HELPER_ARG,
+    ))?;
+    let output = match run_registered_bounded_helper_until(
+        command,
+        &[&frame],
+        IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP,
+        deadline,
     )
     .await
-    .map_err(|_| ImportError::DeadlineExceeded)?
-    .context("wait for bounded import index repair helper")?;
-    if !output.status.success() || output.stdout.len() as u64 > IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP
     {
-        anyhow::bail!("bounded import index repair helper returned an invalid response");
-    }
-    match serde_json::from_slice(&output.stdout)
-        .context("decode bounded import index repair response")?
-    {
+        RegisteredHelperOutput::Output(output) => output,
+        RegisteredHelperOutput::DeadlineExceeded => {
+            return Err(ImportError::DeadlineExceeded.into());
+        }
+        RegisteredHelperOutput::Failed => return Err(ImportError::AuthorizedReaderFailed.into()),
+    };
+    let response = match serde_json::from_slice(&output) {
+        Ok(response) => response,
+        Err(_) => anyhow::bail!("bounded import index repair helper returned an invalid response"),
+    };
+    match response {
         IndexRepairHelperResponse::Ok { repaired_rows } => Ok(repaired_rows),
-        IndexRepairHelperResponse::Error { message } => anyhow::bail!(
-            "import object-index repair failed: {message}; run `libra agent doctor --repair`"
-        ),
+        // Helper errors intentionally carry no provider/database error chain.
+        IndexRepairHelperResponse::Error {} => {
+            anyhow::bail!(
+                "import object-index repair did not complete; run `libra agent doctor --repair`"
+            )
+        }
     }
 }
 
-fn parse_import_index_barrier_marker(value: &str) -> Result<ImportIndexBarrierMarker> {
-    let marker: ImportIndexBarrierMarker =
+fn parse_import_index_barrier_marker(value: &str) -> Result<ImportIndexRepairMarker> {
+    let marker: ImportIndexRepairMarker =
         serde_json::from_str(value).context("decode durable import object-index barrier marker")?;
-    if marker.schema_version != 1
-        || marker.owner.is_empty()
-        || marker.generation.is_empty()
-        || marker.identity_id.is_empty()
-        || marker.agent_kind.is_empty()
-        || marker.provider_session_id.is_empty()
-        || !matches!(marker.state.as_str(), "active" | "repair_pending")
-    {
-        anyhow::bail!(
-            "invalid durable import object-index barrier marker; run `libra agent doctor --repair`"
-        );
-    }
+    validate_import_index_repair_marker(&marker)?;
     Ok(marker)
 }
 
 async fn lock_import_index_barrier_row<C: ConnectionTrait>(db: &C, session_id: &str) -> Result<()> {
-    // This no-op UPDATE is deliberately the first statement in each barrier
-    // transaction. On SQLite it obtains the writer slot before we inspect the
-    // marker, preventing a read/overwrite race with another process.
+    // This no-op UPDATE is deliberately the first mutation after the caller
+    // has checked its workspace fence. On SQLite it obtains the writer slot
+    // before we inspect the marker, preventing a read/overwrite race with
+    // another process.
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "UPDATE metadata_kv SET updated_at = updated_at
@@ -1834,16 +1966,17 @@ async fn lock_import_index_barrier_row<C: ConnectionTrait>(db: &C, session_id: &
     Ok(())
 }
 
-fn marker_is_owned_by(marker: &ImportIndexBarrierMarker, barrier: &ImportIndexBarrier) -> bool {
+fn marker_is_owned_by(marker: &ImportIndexRepairMarker, barrier: &ImportIndexBarrier) -> bool {
     marker.owner == barrier.marker.owner
         && marker.generation == barrier.marker.generation
         && marker.identity_id == barrier.marker.identity_id
+        && marker.capture_scope.as_ref() == Some(&barrier.capture_scope)
 }
 
 async fn read_owned_import_index_barrier<C: ConnectionTrait>(
     db: &C,
     barrier: &ImportIndexBarrier,
-) -> Result<ImportIndexBarrierMarker> {
+) -> Result<ImportIndexRepairMarker> {
     let entry = MetadataKv::get_with_conn(
         db,
         MetadataScope::AgentImportIndexRepair,
@@ -1863,7 +1996,7 @@ async fn read_owned_import_index_barrier<C: ConnectionTrait>(
 async fn persist_import_index_barrier<C: ConnectionTrait>(
     db: &C,
     session_id: &str,
-    marker: &ImportIndexBarrierMarker,
+    marker: &ImportIndexRepairMarker,
 ) -> Result<()> {
     let value = serde_json::to_string(marker).context("encode import object-index barrier")?;
     MetadataKv::set_with_conn(
@@ -1884,10 +2017,19 @@ async fn set_import_index_barrier_pending(
     barrier: &ImportIndexBarrier,
     identity: Option<&ImportIdentityFence>,
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let txn = db::begin_write_transaction(conn)
         .await
         .context("begin import object-index partial finalization")?;
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before marking import object-index repair pending",
+        );
+    }
     lock_import_index_barrier_row(&txn, &barrier.session_id).await?;
     let mut marker = read_owned_import_index_barrier(&txn, barrier).await?;
     if let Some(identity) = identity {
@@ -1898,11 +2040,26 @@ async fn set_import_index_barrier_pending(
             txn.get_database_backend(),
             "UPDATE agent_import_identity
              SET state = 'partial', last_error_code = 'LBR-AGENT-018', updated_at = ?
-             WHERE identity_id = ? AND fence_token = ? AND state = 'committed'",
+             WHERE identity_id = ? AND fence_token = ? AND state = 'committed'
+               AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+               AND workspace_id IS ? AND workspace_fence IS ?
+               AND (agent_import_identity.workspace_id IS NULL OR EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = agent_import_identity.workspace_id
+                     AND repo_id = agent_import_identity.repo_id
+                     AND lease_fence = agent_import_identity.workspace_fence
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               ))",
             [
                 Utc::now().timestamp_millis().into(),
                 identity.identity_id.clone().into(),
                 identity.fence_token.into(),
+                barrier.capture_scope.repo_id.clone().into(),
+                barrier.capture_scope.worktree_id.clone().into(),
+                barrier.capture_scope.workspace_id.clone().into(),
+                barrier.capture_scope.workspace_fence.into(),
             ],
         ))
         .await
@@ -1912,6 +2069,16 @@ async fn set_import_index_barrier_pending(
     marker.state = "repair_pending".to_string();
     marker.lease_expires_at = 0;
     persist_import_index_barrier(&txn, &barrier.session_id, &marker).await?;
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live_for_commit(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before committing import object-index partial finalization",
+        );
+    }
     txn.commit()
         .await
         .context("commit import object-index partial finalization")?;
@@ -1922,10 +2089,18 @@ async fn clear_import_index_barrier(
     conn: &DatabaseConnection,
     barrier: &ImportIndexBarrier,
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let txn = db::begin_write_transaction(conn)
         .await
         .context("begin completed import object-index barrier retirement")?;
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error)
+            .context("verify capture workspace lease before retiring import object-index barrier");
+    }
     lock_import_index_barrier_row(&txn, &barrier.session_id).await?;
     read_owned_import_index_barrier(&txn, barrier).await?;
     MetadataKv::unset_with_conn(
@@ -1936,6 +2111,16 @@ async fn clear_import_index_barrier(
     )
     .await
     .context("retire owned import object-index barrier marker")?;
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live_for_commit(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before committing import object-index barrier retirement",
+        );
+    }
     txn.commit()
         .await
         .context("commit completed import object-index barrier retirement")?;
@@ -1946,17 +2131,82 @@ async fn acquire_import_index_barrier(
     conn: &DatabaseConnection,
     storage_root: &Path,
     request: &ImportRequest,
-    deadline: Instant,
+    deadline: CaptureCommitDeadline,
 ) -> Result<ImportIndexBarrier> {
-    ensure_before_deadline(deadline)?;
+    // Do not wrap this transaction in an outer timeout: cancelling after
+    // SQLx has dispatched COMMIT can report DeadlineExceeded while SQLite
+    // subsequently makes the marker durable. The transaction's final SQL
+    // authorization below owns the deadline decision; once it succeeds we
+    // await COMMIT's acknowledgement unconditionally.
+    let (barrier, needs_repair) =
+        acquire_import_index_barrier_transaction(conn, request, deadline).await?;
+    // Repairing an already-persisted marker is cleanup/recovery, rather than
+    // a new V2 acquisition. Do not let the capture deadline suppress that
+    // bounded handoff: leaving a provisional marker leased forever is worse
+    // than recording it as repair-pending for a later scoped recovery.
+    if needs_repair
+        && let Err(error) =
+            invoke_import_index_repair_helper(storage_root, &barrier, deadline.monotonic()).await
+    {
+        let pending = set_import_index_barrier_pending(conn, &barrier, None).await;
+        return match pending {
+            Ok(()) => Err(error),
+            Err(pending_error) => Err(error.context(format!(
+                "also failed to release the import object-index repair lease: {pending_error:#}"
+            ))),
+        };
+    }
+    Ok(barrier)
+}
+
+/// Acquire a new V2 import barrier under one deadline-bounded transaction.
+///
+/// The caller intentionally keeps recovery-helper work outside this future:
+/// a deadline must roll back a new/overwritten marker, but it must not prevent
+/// a best-effort transition of an already durable marker to repair-pending.
+async fn acquire_import_index_barrier_transaction(
+    conn: &DatabaseConnection,
+    request: &ImportRequest,
+    deadline: CaptureCommitDeadline,
+) -> Result<(ImportIndexBarrier, bool)> {
+    let monotonic_deadline = deadline.monotonic();
+    ensure_before_deadline(monotonic_deadline)?;
+    if request.identity_schema_version != 2 || !is_import_source_commitment_v2(&request.source_id) {
+        return Err(ImportError::SourceAuthorization.into());
+    }
+    let capture_scope = request.capture_scope.as_ref().context(
+        "historical import request has no workspace scope; rerun `libra agent import` from the intended workspace",
+    )?;
     let now_ms = Utc::now().timestamp_millis();
-    let txn = conn
-        .begin()
-        .await
-        .context("begin import object-index barrier acquisition")?;
-    lock_import_index_barrier_row(&txn, &request.session_id).await?;
-    let tombstone = txn
-        .query_one_raw(Statement::from_sql_and_values(
+    let txn = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(monotonic_deadline),
+        db::begin_write_transaction(conn),
+    )
+    .await
+    .map_err(|_| anyhow::Error::from(ImportError::DeadlineExceeded))?
+    .context("begin import object-index barrier acquisition")?;
+    if let Err(error) = await_import_precommit_read_until(
+        monotonic_deadline,
+        capture_scope.assert_workspace_fence_live(&txn),
+    )
+    .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before acquiring import object-index barrier",
+        );
+    }
+    if let Err(error) = ensure_before_deadline(monotonic_deadline) {
+        txn.rollback().await.ok();
+        return Err(error)
+            .context("verify import deadline before locking import object-index barrier");
+    }
+    if let Err(error) = lock_import_index_barrier_row(&txn, &request.session_id).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    let tombstone = match await_import_precommit_read_until(monotonic_deadline, async {
+        txn.query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
@@ -1966,29 +2216,61 @@ async fn acquire_import_index_barrier(
             ],
         ))
         .await
-        .context("check import tombstone before object-index barrier acquisition")?;
+        .context("check import tombstone before object-index barrier acquisition")
+    })
+    .await
+    {
+        Ok(tombstone) => tombstone,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
     if tombstone.is_some() {
         txn.rollback().await.ok();
         return Err(ImportError::Erased.into());
     }
-    let existing = MetadataKv::get_with_conn(
-        &txn,
-        MetadataScope::AgentImportIndexRepair,
-        &request.session_id,
-        IMPORT_INDEX_REPAIR_MARKER_KEY,
-    )
+    let existing = match await_import_precommit_read_until(monotonic_deadline, async {
+        MetadataKv::get_with_conn(
+            &txn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .context("read prior import object-index barrier marker")
+    })
     .await
-    .context("read prior import object-index barrier marker")?;
+    {
+        Ok(existing) => existing,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
     let needs_repair = existing.is_some();
     if let Some(entry) = existing.as_ref() {
         let prior = parse_import_index_barrier_marker(&entry.value)?;
+        if prior.capture_scope.as_ref() != Some(capture_scope) {
+            txn.rollback().await.ok();
+            anyhow::bail!(
+                "import object-index barrier belongs to a legacy or different workspace scope; run `libra agent doctor --repair` before retrying"
+            );
+        }
         if prior.state == "active" && prior.lease_expires_at > now_ms {
             txn.rollback().await.ok();
             return Err(ImportError::LeaseBusy.into());
         }
+        // A V1 marker is migration evidence, not a stale record that a V2
+        // writer may overwrite. The scoped migration must relabel its exact
+        // expired proof atomically with identity/catalog ownership first.
+        if prior.schema_version != IMPORT_INDEX_REPAIR_MARKER_SCHEMA_V2 {
+            txn.rollback().await.ok();
+            return Err(ImportError::RepositoryConflict.into());
+        }
     }
-    let marker = ImportIndexBarrierMarker {
-        schema_version: 1,
+    let marker = ImportIndexRepairMarker {
+        schema_version: IMPORT_INDEX_REPAIR_MARKER_SCHEMA_V2,
         owner: format!(
             "index-barrier:{}:{}",
             std::process::id(),
@@ -2006,28 +2288,51 @@ async fn acquire_import_index_barrier(
             .context("import object-index barrier lease timestamp overflow")?,
         created_at: now_ms,
         fence_token: None,
+        capture_scope: Some(capture_scope.clone()),
     };
-    persist_import_index_barrier(&txn, &request.session_id, &marker).await?;
+    if let Err(error) = ensure_before_deadline(monotonic_deadline) {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify import deadline before persisting import object-index barrier acquisition",
+        );
+    }
+    if let Err(error) = persist_import_index_barrier(&txn, &request.session_id, &marker).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    import_test_delay_after_index_barrier_persist();
+    if let Err(error) = ensure_before_deadline(monotonic_deadline) {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify import deadline after persisting import object-index barrier acquisition",
+        );
+    }
+    // This is the transaction's final SQL statement. It combines the
+    // workspace fence and immutable SQLite wall-clock deadline, so a queued
+    // writer that reaches SQLite after cutoff rolls every earlier mutation
+    // back. No post-fence deadline check is allowed: successful
+    // authorization linearizes the write before COMMIT acknowledgement.
+    if let Err(error) =
+        authorize_final_capture_commit(Some(capture_scope), &txn, Some(deadline)).await
+    {
+        txn.rollback().await.ok();
+        return match error {
+            CaptureFinalCommitAuthorizationError::DeadlineElapsed => {
+                Err(anyhow::Error::from(ImportError::DeadlineExceeded))
+            }
+            error => Err(anyhow::Error::new(error)
+                .context("authorize final import object-index barrier acquisition")),
+        };
+    }
     txn.commit()
         .await
         .context("commit import object-index barrier acquisition")?;
     let barrier = ImportIndexBarrier {
         session_id: request.session_id.clone(),
         marker,
+        capture_scope: capture_scope.clone(),
     };
-    if needs_repair
-        && let Err(error) =
-            invoke_import_index_repair_helper(storage_root, &barrier, deadline).await
-    {
-        let pending = set_import_index_barrier_pending(conn, &barrier, None).await;
-        return match pending {
-            Ok(()) => Err(error),
-            Err(pending_error) => Err(error.context(format!(
-                "also failed to release the import object-index repair lease: {pending_error:#}"
-            ))),
-        };
-    }
-    Ok(barrier)
+    Ok((barrier, needs_repair))
 }
 
 fn import_identity_fence(
@@ -2052,9 +2357,8 @@ async fn import_index_barrier_erasure_won(
     conn: &DatabaseConnection,
     barrier: &ImportIndexBarrier,
 ) -> Result<bool> {
-    if cfg!(debug_assertions)
-        && std::env::var_os("LIBRA_TEST_IMPORT_INDEX_TOMBSTONE_LOOKUP_FAIL").is_some()
-    {
+    #[cfg(test)]
+    if test_support::fail_index_tombstone_lookup() {
         anyhow::bail!("test-only import index tombstone lookup failure");
     }
     Ok(conn
@@ -2072,23 +2376,128 @@ async fn import_index_barrier_erasure_won(
         .is_some())
 }
 
-fn terminate_import_preparation_helper(
-    mut child: tokio::process::Child,
-    stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-) {
-    stdout_task.abort();
-    #[cfg(unix)]
-    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: a negative pid targets the process group created for this
-        // helper. SIGKILL bounds descendants that inherited transcript fds or
-        // sandbox resources; direct-child start_kill remains the fallback.
-        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+/// A command helper may only be spawned by the Libra executable registered
+/// from `main`. Embedded library hosts intentionally have no fallback: their
+/// own executable must never receive Libra's private helper argument.
+fn require_registered_import_helper_command(
+    command: Option<tokio::process::Command>,
+) -> Result<tokio::process::Command> {
+    command.ok_or_else(|| ImportError::AuthorizedReaderUnavailable.into())
+}
+
+/// Run the descriptor-owning preparation helper. `source` is an already
+/// pinned provider descriptor (or anonymous export file); unlike the retired
+/// V1 protocol, neither stdin nor the control frame carries a locator,
+/// provider session id, repository path, storage path, or existing metadata.
+async fn run_import_preparation_descriptor_helper_bounded(
+    mut command: tokio::process::Command,
+    control: PreparationDescriptorControl,
+    source: std::fs::File,
+    output_cap: u64,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    #[cfg(not(unix))]
+    {
+        let _ = (command, control, source, output_cap, deadline);
+        // Preparation can carry transcript-derived material. Without the
+        // Unix dedicated-process-group contract a forked helper descendant
+        // cannot be contained reliably, so this boundary fails closed.
+        return Err(ImportError::AuthorizedReaderUnavailable.into());
     }
-    let _ = child.start_kill();
-    let reaper = tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    drop(reaper);
+
+    #[cfg(unix)]
+    {
+        ensure_before_deadline(deadline)?;
+        let control =
+            serde_json::to_string(&control).map_err(|_| ImportError::AuthorizedReaderFailed)?;
+        if control.len() > 4 * 1024 {
+            return Err(ImportError::AuthorizedReaderFailed.into());
+        }
+        command
+            .env_clear()
+            .current_dir(std::path::Path::new("/"))
+            .env(IMPORT_PREPARATION_DESCRIPTOR_CONTROL_ENV, control)
+            .stdin(Stdio::from(source))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        crate::internal::ai::authorized_read::configure_private_helper_process_group(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|_| ImportError::AuthorizedReaderFailed)?;
+        let mut child = CancellationSafeChild::new_process_group(child);
+        let Some(mut stdout) = child.child_mut().and_then(|child| child.stdout.take()) else {
+            child.terminate_and_reap();
+            return Err(ImportError::AuthorizedReaderFailed.into());
+        };
+        let mut stdout_task = tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(delay) = test_support::preparation_response_read_delay() {
+                tokio::time::sleep(delay).await;
+            }
+            read_async_strictly_bounded(&mut stdout, output_cap).await
+        });
+        child.register_abort_on_cancel(&stdout_task);
+
+        // Drain stdout before reaping the leader. If a descendant inherited the
+        // pipe after the leader exits, the deadline path still owns an unreaped
+        // leader and can safely kill its process group before PID reuse.
+        let response = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            &mut stdout_task,
+        )
+        .await
+        {
+            Ok(Ok(Ok(response))) => response,
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                child.terminate_and_reap();
+                return Err(ImportError::AuthorizedReaderFailed.into());
+            }
+            Err(_) => {
+                stdout_task.abort();
+                child.terminate_and_reap();
+                return Err(ImportError::DeadlineExceeded.into());
+            }
+        };
+        if response.len() as u64 > output_cap {
+            child.terminate_and_reap();
+            return Err(ImportError::AuthorizedReaderFailed.into());
+        }
+
+        let status = match child.child_mut() {
+            Some(child_process) => {
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    child_process.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(_)) => {
+                        child.terminate_and_reap();
+                        return Err(ImportError::AuthorizedReaderFailed.into());
+                    }
+                    Err(_) => {
+                        child.terminate_and_reap();
+                        return Err(ImportError::DeadlineExceeded.into());
+                    }
+                }
+            }
+            None => return Err(ImportError::AuthorizedReaderFailed.into()),
+        };
+        child.disarm_child_after_wait();
+        if !status.success() || Instant::now() >= deadline {
+            child.finish();
+            return Err(if Instant::now() >= deadline {
+                ImportError::DeadlineExceeded
+            } else {
+                ImportError::AuthorizedReaderFailed
+            }
+            .into());
+        }
+        child.finish();
+        Ok(response)
+    }
 }
 
 async fn prepare_candidate_bounded(
@@ -2098,162 +2507,241 @@ async fn prepare_candidate_bounded(
     read_cap: u64,
     conn: &sea_orm::DatabaseConnection,
     capture_scope: &CaptureScope,
-    deadline: Instant,
+    deadline: CaptureCommitDeadline,
 ) -> Result<PreparedCandidateOutcome> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    ensure_before_deadline(deadline)?;
-    let existing_session = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        load_existing_session_ownership_in_scope(
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            candidate,
+            repo_root,
+            storage_root,
+            read_cap,
             conn,
-            candidate.kind,
-            &candidate.provider_session_id,
             capture_scope,
-        ),
-    )
-    .await
-    .map_err(|_| ImportError::DeadlineExceeded)??;
-    let remaining_ms = u64::try_from(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
-    let helper_request = PreparationHelperRequest {
-        candidate: DiscoveryCandidateWire {
-            kind: candidate.kind.as_cli_slug().to_string(),
-            provider_session_id: candidate.provider_session_id.clone(),
-            path: candidate.path.as_deref().map(WirePath::from_path),
-        },
-        repo_root: WirePath::from_path(repo_root),
-        storage_root: WirePath::from_path(storage_root),
-        read_cap,
-        remaining_ms,
-        existing_session,
-    };
-    let frame =
-        serde_json::to_vec(&helper_request).context("encode bounded import preparation request")?;
-    if frame.len() as u64 > IMPORT_PREPARATION_HELPER_INPUT_CAP {
-        return Err(ImportError::BatchInputLimit.into());
+            deadline,
+        );
+        return Err(ImportError::AuthorizedReaderUnavailable.into());
     }
-    let program = std::env::current_exe()
-        .context("resolve Libra executable for bounded import preparation")?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .arg(IMPORT_PREPARATION_HELPER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-
-        command.as_std_mut().process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .context("start bounded import preparation helper")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("bounded import preparation helper has no stdin pipe")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("bounded import preparation helper has no stdout pipe")?;
-    let mut stdout_task = tokio::spawn(async move {
-        if cfg!(debug_assertions)
-            && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_PREPARATION_RESPONSE_READ_DELAY_MS")
-            && let Ok(delay_ms) = value.parse::<u64>()
-        {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let monotonic_deadline = deadline.monotonic();
+        ensure_before_deadline(monotonic_deadline)?;
+        if read_cap > TRANSCRIPT_READ_HARD_CAP_BYTES {
+            return Err(ImportError::BatchInputLimit.into());
         }
-        let mut response = Vec::new();
-        stdout
-            .take(IMPORT_PREPARATION_HELPER_OUTPUT_CAP.saturating_add(1))
-            .read_to_end(&mut response)
-            .await?;
-        Ok(response)
-    });
-    match tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        stdin.write_all(&frame),
-    )
-    .await
-    {
-        Ok(Ok(())) => drop(stdin),
-        Ok(Err(error)) => {
-            terminate_import_preparation_helper(child, stdout_task);
-            return Err(error).context("send bounded import preparation request");
-        }
-        Err(_) => {
-            drop(stdin);
-            terminate_import_preparation_helper(child, stdout_task);
+        await_import_precommit_read_until(
+            monotonic_deadline,
+            capture_scope.assert_workspace_fence_live(conn),
+        )
+        .await
+        .context("verify capture workspace lease before opening import source")?;
+        let (source, source_kind, source_id) =
+            resolve_candidate_source(candidate, repo_root, monotonic_deadline).await?;
+        import_test_pause_after_source_open(monotonic_deadline)?;
+        let source_preimage = import_source_preimage(
+            candidate.kind,
+            &source_kind,
+            &source_id,
+            &candidate.provider_session_id,
+        )?;
+        let provisional_session_id = crate::internal::ai::hooks::runtime::build_ai_session_id(
+            provider_name(candidate.kind),
+            &candidate.provider_session_id,
+        );
+        let source = match source {
+            TranscriptSource::File { file, .. } => match file.into_rewound_inner() {
+                Ok(file) => file,
+                Err(_) => {
+                    return Ok(PreparedCandidateOutcome {
+                        request: Err(ImportError::AuthorizedReaderFailed.into()),
+                        raw_bytes: 0,
+                    });
+                }
+            },
+            TranscriptSource::Bytes { bytes, auth } => {
+                let raw_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if !auth.matches(candidate.kind.as_db_str(), &provisional_session_id, &bytes) {
+                    return Ok(PreparedCandidateOutcome {
+                        request: Err(ImportError::SourceAuthorization.into()),
+                        raw_bytes,
+                    });
+                }
+                if raw_bytes > read_cap {
+                    return Ok(PreparedCandidateOutcome {
+                        request: Err(ImportError::BatchInputLimit.into()),
+                        raw_bytes,
+                    });
+                }
+                let mut file = match tempfile::tempfile() {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return Ok(PreparedCandidateOutcome {
+                            request: Err(ImportError::AuthorizedReaderFailed.into()),
+                            raw_bytes,
+                        });
+                    }
+                };
+                if file.write_all(&bytes).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
+                    return Ok(PreparedCandidateOutcome {
+                        request: Err(ImportError::AuthorizedReaderFailed.into()),
+                        raw_bytes,
+                    });
+                }
+                file
+            }
+        };
+        let remaining_ms = u64::try_from(
+            monotonic_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
             return Err(ImportError::DeadlineExceeded.into());
         }
-    }
-    let status =
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), child.wait()).await
-        {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
-                terminate_import_preparation_helper(child, stdout_task);
-                return Err(error).context("wait for import preparation helper");
-            }
-            Err(_) => {
-                terminate_import_preparation_helper(child, stdout_task);
-                return Err(ImportError::DeadlineExceeded.into());
-            }
+        let control = PreparationDescriptorControl {
+            agent_kind: candidate.kind.as_cli_slug().to_string(),
+            source_kind: source_kind.clone(),
+            provider_commitment: import_provider_commitment(&candidate.provider_session_id),
+            read_cap,
+            remaining_ms,
         };
-    ensure_before_deadline(deadline)?;
-    if !status.success() {
-        stdout_task.abort();
-        anyhow::bail!("bounded import preparation helper exited unsuccessfully");
-    }
-    let response_bytes =
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut stdout_task)
-            .await
-        {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(error))) => {
-                return Err(error).context("read bounded import preparation response");
-            }
-            Ok(Err(error)) => {
-                return Err(error).context("join bounded import preparation response reader");
-            }
-            Err(_) => {
-                stdout_task.abort();
-                return Err(ImportError::DeadlineExceeded.into());
-            }
-        };
-    if response_bytes.len() as u64 > IMPORT_PREPARATION_HELPER_OUTPUT_CAP {
-        anyhow::bail!("bounded import preparation helper exceeded its response limit");
-    }
-    ensure_before_deadline(deadline)?;
-    let response: PreparationHelperResponse = serde_json::from_slice(&response_bytes)
-        .context("decode bounded import preparation response")?;
-    Ok(match response {
-        PreparationHelperResponse::Ok { request, raw_bytes } => {
-            let mut request = *request;
-            request.capture_scope = Some(capture_scope.clone());
-            PreparedCandidateOutcome {
-                request: Ok(request),
+        let command = require_registered_import_helper_command(registered_helper_command(
+            IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG,
+        ))?;
+        let response_bytes = run_import_preparation_descriptor_helper_bounded(
+            command,
+            control,
+            source,
+            IMPORT_PREPARATION_HELPER_OUTPUT_CAP,
+            monotonic_deadline,
+        )
+        .await?;
+        ensure_before_deadline(monotonic_deadline)?;
+        let response: PreparationDescriptorHelperResponse = serde_json::from_slice(&response_bytes)
+            .map_err(|_| ImportError::AuthorizedReaderFailed)?;
+        match response {
+            PreparationDescriptorHelperResponse::Ok {
+                projection,
                 raw_bytes,
+            } => {
+                let mut projection = *projection;
+                if projection.storage_commitment != import_storage_commitment(storage_root)? {
+                    return Ok(PreparedCandidateOutcome {
+                        request: Err(ImportError::RepositoryConflict.into()),
+                        raw_bytes,
+                    });
+                }
+                // The descriptor helper may return its redacted-content
+                // checksum only as a fixed-size transient preimage. Extract
+                // it before this projection can enter any catalog/checkpoint
+                // request, then replace it below with the scoped HMAC.
+                let snapshot_preimage = projection
+                    .transcript_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.redacted_digest_preimage())
+                    .ok_or(ImportError::AuthorizedReaderFailed)?;
+                await_import_precommit_read_until(
+                    monotonic_deadline,
+                    capture_scope.assert_workspace_fence_live(conn),
+                )
+                .await
+                .context("verify capture workspace lease before deriving import source identity")?;
+                let source_commitment = derive_capture_source_commitment_in_scope_until(
+                    conn,
+                    capture_scope,
+                    storage_root,
+                    repo_root,
+                    CaptureSourceCommitmentDomain::ImportSourceV2,
+                    &source_preimage,
+                    monotonic_deadline,
+                )
+                .await
+                .map_err(|error| import_commitment_failure(error, monotonic_deadline))?;
+                let snapshot_commitment = derive_snapshot_content_commitment_in_scope_until(
+                    conn,
+                    capture_scope,
+                    storage_root,
+                    repo_root,
+                    &snapshot_preimage,
+                    monotonic_deadline,
+                )
+                .await
+                .map_err(|error| import_commitment_failure(error, monotonic_deadline))?;
+                if !projection
+                    .transcript_snapshot
+                    .as_mut()
+                    .is_some_and(|snapshot| snapshot.bind_source_commitment(snapshot_commitment))
+                {
+                    return Err(ImportError::AuthorizedReaderFailed.into());
+                }
+                // A historical V1 row may still retain the exact raw locator
+                // used to authorize this held descriptor. Move it only after
+                // proving that legacy identity/catalog/(expired) barrier in
+                // one scoped writer transaction; active or partial recovery
+                // state remains V1 and blocks creation of a divergent V2 row.
+                if let Err(error) = migrate_legacy_import_ownership_in_scope_until(
+                    conn,
+                    LegacyImportMigrationRequest {
+                        scope: capture_scope,
+                        storage_root,
+                        authorized_root: repo_root,
+                        agent_kind: candidate.kind,
+                        provider_session_id: &candidate.provider_session_id,
+                        source_kind: &source_kind,
+                        legacy_source_id: &source_id,
+                        v2_source_commitment: &source_commitment,
+                        deadline,
+                    },
+                )
+                .await
+                {
+                    // Keep the migration's stable failure contract. In
+                    // particular, a tombstone or a competing lease must not
+                    // be flattened into a misleading repository conflict.
+                    if let Some(import_error) = error.downcast_ref::<ImportError>() {
+                        return Err((*import_error).into());
+                    }
+                    return Err(ImportError::RepositoryConflict.into());
+                }
+                let mut request = import_request_from_projection(
+                    candidate.kind,
+                    candidate.provider_session_id.clone(),
+                    source_kind,
+                    source_commitment,
+                    repo_root.to_path_buf(),
+                    projection,
+                );
+                request.capture_scope = Some(capture_scope.clone());
+                let existing_session = await_import_precommit_read_until(
+                    monotonic_deadline,
+                    load_existing_session_ownership_in_scope(
+                        conn,
+                        candidate.kind,
+                        &candidate.provider_session_id,
+                        capture_scope,
+                    ),
+                )
+                .await?;
+                validate_scoped_prepared_existing_session(&mut request, existing_session.as_ref())?;
+                Ok(PreparedCandidateOutcome {
+                    request: Ok(request),
+                    raw_bytes,
+                })
             }
-        }
-        PreparationHelperResponse::Error {
-            error_kind,
-            raw_bytes,
-        } => PreparedCandidateOutcome {
-            request: Err(match error_kind {
-                Some(kind) => preparation_error(kind).into(),
-                None => anyhow::anyhow!("bounded import preparation rejected the source"),
+            PreparationDescriptorHelperResponse::Error {
+                error_kind,
+                raw_bytes,
+            } => Ok(PreparedCandidateOutcome {
+                request: Err(match error_kind {
+                    Some(kind) => preparation_error(kind).into(),
+                    None => anyhow::anyhow!("bounded import preparation rejected the source"),
+                }),
+                raw_bytes,
             }),
-            raw_bytes,
-        },
-    })
+        }
+    }
 }
 
 fn stable_code_for_error(error: &anyhow::Error) -> StableErrorCode {
@@ -2265,20 +2753,26 @@ fn stable_code_for_error(error: &anyhow::Error) -> StableErrorCode {
             StableErrorCode::AgentImportWorkingDirInvalid
         }
         Some(ImportError::Erased) => StableErrorCode::AgentImportErased,
-        Some(ImportError::SourceAuthorization) => {
-            StableErrorCode::AgentTranscriptAuthorizationMissing
-        }
+        Some(
+            ImportError::SourceAuthorization
+            | ImportError::AuthorizedReaderUnavailable
+            | ImportError::AuthorizedReaderFailed,
+        ) => StableErrorCode::AgentTranscriptAuthorizationMissing,
         Some(
             ImportError::LeaseBusy
             | ImportError::NoImportableTurns
             | ImportError::BatchInputLimit
-            | ImportError::DeadlineExceeded,
+            | ImportError::DeadlineExceeded
+            | ImportError::FutureTimestamp,
         )
         | None => StableErrorCode::AgentImportPartialBatch,
     }
 }
 
 fn safe_failure(candidate: &Candidate, error: &anyhow::Error) -> BatchFailure {
+    // The documented per-item id is a short hash of the provider session id
+    // only; the same report already carries full session ids for completed
+    // selections. Never derive it from a source locator, digest, or commitment.
     let digest = sha2::Sha256::digest(candidate.provider_session_id.as_bytes());
     BatchFailure {
         status: "failed",
@@ -2349,7 +2843,12 @@ fn record_candidate_result(
 }
 
 pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<()> {
-    let deadline = Instant::now() + import_total_deadline();
+    // Establish both deadline clocks once before discovery/consent or any
+    // mutation.  The pair is threaded unchanged to every normal durable
+    // import write; only read/helper operations consume its monotonic half.
+    let commit_deadline = CaptureCommitDeadline::from_budget(import_total_deadline())
+        .map_err(|error| CliError::fatal(format!("establish import deadline: {error}")))?;
+    let deadline = commit_deadline.monotonic();
     let repo_root = util::try_working_dir().map_err(|_| CliError::repo_not_found())?;
     let storage_root = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
     let (candidates, next_cursor) = discover_bounded(&args, &repo_root, deadline).await?;
@@ -2357,13 +2856,14 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
     let conn = db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
         .await
         .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
-    let capture_scope = CaptureScope::resolve(&conn, &repo_root)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!(
-                "failed to resolve import workspace scope: {error:#}"
-            ))
-        })?;
+    let capture_scope =
+        await_import_precommit_read_until(deadline, CaptureScope::resolve(&conn, &repo_root))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to resolve import workspace scope: {error:#}"
+                ))
+            })?;
     let (configured_source_cap, explicitly_configured) =
         max_transcript_read_bytes_setting().await.map_err(|error| {
             CliError::fatal(format!(
@@ -2392,12 +2892,12 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
             ));
             continue;
         }
-        let tombstoned =
-            session_is_tombstoned(&conn, candidate.kind, &candidate.provider_session_id)
-                .await
-                .map_err(|error| {
-                    CliError::fatal(format!("failed to check import tombstone: {error}"))
-                })?;
+        let tombstoned = await_import_precommit_read_until(
+            deadline,
+            session_is_tombstoned(&conn, candidate.kind, &candidate.provider_session_id),
+        )
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to check import tombstone: {error}")))?;
         if tombstoned && args.restore_erased {
             restore_tombstone(&conn, candidate.kind, &candidate.provider_session_id)
                 .await
@@ -2431,7 +2931,7 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
                 remaining_raw_bytes,
                 &conn,
                 &capture_scope,
-                deadline,
+                commit_deadline,
             )
             .await?;
             cumulative_raw_bytes = cumulative_raw_bytes
@@ -2445,7 +2945,7 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
                 &conn,
                 &storage_root,
                 &request,
-                deadline,
+                commit_deadline,
             )
             .await?;
             index_barrier = Some(barrier);
@@ -2491,7 +2991,7 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
                 &conn,
                 &storage_root,
                 request,
-                deadline,
+                commit_deadline,
                 subagent_discovery,
             )
             .await
@@ -2682,6 +3182,88 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::error::CliErrorKind;
+
+    #[test]
+    fn source_commitment_failure_preserves_deadline_classification() {
+        let future = Instant::now() + Duration::from_secs(10);
+        let typed_deadline =
+            anyhow::Error::new(CaptureFinalCommitAuthorizationError::DeadlineElapsed);
+        assert!(matches!(
+            import_commitment_failure(typed_deadline, future),
+            ImportError::DeadlineExceeded
+        ));
+
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            import_commitment_failure(anyhow::anyhow!("commitment failed"), expired),
+            ImportError::DeadlineExceeded
+        ));
+
+        assert!(matches!(
+            import_commitment_failure(anyhow::anyhow!("commitment failed"), future),
+            ImportError::AuthorizedReaderFailed
+        ));
+    }
+
+    #[test]
+    fn import_fault_controls_are_in_process_test_state() {
+        let (source_reached_sender, source_reached_receiver) = std::sync::mpsc::channel();
+        let (source_resume_sender, source_resume_receiver) = std::sync::mpsc::channel();
+        let (barrier_reached_sender, barrier_reached_receiver) = std::sync::mpsc::channel();
+        let (barrier_resume_sender, barrier_resume_receiver) = std::sync::mpsc::channel();
+        let _reset = test_support::install(test_support::ImportTestControls {
+            total_deadline: Some(Duration::from_millis(25)),
+            batch_raw_byte_cap: Some(123),
+            fail_index_tombstone_lookup: true,
+            preparation_response_read_delay: Some(Duration::from_millis(1)),
+            source_open_pause: Some(test_support::TestPause {
+                reached: source_reached_sender,
+                resume: source_resume_receiver,
+            }),
+            index_barrier_pause: Some(test_support::TestPause {
+                reached: barrier_reached_sender,
+                resume: barrier_resume_receiver,
+            }),
+            ..test_support::ImportTestControls::default()
+        });
+
+        assert_eq!(import_total_deadline(), Duration::from_millis(25));
+        assert_eq!(batch_raw_byte_cap(), 123);
+        assert!(test_support::fail_index_tombstone_lookup());
+        assert_eq!(
+            test_support::preparation_response_read_delay(),
+            Some(Duration::from_millis(1))
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let source_pause =
+            std::thread::spawn(move || import_test_pause_after_source_open(deadline));
+        source_reached_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("source-open in-process pause is reached");
+        source_resume_sender
+            .send(())
+            .expect("source-open pause is still waiting");
+        source_pause
+            .join()
+            .expect("source-open test pause worker does not panic")
+            .expect("source-open test pause resumes");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let barrier_pause =
+            std::thread::spawn(move || import_test_pause_after_index_barrier(deadline));
+        barrier_reached_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("index-barrier in-process pause is reached");
+        barrier_resume_sender
+            .send(())
+            .expect("index-barrier pause is still waiting");
+        barrier_pause
+            .join()
+            .expect("index-barrier test pause worker does not panic")
+            .expect("index-barrier test pause resumes");
+    }
 
     fn import_summary(parent: usize, subagent: usize) -> DetailedImportSummary {
         DetailedImportSummary {
@@ -2708,6 +3290,82 @@ mod tests {
             "imported"
         );
         assert_eq!(BatchResult::complete(import_summary(0, 0)).status, "noop");
+    }
+
+    struct ImportIndexRepairCheckpointFixture {
+        checkpoint_id: String,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+    }
+
+    /// Write the smallest E4 checkpoint layout that import replay recognizes:
+    /// a manifest-bearing checkpoint tree plus a valid traces commit.
+    fn write_import_index_repair_checkpoint(
+        repo_path: &Path,
+        checkpoint_id: &str,
+    ) -> ImportIndexRepairCheckpointFixture {
+        let write_tree = |entries: &[(&str, &str, &str)]| {
+            let mut body = Vec::new();
+            for (mode, name, oid) in entries {
+                body.extend_from_slice(mode.as_bytes());
+                body.push(b' ');
+                body.extend_from_slice(name.as_bytes());
+                body.push(0);
+                body.extend_from_slice(&hex::decode(oid).expect("fixture tree OID is hex"));
+            }
+            crate::utils::object::write_git_object(repo_path, "tree", &body)
+                .expect("write import repair fixture tree")
+                .to_string()
+        };
+
+        let metadata = serde_json::json!({
+            "schema_version": 2,
+            "checkpoint_id": checkpoint_id,
+            "session_id": "claude_code__import_repair_atomic",
+            "agent_kind": "claude_code",
+        })
+        .to_string();
+        let metadata_blob_oid =
+            crate::utils::object::write_git_object(repo_path, "blob", metadata.as_bytes())
+                .expect("write import repair fixture metadata")
+                .to_string();
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "entries": {
+                "metadata": {
+                    "path": "metadata.json",
+                    "oid": metadata_blob_oid,
+                    "byte_len": metadata.len(),
+                }
+            }
+        })
+        .to_string();
+        let manifest_oid =
+            crate::utils::object::write_git_object(repo_path, "blob", manifest.as_bytes())
+                .expect("write import repair fixture manifest")
+                .to_string();
+        let inner_tree = write_tree(&[
+            ("100644", "manifest.json", &manifest_oid),
+            ("100644", "metadata.json", &metadata_blob_oid),
+        ]);
+        let prefix_tree = write_tree(&[("40000", &checkpoint_id[2..], &inner_tree)]);
+        let checkpoint_tree = write_tree(&[("40000", &checkpoint_id[..2], &prefix_tree)]);
+        let tree_oid = write_tree(&[("40000", "checkpoint", &checkpoint_tree)]);
+        let commit = format!(
+            "tree {tree_oid}\nauthor Libra <traces@libra> 0 +0000\ncommitter Libra <traces@libra> 0 +0000\n\nimport repair fixture\n"
+        );
+        let traces_commit =
+            crate::utils::object::write_git_object(repo_path, "commit", commit.as_bytes())
+                .expect("write import repair fixture traces commit")
+                .to_string();
+
+        ImportIndexRepairCheckpointFixture {
+            checkpoint_id: checkpoint_id.to_string(),
+            tree_oid,
+            metadata_blob_oid,
+            traces_commit,
+        }
     }
 
     #[test]
@@ -2746,7 +3404,47 @@ mod tests {
             StableErrorCode::AgentImportPartialBatch
         );
         assert_eq!(failures[0].status, "failed");
-        assert!(failures[0].session_id.starts_with("sha256:"));
+        assert_eq!(
+            failures[0].session_id, "sha256:ed3704917254",
+            "public import failures keep the documented short hashed session id"
+        );
+    }
+
+    #[test]
+    fn public_batch_items_report_short_hashed_session_id() {
+        let candidate = |provider_session_id: &str| Candidate {
+            kind: AgentKind::ClaudeCode,
+            provider_session_id: provider_session_id.to_string(),
+            path: Some(PathBuf::from("/private/provider/root/session.jsonl")),
+        };
+        let error: anyhow::Error = ImportError::RepositoryConflict.into();
+        let failure = safe_failure(&candidate("provider-session"), &error);
+        let skip = safe_skip(&candidate("provider-session"), &error);
+        // SHA-256("provider-session")[..6], independently computed.
+        assert_eq!(failure.session_id, "sha256:ed3704917254");
+        assert_eq!(skip.session_id, failure.session_id);
+        assert_eq!(skip.status, "skipped");
+        assert_eq!(
+            skip.reason_code,
+            StableErrorCode::AgentImportRepositoryConflict
+        );
+        for public in [&failure.session_id, &skip.session_id] {
+            let digest = public
+                .strip_prefix("sha256:")
+                .expect("hashed session id prefix");
+            assert_eq!(digest.len(), 12);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert!(!public.contains("provider-session") && !public.contains("/private"));
+        }
+        // A per-item id, not a constant sentinel.
+        assert_eq!(
+            safe_failure(&candidate("other-session"), &error).session_id,
+            "sha256:5f711b23ee4f"
+        );
     }
 
     #[test]
@@ -2789,6 +3487,244 @@ mod tests {
             .expect("settle successful discovery");
         assert_eq!(cumulative, 17);
         assert!(settle_subagent_input_allowance(&mut cumulative, 5, 6).is_err());
+    }
+
+    #[test]
+    fn registered_import_helper_is_required_before_any_spawn() {
+        let error = require_registered_import_helper_command(None)
+            .expect_err("an embedded host has no registered Libra helper");
+        assert!(matches!(
+            error.downcast_ref::<ImportError>(),
+            Some(ImportError::AuthorizedReaderUnavailable)
+        ));
+    }
+
+    #[test]
+    fn helper_error_frames_are_content_free_and_reject_extra_payload() {
+        let discovery = serde_json::to_vec(&DiscoveryHelperResponse::Error {
+            reason: DiscoveryRejection::SessionNotFound,
+        })
+        .expect("serialize bounded discovery error");
+        assert_eq!(
+            discovery,
+            br#"{"status":"error","reason":"session_not_found"}"#
+        );
+        for frame in [
+            br#"{"status":"error","reason":"session_not_found","message":"private-path"}"#
+                .as_slice(),
+            br#"{"status":"error","reason":"private-path"}"#.as_slice(),
+            br#"{"status":"error","stable_code":"LBR-AGENT-020"}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<DiscoveryHelperResponse>(frame).is_err());
+        }
+
+        let repair = serde_json::to_vec(&IndexRepairHelperResponse::Error {})
+            .expect("serialize bounded repair error");
+        assert_eq!(repair, br#"{"status":"error"}"#);
+        assert!(
+            serde_json::from_slice::<IndexRepairHelperResponse>(
+                br#"{"status":"error","message":"private-path"}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preparation_error_wire_contract_preserves_safe_import_error_kinds() {
+        for (error, expected) in [
+            (
+                ImportError::AuthorizedReaderUnavailable,
+                PreparationImportErrorKind::SourceAuthorization,
+            ),
+            (
+                ImportError::AuthorizedReaderFailed,
+                PreparationImportErrorKind::SourceAuthorization,
+            ),
+            (
+                ImportError::FutureTimestamp,
+                PreparationImportErrorKind::FutureTimestamp,
+            ),
+        ] {
+            let error: anyhow::Error = error.into();
+            assert_eq!(preparation_error_kind(&error), Some(expected));
+            assert!(matches!(
+                preparation_error(expected),
+                ImportError::SourceAuthorization | ImportError::FutureTimestamp
+            ));
+        }
+        let future: anyhow::Error = ImportError::FutureTimestamp.into();
+        assert_eq!(
+            stable_code_for_error(&future),
+            StableErrorCode::AgentImportPartialBatch
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_import_helper_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create import helper script directory");
+        let script = dir.path().join("import-helper.sh");
+        // The production spawn clears the environment and switches to `/`,
+        // so the script carries its own search path and test marker rather
+        // than inheriting them from the test process.
+        let marker = script.with_extension("pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nPATH=/usr/bin:/bin\nLIBRA_IMPORT_HELPER_TEST_MARKER='{}'\n{body}\n",
+                marker.display()
+            ),
+        )
+        .expect("write import helper script");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("read import helper script permissions")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions)
+            .expect("make import helper script executable");
+        (dir, script)
+    }
+
+    #[cfg(unix)]
+    fn import_helper_script_command(script: &Path, marker: &Path) -> tokio::process::Command {
+        // Inherited variables never reach the helper (`env_clear`), so the
+        // marker is embedded by `write_import_helper_script` instead.
+        assert_eq!(marker, script.with_extension("pid"));
+        tokio::process::Command::new(script)
+    }
+
+    #[cfg(unix)]
+    fn test_descriptor_control() -> PreparationDescriptorControl {
+        PreparationDescriptorControl {
+            agent_kind: "claude-code".to_string(),
+            source_kind: "file".to_string(),
+            provider_commitment: [7; 32],
+            read_cap: 1024,
+            remaining_ms: 1_000,
+        }
+    }
+
+    #[cfg(unix)]
+    fn empty_test_descriptor() -> std::fs::File {
+        tempfile::tempfile().expect("create anonymous descriptor helper input")
+    }
+
+    // These cases intentionally exercise a subprocess and process-group reaping.
+    // Leave scheduling headroom when the full unit suite is running in parallel.
+    #[cfg(unix)]
+    const IMPORT_HELPER_TEST_DEADLINE: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
+    async fn wait_for_import_helper_pid(marker: &Path) -> u32 {
+        let deadline = Instant::now() + IMPORT_HELPER_TEST_DEADLINE;
+        loop {
+            if let Ok(value) = std::fs::read_to_string(marker)
+                && let Ok(pid) = value.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "import helper did not publish its test PID"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn import_helper_pid_is_live(pid: u32) -> bool {
+        // SAFETY: signal 0 only probes the explicitly test-created process;
+        // it neither changes process state nor targets a process group.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_import_helper_exit(pid: u32) {
+        let deadline = Instant::now() + IMPORT_HELPER_TEST_DEADLINE;
+        while import_helper_pid_is_live(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !import_helper_pid_is_live(pid),
+            "import helper process {pid} survived cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparation_helper_rejects_oversized_stdout_with_a_fixed_error() {
+        let (_dir, script) = write_import_helper_script("printf '0123456789abcdef'");
+        let marker = script.with_extension("pid");
+        let error = run_import_preparation_descriptor_helper_bounded(
+            import_helper_script_command(&script, &marker),
+            test_descriptor_control(),
+            empty_test_descriptor(),
+            8,
+            Instant::now() + IMPORT_HELPER_TEST_DEADLINE,
+        )
+        .await
+        .expect_err("oversized helper stdout must be rejected");
+        assert!(matches!(
+            error.downcast_ref::<ImportError>(),
+            Some(ImportError::AuthorizedReaderFailed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outer_cancellation_reaps_the_preparation_process_group() {
+        let (_dir, script) = write_import_helper_script(
+            "printf '%s' \"$$\" > \"$LIBRA_IMPORT_HELPER_TEST_MARKER\"\nsleep 30",
+        );
+        let marker = script.with_extension("pid");
+        let task = tokio::spawn(run_import_preparation_descriptor_helper_bounded(
+            import_helper_script_command(&script, &marker),
+            test_descriptor_control(),
+            empty_test_descriptor(),
+            64,
+            Instant::now() + IMPORT_HELPER_TEST_DEADLINE,
+        ));
+        let pid = wait_for_import_helper_pid(&marker).await;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled helper task must not complete")
+                .is_cancelled()
+        );
+        wait_for_import_helper_exit(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparation_helper_kills_descendant_that_holds_stdout_after_leader_exit() {
+        let (_dir, script) = write_import_helper_script(
+            "sleep 30 &\nprintf '%s' \"$!\" > \"$LIBRA_IMPORT_HELPER_TEST_MARKER\"\nexit 0",
+        );
+        let marker = script.with_extension("pid");
+        let deadline = Instant::now() + IMPORT_HELPER_TEST_DEADLINE;
+        let task = tokio::spawn(run_import_preparation_descriptor_helper_bounded(
+            import_helper_script_command(&script, &marker),
+            test_descriptor_control(),
+            empty_test_descriptor(),
+            64,
+            deadline,
+        ));
+        let descendant_pid = wait_for_import_helper_pid(&marker).await;
+        let error = task
+            .await
+            .expect("helper runner task joins")
+            .expect_err("inherited stdout must not outlive the helper deadline");
+        assert!(matches!(
+            error.downcast_ref::<ImportError>(),
+            Some(ImportError::DeadlineExceeded)
+        ));
+        wait_for_import_helper_exit(descendant_pid).await;
     }
 
     struct TestHomeGuard(Option<std::ffi::OsString>);
@@ -2840,13 +3776,190 @@ mod tests {
             yes: true,
             restore_erased: false,
         };
-        assert!(
+        let error = validate_discovery_selector(&args).expect_err("--path needs --agent");
+        assert_eq!(error.message(), "--path requires --agent");
+        assert_eq!(error.stable_code(), StableErrorCode::CliInvalidArguments);
+        assert_eq!(error.kind(), CliErrorKind::CommandUsage);
+        assert!(matches!(
             discover(
                 &args,
                 Path::new("."),
                 Instant::now() + Duration::from_secs(1)
+            ),
+            Err(DiscoveryRejection::SelectorRejected)
+        ));
+    }
+
+    fn selector_args(configure: impl FnOnce(&mut ImportArgs)) -> ImportArgs {
+        let mut args = ImportArgs {
+            session: None,
+            path: None,
+            since: None,
+            all: true,
+            agent: None,
+            limit: DEFAULT_IMPORT_LIMIT,
+            cursor: None,
+            yes: true,
+            restore_erased: false,
+        };
+        configure(&mut args);
+        args
+    }
+
+    #[test]
+    fn argv_selector_errors_keep_fixed_actionable_messages() {
+        let cases: Vec<(ImportArgs, &str)> = vec![
+            (
+                selector_args(|args| {
+                    args.limit = 0;
+                    args.agent = Some("gemini".to_string());
+                }),
+                "--limit must be between 1 and 100",
+            ),
+            (
+                selector_args(|args| args.limit = MAX_IMPORT_LIMIT + 1),
+                "--limit must be between 1 and 100",
+            ),
+            (
+                selector_args(|args| args.agent = Some("gemini".to_string())),
+                "agent import supports claude-code, codex, or opencode; got 'gemini'",
+            ),
+            (
+                selector_args(|args| {
+                    args.all = false;
+                    args.path = Some(PathBuf::from("/provider/root/x.jsonl"));
+                    args.agent = Some("opencode".to_string());
+                }),
+                "opencode has no transcript file; use --session so Libra can run the trusted export bridge",
+            ),
+            (
+                selector_args(|args| {
+                    args.all = false;
+                    args.session = Some("bad/id".to_string());
+                }),
+                "invalid provider session id (expected a safe Claude or Codex session identifier)",
+            ),
+            (
+                selector_args(|args| {
+                    args.all = false;
+                    args.session = Some("legacy.identifier".to_string());
+                    args.agent = Some("codex".to_string());
+                }),
+                "invalid codex session id (expected alphanumeric/dash/underscore, at most 64 characters)",
+            ),
+            (
+                selector_args(|args| args.agent = Some("opencode".to_string())),
+                "OpenCode batch discovery is unavailable; select a session explicitly with --session",
+            ),
+            (
+                selector_args(|args| {
+                    args.all = false;
+                    args.since = Some("yesterday".to_string());
+                }),
+                "--since must be a valid RFC3339 timestamp",
+            ),
+        ];
+        for (args, expected) in cases {
+            let error = validate_discovery_selector(&args).expect_err(expected);
+            assert_eq!(error.message(), expected);
+            assert_eq!(error.stable_code(), StableErrorCode::CliInvalidArguments);
+            assert_eq!(error.kind(), CliErrorKind::CommandUsage);
+        }
+
+        let oversized = format!("x{}\u{1b}[2J", "y".repeat(80));
+        let error = validate_discovery_selector(&selector_args(|args| {
+            args.agent = Some(oversized.clone());
+        }))
+        .expect_err("unsupported agent");
+        assert_eq!(
+            error.message(),
+            format!(
+                "agent import supports claude-code, codex, or opencode; got 'x{}…'",
+                "y".repeat(63)
             )
-            .is_err()
+        );
+        let error = validate_discovery_selector(&selector_args(|args| {
+            args.agent = Some("bad\u{1b}[2Jslug".to_string());
+        }))
+        .expect_err("unsupported agent");
+        assert_eq!(
+            error.message(),
+            "agent import supports claude-code, codex, or opencode; got 'bad?[2Jslug'"
+        );
+    }
+
+    #[test]
+    fn discovery_rejections_render_fixed_actionable_messages() {
+        for (reason, message, code, kind) in [
+            (
+                DiscoveryRejection::SelectorRejected,
+                "agent import discovery rejected the supplied selector",
+                StableErrorCode::CliInvalidArguments,
+                CliErrorKind::CommandUsage,
+            ),
+            (
+                DiscoveryRejection::AmbiguousSession,
+                "the session id matches multiple providers; add --agent",
+                StableErrorCode::CliInvalidArguments,
+                CliErrorKind::CommandUsage,
+            ),
+            (
+                DiscoveryRejection::SessionNotFound,
+                "no authorized local transcript matched the session id; use --agent opencode for an export-only OpenCode session",
+                StableErrorCode::CliInvalidTarget,
+                CliErrorKind::Fatal,
+            ),
+            (
+                DiscoveryRejection::CursorOutOfRange,
+                "--cursor is outside the discovery result set",
+                StableErrorCode::CliInvalidArguments,
+                CliErrorKind::CommandUsage,
+            ),
+            (
+                DiscoveryRejection::ClaudeProviderRoot,
+                "Claude session discovery failed within its configured provider root",
+                StableErrorCode::AgentTranscriptAuthorizationMissing,
+                CliErrorKind::Fatal,
+            ),
+            (
+                DiscoveryRejection::CodexProviderRoot,
+                "Codex session discovery failed within its configured provider root",
+                StableErrorCode::AgentTranscriptAuthorizationMissing,
+                CliErrorKind::Fatal,
+            ),
+            (
+                DiscoveryRejection::DeadlineExceeded,
+                "agent import discovery exceeded its total execution deadline",
+                StableErrorCode::AgentImportPartialBatch,
+                CliErrorKind::Fatal,
+            ),
+        ] {
+            let frame = serde_json::to_vec(&DiscoveryHelperResponse::Error { reason })
+                .expect("serialize discovery rejection");
+            let decoded = match serde_json::from_slice::<DiscoveryHelperResponse>(&frame)
+                .expect("decode discovery rejection")
+            {
+                DiscoveryHelperResponse::Error { reason } => reason,
+                DiscoveryHelperResponse::Ok { .. } => panic!("expected an error frame"),
+            };
+            let error = decoded.into_cli_error();
+            assert_eq!(error.message(), message);
+            assert_eq!(error.stable_code(), code);
+            assert_eq!(error.kind(), kind);
+        }
+        assert_eq!(
+            DiscoveryRejection::from_provider_error(
+                &ImportError::DeadlineExceeded.into(),
+                DiscoveryRejection::CodexProviderRoot,
+            ),
+            DiscoveryRejection::DeadlineExceeded
+        );
+        assert_eq!(
+            DiscoveryRejection::from_provider_error(
+                &anyhow::anyhow!("/private/provider/root: permission denied"),
+                DiscoveryRejection::ClaudeProviderRoot,
+            ),
+            DiscoveryRejection::ClaudeProviderRoot
         );
     }
 
@@ -2856,6 +3969,972 @@ mod tests {
         assert_eq!(
             effective_source_read_cap(TRANSCRIPT_READ_HARD_CAP_BYTES * 2),
             TRANSCRIPT_READ_HARD_CAP_BYTES
+        );
+    }
+
+    /// A command deadline reached after the barrier UPSERT but before COMMIT
+    /// must roll the whole transaction back. In particular, a retry must not
+    /// overwrite another repair generation and cannot create import/session
+    /// side effects merely by losing a SQLite writer slot late.
+    #[tokio::test]
+    async fn import_barrier_deadline_after_persist_preserves_existing_v2_recovery_state() {
+        let dir = tempfile::tempdir().expect("create import barrier deadline fixture");
+        let db_path = dir.path().join("libra.db");
+        let conn = crate::internal::db::create_database(&db_path.to_string_lossy())
+            .await
+            .expect("create import barrier deadline database");
+        let scope = CaptureScope {
+            repo_id: "import-barrier-deadline-repo".to_string(),
+            worktree_id: String::new(),
+            workspace_id: Some("import-barrier-deadline-workspace".to_string()),
+            workspace_fence: Some(37),
+        };
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO workspace_record (
+                workspace_id, repo_id, kind, worktree_id, path, owner_kind,
+                state, lease_owner, lease_fence, lease_expires_at, created_at, updated_at
+             ) VALUES (?, ?, 'task_copy', NULL, ?, 'agent',
+                       'active', 'import-barrier-deadline-owner', ?, 9999999999999, 1, 1)",
+            [
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                dir.path().to_string_lossy().into_owned().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed live import barrier deadline workspace");
+        let source_id = format!("source/hmac-v2/{}", "b".repeat(64));
+        let request = ImportRequest {
+            agent_kind: AgentKind::ClaudeCode,
+            provider_session_id: "import-barrier-deadline-provider".to_string(),
+            session_id: "claude_code__import_barrier_deadline".to_string(),
+            source_kind: "file".to_string(),
+            source_id: source_id.clone(),
+            identity_schema_version: 2,
+            content_digest: "import-barrier-deadline-digest".to_string(),
+            started_at: 1,
+            ended_at: 1,
+            session_state: "active".to_string(),
+            stopped_at: None,
+            working_dir: dir.path().to_path_buf(),
+            repository_identity: "not_retained".to_string(),
+            capture_scope: Some(scope.clone()),
+            source_fingerprint: source_id.clone(),
+            existing_session_fingerprint: None,
+            redaction_report: serde_json::json!({"raw_persisted": false}),
+            transcript_snapshot: None,
+            turn_boundaries: std::collections::BTreeMap::new(),
+            turns: Vec::new(),
+        };
+        let identity_id = import_identity_id(&request);
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at, schema_version,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, 'claude_code', ?, 'active', ?, '{}', '{}', 1, 1, 2,
+                       ?, ?, ?, ?, 'scoped')",
+            [
+                request.session_id.clone().into(),
+                request.provider_session_id.clone().into(),
+                dir.path().to_string_lossy().into_owned().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed import session without side effects");
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_import_identity (
+                identity_id, agent_kind, provider_session_id, source_kind, source_id,
+                schema_version, observed_digest, next_ordinal, state, owner,
+                lease_expires_at, fence_token, created_at, updated_at,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, 'claude_code', ?, ?, ?, 2, ?, 0, 'committed', NULL,
+                       NULL, 73, 1, 1, ?, ?, ?, ?, 'scoped')",
+            [
+                identity_id.clone().into(),
+                request.provider_session_id.clone().into(),
+                request.source_kind.clone().into(),
+                request.source_id.clone().into(),
+                request.content_digest.clone().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed committed import identity");
+        let marker = ImportIndexRepairMarker {
+            schema_version: IMPORT_INDEX_REPAIR_MARKER_SCHEMA_V2,
+            owner: "prior-deadline-owner".to_string(),
+            generation: "prior-deadline-generation".to_string(),
+            identity_id: identity_id.clone(),
+            agent_kind: request.agent_kind.as_db_str().to_string(),
+            provider_session_id: request.provider_session_id.clone(),
+            source_kind: request.source_kind.clone(),
+            source_id: request.source_id.clone(),
+            state: "repair_pending".to_string(),
+            lease_expires_at: 0,
+            created_at: 1,
+            fence_token: Some(73),
+            capture_scope: Some(scope.clone()),
+        };
+        persist_import_index_barrier(&conn, &request.session_id, &marker)
+            .await
+            .expect("seed existing V2 repair marker");
+        let marker_before = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read seeded marker")
+        .expect("seeded marker exists")
+        .value;
+        let identity_before = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, owner, lease_expires_at, fence_token, last_error_code
+                 FROM agent_import_identity WHERE identity_id = ?",
+                [identity_id.clone().into()],
+            ))
+            .await
+            .expect("read identity before deadline")
+            .expect("seeded identity exists");
+        let identity_before = (
+            identity_before
+                .try_get_by::<String, _>("state")
+                .expect("decode identity state before deadline"),
+            identity_before
+                .try_get_by::<Option<String>, _>("owner")
+                .expect("decode identity owner before deadline"),
+            identity_before
+                .try_get_by::<Option<i64>, _>("lease_expires_at")
+                .expect("decode identity lease before deadline"),
+            identity_before
+                .try_get_by::<Option<i64>, _>("fence_token")
+                .expect("decode identity fence before deadline"),
+            identity_before
+                .try_get_by::<Option<String>, _>("last_error_code")
+                .expect("decode identity error before deadline"),
+        );
+        let session_before = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, metadata_json, redaction_report, schema_version
+                 FROM agent_session WHERE session_id = ?",
+                [request.session_id.clone().into()],
+            ))
+            .await
+            .expect("read session before deadline")
+            .expect("seeded session exists");
+        let session_before = (
+            session_before
+                .try_get_by::<String, _>("state")
+                .expect("decode session state before deadline"),
+            session_before
+                .try_get_by::<String, _>("metadata_json")
+                .expect("decode session metadata before deadline"),
+            session_before
+                .try_get_by::<String, _>("redaction_report")
+                .expect("decode session report before deadline"),
+            session_before
+                .try_get_by::<i64, _>("schema_version")
+                .expect("decode session schema before deadline"),
+        );
+
+        let reset = test_support::install(test_support::ImportTestControls {
+            index_barrier_persist_delay: Some(Duration::from_millis(80)),
+            ..test_support::ImportTestControls::default()
+        });
+        let error = acquire_import_index_barrier(
+            &conn,
+            dir.path(),
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_millis(20))
+                .expect("establish import barrier deadline"),
+        )
+        .await
+        .expect_err("post-persist deadline must roll back barrier acquisition");
+        drop(reset);
+        assert!(
+            error
+                .downcast_ref::<ImportError>()
+                .is_some_and(|error| { matches!(error, ImportError::DeadlineExceeded) }),
+            "deadline classification must survive the post-persist rollback: {error:#}"
+        );
+
+        let marker_after = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read marker after deadline")
+        .expect("existing marker must survive deadline")
+        .value;
+        assert_eq!(
+            marker_after, marker_before,
+            "deadline must not replace an existing V2 marker generation or value"
+        );
+        let identity_after = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, owner, lease_expires_at, fence_token, last_error_code
+                 FROM agent_import_identity WHERE identity_id = ?",
+                [identity_id.into()],
+            ))
+            .await
+            .expect("read identity after deadline")
+            .expect("identity must remain");
+        let identity_after = (
+            identity_after
+                .try_get_by::<String, _>("state")
+                .expect("decode identity state after deadline"),
+            identity_after
+                .try_get_by::<Option<String>, _>("owner")
+                .expect("decode identity owner after deadline"),
+            identity_after
+                .try_get_by::<Option<i64>, _>("lease_expires_at")
+                .expect("decode identity lease after deadline"),
+            identity_after
+                .try_get_by::<Option<i64>, _>("fence_token")
+                .expect("decode identity fence after deadline"),
+            identity_after
+                .try_get_by::<Option<String>, _>("last_error_code")
+                .expect("decode identity error after deadline"),
+        );
+        let session_after = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, metadata_json, redaction_report, schema_version
+                 FROM agent_session WHERE session_id = ?",
+                [request.session_id.clone().into()],
+            ))
+            .await
+            .expect("read session after deadline")
+            .expect("session must remain");
+        let session_after = (
+            session_after
+                .try_get_by::<String, _>("state")
+                .expect("decode session state after deadline"),
+            session_after
+                .try_get_by::<String, _>("metadata_json")
+                .expect("decode session metadata after deadline"),
+            session_after
+                .try_get_by::<String, _>("redaction_report")
+                .expect("decode session report after deadline"),
+            session_after
+                .try_get_by::<i64, _>("schema_version")
+                .expect("decode session schema after deadline"),
+        );
+        assert_eq!(
+            identity_after, identity_before,
+            "deadline acquisition must not mutate the import identity"
+        );
+        assert_eq!(
+            session_after, session_before,
+            "deadline acquisition must not mutate the import session"
+        );
+    }
+
+    /// A normal import deadline must bound the actual file-backed SQLite
+    /// writer acquisition, not merely an in-process delay seam. Releasing the
+    /// competing writer afterwards must not let a cancelled acquisition wake
+    /// up and publish its barrier late.
+    #[tokio::test]
+    async fn import_barrier_deadline_bounds_file_sqlite_writer_acquisition_without_delayed_marker()
+    {
+        let dir = tempfile::tempdir().expect("create import barrier lock fixture");
+        let db_path = dir.path().join("libra.db");
+        let conn = crate::internal::db::create_database(&db_path.to_string_lossy())
+            .await
+            .expect("create import barrier lock database");
+        let lock_conn = crate::internal::db::establish_connection(&db_path.to_string_lossy())
+            .await
+            .expect("open independent import barrier lock connection");
+        let source_id = format!("source/hmac-v2/{}", "c".repeat(64));
+        let request = ImportRequest {
+            agent_kind: AgentKind::ClaudeCode,
+            provider_session_id: "import-barrier-lock-provider".to_string(),
+            session_id: "claude_code__import_barrier_lock".to_string(),
+            source_kind: "file".to_string(),
+            source_id: source_id.clone(),
+            identity_schema_version: 2,
+            content_digest: "import-barrier-lock-digest".to_string(),
+            started_at: 1,
+            ended_at: 1,
+            session_state: "active".to_string(),
+            stopped_at: None,
+            working_dir: dir.path().to_path_buf(),
+            repository_identity: "not_retained".to_string(),
+            capture_scope: Some(CaptureScope {
+                repo_id: "import-barrier-lock-repo".to_string(),
+                worktree_id: String::new(),
+                workspace_id: None,
+                workspace_fence: None,
+            }),
+            source_fingerprint: source_id,
+            existing_session_fingerprint: None,
+            redaction_report: serde_json::json!({"raw_persisted": false}),
+            transcript_snapshot: None,
+            turn_boundaries: std::collections::BTreeMap::new(),
+            turns: Vec::new(),
+        };
+        let holder = crate::internal::db::begin_write_transaction(&lock_conn)
+            .await
+            .expect("hold file SQLite writer for import barrier acquisition");
+        let started = Instant::now();
+        let error = acquire_import_index_barrier_transaction(
+            &conn,
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_millis(30))
+                .expect("establish import barrier lock deadline"),
+        )
+        .await
+        .expect_err("contended barrier acquisition must observe its deadline");
+        assert!(
+            error
+                .downcast_ref::<ImportError>()
+                .is_some_and(|error| matches!(error, ImportError::DeadlineExceeded)),
+            "writer acquisition must preserve the typed deadline: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "writer acquisition ignored the short deadline"
+        );
+        holder
+            .rollback()
+            .await
+            .expect("release file SQLite writer after import barrier deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let marker = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read import barrier marker after cancelled acquisition");
+        assert!(
+            marker.is_none(),
+            "a cancelled writer acquisition must not publish its barrier after the holder releases"
+        );
+    }
+
+    /// A corrupt later checkpoint must reject the entire replay repair before
+    /// it writes any index row for an earlier valid checkpoint. The durable
+    /// barrier remains byte-for-byte intact so a healthy retry can own it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_index_repair_is_atomic_when_a_later_loose_target_is_not_zlib() {
+        let dir = tempfile::tempdir().expect("create import index repair fixture");
+        let db_path = dir.path().join("libra.db");
+        let conn = crate::internal::db::create_database(&db_path.to_string_lossy())
+            .await
+            .expect("create import index repair database");
+        let scope = CaptureScope {
+            repo_id: "import-index-repair-atomic-repo".to_string(),
+            worktree_id: String::new(),
+            workspace_id: Some("import-index-repair-atomic-workspace".to_string()),
+            workspace_fence: Some(41),
+        };
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO workspace_record (
+                workspace_id, repo_id, kind, worktree_id, path, owner_kind,
+                state, lease_owner, lease_fence, lease_expires_at, created_at, updated_at
+             ) VALUES (?, ?, 'task_copy', NULL, ?, 'agent',
+                       'active', 'import-index-repair-atomic-owner', ?, 9999999999999, 1, 1)",
+            [
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                dir.path().to_string_lossy().into_owned().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed live import index repair workspace");
+        crate::internal::config::ConfigKv::set_with_conn(
+            &conn,
+            "libra.repoid",
+            &scope.repo_id,
+            false,
+        )
+        .await
+        .expect("pin import index repair fixture repository id");
+        let source_id = format!("source/hmac-v2/{}", "d".repeat(64));
+        let request = ImportRequest {
+            agent_kind: AgentKind::ClaudeCode,
+            provider_session_id: "import-index-repair-atomic-provider".to_string(),
+            session_id: "claude_code__import_repair_atomic".to_string(),
+            source_kind: "file".to_string(),
+            source_id: source_id.clone(),
+            identity_schema_version: 2,
+            content_digest: "import-index-repair-atomic-digest".to_string(),
+            started_at: 1,
+            ended_at: 1,
+            session_state: "active".to_string(),
+            stopped_at: None,
+            working_dir: dir.path().to_path_buf(),
+            repository_identity: "not_retained".to_string(),
+            capture_scope: Some(scope.clone()),
+            source_fingerprint: source_id,
+            existing_session_fingerprint: None,
+            redaction_report: serde_json::json!({"raw_persisted": false}),
+            transcript_snapshot: None,
+            turn_boundaries: std::collections::BTreeMap::new(),
+            turns: Vec::new(),
+        };
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at, schema_version,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, 'claude_code', ?, 'active', ?, '{}', '{}', 1, 1, 2,
+                       ?, ?, ?, ?, 'scoped')",
+            [
+                request.session_id.clone().into(),
+                request.provider_session_id.clone().into(),
+                dir.path().to_string_lossy().into_owned().into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed scoped import session");
+        let barrier = acquire_import_index_barrier(
+            &conn,
+            dir.path(),
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_secs(1))
+                .expect("establish import index repair deadline"),
+        )
+        .await
+        .expect("acquire live import index repair barrier");
+        let marker_before = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read import index repair barrier")
+        .expect("import index repair barrier exists")
+        .value;
+
+        let first = write_import_index_repair_checkpoint(
+            dir.path(),
+            "aa000000-0000-0000-0000-000000000001",
+        );
+        let second = write_import_index_repair_checkpoint(
+            dir.path(),
+            "bb000000-0000-0000-0000-000000000002",
+        );
+        for (checkpoint, created_at) in [(&first, 1_i64), (&second, 2_i64)] {
+            conn.execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO agent_checkpoint (
+                    checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                    metadata_blob_oid, traces_commit, created_at
+                 ) VALUES (?, ?, 'committed', NULL, ?, ?, ?, ?)",
+                [
+                    checkpoint.checkpoint_id.clone().into(),
+                    request.session_id.clone().into(),
+                    checkpoint.tree_oid.clone().into(),
+                    checkpoint.metadata_blob_oid.clone().into(),
+                    checkpoint.traces_commit.clone().into(),
+                    created_at.into(),
+                ],
+            ))
+            .await
+            .expect("seed import index repair checkpoint");
+        }
+        for checkpoint in [&first, &second] {
+            conn.execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced)
+                 VALUES (?, 'commit', 1, ?, 1, 0)",
+                [
+                    checkpoint.traces_commit.clone().into(),
+                    scope.repo_id.clone().into(),
+                ],
+            ))
+            .await
+            .expect("seed stale import index repair target");
+        }
+        let removed = conn
+            .execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "DELETE FROM object_index WHERE repo_id = ? AND o_id IN (?, ?)",
+                [
+                    scope.repo_id.clone().into(),
+                    first.traces_commit.clone().into(),
+                    second.traces_commit.clone().into(),
+                ],
+            ))
+            .await
+            .expect("remove both import index repair targets");
+        assert_eq!(
+            removed.rows_affected(),
+            2,
+            "the repair fixture must start with both target rows absent"
+        );
+
+        let corrupt_target_path = dir
+            .path()
+            .join("objects")
+            .join(&second.traces_commit[..2])
+            .join(&second.traces_commit[2..]);
+        std::fs::write(&corrupt_target_path, b"not a zlib loose object")
+            .expect("corrupt second loose target after its valid fixture write");
+
+        let error = super::super::doctor::repair_session_object_index(
+            &conn,
+            dir.path(),
+            super::super::doctor::SessionObjectIndexRepairRequest {
+                session_id: &request.session_id,
+                marker_owner: &barrier.marker.owner,
+                marker_generation: &barrier.marker.generation,
+                agent_kind: request.agent_kind.as_db_str(),
+                provider_session_id: &request.provider_session_id,
+                capture_scope: &scope,
+            },
+        )
+        .await
+        .expect_err("a non-zlib later target must reject import index repair");
+        assert!(
+            format!("{error:#}").contains("integrity-check checkpoint object"),
+            "repair must fail while validating the corrupt later target: {error:#}"
+        );
+
+        let indexed_after = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT COUNT(*) AS count FROM object_index WHERE repo_id = ?",
+                [scope.repo_id.clone().into()],
+            ))
+            .await
+            .expect("count object-index rows after rejected repair")
+            .expect("object-index count row exists")
+            .try_get_by::<i64, _>("count")
+            .expect("decode object-index count after rejected repair");
+        assert_eq!(
+            indexed_after, 0,
+            "validation failure must not restore either target or partially index the first checkpoint"
+        );
+        let marker_after = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read barrier after rejected repair")
+        .expect("rejected repair must retain its barrier")
+        .value;
+        assert_eq!(
+            marker_after, marker_before,
+            "rejected repair must preserve the durable barrier marker byte-for-byte"
+        );
+    }
+
+    /// The object-index barrier is durable import state, not advisory local
+    /// logging. A hook that loses its task-workspace lease either before or
+    /// after a barrier mutation must not publish/retire it or downgrade the
+    /// matching import identity while a newer workspace may be recovering the
+    /// same session.
+    #[tokio::test]
+    async fn expired_workspace_scope_cannot_mutate_import_index_barrier_or_identity() {
+        let dir = tempfile::tempdir().expect("create import barrier fixture");
+        let db_path = dir.path().join("libra.db");
+        let conn = crate::internal::db::create_database(&db_path.to_string_lossy())
+            .await
+            .expect("create import barrier database");
+        let scope = CaptureScope {
+            repo_id: "import-barrier-scope-repo".to_string(),
+            worktree_id: String::new(),
+            workspace_id: Some("import-barrier-scope-workspace".to_string()),
+            workspace_fence: Some(31),
+        };
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO workspace_record (
+                workspace_id, repo_id, kind, worktree_id, path, owner_kind,
+                state, lease_owner, lease_fence, lease_expires_at, created_at, updated_at
+             ) VALUES (?, ?, 'task_copy', NULL, ?, 'agent',
+                       'active', 'import-barrier-scope-owner', ?, 9999999999999, 1, 1)",
+            [
+                scope.workspace_id.clone().into(),
+                scope.repo_id.clone().into(),
+                dir.path().to_string_lossy().into_owned().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed live import barrier workspace");
+        let request = ImportRequest {
+            agent_kind: AgentKind::ClaudeCode,
+            provider_session_id: "import-barrier-provider".to_string(),
+            session_id: "claude_code__import_barrier_scope".to_string(),
+            source_kind: "file".to_string(),
+            source_id: format!("source/hmac-v2/{}", "a".repeat(64)),
+            identity_schema_version: 2,
+            content_digest: "import-barrier-digest".to_string(),
+            started_at: 1,
+            ended_at: 1,
+            session_state: "active".to_string(),
+            stopped_at: None,
+            working_dir: dir.path().to_path_buf(),
+            repository_identity: "import-barrier-repository".to_string(),
+            capture_scope: Some(scope.clone()),
+            source_fingerprint: format!("source/hmac-v2/{}", "a".repeat(64)),
+            existing_session_fingerprint: None,
+            redaction_report: serde_json::json!({
+                "pipeline": "typed_allowlist",
+                "raw_persisted": false,
+                "matches": [],
+                "bytes_scanned": 0,
+                "bytes_redacted": 0,
+            }),
+            transcript_snapshot: None,
+            turn_boundaries: std::collections::BTreeMap::new(),
+            turns: Vec::new(),
+        };
+        // Each trigger expires the lease *inside* the transaction after the
+        // named barrier mutation. This deterministically proves the final
+        // commit fence rolls all preceding state back rather than relying on
+        // a scheduler-dependent pause between DML and COMMIT.
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE import_barrier_expiry_mode (mode TEXT NOT NULL)".to_string(),
+        ))
+        .await
+        .expect("create import barrier expiry mode table");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO import_barrier_expiry_mode (mode) VALUES ('acquire')".to_string(),
+        ))
+        .await
+        .expect("seed import barrier expiry mode");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TRIGGER expire_scope_after_barrier_acquire
+             AFTER INSERT ON metadata_kv
+             WHEN NEW.scope = 'agent_import_index_repair'
+               AND NEW.target = 'claude_code__import_barrier_scope'
+               AND NEW.key = 'object-index-v1'
+               AND (SELECT mode FROM import_barrier_expiry_mode LIMIT 1) = 'acquire'
+             BEGIN
+                 UPDATE workspace_record SET lease_expires_at = 0
+                 WHERE workspace_id = 'import-barrier-scope-workspace';
+             END"
+            .to_string(),
+        ))
+        .await
+        .expect("install post-acquire expiry trigger");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TRIGGER expire_scope_after_barrier_pending
+             AFTER UPDATE ON metadata_kv
+             WHEN NEW.scope = 'agent_import_index_repair'
+               AND NEW.target = 'claude_code__import_barrier_scope'
+               AND NEW.key = 'object-index-v1'
+               AND NEW.value <> OLD.value
+               AND (SELECT mode FROM import_barrier_expiry_mode LIMIT 1) = 'pending'
+             BEGIN
+                 UPDATE workspace_record SET lease_expires_at = 0
+                 WHERE workspace_id = 'import-barrier-scope-workspace';
+             END"
+            .to_string(),
+        ))
+        .await
+        .expect("install post-pending expiry trigger");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TRIGGER expire_scope_after_barrier_clear
+             AFTER DELETE ON metadata_kv
+             WHEN OLD.scope = 'agent_import_index_repair'
+               AND OLD.target = 'claude_code__import_barrier_scope'
+               AND OLD.key = 'object-index-v1'
+               AND (SELECT mode FROM import_barrier_expiry_mode LIMIT 1) = 'clear'
+             BEGIN
+                 UPDATE workspace_record SET lease_expires_at = 0
+                 WHERE workspace_id = 'import-barrier-scope-workspace';
+             END"
+            .to_string(),
+        ))
+        .await
+        .expect("install post-clear expiry trigger");
+
+        let error = acquire_import_index_barrier(
+            &conn,
+            dir.path(),
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_secs(1))
+                .expect("establish scoped import barrier deadline"),
+        )
+        .await
+        .expect_err("expiry after barrier persist must roll back acquisition");
+        assert!(format!("{error:#}").contains("workspace lease"));
+        assert!(
+            MetadataKv::get_with_conn(
+                &conn,
+                MetadataScope::AgentImportIndexRepair,
+                &request.session_id,
+                IMPORT_INDEX_REPAIR_MARKER_KEY,
+            )
+            .await
+            .expect("read post-acquire rollback marker")
+            .is_none(),
+            "post-acquire expiry must not publish a durable barrier"
+        );
+        scope
+            .assert_workspace_fence_live(&conn)
+            .await
+            .expect("post-acquire expiry trigger must roll back with the barrier");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE import_barrier_expiry_mode SET mode = 'off'".to_string(),
+        ))
+        .await
+        .expect("disable post-acquire expiry trigger");
+
+        let barrier = acquire_import_index_barrier(
+            &conn,
+            dir.path(),
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_secs(1))
+                .expect("establish live scoped import barrier deadline"),
+        )
+        .await
+        .expect("acquire barrier while workspace lease is live");
+        let marker_before = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read newly acquired barrier")
+        .expect("barrier row exists")
+        .value;
+        let persisted_marker = parse_import_index_barrier_marker(&marker_before)
+            .expect("decode scoped barrier marker");
+        assert_eq!(persisted_marker.capture_scope.as_ref(), Some(&scope));
+
+        let identity_id = import_identity_id(&request);
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_import_identity (
+                identity_id, agent_kind, provider_session_id, source_kind, source_id,
+                schema_version, observed_digest, next_ordinal, state, owner,
+                lease_expires_at, fence_token, created_at, updated_at,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, 'claude_code', ?, ?, ?, 2, ?, 0, 'committed', NULL,
+                       NULL, ?, 1, 1, ?, ?, ?, ?, 'scoped')",
+            [
+                identity_id.clone().into(),
+                request.provider_session_id.clone().into(),
+                request.source_kind.clone().into(),
+                request.source_id.clone().into(),
+                request.content_digest.clone().into(),
+                41_i64.into(),
+                scope.repo_id.clone().into(),
+                scope.worktree_id.clone().into(),
+                scope.workspace_id.clone().into(),
+                scope.workspace_fence.into(),
+            ],
+        ))
+        .await
+        .expect("seed committed scoped import identity");
+
+        let identity = ImportIdentityFence {
+            identity_id: identity_id.clone(),
+            fence_token: 41,
+        };
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE import_barrier_expiry_mode SET mode = 'pending'".to_string(),
+        ))
+        .await
+        .expect("enable post-pending expiry trigger");
+        let error = set_import_index_barrier_pending(&conn, &barrier, Some(&identity))
+            .await
+            .expect_err("expiry after pending mutation must roll back barrier and identity");
+        assert!(format!("{error:#}").contains("workspace lease"));
+        let marker_after_pending = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read post-pending rollback marker")
+        .expect("post-pending expiry must retain barrier")
+        .value;
+        assert_eq!(
+            marker_after_pending, marker_before,
+            "post-pending expiry must roll the barrier marker back byte-for-byte"
+        );
+        scope
+            .assert_workspace_fence_live(&conn)
+            .await
+            .expect("post-pending expiry trigger must roll back with the barrier");
+
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE import_barrier_expiry_mode SET mode = 'clear'".to_string(),
+        ))
+        .await
+        .expect("enable post-clear expiry trigger");
+        let error = clear_import_index_barrier(&conn, &barrier)
+            .await
+            .expect_err("expiry after barrier delete must roll back retirement");
+        assert!(format!("{error:#}").contains("workspace lease"));
+        let marker_after_clear = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read post-clear rollback marker")
+        .expect("post-clear expiry must retain barrier")
+        .value;
+        assert_eq!(
+            marker_after_clear, marker_before,
+            "post-clear expiry must roll the barrier marker back byte-for-byte"
+        );
+        let identity_after_post_mutation_expiry = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, last_error_code, fence_token FROM agent_import_identity
+                 WHERE identity_id = ?",
+                [identity_id.clone().into()],
+            ))
+            .await
+            .expect("read identity after post-mutation expiry")
+            .expect("post-pending expiry must retain identity");
+        assert_eq!(
+            identity_after_post_mutation_expiry
+                .try_get_by::<String, _>("state")
+                .expect("decode post-mutation identity state"),
+            "committed",
+            "post-pending expiry must roll back the import identity downgrade"
+        );
+        assert_eq!(
+            identity_after_post_mutation_expiry
+                .try_get_by::<Option<String>, _>("last_error_code")
+                .expect("decode post-mutation identity error"),
+            None,
+            "post-pending expiry must not leave a partial error code"
+        );
+        scope
+            .assert_workspace_fence_live(&conn)
+            .await
+            .expect("post-clear expiry trigger must roll back with the barrier");
+
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE workspace_record SET lease_expires_at = 0
+             WHERE workspace_id = 'import-barrier-scope-workspace'"
+                .to_string(),
+        ))
+        .await
+        .expect("expire workspace lease after barrier acquisition");
+
+        let error = acquire_import_index_barrier(
+            &conn,
+            dir.path(),
+            &request,
+            CaptureCommitDeadline::from_budget(Duration::from_secs(1))
+                .expect("establish expired scoped import barrier deadline"),
+        )
+        .await
+        .expect_err("expired scope must not replace the import barrier");
+        assert!(format!("{error:#}").contains("workspace lease"));
+
+        let error = super::super::doctor::repair_session_object_index(
+            &conn,
+            dir.path(),
+            super::super::doctor::SessionObjectIndexRepairRequest {
+                session_id: &request.session_id,
+                marker_owner: &barrier.marker.owner,
+                marker_generation: &barrier.marker.generation,
+                agent_kind: request.agent_kind.as_db_str(),
+                provider_session_id: &request.provider_session_id,
+                capture_scope: &scope,
+            },
+        )
+        .await
+        .expect_err("expired scope must not run the import object-index repair helper");
+        assert!(format!("{error:#}").contains("workspace lease"));
+
+        let error = set_import_index_barrier_pending(&conn, &barrier, Some(&identity))
+            .await
+            .expect_err("expired scope must not mark the barrier or identity partial");
+        assert!(format!("{error:#}").contains("workspace lease"));
+        let error = clear_import_index_barrier(&conn, &barrier)
+            .await
+            .expect_err("expired scope must not retire the import barrier");
+        assert!(format!("{error:#}").contains("workspace lease"));
+
+        let marker_after = MetadataKv::get_with_conn(
+            &conn,
+            MetadataScope::AgentImportIndexRepair,
+            &request.session_id,
+            IMPORT_INDEX_REPAIR_MARKER_KEY,
+        )
+        .await
+        .expect("read barrier after failed stale mutations")
+        .expect("stale cleanup must not delete barrier")
+        .value;
+        assert_eq!(
+            marker_after, marker_before,
+            "post-expiry acquire/repair/pending/clear must leave the durable marker byte-identical"
+        );
+        let identity_row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, last_error_code, fence_token FROM agent_import_identity
+                 WHERE identity_id = ?",
+                [identity_id.into()],
+            ))
+            .await
+            .expect("read identity after stale barrier mutations")
+            .expect("seeded import identity remains");
+        assert_eq!(
+            identity_row
+                .try_get_by::<String, _>("state")
+                .expect("decode identity state"),
+            "committed"
+        );
+        assert_eq!(
+            identity_row
+                .try_get_by::<Option<String>, _>("last_error_code")
+                .expect("decode identity error"),
+            None
+        );
+        assert_eq!(
+            identity_row
+                .try_get_by::<Option<i64>, _>("fence_token")
+                .expect("decode identity fence"),
+            Some(41)
         );
     }
 
@@ -2956,7 +5035,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(env)]
     fn claude_discovery_rejects_symlinked_project_directory_before_enumeration() {
         let home = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

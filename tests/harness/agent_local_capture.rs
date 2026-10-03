@@ -31,11 +31,9 @@
 //!   under `~/.local/share/opencode` / `~/.config/opencode`); the
 //!   Libra-managed plugin is *project-local*
 //!   (`<repo>/.opencode/plugin/libra-hooks.js`), so nothing user-level is
-//!   touched. Plugin envelopes stay lifecycle-only. **Linux** checkpoints
-//!   pin an empty transcript snapshot with `extraction.present=false`
-//!   (A6.5 metadata-only). **macOS** (SBX-04/05) enables the export
-//!   bridge under seatbelt, so the same idle path records
-//!   `extraction.present=true` and a non-empty transcript snapshot.
+//!   touched. Plugin envelopes stay lifecycle-only. Checkpoints on every
+//!   platform pin an empty transcript snapshot with `extraction.present=false`
+//!   (A6.5 metadata-only); macOS OpenCode export is rejected before spawn.
 //!
 //! ## Evidence discipline (plan.md §0.3.1)
 //!
@@ -503,19 +501,12 @@ impl SmokeAgent {
             );
         }
         self.assert_hooks_pinned();
-        // macOS SBX-04/05: content capture requires a trusted exporter
-        // (tracing/agent.md §5). Linux A6.5 keeps the untrusted
-        // metadata-only contract — do not register trust there.
-        #[cfg(target_os = "macos")]
-        if slug == "opencode" {
-            self.trust_opencode_exporter();
-        }
         self.summary.insert(
             "install".into(),
             json!({
                 "installed": true,
                 "hook_commands_pinned": true,
-                "opencode_exporter_trusted": cfg!(target_os = "macos") && slug == "opencode",
+                "opencode_exporter_trusted": false,
             }),
         );
 
@@ -565,28 +556,6 @@ impl SmokeAgent {
             "[{slug}] local capture smoke ok (session {session_id}, libra sha256 {})",
             &self.libra_sha256[..12]
         );
-    }
-
-    /// Register the real `opencode` binary as the DR-04b export-bridge
-    /// trusted exporter (repo config). Required for macOS content capture.
-    #[cfg(target_os = "macos")]
-    fn trust_opencode_exporter(&self) {
-        let binary = self
-            .agent_binary
-            .as_ref()
-            .expect("opencode binary resolved in preflight");
-        let dir = binary.parent().unwrap_or_else(|| {
-            panic!(
-                "opencode binary {} has no parent directory",
-                binary.display()
-            )
-        });
-        let dir_s = dir
-            .to_str()
-            .unwrap_or_else(|| panic!("opencode trusted-dir {} is not UTF-8", dir.display()));
-        self.libra_ok(&["config", "set", "agent.external_agents.enabled", "true"]);
-        self.libra_ok(&["agent", "rpc", "trust", "--dir", dir_s]);
-        self.libra_ok(&["agent", "rpc", "trust", "opencode"]);
     }
 
     /// Seed pre-existing user provider config so install/uninstall can
@@ -690,7 +659,7 @@ impl SmokeAgent {
                     "claude-code: user settings key must survive install"
                 );
                 for (event, verb) in CLAUDE_EVENT_VERBS {
-                    let expected = format!("{pinned} hooks claude {verb}");
+                    let expected = format!("{pinned} hooks claude {verb} --capture-budget-ms 9000");
                     let found = settings["hooks"][event].as_array().is_some_and(|matchers| {
                         matchers.iter().any(|matcher| {
                             matcher["hooks"].as_array().is_some_and(|hooks| {
@@ -711,19 +680,27 @@ impl SmokeAgent {
                 )
                 .expect("hooks.json parses");
                 for (event, verb) in CODEX_EVENT_VERBS {
-                    let expected = format!("{pinned} hooks codex {verb}");
+                    let (expected_timeout, expected_budget) = if *event == "SessionEnd" {
+                        (3, 2_000)
+                    } else {
+                        (30, 29_000)
+                    };
+                    let expected = format!(
+                        "{pinned} hooks codex {verb} --capture-budget-ms {expected_budget}"
+                    );
                     let found = hooks["hooks"][event].as_array().is_some_and(|groups| {
                         groups.iter().any(|group| {
                             group["hooks"].as_array().is_some_and(|handlers| {
-                                handlers
-                                    .iter()
-                                    .any(|handler| handler["command"] == json!(expected))
+                                handlers.iter().any(|handler| {
+                                    handler["command"] == json!(expected)
+                                        && handler["timeout"] == json!(expected_timeout)
+                                })
                             })
                         })
                     });
                     assert!(
                         found,
-                        "codex: '{event}' must carry pinned command '{expected}': {hooks}"
+                        "codex: '{event}' must carry pinned timeout/budget command '{expected}': {hooks}"
                     );
                 }
                 let config =
@@ -827,7 +804,7 @@ impl SmokeAgent {
     }
 
     /// §0.3.5 capture assertions: session row → checkpoint rows →
-    /// metadata-first `checkpoint show` / `session show` → traces ref →
+    /// safe-summary `checkpoint show` / `session show` → traces ref →
     /// doctor. Returns the captured Libra session id.
     fn assert_capture(&mut self) -> String {
         let slug = self.spec.slug;
@@ -869,99 +846,30 @@ impl SmokeAgent {
             .expect("traces_commit")
             .to_string();
 
-        // Metadata-first `checkpoint show`: metadata + redaction report +
-        // content hash + token summary, and NO transcript body.
+        // Default `checkpoint show` is a safe fixed summary: no metadata
+        // document, object identifiers, source details, or transcript body.
         let show = self.libra_json(&["agent", "checkpoint", "show", &checkpoint_id, "--json"]);
-        let metadata = &show["data"]["metadata"];
-        assert_eq!(metadata["agent_kind"], json!(kind), "{slug}: metadata kind");
+        let summary = &show["data"]["checkpoint"];
         assert!(
-            metadata["redaction_report"].is_object(),
-            "{slug}: checkpoint show must carry the redaction report summary: {show}"
+            summary.is_object(),
+            "{slug}: checkpoint show must carry its structural summary: {show}"
         );
-        // Transcript-derived facts differ per agent: claude/codex hook
-        // envelopes carry the agent's on-disk transcript path, so the
-        // snapshot is captured and extraction (token summary) must run.
-        // OpenCode plugin envelopes stay lifecycle-only (agent.md「OpenCode
-        // 安装流程契约」). Linux A6.5 pins the fail-open skip
-        // (`extraction.present=false/partial=true` + documented warning).
-        // macOS SBX-04/05 enables the seatbelt export bridge, so the idle
-        // path must record content capture (`present=true` + non-empty
-        // transcript). Both branches stay in source (`linux_a65_criteria_unchanged`).
-        let extraction = &metadata["extraction"];
-        let transcript_bytes = show["data"]["layout"]["transcript"]["parts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|part| part["byte_len"].as_u64())
-            .sum::<u64>();
-        if slug == "opencode" {
-            #[cfg(not(target_os = "macos"))]
-            {
-                assert_eq!(
-                    extraction["present"],
-                    json!(false),
-                    "{slug}: lifecycle-only capture must record the extraction skip: {show}"
-                );
-                assert_eq!(
-                    extraction["partial"],
-                    json!(true),
-                    "{slug}: skipped extraction must be marked partial: {show}"
-                );
-                let warned = extraction["warnings"].as_array().is_some_and(|warnings| {
-                    warnings.iter().any(|warning| {
-                        warning
-                            .as_str()
-                            .unwrap_or_default()
-                            .contains("no raw transcript available")
-                    })
-                });
-                assert!(
-                    warned,
-                    "{slug}: the extraction skip must carry the documented warning: {show}"
-                );
-            }
-            #[cfg(target_os = "macos")]
-            {
-                assert_eq!(
-                    extraction["present"],
-                    json!(true),
-                    "{slug}: macOS seatbelt export must capture content: {show}"
-                );
-                assert!(
-                    extraction["token_usage"].is_object(),
-                    "{slug}: macOS export capture must carry the token summary: {show}"
-                );
-                assert!(
-                    transcript_bytes > 0,
-                    "{slug}: macOS export transcript snapshot must not be empty: {show}"
-                );
-            }
-        } else {
-            assert_eq!(
-                extraction["present"],
-                json!(true),
-                "{slug}: extraction must run on the captured transcript: {show}"
-            );
-            assert!(
-                extraction["token_usage"].is_object(),
-                "{slug}: checkpoint show must carry the token summary: {show}"
-            );
-            assert!(
-                transcript_bytes > 0,
-                "{slug}: the captured transcript snapshot must not be empty: {show}"
-            );
-        }
-        assert_eq!(
-            show["data"]["layout"]["content_hash"]["format_valid"],
-            json!(true),
-            "{slug}: content hash must be present and well-formed: {show}"
+        assert_eq!(summary["checkpoint_id"], json!(checkpoint_id));
+        assert_eq!(summary["scope"], rows[0]["scope"]);
+        assert!(summary["created_at"].is_i64(), "{slug}: created_at: {show}");
+        assert!(
+            summary["parent_snapshot_recorded"].is_boolean(),
+            "{slug}: parent snapshot flag: {show}"
+        );
+        assert!(
+            show["data"].get("metadata").is_none() && show["data"].get("layout").is_none(),
+            "{slug}: checkpoint show must expose no metadata or layout document: {show}"
         );
         let show_text = show.to_string();
         assert!(
             !show_text.contains("libra-agent-smoke-ok")
                 && !show_text.contains("Do not read secrets"),
-            "{slug}: default checkpoint show leaked transcript/prompt content (metadata-first \
-             violation)"
+            "{slug}: default checkpoint show leaked transcript/prompt content"
         );
 
         // `session show` reads the same catalog metadata by OID pointers.
@@ -1024,8 +932,6 @@ impl SmokeAgent {
                 "checkpoint_count": rows.len(),
                 "first_checkpoint_id": checkpoint_id,
                 "traces_commit": traces_commit,
-                "transcript_snapshot_bytes": transcript_bytes,
-                "extraction_present": extraction["present"],
                 "doctor_findings": 0,
             }),
         );

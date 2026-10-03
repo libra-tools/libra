@@ -27,10 +27,14 @@ impl Fixture {
         let home = directory.path().join("home");
         std::fs::create_dir_all(&repo).expect("repo");
         std::fs::create_dir_all(&home).expect("home");
+        // The hook binds and uses the canonical working directory when it
+        // derives Claude's project slug. Keep both fixture identities
+        // canonical too: macOS may spell its temp root as `/var` while the
+        // verified hook scope is `/private/var`.
         let fixture = Self {
             _directory: directory,
-            repo,
-            home,
+            repo: repo.canonicalize().expect("canonical repo"),
+            home: home.canonicalize().expect("canonical home"),
         };
         let output = fixture.run(&["init"], None);
         assert!(output.status.success(), "init: {}", describe(&output));
@@ -141,6 +145,30 @@ impl Fixture {
             .expect("checkpoint rows")
             .clone()
     }
+
+    /// Reject only the parent checkpoint insert after the independent child
+    /// content transaction has had a chance to commit. This uses SQLite's
+    /// per-fixture database rather than a process environment fault knob, so
+    /// a provider-controlled hook environment cannot influence production
+    /// capture behavior.
+    async fn reject_committed_checkpoint_writes(&self) {
+        let database_path = self.repo.join(".libra/libra.db");
+        let conn = Database::connect(format!("sqlite://{}", database_path.display()))
+            .await
+            .expect("connect repository database");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TRIGGER reject_committed_checkpoint_writes
+             BEFORE INSERT ON agent_checkpoint
+             WHEN NEW.scope = 'committed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'test rejects committed parent checkpoint');
+             END"
+            .to_string(),
+        ))
+        .await
+        .expect("install parent checkpoint rejection trigger");
+    }
 }
 
 fn describe(output: &Output) -> String {
@@ -198,6 +226,7 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
         .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT c.current_revision, c.current_checkpoint_id, c.source_key,
+                    c.content_schema_version,
                     cp.metadata_blob_oid, r.partial, l.link_state,
                     l.boundary_checkpoint_id
              FROM agent_subagent_content_claim c
@@ -232,8 +261,13 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
         .try_get_by::<String, _>("source_key")
         .expect("source key");
     assert!(!Path::new(&source_key).is_absolute());
-    assert!(source_key.starts_with("source/sha256/"));
-    assert_eq!(source_key.len(), "source/sha256/".len() + 64);
+    assert!(source_key.starts_with("source/subagent-hmac-v2/"));
+    assert_eq!(source_key.len(), "source/subagent-hmac-v2/".len() + 64);
+    assert_eq!(
+        row.try_get_by::<i64, _>("content_schema_version")
+            .expect("subagent content schema version"),
+        2,
+    );
     assert!(!source_key.contains("child.jsonl"));
     assert!(!source_key.contains(session_id));
     let metadata_oid = row
@@ -249,6 +283,20 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
     let content_checkpoint_id = row
         .try_get_by::<String, _>("current_checkpoint_id")
         .expect("content checkpoint id");
+    // The manual-required finding must name the content checkpoint so the
+    // user can act on it with `agent checkpoint show <id>`.
+    let doctor_json: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON output");
+    let unresolved = doctor_json["data"]["checkpoint_store"]["findings"]
+        .as_array()
+        .expect("doctor findings")
+        .iter()
+        .find(|finding| finding["inconsistency_type"] == "unresolved_subagent_link")
+        .expect("unresolved subagent link finding");
+    assert_eq!(
+        unresolved["checkpoint_id"], content_checkpoint_id,
+        "unresolved link finding must report the content checkpoint id: {unresolved}"
+    );
+    assert_eq!(unresolved["manual_required"], true);
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
@@ -296,9 +344,19 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
         "dangling current content must not be reported as an unchanged success: {}",
         describe(&replay)
     );
+    let stderr = String::from_utf8_lossy(&replay.stderr);
     assert!(
-        String::from_utf8_lossy(&replay.stderr).contains("libra agent doctor"),
-        "replay error must be actionable: {}",
+        stderr.contains(
+            "capture could not be completed; retry the hook or inspect the local repository"
+        ),
+        "replay error must retain the fixed sanitized diagnostic: {}",
+        describe(&replay)
+    );
+    assert!(
+        !stderr.contains("current leaf is incomplete")
+            && !stderr.contains(session_id)
+            && !stderr.contains(fixture.repo.to_string_lossy().as_ref()),
+        "hook stderr must not expose the internal recovery chain or provider-controlled identity: {}",
         describe(&replay)
     );
 }
@@ -308,17 +366,11 @@ async fn child_content_is_durable_before_parent_checkpoint_advertises_attributio
     let fixture = Fixture::new();
     let session_id = "abcdef00-0000-0000-0000-000000000007";
     let transcript = fixture.write_transcripts(session_id);
-    let failed = fixture.stop_with_env(
-        session_id,
-        &transcript,
-        &[(
-            "LIBRA_TEST_FAIL_AFTER_SUBAGENT_CONTENT_BEFORE_PARENT_CHECKPOINT",
-            "1",
-        )],
-    );
+    fixture.reject_committed_checkpoint_writes().await;
+    let failed = fixture.stop(session_id, &transcript);
     assert!(
         !failed.status.success(),
-        "injected stop: {}",
+        "the parent checkpoint rejection must interrupt the stop hook: {}",
         describe(&failed)
     );
 
@@ -338,6 +390,120 @@ async fn child_content_is_durable_before_parent_checkpoint_advertises_attributio
             .count(),
         0,
         "parent must not advertise child-derived attribution first"
+    );
+}
+
+/// The parent checkpoint may derive aggregate child usage, but it must only
+/// do so from the capture snapshot's redacted child bytes. A secret in a
+/// child transcript therefore cannot reach the parent's durable metadata.
+#[tokio::test]
+async fn parent_metadata_uses_redacted_child_snapshot_for_attribution() {
+    let fixture = Fixture::new();
+    let session_id = "abcdef00-0000-0000-0000-00000000000b";
+    let transcript = fixture.write_transcripts(session_id);
+    let secret = format!("ghp_{}", "c".repeat(36));
+    let child_path = fixture
+        .home
+        .join(".claude/projects")
+        .join(claude_project_slug(&fixture.repo))
+        .join(session_id)
+        .join("subagents/child.jsonl");
+    std::fs::write(
+        &child_path,
+        format!(
+            "{}\n",
+            json!({
+                "type": "assistant",
+                "uuid": "child-secret",
+                "message": {
+                    "role": "assistant",
+                    "content": format!("child handled {secret}"),
+                    "usage": {"input_tokens": 13, "output_tokens": 5}
+                }
+            })
+        ),
+    )
+    .expect("write secret-bearing child transcript");
+
+    let stop = fixture.stop(session_id, &transcript);
+    assert!(stop.status.success(), "stop: {}", describe(&stop));
+    let checkpoint_id = fixture
+        .checkpoints()
+        .into_iter()
+        .find(|row| row["scope"] == "committed")
+        .and_then(|row| row["checkpoint_id"].as_str().map(str::to_owned))
+        .expect("committed parent checkpoint");
+    let show = fixture.run(
+        &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
+        None,
+    );
+    assert!(
+        show.status.success(),
+        "checkpoint show: {}",
+        describe(&show)
+    );
+    let show_json: Value = serde_json::from_slice(&show.stdout).expect("checkpoint show JSON");
+    assert_eq!(
+        show_json["data"]["checkpoint"]["checkpoint_id"],
+        json!(checkpoint_id),
+        "default show retains only the requested checkpoint identity"
+    );
+    assert!(
+        show_json["data"].get("metadata").is_none(),
+        "default show must withhold the metadata document: {show_json}"
+    );
+    let show_text = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        !show_text.contains(&secret),
+        "child secret leaked through default checkpoint show: {show_text}"
+    );
+
+    // The parent aggregate is a durable invariant, not a public `show`
+    // schema. Read the object directly so this test does not restore the
+    // withheld metadata body to the CLI contract.
+    let database_path = fixture.repo.join(".libra/libra.db");
+    let conn = Database::connect(format!("sqlite://{}?mode=ro", database_path.display()))
+        .await
+        .expect("connect repository database for metadata assertion");
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT metadata_blob_oid FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [checkpoint_id.clone().into()],
+        ))
+        .await
+        .expect("query parent metadata object")
+        .expect("parent checkpoint row");
+    let metadata_oid: String = row
+        .try_get_by("metadata_blob_oid")
+        .expect("parent metadata object id");
+    drop(conn);
+    let metadata_hash = ObjectHash::from_str(&metadata_oid).expect("metadata object hash");
+    let metadata: Value = serde_json::from_slice(
+        &read_git_object(&fixture.repo.join(".libra"), &metadata_hash)
+            .expect("read parent metadata object"),
+    )
+    .expect("parent metadata JSON");
+    let metadata_text = serde_json::to_string(&metadata).expect("serialize parent metadata");
+    assert!(
+        !metadata_text.contains(&secret),
+        "child secret leaked into durable parent metadata: {metadata_text}"
+    );
+    let extraction = &metadata["extraction"];
+    assert_eq!(extraction["subagent_source_count"], json!(1));
+    assert_eq!(
+        extraction["subagent_token_usage"]["input_tokens"],
+        json!(13),
+        "redacted child snapshot must retain aggregate attribution: {extraction}"
+    );
+    assert_eq!(
+        extraction["subagent_snapshot"]["complete_source_count"],
+        json!(1),
+        "parent metadata must record that the child crossed the safe snapshot boundary"
+    );
+    assert_eq!(
+        extraction["subagent_snapshot"]["partial_source_count"],
+        json!(0)
     );
 }
 
@@ -371,27 +537,34 @@ async fn unchanged_replay_rejects_an_uncataloged_traces_ancestor() {
     );
     let stderr = String::from_utf8_lossy(&replay.stderr);
     assert!(
-        stderr.contains("traces reachability are incomplete")
-            && stderr.contains("libra agent doctor"),
-        "uncataloged history error must identify the repair path: {}",
+        stderr.contains(
+            "capture could not be completed; retry the hook or inspect the local repository"
+        ),
+        "uncataloged history error must retain the fixed sanitized diagnostic: {}",
+        describe(&replay)
+    );
+    assert!(
+        !stderr.contains("traces reachability are incomplete")
+            && !stderr.contains(session_id)
+            && !stderr.contains(fixture.repo.to_string_lossy().as_ref()),
+        "hook stderr must not expose the internal recovery chain or provider-controlled identity: {}",
         describe(&replay)
     );
 }
 
 #[test]
-fn blocking_child_discovery_is_killed_at_live_deadline() {
+fn untrusted_discovery_test_environment_cannot_change_live_capture() {
     let fixture = Fixture::new();
     let session_id = "abcdef00-0000-0000-0000-000000000008";
     let transcript = fixture.write_transcripts(session_id);
-    let started = std::time::Instant::now();
     let output = fixture.stop_with_env(
         session_id,
         &transcript,
         &[
-            // Helper delay must stay above the kill budget so a missed kill
-            // still fails the elapsed assert under a loaded nextest run.
-            ("LIBRA_TEST_SUBAGENT_DISCOVERY_HELPER_DELAY_MS", "15000"),
-            ("LIBRA_TEST_SUBAGENT_DISCOVERY_DEADLINE_MS", "80"),
+            // This was a historical debug-binary test knob. The ordinary
+            // hook executable must not let an untrusted environment force an
+            // already-expired discovery deadline.
+            ("LIBRA_TEST_SUBAGENT_DISCOVERY_DEADLINE_MS", "0"),
         ],
     );
     assert!(
@@ -399,18 +572,14 @@ fn blocking_child_discovery_is_killed_at_live_deadline() {
         "partial parent stop: {}",
         describe(&output)
     );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(8),
-        "blocking helper exceeded the parent deadline: {:?}",
-        started.elapsed()
-    );
     let checkpoints = fixture.checkpoints();
     assert_eq!(
         checkpoints
             .iter()
             .filter(|row| row["scope"] == "subagent")
             .count(),
-        0
+        1,
+        "untrusted deadline environment must not suppress normal child capture"
     );
     assert_eq!(
         checkpoints
@@ -418,46 +587,27 @@ fn blocking_child_discovery_is_killed_at_live_deadline() {
             .filter(|row| row["scope"] == "committed")
             .count(),
         1,
-        "live discovery timeout preserves a partial parent checkpoint"
+        "untrusted deadline environment must not prevent the parent checkpoint"
     );
 }
 
 #[test]
-fn blocking_unchanged_durability_probe_is_killed_at_live_deadline() {
+fn unchanged_durability_probe_replays_without_checkpoint_duplication() {
     let fixture = Fixture::new();
     let session_id = "abcdef00-0000-0000-0000-000000000009";
     let transcript = fixture.write_transcripts(session_id);
     let first = fixture.stop(session_id, &transcript);
     assert!(first.status.success(), "first stop: {}", describe(&first));
-
-    let ready = fixture.repo.join("verify-helper.ready");
-    let ready_text = ready.to_string_lossy().into_owned();
-    let started = std::time::Instant::now();
-    let repeated = fixture.stop_with_env(
-        session_id,
-        &transcript,
-        &[
-            ("LIBRA_TEST_CHECKPOINT_VERIFY_READY_FILE", &ready_text),
-            ("LIBRA_TEST_SUBAGENT_DISCOVERY_DEADLINE_MS", "120"),
-        ],
-    );
+    let checkpoints_before = fixture.checkpoints();
+    let repeated = fixture.stop(session_id, &transcript);
     assert!(
-        !repeated.status.success(),
-        "a killed durability probe must fail the replay closed: {}",
+        repeated.status.success(),
+        "a normal durability replay must remain successful: {}",
         describe(&repeated)
     );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "blocking durability helper exceeded the parent deadline: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        ready.exists(),
-        "the killable verification helper was not reached"
-    );
-    assert!(
-        String::from_utf8_lossy(&repeated.stderr).contains("libra agent doctor"),
-        "killed durability verification must fail closed with a recovery path: {}",
-        describe(&repeated)
+    assert_eq!(
+        fixture.checkpoints(),
+        checkpoints_before,
+        "unchanged durability replay must not duplicate a checkpoint"
     );
 }

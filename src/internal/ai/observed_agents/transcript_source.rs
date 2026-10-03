@@ -2,9 +2,9 @@
 //!
 //! This is the **single writer read entry point** for external-agent
 //! transcript content. Both the live checkpoint writer
-//! (`hooks::runtime::write_committed_checkpoint`) and — once it lands (M4) —
-//! the import writer resolve their bytes through
-//! [`resolve_transcript_source`], never by re-opening a path themselves.
+//! (`capture::live_checkpoint::write_committed_checkpoint`) and the import
+//! writer resolve their bytes through [`resolve_transcript_source`], never by
+//! re-opening a path themselves.
 //!
 //! Two source shapes exist (ADR-DR-02):
 //!
@@ -15,27 +15,31 @@
 //!   post-authorization path swap (symlink flip / TOCTOU) cannot change the
 //!   bytes it reads.
 //! - [`TranscriptSource::Bytes`] — in-memory bytes carrying an
-//!   [`ExportAuthorized`] tag. This shape is **only** constructed by the
-//!   OpenCode export bridge (DR-04b) after a trusted, sandboxed export; there
-//!   is no public way to forge the tag, so the writer will not treat an
-//!   arbitrary `&[u8]` as a trusted source.
+//!   [`ExportAuthorized`] tag. This shape is constructed only by a trusted
+//!   in-process producer: the OpenCode export bridge (DR-04b), or a securely
+//!   discovered Claude child source that is being handed to the capture
+//!   snapshot boundary. There is no public way to forge the tag, so the
+//!   writer will not treat an arbitrary `&[u8]` as a trusted source.
 //!
-//! Security note (ADR-DR-13): the provider-root containment check here
-//! ([`transcript_path_within_provider_root`]) is the **migration-period
-//! precheck**. The final fd-relative `openat2(RESOLVE_BENEATH | …)` safe-open
-//! lands with DR-05b; until then the resolver opens the path once (after the
-//! precheck) and hands the writer the open handle, which already removes the
-//! re-open-by-path TOCTOU on the read side.
+//! Security note (ADR-DR-13): containment is enforced by the current pinned,
+//! descriptor-relative safe-open implementation. On Unix it walks the
+//! provider root and source with `openat(O_NOFOLLOW)` rather than trusting a
+//! deferred path check; unsupported platforms fail closed. The writer then
+//! consumes only that held descriptor and never re-opens the source path.
 
 use std::{
-    io::{Read, Seek},
+    fmt,
+    io::Seek,
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use thiserror::Error;
 
-use crate::internal::ai::observed_agents::{AgentSessionCtx, ObservedAgent};
+use crate::internal::ai::{
+    authorized_read::{StrictBoundedRead, read_strictly_bounded},
+    observed_agents::{AgentSessionCtx, ObservedAgent},
+};
 
 /// Default effective byte cap for a single transcript read (GC-DR-04). Matches
 /// the existing Claude adapter hard cap so DR-04a does not silently enlarge the
@@ -54,24 +58,42 @@ pub enum TranscriptReadError {
 #[derive(Debug)]
 pub struct ProviderRootAuthorized(());
 
-/// Proof token that a [`TranscriptSource::Bytes`] payload came from this
-/// process's own trusted export bridge (DR-04b). Fields are private and the
-/// only constructor is crate-scoped [`ExportAuthorized::issue`], which binds
-/// the tag to the exact bytes via SHA-256 — so no caller outside this crate
-/// can mint a tag, and a tag cannot be re-attached to different bytes: the
-/// writer re-verifies with [`ExportAuthorized::matches`].
-#[derive(Debug, Clone)]
+/// The trusted in-process producer that authorized an in-memory transcript.
+///
+/// This is crate-scoped deliberately: the wire-facing snapshot projection
+/// retains only its safe classification, never this proof object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InMemoryTranscriptOrigin {
+    TrustedExport,
+    DiscoveredSubagent,
+}
+
+/// Proof token that a [`TranscriptSource::Bytes`] payload came from a trusted
+/// in-process producer. Fields are private and constructors bind the tag to
+/// the exact bytes via SHA-256 — so no caller outside this crate can mint a
+/// tag, and a tag cannot be re-attached to different bytes: the writer
+/// re-verifies with [`ExportAuthorized::matches`].
+#[derive(Clone)]
 pub struct ExportAuthorized {
     agent_kind: String,
     session_id: String,
     content_digest: String,
+    origin: InMemoryTranscriptOrigin,
+}
+
+impl std::fmt::Debug for ExportAuthorized {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExportAuthorized")
+            .field("origin", &self.origin)
+            .field("sensitive_fields", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ExportAuthorized {
     /// Mint an authorization tag for freshly exported `bytes`. Crate-scoped:
-    /// only the verified export bridge (DR-04b) may issue tags.
-    // Production caller lands with the DR-04b export bridge (M3); the digest
-    // binding is unit-tested until then.
+    /// only the verified export bridge (DR-04b) may issue this export form.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(agent_kind: &str, session_id: &str, bytes: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
@@ -79,6 +101,27 @@ impl ExportAuthorized {
             agent_kind: agent_kind.to_string(),
             session_id: session_id.to_string(),
             content_digest: hex::encode(Sha256::digest(bytes)),
+            origin: InMemoryTranscriptOrigin::TrustedExport,
+        }
+    }
+
+    /// Mint the distinct proof form used only after Claude child discovery
+    /// has securely read a provider-root source. The provider-relative source
+    /// key remains in discovery's transient ownership/linking state; it is
+    /// intentionally not copied into this authorization token or any durable
+    /// snapshot projection, even as an unkeyed digest.
+    pub(crate) fn issue_discovered_subagent(
+        agent_kind: &str,
+        session_id: &str,
+        bytes: &[u8],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self {
+            agent_kind: agent_kind.to_string(),
+            session_id: session_id.to_string(),
+            content_digest: hex::encode(Sha256::digest(bytes)),
+            origin: InMemoryTranscriptOrigin::DiscoveredSubagent,
         }
     }
 
@@ -100,17 +143,25 @@ impl ExportAuthorized {
         &self.session_id
     }
 
-    pub fn content_digest(&self) -> &str {
-        &self.content_digest
+    pub(crate) fn origin(&self) -> InMemoryTranscriptOrigin {
+        self.origin
     }
 }
 
 /// A transcript file that has already been safely opened inside the provider
 /// root. The writer reads from the held descriptor; the path is retained only
 /// for diagnostics / `source_id` derivation and is **never** re-opened.
-#[derive(Debug)]
 pub struct AuthorizedTranscriptFile {
     file: std::fs::File,
+}
+
+impl std::fmt::Debug for AuthorizedTranscriptFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedTranscriptFile")
+            .field("file", &"<descriptor>")
+            .finish()
+    }
 }
 
 impl AuthorizedTranscriptFile {
@@ -141,27 +192,20 @@ impl AuthorizedTranscriptFile {
         {
             return (Err(error), 0);
         }
-        let mut buf = Vec::new();
-        // Read one past the cap so an oversize file is detected, not silently
-        // truncated; `take` still bounds memory on the hook path.
-        if let Err(error) = self
-            .file
-            .by_ref()
-            .take(cap.saturating_add(1))
-            .read_to_end(&mut buf)
-            .context("read authorized transcript handle")
-        {
-            let bytes_read = buf.len() as u64;
-            return (Err(error), bytes_read);
-        }
-        let bytes_read = buf.len() as u64;
-        if bytes_read > cap {
-            return (
+        match read_strictly_bounded(&mut self.file, cap) {
+            StrictBoundedRead::Complete(bytes) => {
+                let bytes_read = bytes.len() as u64;
+                (Ok(bytes), bytes_read)
+            }
+            StrictBoundedRead::Oversize { observed_bytes } => (
                 Err(TranscriptReadError::ExceedsCap { cap }.into()),
+                observed_bytes,
+            ),
+            StrictBoundedRead::Failed { bytes_read, error } => (
+                Err(error).context("read authorized transcript handle"),
                 bytes_read,
-            );
+            ),
         }
-        (Ok(buf), bytes_read)
     }
 
     fn len(&self) -> Result<u64> {
@@ -193,7 +237,6 @@ impl AuthorizedTranscriptFile {
 }
 
 /// The unified writer read source (ADR-DR-02).
-#[derive(Debug)]
 pub enum TranscriptSource {
     File {
         file: AuthorizedTranscriptFile,
@@ -206,6 +249,55 @@ pub enum TranscriptSource {
         bytes: Vec<u8>,
         auth: ExportAuthorized,
     },
+}
+
+/// Source debugging is intentionally content-free.  A trusted export still
+/// contains native/raw transcript bytes at this boundary; deriving `Debug`
+/// for the `Vec<u8>` would leak them through otherwise harmless diagnostics.
+impl fmt::Debug for TranscriptSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { source_id, .. } => formatter
+                .debug_struct("TranscriptSource::File")
+                .field("source_id_len", &source_id.len())
+                .finish(),
+            Self::Bytes { bytes, .. } => formatter
+                .debug_struct("TranscriptSource::Bytes")
+                .field("byte_len", &bytes.len())
+                .finish(),
+        }
+    }
+}
+
+/// Classified result of resolving an external-agent transcript source.
+///
+/// The legacy [`resolve_transcript_source`] API intentionally folds a missing
+/// locator and a rejected locator into `Ok(None)`: its only consumer used to
+/// need a prompt fallback in either case. Capture snapshots need to preserve
+/// that security distinction in safe metadata, however. This enum carries no
+/// path or error text, so it is safe to turn into a durable partial reason.
+pub enum TranscriptSourceResolution {
+    /// A descriptor-pinned file or export-backed byte source was authorized.
+    Authorized(TranscriptSource),
+    /// No source was supplied, or the supplied source disappeared before it
+    /// could be opened.
+    Absent,
+    /// A caller supplied a source outside the adapter's protected provider
+    /// root. Its path is intentionally not retained here.
+    Untrusted,
+}
+
+impl fmt::Debug for TranscriptSourceResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorized(source) => formatter
+                .debug_tuple("TranscriptSourceResolution::Authorized")
+                .field(source)
+                .finish(),
+            Self::Absent => formatter.write_str("TranscriptSourceResolution::Absent"),
+            Self::Untrusted => formatter.write_str("TranscriptSourceResolution::Untrusted"),
+        }
+    }
 }
 
 impl TranscriptSource {
@@ -222,15 +314,21 @@ impl TranscriptSource {
     }
 }
 
-/// Resolve the provider root that contains `canonical_path`, if any. Mirrors
-/// the Codex `$CODEX_HOME` relocation honored elsewhere in the codex chain so a
-/// relocated home is not silently captured with an empty transcript.
-fn normalize_macos_var_alias(path: &Path) -> PathBuf {
+/// Normalize the fixed macOS system aliases before descriptor-relative
+/// no-follow traversal. These aliases are OS-owned, unlike any component below
+/// them, which must remain subject to the strict symlink checks.
+fn normalize_macos_system_directory_alias(path: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        path.strip_prefix("/var")
-            .map(|suffix| Path::new("/private/var").join(suffix))
-            .unwrap_or_else(|_| path.to_path_buf())
+        for (alias, canonical) in [
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/var"), Path::new("/private/var")),
+        ] {
+            if let Ok(suffix) = path.strip_prefix(alias) {
+                return canonical.join(suffix);
+            }
+        }
+        path.to_path_buf()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -251,7 +349,9 @@ fn provider_root_containing(adapter: &dyn ObservedAgent, canonical_path: &Path) 
         } else {
             home.join(dir)
         };
-        let root = normalize_macos_var_alias(&root).canonicalize().ok()?;
+        let root = normalize_macos_system_directory_alias(&root)
+            .canonicalize()
+            .ok()?;
         canonical_path.starts_with(&root).then_some(root)
     })
 }
@@ -275,7 +375,7 @@ fn configured_provider_roots(adapter: &dyn ObservedAgent) -> Vec<PathBuf> {
             } else {
                 home.join(dir)
             };
-            normalize_macos_var_alias(&root)
+            normalize_macos_system_directory_alias(&root)
         })
         .collect()
 }
@@ -415,11 +515,11 @@ pub(crate) fn open_provider_directory_for_discovery(
         return Ok(None);
     }
     // Mirror `securely_open_provider_file`: the roots below come back through
-    // `normalize_macos_var_alias`, so the query path must be normalized the
-    // same way or `strip_prefix` never matches on macOS (`/var` is a symlink
-    // to `/private/var`) — and a silent `Ok(None)` here means the no-follow /
-    // budget hardening below never runs at all.
-    let path = normalize_macos_var_alias(path);
+    // `normalize_macos_system_directory_alias`, so the query path must be
+    // normalized the same way or `strip_prefix` never matches on macOS (for
+    // example, `/tmp` is a symlink to `/private/tmp`) — and a silent `Ok(None)`
+    // here means the no-follow / budget hardening below never runs at all.
+    let path = normalize_macos_system_directory_alias(path);
     for root in configured_provider_roots(adapter) {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;
@@ -770,7 +870,7 @@ fn securely_open_provider_file(
     if !path.is_absolute() {
         return Ok(None);
     }
-    let path = normalize_macos_var_alias(path);
+    let path = normalize_macos_system_directory_alias(path);
     for root in configured_provider_roots(adapter) {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;
@@ -831,22 +931,81 @@ fn open_provider_file_for_capture(
     }
 }
 
-fn import_test_pause_before_secure_open() -> Result<()> {
-    if !cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_SECURE_OPEN_READY_FILE") else {
-        return Ok(());
+#[cfg(test)]
+mod test_support {
+    use std::{
+        sync::{Mutex, OnceLock, mpsc},
+        time::Duration,
     };
-    let continue_path = std::env::var("LIBRA_TEST_IMPORT_SECURE_OPEN_CONTINUE_FILE")
-        .context("secure-open pause requires a continue-file path")?;
-    std::fs::write(&ready_path, b"ready").context("publish test-only secure-open import pause")?;
-    while !Path::new(&continue_path).exists() {
-        // Deliberately ignore the in-process deadline: this models an
-        // uninterruptible filesystem open. Historical import must remain
-        // bounded because this code executes only in its killable helper.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+
+    use anyhow::{Result, anyhow};
+
+    struct SecureOpenPause {
+        reached: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
     }
+
+    fn pause_slot() -> &'static Mutex<Option<SecureOpenPause>> {
+        static PAUSE: OnceLock<Mutex<Option<SecureOpenPause>>> = OnceLock::new();
+        PAUSE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) struct PauseReset;
+
+    impl Drop for PauseReset {
+        fn drop(&mut self) {
+            let mut pause = pause_slot()
+                .lock()
+                .expect("secure-open test pause lock is not poisoned");
+            pause.take();
+        }
+    }
+
+    pub(super) fn install_secure_open_pause() -> (mpsc::Receiver<()>, mpsc::Sender<()>, PauseReset)
+    {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut pause = pause_slot()
+            .lock()
+            .expect("secure-open test pause lock is not poisoned");
+        assert!(
+            pause.is_none(),
+            "a secure-open test pause is already installed"
+        );
+        *pause = Some(SecureOpenPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx, PauseReset)
+    }
+
+    pub(super) fn pause_before_secure_open() -> Result<()> {
+        let pause = pause_slot()
+            .lock()
+            .expect("secure-open test pause lock is not poisoned")
+            .take();
+        let Some(pause) = pause else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow!("secure-open test lost its pause observer"))?;
+        pause
+            .resume
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| anyhow!("secure-open test pause was not resumed"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn import_test_pause_before_secure_open() -> Result<()> {
+    test_support::pause_before_secure_open()
+}
+
+#[cfg(not(test))]
+fn import_test_pause_before_secure_open() -> Result<()> {
     Ok(())
 }
 
@@ -876,26 +1035,33 @@ pub fn transcript_path_within_provider_root(adapter: &dyn ObservedAgent, path: &
 fn resolve_transcript_source_with_policy(
     adapter: &dyn ObservedAgent,
     ctx: &AgentSessionCtx,
-    strict_import: bool,
+    require_pinned_open: bool,
+    import_test_pause: bool,
     preparation_deadline: Option<std::time::Instant>,
+    run_preparer: bool,
 ) -> Result<Option<TranscriptSource>> {
     let Some(path) = ctx.transcript_path.as_deref() else {
         return Ok(None);
     };
-    if strict_import {
+    if import_test_pause {
         import_test_pause_before_secure_open()?;
     }
-    match open_provider_file_for_capture(adapter, path, strict_import) {
+    match open_provider_file_for_capture(adapter, path, require_pinned_open) {
         Ok(Some((file, source_id))) => {
             let authorized = AuthorizedTranscriptFile { file };
             // DR-01/ADR-DR-13: preparation consumes the exact pinned
             // descriptor. It cannot reopen a path that may have been swapped
             // after authorization.
-            if let Some(preparer) = adapter.as_transcript_preparer()
-                && let Err(err) =
-                    preparer.prepare_transcript(ctx, authorized.descriptor(), preparation_deadline)
+            if run_preparer
+                && let Some(preparer) = adapter.as_transcript_preparer()
+                && preparer
+                    .prepare_transcript(ctx, authorized.descriptor(), preparation_deadline)
+                    .is_err()
             {
-                tracing::warn!(error = %format!("{err:#}"), "transcript preparer failed; continuing");
+                tracing::warn!(
+                    reason = "transcript_preparer_failed",
+                    "transcript preparer failed; continuing"
+                );
             }
             Ok(Some(TranscriptSource::File {
                 file: authorized,
@@ -920,6 +1086,55 @@ fn resolve_transcript_source_with_policy(
     }
 }
 
+/// Resolve a live source while preserving the distinction between absence and
+/// a rejected path. The returned classification remains deliberately narrow:
+/// callers must not recover or persist the original locator.
+fn resolve_transcript_source_classified_with_policy(
+    adapter: &dyn ObservedAgent,
+    ctx: &AgentSessionCtx,
+    require_pinned_open: bool,
+    import_test_pause: bool,
+    preparation_deadline: Option<std::time::Instant>,
+    run_preparer: bool,
+) -> Result<TranscriptSourceResolution> {
+    let Some(path) = ctx.transcript_path.as_deref() else {
+        return Ok(TranscriptSourceResolution::Absent);
+    };
+
+    // Classify an explicitly supplied path before secure opening. `try_exists`
+    // is only diagnostic classification; authorization and opening still occur
+    // through the descriptor-pinned resolver below.
+    match path.try_exists() {
+        Ok(false) => return Ok(TranscriptSourceResolution::Absent),
+        Ok(true) => {}
+        Err(error) => return Err(error).context("inspect transcript source candidate"),
+    }
+    if !transcript_path_within_provider_root(adapter, path) {
+        return Ok(TranscriptSourceResolution::Untrusted);
+    }
+
+    match resolve_transcript_source_with_policy(
+        adapter,
+        ctx,
+        require_pinned_open,
+        import_test_pause,
+        preparation_deadline,
+        run_preparer,
+    ) {
+        Ok(Some(source)) => Ok(TranscriptSourceResolution::Authorized(source)),
+        // A present path that could not be opened beneath the lexical
+        // provider root is untrusted (for example, an outside symlink whose
+        // canonical target points back inside the root). Recheck only to
+        // preserve the absent classification for a genuine remove race.
+        Ok(None) => match path.try_exists() {
+            Ok(true) => Ok(TranscriptSourceResolution::Untrusted),
+            Ok(false) => Ok(TranscriptSourceResolution::Absent),
+            Err(error) => Err(error).context("recheck transcript source after secure open"),
+        },
+        Err(error) => Err(error),
+    }
+}
+
 /// Resolve a source for existing live hook capture. Unix receives the same
 /// descriptor-relative no-follow protection as import; other platforms keep
 /// the prior canonical-path compatibility behavior.
@@ -927,7 +1142,37 @@ pub fn resolve_transcript_source(
     adapter: &dyn ObservedAgent,
     ctx: &AgentSessionCtx,
 ) -> Result<Option<TranscriptSource>> {
-    resolve_transcript_source_with_policy(adapter, ctx, false, None)
+    resolve_transcript_source_with_policy(adapter, ctx, false, false, None, true)
+}
+
+/// Resolve one live source with a cooperative preparation deadline and a
+/// classified safe outcome.
+///
+/// Live capture deliberately takes the same strict descriptor-pinned path as
+/// historical import.  The former compatibility branch on non-Unix platforms
+/// canonicalized a path and then re-opened it, which let a pathname swap turn
+/// a successfully checked provider source into an arbitrary file.  A platform
+/// without an equivalent no-follow handle walk therefore yields a safe
+/// read-error/partial snapshot instead of weakening the authorization claim.
+/// This is crate-private because only capture services should need to
+/// distinguish rejected from absent sources.
+pub(crate) fn resolve_live_transcript_source_until(
+    adapter: &dyn ObservedAgent,
+    ctx: &AgentSessionCtx,
+    deadline: Option<std::time::Instant>,
+) -> Result<TranscriptSourceResolution> {
+    // A deadline-bound live snapshot passes its held descriptor to the
+    // killable helper, which owns Claude's flush preparation and raw read.
+    // The synchronous compatibility path retains the historical in-process
+    // preparer because it never crosses the descriptor helper boundary.
+    resolve_transcript_source_classified_with_policy(
+        adapter,
+        ctx,
+        true,
+        false,
+        deadline,
+        deadline.is_none(),
+    )
 }
 
 /// Resolve a historical-import source. Platforms without an equivalent to
@@ -937,7 +1182,7 @@ pub fn resolve_import_transcript_source(
     adapter: &dyn ObservedAgent,
     ctx: &AgentSessionCtx,
 ) -> Result<Option<TranscriptSource>> {
-    resolve_transcript_source_with_policy(adapter, ctx, true, None)
+    resolve_transcript_source_with_policy(adapter, ctx, true, true, None, true)
 }
 
 pub(crate) fn resolve_import_transcript_source_until(
@@ -945,7 +1190,7 @@ pub(crate) fn resolve_import_transcript_source_until(
     ctx: &AgentSessionCtx,
     deadline: std::time::Instant,
 ) -> Result<Option<TranscriptSource>> {
-    resolve_transcript_source_with_policy(adapter, ctx, true, Some(deadline))
+    resolve_transcript_source_with_policy(adapter, ctx, true, true, Some(deadline), true)
 }
 
 #[cfg(test)]
@@ -958,6 +1203,25 @@ mod tests {
     use crate::internal::ai::observed_agents::{
         AgentKind, builtin::ClaudeCodeObservedAgent, capability::TranscriptPreparer,
     };
+
+    #[test]
+    fn authorized_source_debug_omits_session_digest_and_path() {
+        let bytes = b"unique-transcript-debug-marker";
+        let authorization = ExportAuthorized::issue("claude_code", "private-session-marker", bytes);
+        let debug = format!("{authorization:?}");
+        assert!(!debug.contains("private-session-marker"));
+        assert!(!debug.contains(&authorization.content_digest));
+        assert!(debug.contains("<redacted>"));
+
+        let file = tempfile::NamedTempFile::new().expect("create authorized source fixture");
+        let path = file.path().display().to_string();
+        let authorized = AuthorizedTranscriptFile {
+            file: file.reopen().expect("reopen fixture"),
+        };
+        let debug = format!("{authorized:?}");
+        assert!(!debug.contains(&path));
+        assert!(debug.contains("<descriptor>"));
+    }
 
     #[derive(Default)]
     struct CountingPreparer {
@@ -1000,7 +1264,7 @@ mod tests {
 
     /// RAII guard that points `LIBRA_TEST_HOME` at `path` and restores the
     /// prior value on drop. Env mutation is `unsafe` and the tests carry
-    /// `#[serial]` so it cannot race other env readers.
+    /// `#[serial(env)]` so it cannot race other env readers.
     fn test_ctx(path: Option<PathBuf>) -> AgentSessionCtx {
         AgentSessionCtx {
             session_id: "claude_code__t".to_string(),
@@ -1048,6 +1312,29 @@ mod tests {
             resolve_transcript_source(adapter, &test_ctx(None))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn transcript_preparer_failure_telemetry_is_content_free() {
+        let production = include_str!("transcript_source.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("transcript-source test module delimiter exists");
+        let resolver = production
+            .split("fn resolve_transcript_source_with_policy(")
+            .nth(1)
+            .and_then(|entry| {
+                entry
+                    .split("/// Resolve a source for existing live hook capture.")
+                    .next()
+            })
+            .expect("transcript source resolver exists");
+        assert!(
+            resolver.contains("reason = \"transcript_preparer_failed\"")
+                && !resolver.contains("error = %")
+                && !resolver.contains("format!(\"{err:#}\")"),
+            "preparer failure telemetry must use a fixed reason, not an error chain that can contain source data"
         );
     }
 
@@ -1105,6 +1392,70 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial(env)]
+    fn live_resolution_classifies_outside_symlink_into_root_as_untrusted() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(home.path());
+        let trusted = make_claude_transcript(home.path(), "s.jsonl", b"trusted");
+        let outside_link = outside.path().join("alias.jsonl");
+        std::os::unix::fs::symlink(&trusted, &outside_link).unwrap();
+        let agent = ClaudeCodeObservedAgent::new();
+
+        let resolution =
+            resolve_live_transcript_source_until(&agent, &test_ctx(Some(outside_link)), None)
+                .unwrap();
+
+        assert!(matches!(resolution, TranscriptSourceResolution::Untrusted));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial(env)]
+    fn secure_import_accepts_the_fixed_tmp_system_alias() {
+        // `/tmp` is an OS-owned symlink to `/private/tmp` on macOS. The
+        // provider root and candidate path use its lexical form here so this
+        // exercises normalization before the no-follow descriptor walk.
+        let fixture = tempfile::Builder::new()
+            .prefix("libra-transcript-tmp-alias-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let real_home = fixture.path().join("home");
+        let real_path = make_claude_transcript(&real_home, "s.jsonl", b"trusted");
+        let relative = real_path.strip_prefix(&real_home).unwrap();
+        let alias_home = Path::new("/tmp")
+            .join(fixture.path().file_name().unwrap())
+            .join("home");
+        let alias_path = alias_home.join(relative);
+        let _guard = HomeGuard::set(&alias_home);
+        let agent = ClaudeCodeObservedAgent::new();
+
+        assert!(
+            open_provider_directory_for_discovery(
+                &agent,
+                &alias_home.join(".claude").join("projects").join("proj"),
+            )
+            .unwrap()
+            .is_some(),
+            "the fixed /tmp alias must remain available for secure discovery"
+        );
+
+        let source = resolve_import_transcript_source(&agent, &test_ctx(Some(alias_path)))
+            .unwrap()
+            .expect("the fixed /tmp alias must remain an authorized provider root");
+        match source {
+            TranscriptSource::File { mut file, .. } => {
+                assert_eq!(
+                    file.read_bounded(TRANSCRIPT_READ_HARD_CAP_BYTES).unwrap(),
+                    b"trusted"
+                );
+            }
+            _ => panic!("expected File source"),
+        }
+    }
+
     // On Unix a held descriptor keeps reading the original inode even after the
     // path is unlinked and replaced, so a post-authorization symlink/path swap
     // cannot change the bytes the writer reads (the TOCTOU invariant).
@@ -1133,6 +1484,39 @@ mod tests {
             }
             _ => panic!("expected File source"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(env)]
+    fn secure_open_pause_rechecks_a_swapped_source_without_env() {
+        let home = tempfile::tempdir().expect("create provider-root fixture");
+        let outside = tempfile::tempdir().expect("create outside-source fixture");
+        let _guard = HomeGuard::set(home.path());
+        let path = make_claude_transcript(home.path(), "pre-open-swap.jsonl", b"ORIGINAL");
+        let outside_source = outside.path().join("outside.jsonl");
+        std::fs::write(&outside_source, b"OUTSIDE").expect("write outside source");
+        let (reached, resume, _pause_reset) = test_support::install_secure_open_pause();
+        let worker_path = path.clone();
+
+        let worker = std::thread::spawn(move || {
+            let agent = ClaudeCodeObservedAgent::new();
+            resolve_import_transcript_source(&agent, &test_ctx(Some(worker_path)))
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("secure open must pause after authorizing the test seam");
+
+        std::fs::remove_file(&path).expect("remove checked source");
+        std::os::unix::fs::symlink(&outside_source, &path)
+            .expect("replace checked source with symlink");
+        resume.send(()).expect("resume protected open");
+
+        let result = worker.join().expect("join secure-open worker");
+        assert!(
+            result.is_err(),
+            "descriptor-relative no-follow open must reject a source swapped after the pause"
+        );
     }
 
     #[cfg(unix)]
@@ -1192,7 +1576,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[serial(env)]
     fn pinned_provider_directory_survives_root_rename_and_symlink_swap() {
         let container = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

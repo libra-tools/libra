@@ -1,18 +1,23 @@
-# Session Capture decision
+# Session Capture lifecycle decision
 
-AgentTraces ingest (`ingest_agent_traces_payload_with_scope`) asks
-`session_capture::decide` for two facts: the SQLite `agent_session.state`
-string, and whether the existing committed or subagent checkpoint writer
-should run. `decide` is a pure match over `LifecycleEventKind`. It does not
-open a repository, read a transcript, or call `transition_phase`.
+AgentTraces ingress lowers every trusted hook to `LifecycleEvent`, then asks
+`ai::capture::state::reduce_lifecycle` for the durable `agent_session.state`,
+terminal timestamp mutation, revision expectation, and checkpoint action.
+The reducer is pure: it accepts the current durable state, event id, injected
+time/deadline, and `LifecycleEventKind`; it does not open a repository, read a
+transcript, or call `transition_phase`.
 
-`repo_path == None` still skips checkpoint writes after the decision returns
-`Committed` or `SubagentBoundary`. Owner filtering for `SessionStart` and
-`TurnStart`, and the `stopped_at` column, stay in `runtime.rs`. Import,
-`libra agent session` stop/resume, and the coverage gate write state on
-their own paths and do not call `decide`.
+缺少 `repo_path` 绝不允许绕过需要 checkpoint 的终态 action：coordinator 会保留
+content-free、可重放的 pending-finalize receipt，而不会写入 `stopped` 或伪造
+checkpoint。只有后续具备已验证 repository scope 的重放实际得到耐久 checkpoint
+并完成 receipt，终态才可发布。Owner filtering、scope binding 和 durable catalog
+adapter remain outside the reducer. Import and explicit `libra agent session
+resume` retain their entry-specific semantics; consumers must use the complete
+terminal predicate (`state='stopped'` plus a non-null `stopped_at`), never the
+state string alone.
 
-AgentTraces 的 session_state 与 checkpoint 类别只来自 session_capture::decide。
-transition_phase 只服务 HookTarget::AiIntent 的 session_phase，本文件不修改它。
-decide 不读取 SessionPhase，也不复制 Entire 的 git session 存储。
-本计划不编辑 docs/development/tracing/agent.md。
+AgentTraces 的 session_state 与 checkpoint 类别只来自
+`capture::state::reduce_lifecycle`。`transition_phase` 仅服务
+`HookTarget::AiIntent` 的旧 session metadata 兼容投影；它不是 AgentTraces
+的 durable state machine。该 reducer 不读取 `SessionPhase`，也不复制 Entire
+的 git session 存储。

@@ -1546,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_colorize_match_basic() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);
@@ -1561,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_colorize_match_regex_highlights_full_match() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);
@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn test_colorize_match_case_insensitive() {
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);

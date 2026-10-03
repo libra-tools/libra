@@ -3,15 +3,25 @@
 //! rewriting provider transcripts. There is no `promote --as-intent`
 //! surface: captured sessions stay on the observation path.
 
-use clap::{Args, Subcommand};
-use sea_orm::{ConnectionTrait, Statement};
-use serde::Serialize;
+use std::{
+    io::{Read, Write},
+    path::Path,
+};
 
-use super::checkpoint::{
-    PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit,
+use clap::{Args, Subcommand};
+use sea_orm::{ConnectionTrait, QueryResult, Statement};
+use serde::Serialize;
+use tempfile::NamedTempFile;
+
+use super::{
+    capture_source::{DerivedTranscriptSource, resolve_derived_transcript_source},
+    checkpoint::{PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit},
 };
 use crate::{
-    internal::{ai::observed_agents::AgentKind, db::get_db_conn_instance},
+    internal::{
+        ai::observed_agents::{AgentKind, TRANSCRIPT_READ_HARD_CAP_BYTES},
+        db::get_db_conn_instance,
+    },
     utils::{
         error::{CliError, CliResult},
         output::{OutputConfig, emit_json_data},
@@ -63,7 +73,9 @@ pub struct SessionShowArgs {
     /// `agent_session.session_id` of the session to inspect (from `libra agent session list`)
     #[arg(value_name = "SESSION_ID")]
     pub session_id: String,
-    /// Materialise the captured transcript at the given path (Phase 2)
+    /// Copy the currently verified Claude Code transcript source to a new
+    /// path; extraction never overwrites an existing file, has no
+    /// captured-metadata-path fallback, and may be unavailable.
     #[arg(long, value_name = "PATH")]
     pub extract_transcript: Option<String>,
 }
@@ -185,9 +197,43 @@ struct SessionMutationOutput {
 
 #[derive(Debug, Serialize)]
 struct TranscriptExtraction {
-    source_path: String,
     output_path: String,
     bytes: u64,
+}
+
+/// JSON result emitted only when a transcript extraction was requested.
+/// Keep the extraction projection narrow: the derived provider source is an
+/// implementation detail and must never become part of the CLI contract.
+#[derive(Debug, Serialize)]
+struct SessionTranscriptExtractionOutput {
+    session: SessionRow,
+    extracted_transcript: TranscriptExtraction,
+}
+
+fn decode_session_show_text(
+    row: &QueryResult,
+    column: &str,
+    requested_session_id: &str,
+) -> CliResult<String> {
+    row.try_get_by::<String, _>(column).map_err(|error| {
+        CliError::fatal(format!(
+            "agent_session.{column} for '{requested_session_id}' could not be decoded as TEXT: {error}; \
+             repair the captured session record before retrying"
+        ))
+    })
+}
+
+fn decode_session_show_i64(
+    row: &QueryResult,
+    column: &str,
+    requested_session_id: &str,
+) -> CliResult<i64> {
+    row.try_get_by::<i64, _>(column).map_err(|error| {
+        CliError::fatal(format!(
+            "agent_session.{column} for '{requested_session_id}' could not be decoded as INTEGER: {error}; \
+             repair the captured session record before retrying"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,45 +258,111 @@ impl SessionMutationKind {
     }
 }
 
-fn extract_transcript_from_metadata(
-    metadata_json: &str,
+/// Copy a transcript only after deriving and securely opening its
+/// provider-native source from durable capture identity.  In particular, do
+/// not use a legacy `metadata_json.transcript_path`: it originated in an
+/// untrusted hook envelope and is not authority for a later operator command.
+fn extract_transcript_from_capture_identity(
+    agent_kind: &str,
+    session_id: &str,
+    working_dir: &str,
+    provider_session_id: &str,
     output_path: &str,
 ) -> CliResult<TranscriptExtraction> {
-    let metadata: serde_json::Value = serde_json::from_str(metadata_json).map_err(|e| {
+    let source = match resolve_derived_transcript_source(
+        agent_kind,
+        session_id,
+        working_dir,
+        provider_session_id,
+    ) {
+        Ok(DerivedTranscriptSource::Available(source)) => source,
+        Ok(DerivedTranscriptSource::UnsupportedKind) => {
+            return Err(CliError::fatal(
+                "this captured agent does not have a verified provider transcript source; \
+                 extraction currently supports Claude Code sessions",
+            ));
+        }
+        Ok(DerivedTranscriptSource::Unavailable) => {
+            return Err(CliError::fatal(
+                "no verified provider transcript source is available for this captured session; \
+                 the provider may have removed the local transcript",
+            ));
+        }
+        Err(_) => {
+            return Err(CliError::fatal(
+                "could not securely derive the provider transcript source; verify the \
+                 captured working directory and provider session",
+            ));
+        }
+    };
+    let mut source_file = source.file.into_rewound_inner().map_err(|_| {
+        CliError::fatal(
+            "could not read the verified provider transcript source; the provider source may no longer be available",
+        )
+    })?;
+    let output = std::path::PathBuf::from(output_path);
+    let output_parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_parent).map_err(|e| {
         CliError::fatal(format!(
-            "captured session metadata_json is not valid JSON; cannot extract transcript: {e}"
+            "failed to create transcript output directory '{}': {e}",
+            output_parent.display()
         ))
     })?;
-    let source = metadata
-        .get("transcript_path")
-        .and_then(|value| value.as_str())
-        .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| {
-            CliError::fatal(
-                "captured session metadata_json does not contain transcript_path; cannot extract transcript",
-            )
-        })?;
-    let source_path = std::path::PathBuf::from(source);
-    let output = std::path::PathBuf::from(output_path);
-    if let Some(parent) = output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CliError::fatal(format!(
-                "failed to create transcript output directory '{}': {e}",
-                parent.display()
-            ))
-        })?;
-    }
-    let bytes = std::fs::copy(&source_path, &output).map_err(|e| {
+    // Stage beside the requested destination and publish with no-clobber
+    // semantics. Opening the destination with `File::create` would truncate
+    // the provider source when the operator supplied that path (or an alias)
+    // as the extraction target. A no-clobber publish is also race-safe: an
+    // entry materializing after this check cannot be replaced by us.
+    let mut output_file = NamedTempFile::new_in(output_parent).map_err(|e| {
         CliError::fatal(format!(
-            "failed to copy transcript from '{}' to '{}': {e}",
-            source_path.display(),
+            "failed to stage transcript output in '{}': {e}",
+            output_parent.display()
+        ))
+    })?;
+    // Keep this raw-copy exception inside the same hard read cap as capture
+    // ingestion. Reading one byte past the cap makes an oversize source fail
+    // rather than silently truncating it; the staged file is dropped without
+    // publication on that error path.
+    let bytes = std::io::copy(
+        &mut Read::by_ref(&mut source_file).take(TRANSCRIPT_READ_HARD_CAP_BYTES.saturating_add(1)),
+        &mut output_file,
+    )
+    .map_err(|e| {
+        CliError::fatal(format!(
+            "failed to stage verified transcript source for '{}': {e}",
             output.display()
         ))
     })?;
+    if bytes > TRANSCRIPT_READ_HARD_CAP_BYTES {
+        return Err(CliError::fatal(format!(
+            "verified provider transcript exceeds the {} MiB extraction limit; no output was published",
+            TRANSCRIPT_READ_HARD_CAP_BYTES / (1024 * 1024)
+        )));
+    }
+    output_file.flush().map_err(|e| {
+        CliError::fatal(format!(
+            "failed to flush transcript output '{}': {e}",
+            output.display()
+        ))
+    })?;
+    output_file.persist_noclobber(&output).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            CliError::fatal(format!(
+                "refusing to overwrite existing transcript output '{}'; choose a new path",
+                output.display()
+            ))
+        } else {
+            CliError::fatal(format!(
+                "failed to publish transcript output '{}': {}",
+                output.display(),
+                error.error
+            ))
+        }
+    })?;
     Ok(TranscriptExtraction {
-        source_path: source_path.display().to_string(),
         output_path: output.display().to_string(),
         bytes,
     })
@@ -399,7 +511,8 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
 
     let stmt = Statement::from_sql_and_values(
         backend,
-        "SELECT session_id, agent_kind, state, working_dir, started_at, last_event_at, \
+        "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
+                started_at, last_event_at, \
                 COALESCE(metadata_json, '{}') AS metadata_json \
          FROM agent_session WHERE session_id = ? LIMIT 1",
         [args.session_id.clone().into()],
@@ -410,57 +523,54 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
     match row {
         Some(row) => {
-            let metadata_json = row
-                .try_get_by::<String, _>("metadata_json")
-                .unwrap_or_else(|_| "{}".to_string());
+            let metadata_json = decode_session_show_text(&row, "metadata_json", &args.session_id)?;
             let capture = capture_diagnostic_from_metadata(&metadata_json);
+            let session_id = decode_session_show_text(&row, "session_id", &args.session_id)?;
+            let agent_kind = decode_session_show_text(&row, "agent_kind", &args.session_id)?;
+            let provider_session_id =
+                decode_session_show_text(&row, "provider_session_id", &args.session_id)?;
+            let working_dir = decode_session_show_text(&row, "working_dir", &args.session_id)?;
             let payload = SessionRow {
-                session_id: row
-                    .try_get_by::<String, _>("session_id")
-                    .unwrap_or_default(),
-                agent_kind: row
-                    .try_get_by::<String, _>("agent_kind")
-                    .unwrap_or_default(),
-                state: row.try_get_by::<String, _>("state").unwrap_or_default(),
-                working_dir: row
-                    .try_get_by::<String, _>("working_dir")
-                    .unwrap_or_default(),
-                started_at: row.try_get_by::<i64, _>("started_at").unwrap_or_default(),
-                last_event_at: row
-                    .try_get_by::<i64, _>("last_event_at")
-                    .unwrap_or_default(),
+                session_id: session_id.clone(),
+                agent_kind: agent_kind.clone(),
+                state: decode_session_show_text(&row, "state", &args.session_id)?,
+                working_dir: working_dir.clone(),
+                started_at: decode_session_show_i64(&row, "started_at", &args.session_id)?,
+                last_event_at: decode_session_show_i64(&row, "last_event_at", &args.session_id)?,
                 capture_status: capture.status,
                 capture_error_code: capture.error_code,
                 capture_error_stage: capture.error_stage,
                 capture_failed_at: capture.failed_at,
             };
             let transcript = if let Some(path) = args.extract_transcript.as_deref() {
-                let metadata_json = row.try_get_by::<String, _>("metadata_json").map_err(|e| {
-                    CliError::fatal(format!(
-                        "agent_session.metadata_json for '{}' could not be decoded as TEXT: {e}",
-                        args.session_id
-                    ))
-                })?;
-                Some(extract_transcript_from_metadata(&metadata_json, path)?)
+                Some(extract_transcript_from_capture_identity(
+                    &agent_kind,
+                    &session_id,
+                    &working_dir,
+                    &provider_session_id,
+                    path,
+                )?)
             } else {
                 None
             };
-            if output.is_json() && transcript.is_some() {
+            if output.is_json()
+                && let Some(transcript) = transcript
+            {
                 return emit_json_data(
                     "agent_session",
-                    &serde_json::json!({
-                        "session": payload,
-                        "extracted_transcript": transcript,
-                    }),
+                    &SessionTranscriptExtractionOutput {
+                        session: payload,
+                        extracted_transcript: transcript,
+                    },
                     output,
                 );
             }
             emit_one(&payload, output)?;
             if let Some(transcript) = transcript
                 && !output.quiet
+                && !output.is_json()
             {
                 println!("transcript     : {}", transcript.output_path);
-                println!("transcript_src : {}", transcript.source_path);
                 println!("transcript_len : {} bytes", transcript.bytes);
             }
             Ok(())
@@ -820,6 +930,33 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
 mod tests {
     use super::*;
 
+    struct TestHomeGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl TestHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let prior = std::env::var_os("LIBRA_TEST_HOME");
+            // SAFETY: test-only process environment mutation, restored by
+            // Drop; the test holds the named serial env lane.
+            unsafe { std::env::set_var("LIBRA_TEST_HOME", path) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for TestHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with `set`; restore the ambient value before
+            // releasing the serial env lane.
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var("LIBRA_TEST_HOME", value),
+                    None => std::env::remove_var("LIBRA_TEST_HOME"),
+                }
+            }
+        }
+    }
+
     /// §C.4.1.1 fail-closed witness (W4 review): lifecycle mutations refuse
     /// (a) `legacy_unknown` rows — excluded from every new write until
     /// explicitly adopted — and (b) rows another worktree scope owns. Both
@@ -1135,25 +1272,111 @@ mod tests {
     }
 
     #[test]
-    fn agent_session_extract_transcript_copies_metadata_path() {
+    #[serial_test::serial(env)]
+    fn agent_session_extract_transcript_copies_derived_claude_source_ignoring_metadata_pointer() {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("captured.jsonl");
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let _home = TestHomeGuard::set(&home);
+        let working_dir = dir.path().join("workspace");
+        std::fs::create_dir(&working_dir).unwrap();
+        let source_dir = crate::internal::ai::observed_agents::claude_session_dir(&working_dir)
+            .expect("LIBRA_TEST_HOME provides a Claude session directory");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("provider-session.jsonl");
         let output = dir.path().join("nested").join("copy.jsonl");
         std::fs::write(&source, "{\"type\":\"message\"}\n").unwrap();
-        let metadata = serde_json::json!({
-            "transcript_path": source,
-        })
-        .to_string();
+        let forged_pointer = dir.path().join("unrelated.jsonl");
+        std::fs::write(&forged_pointer, "{\"type\":\"forged\"}\n").unwrap();
 
-        let result =
-            extract_transcript_from_metadata(&metadata, output.to_string_lossy().as_ref()).unwrap();
+        let result = extract_transcript_from_capture_identity(
+            "claude_code",
+            "claude__provider-session",
+            working_dir.to_string_lossy().as_ref(),
+            "provider-session",
+            output.to_string_lossy().as_ref(),
+        )
+        .unwrap();
 
         assert_eq!(result.bytes, 19);
-        assert_eq!(result.source_path, source.display().to_string());
         assert_eq!(result.output_path, output.display().to_string());
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             "{\"type\":\"message\"}\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(forged_pointer).unwrap(),
+            "{\"type\":\"forged\"}\n",
+            "a legacy metadata pointer must never supply extraction bytes"
+        );
+
+        let oversized_source = source_dir.join("oversized-provider-session.jsonl");
+        std::fs::write(&oversized_source, b"x").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&oversized_source)
+            .unwrap()
+            .set_len(TRANSCRIPT_READ_HARD_CAP_BYTES.saturating_add(1))
+            .unwrap();
+        let oversized_output = dir.path().join("oversized-copy.jsonl");
+        let error = extract_transcript_from_capture_identity(
+            "claude_code",
+            "claude__oversized-provider-session",
+            working_dir.to_string_lossy().as_ref(),
+            "oversized-provider-session",
+            oversized_output.to_string_lossy().as_ref(),
+        )
+        .expect_err("oversized extraction must be rejected");
+        assert!(
+            error.to_string().contains("16 MiB extraction limit"),
+            "oversize error must explain the bounded extraction contract: {error}"
+        );
+        assert!(
+            !oversized_output.exists(),
+            "oversized extraction must not publish a partial output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env)]
+    fn agent_session_extract_transcript_refuses_existing_source_aliases_without_mutation() {
+        let dir = tempfile::tempdir().expect("create extraction fixture directory");
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).expect("create extraction fixture home");
+        let _home = TestHomeGuard::set(&home);
+        let working_dir = dir.path().join("workspace");
+        std::fs::create_dir(&working_dir).expect("create extraction fixture workspace");
+        let source_dir = crate::internal::ai::observed_agents::claude_session_dir(&working_dir)
+            .expect("LIBRA_TEST_HOME provides a Claude session directory");
+        std::fs::create_dir_all(&source_dir).expect("create Claude source directory");
+        let source = source_dir.join("provider-session.jsonl");
+        let source_bytes = b"{\"type\":\"message\"}\n";
+        std::fs::write(&source, source_bytes).expect("write provider source");
+        let hard_link = dir.path().join("source-hard-link.jsonl");
+        std::fs::hard_link(&source, &hard_link).expect("create source hard link");
+        let symlink = dir.path().join("source-symlink.jsonl");
+        std::os::unix::fs::symlink(&source, &symlink).expect("create source symlink");
+
+        for output in [&source, &hard_link, &symlink] {
+            let error = extract_transcript_from_capture_identity(
+                "claude_code",
+                "claude__provider-session",
+                working_dir.to_string_lossy().as_ref(),
+                "provider-session",
+                output.to_string_lossy().as_ref(),
+            )
+            .expect_err("existing source alias must never be overwritten");
+            assert!(
+                error.to_string().contains("refusing to overwrite"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(&source).expect("read preserved provider source"),
+                source_bytes,
+                "output alias '{}' must not truncate the provider source",
+                output.display()
+            );
+        }
     }
 }

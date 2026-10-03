@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(env)]
+    #[serial(env, warning_tracker)]
     fn lenient_read_warns_exactly_once_per_process() {
         use crate::utils::output::{reset_warning_tracker, warning_was_emitted};
         let (_dir, _env) = scoped_home();

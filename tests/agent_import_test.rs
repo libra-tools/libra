@@ -15,7 +15,9 @@ use libra::{
         ai::{
             agent_import::restore_tombstone,
             history::{HistoryManager, TracesInflightMarker, write_traces_inflight_marker},
-            observed_agents::AgentKind,
+            observed_agents::{
+                AgentKind, normalize_claude_transcript, redact_turns, safe_turn_projection,
+            },
         },
         branch::TRACES_BRANCH,
     },
@@ -70,19 +72,20 @@ impl ImportRepo {
         self.command().args(args).output().expect("run libra")
     }
 
-    fn run_with_env(&self, args: &[&str], key: &str, value: &str) -> Output {
-        self.command()
-            .env(key, value)
-            .args(args)
-            .output()
-            .expect("run libra with test env")
+    fn session_end_hook(&self, session_id: &str, transcript_path: &Path) -> Output {
+        self.session_end_hook_from_cwd(&self.repo, session_id, transcript_path)
     }
 
-    fn session_end_hook(&self, session_id: &str, transcript_path: &Path) -> Output {
+    fn session_end_hook_from_cwd(
+        &self,
+        cwd: &Path,
+        session_id: &str,
+        transcript_path: &Path,
+    ) -> Output {
         let envelope = json!({
             "hook_event_name": "SessionEnd",
             "session_id": session_id,
-            "cwd": self.repo.to_string_lossy(),
+            "cwd": cwd.to_string_lossy(),
             "transcript_path": transcript_path.to_string_lossy(),
         })
         .to_string();
@@ -111,9 +114,8 @@ impl ImportRepo {
             .join(format!("{session_id}.jsonl"))
     }
 
-    fn discoverable_transcript_path(&self, session_id: &str) -> PathBuf {
-        let slug = self
-            .repo
+    fn discoverable_transcript_path_for_cwd(&self, session_id: &str, cwd: &Path) -> PathBuf {
+        let slug = cwd
             .to_string_lossy()
             .chars()
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
@@ -123,6 +125,10 @@ impl ImportRepo {
             .join("projects")
             .join(slug)
             .join(format!("{session_id}.jsonl"))
+    }
+
+    fn discoverable_transcript_path(&self, session_id: &str) -> PathBuf {
+        self.discoverable_transcript_path_for_cwd(session_id, &self.repo)
     }
 
     fn write_transcript(&self, session_id: &str, cwd: &Path, complete: bool) -> PathBuf {
@@ -170,8 +176,12 @@ impl ImportRepo {
     }
 
     fn write_discoverable_transcript(&self, session_id: &str, cwd: &Path) -> PathBuf {
+        self.write_discoverable_transcript_for_cwd(session_id, cwd)
+    }
+
+    fn write_discoverable_transcript_for_cwd(&self, session_id: &str, cwd: &Path) -> PathBuf {
         let source = self.write_transcript(session_id, cwd, true);
-        let destination = self.discoverable_transcript_path(session_id);
+        let destination = self.discoverable_transcript_path_for_cwd(session_id, cwd);
         std::fs::create_dir_all(destination.parent().expect("discovery parent"))
             .expect("create discovery dir");
         std::fs::rename(source, &destination).expect("move transcript into discovery dir");
@@ -403,6 +413,49 @@ fn agent_import_explicit_session_accepts_safe_legacy_claude_identifier() {
     );
 }
 
+#[test]
+fn agent_import_deduplicates_equivalent_transcript_working_directories() {
+    let fixture = ImportRepo::init();
+    let session_id = "cwd-alias-import";
+    let transcript = fixture.discoverable_transcript_path(session_id);
+    std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+        .expect("create provider transcript directory");
+    let alias = fixture.repo.join(".");
+    let body = [
+        json!({
+            "type": "user", "uuid": "turn-1", "sessionId": session_id,
+            "cwd": fixture.repo, "message": {"role": "user", "content": "inspect"}
+        }),
+        json!({
+            "type": "assistant", "uuid": "answer-1", "sessionId": session_id,
+            "cwd": alias,
+            "message": {"role": "assistant", "content": [{"type":"text", "text":"done"}]}
+        }),
+        json!({"type": "session_end", "sessionId": session_id, "cwd": fixture.repo}),
+    ]
+    .into_iter()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(&transcript, format!("{body}\n")).expect("write alias transcript");
+
+    let output = fixture.run(&[
+        "agent",
+        "import",
+        "--session",
+        session_id,
+        "--agent",
+        "claude-code",
+        "--yes",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "equivalent canonical transcript cwd spellings must import: {}",
+        describe(&output)
+    );
+}
+
 fn tree_entry_oid(tree: &[u8], wanted: &str) -> String {
     let mut cursor = 0usize;
     while cursor < tree.len() {
@@ -533,13 +586,391 @@ async fn agent_import_derives_working_dir_and_is_idempotent() {
     );
 }
 
+/// ACF-08: the post-consent importer must cross the same bounded snapshot
+/// boundary as live capture before it normalizes or persists any source
+/// evidence. The durable checkpoint carries only the safe projection, not a
+/// path or raw transcript.
+#[tokio::test]
+async fn import_uses_capture_foundation_services() {
+    let fixture = ImportRepo::init();
+    let session_id = "capture-foundation-import";
+    let transcript = fixture.write_transcript(session_id, &fixture.repo, true);
+    let imported = fixture.run(&[
+        "agent",
+        "import",
+        "--path",
+        path_arg(&transcript).as_str(),
+        "--agent",
+        "claude-code",
+        "--yes",
+        "--json",
+    ]);
+    assert!(imported.status.success(), "import: {}", describe(&imported));
+
+    let db = Database::connect(format!(
+        "sqlite://{}?mode=ro",
+        fixture.repo.join(".libra/libra.db").display()
+    ))
+    .await
+    .expect("open capture-foundation db");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT checkpoint_id, tree_oid FROM agent_checkpoint \
+             WHERE session_id = 'claude__capture-foundation-import'"
+                .to_string(),
+        ))
+        .await
+        .expect("query import checkpoint")
+        .expect("import checkpoint");
+    let checkpoint_id: String = row.try_get_by("checkpoint_id").expect("checkpoint id");
+    let tree_oid: String = row.try_get_by("tree_oid").expect("checkpoint tree");
+    db.close().await.expect("close capture-foundation db");
+
+    let metadata: Value = serde_json::from_slice(&read_checkpoint_blob(
+        &fixture.repo.join(".libra"),
+        &tree_oid,
+        &checkpoint_id,
+        &["metadata.json"],
+    ))
+    .expect("parse import checkpoint metadata");
+    let snapshot = &metadata["transcript_snapshot"];
+    assert_eq!(snapshot["completeness"], "complete");
+    assert_eq!(snapshot["source"]["kind"], "trusted_export");
+    assert!(
+        snapshot["source"]["digest_sha256"]
+            .as_str()
+            .is_some_and(|digest| {
+                digest.strip_prefix("source/hmac-v2/").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                })
+            }),
+        "imported snapshot must retain only a repository-keyed HMAC v2 commitment: {snapshot}"
+    );
+    assert_eq!(
+        snapshot["source"]["identity"], "not_retained:v1",
+        "snapshot identity must not retain a correlating provider source key"
+    );
+    assert_eq!(metadata["redaction_report"]["snapshot_redaction"], true);
+    let metadata_text = metadata.to_string();
+    assert!(
+        !metadata_text.contains("AKIAAAAAAAAAAAAAAAAA"),
+        "the snapshot projection or report retained a raw source secret"
+    );
+}
+
+/// Load the single checkpoint row a parity phase expects for `session_id`.
+async fn sole_checkpoint(fixture: &ImportRepo, session_id: &str) -> (String, String) {
+    let rows = fixture
+        .text_rows(
+            &format!(
+                "SELECT checkpoint_id || ' ' || tree_oid AS row FROM agent_checkpoint \
+                 WHERE session_id = '{session_id}'"
+            ),
+            "row",
+        )
+        .await;
+    assert_eq!(rows.len(), 1, "expected exactly one checkpoint: {rows:?}");
+    let (checkpoint_id, tree_oid) = rows[0].split_once(' ').expect("checkpoint id and tree oid");
+    (checkpoint_id.to_string(), tree_oid.to_string())
+}
+
+/// The content-bearing roles of one checkpoint tree.
+struct CheckpointContent {
+    metadata: Value,
+    transcript: Vec<u8>,
+    redaction_report: Value,
+}
+
+fn checkpoint_content(
+    fixture: &ImportRepo,
+    (checkpoint_id, tree_oid): &(String, String),
+) -> CheckpointContent {
+    let storage = fixture.repo.join(".libra");
+    let read = |path: &[&str]| read_checkpoint_blob(&storage, tree_oid, checkpoint_id, path);
+    CheckpointContent {
+        metadata: serde_json::from_slice(&read(&["metadata.json"]))
+            .expect("parse checkpoint metadata"),
+        transcript: read(&["transcript", "claude_code.jsonl"]),
+        redaction_report: serde_json::from_slice(&read(&["redaction_report.json"]))
+            .expect("parse checkpoint redaction report"),
+    }
+}
+
+/// ACF-08 parity pin (AC3): identical transcript bytes captured live and
+/// through `agent import` commit the same exact-source digest, snapshot
+/// redaction projection and checkpoint content.
+///
+/// Phase 1 replays the import over the live capture: coverage recognizes the
+/// turn, writes no second checkpoint, and the session-level projection keeps
+/// the live digest.
+///
+/// Phase 2 erases the live session and imports the same bytes through the
+/// audited restore path, so both entries write a checkpoint tree under one
+/// repository key. Entry metadata (source kind, ids, timestamps, channel, the
+/// lifecycle events and therefore `content_hash.txt`, which covers them) is
+/// excluded; every content role is compared. The transcript role is typed by
+/// provenance: live persists the exact redacted snapshot, import persists the
+/// allowlisted per-turn projection derived from that same snapshot
+/// (`CheckpointRedactedPayload::from_derived_turn_projection`). The import
+/// blob must therefore be byte-for-byte the projection of the live blob, and
+/// both entries must commit the same coverage-v1 content digest.
+#[tokio::test]
+async fn live_and_import_snapshot_hashes_match() {
+    const SESSION: &str = "claude__capture-foundation-parity";
+    let fixture = ImportRepo::init();
+    let session_id = "capture-foundation-parity";
+    let transcript = fixture.write_discoverable_transcript(session_id, &fixture.repo);
+    let live = fixture.session_end_hook(session_id, &transcript);
+    assert!(live.status.success(), "live hook: {}", describe(&live));
+
+    let live_checkpoint = sole_checkpoint(&fixture, SESSION).await;
+    let live_content = checkpoint_content(&fixture, &live_checkpoint);
+    let live_snapshot = &live_content.metadata["transcript_snapshot"];
+    assert_eq!(live_snapshot["source"]["kind"], "provider_file");
+    assert_eq!(live_snapshot["completeness"], "complete");
+    let live_claims = fixture
+        .text_rows(
+            "SELECT logical_turn_key || ' ' || coverage_digest || ' ' || completeness AS claim \
+             FROM agent_coverage_claim WHERE state = 'catalog_committed' \
+             ORDER BY logical_turn_key",
+            "claim",
+        )
+        .await;
+    assert!(
+        !live_claims.is_empty(),
+        "live capture committed no coverage"
+    );
+
+    let import_args = |restore: bool| {
+        let mut args = vec![
+            "agent".to_string(),
+            "import".to_string(),
+            "--path".to_string(),
+            path_arg(&transcript),
+            "--agent".to_string(),
+            "claude-code".to_string(),
+            "--yes".to_string(),
+            "--json".to_string(),
+        ];
+        if restore {
+            args.push("--restore-erased".to_string());
+        }
+        args
+    };
+    let covered = fixture
+        .command()
+        .args(import_args(false))
+        .output()
+        .expect("run covered import");
+    assert!(
+        covered.status.success(),
+        "covered import: {}",
+        describe(&covered)
+    );
+    assert_eq!(
+        fixture
+            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
+            .await,
+        1,
+        "the import must reuse the live coverage claim rather than write another checkpoint"
+    );
+    let session_metadata = fixture
+        .text_rows(
+            &format!("SELECT metadata_json FROM agent_session WHERE session_id = '{SESSION}'"),
+            "metadata_json",
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("imported session metadata");
+    let session_metadata: Value =
+        serde_json::from_str(&session_metadata).expect("parse imported session metadata");
+    let session_snapshot = &session_metadata["transcript_snapshot"];
+    assert_eq!(session_snapshot["source"]["kind"], "trusted_export");
+    for field in [
+        "completeness",
+        "transcript_redacted_bytes",
+        "redaction_match_count",
+        "redaction_bytes_scanned",
+        "redaction_bytes_redacted",
+    ] {
+        assert_eq!(
+            session_snapshot[field], live_snapshot[field],
+            "snapshot projection field {field} drifted between live and import"
+        );
+    }
+    assert_eq!(
+        session_snapshot["source"]["digest_sha256"], live_snapshot["source"]["digest_sha256"],
+        "the shared snapshot service must commit the same exact-source digest"
+    );
+
+    // Phase 2: remove the live evidence (checkpoint, catalog, coverage) and
+    // import the same bytes again so the import writes its own tree.
+    let conn = Database::connect(format!(
+        "sqlite://{}",
+        fixture.repo.join(".libra/libra.db").display()
+    ))
+    .await
+    .expect("open writable repo db");
+    let libra_dir = fixture.repo.join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+        libra_dir,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let erased = history
+        .erase_session_local(SESSION)
+        .await
+        .expect("erase live session");
+    assert!(erased.session_deleted);
+    drop(history);
+    conn.close().await.expect("close writable repo db");
+
+    let restored = fixture
+        .command()
+        .args(import_args(true))
+        .output()
+        .expect("run restored import");
+    assert!(
+        restored.status.success(),
+        "restored import: {}",
+        describe(&restored)
+    );
+    let restored_json: Value = serde_json::from_slice(&restored.stdout).expect("import JSON");
+    assert_eq!(restored_json["data"]["results"][0]["status"], "imported");
+    let import_checkpoint = sole_checkpoint(&fixture, SESSION).await;
+    assert_ne!(
+        import_checkpoint.0, live_checkpoint.0,
+        "the restored import must write its own checkpoint tree"
+    );
+    let import_content = checkpoint_content(&fixture, &import_checkpoint);
+
+    // Source digest and snapshot projection: only the entry's source kind
+    // differs (provider file versus the importer's trusted handoff).
+    let mut live_projection = live_snapshot.clone();
+    let mut import_projection = import_content.metadata["transcript_snapshot"].clone();
+    assert_eq!(import_projection["source"]["kind"], "trusted_export");
+    for projection in [&mut live_projection, &mut import_projection] {
+        projection["source"]
+            .as_object_mut()
+            .expect("snapshot source object")
+            .remove("kind");
+    }
+    assert_eq!(
+        import_projection, live_projection,
+        "checkpoint snapshot projections (digest, sizes, redaction counts) drifted"
+    );
+
+    // Transcript role: the import blob is exactly the allowlisted projection
+    // of the live exact-snapshot blob, turn by turn.
+    let mut derived_turns = normalize_claude_transcript(&live_content.transcript);
+    redact_turns(&mut derived_turns);
+    assert_eq!(derived_turns.len(), 1, "fixture holds one logical turn");
+    let mut derived_blob =
+        serde_json::to_vec(&safe_turn_projection("claude_code", &derived_turns[0]))
+            .expect("serialize derived projection");
+    derived_blob.push(b'\n');
+    assert!(
+        import_content.transcript == derived_blob,
+        "import transcript blob is not the projection of the live snapshot blob: import={} derived={}",
+        String::from_utf8_lossy(&import_content.transcript),
+        String::from_utf8_lossy(&derived_blob),
+    );
+
+    // Coverage-v1 content digest: both entries commit the digest of the turn
+    // derived from the live checkpoint's transcript bytes.
+    let derived_claims = derived_turns
+        .iter()
+        .map(|turn| format!("{} {} complete", turn.logical_turn_key, turn.digest_hex()))
+        .collect::<Vec<_>>();
+    assert_eq!(live_claims, derived_claims, "live coverage digest drifted");
+    let import_claims = fixture
+        .text_rows(
+            "SELECT logical_turn_key || ' ' || coverage_digest || ' ' || completeness AS claim \
+             FROM agent_coverage_claim WHERE state = 'catalog_committed' \
+             AND source_channel = 'import' ORDER BY logical_turn_key",
+            "claim",
+        )
+        .await;
+    assert_eq!(import_claims, live_claims, "import coverage digest drifted");
+
+    // Redaction report: the same snapshot-stage matches and redacted byte
+    // count. Import additionally records its typed-field pass and pipeline
+    // markers, so its scanned-byte total may only grow.
+    for key in ["matches", "bytes_redacted"] {
+        assert_eq!(
+            import_content.redaction_report[key], live_content.redaction_report[key],
+            "redaction report {key} drifted between live and import"
+        );
+        assert_eq!(
+            import_content.metadata["redaction_report"][key],
+            live_content.metadata["redaction_report"][key],
+            "metadata redaction report {key} drifted between live and import"
+        );
+    }
+    assert!(
+        live_content.redaction_report["matches"]
+            .as_array()
+            .is_some_and(|matches| !matches.is_empty()),
+        "the fixture secret must produce a snapshot redaction match"
+    );
+    let scanned = |report: &Value| report["bytes_scanned"].as_u64().expect("bytes scanned");
+    assert_eq!(
+        scanned(&live_content.redaction_report),
+        live_snapshot["redaction_bytes_scanned"]
+            .as_u64()
+            .expect("snapshot bytes scanned")
+    );
+    assert!(scanned(&import_content.redaction_report) >= scanned(&live_content.redaction_report));
+    let extra_keys = import_content
+        .redaction_report
+        .as_object()
+        .expect("import report object")
+        .keys()
+        .filter(|key| live_content.redaction_report.get(key.as_str()).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        extra_keys,
+        ["pipeline", "raw_persisted", "snapshot_redaction"],
+        "import redaction report gained an undocumented divergence"
+    );
+    for content in [&live_content, &import_content] {
+        assert!(
+            !String::from_utf8_lossy(&content.transcript).contains("AKIAAAAAAAAAAAAAAAAA"),
+            "a checkpoint transcript retained the raw fixture secret"
+        );
+    }
+}
+
 #[tokio::test]
 async fn agent_import_skips_live_covered_turn_and_merges_terminal_lifecycle() {
     let fixture = ImportRepo::init();
     let session_id = "live-covered-import";
-    let transcript = fixture.write_transcript(session_id, &fixture.repo, true);
+    // Live capture deliberately ignores the envelope transcript pointer and
+    // resolves only the provider-root-derived path. Use that discoverable
+    // source so this is a real live/import coverage-dedup contract.
+    let transcript = fixture.write_discoverable_transcript(session_id, &fixture.repo);
     let live = fixture.session_end_hook(session_id, &transcript);
     assert!(live.status.success(), "live hook: {}", describe(&live));
+    assert_eq!(
+        fixture
+            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_claim")
+            .await,
+        1,
+        "the live side of a cross-channel dedup test must have an authorized coverage claim"
+    );
+    let live_coverage_digest = fixture
+        .text_rows(
+            "SELECT coverage_digest FROM agent_coverage_claim ORDER BY logical_turn_key",
+            "coverage_digest",
+        )
+        .await;
     let transcript_arg = path_arg(&transcript);
 
     let imported = fixture.run(&[
@@ -577,6 +1008,16 @@ async fn agent_import_skips_live_covered_turn_and_merges_terminal_lifecycle() {
     assert_eq!(
         fixture
             .text_rows(
+                "SELECT coverage_digest FROM agent_coverage_claim ORDER BY logical_turn_key",
+                "coverage_digest",
+            )
+            .await,
+        live_coverage_digest,
+        "the import must compare against the same canonical redacted coverage digest as live"
+    );
+    assert_eq!(
+        fixture
+            .text_rows(
                 "SELECT state FROM agent_session WHERE provider_session_id = 'live-covered-import'",
                 "state"
             )
@@ -590,7 +1031,10 @@ async fn agent_import_skips_live_covered_turn_and_merges_terminal_lifecycle() {
 async fn agent_import_commit_before_live_hook_has_one_defined_revision() {
     let fixture = ImportRepo::init();
     let session_id = "import-before-live";
-    let transcript = fixture.write_transcript(session_id, &fixture.repo, true);
+    // The subsequent live hook must read the same provider-root-derived
+    // source that the explicit import consumed; an envelope pointer alone is
+    // intentionally never an authorized live transcript capability.
+    let transcript = fixture.write_discoverable_transcript(session_id, &fixture.repo);
     let imported = fixture.run(&[
         "agent",
         "import",
@@ -602,6 +1046,19 @@ async fn agent_import_commit_before_live_hook_has_one_defined_revision() {
         "--json",
     ]);
     assert!(imported.status.success(), "import: {}", describe(&imported));
+    let import_coverage_digest = fixture
+        .text_rows(
+            "SELECT coverage_digest FROM agent_coverage_claim ORDER BY logical_turn_key",
+            "coverage_digest",
+        )
+        .await;
+    let import_stopped_at = fixture
+        .text_rows(
+            "SELECT CAST(stopped_at AS TEXT) AS stopped_at FROM agent_session \
+             WHERE provider_session_id = 'import-before-live'",
+            "stopped_at",
+        )
+        .await;
 
     let live = fixture.session_end_hook(session_id, &transcript);
     assert!(
@@ -626,12 +1083,53 @@ async fn agent_import_commit_before_live_hook_has_one_defined_revision() {
     assert_eq!(
         fixture
             .text_rows(
+                "SELECT coverage_digest FROM agent_coverage_claim ORDER BY logical_turn_key",
+                "coverage_digest",
+            )
+            .await,
+        import_coverage_digest,
+        "the live hook must compare against the same canonical redacted coverage digest as import"
+    );
+    assert_eq!(
+        fixture
+            .text_rows(
                 "SELECT state FROM agent_session WHERE provider_session_id = 'import-before-live'",
                 "state"
             )
             .await,
         vec!["stopped"],
         "a covered live replay must not regress terminal session state"
+    );
+    assert_eq!(
+        fixture
+            .text_rows(
+                "SELECT CAST(stopped_at AS TEXT) AS stopped_at FROM agent_session \
+                 WHERE provider_session_id = 'import-before-live'",
+                "stopped_at",
+            )
+            .await,
+        import_stopped_at,
+        "a covered live replay must not re-publish the terminal timestamp"
+    );
+    let session_metadata = fixture
+        .text_rows(
+            "SELECT metadata_json FROM agent_session \
+             WHERE provider_session_id = 'import-before-live'",
+            "metadata_json",
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("captured session metadata");
+    let metadata: Value = serde_json::from_str(&session_metadata).expect("parse session metadata");
+    let receipts = metadata["capture_catalog_receipts_v1"]["entries"]
+        .as_array()
+        .expect("capture receipt ledger entries");
+    assert!(
+        receipts
+            .iter()
+            .all(|receipt| receipt["status"] == "complete"),
+        "covered live replay must settle its catalog receipt rather than leave finalizer work pending"
     );
 }
 
@@ -823,6 +1321,7 @@ async fn agent_import_same_digest_terminal_upgrade_writes_complete_schema_valid_
         for key in [
             "schema_version",
             "event_id",
+            "identity_scheme",
             "kind",
             "agent_kind",
             "session_id",
@@ -836,6 +1335,8 @@ async fn agent_import_same_digest_terminal_upgrade_writes_complete_schema_valid_
         }
         uuid::Uuid::parse_str(event["event_id"].as_str().expect("event id string"))
             .expect("event id UUID");
+        assert_eq!(event["schema_version"], 2);
+        assert_eq!(event["identity_scheme"], "import_uuid_v5");
         assert_eq!(event["partial"], false);
     }
 
@@ -1186,7 +1687,7 @@ async fn agent_import_duplicate_provider_turn_ids_do_not_silently_drop_turns() {
 }
 
 #[tokio::test]
-async fn agent_import_activity_after_old_session_end_reopens_incomplete_session() {
+async fn import_reactivation_consumer_contract_v1() {
     let fixture = ImportRepo::init();
     let session_id = "resumed-after-end";
     let transcript = fixture.transcript_path(session_id);
@@ -1235,6 +1736,12 @@ async fn agent_import_activity_after_old_session_end_reopens_incomplete_session(
         vec!["stopped"],
         "the first import must establish the terminal lifecycle being reopened"
     );
+    let terminal_sync_revision = fixture
+        .scalar(
+            "SELECT sync_revision AS n FROM agent_session \
+             WHERE provider_session_id = 'resumed-after-end'",
+        )
+        .await;
 
     let mut resumed = std::fs::OpenOptions::new()
         .append(true)
@@ -1270,6 +1777,16 @@ async fn agent_import_activity_after_old_session_end_reopens_incomplete_session(
             .await,
         1,
         "a reopened active session must clear its obsolete stopped timestamp"
+    );
+    assert!(
+        fixture
+            .scalar(
+                "SELECT sync_revision AS n FROM agent_session \
+                 WHERE provider_session_id = 'resumed-after-end'",
+            )
+            .await
+            > terminal_sync_revision,
+        "a newer historical nonterminal tail must advance the consumer revision"
     );
     assert_eq!(
         fixture
@@ -1535,7 +2052,8 @@ async fn agent_import_reuses_same_repository_live_session_from_subdirectory() {
     let fixture = ImportRepo::init();
     let subdir = fixture.repo.join("nested/work");
     std::fs::create_dir_all(&subdir).expect("create repo subdir");
-    let transcript = fixture.write_transcript("subdir123", &subdir, true);
+    let subdir = subdir.canonicalize().expect("canonical subdir");
+    let transcript = fixture.write_discoverable_transcript_for_cwd("subdir123", &subdir);
     let repo_id = fixture.repo_id().await;
     let db_url = format!(
         "sqlite://{}",
@@ -1556,16 +2074,18 @@ async fn agent_import_reuses_same_repository_live_session_from_subdirectory() {
     .expect("seed live session");
     conn.close().await.expect("close db");
 
-    let output = fixture.run(&[
+    let transcript_arg = path_arg(&transcript);
+    let args = [
         "agent",
         "import",
         "--path",
-        path_arg(&transcript).as_str(),
+        transcript_arg.as_str(),
         "--agent",
         "claude-code",
         "--yes",
         "--json",
-    ]);
+    ];
+    let output = fixture.run(&args);
     assert!(
         output.status.success(),
         "subdir import: {}",
@@ -1575,15 +2095,160 @@ async fn agent_import_reuses_same_repository_live_session_from_subdirectory() {
         fixture
             .text_rows("SELECT working_dir FROM agent_session", "working_dir")
             .await,
-        vec![
-            fixture
+        vec![subdir.to_string_lossy().into_owned()]
+    );
+
+    let replay = fixture.run(&args);
+    assert!(
+        replay.status.success(),
+        "subdir import replay: {}",
+        describe(&replay)
+    );
+
+    let live = fixture.session_end_hook_from_cwd(&subdir, "subdir123", &transcript);
+    assert!(
+        live.status.success(),
+        "live hook after subdirectory adoption: {}",
+        describe(&live)
+    );
+    assert_eq!(
+        fixture
+            .text_rows("SELECT working_dir FROM agent_session", "working_dir")
+            .await,
+        vec![subdir.to_string_lossy().into_owned()],
+        "historical import must retain the verified live cwd for later hooks"
+    );
+}
+
+/// A matching repository storage identity permits a live session rooted in a
+/// subdirectory, but no import may adopt the same provider id from a different
+/// durable capture scope.  This protects the catalog transaction-bound import
+/// prepare seam from becoming a weaker replacement for `CaptureScope`.
+#[tokio::test]
+async fn agent_import_refuses_mismatched_catalog_scope_and_fence() {
+    let provider_session_id = "foreign-scope-import";
+    for label in ["repo_id", "worktree_id", "scope_state", "workspace_fence"] {
+        let fixture = ImportRepo::init();
+        let transcript = fixture.write_transcript(provider_session_id, &fixture.repo, true);
+        let repo_id = fixture.repo_id().await;
+        let (case_repo_id, worktree_id, workspace_id, workspace_fence, scope_state): (
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            &str,
+        ) = match label {
+            "repo_id" => (
+                "foreign-repo".to_string(),
+                String::new(),
+                None,
+                None,
+                "scoped",
+            ),
+            "worktree_id" => (
+                repo_id.clone(),
+                "foreign-worktree".to_string(),
+                None,
+                None,
+                "scoped",
+            ),
+            "scope_state" => (repo_id.clone(), String::new(), None, None, "legacy_unknown"),
+            "workspace_fence" => (
+                repo_id.clone(),
+                String::new(),
+                Some("import-scope-workspace".to_string()),
+                Some(9_i64),
+                "scoped",
+            ),
+            _ => unreachable!("fixed scope-mismatch matrix"),
+        };
+        let conn = Database::connect(format!(
+            "sqlite://{}",
+            fixture.repo.join(".libra/libra.db").display()
+        ))
+        .await
+        .expect("open repo db");
+        if label == "workspace_fence" {
+            let workspace_path = fixture
                 .repo
                 .canonicalize()
-                .unwrap()
+                .expect("canonical workspace path")
                 .to_string_lossy()
-                .into_owned()
-        ]
-    );
+                .into_owned();
+            conn.execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO workspace_record (
+                    workspace_id, repo_id, kind, worktree_id, path, owner_kind,
+                    owner_id, task_id, session_id, base_commit, branch, state,
+                    lease_owner, lease_fence, lease_expires_at, created_at, updated_at
+                 ) VALUES (?, ?, 'task_copy', NULL, ?, 'agent', 'scope-test',
+                           NULL, NULL, NULL, NULL, 'active', 'scope-test-owner',
+                           8, 9999999999999, 1, 1)",
+                [
+                    workspace_id
+                        .clone()
+                        .expect("fence case has a matching workspace id")
+                        .into(),
+                    repo_id.clone().into(),
+                    workspace_path.into(),
+                ],
+            ))
+            .await
+            .expect("seed current workspace fence");
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at, schema_version,
+                repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             ) VALUES (?, 'claude_code', ?, 'active', ?, '{}', '{}', 1, 1, 1,
+                       ?, ?, ?, ?, ?)",
+            [
+                "claude__foreign-scope-import".into(),
+                provider_session_id.into(),
+                fixture.repo.to_string_lossy().into_owned().into(),
+                case_repo_id.into(),
+                worktree_id.into(),
+                workspace_id.into(),
+                workspace_fence.into(),
+                scope_state.into(),
+            ],
+        ))
+        .await
+        .expect("seed foreign catalog scope");
+        conn.close().await.expect("close seeded db");
+
+        let output = fixture.run(&[
+            "agent",
+            "import",
+            "--path",
+            path_arg(&transcript).as_str(),
+            "--agent",
+            "claude-code",
+            "--yes",
+            "--json",
+        ]);
+        assert!(
+            !output.status.success(),
+            "import unexpectedly adopted {label} mismatch: {}",
+            describe(&output)
+        );
+        assert_eq!(
+            fixture
+                .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
+                .await,
+            0,
+            "{label} mismatch must fail before a checkpoint is durable"
+        );
+        assert_eq!(
+            fixture
+                .scalar("SELECT COUNT(*) AS n FROM agent_import_identity")
+                .await,
+            0,
+            "{label} mismatch must fail before an import lease is durable"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1773,16 +2438,6 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
         "initial import: {}",
         describe(&imported)
     );
-    let imported_fingerprint = fixture
-        .text_rows(
-            "SELECT json_extract(metadata_json, '$.source_fingerprint') AS fingerprint
-             FROM agent_session WHERE session_id = 'claude__erase123'",
-            "fingerprint",
-        )
-        .await
-        .into_iter()
-        .next()
-        .expect("imported source fingerprint");
     let imported_sync_revision = fixture
         .scalar(
             "SELECT sync_revision AS n FROM agent_session WHERE session_id = 'claude__erase123'",
@@ -1796,6 +2451,19 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
+    let legacy_source_fingerprint = "a".repeat(64);
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET metadata_json = ? WHERE session_id = ?",
+        [
+            json!({"source_fingerprint": legacy_source_fingerprint})
+                .to_string()
+                .into(),
+            "claude__erase123".into(),
+        ],
+    ))
+    .await
+    .expect("seed legacy unkeyed source fingerprint");
     let libra_dir = fixture.repo.join(".libra");
     let history = HistoryManager::new_with_ref(
         Arc::new(ClientStorage::init(libra_dir.join("objects"))),
@@ -1822,15 +2490,22 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
             .await,
         1
     );
+    let tombstone = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT source_fingerprint FROM agent_import_tombstone \
+             WHERE agent_kind = 'claude_code' AND provider_session_id = 'erase123'"
+                .to_string(),
+        ))
+        .await
+        .expect("query erased import tombstone")
+        .expect("tombstone exists");
+    let tombstone_fingerprint: Option<String> = tombstone
+        .try_get_by("source_fingerprint")
+        .expect("decode nullable tombstone fingerprint");
     assert_eq!(
-        fixture
-            .text_rows(
-                "SELECT source_fingerprint AS fingerprint FROM agent_import_tombstone",
-                "fingerprint"
-            )
-            .await,
-        vec![imported_fingerprint],
-        "erasure must preserve the non-reversible import audit fingerprint"
+        tombstone_fingerprint, None,
+        "erasure must not copy a legacy raw/unkeyed source fingerprint from session metadata into a durable tombstone"
     );
     assert_eq!(
         fixture
@@ -1910,6 +2585,86 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
 }
 
 #[tokio::test]
+async fn agent_import_tombstone_update_clears_legacy_source_fingerprint() {
+    let fixture = ImportRepo::init();
+    let db_url = format!(
+        "sqlite://{}",
+        fixture.repo.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(db_url).await.expect("open repo db");
+    let legacy_source_fingerprint = "b".repeat(64);
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, schema_version
+         ) VALUES (?, 'claude_code', 'tombstone-update', 'stopped', ?, ?, '{}', 1, 1, 1)",
+        [
+            "claude__tombstone-update".into(),
+            fixture.repo.to_string_lossy().into_owned().into(),
+            json!({"source_fingerprint": legacy_source_fingerprint})
+                .to_string()
+                .into(),
+        ],
+    ))
+    .await
+    .expect("seed session with a legacy source fingerprint");
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_tombstone (
+            tombstone_id, agent_kind, provider_session_id, erased_session_id,
+            source_fingerprint, erased_at
+         ) VALUES (?, 'claude_code', 'tombstone-update', ?, ?, 1)",
+        [
+            "legacy-tombstone-update".into(),
+            "claude__previous-erasure".into(),
+            "c".repeat(64).into(),
+        ],
+    ))
+    .await
+    .expect("seed pre-existing legacy tombstone");
+
+    let libra_dir = fixture.repo.join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+        libra_dir,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let erased = history
+        .erase_session_local("claude__tombstone-update")
+        .await
+        .expect("erase session through the existing tombstone");
+    assert!(erased.session_deleted);
+    drop(history);
+
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT erased_session_id, source_fingerprint
+             FROM agent_import_tombstone
+             WHERE agent_kind = 'claude_code' AND provider_session_id = 'tombstone-update'"
+                .to_string(),
+        ))
+        .await
+        .expect("query updated tombstone")
+        .expect("updated tombstone exists");
+    assert_eq!(
+        row.try_get_by::<String, _>("erased_session_id")
+            .expect("decode erased session id"),
+        "claude__tombstone-update",
+        "the existing anti-resurrection barrier must continue to track the newly erased session"
+    );
+    let fingerprint: Option<String> = row
+        .try_get_by("source_fingerprint")
+        .expect("decode nullable tombstone fingerprint");
+    assert_eq!(
+        fingerprint, None,
+        "updating an existing tombstone must clear, not retain, a legacy unkeyed source fingerprint"
+    );
+}
+
+#[tokio::test]
 async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
     let fixture = ImportRepo::init();
     let db_url = format!(
@@ -1954,11 +2709,32 @@ async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
 }
 
 #[tokio::test]
-async fn import_intermediate_erasure_tombstone_reaches_exact_fence_when_recheck_fails() {
+async fn import_of_a_shortened_source_releases_all_claim_leases() {
     let fixture = ImportRepo::init();
-    let transcript = fixture.write_discoverable_transcript("erasure-midphase", &fixture.repo);
+    let session_id = "shortened-source";
+    let transcript = fixture.transcript_path(session_id);
+    std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+        .expect("create transcript directory");
+    let source = [
+        json!({
+            "type": "user", "uuid": "shortened-turn",
+            "sessionId": session_id, "cwd": fixture.repo,
+            "message": {"role": "user", "content": "question"}
+        }),
+        json!({
+            "type": "assistant", "uuid": "shortened-answer",
+            "sessionId": session_id, "cwd": fixture.repo,
+            "message": {"role": "assistant", "content": "answer"}
+        }),
+        json!({"type": "session_end", "sessionId": session_id, "cwd": fixture.repo}),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(&transcript, format!("{source}\n")).expect("write shortened transcript");
     let transcript_arg = path_arg(&transcript);
-    let args = [
+    let output = fixture.run(&[
         "agent",
         "import",
         "--path",
@@ -1967,643 +2743,39 @@ async fn import_intermediate_erasure_tombstone_reaches_exact_fence_when_recheck_
         "claude-code",
         "--yes",
         "--json",
-    ];
-    let first = fixture.run(&args);
-    assert!(first.status.success(), "{}", describe(&first));
-
-    let barrier_ready = fixture._tmp.path().join("midphase-barrier-ready");
-    let barrier_resume = fixture._tmp.path().join("midphase-barrier-resume");
-    let replay = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_INDEX_BARRIER_READY_FILE", &barrier_ready)
-        .env(
-            "LIBRA_TEST_IMPORT_INDEX_BARRIER_CONTINUE_FILE",
-            &barrier_resume,
-        )
-        .env("LIBRA_TEST_IMPORT_INDEX_TOMBSTONE_LOOKUP_FAIL", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("spawn replay at index barrier");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !barrier_ready.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        barrier_ready.exists(),
-        "replay did not acquire index barrier"
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url).await.expect("open repo db");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "INSERT INTO agent_import_tombstone (
-            tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
-         ) VALUES (
-            't-erasure-midphase', 'claude_code', 'erasure-midphase',
-            'claude__erasure-midphase', 1
-         )"
-        .to_string(),
-    ))
-    .await
-    .expect("seed committed tombstone before catalog deletion");
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_session
-                 WHERE session_id = 'claude__erasure-midphase'"
-            )
-            .await,
-        1,
-        "the regression requires erasure's tombstone-committed/catalog-retained window"
-    );
-
-    std::fs::write(&barrier_resume, b"continue").expect("resume tombstoned replay");
-    let replay = replay
-        .wait_with_output()
-        .expect("wait for tombstoned replay");
-    assert!(!replay.status.success(), "replay unexpectedly succeeded");
-    assert!(
-        String::from_utf8_lossy(&replay.stderr).contains("LBR-AGENT-019"),
-        "the in-transaction exact fence must establish erasure even when the advisory recheck fails: {}",
-        describe(&replay)
-    );
-}
-
-#[tokio::test]
-async fn agent_import_crash_recovery_never_double_appends() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("crash123", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-
-    let before_objects = fixture.run_with_env(&args, "LIBRA_TEST_IMPORT_FAILPOINT", "after_bind");
-    assert!(!before_objects.status.success());
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
+    ]);
+    assert!(output.status.success(), "import: {}", describe(&output));
     assert_eq!(
         fixture
             .scalar(
                 "SELECT COUNT(*) AS n FROM agent_coverage_claim \
-                 WHERE state = 'reserved_import'"
-            )
-            .await,
-        1
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE agent_import_identity SET lease_expires_at = 0".to_string(),
-    ))
-    .await
-    .expect("expire crashed identity lease");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE agent_coverage_claim SET lease_expires_at = 0".to_string(),
-    ))
-    .await
-    .expect("expire crashed coverage lease");
-    drop(conn);
-
-    let recovered = fixture.run(&args);
-    assert!(
-        recovered.status.success(),
-        "recover bound attempt: {}",
-        describe(&recovered)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        1
-    );
-
-    let committed_but_unreported = fixture.write_transcript("crash456", &fixture.repo, true);
-    let committed_arg = path_arg(&committed_but_unreported);
-    let committed_args = [
-        "agent",
-        "import",
-        "--path",
-        committed_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let failed_report = fixture.run_with_env(
-        &committed_args,
-        "LIBRA_TEST_IMPORT_FAILPOINT",
-        "after_catalog_commit",
-    );
-    assert!(!failed_report.status.success());
-    let failed_stderr = String::from_utf8_lossy(&failed_report.stderr);
-    assert!(
-        failed_stderr.contains("\"checkpoints_written\": 1"),
-        "durable progress must be reported exactly: {}",
-        describe(&failed_report)
-    );
-    assert!(
-        failed_stderr.contains("\"succeeded\": 0")
-            && failed_stderr.contains("\"partial\": 1")
-            && failed_stderr.contains("\"partial_results\""),
-        "one failed selection with durable progress must not be counted as a success: {}",
-        describe(&failed_report)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        2
-    );
-
-    let replay = fixture.run(&committed_args);
-    assert!(
-        replay.status.success(),
-        "replay committed attempt: {}",
-        describe(&replay)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        2,
-        "catalog-committed crash replay must not append a duplicate"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_concurrent_recovery_appends_exactly_once() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("concurrent-recovery", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let ready = fixture._tmp.path().join("concurrent-import-ready");
-    let resume = fixture._tmp.path().join("concurrent-import-resume");
-    let first = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_BEFORE_BIND_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_BEFORE_BIND_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("spawn first importer");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "first importer did not reserve its claims");
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    for sql in [
-        "UPDATE agent_import_identity SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE agent_coverage_claim SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.lease_expires_at', 0)
-         WHERE scope = 'agent_import_index_repair'",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            sql.to_string(),
-        ))
-        .await
-        .expect("expire first importer lease");
-    }
-    drop(conn);
-
-    let recovered = fixture.run(&args);
-    assert!(
-        recovered.status.success(),
-        "takeover importer: {}",
-        describe(&recovered)
-    );
-    std::fs::write(&resume, b"continue").expect("resume fenced importer");
-    let stale = first.wait_with_output().expect("wait for fenced importer");
-    assert!(
-        !stale.status.success(),
-        "fenced importer unexpectedly reported success: {}",
-        describe(&stale)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        1,
-        "concurrent takeover must append one checkpoint"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_revision")
-            .await,
-        1,
-        "concurrent takeover must publish one coverage revision"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_import_identity
-                 WHERE state = 'committed' AND owner IS NULL"
-            )
-            .await,
-        1,
-        "the winning importer must finalize the shared identity"
-    );
-}
-
-#[tokio::test]
-async fn concurrent_import_loser_cannot_clear_winners_index_barrier() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("index-barrier-race", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let ready = fixture._tmp.path().join("index-barrier-ready");
-    let resume = fixture._tmp.path().join("index-barrier-resume");
-    let first = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_INDEX_BARRIER_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_INDEX_BARRIER_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("spawn index-barrier owner");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        ready.exists(),
-        "first importer did not acquire index barrier"
-    );
-    let before = fixture
-        .text_rows(
-            "SELECT value FROM metadata_kv
-             WHERE scope = 'agent_import_index_repair'
-               AND target = 'claude__index-barrier-race'",
-            "value",
-        )
-        .await;
-    assert_eq!(before.len(), 1);
-
-    let loser = fixture.run(&args);
-    assert!(
-        !loser.status.success(),
-        "losing importer: {}",
-        describe(&loser)
-    );
-    let after = fixture
-        .text_rows(
-            "SELECT value FROM metadata_kv
-             WHERE scope = 'agent_import_index_repair'
-               AND target = 'claude__index-barrier-race'",
-            "value",
-        )
-        .await;
-    assert_eq!(
-        after, before,
-        "a lease-losing process must not overwrite or retire the active writer's barrier"
-    );
-
-    std::fs::write(&resume, b"continue").expect("resume index-barrier owner");
-    let winner = first
-        .wait_with_output()
-        .expect("wait for index-barrier owner");
-    assert!(
-        winner.status.success(),
-        "winning importer: {}",
-        describe(&winner)
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_import_index_repair'
-                   AND target = 'claude__index-barrier-race'"
-            )
-            .await,
-        0,
-        "only the owning generation may retire the completed barrier"
-    );
-}
-
-#[tokio::test]
-async fn crashed_provisional_session_is_reaped_after_takeover_fails_without_progress() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("provisional-crash", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let crashed = fixture.run_with_env(&args, "LIBRA_TEST_IMPORT_FAILPOINT", "after_bind");
-    assert!(!crashed.status.success(), "crash failpoint did not fire");
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE agent_import_identity SET lease_expires_at = 0".to_string(),
-    ))
-    .await
-    .expect("expire crashed identity lease");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE agent_coverage_claim SET lease_expires_at = 0".to_string(),
-    ))
-    .await
-    .expect("expire crashed coverage lease");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "CREATE TRIGGER reject_recovered_marker
-         BEFORE UPDATE OF value ON metadata_kv
-         WHEN OLD.scope = 'agent_traces_inflight'
-         BEGIN
-             SELECT RAISE(ABORT, 'test recovered marker failure');
-         END"
-        .to_string(),
-    ))
-    .await
-    .expect("reject takeover marker");
-    drop(conn);
-
-    let retry = fixture.run(&args);
-    assert!(
-        !retry.status.success(),
-        "failing takeover unexpectedly passed"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "a recovered zero-progress provisional session became permanent"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        0,
-        "failed takeover left its ordinary writer marker"
-    );
-}
-
-#[tokio::test]
-async fn crashed_import_takeover_abandons_claims_missing_from_shrunk_source() {
-    let fixture = ImportRepo::init();
-    let session_id = "shrunk-after-crash";
-    let transcript = fixture.transcript_path(session_id);
-    std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
-        .expect("create transcript directory");
-    let turn = |ordinal: usize| {
-        [
-            json!({
-                "type": "user", "uuid": format!("shrunk-turn-{ordinal}"),
-                "sessionId": session_id, "cwd": fixture.repo,
-                "timestamp": format!("2026-07-15T01:0{ordinal}:00Z"),
-                "message": {"role": "user", "content": format!("question {ordinal}")}
-            }),
-            json!({
-                "type": "assistant", "uuid": format!("shrunk-answer-{ordinal}"),
-                "sessionId": session_id, "cwd": fixture.repo,
-                "timestamp": format!("2026-07-15T01:0{ordinal}:01Z"),
-                "message": {"role": "assistant", "content": format!("answer {ordinal}")}
-            }),
-        ]
-    };
-    let first_turn = turn(0);
-    let second_turn = turn(1);
-    let full = first_turn
-        .iter()
-        .chain(second_turn.iter())
-        .map(Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&transcript, format!("{full}\n")).expect("write two-turn transcript");
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let crashed = fixture
-        .command()
-        .env("LIBRA_TEST_CHECKPOINT_CRASH_AFTER_FIRST_OBJECT", "1")
-        .args(args)
-        .output()
-        .expect("run crashed importer");
-    assert_eq!(crashed.status.code(), Some(86), "{}", describe(&crashed));
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_coverage_claim WHERE state = 'reserved_import'"
-            )
-            .await,
-        2,
-        "crash fixture must reserve both source turns before object construction"
-    );
-
-    let conn = Database::connect(format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    ))
-    .await
-    .expect("open writable repo db");
-    for sql in [
-        "UPDATE agent_import_identity SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE agent_coverage_claim SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.lease_expires_at', 0)
-         WHERE scope = 'agent_import_index_repair'",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            sql.to_string(),
-        ))
-        .await
-        .expect("expire crashed lease");
-    }
-    conn.close().await.expect("close writable db");
-
-    let shrunk = first_turn
-        .iter()
-        .map(Value::to_string)
-        .chain(std::iter::once(
-            json!({
-                "type": "session_end", "sessionId": session_id, "cwd": fixture.repo,
-                "timestamp": "2026-07-15T01:00:02Z"
-            })
-            .to_string(),
-        ))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&transcript, format!("{shrunk}\n")).expect("shrink transcript");
-    let recovered = fixture.run(&args);
-    assert!(
-        recovered.status.success(),
-        "takeover: {}",
-        describe(&recovered)
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_coverage_claim
                  WHERE state = 'reserved_import' OR owner IS NOT NULL"
             )
             .await,
         0,
-        "takeover must not strand the missing turn under the crashed owner"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_claim WHERE state = 'abandoned'")
-            .await,
-        1,
-        "the removed turn must remain explicitly abandoned and fenced"
+        "a completed import must release every claim lease"
     );
 }
 
 #[tokio::test]
-async fn crash_after_first_object_is_recovered_from_durable_attempt_ownership() {
+async fn doctor_retires_a_seeded_expired_object_writer_marker_without_deleting_objects() {
     let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("object-crash", &fixture.repo, true);
-    let objects_dir = fixture.repo.join(".libra/objects");
-    let objects_before = loose_object_file_count(&objects_dir);
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_CHECKPOINT_CRASH_AFTER_FIRST_OBJECT", "1")
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run object-construction crash probe");
-    assert_eq!(output.status.code(), Some(86), "{}", describe(&output));
-    assert!(
-        loose_object_file_count(&objects_dir) > objects_before,
-        "crash probe did not leave the first loose object"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
+    let libra_dir = fixture.repo.join(".libra");
+    let oid = libra::utils::object::write_git_object(&libra_dir, "blob", b"crash residue")
+        .expect("write crash-residue fixture object")
+        .to_string();
+    let conn = Database::connect(format!("sqlite://{}", libra_dir.join("libra.db").display()))
         .await
         .expect("open writable repo db");
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
-         WHERE scope = 'agent_traces_inflight'"
-            .to_string(),
-    ))
-    .await
-    .expect("expire crashed object owner marker");
-    let libra_dir = fixture.repo.join(".libra");
-    let history = HistoryManager::new_with_ref(
-        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-        libra_dir.clone(),
-        Arc::new(conn.clone()),
-        TRACES_BRANCH,
-    );
-    history
-        .erase_session_local("claude__object-crash")
+    let mut marker = TracesInflightMarker::new("claude__object-crash", "object-crash", 0);
+    marker.ttl_ms = 0;
+    marker.created_oids.push(oid.clone());
+    marker.cleanup_pending = true;
+    write_traces_inflight_marker(&conn, &marker)
         .await
-        .expect("erasure should not block on unrelated object reclamation");
-    assert!(
-        loose_object_file_count(&objects_dir) > objects_before,
-        "expired crash ownership must leave physical reclamation to repository GC"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        1,
-        "foreground erasure must leave full reachability cleanup to doctor/GC"
-    );
+        .expect("seed durable crash ownership marker");
+    conn.close().await.expect("close seeded marker database");
+
     let repaired = fixture.run(&["agent", "doctor", "--repair", "--json"]);
     assert!(repaired.status.success(), "{}", describe(&repaired));
     assert_eq!(
@@ -2611,500 +2783,12 @@ async fn crash_after_first_object_is_recovered_from_durable_attempt_ownership() 
             .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
             .await,
         0,
-        "doctor repair must retire the expired ownership marker"
+        "doctor repair must retire stale ownership evidence"
     );
-}
-
-#[tokio::test]
-async fn expired_object_crash_takeover_retires_marker_and_resumes_import() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("object-takeover", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let crashed = fixture
-        .command()
-        .env("LIBRA_TEST_CHECKPOINT_CRASH_AFTER_FIRST_OBJECT", "1")
-        .args(args)
-        .output()
-        .expect("run object crash probe");
-    assert_eq!(crashed.status.code(), Some(86), "{}", describe(&crashed));
-    let marker_values = fixture
-        .text_rows(
-            "SELECT value FROM metadata_kv WHERE scope = 'agent_traces_inflight'",
-            "value",
-        )
-        .await;
-    assert_eq!(marker_values.len(), 1);
-    let marker: Value = serde_json::from_str(&marker_values[0]).expect("parse crash marker");
+    let object_path = libra_dir.join("objects").join(&oid[..2]).join(&oid[2..]);
     assert!(
-        marker["created_oids"]
-            .as_array()
-            .is_some_and(|oids| !oids.is_empty()),
-        "crash marker did not persist proven-created object ownership: {marker}"
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    for sql in [
-        "UPDATE agent_import_identity SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE agent_coverage_claim SET lease_expires_at = 0 WHERE owner IS NOT NULL",
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
-         WHERE scope = 'agent_traces_inflight'",
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.lease_expires_at', 0)
-         WHERE scope = 'agent_import_index_repair'",
-    ] {
-        conn.execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            sql.to_string(),
-        ))
-        .await
-        .expect("expire crashed import lease or marker");
-    }
-    drop(conn);
-
-    let resumed = fixture.run(&args);
-    assert!(
-        resumed.status.success(),
-        "expired crash takeover failed: {}",
-        describe(&resumed)
-    );
-    assert!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await
-            > 0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        1,
-        "successful takeover must not run a full all-ref cleanup drain on the append hot path"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_import_identity WHERE state = 'committed' AND owner IS NULL"
-            )
-            .await,
-        1
-    );
-    let repaired = fixture.run(&["agent", "doctor", "--repair", "--json"]);
-    assert!(repaired.status.success(), "{}", describe(&repaired));
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        0,
-        "doctor repair must retire the superseded writer marker"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_failure_advances_only_source_ordinal_prefix() {
-    let fixture = ImportRepo::init();
-    let path = fixture.transcript_path("ordinal123");
-    std::fs::create_dir_all(path.parent().expect("transcript parent"))
-        .expect("create transcript dir");
-    let lines = [
-        json!({
-            "type": "user", "uuid": "z-turn", "sessionId": "ordinal123",
-            "cwd": fixture.repo, "message": {"role": "user", "content": "first"}
-        }),
-        json!({
-            "type": "assistant", "uuid": "z-answer", "sessionId": "ordinal123",
-            "cwd": fixture.repo, "message": {"role": "assistant", "content": "one"}
-        }),
-        json!({
-            "type": "user", "uuid": "a-turn", "sessionId": "ordinal123",
-            "cwd": fixture.repo, "message": {"role": "user", "content": "second"}
-        }),
-        json!({
-            "type": "assistant", "uuid": "a-answer", "sessionId": "ordinal123",
-            "cwd": fixture.repo, "message": {"role": "assistant", "content": "two"}
-        }),
-        json!({
-            "type": "session_end", "sessionId": "ordinal123", "cwd": fixture.repo
-        }),
-    ];
-    std::fs::write(
-        &path,
-        format!(
-            "{}\n",
-            lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    )
-    .expect("write adversarial-order transcript");
-    let output = fixture.run_with_env(
-        &[
-            "agent",
-            "import",
-            "--path",
-            path_arg(&path).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ],
-        "LIBRA_TEST_IMPORT_FAILPOINT",
-        "after_catalog_commit",
-    );
-    assert!(!output.status.success(), "failpoint did not fire");
-    assert_eq!(
-        fixture
-            .text_rows(
-                "SELECT logical_turn_key FROM agent_coverage_claim \
-                 WHERE state = 'catalog_committed'",
-                "logical_turn_key",
-            )
-            .await,
-        vec!["z-turn"],
-        "provider-key sorting must not commit source ordinal 1 before ordinal 0"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT next_ordinal AS n FROM agent_import_identity")
-            .await,
-        1,
-        "partial finalization must preserve the committed contiguous prefix"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_coverage_claim WHERE state = 'reserved_import'"
-            )
-            .await,
-        0,
-        "terminal partial progress must release every unused reservation immediately"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        0,
-        "terminal partial progress must not retain a non-cleanup marker"
-    );
-}
-
-/// ADR-DR-19 erasure-window matrix, import half: the `after_bind` probe stops
-/// after the identity and turn reservation transactions but before object
-/// construction. Erasing at that point must remove/fence every durable holder;
-/// therefore the same stale attempt cannot reach either the object-construction
-/// or final ref/catalog transaction windows, and a fresh process is rejected
-/// before it can recreate the session. The complementary object-built/final
-/// transaction interleaving is pinned by
-/// `coverage_gate::tests::tombstone_blocks_reservation_and_fences_reserved_commit`.
-#[tokio::test]
-async fn agent_erase_between_reservation_and_objects_blocks_all_later_import_windows() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("erasewindow123", &fixture.repo, true);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-
-    let stopped = fixture.run_with_env(&args, "LIBRA_TEST_IMPORT_FAILPOINT", "after_bind");
-    assert!(
-        !stopped.status.success(),
-        "failpoint did not stop: {}",
-        describe(&stopped)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_import_identity WHERE state = 'writing'")
-            .await,
-        1,
-        "identity lease must be durable before the erasure interleaving"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_coverage_claim WHERE state = 'reserved_import'"
-            )
-            .await,
-        1,
-        "turn reservation must be durable before the erasure interleaving"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0,
-        "the probe is before object/ref/catalog publication"
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    let libra_dir = fixture.repo.join(".libra");
-    let history = HistoryManager::new_with_ref(
-        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-        libra_dir,
-        Arc::new(conn.clone()),
-        TRACES_BRANCH,
-    );
-    let blocked = history
-        .erase_session_local("claude__erasewindow123")
-        .await
-        .expect_err("live pre-object marker must block an apparently empty erasure");
-    assert!(
-        format!("{blocked:#}").contains("in-flight"),
-        "unexpected erasure refusal: {blocked:#}"
-    );
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE metadata_kv
-             SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
-             WHERE scope = 'agent_traces_inflight'
-               AND target = 'claude__erasewindow123'"
-            .to_string(),
-    ))
-    .await
-    .expect("expire crashed writer marker");
-    let erased = history
-        .erase_session_local("claude__erasewindow123")
-        .await
-        .expect("erase session after crashed marker expiry");
-    assert!(erased.session_deleted);
-    drop(history);
-
-    for table in [
-        "agent_session",
-        "agent_checkpoint",
-        "agent_coverage_claim",
-        "agent_coverage_revision",
-        "agent_import_identity",
-        "agent_export_job",
-    ] {
-        assert_eq!(
-            fixture
-                .scalar(&format!("SELECT COUNT(*) AS n FROM {table}"))
-                .await,
-            0,
-            "erasure left reachable or resumable state in {table}"
-        );
-    }
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_import_tombstone")
-            .await,
-        1
-    );
-
-    let replay = fixture.run(&args);
-    assert!(!replay.status.success(), "erased import replay succeeded");
-    assert!(
-        String::from_utf8_lossy(&replay.stderr).contains("LBR-AGENT-019"),
-        "{}",
-        describe(&replay)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "post-erase parsing must not recreate the session"
-    );
-}
-
-#[tokio::test]
-async fn concurrent_erase_blocks_marked_writer_and_leaves_rejected_objects_for_gc() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("eraserace123", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("import-ready");
-    let resume = fixture._tmp.path().join("import-resume");
-    let mut command = fixture.command();
-    let child = command
-        .env("LIBRA_TEST_IMPORT_AFTER_BIND_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_AFTER_BIND_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .spawn()
-        .expect("spawn paused importer");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        ready.exists(),
-        "importer did not reach the bound-attempt window"
-    );
-
-    let objects_dir = fixture.repo.join(".libra/objects");
-    let objects_before = loose_object_file_count(&objects_dir);
-    let index_before = fixture
-        .scalar("SELECT COUNT(*) AS n FROM object_index")
-        .await;
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    let libra_dir = fixture.repo.join(".libra");
-    let history = HistoryManager::new_with_ref(
-        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-        libra_dir.clone(),
-        Arc::new(conn.clone()),
-        TRACES_BRANCH,
-    );
-    let blocked = history
-        .erase_session_local("claude__eraserace123")
-        .await
-        .expect_err("erase must not report success while its writer marker is live");
-    assert!(format!("{blocked:#}").contains("in-flight"));
-
-    std::fs::write(&resume, b"continue").expect("resume stale importer");
-    let output = child.wait_with_output().expect("wait for stale importer");
-    assert!(
-        !output.status.success(),
-        "tombstoned stale importer unexpectedly committed: {}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv \
-                 WHERE scope = 'agent_traces_inflight' \
-                   AND target = 'claude__eraserace123'"
-            )
-            .await,
-        1,
-        "rejected append must leave durable ownership for doctor/GC: {}",
-        describe(&output)
-    );
-    assert!(
-        loose_object_file_count(&objects_dir) > objects_before,
-        "rejected objects were unsafely unlinked instead of being left for repository GC"
-    );
-    assert!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM object_index")
-            .await
-            >= index_before,
-        "inline cleanup must not delete shared object_index rows"
-    );
-
-    let still_blocked = history
-        .erase_session_local("claude__eraserace123")
-        .await
-        .expect_err("fresh durable cleanup ownership must still block erasure");
-    assert!(
-        format!("{still_blocked:#}").contains("in-flight"),
-        "unexpected cleanup-pending erasure refusal: {still_blocked:#}"
-    );
-    conn.execute_raw(Statement::from_string(
-        conn.get_database_backend(),
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.started_at_ms', 0, '$.ttl_ms', 0)
-         WHERE scope = 'agent_traces_inflight'
-           AND target = 'claude__eraserace123'"
-            .to_string(),
-    ))
-    .await
-    .expect("expire rejected cleanup marker");
-    let expired_still_blocked = history
-        .erase_session_local("claude__eraserace123")
-        .await
-        .expect_err("expired durable cleanup ownership must still block erasure");
-    assert!(
-        format!("{expired_still_blocked:#}").contains("in-flight"),
-        "unexpected expired-cleanup erasure refusal: {expired_still_blocked:#}"
-    );
-    conn.execute_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "UPDATE metadata_kv
-         SET value = json_set(value, '$.started_at_ms', ?, '$.ttl_ms', 120000)
-         WHERE scope = 'agent_traces_inflight'
-           AND target = 'claude__eraserace123'",
-        [chrono::Utc::now().timestamp_millis().into()],
-    ))
-    .await
-    .expect("refresh cleanup marker TTL before doctor repair");
-    drop(history);
-    drop(conn);
-    let repaired = fixture.run(&["agent", "doctor", "--repair", "--json"]);
-    assert!(repaired.status.success(), "{}", describe(&repaired));
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_traces_inflight'
-                   AND target = 'claude__eraserace123'"
-            )
-            .await,
-        0,
-        "doctor must retire the durable rejected-object ownership marker"
-    );
-
-    let conn = Database::connect(format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    ))
-    .await
-    .expect("reopen writable repo db");
-    let history = HistoryManager::new_with_ref(
-        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-        libra_dir,
-        Arc::new(conn),
-        TRACES_BRANCH,
-    );
-    let erased = history
-        .erase_session_local("claude__eraserace123")
-        .await
-        .expect("retry erasure after doctor retires rejected ownership");
-    assert!(
-        erased.session_deleted,
-        "a fenced stale importer must leave provisional-session deletion to the erasure owner"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_import_tombstone")
-            .await,
-        1,
-        "idempotent retry lost the anti-resurrection barrier"
+        object_path.exists(),
+        "ownership retirement is non-destructive; repository GC owns loose object reclamation"
     );
 }
 
@@ -3206,54 +2890,6 @@ async fn agent_doctor_retires_marker_without_reading_fifo_cleanup_root() {
             .file_type()
             .is_fifo(),
         "non-destructive marker retirement replaced or removed the FIFO payload"
-    );
-}
-
-#[tokio::test]
-async fn agent_doctor_repair_kills_index_snapshot_helper_at_aggregate_deadline() {
-    let fixture = ImportRepo::init();
-    let conn = Database::connect(format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    ))
-    .await
-    .expect("open writable cleanup database");
-    let mut marker = TracesInflightMarker::new(
-        "claude__hung-index-snapshot",
-        "hung-index-snapshot-attempt",
-        chrono::Utc::now().timestamp_millis(),
-    );
-    marker.cleanup_pending = true;
-    write_traces_inflight_marker(&conn, &marker)
-        .await
-        .expect("seed cleanup ownership");
-    conn.close().await.expect("close cleanup database");
-
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_REJECTED_CLEANUP_DEADLINE_MS", "100")
-        .env("LIBRA_TEST_REJECTED_CLEANUP_INDEX_HELPER_DELAY_MS", "5000")
-        .args(["agent", "doctor", "--repair", "--json"])
-        .output()
-        .expect("run bounded cleanup doctor");
-    assert!(output.status.success(), "{}", describe(&output));
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "doctor did not kill its blocked filesystem helper: {}",
-        describe(&output)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("traversal deadline"),
-        "deadline failure was not actionable: {}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        1,
-        "failed root proof must retain durable cleanup ownership"
     );
 }
 
@@ -3580,73 +3216,6 @@ fn agent_import_codex_discovery_rejects_symlinked_nested_directory_pre_consent()
     assert_eq!(std::fs::read(&victim).unwrap(), b"outside");
 }
 
-#[cfg(unix)]
-#[test]
-fn agent_import_codex_session_discovery_rejects_component_swap_pre_consent() {
-    let fixture = ImportRepo::init();
-    let codex_home = fixture._tmp.path().join("codex-home-swap");
-    let sessions = codex_home.join("sessions");
-    let original_year = sessions.join("2026");
-    let original_day = original_year.join("07/15");
-    let outside_year = fixture._tmp.path().join("outside-year-swap");
-    let outside_day = outside_year.join("07/15");
-    let session_id = "123e4567-e89b-12d3-a456-426614174097";
-    std::fs::create_dir_all(&original_day).expect("create original Codex date tree");
-    std::fs::create_dir_all(&outside_day).expect("create outside Codex date tree");
-    for day in [&original_day, &outside_day] {
-        std::fs::write(
-            day.join(format!("rollout-2026-07-15T01-00-00-{session_id}.jsonl")),
-            b"outside must not be read",
-        )
-        .expect("write rollout swap fixture");
-    }
-    let ready = fixture._tmp.path().join("codex-open-ready");
-    let resume = fixture._tmp.path().join("codex-open-resume");
-    let child = fixture
-        .command()
-        .env("CODEX_HOME", &codex_home)
-        .env("LIBRA_TEST_CODEX_DISCOVERY_OPEN_READY_FILE", &ready)
-        .env("LIBRA_TEST_CODEX_DISCOVERY_OPEN_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "agent",
-            "import",
-            "--session",
-            session_id,
-            "--agent",
-            "codex",
-            "--yes",
-            "--json",
-        ])
-        .spawn()
-        .expect("spawn paused Codex session discovery");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "Codex finder did not reach its pinned open");
-
-    let moved_year = sessions.join("2026-original");
-    std::fs::rename(&original_year, &moved_year).expect("move checked Codex year");
-    std::os::unix::fs::symlink(&outside_year, &original_year)
-        .expect("replace checked year with outside symlink");
-    std::fs::write(&resume, b"continue").expect("resume Codex discovery open");
-    let output = child.wait_with_output().expect("wait for Codex discovery");
-    assert!(!output.status.success(), "{}", describe(&output));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-020"),
-        "component replacement must fail closed: {}",
-        describe(&output)
-    );
-    assert!(
-        outside_day
-            .join(format!("rollout-2026-07-15T01-00-00-{session_id}.jsonl"))
-            .exists(),
-        "outside rollout must remain untouched"
-    );
-}
-
 #[test]
 fn agent_import_codex_discovery_fanout_limit_fails_loudly() {
     let fixture = ImportRepo::init();
@@ -3670,38 +3239,6 @@ fn agent_import_codex_discovery_fanout_limit_fails_loudly() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-020"),
         "the discovery safety bound must fail loudly: {}",
-        describe(&output)
-    );
-}
-
-#[test]
-fn agent_import_absolute_deadline_kills_blocked_discovery_helper() {
-    let fixture = ImportRepo::init();
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "150")
-        .env("LIBRA_TEST_IMPORT_DISCOVERY_HELPER_DELAY_MS", "2000")
-        .args([
-            "agent",
-            "import",
-            "--all",
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run blocked discovery helper");
-    assert!(!output.status.success(), "{}", describe(&output));
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "killable discovery helper exceeded the absolute command deadline: {}",
-        describe(&output)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
         describe(&output)
     );
 }
@@ -3834,7 +3371,17 @@ async fn agent_import_batch_limit_cursor_filter_and_partial_contract() {
         "{}",
         describe(&partial)
     );
-    assert!(stderr.contains("sha256:"), "{}", describe(&partial));
+    // SHA-256("batchbad")[..6]: the documented short hashed session id.
+    assert!(
+        stderr.contains("\"session_id\": \"sha256:33cec74cbb24\""),
+        "{}",
+        describe(&partial)
+    );
+    assert!(
+        !stderr.contains("source/hmac-v2") && !stderr.contains("\"session_id\": \"batchbad\""),
+        "batch failures must not expose a source commitment or raw session id: {}",
+        describe(&partial)
+    );
     assert!(!stderr.contains("\"session_id\": \"partial\""));
 }
 
@@ -3924,70 +3471,171 @@ async fn agent_import_codex_batch_reports_cross_repository_candidates_as_skipped
         payload["data"]["skipped"][0]["reason_code"],
         "LBR-AGENT-015"
     );
+    // SHA-256("123e4567-e89b-12d3-a456-426614174011")[..6].
+    assert_eq!(
+        payload["data"]["skipped"][0]["session_id"],
+        "sha256:278a7e727b81"
+    );
     assert_eq!(
         payload["data"]["failures"].as_array().map(Vec::len),
         Some(0)
     );
 }
 
+/// Discovery runs in a private helper; argv errors are rejected by the parent
+/// and provider errors cross the wire only as a closed reason, but each must
+/// still render the shipped actionable message, stable code, and exit status.
 #[test]
-fn agent_import_cumulative_raw_input_cap_returns_sanitized_partial_result() {
+fn agent_import_discovery_errors_keep_actionable_messages() {
     let fixture = ImportRepo::init();
-    let first = fixture.write_discoverable_transcript("cap001", &fixture.repo);
-    let second = fixture.write_discoverable_transcript("cap002", &fixture.repo);
-    fixture.write_discoverable_transcript("cap003", &fixture.repo);
-    let cap = std::fs::metadata(&first).expect("first metadata").len()
-        + std::fs::metadata(&second).expect("second metadata").len()
-        - 1;
-    let output = fixture.run_with_env(
-        &[
-            "agent",
-            "import",
-            "--all",
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ],
-        "LIBRA_TEST_IMPORT_BATCH_CAP_BYTES",
-        &cap.to_string(),
+    // A real Claude project root, so a missing id is "not found" rather than
+    // an absent provider.
+    fixture.write_discoverable_transcript("present", &fixture.repo);
+    for (args, message, code, exit) in [
+        (
+            &[
+                "--all",
+                "--agent",
+                "claude-code",
+                "--limit",
+                "0",
+                "--yes",
+                "--json",
+            ][..],
+            "--limit must be between 1 and 100",
+            "LBR-CLI-002",
+            129,
+        ),
+        (
+            &["--all", "--agent", "gemini", "--yes"][..],
+            "agent import supports claude-code, codex, or opencode; got 'gemini'",
+            "LBR-CLI-002",
+            129,
+        ),
+        (
+            &["--path", "x.jsonl", "--yes"][..],
+            "--path requires --agent",
+            "LBR-CLI-002",
+            129,
+        ),
+        (
+            &["--all", "--agent", "opencode", "--yes"][..],
+            "OpenCode batch discovery is unavailable; select a session explicitly with --session",
+            "LBR-CLI-002",
+            129,
+        ),
+        (
+            &[
+                "--session",
+                "missing123",
+                "--agent",
+                "claude-code",
+                "--yes",
+                "--json",
+            ][..],
+            "no authorized local transcript matched the session id; use --agent opencode for an export-only OpenCode session",
+            "LBR-CLI-003",
+            129,
+        ),
+        (
+            &["--all", "--agent", "claude-code", "--cursor", "5", "--yes"][..],
+            "--cursor is outside the discovery result set",
+            "LBR-CLI-002",
+            129,
+        ),
+    ] {
+        let output = fixture
+            .command()
+            .args(["agent", "import"])
+            .args(args)
+            .output()
+            .expect("run agent import");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{args:?}: {}",
+            describe(&output)
+        );
+        assert!(stderr.contains(message), "{args:?}: {}", describe(&output));
+        assert!(stderr.contains(code), "{args:?}: {}", describe(&output));
+        assert!(
+            !stderr.contains("rejected the supplied selector")
+                && !stderr.contains("rejected the selected target"),
+            "{args:?}: {}",
+            describe(&output)
+        );
+    }
+
+    // The same UUID as a Claude transcript and a Codex rollout is ambiguous
+    // without --agent.
+    let session_id = "123e4567-e89b-12d3-a456-426614174099";
+    fixture.write_discoverable_transcript(session_id, &fixture.repo);
+    let codex_home = fixture._tmp.path().join("codex-home");
+    let day = codex_home.join("sessions/2026/07/15");
+    std::fs::create_dir_all(&day).expect("create Codex day partition");
+    std::fs::write(
+        day.join(format!("rollout-2026-07-15T01-00-00-{session_id}.jsonl")),
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-15T01:00:00Z",
+                "payload": {"id": session_id, "cwd": fixture.repo}
+            })
+        ),
+    )
+    .expect("write Codex rollout");
+    let ambiguous = fixture
+        .command()
+        .env("CODEX_HOME", &codex_home)
+        .args(["agent", "import", "--session", session_id, "--yes"])
+        .output()
+        .expect("run ambiguous agent import");
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert_eq!(
+        ambiguous.status.code(),
+        Some(129),
+        "{}",
+        describe(&ambiguous)
     );
-    assert!(!output.status.success(), "cap unexpectedly passed");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("LBR-AGENT-018"), "{}", describe(&output));
-    assert!(stderr.contains("\"succeeded\": 1"), "{}", describe(&output));
-    assert!(!stderr.contains(fixture.home.to_string_lossy().as_ref()));
+    assert!(
+        stderr.contains("the session id matches multiple providers; add --agent")
+            && stderr.contains("LBR-CLI-002"),
+        "{}",
+        describe(&ambiguous)
+    );
 }
 
 #[tokio::test]
-async fn agent_import_attributes_index_drain_timeout_to_the_completed_candidate() {
+async fn agent_import_all_records_each_completed_candidate() {
     let fixture = ImportRepo::init();
     fixture.write_discoverable_transcript("a-index-first", &fixture.repo);
     fixture.write_discoverable_transcript("b-index-second", &fixture.repo);
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "5000")
-        .env("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "10000")
-        .args([
-            "agent",
-            "import",
-            "--all",
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run delayed object-index batch");
-    assert!(!output.status.success(), "{}", describe(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("\"succeeded\": 0"), "{}", describe(&output));
-    assert!(stderr.contains("\"partial\": 1"), "{}", describe(&output));
+    let output = fixture.run(&[
+        "agent",
+        "import",
+        "--all",
+        "--agent",
+        "claude-code",
+        "--yes",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", describe(&output));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("batch JSON");
+    assert_eq!(payload["data"]["results"].as_array().map(Vec::len), Some(2));
     assert!(
-        stderr.contains("\"session_id\": \"claude__a-index-first\"")
-            && stderr.contains("\"status\": \"partial\""),
-        "the candidate that enqueued the pending writes must own the partial result: {}",
+        payload["data"]["results"]
+            .as_array()
+            .expect("batch results")
+            .iter()
+            .all(|result| result["status"] == "imported"),
+        "each discovered candidate should report imported: {}",
         describe(&output)
+    );
+    assert_eq!(
+        payload["data"]["failures"].as_array().map(Vec::len),
+        Some(0)
     );
     assert_eq!(
         fixture
@@ -4007,41 +3655,9 @@ async fn agent_import_attributes_index_drain_timeout_to_the_completed_candidate(
                  WHERE s.provider_session_id = 'b-index-second'"
             )
             .await,
-        0,
-        "the not-yet-started next candidate must not receive the first candidate's progress"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_import_index_repair'
-                   AND target = 'claude__a-index-first'"
-            )
-            .await,
         1,
-        "a drain timeout must leave a durable replay-repair marker"
+        "each discovered candidate should receive its own checkpoint"
     );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_import_identity
-                 WHERE provider_session_id = 'a-index-first' AND state = 'partial'"
-            )
-            .await,
-        1
-    );
-
-    let replay = fixture.run(&[
-        "agent",
-        "import",
-        "--session",
-        "a-index-first",
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ]);
-    assert!(replay.status.success(), "{}", describe(&replay));
     assert_eq!(
         fixture
             .scalar(
@@ -4051,78 +3667,16 @@ async fn agent_import_attributes_index_drain_timeout_to_the_completed_candidate(
             )
             .await,
         0,
-        "successful replay must repair and retire the marker"
-    );
-    let doctor = fixture.run(&["agent", "doctor", "--json"]);
-    assert!(doctor.status.success(), "{}", describe(&doctor));
-    assert!(
-        !String::from_utf8_lossy(&doctor.stdout).contains("missing_object_index"),
-        "replay must repair the full checkpoint object set: {}",
-        describe(&doctor)
+        "a completed import should not retain an index-repair barrier"
     );
 }
 
 #[tokio::test]
-async fn agent_import_index_update_error_is_partial_and_replay_repairs() {
+async fn agent_import_completed_index_write_needs_no_repair_barrier() {
     let fixture = ImportRepo::init();
     let transcript = fixture.write_discoverable_transcript("index-error", &fixture.repo);
     let transcript_arg = path_arg(&transcript);
-    let first = fixture.run_with_env(
-        &[
-            "agent",
-            "import",
-            "--path",
-            transcript_arg.as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ],
-        "LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL",
-        "1",
-    );
-    assert!(!first.status.success(), "{}", describe(&first));
-    let stderr = String::from_utf8_lossy(&first.stderr);
-    assert!(stderr.contains("LBR-AGENT-018"), "{}", describe(&first));
-    assert!(stderr.contains("\"partial\": 1"), "{}", describe(&first));
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_import_index_repair'
-                   AND target = 'claude__index-error'"
-            )
-            .await,
-        1
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_import_identity
-                 WHERE provider_session_id = 'index-error' AND state = 'partial'"
-            )
-            .await,
-        1
-    );
-    assert!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_checkpoint cp
-                 WHERE cp.session_id = 'claude__index-error'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.traces_commit)
-                     OR NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.tree_oid)
-                     OR NOT EXISTS (
-                         SELECT 1 FROM object_index oi WHERE oi.o_id = cp.metadata_blob_oid
-                     )
-                   )"
-            )
-            .await
-            > 0,
-        "the injected terminal queue failure must create a real repair target"
-    );
-
-    let replay = fixture.run(&[
+    let first = fixture.run(&[
         "agent",
         "import",
         "--path",
@@ -4132,7 +3686,7 @@ async fn agent_import_index_update_error_is_partial_and_replay_repairs() {
         "--yes",
         "--json",
     ]);
-    assert!(replay.status.success(), "{}", describe(&replay));
+    assert!(first.status.success(), "{}", describe(&first));
     assert_eq!(
         fixture
             .scalar(
@@ -4141,7 +3695,8 @@ async fn agent_import_index_update_error_is_partial_and_replay_repairs() {
                    AND target = 'claude__index-error'"
             )
             .await,
-        0
+        0,
+        "a completed import should not retain a repair barrier"
     );
     assert_eq!(
         fixture
@@ -4152,371 +3707,24 @@ async fn agent_import_index_update_error_is_partial_and_replay_repairs() {
             .await,
         1
     );
+
+    let replay = fixture.run(&[
+        "agent",
+        "import",
+        "--path",
+        transcript_arg.as_str(),
+        "--agent",
+        "claude-code",
+        "--yes",
+        "--json",
+    ]);
+    assert!(replay.status.success(), "{}", describe(&replay));
     let doctor = fixture.run(&["agent", "doctor", "--json"]);
     assert!(doctor.status.success(), "{}", describe(&doctor));
     assert!(
         !String::from_utf8_lossy(&doctor.stdout).contains("missing_object_index"),
         "foreground replay repair must restore every E4 index row: {}",
         describe(&doctor)
-    );
-}
-
-#[tokio::test]
-async fn import_index_tombstone_lookup_failure_is_partial_and_replay_repairs() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_discoverable_transcript("index-tombstone-lookup", &fixture.repo);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let first = fixture.run_with_env(&args, "LIBRA_TEST_IMPORT_INDEX_TOMBSTONE_LOOKUP_FAIL", "1");
-    assert!(!first.status.success(), "{}", describe(&first));
-    assert!(
-        String::from_utf8_lossy(&first.stderr).contains("LBR-AGENT-018"),
-        "a failed tombstone recheck must fail closed: {}",
-        describe(&first)
-    );
-    let marker = fixture
-        .text_rows(
-            "SELECT value FROM metadata_kv
-             WHERE scope = 'agent_import_index_repair'
-               AND target = 'claude__index-tombstone-lookup'",
-            "value",
-        )
-        .await;
-    assert_eq!(marker.len(), 1);
-    let marker: Value = serde_json::from_str(&marker[0]).expect("decode pending barrier marker");
-    assert_eq!(marker["state"], "repair_pending");
-    assert_eq!(marker["lease_expires_at"], 0);
-
-    let replay = fixture.run(&args);
-    assert!(replay.status.success(), "{}", describe(&replay));
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_import_index_repair'
-                   AND target = 'claude__index-tombstone-lookup'"
-            )
-            .await,
-        0,
-        "replay must repair and retire the lookup-failure marker"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_index_repair_serializes_with_session_erasure() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_discoverable_transcript("index-repair-erase", &fixture.repo);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let first = fixture.run_with_env(&args, "LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
-    assert!(!first.status.success(), "{}", describe(&first));
-    let checkpoint_oids = fixture
-        .text_rows(
-            "SELECT traces_commit AS oid FROM agent_checkpoint
-             WHERE session_id = 'claude__index-repair-erase'
-             UNION SELECT tree_oid AS oid FROM agent_checkpoint
-             WHERE session_id = 'claude__index-repair-erase'
-             UNION SELECT metadata_blob_oid AS oid FROM agent_checkpoint
-             WHERE session_id = 'claude__index-repair-erase'",
-            "oid",
-        )
-        .await;
-    assert_eq!(checkpoint_oids.len(), 3);
-
-    let repair_ready = fixture._tmp.path().join("repair-lock-ready");
-    let repair_resume = fixture._tmp.path().join("repair-lock-resume");
-    let barrier_ready = fixture._tmp.path().join("post-repair-barrier-ready");
-    let barrier_resume = fixture._tmp.path().join("post-repair-barrier-resume");
-    let replay = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_INDEX_REPAIR_READY_FILE", &repair_ready)
-        .env(
-            "LIBRA_TEST_IMPORT_INDEX_REPAIR_CONTINUE_FILE",
-            &repair_resume,
-        )
-        .env("LIBRA_TEST_IMPORT_INDEX_BARRIER_READY_FILE", &barrier_ready)
-        .env(
-            "LIBRA_TEST_IMPORT_INDEX_BARRIER_CONTINUE_FILE",
-            &barrier_resume,
-        )
-        .env("LIBRA_TEST_IMPORT_INDEX_TOMBSTONE_LOOKUP_FAIL", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("spawn replay repair");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !repair_ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        repair_ready.exists(),
-        "repair helper did not acquire SQLite writer lock"
-    );
-
-    let repo = fixture.repo.clone();
-    let (erase_tx, erase_rx) = std::sync::mpsc::channel();
-    let erase_thread = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build erasure runtime");
-        let result = runtime.block_on(async move {
-            let libra_dir = repo.join(".libra");
-            let db_url = format!("sqlite://{}", libra_dir.join("libra.db").display());
-            let conn = Database::connect(db_url)
-                .await
-                .map_err(|error| format!("open erasure database: {error}"))?;
-            let history = HistoryManager::new_with_ref(
-                Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-                libra_dir,
-                Arc::new(conn),
-                TRACES_BRANCH,
-            );
-            history
-                .erase_session_local("claude__index-repair-erase")
-                .await
-                .map(|outcome| outcome.session_deleted)
-                .map_err(|error| format!("erase repaired import session: {error:#}"))
-        });
-        erase_tx.send(result).expect("send erasure outcome");
-    });
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        matches!(
-            erase_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ),
-        "erasure must wait while the repair transaction owns the SQLite writer slot"
-    );
-
-    std::fs::write(&repair_resume, b"continue").expect("resume repair helper");
-    let barrier_deadline = Instant::now() + Duration::from_secs(10);
-    while !barrier_ready.exists() && Instant::now() < barrier_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        barrier_ready.exists(),
-        "replay did not return from fenced repair"
-    );
-    let erased = erase_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("erasure did not finish after repair transaction committed")
-        .expect("session erasure failed");
-    assert!(erased);
-    erase_thread.join().expect("join erasure thread");
-
-    std::fs::write(&barrier_resume, b"continue").expect("resume tombstoned replay");
-    let replay = replay
-        .wait_with_output()
-        .expect("wait for tombstoned replay");
-    assert!(
-        !replay.status.success(),
-        "erased replay succeeded: {}",
-        describe(&replay)
-    );
-    assert!(
-        String::from_utf8_lossy(&replay.stderr).contains("LBR-AGENT-019"),
-        "tombstone-winning erasure must retain its actionable error code: {}",
-        describe(&replay)
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv
-                 WHERE scope = 'agent_import_index_repair'
-                   AND target = 'claude__index-repair-erase'"
-            )
-            .await,
-        0,
-        "erasure must retire the owned repair marker"
-    );
-    let oid_list = checkpoint_oids
-        .iter()
-        .map(|oid| format!("'{oid}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    assert_eq!(
-        fixture
-            .scalar(&format!(
-                "SELECT COUNT(*) AS n FROM object_index WHERE o_id IN ({oid_list})"
-            ))
-            .await,
-        0,
-        "fenced repair must not reinsert cloud-eligible index rows after erasure"
-    );
-}
-
-#[tokio::test]
-async fn import_index_repair_timeout_rolls_back_and_preserves_pending_barrier() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_discoverable_transcript("index-repair-timeout", &fixture.repo);
-    let transcript_arg = path_arg(&transcript);
-    let args = [
-        "agent",
-        "import",
-        "--path",
-        transcript_arg.as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ];
-    let first = fixture.run_with_env(&args, "LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
-    assert!(!first.status.success(), "{}", describe(&first));
-    let missing_before = fixture
-        .scalar(
-            "SELECT COUNT(*) AS n FROM agent_checkpoint cp
-             WHERE cp.session_id = 'claude__index-repair-timeout'
-               AND (
-                 NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.traces_commit)
-                 OR NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.tree_oid)
-                 OR NOT EXISTS (
-                     SELECT 1 FROM object_index oi WHERE oi.o_id = cp.metadata_blob_oid
-                 )
-               )",
-        )
-        .await;
-    assert!(missing_before > 0);
-
-    let ready = fixture._tmp.path().join("repair-timeout-ready");
-    let never_resume = fixture._tmp.path().join("repair-timeout-never-resume");
-    let started = Instant::now();
-    let replay = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "3000")
-        // Keep the durable command preflight from repairing the deliberately
-        // missing rows before this test reaches the import helper transaction.
-        .env("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")
-        .env("LIBRA_TEST_IMPORT_INDEX_REPAIR_READY_FILE", &ready)
-        .env(
-            "LIBRA_TEST_IMPORT_INDEX_REPAIR_CONTINUE_FILE",
-            &never_resume,
-        )
-        .args(args)
-        .output()
-        .expect("run bounded repair timeout");
-    assert!(!replay.status.success(), "repair timeout succeeded");
-    assert!(
-        ready.exists(),
-        "repair helper never entered its writer transaction"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "killable repair helper exceeded the aggregate import deadline"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_checkpoint cp
-                 WHERE cp.session_id = 'claude__index-repair-timeout'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.traces_commit)
-                     OR NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.tree_oid)
-                     OR NOT EXISTS (
-                         SELECT 1 FROM object_index oi WHERE oi.o_id = cp.metadata_blob_oid
-                     )
-                   )"
-            )
-            .await,
-        missing_before,
-        "killing the helper must roll back every object-index mutation"
-    );
-    let marker_values = fixture
-        .text_rows(
-            "SELECT value FROM metadata_kv
-             WHERE scope = 'agent_import_index_repair'
-               AND target = 'claude__index-repair-timeout'",
-            "value",
-        )
-        .await;
-    assert_eq!(marker_values.len(), 1);
-    let marker: Value = serde_json::from_str(&marker_values[0]).expect("parse pending barrier");
-    assert_eq!(marker["state"], "repair_pending");
-    assert_eq!(marker["lease_expires_at"], 0);
-}
-
-#[tokio::test]
-async fn agent_import_charges_subagent_bytes_to_cumulative_raw_input_cap() {
-    let fixture = ImportRepo::init();
-    let session_id = "abcdef00-0000-0000-0000-000000000010";
-    let parent = fixture.write_discoverable_transcript(session_id, &fixture.repo);
-    let child_dir = parent
-        .parent()
-        .expect("Claude project directory")
-        .join(session_id)
-        .join("subagents");
-    std::fs::create_dir_all(&child_dir).expect("subagent directory");
-    let child = child_dir.join("child.jsonl");
-    let child_body = format!(
-        "{}\n",
-        json!({
-            "type": "assistant",
-            "uuid": "child-assistant",
-            "message": {
-                "role": "assistant",
-                "content": "child result",
-                "usage": {"input_tokens": 2, "output_tokens": 1}
-            }
-        })
-    );
-    std::fs::write(&child, child_body).expect("child transcript");
-    let cap = std::fs::metadata(&parent).expect("parent metadata").len()
-        + std::fs::metadata(&child).expect("child metadata").len()
-        - 1;
-    let output = fixture.run_with_env(
-        &[
-            "agent",
-            "import",
-            "--path",
-            path_arg(&parent).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ],
-        "LIBRA_TEST_IMPORT_BATCH_CAP_BYTES",
-        &cap.to_string(),
-    );
-    assert!(
-        !output.status.success(),
-        "subagent bytes bypassed batch cap"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0,
-        "budget failure must happen before parent or child persistence"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_subagent_content_claim")
-            .await,
-        0
     );
 }
 
@@ -4693,727 +3901,6 @@ async fn agent_import_marks_empty_subagent_content_partial() {
 }
 
 #[tokio::test]
-async fn agent_import_late_child_validation_preserves_partial_parent() {
-    let fixture = ImportRepo::init();
-    let session_id = "abcdef00-0000-0000-0000-000000000013";
-    let parent = fixture.write_discoverable_transcript(session_id, &fixture.repo);
-    let child_dir = parent
-        .parent()
-        .expect("Claude project directory")
-        .join(session_id)
-        .join("subagents");
-    std::fs::create_dir_all(&child_dir).expect("subagent directory");
-    std::fs::write(
-        child_dir.join("child.jsonl"),
-        format!(
-            "{}\n",
-            json!({
-                "type": "assistant",
-                "uuid": "late-child-assistant",
-                "message": {"role": "assistant", "content": "late child"}
-            })
-        ),
-    )
-    .expect("child transcript");
-
-    let output = fixture
-        .command()
-        // Exhaust the discovery window (delay ≥ window) while leaving the
-        // parent-persistence reserve intact. Under full nextest load the
-        // reserve must absorb SQLite/object-index latency after the abort.
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "90000")
-        .env("LIBRA_TEST_SUBAGENT_PARENT_VALIDATION_DELAY_MS", "75000")
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&parent).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run late child validation import");
-    assert!(!output.status.success(), "{}", describe(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("LBR-AGENT-018"), "{}", describe(&output));
-    assert!(
-        stderr.contains("\"status\": \"partial\"") && stderr.contains("\"checkpoints_written\": 1"),
-        "late child validation must retain exact parent progress: {}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint WHERE scope = 'committed'")
-            .await,
-        1,
-        "the independently valid parent checkpoint must be durable"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint WHERE scope = 'subagent'")
-            .await,
-        0,
-        "unvalidated child content must not be persisted"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_import_identity WHERE state = 'partial'")
-            .await,
-        1
-    );
-}
-
-#[tokio::test]
-async fn agent_import_failed_candidate_bytes_reduce_remaining_batch_budget() {
-    let fixture = ImportRepo::init();
-    let malformed = fixture.write_discoverable_transcript("bad001", &fixture.repo);
-    std::fs::write(&malformed, vec![b'{'; 900]).expect("write malformed charged candidate");
-    fixture.write_discoverable_transcript("good002", &fixture.repo);
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_BATCH_CAP_BYTES", "1000")
-        .args([
-            "agent",
-            "import",
-            "--all",
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run failed-input budget probe");
-    assert!(!output.status.success(), "failed bytes were not budgeted");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("\"succeeded\": 0"), "{}", describe(&output));
-    assert!(stderr.contains("\"failed\": 2"), "{}", describe(&output));
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "the valid second candidate was read as though the failed first read were free"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_charges_bytes_read_from_growing_held_descriptor() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("growing123", &fixture.repo, true);
-    let initial_len = std::fs::metadata(&transcript)
-        .expect("initial transcript metadata")
-        .len();
-    let ready = fixture._tmp.path().join("source-ready");
-    let resume = fixture._tmp.path().join("source-resume");
-    let mut command = fixture.command();
-    let child = command
-        .env(
-            "LIBRA_TEST_IMPORT_BATCH_CAP_BYTES",
-            (initial_len + 8).to_string(),
-        )
-        .env("LIBRA_TEST_IMPORT_SOURCE_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_SOURCE_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .spawn()
-        .expect("spawn source-pinned importer");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "importer did not open the held descriptor");
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript)
-        .expect("open growing transcript")
-        .write_all(b"0123456789abcdef0123456789abcdef")
-        .expect("grow transcript after authorization");
-    std::fs::write(&resume, b"continue").expect("resume source read");
-    let output = child.wait_with_output().expect("wait for growing import");
-    assert!(
-        !output.status.success(),
-        "growing source bypassed batch cap"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "over-budget held bytes must be rejected before persistence"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_abandons_bound_leases_and_marker() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("deadline123", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("deadline-ready");
-    let never_resume = fixture._tmp.path().join("deadline-never-resume");
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "500")
-        .env("LIBRA_TEST_IMPORT_AFTER_BIND_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_AFTER_BIND_CONTINUE_FILE", &never_resume)
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run deadline-bound import");
-    assert!(
-        !output.status.success(),
-        "deadline import unexpectedly passed"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_import_identity \
-                 WHERE state = 'failed' AND owner IS NULL AND lease_expires_at IS NULL"
-            )
-            .await,
-        1
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_claim")
-            .await,
-        0,
-        "zero-progress provisional session cleanup cascades abandoned claims"
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv \
-                 WHERE scope = 'agent_traces_inflight'"
-            )
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "a terminal zero-progress import must remove its provisional session"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_kills_blocked_authorized_reader_process() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("slowread123", &fixture.repo, true);
-    let reader_pid_file = fixture._tmp.path().join("authorized-reader.pid");
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "150")
-        .env("LIBRA_TEST_AUTHORIZED_READ_HELPER_DELAY_MS", "5000")
-        .env(
-            "LIBRA_TEST_AUTHORIZED_READ_HELPER_PID_FILE",
-            &reader_pid_file,
-        )
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run blocked authorized-reader deadline probe");
-    assert!(!output.status.success(), "slow reader bypassed deadline");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "killable reader process outlived the absolute deadline: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    let reader_pid = std::fs::read_to_string(&reader_pid_file)
-        .expect("nested authorized reader published its pid")
-        .parse::<u32>()
-        .expect("authorized reader pid is numeric");
-    let reap_deadline = Instant::now() + Duration::from_secs(2);
-    let reader_proc = format!("/proc/{reader_pid}");
-    while std::path::Path::new(&reader_proc).exists() && Instant::now() < reap_deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        !std::path::Path::new(&reader_proc).exists(),
-        "timed-out preparation left nested authorized reader pid {reader_pid} alive"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_kills_helper_blocked_at_secure_open_stage() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("secureopen123", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("secure-open-ready");
-    let never_continue = fixture._tmp.path().join("secure-open-never-continue");
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "200")
-        .env("LIBRA_TEST_IMPORT_SECURE_OPEN_READY_FILE", &ready)
-        .env(
-            "LIBRA_TEST_IMPORT_SECURE_OPEN_CONTINUE_FILE",
-            &never_continue,
-        )
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run secure-open deadline probe");
-    assert!(
-        !output.status.success(),
-        "blocked secure open bypassed deadline"
-    );
-    assert!(ready.exists(), "probe never entered the secure-open stage");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "secure-open helper outlived the absolute deadline: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_kills_helper_blocked_at_transcript_cwd_resolution() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("cwdblock123", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("transcript-cwd-ready");
-    let never_continue = fixture._tmp.path().join("transcript-cwd-never-continue");
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "500")
-        .env("LIBRA_TEST_IMPORT_TRANSCRIPT_CWD_READY_FILE", &ready)
-        .env(
-            "LIBRA_TEST_IMPORT_TRANSCRIPT_CWD_CONTINUE_FILE",
-            &never_continue,
-        )
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run transcript-cwd deadline probe");
-    assert!(
-        !output.status.success(),
-        "blocked cwd lookup bypassed deadline"
-    );
-    assert!(
-        ready.exists(),
-        "probe never entered transcript cwd resolution"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "transcript-cwd helper outlived the deadline: {:?}",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_bounds_preparation_response_pipe_drain() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("responsepipe123", &fixture.repo, true);
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "500")
-        .env(
-            "LIBRA_TEST_IMPORT_PREPARATION_RESPONSE_READ_DELAY_MS",
-            "2000",
-        )
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run delayed preparation-response deadline probe");
-    assert!(
-        !output.status.success(),
-        "delayed preparation response bypassed deadline"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "response pipe drain outlived the absolute deadline: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0,
-        "preparation response timeout persisted a session"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0,
-        "preparation response timeout persisted a checkpoint"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_kills_helper_blocked_at_existing_session_cwd_revalidation() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("existingcwd123", &fixture.repo, true);
-    let first = fixture.run(&[
-        "agent",
-        "import",
-        "--path",
-        path_arg(&transcript).as_str(),
-        "--agent",
-        "claude-code",
-        "--yes",
-        "--json",
-    ]);
-    assert!(first.status.success(), "seed import: {}", describe(&first));
-    let checkpoints_before = fixture
-        .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-        .await;
-    let ready = fixture._tmp.path().join("existing-cwd-ready");
-    let never_continue = fixture._tmp.path().join("existing-cwd-never-continue");
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "750")
-        .env("LIBRA_TEST_IMPORT_EXISTING_CWD_READY_FILE", &ready)
-        .env(
-            "LIBRA_TEST_IMPORT_EXISTING_CWD_CONTINUE_FILE",
-            &never_continue,
-        )
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run existing-cwd deadline probe");
-    assert!(
-        !output.status.success(),
-        "blocked ownership revalidation bypassed deadline"
-    );
-    assert!(
-        ready.exists(),
-        "probe never entered existing cwd revalidation"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "existing-session cwd helper outlived deadline: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        checkpoints_before,
-        "timed-out ownership validation mutated durable import state"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_cancels_slow_append_before_objects() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("slowappend123", &fixture.repo, true);
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "150")
-        .env("LIBRA_TEST_CHECKPOINT_APPEND_DELAY_MS", "1500")
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run slow append deadline probe");
-    assert!(!output.status.success(), "slow append bypassed deadline");
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "append delay was not cancelled at the absolute deadline: {:?}",
-        started.elapsed()
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_kills_blocked_checkpoint_object_write() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("blockedobject123", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("checkpoint-object-write-ready");
-    let started = Instant::now();
-    let output = fixture
-        .command()
-        // Full nextest load can spend multiple seconds before the checkpoint
-        // object-write hook runs; keep deadline long enough to reach the hook
-        // but still bound the blocked helper after it parks.
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "5000")
-        .env("LIBRA_TEST_CHECKPOINT_OBJECT_WRITE_READY_FILE", &ready)
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run blocked object-write deadline probe");
-    assert!(
-        ready.exists(),
-        "import never reached checkpoint object write"
-    );
-    assert!(
-        !output.status.success(),
-        "blocked object write bypassed deadline"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "blocked object helper held the foreground past its deadline: {:?}",
-        started.elapsed()
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("LBR-AGENT-018"),
-        "{}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0
-    );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM metadata_kv \
-                 WHERE scope = 'agent_traces_inflight'"
-            )
-            .await,
-        0,
-        "timed-out object preclaim/marker was not abandoned"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_claim")
-            .await,
-        0,
-        "timed-out object write retained provisional coverage claims"
-    );
-}
-
-#[tokio::test]
-async fn agent_import_reports_success_when_deadline_expires_after_atomic_commit() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("postcommitdeadline", &fixture.repo, true);
-    let output = fixture
-        .command()
-        // Full nextest load can spend multiple seconds before the post-commit
-        // delay hook runs; keep deadline < delay but leave headroom so the
-        // atomic commit still lands before the deadline fires.
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "8000")
-        .env("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS", "10000")
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run post-commit deadline probe");
-    assert!(
-        output.status.success(),
-        "a fully committed import was reported partial: {}",
-        describe(&output)
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_checkpoint")
-            .await,
-        1
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_import_identity WHERE state = 'committed'")
-            .await,
-        1
-    );
-}
-
-#[tokio::test]
-async fn agent_import_deadline_abandons_prior_reservation_batches() {
-    let fixture = ImportRepo::init();
-    let path = fixture.transcript_path("manyturns123");
-    std::fs::create_dir_all(path.parent().expect("transcript parent"))
-        .expect("create transcript dir");
-    let mut lines = Vec::new();
-    for ordinal in 0..130 {
-        lines.push(json!({
-            "type": "user", "uuid": format!("turn-{ordinal}"),
-            "sessionId": "manyturns123", "cwd": fixture.repo,
-            "message": {"role": "user", "content": format!("question {ordinal}")}
-        }));
-        lines.push(json!({
-            "type": "assistant", "uuid": format!("answer-{ordinal}"),
-            "sessionId": "manyturns123", "cwd": fixture.repo,
-            "message": {"role": "assistant", "content": [{"type":"text", "text":"ok"}]}
-        }));
-    }
-    lines.push(json!({
-        "type": "session_end", "sessionId": "manyturns123", "cwd": fixture.repo
-    }));
-    std::fs::write(
-        &path,
-        format!(
-            "{}\n",
-            lines
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    )
-    .expect("write many-turn transcript");
-    let output = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "150")
-        .env("LIBRA_TEST_IMPORT_RESERVATION_BATCH_DELAY_MS", "100")
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&path).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .output()
-        .expect("run batched reservation deadline probe");
-    assert!(
-        !output.status.success(),
-        "reservation batching bypassed deadline"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_coverage_claim")
-            .await,
-        0,
-        "reservations from committed earlier batches were not abandoned/cascaded"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0
-    );
-}
-
-#[tokio::test]
 async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_session() {
     let fixture = ImportRepo::init();
     let db_url = format!(
@@ -5515,78 +4002,6 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
             .expect("metadata"),
         serde_json::json!({"sentinel":"keep"}).to_string(),
         "failed import mutated existing session ownership metadata"
-    );
-}
-
-#[tokio::test]
-async fn erasure_winning_before_marker_prevents_all_import_objects() {
-    let fixture = ImportRepo::init();
-    let transcript = fixture.write_transcript("erase-before-marker", &fixture.repo, true);
-    let ready = fixture._tmp.path().join("before-marker-ready");
-    let resume = fixture._tmp.path().join("before-marker-resume");
-    let objects_before = loose_object_file_count(&fixture.repo.join(".libra/objects"));
-    let child = fixture
-        .command()
-        .env("LIBRA_TEST_IMPORT_BEFORE_BIND_READY_FILE", &ready)
-        .env("LIBRA_TEST_IMPORT_BEFORE_BIND_CONTINUE_FILE", &resume)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .args([
-            "agent",
-            "import",
-            "--path",
-            path_arg(&transcript).as_str(),
-            "--agent",
-            "claude-code",
-            "--yes",
-            "--json",
-        ])
-        .spawn()
-        .expect("spawn pre-marker importer");
-    let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "importer did not reach pre-marker pause");
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
-            .await,
-        0
-    );
-
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
-    let conn = Database::connect(db_url)
-        .await
-        .expect("open writable repo db");
-    let libra_dir = fixture.repo.join(".libra");
-    let history = HistoryManager::new_with_ref(
-        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
-        libra_dir,
-        Arc::new(conn),
-        TRACES_BRANCH,
-    );
-    let erased = history
-        .erase_session_local("claude__erase-before-marker")
-        .await
-        .expect("erasure should win before marker registration");
-    assert!(erased.session_deleted);
-    std::fs::write(&resume, b"resume").expect("resume stale importer");
-    let output = child.wait_with_output().expect("wait stale importer");
-    assert!(!output.status.success(), "stale importer survived erasure");
-    assert_eq!(
-        loose_object_file_count(&fixture.repo.join(".libra/objects")),
-        objects_before,
-        "tombstone winner must reject bind before object construction"
-    );
-    assert_eq!(
-        fixture
-            .scalar("SELECT COUNT(*) AS n FROM agent_session")
-            .await,
-        0
     );
 }
 

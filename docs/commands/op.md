@@ -164,9 +164,11 @@ not arbitrary working-tree or nested-repository contents. HEAD and the
 captured branch refs are reset to the target view, and local branches that are
 absent from that view are pruned, so the restore reproduces the operation's
 exact local-branch set. The restored HEAD branch is always kept; remote-tracking
-refs and Libra-owned internal refs (the locked `main`/`intent`/`traces`
-branches and the reserved `libra/` namespace, e.g. the AI history branch
-`libra/intent`) are never pruned.
+refs are never pruned. The Libra-owned capture and history branches — `traces`
+(`refs/libra/traces`, legacy name `agent-traces`), `intent`, and the AI history
+branch `libra/intent` — keep their current values: agent hook callbacks advance
+them without recording an operation, so a restore never rewinds, prunes, or
+recreates them from the view (the `--dry-run` preview lists them as kept).
 
 ```bash
 libra op restore [--force] [--dry-run] <OP_REF>
@@ -232,9 +234,18 @@ the next mutation boundary records any on-disk drift as an external snapshot.
 
 - `op restore` records a new `op restore` operation on success.
 - `op restore --dry-run` does not write a new operation.
+- Agent hook callbacks (`libra hooks <provider> <event>` and the hidden
+  `libra agent hooks` alias) are never recorded as operations: they do not
+  appear in `op log` and are never an `op undo` / `op restore` target. Their
+  capture state lives in the capture catalog and on `refs/libra/traces` (see
+  `docs/commands/hooks.md`). Operation views still snapshot that ref, but
+  `op undo` / `op redo` / `op revert` / `op restore` keep it at its current
+  value, so checkpoints captured after the target view stay reachable.
 - Restore resets HEAD and the branch refs captured in the target view, and
   prunes local branches that are absent from that view (the restored HEAD branch
-  is always kept; remote-tracking refs are left untouched).
+  is always kept; the Libra-owned capture and history branches `traces`,
+  `agent-traces`, `intent`, and `libra/intent` keep their current values;
+  remote-tracking refs are left untouched).
 - A repository-wide restore (`--what all --confirm-repo-wide`) refuses to run
   when it would delete the HEAD of a linked worktree that is absent from the
   target snapshot; such a worktree was created after the snapshot, and its HEAD

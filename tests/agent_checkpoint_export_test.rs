@@ -1,9 +1,8 @@
 //! AG-20 E4-libra checkpoint export writer tests (plan.md Task A5).
 //!
-//! Drives the hook-ingest writer in-process
-//! (`libra::internal::ai::hooks::runtime::ingest_agent_traces_payload`,
-//! exported `pub` for tests — not a stable API) against a fresh
-//! production-shaped SQLite database plus an isolated objects directory,
+//! Drives the hook-ingest writer in-process through capture ingress's typed
+//! handoff against a fresh production-shaped SQLite database plus an isolated
+//! objects directory,
 //! then walks the resulting `refs/libra/traces` checkpoint tree straight
 //! from the on-disk Git objects. Covered contracts:
 //!
@@ -15,30 +14,35 @@
 //! - `content_hash.txt` is `sha256:<64-hex>` and recomputes over the
 //!   manifest-declared coverage; the reader helper tolerates legacy bare
 //!   hex;
-//! - E5 chunking: small transcripts stay single-file; transcripts above
-//!   the (test-overridden) threshold split into ordered, line-safe
-//!   `.jsonl.%03d` parts declared by the manifest;
+//! - E5 single-file writer behavior; the small-threshold chunking writer
+//!   regression lives in the in-crate history test, where its typed
+//!   task-local fixture cannot alter a hook binary's durable layout;
 //! - stage (d) catalog idempotency: probe-by-`traces_commit` +
 //!   `ON CONFLICT(checkpoint_id) DO NOTHING` keep crash retries at exactly
 //!   one row;
 //! - window A/B in-flight markers: written before the blobs, cleared after
 //!   the catalog INSERT, and expired markers drop out of the live listing.
 //!
-//! Env mutation (`LIBRA_TEST_HOME`, `LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD`)
-//! makes the ingest-driving tests `#[serial]`.
+//! `LIBRA_TEST_HOME` configures the isolated provider-root fixture, so the
+//! ingest-driving tests that mutate it remain `#[serial]`.
 
 use std::path::{Path, PathBuf};
 
 use libra::internal::{
     ai::{
+        capture::{
+            ingress::lower_in_process_capture_frame_for_test,
+            test_support::ingest_agent_traces_ingress_outcome_for_test,
+        },
         history::{self, TracesInflightMarker, checkpoint_content_hash, parse_content_hash},
         hooks::{
             LifecycleEventKind, ProviderHookCommand, claude_provider,
             runtime::{
-                AgentCheckpointRow, SubagentCheckpointRow, ingest_agent_traces_payload,
-                insert_agent_checkpoint_row_idempotent, insert_subagent_checkpoint_row_idempotent,
+                AgentCheckpointRow, SubagentCheckpointRow, insert_agent_checkpoint_row_idempotent,
+                insert_subagent_checkpoint_row_idempotent,
             },
         },
+        observed_agents::claude_session_dir,
     },
     config::ConfigKv,
 };
@@ -46,6 +50,24 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{Value, json};
 use serial_test::serial;
 use tempfile::TempDir;
+
+async fn ingest_agent_traces_payload(
+    payload: &[u8],
+    command: ProviderHookCommand,
+    expected_kind: LifecycleEventKind,
+    provider: &dyn libra::internal::ai::hooks::HookProvider,
+    conn: &DatabaseConnection,
+    repo_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let outcome = lower_in_process_capture_frame_for_test(
+        payload,
+        command,
+        expected_kind,
+        provider,
+        repo_path,
+    );
+    ingest_agent_traces_ingress_outcome_for_test(outcome, command, provider, conn, repo_path).await
+}
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -60,13 +82,26 @@ struct ExportRepo {
     home: TempDir,
     repo_path: PathBuf,
     conn: DatabaseConnection,
-    transcript_path: PathBuf,
+    transcript: Vec<u8>,
 }
 
 impl ExportRepo {
     async fn init(transcript: &[u8]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let repo_path = dir.path().to_path_buf();
+        // The in-process capture seam binds its runtime scope to a
+        // canonical working directory before deriving Claude's project
+        // slug. Keep this fixture on that same identity: macOS exposes its
+        // temporary root through `/var -> /private/var` on many hosts.
+        let repo_path = dir
+            .path()
+            .canonicalize()
+            .expect("canonical export fixture repository");
+        // Model an initialized repository, rather than only a standalone
+        // SQLite catalog. A complete live snapshot now obtains its durable
+        // source commitment only after confirming that its object storage is
+        // rooted in this repository.
+        std::fs::create_dir_all(repo_path.join("objects"))
+            .expect("create export fixture object storage");
         let db_path = repo_path.join("libra.db");
         let conn = libra::internal::db::create_database(&db_path.display().to_string())
             .await
@@ -76,17 +111,13 @@ impl ExportRepo {
             .expect("seed repository identity");
 
         let home = tempfile::tempdir().expect("fake home tempdir");
-        let claude_dir = home.path().join(".claude");
-        std::fs::create_dir_all(&claude_dir).expect("create fake ~/.claude");
-        let transcript_path = claude_dir.join("session-transcript.jsonl");
-        std::fs::write(&transcript_path, transcript).expect("write provider transcript");
 
         Self {
             _dir: dir,
             home,
             repo_path,
             conn,
-            transcript_path,
+            transcript: transcript.to_vec(),
         }
     }
 
@@ -94,8 +125,10 @@ impl ExportRepo {
         let mut base = json!({
             "hook_event_name": hook_event_name,
             "session_id": session_id,
-            "cwd": "/tmp/repo",
-            "transcript_path": self.transcript_path.display().to_string(),
+            "cwd": self.repo_path.display().to_string(),
+            // The raw hook locator is intentionally false. The source must
+            // be derived from the verified cwd and session ID instead.
+            "transcript_path": self.repo_path.join("untrusted-hook-pointer.jsonl").display().to_string(),
         });
         if let (Value::Object(extra_map), Some(base_map)) = (extra, base.as_object_mut()) {
             for (key, value) in extra_map {
@@ -103,6 +136,17 @@ impl ExportRepo {
             }
         }
         serde_json::to_vec(&base).expect("serialize envelope")
+    }
+
+    fn write_claude_transcript(&self, session_id: &str) {
+        let directory = claude_session_dir(&self.repo_path)
+            .expect("LIBRA_TEST_HOME provides a Claude session directory");
+        std::fs::create_dir_all(&directory).expect("create derived Claude session directory");
+        std::fs::write(
+            directory.join(format!("{session_id}.jsonl")),
+            &self.transcript,
+        )
+        .expect("write derived provider transcript");
     }
 
     async fn ingest(&self, payload: &[u8], command: ProviderHookCommand, kind: LifecycleEventKind) {
@@ -128,6 +172,7 @@ impl ExportRepo {
         unsafe {
             std::env::set_var("LIBRA_TEST_HOME", self.home.path());
         }
+        self.write_claude_transcript(session_id);
         self.ingest(
             &self.envelope("SessionStart", session_id, json!({})),
             ProviderHookCommand::SessionStart,
@@ -355,19 +400,24 @@ async fn writer_emits_all_six_e4_libra_entries() {
         "v1 field redaction_report must survive in v2 (additive schema)"
     );
 
-    // events/lifecycle.jsonl: one canonical E3 line for the SessionEnd.
+    // events/lifecycle.jsonl: one canonical E3 line for the session-end.
     let events_bytes = repo.blob(&events[0].oid);
     let text = String::from_utf8(events_bytes).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "one triggering event → one JSONL line");
     let line: Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(line["schema_version"], json!(1));
+    assert_eq!(line["schema_version"], json!(2));
+    assert_eq!(
+        line["identity_scheme"],
+        json!("fallback_action_hmac_v1"),
+        "a hook without a provider replay identifier must declare its fallback action-HMAC identity"
+    );
     assert_eq!(line["kind"], json!("session_end"));
     assert_eq!(line["agent_kind"], json!("claude_code"));
     assert_eq!(line["session_id"], json!(row.session_id));
     assert_eq!(line["provider_session_id"], json!("sess-e4-shape"));
     assert_eq!(line["partial"], json!(false));
-    assert_eq!(line["provenance"]["hook_event_name"], json!("SessionEnd"));
+    assert_eq!(line["provenance"]["hook_event_name"], json!("session_end"));
     assert!(
         uuid::Uuid::parse_str(line["event_id"].as_str().unwrap()).is_ok(),
         "event_id must be a UUID"
@@ -380,17 +430,44 @@ async fn writer_emits_all_six_e4_libra_entries() {
     assert!(report.get("matches").is_some());
 }
 
-/// A model carried by the triggering event lands in metadata.json instead
-/// of "unknown".
+/// A provider-native replay key uses the ingress HMAC identity, and the
+/// canonical JSONL record must preserve that distinction for downstream
+/// tooling without asking it to infer the HMAC form from the UUID itself.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
-async fn metadata_model_field_prefers_event_model() {
+async fn lifecycle_jsonl_declares_native_replay_hmac_identity() {
+    let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
+    let row = repo
+        .ingest_session(
+            "sess-e3-native-replay",
+            json!({"event_id": "provider-native-replay-123"}),
+        )
+        .await;
+
+    let inner = repo.inner_tree(&row);
+    let events = subtree(&repo.repo_path, &inner, "events");
+    let text = String::from_utf8(repo.blob(&events[0].oid)).expect("lifecycle JSONL is UTF-8");
+    let line: Value = serde_json::from_str(text.trim_end()).expect("one canonical lifecycle line");
+
+    assert_eq!(line["schema_version"], json!(2));
+    assert_eq!(
+        line["identity_scheme"],
+        json!("native_replay_hmac_v2"),
+        "a provider replay key must be persisted as a typed native HMAC identity"
+    );
+}
+
+/// An untrusted provider-supplied model is not copied into checkpoint
+/// metadata; generic capture records the safe literal `unknown` instead.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn metadata_model_field_drops_untrusted_event_model() {
     let repo = ExportRepo::init(SMALL_TRANSCRIPT).await;
     let row = repo
         .ingest_session("sess-e4-model", json!({"model": "claude-sonnet-4-5"}))
         .await;
     let metadata: Value = serde_json::from_slice(&repo.blob(&row.metadata_blob_oid)).unwrap();
-    assert_eq!(metadata["model"], json!("claude-sonnet-4-5"));
+    assert_eq!(metadata["model"], json!("unknown"));
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +535,11 @@ async fn manifest_roles_oids_and_lengths_match_actual_blobs() {
     // Redaction states per role.
     assert_eq!(entries["transcript"]["redaction"], json!("redacted"));
     assert_eq!(entries["lifecycle_events"]["redaction"], json!("redacted"));
+    assert_eq!(
+        entries["lifecycle_events"]["schema_version"],
+        json!(2),
+        "the lifecycle role must advertise the v2 lines that require identity_scheme"
+    );
     assert_eq!(entries["metadata"]["redaction"], json!("redacted"));
     assert_eq!(entries["redaction_report"]["redaction"], json!("report"));
     assert_eq!(entries["content_hash"]["redaction"], json!("none"));
@@ -521,114 +603,6 @@ async fn content_hash_format_and_recompute() {
 // ---------------------------------------------------------------------------
 // E5 chunking
 // ---------------------------------------------------------------------------
-
-/// Transcripts above the threshold split at line boundaries into ordered
-/// `.jsonl.%03d` parts; the manifest declares the parts (in order) under
-/// the logical transcript role; the parts reassemble byte-identically; and
-/// the content hash covers the logical (reassembled) stream.
-#[tokio::test]
-#[serial(env)]
-async fn chunking_large_transcript_splits_line_safe() {
-    // ~40 bytes per line × 40 lines ≈ 1.6 KiB, threshold 256 → ≥ 6 chunks.
-    let mut transcript = Vec::new();
-    for index in 0..40 {
-        transcript.extend_from_slice(
-            format!("{{\"turn\":{index:04},\"text\":\"chunk me\"}}\n").as_bytes(),
-        );
-    }
-    let threshold = 256usize;
-
-    let repo = ExportRepo::init(&transcript).await;
-    let prior = std::env::var_os("LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD");
-    // SAFETY: test-only env mutation under #[serial], restored below.
-    unsafe {
-        std::env::set_var(
-            "LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD",
-            threshold.to_string(),
-        );
-    }
-    let row = repo.ingest_session("sess-e5-chunks", json!({})).await;
-    unsafe {
-        match prior {
-            Some(value) => std::env::set_var("LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD", value),
-            None => std::env::remove_var("LIBRA_TEST_TRANSCRIPT_CHUNK_THRESHOLD"),
-        }
-    }
-
-    let inner = repo.inner_tree(&row);
-    let transcript_tree = subtree(&repo.repo_path, &inner, "transcript");
-    assert!(
-        transcript_tree.len() > 1,
-        "large transcript must split into multiple parts: {transcript_tree:?}"
-    );
-    assert!(
-        transcript_tree
-            .iter()
-            .all(|entry| entry.name != "claude_code.jsonl"),
-        "chunked layout must not also carry the unchunked file"
-    );
-
-    // Manifest declares the logical role with ordered parts and no
-    // single-blob oid.
-    let manifest: Value =
-        serde_json::from_slice(&repo.blob(&entry(&inner, "manifest.json").oid)).unwrap();
-    let declared = &manifest["entries"]["transcript"];
-    assert_eq!(declared["path"], json!("transcript/claude_code.jsonl"));
-    assert_eq!(declared["chunked"], json!(true));
-    assert!(
-        declared.get("oid").is_none(),
-        "a chunked transcript has no single blob oid"
-    );
-    let parts = declared["parts"].as_array().expect("ordered parts");
-    assert_eq!(parts.len(), transcript_tree.len());
-
-    // Parts are numbered .001, .002, … in manifest order; each part is
-    // within the threshold, ends on a line boundary, and the declared
-    // byte_len matches the blob.
-    let mut reassembled = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        let expected_name = format!("claude_code.jsonl.{:03}", index + 1);
-        let path = part["path"].as_str().unwrap();
-        assert_eq!(path, format!("transcript/{expected_name}"));
-        let oid = part["oid"].as_str().unwrap();
-        assert_eq!(
-            entry(&transcript_tree, &expected_name).oid,
-            oid,
-            "part {expected_name}: manifest oid vs tree oid"
-        );
-        let bytes = repo.blob(oid);
-        assert_eq!(bytes.len() as u64, part["byte_len"].as_u64().unwrap());
-        assert!(
-            bytes.len() <= threshold,
-            "part {expected_name} exceeds the threshold"
-        );
-        assert!(
-            bytes.ends_with(b"\n"),
-            "part {expected_name} must end at a line boundary"
-        );
-        reassembled.extend_from_slice(&bytes);
-    }
-    // Line-boundary property + byte identity: the concatenation equals the
-    // source transcript (no secrets → redaction is the identity).
-    assert_eq!(reassembled, transcript);
-    assert_eq!(
-        declared["byte_len"].as_u64().unwrap(),
-        transcript.len() as u64,
-        "logical byte_len must be the total across parts"
-    );
-
-    // content_hash covers the logical stream, so it must recompute from
-    // the reassembled bytes.
-    let metadata_bytes = repo.blob(&entry(&inner, "metadata.json").oid);
-    let events_bytes = repo.blob(&resolve_path(&repo, &inner, "events/lifecycle.jsonl"));
-    let report_bytes = repo.blob(&entry(&inner, "redaction_report.json").oid);
-    let hash_text = String::from_utf8(repo.blob(&entry(&inner, "content_hash.txt").oid)).unwrap();
-    assert_eq!(
-        checkpoint_content_hash(&[&metadata_bytes, &events_bytes, &reassembled, &report_bytes]),
-        hash_text,
-        "content hash must be invariant under chunking (logical stream)"
-    );
-}
 
 /// A single line larger than the threshold is a hard error (E5), asserted
 /// at the chunker contract level so the test does not need to construct a
@@ -921,11 +895,11 @@ async fn inflight_marker_lifecycle_and_expiry() {
 
 /// The committed pre-AG-20 fixture (`tests/fixtures/agent_checkpoints/
 /// v1_claude_code/`, captured at v0.18.6) stays readable through the
-/// existing metadata-first reader path: seed its byte-identical blobs +
-/// catalog rows into a fresh repo and drive `libra agent checkpoint show`
-/// end-to-end. Full v1 fallback (manifest-less show/transcript) is the
-/// reader slice's job; this guard pins that the shared
-/// `load_metadata_blob` flow keeps accepting v1 checkpoints.
+/// safe-summary reader path: seed its byte-identical blobs + catalog rows
+/// into a fresh repo and drive `libra agent checkpoint show` end-to-end. Full
+/// v1 fallback (manifest-less export/transcript) is the reader slice's job;
+/// this guard pins that a legacy catalog row remains readable without exposing
+/// its metadata blob through default show output.
 #[cfg(unix)]
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
@@ -1021,7 +995,8 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
     .expect("seed agent_checkpoint");
     drop(conn);
 
-    // The metadata-first reader path must render the v1 checkpoint.
+    // The safe-summary reader path must render the v1 checkpoint without
+    // serializing its arbitrary legacy metadata object.
     let show = run(&["agent", "checkpoint", "show", checkpoint_id, "--json"]);
     assert!(show.status.success(), "checkpoint show failed: {show:?}");
     let stdout = String::from_utf8_lossy(&show.stdout).to_string();
@@ -1030,17 +1005,12 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
         parsed["data"]["checkpoint"]["checkpoint_id"],
         json!(checkpoint_id)
     );
-    assert_eq!(
-        parsed["data"]["metadata"]["schema_version"],
-        json!(1),
-        "v1 metadata must surface unchanged (schema_version 1)"
+    assert!(
+        parsed["data"].get("metadata").is_none(),
+        "default show must not expose legacy metadata: {parsed}"
     );
-    assert_eq!(
-        parsed["data"]["metadata"]["agent_kind"],
-        json!("claude_code")
-    );
-    // The fixture's redaction promise holds end-to-end: the raw token never
-    // appears; the marker does (inside metadata.redaction_report matches).
+    // The fixture's redaction promise holds end-to-end: no raw token or
+    // metadata body enters the default summary.
     assert!(
         !stdout.contains(&format!("AKIA{}", "IOSFODNN7EXAMPLE")),
         "raw secret must not surface through checkpoint show"

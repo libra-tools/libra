@@ -63,6 +63,14 @@ pub enum MetadataScope {
     /// Durable import-side marker requiring foreground object-index repair
     /// before an otherwise idempotent replay may become a no-op.
     AgentImportIndexRepair,
+    /// Repository-private authenticated SessionEnd recovery headers.
+    AgentCapturePending,
+    /// Retained headers requiring explicit repair; still count towards capacity.
+    AgentCaptureQuarantine,
+    /// Bounded base64 chunks; never enumerate through generic metadata/GC walkers.
+    AgentCapturePendingChunk,
+    /// Local sensitive catalog association; never hydrate through GC/export.
+    AgentCaptureSessionAlias,
 }
 
 impl MetadataScope {
@@ -71,6 +79,10 @@ impl MetadataScope {
             MetadataScope::Branch => "branch",
             MetadataScope::AgentTracesInflight => "agent_traces_inflight",
             MetadataScope::AgentImportIndexRepair => "agent_import_index_repair",
+            MetadataScope::AgentCapturePending => "agent_capture_pending",
+            MetadataScope::AgentCaptureQuarantine => "agent_capture_quarantine",
+            MetadataScope::AgentCapturePendingChunk => "agent_capture_pending_chunk",
+            MetadataScope::AgentCaptureSessionAlias => "agent_capture_session_alias",
         }
     }
 }
@@ -210,6 +222,74 @@ fn truthy_fail_closed(value: &str) -> bool {
 pub struct MetadataKv;
 
 impl MetadataKv {
+    /// Private bounded reader. SQLite checks byte length before returning the
+    /// value, so corrupted rows cannot allocate unbounded buffers in callers.
+    /// `key_range` is half-open and uses the existing scope/target/key index.
+    pub(crate) async fn list_bounded_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scopes: &[MetadataScope],
+        target: Option<&str>,
+        key_range: Option<(&str, &str)>,
+        limit: u64,
+        value_cap: usize,
+    ) -> Result<Vec<MetadataEntry>> {
+        anyhow::ensure!(
+            !scopes.is_empty()
+                && scopes.len() <= 3
+                && limit > 0
+                && limit <= 129
+                && value_cap <= MAX_VALUE_LEN,
+            "invalid bounded metadata read; inspect the capture recovery configuration"
+        );
+        // Keys are capped like values: an out-of-band oversized key is never
+        // hydrated into the caller, only reported through the safe-limit error.
+        let mut values: Vec<sea_orm::Value> =
+            vec![(MAX_KEY_LEN as i64).into(), (value_cap as i64).into()];
+        let placeholders = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut sql = format!(
+            "SELECT scope, target,
+             CASE WHEN length(CAST(key AS BLOB)) <= ? THEN key ELSE NULL END AS bounded_key,
+             value_type,
+             CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value ELSE NULL END AS bounded_value
+             FROM metadata_kv WHERE scope IN ({placeholders})"
+        );
+        values.extend(scopes.iter().map(|scope| scope.as_str().into()));
+        if let Some(target) = target {
+            sql.push_str(" AND target = ?");
+            values.push(target.into());
+        }
+        if let Some((lower, upper)) = key_range {
+            sql.push_str(" AND key >= ? AND key < ?");
+            values.extend([lower.into(), upper.into()]);
+        }
+        sql.push_str(" ORDER BY target, key, scope LIMIT ?");
+        values.push((limit as i64).into());
+        db.query_all_raw(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await
+        .context("cannot read bounded capture metadata; run `libra agent doctor`")?
+        .into_iter()
+        .map(|row| {
+            let key: Option<String> = row.try_get_by("bounded_key")?;
+            let value: Option<String> = row.try_get_by("bounded_value")?;
+            Ok(MetadataEntry {
+                scope: row.try_get_by("scope")?,
+                target: row.try_get_by("target")?,
+                key: key.context(
+                    "capture metadata key exceeds its safe size limit; run `libra agent doctor`",
+                )?,
+                value_type: row.try_get_by("value_type")?,
+                value: value.context(
+                    "capture metadata exceeds its safe size limit; run `libra agent doctor`",
+                )?,
+            })
+        })
+        .collect()
+    }
+
     /// Get one entry, or `None` when absent.
     pub async fn get_with_conn<C: ConnectionTrait>(
         db: &C,

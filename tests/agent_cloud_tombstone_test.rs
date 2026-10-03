@@ -534,6 +534,10 @@ async fn cloud_tombstone_propagates_for_agent_capture() {
         "the idempotent republish kept the original erased_at"
     );
     assert_eq!(
+        catalog_tombstones[0].source_fingerprint, None,
+        "the remote restore catalog must not re-export a legacy source fingerprint"
+    );
+    assert_eq!(
         catalog_sessions, 0,
         "no erased session survives into the restore catalog"
     );

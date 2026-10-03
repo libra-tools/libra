@@ -350,6 +350,10 @@ path = "tests/compat/agent_capability_matrix_pin.rs"
 name = "compat_agent_architecture_guard"
 path = "tests/compat/agent_architecture_guard.rs"
 
+[[test]]
+name = "compat_agent_docs_contract"
+path = "tests/compat/agent_docs_contract.rs"
+
 # plan-20260818 LB-01: DeepSeek Harness bridge protocol + stdio transport.
 [[test]]
 name = "agent_bridge_protocol_test"

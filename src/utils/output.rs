@@ -775,6 +775,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(warning_tracker)]
     fn warning_tracker() {
         reset_warning_tracker();
         assert!(!warning_was_emitted());
@@ -824,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(cwd, env)]
     fn apply_color_override_auto_clears_previous_override() {
         let _guard = ColorOverrideReset;
 

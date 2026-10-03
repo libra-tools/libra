@@ -153,7 +153,7 @@ libra op show @{0} --view
 
 ## `libra op restore`
 
-从先前捕获的 operation view 恢复受支持的 HEAD/ref 状态，而不是任意工作树或嵌套仓库内容。HEAD 和捕获的 branch refs 会重置为目标 view，本地分支中不存在于该 view 的会被 prune，因此 restore 会复现该 operation 的精确本地分支集合。恢复后的 HEAD branch 始终保留；remote-tracking refs 和 Libra-owned internal refs（locked `main`/`intent`/`traces` branches 以及保留 `libra/` namespace，例如 AI history branch `libra/intent`）永不 prune。
+从先前捕获的 operation view 恢复受支持的 HEAD/ref 状态，而不是任意工作树或嵌套仓库内容。HEAD 和捕获的 branch refs 会重置为目标 view，本地分支中不存在于该 view 的会被 prune，因此 restore 会复现该 operation 的精确本地分支集合。恢复后的 HEAD branch 始终保留；remote-tracking refs 永不 prune。Libra 拥有的 capture 与 history 分支——`traces`（`refs/libra/traces`，旧名 `agent-traces`）、`intent` 以及 AI history branch `libra/intent`——保持当前值：agent hook 回调推进这些分支时不会记录 operation，因此 restore 绝不会从 view 回退、prune 或重建它们（`--dry-run` 预览会把它们列为保留项）。
 
 仓库级 restore（`--what all --confirm-repo-wide`）在会删除快照中不存在的 linked worktree 的 HEAD 时拒绝执行：该 worktree 是在快照之后创建的，restore 后必须重新创建或 checkout 其 HEAD。
 
@@ -249,7 +249,8 @@ libra op restore @{1} --dry-run
 
 - `op restore` 成功时会记录一个新的 `op restore` operation。
 - `op restore --dry-run` 不写入新 operation。
-- Restore 会重置 HEAD 和目标 view 中捕获的 branch refs，并 prune 该 view 中不存在的本地分支（恢复后的 HEAD branch 始终保留；remote-tracking refs 保持不变）。
+- Agent hook 回调（`libra hooks <provider> <event>` 与隐藏的 `libra agent hooks` 别名）绝不会被记录为 operation：它们不会出现在 `op log` 中，也绝不会成为 `op undo` / `op restore` 的目标。其 capture 状态位于 capture catalog 与 `refs/libra/traces`（见 `docs/commands/zh-CN/hooks.md`）。Operation view 仍会快照该 ref，但 `op undo` / `op redo` / `op revert` / `op restore` 会让它保持当前值，因此在目标 view 之后捕获的检查点仍可到达。
+- Restore 会重置 HEAD 和目标 view 中捕获的 branch refs，并 prune 该 view 中不存在的本地分支（恢复后的 HEAD branch 始终保留；Libra 拥有的 capture 与 history 分支 `traces`、`agent-traces`、`intent` 和 `libra/intent` 保持当前值；remote-tracking refs 保持不变）。
 
 ### Operation 作用域执行
 

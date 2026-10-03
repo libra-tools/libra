@@ -6,7 +6,7 @@
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
     process::Command,
     sync::{
@@ -36,6 +36,60 @@ struct MockServer {
     join: Option<thread::JoinHandle<()>>,
 }
 
+/// Reads one bounded HTTP request, including the whole declared JSON body.
+///
+/// A single `read` is not a message boundary: under concurrent command tests
+/// the headers and body can arrive in separate TCP reads. The mock must not
+/// silently record only whichever request happened to arrive in one packet.
+fn read_json_request(stream: &mut TcpStream) -> Option<serde_json::Value> {
+    const MAX_REQUEST_BYTES: usize = 32 * 1024;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end;
+        }
+        let remaining = MAX_REQUEST_BYTES.checked_sub(bytes.len())?;
+        if remaining == 0 {
+            return None;
+        }
+        let read_len = remaining.min(chunk.len());
+        let n = stream.read(&mut chunk[..read_len]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    };
+
+    let header = std::str::from_utf8(&bytes[..header_end]).ok()?;
+    let content_length = header
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let body_start = header_end.checked_add(4)?;
+    let body_end = body_start.checked_add(content_length)?;
+    if body_end > MAX_REQUEST_BYTES {
+        return None;
+    }
+    while bytes.len() < body_end {
+        let remaining = MAX_REQUEST_BYTES.checked_sub(bytes.len())?;
+        let read_len = remaining.min(chunk.len());
+        let n = stream.read(&mut chunk[..read_len]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    serde_json::from_slice(&bytes[body_start..body_end]).ok()
+}
+
 impl MockServer {
     /// `entry` responses return the mutate payload; otherwise a tree listing.
     fn start(entry: bool) -> Self {
@@ -52,13 +106,16 @@ impl MockServer {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = vec![0u8; 32 * 1024];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let raw = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if let Some((_, body)) = raw.split_once("\r\n\r\n")
-                            && let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+                        if stream.set_nonblocking(false).is_err()
+                            || stream
+                                .set_write_timeout(Some(Duration::from_secs(5)))
+                                .is_err()
                         {
-                            bodies_clone.lock().expect("lock").push(json);
+                            continue;
+                        }
+                        let body = read_json_request(&mut stream);
+                        if let Some(body) = body {
+                            bodies_clone.lock().expect("lock").push(body);
                         }
                         requests_clone.fetch_add(1, Ordering::SeqCst);
                         let payload = if entry {

@@ -56,10 +56,6 @@ impl HookProvider for GeminiProvider {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }
 
-    fn lifecycle_fallback_events(&self) -> &'static [&'static str] {
-        parser::GEMINI_LIFECYCLE_FALLBACK_EVENTS
-    }
-
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
         settings::install_gemini_hooks(options)
     }

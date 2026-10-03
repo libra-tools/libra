@@ -648,10 +648,11 @@ async fn run_gc(
         let live =
             crate::internal::ai::history::list_live_traces_inflight_markers(&db_conn, now_ms)
                 .await
-                .map_err(|err| {
-                    CliError::fatal(format!(
-                        "traces-inflight markers cannot be trusted before pruning: {err:#}"
-                    ))
+                .map_err(|_| {
+                    CliError::fatal(
+                        "traces-inflight markers cannot be trusted before pruning; inspect them with `libra agent doctor`"
+                            .to_string(),
+                    )
                     .with_stable_code(StableErrorCode::RepoCorrupt)
                 })?;
         // Only LIVE ordinary markers defer: their write window may hold
@@ -3562,29 +3563,54 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let live_markers = crate::internal::ai::history::list_live_traces_inflight_markers(db, now_ms)
         .await
-        .map_err(|err| {
-            CliError::fatal(format!(
-                "traces-inflight markers cannot be trusted while computing GC roots \
-                      (destructive maintenance stops): {err:#}"
-            ))
+        .map_err(|_| {
+            CliError::fatal(
+                "traces-inflight markers cannot be trusted while computing GC roots; destructive maintenance stopped and `libra agent doctor` must inspect them"
+                    .to_string(),
+            )
             .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
     for marker in &live_markers {
-        let value = serde_json::to_value(marker).map_err(|err| {
-            CliError::fatal(format!(
-                "traces-inflight marker cannot be re-encoded while computing GC roots: {err}"
-            ))
+        let value = serde_json::to_value(marker).map_err(|_| {
+            CliError::fatal(
+                "traces-inflight marker cannot be re-encoded while computing GC roots; inspect it with `libra agent doctor`"
+                    .to_string(),
+            )
             .with_stable_code(StableErrorCode::InternalInvariant)
         })?;
         walk_json_value_oids(value, storage, boundaries, reachable)?;
     }
     match db
         .query_all_raw(stmt_of(
-            "SELECT scope, value FROM metadata_kv WHERE scope <> 'agent_traces_inflight'",
+            "SELECT scope, value FROM metadata_kv WHERE scope NOT IN (
+                'agent_traces_inflight', 'agent_capture_pending',
+                'agent_capture_quarantine', 'agent_capture_pending_chunk',
+                'agent_capture_session_alias'
+             )",
         ))
         .await
     {
         Ok(rows) => {
+            crate::internal::ai::capture::pending_identity::assert_private_targets_for_gc(db)
+                .await
+                .map_err(|_| CliError::fatal(
+                    "capture recovery scope cannot be trusted; destructive maintenance stopped; run `libra agent doctor`".to_string(),
+                ).with_stable_code(StableErrorCode::RepoCorrupt))?;
+            let parents = crate::internal::ai::capture::pending::gc_parent_roots(db)
+                .await
+                .map_err(|_| CliError::fatal(
+                    "capture recovery headers cannot be trusted while computing GC roots; destructive maintenance stopped; run `libra agent doctor`".to_string(),
+                ).with_stable_code(StableErrorCode::RepoCorrupt))?;
+            for parent in parents {
+                let hash = parse_object_hash(&parent).ok_or_else(|| {
+                    CliError::fatal(
+                        "capture recovery parent proof is invalid; destructive maintenance stopped"
+                            .to_string(),
+                    )
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                walk_reachable(&hash, storage, boundaries, reachable)?;
+            }
             for row in rows {
                 let value: String = row.try_get_by_index(1).map_err(|err| {
                     CliError::fatal(format!(
@@ -4522,6 +4548,389 @@ fn info_println(output: &OutputConfig, message: &str) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn gc_does_not_hydrate_capture_pending_chunks() {
+        use std::time::Duration;
+
+        use git_internal::internal::object::{
+            ObjectTrait,
+            blob::Blob,
+            signature::Signature,
+            tree::{TreeItem, TreeItemMode},
+        };
+        use sea_orm::{ConnectionTrait, Statement};
+
+        use crate::internal::{
+            ai::{
+                capture::pending::{PendingBinding, PendingHeader},
+                capture_scope::CaptureScope,
+            },
+            config::ConfigKv,
+            metadata::{MetadataKv, MetadataScope, MetadataValueType},
+        };
+
+        const CHILD: &str = "LIBRA_ACF10_GC_FIXTURE_CHILD";
+        const COMPLETE: &str = "ACF10_GC_CHILD_ASSERTIONS_COMPLETE";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            // The existing commit/tree GC loader is cwd-bound. Run only this
+            // fixture in an isolated child instead of mutating the shared
+            // test process's cwd, environment, or hash-kind state.
+            let root = tempfile::Builder::new()
+                .prefix("libra-acf10-gc-")
+                .tempdir()
+                .unwrap();
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .args([
+                    "--exact",
+                    "command::maintenance::tests::gc_does_not_hydrate_capture_pending_chunks",
+                    "--nocapture",
+                ])
+                .current_dir(root.path())
+                .env(CHILD, "1")
+                .env("LIBRA_TEST", "1")
+                .env("TMPDIR", root.path())
+                .env("TMP", root.path())
+                .env("TEMP", root.path())
+                .env(
+                    "LIBRA_CONFIG_GLOBAL_DB",
+                    root.path().join("global-config.db"),
+                )
+                .env(
+                    "LIBRA_CONFIG_SYSTEM_DB",
+                    root.path().join("system-config.db"),
+                )
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            if let Some(system_root) = std::env::var_os("SYSTEMROOT") {
+                command.env("SYSTEMROOT", system_root);
+            }
+            let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+                .await
+                .expect("isolated GC fixture must finish within its test timeout")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated GC fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == COMPLETE),
+                "a successful child exit without the final assertion receipt is not GC evidence"
+            );
+            return;
+        }
+        let root = std::env::current_dir().unwrap();
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("libra-acf10-gc-")
+        );
+        let repo = root.join(".libra");
+        std::fs::create_dir(&repo).unwrap();
+        let objects = repo.join("objects");
+        std::fs::create_dir(&objects).unwrap();
+        let conn = db::create_database(repo.join("libra.db").to_str().unwrap())
+            .await
+            .unwrap();
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "gc-private-pending", false)
+            .await
+            .unwrap();
+        let storage = ClientStorage::init(objects);
+        let old_blob =
+            Blob::from_content_with_kind(HashKind::Sha1, "old HEAD protected by recovery parent")
+                .unwrap();
+        let new_blob =
+            Blob::from_content_with_kind(HashKind::Sha1, "rewritten unrelated HEAD").unwrap();
+        let canary =
+            Blob::from_content_with_kind(HashKind::Sha1, "chunk content is not a GC object root")
+                .unwrap();
+        let old_tree = Tree::from_tree_items_with_kind(
+            HashKind::Sha1,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                old_blob.id,
+                "old.txt".into(),
+            )],
+        )
+        .unwrap();
+        let new_tree = Tree::from_tree_items_with_kind(
+            HashKind::Sha1,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                new_blob.id,
+                "new.txt".into(),
+            )],
+        )
+        .unwrap();
+        let author =
+            Signature::from_data(b"author t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
+        let signature =
+            Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
+        let old_head = Commit::new_with_kind(
+            HashKind::Sha1,
+            author.clone(),
+            signature.clone(),
+            old_tree.id,
+            vec![],
+            "old HEAD",
+        )
+        .unwrap();
+        let new_head = Commit::new_with_kind(
+            HashKind::Sha1,
+            author,
+            signature,
+            new_tree.id,
+            vec![],
+            "rewritten HEAD",
+        )
+        .unwrap();
+        for blob in [&old_blob, &new_blob, &canary] {
+            storage
+                .put(&blob.id, &blob.to_data().unwrap(), blob.get_type())
+                .unwrap();
+        }
+        for tree in [&old_tree, &new_tree] {
+            storage
+                .put(&tree.id, &tree.to_data().unwrap(), tree.get_type())
+                .unwrap();
+        }
+        for commit in [&old_head, &new_head] {
+            storage
+                .put(&commit.id, &commit.to_data().unwrap(), commit.get_type())
+                .unwrap();
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO reference (name, kind, \"commit\") VALUES (NULL, 'Head', ?)",
+            [old_head.id.to_string().into()],
+        ))
+        .await
+        .unwrap();
+        let repository_entries = || {
+            std::fs::read_dir(&repo)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                // SQLite may create/remove these during background index
+                // writes. They are not private key storage, and must not
+                // make this top-level no-new-key assertion timing-dependent.
+                .filter(|name| {
+                    !["libra.db-journal", "libra.db-wal", "libra.db-shm"]
+                        .iter()
+                        .any(|sqlite_file| name == std::ffi::OsStr::new(sqlite_file))
+                })
+                .collect::<HashSet<_>>()
+        };
+        let keyless_layout = repository_entries();
+        let before = collect_reachable_objects_with_conn(&storage, &conn)
+            .await
+            .unwrap();
+        assert!(
+            before.contains(&old_head.id)
+                && before.contains(&old_tree.id)
+                && before.contains(&old_blob.id)
+        );
+        assert!(!before.contains(&canary.id));
+
+        // Ownership-only GC fixture: header parsing, not key/sidecar
+        // authentication, protects the parent. Deliberately non-codec chunk
+        // bytes contain a real object's OID and must never be hydrated.
+        let checkpoint = uuid::Uuid::new_v4().to_string();
+        let binding = PendingBinding {
+            scope: CaptureScope {
+                repo_id: "gc-private-pending".into(),
+                worktree_id: String::new(),
+                workspace_id: None,
+                workspace_fence: None,
+            },
+            session_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint_id: checkpoint.clone(),
+            event_id: uuid::Uuid::new_v4().to_string(),
+            action_key: "gc-parent-action".into(),
+            receipt_key: "gc-parent-receipt".into(),
+            marker_generation: "expired-marker".into(),
+            source_commitment: format!("source/hmac-v2/{}", "a".repeat(64)),
+            reserved_revision: 1,
+            original_deadline_millis: None,
+            deferrable: true,
+            first_attempt_millis: 1,
+            parent_commit: Some(old_head.id.to_string()),
+            parent_unborn: false,
+        };
+        let header = format!(
+            "{{\"version\":1,\"binding\":{},\"mac\":\"pending-envelope/hmac-v1/{}\",\"envelope_bytes\":1,\"chunks\":1,\"manual_attempted\":false}}",
+            serde_json::to_string(&binding).unwrap(),
+            "b".repeat(64),
+        );
+        assert!(PendingHeader::decode(&header).is_ok());
+        MetadataKv::set_with_conn(
+            &conn,
+            MetadataScope::AgentCapturePending,
+            "gc-private-pending",
+            &checkpoint,
+            &header,
+            MetadataValueType::Text,
+        )
+        .await
+        .unwrap();
+        MetadataKv::set_with_conn(
+            &conn,
+            MetadataScope::AgentCapturePendingChunk,
+            "gc-private-pending",
+            &format!("{checkpoint}:000"),
+            &serde_json::json!({"oid":canary.id.to_string(), "invalid_chunk":"x".repeat(64*1024)})
+                .to_string(),
+            MetadataValueType::Binary,
+        )
+        .await
+        .unwrap();
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "UPDATE reference SET \"commit\" = ? WHERE kind = 'Head'",
+            [new_head.id.to_string().into()],
+        ))
+        .await
+        .unwrap();
+        let expected = HashSet::from([
+            old_head.id,
+            old_tree.id,
+            old_blob.id,
+            new_head.id,
+            new_tree.id,
+            new_blob.id,
+        ]);
+        let after = collect_reachable_objects_with_conn(&storage, &conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, expected,
+            "pending parent keeps the old graph alive after actual HEAD rewrite"
+        );
+        assert!(
+            !after.contains(&canary.id),
+            "chunk OID must not be rooted through the generic metadata walker"
+        );
+
+        conn.execute_raw(Statement::from_sql_and_values(conn.get_database_backend(),
+            "DELETE FROM metadata_kv WHERE scope = 'agent_capture_pending' AND target = ? AND key = ?",
+            ["gc-private-pending".into(), checkpoint.clone().into()],
+        )).await.unwrap();
+        let without_header = collect_reachable_objects_with_conn(&storage, &conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            without_header,
+            HashSet::from([new_head.id, new_tree.id, new_blob.id]),
+            "the retained chunk alone cannot protect the old graph or canary"
+        );
+        MetadataKv::set_with_conn(
+            &conn,
+            MetadataScope::AgentCaptureQuarantine,
+            "gc-private-pending",
+            &checkpoint,
+            "malformed-private-header-canary",
+            MetadataValueType::Text,
+        )
+        .await
+        .unwrap();
+        let error = collect_reachable_objects_with_conn(&storage, &conn)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("destructive maintenance stopped"));
+        assert!(!error.contains("malformed-private-header-canary"));
+        assert_eq!(
+            repository_entries(),
+            keyless_layout,
+            "GC must not create new top-level private key storage"
+        );
+        println!("\n{COMPLETE}");
+    }
+
+    #[tokio::test]
+    async fn gc_does_not_hydrate_capture_session_alias() {
+        use sea_orm::ConnectionTrait;
+
+        use crate::internal::{
+            config::ConfigKv,
+            metadata::{MetadataKv, MetadataScope, MetadataValueType},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("repository.db");
+        let conn = crate::internal::db::create_database(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        ConfigKv::set_with_conn(&conn, "libra.repoid", "gc-private-repo", false)
+            .await
+            .unwrap();
+        use git_internal::internal::object::{ObjectTrait, blob::Blob};
+
+        use crate::utils::storage::{Storage, local::LocalStorage};
+        let objects = root.path().join("objects");
+        let local = std::sync::Arc::new(LocalStorage::new(objects.clone()));
+        let blob =
+            Blob::from_content_with_kind(HashKind::Sha1, "real GC alias exclusion canary").unwrap();
+        local
+            .put(&blob.id, &blob.data, blob.get_type())
+            .await
+            .unwrap();
+        let canary_oid = blob.id.to_string();
+        let value = serde_json::json!({"catalog_pk": canary_oid, "invalid_association": "x".repeat(32 * 1024)}).to_string();
+        MetadataKv::set_with_conn(
+            &conn,
+            MetadataScope::AgentCaptureSessionAlias,
+            "gc-private-repo",
+            &uuid::Uuid::new_v4().to_string(),
+            &value,
+            MetadataValueType::Text,
+        )
+        .await
+        .unwrap();
+        let storage = ClientStorage::from_test_storage(local, objects);
+        let mut reachable = HashSet::new();
+        collect_registered_store_roots(&conn, &storage, &HashSet::new(), &mut reachable)
+            .await
+            .unwrap();
+        assert!(
+            reachable.is_empty(),
+            "private PK must not become an OID root"
+        );
+        MetadataKv::set_with_conn(
+            &conn,
+            MetadataScope::Branch,
+            "ordinary",
+            "control-root",
+            &serde_json::json!({"oid": blob.id.to_string()}).to_string(),
+            MetadataValueType::Text,
+        )
+        .await
+        .unwrap();
+        collect_registered_store_roots(&conn, &storage, &HashSet::new(), &mut reachable)
+            .await
+            .unwrap();
+        assert_eq!(
+            reachable,
+            HashSet::from([blob.id]),
+            "ordinary metadata must root the same real object"
+        );
+        assert!(!root.path().join("private").exists());
+        conn.execute_unprepared(
+            "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, updated_at)
+             VALUES ('agent_capture_session_alias', 'foreign-repo', 'unassigned', 'not-hydrated', 'text', '', '')",
+        ).await.unwrap();
+        assert!(
+            collect_registered_store_roots(&conn, &storage, &HashSet::new(), &mut reachable)
+                .await
+                .is_err()
+        );
+    }
+
     /// The 4 MiB ledger cap is enforced on the way OUT, not only on the way
     /// in. Checking it only on read lets THIS run write a ledger every later
     /// run then refuses to read — the quarantine clock stops for a file this
@@ -4908,6 +5317,10 @@ mod tests {
             (
                 "libra.db",
                 "the repository SQLite database; ref/object inventory lives in its tables, not in on-disk object files",
+            ),
+            (
+                "private",
+                "repository-private capture key material and worker advisory locks; no object ids",
             ),
             (
                 "refs",

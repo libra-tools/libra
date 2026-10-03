@@ -2059,14 +2059,20 @@ pub(crate) async fn remove_worktree_delete_dir(
         }
     }
 
-    // `remove --delete-dir .` runs with cwd INSIDE the target: move out
-    // before deleting it, or every later cwd-based lookup (and the user's
-    // shell) sits in a deleted directory.
-    if let Ok(cwd) = env::current_dir()
-        && cwd.starts_with(target)
-        && let Some(parent) = target.parent()
     {
-        let _ = env::set_current_dir(parent);
+        // `remove --delete-dir .` runs with cwd INSIDE the target: move out
+        // before deleting it, or every later cwd-based lookup (and the user's
+        // shell) sits in a deleted directory.
+        // Test commands run in one process, so this exceptional cwd repair must
+        // participate in the same lock as ChangeDirGuard.
+        #[cfg(test)]
+        let _cwd_lock = crate::utils::test::cwd_lock_guard();
+        if let Ok(cwd) = env::current_dir()
+            && cwd.starts_with(target)
+            && let Some(parent) = target.parent()
+        {
+            let _ = env::set_current_dir(parent);
+        }
     }
     if let Err(e) = fs::remove_dir_all(target) {
         // Re-freeze a detached entry before surfacing the error — the

@@ -31,13 +31,13 @@ pub(crate) async fn run_cloud_sync(
     // Initialize D1 client.
     let d1_client = D1Client::from_env()
         .await
-        .map_err(|e| CloudError::D1(format!("D1 client error: {}", e.message)))?;
+        .map_err(|error| cloud_d1_failure("initialize cloud client", &error))?;
 
     // Ensure D1 table exists before any operations.
     d1_client
         .ensure_object_index_table()
         .await
-        .map_err(|e| CloudError::D1(format!("Failed to create D1 table: {}", e.message)))?;
+        .map_err(|error| cloud_d1_failure("ensure object-index table", &error))?;
 
     // Get database connection.
     let db_conn = db::get_db_conn_instance().await;
@@ -68,12 +68,10 @@ pub(crate) async fn run_cloud_sync(
         });
 
     // Ensure repositories table exists.
-    d1_client.ensure_repositories_table().await.map_err(|e| {
-        CloudError::D1(format!(
-            "Failed to create repositories table: {}",
-            e.message
-        ))
-    })?;
+    d1_client
+        .ensure_repositories_table()
+        .await
+        .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
 
     // Persist the repository object-format alongside the backup catalog so
     // restore can read an authoritative kind (B3-09 storage axis; B3-14
@@ -84,23 +82,11 @@ pub(crate) async fn run_cloud_sync(
     let repo_row = d1_client
         .upsert_repository_with_format(&repo_id, &project_name, Some(object_format))
         .await
-        .map_err(|e| {
-            if e.message.contains("UNIQUE constraint failed: repositories.name") {
-                CloudError::NameAlreadyTaken(format!(
-                    "Project name '{}' is already taken by another repository. Please choose a different name in cloud.name config.",
-                    project_name
-                ))
-            } else {
-                CloudError::D1(format!("Failed to upsert repository: {}", e.message))
-            }
-        })?;
+        .map_err(|error| repository_upsert_failure(&project_name, &error))?;
 
     // Verify repo_id matches (to detect name conflict).
     if repo_row.repo_id != repo_id {
-        return Err(CloudError::NameAlreadyTaken(format!(
-            "Project name '{}' is already taken by another repository (ID: {}). Please choose a different name in cloud.name config.",
-            project_name, repo_row.repo_id
-        )));
+        return Err(project_name_taken(&project_name));
     }
 
     // Query unsynced objects.
@@ -129,16 +115,7 @@ pub(crate) async fn run_cloud_sync(
         // ship, the agent_session/agent_checkpoint catalog may have new
         // rows from local hook ingestion. Mirror them on every sync.
         let agent_capture =
-            match sync_agent_capture_tables(&db_conn, &d1_client, &r2_storage, &repo_id, progress)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    let err = err.to_string();
-                    progress.on_agent_capture_warning(&err);
-                    AgentCaptureSyncOutcome::Failed { error: err }
-                }
-            };
+            mirror_agent_capture(&db_conn, &d1_client, &r2_storage, &repo_id, progress).await;
         return Ok(CloudSyncReport {
             repo_id,
             project_name,
@@ -236,22 +213,8 @@ pub(crate) async fn run_cloud_sync(
     // tail of the sync flow per the plan. The report retains the detailed
     // phase outcome; `execute_sync` turns a failed mirror into a non-zero,
     // actionable partial-transfer result after rendering progress.
-    let agent_capture = match sync_agent_capture_tables(
-        &db_conn,
-        &d1_client,
-        &r2_storage,
-        &repo_id,
-        progress,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            let err = err.to_string();
-            progress.on_agent_capture_warning(&err);
-            AgentCaptureSyncOutcome::Failed { error: err }
-        }
-    };
+    let agent_capture =
+        mirror_agent_capture(&db_conn, &d1_client, &r2_storage, &repo_id, progress).await;
 
     Ok(CloudSyncReport {
         repo_id,
@@ -262,6 +225,26 @@ pub(crate) async fn run_cloud_sync(
         metadata,
         agent_capture,
     })
+}
+
+/// Run the agent-capture mirror phase. This is the single place a phase
+/// failure is reported: exactly one fixed `agent_capture` warning carrying the
+/// content-free reason that the report (and the final error) also carries.
+pub(super) async fn mirror_agent_capture(
+    db_conn: &sea_orm::DatabaseConnection,
+    d1_client: &D1Client,
+    r2_storage: &RemoteStorage,
+    repo_id: &str,
+    progress: &dyn CloudSyncProgress,
+) -> AgentCaptureSyncOutcome {
+    match sync_agent_capture_tables(db_conn, d1_client, r2_storage, repo_id, progress).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let reason = agent_capture_sync_failure_reason(&error);
+            progress.on_agent_capture_warning(&reason);
+            AgentCaptureSyncOutcome::Failed { error: reason }
+        }
+    }
 }
 
 /// Parse an `object_index` model's hex `o_id` into an `ObjectHash`.
@@ -313,7 +296,77 @@ async fn sync_single_object(
             Some(object_format),
         )
         .await
-        .map_err(|e| CloudError::D1(format!("D1 write failed: {}", e.message)))?;
+        .map_err(|error| cloud_d1_failure("write object index", &error))?;
 
     Ok(())
+}
+
+fn project_name_taken(project_name: &str) -> CloudError {
+    CloudError::NameAlreadyTaken(format!(
+        "Project name '{project_name}' is already taken by another repository. Please choose a different name in cloud.name config."
+    ))
+}
+
+/// A concurrent registration of the same project name surfaces as the remote
+/// UNIQUE constraint. Classify it as the same name conflict as the post-upsert
+/// check, using only the locally configured name; every other failure keeps
+/// the redacted D1 diagnostic.
+fn repository_upsert_failure(project_name: &str, error: &D1Error) -> CloudError {
+    if error
+        .message
+        .contains("UNIQUE constraint failed: repositories.name")
+    {
+        project_name_taken(project_name)
+    } else {
+        cloud_d1_failure("upsert repository", error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_project_name_collision_stays_a_redacted_name_conflict() {
+        const REMOTE_SENTINEL: &str = "REMOTE_D1_ROW_SENTINEL";
+        let collision = repository_upsert_failure(
+            "demo",
+            &D1Error {
+                code: 7500,
+                message: format!("UNIQUE constraint failed: repositories.name {REMOTE_SENTINEL}"),
+            },
+        );
+        match &collision {
+            CloudError::NameAlreadyTaken(detail) => {
+                assert!(detail.contains("'demo'"), "{detail}");
+                assert!(!detail.contains(REMOTE_SENTINEL), "{detail}");
+            }
+            other => panic!("UNIQUE name collision must stay a name conflict: {other:?}"),
+        }
+        // Both name-conflict paths keep the shipped text and stable code.
+        assert_eq!(collision, project_name_taken("demo"));
+        assert_eq!(
+            collision.to_string(),
+            "Project name 'demo' is already taken by another repository. Please choose a different name in cloud.name config."
+        );
+        assert_eq!(
+            collision.into_cli_error("sync").stable_code(),
+            crate::utils::error::StableErrorCode::ConflictOperationBlocked
+        );
+        let other = repository_upsert_failure(
+            "demo",
+            &D1Error {
+                code: 7500,
+                message: REMOTE_SENTINEL.to_string(),
+            },
+        );
+        match &other {
+            CloudError::D1(detail) => assert!(!detail.contains(REMOTE_SENTINEL), "{detail}"),
+            other => panic!("other upsert failures stay redacted D1 errors: {other:?}"),
+        }
+        assert_eq!(
+            other.into_cli_error("sync").stable_code(),
+            crate::utils::error::StableErrorCode::NetworkProtocol
+        );
+    }
 }

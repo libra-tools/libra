@@ -36,7 +36,8 @@ use super::{
 };
 use crate::{
     internal::{
-        branch::is_locked_branch,
+        ai::history::AI_REF,
+        branch::{is_ai_managed_branch, is_locked_branch},
         config::ConfigKv,
         db::begin_write_transaction,
         head::Head,
@@ -45,6 +46,47 @@ use crate::{
     },
     utils::client_storage::ClientStorage,
 };
+
+/// Return `true` for the Libra-owned AI capture and history branches whose
+/// live value an operation restore keeps instead of applying a view's value:
+/// `traces`, its legacy `agent-traces` name, `intent`, and the AI history ref
+/// `libra/intent`.
+///
+/// Agent hook callbacks advance these refs outside the operation boundary and
+/// record no operation, so no operation view is authoritative for them.
+/// Rewinding `traces` to a view captured before later callbacks would leave
+/// every checkpoint catalogued since then unreachable from the ref, and the
+/// next callback would start a new chain that orphans them for good. Views
+/// never snapshot the capture catalog either, so even for a recorded
+/// `libra agent` operation a rewound ref would disagree with its catalog. A
+/// repository-wide ref restore (`op restore` / `op undo` / `op redo` /
+/// `op revert`, and the rollback of a failed one) therefore keeps the current
+/// row of each such branch, including its absence: it never moves, prunes,
+/// or recreates one from a view.
+pub fn is_restore_preserved_branch(name: &str) -> bool {
+    is_ai_managed_branch(name) || name == AI_REF
+}
+
+/// Whether one refs-facet entry names a local branch that restore preserves
+/// (see [`is_restore_preserved_branch`]).
+pub fn is_restore_preserved_reference(reference: &serde_json::Value) -> bool {
+    reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+        && reference
+            .get("remote")
+            .is_none_or(serde_json::Value::is_null)
+        && reference
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_restore_preserved_branch)
+}
+
+/// One live preserved branch row, kept verbatim across a ref restore.
+struct PreservedBranchRow {
+    id: i64,
+    name: String,
+    commit: Option<String>,
+    worktree_id: Option<String>,
+}
 
 /// The state facets that a restore may touch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -521,17 +563,23 @@ impl RestoreEngine {
                 )
                 .await);
         }
-        if restore_refs && let Err(error) = self.restore_references(&view).await {
-            return Err(self
-                .fail_and_rollback(
-                    &op_id,
-                    current.view_oid,
-                    &current.snapshot,
-                    &snapshot,
-                    restore_refs,
-                    error,
-                )
-                .await);
+        let mut preserved_refs_diverged = false;
+        if restore_refs {
+            match self.restore_references(&view).await {
+                Ok(diverged) => preserved_refs_diverged = diverged,
+                Err(error) => {
+                    return Err(self
+                        .fail_and_rollback(
+                            &op_id,
+                            current.view_oid,
+                            &current.snapshot,
+                            &snapshot,
+                            restore_refs,
+                            error,
+                        )
+                        .await);
+                }
+            }
         }
         let post = match self.capture_current_state(generation).await {
             Ok(post) => post,
@@ -567,7 +615,10 @@ impl RestoreEngine {
         published_view
             .workspaces
             .insert(workspace_id.clone(), post.snapshot_oid);
-        if !restore_refs {
+        // Record the refs this restore actually published: the live refs when
+        // it restored none, or when it kept a preserved Libra-owned branch at
+        // a value that differs from the target view's.
+        if !restore_refs || preserved_refs_diverged {
             published_view.refs_facet_oid = post_manifest.refs_facet_oid;
         }
         let post_view_oid = match self.store.write_view_manifest(&published_view) {
@@ -1153,7 +1204,14 @@ impl RestoreEngine {
         Ok(())
     }
 
-    async fn restore_references(&self, view: &RepoViewV2) -> Result<(), RestoreError> {
+    /// Replace the reference table with the view's refs facet, keeping every
+    /// preserved Libra-owned branch row (see [`is_restore_preserved_branch`])
+    /// at its live value.
+    ///
+    /// Returns `true` when a kept preserved branch differs from the view's
+    /// entry for it (value, presence, or absence), i.e. when the published
+    /// ref state is not exactly the view's refs facet.
+    async fn restore_references(&self, view: &RepoViewV2) -> Result<bool, RestoreError> {
         let bytes = self
             .store
             .load_object(&view.refs_facet_oid)
@@ -1245,13 +1303,23 @@ impl RestoreEngine {
                 // The protected Libra-owned branches are created as empty
                 // placeholders during init. They are real branch rows, but
                 // intentionally have no commit until their first capture.
-                "Branch" if commit.is_none() && !name.is_some_and(is_locked_branch) => {
+                "Branch"
+                    if commit.is_none()
+                        && !name.is_some_and(|name| {
+                            is_locked_branch(name) || is_restore_preserved_branch(name)
+                        }) =>
+                {
                     return Err(RestoreError::Storage(
                         "Branch ref has no commit and is not a locked placeholder".to_string(),
                     ));
                 }
                 "Branch" => {}
                 _ => unreachable!(),
+            }
+            // A preserved branch's view value is never applied, so its commit
+            // need not still exist (e.g. after `agent clean` rewrote traces).
+            if is_restore_preserved_reference(reference) {
+                continue;
             }
             if let Some(commit) = commit {
                 let oid =
@@ -1284,13 +1352,36 @@ impl RestoreEngine {
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         self.protect_changed_branch_refs(&txn, references).await?;
+        // Read the live preserved rows under the write lock so a concurrent
+        // capture writer's update is either kept here or applied after us.
+        let preserved = read_preserved_branch_rows(&txn).await?;
+        let diverged = preserved_branches_diverge(references, &preserved);
         txn.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "DELETE FROM reference",
         ))
         .await
         .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        for row in &preserved {
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
+                 VALUES (?, ?, 'Branch', ?, NULL, ?)",
+                [
+                    row.id.into(),
+                    row.name.clone().into(),
+                    row.commit.clone().into(),
+                    row.worktree_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        }
+        let preserved_ids = preserved.iter().map(|row| row.id).collect::<BTreeSet<_>>();
         for reference in references {
+            if is_restore_preserved_reference(reference) {
+                continue;
+            }
             let id = reference
                 .get("id")
                 .and_then(serde_json::Value::as_i64)
@@ -1315,26 +1406,46 @@ impl RestoreEngine {
                 .get("worktree_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    id.into(),
-                    name.into(),
-                    kind.to_string().into(),
-                    commit.into(),
-                    remote.into(),
-                    worktree_id.into(),
-                ],
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            // Reference ids carry no meaning beyond row identity. Ids are
+            // never reused (AUTOINCREMENT), so a view row colliding with a
+            // kept preserved row is not expected; if one does, let SQLite
+            // assign it a fresh id rather than drop either row.
+            let statement = if preserved_ids.contains(&id) {
+                Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO reference (name, kind, `commit`, remote, worktree_id) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    [
+                        name.into(),
+                        kind.to_string().into(),
+                        commit.into(),
+                        remote.into(),
+                        worktree_id.into(),
+                    ],
+                )
+            } else {
+                Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        id.into(),
+                        name.into(),
+                        kind.to_string().into(),
+                        commit.into(),
+                        remote.into(),
+                        worktree_id.into(),
+                    ],
+                )
+            };
+            txn.execute_raw(statement)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
         }
         txn.commit()
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        Ok(())
+        Ok(diverged)
     }
 
     /// A repository-wide restore rewrites the shared branch table. Refuse to
@@ -1378,6 +1489,10 @@ impl RestoreEngine {
             else {
                 continue;
             };
+            // Preserved Libra-owned branches keep their live row.
+            if is_restore_preserved_branch(&name) {
+                continue;
+            }
             let current_commit = row
                 .try_get_by_index::<Option<String>>(1)
                 .map_err(|error| RestoreError::Storage(error.to_string()))?;
@@ -1822,6 +1937,70 @@ impl RestoreEngine {
         }
         Ok(())
     }
+}
+
+/// Read the live rows of every preserved Libra-owned local branch.
+async fn read_preserved_branch_rows<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<PreservedBranchRow>, RestoreError> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT id, name, `commit`, worktree_id FROM reference \
+             WHERE kind = 'Branch' AND remote IS NULL ORDER BY id",
+        ))
+        .await
+        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+    let mut preserved = Vec::new();
+    for row in rows {
+        let Some(name) = row
+            .try_get_by_index::<Option<String>>(1)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?
+        else {
+            continue;
+        };
+        if !is_restore_preserved_branch(&name) {
+            continue;
+        }
+        preserved.push(PreservedBranchRow {
+            id: row
+                .try_get_by_index::<i64>(0)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?,
+            name,
+            commit: row
+                .try_get_by_index::<Option<String>>(2)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?,
+            worktree_id: row
+                .try_get_by_index::<Option<String>>(3)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?,
+        });
+    }
+    Ok(preserved)
+}
+
+/// Whether the kept preserved branches differ from the target view's entries
+/// for them, by presence or by commit.
+fn preserved_branches_diverge(
+    target_references: &[serde_json::Value],
+    preserved: &[PreservedBranchRow],
+) -> bool {
+    let target = target_references
+        .iter()
+        .filter(|reference| is_restore_preserved_reference(reference))
+        .filter_map(|reference| {
+            let name = reference.get("name").and_then(serde_json::Value::as_str)?;
+            let commit = reference
+                .get("commit")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            Some((name.to_string(), commit))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let live = preserved
+        .iter()
+        .map(|row| (row.name.clone(), row.commit.clone()))
+        .collect::<BTreeMap<_, _>>();
+    target != live
 }
 
 fn selected_facets(what: RestoreWhat) -> Vec<FacetName> {
@@ -3253,5 +3432,197 @@ mod tests {
             .protect_linked_worktree_heads(&[target_linked])
             .await
             .expect("linked HEAD present in the target is allowed");
+    }
+
+    /// Live local branch rows as `(name, (id, commit))`.
+    async fn local_branch_rows(
+        database: &sea_orm::DatabaseConnection,
+    ) -> BTreeMap<String, (i64, Option<String>)> {
+        database
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, name, `commit` FROM reference \
+                 WHERE kind = 'Branch' AND remote IS NULL",
+            ))
+            .await
+            .expect("query branch rows")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get_by_index::<String>(1).expect("branch name"),
+                    (
+                        row.try_get_by_index::<i64>(0).expect("branch id"),
+                        row.try_get_by_index::<Option<String>>(2)
+                            .expect("branch commit"),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn branch_entry(id: i64, name: &str, commit: Option<&ObjectHash>) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "kind": "Branch",
+            "commit": commit.map(ToString::to_string),
+            "remote": serde_json::Value::Null,
+            "worktree_id": serde_json::Value::Null,
+        })
+    }
+
+    fn refs_view(engine: &RestoreEngine, references: Vec<serde_json::Value>) -> RepoViewV2 {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "references": references,
+        }))
+        .expect("refs facet bytes");
+        let oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);
+        engine
+            .store
+            .write_blob(&oid, &bytes, ObjectType::Blob)
+            .expect("store refs facet");
+        RepoViewV2 {
+            schema_version: REPO_VIEW_SCHEMA_VERSION,
+            repo_id: "repo".to_string(),
+            refs_facet_oid: oid,
+            workspaces: BTreeMap::new(),
+            change_roots: Vec::new(),
+            extension_facets: BTreeMap::new(),
+        }
+    }
+
+    /// A repository-wide ref restore rewinds and prunes ordinary branches but
+    /// keeps every Libra-owned capture/history branch at its live row: an
+    /// agent hook callback advances `traces` without recording an operation,
+    /// so rewinding it to an older view would orphan the checkpoints
+    /// catalogued since then.
+    #[tokio::test]
+    async fn ref_restore_keeps_libra_owned_capture_branches_at_live_values() {
+        use git_internal::internal::object::commit::Commit;
+
+        let root = tempdir().expect("worktree");
+        let gitdir = root.path().join(".libra");
+        fs::create_dir_all(gitdir.join("info")).expect("gitdir info");
+        let scope = crate::internal::worktree_scope::RequestScope {
+            scope: crate::internal::worktree_scope::WorktreeScope::Main,
+            workdir: root.path().to_path_buf(),
+            gitdir,
+            storage: root.path().to_path_buf(),
+            worktree_root: root.path().to_path_buf(),
+        };
+        let database = db::create_database(
+            root.path()
+                .join("libra.db")
+                .to_str()
+                .expect("database path"),
+        )
+        .await
+        .expect("database");
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let engine = RestoreEngine::new(scope, "repo", database.clone(), storage.clone());
+
+        let tree = store_empty_tree(&storage);
+        let store_commit = |message: &str| {
+            let commit = Commit::from_tree_id(tree, vec![], message);
+            storage
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("commit bytes"),
+                    ObjectType::Commit,
+                )
+                .expect("store commit");
+            commit.id
+        };
+        let user_old = store_commit("user branch, target view");
+        let user_new = store_commit("user branch, live");
+        let traces_live = store_commit("traces checkpoint written by a hook callback");
+        let history_live = store_commit("AI history written by a hook callback");
+        // The view's traces commit is gone (e.g. rewritten by `agent clean`):
+        // a preserved branch's view value is never loaded or applied.
+        let traces_pruned = Commit::from_tree_id(tree, vec![], "pruned traces checkpoint").id;
+
+        database
+            .execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "DELETE FROM reference",
+            ))
+            .await
+            .expect("clear reference table");
+        for (id, name, commit) in [
+            (1, "main", Some(user_new)),
+            (2, "intent", None),
+            (3, "traces", Some(traces_live)),
+            (4, "feature", Some(user_new)),
+            (5, AI_REF, Some(history_live)),
+        ] {
+            database
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
+                     VALUES (?, ?, 'Branch', ?, NULL, NULL)",
+                    [
+                        id.into(),
+                        name.into(),
+                        commit.map(|oid| oid.to_string()).into(),
+                    ],
+                ))
+                .await
+                .expect("live branch row");
+        }
+
+        // The target view predates the hook callbacks: traces had an older
+        // tip, the AI history ref did not exist, and a legacy traces row did.
+        let view = refs_view(
+            &engine,
+            vec![
+                branch_entry(1, "main", Some(&user_old)),
+                branch_entry(2, "intent", None),
+                branch_entry(3, "traces", Some(&traces_pruned)),
+                branch_entry(6, "agent-traces", Some(&traces_pruned)),
+                branch_entry(7, "topic", Some(&user_old)),
+            ],
+        );
+        let diverged = engine
+            .restore_references(&view)
+            .await
+            .expect("ref restore with preserved capture branches");
+        assert!(
+            diverged,
+            "kept capture branches differ from the view, so the published refs must be re-captured"
+        );
+
+        let user_old = Some(user_old.to_string());
+        let expected = BTreeMap::from([
+            ("main".to_string(), (1, user_old.clone())),
+            ("intent".to_string(), (2, None)),
+            ("traces".to_string(), (3, Some(traces_live.to_string()))),
+            (AI_REF.to_string(), (5, Some(history_live.to_string()))),
+            ("topic".to_string(), (7, user_old)),
+        ]);
+        assert_eq!(
+            local_branch_rows(&database).await,
+            expected,
+            "ordinary branches follow the view; capture branches keep their live rows"
+        );
+
+        // A view that already agrees with the live capture branches publishes
+        // exactly its own refs facet.
+        let agreeing = refs_view(
+            &engine,
+            vec![
+                branch_entry(1, "main", Some(&user_new)),
+                branch_entry(2, "intent", None),
+                branch_entry(3, "traces", Some(&traces_live)),
+                branch_entry(5, AI_REF, Some(&history_live)),
+            ],
+        );
+        let diverged = engine
+            .restore_references(&agreeing)
+            .await
+            .expect("ref restore with agreeing capture branches");
+        assert!(!diverged, "agreeing capture branches are not a divergence");
+        assert_eq!(
+            local_branch_rows(&database).await["main"],
+            (1, Some(user_new.to_string()))
+        );
     }
 }

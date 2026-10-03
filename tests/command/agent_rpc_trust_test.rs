@@ -570,3 +570,100 @@ fn provider_exporter_trust_is_ungated_and_trusted_dir_bound() {
         String::from_utf8_lossy(&untrust.stdout)
     );
 }
+
+/// R85: provider-exporter trust has no fixed binary-size cap. The stock
+/// OpenCode CLI is a ~171 MiB single-file Bun binary, so a 200 MiB (sparse)
+/// `opencode` must be trustable, its sha256 must be the whole-file digest, and
+/// the read-only `agent list --schema-version 2` revalidation must keep (not
+/// revoke) the record. The former 64 MiB cap refused the trust and revoked an
+/// existing record on the next list.
+#[test]
+fn provider_exporter_trust_accepts_large_single_file_binary_and_list_keeps_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const LARGE_EXPORTER_BYTES: u64 = 200 * 1024 * 1024;
+    // `printf '#!/bin/sh\nexit 0\n'` zero-extended to 200 MiB, digested
+    // independently with `shasum -a 256`.
+    const LARGE_EXPORTER_SHA256: &str =
+        "4e045ec6b0ef4cdc8c82e9d87983f6bafb0e2950c0c8ad971d391657589ec0c4";
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    init_repo_via_cli(&repo);
+    let fixtures = temp.path().join("bin");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let exporter = fixtures.join("opencode");
+    std::fs::write(&exporter, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&exporter)
+        .and_then(|file| file.set_len(LARGE_EXPORTER_BYTES))
+        .expect("extend exporter sparsely past the real OpenCode size");
+    std::fs::set_permissions(&exporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let trust_dir = run_with_path(
+        &["agent", "rpc", "trust", "--dir", fixtures.to_str().unwrap()],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        trust_dir.status.success(),
+        "trust --dir must succeed: {}",
+        String::from_utf8_lossy(&trust_dir.stderr)
+    );
+
+    let trusted = run_with_path(
+        &["--json", "agent", "rpc", "trust", "opencode"],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        trusted.status.success(),
+        "a realistic-size exporter must be trustable: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&trusted.stdout).unwrap_or_default();
+    assert_eq!(
+        json["data"]["kind"],
+        "provider-exporter",
+        "{}",
+        String::from_utf8_lossy(&trusted.stdout)
+    );
+    assert_eq!(
+        json["data"]["sha256"],
+        LARGE_EXPORTER_SHA256,
+        "trust records the whole-file sha256: {}",
+        String::from_utf8_lossy(&trusted.stdout)
+    );
+
+    // `agent list --schema-version 2` revalidates the OpenCode exporter trust
+    // (and revokes it on any revalidation error), so it must succeed and leave
+    // the record in place.
+    let list = run_with_path(
+        &["--json", "agent", "list", "--schema-version", "2"],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        list.status.success(),
+        "agent list v2 must succeed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let untrust = run_with_path(
+        &["--json", "agent", "rpc", "untrust", "opencode"],
+        &repo,
+        &fixtures,
+    );
+    assert!(
+        untrust.status.success(),
+        "untrust works: {}",
+        String::from_utf8_lossy(&untrust.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&untrust.stdout).unwrap_or_default();
+    assert_eq!(
+        json["data"]["removed"],
+        true,
+        "agent list revalidation must not revoke a valid large exporter trust: {}",
+        String::from_utf8_lossy(&untrust.stdout)
+    );
+}

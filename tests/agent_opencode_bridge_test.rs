@@ -37,7 +37,7 @@ impl BridgeRepo {
         // export path degrades when bwrap fails the integrity policy (e.g. it
         // lives under a user-writable path), which would make the content
         // assertions below spuriously fail — skip instead.
-        if !libra::internal::ai::observed_agents::opencode_export::trusted_bwrap_available() {
+        if !libra::internal::ai::observed_agents::opencode_export::trusted_bwrap_available().await {
             eprintln!("skipped (no trusted, usable bwrap)");
             return None;
         }
@@ -171,30 +171,16 @@ impl BridgeRepo {
         self.run(&["agent", "hooks", "opencode", "stop"], Some(&envelope))
     }
 
-    fn stop_with_env(&self, session_id: &str, key: &str, value: &str) -> Output {
-        let envelope = json!({
-            "hook_event_name": "session.idle",
-            "session_id": session_id,
-            "cwd": self.repo.to_string_lossy(),
-        })
-        .to_string();
-        let mut cmd = self.command();
-        cmd.env(key, value)
-            .args(["agent", "hooks", "opencode", "stop"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .expect("spawn opencode hook with test environment");
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin piped")
-            .write_all(envelope.as_bytes())
-            .expect("write hook envelope");
-        child.wait_with_output().expect("wait opencode hook")
+    /// Make object publication fail after the checkpoint writer owns its
+    /// finalizer marker. This keeps the crash-path assertion on a real
+    /// filesystem failure instead of exposing a production environment seam.
+    fn block_object_directory(&self) {
+        let objects = self.repo.join(".libra").join("objects");
+        let preserved = self.repo.join(".libra").join("objects-preserved");
+        if objects.exists() {
+            std::fs::rename(&objects, &preserved).expect("preserve objects directory");
+        }
+        std::fs::write(&objects, "not a directory").expect("block objects directory");
     }
 
     fn checkpoints(&self) -> Vec<Value> {
@@ -249,9 +235,11 @@ fn describe(out: &Output) -> String {
 
 /// A minimal valid export with one user turn (`hi` / `hello`) — normalizes
 /// to golden vector 1.
-const EXPORT_HELLO: &str = r#"printf '%s' '{"info":{"id":"ses_x"},"messages":[{"info":{"role":"user","id":"msg_u1"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant","id":"msg_a1"},"parts":[{"type":"text","text":"hello"}]}]}'"#;
+const EXPORT_HELLO: &str = r#"printf '{"info":{"id":"%s","directory":"__REPO__"},"messages":[{"info":{"role":"user","id":"msg_u1"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant","id":"msg_a1"},"parts":[{"type":"text","text":"hello"}]}]}' "$2""#;
 
 const EXPORT_IMPORT: &str = r#"printf '%s' '{"info":{"id":"ses_import","directory":"__REPO__","status":"stopped","time":{"created":1784077200000,"updated":1784077260000}},"messages":[{"info":{"role":"user","id":"msg_u1","time":{"created":1784077210000}},"parts":[{"type":"text","text":"historical"}]},{"info":{"role":"assistant","id":"msg_a1","time":{"created":1784077250000}},"parts":[{"type":"text","text":"imported"}]}]}'"#;
+
+const EXPORT_WRONG_SESSION: &str = r#"printf '%s' '{"info":{"id":"ses_other","directory":"__REPO__"},"messages":[{"info":{"role":"user","id":"msg_u1"},"parts":[{"type":"text","text":"wrong session"}]}]}'"#;
 
 /// M4 DR-05: the explicit-ID import command consumes the trusted sandboxed
 /// export bridge and persists an import-channel checkpoint, not an export-job
@@ -351,16 +339,84 @@ async fn opencode_export_whole_session_idempotent() {
     assert_eq!(observed, processed, "export job converged (clean)");
 }
 
+/// The trusted exporter hands `capture_authorized` a transient redacted
+/// checksum. Its successful durable path must bind that checksum to this
+/// repository before a snapshot projection reaches `agent_session` metadata.
+#[tokio::test]
+async fn opencode_export_durable_snapshot_uses_repository_keyed_hmac() {
+    let Some(repo) = BridgeRepo::init(EXPORT_HELLO).await else {
+        return;
+    };
+    let output = repo.stop("ses_hmac_snapshot");
+    assert!(
+        output.status.success(),
+        "successful export: {}",
+        describe(&output)
+    );
+
+    let rows = repo
+        .query_rows(
+            "SELECT metadata_json FROM agent_session \
+             WHERE provider_session_id = 'ses_hmac_snapshot'",
+        )
+        .await;
+    assert_eq!(rows.len(), 1, "successful export must have one session row");
+    let metadata_json: String = rows[0].try_get_by("metadata_json").unwrap();
+    let metadata: Value =
+        serde_json::from_str(&metadata_json).expect("OpenCode metadata is valid JSON");
+    let digest = metadata["transcript_snapshot"]["source"]["digest_sha256"]
+        .as_str()
+        .expect("successful OpenCode snapshot has a durable source commitment");
+    assert!(
+        digest.strip_prefix("source/hmac-v2/").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }),
+        "durable OpenCode source commitment must be repository-keyed HMAC v2: {digest}"
+    );
+    assert!(
+        !metadata_json.contains("sha256:"),
+        "durable OpenCode metadata retained a transient helper SHA-256: {metadata_json}"
+    );
+}
+
+/// The exporter binary may be trusted but still select a stale/incorrect
+/// OpenCode session. Identity validation must keep those bytes out of the
+/// export channel while the hook continues with its metadata-only fallback.
+#[tokio::test]
+async fn opencode_export_rejects_wrong_native_session_without_export_claim() {
+    let Some(repo) = BridgeRepo::init(EXPORT_WRONG_SESSION).await else {
+        return;
+    };
+    let output = repo.stop("ses_expected");
+    assert!(
+        output.status.success(),
+        "identity mismatch must degrade safely: {}",
+        describe(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("ses_other"),
+        "exporter-supplied session id leaked to hook stderr: {}",
+        describe(&output)
+    );
+    let claims = repo
+        .query_rows("SELECT session_id FROM agent_coverage_claim WHERE source_channel = 'export'")
+        .await;
+    assert!(
+        claims.is_empty(),
+        "mismatched export must not produce an export-channel coverage claim"
+    );
+}
+
 #[tokio::test]
 async fn opencode_registered_failure_releases_dirty_job_claim_and_marker() {
     let Some(repo) = BridgeRepo::init(EXPORT_HELLO).await else {
         return;
     };
-    let failed = repo.stop_with_env(
-        "ses_registered_failure",
-        "LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION",
-        "1",
-    );
+    repo.block_object_directory();
+    let failed = repo.stop("ses_registered_failure");
     assert!(!failed.status.success(), "{}", describe(&failed));
     assert!(repo.checkpoints().is_empty());
     let claims = repo
@@ -403,7 +459,7 @@ async fn opencode_registered_failure_releases_dirty_job_claim_and_marker() {
 async fn opencode_export_plaintext_never_in_persist_or_logs() {
     let secret = "AKIAZZZZZZZZZZZZZZZZ";
     let body = format!(
-        r#"printf '%s' '{{"info":{{"id":"ses_x"}},"messages":[{{"info":{{"role":"user","id":"msg_u1"}},"parts":[{{"type":"text","text":"use {secret} now"}}]}}]}}'"#
+        r#"printf '{{"info":{{"id":"%s","directory":"__REPO__"}},"messages":[{{"info":{{"role":"user","id":"msg_u1"}},"parts":[{{"type":"text","text":"use {secret} now"}}]}}]}}' "$2""#
     );
     let Some(repo) = BridgeRepo::init(&body).await else {
         return;
@@ -486,144 +542,35 @@ async fn opencode_export_oversize_session_degrades() {
     assert_eq!(n, 0, "oversize content must not produce an export claim");
 }
 
-/// SBX-04: seatbelt-gated fake exporter (does **not** use `BridgeRepo::init`'s
-/// `trusted_bwrap_available()` early return). Four-piece: export succeeds,
-/// store dir is writable, host path write outside the store is denied,
-/// network is denied.
+/// macOS has no containment equivalent to bwrap's PID namespace for an
+/// exporter that can fork and `setsid()` away from its direct leader. The
+/// bridge must fail before it ever executes a trusted-looking exporter.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn opencode_export_seatbelt_fake_exporter() {
+async fn opencode_export_macos_is_unsupported_before_spawn() {
     use libra::internal::ai::observed_agents::opencode_export::{
         ExportLimits, run_export_subprocess_sandboxed,
     };
 
-    assert!(
-        std::path::Path::new("/usr/bin/sandbox-exec").is_file(),
-        "sandbox-exec must be present (DEP-SBX-02); this test must not skip"
-    );
-
-    // Child-reentry: pin + extra_ro_bind read process HOME/XDG. Mutating
-    // those in this binary races parallel tests (set_var is not thread-safe).
-    // The parent spawns this test binary with the fixture env instead.
-    const CHILD_EXPORTER: &str = "LIBRA_SBX04_SEATBELT_EXPORTER";
-    if let Ok(child_exporter) = std::env::var(CHILD_EXPORTER) {
-        let out = run_export_subprocess_sandboxed(
-            std::path::Path::new(&child_exporter),
-            "sess-seatbelt",
-            ExportLimits::default(),
-        )
-        .await
-        .expect("seatbelt sandboxed export must succeed");
-        assert_eq!(
-            String::from_utf8_lossy(&out),
-            r#"{"info":{},"messages":[]}"#
-        );
-        return;
-    }
-
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let home = tmp.path().join("home");
-    let xdg = tmp.path().join("xdg");
-    let bin_dir = tmp.path().join("bin");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(xdg.join("opencode")).unwrap();
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let outside = home.join("outside-store");
-    let store_probe = xdg.join("opencode").join("probe");
-    let host_tmp = std::path::PathBuf::from(format!(
-        "/private/tmp/libra-sbx05-seatbelt-deny-{}",
-        std::process::id()
-    ));
-    let scratch_probe = std::path::PathBuf::from(format!(
-        "/tmp/opencode/libra-sbx-fix-probe-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&host_tmp);
-    let _ = std::fs::remove_file(&scratch_probe);
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
-    let port = listener.local_addr().expect("addr").port();
-    listener.set_nonblocking(true).expect("nonblocking accept");
-    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let accepted_flag = accepted.clone();
-    let stop_flag = stop.clone();
-    let accept_thread = std::thread::spawn(move || {
-        while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            match listener.accept() {
-                Ok(_) => {
-                    accepted_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    let exporter = bin_dir.join("fake-opencode");
-    let body = format!(
-        r#"touch "{store}" || {{ echo store-unwritable >&2; exit 4; }}
-if echo x > "{outside}"; then echo host-write-open >&2; exit 5; fi
-if echo x > "{host_tmp}"; then echo host-tmp-open >&2; exit 8; fi
-touch "{scratch}" || {{ echo scratch-unwritable >&2; exit 9; }}
-command -v python3 >/dev/null || {{ echo python3-missing >&2; exit 7; }}
-if python3 -c "import socket; socket.create_connection(('127.0.0.1', {port}), 1)"; then
-  echo net-open >&2; exit 6
-fi
-printf '{{"info":{{}},"messages":[]}}'
-"#,
-        store = store_probe.display(),
-        outside = outside.display(),
-        host_tmp = host_tmp.display(),
-        scratch = scratch_probe.display(),
-        port = port,
-    );
-    std::fs::write(&exporter, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let marker = tmp.path().join("must-not-execute");
+    let exporter = tmp.path().join("fake-opencode");
+    std::fs::write(
+        &exporter,
+        format!("#!/bin/sh\ntouch {}\n", marker.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&exporter, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let exe = std::env::current_exe().expect("current test binary");
-    let child = Command::new(&exe)
-        .arg("opencode_export_seatbelt_fake_exporter")
-        .arg("--exact")
-        .arg("--nocapture")
-        .env(CHILD_EXPORTER, &exporter)
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", &xdg)
-        .env_remove("XDG_CONFIG_HOME")
-        .output()
-        .expect("spawn seatbelt child");
+    let error = run_export_subprocess_sandboxed(&exporter, "sess-macos", ExportLimits::default())
+        .await
+        .expect_err("macOS OpenCode export must fail closed before spawn");
+    let rendered = format!("{error:#}");
     assert!(
-        child.status.success(),
-        "seatbelt child export failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
-        child.status,
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr),
+        rendered.contains("unsupported on macOS") && rendered.contains("fail-closed"),
+        "unexpected macOS rejection: {rendered}"
     );
     assert!(
-        store_probe.exists(),
-        "exporter must be able to write inside the store"
-    );
-    assert!(
-        !outside.exists(),
-        "write outside the store must be denied by seatbelt"
-    );
-    assert!(
-        !host_tmp.exists(),
-        "write to host /private/tmp sibling must stay denied (not a host-/tmp bind)"
-    );
-    assert!(
-        scratch_probe.exists(),
-        "exporter must be able to write inside /tmp/opencode (FIX-SBX-01 narrow scratch)"
-    );
-    let _ = std::fs::remove_file(&host_tmp);
-    let _ = std::fs::remove_file(&scratch_probe);
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = accept_thread.join();
-    assert!(
-        !accepted.load(std::sync::atomic::Ordering::SeqCst),
-        "seatbelt must deny connect to the local listener (network not confined would accept)"
+        !marker.exists(),
+        "macOS failure must occur before the exporter is spawned"
     );
 }

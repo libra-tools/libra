@@ -6,7 +6,7 @@
 //! and asserts the whole capture chain end to end: `libra agent add` hook
 //! install (pinned-binary provenance + user-config preservation) → real
 //! non-interactive session → `agent session/checkpoint list`,
-//! metadata-first `checkpoint show`, `session show`, `refs/libra/traces`,
+//! safe-summary `checkpoint show`, `session show`, `refs/libra/traces`,
 //! `agent doctor` → §0.3.5 uninstall smoke (semantic config restore,
 //! idempotent remove, captured data retained). Deterministic fixtures
 //! cannot stand in for this target (plan.md A6.5 acceptance).
@@ -87,49 +87,40 @@ fn local_capture_smoke_opencode() {
     smoke::run_slug("opencode");
 }
 
-/// SBX-05: Darwin A6.5-style live capture after seatbelt export enable.
-/// Same driver as `local_capture_smoke_opencode`; on macOS the harness
-/// asserts content capture (`extraction.present=true` + non-empty
-/// transcript). Gate + `--ignored` identical to the A6.5 trio.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "drives a real paid opencode session on macOS seatbelt export; set \
-            LIBRA_RUN_LOCAL_AGENTS=1 and run with --ignored --test-threads=1"]
-#[serial(cwd, env, hash_kind)]
-fn local_capture_smoke_opencode_macos() {
-    check_agent_set();
-    smoke::run_slug("opencode");
-}
-
-/// SBX-05: Linux A6.5 opencode criteria remain in source (lifecycle-only
-/// `extraction.present=false` branch is not replaced by the macOS export
-/// assertions). Not live, not `#[ignore]`.
+/// OpenCode's A6.5 criteria remain lifecycle-only on every platform.
+/// macOS content export is rejected before spawn; this source guard keeps the
+/// smoke driver from reviving a seatbelt content-capture branch. Not live,
+/// not `#[ignore]`.
 #[test]
 fn linux_a65_criteria_unchanged() {
     let harness = include_str!("harness/agent_local_capture.rs");
     assert!(
-        harness.contains("lifecycle-only capture must record the extraction skip"),
-        "Linux A6.5 opencode extraction-skip assertion must remain in the driver"
+        harness.contains("on every\n//!   platform pin an empty transcript snapshot with `extraction.present=false`"),
+        "A6.5 must retain the lifecycle-only OpenCode snapshot contract on every platform"
     );
     assert!(
-        harness.contains("skipped extraction must be marked partial"),
-        "Linux A6.5 partial=true pin must remain in the driver"
+        harness.contains("macOS OpenCode export is rejected before spawn"),
+        "the smoke driver must document that unsupported macOS export is rejected before spawn"
     );
     assert!(
-        harness.contains("no raw transcript available"),
-        "Linux A6.5 documented skip warning must remain in the driver"
-    );
-    assert!(
-        harness.contains("macOS seatbelt export must capture content"),
-        "macOS export-content assertion must be additive, not a replacement of the Linux branch"
+        !harness.contains("macOS seatbelt export must capture content"),
+        "the smoke driver must not revive a macOS seatbelt content-capture branch"
     );
     let smoke = include_str!("agent_local_capture_smoke_test.rs");
+    let opencode_smoke_name = ["local_capture", "smoke", "opencode"].join("_");
+    let opencode_smoke_signature = ["fn ", &opencode_smoke_name, "("].concat();
     assert!(
-        smoke.contains("fn local_capture_smoke_opencode("),
+        smoke.contains(&opencode_smoke_signature),
         "original A6.5 opencode smoke fn must remain"
     );
+    let opencode_run_call = ["smoke::run_slug(", r#""opencode")"#].concat();
     assert!(
-        smoke.contains("smoke::run_slug(\"opencode\")"),
+        smoke.contains(&opencode_run_call),
         "original A6.5 opencode smoke must still call run_slug"
+    );
+    let unsupported_macos_smoke = ["fn", "local_capture_smoke_opencode_macos("].join(" ");
+    assert!(
+        !smoke.contains(&unsupported_macos_smoke),
+        "the unsupported macOS export smoke must stay absent"
     );
 }

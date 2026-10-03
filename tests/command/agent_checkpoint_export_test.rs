@@ -71,6 +71,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
             checkpoint_id: &checkpoint_id,
             session_id: "sess-x",
             marker_generation: marker.generation.as_deref().expect("new marker generation"),
+            capture_scope: None,
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Committed,

@@ -101,6 +101,100 @@ struct IndexUpdateMsg {
     pending_counter: Arc<AtomicUsize>,
 }
 
+/// In-process object-index fault controls used only by this module's unit
+/// tests. They are deliberately absent from normal and debug binaries: an
+/// environment variable must never make a capture writer sleep, fail, or
+/// retain a durable repair marker.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ObjectIndexTestFaults {
+    pub(crate) update_failure: bool,
+    pub(crate) marker_retirement_failure: bool,
+    pub(crate) consumer_delay: Option<Duration>,
+}
+
+#[cfg(test)]
+static TEST_OBJECT_INDEX_FAULTS: Lazy<std::sync::Mutex<BTreeMap<PathBuf, ObjectIndexTestFaults>>> =
+    Lazy::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+static TEST_OBJECT_INDEX_FAULT_SERIAL: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
+
+/// Keep test fault controls tied to the same physical database even when a
+/// platform exposes its temporary directory through an alias (for example,
+/// macOS `/var` and `/private/var`). The database file need not exist yet:
+/// canonicalizing the parent preserves the key used when a later queue
+/// consumer opens it.
+#[cfg(test)]
+fn test_object_index_fault_key(db_path: &Path) -> PathBuf {
+    db_path
+        .file_name()
+        .zip(db_path.parent())
+        .and_then(|(file_name, parent)| {
+            parent
+                .canonicalize()
+                .ok()
+                .map(|parent| parent.join(file_name))
+        })
+        .unwrap_or_else(|| db_path.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) struct ObjectIndexTestFaultGuard {
+    db_path: PathBuf,
+    previous: Option<ObjectIndexTestFaults>,
+    // Fault injection affects a background consumer shared by in-crate tests.
+    // Keep these scoped controls mutually exclusive so one test cannot restore
+    // another test's prior fixture while its queue is still draining.
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ObjectIndexTestFaultGuard {
+    fn drop(&mut self) {
+        let mut faults = TEST_OBJECT_INDEX_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = self.previous {
+            faults.insert(self.db_path.clone(), previous);
+        } else {
+            faults.remove(&self.db_path);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_object_index_faults(
+    db_path: &Path,
+    faults: ObjectIndexTestFaults,
+) -> ObjectIndexTestFaultGuard {
+    let serial = TEST_OBJECT_INDEX_FAULT_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut active = TEST_OBJECT_INDEX_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let db_path = test_object_index_fault_key(db_path);
+    let previous = active.insert(db_path.clone(), faults);
+    ObjectIndexTestFaultGuard {
+        db_path,
+        previous,
+        _serial: serial,
+    }
+}
+
+#[cfg(test)]
+fn test_object_index_faults(db_path: &Path) -> ObjectIndexTestFaults {
+    let db_path = test_object_index_fault_key(db_path);
+    TEST_OBJECT_INDEX_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&db_path)
+        .copied()
+        .unwrap_or_default()
+}
+
 const INDEX_REPAIR_MARKER_DIR: &str = "object-index-repair";
 const INDEX_REPAIR_MARKER_STAGING_DIR: &str = "object-index-repair-tmp";
 const INDEX_REPAIR_LOCK_DIR: &str = "object-index-repair-locks";
@@ -133,13 +227,54 @@ const INDEX_REPAIR_BATCH_SIZE: usize = 2;
 const INDEX_REPAIR_MARKER_BATCH: usize = 256;
 
 /// Debug-build counter of repository-wide generation lock acquisitions. The
-/// regression guard for issue #469 asserts that the queued consumer never
-/// takes this lock, and OI-04 (M-BATCH B1) asserts batch publication bounds
-/// via `LIBRA_TEST_OBJECT_INDEX_GENERATION_LOCK_COUNT_PATH`. Only
+/// command-level OI-04 hook reports this process-wide total. Only
 /// `acquire_index_repair_generation_lock` increments it, and only in debug
 /// builds (release binaries carry zero cost).
 #[cfg(any(test, debug_assertions))]
 static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Unit tests run different temporary repositories concurrently, so the
+/// process-wide debug counter above cannot attribute an acquisition to one
+/// queued update. Keep a test-only per-database view for the issue #469
+/// regression guard; this never ships in normal or debug CLI binaries.
+#[cfg(test)]
+static TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE: Lazy<
+    std::sync::Mutex<HashMap<PathBuf, usize>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Batch-publication assertions must be attributed to their repository. A
+/// process-wide counter is inherently racy because unrelated test repositories
+/// publish batches concurrently on the shared storage runtime.
+#[cfg(test)]
+static TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE: Lazy<
+    std::sync::Mutex<HashMap<PathBuf, usize>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_test_generation_lock_acquisition(db_path: &Path) {
+    let mut acquisitions = TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *acquisitions.entry(db_path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn test_generation_lock_acquisition_count(db_path: &Path) -> usize {
+    TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(db_path)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_test_batched_marker_publication(db_path: &Path) {
+    let mut publications = TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *publications.entry(db_path.to_path_buf()).or_default() += 1;
+}
 
 /// Holder metadata written into a repair lock file right after acquisition.
 /// Diagnostic only: lock semantics come from the advisory flock, never from
@@ -471,6 +606,8 @@ fn acquire_index_repair_generation_lock(
     )?;
     #[cfg(any(test, debug_assertions))]
     GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_test_generation_lock_acquisition(db_path);
     Ok(lock)
 }
 
@@ -481,10 +618,17 @@ pub(crate) fn generation_lock_acquisition_count() -> usize {
     GENERATION_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
 }
 
-/// Test-build accessor for the batched-publication counter (M-BATCH B1).
+/// Test-build accessor for the batched-publication counter (M-BATCH B1),
+/// scoped to one repository database so parallel temporary repositories cannot
+/// perturb the assertion.
 #[cfg(test)]
-pub(crate) fn batched_marker_publication_count() -> usize {
-    BATCHED_MARKER_PUBLICATIONS.load(Ordering::Relaxed)
+pub(crate) fn batched_marker_publication_count(db_path: &Path) -> usize {
+    TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(db_path)
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -680,6 +824,8 @@ fn persist_index_repair_marker_batch(msgs: &[IndexUpdateMsg]) -> io::Result<Vec<
     }
     #[cfg(any(test, debug_assertions))]
     BATCHED_MARKER_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_test_batched_marker_publication(&msgs[0].db_path);
     let _generation_lock =
         acquire_index_repair_generation_lock(&msgs[0].db_path, "marker_publication")?;
     let mut paths = Vec::with_capacity(msgs.len());
@@ -689,10 +835,9 @@ fn persist_index_repair_marker_batch(msgs: &[IndexUpdateMsg]) -> io::Result<Vec<
     Ok(paths)
 }
 
-fn retire_index_repair_marker(path: &Path) -> io::Result<()> {
-    if cfg!(debug_assertions)
-        && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL").is_some()
-    {
+fn retire_index_repair_marker(_db_path: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if test_object_index_faults(_db_path).marker_retirement_failure {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "injected object-index repair marker retirement failure",
@@ -883,12 +1028,9 @@ async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
         // Catch one update's panic so the lane continues processing later
         // durable markers instead of becoming permanently wedged.
         let future = async {
-            if cfg!(debug_assertions)
-                && let Ok(value) = std::env::var("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS")
-                && let Ok(delay_ms) = value.parse::<u64>()
-                && delay_ms > 0
-            {
-                tokio::time::sleep(Duration::from_millis(delay_ms.min(30_000))).await;
+            #[cfg(test)]
+            if let Some(delay) = test_object_index_faults(&msg.db_path).consumer_delay {
+                tokio::time::sleep(delay).await;
             }
             match apply_queued_index_update(&msg).await {
                 Ok(()) => {}
@@ -965,7 +1107,7 @@ async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
     }
 
     update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
-    retire_index_repair_marker(marker_path).map_err(|error| {
+    retire_index_repair_marker(&msg.db_path, marker_path).map_err(|error| {
         format!(
             "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
             msg.hash,
@@ -2687,6 +2829,100 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
     Ok(())
 }
 
+/// Upsert agent-capture object-index rows in a caller-owned transaction.
+///
+/// Checkpoint writers use this at their final traces-ref CAS boundary: the
+/// ref/catalog mutation and every cloud-visible object-index row therefore
+/// commit together, or all roll back together. Unlike
+/// [`enqueue_agent_blob_object_index_update`], this deliberately creates no
+/// filesystem repair marker because the caller already owns a durable SQLite
+/// transaction.
+///
+/// Minimal/legacy databases without `object_index` remain a no-op, matching
+/// the background enqueue helper's absent-database compatibility behavior.
+pub(crate) async fn upsert_agent_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    updates: &[(String, String, i64)],
+) -> std::result::Result<(), DbErr> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(());
+    }
+
+    let repo_id = match conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+    const UPSERT_CHUNK: usize = 200;
+    let created_at = chrono::Utc::now().timestamp();
+    for chunk in updates.chunks(UPSERT_CHUNK) {
+        let mut sql = String::from(
+            "INSERT INTO object_index \
+             (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES ",
+        );
+        let mut values = Vec::with_capacity(chunk.len() * 5);
+        for (index, (oid, object_type, size)) in chunk.iter().enumerate() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?, ?, ?, ?, 0)");
+            values.extend([
+                Value::from(oid.clone()),
+                Value::from(object_type.clone()),
+                Value::from(*size),
+                Value::from(repo_id.clone()),
+                Value::from(created_at),
+            ]);
+        }
+        // Match the queued repair worker exactly: a semantic agent type may
+        // promote a generic blob row, but a later generic write never
+        // demotes an already-semantic row or reopens a synced upload.
+        sql.push_str(
+            " ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+             o_type = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN excluded.o_type ELSE object_index.o_type END, \
+             o_size = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN excluded.o_size ELSE object_index.o_size END, \
+             is_synced = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN 0 ELSE object_index.is_synced END",
+        );
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Delete `object_index` rows for the given OIDs in the current repo
 /// (AG-20 prune-side counterpart of
 /// [`enqueue_agent_blob_object_index_update`]).
@@ -3277,7 +3513,8 @@ async fn apply_pending_object_index_page(
             remaining: page.has_more,
         });
     }
-    if cfg!(debug_assertions) && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some() {
+    #[cfg(test)]
+    if test_object_index_faults(db_path).update_failure {
         return Err("injected object index update failure".to_string());
     }
     let repo_id = resolve_repo_id_for_index(db_conn).await?;
@@ -3286,7 +3523,7 @@ async fn apply_pending_object_index_page(
         update_object_index_batch(db_conn, db_path, &repo_id, batch).await?;
         for msg in batch {
             if let Some(marker_path) = msg.marker_path.as_deref() {
-                retire_index_repair_marker(marker_path).map_err(|error| {
+                retire_index_repair_marker(db_path, marker_path).map_err(|error| {
                     format!(
                         "updated object index for {}, but failed to retire repair marker '{}': {error}",
                         msg.hash,
@@ -3690,7 +3927,8 @@ async fn update_object_index(
     o_type: &str,
     o_size: i64,
 ) -> Result<(), String> {
-    if cfg!(debug_assertions) && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some() {
+    #[cfg(test)]
+    if test_object_index_faults(db_path).update_failure {
         return Err("injected object index update failure".to_string());
     }
     let mut last_err = None;
@@ -5165,7 +5403,13 @@ mod tests {
             .expect("evict local payload after its successful write and durable marker");
 
         {
-            let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+            let _faults = super::install_test_object_index_faults(
+                &db_path,
+                super::ObjectIndexTestFaults {
+                    update_failure: true,
+                    ..Default::default()
+                },
+            );
             let error = ClientStorage::repair_pending_object_index_updates(&db_path)
                 .await
                 .expect_err("injected index failure should preserve the marker");
@@ -5465,11 +5709,72 @@ mod tests {
         })
         .expect("persist SHA-256 repair marker");
 
+        // A fault fixture for another repository must not make this valid
+        // SHA-256 replay fail. The background consumer is process-wide, but
+        // its test controls are repository-local just like durable markers.
+        let unrelated_storage = tempdir().expect("create unrelated storage dir");
+        let unrelated_db_path = unrelated_storage.path().join(crate::utils::util::DATABASE);
+        let _unrelated_fault = super::install_test_object_index_faults(
+            &unrelated_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
         let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
             .await
-            .expect("matching SHA-256 marker should repair");
+            .expect("matching SHA-256 marker should repair despite an unrelated fault fixture");
         assert_eq!(outcome.repaired, 1);
         assert!(!outcome.remaining);
+    }
+
+    #[test]
+    #[serial]
+    fn object_index_test_faults_follow_canonical_database_path() {
+        let storage = tempdir().expect("create storage dir");
+        let raw_db_path = storage.path().join(crate::utils::util::DATABASE);
+        let canonical_db_path = storage
+            .path()
+            .canonicalize()
+            .expect("canonicalize existing storage parent")
+            .join(crate::utils::util::DATABASE);
+        let _fault = super::install_test_object_index_faults(
+            &raw_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            super::test_object_index_faults(&canonical_db_path).update_failure,
+            "a fault installed through a temporary-directory alias must affect the physical database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn object_index_test_faults_follow_symlinked_database_parent() {
+        let storage = tempdir().expect("create storage dir");
+        let real_parent = storage.path().join("real");
+        fs::create_dir(&real_parent).expect("create real database parent");
+        let alias_parent = storage.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias_parent)
+            .expect("create database-parent alias");
+        let real_db_path = real_parent.join(crate::utils::util::DATABASE);
+        let alias_db_path = alias_parent.join(crate::utils::util::DATABASE);
+        let _fault = super::install_test_object_index_faults(
+            &alias_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            super::test_object_index_faults(&real_db_path).update_failure,
+            "a fault installed through a symlinked parent must target the physical database"
+        );
     }
 
     #[tokio::test]
@@ -5561,7 +5866,13 @@ mod tests {
         let blob = Blob::from_content("retirement warning");
         let failures_before = ClientStorage::background_index_failure_count();
         {
-            let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1");
+            let _faults = super::install_test_object_index_faults(
+                &db_path,
+                super::ObjectIndexTestFaults {
+                    marker_retirement_failure: true,
+                    ..Default::default()
+                },
+            );
             client
                 .put(&blob.id, &blob.data, blob.get_type())
                 .expect("store object and marker");
@@ -5601,8 +5912,14 @@ mod tests {
         fs::create_dir_all(&objects).expect("create object directory");
         let client = ClientStorage::init_local(objects);
 
-        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
-        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
         let blob = Blob::from_content("late invocation-scoped failure");
         let first_scope = ClientStorage::with_background_index_failure_scope(async {
             let scope = ClientStorage::begin_background_index_failure_scope();
@@ -5649,14 +5966,32 @@ mod tests {
         fs::create_dir_all(&objects).expect("create object directory");
         let client = ClientStorage::init_local(objects);
 
+        // Model another parallel test publishing a marker for a different
+        // temporary repository. That acquisition must not affect this
+        // repository's queued-consumer assertion.
+        let unrelated_storage = tempdir().expect("create unrelated storage dir");
+        let unrelated_db_path = unrelated_storage.path().join(crate::utils::util::DATABASE);
+        let unrelated_before = super::test_generation_lock_acquisition_count(&unrelated_db_path);
+        let _unrelated_generation_lock =
+            super::acquire_index_repair_generation_lock(&unrelated_db_path, "marker_publication")
+                .expect("acquire unrelated generation lock");
+        assert_eq!(
+            super::test_generation_lock_acquisition_count(&unrelated_db_path),
+            unrelated_before + 1,
+            "test telemetry must retain the database that acquired the lock"
+        );
+
         // The foreground publisher takes the generation lock exactly once to
         // persist the durable repair marker before queueing.
-        let before = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        // Other tests can publish markers for their own temporary repositories
+        // while this queue drains. Attribute lock telemetry to this database so
+        // their work cannot mask or fabricate a queued-consumer acquisition.
+        let before = super::test_generation_lock_acquisition_count(&db_path);
         let blob = Blob::from_content("generation lock guard payload");
         client
             .put(&blob.id, &blob.data, blob.get_type())
             .expect("store object and enqueue index update");
-        let after_put = super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed);
+        let after_put = super::test_generation_lock_acquisition_count(&db_path);
         assert_eq!(
             after_put,
             before + 1,
@@ -5668,7 +6003,7 @@ mod tests {
         // The queued consumer must apply the update through the OID-shard lock
         // only: no additional generation lock acquisition may have happened.
         assert_eq!(
-            super::GENERATION_LOCK_ACQUISITIONS.load(super::Ordering::Relaxed),
+            super::test_generation_lock_acquisition_count(&db_path),
             after_put,
             "queued consumer must never acquire the generation lock"
         );
@@ -5701,8 +6036,14 @@ mod tests {
         fs::create_dir_all(&objects).expect("create object directory");
         let client = ClientStorage::init_local(objects);
 
-        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
-        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
         let scope = ClientStorage::with_background_index_failure_scope(async {
             let scope = ClientStorage::begin_background_index_failure_scope();
             let direct_client = client.clone();
@@ -5754,7 +6095,13 @@ mod tests {
         fs::create_dir_all(&objects).expect("create object directory");
         let client = ClientStorage::init_local(objects);
 
-        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
         for index in 0..8 {
             let blob = Blob::from_content(&format!("unscoped backlog {index}"));
             client
@@ -5800,7 +6147,13 @@ mod tests {
         fs::create_dir_all(&objects).expect("create object directory");
         let client = ClientStorage::init_local(objects);
 
-        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
         let scope = ClientStorage::with_background_index_failure_scope(async move {
             let scope = ClientStorage::begin_background_index_failure_scope();
             let producer = ClientStorage::spawn_background_index_work(async move {
@@ -5851,7 +6204,13 @@ mod tests {
         let client = ClientStorage::init_local(objects);
         let blob = Blob::from_content("delayed writer must not resurrect a pruned row");
 
-        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "500");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
+        );
         client
             .put(&blob.id, &blob.data, blob.get_type())
             .expect("store object and enqueue delayed index update");
@@ -6047,7 +6406,13 @@ mod tests {
             .expect("derive marker path");
         let moved_db_path = storage.path().join("libra.db.moved");
 
-        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "250");
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(250)),
+                ..Default::default()
+            },
+        );
         let scope = ClientStorage::with_background_index_failure_scope(async {
             client
                 .put(&blob.id, &blob.data, blob.get_type())

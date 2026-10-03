@@ -23,6 +23,10 @@ use std::{
 
 use libra::{
     cli,
+    internal::ai::authorized_read::{
+        AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, AUTHORIZED_READ_HELPER_MAX_CAP,
+        AUTHORIZED_READ_HELPER_MODE_ENV,
+    },
     utils::{
         error::INTERNAL_ERROR_REPORT_HINT,
         log_config::{LogRotation, resolve_log_config},
@@ -33,10 +37,132 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
 static STDOUT_BROKEN_PIPE_PANIC: AtomicBool = AtomicBool::new(false);
-const AUTHORIZED_READ_HELPER_ARG: &str = "--libra-internal-authorized-read-helper";
-const AUTHORIZED_READ_HELPER_CAP_ENV: &str = "LIBRA_INTERNAL_AUTHORIZED_READ_CAP";
 const REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP: u64 = 1024 * 1024;
 const REJECTED_CLEANUP_INDEX_HELPER_OUTPUT_CAP: u64 = 64 * 1024 * 1024;
+
+/// Outcome for a private helper stdin frame. The reader reserves no more than
+/// the accepted content cap and probes overflow with one stack byte, avoiding
+/// `read_to_end` growth when an exact-capacity frame reaches EOF.
+enum StrictHelperStdinRead {
+    Complete(Vec<u8>),
+    Oversize { observed_bytes: u64 },
+    Failed { bytes_read: u64 },
+}
+
+fn read_helper_stdin_strictly_bounded(cap: u64) -> StrictHelperStdinRead {
+    let Ok(capacity) = usize::try_from(cap) else {
+        return StrictHelperStdinRead::Failed { bytes_read: 0 };
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(capacity).is_err() || bytes.capacity() > capacity {
+        return StrictHelperStdinRead::Failed { bytes_read: 0 };
+    }
+
+    let mut stdin = std::io::stdin().lock();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let remaining = capacity.saturating_sub(bytes.len());
+        if remaining == 0 {
+            let mut sentinel = [0_u8; 1];
+            loop {
+                match stdin.read(&mut sentinel) {
+                    Ok(0) => return StrictHelperStdinRead::Complete(bytes),
+                    Ok(_) => {
+                        return StrictHelperStdinRead::Oversize {
+                            observed_bytes: cap.saturating_add(1),
+                        };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        return StrictHelperStdinRead::Failed {
+                            bytes_read: bytes.len() as u64,
+                        };
+                    }
+                }
+            }
+        }
+
+        let read_len = remaining.min(chunk.len());
+        match stdin.read(&mut chunk[..read_len]) {
+            Ok(0) => return StrictHelperStdinRead::Complete(bytes),
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return StrictHelperStdinRead::Failed {
+                    bytes_read: bytes.len() as u64,
+                };
+            }
+        }
+    }
+}
+
+// Keep test fault controls out of ordinary debug binaries. `cfg!(debug_assertions)`
+// is a runtime condition and remains true for `cargo build`, so it is not a
+// production-safe substitute for `cfg(test)` here.
+#[cfg(test)]
+mod test_support {
+    use std::{
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+        time::Duration,
+    };
+
+    #[derive(Default)]
+    pub(super) struct MainTestControls {
+        pub(super) rejected_cleanup_index_helper_delay: Option<Duration>,
+        pub(super) import_discovery_helper_delay: Option<Duration>,
+        pub(super) subagent_discovery_helper_delay: Option<Duration>,
+        pub(super) authorized_read_helper_delay: Option<Duration>,
+        pub(super) authorized_read_helper_pid_file: Option<PathBuf>,
+    }
+
+    static CONTROLS: OnceLock<Mutex<MainTestControls>> = OnceLock::new();
+
+    fn controls() -> &'static Mutex<MainTestControls> {
+        CONTROLS.get_or_init(|| Mutex::new(MainTestControls::default()))
+    }
+
+    fn lock_controls() -> std::sync::MutexGuard<'static, MainTestControls> {
+        controls()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) struct ControlsReset(Option<MainTestControls>);
+
+    pub(super) fn install(controls: MainTestControls) -> ControlsReset {
+        let previous = std::mem::replace(&mut *lock_controls(), controls);
+        ControlsReset(Some(previous))
+    }
+
+    impl Drop for ControlsReset {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                let _ = std::mem::replace(&mut *lock_controls(), previous);
+            }
+        }
+    }
+
+    pub(super) fn rejected_cleanup_index_helper_delay() -> Option<Duration> {
+        lock_controls().rejected_cleanup_index_helper_delay
+    }
+
+    pub(super) fn import_discovery_helper_delay() -> Option<Duration> {
+        lock_controls().import_discovery_helper_delay
+    }
+
+    pub(super) fn subagent_discovery_helper_delay() -> Option<Duration> {
+        lock_controls().subagent_discovery_helper_delay
+    }
+
+    pub(super) fn authorized_read_helper_delay() -> Option<Duration> {
+        lock_controls().authorized_read_helper_delay
+    }
+
+    pub(super) fn authorized_read_helper_pid_file() -> Option<PathBuf> {
+        lock_controls().authorized_read_helper_pid_file.clone()
+    }
+}
 
 fn run_checkpoint_object_io_helper_if_requested() -> Option<i32> {
     let mut args = std::env::args_os();
@@ -46,16 +172,11 @@ fn run_checkpoint_object_io_helper_if_requested() -> Option<i32> {
     {
         return None;
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP.saturating_add(1))
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64 > libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP
-    {
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP,
+    ) else {
         return Some(2);
-    }
+    };
     let output = match libra::internal::ai::history::run_checkpoint_object_io_helper(&input) {
         Ok(output)
             if output.len() as u64
@@ -81,21 +202,14 @@ fn run_rejected_cleanup_index_helper_if_requested() -> Option<i32> {
     {
         return None;
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP.saturating_add(1))
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64 > REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP
-    {
+    let StrictHelperStdinRead::Complete(input) =
+        read_helper_stdin_strictly_bounded(REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP)
+    else {
         return Some(2);
-    }
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_REJECTED_CLEANUP_INDEX_HELPER_DELAY_MS")
-        && let Ok(delay_ms) = value.parse::<u64>()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    };
+    #[cfg(test)]
+    if let Some(delay) = test_support::rejected_cleanup_index_helper_delay() {
+        std::thread::sleep(delay);
     }
     let output = match libra::internal::ai::history::run_rejected_cleanup_index_helper(&input) {
         Ok(output) if output.len() as u64 <= REJECTED_CLEANUP_INDEX_HELPER_OUTPUT_CAP => output,
@@ -116,22 +230,15 @@ fn run_import_discovery_helper_if_requested() -> Option<i32> {
     {
         return None;
     }
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_DISCOVERY_HELPER_DELAY_MS")
-        && let Ok(delay_ms) = value.parse::<u64>()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    #[cfg(test)]
+    if let Some(delay) = test_support::import_discovery_helper_delay() {
+        std::thread::sleep(delay);
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP.saturating_add(1))
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64 > libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP
-    {
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP,
+    ) else {
         return Some(2);
-    }
+    };
     let output = match libra::command::agent::run_import_discovery_helper(&input) {
         Ok(output)
             if output.len() as u64 <= libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP =>
@@ -147,25 +254,17 @@ fn run_import_discovery_helper_if_requested() -> Option<i32> {
     Some(0)
 }
 
-fn run_import_preparation_helper_if_requested() -> Option<i32> {
+fn run_import_preparation_descriptor_helper_if_requested() -> Option<i32> {
     let mut args = std::env::args_os();
     let _program = args.next()?;
-    if args.next()?.to_str() != Some(libra::command::agent::IMPORT_PREPARATION_HELPER_ARG)
+    if args.next()?.to_str()
+        != Some(libra::command::agent::IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG)
         || args.next().is_some()
     {
         return None;
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(libra::command::agent::IMPORT_PREPARATION_HELPER_INPUT_CAP.saturating_add(1))
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64 > libra::command::agent::IMPORT_PREPARATION_HELPER_INPUT_CAP
+    let output = match libra::command::agent::run_import_preparation_descriptor_helper_from_stdin()
     {
-        return Some(2);
-    }
-    let output = match libra::command::agent::run_import_preparation_helper(&input) {
         Ok(output)
             if output.len() as u64
                 <= libra::command::agent::IMPORT_PREPARATION_HELPER_OUTPUT_CAP =>
@@ -189,16 +288,11 @@ fn run_import_index_repair_helper_if_requested() -> Option<i32> {
     {
         return None;
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP.saturating_add(1))
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64 > libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP
-    {
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP,
+    ) else {
         return Some(2);
-    }
+    };
     let output = match libra::command::agent::run_import_index_repair_helper(&input) {
         Ok(output)
             if output.len() as u64
@@ -224,26 +318,15 @@ fn run_subagent_discovery_helper_if_requested() -> Option<i32> {
     {
         return None;
     }
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_SUBAGENT_DISCOVERY_HELPER_DELAY_MS")
-        && let Ok(delay_ms) = value.parse::<u64>()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    #[cfg(test)]
+    if let Some(delay) = test_support::subagent_discovery_helper_delay() {
+        std::thread::sleep(delay);
     }
-    let mut input = Vec::new();
-    if std::io::stdin()
-        .lock()
-        .take(
-            libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_INPUT_CAP
-                .saturating_add(1),
-        )
-        .read_to_end(&mut input)
-        .is_err()
-        || input.len() as u64
-            > libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_INPUT_CAP
-    {
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_INPUT_CAP,
+    ) else {
         return Some(2);
-    }
+    };
     let output = match libra::internal::ai::subagent_content::run_subagent_discovery_helper(&input)
     {
         Ok(output)
@@ -254,6 +337,71 @@ fn run_subagent_discovery_helper_if_requested() -> Option<i32> {
         }
         Ok(_) | Err(_) => return Some(2),
     };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+/// Killable subprocess boundary for CPU-heavy child-transcript projection.
+/// It runs before logging and normal CLI initialization; stdin/stdout carry
+/// only the bounded private binary frame consumed by the deadline owner.
+fn run_subagent_projection_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str()
+        != Some(libra::internal::ai::subagent_content::SUBAGENT_PROJECTION_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::internal::ai::subagent_content::SUBAGENT_PROJECTION_HELPER_INPUT_CAP,
+    ) else {
+        return Some(2);
+    };
+    let output = match libra::internal::ai::subagent_content::run_subagent_projection_helper(input)
+    {
+        Ok(output)
+            if output.len() as u64
+                <= libra::internal::ai::subagent_content::SUBAGENT_PROJECTION_HELPER_OUTPUT_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+/// Killable subprocess boundary for redacted-only extraction metadata. The
+/// helper receives no provider paths, raw errors, or native child bytes; it
+/// runs before logging and normal CLI initialization so stdout stays a strict
+/// private frame for the deadline-owning snapshot service.
+fn run_capture_extraction_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str()
+        != Some(libra::internal::ai::capture::snapshot::CAPTURE_EXTRACTION_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::internal::ai::capture::snapshot::CAPTURE_EXTRACTION_HELPER_INPUT_CAP,
+    ) else {
+        return Some(2);
+    };
+    let output = libra::internal::ai::capture::snapshot::run_capture_extraction_helper(input);
+    if output.len() as u64
+        > libra::internal::ai::capture::snapshot::CAPTURE_EXTRACTION_HELPER_OUTPUT_CAP
+    {
+        return Some(2);
+    }
     let mut stdout = std::io::stdout().lock();
     if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
         return Some(1);
@@ -288,38 +436,70 @@ fn run_authorized_read_helper_if_requested() -> Option<i32> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
-        Some(cap) if cap <= 16 * 1024 * 1024 => cap,
+        Some(cap) if cap <= AUTHORIZED_READ_HELPER_MAX_CAP => cap,
         _ => return Some(2),
     };
-    if cfg!(debug_assertions)
-        && let Ok(path) = std::env::var("LIBRA_TEST_AUTHORIZED_READ_HELPER_PID_FILE")
+    if std::env::var_os(AUTHORIZED_READ_HELPER_MODE_ENV)
+        .is_some_and(|mode| mode == "live-claude-source-v2")
+    {
+        return Some(libra::internal::ai::authorized_read::run_live_claude_source_helper(cap));
+    }
+    if std::env::var_os(AUTHORIZED_READ_HELPER_MODE_ENV).is_some() {
+        return Some(2);
+    }
+    #[cfg(test)]
+    if let Some(path) = test_support::authorized_read_helper_pid_file()
         && std::fs::write(path, std::process::id().to_string()).is_err()
     {
         return Some(2);
     }
-    if cfg!(debug_assertions)
-        && let Ok(value) = std::env::var("LIBRA_TEST_AUTHORIZED_READ_HELPER_DELAY_MS")
-        && let Ok(delay_ms) = value.parse::<u64>()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    #[cfg(test)]
+    if let Some(delay) = test_support::authorized_read_helper_delay() {
+        std::thread::sleep(delay);
     }
 
-    let mut bytes = Vec::new();
-    let read = std::io::stdin()
-        .lock()
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut bytes);
-    let raw_bytes = bytes.len() as u64;
-    let (status, payload) = match read {
-        Ok(_) if raw_bytes > cap => (1u8, Vec::new()),
-        Ok(_) => (0u8, bytes),
-        Err(error) => (2u8, error.to_string().into_bytes()),
+    let (status, raw_bytes, payload) = match read_helper_stdin_strictly_bounded(cap) {
+        StrictHelperStdinRead::Complete(bytes) => (0u8, bytes.len() as u64, bytes),
+        StrictHelperStdinRead::Oversize { observed_bytes } => (1u8, observed_bytes, Vec::new()),
+        // The parent maps a failed helper read to a typed safe partial. Do
+        // not send filesystem error text over this private raw-source frame.
+        StrictHelperStdinRead::Failed { bytes_read } => (2u8, bytes_read, Vec::new()),
     };
     let mut stdout = std::io::stdout().lock();
     if stdout.write_all(&[status]).is_err()
         || stdout.write_all(&raw_bytes.to_le_bytes()).is_err()
         || stdout.write_all(&payload).is_err()
         || stdout.flush().is_err()
+    {
+        return Some(1);
+    }
+    Some(0)
+}
+
+/// Killable subprocess boundary for scope/worktree binding and the
+/// repository-private capture replay key. This runs before tracing and normal
+/// CLI startup; its sole fixed argument and bounded stdio frame keep it from
+/// becoming a general command execution surface.
+fn run_capture_scope_binding_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str()
+        != Some(libra::internal::ai::hooks::runtime::CAPTURE_SCOPE_BINDING_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let StrictHelperStdinRead::Complete(input) = read_helper_stdin_strictly_bounded(
+        libra::internal::ai::hooks::runtime::CAPTURE_SCOPE_BINDING_HELPER_INPUT_CAP,
+    ) else {
+        return Some(2);
+    };
+    let mut stdout = std::io::stdout().lock();
+    if libra::internal::ai::hooks::runtime::run_capture_scope_binding_helper_to_writer(
+        &input,
+        &mut stdout,
+    )
+    .is_err()
     {
         return Some(1);
     }
@@ -342,6 +522,7 @@ fn run_authorized_read_helper_if_requested() -> Option<i32> {
 /// - On a clean `Err(CliError)`, the exit code is sourced from
 ///   [`CliError::exit_code`] so each error class has a stable code.
 fn main() {
+    libra::internal::ai::authorized_read::register_running_program();
     if let Some(exit_code) = run_checkpoint_object_io_helper_if_requested() {
         if exit_code != 0 {
             std::process::exit(exit_code);
@@ -360,7 +541,7 @@ fn main() {
         }
         return;
     }
-    if let Some(exit_code) = run_import_preparation_helper_if_requested() {
+    if let Some(exit_code) = run_import_preparation_descriptor_helper_if_requested() {
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -378,7 +559,25 @@ fn main() {
         }
         return;
     }
+    if let Some(exit_code) = run_subagent_projection_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_capture_extraction_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
     if let Some(exit_code) = run_authorized_read_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_capture_scope_binding_helper_if_requested() {
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -688,6 +887,47 @@ fn build_env_filter(directives: &str) -> EnvFilter {
     env_filter.add_directive(
         "rfuse3::raw::session=error"
             .parse()
+            // INVARIANT: this static directive is accepted by all supported
+            // tracing-subscriber versions; it is not derived from user input.
             .expect("static rfuse3 directive must parse"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_fault_controls_are_in_process_test_state() {
+        let directory = tempfile::tempdir().expect("create main test-control directory");
+        let pid_file = directory.path().join("authorized-read.pid");
+        let _reset = test_support::install(test_support::MainTestControls {
+            rejected_cleanup_index_helper_delay: Some(std::time::Duration::from_millis(1)),
+            import_discovery_helper_delay: Some(std::time::Duration::from_millis(2)),
+            subagent_discovery_helper_delay: Some(std::time::Duration::from_millis(3)),
+            authorized_read_helper_delay: Some(std::time::Duration::from_millis(4)),
+            authorized_read_helper_pid_file: Some(pid_file.clone()),
+        });
+
+        assert_eq!(
+            test_support::rejected_cleanup_index_helper_delay(),
+            Some(std::time::Duration::from_millis(1))
+        );
+        assert_eq!(
+            test_support::import_discovery_helper_delay(),
+            Some(std::time::Duration::from_millis(2))
+        );
+        assert_eq!(
+            test_support::subagent_discovery_helper_delay(),
+            Some(std::time::Duration::from_millis(3))
+        );
+        assert_eq!(
+            test_support::authorized_read_helper_delay(),
+            Some(std::time::Duration::from_millis(4))
+        );
+        assert_eq!(
+            test_support::authorized_read_helper_pid_file(),
+            Some(pid_file)
+        );
+    }
 }

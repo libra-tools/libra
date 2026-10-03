@@ -37,17 +37,6 @@ use super::super::super::lifecycle::{
     LifecycleEvent, LifecycleEventKind, SessionHookEnvelope, build_lifecycle_event,
 };
 
-/// OpenCode event names that should fall back to `session_id` when no
-/// canonical identity field (event_id, request_id, …) is present in the
-/// payload. These are the session-scoped events that fire (at most) once
-/// per session/turn boundary.
-pub(super) const OPENCODE_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
-    "session.created",
-    "session.idle",
-    "session.deleted",
-    "session.compacted",
-];
-
 /// Every OpenCode event name [`parse_opencode_hook_event`] understands.
 /// Keep in sync with its `match`; the dispatcher consults this via
 /// `HookProvider::recognizes_event` to skip-and-log names a newer OpenCode
@@ -154,18 +143,6 @@ mod tests {
             assert!(
                 parse_opencode_hook_event(name, &envelope).is_ok(),
                 "advertised event '{name}' must parse",
-            );
-        }
-    }
-
-    // Scenario: fallback events are a subset of the advertised name table so
-    // the dispatcher never falls back for an event the parser would reject.
-    #[test]
-    fn fallback_events_are_a_subset_of_advertised_names() {
-        for name in OPENCODE_LIFECYCLE_FALLBACK_EVENTS {
-            assert!(
-                OPENCODE_HOOK_EVENT_NAMES.contains(name),
-                "fallback event '{name}' must be an advertised event name",
             );
         }
     }

@@ -34,7 +34,8 @@ use crate::{
             AgentCaptureGenerationManifest, AgentCaptureGenerationRow,
             AgentCaptureRestoreCatalogRows, AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row,
             AgentImportTombstoneRow, AgentSessionV2Row, AgentSubagentContentClaimRow,
-            AgentSubagentContentRevisionRow, AgentSubagentLinkRow, D1Client, ObjectIndexRow,
+            AgentSubagentContentRevisionRow, AgentSubagentLinkRow, D1Client, D1Error,
+            ObjectIndexRow,
         },
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, ProgressMode, emit_json_data},
@@ -184,7 +185,9 @@ pub enum AgentCaptureSyncOutcome {
         checkpoints_synced: usize,
         checkpoints_failed: usize,
     },
-    /// Hard error (table-existence query, ensure-table call, ...).
+    /// Hard error (table-existence query, ensure-table call, ...). `error`
+    /// is the fixed, content-free reason from
+    /// `agent_capture_sync_failure_reason`.
     Failed { error: String },
 }
 
@@ -391,11 +394,11 @@ impl CloudSyncProgress for ConsoleCloudSyncProgress {
     fn on_agent_capture_starting(&self) {
         println!("Syncing agent capture catalog to D1...");
     }
-    fn on_agent_capture_session_warning(&self, session_id: &str, err: &str) {
-        eprintln!("warning: agent_session {session_id} upsert failed: {err}");
+    fn on_agent_capture_session_warning(&self, _session_id: &str, _err: &str) {
+        self.on_agent_capture_warning(AGENT_CAPTURE_SYNC_FAILURE_MESSAGE);
     }
-    fn on_agent_capture_checkpoint_warning(&self, checkpoint_id: &str, err: &str) {
-        eprintln!("warning: agent_checkpoint {checkpoint_id} upsert failed: {err}");
+    fn on_agent_capture_checkpoint_warning(&self, _checkpoint_id: &str, _err: &str) {
+        self.on_agent_capture_warning(AGENT_CAPTURE_SYNC_FAILURE_MESSAGE);
     }
     fn on_agent_capture_done_with_subagents(
         &self,
@@ -496,18 +499,16 @@ impl CloudSyncProgress for JsonCloudSyncProgress {
             "event": "cloud_sync.agent_capture.start",
         }));
     }
-    fn on_agent_capture_session_warning(&self, session_id: &str, err: &str) {
+    fn on_agent_capture_session_warning(&self, _session_id: &str, _err: &str) {
         Self::emit(serde_json::json!({
-            "event": "cloud_sync.agent_capture.session_warning",
-            "session_id": session_id,
-            "error": err,
+            "event": "cloud_sync.agent_capture.warning",
+            "error": AGENT_CAPTURE_SYNC_FAILURE_MESSAGE,
         }));
     }
-    fn on_agent_capture_checkpoint_warning(&self, checkpoint_id: &str, err: &str) {
+    fn on_agent_capture_checkpoint_warning(&self, _checkpoint_id: &str, _err: &str) {
         Self::emit(serde_json::json!({
-            "event": "cloud_sync.agent_capture.checkpoint_warning",
-            "checkpoint_id": checkpoint_id,
-            "error": err,
+            "event": "cloud_sync.agent_capture.warning",
+            "error": AGENT_CAPTURE_SYNC_FAILURE_MESSAGE,
         }));
     }
     fn on_agent_capture_done_with_subagents(
@@ -613,9 +614,7 @@ pub async fn execute_safe(args: CloudArgs, output: &OutputConfig) -> CliResult<(
                 if let AgentCaptureSyncOutcome::Failed { error } = &report.agent_capture {
                     return Err(cloud_cli_error_typed(
                         "sync",
-                        CloudError::PartialTransfer(format!(
-                            "agent capture mirror failed: {error}"
-                        )),
+                        agent_capture_mirror_failure(error),
                     ));
                 }
                 render_cloud_sync_output(&report, output)?;
@@ -681,6 +680,64 @@ pub(crate) enum CloudError {
 }
 
 type CloudResult<T> = std::result::Result<T, CloudError>;
+
+/// Convert an untrusted D1 failure into a stable public diagnostic.
+///
+/// Cloudflare may include SQL fragments or submitted values in `message`.
+/// Agent-capture rows include privacy-sensitive commitments, so neither the
+/// original message nor its Debug representation may cross a CLI, progress, or
+/// JSON boundary. The numeric D1 code is deliberately retained as a safe
+/// correlation value for support and retry decisions.
+pub(super) fn cloud_d1_failure(operation: &'static str, error: &D1Error) -> CloudError {
+    tracing::warn!(
+        d1_operation = operation,
+        d1_error_code = error.code,
+        "cloud D1 request failed"
+    );
+    CloudError::D1(format!(
+        "cloud D1 {operation} failed (D1 code {}); verify cloud connectivity and credentials, then retry",
+        error.code
+    ))
+}
+
+/// Fixed reason for a failed agent-capture row batch (the user-approved
+/// `cloud_sync.agent_capture.warning` text). It carries no session or
+/// checkpoint id and no remote D1 text.
+pub(super) const AGENT_CAPTURE_SYNC_FAILURE_MESSAGE: &str = "agent-capture catalog sync failed; inspect the local capture catalog and retry `libra cloud sync`";
+
+/// Fixed success-path warning: legacy V1 subagent evidence the remote catalog
+/// never held stays local-only (see `PendingSubagentRows`).
+pub(super) const AGENT_CAPTURE_LEGACY_LOCAL_ONLY_MESSAGE: &str = "legacy V1 subagent evidence keyed by an unkeyed source digest stays local-only and was not mirrored; its checkpoints and all other agent-capture rows were synced";
+
+/// Map a failed agent-capture row batch to the fixed row-failure reason. The
+/// D1 code goes to tracing only; the D1 message may quote submitted rows.
+pub(super) fn agent_capture_row_failure(operation: &'static str, error: &D1Error) -> CloudError {
+    tracing::warn!(
+        d1_operation = operation,
+        d1_error_code = error.code,
+        "cloud D1 agent-capture row batch failed"
+    );
+    CloudError::D1(AGENT_CAPTURE_SYNC_FAILURE_MESSAGE.to_string())
+}
+
+/// The reason reported for a failed agent-capture sync phase: its progress
+/// warning, `--json` `agent_capture.error`, and final error. Every
+/// agent-capture `CloudError` is a fixed diagnostic parameterised only by
+/// static labels and counts (D1 and local driver text is redacted at its
+/// source), so the closed set of reasons stays content-free. A missing-env
+/// detail can embed arbitrary configuration text and keeps the fixed message.
+pub(super) fn agent_capture_sync_failure_reason(error: &CloudError) -> String {
+    match error {
+        CloudError::MissingEnv { .. } => AGENT_CAPTURE_SYNC_FAILURE_MESSAGE.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Final `cloud sync` error for a failed agent-capture phase, after its
+/// progress has been rendered (`LBR-CONFLICT-002`).
+fn agent_capture_mirror_failure(reason: &str) -> CloudError {
+    CloudError::PartialTransfer(format!("agent capture mirror failed: {reason}"))
+}
 
 impl From<String> for CloudError {
     fn from(error: String) -> Self {
@@ -899,9 +956,7 @@ async fn execute_sync(args: SyncArgs) -> CloudResult<()> {
         )));
     }
     if let AgentCaptureSyncOutcome::Failed { error } = report.agent_capture {
-        return Err(CloudError::PartialTransfer(format!(
-            "agent capture mirror failed: {error}"
-        )));
+        return Err(agent_capture_mirror_failure(&error));
     }
     Ok(())
 }
@@ -982,20 +1037,20 @@ async fn preflight_agent_capture_prune_fences(
         .agent_capture_generation_table_exists()
         .await
         .map_err(|error| {
-            CloudError::D1(format!(
-                "probe remote agent-capture generation before prune preflight: {}",
-                error.message
-            ))
+            cloud_d1_failure(
+                "probe agent-capture generation before prune preflight",
+                &error,
+            )
         })?;
     if !generation_table_present {
         let has_capture_rows = d1_client
             .agent_capture_catalog_has_rows(repo_id)
             .await
             .map_err(|error| {
-                CloudError::D1(format!(
-                    "probe unmanifested remote capture before prune preflight: {}",
-                    error.message
-                ))
+                cloud_d1_failure(
+                    "probe unmanifested agent capture before prune preflight",
+                    &error,
+                )
             })?;
         if !has_capture_rows {
             return Ok(());
@@ -1011,20 +1066,20 @@ async fn preflight_agent_capture_prune_fences(
             .get_agent_capture_generation(repo_id)
             .await
             .map_err(|error| {
-                CloudError::D1(format!(
-                    "read remote agent-capture generation before prune preflight: {}",
-                    error.message
-                ))
+                cloud_d1_failure(
+                    "read agent-capture generation before prune preflight",
+                    &error,
+                )
             })?;
         let Some(before) = before else {
             let has_capture_rows = d1_client
                 .agent_capture_catalog_has_rows(repo_id)
                 .await
                 .map_err(|error| {
-                    CloudError::D1(format!(
-                        "probe remote capture without a repo generation before prune preflight: {}",
-                        error.message
-                    ))
+                    cloud_d1_failure(
+                        "probe agent capture without a generation before prune preflight",
+                        &error,
+                    )
                 })?;
             if !has_capture_rows {
                 return Ok(());
@@ -1044,19 +1099,16 @@ async fn preflight_agent_capture_prune_fences(
             .find_agent_checkpoint_ids_by_ids(repo_id, &checkpoint_ids)
             .await
             .map_err(|error| {
-                CloudError::D1(format!(
-                    "compare local checkpoint prune fences with the remote capture: {}",
-                    error.message
-                ))
+                cloud_d1_failure("compare checkpoint prune fences with agent capture", &error)
             })?;
         let after = d1_client
             .get_agent_capture_generation(repo_id)
             .await
             .map_err(|error| {
-                CloudError::D1(format!(
-                    "recheck remote agent-capture generation after prune preflight: {}",
-                    error.message
-                ))
+                cloud_d1_failure(
+                    "recheck agent-capture generation after prune preflight",
+                    &error,
+                )
             })?;
         if after.as_ref() != Some(&before) {
             continue;
@@ -1074,13 +1126,14 @@ fn reject_local_prune_conflicts(
     local_checkpoint_ids: &[String],
     remote_checkpoint_ids: &HashSet<String>,
 ) -> CloudResult<()> {
-    if let Some(checkpoint_id) = local_checkpoint_ids
+    if local_checkpoint_ids
         .iter()
-        .find(|checkpoint_id| remote_checkpoint_ids.contains(checkpoint_id.as_str()))
+        .any(|checkpoint_id| remote_checkpoint_ids.contains(checkpoint_id.as_str()))
     {
-        return Err(CloudError::PartialTransfer(format!(
-            "remote checkpoint {checkpoint_id} was already pruned locally; run `libra cloud sync` to publish the prune tombstone before restoring"
-        )));
+        return Err(CloudError::PartialTransfer(
+            "a remote checkpoint was already pruned locally; run `libra cloud sync` to publish the prune tombstone before restoring"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -1393,7 +1446,7 @@ fn validate_missing_capture_manifest(has_capture_rows: bool) -> CloudResult<()> 
 
 /// PD-03: UPSERT restored session tombstones into the local
 /// `agent_import_tombstone` table (same idempotent shape the local erase
-/// writes: newest `erased_at` wins, known fingerprints are kept). A
+/// writes: newest `erased_at` wins and retired fingerprints are cleared). A
 /// legacy local schema without the table skips with a warning — the
 /// restore itself already filtered the erased rows.
 async fn persist_local_import_tombstones(
@@ -1415,7 +1468,7 @@ async fn persist_local_import_tombstones(
         ))
         .await
         .map_err(|error| {
-            CloudError::Generic(format!("query local import-tombstone schema: {error}"))
+            local_agent_capture_restore_failure("probe import-tombstone schema", error)
         })?
         .is_some();
     if !table_present {
@@ -1435,26 +1488,23 @@ async fn persist_local_import_tombstones(
                  ) VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
                     erased_session_id = excluded.erased_session_id,
-                    source_fingerprint = COALESCE(
-                        excluded.source_fingerprint,
-                        agent_import_tombstone.source_fingerprint
-                    ),
+                    source_fingerprint = NULL,
                     erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at)",
                 [
                     uuid::Uuid::new_v4().to_string().into(),
                     row.agent_kind.clone().into(),
                     row.provider_session_id.clone().into(),
                     row.erased_session_id.clone().into(),
-                    Value::from(row.source_fingerprint.clone()),
+                    Value::from(Option::<String>::None),
                     row.erased_at.into(),
                 ],
             ))
             .await
-            .map_err(|error| {
-                CloudError::Generic(format!(
-                    "persist restored session tombstone for {}/{}: {error}",
-                    row.agent_kind, row.provider_session_id
-                ))
+            .map_err(|_| {
+                CloudError::Generic(
+                    "failed to persist a restored session tombstone; repair the local catalog and retry cloud restore"
+                        .to_string(),
+                )
             })?;
     }
     Ok(())
@@ -1481,12 +1531,7 @@ async fn load_remote_agent_capture_rows(
             AGENT_CAPTURE_RESTORE_MAX_ROWS,
         )
         .await
-        .map_err(|error| {
-            CloudError::D1(format!(
-                "list aggregate-bounded agent-capture restore catalog: {}",
-                error.message
-            ))
-        })?;
+        .map_err(|error| cloud_d1_failure("list agent-capture restore catalog", &error))?;
     // PD-03 tombstone-first: an erased session never restores, even when
     // a stale mirror still carries its rows.
     let erased_session_ids: HashSet<&str> = import_tombstones
@@ -1646,13 +1691,13 @@ mod tests {
             source_fingerprint: fp.map(str::to_string),
             erased_at,
         };
-        // Newest erased_at wins; an older row's fingerprint survives when
-        // the newer one lacks it.
+        // Newest erased_at wins, but retired source fingerprints never
+        // survive a local/remote merge.
         let merged = super::merge_import_tombstones(&[row(5, None)], &[row(3, Some("aa"))]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].erased_at, 5);
         assert_eq!(merged[0].erased_session_id, "sess-5");
-        assert_eq!(merged[0].source_fingerprint.as_deref(), Some("aa"));
+        assert_eq!(merged[0].source_fingerprint, None);
         // Distinct provider identities stay distinct.
         let mut other = row(7, None);
         other.provider_session_id = "prov-2".to_string();
@@ -1661,6 +1706,1198 @@ mod tests {
         // Idempotent under replay: merging the merged set changes nothing.
         let replay = super::merge_import_tombstones(&merged, &merged);
         assert_eq!(replay, merged);
+    }
+
+    #[tokio::test]
+    async fn persist_local_import_tombstones_scrubs_legacy_source_fingerprints() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open local tombstone fixture");
+        for sql in [
+            "CREATE TABLE agent_import_tombstone (
+                tombstone_id TEXT PRIMARY KEY,
+                agent_kind TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                erased_session_id TEXT NOT NULL,
+                source_fingerprint TEXT,
+                erased_at INTEGER NOT NULL,
+                UNIQUE(agent_kind, provider_session_id)
+             )",
+            "INSERT INTO agent_import_tombstone VALUES (
+                'legacy-local', 'claude_code', 'provider', 'old-session',
+                'legacy-local-fingerprint', 3
+             )",
+        ] {
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("prepare local tombstone fixture");
+        }
+
+        persist_local_import_tombstones(
+            &conn,
+            &[AgentImportTombstoneRow {
+                agent_kind: "claude_code".to_string(),
+                provider_session_id: "provider".to_string(),
+                erased_session_id: "restored-session".to_string(),
+                source_fingerprint: Some("remote-legacy-fingerprint".to_string()),
+                erased_at: 7,
+            }],
+        )
+        .await
+        .expect("restore tombstone while clearing retired metadata");
+
+        let row = conn
+            .query_one_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT erased_session_id, source_fingerprint, erased_at
+                 FROM agent_import_tombstone
+                 WHERE agent_kind = 'claude_code' AND provider_session_id = 'provider'"
+                    .to_string(),
+            ))
+            .await
+            .expect("read restored tombstone")
+            .expect("restored tombstone row");
+        assert_eq!(
+            row.try_get_by::<String, _>("erased_session_id")
+                .expect("restored session id"),
+            "restored-session"
+        );
+        assert_eq!(
+            row.try_get_by::<Option<String>, _>("source_fingerprint")
+                .expect("retired fingerprint column"),
+            None,
+            "restore must clear both a remote legacy value and any local value it replaces"
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("erased_at")
+                .expect("newest erasure timestamp"),
+            7
+        );
+    }
+
+    fn legacy_import_ownership_metadata(schema_version: Option<i64>) -> String {
+        let mut metadata = serde_json::json!({
+            "repository_identity": "legacy-repository-proof",
+            "source_kind": "file",
+            "source_id": "/private/provider/session.jsonl",
+            "source_fingerprint": "legacy-unkeyed-fingerprint",
+            "import_provisional": false,
+            "imported": true,
+        });
+        if let Some(schema_version) = schema_version {
+            metadata["import_source_schema_version"] = serde_json::Value::from(schema_version);
+        }
+        metadata.to_string()
+    }
+
+    fn malformed_unversioned_legacy_ownership_metadata() -> String {
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&legacy_import_ownership_metadata(None))
+                .expect("legacy ownership fixture is valid JSON");
+        metadata["source_fingerprint"] = serde_json::Value::Null;
+        metadata.to_string()
+    }
+
+    const LEGACY_OWNERSHIP_SENTINEL: &str = "LEGACY_OWNERSHIP_SENTINEL_MUST_NOT_CROSS_CLOUD";
+
+    fn partial_legacy_ownership_metadata(field: &str) -> String {
+        let value = if field == "import_source_schema_version" {
+            // A V2 version without the rest of the closed V2 record must be
+            // rejected by the catalog validator too.
+            serde_json::Value::from(
+                crate::internal::ai::agent_import::IMPORT_IDENTITY_SCHEMA_VERSION_V2,
+            )
+        } else {
+            serde_json::Value::String(LEGACY_OWNERSHIP_SENTINEL.to_string())
+        };
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(field.to_string(), value);
+        serde_json::Value::Object(metadata).to_string()
+    }
+
+    fn partial_legacy_ownership_metadata_cases() -> Vec<(String, String)> {
+        [
+            "repository_identity",
+            "source_kind",
+            "source_id",
+            "source_fingerprint",
+            "import_source_schema_version",
+            "import_provisional",
+            "imported",
+            "transcript_snapshot",
+        ]
+        .into_iter()
+        .map(|field| {
+            (
+                format!("partial reserved field {field}"),
+                partial_legacy_ownership_metadata(field),
+            )
+        })
+        .collect()
+    }
+
+    fn assert_cloud_ownership_rejection(label: &str, error: &CloudError) {
+        let message = error.to_string();
+        assert!(
+            message.contains("import ownership metadata")
+                || message.contains("unsupported import ownership schema"),
+            "unexpected {label} ownership error: {message}"
+        );
+        assert!(
+            !message.contains("/private/provider/session.jsonl"),
+            "{label} diagnostic must not disclose the legacy locator: {message}"
+        );
+        assert!(
+            !message.contains(LEGACY_OWNERSHIP_SENTINEL),
+            "{label} diagnostic must not disclose partial ownership metadata: {message}"
+        );
+    }
+
+    async fn cloud_snapshot_fixture_with_metadata(
+        metadata_json: &str,
+    ) -> sea_orm::DatabaseConnection {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open cloud snapshot fixture");
+        for sql in [
+            "CREATE TABLE object_index (repo_id TEXT NOT NULL, is_synced INTEGER NOT NULL)",
+            "CREATE TABLE agent_session (
+                session_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                worktree_id TEXT,
+                parent_commit TEXT,
+                parent_session_id TEXT,
+                metadata_json TEXT NOT NULL,
+                redaction_report TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                last_event_at INTEGER NOT NULL,
+                stopped_at INTEGER,
+                schema_version INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL
+             )",
+            "CREATE TABLE agent_checkpoint (
+                checkpoint_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                scope TEXT NOT NULL,
+                parent_commit TEXT,
+                tree_oid TEXT NOT NULL,
+                metadata_blob_oid TEXT NOT NULL,
+                traces_commit TEXT NOT NULL,
+                tool_use_id TEXT,
+                subagent_session_id TEXT,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL
+             )",
+            "CREATE TABLE reference (name TEXT, kind TEXT, remote TEXT, `commit` TEXT)",
+            "CREATE TABLE agent_capture_cloud_base (
+                repo_id TEXT PRIMARY KEY,
+                remote_generation INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             )",
+        ] {
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("create cloud snapshot fixture table");
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at,
+                schema_version, sync_revision
+             ) VALUES (?, ?, ?, 'active', '/repo', ?, '{}', 1, 1, 1, 1)",
+            [
+                "session".into(),
+                "claude_code".into(),
+                "provider".into(),
+                metadata_json.to_string().into(),
+            ],
+        ))
+        .await
+        .expect("seed cloud snapshot session");
+        conn
+    }
+
+    async fn cloud_snapshot_fixture_with_companion_source_keys(
+        claim_schema_version: i64,
+        claim_source_key: &str,
+        revision: Option<(i64, &str)>,
+    ) -> sea_orm::DatabaseConnection {
+        cloud_snapshot_fixture_with_session_and_companions(
+            "{}",
+            claim_schema_version,
+            claim_source_key,
+            revision,
+        )
+        .await
+    }
+
+    async fn cloud_snapshot_fixture_with_session_and_companions(
+        metadata_json: &str,
+        claim_schema_version: i64,
+        claim_source_key: &str,
+        revision: Option<(i64, &str)>,
+    ) -> sea_orm::DatabaseConnection {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let conn = cloud_snapshot_fixture_with_metadata(metadata_json).await;
+        for sql in [
+            "CREATE TABLE agent_checkpoint_prune_tombstone (
+                checkpoint_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                pruned_at INTEGER NOT NULL
+             )",
+            "CREATE TABLE agent_subagent_content_claim (
+                parent_session_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                content_schema_version INTEGER NOT NULL,
+                revision_cursor INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL,
+                current_revision INTEGER NOT NULL,
+                current_checkpoint_id TEXT,
+                current_digest TEXT,
+                fence_token INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             )",
+            "CREATE TABLE agent_subagent_content_revision (
+                parent_session_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                content_schema_version INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                source_channel TEXT NOT NULL,
+                partial INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+             )",
+            "CREATE TABLE agent_subagent_link (
+                content_checkpoint_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                link_state TEXT NOT NULL,
+                boundary_checkpoint_id TEXT,
+                stable_subagent_id TEXT,
+                sync_revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             )",
+        ] {
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("create companion cloud snapshot fixture table");
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_subagent_content_claim (
+                parent_session_id, provider_kind, source_key, content_schema_version,
+                revision_cursor, sync_revision, current_revision, current_checkpoint_id,
+                current_digest, fence_token, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 0, 0, 0, NULL, NULL, 0, 1, 1)",
+            [
+                "session".into(),
+                "claude_code".into(),
+                claim_source_key.to_string().into(),
+                claim_schema_version.into(),
+            ],
+        ))
+        .await
+        .expect("seed companion claim fixture");
+        if let Some((revision_schema_version, revision_source_key)) = revision {
+            conn.execute_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "INSERT INTO agent_subagent_content_revision (
+                    parent_session_id, provider_kind, source_key, content_schema_version,
+                    revision, checkpoint_id, content_digest, source_channel, partial, created_at
+                 ) VALUES (?, ?, ?, ?, 1, 'unused-checkpoint', 'digest', 'import', 0, 1)",
+                [
+                    "session".into(),
+                    "claude_code".into(),
+                    revision_source_key.to_string().into(),
+                    revision_schema_version.into(),
+                ],
+            ))
+            .await
+            .expect("seed companion revision fixture");
+        }
+        conn
+    }
+
+    fn invalid_subagent_companion_source_key_cases() -> Vec<(&'static str, i64, String, i64, String)>
+    {
+        let valid_v1 = format!("source/sha256/{}", "a".repeat(64));
+        let valid_v2 = format!("source/subagent-hmac-v2/{}", "b".repeat(64));
+        let raw_locator = "/private/provider/subagents/session.jsonl".to_string();
+        let malformed_v2 = "source/subagent-hmac-v2/not-a-hex-commitment".to_string();
+        let v2 = crate::internal::ai::subagent_content::SUBAGENT_CONTENT_SCHEMA_VERSION;
+
+        vec![
+            (
+                "claim raw locator",
+                1,
+                raw_locator.clone(),
+                1,
+                valid_v1.clone(),
+            ),
+            (
+                "claim malformed V2 commitment",
+                v2,
+                malformed_v2.clone(),
+                v2,
+                valid_v2.clone(),
+            ),
+            ("revision raw locator", 1, valid_v1, 1, raw_locator),
+            (
+                "revision malformed V2 commitment",
+                v2,
+                valid_v2,
+                v2,
+                malformed_v2,
+            ),
+        ]
+    }
+
+    const RESERVED_OWNERSHIP_FIELDS: [&str; 8] = [
+        "repository_identity",
+        "source_kind",
+        "source_id",
+        "source_fingerprint",
+        "import_source_schema_version",
+        "import_provisional",
+        "imported",
+        "transcript_snapshot",
+    ];
+
+    const LEGACY_OWNERSHIP_VALUES: [&str; 4] = [
+        "/private/provider/session.jsonl",
+        "legacy-unkeyed-fingerprint",
+        "legacy-repository-proof",
+        LEGACY_OWNERSHIP_SENTINEL,
+    ];
+
+    fn valid_v2_import_session_row(
+        session_id: &str,
+        provider_session_id: &str,
+    ) -> AgentSessionV2Row {
+        let source_id = format!("source/hmac-v2/{}", "a".repeat(64));
+        let mut row = fixture_session_row(session_id, provider_session_id);
+        row.metadata_json = format!(
+            r#"{{"repository_identity":"not_retained:v1","source_kind":"file","source_id":"{source_id}","source_fingerprint":"{source_id}","import_source_schema_version":2,"import_provisional":false,"transcript_snapshot":null,"imported":true}}"#
+        );
+        row.redaction_report = r#"{"import":{"pipeline":"typed_allowlist","snapshot_redaction":true,"raw_persisted":false,"matches":[],"bytes_scanned":0,"bytes_redacted":0}}"#.to_string();
+        row
+    }
+
+    /// Legacy ownership crosses the cloud boundary only as its projection:
+    /// every ownership member is omitted and every other column is unchanged.
+    fn assert_legacy_ownership_projected(
+        label: &str,
+        original: &AgentSessionV2Row,
+        projected: &AgentSessionV2Row,
+    ) {
+        let metadata: serde_json::Value = serde_json::from_str(&projected.metadata_json)
+            .unwrap_or_else(|error| panic!("{label}: projected metadata is JSON: {error}"));
+        let object = metadata
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: projected metadata stays a JSON object"));
+        for field in RESERVED_OWNERSHIP_FIELDS {
+            assert!(
+                !object.contains_key(field),
+                "{label}: ownership member {field} must not cross cloud"
+            );
+        }
+        for value in LEGACY_OWNERSHIP_VALUES {
+            assert!(
+                !projected.metadata_json.contains(value),
+                "{label}: projected metadata disclosed legacy ownership"
+            );
+        }
+        let expected = AgentSessionV2Row {
+            metadata_json: projected.metadata_json.clone(),
+            ..original.clone()
+        };
+        assert_eq!(
+            projected, &expected,
+            "{label}: only ownership metadata may change"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingCaptureProgress {
+        warnings: std::sync::Mutex<Vec<String>>,
+        completions: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+    }
+
+    impl RecordingCaptureProgress {
+        fn warnings(&self) -> Vec<String> {
+            self.warnings.lock().unwrap().clone()
+        }
+
+        fn completions(&self) -> Vec<(usize, usize, usize)> {
+            self.completions.lock().unwrap().clone()
+        }
+    }
+
+    impl CloudSyncProgress for RecordingCaptureProgress {
+        // The console and JSON renderers turn all three callbacks into a
+        // `cloud_sync.agent_capture.warning`; record them as one event stream.
+        fn on_agent_capture_session_warning(&self, _session_id: &str, err: &str) {
+            self.warnings.lock().unwrap().push(err.to_string());
+        }
+        fn on_agent_capture_checkpoint_warning(&self, _checkpoint_id: &str, err: &str) {
+            self.warnings.lock().unwrap().push(err.to_string());
+        }
+        fn on_agent_capture_warning(&self, err: &str) {
+            self.warnings.lock().unwrap().push(err.to_string());
+        }
+        fn on_agent_capture_done_with_subagents(
+            &self,
+            sessions_synced: usize,
+            _sessions_failed: usize,
+            checkpoints_synced: usize,
+            _checkpoints_failed: usize,
+            subagent_rows_synced: usize,
+            _subagent_rows_failed: usize,
+        ) {
+            self.completions.lock().unwrap().push((
+                sessions_synced,
+                checkpoints_synced,
+                subagent_rows_synced,
+            ));
+        }
+    }
+
+    async fn mock_d1_with_object_index() -> crate::utils::d1_client::test_support::MockD1 {
+        let mock = crate::utils::d1_client::test_support::MockD1::spawn().await;
+        // `run_cloud_sync` converges the object index before the capture
+        // phase; the capture tests start from that same remote state.
+        mock.client()
+            .ensure_object_index_table()
+            .await
+            .expect("prepare mock D1 object index");
+        mock
+    }
+
+    async fn local_session_metadata(
+        conn: &sea_orm::DatabaseConnection,
+        session_id: &str,
+    ) -> String {
+        use sea_orm::Statement;
+
+        conn.query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT metadata_json FROM agent_session WHERE session_id = ?",
+            [session_id.into()],
+        ))
+        .await
+        .expect("read local session metadata")
+        .expect("local session row")
+        .try_get_by::<String, _>("metadata_json")
+        .expect("decode local session metadata")
+    }
+
+    #[test]
+    fn cloud_session_projection_omits_legacy_ownership_and_keeps_live_and_v2_rows() {
+        let (v2_version_only, partial_legacy): (Vec<_>, Vec<_>) =
+            partial_legacy_ownership_metadata_cases()
+                .into_iter()
+                .partition(|(label, _)| label.ends_with("import_source_schema_version"));
+        let mut legacy_cases = vec![
+            (
+                "explicit V1".to_string(),
+                legacy_import_ownership_metadata(Some(1)),
+            ),
+            (
+                "unversioned".to_string(),
+                legacy_import_ownership_metadata(None),
+            ),
+            (
+                "unversioned null fingerprint".to_string(),
+                malformed_unversioned_legacy_ownership_metadata(),
+            ),
+        ];
+        legacy_cases.extend(partial_legacy);
+        for (label, metadata_json) in legacy_cases {
+            let mut row = fixture_session_row("legacy-session", "legacy-provider");
+            row.metadata_json = metadata_json;
+            let projected = project_agent_session_for_cloud(&row, "test").unwrap_or_else(|error| {
+                panic!("{label} legacy ownership must still sync: {error}")
+            });
+            assert_legacy_ownership_projected(&label, &row, &projected);
+            assert_eq!(
+                project_agent_session_for_cloud(&projected, "test").expect("re-project"),
+                projected,
+                "{label}: a projected row is a fixed point, so a mirrored copy compares equal"
+            );
+        }
+
+        let mut mixed = fixture_session_row("mixed-session", "mixed-provider");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&legacy_import_ownership_metadata(None))
+                .expect("legacy ownership fixture is valid JSON");
+        metadata["event"] = serde_json::Value::from("SessionStart");
+        mixed.metadata_json = metadata.to_string();
+        let projected =
+            project_agent_session_for_cloud(&mixed, "test").expect("mixed legacy metadata syncs");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&projected.metadata_json)
+                .expect("projected metadata is JSON"),
+            serde_json::json!({"event": "SessionStart"}),
+            "non-ownership metadata next to legacy ownership must survive the projection"
+        );
+
+        for (label, metadata_json) in [
+            ("ordinary event", r#"{"event":"SessionStart","live":true}"#),
+            (
+                "ordinary live diagnostic",
+                r#"{"event":"SessionStart","attempt":1}"#,
+            ),
+        ] {
+            let mut live = fixture_session_row("live-session", "live-provider");
+            live.metadata_json = metadata_json.to_string();
+            assert_eq!(
+                project_agent_session_for_cloud(&live, "test")
+                    .unwrap_or_else(|error| panic!("{label} metadata must stay syncable: {error}")),
+                live,
+                "{label} metadata crosses cloud byte-identically"
+            );
+        }
+
+        let v2 = valid_v2_import_session_row("v2-session", "v2-provider");
+        assert_eq!(
+            project_agent_session_for_cloud(&v2, "test").expect("valid V2 ownership syncs"),
+            v2,
+            "a complete V2 ownership record crosses cloud byte-identically"
+        );
+
+        let mut rejected = v2_version_only;
+        rejected.extend([
+            (
+                "non-integer schema".to_string(),
+                format!(
+                    r#"{{"import_source_schema_version":"1","source_id":"{LEGACY_OWNERSHIP_SENTINEL}"}}"#
+                ),
+            ),
+            (
+                "unknown schema".to_string(),
+                format!(
+                    r#"{{"import_source_schema_version":3,"source_id":"{LEGACY_OWNERSHIP_SENTINEL}"}}"#
+                ),
+            ),
+            (
+                "duplicate keys".to_string(),
+                format!(
+                    r#"{{"source_id":"{LEGACY_OWNERSHIP_SENTINEL}","source_id":"/private/provider/session.jsonl"}}"#
+                ),
+            ),
+            ("non-object".to_string(), "[]".to_string()),
+            (
+                "not JSON".to_string(),
+                format!("{LEGACY_OWNERSHIP_SENTINEL} /private/provider/session.jsonl"),
+            ),
+        ]);
+        for (label, metadata_json) in rejected {
+            let mut row = fixture_session_row("rejected-session", "rejected-provider");
+            row.metadata_json = metadata_json;
+            let error = project_agent_session_for_cloud(&row, "test")
+                .expect_err("malformed or invalid ownership must stay a fixed error");
+            assert_cloud_ownership_rejection(&label, &error);
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_snapshot_projects_legacy_ownership_without_mutating_local_evidence() {
+        for (label, metadata_json) in [
+            ("explicit V1", legacy_import_ownership_metadata(Some(1))),
+            ("unversioned", legacy_import_ownership_metadata(None)),
+            (
+                "unversioned null fingerprint",
+                malformed_unversioned_legacy_ownership_metadata(),
+            ),
+        ] {
+            let conn = cloud_snapshot_fixture_with_metadata(&metadata_json).await;
+            let snapshot = load_agent_capture_snapshot(&conn, "repo", false)
+                .await
+                .unwrap_or_else(|error| panic!("{label} legacy ownership must sync: {error}"));
+            assert_eq!(snapshot.sessions.len(), 1);
+            let original = AgentSessionV2Row {
+                metadata_json: metadata_json.clone(),
+                ..snapshot.sessions[0].clone()
+            };
+            assert_legacy_ownership_projected(label, &original, &snapshot.sessions[0]);
+            assert_eq!(
+                local_session_metadata(&conn, "session").await,
+                metadata_json,
+                "{label}: the projection must not rewrite immutable local evidence"
+            );
+        }
+
+        let conn = cloud_snapshot_fixture_with_metadata(&partial_legacy_ownership_metadata(
+            "import_source_schema_version",
+        ))
+        .await;
+        let error = load_agent_capture_snapshot(&conn, "repo", false)
+            .await
+            .expect_err("an incomplete V2 record must fail before a D1 client is involved");
+        assert_cloud_ownership_rejection("V2 version only", &error);
+    }
+
+    #[tokio::test]
+    async fn cloud_sync_projects_legacy_ownership_and_withholds_unmirrored_v1_companions() {
+        let mock = mock_d1_with_object_index().await;
+        let d1_client = mock.client();
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let legacy_metadata = legacy_import_ownership_metadata(Some(1));
+        let legacy_source_key = format!("source/sha256/{}", "c".repeat(64));
+        // A zero-revision claim is a complete local companion on its own, so
+        // the never-mirrored V1 source identity is the behavior under test.
+        let conn = cloud_snapshot_fixture_with_session_and_companions(
+            &legacy_metadata,
+            1,
+            &legacy_source_key,
+            None,
+        )
+        .await;
+
+        for (attempt, expected_sessions) in [("first", 1), ("repeat", 0)] {
+            let progress = RecordingCaptureProgress::default();
+            let outcome = sync_agent_capture_tables(&conn, &d1_client, &remote, "repo", &progress)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{attempt} sync of an upgraded repository must succeed: {error}")
+                });
+            assert_eq!(
+                outcome,
+                AgentCaptureSyncOutcome::Completed {
+                    sessions_synced: expected_sessions,
+                    sessions_failed: 0,
+                    checkpoints_synced: 0,
+                    checkpoints_failed: 0,
+                },
+                "{attempt} sync"
+            );
+            assert_eq!(
+                progress.warnings(),
+                vec![AGENT_CAPTURE_LEGACY_LOCAL_ONLY_MESSAGE.to_string()],
+                "{attempt} sync reports withheld legacy evidence with exactly one fixed warning"
+            );
+            assert_eq!(progress.completions(), vec![(expected_sessions, 0, 0)]);
+        }
+
+        let wire = serde_json::to_string(&mock.request_bodies().await)
+            .expect("serialize recorded D1 requests");
+        for value in LEGACY_OWNERSHIP_VALUES {
+            assert!(
+                !wire.contains(value),
+                "legacy session ownership must not reach any D1 request"
+            );
+        }
+        assert!(
+            !wire.contains(&legacy_source_key),
+            "a never-mirrored V1 source digest must not become a new cloud value"
+        );
+        let remote_rows = d1_client
+            .list_agent_capture_restore_catalog_rows("repo", true, 100)
+            .await
+            .expect("read mirrored catalog");
+        assert!(remote_rows.claims.is_empty());
+        assert_eq!(remote_rows.sessions.len(), 1);
+        let original = AgentSessionV2Row {
+            metadata_json: legacy_metadata.clone(),
+            ..remote_rows.sessions[0].clone()
+        };
+        assert_legacy_ownership_projected("mirrored session", &original, &remote_rows.sessions[0]);
+        assert_eq!(
+            local_session_metadata(&conn, "session").await,
+            legacy_metadata,
+            "sync must leave local legacy evidence untouched"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) AS n FROM agent_subagent_content_claim"
+            )
+            .await
+            .expect("count local claims"),
+            1,
+            "withheld legacy evidence stays local"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_sync_accepts_head_mirrored_legacy_rows_and_restores_their_projection() {
+        let mock = mock_d1_with_object_index().await;
+        let d1_client = mock.client();
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let legacy_metadata = legacy_import_ownership_metadata(None);
+        let legacy_source_key = format!("source/sha256/{}", "d".repeat(64));
+        let conn = cloud_snapshot_fixture_with_session_and_companions(
+            &legacy_metadata,
+            1,
+            &legacy_source_key,
+            None,
+        )
+        .await;
+
+        // Mirror the local rows verbatim, as releases up to HEAD did.
+        d1_client.ensure_agent_session_table().await.unwrap();
+        d1_client.ensure_agent_checkpoint_table().await.unwrap();
+        d1_client
+            .ensure_agent_capture_generation_table()
+            .await
+            .unwrap();
+        d1_client
+            .ensure_agent_checkpoint_prune_tombstone_table()
+            .await
+            .unwrap();
+        d1_client
+            .ensure_agent_import_tombstone_table()
+            .await
+            .unwrap();
+        d1_client
+            .ensure_agent_subagent_content_tables()
+            .await
+            .unwrap();
+        let snapshot_session = AgentSessionV2Row {
+            session_id: "session".to_string(),
+            agent_kind: "claude_code".to_string(),
+            provider_session_id: "provider".to_string(),
+            state: "active".to_string(),
+            working_dir: "/repo".to_string(),
+            worktree_id: None,
+            parent_commit: None,
+            parent_session_id: None,
+            metadata_json: legacy_metadata.clone(),
+            redaction_report: "{}".to_string(),
+            started_at: 1,
+            last_event_at: 1,
+            stopped_at: None,
+            schema_version: 1,
+            sync_revision: 1,
+        };
+        let legacy_claim = AgentSubagentContentClaimRow {
+            parent_session_id: "session".to_string(),
+            provider_kind: "claude_code".to_string(),
+            source_key: legacy_source_key.clone(),
+            content_schema_version: 1,
+            revision_cursor: 0,
+            sync_revision: 0,
+            current_revision: 0,
+            current_checkpoint_id: None,
+            current_digest: None,
+            fence_token: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let (object_index_digest, object_index_count) =
+            agent_capture_object_index_digest(&[]).expect("empty object manifest");
+        let writer = "head-release-writer";
+        d1_client
+            .begin_agent_capture_generation_from(
+                "repo",
+                writer,
+                None,
+                AgentCaptureGenerationManifest {
+                    object_index_digest: &object_index_digest,
+                    object_index_count,
+                    object_index_scope: "checkpoint_projection",
+                    object_index_generation: 0,
+                    traces_head: None,
+                },
+            )
+            .await
+            .expect("begin HEAD-era generation");
+        d1_client
+            .sync_agent_sessions_batch("repo", writer, std::slice::from_ref(&snapshot_session))
+            .await
+            .expect("mirror HEAD-era legacy session");
+        d1_client
+            .sync_agent_subagent_claims_batch("repo", writer, std::slice::from_ref(&legacy_claim))
+            .await
+            .expect("mirror HEAD-era V1 claim");
+        let generation = d1_client
+            .complete_agent_capture_generation("repo", writer, 0)
+            .await
+            .expect("complete HEAD-era generation");
+        store_local_agent_capture_cloud_base(&conn, "repo", generation.generation)
+            .await
+            .expect("record HEAD-era cloud base");
+
+        let progress = RecordingCaptureProgress::default();
+        let outcome = sync_agent_capture_tables(&conn, &d1_client, &remote, "repo", &progress)
+            .await
+            .expect("rows mirrored by an earlier release must not block sync");
+        assert_eq!(
+            outcome,
+            AgentCaptureSyncOutcome::Completed {
+                sessions_synced: 0,
+                sessions_failed: 0,
+                checkpoints_synced: 0,
+                checkpoints_failed: 0,
+            }
+        );
+        assert!(
+            progress.warnings().is_empty(),
+            "already mirrored legacy evidence is not withheld"
+        );
+        assert_eq!(progress.completions(), vec![(0, 0, 0)]);
+
+        let restore_root = tempdir().unwrap();
+        let restore_db = restore_root.path().join("restore.db");
+        let restore_conn = crate::internal::db::create_database(restore_db.to_str().unwrap())
+            .await
+            .expect("create restore target catalog");
+        assert_eq!(
+            restore_agent_capture_from_d1(&restore_conn, &d1_client, "repo", false)
+                .await
+                .expect("a HEAD-mirrored legacy remote stays restorable"),
+            AgentCaptureRestoreOutcome::GenerationInstalled
+        );
+        let restored_metadata = local_session_metadata(&restore_conn, "session").await;
+        let restored = AgentSessionV2Row {
+            metadata_json: restored_metadata,
+            ..snapshot_session.clone()
+        };
+        assert_legacy_ownership_projected("restored session", &snapshot_session, &restored);
+        assert_eq!(
+            scalar_count(
+                &restore_conn,
+                "SELECT COUNT(*) AS n FROM agent_subagent_content_claim"
+            )
+            .await
+            .expect("count restored claims"),
+            1,
+            "mirrored legacy subagent evidence remains restorable"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_restore_projects_legacy_ownership_and_keeps_equal_generation_local_evidence() {
+        use sea_orm::Statement;
+
+        let root = tempdir().unwrap();
+        let mut remote = fixture_session_row("remote-session", "remote-provider");
+        remote.metadata_json = legacy_import_ownership_metadata(Some(1));
+
+        let fresh_path = root.path().join("fresh.db");
+        let fresh = crate::internal::db::create_database(fresh_path.to_str().unwrap())
+            .await
+            .expect("create fresh restore catalog");
+        restore_agent_capture_from_rows(&fresh, std::slice::from_ref(&remote), &[], false)
+            .await
+            .expect("legacy remote ownership must restore as its projection");
+        let restored = AgentSessionV2Row {
+            metadata_json: local_session_metadata(&fresh, "remote-session").await,
+            ..remote.clone()
+        };
+        assert_legacy_ownership_projected("restored session", &remote, &restored);
+
+        // The clone that captured the row still holds the raw legacy row at
+        // the same generation; the projected remote copy is not a conflict.
+        let owner_path = root.path().join("owner.db");
+        let owner = crate::internal::db::create_database(owner_path.to_str().unwrap())
+            .await
+            .expect("create owner catalog");
+        owner
+            .execute_raw(Statement::from_sql_and_values(
+                owner.get_database_backend(),
+                "INSERT INTO agent_session (
+                    session_id, agent_kind, provider_session_id, state, working_dir,
+                    metadata_json, redaction_report, started_at, last_event_at,
+                    schema_version, sync_revision
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    remote.session_id.clone().into(),
+                    remote.agent_kind.clone().into(),
+                    remote.provider_session_id.clone().into(),
+                    remote.state.clone().into(),
+                    remote.working_dir.clone().into(),
+                    remote.metadata_json.clone().into(),
+                    remote.redaction_report.clone().into(),
+                    remote.started_at.into(),
+                    remote.last_event_at.into(),
+                    remote.schema_version.into(),
+                    remote.sync_revision.into(),
+                ],
+            ))
+            .await
+            .expect("seed local legacy evidence");
+        restore_agent_capture_from_rows(&owner, std::slice::from_ref(&remote), &[], false)
+            .await
+            .expect("an equal-generation legacy row is the same session, not a conflict");
+        assert_eq!(
+            local_session_metadata(&owner, "remote-session").await,
+            remote.metadata_json,
+            "restore must leave equal-generation local legacy evidence untouched"
+        );
+
+        let mut divergent = remote.clone();
+        divergent.state = "stopped".to_string();
+        let error = restore_agent_capture_from_rows(&owner, &[divergent], &[], false)
+            .await
+            .expect_err("a real equal-generation divergence still fails closed");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with local state at the same sync generation"),
+            "unexpected divergence error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_capture_batch_failure_emits_one_fixed_warning() {
+        const REMOTE_SENTINEL: &str = "REMOTE_D1_BATCH_SENTINEL=/private/provider/session.jsonl";
+        let mock = mock_d1_with_object_index().await;
+        let d1_client = mock.client();
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let conn = cloud_snapshot_fixture_with_metadata(r#"{"event":"SessionStart"}"#).await;
+        // Only the session row batch extracts `metadata_json` from its payload.
+        mock.fail_once_when_sql_contains("json_extract(value, '$.metadata_json')", REMOTE_SENTINEL);
+
+        let progress = RecordingCaptureProgress::default();
+        let outcome =
+            sync::mirror_agent_capture(&conn, &d1_client, &remote, "repo", &progress).await;
+
+        assert_eq!(
+            progress.warnings(),
+            vec![AGENT_CAPTURE_SYNC_FAILURE_MESSAGE.to_string()],
+            "a failed row batch must emit exactly one fixed agent-capture warning"
+        );
+        assert_eq!(
+            outcome,
+            AgentCaptureSyncOutcome::Failed {
+                error: AGENT_CAPTURE_SYNC_FAILURE_MESSAGE.to_string(),
+            }
+        );
+        assert!(
+            serde_json::to_string(&mock.request_bodies().await)
+                .expect("serialize recorded D1 requests")
+                .contains("$.metadata_json"),
+            "the injected failure must come from the session row batch"
+        );
+        let report = CloudSyncReport {
+            repo_id: "repo".to_string(),
+            project_name: "project".to_string(),
+            total_unsynced: 0,
+            synced_count: 0,
+            failed_count: 0,
+            metadata: MetadataSyncOutcome::Skipped,
+            agent_capture: outcome,
+        };
+        let wire = serde_json::to_value(cloud_sync_output_from_report(&report))
+            .expect("serialize failed cloud sync");
+        assert_eq!(
+            wire["agent_capture"]["error"],
+            AGENT_CAPTURE_SYNC_FAILURE_MESSAGE
+        );
+        assert!(!wire.to_string().contains(REMOTE_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn agent_capture_validation_failure_reports_one_specific_reason() {
+        let mock = mock_d1_with_object_index().await;
+        let requests_before = mock.request_bodies().await.len();
+        let d1_client = mock.client();
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+        let valid_v1 = format!("source/sha256/{}", "a".repeat(64));
+        let raw_locator = "/private/provider/subagents/session.jsonl";
+        let conn =
+            cloud_snapshot_fixture_with_companion_source_keys(1, &valid_v1, Some((1, raw_locator)))
+                .await;
+
+        let progress = RecordingCaptureProgress::default();
+        let outcome =
+            sync::mirror_agent_capture(&conn, &d1_client, &remote, "repo", &progress).await;
+        let AgentCaptureSyncOutcome::Failed { error } = outcome else {
+            panic!("an invalid companion source key must fail the capture phase: {outcome:?}");
+        };
+        assert_eq!(
+            error, "local subagent companion has an invalid source commitment",
+            "the specific fixed reason must survive, not a retry-only placeholder"
+        );
+        assert_eq!(progress.warnings(), vec![error.clone()]);
+        assert_eq!(
+            mock.request_bodies().await.len(),
+            requests_before,
+            "local validation must fail before any agent-capture D1 request"
+        );
+
+        let cli = cloud_cli_error_typed("sync", agent_capture_mirror_failure(&error));
+        assert_eq!(
+            cli.message(),
+            "agent capture mirror failed: local subagent companion has an invalid source commitment"
+        );
+        assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
+        assert!(!format!("{:?}", cli.details()).contains(raw_locator));
+    }
+
+    #[tokio::test]
+    async fn cloud_sync_rejects_invalid_companion_source_keys_before_any_d1_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::{net::TcpListener, sync::oneshot};
+
+        // The snapshot must validate both companion row types before sync
+        // creates a remote table or emits a payload containing a raw locator.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local D1 request trap");
+        let base_url = format!("http://{}/client/v4", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let trap_requests = Arc::clone(&requests);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let trap = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        if accepted.is_err() {
+                            break;
+                        }
+                        trap_requests.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        let d1_client = D1Client::new_with_api_base_url(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "test-database".to_string(),
+            &base_url,
+        )
+        .expect("build local D1 trap client");
+        let remote = RemoteStorage::new(Arc::new(InMemory::new()));
+
+        for (
+            label,
+            claim_schema_version,
+            claim_source_key,
+            revision_schema_version,
+            revision_source_key,
+        ) in invalid_subagent_companion_source_key_cases()
+        {
+            let conn = cloud_snapshot_fixture_with_companion_source_keys(
+                claim_schema_version,
+                &claim_source_key,
+                Some((revision_schema_version, &revision_source_key)),
+            )
+            .await;
+            let error = sync_agent_capture_tables(
+                &conn,
+                &d1_client,
+                &remote,
+                "repo",
+                &SilentCloudSyncProgress,
+            )
+            .await
+            .expect_err("invalid companion source key must fail before D1 publication");
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid source commitment"),
+                "unexpected {label} sync error: {message}"
+            );
+            assert!(
+                !message.contains(&claim_source_key) && !message.contains(&revision_source_key),
+                "{label} diagnostic must not disclose a companion source key: {message}"
+            );
+        }
+
+        shutdown_tx.send(()).expect("stop local D1 request trap");
+        trap.await.expect("join local D1 request trap");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "invalid companion source keys must make zero D1 requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_restore_rejects_invalid_companion_source_keys_before_local_writes() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        for (
+            label,
+            claim_schema_version,
+            claim_source_key,
+            revision_schema_version,
+            revision_source_key,
+        ) in invalid_subagent_companion_source_key_cases()
+        {
+            let conn = Database::connect("sqlite::memory:")
+                .await
+                .expect("open remote companion restore fixture");
+            let session = fixture_session_row("remote-session", "remote-provider");
+            let (mut claim, mut revision, _) = fixture_subagent_rows();
+            claim.parent_session_id = session.session_id.clone();
+            claim.content_schema_version = claim_schema_version;
+            claim.source_key = claim_source_key.clone();
+            revision.parent_session_id = session.session_id.clone();
+            revision.content_schema_version = revision_schema_version;
+            revision.source_key = revision_source_key.clone();
+
+            let error = restore_agent_capture_from_rows_with_subagents(
+                &conn,
+                AgentCaptureRestoreRows {
+                    sessions: std::slice::from_ref(&session),
+                    checkpoints: &[],
+                    claims: std::slice::from_ref(&claim),
+                    revisions: std::slice::from_ref(&revision),
+                    links: &[],
+                    traces_head: None,
+                    remote_is_known_ancestor: true,
+                },
+                false,
+            )
+            .await
+            .expect_err("invalid remote companion source key must fail before restore writes");
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid source commitment"),
+                "unexpected {label} restore error: {message}"
+            );
+            assert!(
+                !message.contains(&claim_source_key) && !message.contains(&revision_source_key),
+                "{label} diagnostic must not disclose a companion source key: {message}"
+            );
+            let writes = conn
+                .query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT COUNT(*) AS n FROM sqlite_master
+                     WHERE type = 'table' AND name IN (
+                        'agent_session', 'agent_subagent_content_claim',
+                        'agent_subagent_content_revision', 'agent_subagent_link'
+                     )"
+                    .to_string(),
+                ))
+                .await
+                .expect("query remote companion restore fixture")
+                .expect("remote companion restore count")
+                .try_get_by::<i64, _>("n")
+                .expect("decode remote companion restore count");
+            assert_eq!(
+                writes, 0,
+                "{label} remote restore must not create local capture rows"
+            );
+        }
     }
 
     use std::{env, ffi::OsString, fs, sync::Arc};
@@ -1961,32 +3198,120 @@ mod tests {
 
     #[test]
     fn cloud_sync_output_maps_skipped_and_failed_outcomes() {
-        let report = CloudSyncReport {
-            repo_id: "repo-2".to_string(),
-            project_name: "project-2".to_string(),
-            total_unsynced: 0,
-            synced_count: 0,
-            failed_count: 0,
-            metadata: MetadataSyncOutcome::Skipped,
-            agent_capture: AgentCaptureSyncOutcome::Failed {
-                error: "network timeout".to_string(),
+        const REMOTE_SENTINEL: &str = "REMOTE_D1_SOURCE_KEY=/private/provider/session.jsonl";
+        let d1_reason = agent_capture_sync_failure_reason(&cloud_d1_failure(
+            "list agent-capture catalog before sync",
+            &D1Error {
+                code: 7500,
+                message: REMOTE_SENTINEL.to_string(),
             },
-        };
+        ));
+        let row_reason = agent_capture_sync_failure_reason(&agent_capture_row_failure(
+            "sync agent-session batch",
+            &D1Error {
+                code: 7500,
+                message: REMOTE_SENTINEL.to_string(),
+            },
+        ));
+        let validation_reason = agent_capture_sync_failure_reason(&CloudError::Generic(
+            "remote subagent companion has an invalid source commitment".to_string(),
+        ));
+        let env_reason = agent_capture_sync_failure_reason(&CloudError::MissingEnv {
+            detail: REMOTE_SENTINEL.to_string(),
+            missing_keys: vec![REMOTE_SENTINEL.to_string()],
+        });
+        for (reason, expected) in [
+            (
+                d1_reason,
+                "cloud D1 list agent-capture catalog before sync failed (D1 code 7500); verify cloud connectivity and credentials, then retry",
+            ),
+            (row_reason, AGENT_CAPTURE_SYNC_FAILURE_MESSAGE),
+            (
+                validation_reason,
+                "remote subagent companion has an invalid source commitment",
+            ),
+            (env_reason, AGENT_CAPTURE_SYNC_FAILURE_MESSAGE),
+        ] {
+            let report = CloudSyncReport {
+                repo_id: "repo-2".to_string(),
+                project_name: "project-2".to_string(),
+                total_unsynced: 0,
+                synced_count: 0,
+                failed_count: 0,
+                metadata: MetadataSyncOutcome::Skipped,
+                agent_capture: AgentCaptureSyncOutcome::Failed { error: reason },
+            };
 
-        let output = cloud_sync_output_from_report(&report);
-        assert_eq!(output.metadata.status, "skipped");
-        assert!(output.metadata.references.is_none());
-        assert_eq!(output.agent_capture.status, "failed");
-        assert_eq!(
-            output.agent_capture.error.as_deref(),
-            Some("network timeout")
+            let output = cloud_sync_output_from_report(&report);
+            assert_eq!(output.metadata.status, "skipped");
+            assert!(output.metadata.references.is_none());
+            assert_eq!(output.agent_capture.status, "failed");
+            assert_eq!(output.agent_capture.error.as_deref(), Some(expected));
+            assert!(output.agent_capture.sessions_synced.is_none());
+            assert!(output.agent_capture.sessions_failed.is_none());
+            assert!(output.agent_capture.checkpoints_synced.is_none());
+            assert!(output.agent_capture.checkpoints_failed.is_none());
+            let wire = serde_json::to_value(&output).expect("serialize failed cloud sync");
+            let rendered = wire.to_string();
+            assert_eq!(wire["agent_capture"]["error"], expected);
+            assert!(
+                !rendered.contains(REMOTE_SENTINEL),
+                "cloud-sync JSON must not serialize remote failure text: {rendered}"
+            );
+            let cli = cloud_cli_error_typed("sync", agent_capture_mirror_failure(expected));
+            assert_eq!(
+                cli.message(),
+                format!("agent capture mirror failed: {expected}")
+            );
+            assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
+        }
+    }
+
+    #[test]
+    fn cloud_d1_failure_redacts_remote_text_from_cli_error() {
+        const REMOTE_SENTINEL: &str = "REMOTE_D1_SOURCE_KEY=/private/provider/session.jsonl";
+        let failure = cloud_d1_failure(
+            "sync agent-capture catalog",
+            &D1Error {
+                code: 3999,
+                message: REMOTE_SENTINEL.to_string(),
+            },
         );
-        assert!(output.agent_capture.sessions_synced.is_none());
-        assert!(output.agent_capture.sessions_failed.is_none());
-        assert!(output.agent_capture.checkpoints_synced.is_none());
-        assert!(output.agent_capture.checkpoints_failed.is_none());
-        let wire = serde_json::to_value(&output).expect("serialize failed cloud sync");
-        assert_eq!(wire["agent_capture"]["error"], "network timeout");
+        let cli = cloud_cli_error_typed("sync", failure);
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo a D1-controlled message: {}",
+            cli.message()
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain a D1-controlled message"
+        );
+        assert!(cli.message().contains("D1 code 3999"));
+    }
+
+    #[test]
+    fn local_agent_capture_failure_redacts_database_text_from_cli_error() {
+        const LOCAL_SENTINEL: &str = "LOCAL_SQLITE_ROW=/private/provider/session-capture.jsonl";
+        let failure = local_agent_capture_failure(
+            "decode local agent-session snapshot",
+            std::io::Error::other(LOCAL_SENTINEL),
+        );
+        let detail = failure.to_string();
+        let cli = cloud_cli_error_typed("sync", failure);
+        assert!(detail.contains("decode local agent-session snapshot"));
+        assert!(
+            !detail.contains(LOCAL_SENTINEL),
+            "CloudError must not echo a database error payload: {detail}"
+        );
+        assert!(
+            !cli.message().contains(LOCAL_SENTINEL),
+            "human CLI error must not echo a database error payload"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(LOCAL_SENTINEL),
+            "structured CLI details must not retain a database error payload"
+        );
     }
 
     /// Scenario: metadata restore into a freshly initialized repo where local refs
@@ -2171,12 +3496,26 @@ mod tests {
 
     #[test]
     fn checkpoint_prune_preflight_rejects_a_remote_match() {
-        let local = vec!["checkpoint-pruned-locally".to_string()];
-        let remote = HashSet::from(["checkpoint-pruned-locally".to_string()]);
+        const REMOTE_SENTINEL: &str =
+            "REMOTE_PRUNED_CHECKPOINT=/private/provider/session-capture.jsonl";
+        let local = vec![REMOTE_SENTINEL.to_string()];
+        let remote = HashSet::from([REMOTE_SENTINEL.to_string()]);
         let error = reject_local_prune_conflicts(&local, &remote)
             .expect_err("matching completed remote checkpoint must fail preflight");
         let message = error.to_string();
-        assert!(message.contains("checkpoint-pruned-locally"));
+        let cli = cloud_cli_error_typed("restore", error);
+        assert!(
+            !message.contains(REMOTE_SENTINEL),
+            "CloudError must not echo a remote checkpoint id: {message}"
+        );
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo a remote checkpoint id"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain a remote checkpoint id"
+        );
         assert!(message.contains("libra cloud sync"));
         assert!(message.contains("already pruned locally"));
     }
@@ -2258,10 +3597,13 @@ mod tests {
         assert_eq!(report.skipped, 0);
         assert_eq!(report.failed, 1);
         assert_eq!(report.warnings.len(), 1);
+        assert_eq!(
+            report.warnings[0],
+            "warning: restored object hash does not match the cloud object index"
+        );
         assert!(
-            report.warnings[0].contains("hash mismatch"),
-            "warning should explain the hash mismatch: {:?}",
-            report.warnings
+            !report.warnings[0].contains(&expected_hash.to_string()),
+            "hash-mismatch warning must not disclose the remote object id"
         );
         assert!(!local.exist(&expected_hash).await);
     }
@@ -2543,13 +3885,15 @@ mod tests {
         AgentSubagentContentRevisionRow,
         AgentSubagentLinkRow,
     ) {
-        let source_key = format!("source/sha256/{}", "a".repeat(64));
+        let source_key = format!("source/subagent-hmac-v2/{}", "a".repeat(64));
+        let content_schema_version =
+            crate::internal::ai::subagent_content::SUBAGENT_CONTENT_SCHEMA_VERSION;
         (
             AgentSubagentContentClaimRow {
                 parent_session_id: "sess-A".to_string(),
                 provider_kind: "claude_code".to_string(),
                 source_key: source_key.clone(),
-                content_schema_version: 1,
+                content_schema_version,
                 revision_cursor: 1,
                 sync_revision: 1,
                 current_revision: 1,
@@ -2563,7 +3907,7 @@ mod tests {
                 parent_session_id: "sess-A".to_string(),
                 provider_kind: "claude_code".to_string(),
                 source_key,
-                content_schema_version: 1,
+                content_schema_version,
                 revision: 1,
                 checkpoint_id: "child-A".to_string(),
                 content_digest: "digest-A".to_string(),
@@ -2582,6 +3926,70 @@ mod tests {
                 updated_at: 1_700_000_021,
             },
         )
+    }
+
+    #[test]
+    fn unmirrored_legacy_companions_stay_local_with_their_links() {
+        let (v2_claim, v2_revision, v2_link) = fixture_subagent_rows();
+        let legacy = |digit: &str, checkpoint: &str| {
+            let source_key = format!("source/sha256/{}", digit.repeat(64));
+            let mut claim = v2_claim.clone();
+            claim.source_key = source_key.clone();
+            claim.content_schema_version = 1;
+            claim.current_checkpoint_id = Some(checkpoint.to_string());
+            let mut revision = v2_revision.clone();
+            revision.source_key = source_key;
+            revision.content_schema_version = 1;
+            revision.checkpoint_id = checkpoint.to_string();
+            let mut link = v2_link.clone();
+            link.content_checkpoint_id = checkpoint.to_string();
+            (claim, revision, link)
+        };
+        let (local_claim, local_revision, local_link) = legacy("1", "legacy-local");
+        let (claim_proven, revision_of_claim_proven, link_of_claim_proven) =
+            legacy("2", "legacy-claim-proven");
+        let (revision_proven_claim, revision_proven, link_of_revision_proven) =
+            legacy("3", "legacy-revision-proven");
+        let local_revisions = [
+            v2_revision.clone(),
+            local_revision.clone(),
+            revision_of_claim_proven.clone(),
+            revision_proven.clone(),
+        ];
+        let mut pending = PendingSubagentRows {
+            claims: vec![
+                v2_claim.clone(),
+                local_claim,
+                claim_proven.clone(),
+                revision_proven_claim.clone(),
+            ],
+            revisions: local_revisions.to_vec(),
+            links: vec![
+                v2_link.clone(),
+                local_link.clone(),
+                link_of_claim_proven.clone(),
+                link_of_revision_proven.clone(),
+            ],
+            pre_prune_links: vec![local_link],
+        };
+
+        // The remote proves a legacy source identity through its claim or
+        // through one of its revisions; only the never-mirrored one stays local.
+        let withheld = pending.withhold_unmirrored_legacy(
+            &local_revisions,
+            std::slice::from_ref(&claim_proven),
+            std::slice::from_ref(&revision_proven),
+        );
+        assert_eq!(withheld, 4, "claim, revision, link and pre-prune link");
+        assert_eq!(
+            pending,
+            PendingSubagentRows {
+                claims: vec![v2_claim, claim_proven, revision_proven_claim],
+                revisions: vec![v2_revision, revision_of_claim_proven, revision_proven],
+                links: vec![v2_link, link_of_claim_proven, link_of_revision_proven],
+                pre_prune_links: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -2881,7 +4289,9 @@ mod tests {
         rt.block_on(async {
             let db_conn = db::get_db_conn_instance().await;
             let sessions = vec![fixture_session_row("sess-A", "prov-A")];
-            let checkpoints = vec![fixture_checkpoint_row("ckpt-A", "sess-A", None)];
+            const REMOTE_SENTINEL: &str =
+                "REMOTE_PRUNED_CHECKPOINT=/private/provider/session-capture.jsonl";
+            let checkpoints = vec![fixture_checkpoint_row(REMOTE_SENTINEL, "sess-A", None)];
             let fenced_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
             restore_agent_capture_from_rows_with_subagents(
                 &db_conn,
@@ -2905,14 +4315,15 @@ mod tests {
                     backend,
                     "INSERT INTO agent_checkpoint_prune_tombstone \
                      (checkpoint_id, session_id, pruned_at) VALUES (?, ?, ?)",
-                    ["ckpt-A".into(), "sess-A".into(), 1_i64.into()],
+                    [REMOTE_SENTINEL.into(), "sess-A".into(), 1_i64.into()],
                 ))
                 .await
                 .expect("record ordinary local prune fence");
             db_conn
-                .execute_raw(sea_orm::Statement::from_string(
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
                     backend,
-                    "DELETE FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-A'".to_string(),
+                    "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
+                    [REMOTE_SENTINEL.into()],
                 ))
                 .await
                 .expect("delete locally pruned checkpoint");
@@ -2942,7 +4353,19 @@ mod tests {
             .await
             .expect_err("stale remote checkpoint must not cross the local prune fence");
             let message = error.to_string();
-            assert!(message.contains("ckpt-A"));
+            let cli = error.into_cli_error("restore");
+            assert!(
+                !message.contains(REMOTE_SENTINEL),
+                "CloudError must not echo the remote checkpoint id: {message}"
+            );
+            assert!(
+                !cli.message().contains(REMOTE_SENTINEL),
+                "human CLI error must not echo the remote checkpoint id"
+            );
+            assert!(
+                !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+                "structured CLI details must not retain the remote checkpoint id"
+            );
             assert!(message.contains("already pruned locally"));
             assert!(message.contains("libra cloud sync"));
             assert_eq!(
@@ -2990,7 +4413,7 @@ mod tests {
             let checkpoints = vec![child];
             let (claim, revision, link) = fixture_subagent_rows();
             let mut pruned_claim = claim.clone();
-            pruned_claim.source_key = format!("source/sha256/{}", "b".repeat(64));
+            pruned_claim.source_key = format!("source/subagent-hmac-v2/{}", "b".repeat(64));
             pruned_claim.revision_cursor = 2;
             pruned_claim.current_revision = 0;
             pruned_claim.current_checkpoint_id = None;
@@ -3303,6 +4726,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_companion_validation_redacts_untrusted_checkpoint_ids() {
+        const REMOTE_SENTINEL: &str =
+            "REMOTE_COMPANION_CHECKPOINT=/private/provider/session-capture.jsonl";
+        let (_, mut revision, _) = fixture_subagent_rows();
+        revision.checkpoint_id = REMOTE_SENTINEL.to_string();
+
+        let error = validate_agent_capture_companions(
+            &[],
+            &[],
+            &[revision],
+            &[],
+            "remote",
+            CompanionValidationMode::Complete,
+        )
+        .expect_err("a remote revision without its claim must fail");
+        let detail = error.to_string();
+        let cli = error.into_cli_error("restore");
+        assert!(detail.contains("no source claim dependency"));
+        assert!(
+            !detail.contains(REMOTE_SENTINEL),
+            "CloudError must not echo remote companion metadata: {detail}"
+        );
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo remote companion metadata"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain remote companion metadata"
+        );
+    }
+
+    #[test]
     fn companion_snapshot_rejects_non_subagent_content_and_boundary_targets() {
         let committed = fixture_checkpoint_row("child-A", "sess-A", None);
         let (claim, revision, link) = fixture_subagent_rows();
@@ -3336,7 +4792,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_projection_rejects_deferred_erasure_but_applies_ordinary_prune() {
+    fn checkpoint_projection_rejects_unreconciled_remote_rows_but_applies_ordinary_prune() {
         let local = fixture_checkpoint_row("local-A", "sess-A", None);
         assert_eq!(
             object_manifest_scope_for_remote_catalog(
@@ -3353,11 +4809,11 @@ mod tests {
             &[],
             true,
         )
-        .expect_err("an unmarked remote-only checkpoint is deferred session erasure");
+        .expect_err("an unmarked remote-only checkpoint must be reconciled before publication");
+        assert!(error.to_string().contains("absent from this local catalog"));
         assert!(
-            error
-                .to_string()
-                .contains("erasure propagation is deferred")
+            !error.to_string().contains(&remote_only.checkpoint_id),
+            "the reconciliation error must not disclose the remote checkpoint identifier"
         );
 
         let tombstone = AgentCheckpointPruneTombstoneRow {
@@ -3402,10 +4858,27 @@ mod tests {
         let mut retained = remote_only;
         retained.traces_commit = "traces".to_string();
         retained.tree_oid = "tree".to_string();
-        retained.metadata_blob_oid = "metadata".to_string();
+        const REMOTE_SENTINEL: &str =
+            "REMOTE_CHECKPOINT_OID=/private/provider/session-capture.jsonl";
+        retained.metadata_blob_oid = REMOTE_SENTINEL.to_string();
         let error = validate_checkpoint_object_index_roots(&[retained], &indexes, "remote")
             .expect_err("a full manifest must include every retained checkpoint root");
-        assert!(error.to_string().contains("metadata blob object metadata"));
+        let detail = error.to_string();
+        let cli = error.into_cli_error("sync");
+        assert!(detail.contains("references an object absent from the fenced object index"));
+        assert!(
+            !detail.contains(REMOTE_SENTINEL),
+            "CloudError must not echo remote checkpoint metadata: {detail}"
+        );
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo remote checkpoint metadata"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain remote checkpoint metadata"
+        );
+        assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
     }
 
     #[test]
@@ -3461,6 +4934,39 @@ mod tests {
             agent_capture_object_index_digest(&[first, changed]).expect("digest changed indexes"),
             "object identity metadata must be fenced by the manifest"
         );
+    }
+
+    #[test]
+    fn agent_capture_object_manifest_errors_redact_remote_object_ids() {
+        const REMOTE_SENTINEL: &str = "REMOTE_OBJECT_ID=/private/provider/session-capture.jsonl";
+        let remote_row = ObjectIndexRow {
+            o_id: REMOTE_SENTINEL.to_string(),
+            o_type: "blob".to_string(),
+            o_size: 1,
+            repo_id: "repo".to_string(),
+            created_at: 1,
+            is_synced: 1,
+            object_format: None,
+        };
+
+        let error = agent_capture_object_index_digest(&[remote_row.clone(), remote_row])
+            .expect_err("duplicate remote object ids must fail");
+        let detail = error.to_string();
+        let cli = error.into_cli_error("sync");
+        assert!(detail.contains("duplicate object ids"));
+        assert!(
+            !detail.contains(REMOTE_SENTINEL),
+            "CloudError must not echo remote object ids: {detail}"
+        );
+        assert!(
+            !cli.message().contains(REMOTE_SENTINEL),
+            "human CLI error must not echo remote object ids"
+        );
+        assert!(
+            !format!("{:?}", cli.details()).contains(REMOTE_SENTINEL),
+            "structured CLI details must not retain remote object ids"
+        );
+        assert_eq!(cli.stable_code(), StableErrorCode::ConflictOperationBlocked);
     }
 
     #[test]
@@ -3908,6 +5414,63 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(good_count, 0);
+
+            // `serde_json::Value` otherwise accepts this raw-locator/safe-id
+            // pair with last-key-wins semantics. Restore must reject it before
+            // it opens its local write transaction.
+            let source_id = format!("source/hmac-v2/{}", "a".repeat(64));
+            let mut duplicate_metadata = fixture_session_row("sess-duplicate-meta", "prov-meta");
+            duplicate_metadata.metadata_json = format!(
+                r#"{{"repository_identity":"not-retained","source_kind":"file","source_id":"/private/raw/session.jsonl","source_fingerprint":"{source_id}","import_source_schema_version":2,"import_provisional":false,"transcript_snapshot":null,"imported":true,"source_id":"{source_id}"}}"#
+            );
+            duplicate_metadata.redaction_report = r#"{"import":{"pipeline":"typed_allowlist","snapshot_redaction":true,"raw_persisted":false,"matches":[],"bytes_scanned":0,"bytes_redacted":0}}"#.to_string();
+
+            let err = restore_agent_capture_from_rows(
+                &db_conn,
+                &[duplicate_metadata],
+                &[],
+                true,
+            )
+            .await
+            .expect_err("duplicate top-level ownership metadata must be rejected");
+            assert!(
+                err.to_string().contains("malformed import ownership metadata"),
+                "duplicate metadata error must identify the ownership boundary: {err}"
+            );
+            let session_count =
+                scalar_count(&db_conn, "SELECT COUNT(*) AS n FROM agent_session")
+                    .await
+                    .unwrap();
+            assert_eq!(session_count, 0, "rejected metadata must not write locally");
+
+            // The redaction report is a separate persisted JSON column. A
+            // duplicate nested under its import wrapper must be caught before
+            // serde can turn true/false into a safe-looking final value.
+            let mut duplicate_redaction =
+                fixture_session_row("sess-duplicate-redaction", "prov-redaction");
+            duplicate_redaction.metadata_json = format!(
+                r#"{{"repository_identity":"not-retained","source_kind":"file","source_id":"{source_id}","source_fingerprint":"{source_id}","import_source_schema_version":2,"import_provisional":false,"transcript_snapshot":null,"imported":true}}"#
+            );
+            duplicate_redaction.redaction_report = r#"{"import":{"pipeline":"typed_allowlist","snapshot_redaction":true,"raw_persisted":true,"raw_persisted":false,"matches":[],"bytes_scanned":0,"bytes_redacted":0}}"#.to_string();
+
+            let err = restore_agent_capture_from_rows(
+                &db_conn,
+                &[duplicate_redaction],
+                &[],
+                true,
+            )
+            .await
+            .expect_err("duplicate nested redaction metadata must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("invalid V2 import ownership metadata"),
+                "duplicate redaction error must identify the V2 boundary: {err}"
+            );
+            let session_count =
+                scalar_count(&db_conn, "SELECT COUNT(*) AS n FROM agent_session")
+                    .await
+                    .unwrap();
+            assert_eq!(session_count, 0, "rejected redaction must not write locally");
         });
     }
 

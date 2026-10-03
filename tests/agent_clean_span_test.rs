@@ -112,6 +112,7 @@ async fn seed_temporary_checkpoint(
             checkpoint_id,
             session_id: "span-session",
             marker_generation: marker.generation.as_deref().expect("new marker generation"),
+            capture_scope: None,
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Temporary,

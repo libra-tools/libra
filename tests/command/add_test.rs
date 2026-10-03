@@ -2188,13 +2188,12 @@ fn test_literal_pathspecs_global_add_matrix() {
     );
 }
 
-/// M-GUARD G1: with the background index consumer slowed (50ms per update),
-/// one `add` of 300 modified files still stages everything without a lock
-/// timeout and without a drain warning. The regression it guards (issue #469):
-/// the consumer used to hold the repository-wide generation lock while
-/// applying queued updates, starving foreground marker publishers.
+/// M-GUARD G1: one `add` of 300 modified files stages everything without a
+/// lock timeout or drain warning. The slow-consumer interleaving itself is
+/// covered by the in-process `client_storage` test control so the CLI has no
+/// environment-controlled capture-writer behavior.
 #[test]
-fn test_add_batch_survives_slow_index_consumer() {
+fn test_add_batch_survives_index_consumer() {
     let repo = tempdir().unwrap();
     let p = repo.path();
     init_repo_via_cli(p);
@@ -2211,12 +2210,8 @@ fn test_add_batch_survives_slow_index_consumer() {
         fs::write(p.join(format!("f{i:03}.txt")), "modified\n").unwrap();
     }
 
-    let out = run_libra_env(
-        &["add", "."],
-        p,
-        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "50")],
-    );
-    assert_cli_success(&out, "batch add with slow index consumer");
+    let out = run_libra_command(&["add", "."], p);
+    assert_cli_success(&out, "batch add with index consumer");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("timed out"),

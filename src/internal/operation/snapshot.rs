@@ -71,11 +71,36 @@ const DEFAULT_MAX_FILES: usize = 100_000;
 const DEFAULT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 fn in_process_test_host() -> bool {
+    // Unit-test executables can be emitted under `target/.../build/.../out`
+    // by the generated test harness, not only `target/.../deps`. They cannot
+    // re-enter the production CLI worker, so compile-time test builds must
+    // always use the bounded in-process capability seam. Non-test callers
+    // retain the existing path-based behavior below.
+    if cfg!(test) {
+        return true;
+    }
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .and_then(|path| path.file_name().map(|name| name == "deps"))
-        .unwrap_or(false)
+        .is_some_and(|path| is_cargo_test_harness_executable(&path))
+}
+
+fn is_cargo_test_harness_executable(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        return true;
+    }
+
+    // Cargo's generated integration-test harnesses run from
+    // `target/.../build/<package>/<package-hash>/out/<test-name>`.
+    parent.file_name().is_some_and(|name| name == "out")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "build")
 }
 
 #[derive(Debug, Error)]
@@ -1165,6 +1190,22 @@ mod ignore_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn cargo_test_harness_paths_use_the_in_process_capability_seam() {
+        assert!(is_cargo_test_harness_executable(Path::new(
+            "/work/target/debug/deps/op_undo_redo-abc123"
+        )));
+        assert!(is_cargo_test_harness_executable(Path::new(
+            "/work/target/debug/build/libra/abc123/out/op_undo_redo"
+        )));
+        assert!(!is_cargo_test_harness_executable(Path::new(
+            "/work/target/debug/libra"
+        )));
+        assert!(!is_cargo_test_harness_executable(Path::new(
+            "/usr/local/bin/libra"
+        )));
+    }
+
     include!("snapshot/stat_short_circuit_tests.rs");
 
     /// M-BATCH B4: snapshot object writes publish their markers through the
@@ -1194,7 +1235,7 @@ mod tests {
         let objects = temp.path().join("objects");
         let storage = ClientStorage::init_local(objects);
         #[cfg(debug_assertions)]
-        let before = crate::utils::client_storage::batched_marker_publication_count();
+        let before = crate::utils::client_storage::batched_marker_publication_count(&db_path);
         storage.begin_object_index_batch();
         for index in 0..10u32 {
             let oid =
@@ -1213,7 +1254,7 @@ mod tests {
             .expect("flush snapshot batch");
         #[cfg(debug_assertions)]
         assert_eq!(
-            crate::utils::client_storage::batched_marker_publication_count() - before,
+            crate::utils::client_storage::batched_marker_publication_count(&db_path) - before,
             1,
             "the snapshot batch must publish under a single batch publication"
         );

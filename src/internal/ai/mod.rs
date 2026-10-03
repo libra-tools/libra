@@ -13,6 +13,10 @@ pub mod automation;
 pub mod agent_run;
 // Historical external-agent transcript import orchestration (M4 / DR-05).
 pub mod agent_import;
+// Private, killable bounded-read helper contract shared by import and hooks.
+pub mod authorized_read;
+// Provider-neutral capture foundation shared by live hooks and import.
+pub mod capture;
 // Provider-root subagent transcript discovery and source-scoped content
 // revisions (plan-20260713 M5 / DR-06).
 pub mod subagent_content;

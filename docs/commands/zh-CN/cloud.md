@@ -288,6 +288,15 @@ Unsynced objects:
 {"event":"cloud_sync.agent_capture.complete","sessions_synced":2,"sessions_failed":0,"checkpoints_synced":6,"checkpoints_failed":0,"subagent_rows_synced":3,"subagent_rows_failed":0}
 ```
 
+agent-capture 行失败时输出
+`{"event":"cloud_sync.agent_capture.warning","error":"agent-capture catalog sync failed; inspect the local capture catalog and retry `libra cloud sync`"}`：
+消息固定，不含 session/checkpoint id，也不含远端 D1 文本（旧版本按 id 输出的
+`cloud_sync.agent_capture.session_warning` / `checkpoint_warning` 事件会回显这些内容）。
+其它 agent-capture 失败同样只输出一个这样的事件，其 `error` 为该失败固定、不含内容的原因——
+例如带 D1 code 与连通性补救提示的 D1 请求失败，或被拒绝的具体本地 catalog 形态。
+每次 agent-capture 失败最终都以携带同一原因的 `LBR-CONFLICT-002` 错误
+`agent capture mirror failed: <reason>` 结束。
+
 完成计数只包含本次增量同步实际发送的行；subagent companion 计数覆盖耐久 source claim、
 append-only source revision 与 boundary/content link 行。agent catalog 发布先取得一个短时本地 SQLite snapshot，在有界对象存储
 扫描前释放 rollback-journal 读锁，再要求第二个 catalog snapshot 与已完成的
@@ -305,6 +314,16 @@ generation 与 **checkpoint 可达 object-index 投影**的 canonical digest/cou
 fail-closed；revision 与 link 依赖先发布，单调 claim high-water 最后发布。每个 D1 请求
 有 30 秒 timeout，整个 agent-capture 阶段有 120 秒 deadline。任意 mirror 失败都会让
 `cloud sync` 非零退出，machine 输出也不会先发一个成功 envelope。
+
+从旧版本升级的仓库可继续 sync 与 restore。sync 镜像或 restore 写入的每个 session 行都会省略
+legacy（未版本化或 V1）import-ownership 字段，其它 session metadata 保持不变；旧版本已镜像的行
+保持原样且仍可 restore。远端 catalog 尚未持有的 legacy V1 `source/sha256/...` subagent claim 与
+revision，连同其 content checkpoint 的关联 link，只保留在本地，因为其未加钥的 source digest
+不得写入新的 cloud catalog 行；这些 checkpoint 本身仍会镜像，restore 所需的不可变 checkpoint
+metadata blob 仍携带该 digest。只要存在此类证据，每次成功 sync 还会输出
+一个固定 warning
+`{"event":"cloud_sync.agent_capture.warning","error":"legacy V1 subagent evidence keyed by an unkeyed source digest stays local-only and was not mirrored; its checkpoints and all other agent-capture rows were synced"}`，
+退出码仍为 0。
 
 普通 `agent clean` checkpoint retention 会在 ref/catalog 重写的同一本地事务写入耐久 prune
 tombstone。cloud sync 先发布该 fence，再按 current claim、revision、link、checkpoint 的可续传
@@ -343,7 +362,10 @@ restore 只读探测远端 capture schema，不安装写屏障也不收养行，
 之间竞态写入。无 fence 的单行 v2 写入也会 fail closed；当前发布只走带 writer token
 的批量写入。restore 会从 generation-stable snapshot 读取 object index，并拒绝 fenced
 投影已不匹配 manifest digest 的 catalog 状态；后续无关 object-index 新增不会使未变化的
-checkpoint 投影失效。它从 manifest 绑定的 traces head
+checkpoint 投影失效。任一 agent-capture restore 失败都以 `LBR-NET-002` 与
+`agent capture restore failed: <reason>` 退出；固定原因保留其具体补救提示（用 `libra cloud sync`
+发布 prune tombstone、待 cloud sync 空闲时重试、120 秒 deadline，或核对 cloud 连通性与凭据），
+绝不回显远端行或 D1 文本。它从 manifest 绑定的 traces head
 验证可达性，并把该 head 与 catalog 原子恢复，不信任独立上传的通用 ref metadata。已有本地对象会被解码并校验 hash；损坏路径会原子重下，并在
 catalog transaction 开始前验证完整 traces 链及每个 checkpoint tree/blob。session 擦除 tombstone
 现已传播：`cloud sync` 在同一 generation fence 下把本地 `agent_import_tombstone`
@@ -453,6 +475,8 @@ Libra 已经通过 `LIBRA_STORAGE_*` 环境变量为分层对象缓存提供通�
 | `LBR-CLI-002` | restore 未提供 `--repo-id` 或 `--name` |
 | `LBR-CLI-003` | D1 中未找到给定名称的仓库 |
 | `LBR-CONFLICT-002` | 项目名已被另一个仓库占用 |
+| `LBR-CONFLICT-002` | sync 期间 agent-capture 镜像失败（`agent capture mirror failed: <reason>`） |
+| `LBR-NET-002` | agent-capture restore 失败（`agent capture restore failed: <reason>`） |
 | `LBR-IO-001` | D1 client 初始化失败 |
 | `LBR-IO-001` | 创建 D1 表失败 |
 | `LBR-IO-001` | 数据库查询失败 |

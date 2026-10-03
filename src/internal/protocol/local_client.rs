@@ -62,6 +62,95 @@ fn local_protocol_cwd_lock() -> &'static Mutex<()> {
     LOCAL_PROTOCOL_CWD_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
+mod test_support {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Mutex, OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    use tokio::sync::oneshot;
+
+    struct LocalProtocolCwdLockProbe {
+        id: u64,
+        repo_path: PathBuf,
+        before_test_cwd_lock: Option<oneshot::Sender<()>>,
+        after_local_protocol_lock: Option<oneshot::Sender<()>>,
+    }
+
+    static LOCAL_PROTOCOL_CWD_LOCK_PROBES: OnceLock<Mutex<Vec<LocalProtocolCwdLockProbe>>> =
+        OnceLock::new();
+    static NEXT_LOCAL_PROTOCOL_CWD_LOCK_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn probes() -> &'static Mutex<Vec<LocalProtocolCwdLockProbe>> {
+        LOCAL_PROTOCOL_CWD_LOCK_PROBES.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(super) struct LocalProtocolCwdLockProbeGuard {
+        id: u64,
+    }
+
+    impl Drop for LocalProtocolCwdLockProbeGuard {
+        fn drop(&mut self) {
+            let mut probes = probes().lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(index) = probes.iter().position(|probe| probe.id == self.id) {
+                probes.swap_remove(index);
+            }
+        }
+    }
+
+    pub(super) fn arm_local_protocol_cwd_lock_probe(
+        repo_path: &Path,
+    ) -> (
+        LocalProtocolCwdLockProbeGuard,
+        oneshot::Receiver<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let id = NEXT_LOCAL_PROTOCOL_CWD_LOCK_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+        let (before_test_cwd_lock_tx, before_test_cwd_lock_rx) = oneshot::channel();
+        let (after_local_protocol_lock_tx, after_local_protocol_lock_rx) = oneshot::channel();
+        let mut probes = probes().lock().unwrap_or_else(|error| error.into_inner());
+        probes.push(LocalProtocolCwdLockProbe {
+            id,
+            repo_path: repo_path.to_path_buf(),
+            before_test_cwd_lock: Some(before_test_cwd_lock_tx),
+            after_local_protocol_lock: Some(after_local_protocol_lock_tx),
+        });
+
+        (
+            LocalProtocolCwdLockProbeGuard { id },
+            before_test_cwd_lock_rx,
+            after_local_protocol_lock_rx,
+        )
+    }
+
+    fn signal(repo_path: &Path, signal: impl FnOnce(&mut LocalProtocolCwdLockProbe)) {
+        let mut probes = probes().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(probe) = probes.iter_mut().find(|probe| probe.repo_path == repo_path) {
+            signal(probe);
+        }
+    }
+
+    pub(super) fn signal_before_test_cwd_lock(repo_path: &Path) {
+        signal(repo_path, |probe| {
+            if let Some(sender) = probe.before_test_cwd_lock.take() {
+                let _ = sender.send(());
+            }
+        });
+    }
+
+    pub(super) fn signal_after_local_protocol_lock(repo_path: &Path) {
+        signal(repo_path, |probe| {
+            if let Some(sender) = probe.after_local_protocol_lock.take() {
+                let _ = sender.send(());
+            }
+        });
+    }
+}
+
 /// RAII guard for temporarily switching the process current directory.
 ///
 /// This supports an explicit `restore()` so callers can surface restore
@@ -76,9 +165,10 @@ struct RepoCurrentDirGuard {
 }
 
 impl RepoCurrentDirGuard {
-    fn change_to(new_dir: &Path) -> Result<Self, IoError> {
-        #[cfg(test)]
-        let cwd_lock = crate::utils::test::cwd_lock_guard();
+    fn change_to(
+        new_dir: &Path,
+        #[cfg(test)] cwd_lock: crate::utils::test::CwdLockGuard,
+    ) -> Result<Self, IoError> {
         let original_dir = env::current_dir()?;
         env::set_current_dir(new_dir)?;
         Ok(Self {
@@ -176,8 +266,19 @@ impl LocalClient {
     {
         // Local protocol operations mutate the process cwd, so serialize them
         // to avoid cross-task races while the repo-scoped cwd is active.
-        let _cwd_lock = local_protocol_cwd_lock().lock().await;
-        let mut guard = RepoCurrentDirGuard::change_to(&self.repo_path).map_err(E::from)?;
+        #[cfg(test)]
+        test_support::signal_before_test_cwd_lock(&self.repo_path);
+        #[cfg(test)]
+        let test_cwd_lock = crate::utils::test::cwd_lock_guard();
+        let _local_protocol_cwd_lock = local_protocol_cwd_lock().lock().await;
+        #[cfg(test)]
+        test_support::signal_after_local_protocol_lock(&self.repo_path);
+        let mut guard = RepoCurrentDirGuard::change_to(
+            &self.repo_path,
+            #[cfg(test)]
+            test_cwd_lock,
+        )
+        .map_err(E::from)?;
         let result = operation().await;
 
         match guard.restore() {
@@ -1320,7 +1421,10 @@ async fn peel_tag_object_hash(
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, fs, future::pending, process::Command as StdCommand};
+    use std::{
+        ffi::OsStr, fs, future::pending, process::Command as StdCommand, sync::mpsc as std_mpsc,
+        thread,
+    };
 
     use serial_test::serial;
     use tempfile::tempdir;
@@ -1334,8 +1438,49 @@ mod tests {
     use super::*;
     use crate::{
         git_protocol::ServiceType,
-        utils::test::{ChangeDirGuard, setup_with_new_libra_in},
+        utils::test::{ChangeDirGuard, cwd_lock_guard, setup_with_new_libra_in},
     };
+
+    struct DedicatedCwdLockHolder {
+        release_tx: Option<std_mpsc::Sender<()>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl DedicatedCwdLockHolder {
+        fn acquire() -> Self {
+            let (ready_tx, ready_rx) = std_mpsc::channel();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            let handle = thread::spawn(move || {
+                let _cwd_lock = cwd_lock_guard();
+                let _ = ready_tx.send(());
+                let _ = release_rx.recv();
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("dedicated thread should acquire the test cwd lock");
+
+            Self {
+                release_tx: Some(release_tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn release(&mut self) {
+            if let Some(release_tx) = self.release_tx.take() {
+                let _ = release_tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for DedicatedCwdLockHolder {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     fn run_git<I, S>(cwd: Option<&Path>, args: I) -> StdCommand
     where
@@ -1762,6 +1907,47 @@ mod tests {
             fs::canonicalize(original_dir).unwrap(),
             "serialized local protocol operations should restore caller cwd",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(cwd, env)]
+    async fn with_repo_current_dir_acquires_test_cwd_lock_before_local_protocol_lock() {
+        let repo_dir = tempdir().unwrap();
+        setup_with_new_libra_in(repo_dir.path()).await;
+        let client = LocalClient::from_path(repo_dir.path()).unwrap();
+        let (_probe, before_test_cwd_lock, mut after_local_protocol_lock) =
+            test_support::arm_local_protocol_cwd_lock_probe(client.repo_path());
+        let mut cwd_lock_holder = DedicatedCwdLockHolder::acquire();
+
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .with_repo_current_dir(|| async { Ok::<(), IoError>(()) })
+                    .await
+            }
+        });
+
+        timeout(Duration::from_secs(1), before_test_cwd_lock)
+            .await
+            .expect("operation should reach the test cwd lock")
+            .expect("cwd lock probe should remain armed");
+        let acquired_local_protocol_lock_while_cwd_was_held =
+            timeout(Duration::from_millis(100), &mut after_local_protocol_lock)
+                .await
+                .is_ok();
+
+        cwd_lock_holder.release();
+
+        assert!(
+            !acquired_local_protocol_lock_while_cwd_was_held,
+            "a local protocol operation must wait for the test cwd lock before it can hold the local protocol lock",
+        );
+        timeout(Duration::from_secs(5), operation)
+            .await
+            .expect("operation should complete after the cwd lock is released")
+            .expect("local protocol operation task should not panic")
+            .expect("local protocol operation should succeed");
     }
 
     /// M-BOUND topology: `c1←c2←c3`(main), `c2←dev1`(dev), tag `v1`→c1, `refs/mr/1`→c2.

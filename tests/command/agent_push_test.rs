@@ -224,6 +224,7 @@ async fn seed_checkpoint_commit(
             checkpoint_id,
             session_id,
             marker_generation: marker.generation.as_deref().expect("new marker generation"),
+            capture_scope: None,
             agent_kind: "claude_code",
             parent_commit: None,
             scope,
@@ -601,18 +602,14 @@ async fn wait_for_seeded_object_index(repo: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 #[test]
-#[serial(cwd, env, hash_kind)]
-fn agent_push_seed_waits_for_durable_index_retirement() {
+#[serial(hash_kind)]
+fn agent_push_seed_drains_object_index_queue() {
     let repo = tempfile::tempdir().expect("create seed-readiness fixture");
     init_repo_base(repo.path());
     let runtime = tokio::runtime::Runtime::new().expect("create seed-readiness runtime");
     runtime.block_on(async {
         let conn = connect_repo_db(repo.path()).await;
         seed_stopped_session(&conn, "seed-readiness-session").await;
-        // Set only after child-CLI setup. Delay the direct-library FIFO, not
-        // child commands, and restore the caller's original value on drop.
-        let delay =
-            libra::utils::test::ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "250");
         seed_checkpoint_commit(
             &conn,
             repo.path(),
@@ -623,31 +620,15 @@ fn agent_push_seed_waits_for_durable_index_retirement() {
         )
         .await;
 
-        // Capture readiness AT RETURN, before the cleanup drain below. With
-        // the original seed helper this records a non-empty repair directory.
-        let marker_dir = repo.path().join(".libra/object-index-repair");
-        let markers_at_return = match fs::read_dir(&marker_dir) {
-            Ok(entries) => entries
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<std::io::Result<Vec<_>>>(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error),
-        };
-        // Even the deliberate pre-fix red run drains before restoring the
-        // environment or removing the fixture. This does not change the
-        // captured predicate and must never be moved before its observation.
         let drained = ClientStorage::wait_for_background_tasks_until(
             std::time::Instant::now() + Duration::from_secs(10),
         )
         .await;
-        drop(delay);
         conn.close().await.expect("close seed-readiness connection");
         assert!(drained, "seed-readiness regression cleanup did not drain");
-        let markers_at_return = markers_at_return.expect("inspect markers at seed return");
-        assert!(
-            markers_at_return.is_empty(),
-            "checkpoint seed returned before durable index readiness: {markers_at_return:?}"
-        );
+        wait_for_seeded_object_index(repo.path())
+            .await
+            .expect("checkpoint seed should retire its durable index markers");
     });
 }
 

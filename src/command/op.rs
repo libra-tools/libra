@@ -1076,6 +1076,7 @@ async fn render_restore_preview(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| CliError::fatal("restore preview refs have no references array"))?;
     println!("Refs that would be restored:");
+    let mut kept_capture_refs = Vec::new();
     for reference in references {
         let Some(kind) = reference.get("kind").and_then(serde_json::Value::as_str) else {
             continue;
@@ -1084,6 +1085,10 @@ async fn render_restore_preview(
             .get("name")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("HEAD");
+        if crate::internal::operation::restore::is_restore_preserved_reference(reference) {
+            kept_capture_refs.push(name);
+            continue;
+        }
         let ref_name = reference
             .get("remote")
             .and_then(serde_json::Value::as_str)
@@ -1093,6 +1098,12 @@ async fn render_restore_preview(
             println!("  {ref_name}: {}", &target[..7.min(target.len())]);
         } else {
             println!("  {ref_name}");
+        }
+    }
+    if !kept_capture_refs.is_empty() {
+        println!("Libra-owned capture refs kept at their current values:");
+        for name in kept_capture_refs {
+            println!("  Branch {name}");
         }
     }
 

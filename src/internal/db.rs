@@ -156,6 +156,10 @@ pub(crate) async fn open_connection_without_schema_management(
     let normalized_path = normalize_path_for_sqlite(db_path);
     let mut option = ConnectOptions::new(format!("sqlite://{normalized_path}"));
     option.sqlx_logging(false); // TODO use better option
+    // A caller selecting a short SQLite busy timeout (notably the managed
+    // hook hot path) must not still wait for SeaORM's independent default
+    // pool-acquire timeout before that pragma can take effect.
+    option.connect_timeout(busy_timeout);
     option.map_sqlx_sqlite_pool_opts(sqlite_pool_options);
     // Recovery-critical durability (lore.md 2.6 / _general.md §12): the
     // sequencer, refs, reflog, and config all live here, so every commit MUST
@@ -295,10 +299,11 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
             // BUSY, and evicting (let alone closing) on that would tear the
             // pool out from under the writer. Hand back the cached
             // connection; the next acquisition re-checks.
-            Err(error) => {
+            Err(_) => {
+                // Callers can reach this from metadata diagnostics. Do not
+                // turn a malformed database path or driver error into a log
+                // disclosure merely because the cached connection is kept.
                 tracing::debug!(
-                    db_path = %db_path.display(),
-                    error = %error,
                     "schema re-check on a cached connection failed transiently; keeping it"
                 );
                 return Ok(conn);
@@ -490,13 +495,9 @@ pub async fn reset_db_conn_instance_for_path(db_path: &Path) {
     drop(connections);
 
     if let Some(conn) = removed
-        && let Err(err) = conn.close().await
+        && conn.close().await.is_err()
     {
-        tracing::warn!(
-            db_path = %db_path.display(),
-            error = %err,
-            "Failed to close cached database connection during reset"
-        );
+        tracing::warn!("failed to close cached database connection during reset");
     }
 }
 

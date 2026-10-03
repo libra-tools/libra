@@ -26,7 +26,7 @@
 //!    `refs/libra/traces` with no `agent_checkpoint` row (crash window B:
 //!    ref CAS succeeded, catalog INSERT did not). Repair re-INSERTs the row
 //!    via the same probe-first idempotent path the writer uses
-//!    (`runtime::insert_agent_checkpoint_row_idempotent`), reconstructing
+//!    (`capture::checkpoint::insert_agent_checkpoint_row_idempotent`), reconstructing
 //!    the columns from the commit's `metadata.json` (both the AG-20 v2 and
 //!    the legacy v1 metadata shapes parse) plus the `Libra-*` commit
 //!    trailers. Checkpoints named by a LIVE traces in-flight marker are
@@ -38,10 +38,10 @@
 //!    (trees as `tree`, transcript blobs/chunks as `agent_transcript`,
 //!    JSON/text sidecars as `blob` — mirroring the
 //!    `history.rs::append_checkpoint_commit` / `splice_checkpoint_tree`
-//!    enqueue calls). `o_size` comes from the manifest-declared `byte_len`
-//!    wherever the manifest declares one — transcript payloads are never
-//!    read; only trees, the commit, and the manifest blob itself (all
-//!    small) are sized by reading. Repair inserts rows directly
+//!    enqueue calls). `o_size` is never taken from manifest `byte_len`:
+//!    doctor streams a descriptor-pinned loose object through its
+//!    content-addressed hash under the transcript cap and retains no payload
+//!    bytes before writing the verified size. Repair inserts rows directly
 //!    (idempotent existence-checked INSERT mirroring
 //!    `client_storage::update_object_index_once` semantics — doctor is a
 //!    foreground command, so it does not go through the background queue).
@@ -72,7 +72,8 @@
 //! `agent.doctor.repair` span is emitted per repair attempt (including
 //! attempts that end `manual_required`) carrying `inconsistency_type`,
 //! `repaired`, `manual_required`. Raw transcript bytes never reach the
-//! span sink — doctor is metadata-first and never reads transcript blobs.
+//! span sink — doctor is metadata-first and never materializes or renders
+//! transcript blobs.
 //! Detection-only runs emit no repair spans (nothing was attempted).
 //!
 //! Without `--repair` the command is strictly read-only; findings report
@@ -81,15 +82,17 @@
 //! consistent store and does nothing.
 
 use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
+    path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use anyhow::{Context, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, set_hash_kind},
     internal::object::{
         ObjectTrait,
         commit::Commit,
@@ -97,35 +100,41 @@ use git_internal::{
     },
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    QueryFilter, Statement, TransactionTrait,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use super::DoctorArgs;
 use crate::{
     internal::{
         ai::{
-            history::HistoryManager,
-            hooks::{
-                providers::{claude_provider, gemini_provider},
-                runtime::{
+            capture::{
+                catalog::{
+                    CaptureCatalogFinalizerRecovery, CaptureCatalogFinalizerRecoveryResult,
+                    CaptureCatalogStore,
+                },
+                checkpoint::{
                     AgentCheckpointRow, SubagentCheckpointRow,
                     insert_agent_checkpoint_row_idempotent,
                     insert_subagent_checkpoint_row_idempotent,
                 },
+                pending,
+                recovery::{self, ArtifactRecoveryOutcome},
             },
+            capture_scope::{CaptureCommitDeadline, CaptureScope},
+            history::HistoryManager,
+            hooks::providers::{claude_provider, gemini_provider},
             observed_agents::{AgentStability, PREVIEW_SPECS, STABLE_PROMOTED_SPECS},
             traces,
         },
         config::ConfigKv,
-        db::get_db_conn_instance,
+        db::get_db_conn_instance_for_path,
         model::reference::{self, ConfigKind},
     },
     utils::{
         client_storage::ClientStorage,
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         util,
     },
@@ -136,20 +145,97 @@ use crate::{
 /// with a note; truncation only ever *under*-detects (fail-safe direction).
 const MAX_TRACES_WALK_COMMITS: usize = 100_000;
 const MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS: usize = 4_096;
+/// Doctor never needs an unbounded payload. Trees, commits, manifests, and
+/// findings sidecars are control-plane objects; transcript bodies are never
+/// read here. A corrupt loose object therefore cannot turn a diagnostic into
+/// an unbounded decompression/allocation path.
+const DOCTOR_LOCAL_OBJECT_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
+/// Object-index repair must prove the actual size it writes. It streams a
+/// held loose-object descriptor through the repository hash without retaining
+/// payload bytes; the capture source cap bounds that work even for a
+/// transcript blob.
+const DOCTOR_STREAMING_OBJECT_VALIDATION_CAP_BYTES: u64 =
+    crate::internal::ai::observed_agents::TRANSCRIPT_READ_HARD_CAP_BYTES;
+/// Bound the aggregate decompressed object content that one doctor/import
+/// index-repair pass can validate. Per-object caps alone would still permit a
+/// damaged checkpoint store to make a foreground diagnostic stream many
+/// thousands of individually valid transcript objects. Exhausting this
+/// budget fails closed: the affected checkpoint requires manual repair and
+/// receives no object-index writes.
+const DOCTOR_OBJECT_INDEX_VALIDATION_TOTAL_CAP_BYTES: u64 = 128 * 1024 * 1024;
+/// Review/investigate sidecars are untrusted local input. Keeping their cap
+/// equal to doctor object reads bounds both a hostile manifest and a findings
+/// rewrite candidate without silently reading external data through a link.
+const DOCTOR_AGENT_RUN_SIDECAR_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
+/// A damaged or attacker-controlled agent-runs directory must not turn a
+/// foreground diagnostic into an unbounded directory walk. This comfortably
+/// exceeds the normal number of retained review/investigate runs while making
+/// an intentionally huge store fail closed for repair purposes.
+const DOCTOR_AGENT_RUN_ENTRY_CAP: usize = 4_096;
+/// A damaged E4 tree or manifest can contain arbitrarily many legal-looking
+/// entries within its byte cap. Bound both dimensions before cross-checking so
+/// doctor remains predictable and refuses to auto-repair an incomplete view.
+const DOCTOR_E4_TREE_ENTRY_CAP: usize = 4_096;
+const DOCTOR_E4_MANIFEST_DECLARATION_CAP: usize = 4_096;
+const DOCTOR_E4_OBJECT_CAP: usize = 4_096;
 
+// `cfg!(debug_assertions)` is true for ordinary developer builds, so test
+// rendezvous state must be compiled only into unit-test binaries.
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    use anyhow::{Result, anyhow};
+
+    pub(super) struct TestPause {
+        pub(super) reached: mpsc::Sender<()>,
+        pub(super) resume: mpsc::Receiver<()>,
+    }
+
+    static PAUSE: OnceLock<Mutex<Option<TestPause>>> = OnceLock::new();
+
+    fn pause() -> &'static Mutex<Option<TestPause>> {
+        PAUSE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn lock_pause() -> std::sync::MutexGuard<'static, Option<TestPause>> {
+        pause()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) struct PauseReset(Option<TestPause>);
+
+    pub(super) fn install(test_pause: TestPause) -> PauseReset {
+        PauseReset((*lock_pause()).replace(test_pause))
+    }
+
+    impl Drop for PauseReset {
+        fn drop(&mut self) {
+            let _ = std::mem::replace(&mut *lock_pause(), self.0.take());
+        }
+    }
+
+    pub(super) fn wait_for_pause() -> Result<()> {
+        let Some(pause) = lock_pause().take() else {
+            return Ok(());
+        };
+        let _ = pause.reached.send(());
+        pause
+            .resume
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| anyhow!("test import index-repair pause timed out"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn import_index_repair_test_pause_after_lock() -> anyhow::Result<()> {
-    if !cfg!(debug_assertions) {
-        return Ok(());
-    }
-    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_INDEX_REPAIR_READY_FILE") else {
-        return Ok(());
-    };
-    let continue_path = std::env::var("LIBRA_TEST_IMPORT_INDEX_REPAIR_CONTINUE_FILE")
-        .context("index repair pause requires a continue-file path")?;
-    std::fs::write(&ready_path, b"ready").context("publish test-only import index-repair pause")?;
-    while !Path::new(&continue_path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    test_support::wait_for_pause()
+}
+
+#[cfg(not(test))]
+fn import_index_repair_test_pause_after_lock() -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -234,6 +320,8 @@ struct FindingsStoreReport {
 struct FindingsObjectFinding {
     /// `missing_findings_object` or `missing_findings_object_index`.
     inconsistency_type: String,
+    /// Review/investigate run id (the `agent-runs/<run_id>` name), emitted
+    /// only after `is_valid_run_id` so `review show <run_id>` can act on it.
     run_id: String,
     /// Diagnosis — OIDs/reasons only, never findings content.
     detail: String,
@@ -328,8 +416,123 @@ enum RepairPlan {
         /// in-place UPDATE instead of insert.
         updates: Vec<(String, String, i64)>,
     },
+    /// A terminal receipt survived a crash after its checkpoint became
+    /// durable. The catalog revalidates its original marker/source fence
+    /// before publishing the deferred terminal state.
+    RecoverPendingFinalizer {
+        recovery: CaptureCatalogFinalizerRecovery,
+        observed_at_ms: i64,
+    },
+    /// A pending finalizer has exhausted its persisted replay/window budget
+    /// without a durable checkpoint, so doctor may only quarantine it.
+    QuarantineExhaustedPendingFinalizer {
+        recovery: CaptureCatalogFinalizerRecovery,
+        observed_at_ms: i64,
+    },
+    /// A superseded or quarantined session must leave its artifact header out
+    /// of the pending replay window so it cannot block unrelated candidates.
+    QuarantineStalePendingArtifact {
+        recovery: CaptureCatalogFinalizerRecovery,
+    },
+    /// Replay one authenticated artifact through the local checkpoint writer
+    /// while the original finalizer budget still permits another attempt.
+    ReplayPendingArtifact {
+        recovery: CaptureCatalogFinalizerRecovery,
+        observed_at_ms: i64,
+    },
     /// No automatic action is safe; a human must restore objects/rows.
     Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizerRepairKind {
+    Manual,
+    CompleteDurable,
+    QuarantineExhausted,
+    QuarantineStaleArtifact,
+    ReplayArtifact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactReplayDisposition {
+    Completed,
+    PermanentFailure,
+    Deferred,
+    RetryLater,
+    Refused,
+}
+
+/// Diagnosis never grants source access. In particular, a newer session
+/// revision wins even when the old deterministic checkpoint is durable.
+fn diagnose_pending_finalizer(
+    manual_only: bool,
+    durable: bool,
+    budget_exhausted: bool,
+    artifact_present: bool,
+    artifact_pending: bool,
+    artifact_manual_attempted: bool,
+) -> (&'static str, FinalizerRepairKind) {
+    if manual_only {
+        if artifact_present && artifact_pending {
+            (
+                "terminal finalizer evidence is superseded or session-quarantined; doctor will retain its header in quarantine so it cannot block eligible recovery, without overwriting the current session",
+                FinalizerRepairKind::QuarantineStaleArtifact,
+            )
+        } else {
+            (
+                "terminal finalizer evidence is superseded or session-quarantined; manual recovery is required and doctor will not overwrite the current session",
+                FinalizerRepairKind::Manual,
+            )
+        }
+    } else if durable {
+        (
+            "terminal finalizer remains pending after its checkpoint became durable; `libra agent doctor --repair` will revalidate the persisted marker/source fence and complete the deferred terminal receipt",
+            FinalizerRepairKind::CompleteDurable,
+        )
+    } else if artifact_present && budget_exhausted && artifact_manual_attempted {
+        (
+            "terminal finalizer exhausted its original replay budget and its one audited manual attempt is already consumed; doctor will not charge another attempt",
+            FinalizerRepairKind::Manual,
+        )
+    } else if artifact_present && budget_exhausted {
+        (
+            "terminal finalizer exhausted its original replay budget; repair retains the artifact header in quarantine without changing the original receipt, and authenticated manual recovery is required",
+            FinalizerRepairKind::QuarantineExhausted,
+        )
+    } else if artifact_present && !artifact_pending {
+        (
+            "authenticated capture evidence is already parked in quarantine; automatic replay is disabled until the original retry budget expires and an explicit repair is requested",
+            FinalizerRepairKind::Manual,
+        )
+    } else if artifact_present {
+        (
+            "authenticated pending capture artifact is eligible for one bounded local replay; `libra agent doctor --repair` will revalidate catalog and coverage fences before checkpoint publication",
+            FinalizerRepairKind::ReplayArtifact,
+        )
+    } else if budget_exhausted {
+        (
+            "terminal finalizer exhausted its persisted replay budget without a ref-reachable durable checkpoint; `libra agent doctor --repair` will quarantine it for manual recovery",
+            FinalizerRepairKind::QuarantineExhausted,
+        )
+    } else {
+        // Every artifact-present case returned above.
+        (
+            "terminal finalizer has no durable recovery artifact (pending_source); doctor cannot reopen provider sources, and replay through the provider or explicit manual recovery is required",
+            FinalizerRepairKind::Manual,
+        )
+    }
+}
+
+/// The ownership mode of a catalog row repaired by doctor.
+///
+/// Old captures intentionally remain repairable without a workspace fence:
+/// they predate durable ownership and are explicitly marked
+/// `legacy_unknown`. Every new scoped row instead carries a workspace fence
+/// that doctor must honor even though the repair is operator initiated.
+#[derive(Debug)]
+enum DoctorCatalogRepairScope {
+    LegacyUnscoped,
+    Scoped(CaptureScope),
 }
 
 /// Repository-relative paths of the frozen Code-era residue that still exist
@@ -362,11 +565,11 @@ async fn scan_legacy_code_residue(conn: &DatabaseConnection) -> CliResult<Legacy
         .filter(reference::Column::Kind.eq(ConfigKind::Branch))
         .one(conn)
         .await
-        .map_err(|error| {
-            CliError::fatal(format!(
-                "agent doctor could not read the intent ref '{}': {error}",
-                crate::internal::ai::history::AI_REF
-            ))
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not inspect the frozen intent ref; check the repository database and rerun doctor"
+                    .to_string(),
+            )
         })?
         .map(|_| crate::internal::ai::history::AI_REF.to_string());
     Ok(LegacyCodeResidue {
@@ -377,7 +580,17 @@ async fn scan_legacy_code_residue(conn: &DatabaseConnection) -> CliResult<Legacy
 }
 
 pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    // `agent doctor` is the corruption diagnostic itself. It must return a
+    // controlled, path-free error when the database is unavailable instead
+    // of reaching the legacy panic convenience wrapper. The CLI preflight has
+    // already resolved repository storage through the shared
+    // `LBR-REPO-001` / `LBR-REPO-003` mapping; this fallback keeps the same
+    // stable codes for in-process callers.
+    let storage = util::try_get_storage_path(None).map_err(doctor_storage_resolution_error)?;
+    let conn = get_db_conn_instance_for_path(&storage.join(util::DATABASE))
+        .await
+        .map_err(|error| doctor_database_open_error(error.kind()))?;
+    pin_doctor_hash_kind(&conn).await?;
     let schema_present = table_exists(&conn, "agent_session").await?
         && table_exists(&conn, "agent_checkpoint").await?;
 
@@ -569,37 +782,128 @@ fn parse_libra_trailers(message: &str) -> LibraTrailers {
     trailers
 }
 
-/// Thin typed reader over the repo object store. Uses [`ClientStorage`] so
-/// packed / tiered objects resolve the same way the rest of the CLI sees
-/// them (doctor must not report an object "missing" just because it was
-/// synced to the durable tier).
+/// Thin, no-write reader over loose objects owned by this repository.
+///
+/// Doctor is a diagnostic boundary: it must not consult alternates, parse
+/// `LIBRA_STORAGE_*`, enumerate packs, or rebuild a missing pack index.
+/// Those generic storage paths can expose foreign filesystem details through
+/// tracing and can mutate a repository during a nominally read-only scan.
+/// A packed or remote-only object is therefore deliberately reported as
+/// unavailable until a normal storage command restores a local loose copy.
 struct ObjectReader {
-    storage: Arc<ClientStorage>,
+    repo_path: PathBuf,
 }
 
 impl ObjectReader {
+    fn secure_reads_supported() -> bool {
+        cfg!(unix)
+    }
+
+    fn open_loose(&self, oid: &ObjectHash) -> std::io::Result<std::fs::File> {
+        crate::utils::object::open_local_loose_object_no_follow(&self.repo_path, oid)
+    }
+
+    fn exists(&self, oid: &ObjectHash) -> bool {
+        self.open_loose(oid).is_ok()
+    }
+
     fn exists_str(&self, oid: &str) -> bool {
         crate::internal::object_format::parse_repo_oid(oid)
-            .map(|hash| self.storage.exist(&hash))
+            .map(|hash| self.exists(&hash))
             .unwrap_or(false)
     }
 
+    fn read_typed(&self, oid: &ObjectHash) -> anyhow::Result<(String, Vec<u8>)> {
+        let file = self
+            .open_loose(oid)
+            .map_err(|_| anyhow::anyhow!("local object is unavailable"))?;
+        crate::utils::object::read_git_object_bounded_validated_file(
+            file,
+            oid,
+            DOCTOR_LOCAL_OBJECT_READ_CAP_BYTES,
+        )
+        .map_err(|_| anyhow::anyhow!("local object could not be read"))
+    }
+
     fn read_raw(&self, oid: &ObjectHash) -> anyhow::Result<Vec<u8>> {
-        self.storage
-            .get(oid)
-            .map_err(|e| anyhow::anyhow!("failed to read object {oid}: {e}"))
+        self.read_typed(oid).map(|(_, bytes)| bytes)
+    }
+
+    /// Return a size only after validating the entire held loose-object
+    /// stream against its content-addressed OID. The payload is streamed in a
+    /// fixed buffer rather than returned, so index repair never adopts a
+    /// mutable manifest `byte_len` or materializes transcript contents.
+    fn validated_size(
+        &self,
+        oid: &ObjectHash,
+        expected_type: &str,
+        max_content_bytes: u64,
+    ) -> anyhow::Result<i64> {
+        let file = self
+            .open_loose(oid)
+            .map_err(|_| anyhow::anyhow!("local object is unavailable"))?;
+        let (actual_type, size) =
+            crate::utils::object::validate_git_object_streaming_file(file, oid, max_content_bytes)
+                .map_err(|_| anyhow::anyhow!("local object could not be integrity-checked"))?;
+        if actual_type != expected_type {
+            bail!("local object has an unexpected type");
+        }
+        i64::try_from(size).map_err(|_| anyhow::anyhow!("local object size exceeds index range"))
     }
 
     fn read_commit(&self, oid: &ObjectHash) -> anyhow::Result<Commit> {
-        let data = self.read_raw(oid)?;
+        let (object_type, data) = self.read_typed(oid)?;
+        if object_type != "commit" {
+            bail!("local object has an unexpected type");
+        }
         Commit::from_bytes(&data, *oid)
-            .map_err(|e| anyhow::anyhow!("failed to parse commit {oid}: {e}"))
+            .map_err(|_| anyhow::anyhow!("local commit object is malformed"))
     }
 
     fn read_tree(&self, oid: &ObjectHash) -> anyhow::Result<Tree> {
-        let data = self.read_raw(oid)?;
-        Tree::from_bytes(&data, *oid)
-            .map_err(|e| anyhow::anyhow!("failed to parse tree {oid}: {e}"))
+        let (object_type, data) = self.read_typed(oid)?;
+        if object_type != "tree" {
+            bail!("local object has an unexpected type");
+        }
+        Tree::from_bytes(&data, *oid).map_err(|_| anyhow::anyhow!("local tree object is malformed"))
+    }
+}
+
+/// Aggregate budget for descriptor-pinned object validation. A validation
+/// request uses at most the remaining global budget, so a large declared
+/// object cannot consume more than this pass is allowed to inspect.
+#[derive(Debug)]
+struct ObjectIndexValidationBudget {
+    remaining_bytes: u64,
+}
+
+impl ObjectIndexValidationBudget {
+    fn new() -> Self {
+        Self {
+            remaining_bytes: DOCTOR_OBJECT_INDEX_VALIDATION_TOTAL_CAP_BYTES,
+        }
+    }
+
+    fn validate(
+        &mut self,
+        reader: &ObjectReader,
+        oid: &ObjectHash,
+        expected_type: &str,
+    ) -> anyhow::Result<i64> {
+        if self.remaining_bytes == 0 {
+            bail!("object-index validation budget is exhausted");
+        }
+        let maximum = self
+            .remaining_bytes
+            .min(DOCTOR_STREAMING_OBJECT_VALIDATION_CAP_BYTES);
+        let size = reader.validated_size(oid, expected_type, maximum)?;
+        let consumed =
+            u64::try_from(size).map_err(|_| anyhow::anyhow!("validated object size is invalid"))?;
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(consumed)
+            .context("object-index validation budget was exceeded")?;
+        Ok(size)
     }
 }
 
@@ -612,21 +916,16 @@ impl ObjectReader {
 /// are `blob`.
 #[derive(Debug)]
 struct E4Object {
-    /// Human-readable role/path (e.g. `manifest.json`,
-    /// `transcript/claude_code.jsonl.001`) for findings — never content.
-    path: String,
+    /// A fixed role label for findings. This never comes from a tree-entry
+    /// name or manifest path: a damaged checkpoint can otherwise turn a
+    /// diagnostic into a transcript/metadata disclosure channel.
+    label: String,
     oid: String,
     o_type: &'static str,
-    /// Manifest-declared payload byte length, when the object's role
-    /// declares one (`byte_len` on single entries, per-part on E5 chunk
-    /// parts). The writer enqueues exactly the payload length into
-    /// `object_index` and records that same number in the manifest, so
-    /// class 3 can size transcript blobs WITHOUT reading their payloads
-    /// (metadata-first / no-transcript-read contract). `None` — trees,
-    /// the manifest blob itself, or a corrupt manifest — falls back to a
-    /// payload read in class 3, which for a well-formed E4 layout only
-    /// ever touches small tree/JSON objects, never a transcript.
-    size: Option<i64>,
+    /// The fixed checkpoint-tree role that may be corroborated by a manifest
+    /// entry. `None` means a structural tree/foreign entry that must never
+    /// receive a manifest-provided size.
+    manifest_role: Option<ManifestRole>,
 }
 
 /// Result of sweeping one E4 checkpoint's full object set (class 1
@@ -636,11 +935,15 @@ struct E4Sweep {
     /// Objects verified present (existence via read for trees, store
     /// probe for blobs), with writer-matching o_type.
     present: Vec<E4Object>,
-    /// `"path oid"` descriptors of missing/unreadable objects.
+    /// Content-free descriptors of missing/unreadable objects.
     missing: Vec<String>,
     /// The inner checkpoint tree carries the M4+ manifest entry. Legacy-v1
     /// checkpoints are deliberately outside automatic import replay repair.
     manifest_present: bool,
+    /// Once the global reachability budget is exhausted, the sweep must stop
+    /// issuing object reads/probes. The accompanying fixed finding suppresses
+    /// all automatic index repair for this checkpoint.
+    entry_limit_hit: bool,
 }
 
 impl E4Sweep {
@@ -649,25 +952,291 @@ impl E4Sweep {
     fn record(
         &mut self,
         seen: &mut BTreeSet<String>,
-        path: &str,
+        label: &str,
         oid: &str,
         o_type: &'static str,
-        size: Option<i64>,
+        manifest_role: Option<ManifestRole>,
         exists: bool,
     ) {
+        if self.entry_limit_hit {
+            return;
+        }
         if !seen.insert(oid.to_string()) {
+            return;
+        }
+        if self.present.len().saturating_add(self.missing.len()) >= DOCTOR_E4_OBJECT_CAP {
+            self.record_tree_entry_limit();
             return;
         }
         if exists {
             self.present.push(E4Object {
-                path: path.to_string(),
+                label: label.to_string(),
                 oid: oid.to_string(),
                 o_type,
-                size,
+                manifest_role,
             });
         } else {
-            self.missing.push(format!("{path} {oid}"));
+            self.missing
+                .push(format!("{label} {}", diagnostic_oid(oid)));
         }
+    }
+
+    fn record_invalid_manifest_object(&mut self) {
+        self.missing
+            .push("manifest-declared object has an invalid object identifier".to_string());
+    }
+
+    fn record_invalid_manifest_declaration(&mut self) {
+        self.missing
+            .push("manifest contains an invalid object declaration".to_string());
+    }
+
+    fn record_manifest_tree_mismatch(&mut self) {
+        self.missing
+            .push("manifest-declared object does not match the checkpoint tree".to_string());
+    }
+
+    fn record_tree_entry_limit(&mut self) {
+        if !self.entry_limit_hit {
+            self.entry_limit_hit = true;
+            self.missing.push(
+                "checkpoint tree exceeds the doctor entry limit; manual review is required"
+                    .to_string(),
+            );
+        }
+    }
+
+    fn record_manifest_declaration_limit(&mut self) {
+        self.missing.push(
+            "checkpoint manifest exceeds the doctor declaration limit; manual review is required"
+                .to_string(),
+        );
+    }
+}
+
+/// Return an OID only after validating its exact repository grammar. OIDs are
+/// safe structural diagnostics; arbitrary strings from a damaged manifest or
+/// catalog are not.
+fn diagnostic_oid(value: &str) -> String {
+    crate::internal::object_format::parse_repo_oid(value)
+        .map(|oid| oid.to_string())
+        .unwrap_or_else(|_| "invalid object identifier".to_string())
+}
+
+/// Return a checkpoint identity only if it is the writer's canonical UUID
+/// spelling. Ref tree entry names are untrusted too: callers must validate
+/// before using one as a catalog key or repair input.
+fn canonical_checkpoint_id(value: &str) -> Option<String> {
+    let parsed = uuid::Uuid::parse_str(value).ok()?;
+    let canonical = parsed.hyphenated().to_string();
+    (value == canonical).then_some(canonical)
+}
+
+/// `checkpoint_id` is normally a writer-generated UUID, but a damaged
+/// catalog or ref tree can contain arbitrary bytes. It reaches both human and
+/// JSON doctor reports (and repair spans), so accept only the canonical UUID
+/// spelling; anything else gets a fixed non-correlatable label.
+fn diagnostic_checkpoint_id(value: &str) -> String {
+    canonical_checkpoint_id(value).unwrap_or_else(|| "checkpoint-id-redacted".to_string())
+}
+
+/// `object_index.o_type` is mutable database content, not a trusted enum.
+/// Keep the public writer taxonomy readable while refusing to echo arbitrary
+/// damaged-row strings in human or JSON diagnostics.
+fn diagnostic_object_index_type(value: &str) -> &'static str {
+    match value {
+        "commit" => "commit",
+        "tree" => "tree",
+        "blob" => "blob",
+        "agent_transcript" => "agent_transcript",
+        _ => "unrecognized type",
+    }
+}
+
+/// `object_index.o_type` has one capture-specific tag for transcript blobs;
+/// the loose-object header still uses Git's ordinary `blob` type.
+fn expected_git_object_type(index_type: &str) -> &'static str {
+    match index_type {
+        "commit" => "commit",
+        "tree" => "tree",
+        "blob" | "agent_transcript" => "blob",
+        // All callers supply the fixed writer vocabulary. Keeping this
+        // fallback fail-closed avoids accidentally treating a future mutable
+        // database value as a valid loose-object kind.
+        _ => "invalid",
+    }
+}
+
+/// Fallback mapping for a repository-resolution failure reached without the
+/// CLI preflight. A genuine NotFound keeps the shared `LBR-REPO-001`
+/// contract; every other resolution failure (detached, migrating or corrupt
+/// linked worktree) keeps `LBR-REPO-003` with a path-free remedy.
+fn doctor_storage_resolution_error(error: std::io::Error) -> CliError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return CliError::repo_not_found();
+    }
+    CliError::fatal(
+        "agent doctor could not resolve repository storage; from the main worktree run \
+         `libra worktree repair --confirm <worktree-path>` (or re-add the worktree), then \
+         rerun doctor",
+    )
+    .with_stable_code(StableErrorCode::RepoStateInvalid)
+}
+
+/// Path-free mapping for a failed repository-database open. The stable codes
+/// match the generic repository preflight that doctor deliberately skips: a
+/// missing database is `LBR-REPO-002`, any other open failure (permissions,
+/// corruption, a schema written by a newer Libra) is `LBR-IO-001`.
+fn doctor_database_open_error(kind: std::io::ErrorKind) -> CliError {
+    if kind == std::io::ErrorKind::NotFound {
+        return CliError::fatal(
+            "repository database not found; restore the repository's .libra storage (for \
+             example from a backup) and rerun `libra agent doctor`",
+        )
+        .with_stable_code(StableErrorCode::RepoCorrupt);
+    }
+    CliError::fatal(
+        "agent doctor could not open the repository database; if it was written by a newer \
+         Libra, install a newer Libra binary; otherwise restore repository storage, then rerun \
+         doctor",
+    )
+    .with_stable_code(StableErrorCode::IoReadFailed)
+}
+
+/// Doctor bypasses the generic CLI database preflight so it can render a
+/// path-free database failure. Once its explicit open succeeds, it still must
+/// pin the repository object format before reading traces objects. The stable
+/// codes match that preflight (`LBR-IO-001` for an unreadable value,
+/// `LBR-REPO-002` for an unsupported one); the stored value is never echoed.
+async fn pin_doctor_hash_kind(conn: &DatabaseConnection) -> CliResult<()> {
+    let object_format = ConfigKv::get_with_conn(conn, "core.objectformat")
+        .await
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not read repository object format; repair the repository database and rerun doctor"
+                    .to_string(),
+            )
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
+    let hash_kind = crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+        CliError::fatal(
+            "agent doctor found an unsupported object format in the repository configuration; repair core.objectformat and rerun doctor"
+                .to_string(),
+        )
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
+    set_hash_kind(hash_kind);
+    Ok(())
+}
+
+/// Keep tree-entry names out of doctor output. The writer emits this small,
+/// fixed layout, while foreign names in a damaged tree have no diagnostic
+/// authority and must not be reflected back to the terminal or JSON.
+fn checkpoint_inner_entry_label(name: &str, is_tree: bool) -> &'static str {
+    match (name, is_tree) {
+        ("metadata.json", false) => "metadata.json",
+        ("manifest.json", false) => "manifest.json",
+        ("redaction_report.json", false) => "redaction_report.json",
+        ("content_hash.txt", false) => "content_hash.txt",
+        ("events", true) => "events tree",
+        ("transcript", true) => "transcript tree",
+        (_, true) => "unrecognized checkpoint subtree",
+        (_, false) => "unrecognized checkpoint sidecar",
+    }
+}
+
+/// Classify one manifest declaration without trusting its caller-controlled
+/// role/path spelling. The label is intentionally a fixed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ManifestRole {
+    Metadata,
+    LifecycleEvents,
+    Transcript,
+    RedactionReport,
+    ContentHash,
+}
+
+fn manifest_role_from_key(role: &str) -> Option<ManifestRole> {
+    match role {
+        "metadata" => Some(ManifestRole::Metadata),
+        "lifecycle_events" => Some(ManifestRole::LifecycleEvents),
+        "transcript" => Some(ManifestRole::Transcript),
+        "redaction_report" => Some(ManifestRole::RedactionReport),
+        "content_hash" => Some(ManifestRole::ContentHash),
+        _ => None,
+    }
+}
+
+fn checkpoint_manifest_role_for_sidecar(name: &str) -> Option<ManifestRole> {
+    match name {
+        "metadata.json" => Some(ManifestRole::Metadata),
+        "redaction_report.json" => Some(ManifestRole::RedactionReport),
+        "content_hash.txt" => Some(ManifestRole::ContentHash),
+        _ => None,
+    }
+}
+
+fn checkpoint_manifest_role_for_subtree_entry(
+    parent: &str,
+    name: &str,
+    is_tree: bool,
+) -> Option<ManifestRole> {
+    if is_tree {
+        return None;
+    }
+    match parent {
+        "transcript" => Some(ManifestRole::Transcript),
+        "events" if name == "lifecycle.jsonl" => Some(ManifestRole::LifecycleEvents),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestDeclaredBlob {
+    label: String,
+    role: Option<ManifestRole>,
+    oid: Option<String>,
+    o_type: &'static str,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ManifestDeclarations {
+    declarations: Vec<ManifestDeclaredBlob>,
+    over_limit: bool,
+}
+
+fn manifest_declared_label(role: &str, part_index: Option<usize>) -> String {
+    match (role, part_index) {
+        ("metadata", None) => "manifest-declared metadata".to_string(),
+        ("lifecycle_events", None) => "manifest-declared lifecycle events".to_string(),
+        ("transcript", None) => "manifest-declared transcript".to_string(),
+        ("transcript", Some(index)) => {
+            format!("manifest-declared transcript part {}", index + 1)
+        }
+        ("redaction_report", None) => "manifest-declared redaction report".to_string(),
+        ("content_hash", None) => "manifest-declared content hash".to_string(),
+        (_, _) => "manifest-declared object".to_string(),
+    }
+}
+
+fn manifest_declared_blob(
+    role: &str,
+    part_index: Option<usize>,
+    oid: &str,
+) -> ManifestDeclaredBlob {
+    ManifestDeclaredBlob {
+        label: manifest_declared_label(role, part_index),
+        role: manifest_role_from_key(role),
+        oid: crate::internal::object_format::parse_repo_oid(oid)
+            .ok()
+            .map(|parsed| parsed.to_string()),
+        o_type: if role == "transcript" {
+            "agent_transcript"
+        } else {
+            "blob"
+        },
     }
 }
 
@@ -676,10 +1245,9 @@ impl E4Sweep {
 /// (top-level sidecar blobs plus the `events/` and `transcript/`
 /// subtrees), then cross-check the manifest's declared entries. The tree
 /// enumeration is the primary probe — a missing `manifest.json` is
-/// recorded like any other missing sidecar and never hides the rest; the
-/// manifest pass only adds declared blobs the tree did not already cover
-/// (defence in depth, and it contributes role/path naming for chunked
-/// transcripts).
+/// recorded like any other missing sidecar and never hides the rest. A
+/// manifest may corroborate the size of a matching writer-owned tree entry,
+/// but it can never add a new object to the reachability/index-repair set.
 fn sweep_e4_checkpoint_objects(
     reader: &ObjectReader,
     root_tree_oid: &str,
@@ -689,9 +1257,9 @@ fn sweep_e4_checkpoint_objects(
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     let (Some(prefix), Some(rest)) = (checkpoint_id.get(..2), checkpoint_id.get(2..)) else {
-        sweep.missing.push(format!(
-            "checkpoint id '{checkpoint_id}' too short to resolve its tree path"
-        ));
+        sweep
+            .missing
+            .push("checkpoint tree path cannot be resolved from its identifier".to_string());
         return sweep;
     };
 
@@ -700,10 +1268,10 @@ fn sweep_e4_checkpoint_objects(
     // unreadable tree ends the walk — everything below it is unreachable
     // and the finding already names the break point.
     let labels = [
-        "tree_oid (root tree)".to_string(),
-        "checkpoint (tree)".to_string(),
-        format!("checkpoint/{prefix} (tree)"),
-        format!("checkpoint/{prefix}/{rest} (tree)"),
+        "root checkpoint tree",
+        "checkpoint tree",
+        "checkpoint prefix tree",
+        "checkpoint leaf tree",
     ];
     let mut oid = root_tree_oid.to_string();
     let mut inner_tree: Option<Tree> = None;
@@ -711,6 +1279,10 @@ fn sweep_e4_checkpoint_objects(
         let tree = match crate::internal::object_format::parse_repo_oid(&oid) {
             Ok(hash) => match reader.read_tree(&hash) {
                 Ok(tree) => {
+                    if tree.tree_items.len() > DOCTOR_E4_TREE_ENTRY_CAP {
+                        sweep.record_tree_entry_limit();
+                        return sweep;
+                    }
                     sweep.record(&mut seen, label, &oid, "tree", None, true);
                     tree
                 }
@@ -739,7 +1311,7 @@ fn sweep_e4_checkpoint_objects(
             .find(|item| item.name == next_name && item.mode == TreeItemMode::Tree)
         else {
             sweep.missing.push(format!(
-                "{} (tree entry absent under {label})",
+                "{} is absent from the checkpoint tree",
                 labels[depth + 1]
             ));
             return sweep;
@@ -750,14 +1322,11 @@ fn sweep_e4_checkpoint_objects(
         return sweep;
     };
 
-    // Manifest first: read + parse it (one small JSON blob) so the tree
-    // enumeration below can attach the manifest-declared `byte_len` to
-    // every declared blob — class 3 must never read transcript payloads
-    // just to size them. A missing/corrupt manifest degrades to
-    // size-by-read for the (small) non-transcript objects and is itself
-    // reported missing by the tree enumeration.
-    let mut declared: Vec<(String, String, Option<i64>)> = Vec::new();
-    let mut declared_sizes: HashMap<String, i64> = HashMap::new();
+    // Read the small manifest before the tree enumeration, then bind its
+    // declarations only to entries proven by that enumeration. A manifest is
+    // untrusted metadata: it may supply a size for its matching role, never
+    // introduce a new cloud-index target or override a tree role/type.
+    let mut declared = ManifestDeclarations::default();
     let manifest_item = inner
         .tree_items
         .iter()
@@ -768,124 +1337,509 @@ fn sweep_e4_checkpoint_objects(
         && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
     {
         declared = manifest_declared_blobs(&manifest);
-        for (_, declared_oid, byte_len) in &declared {
-            if let Some(byte_len) = byte_len {
-                declared_sizes.insert(declared_oid.clone(), *byte_len);
-            }
-        }
+    }
+    if declared.over_limit {
+        sweep.record_manifest_declaration_limit();
     }
 
-    // Inner tree enumeration (the primary probe): sidecar blobs at the
-    // top level, one level of subtrees below (`events/`, `transcript/`;
-    // future additive dirs are treated generically). Transcript blobs —
-    // including E5 chunk parts — carry the writer's distinguished
-    // "agent_transcript" tag.
+    // Inner tree enumeration (the primary probe): sidecar blobs at the top
+    // level and exactly the two writer-owned subtrees (`events/` and
+    // `transcript/`). Do not recursively inspect arbitrary foreign subtrees:
+    // they are not part of the checkpoint protocol and a damaged inner tree
+    // could otherwise amplify this foreground scan by another full tree cap
+    // per entry. Transcript blobs — including E5 chunk parts — carry the
+    // writer's distinguished "agent_transcript" tag.
     for item in &inner.tree_items {
+        if sweep.entry_limit_hit {
+            break;
+        }
         let item_oid = item.id.to_string();
         if item.mode == TreeItemMode::Tree {
-            let label = format!("{} (tree)", item.name);
+            let label = checkpoint_inner_entry_label(&item.name, true);
+            // Foreign/additive trees have no stable writer semantics below
+            // their root. Record the tree itself, but never fan out into
+            // untrusted descendants.
+            if item.name != "events" && item.name != "transcript" {
+                sweep.record(&mut seen, label, &item_oid, "tree", None, true);
+                continue;
+            }
             match reader.read_tree(&item.id) {
                 Ok(subtree) => {
-                    sweep.record(&mut seen, &label, &item_oid, "tree", None, true);
+                    sweep.record(&mut seen, label, &item_oid, "tree", None, true);
+                    if subtree.tree_items.len() > DOCTOR_E4_TREE_ENTRY_CAP {
+                        sweep.record_tree_entry_limit();
+                        continue;
+                    }
                     let leaf_type = if item.name == "transcript" {
                         "agent_transcript"
                     } else {
                         "blob"
                     };
                     for leaf in &subtree.tree_items {
+                        if sweep.entry_limit_hit {
+                            break;
+                        }
                         let leaf_oid = leaf.id.to_string();
-                        let leaf_path = format!("{}/{}", item.name, leaf.name);
+                        let leaf_label = match item.name.as_str() {
+                            "transcript" => "transcript entry",
+                            "events" => "lifecycle event entry",
+                            _ => "checkpoint subtree entry",
+                        };
                         let o_type = if leaf.mode == TreeItemMode::Tree {
                             "tree"
                         } else {
                             leaf_type
                         };
-                        let size = declared_sizes.get(&leaf_oid).copied();
                         sweep.record(
                             &mut seen,
-                            &leaf_path,
+                            leaf_label,
                             &leaf_oid,
                             o_type,
-                            size,
+                            checkpoint_manifest_role_for_subtree_entry(
+                                &item.name,
+                                &leaf.name,
+                                leaf.mode == TreeItemMode::Tree,
+                            ),
                             reader.exists_str(&leaf_oid),
                         );
                     }
                 }
-                Err(_) => sweep.record(&mut seen, &label, &item_oid, "tree", None, false),
+                Err(_) => sweep.record(&mut seen, label, &item_oid, "tree", None, false),
             }
         } else {
-            let size = declared_sizes.get(&item_oid).copied();
             sweep.record(
                 &mut seen,
-                &item.name,
+                checkpoint_inner_entry_label(&item.name, false),
                 &item_oid,
                 "blob",
-                size,
+                checkpoint_manifest_role_for_sidecar(&item.name),
                 reader.exists_str(&item_oid),
             );
         }
     }
 
-    // Manifest cross-check: verify every declared entry/chunk OID. OIDs
-    // already visited above dedupe out; this only adds blobs the manifest
-    // names beyond the tree (corruption defence) with role-path labels.
-    for (path, declared_oid, byte_len) in declared {
-        let o_type = if path.starts_with("transcript/") {
-            "agent_transcript"
-        } else {
-            "blob"
+    // Manifest cross-check: accept a declaration only when the same OID,
+    // fixed role, and writer object type were all enumerated from the
+    // checkpoint tree. Extra/mislabelled declarations are corruption
+    // findings, not reachability evidence: otherwise `--repair` could place
+    // an attacker-selected existing blob into object_index for cloud sync.
+    // The map keeps this O(tree entries + declarations), rather than scanning
+    // the complete reachability set once per untrusted declaration.
+    let mut tree_backed: BTreeMap<(String, ManifestRole, &'static str), usize> = BTreeMap::new();
+    for (index, object) in sweep.present.iter().enumerate() {
+        if let Some(role) = object.manifest_role {
+            tree_backed.insert((object.oid.clone(), role, object.o_type), index);
+        }
+    }
+    let mut seen_declarations: BTreeSet<(String, ManifestRole)> = BTreeSet::new();
+    for declaration in declared.declarations {
+        let (Some(declared_oid), Some(role)) = (declaration.oid.as_deref(), declaration.role)
+        else {
+            sweep.record_invalid_manifest_object();
+            continue;
         };
-        let label = format!("{path} (manifest-declared)");
-        sweep.record(
-            &mut seen,
-            &label,
-            &declared_oid,
-            o_type,
-            byte_len,
-            reader.exists_str(&declared_oid),
-        );
+        if !seen_declarations.insert((declared_oid.to_string(), role)) {
+            sweep.record_invalid_manifest_declaration();
+            continue;
+        }
+        if !tree_backed.contains_key(&(declared_oid.to_string(), role, declaration.o_type)) {
+            sweep.record_manifest_tree_mismatch();
+        }
     }
 
     sweep
 }
 
-/// Extract every `(path, oid, byte_len)` triple a checkpoint manifest
-/// declares: single-blob entries carry `path` + `oid` + `byte_len`; the
-/// chunked transcript shape (E5) declares `parts: [{path, oid, byte_len}]`
-/// instead. The `byte_len` is the payload length the writer enqueued into
-/// `object_index`, letting class 3 size transcript blobs without reading
-/// them (a missing `byte_len` yields `None` and a read-based fallback for
-/// that object only).
-fn manifest_declared_blobs(manifest: &serde_json::Value) -> Vec<(String, String, Option<i64>)> {
-    let mut out = Vec::new();
-    let Some(entries) = manifest.get("entries").and_then(|v| v.as_object()) else {
-        return out;
+/// Extract checkpoint manifest declarations using only the writer's fixed
+/// role vocabulary. The manifest is corroborating metadata only: its OIDs
+/// may be matched to a tree-backed role, but its `byte_len` is deliberately
+/// ignored because object-index repair derives size from an integrity-checked
+/// loose object stream instead.
+///
+/// Both the known role surface and the total declarations are bounded. A
+/// damaged 4 MiB JSON object can otherwise contain enough syntactically valid
+/// parts to turn a foreground doctor run into an unbounded/O(n²) operation.
+fn manifest_declared_blobs(manifest: &serde_json::Value) -> ManifestDeclarations {
+    let Some(entries) = manifest.get("entries").and_then(|value| value.as_object()) else {
+        return ManifestDeclarations::default();
     };
-    for (role, entry) in entries {
-        let entry_path = entry
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(role)
-            .to_string();
-        if let Some(oid) = entry.get("oid").and_then(|v| v.as_str()) {
-            let byte_len = entry.get("byte_len").and_then(|v| v.as_i64());
-            out.push((entry_path.clone(), oid.to_string(), byte_len));
-        }
-        if let Some(parts) = entry.get("parts").and_then(|v| v.as_array()) {
-            for part in parts {
-                if let Some(oid) = part.get("oid").and_then(|v| v.as_str()) {
-                    let part_path = part
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(entry_path.as_str())
-                        .to_string();
-                    let byte_len = part.get("byte_len").and_then(|v| v.as_i64());
-                    out.push((part_path, oid.to_string(), byte_len));
-                }
+    let mut out = ManifestDeclarations {
+        declarations: Vec::new(),
+        over_limit: entries.len() > 5,
+    };
+    for role in [
+        "metadata",
+        "lifecycle_events",
+        "transcript",
+        "redaction_report",
+        "content_hash",
+    ] {
+        let Some(entry) = entries.get(role) else {
+            continue;
+        };
+        if let Some(oid) = entry.get("oid").and_then(|value| value.as_str()) {
+            if out.declarations.len() == DOCTOR_E4_MANIFEST_DECLARATION_CAP {
+                out.over_limit = true;
+                return out;
             }
+            out.declarations
+                .push(manifest_declared_blob(role, None, oid));
+        }
+        // Only transcript entries use E5 parts. Treat all other `parts`
+        // fields as untrusted extension data, not repair evidence.
+        if role != "transcript" {
+            continue;
+        }
+        let Some(parts) = entry.get("parts").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if parts.len() > DOCTOR_E4_MANIFEST_DECLARATION_CAP {
+            out.over_limit = true;
+        }
+        for (part_index, part) in parts
+            .iter()
+            .take(DOCTOR_E4_MANIFEST_DECLARATION_CAP)
+            .enumerate()
+        {
+            let Some(oid) = part.get("oid").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if out.declarations.len() == DOCTOR_E4_MANIFEST_DECLARATION_CAP {
+                out.over_limit = true;
+                return out;
+            }
+            out.declarations
+                .push(manifest_declared_blob(role, Some(part_index), oid));
         }
     }
     out
+}
+
+/// Run only the bounded, automatic pending-artifact replay path for the
+/// detached SessionStart worker. This skips doctor classification and every
+/// unrelated repair family.
+pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
+    let Ok(storage) = util::try_get_storage_path(None) else {
+        return Ok(());
+    };
+    let database_path = storage.join(util::DATABASE);
+    let Some(database_path) = database_path.to_str() else {
+        return Ok(());
+    };
+    let Ok(conn) = crate::internal::db::open_connection_without_schema_management(
+        database_path,
+        Duration::from_millis(200),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let schema_present = match (
+        table_exists(&conn, "agent_session").await,
+        table_exists(&conn, "agent_checkpoint").await,
+    ) {
+        (Ok(true), Ok(true)) => true,
+        (Ok(false), _) | (_, Ok(false)) => false,
+        _ => {
+            tracing::warn!(
+                target: "agent.capture.recovery",
+                reason = "worker_schema_probe_failed",
+                "automatic capture recovery stopped before a schema could be verified"
+            );
+            return Ok(());
+        }
+    };
+    if !schema_present {
+        return Ok(());
+    }
+    if pin_doctor_hash_kind(&conn).await.is_err() {
+        return Ok(());
+    }
+    let observed_at_ms = Utc::now().timestamp_millis();
+    let repo = match crate::internal::workspace::RepoIdentity::resolve(&conn).await {
+        Ok(repo) => repo,
+        Err(_) => return Ok(()),
+    };
+    let root = util::request_working_dir();
+    let scope = match crate::internal::ai::capture_scope::CaptureScope::resolve(&conn, &root).await
+    {
+        Ok(scope) if scope.repo_id == repo.as_str() => scope,
+        _ => return Ok(()),
+    };
+    // An expired or released workspace fence gives this worker no authority
+    // to mutate candidates. Return before queueing so an early stale candidate
+    // cannot block later worktrees or candidates until the lease is renewed.
+    if scope.assert_workspace_fence_live(&conn).await.is_err() {
+        return Ok(());
+    }
+    let catalog = CaptureCatalogStore::new(conn.clone());
+    let mut batch = ArtifactReplayBatch::new();
+    let deadline = match batch.deadline() {
+        Ok(deadline) => deadline.monotonic(),
+        Err(_) => return Ok(()),
+    };
+    for _ in 0..=pending::MAX_ARTIFACTS {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let queue = match conn.begin().await {
+            Ok(txn) => match pending::pending_candidates_for_scope(&txn, &scope).await {
+                Ok(queue) => match txn.commit().await {
+                    Ok(()) => queue,
+                    Err(_) => return Ok(()),
+                },
+                Err(_) => {
+                    let _ = txn.rollback().await;
+                    return Ok(());
+                }
+            },
+            Err(_) => return Ok(()),
+        };
+        let mut made_progress = queue.quarantined > 0;
+        let mut stop_after_round = false;
+        if queue.headers.is_empty() && !made_progress {
+            break;
+        }
+        for header in queue.headers {
+            if std::time::Instant::now() >= deadline
+                || scope.assert_workspace_fence_live(&conn).await.is_err()
+            {
+                tracing::warn!(target: "agent.capture.recovery", reason = "workspace_lease_expired", "capture recovery stopped because the current workspace lease is no longer live");
+                stop_after_round = true;
+                break;
+            }
+            let recovery = match catalog
+                .pending_finalizer_recovery_for_header(
+                    &header,
+                    &storage,
+                    &root,
+                    observed_at_ms,
+                    deadline,
+                )
+                .await
+            {
+                Ok(Some(recovery)) => recovery,
+                Ok(None) => {
+                    if !quarantine_worker_candidate(
+                        &conn,
+                        &scope,
+                        &header.binding.checkpoint_id,
+                        Some(deadline),
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_quarantine_failed", "capture recovery stopped because an unresolvable candidate could not be retained in quarantine");
+                        stop_after_round = true;
+                        break;
+                    }
+                    made_progress = true;
+                    tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_unresolvable", "capture recovery candidate was retained in quarantine");
+                    continue;
+                }
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_deadline", "capture recovery stopped after its shared batch deadline elapsed");
+                    stop_after_round = true;
+                    break;
+                }
+                Err(error) if is_permanent_worker_candidate_error(&error) => {
+                    if !quarantine_worker_candidate(
+                        &conn,
+                        &scope,
+                        &header.binding.checkpoint_id,
+                        Some(deadline),
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_quarantine_failed", "capture recovery stopped because an invalid candidate could not be retained in quarantine");
+                        stop_after_round = true;
+                        break;
+                    }
+                    made_progress = true;
+                    tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_invalid", "capture recovery candidate was retained in quarantine");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_lookup_failed", "capture recovery skipped a candidate after a transient lookup failure");
+                    continue;
+                }
+            };
+            if !recovery.artifact_present() {
+                continue;
+            }
+            if recovery.superseded() || recovery.quarantined() || recovery.budget_exhausted() {
+                if !quarantine_worker_candidate(
+                    &conn,
+                    &scope,
+                    recovery.checkpoint_id(),
+                    Some(deadline),
+                )
+                .await
+                {
+                    tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_quarantine_failed", "capture recovery stopped because a stale candidate could not be retained in quarantine");
+                    stop_after_round = true;
+                    break;
+                }
+                made_progress = true;
+                continue;
+            }
+            let mut finding = CheckpointFinding {
+                inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
+                checkpoint_id: diagnostic_checkpoint_id(recovery.checkpoint_id()),
+                detail: "bounded automatic capture recovery".to_string(),
+                repaired: false,
+                manual_required: false,
+            };
+            let replay_disposition = replay_capture_artifact(
+                &conn,
+                &mut finding,
+                &recovery,
+                observed_at_ms,
+                false,
+                &mut batch,
+            )
+            .await;
+            match replay_disposition {
+                ArtifactReplayDisposition::PermanentFailure => {
+                    if !quarantine_worker_candidate(
+                        &conn,
+                        &scope,
+                        recovery.checkpoint_id(),
+                        Some(deadline),
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "agent.capture.recovery", reason = "pending_candidate_quarantine_failed", "capture recovery stopped because a failed candidate could not be retained in quarantine");
+                        stop_after_round = true;
+                        break;
+                    }
+                    made_progress = true;
+                }
+                ArtifactReplayDisposition::Completed => made_progress = true,
+                ArtifactReplayDisposition::RetryLater | ArtifactReplayDisposition::Refused => {
+                    // Candidate-local retry/refusal must not block later
+                    // snapshot entries; the attempt budget still bounds work.
+                    continue;
+                }
+                ArtifactReplayDisposition::Deferred => {
+                    stop_after_round = true;
+                    break;
+                }
+            }
+            if !batch.has_capacity() {
+                stop_after_round = true;
+                break;
+            }
+        }
+        if stop_after_round || !made_progress || !batch.has_capacity() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn is_permanent_worker_candidate_error(
+    error: &crate::internal::ai::capture::catalog::CaptureCatalogError,
+) -> bool {
+    use crate::internal::ai::capture::catalog::CaptureCatalogError;
+
+    !matches!(
+        error,
+        CaptureCatalogError::TransactionStart
+            | CaptureCatalogError::DeadlineExceeded
+            | CaptureCatalogError::CommitFailed
+            | CaptureCatalogError::Database
+            | CaptureCatalogError::SchemaUnavailable
+            | CaptureCatalogError::WorkspaceLeaseRejected
+    )
+}
+
+async fn quarantine_worker_candidate(
+    conn: &DatabaseConnection,
+    scope: &CaptureScope,
+    checkpoint_id: &str,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return false;
+    }
+    let Ok(txn) = conn.begin().await else {
+        return false;
+    };
+    if txn
+        .execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+        .await
+        .is_err()
+        || scope.assert_workspace_fence_live(&txn).await.is_err()
+        || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
+        let _ = txn.rollback().await;
+        return false;
+    }
+    match pending::quarantine_checkpoint_if_present(&txn, &scope.repo_id, checkpoint_id).await {
+        Ok(true) => txn.commit().await.is_ok(),
+        Ok(false) => {
+            let _ = txn.rollback().await;
+            false
+        }
+        Err(_) => {
+            let _ = txn.rollback().await;
+            false
+        }
+    }
+}
+
+/// Retain a superseded artifact outside the eligible pending window without
+/// authenticating or hydrating its payload. The scope fence is rechecked
+/// before the exact current-scope pending header is moved.
+async fn quarantine_stale_pending_artifact(
+    conn: &DatabaseConnection,
+    scope: &CaptureScope,
+    checkpoint_id: &str,
+) -> Result<()> {
+    let txn = conn
+        .begin()
+        .await
+        .context("start stale capture artifact quarantine")?;
+    let result = async {
+        txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+            .await
+            .context("lock stale capture artifact quarantine")?;
+        scope
+            .assert_workspace_fence_live(&txn)
+            .await
+            .context("verify current capture workspace lease")?;
+        let (header, namespace) =
+            pending::header_for_checkpoint(&txn, &scope.repo_id, checkpoint_id)
+                .await?
+                .context("stale capture artifact header disappeared")?;
+        anyhow::ensure!(
+            namespace == crate::internal::metadata::MetadataScope::AgentCapturePending
+                && header.binding.scope == *scope,
+            "stale capture artifact scope or namespace changed"
+        );
+        anyhow::ensure!(
+            pending::quarantine_checkpoint_if_present(&txn, &scope.repo_id, checkpoint_id).await?,
+            "stale capture artifact could not be retained"
+        );
+        let (retained, namespace) =
+            pending::header_for_checkpoint(&txn, &scope.repo_id, checkpoint_id)
+                .await?
+                .context("stale capture artifact disappeared during quarantine")?;
+        anyhow::ensure!(
+            namespace == crate::internal::metadata::MetadataScope::AgentCaptureQuarantine
+                && retained.binding.scope == *scope,
+            "stale capture artifact was not moved to its exact quarantine namespace"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = txn.rollback().await;
+        return Err(error);
+    }
+    txn.commit()
+        .await
+        .context("commit stale capture artifact quarantine")
 }
 
 /// Run the AG-20 checkpoint-store and marker scan (and repairs when enabled).
@@ -917,19 +1871,34 @@ async fn scan_checkpoint_store(
     }
     let repo_path = match util::try_get_storage_path(None) {
         Ok(path) => path,
-        Err(err) => {
-            report.note = Some(format!("failed to locate .libra directory: {err}"));
+        Err(_) => {
+            report.note = Some("repository storage unavailable".to_string());
             return Ok(report);
         }
     };
     report.scanned = true;
     let mut notes: Vec<String> = Vec::new();
 
+    // Doctor deliberately reads only this repository's local object directory.
+    // Following `objects/info/alternates` would make a malformed foreign
+    // alternate path observable through the diagnostic/logging boundary. A
+    // normal object command can restore a missing borrowed object locally;
+    // until then doctor reports it conservatively as unavailable.
     let reader = ObjectReader {
-        storage: Arc::new(ClientStorage::init(repo_path.join("objects"))),
+        repo_path: repo_path.clone(),
     };
+    if !ObjectReader::secure_reads_supported() {
+        report.repair_applied = false;
+        report.note = Some(
+            "checkpoint object scan is unavailable because this platform lacks secure descriptor-relative reads; no repairs were applied"
+                .to_string(),
+        );
+        return Ok(report);
+    }
     let history = HistoryManager::for_traces(
-        reader.storage.clone(),
+        Arc::new(ClientStorage::init_local_existing(
+            repo_path.join("objects"),
+        )),
         repo_path.clone(),
         Arc::new(conn.clone()),
     );
@@ -940,8 +1909,7 @@ async fn scan_checkpoint_store(
         let conflicts = conn
             .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
-                "SELECT c.session_id, c.logical_turn_key, c.coverage_schema_version,
-                        c.coverage_digest, c.completeness, c.revision,
+                "SELECT c.coverage_schema_version, c.completeness, c.revision,
                         f.incoming_digest, f.incoming_source_channel,
                         f.incoming_observed_at, f.incoming_redaction_report_json
                  FROM agent_coverage_claim c
@@ -954,60 +1922,39 @@ async fn scan_checkpoint_store(
                     .to_string(),
             ))
             .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to inspect conflicted coverage claims: {error}"
-                ))
+            .map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not inspect conflicted coverage claims; check the repository database and rerun doctor"
+                        .to_string(),
+                )
             })?;
-        for row in conflicts {
-            let session_id: String = row.try_get_by("session_id").map_err(|error| {
-                CliError::fatal(format!("failed to read coverage conflict session: {error}"))
-            })?;
-            let logical_turn_key: String = row.try_get_by("logical_turn_key").map_err(|error| {
-                CliError::fatal(format!("failed to read coverage conflict key: {error}"))
-            })?;
+        for (ordinal, row) in conflicts.into_iter().enumerate() {
             let coverage_schema_version: i64 =
-                row.try_get_by("coverage_schema_version").map_err(|error| {
-                    CliError::fatal(format!(
-                        "failed to read coverage conflict schema version: {error}"
-                    ))
+                row.try_get_by("coverage_schema_version").map_err(|_| {
+                    CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
                 })?;
-            let coverage_digest: String = row.try_get_by("coverage_digest").map_err(|error| {
-                CliError::fatal(format!("failed to read coverage conflict digest: {error}"))
+            let completeness: String = row.try_get_by("completeness").map_err(|_| {
+                CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
             })?;
-            let completeness: String = row.try_get_by("completeness").map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to read coverage conflict completeness: {error}"
-                ))
+            let revision: i64 = row.try_get_by("revision").map_err(|_| {
+                CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
             })?;
-            let revision: i64 = row.try_get_by("revision").map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to read coverage conflict revision: {error}"
-                ))
-            })?;
-            let mut identity = Sha256::new();
-            identity.update(session_id.as_bytes());
-            identity.update([0]);
-            identity.update(logical_turn_key.as_bytes());
-            identity.update([0]);
-            identity.update(coverage_schema_version.to_be_bytes());
-            let identity = hex::encode(identity.finalize());
             let incoming_digest: Option<String> =
-                row.try_get_by("incoming_digest").map_err(|error| {
-                    CliError::fatal(format!("failed to read incoming conflict digest: {error}"))
+                row.try_get_by("incoming_digest").map_err(|_| {
+                    CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
                 })?;
             let incoming_source_channel: Option<String> =
-                row.try_get_by("incoming_source_channel").map_err(|error| {
-                    CliError::fatal(format!("failed to read conflict source channel: {error}"))
+                row.try_get_by("incoming_source_channel").map_err(|_| {
+                    CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
                 })?;
             let incoming_observed_at: Option<i64> =
-                row.try_get_by("incoming_observed_at").map_err(|error| {
-                    CliError::fatal(format!("failed to read conflict observation time: {error}"))
+                row.try_get_by("incoming_observed_at").map_err(|_| {
+                    CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
                 })?;
             let incoming_redaction_report_json: Option<String> = row
                 .try_get_by("incoming_redaction_report_json")
-                .map_err(|error| {
-                    CliError::fatal(format!("failed to read conflict redaction report: {error}"))
+                .map_err(|_| {
+                    CliError::fatal("agent doctor could not decode a coverage conflict".to_string())
                 })?;
             let challenger = match (
                 incoming_digest,
@@ -1015,19 +1962,22 @@ async fn scan_checkpoint_store(
                 incoming_observed_at,
                 incoming_redaction_report_json,
             ) {
-                (Some(digest), Some(channel), Some(observed_at), Some(redaction_report)) => {
-                    format!(
-                        "incoming digest={digest}, channel={channel}, observed_at={observed_at}; sanitized canonical evidence and redaction report {redaction_report} are stored in agent_coverage_conflict"
-                    )
-                }
+                (Some(_), Some(_), Some(_), Some(_)) =>
+                    "incoming redacted evidence and its redaction report are stored in agent_coverage_conflict".to_string(),
                 _ => "incoming evidence is missing (legacy or externally damaged conflict row)"
                     .to_string(),
             };
+            let completeness = match completeness.as_str() {
+                "complete" => "complete",
+                "partial" => "partial",
+                "incomplete" => "incomplete",
+                _ => "unrecognized",
+            };
             findings.push(CheckpointFinding {
                 inconsistency_type: CLASS_CONFLICTED_COVERAGE_CLAIM.to_string(),
-                checkpoint_id: format!("coverage-conflict-{identity}"),
+                checkpoint_id: format!("coverage-conflict-{}", ordinal + 1),
                 detail: format!(
-                    "coverage conflict {identity} for coverage schema {coverage_schema_version} is parked at incumbent revision {revision} (completeness={completeness}, digest={coverage_digest}); {challenger}; automatic resolution is unsafe because choosing either complete payload would discard provenance; inspect both durable candidates and resolve manually"
+                    "coverage conflict for coverage schema {coverage_schema_version} is parked at incumbent revision {revision} (completeness={completeness}); {challenger}; automatic resolution is unsafe because choosing either complete payload would discard provenance; inspect both durable candidates and resolve manually"
                 ),
                 repaired: false,
                 manual_required: true,
@@ -1040,8 +1990,7 @@ async fn scan_checkpoint_store(
         let inconsistent = conn
             .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
-                "SELECT c.parent_session_id, c.provider_kind, c.source_key,
-                        c.content_schema_version, c.current_revision,
+                "SELECT c.content_schema_version, c.current_revision,
                         c.current_checkpoint_id, c.current_digest,
                         r.checkpoint_id AS revision_checkpoint_id,
                         r.content_digest AS revision_digest,
@@ -1075,50 +2024,37 @@ async fn scan_checkpoint_store(
                     .to_string(),
             ))
             .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to inspect current subagent content relations: {error}"
-                ))
+            .map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not inspect subagent content relations; check the repository database and rerun doctor"
+                        .to_string(),
+                )
             })?;
-        for row in inconsistent {
-            let parent_session_id: String =
-                row.try_get_by("parent_session_id").map_err(|error| {
-                    CliError::fatal(format!("failed to read subagent content parent: {error}"))
-                })?;
-            let provider_kind: String = row.try_get_by("provider_kind").map_err(|error| {
-                CliError::fatal(format!("failed to read subagent content provider: {error}"))
+        for (ordinal, row) in inconsistent.into_iter().enumerate() {
+            let schema_version: i64 = row.try_get_by("content_schema_version").map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not decode a subagent content relation".to_string(),
+                )
             })?;
-            let source_key: String = row.try_get_by("source_key").map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to read subagent content source identity: {error}"
-                ))
-            })?;
-            let schema_version: i64 =
-                row.try_get_by("content_schema_version").map_err(|error| {
-                    CliError::fatal(format!("failed to read subagent content schema: {error}"))
-                })?;
-            let current_revision: i64 = row.try_get_by("current_revision").map_err(|error| {
-                CliError::fatal(format!("failed to read subagent content revision: {error}"))
+            let current_revision: i64 = row.try_get_by("current_revision").map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not decode a subagent content relation".to_string(),
+                )
             })?;
             let checkpoint_id: Option<String> =
-                row.try_get_by("current_checkpoint_id").map_err(|error| {
-                    CliError::fatal(format!("failed to read subagent checkpoint id: {error}"))
+                row.try_get_by("current_checkpoint_id").map_err(|_| {
+                    CliError::fatal(
+                        "agent doctor could not decode a subagent content relation".to_string(),
+                    )
                 })?;
-            let mut identity = Sha256::new();
-            identity.update(parent_session_id.as_bytes());
-            identity.update([0]);
-            identity.update(provider_kind.as_bytes());
-            identity.update([0]);
-            identity.update(source_key.as_bytes());
-            identity.update([0]);
-            identity.update(schema_version.to_be_bytes());
-            let identity = hex::encode(identity.finalize());
             findings.push(CheckpointFinding {
                 inconsistency_type: CLASS_INCONSISTENT_SUBAGENT_CONTENT.to_string(),
                 checkpoint_id: checkpoint_id
-                    .unwrap_or_else(|| format!("subagent-content-{identity}")),
+                    .as_deref()
+                    .map(diagnostic_checkpoint_id)
+                    .unwrap_or_else(|| format!("subagent-content-{}", ordinal + 1)),
                 detail: format!(
-                    "current subagent content relation {identity} at revision {current_revision} is missing or disagrees across its claim, immutable revision, checkpoint catalog, and association link; replay is fail-closed and automatic reconstruction is unsafe"
+                    "current subagent content relation for schema {schema_version} at revision {current_revision} is missing or disagrees across its claim, immutable revision, checkpoint catalog, and association link; replay is fail-closed and automatic reconstruction is unsafe"
                 ),
                 repaired: false,
                 manual_required: true,
@@ -1139,21 +2075,22 @@ async fn scan_checkpoint_store(
                     .to_string(),
             ))
             .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "failed to inspect unresolved subagent content links: {error}"
-                ))
+            .map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not inspect unresolved subagent content links; check the repository database and rerun doctor"
+                        .to_string(),
+                )
             })?;
-        for row in unresolved {
-            let checkpoint_id: String =
-                row.try_get_by("content_checkpoint_id").map_err(|error| {
-                    CliError::fatal(format!(
-                        "failed to read unresolved subagent checkpoint id: {error}"
-                    ))
-                })?;
+        for (ordinal, row) in unresolved.into_iter().enumerate() {
+            let checkpoint_id: String = row.try_get_by("content_checkpoint_id").map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not decode an unresolved subagent content link".to_string(),
+                )
+            })?;
             findings.push(CheckpointFinding {
                 inconsistency_type: CLASS_UNRESOLVED_SUBAGENT_LINK.to_string(),
-                checkpoint_id,
+                checkpoint_id: canonical_checkpoint_id(&checkpoint_id)
+                    .unwrap_or_else(|| format!("unresolved-subagent-link-{}", ordinal + 1)),
                 detail: "subagent content has no unique provider-stable boundary match; content and boundary evidence remain independently preserved, and automatic guessing is unsafe"
                     .to_string(),
                 repaired: false,
@@ -1178,13 +2115,16 @@ async fn scan_checkpoint_store(
     .await
     {
         Ok(entries) => entries,
-        Err(err) => {
-            notes.push(format!("in-flight marker listing unavailable: {err:#}"));
+        Err(_) => {
+            notes.push("in-flight marker listing unavailable".to_string());
             Vec::new()
         }
     };
     let mut markers = Vec::new();
-    for entry in marker_entries {
+    for (ordinal, entry) in marker_entries.into_iter().enumerate() {
+        // Canonical checkpoint UUIDs are public ids (`checkpoint list/show`);
+        // a damaged attempt id/key keeps the opaque per-report label.
+        let diagnostic_id = format!("inflight-marker-{}", ordinal + 1);
         match traces::decode_and_validate_traces_inflight_marker(
             &entry.value,
             &entry.target,
@@ -1199,13 +2139,13 @@ async fn scan_checkpoint_store(
                 // never classify it as live.
                 findings.push(CheckpointFinding {
                     inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
-                    checkpoint_id: marker.attempt_id.clone(),
+                    checkpoint_id: canonical_checkpoint_id(&marker.attempt_id)
+                        .unwrap_or(diagnostic_id),
                     detail: format!(
-                        "future-dated traces marker for session '{}' (started_at_ms {} is \
-                         beyond clock-skew tolerance) blocks destructive maintenance \
+                        "future-dated traces marker (started_at_ms {} is beyond clock-skew tolerance) blocks destructive maintenance \
                          fail-closed; `libra agent doctor --repair` will run serialized \
                          root-fenced ownership retirement",
-                        marker.session_id, marker.started_at_ms
+                        marker.started_at_ms
                     ),
                     repaired: false,
                     manual_required: false,
@@ -1220,10 +2160,10 @@ async fn scan_checkpoint_store(
             Ok(marker) => {
                 findings.push(CheckpointFinding {
                     inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
-                    checkpoint_id: marker.attempt_id.clone(),
+                    checkpoint_id: canonical_checkpoint_id(&marker.attempt_id)
+                        .unwrap_or(diagnostic_id),
                     detail: format!(
-                        "expired or cleanup-pending traces marker for session '{}' owns {} candidate object(s) (cleanup_pending={}); `libra agent doctor --repair` will run serialized root-fenced ownership retirement; repository GC owns payload reachability and reclamation",
-                        marker.session_id,
+                        "expired or cleanup-pending traces marker owns {} candidate object(s) (cleanup_pending={}); `libra agent doctor --repair` will run serialized root-fenced ownership retirement; repository GC owns payload reachability and reclamation",
                         marker.oids.len(),
                         marker.cleanup_pending
                     ),
@@ -1236,14 +2176,11 @@ async fn scan_checkpoint_store(
                     observed_at_ms: now_ms,
                 });
             }
-            Err(error) => {
+            Err(_) => {
                 findings.push(CheckpointFinding {
                     inconsistency_type: CLASS_INVALID_INFLIGHT_MARKER.to_string(),
-                    checkpoint_id: entry.key,
-                    detail: format!(
-                        "malformed traces writer marker for session '{}': {error:#}; automatic removal is unsafe because object ownership cannot be decoded",
-                        entry.target
-                    ),
+                    checkpoint_id: canonical_checkpoint_id(&entry.key).unwrap_or(diagnostic_id),
+                    detail: "malformed traces writer marker; automatic removal is unsafe because object ownership cannot be decoded".to_string(),
                     repaired: false,
                     manual_required: true,
                 });
@@ -1265,13 +2202,29 @@ async fn scan_checkpoint_store(
     // its introducing commit.
     let head = match history.resolve_history_head().await {
         Ok(head) => head,
-        Err(err) => {
-            notes.push(format!("traces ref unresolvable: {err:#}"));
+        Err(_) => {
+            notes.push("traces ref is unresolvable".to_string());
             None
         }
     };
-    let ref_map = walk_traces_checkpoints(&reader, head, &mut notes);
+    let (ref_map, has_noncanonical_checkpoint_id) =
+        walk_traces_checkpoints(&reader, head, &mut notes);
     report.ref_reachable_checkpoints = ref_map.len();
+
+    // Do not put a caller-shaped tree name into the reachability map: class-2
+    // repair ultimately persists this key in `agent_checkpoint`. One fixed
+    // manual finding makes the corruption actionable without reflecting the
+    // malformed identity in human, JSON, or tracing output.
+    if has_noncanonical_checkpoint_id {
+        findings.push(CheckpointFinding {
+            inconsistency_type: CLASS_MISSING_CATALOG_ROW.to_string(),
+            checkpoint_id: "checkpoint-id-redacted".to_string(),
+            detail: "invalid checkpoint identity in refs/libra/traces; manual repair required because automatic catalog reconstruction is unsafe".to_string(),
+            repaired: false,
+            manual_required: true,
+        });
+        plans.push(RepairPlan::Manual);
+    }
 
     let rows = load_catalog_rows(conn).await?;
     report.catalog_rows = rows.len() as i64;
@@ -1301,7 +2254,11 @@ async fn scan_checkpoint_store(
     // suppress class 3: its ref-side objects are intact, and both repairs
     // must land in the same `--repair` run (otherwise cloud-sync
     // visibility would stay broken until a second invocation).
-    let mut class1_manual_ids: BTreeSet<String> = BTreeSet::new();
+    // Any checkpoint that needs manual treatment is excluded from later
+    // repairs as well (including deferred terminal-finalizer completion).
+    // A corrupt object that fails index validation is not safe evidence that
+    // its capture became durable.
+    let mut manual_checkpoint_ids: BTreeSet<String> = BTreeSet::new();
 
     // ---- Class 1: catalog rows vs object store / ref truth -------------
     // Per-checkpoint E4 sweeps are kept for class 3 (the `present` list is
@@ -1342,13 +2299,19 @@ async fn scan_checkpoint_store(
         } else {
             let mut parts: Vec<String> = Vec::new();
             if !commit_ok {
-                parts.push(format!("traces_commit {}", row.traces_commit));
+                parts.push(format!(
+                    "traces_commit {}",
+                    diagnostic_oid(&row.traces_commit)
+                ));
             }
             if !tree_ok {
-                parts.push(format!("tree_oid {}", row.tree_oid));
+                parts.push(format!("tree_oid {}", diagnostic_oid(&row.tree_oid)));
             }
             if !meta_ok {
-                parts.push(format!("metadata_blob_oid {}", row.metadata_blob_oid));
+                parts.push(format!(
+                    "metadata_blob_oid {}",
+                    diagnostic_oid(&row.metadata_blob_oid)
+                ));
             }
             for part in &sweep.missing {
                 let dup = (!commit_ok && part.contains(&row.traces_commit))
@@ -1372,14 +2335,14 @@ async fn scan_checkpoint_store(
             // needs an existence probe).
             let replacement_ok = expected_meta.is_some_and(|meta| reader.exists_str(meta));
             if stale && replacement_ok {
-                // Auto-repairable: deliberately NOT in class1_manual_ids —
+                // Auto-repairable: deliberately NOT in manual_checkpoint_ids —
                 // the same run's class-3 pass still checks/repairs this
                 // checkpoint's (ref-side) object_index rows.
                 // INVARIANT: replacement_ok proved expected_meta is Some.
                 let metadata_blob_oid = expected_meta.unwrap_or_default().to_string();
                 findings.push(CheckpointFinding {
                     inconsistency_type: CLASS_STALE_CATALOG_ROW.to_string(),
-                    checkpoint_id: row.checkpoint_id.clone(),
+                    checkpoint_id: diagnostic_checkpoint_id(&row.checkpoint_id),
                     detail: format!(
                         "row OIDs disagree with refs/libra/traces (ref: commit {}, tree {}); \
                          rebuild from ref",
@@ -1398,10 +2361,10 @@ async fn scan_checkpoint_store(
             // Missing objects are reported independently of staleness —
             // rebuilding row columns cannot resurrect a lost sidecar blob.
             if !missing_parts.is_empty() || (stale && !replacement_ok) {
-                class1_manual_ids.insert(row.checkpoint_id.clone());
+                manual_checkpoint_ids.insert(row.checkpoint_id.clone());
                 findings.push(CheckpointFinding {
                     inconsistency_type: CLASS_MISSING_OBJECTS.to_string(),
-                    checkpoint_id: row.checkpoint_id.clone(),
+                    checkpoint_id: diagnostic_checkpoint_id(&row.checkpoint_id),
                     detail: missing_objects_detail(&missing_parts),
                     repaired: false,
                     manual_required: true,
@@ -1409,10 +2372,10 @@ async fn scan_checkpoint_store(
                 plans.push(RepairPlan::Manual);
             }
         } else if !missing_parts.is_empty() {
-            class1_manual_ids.insert(row.checkpoint_id.clone());
+            manual_checkpoint_ids.insert(row.checkpoint_id.clone());
             findings.push(CheckpointFinding {
                 inconsistency_type: CLASS_MISSING_OBJECTS.to_string(),
-                checkpoint_id: row.checkpoint_id.clone(),
+                checkpoint_id: diagnostic_checkpoint_id(&row.checkpoint_id),
                 detail: format!(
                     "{} (checkpoint is not reachable from refs/libra/traces, so it \
                      cannot be rebuilt automatically)",
@@ -1441,17 +2404,18 @@ async fn scan_checkpoint_store(
         match traces::agent_checkpoint_id_for_traces_commit(conn, &rc.commit).await {
             Ok(Some(_)) => continue,
             Ok(None) => {}
-            Err(err) => {
-                return Err(CliError::fatal(format!(
-                    "doctor failed to probe agent_checkpoint by traces_commit: {err:#}"
-                )));
+            Err(_) => {
+                return Err(CliError::fatal(
+                    "agent doctor could not inspect checkpoint catalog state; check the repository database and rerun doctor"
+                        .to_string(),
+                ));
             }
         }
         let (detail, plan) = build_class2_plan(conn, &reader, id, rc).await?;
         let manual = matches!(plan, RepairPlan::Manual);
         findings.push(CheckpointFinding {
             inconsistency_type: CLASS_MISSING_CATALOG_ROW.to_string(),
-            checkpoint_id: id.clone(),
+            checkpoint_id: diagnostic_checkpoint_id(id),
             detail,
             repaired: false,
             manual_required: manual,
@@ -1461,8 +2425,10 @@ async fn scan_checkpoint_store(
 
     // ---- Class 3: checkpoint objects missing from object_index ---------
     let repo_id = resolve_repo_id(conn).await;
+    let mut validation_budget = ObjectIndexValidationBudget::new();
     for row in &rows {
-        if legacy_ids.contains(&row.checkpoint_id) || class1_manual_ids.contains(&row.checkpoint_id)
+        if legacy_ids.contains(&row.checkpoint_id)
+            || manual_checkpoint_ids.contains(&row.checkpoint_id)
         {
             continue;
         }
@@ -1477,19 +2443,17 @@ async fn scan_checkpoint_store(
             .get(&row.checkpoint_id)
             .map(|rc| rc.commit.clone())
             .unwrap_or_else(|| row.traces_commit.clone());
-        let mut targets: Vec<(String, &'static str, String, Option<i64>)> = vec![(
+        let mut targets: Vec<(String, &'static str, String)> = vec![(
             commit_truth.clone(),
             "commit",
-            format!("traces_commit {commit_truth}"),
-            None,
+            format!("traces_commit {}", diagnostic_oid(&commit_truth)),
         )];
         if let Some(sweep) = e4_sweeps.get(&row.checkpoint_id) {
             for object in &sweep.present {
                 targets.push((
                     object.oid.clone(),
                     object.o_type,
-                    format!("{} {}", object.path, object.oid),
-                    object.size,
+                    format!("{} {}", object.label, diagnostic_oid(&object.oid)),
                 ));
             }
         }
@@ -1498,77 +2462,63 @@ async fn scan_checkpoint_store(
         let mut drifted: Vec<(String, String, i64)> = Vec::new();
         let mut drifted_names: Vec<String> = Vec::new();
         let mut seen_oids: BTreeSet<String> = BTreeSet::new();
-        for (oid, o_type, label, declared_size) in targets {
+        let mut validation_failed = false;
+        for (oid, o_type, label) in targets {
             if !seen_oids.insert(oid.clone()) {
                 continue;
             }
+            // Never repair an index row from manifest-provided `byte_len`.
+            // Instead stream-hash the descriptor-pinned loose object in a
+            // fixed buffer and use its verified header size. This validates
+            // the actual object without retaining transcript bytes.
+            let size = match crate::internal::object_format::parse_repo_oid(&oid)
+                .map_err(|_| anyhow::anyhow!("invalid object identifier"))
+                .and_then(|hash| {
+                    validation_budget.validate(&reader, &hash, expected_git_object_type(o_type))
+                }) {
+                Ok(size) => size,
+                Err(_) => {
+                    validation_failed = true;
+                    break;
+                }
+            };
             if let Some((existing_type, existing_size)) =
                 object_index_row_shape(conn, &oid, &repo_id).await?
             {
                 // A row that exists but drifted from the writer's
                 // semantics (e.g. a transcript blob indexed as a generic
                 // `blob`, or a wrong size) breaks cloud-sync classification
-                // just like a missing row. Size is only verifiable when
-                // the manifest declares it — never read payloads here.
+                // just like a missing row. Size is proven from the
+                // descriptor-pinned content-addressed object stream.
                 let type_drift = existing_type != o_type;
-                let size_drift = declared_size.is_some_and(|d| d != existing_size);
+                let size_drift = size != existing_size;
                 if type_drift || size_drift {
-                    drifted.push((
-                        oid.clone(),
-                        o_type.to_string(),
-                        declared_size.unwrap_or(existing_size),
+                    drifted.push((oid.clone(), o_type.to_string(), size));
+                    drifted_names.push(format!(
+                        "{label} (was {}/{existing_size})",
+                        diagnostic_object_index_type(&existing_type)
                     ));
-                    drifted_names.push(format!("{label} (was {existing_type}/{existing_size})"));
                 }
                 continue;
             }
-            // o_size mirrors the writer's enqueue semantics: payload byte
-            // length. Prefer the manifest-declared byte_len (identical to
-            // what the writer enqueued) so transcript payloads are NEVER
-            // read here (metadata-first contract); the read-based fallback
-            // only fires for objects the manifest cannot declare — trees,
-            // the commit, and the manifest blob itself, all small (a tree
-            // / commit read returns exactly the payload the writer sized:
-            // `write_tree_with_size` / `commit_data.len()`). Class 1
-            // already verified these objects exist; a racing deletion
-            // degrades to a note rather than a hard error.
-            //
-            // Transcript payloads are exempt from the fallback entirely:
-            // when the manifest is unreadable/corrupt or omits byte_len,
-            // reading the blob to size it would violate the no-transcript-
-            // read contract, so the row is skipped with an actionable
-            // note instead (re-running doctor after restoring the
-            // manifest repairs it without ever loading the payload).
-            let size = match declared_size {
-                Some(size) => size,
-                None if o_type == "agent_transcript" => {
-                    notes.push(format!(
-                        "object_index repair for checkpoint {} skipped {label}: the \
-                         manifest declares no byte_len for this transcript object and \
-                         doctor never reads transcript payloads; restore or repair \
-                         manifest.json, then re-run 'libra agent doctor --repair'",
-                        row.checkpoint_id
-                    ));
-                    continue;
-                }
-                None => {
-                    match crate::internal::object_format::parse_repo_oid(&oid)
-                        .map_err(|e| anyhow::anyhow!("invalid OID '{oid}': {e}"))
-                        .and_then(|hash| reader.read_raw(&hash))
-                    {
-                        Ok(bytes) => bytes.len() as i64,
-                        Err(err) => {
-                            notes.push(format!(
-                                "object_index repair for checkpoint {} skipped {label}: {err:#}",
-                                row.checkpoint_id
-                            ));
-                            continue;
-                        }
-                    }
-                }
-            };
             missing.push((oid.clone(), o_type.to_string(), size));
             missing_names.push(label);
+        }
+        if validation_failed {
+            // A loose object can disappear, be malformed, or exceed the
+            // aggregate validation budget after the E4 sweep proved only its
+            // name. Treat the entire checkpoint as manual: a partial index
+            // plan would make cloud sync observe an incomplete capture.
+            manual_checkpoint_ids.insert(row.checkpoint_id.clone());
+            findings.push(CheckpointFinding {
+                inconsistency_type: CLASS_MISSING_OBJECT_INDEX.to_string(),
+                checkpoint_id: diagnostic_checkpoint_id(&row.checkpoint_id),
+                detail: "checkpoint object integrity could not be validated within doctor safety limits; no object-index rows were changed and manual review is required".to_string(),
+                repaired: false,
+                manual_required: true,
+            });
+            plans.push(RepairPlan::Manual);
+            continue;
         }
         if missing.is_empty() && drifted.is_empty() {
             continue;
@@ -1588,7 +2538,7 @@ async fn scan_checkpoint_store(
         }
         findings.push(CheckpointFinding {
             inconsistency_type: CLASS_MISSING_OBJECT_INDEX.to_string(),
-            checkpoint_id: row.checkpoint_id.clone(),
+            checkpoint_id: diagnostic_checkpoint_id(&row.checkpoint_id),
             detail: format!(
                 "{} (objects would not reach `libra cloud sync` correctly)",
                 detail_parts.join("; ")
@@ -1602,10 +2552,89 @@ async fn scan_checkpoint_store(
         });
     }
 
+    // ---- ACF-07: terminal receipts left after durable checkpoint --------
+    // A crash after the ref/catalog checkpoint transaction but before strict
+    // receipt completion has no live marker to protect it. Reuse the existing
+    // checkpoint-store `expired_inflight_marker` classification rather than
+    // changing doctor JSON: the receipt is an expired finalization attempt
+    // whose deterministic checkpoint is already ref-reachable. The catalog
+    // owns the subsequent marker/source/revision revalidation.
+    match CaptureCatalogStore::new(conn.clone())
+        .pending_finalizer_recoveries_for_doctor(now_ms)
+        .await
+    {
+        Ok(scan) => {
+            if scan.malformed_rows != 0 {
+                notes.push("one or more pending terminal-finalizer rows are malformed or oversized; those rows require manual catalog recovery and were not repaired".to_string());
+            }
+            if scan.skipped_invalid_keys {
+                notes.push("pending terminal-finalizer scan skipped malformed session keys; diagnostic coverage is incomplete and skipped rows require manual catalog recovery".to_string());
+            }
+            if scan.truncated {
+                notes.push("pending terminal-finalizer scan reached its bounded limit; this report is incomplete and unlisted receipts were not repaired".to_string());
+            }
+            for recovery in scan.recoveries {
+                let checkpoint_id = recovery.checkpoint_id().to_string();
+                // A live marker means the writer is still protected by its
+                // normal window-A/B protocol; doctor must not race it.
+                if !recovery.manual_only() && inflight_ids.contains(&checkpoint_id) {
+                    continue;
+                }
+                let durable = ref_map.contains_key(&checkpoint_id)
+                    && !manual_checkpoint_ids.contains(&checkpoint_id);
+                let budget_exhausted = recovery.budget_exhausted();
+                let manual_only = recovery.manual_only();
+                let artifact_present = recovery.artifact_present();
+                let artifact_pending = recovery.artifact_pending();
+                let artifact_manual_attempted = recovery.artifact_manual_attempted();
+                let (detail, repair_kind) = diagnose_pending_finalizer(
+                    manual_only,
+                    durable,
+                    budget_exhausted,
+                    artifact_present,
+                    artifact_pending,
+                    artifact_manual_attempted,
+                );
+                findings.push(CheckpointFinding {
+                    inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
+                    checkpoint_id: diagnostic_checkpoint_id(&checkpoint_id),
+                    detail: detail.to_string(),
+                    repaired: false,
+                    manual_required: manual_only || !durable,
+                });
+                plans.push(match repair_kind {
+                    FinalizerRepairKind::Manual => RepairPlan::Manual,
+                    FinalizerRepairKind::CompleteDurable => RepairPlan::RecoverPendingFinalizer {
+                        recovery,
+                        observed_at_ms: now_ms,
+                    },
+                    FinalizerRepairKind::QuarantineExhausted => {
+                        RepairPlan::QuarantineExhaustedPendingFinalizer {
+                            recovery,
+                            observed_at_ms: now_ms,
+                        }
+                    }
+                    FinalizerRepairKind::QuarantineStaleArtifact => {
+                        RepairPlan::QuarantineStalePendingArtifact { recovery }
+                    }
+                    FinalizerRepairKind::ReplayArtifact => RepairPlan::ReplayPendingArtifact {
+                        recovery,
+                        observed_at_ms: now_ms,
+                    },
+                });
+            }
+        }
+        Err(_) => notes.push(
+            "pending terminal-finalizer receipt scan unavailable; no terminal state was advanced"
+                .to_string(),
+        ),
+    }
+
     // ---- Repair execution (idempotent; spans per attempt) ---------------
     if repair {
+        let mut replay_batch = ArtifactReplayBatch::new();
         for (finding, plan) in findings.iter_mut().zip(plans.iter()) {
-            execute_repair(conn, &history, finding, plan, &repo_id).await;
+            execute_repair(conn, &history, finding, plan, &repo_id, &mut replay_batch).await;
             emit_repair_span(finding);
         }
     }
@@ -1619,10 +2648,41 @@ async fn scan_checkpoint_store(
     Ok(report)
 }
 
+/// Exercise the production doctor classification-and-repair orchestrator from
+/// in-crate recovery fixtures without making its internal report a public API.
+#[cfg(test)]
+pub(crate) async fn scan_checkpoint_store_for_test(
+    conn: &DatabaseConnection,
+    schema_present: bool,
+    repair: bool,
+) -> CliResult<serde_json::Value> {
+    let report = scan_checkpoint_store(conn, schema_present, repair).await?;
+    serde_json::to_value(report).map_err(|_| {
+        CliError::fatal("could not serialize the in-process doctor test report".to_string())
+    })
+}
+
+/// Same orchestrator with a widened cooperative replay budget, for fixtures
+/// that assert repair semantics rather than timing under full-suite load.
+#[cfg(test)]
+pub(crate) async fn scan_checkpoint_store_with_replay_budget_for_test(
+    conn: &DatabaseConnection,
+    schema_present: bool,
+    repair: bool,
+    budget: Duration,
+) -> CliResult<serde_json::Value> {
+    TEST_ARTIFACT_REPLAY_BUDGET
+        .scope(
+            budget,
+            scan_checkpoint_store_for_test(conn, schema_present, repair),
+        )
+        .await
+}
+
 /// One `agent.doctor.repair` span per repair attempt (`agent.md` §6).
 /// Required fields: `inconsistency_type`, `repaired`, `manual_required`.
-/// Forbidden: raw transcript — only the checkpoint id rides along on the
-/// inner event for correlation.
+/// Forbidden: raw transcript, metadata, provider identity, and caller-shaped
+/// checkpoint IDs. The stable inconsistency class is sufficient correlation.
 fn emit_repair_span(finding: &CheckpointFinding) {
     let span = tracing::info_span!(
         "agent.doctor.repair",
@@ -1631,10 +2691,192 @@ fn emit_repair_span(finding: &CheckpointFinding) {
         manual_required = finding.manual_required,
     );
     let _guard = span.enter();
-    tracing::info!(
-        checkpoint_id = %finding.checkpoint_id,
-        "agent doctor repair attempt"
-    );
+    tracing::info!("agent doctor repair attempt");
+}
+
+/// Cooperative budget for one doctor replay batch (and for a fresh one-shot
+/// manual attempt). It bounds cancellable work, not arbitrary syscalls.
+const ARTIFACT_REPLAY_BUDGET: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ARTIFACT_REPLAY_BUDGET: Duration;
+}
+
+fn replay_budget() -> Duration {
+    #[cfg(test)]
+    if let Ok(budget) = TEST_ARTIFACT_REPLAY_BUDGET.try_with(|budget| *budget) {
+        return budget;
+    }
+    ARTIFACT_REPLAY_BUDGET
+}
+
+/// One doctor invocation shares a single bounded replay budget across every
+/// finding. Re-querying the indexed queue for each finding must not let a
+/// successful removal pull a sixth receipt into the same repair batch.
+struct ArtifactReplayBatch {
+    attempts_remaining: u8,
+    deadline: Option<CaptureCommitDeadline>,
+}
+
+impl ArtifactReplayBatch {
+    const MAX_ATTEMPTS: u8 = 5;
+
+    fn new() -> Self {
+        Self {
+            attempts_remaining: Self::MAX_ATTEMPTS,
+            deadline: None,
+        }
+    }
+
+    fn deadline(&mut self) -> Result<CaptureCommitDeadline> {
+        if self.deadline.is_none() {
+            self.deadline = Some(CaptureCommitDeadline::from_budget(replay_budget())?);
+        }
+        self.deadline
+            .context("capture recovery batch deadline was not established")
+    }
+
+    fn attempt_deadline(&mut self, manual: bool) -> Result<CaptureCommitDeadline> {
+        if manual {
+            CaptureCommitDeadline::from_budget(replay_budget())
+        } else {
+            self.deadline()
+        }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.attempts_remaining > 0
+    }
+
+    fn record_attempt(&mut self) {
+        self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
+    }
+}
+
+async fn replay_capture_artifact(
+    conn: &DatabaseConnection,
+    finding: &mut CheckpointFinding,
+    recovery: &CaptureCatalogFinalizerRecovery,
+    observed_at_ms: i64,
+    manual: bool,
+    replay_batch: &mut ArtifactReplayBatch,
+) -> ArtifactReplayDisposition {
+    if !replay_batch.has_capacity() {
+        finding.manual_required = true;
+        finding.detail.push_str(
+            "; bounded recovery batch limit was reached; rerun `libra agent doctor --repair` to continue",
+        );
+        return ArtifactReplayDisposition::Deferred;
+    }
+    let storage = util::request_storage_path();
+    let root = util::request_working_dir();
+    let repo_path = match util::request_worktree_gitdir() {
+        Ok(path) => path,
+        Err(_) => {
+            finding.manual_required = true;
+            finding.detail.push_str(
+                "; repository checkpoint storage could not be resolved; no checkpoint was written",
+            );
+            return ArtifactReplayDisposition::Refused;
+        }
+    };
+    let deadline = match replay_batch.attempt_deadline(manual) {
+        Ok(deadline) => deadline,
+        Err(_) => {
+            finding.manual_required = true;
+            finding.detail.push_str(
+                "; bounded capture recovery deadline could not be established; no checkpoint was written",
+            );
+            return ArtifactReplayDisposition::Refused;
+        }
+    };
+    let replay_result = recovery::replay_for_doctor(recovery::DoctorReplayRequest {
+        conn,
+        recovery,
+        storage: &storage,
+        root: &root,
+        repo_path: &repo_path,
+        now_millis: observed_at_ms,
+        deadline,
+        manual,
+    })
+    .await;
+    let replay_result = match replay_result {
+        Err(error) if pending::retryable_load_failure(&error, deadline.monotonic()) => {
+            Ok(ArtifactRecoveryOutcome::RetryLater)
+        }
+        Err(error) if is_permanent_pending_replay_failure(&error) => {
+            Ok(ArtifactRecoveryOutcome::ManualRequired)
+        }
+        result => result,
+    };
+    if !matches!(
+        replay_result,
+        Ok(ArtifactRecoveryOutcome::DeferredByBatchLimit | ArtifactRecoveryOutcome::RetryLater)
+    ) {
+        replay_batch.record_attempt();
+    }
+    match &replay_result {
+        Ok(ArtifactRecoveryOutcome::Completed | ArtifactRecoveryOutcome::AlreadyComplete) => {
+            finding.repaired = true;
+            finding.manual_required = false;
+            finding.detail.push_str(
+                "; authenticated local checkpoint was durably published and its original terminal receipt completed",
+            );
+        }
+        Ok(ArtifactRecoveryOutcome::DeferredByBatchLimit) => {
+            finding.manual_required = true;
+            finding.detail.push_str(
+                "; bounded recovery batch limit was reached; rerun `libra agent doctor --repair` to continue",
+            );
+        }
+        Ok(ArtifactRecoveryOutcome::RetryLater) => {
+            finding.manual_required = true;
+            finding.detail.push_str(
+                "; another capture attempt is still active or cleanup is pending; automatic replay will retry later",
+            );
+        }
+        Ok(ArtifactRecoveryOutcome::ManualRequired) | Err(_) => {
+            finding.manual_required = true;
+            finding.detail.push_str(
+                "; authenticated artifact replay was refused or failed closed; manual recovery is required",
+            );
+        }
+    }
+    match &replay_result {
+        Ok(ArtifactRecoveryOutcome::Completed | ArtifactRecoveryOutcome::AlreadyComplete) => {
+            ArtifactReplayDisposition::Completed
+        }
+        Ok(ArtifactRecoveryOutcome::ManualRequired) => ArtifactReplayDisposition::PermanentFailure,
+        Ok(ArtifactRecoveryOutcome::DeferredByBatchLimit) => ArtifactReplayDisposition::Deferred,
+        Ok(ArtifactRecoveryOutcome::RetryLater) => ArtifactReplayDisposition::RetryLater,
+        Err(_) => ArtifactReplayDisposition::Refused,
+    }
+}
+
+fn is_permanent_pending_replay_failure(error: &anyhow::Error) -> bool {
+    use crate::internal::ai::capture::catalog::CaptureCatalogError;
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<CaptureCatalogError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    CaptureCatalogError::InvalidRequest
+                        | CaptureCatalogError::InvalidReceiptKey
+                        | CaptureCatalogError::MalformedReceiptLedger
+                        | CaptureCatalogError::ReceiptCapacityExhausted
+                        | CaptureCatalogError::ScopeRejected
+                        | CaptureCatalogError::Tombstoned
+                        | CaptureCatalogError::ImportSessionConflict
+                )
+            })
+            || cause
+                .to_string()
+                .contains("retained capture identity is missing")
+    })
 }
 
 /// Execute one repair plan, updating the finding in place. Repair failures
@@ -1646,8 +2888,185 @@ async fn execute_repair(
     finding: &mut CheckpointFinding,
     plan: &RepairPlan,
     repo_id: &str,
+    replay_batch: &mut ArtifactReplayBatch,
 ) {
+    let finalizer_recovery = match plan {
+        RepairPlan::RecoverPendingFinalizer { recovery, .. }
+        | RepairPlan::QuarantineExhaustedPendingFinalizer { recovery, .. }
+        | RepairPlan::QuarantineStalePendingArtifact { recovery }
+        | RepairPlan::ReplayPendingArtifact { recovery, .. } => Some(recovery),
+        _ => None,
+    };
+    if let Some(recovery) = finalizer_recovery {
+        let root = util::request_working_dir();
+        match CaptureScope::resolve(conn, &root).await {
+            Ok(scope) if &scope != recovery.scope() => {
+                finding.detail.push_str(
+                    "; retained terminal capture belongs to a different worktree/workspace scope and was not replayed or charged against this worktree's recovery budget",
+                );
+                return;
+            }
+            Ok(scope) => {
+                if scope.assert_workspace_fence_live(conn).await.is_err() {
+                    finding.detail.push_str(
+                        "; current workspace lease could not be verified; repair was deferred without changing the artifact",
+                    );
+                    return;
+                }
+            }
+            Err(_) => {
+                finding.detail.push_str(
+                    "; current capture scope could not be verified; repair was deferred without changing the artifact",
+                );
+                return;
+            }
+        }
+    }
     match plan {
+        RepairPlan::QuarantineExhaustedPendingFinalizer {
+            recovery,
+            observed_at_ms,
+        } => match CaptureCatalogStore::new(conn.clone())
+            .quarantine_exhausted_pending_finalizer(recovery, *observed_at_ms)
+            .await
+        {
+            Ok(CaptureCatalogFinalizerRecoveryResult::Quarantined) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; exhausted artifact was retained in quarantine without changing its original receipt; explicit one-shot replay follows",
+                );
+                if recovery.artifact_present() {
+                    let _ = replay_capture_artifact(
+                        conn,
+                        finding,
+                        recovery,
+                        *observed_at_ms,
+                        true,
+                        replay_batch,
+                    )
+                    .await;
+                }
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::AlreadyComplete) => {
+                finding.repaired = true;
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::Pending) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; original finalizer budget is not exhausted; it remains pending",
+                );
+            }
+            Ok(
+                CaptureCatalogFinalizerRecoveryResult::MissingDurableCheckpoint
+                | CaptureCatalogFinalizerRecoveryResult::ConflictUnchanged,
+            ) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer fence changed during quarantine recovery; no terminal state was advanced",
+                );
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::Completed) => {
+                // This path has no durable checkpoint by construction; keep
+                // the outcome fail-closed if a future implementation returns
+                // a terminal completion here.
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; unexpected terminal recovery result was rejected",
+                );
+            }
+            Err(_) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer quarantine recovery failed closed",
+                );
+            }
+        },
+        RepairPlan::QuarantineStalePendingArtifact { recovery } => {
+            match quarantine_stale_pending_artifact(
+                conn,
+                recovery.scope(),
+                recovery.checkpoint_id(),
+            )
+            .await
+            {
+                Ok(()) => finding.detail.push_str("; stale pending header was moved to quarantine under the current workspace fence; no replay was attempted"),
+                Err(_) => {
+                    finding.manual_required = true;
+                    finding.detail.push_str("; stale artifact quarantine failed closed; no repair was recorded");
+                }
+            }
+        }
+        RepairPlan::RecoverPendingFinalizer {
+            recovery,
+            observed_at_ms,
+        } => match CaptureCatalogStore::new(conn.clone())
+            .recover_pending_finalizer_after_durable_checkpoint(recovery, *observed_at_ms)
+            .await
+        {
+            Ok(
+                CaptureCatalogFinalizerRecoveryResult::Completed
+                | CaptureCatalogFinalizerRecoveryResult::AlreadyComplete,
+            ) => finding.repaired = true,
+            Ok(CaptureCatalogFinalizerRecoveryResult::MissingDurableCheckpoint) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; durable checkpoint evidence disappeared before recovery; no terminal state was advanced",
+                );
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::Pending) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer receipt is still pending after revalidation; no terminal state was advanced",
+                );
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::Quarantined) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer is already quarantined and requires operator recovery",
+                );
+            }
+            Ok(CaptureCatalogFinalizerRecoveryResult::ConflictUnchanged) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer fence changed during doctor recovery; no terminal state was advanced",
+                );
+            }
+            Err(_) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; finalizer recovery failed closed; no terminal state was advanced",
+                );
+            }
+        },
+        RepairPlan::ReplayPendingArtifact {
+            recovery,
+            observed_at_ms,
+        } => {
+            let replay_disposition = replay_capture_artifact(
+                conn,
+                finding,
+                recovery,
+                *observed_at_ms,
+                false,
+                replay_batch,
+            )
+            .await;
+            if replay_disposition == ArtifactReplayDisposition::PermanentFailure
+                && let Ok(scope) = CaptureScope::resolve(conn, &util::request_working_dir()).await
+                && &scope == recovery.scope()
+                && quarantine_worker_candidate(
+                    conn,
+                    &scope,
+                    recovery.checkpoint_id(),
+                    replay_batch.deadline().ok().map(CaptureCommitDeadline::monotonic),
+                )
+                .await
+            {
+                finding.detail.push_str(
+                    "; failed automatic candidate was retained in quarantine for operator inspection",
+                );
+            }
+        }
         RepairPlan::Manual => {}
         RepairPlan::RepairExpiredInflightMarker {
             session_id,
@@ -1661,9 +3080,12 @@ async fn execute_repair(
             Ok(false) => finding.detail.push_str(
                 "; repair skipped because the marker was refreshed or remained protected; retry after the active writer exits",
             ),
-            Err(err) => finding
-                .detail
-                .push_str(&format!("; reachability repair failed closed: {err:#}")),
+            Err(_) => {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; reachability repair failed closed; retry after active writers finish or rerun doctor",
+                );
+            }
         },
         RepairPlan::InsertCatalogRow {
             checkpoint_id,
@@ -1683,15 +3105,13 @@ async fn execute_repair(
                 traces_commit,
                 created_at: *created_at,
             };
-            match insert_agent_checkpoint_row_idempotent(conn, &row).await {
+            match repair_insert_agent_checkpoint_catalog_row(conn, &row).await {
                 // `false` means another writer (or an earlier repair)
                 // already landed the row — the inconsistency is gone
                 // either way.
                 Ok(_) => finding.repaired = true,
-                Err(err) => {
-                    finding
-                        .detail
-                        .push_str(&format!("; repair failed: {err:#}"));
+                Err(_) => {
+                    mark_catalog_repair_failed(finding);
                 }
             }
         }
@@ -1721,12 +3141,10 @@ async fn execute_repair(
                 traces_commit,
                 created_at: *created_at,
             };
-            match insert_subagent_checkpoint_row_idempotent(conn, &row).await {
+            match repair_insert_subagent_checkpoint_catalog_row(conn, &row).await {
                 Ok(_) => finding.repaired = true,
-                Err(err) => {
-                    finding
-                        .detail
-                        .push_str(&format!("; repair failed: {err:#}"));
+                Err(_) => {
+                    mark_catalog_repair_failed(finding);
                 }
             }
         }
@@ -1736,53 +3154,289 @@ async fn execute_repair(
             metadata_blob_oid,
             traces_commit,
         } => {
-            let backend = conn.get_database_backend();
-            let result = conn
-                .execute_raw(Statement::from_sql_and_values(
-                    backend,
-                    "UPDATE agent_checkpoint \
-                     SET tree_oid = ?, metadata_blob_oid = ?, traces_commit = ?, \
-                         sync_revision = sync_revision + 1 \
-                     WHERE checkpoint_id = ?",
-                    [
-                        tree_oid.as_str().into(),
-                        metadata_blob_oid.as_str().into(),
-                        traces_commit.as_str().into(),
-                        checkpoint_id.as_str().into(),
-                    ],
-                ))
-                .await;
-            match result {
-                Ok(_) => finding.repaired = true,
-                Err(err) => {
-                    finding.detail.push_str(&format!("; repair failed: {err}"));
+            match repair_update_checkpoint_catalog_row(
+                conn,
+                checkpoint_id,
+                tree_oid,
+                metadata_blob_oid,
+                traces_commit,
+            )
+            .await
+            {
+                Ok(true) => finding.repaired = true,
+                Ok(false) => {
+                    finding.manual_required = true;
+                    finding.detail.push_str(
+                        "; checkpoint row disappeared before its scoped repair could commit; rerun doctor",
+                    );
+                }
+                Err(_) => {
+                    mark_catalog_repair_failed(finding);
                 }
             }
         }
         RepairPlan::InsertObjectIndex { entries, updates } => {
-            let mut all_ok = true;
-            for (oid, o_type, o_size) in entries {
-                if let Err(err) = insert_object_index_row(conn, oid, o_type, *o_size, repo_id).await
-                {
-                    all_ok = false;
-                    finding
-                        .detail
-                        .push_str(&format!("; repair failed for {oid}: {err}"));
-                }
+            if repair_object_index_rows_atomically(conn, entries, updates, repo_id)
+                .await
+                .is_ok()
+            {
+                finding.repaired = true;
+            } else {
+                finding.manual_required = true;
+                finding.detail.push_str(
+                    "; object-index repair failed closed; rerun doctor after resolving the store condition",
+                );
             }
-            for (oid, o_type, o_size) in updates {
-                if let Err(err) =
-                    update_object_index_row_shape(conn, oid, o_type, *o_size, repo_id).await
-                {
-                    all_ok = false;
-                    finding
-                        .detail
-                        .push_str(&format!("; drift repair failed for {oid}: {err}"));
-                }
-            }
-            finding.repaired = all_ok;
         }
     }
+}
+
+/// Make a failed scoped catalog repair visibly actionable.  In particular, a
+/// workspace fence loss must never leave the finding looking like a harmless
+/// best-effort miss: the operator needs to rerun from the current workspace
+/// or resolve the ownership record before doctor can mutate it.
+fn mark_catalog_repair_failed(finding: &mut CheckpointFinding) {
+    finding.manual_required = true;
+    finding.detail.push_str(
+        "; scoped catalog repair failed closed; rerun doctor from the current workspace after resolving the ownership record",
+    );
+}
+
+/// Load the durable owner for a session while holding the SQLite writer
+/// transaction used by the repair.  Do not derive this from the current
+/// process worktree: doctor may be invoked from a different worktree, and
+/// the existing scoped session is the authority for a catalog backfill.
+async fn doctor_catalog_repair_scope_for_session(
+    txn: &DatabaseTransaction,
+    session_id: &str,
+) -> Result<DoctorCatalogRepairScope> {
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT scope_state, repo_id, worktree_id, workspace_id, workspace_fence
+             FROM agent_session WHERE session_id = ? LIMIT 1",
+            [session_id.into()],
+        ))
+        .await
+        .context("read durable agent-session ownership for doctor catalog repair")?
+        .with_context(|| {
+            format!(
+                "agent_session '{session_id}' disappeared before doctor could repair its checkpoint catalog"
+            )
+        })?;
+    let scope_state: String = row
+        .try_get_by("scope_state")
+        .context("decode agent-session scope state for doctor catalog repair")?;
+    match scope_state.as_str() {
+        // Legacy captures intentionally have no attributable workspace
+        // fence. Keep their historical repair contract explicit rather than
+        // silently treating a malformed scoped row as unscoped.
+        "legacy_unknown" => Ok(DoctorCatalogRepairScope::LegacyUnscoped),
+        "scoped" => {
+            let repo_id: Option<String> = row
+                .try_get_by("repo_id")
+                .context("decode agent-session repository ownership for doctor catalog repair")?;
+            let worktree_id: Option<String> = row
+                .try_get_by("worktree_id")
+                .context("decode agent-session worktree ownership for doctor catalog repair")?;
+            let workspace_id: Option<String> = row
+                .try_get_by("workspace_id")
+                .context("decode agent-session workspace ownership for doctor catalog repair")?;
+            let workspace_fence: Option<i64> = row
+                .try_get_by("workspace_fence")
+                .context("decode agent-session workspace fence for doctor catalog repair")?;
+            let repo_id = repo_id
+                .filter(|value| !value.is_empty())
+                .context("scoped agent session has no repository owner; inspect it with `libra worktree doctor`")?;
+            let worktree_id = worktree_id.context(
+                "scoped agent session has no worktree owner; inspect it with `libra worktree doctor`",
+            )?;
+            match (&workspace_id, workspace_fence) {
+                (None, None) => {}
+                (Some(id), Some(_)) if !id.is_empty() => {}
+                _ => {
+                    bail!(
+                        "scoped agent session has an incomplete workspace owner; inspect it with `libra worktree doctor`"
+                    );
+                }
+            }
+            Ok(DoctorCatalogRepairScope::Scoped(CaptureScope {
+                repo_id,
+                worktree_id,
+                workspace_id,
+                workspace_fence,
+            }))
+        }
+        other => bail!(
+            "agent session has unknown scope state '{other}'; inspect it with `libra worktree doctor` before repairing its checkpoint catalog"
+        ),
+    }
+}
+
+async fn assert_doctor_catalog_repair_scope_live(
+    txn: &DatabaseTransaction,
+    scope: &DoctorCatalogRepairScope,
+    operation: &'static str,
+) -> Result<()> {
+    if let DoctorCatalogRepairScope::Scoped(scope) = scope {
+        scope
+            .assert_workspace_fence_live(txn)
+            .await
+            .with_context(|| format!("verify capture workspace lease before {operation}"))?;
+    }
+    Ok(())
+}
+
+async fn begin_doctor_catalog_repair_transaction(
+    conn: &DatabaseConnection,
+    session_id: &str,
+    operation: &'static str,
+) -> Result<(DatabaseTransaction, DoctorCatalogRepairScope)> {
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .with_context(|| format!("begin {operation}"))?;
+    let scope = match doctor_catalog_repair_scope_for_session(&txn, session_id).await {
+        Ok(scope) => scope,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error).with_context(|| format!("resolve durable scope before {operation}"));
+        }
+    };
+    if let Err(error) = assert_doctor_catalog_repair_scope_live(&txn, &scope, operation).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    Ok((txn, scope))
+}
+
+/// Commit a doctor catalog mutation. Scoped repairs put the conditional lease
+/// DML last so an expiry after the INSERT/UPDATE rolls the entire repair back.
+async fn commit_doctor_catalog_repair_transaction(
+    txn: DatabaseTransaction,
+    scope: &DoctorCatalogRepairScope,
+    operation: &'static str,
+    changed_catalog: bool,
+) -> Result<()> {
+    if changed_catalog
+        && let DoctorCatalogRepairScope::Scoped(scope) = scope
+        && let Err(error) = scope.assert_workspace_fence_live_for_commit(&txn).await
+    {
+        txn.rollback().await.ok();
+        return Err(error).with_context(|| {
+            format!("verify capture workspace lease before committing {operation}")
+        });
+    }
+    txn.commit()
+        .await
+        .with_context(|| format!("commit {operation}"))
+}
+
+async fn repair_insert_agent_checkpoint_catalog_row(
+    conn: &DatabaseConnection,
+    row: &AgentCheckpointRow<'_>,
+) -> Result<bool> {
+    const OPERATION: &str = "doctor missing checkpoint catalog-row repair";
+    let (txn, scope) =
+        begin_doctor_catalog_repair_transaction(conn, row.session_id, OPERATION).await?;
+    let inserted = match insert_agent_checkpoint_row_idempotent(&txn, row).await {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error).context("insert missing checkpoint catalog row");
+        }
+    };
+    commit_doctor_catalog_repair_transaction(txn, &scope, OPERATION, inserted).await?;
+    Ok(inserted)
+}
+
+async fn repair_insert_subagent_checkpoint_catalog_row(
+    conn: &DatabaseConnection,
+    row: &SubagentCheckpointRow<'_>,
+) -> Result<bool> {
+    const OPERATION: &str = "doctor missing subagent checkpoint catalog-row repair";
+    let (txn, scope) =
+        begin_doctor_catalog_repair_transaction(conn, row.session_id, OPERATION).await?;
+    let inserted = match insert_subagent_checkpoint_row_idempotent(&txn, row).await {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error).context("insert missing subagent checkpoint catalog row");
+        }
+    };
+    commit_doctor_catalog_repair_transaction(txn, &scope, OPERATION, inserted).await?;
+    Ok(inserted)
+}
+
+async fn repair_update_checkpoint_catalog_row(
+    conn: &DatabaseConnection,
+    checkpoint_id: &str,
+    tree_oid: &str,
+    metadata_blob_oid: &str,
+    traces_commit: &str,
+) -> Result<bool> {
+    const OPERATION: &str = "doctor stale checkpoint catalog-row repair";
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .with_context(|| format!("begin {OPERATION}"))?;
+    let row = match txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT session_id FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [checkpoint_id.into()],
+        ))
+        .await
+        .context("read checkpoint session ownership for doctor catalog repair")?
+    {
+        Some(row) => row,
+        None => {
+            txn.rollback().await.ok();
+            return Ok(false);
+        }
+    };
+    let session_id: String = match row.try_get_by("session_id") {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error)
+                .context("decode checkpoint session ownership for doctor catalog repair");
+        }
+    };
+    let scope = match doctor_catalog_repair_scope_for_session(&txn, &session_id).await {
+        Ok(scope) => scope,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error).with_context(|| format!("resolve durable scope before {OPERATION}"));
+        }
+    };
+    if let Err(error) = assert_doctor_catalog_repair_scope_live(&txn, &scope, OPERATION).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    let updated = match txn
+        .execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE agent_checkpoint
+             SET tree_oid = ?, metadata_blob_oid = ?, traces_commit = ?,
+                 sync_revision = sync_revision + 1
+             WHERE checkpoint_id = ? AND session_id = ?",
+            [
+                tree_oid.into(),
+                metadata_blob_oid.into(),
+                traces_commit.into(),
+                checkpoint_id.into(),
+                session_id.into(),
+            ],
+        ))
+        .await
+    {
+        Ok(result) => result.rows_affected() == 1,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error).context("update stale checkpoint catalog row");
+        }
+    };
+    commit_doctor_catalog_repair_transaction(txn, &scope, OPERATION, updated).await?;
+    Ok(updated)
 }
 
 /// Class-2 repair plan: reconstruct the catalog row from the introducing
@@ -1810,18 +3464,18 @@ async fn build_class2_plan(
         .and_then(|hash| reader.read_raw(&hash))
     {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(_) => {
             return Ok((
-                format!("{base}; metadata.json unreadable ({err:#}) — manual review"),
+                format!("{base}; metadata.json unreadable — manual review"),
                 RepairPlan::Manual,
             ));
         }
     };
     let metadata: CheckpointMetadataProbe = match serde_json::from_slice(&metadata_bytes) {
         Ok(metadata) => metadata,
-        Err(err) => {
+        Err(_) => {
             return Ok((
-                format!("{base}; metadata.json unparsable ({err}) — manual review"),
+                format!("{base}; metadata.json unparsable — manual review"),
                 RepairPlan::Manual,
             ));
         }
@@ -1870,17 +3524,14 @@ async fn build_class2_plan(
         Ok(rebuilt) => rebuilt,
         Err(_) => {
             return Ok((
-                format!("{base}; scope '{scope}' is not auto-repairable — manual review"),
+                format!("{base}; checkpoint scope is not auto-repairable — manual review"),
                 RepairPlan::Manual,
             ));
         }
     };
     if !session_exists(conn, &metadata.session_id).await? {
         return Ok((
-            format!(
-                "{base}; agent_session row '{}' is missing (FK target) — manual review",
-                metadata.session_id
-            ),
+            format!("{base}; required agent-session record is missing — manual review"),
             RepairPlan::Manual,
         ));
     }
@@ -1944,7 +3595,7 @@ fn walk_traces_checkpoints(
     reader: &ObjectReader,
     head: Option<ObjectHash>,
     notes: &mut Vec<String>,
-) -> HashMap<String, RefCheckpoint> {
+) -> (HashMap<String, RefCheckpoint>, bool) {
     let mut chain: Vec<Commit> = Vec::new();
     let mut cursor = head;
     while let Some(oid) = cursor {
@@ -1959,22 +3610,25 @@ fn walk_traces_checkpoints(
                 cursor = commit.parent_commit_ids.first().copied();
                 chain.push(commit);
             }
-            Err(err) => {
-                notes.push(format!("traces walk truncated: {err:#}"));
+            Err(_) => {
+                notes.push("traces walk truncated because a commit could not be read".to_string());
                 break;
             }
         }
     }
 
     let mut per_commit: Vec<HashMap<String, ObjectHash>> = Vec::with_capacity(chain.len());
+    let mut has_noncanonical_checkpoint_id = false;
     for commit in &chain {
         match checkpoint_ids_in_commit(reader, commit) {
-            Ok(ids) => per_commit.push(ids),
-            Err(err) => {
-                notes.push(format!(
-                    "checkpoint tree of commit {} unreadable: {err:#}",
-                    commit.id
-                ));
+            Ok((ids, has_noncanonical_id)) => {
+                has_noncanonical_checkpoint_id |= has_noncanonical_id;
+                per_commit.push(ids);
+            }
+            Err(_) => {
+                notes.push(
+                    "a checkpoint tree is unreadable; reachability scan is incomplete".to_string(),
+                );
                 per_commit.push(HashMap::new());
             }
         }
@@ -2013,14 +3667,17 @@ fn walk_traces_checkpoints(
                         }
                     }
                 }
-                Err(err) => {
-                    notes.push(format!("checkpoint {id} inner tree unreadable: {err:#}"));
+                Err(_) => {
+                    notes.push(
+                        "a checkpoint inner tree is unreadable; reachability scan is incomplete"
+                            .to_string(),
+                    );
                 }
             }
             out.insert(id.clone(), rc);
         }
     }
-    out
+    (out, has_noncanonical_checkpoint_id)
 }
 
 /// Enumerate `checkpoint/<prefix>/<rest>` ids (and their inner tree OIDs)
@@ -2028,17 +3685,18 @@ fn walk_traces_checkpoints(
 fn checkpoint_ids_in_commit(
     reader: &ObjectReader,
     commit: &Commit,
-) -> anyhow::Result<HashMap<String, ObjectHash>> {
+) -> anyhow::Result<(HashMap<String, ObjectHash>, bool)> {
     let root = reader.read_tree(&commit.tree_id)?;
     let Some(checkpoint_entry) = root
         .tree_items
         .iter()
         .find(|item| item.name == "checkpoint" && item.mode == TreeItemMode::Tree)
     else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), false));
     };
     let checkpoint_tree = reader.read_tree(&checkpoint_entry.id)?;
     let mut out = HashMap::new();
+    let mut has_noncanonical_checkpoint_id = false;
     for prefix in &checkpoint_tree.tree_items {
         if prefix.mode != TreeItemMode::Tree {
             continue;
@@ -2048,10 +3706,15 @@ fn checkpoint_ids_in_commit(
             if rest.mode != TreeItemMode::Tree {
                 continue;
             }
-            out.insert(format!("{}{}", prefix.name, rest.name), rest.id);
+            let checkpoint_id = format!("{}{}", prefix.name, rest.name);
+            if let Some(checkpoint_id) = canonical_checkpoint_id(&checkpoint_id) {
+                out.insert(checkpoint_id, rest.id);
+            } else {
+                has_noncanonical_checkpoint_id = true;
+            }
         }
     }
-    Ok(out)
+    Ok((out, has_noncanonical_checkpoint_id))
 }
 
 /// Determine whether a catalog-only row (not ref-reachable) points at a
@@ -2117,16 +3780,42 @@ async fn load_catalog_rows(conn: &DatabaseConnection) -> CliResult<Vec<CatalogRo
             [],
         ))
         .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| CatalogRow {
-            checkpoint_id: row.try_get_by("checkpoint_id").unwrap_or_default(),
-            tree_oid: row.try_get_by("tree_oid").unwrap_or_default(),
-            metadata_blob_oid: row.try_get_by("metadata_blob_oid").unwrap_or_default(),
-            traces_commit: row.try_get_by("traces_commit").unwrap_or_default(),
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not inspect checkpoint catalog rows; check the repository database and rerun doctor"
+                    .to_string(),
+            )
+        })?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(CatalogRow {
+                checkpoint_id: row.try_get_by("checkpoint_id").map_err(|_| {
+                    CliError::fatal(
+                        "agent doctor could not decode a checkpoint catalog row; check the repository database and rerun doctor"
+                            .to_string(),
+                    )
+                })?,
+                tree_oid: row.try_get_by("tree_oid").map_err(|_| {
+                    CliError::fatal(
+                        "agent doctor could not decode a checkpoint catalog row; check the repository database and rerun doctor"
+                            .to_string(),
+                    )
+                })?,
+                metadata_blob_oid: row.try_get_by("metadata_blob_oid").map_err(|_| {
+                    CliError::fatal(
+                        "agent doctor could not decode a checkpoint catalog row; check the repository database and rerun doctor"
+                            .to_string(),
+                    )
+                })?,
+                traces_commit: row.try_get_by("traces_commit").map_err(|_| {
+                    CliError::fatal(
+                        "agent doctor could not decode a checkpoint catalog row; check the repository database and rerun doctor"
+                            .to_string(),
+                    )
+                })?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 async fn session_exists(conn: &DatabaseConnection, session_id: &str) -> CliResult<bool> {
@@ -2138,7 +3827,12 @@ async fn session_exists(conn: &DatabaseConnection, session_id: &str) -> CliResul
     ))
     .await
     .map(|row| row.is_some())
-    .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))
+    .map_err(|_| {
+        CliError::fatal(
+            "agent doctor could not inspect agent-session ownership; check the repository database and rerun doctor"
+                .to_string(),
+        )
+    })
 }
 
 /// Same repo-id resolution as the background indexer
@@ -2154,12 +3848,100 @@ fn blob_oid_hex(bytes: &[u8]) -> String {
     ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &content).to_string()
 }
 
+/// Result of reading a review/investigate sidecar through a descriptor-pinned
+/// run directory. Refusal variants deliberately carry neither a path nor
+/// source bytes into doctor output.
+enum AgentRunSidecar {
+    Absent,
+    Unavailable,
+    Oversized,
+    Bytes(Vec<u8>),
+}
+
+/// Read a regular sidecar from an already-open run directory. The directory
+/// and leaf are held with no-follow descriptors, while the post-read stat
+/// rejects replacement/growth races before a repair can hash or publish it.
+fn read_agent_run_sidecar(run_dir: &std::fs::File, name: &str) -> AgentRunSidecar {
+    let file = match crate::utils::object::open_regular_file_at_no_follow(
+        run_dir,
+        std::ffi::OsStr::new(name),
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AgentRunSidecar::Absent;
+        }
+        Err(_) => return AgentRunSidecar::Unavailable,
+    };
+    let Ok(initial_len) = file.metadata().map(|metadata| metadata.len()) else {
+        return AgentRunSidecar::Unavailable;
+    };
+    if initial_len > DOCTOR_AGENT_RUN_SIDECAR_READ_CAP_BYTES {
+        return AgentRunSidecar::Oversized;
+    }
+    let Ok(capacity) = usize::try_from(initial_len) else {
+        return AgentRunSidecar::Oversized;
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(capacity).is_err() {
+        return AgentRunSidecar::Unavailable;
+    }
+    let mut reader = std::io::BufReader::new(file).take(initial_len);
+    if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 != initial_len {
+        return AgentRunSidecar::Unavailable;
+    }
+    let Ok(final_len) = reader
+        .into_inner()
+        .into_inner()
+        .metadata()
+        .map(|metadata| metadata.len())
+    else {
+        return AgentRunSidecar::Unavailable;
+    };
+    if final_len != initial_len {
+        return AgentRunSidecar::Unavailable;
+    }
+    AgentRunSidecar::Bytes(bytes)
+}
+
+fn append_findings_store_note(report: &mut FindingsStoreReport, note: &'static str) {
+    match report.note.as_mut() {
+        Some(existing) if !existing.contains(note) => {
+            existing.push_str("; ");
+            existing.push_str(note);
+        }
+        Some(_) => {}
+        None => report.note = Some(note.to_string()),
+    }
+}
+
 /// Minimal parse of a run manifest's non-null `findings_oid` (avoids pulling
-/// the review/investigate manifest structs into doctor).
-fn manifest_findings_oid(manifest_path: &std::path::Path) -> Option<String> {
-    let bytes = std::fs::read(manifest_path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("findings_oid")?.as_str().map(str::to_string)
+/// the review/investigate manifest structs into doctor). A damaged manifest
+/// must never reflect its arbitrary string back into a diagnostic.
+enum ManifestFindingsOid {
+    Absent,
+    Valid(String),
+    Invalid,
+    Unavailable,
+}
+
+fn manifest_findings_oid(run_dir: &std::fs::File) -> ManifestFindingsOid {
+    let bytes = match read_agent_run_sidecar(run_dir, "manifest.json") {
+        AgentRunSidecar::Bytes(bytes) => bytes,
+        AgentRunSidecar::Absent => return ManifestFindingsOid::Absent,
+        AgentRunSidecar::Unavailable | AgentRunSidecar::Oversized => {
+            return ManifestFindingsOid::Unavailable;
+        }
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return ManifestFindingsOid::Absent;
+    };
+    let Some(value) = value.get("findings_oid").and_then(|value| value.as_str()) else {
+        return ManifestFindingsOid::Absent;
+    };
+    crate::internal::object_format::parse_repo_oid(value)
+        .ok()
+        .map(|oid| ManifestFindingsOid::Valid(oid.to_string()))
+        .unwrap_or(ManifestFindingsOid::Invalid)
 }
 
 /// A0-06: scan review/investigate run manifests for findings-object
@@ -2196,35 +3978,68 @@ async fn scan_agent_findings(
     }
     let repo_path = match util::try_get_storage_path(None) {
         Ok(path) => path,
-        Err(err) => {
-            report.note = Some(format!("failed to locate .libra directory: {err}"));
+        Err(_) => {
+            report.note = Some("repository storage unavailable".to_string());
             return Ok(report);
         }
     };
     report.scanned = true;
+    if !ObjectReader::secure_reads_supported() {
+        report.repair_applied = false;
+        report.note = Some(
+            "agent-run findings scan is unavailable because this platform lacks secure descriptor-relative reads; no repairs were applied"
+                .to_string(),
+        );
+        return Ok(report);
+    }
+    // See the checkpoint scan: doctor must not resolve externally controlled
+    // alternate paths while producing a bounded diagnostic.
     let reader = ObjectReader {
-        storage: Arc::new(ClientStorage::init(repo_path.join("objects"))),
+        repo_path: repo_path.clone(),
     };
     let repo_id = resolve_repo_id(conn).await;
     let runs_root = repo_path.join("sessions").join("agent-runs");
-    let entries = match std::fs::read_dir(&runs_root) {
-        Ok(read_dir) => read_dir,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
-        Err(err) => {
-            report.note = Some(format!("failed to read agent-runs directory: {err}"));
+    let runs_root_dir = match crate::utils::object::open_directory_tree_no_follow(&runs_root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(_) => {
+            report.note = Some("agent-run storage is unavailable for a secure scan".to_string());
             return Ok(report);
         }
     };
-    for entry in entries.flatten() {
-        let run_dir = entry.path();
-        if !run_dir.is_dir() {
-            continue;
+    // Enumerate the held descriptor, rather than `runs_root` by pathname.
+    // Otherwise an attacker could replace `sessions/agent-runs` after the
+    // no-follow open above and make `read_dir` follow their replacement.
+    let entries = match runs_root_dir
+        .try_clone()
+        .and_then(crate::utils::beneath::read_dir_fd)
+    {
+        Ok(entries) => entries,
+        Err(_) => {
+            report.note = Some("agent-run storage is unavailable for a secure scan".to_string());
+            return Ok(report);
         }
-        let Some(run_id) = run_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
+    };
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= DOCTOR_AGENT_RUN_ENTRY_CAP {
+            append_findings_store_note(
+                &mut report,
+                "agent-run storage exceeds the doctor entry limit; remaining runs require manual review",
+            );
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                append_findings_store_note(
+                    &mut report,
+                    "agent-run storage could not be enumerated safely; remaining runs require manual review",
+                );
+                break;
+            }
+        };
+        let run_name = entry.name;
+        let Some(run_id) = run_name.to_str().map(str::to_string) else {
             continue;
         };
         // Skip `.admission` and any foreign directory — same validity gate the
@@ -2232,14 +4047,67 @@ async fn scan_agent_findings(
         if !is_valid_run_id(&run_id) {
             continue;
         }
-        let Some(findings_oid) = manifest_findings_oid(&run_dir.join("manifest.json")) else {
-            continue;
+        let run_dir = match crate::utils::object::open_directory_at_no_follow(
+            &runs_root_dir,
+            &run_name,
+        ) {
+            Ok(directory) => directory,
+            Err(_) => {
+                append_findings_store_note(
+                    &mut report,
+                    "some agent-run entries were skipped because they could not be opened safely",
+                );
+                continue;
+            }
         };
+        let findings_oid = manifest_findings_oid(&run_dir);
+        if matches!(findings_oid, ManifestFindingsOid::Absent) {
+            continue;
+        }
         report.runs_with_findings += 1;
+        let findings_oid = match findings_oid {
+            ManifestFindingsOid::Valid(oid) => oid,
+            ManifestFindingsOid::Invalid => {
+                report.manual_required += 1;
+                report.findings.push(FindingsObjectFinding {
+                    inconsistency_type: CLASS_MISSING_FINDINGS_OBJECT.to_string(),
+                    run_id,
+                    detail:
+                        "findings manifest declares an invalid object identifier; manual review"
+                            .to_string(),
+                    repaired: false,
+                    manual_required: true,
+                });
+                continue;
+            }
+            ManifestFindingsOid::Unavailable => {
+                append_findings_store_note(
+                    &mut report,
+                    "some agent-run manifests were skipped because they could not be read safely",
+                );
+                continue;
+            }
+            ManifestFindingsOid::Absent => continue,
+        };
 
-        let on_disk = std::fs::read(run_dir.join("findings.md"))
-            .ok()
-            .filter(|bytes| !bytes.is_empty());
+        let on_disk = match read_agent_run_sidecar(&run_dir, "findings.md") {
+            AgentRunSidecar::Bytes(bytes) if !bytes.is_empty() => Some(bytes),
+            AgentRunSidecar::Bytes(_) | AgentRunSidecar::Absent => None,
+            AgentRunSidecar::Unavailable => {
+                append_findings_store_note(
+                    &mut report,
+                    "some findings sidecars were skipped because they could not be read safely",
+                );
+                None
+            }
+            AgentRunSidecar::Oversized => {
+                append_findings_store_note(
+                    &mut report,
+                    "some findings sidecars exceed the doctor read limit and require manual review",
+                );
+                None
+            }
+        };
 
         if !reader.exists_str(&findings_oid) {
             // Auto-repairable only when findings.md is present AND re-hashes to
@@ -2256,13 +4124,21 @@ async fn scan_agent_findings(
                     // hold (its runs are long). Without this the repair could
                     // land inside a deletion phase and be pruned right back
                     // out — repairing the same run forever.
-                    let _publication =
-                        crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?;
+                    let _publication = crate::internal::maintenance_lock::MaintenanceLock::shared(
+                        &repo_path,
+                    )
+                    .map_err(|_| {
+                        CliError::fatal(
+                            "agent doctor could not acquire the findings repair lock; resolve the store condition and rerun doctor"
+                                .to_string(),
+                        )
+                    })?;
                     crate::utils::object::write_git_object(&repo_path, "blob", bytes).map_err(
-                        |e| {
-                            CliError::fatal(format!(
-                                "failed to rewrite findings blob for run '{run_id}': {e}"
-                            ))
+                        |_| {
+                            CliError::fatal(
+                                "agent doctor could not rewrite a findings object; resolve the store condition and rerun doctor"
+                                    .to_string(),
+                            )
                         },
                     )?;
                     insert_object_index_row(
@@ -2273,10 +4149,11 @@ async fn scan_agent_findings(
                         &repo_id,
                     )
                     .await
-                    .map_err(|e| {
-                        CliError::fatal(format!(
-                            "failed to reinsert findings object_index for run '{run_id}': {e}"
-                        ))
+                    .map_err(|_| {
+                        CliError::fatal(
+                            "agent doctor could not reindex a findings object; resolve the store condition and rerun doctor"
+                                .to_string(),
+                        )
                     })?;
                     report.repaired += 1;
                     (
@@ -2319,7 +4196,29 @@ async fn scan_agent_findings(
         let Ok(hash) = crate::internal::object_format::parse_repo_oid(&findings_oid) else {
             continue;
         };
-        let o_size = reader.read_raw(&hash).map(|b| b.len() as i64).unwrap_or(0);
+        let o_size = match reader.read_raw(&hash).and_then(|bytes| {
+            i64::try_from(bytes.len())
+                .map_err(|_| anyhow::anyhow!("findings object size exceeds index range"))
+        }) {
+            Ok(size) => size,
+            Err(_) => {
+                // The existence probe and payload read are separate filesystem
+                // operations. If the object disappeared or became unreadable
+                // in between, do not turn a healthy index row into size zero
+                // (and do not manufacture a new row). A later safe scan can
+                // retry from fresh evidence.
+                let note =
+                    "findings object index check skipped because a local object could not be read";
+                match report.note.as_mut() {
+                    Some(existing) => {
+                        existing.push_str("; ");
+                        existing.push_str(note);
+                    }
+                    None => report.note = Some(note.to_string()),
+                }
+                continue;
+            }
+        };
         let shape = object_index_row_shape(conn, &findings_oid, &repo_id).await?;
         // The o_type is cosmetic here: doctor enumerates findings from the
         // MANIFEST (`findings_oid`), not from `object_index`, and cloud sync
@@ -2343,10 +4242,11 @@ async fn scan_agent_findings(
                         &repo_id,
                     )
                     .await
-                    .map_err(|e| {
-                        CliError::fatal(format!(
-                            "failed to update findings object_index for run '{run_id}': {e}"
-                        ))
+                    .map_err(|_| {
+                        CliError::fatal(
+                            "agent doctor could not update a findings object index; resolve the store condition and rerun doctor"
+                                .to_string(),
+                        )
                     })?;
                 } else {
                     insert_object_index_row(
@@ -2357,10 +4257,11 @@ async fn scan_agent_findings(
                         &repo_id,
                     )
                     .await
-                    .map_err(|e| {
-                        CliError::fatal(format!(
-                            "failed to insert findings object_index for run '{run_id}': {e}"
-                        ))
+                    .map_err(|_| {
+                        CliError::fatal(
+                            "agent doctor could not insert a findings object index; resolve the store condition and rerun doctor"
+                                .to_string(),
+                        )
                     })?;
                 }
                 report.repaired += 1;
@@ -2405,14 +4306,29 @@ async fn object_index_row_shape<C: ConnectionTrait>(
             [o_id.into(), repo_id.into()],
         ))
         .await
-        .map_err(|e| CliError::fatal(format!("failed to query object_index: {e}")))?;
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not inspect object-index state; check the repository database and rerun doctor"
+                    .to_string(),
+            )
+        })?;
     row.map(|r| {
         let o_type: String = r
             .try_get("", "o_type")
-            .map_err(|e| CliError::fatal(format!("failed to read object_index.o_type: {e}")))?;
+            .map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not decode object-index state; check the repository database and rerun doctor"
+                        .to_string(),
+                )
+            })?;
         let o_size: i64 = r
             .try_get("", "o_size")
-            .map_err(|e| CliError::fatal(format!("failed to read object_index.o_size: {e}")))?;
+            .map_err(|_| {
+                CliError::fatal(
+                    "agent doctor could not decode object-index state; check the repository database and rerun doctor"
+                        .to_string(),
+                )
+            })?;
         Ok::<_, CliError>((o_type, o_size))
     })
     .transpose()
@@ -2470,24 +4386,79 @@ async fn insert_object_index_row<C: ConnectionTrait>(
     .map(|_| ())
 }
 
+/// Apply one class-3 repair plan as a single database mutation. The plan is
+/// built only after all object validation has finished, but a later DML can
+/// still fail (for example, because a local database trigger or constraint
+/// rejects a row). Rolling that failure back prevents a partially repaired
+/// checkpoint from becoming cloud-visible while its sibling objects remain
+/// missing from `object_index`.
+async fn repair_object_index_rows_atomically(
+    conn: &DatabaseConnection,
+    entries: &[(String, String, i64)],
+    updates: &[(String, String, i64)],
+    repo_id: &str,
+) -> Result<()> {
+    const OPERATION: &str = "doctor object-index repair";
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .with_context(|| format!("begin {OPERATION}"))?;
+
+    for (oid, o_type, o_size) in entries {
+        if let Err(error) = insert_object_index_row(&txn, oid, o_type, *o_size, repo_id).await {
+            txn.rollback().await.ok();
+            return Err(error).with_context(|| format!("insert checkpoint object index row {oid}"));
+        }
+    }
+    for (oid, o_type, o_size) in updates {
+        if let Err(error) = update_object_index_row_shape(&txn, oid, o_type, *o_size, repo_id).await
+        {
+            txn.rollback().await.ok();
+            return Err(error).with_context(|| format!("update checkpoint object index row {oid}"));
+        }
+    }
+
+    txn.commit()
+        .await
+        .with_context(|| format!("commit {OPERATION}"))
+}
+
 /// Foreground, idempotent repair used by historical-import replay after its
 /// previous background object-index barrier timed out or observed an update
 /// error. The caller runs this function in a killable helper process, so local
 /// or tiered object reads cannot extend the import command's absolute deadline.
-/// Transcript payloads are never read: their sizes come from the E4 manifest.
+/// Transcript payloads are never materialized: row sizes come from a
+/// descriptor-pinned streaming integrity check under both per-object and
+/// aggregate validation budgets.
+pub(crate) struct SessionObjectIndexRepairRequest<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) marker_owner: &'a str,
+    pub(crate) marker_generation: &'a str,
+    pub(crate) agent_kind: &'a str,
+    pub(crate) provider_session_id: &'a str,
+    pub(crate) capture_scope: &'a CaptureScope,
+}
+
 pub(crate) async fn repair_session_object_index(
     conn: &DatabaseConnection,
     repo_path: &Path,
-    session_id: &str,
-    marker_owner: &str,
-    marker_generation: &str,
-    agent_kind: &str,
-    provider_session_id: &str,
+    request: SessionObjectIndexRepairRequest<'_>,
 ) -> anyhow::Result<usize> {
-    let txn = conn
-        .begin()
+    let SessionObjectIndexRepairRequest {
+        session_id,
+        marker_owner,
+        marker_generation,
+        agent_kind,
+        provider_session_id,
+        capture_scope,
+    } = request;
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin fenced import object-index repair")?;
+    if let Err(error) = capture_scope.assert_workspace_fence_live(&txn).await {
+        txn.rollback().await.ok();
+        return Err(error)
+            .context("verify capture workspace lease before import object-index repair");
+    }
     // Acquire the SQLite writer slot before reading either the marker or the
     // session. Erasure uses the same database writer serialization, so it
     // cannot prune the catalog and then race these index inserts back in.
@@ -2520,6 +4491,14 @@ pub(crate) async fn repair_session_object_index(
         .context("decode fenced import object-index repair marker")?;
     let marker_json: serde_json::Value = serde_json::from_str(&marker_value)
         .context("decode fenced import object-index repair marker JSON")?;
+    let marker_scope = marker_json
+        .get("capture_scope")
+        .cloned()
+        .context("import object-index repair marker has no capture scope")
+        .and_then(|value| {
+            serde_json::from_value::<CaptureScope>(value)
+                .context("decode import object-index repair marker capture scope")
+        })?;
     if marker_json.get("owner").and_then(serde_json::Value::as_str) != Some(marker_owner)
         || marker_json
             .get("generation")
@@ -2533,6 +4512,7 @@ pub(crate) async fn repair_session_object_index(
             .get("provider_session_id")
             .and_then(serde_json::Value::as_str)
             != Some(provider_session_id)
+        || marker_scope != *capture_scope
     {
         bail!("import object-index repair marker ownership changed");
     }
@@ -2592,83 +4572,110 @@ pub(crate) async fn repair_session_object_index(
     }
 
     let reader = ObjectReader {
-        storage: Arc::new(ClientStorage::init_local_existing(
-            repo_path.join("objects"),
-        )),
+        repo_path: repo_path.to_path_buf(),
     };
     let repo_id = resolve_repo_id(&txn).await;
-    let mut repaired = 0_usize;
-    for row in rows {
-        let checkpoint_id: String = row
-            .try_get_by("checkpoint_id")
-            .context("decode import index repair checkpoint id")?;
-        let tree_oid: String = row
-            .try_get_by("tree_oid")
-            .context("decode import index repair root tree")?;
-        let traces_commit: String = row
-            .try_get_by("traces_commit")
-            .context("decode import index repair traces commit")?;
-        let sweep = sweep_e4_checkpoint_objects(&reader, &tree_oid, &checkpoint_id);
-        if !sweep.manifest_present {
-            continue;
-        }
-        if !sweep.missing.is_empty() {
-            bail!(
-                "checkpoint {checkpoint_id} is missing object-store data required for index repair: {}; run `libra agent doctor --repair`",
-                sweep.missing.join(", ")
-            );
-        }
-        let mut targets = vec![(traces_commit, "commit", None)];
-        targets.extend(
-            sweep
-                .present
-                .into_iter()
-                .map(|object| (object.oid, object.o_type, object.size)),
-        );
-        let mut seen = BTreeSet::new();
-        for (oid, o_type, declared_size) in targets {
-            if !seen.insert(oid.clone()) {
+    // Validate every target before issuing any object-index DML. A later
+    // corrupt blob or exhausted aggregate budget must not leave an earlier
+    // checkpoint partially indexed if this fenced import repair aborts.
+    let mut validation_budget = ObjectIndexValidationBudget::new();
+    let mut seen = BTreeSet::new();
+    let validated_targets = (|| -> anyhow::Result<Vec<(String, &'static str, i64)>> {
+        let mut targets_to_write = Vec::new();
+        for row in rows {
+            let checkpoint_id: String = row
+                .try_get_by("checkpoint_id")
+                .context("decode import index repair checkpoint id")?;
+            let tree_oid: String = row
+                .try_get_by("tree_oid")
+                .context("decode import index repair root tree")?;
+            let traces_commit: String = row
+                .try_get_by("traces_commit")
+                .context("decode import index repair traces commit")?;
+            let sweep = sweep_e4_checkpoint_objects(&reader, &tree_oid, &checkpoint_id);
+            if !sweep.manifest_present {
                 continue;
             }
-            let size = match declared_size {
-                Some(size) => size,
-                None if o_type == "agent_transcript" => bail!(
-                    "checkpoint {checkpoint_id} transcript size is absent from manifest; run `libra agent doctor --repair`"
-                ),
-                None => {
-                    let hash =
-                        crate::internal::object_format::parse_repo_oid(&oid).map_err(|error| {
-                            anyhow::anyhow!("invalid checkpoint object id {oid}: {error}")
-                        })?;
-                    i64::try_from(reader.read_raw(&hash)?.len())
-                        .context("checkpoint object exceeds object-index size range")?
+            if !sweep.missing.is_empty() {
+                bail!(
+                    "checkpoint {checkpoint_id} is missing object-store data required for index repair: {}; run `libra agent doctor --repair`",
+                    sweep.missing.join(", ")
+                );
+            }
+            let mut targets = vec![(traces_commit, "commit")];
+            targets.extend(
+                sweep
+                    .present
+                    .into_iter()
+                    .map(|object| (object.oid, object.o_type)),
+            );
+            for (oid, o_type) in targets {
+                if !seen.insert(oid.clone()) {
+                    continue;
                 }
-            };
-            match object_index_row_shape(&txn, &oid, &repo_id)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-            {
-                Some((existing_type, existing_size))
-                    if existing_type == o_type && existing_size == size => {}
-                Some(_) => {
-                    update_object_index_row_shape(&txn, &oid, o_type, size, &repo_id)
-                        .await
-                        .with_context(|| format!("repair object-index row {oid}"))?;
-                    repaired = repaired.saturating_add(1);
-                }
-                None => {
-                    insert_object_index_row(&txn, &oid, o_type, size, &repo_id)
-                        .await
-                        .with_context(|| format!("insert object-index row {oid}"))?;
-                    repaired = repaired.saturating_add(1);
-                }
+                let hash = crate::internal::object_format::parse_repo_oid(&oid)
+                    .map_err(|_| anyhow::anyhow!("invalid checkpoint object identifier"))?;
+                let size = validation_budget
+                    .validate(&reader, &hash, expected_git_object_type(o_type))
+                    .context("integrity-check checkpoint object for index repair")?;
+                targets_to_write.push((oid, o_type, size));
+            }
+        }
+        Ok(targets_to_write)
+    })();
+    let validated_targets = match validated_targets {
+        Ok(targets) => targets,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
+
+    let mut repaired = 0_usize;
+    for (oid, o_type, size) in validated_targets {
+        match object_index_row_shape(&txn, &oid, &repo_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        {
+            Some((existing_type, existing_size))
+                if existing_type == o_type && existing_size == size => {}
+            Some(_) => {
+                update_object_index_row_shape(&txn, &oid, o_type, size, &repo_id)
+                    .await
+                    .with_context(|| format!("repair object-index row {oid}"))?;
+                repaired = repaired.saturating_add(1);
+            }
+            None => {
+                insert_object_index_row(&txn, &oid, o_type, size, &repo_id)
+                    .await
+                    .with_context(|| format!("insert object-index row {oid}"))?;
+                repaired = repaired.saturating_add(1);
             }
         }
     }
+    commit_session_object_index_repair(txn, capture_scope).await?;
+    Ok(repaired)
+}
+
+/// Finish an import object-index repair only while the originating workspace
+/// lease is live. The conditional workspace update is deliberately the final
+/// DML so an expiry after a repaired row was written rolls that row back.
+async fn commit_session_object_index_repair(
+    txn: DatabaseTransaction,
+    capture_scope: &CaptureScope,
+) -> anyhow::Result<()> {
+    if let Err(error) = capture_scope
+        .assert_workspace_fence_live_for_commit(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before committing import object-index repair",
+        );
+    }
     txn.commit()
         .await
-        .context("commit fenced import object-index repair")?;
-    Ok(repaired)
+        .context("commit fenced import object-index repair")
 }
 
 // ---------------------------------------------------------------------------
@@ -2697,11 +4704,14 @@ fn check_provider(
             installed: Some(installed),
             error: None,
         },
-        Err(err) => ProviderHookStatus {
+        Err(_) => ProviderHookStatus {
             name,
             tier,
             installed: None,
-            error: Some(err.to_string()),
+            error: Some(
+                "provider hook settings could not be inspected; verify the provider configuration and rerun doctor"
+                    .to_string(),
+            ),
         },
     }
 }
@@ -2890,7 +4900,12 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
     ))
     .await
     .map(|row| row.is_some())
-    .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
+    .map_err(|_| {
+        CliError::fatal(
+            "agent doctor could not inspect repository schema; check the repository database and rerun doctor"
+                .to_string(),
+        )
+    })
 }
 
 async fn scalar_count(conn: &(impl ConnectionTrait + ?Sized), sql: &str) -> CliResult<i64> {
@@ -2898,15 +4913,622 @@ async fn scalar_count(conn: &(impl ConnectionTrait + ?Sized), sql: &str) -> CliR
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(backend, sql, []))
         .await
-        .map_err(|e| CliError::fatal(format!("doctor query failed: {e}")))?
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not query repository state; check the repository database and rerun doctor"
+                    .to_string(),
+            )
+        })?
         .ok_or_else(|| CliError::fatal("doctor count returned no rows".to_string()))?;
-    row.try_get_by::<i64, _>("n")
-        .map_err(|e| CliError::fatal(format!("failed to decode doctor count: {e}")))
+    row.try_get_by::<i64, _>("n").map_err(|_| {
+        CliError::fatal(
+            "agent doctor could not decode repository state; check the repository database and rerun doctor"
+                .to_string(),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::{Database, DbBackend};
+
     use super::*;
+
+    /// The handler's own storage/database mappings keep the stable codes of
+    /// the generic repository preflight that doctor skips, and never embed
+    /// the path carried by the underlying `io::Error`.
+    #[test]
+    fn storage_and_database_failures_keep_preflight_stable_codes_without_paths() {
+        const PATH_CANARY: &str = "/doctor-path-canary/.libra";
+        let not_found = doctor_storage_resolution_error(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{PATH_CANARY} is not a libra repository"),
+        ));
+        assert_eq!(not_found.stable_code(), StableErrorCode::RepoNotFound);
+        assert_eq!(not_found.stable_code().exit_code().as_i32(), 128);
+
+        let detached = doctor_storage_resolution_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("this worktree was removed from the registry (detached): {PATH_CANARY}"),
+        ));
+        assert_eq!(detached.stable_code(), StableErrorCode::RepoStateInvalid);
+        assert_eq!(detached.stable_code().exit_code().as_i32(), 128);
+
+        let missing_db = doctor_database_open_error(std::io::ErrorKind::NotFound);
+        assert_eq!(missing_db.stable_code(), StableErrorCode::RepoCorrupt);
+        assert_eq!(missing_db.stable_code().exit_code().as_i32(), 128);
+        assert!(
+            missing_db
+                .message()
+                .contains("repository database not found")
+        );
+
+        let unopenable = doctor_database_open_error(std::io::ErrorKind::Other);
+        assert_eq!(unopenable.stable_code(), StableErrorCode::IoReadFailed);
+        assert_eq!(unopenable.stable_code().exit_code().as_i32(), 128);
+
+        for error in [not_found, detached, missing_db, unopenable] {
+            assert!(
+                !error.render_json().contains(PATH_CANARY),
+                "doctor storage errors must stay path-free: {}",
+                error.render_json()
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_replay_batch_shares_deadline_and_caps_attempts() {
+        let mut batch = ArtifactReplayBatch::new();
+        let deadline = batch.deadline().expect("establish batch deadline");
+        assert_eq!(batch.deadline().expect("reuse batch deadline"), deadline);
+
+        for _ in 0..ArtifactReplayBatch::MAX_ATTEMPTS {
+            assert!(batch.has_capacity());
+            batch.record_attempt();
+        }
+
+        assert!(!batch.has_capacity());
+        assert_eq!(batch.deadline().expect("deadline remains pinned"), deadline);
+    }
+
+    #[test]
+    fn manual_artifact_attempt_gets_a_fresh_bounded_deadline() {
+        let mut batch = ArtifactReplayBatch::new();
+        let automatic = batch.attempt_deadline(false).expect("automatic deadline");
+        std::thread::sleep(Duration::from_millis(5));
+        let manual = batch.attempt_deadline(true).expect("fresh manual deadline");
+        assert!(manual.monotonic() > automatic.monotonic());
+        assert_eq!(batch.attempt_deadline(false).unwrap(), automatic);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_artifact_is_quarantined_without_entering_worker_queue() {
+        let dir = tempfile::tempdir().expect("create doctor test directory");
+        let conn = crate::internal::db::create_database(
+            dir.path()
+                .join("doctor-stale-artifact.db")
+                .to_str()
+                .expect("database path is UTF-8"),
+        )
+        .await
+        .expect("create doctor test database");
+        crate::internal::config::ConfigKv::set_with_conn(
+            &conn,
+            "libra.repoid",
+            "opaque-repository",
+            false,
+        )
+        .await
+        .expect("set doctor test repository identity");
+        let scope = CaptureScope {
+            repo_id: "opaque-repository".into(),
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        };
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let header = format!(
+            "{{\"version\":1,\"binding\":{{\"scope\":{{\"repo_id\":\"{}\",\"worktree_id\":\"\",\"workspace_id\":null,\"workspace_fence\":null}},\"session_id\":\"{}\",\"checkpoint_id\":\"{}\",\"event_id\":\"{}\",\"action_key\":\"action/test\",\"receipt_key\":\"receipt/test\",\"marker_generation\":\"marker/test\",\"source_commitment\":\"source/hmac-v2/{}\",\"reserved_revision\":1,\"original_deadline_millis\":null,\"deferrable\":true,\"first_attempt_millis\":1,\"parent_commit\":null,\"parent_unborn\":true}},\"mac\":\"pending-envelope/hmac-v1/{}\",\"envelope_bytes\":1,\"chunks\":1,\"manual_attempted\":false}}",
+            scope.repo_id,
+            uuid::Uuid::new_v4(),
+            checkpoint_id,
+            uuid::Uuid::new_v4(),
+            "a".repeat(64),
+            "c".repeat(64),
+        );
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &conn,
+            crate::internal::metadata::MetadataScope::AgentCapturePending,
+            "opaque-repository",
+            &checkpoint_id,
+            &header,
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("insert exact pending artifact header");
+
+        quarantine_stale_pending_artifact(&conn, &scope, &checkpoint_id)
+            .await
+            .expect("quarantine stale pending artifact");
+        assert!(
+            !pending::has_pending_header_for_checkpoint(&conn, "opaque-repository", &checkpoint_id)
+                .await
+                .expect("probe pending header")
+        );
+        assert!(
+            pending::has_header_for_checkpoint(&conn, "opaque-repository", &checkpoint_id)
+                .await
+                .expect("probe retained header")
+        );
+        let (_, namespace) =
+            pending::header_for_checkpoint(&conn, "opaque-repository", &checkpoint_id)
+                .await
+                .expect("read quarantined header")
+                .expect("header retained");
+        assert_eq!(
+            namespace,
+            crate::internal::metadata::MetadataScope::AgentCaptureQuarantine
+        );
+
+        let other_checkpoint = uuid::Uuid::new_v4().to_string();
+        let foreign_worktree_header = header.replace(&checkpoint_id, &other_checkpoint).replace(
+            "\"worktree_id\":\"\"",
+            "\"worktree_id\":\"foreign-worktree\"",
+        );
+        crate::internal::metadata::MetadataKv::set_with_conn(
+            &conn,
+            crate::internal::metadata::MetadataScope::AgentCapturePending,
+            "opaque-repository",
+            &other_checkpoint,
+            &foreign_worktree_header,
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("insert foreign-worktree pending header");
+        assert!(
+            quarantine_stale_pending_artifact(&conn, &scope, &other_checkpoint)
+                .await
+                .is_err(),
+            "a different worktree binding must fail closed"
+        );
+        assert!(
+            pending::has_pending_header_for_checkpoint(
+                &conn,
+                "opaque-repository",
+                &other_checkpoint
+            )
+            .await
+            .expect("probe untouched foreign-worktree pending header")
+        );
+    }
+
+    #[test]
+    fn pending_source_is_reported_and_never_swept() {
+        let (detail, plan) = diagnose_pending_finalizer(false, false, false, false, false, false);
+        assert!(detail.contains("pending_source"));
+        assert!(detail.contains("cannot reopen provider sources"));
+        assert_eq!(plan, FinalizerRepairKind::Manual);
+        // The integration fixture drives real stop/resume; pin that its
+        // superseded diagnosis takes precedence over every old-CAS/budget flag.
+        for durable in [false, true] {
+            for exhausted in [false, true] {
+                for artifact in [false, true] {
+                    let (detail, plan) = diagnose_pending_finalizer(
+                        true, durable, exhausted, artifact, artifact, false,
+                    );
+                    assert!(detail.contains("superseded"));
+                    assert_eq!(
+                        plan,
+                        if artifact {
+                            FinalizerRepairKind::QuarantineStaleArtifact
+                        } else {
+                            FinalizerRepairKind::Manual
+                        }
+                    );
+                }
+            }
+        }
+        let (detail, plan) = diagnose_pending_finalizer(false, false, false, true, false, false);
+        assert!(detail.contains("parked in quarantine"));
+        assert_eq!(plan, FinalizerRepairKind::Manual);
+        let (detail, plan) = diagnose_pending_finalizer(false, false, true, true, false, true);
+        assert!(detail.contains("already consumed"));
+        assert_eq!(plan, FinalizerRepairKind::Manual);
+        let (detail, plan) = diagnose_pending_finalizer(false, false, true, true, false, false);
+        assert!(detail.contains("manual recovery is required"));
+        assert_eq!(plan, FinalizerRepairKind::QuarantineExhausted);
+    }
+
+    #[test]
+    fn import_index_repair_pause_is_an_in_process_test_control() {
+        let (reached_sender, reached_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+        let _reset = test_support::install(test_support::TestPause {
+            reached: reached_sender,
+            resume: resume_receiver,
+        });
+        let worker = std::thread::spawn(import_index_repair_test_pause_after_lock);
+        reached_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("test pause reports reaching the repair lock");
+        resume_sender
+            .send(())
+            .expect("test pause waiter remains available");
+        worker
+            .join()
+            .expect("test pause worker does not panic")
+            .expect("test pause resumes after the in-process signal");
+    }
+
+    #[tokio::test]
+    async fn final_scope_fence_rolls_back_object_index_repair_write() {
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open doctor test database");
+        for statement in [
+            "CREATE TABLE config_kv (id TEXT PRIMARY KEY)",
+            "CREATE TABLE workspace_record (
+                workspace_id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                lease_fence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at INTEGER
+            )",
+            "CREATE TABLE object_index (
+                o_id TEXT NOT NULL,
+                o_type TEXT NOT NULL,
+                o_size INTEGER NOT NULL,
+                repo_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                is_synced INTEGER NOT NULL
+            )",
+            "INSERT INTO workspace_record (
+                workspace_id, repo_id, lease_fence, state, lease_owner, lease_expires_at
+             ) VALUES ('workspace-a', 'repo-a', 1, 'active', 'doctor-test-owner',
+                       unixepoch('now') * 1000 + 60000)",
+            "CREATE TRIGGER expire_doctor_scope_after_object_index_insert
+             AFTER INSERT ON object_index
+             BEGIN
+                 UPDATE workspace_record
+                    SET lease_expires_at = 0
+                  WHERE workspace_id = 'workspace-a';
+             END",
+        ] {
+            conn.execute_unprepared(statement)
+                .await
+                .expect("create doctor scope-fence test fixture");
+        }
+        let scope = CaptureScope {
+            repo_id: "repo-a".to_string(),
+            worktree_id: String::new(),
+            workspace_id: Some("workspace-a".to_string()),
+            workspace_fence: Some(1),
+        };
+        let txn = crate::internal::db::begin_write_transaction(&conn)
+            .await
+            .expect("begin object-index repair transaction");
+        scope
+            .assert_workspace_fence_live(&txn)
+            .await
+            .expect("entry scope fence is live");
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced)
+             VALUES ('object-a', 'blob', 1, 'repo-a', 1, 0)",
+            [],
+        ))
+        .await
+        .expect("write repaired object-index row");
+
+        let error = commit_session_object_index_repair(txn, &scope)
+            .await
+            .expect_err("post-write expiry rejects the repair commit");
+        assert!(
+            format!("{error:#}").contains("capture workspace lease is no longer live"),
+            "unexpected scope-fence error: {error:#}"
+        );
+        let count: i64 = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM object_index",
+                [],
+            ))
+            .await
+            .expect("read object-index row count")
+            .expect("object-index count row")
+            .try_get_by("count")
+            .expect("decode object-index row count");
+        assert_eq!(
+            count, 0,
+            "expired lease rolls back repaired object-index row"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_index_repair_rolls_back_all_rows_when_second_dml_fails() {
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open doctor object-index repair test database");
+        for statement in [
+            "CREATE TABLE config_kv (id TEXT PRIMARY KEY)",
+            "CREATE TABLE object_index (
+                o_id TEXT NOT NULL,
+                o_type TEXT NOT NULL,
+                o_size INTEGER NOT NULL,
+                repo_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                is_synced INTEGER NOT NULL
+            )",
+            "CREATE TRIGGER reject_second_doctor_object_index_write
+             BEFORE INSERT ON object_index
+             WHEN NEW.o_id = 'object-b'
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected second object-index DML failure');
+             END",
+        ] {
+            conn.execute_unprepared(statement)
+                .await
+                .expect("create doctor object-index repair fixture");
+        }
+
+        let error = repair_object_index_rows_atomically(
+            &conn,
+            &[
+                ("object-a".to_string(), "blob".to_string(), 1),
+                ("object-b".to_string(), "blob".to_string(), 2),
+            ],
+            &[],
+            "repo-a",
+        )
+        .await
+        .expect_err("injected second object-index DML failure rejects the repair plan");
+        assert!(
+            format!("{error:#}").contains("insert checkpoint object index row object-b"),
+            "unexpected object-index repair error: {error:#}"
+        );
+
+        let count: i64 = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM object_index",
+                [],
+            ))
+            .await
+            .expect("read object-index row count after failed repair")
+            .expect("object-index count row after failed repair")
+            .try_get_by("count")
+            .expect("decode object-index row count after failed repair");
+        assert_eq!(
+            count, 0,
+            "a later object-index DML failure rolls back every earlier repair write"
+        );
+    }
+
+    async fn scoped_catalog_repair_fixture() -> DatabaseConnection {
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open doctor catalog-repair test database");
+        for statement in [
+            "CREATE TABLE config_kv (id TEXT PRIMARY KEY)",
+            "CREATE TABLE workspace_record (
+                workspace_id TEXT PRIMARY KEY,
+                repo_id TEXT NOT NULL,
+                lease_fence INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at INTEGER NOT NULL
+            )",
+            "CREATE TABLE agent_session (
+                session_id TEXT PRIMARY KEY,
+                scope_state TEXT NOT NULL,
+                repo_id TEXT,
+                worktree_id TEXT,
+                workspace_id TEXT,
+                workspace_fence INTEGER
+            )",
+            "CREATE TABLE agent_checkpoint (
+                checkpoint_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                scope TEXT NOT NULL,
+                parent_commit TEXT,
+                tree_oid TEXT NOT NULL,
+                metadata_blob_oid TEXT NOT NULL,
+                traces_commit TEXT NOT NULL,
+                tool_use_id TEXT,
+                subagent_session_id TEXT,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL DEFAULT 0
+            )",
+            "INSERT INTO workspace_record (
+                workspace_id, repo_id, lease_fence, state, lease_owner, lease_expires_at
+             ) VALUES ('workspace-a', 'repo-a', 1, 'active', 'doctor-test-owner',
+                       unixepoch('now') * 1000 + 60000)",
+            "INSERT INTO agent_session (
+                session_id, scope_state, repo_id, worktree_id, workspace_id, workspace_fence
+             ) VALUES ('session-scoped', 'scoped', 'repo-a', '', 'workspace-a', 1)",
+        ] {
+            conn.execute_unprepared(statement)
+                .await
+                .expect("create doctor scoped catalog-repair fixture");
+        }
+        conn
+    }
+
+    async fn catalog_checkpoint_count(conn: &DatabaseConnection) -> i64 {
+        conn.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS count FROM agent_checkpoint",
+            [],
+        ))
+        .await
+        .expect("read checkpoint count")
+        .expect("checkpoint count row")
+        .try_get_by("count")
+        .expect("decode checkpoint count")
+    }
+
+    #[tokio::test]
+    async fn scoped_doctor_insert_rolls_back_after_post_insert_scope_expiry() {
+        let conn = scoped_catalog_repair_fixture().await;
+        conn.execute_unprepared(
+            "CREATE TRIGGER expire_doctor_scope_after_checkpoint_insert
+             AFTER INSERT ON agent_checkpoint
+             BEGIN
+                 UPDATE workspace_record
+                    SET lease_expires_at = 0
+                  WHERE workspace_id = 'workspace-a';
+             END",
+        )
+        .await
+        .expect("install post-insert scope expiry trigger");
+        let row = AgentCheckpointRow {
+            checkpoint_id: "checkpoint-insert-expiry",
+            session_id: "session-scoped",
+            parent_commit: None,
+            tree_oid: "tree-new",
+            metadata_blob_oid: "metadata-new",
+            traces_commit: "traces-new",
+            created_at: 1,
+        };
+
+        let error = repair_insert_agent_checkpoint_catalog_row(&conn, &row)
+            .await
+            .expect_err("post-insert expiry must reject scoped doctor repair");
+        assert!(
+            format!("{error:#}").contains("capture workspace lease is no longer live"),
+            "unexpected scope-fence error: {error:#}"
+        );
+        assert_eq!(
+            catalog_checkpoint_count(&conn).await,
+            0,
+            "expired scope rolls the catalog insertion back"
+        );
+
+        let mut finding = CheckpointFinding {
+            inconsistency_type: CLASS_MISSING_CATALOG_ROW.to_string(),
+            checkpoint_id: row.checkpoint_id.to_string(),
+            detail: "missing catalog row".to_string(),
+            repaired: false,
+            manual_required: false,
+        };
+        mark_catalog_repair_failed(&mut finding);
+        assert!(
+            !finding.repaired,
+            "a rejected repair is never reported repaired"
+        );
+        assert!(
+            finding.manual_required,
+            "a scope-fenced repair remains actionable/manual for the operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_doctor_update_rolls_back_after_post_update_scope_expiry() {
+        let conn = scoped_catalog_repair_fixture().await;
+        conn.execute_unprepared(
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                metadata_blob_oid, traces_commit, created_at, sync_revision
+             ) VALUES (
+                'checkpoint-update-expiry', 'session-scoped', 'committed', NULL,
+                'tree-old', 'metadata-old', 'traces-old', 1, 0
+             )",
+        )
+        .await
+        .expect("insert stale checkpoint catalog row");
+        conn.execute_unprepared(
+            "CREATE TRIGGER expire_doctor_scope_after_checkpoint_update
+             AFTER UPDATE ON agent_checkpoint
+             BEGIN
+                 UPDATE workspace_record
+                    SET lease_expires_at = 0
+                  WHERE workspace_id = 'workspace-a';
+             END",
+        )
+        .await
+        .expect("install post-update scope expiry trigger");
+
+        let error = repair_update_checkpoint_catalog_row(
+            &conn,
+            "checkpoint-update-expiry",
+            "tree-new",
+            "metadata-new",
+            "traces-new",
+        )
+        .await
+        .expect_err("post-update expiry must reject scoped doctor repair");
+        assert!(
+            format!("{error:#}").contains("capture workspace lease is no longer live"),
+            "unexpected scope-fence error: {error:#}"
+        );
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT tree_oid, metadata_blob_oid, traces_commit, sync_revision
+                 FROM agent_checkpoint WHERE checkpoint_id = 'checkpoint-update-expiry'",
+                [],
+            ))
+            .await
+            .expect("read stale checkpoint after rejected repair")
+            .expect("stale checkpoint remains present");
+        let tree_oid: String = row.try_get_by("tree_oid").expect("decode old tree");
+        let metadata_blob_oid: String = row
+            .try_get_by("metadata_blob_oid")
+            .expect("decode old metadata");
+        let traces_commit: String = row
+            .try_get_by("traces_commit")
+            .expect("decode old traces commit");
+        let sync_revision: i64 = row
+            .try_get_by("sync_revision")
+            .expect("decode old sync revision");
+        assert_eq!(
+            (
+                tree_oid.as_str(),
+                metadata_blob_oid.as_str(),
+                traces_commit.as_str(),
+                sync_revision
+            ),
+            ("tree-old", "metadata-old", "traces-old", 0),
+            "expired scope rolls the entire catalog update back"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_doctor_catalog_insert_remains_repairable() {
+        let conn = scoped_catalog_repair_fixture().await;
+        conn.execute_unprepared(
+            "UPDATE agent_session
+             SET scope_state = 'legacy_unknown', repo_id = NULL, worktree_id = NULL,
+                 workspace_id = NULL, workspace_fence = NULL
+             WHERE session_id = 'session-scoped'",
+        )
+        .await
+        .expect("make fixture an explicit legacy catalog row");
+        conn.execute_unprepared(
+            "UPDATE workspace_record SET lease_expires_at = 0 WHERE workspace_id = 'workspace-a'",
+        )
+        .await
+        .expect("expire irrelevant workspace record");
+        let row = AgentCheckpointRow {
+            checkpoint_id: "checkpoint-legacy",
+            session_id: "session-scoped",
+            parent_commit: None,
+            tree_oid: "tree-legacy",
+            metadata_blob_oid: "metadata-legacy",
+            traces_commit: "traces-legacy",
+            created_at: 1,
+        };
+
+        assert!(
+            repair_insert_agent_checkpoint_catalog_row(&conn, &row)
+                .await
+                .expect("explicit legacy catalog repair remains compatible")
+        );
+        assert_eq!(catalog_checkpoint_count(&conn).await, 1);
+    }
 
     #[test]
     fn libra_trailers_parse_parent_commit_and_scope() {
@@ -2973,18 +5595,23 @@ mod tests {
         assert_eq!(parsed.created_at, 42);
     }
 
-    /// The manifest sweep understands both transcript shapes: a single
-    /// `oid` entry and the E5 chunked `parts` array; single-blob roles
-    /// contribute their `path` + `oid`.
+    /// The manifest sweep understands both transcript shapes while deriving
+    /// only fixed labels from entry roles, never caller-shaped paths.
     #[test]
     fn manifest_declared_blobs_covers_single_and_chunked_entries() {
+        let metadata_oid = "a".repeat(40);
+        let lifecycle_oid = "b".repeat(40);
+        let transcript_part_one_oid = "c".repeat(40);
+        let transcript_part_two_oid = "d".repeat(40);
+        let redaction_oid = "e".repeat(40);
+        let content_hash_oid = "f".repeat(40);
         let manifest = serde_json::json!({
             "schema_version": 1,
             "checkpoint_id": "abc",
             "entries": {
-                "metadata": { "path": "metadata.json", "oid": "aa1", "byte_len": 100 },
+                "metadata": { "path": "metadata.json", "oid": metadata_oid, "byte_len": 100 },
                 "lifecycle_events": {
-                    "path": "events/lifecycle.jsonl", "oid": "bb2", "byte_len": 200
+                    "path": "events/lifecycle.jsonl", "oid": lifecycle_oid, "byte_len": 200
                 },
                 "transcript": {
                     "path": "transcript/claude_code.jsonl",
@@ -2993,84 +5620,220 @@ mod tests {
                     "parts": [
                         {
                             "path": "transcript/claude_code.jsonl.001",
-                            "oid": "cc3",
+                            "oid": transcript_part_one_oid,
                             "byte_len": 400
                         },
                         {
                             "path": "transcript/claude_code.jsonl.002",
-                            "oid": "dd4",
+                            "oid": transcript_part_two_oid,
                             "byte_len": 300
                         }
                     ]
                 },
                 "redaction_report": {
-                    "path": "redaction_report.json", "oid": "ee5", "byte_len": 50
+                    "path": "redaction_report.json", "oid": redaction_oid, "byte_len": 50
                 },
-                "content_hash": { "path": "content_hash.txt", "oid": "ff6", "byte_len": 71 }
+                "content_hash": { "path": "content_hash.txt", "oid": content_hash_oid, "byte_len": 71 }
             }
         });
-        let mut declared = manifest_declared_blobs(&manifest);
-        declared.sort();
+        let parsed = manifest_declared_blobs(&manifest);
+        assert!(!parsed.over_limit, "ordinary manifest stays within the cap");
+        let mut declared = parsed
+            .declarations
+            .into_iter()
+            .map(|entry| (entry.label, entry.oid, entry.o_type))
+            .collect::<Vec<_>>();
+        declared.sort_by(|left, right| left.0.cmp(&right.0));
         // Chunked transcript: the top-level entry has NO `oid` (only
-        // `parts`), so exactly the per-chunk OIDs surface — each with the
-        // per-chunk byte_len class 3 uses as o_size, guaranteeing the
-        // repair path never reads a transcript payload to size it.
+        // `parts`), so exactly the per-chunk OIDs surface. `byte_len` is
+        // deliberately ignored; class 3 streams the held object descriptor
+        // and verifies its content-addressed identity before writing a size.
         assert_eq!(
             declared,
             vec![
-                ("content_hash.txt".to_string(), "ff6".to_string(), Some(71)),
                 (
-                    "events/lifecycle.jsonl".to_string(),
-                    "bb2".to_string(),
-                    Some(200)
-                ),
-                ("metadata.json".to_string(), "aa1".to_string(), Some(100)),
-                (
-                    "redaction_report.json".to_string(),
-                    "ee5".to_string(),
-                    Some(50)
+                    "manifest-declared content hash".to_string(),
+                    Some("f".repeat(40)),
+                    "blob",
                 ),
                 (
-                    "transcript/claude_code.jsonl.001".to_string(),
-                    "cc3".to_string(),
-                    Some(400)
+                    "manifest-declared lifecycle events".to_string(),
+                    Some("b".repeat(40)),
+                    "blob",
                 ),
                 (
-                    "transcript/claude_code.jsonl.002".to_string(),
-                    "dd4".to_string(),
-                    Some(300)
+                    "manifest-declared metadata".to_string(),
+                    Some("a".repeat(40)),
+                    "blob",
+                ),
+                (
+                    "manifest-declared redaction report".to_string(),
+                    Some("e".repeat(40)),
+                    "blob",
+                ),
+                (
+                    "manifest-declared transcript part 1".to_string(),
+                    Some("c".repeat(40)),
+                    "agent_transcript",
+                ),
+                (
+                    "manifest-declared transcript part 2".to_string(),
+                    Some("d".repeat(40)),
+                    "agent_transcript",
                 ),
             ]
         );
 
-        // Single-file transcript (small): plain `oid` + `byte_len`, no
-        // parts — the declared byte_len is what class 3 enqueues.
+        // Single-file transcript (small): plain `oid` is cross-checked to
+        // the tree, but its declared byte_len never reaches object_index.
+        let single_oid = "c".repeat(40);
         let single = serde_json::json!({
             "entries": {
                 "transcript": {
-                    "path": "transcript/claude_code.jsonl", "oid": "cc9", "byte_len": 42
+                    "path": "transcript/claude_code.jsonl", "oid": single_oid, "byte_len": 42
                 }
             }
         });
         assert_eq!(
             manifest_declared_blobs(&single),
-            vec![(
-                "transcript/claude_code.jsonl".to_string(),
-                "cc9".to_string(),
-                Some(42)
-            )]
+            ManifestDeclarations {
+                declarations: vec![ManifestDeclaredBlob {
+                    label: "manifest-declared transcript".to_string(),
+                    role: Some(ManifestRole::Transcript),
+                    oid: Some("c".repeat(40)),
+                    o_type: "agent_transcript",
+                }],
+                over_limit: false,
+            }
         );
 
-        // Legacy/corrupt manifests without byte_len still yield the OIDs
-        // (size falls back to a payload read for those objects only).
+        // Legacy/corrupt manifests without byte_len still yield the OIDs;
+        // size comes from descriptor-pinned streaming validation instead.
+        let no_len_oid = "a".repeat(40);
         let no_len = serde_json::json!({
             "entries": {
-                "metadata": { "path": "metadata.json", "oid": "aa7" }
+                "metadata": { "path": "metadata.json", "oid": no_len_oid }
             }
         });
         assert_eq!(
             manifest_declared_blobs(&no_len),
-            vec![("metadata.json".to_string(), "aa7".to_string(), None)]
+            ManifestDeclarations {
+                declarations: vec![ManifestDeclaredBlob {
+                    label: "manifest-declared metadata".to_string(),
+                    role: Some(ManifestRole::Metadata),
+                    oid: Some("a".repeat(40)),
+                    o_type: "blob",
+                }],
+                over_limit: false,
+            }
+        );
+
+        let damaged = serde_json::json!({
+            "entries": {
+                "transcript": {
+                    "path": "/private/manifest-path-secret",
+                    "oid": "manifest-oid-secret"
+                }
+            }
+        });
+        assert_eq!(
+            manifest_declared_blobs(&damaged),
+            ManifestDeclarations {
+                declarations: vec![ManifestDeclaredBlob {
+                    label: "manifest-declared transcript".to_string(),
+                    role: Some(ManifestRole::Transcript),
+                    oid: None,
+                    o_type: "agent_transcript",
+                }],
+                over_limit: false,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_declaration_limit_fails_closed_without_retaining_all_parts() {
+        let part = serde_json::json!({ "oid": "a".repeat(40), "byte_len": 1 });
+        let manifest = serde_json::json!({
+            "entries": {
+                "transcript": {
+                    "parts": vec![part; DOCTOR_E4_MANIFEST_DECLARATION_CAP + 1]
+                }
+            }
+        });
+        let declarations = manifest_declared_blobs(&manifest);
+        assert!(
+            declarations.over_limit,
+            "oversized parts list must be manual-only"
+        );
+        assert!(
+            declarations.declarations.len() <= DOCTOR_E4_MANIFEST_DECLARATION_CAP,
+            "bounded parser must not retain every malicious declaration"
+        );
+    }
+
+    #[test]
+    fn e4_sweep_global_object_limit_stops_before_unbounded_fan_out() {
+        let mut sweep = E4Sweep::default();
+        let mut seen = BTreeSet::new();
+        for index in 0..=DOCTOR_E4_OBJECT_CAP {
+            sweep.record(
+                &mut seen,
+                "unrecognized checkpoint sidecar",
+                &format!("{index:040x}"),
+                "blob",
+                None,
+                true,
+            );
+        }
+        assert!(
+            sweep.entry_limit_hit,
+            "global sweep budget must stop the walk"
+        );
+        assert_eq!(
+            sweep.present.len(),
+            DOCTOR_E4_OBJECT_CAP,
+            "the sweep must not retain an unbounded reachability set"
+        );
+        assert!(
+            sweep
+                .missing
+                .iter()
+                .any(|detail| detail.contains("doctor entry limit")),
+            "cap hit must become a fixed manual-review finding: {sweep:?}"
+        );
+    }
+
+    /// The per-object cap is not sufficient on its own: many valid small
+    /// objects could otherwise make doctor stream an unbounded aggregate.
+    #[cfg(unix)]
+    #[test]
+    fn object_index_validation_budget_is_cumulative_across_objects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path();
+        std::fs::create_dir_all(repo_path.join("objects")).expect("objects directory");
+        let first = crate::utils::object::write_git_object(repo_path, "blob", b"abc")
+            .expect("write first loose object");
+        let second = crate::utils::object::write_git_object(repo_path, "blob", b"def")
+            .expect("write second loose object");
+        let reader = ObjectReader {
+            repo_path: repo_path.to_path_buf(),
+        };
+        let mut budget = ObjectIndexValidationBudget { remaining_bytes: 5 };
+
+        assert_eq!(
+            budget
+                .validate(&reader, &first, "blob")
+                .expect("first object fits aggregate budget"),
+            3
+        );
+        assert_eq!(budget.remaining_bytes, 2);
+        assert!(
+            budget.validate(&reader, &second, "blob").is_err(),
+            "the second 3-byte object must not exceed the remaining 2-byte budget"
+        );
+        assert_eq!(
+            budget.remaining_bytes, 2,
+            "a rejected validation must not consume budget or allow partial accounting"
         );
     }
 
@@ -3090,6 +5853,39 @@ mod tests {
                 ".libra/sessions/code".to_string(),
                 ".libra/code".to_string()
             ]
+        );
+    }
+
+    /// The findings scanner must list the same directory object it opened
+    /// with the no-follow walk. Re-resolving the pathname here would let a
+    /// concurrent replacement redirect an otherwise descriptor-safe repair
+    /// into an attacker-controlled tree.
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_listing_stays_pinned_when_storage_path_is_replaced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runs_root = temp.path().join("agent-runs");
+        std::fs::create_dir_all(runs_root.join("original-run")).expect("create original run");
+        let pinned = crate::utils::object::open_directory_tree_no_follow(&runs_root)
+            .expect("pin original agent-runs directory");
+
+        let displaced = temp.path().join("agent-runs-displaced");
+        std::fs::rename(&runs_root, &displaced).expect("displace original root");
+        std::fs::create_dir_all(runs_root.join("attacker-run")).expect("create replacement root");
+
+        let names = pinned
+            .try_clone()
+            .and_then(crate::utils::beneath::read_dir_fd)
+            .expect("list held root descriptor")
+            .map(|entry| entry.expect("read held root entry").name)
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name == "original-run"),
+            "pinned listing must retain the original directory: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "attacker-run"),
+            "pinned listing must not follow the replacement directory: {names:?}"
         );
     }
 }

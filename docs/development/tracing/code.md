@@ -163,7 +163,7 @@ retention、artifact store 或 fix bridge。
 | A0 产物 | 已核对接口（2026-08-09） | Code 消费决定 / 漂移处置 |
 |---|---|---|
 | A0-02 subagent checkpoint | `src/command/agent/hooks.rs:61-78` 的 `SubagentStart/SubagentEnd`；`src/internal/ai/history.rs:4764-4780` 的 `CheckpointScope::Subagent`；agent.md `:1057` 记录消费关系。 | 非 Code turn queue；Code 不复制 checkpoint writer。 |
-| A0-03 stable error emit | `src/command/agent/hooks.rs:133-141` 映射 `HookEnvelopeInvalid` → `LBR-AGENT-008`；`src/command/agent/checkpoint.rs:337,351` 映射 `LBR-AGENT-009`/`AgentCheckpointStoreInconsistent`。 | 保留 agent error model；Code runtime 只返回其自己的 typed worker error。 |
+| A0-03 stable error emit | `src/internal/ai/capture/ingress.rs` 统一产生 `HookEnvelopeInvalid`，`src/command/hooks.rs::map_capture_ingest_error` 为安装的 Claude 与隐藏的 agent 入口映射 `LBR-AGENT-008`；`src/command/agent/checkpoint.rs:337,351` 映射 `LBR-AGENT-009`/`AgentCheckpointStoreInconsistent`。 | 保留 agent error model；Code runtime 只返回其自己的 typed worker error。 |
 | A0-04 run admission | `src/internal/ai/run_admission.rs:82,132,147` 的 `decide`、`RunSlot`、`QueueTicket`。 | 仅 review/investigate run 粒度；W1 worker 另行拥有 session turn 串行化。 |
 | A0-05 fix bridge | `src/command/agent/review.rs:23,74` 与 `investigate.rs:22,77` 保持 `LBR-AGENT-010` fail-closed。 | 不等待、不伪造 bridge；W1 绑定 hardening/tool-loop，W6-02 再登记 bridge restart。 |
 | A0-06 findings artifacts | `src/internal/ai/review/store.rs:608-618` 与 `src/internal/ai/investigate/store.rs:691-701` 均写 `findings_oid`；doctor/attach 为 agent 路径。 | Code session 不拥有或 GC agent artifacts。 |

@@ -87,6 +87,30 @@ fn test_agent_graph_help_pins_session_repo_and_machine_surface() {
 }
 
 #[test]
+fn test_capture_budget_is_scoped_to_hidden_hook_entrypoints() {
+    let repo = tempdir().expect("tempdir for hidden capture-budget grammar");
+    let output = run_libra_command(
+        &[
+            "--json=compact",
+            "agent",
+            "status",
+            "--capture-budget-ms",
+            "1",
+        ],
+        repo.path(),
+    );
+    assert!(
+        !output.status.success(),
+        "non-hook agent commands must reject installer-only capture budgets"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains("--capture-budget-ms"),
+        "clap must reject the hidden hook-only flag before status dispatch: {stderr}"
+    );
+}
+
+#[test]
 fn test_agent_import_help_pins_consent_and_selector_surface() {
     let repo = tempdir().expect("tempdir for agent import --help");
     let output = run_libra_command(&["agent", "import", "--help"], repo.path());
@@ -116,7 +140,7 @@ fn test_agent_import_help_pins_consent_and_selector_surface() {
 }
 
 #[test]
-fn test_agent_checkpoint_rewind_help_mentions_supported_transcript_truncation() {
+fn test_agent_checkpoint_rewind_help_pins_worktree_only_contract() {
     let repo = tempdir().expect("tempdir for agent checkpoint rewind --help");
     let output = run_libra_command(&["agent", "checkpoint", "rewind", "--help"], repo.path());
     assert!(
@@ -126,13 +150,36 @@ fn test_agent_checkpoint_rewind_help_mentions_supported_transcript_truncation() 
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("supported agent transcripts"),
-        "rewind help should describe the current truncation behavior, stdout: {stdout}"
+        stdout.contains("restores the worktree only"),
+        "rewind help should state the worktree-only contract, stdout: {stdout}"
     );
     assert!(
-        !stdout.contains("NOT rewritten") && !stdout.contains("restores worktree only"),
-        "rewind help must not claim transcripts are never rewritten, stdout: {stdout}"
+        !stdout.contains("supported transcripts"),
+        "rewind help must not promise provider transcript rewrites, stdout: {stdout}"
     );
+}
+
+#[test]
+fn test_agent_session_show_help_pins_verified_transcript_source_contract() {
+    let repo = tempdir().expect("tempdir for agent session show --help");
+    let output = run_libra_command(&["agent", "session", "show", "--help"], repo.path());
+    assert!(
+        output.status.success(),
+        "agent session show --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "--extract-transcript <PATH>",
+        "currently verified Claude Code transcript source",
+        "no captured-metadata-path fallback",
+        "may be unavailable",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "agent session show help should include `{text}`, stdout: {stdout}"
+        );
+    }
 }
 
 /// RC-11: `agent session promote` is gone. Clap must reject it as an

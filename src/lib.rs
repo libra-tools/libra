@@ -81,7 +81,10 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    use crate::utils::test::{self, ScopedEnvVar};
+    use crate::utils::{
+        client_storage::{ObjectIndexTestFaults, install_test_object_index_faults},
+        test,
+    };
 
     /// Smoke test: verifies that the [`ChangeDirGuard`](test::ChangeDirGuard) test
     /// helper can be acquired against a freshly-created temporary directory.
@@ -113,8 +116,17 @@ mod tests {
                         let _cwd = test::ChangeDirGuard::new(repo.path());
                         let input = repo.path().join("payload.txt");
                         fs::write(&input, b"async drain payload").expect("write hash-object input");
-                        let _delay =
-                            ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "500");
+                        let db_path = repo
+                            .path()
+                            .join(crate::utils::util::ROOT_DIR)
+                            .join(crate::utils::util::DATABASE);
+                        let _delay = install_test_object_index_faults(
+                            &db_path,
+                            ObjectIndexTestFaults {
+                                consumer_delay: Some(Duration::from_millis(500)),
+                                ..Default::default()
+                            },
+                        );
 
                         let timer_fired = Arc::new(AtomicBool::new(false));
                         let timer_state = Arc::clone(&timer_fired);

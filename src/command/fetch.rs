@@ -7586,11 +7586,14 @@ mod tests {
         assert!(keep.exists(), "non-temp file should remain");
     }
 
-    // Bridge default and env groups (env alone misses default), in that order.
-    #[serial_test::serial(inner_attrs = [serial_test::serial(env)])]
+    // Bridge default and env groups (env alone misses default). The later
+    // bare attribute wraps the named one, taking the legacy lock first.
     #[test]
     #[serial_test::serial(env)]
+    #[serial_test::serial]
     fn test_ensure_vault_ssh_tmp_dir_uses_home_directory() {
+        assert!(serial_test::is_locked_serially(None));
+        assert!(serial_test::is_locked_serially(Some("env")));
         let temp_home = tempdir().expect("failed to create temp home");
         let _home = ScopedEnvVar::set("HOME", temp_home.path());
         let _userprofile = ScopedEnvVar::set("USERPROFILE", temp_home.path());
