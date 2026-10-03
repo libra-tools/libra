@@ -112,6 +112,7 @@ the forms available in this release.
 | `d` | `--delete-dir <NAME>` (PATH is the parent) | `POST /api/v1/delete-entry` |
 | `m` | `--move-dir <NAME> <PARENT-PATH>` (PATH is NAME's current parent; the name is kept) | `POST /api/v1/move-entry` |
 | `R` | `--rename-dir <NAME> <NEW-NAME>` (PATH is the parent, which is kept) | `POST /api/v1/move-entry` |
+| `t`, then `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]` (PATH must be `/`) | `GET /api/v1/tags/list` |
 
 Every non-interactive call follows the same rules:
 
@@ -136,6 +137,9 @@ Every non-interactive call follows the same rules:
 - **One operation, no `--ref` on writes.** Combining two operation flags is a
   usage error (`LBR-CLI-002`), and so is `--ref` with a write operation:
   writes always target the server's default revision. Neither sends a request.
+- **Tags: root only, no revision.** Tag operations act on root tags: PATH
+  must be `/` (the default), and `--ref` is refused. Both fail with
+  `LBR-CLI-002` before any request.
 - **Writes are not retried.** A write whose outcome is unknown is never
   repeated by Libra. That happens when it times out or fails before any
   response (`LBR-NET-001` with `details.transport` `timeout` or `request`),
@@ -267,6 +271,49 @@ Errors:
 | HTTP 404: NAME or PATH does not exist | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
 
+`--list-tags` lists one page of root tags with one anonymous
+`GET /api/v1/tags/list` (query `page`, `per_page` and `path=/`). `--page`
+(1–1000, default 1) and `--per-page` (1–100, default 20, the interactive
+panel's page size) choose the page; both are refused without `--list-tags`.
+Each tag prints as `<name>  <object_type>  <tagger>`, followed by its message
+on a line indented by four spaces when it has one, then a
+`page <page> · per_page <per_page> · total <total>` line; control characters
+in server strings print as `?`. With `--json`/`--machine` the payload is:
+
+```json
+{
+  "operation": "list-tags",
+  "server": "https://mega2.example.com",
+  "path": "/",
+  "page": 1,
+  "per_page": 20,
+  "total": 42,
+  "has_next": true,
+  "items": [
+    { "name": "v1.0", "tag_id": "…", "object_id": "…", "object_type": "commit",
+      "tagger": "…", "message": "…", "created_at": "…" }
+  ]
+}
+```
+
+`has_next` is `page * per_page < total`; `items` keep every server field
+verbatim. mega2 today pages annotated tags in its database, then fills the
+rest of the page from its `refs/tags/*` refs, always starting again from the
+first ref and skipping only the annotated tags already on that page. Annotated
+tags have refs too, so a page can repeat tags from other pages; such entries,
+like lightweight tags, carry ref-only fields (`object_type` `commit`, empty
+`tagger` and `message`, `tag_id` equal to `object_id`). `total` adds every
+such ref to the annotated count, so it can exceed the number of distinct tags
+and differ from page to page, and `has_next` inherits that. Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| `--page` outside 1–1000 or `--per-page` outside 1–100 | `LBR-CLI-002` | none (no request) |
+| `--page` or `--per-page` without `--list-tags` | `LBR-CLI-002` | none (no request) |
+| A malformed PATH (not rooted, or with `.`/`..` components) | `LBR-CLI-003` | none (no request) |
+| A rooted PATH other than `/`, `--ref`, a token flag, or another operation flag | `LBR-CLI-002` | none (no request) |
+| HTTP, transport or response failures | the failure's stable code (see Machine error details) | `http_status` or `transport` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -329,13 +376,16 @@ terminal. The panel operates root tags only.
 | Option | Description |
 |--------|-------------|
 | `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS, or loopback HTTP. |
-| `[PATH]` | Rooted directory to list, or the parent for a directory write; defaults to `/`. |
+| `[PATH]` | Rooted directory to list, or the parent for a directory write; defaults to `/`. Tag operations accept only `/`. |
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
 | `--create-dir <NAME>` | Create directory NAME under PATH without a terminal (one POST, no reload). |
 | `--delete-dir <NAME>` | Delete directory NAME under PATH without a terminal (one POST, no confirmation, no reload). |
 | `--move-dir <NAME> <PARENT-PATH>` | Move directory NAME from PATH into PARENT-PATH, keeping its name, without a terminal (one POST, no reload). |
 | `--rename-dir <NAME> <NEW-NAME>` | Rename directory NAME under PATH to NEW-NAME, keeping its parent, without a terminal (one POST, no reload). |
+| `--list-tags` | List one page of root tags without a terminal (one GET). |
+| `--page <N>` | With `--list-tags`: the page to list (1–1000; default 1). |
+| `--per-page <N>` | With `--list-tags`: tags per page (1–100; default 20). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -412,6 +462,9 @@ libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /li
 
 # Rename /src/old to /src/new without a terminal
 libra --json mega2 browser --server https://mega2.example.com --rename-dir old new /src --token-file ~/.mega2-token
+
+# Second page of root tags, 50 per page, as JSON
+libra --json mega2 browser --server https://mega2.example.com --list-tags --page 2 --per-page 50
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

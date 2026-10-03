@@ -27,6 +27,7 @@ use crate::{
             DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient,
             MoveReceipt as RemoteMoveReceipt,
         },
+        mega2_tag::{Mega2TagClient, TagPage},
         mega2_tree::{ContentType, Listing, Mega2TreeSession, normalize_path},
     },
     utils::{
@@ -115,6 +116,13 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Write,
         surface: Surface::Directory,
     },
+    OperationSpec {
+        name: "list-tags",
+        flag: "--list-tags",
+        endpoint: mega2_diag::LIST_TAGS,
+        access: Access::Read,
+        surface: Surface::Tag,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
@@ -137,6 +145,11 @@ pub enum Operation {
         name: String,
         new_name: String,
     },
+    /// One page of root tags.
+    ListTags {
+        page: u64,
+        per_page: u64,
+    },
 }
 
 impl Operation {
@@ -148,6 +161,7 @@ impl Operation {
             Operation::DeleteDir { .. } => "delete-dir",
             Operation::MoveDir { .. } => "move-dir",
             Operation::RenameDir { .. } => "rename-dir",
+            Operation::ListTags { .. } => "list-tags",
         }
     }
 
@@ -293,6 +307,16 @@ pub async fn execute(
             );
             emit_write(spec, invocation, output, &target, &receipt, &summary)
         }
+        Operation::ListTags { page, per_page } => {
+            let client = Mega2TagClient::new(invocation.server, token)?;
+            let tags = client.list_tags(page, per_page, invocation.path).await?;
+            if output.is_json() {
+                let data = ListTagsData::new(spec.name, invocation, page, per_page, &tags);
+                emit_json_data(COMMAND, &data, output)
+            } else {
+                write_human(output, &render_tags(page, per_page, &tags))
+            }
+        }
     }
 }
 
@@ -323,6 +347,9 @@ fn emit_write<T: Serialize, R: Serialize>(
 /// request:
 /// - R8: write operations refuse `--ref`; writes always target the server's
 ///   default revision;
+/// - R10b: read tag operations refuse `--ref` as well: tags are not listed
+///   per revision;
+/// - R10a: tag operations act on root tags only, so PATH must be `/`;
 /// - R5a/R5b: read operations take no credentials, so they refuse the token
 ///   flags and never read `LIBRA_MEGA2_TOKEN` (R6); write operations resolve
 ///   their token in [`Invocation::write_token`] (R9a–R9c).
@@ -334,6 +361,22 @@ fn check_class_rules(spec: &OperationSpec, invocation: &Invocation<'_>) -> CliRe
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)
         .with_hint("remove --ref"));
+    }
+    if spec.surface == Surface::Tag && invocation.git_ref.is_some() {
+        return Err(CliError::fatal(format!(
+            "mega2 browser: {} cannot be combined with --ref; tags are not selected by revision",
+            spec.flag
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("remove --ref"));
+    }
+    if spec.surface == Surface::Tag && invocation.path != "/" {
+        return Err(CliError::fatal(format!(
+            "mega2 browser: {} operates on root tags only; PATH must be /",
+            spec.flag
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("omit PATH or pass /"));
     }
     if invocation.has_token_flags() && !spec.access.takes_credentials() {
         return Err(CliError::fatal(
@@ -451,6 +494,88 @@ struct WriteData<'a, T, R> {
     receipt: &'a R,
 }
 
+/// One tag of a `list-tags` page, every field as the server sent it.
+#[derive(Serialize, Debug)]
+struct TagItem<'a> {
+    name: &'a str,
+    tag_id: &'a str,
+    object_id: &'a str,
+    object_type: &'a str,
+    tagger: &'a str,
+    message: &'a str,
+    created_at: &'a str,
+}
+
+/// The `list-tags` machine payload: the page asked for, the server's total and
+/// whether a later page exists.
+#[derive(Serialize, Debug)]
+struct ListTagsData<'a> {
+    operation: &'static str,
+    server: &'a str,
+    path: &'a str,
+    page: u64,
+    per_page: u64,
+    total: u64,
+    has_next: bool,
+    items: Vec<TagItem<'a>>,
+}
+
+impl<'a> ListTagsData<'a> {
+    fn new(
+        operation: &'static str,
+        invocation: &Invocation<'a>,
+        page: u64,
+        per_page: u64,
+        tags: &'a TagPage,
+    ) -> Self {
+        Self {
+            operation,
+            server: invocation.server,
+            path: invocation.path,
+            page,
+            per_page,
+            total: tags.total,
+            has_next: page.saturating_mul(per_page) < tags.total,
+            items: tags
+                .items
+                .iter()
+                .map(|tag| TagItem {
+                    name: &tag.name,
+                    tag_id: &tag.tag_id,
+                    object_id: &tag.object_id,
+                    object_type: &tag.object_type,
+                    tagger: &tag.tagger,
+                    message: &tag.message,
+                    created_at: &tag.created_at,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One line per tag, `<name>  <object_type>  <tagger>`, a four-space indented
+/// message line when the message is not empty, then the paging line. Server
+/// strings are sanitized.
+fn render_tags(page: u64, per_page: u64, tags: &TagPage) -> String {
+    let mut out = String::new();
+    for tag in &tags.items {
+        out.push_str(&format!(
+            "{}  {}  {}\n",
+            sanitize(&tag.name),
+            sanitize(&tag.object_type),
+            sanitize(&tag.tagger)
+        ));
+        if !tag.message.is_empty() {
+            out.push_str(&format!("    {}\n", sanitize(&tag.message)));
+        }
+    }
+    out.push_str(&format!(
+        "page {page} · per_page {per_page} · total {}\n",
+        tags.total
+    ));
+    out
+}
+
 /// One line per entry, `dir  <name>` or `file  <name>`, in listing order.
 fn render_listing(listing: &Listing) -> String {
     listing
@@ -561,6 +686,14 @@ mod tests {
         .expect("rename-dir is registered");
         assert_eq!(spec.name, "rename-dir");
         assert_eq!(spec.endpoint, mega2_diag::MOVE_ENTRY);
+        let spec = Operation::ListTags {
+            page: 1,
+            per_page: 20,
+        }
+        .spec()
+        .expect("list-tags is registered");
+        assert_eq!(spec.name, "list-tags");
+        assert_eq!(spec.endpoint, mega2_diag::LIST_TAGS);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -708,6 +841,35 @@ mod tests {
                 },
                 "receipt": {"commit_id": "c1", "from_path": "/src/old", "to_path": "/src/new", "cl_link": null},
             })
+        );
+    }
+
+    /// MN-05: `has_next` is `page * per_page < total`.
+    #[test]
+    fn list_tags_payload_computes_has_next() {
+        let invocation = Invocation {
+            server: "https://mega2.example.com",
+            path: "/",
+            git_ref: None,
+            token_file: None,
+            token: None,
+        };
+        let tags = |total| TagPage {
+            total,
+            items: Vec::new(),
+        };
+        let has_next = |page, per_page, total| {
+            ListTagsData::new("list-tags", &invocation, page, per_page, &tags(total)).has_next
+        };
+        assert_eq!(
+            (
+                has_next(1, 20, 21),
+                has_next(1, 20, 20),
+                has_next(2, 10, 21),
+                has_next(3, 10, 21),
+                has_next(1, 20, 0),
+            ),
+            (true, false, true, false, false)
         );
     }
 }

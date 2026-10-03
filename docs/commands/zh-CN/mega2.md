@@ -97,6 +97,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | `d` | `--delete-dir <NAME>`（PATH 为父目录） | `POST /api/v1/delete-entry` |
 | `m` | `--move-dir <NAME> <PARENT-PATH>`（PATH 为 NAME 当前的父目录；名称不变） | `POST /api/v1/move-entry` |
 | `R` | `--rename-dir <NAME> <NEW-NAME>`（PATH 为父目录，保持不变） | `POST /api/v1/move-entry` |
+| `t`，再按 `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]`（PATH 只能为 `/`） | `GET /api/v1/tags/list` |
 
 所有非交互调用遵守同一组规则：
 
@@ -115,6 +116,8 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 - **一次一个操作，写操作不带 `--ref`。** 同时给出两个操作 flag 是用法错误
   （`LBR-CLI-002`），写操作带 `--ref` 也是（写入总是作用于服务端默认 revision）；
   两者都不发请求。
+- **tag 只在根上，不分 revision。** tag 操作只作用于 root tag：PATH 只能为 `/`（默认值），
+  并拒绝 `--ref`；两者都以 `LBR-CLI-002` 失败，不发请求。
 - **写请求不重试。** 结果未知的写请求 Libra 绝不重发。以下情形结果未知：在收到任何
   响应之前超时或失败（`LBR-NET-001`，`details.transport` 为 `timeout` 或 `request`）；
   读取回执时连接中断（`LBR-NET-001`，带 `details.http_status`）；`2xx` 但回执不合规
@@ -236,6 +239,44 @@ payload 与 `--move-dir` 同形，`target.to.parent` 等于 `target.from.parent`
 | HTTP 404：NAME 或 PATH 不存在 | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409、其它失败与结果未知 | 同 `--create-dir` | 同 `--create-dir` |
 
+`--list-tags` 以一次匿名 `GET /api/v1/tags/list`（query 为 `page`、`per_page` 与 `path=/`）
+列出一页 root tag。`--page`（1–1000，默认 1）与 `--per-page`（1–100，默认 20，即交互
+面板的页大小）选择页面；不带 `--list-tags` 时两者都被拒绝。每个 tag 输出一行
+`<name>  <object_type>  <tagger>`，有 message 时下一行以四个空格缩进输出 message，
+最后一行为 `page <page> · per_page <per_page> · total <total>`；服务端字符串中的控制字符
+输出为 `?`。带 `--json`/`--machine` 时 payload 为：
+
+```json
+{
+  "operation": "list-tags",
+  "server": "https://mega2.example.com",
+  "path": "/",
+  "page": 1,
+  "per_page": 20,
+  "total": 42,
+  "has_next": true,
+  "items": [
+    { "name": "v1.0", "tag_id": "…", "object_id": "…", "object_type": "commit",
+      "tagger": "…", "message": "…", "created_at": "…" }
+  ]
+}
+```
+
+`has_next` 为 `page * per_page < total`；`items` 原样保留服务端的每个字段。mega2 目前在
+数据库中对 annotated tag 分页，再用 `refs/tags/*` ref 补满本页剩余的位置：每页都从第一个
+ref 重新开始取，只跳过本页已有的 annotated tag。annotated tag 也有 ref，因此一页可能重复
+出现其它页的 tag；这类条目与 lightweight tag 一样只带 ref 字段（`object_type` 为 `commit`，
+`tagger` 与 `message` 为空，`tag_id` 等于 `object_id`）。`total` 会把这些 ref 全部加到
+annotated 的计数上，因此可能大于实际不同 tag 的数目、随页不同，`has_next` 也随之受影响。错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| `--page` 不在 1–1000 或 `--per-page` 不在 1–100 | `LBR-CLI-002` | 无（不发请求） |
+| 不带 `--list-tags` 而给出 `--page` 或 `--per-page` | `LBR-CLI-002` | 无（不发请求） |
+| PATH 格式不合规（不是 rooted 路径，或含 `.`/`..` 组件） | `LBR-CLI-003` | 无（不发请求） |
+| PATH 是 `/` 以外的合规路径、带 `--ref`、带 token flag，或与另一个操作 flag 同用 | `LBR-CLI-002` | 无（不发请求） |
+| HTTP、传输或响应失败 | 该失败的 stable code（见「机器可读的错误细节」） | `http_status` 或 `transport` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -283,13 +324,16 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | 选项 | 说明 |
 |------|------|
 | `--server <BASE-URL>` | Mega2 服务端 base URL（必填）。HTTPS，或 loopback HTTP。 |
-| `[PATH]` | 要列出的 rooted 目录，或目录写操作的父目录；默认 `/`。 |
+| `[PATH]` | 要列出的 rooted 目录，或目录写操作的父目录；默认 `/`。tag 操作只接受 `/`。 |
 | `--ref <COMMIT-OR-TAG>` | 可选的 commit 或 tag。 |
 | `--list` | 不用终端列出一次 PATH：纯文本行，带 `--json`/`--machine` 时为 JSON payload。 |
 | `--create-dir <NAME>` | 不用终端在 PATH 下建立目录 NAME（一次 POST，不重新列出）。 |
 | `--delete-dir <NAME>` | 不用终端删除 PATH 下的目录 NAME（一次 POST，无确认行，不重新列出）。 |
 | `--move-dir <NAME> <PARENT-PATH>` | 不用终端把 PATH 下的目录 NAME 移到 PARENT-PATH 下，名称不变（一次 POST，不重新列出）。 |
 | `--rename-dir <NAME> <NEW-NAME>` | 不用终端把 PATH 下的目录 NAME 改名为 NEW-NAME，父目录不变（一次 POST，不重新列出）。 |
+| `--list-tags` | 不用终端列出一页 root tag（一次 GET）。 |
+| `--page <N>` | 与 `--list-tags` 同用：要列出的页（1–1000；默认 1）。 |
+| `--per-page <N>` | 与 `--list-tags` 同用：每页 tag 数（1–100；默认 20）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -361,6 +405,9 @@ libra --json mega2 browser --server https://mega2.example.com --move-dir pkg /li
 
 # 不用终端把 /src/old 改名为 /src/new
 libra --json mega2 browser --server https://mega2.example.com --rename-dir old new /src --token-file ~/.mega2-token
+
+# root tag 的第 2 页，每页 50 个，输出 JSON
+libra --json mega2 browser --server https://mega2.example.com --list-tags --page 2 --per-page 50
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

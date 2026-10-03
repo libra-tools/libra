@@ -1827,3 +1827,337 @@ fn rename_dir_same_name_http_status() {
     assert!(!output.status.success());
     assert_eq!(error_envelope(&output)["details"]["http_status"], 400);
 }
+
+// ---- list_tags (MN-05): R1, R1b, R2, R3, R4a, R4b, R5a, R5b, R6, R7, R10a, R10b ----
+
+fn tags_page(total: u64, items: Value) -> String {
+    envelope(json!({"total": total, "items": items}))
+}
+
+/// The rule fixture's tagger carries an ESC, so R2 proves the human output
+/// sanitizes server strings.
+fn list_tags_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        tags_page(
+            1,
+            json!([{
+                "name": "v1",
+                "tag_id": "t-1",
+                "object_id": "o-1",
+                "object_type": "commit",
+                "tagger": "Ann \u{1b}[31m<ann@example.com>",
+                "message": "first",
+                "created_at": "2026-10-01T00:00:00Z",
+            }]),
+        ),
+    )
+}
+
+const LIST_TAGS_CASE: OpCase = OpCase {
+    op_args: &["--list-tags"],
+    method: "GET",
+    route: "/api/v1/tags/list",
+    path: "/api/v1/tags/list",
+    ok: list_tags_ok,
+};
+
+fn r10a_output(case: &OpCase, mock: &MockMega2) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &argv(&mock.url(), case, &["--machine"], &["/x"]),
+        &[],
+    )
+}
+
+/// R10a ①: a tag operation with a PATH other than `/` fails with `LBR-CLI-002`.
+fn rule_r10a_code(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r10a_output(case, &mock);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// R10a ②: the refusal sends no request.
+fn rule_r10a_no_request(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r10a_output(case, &mock);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+fn r10b_output(case: &OpCase, mock: &MockMega2) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(
+        dir.path(),
+        &argv(&mock.url(), case, &["--machine"], &["--ref", "v1"]),
+        &[],
+    )
+}
+
+/// R10b ①: a read tag operation with `--ref` fails with `LBR-CLI-002`.
+fn rule_r10b_code(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r10b_output(case, &mock);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// R10b ②: the refusal sends no request.
+fn rule_r10b_no_request(case: &OpCase) {
+    let mock = MockMega2::start(case.ok);
+    let output = r10b_output(case, &mock);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+op_rule!(op_rule_list_tags_r1, rule_r1, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r1b, rule_r1b, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r2, rule_r2, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r3, rule_r3, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r4a, rule_r4a, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r4b, rule_r4b, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r5a_code, rule_r5a_code, LIST_TAGS_CASE);
+op_rule!(
+    op_rule_list_tags_r5a_no_request,
+    rule_r5a_no_request,
+    LIST_TAGS_CASE
+);
+op_rule!(op_rule_list_tags_r5b_code, rule_r5b_code, LIST_TAGS_CASE);
+op_rule!(
+    op_rule_list_tags_r5b_no_request,
+    rule_r5b_no_request,
+    LIST_TAGS_CASE
+);
+op_rule!(op_rule_list_tags_r6, rule_r6, LIST_TAGS_CASE);
+op_rule!(op_rule_list_tags_r7_code, rule_r7_code, LIST_TAGS_CASE);
+op_rule!(
+    op_rule_list_tags_r7_no_request,
+    rule_r7_no_request,
+    LIST_TAGS_CASE
+);
+op_rule!(op_rule_list_tags_r10a_code, rule_r10a_code, LIST_TAGS_CASE);
+op_rule!(
+    op_rule_list_tags_r10a_no_request,
+    rule_r10a_no_request,
+    LIST_TAGS_CASE
+);
+op_rule!(op_rule_list_tags_r10b_code, rule_r10b_code, LIST_TAGS_CASE);
+op_rule!(
+    op_rule_list_tags_r10b_no_request,
+    rule_r10b_no_request,
+    LIST_TAGS_CASE
+);
+
+// ---- list_tags (MN-05): operation-specific behavior ----
+
+/// `--list-tags` plus `extra` against `mock`.
+fn list_tags_output(mock: &MockMega2, extra: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = mock.url();
+    let mut args = vec!["mega2", "browser", "--server", &url, "--list-tags"];
+    args.extend_from_slice(extra);
+    run(dir.path(), &args, &[])
+}
+
+/// AC-1: explicit paging is sent as given, with the root path selector.
+#[test]
+fn list_tags_request_record_explicit_paging() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = list_tags_output(&mock, &["--page", "3", "--per-page", "50", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "GET".to_string(),
+            "/api/v1/tags/list?page=3&per_page=50&path=%2F".to_string(),
+            None,
+            None,
+        )]
+    );
+}
+
+/// AC-2: without `--page`/`--per-page` the TUI panel's defaults are sent.
+#[test]
+fn list_tags_request_record_default_paging() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = list_tags_output(&mock, &["--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "GET".to_string(),
+            "/api/v1/tags/list?page=1&per_page=20&path=%2F".to_string(),
+            None,
+            None,
+        )]
+    );
+}
+
+/// A page of two tags, one with ESC and BEL in its tagger and message.
+fn list_tags_hostile_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        tags_page(
+            5,
+            json!([
+                {
+                    "name": "v2",
+                    "tag_id": "t-2",
+                    "object_id": "o-2",
+                    "object_type": "tag",
+                    "tagger": "Ann\u{1b}[31m\u{7}",
+                    "message": "release\u{7}notes\u{1b}[0m",
+                    "created_at": "2026-10-02T00:00:00Z",
+                },
+                {
+                    "name": "v1",
+                    "tag_id": "o-1",
+                    "object_id": "o-1",
+                    "object_type": "commit",
+                    "tagger": "",
+                    "message": "",
+                    "created_at": "2026-10-01T00:00:00Z",
+                },
+            ]),
+        ),
+    )
+}
+
+/// AC-3: the payload carries the paging, the server's total, `has_next`
+/// (`page * per_page < total`) and every item field verbatim.
+#[test]
+fn list_tags_json_payload() {
+    let mock = MockMega2::start(list_tags_hostile_ok);
+    let output = list_tags_output(&mock, &["--page", "2", "--per-page", "2", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "list-tags",
+            "server": mock.url(),
+            "path": "/",
+            "page": 2,
+            "per_page": 2,
+            "total": 5,
+            "has_next": true,
+            "items": [
+                {
+                    "name": "v2",
+                    "tag_id": "t-2",
+                    "object_id": "o-2",
+                    "object_type": "tag",
+                    "tagger": "Ann\u{1b}[31m\u{7}",
+                    "message": "release\u{7}notes\u{1b}[0m",
+                    "created_at": "2026-10-02T00:00:00Z",
+                },
+                {
+                    "name": "v1",
+                    "tag_id": "o-1",
+                    "object_id": "o-1",
+                    "object_type": "commit",
+                    "tagger": "",
+                    "message": "",
+                    "created_at": "2026-10-01T00:00:00Z",
+                },
+            ],
+        })
+    );
+}
+
+/// AC-4: one line per tag, the message indented on the next line, then the
+/// paging line; control characters are rendered as `?`.
+#[test]
+fn list_tags_human_output_is_sanitized() {
+    let mock = MockMega2::start(list_tags_hostile_ok);
+    let output = list_tags_output(&mock, &[]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "v2  tag  Ann?[31m?\n    release?notes?[0m\nv1  commit  \npage 1 · per_page 20 · total 5\n"
+    );
+}
+
+/// Runs `args` (after `--server <url>`) under `--machine` against `mock`.
+fn tag_paging_output(mock: &MockMega2, args: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = mock.url();
+    let mut argv = vec!["mega2", "browser", "--server", &url];
+    argv.extend_from_slice(args);
+    argv.push("--machine");
+    run(dir.path(), &argv, &[])
+}
+
+/// G18: `--page 0` (delegated to `validate_pagination`) fails with `LBR-CLI-002`.
+#[test]
+fn list_tags_rejects_page_zero_code() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--list-tags", "--page", "0"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G19: the same refusal sends no request.
+#[test]
+fn list_tags_rejects_page_zero_no_request() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--list-tags", "--page", "0"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G20: `--per-page 101` fails with `LBR-CLI-002`.
+#[test]
+fn list_tags_rejects_per_page_101_code() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--list-tags", "--per-page", "101"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G21: the same refusal sends no request.
+#[test]
+fn list_tags_rejects_per_page_101_no_request() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--list-tags", "--per-page", "101"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G22: `--page` without `--list-tags` fails with `LBR-CLI-002`.
+#[test]
+fn list_tags_page_requires_list_tags_code() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--page", "2"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G23: the same refusal sends no request.
+#[test]
+fn list_tags_page_requires_list_tags_no_request() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--page", "2"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G24: `--per-page` without `--list-tags` fails with `LBR-CLI-002`.
+#[test]
+fn list_tags_per_page_requires_list_tags_code() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--per-page", "50"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G25: the same refusal sends no request.
+#[test]
+fn list_tags_per_page_requires_list_tags_no_request() {
+    let mock = MockMega2::start(list_tags_ok);
+    let output = tag_paging_output(&mock, &["--per-page", "50"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}

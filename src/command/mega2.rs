@@ -27,7 +27,10 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::{
-    command::mega2_browser::noninteractive::{self, Invocation, Operation},
+    command::mega2_browser::{
+        TAG_PAGE_SIZE,
+        noninteractive::{self, Invocation, Operation},
+    },
     internal::protocol::{
         mega2_auth::resolve_token_from_process,
         mega2_tree::{ContentType, Listing, normalize_path, validate_server_url},
@@ -57,6 +60,7 @@ EXAMPLES:
     libra mega2 browser --server https://mega2.example.com /src/pkg    Interactive browse of /src/pkg
     libra mega2 browser --server https://mega2.example.com --ref v1.2  List one commit or tag
     libra mega2 browser --server https://mega2.example.com --list /src/pkg  Plain-text listing, no terminal
+    libra mega2 browser --server https://mega2.example.com --list-tags --page 2  Root tags, page 2, no terminal
     libra mega2 browser --server http://127.0.0.1:8080 --json          Exactly one fetch, JSON schema
     libra --machine mega2 browser --server https://mega2.example.com   NDJSON for automation
     libra mega2 browser --server https://mega2.example.com --token-file ~/.mega2-token  Create/delete/move with a token file
@@ -93,7 +97,7 @@ pub struct BrowserArgs {
     #[arg(long, value_name = "BASE-URL")]
     pub server: String,
 
-    /// Rooted directory: the one to list, or the parent for a directory write; never escapes above `/`
+    /// Rooted directory: the one to list, or the parent for a directory write (tag operations accept only `/`); never escapes above `/`
     #[arg(value_name = "PATH", default_value = "/")]
     pub path: String,
 
@@ -111,6 +115,9 @@ pub struct BrowserArgs {
 
     #[command(flatten)]
     pub operation: OperationArgs,
+
+    #[command(flatten)]
+    pub tag_paging: TagPagingArgs,
 }
 
 /// Non-interactive operations (plan-20261001 ADR-MN-01): at most one per
@@ -137,11 +144,27 @@ pub struct OperationArgs {
     /// Rename directory NAME under PATH to NEW-NAME, keeping its parent: one POST, no reload
     #[arg(long = "rename-dir", num_args = 2, value_names = ["NAME", "NEW-NAME"])]
     pub rename_dir: Option<Vec<String>>,
+
+    /// List one page of root tags and exit: one GET (see --page, --per-page)
+    #[arg(long = "list-tags")]
+    pub list_tags: bool,
+}
+
+/// Paging for `--list-tags` (plan-20261001 MN-05); refused without it.
+#[derive(Args, Debug, Default)]
+pub struct TagPagingArgs {
+    /// Tag page to list with --list-tags (1..=1000; default 1)
+    #[arg(long, value_name = "N", requires = "list_tags")]
+    pub page: Option<u64>,
+
+    /// Tags per page with --list-tags (1..=100; default 20)
+    #[arg(long = "per-page", value_name = "N", requires = "list_tags")]
+    pub per_page: Option<u64>,
 }
 
 impl OperationArgs {
-    /// The selected operation, if any.
-    fn selected(&self) -> CliResult<Option<Operation>> {
+    /// The selected operation, if any; `paging` only applies to `--list-tags`.
+    fn selected(&self, paging: &TagPagingArgs) -> CliResult<Option<Operation>> {
         if self.list {
             return Ok(Some(Operation::List));
         }
@@ -158,6 +181,13 @@ impl OperationArgs {
         if let Some(values) = &self.rename_dir {
             let (name, new_name) = value_pair("--rename-dir", values)?;
             return Ok(Some(Operation::RenameDir { name, new_name }));
+        }
+        if self.list_tags {
+            // The TUI panel's defaults: page 1, TAG_PAGE_SIZE per page.
+            return Ok(Some(Operation::ListTags {
+                page: paging.page.unwrap_or(1),
+                per_page: paging.per_page.unwrap_or(TAG_PAGE_SIZE),
+            }));
         }
         Ok(None)
     }
@@ -263,7 +293,7 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
     // the refusal of token flags — run there, before the one request.
     if let Some(operation) = args
         .operation
-        .selected()?
+        .selected(&args.tag_paging)?
         .or_else(|| output.is_json().then_some(Operation::List))
     {
         let invocation = Invocation {
