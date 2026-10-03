@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-03 05:25:14 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md)：MN-10、MN-01、MN-02、MN-03、MN-11、MN-04、MN-08、MN-12、MN-05 `done`/`complete`（v0.30.14–v0.30.21、v0.30.24）；MN-06（非交互创建 tag `--create-tag`）`in-progress`/`remote-pending`——v0.30.25 已发布（PR #605 squash `cdd32b7`），D 组跟踪中；MN-09（非交互删除 tag `--delete-tag`）`in-progress`/`locally-accepted`——A 组全绿，C 组进行中（目标 0.30.26）；MN-07 harness/live 门代码评审 `PASS`、live 门已在 `DEP-MN-04` 实例预跑 12/12；其余沿用 2026-10-02 21:24:02 UTC 快照（issues/498 TT-02）。）
+> **当前快照：** 2026-10-03 07:52:14 UTC（[`issues/498.md`](issues/498.md)：**已收口**——TT-05 / TT-02 均为 `done`/`complete`（v0.30.22 / v0.30.23）；M3 全量收口门 8754/8754 passed；#498 CLOSED；DEFER-TT-01..08 残留。[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md)：MN-05 / MN-06 / MN-09 已合入 `origin/main`（v0.30.24 / v0.30.25 / v0.30.26）；其余 MN 进度以该计划与其发布会话为准。）
 
 ---
 
@@ -60,7 +60,7 @@
 
 ### issues/ 下的计划（Issue 驱动的 Git 对齐修复计划）
 
-`issues/` 目录每份文件对应一个 GitHub Issue，是独立的可执行计划。`474`/`477` 已收口、`486` 已关闭、`476` 执行中（用户 2026-09-20 覆盖：执行期间不调用 Codex/Claude 评审）。其余多为设计计划。状态列取值同上。
+`issues/` 目录每份文件对应一个 GitHub Issue，是独立的可执行计划。`474`/`477`/`486`/`497`/`498`/`574`/`577`/`582` 已收口或关闭、`476` 执行中（用户 2026-09-20 覆盖：执行期间不调用 Codex/Claude 评审）。其余多为设计计划。状态列取值同上。
 
 | 计划 | Issue 主题 | 状态 | 任务卡 |
 |---|---|---|---|
@@ -81,7 +81,7 @@
 | [`issues/490.md`](issues/490.md) | skip-worktree 索引位与 `add` 稀疏路径诊断 | 未启动 | SW-01..SW-07（7 卡；SW-06 已迁至 plan-20260918） |
 | [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | **实施中（待 Codex 评审）** | CLH-01..04 `done`（根因 ADR-CLH-01：`local_client.rs` 旧 `encode_pack_bytes` 同任务先喂满有界输入通道再排空有界输出通道的循环等待；已复用 `pack_writer::encode_pack_bytes`，新增 pack_writer 单元回归 + clone 集成回归；文档/`COMPATIBILITY.md`/`../libra-backend` 同步；发布 `v0.30.1`） |
 | [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | **已收口** | CD-01..CD-04 全部 `done`/`complete`；`v0.27.2`（PR #581 squash merge `859d7fb`；PR head `base.yml` 7/7 + CodeQL 绿；`release.yml` 8/8 + stable manifest `0.27.2`）；ER-07 签名例外 EX-CD-01（仓库 vault 不可 unseal，操作者 2026-09-24 裁决维持未签名发布） |
-| [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | **实施中** | 2026-10-02 按模板 v2.12 重写；Codex R1–R5 `FAIL` → R6 `PASS`（2026-10-02 10:15:38 UTC）；活动卡 TT-05（列表过滤器沿标签链完全 peel，34 门）**`done`/`complete`（v0.30.22，PR #602 `a2f1c34`，release `37055840149` 8/8，CDN 200，网站 `cf@a976e4c`）**→ TT-02（tag 创建的显式目标：轻量 / 附注 / 签名 / 嵌套 + E1–E5 契约，108 门）`in-progress`/`locally-accepted`（108/108 门绿、CR1 `PASS`，C 组进行中，目标 0.30.23）；TT-01/03/04 废弃，TT-06/07 合并回 TT-02；门族以 EX-TT-01（G-03 门族型验收）承载，genedna 已于 2026-10-02 09:02:14 UTC 显式批准；DEP-498-01（477b HW-05/#533）、DEP-498-07（与 plan-20261001 MN 卡共用版本面与 release 序列）、DEFER-TT-01..08；全量门在 `umask 022` 下执行（基线 8458/8458 passed） |
+| [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | **已收口** | TT-05 `done`/`complete`（v0.30.22，PR #602 `a2f1c34`，release `37055840149` 8/8；网站 `cf@a976e4c`）；TT-02 `done`/`complete`（v0.30.23，PR #604 `52bf7d2`，release `37087459978` 8/8；网站 `cf@e908d01`）；M3 收口门 2026-10-03 06:19:24 UTC 全绿（CI 口径：8754/8754 passed / 4 skipped）；完成判据全勾选；`issues/478.md` DEFER-04 已登记由 TT-02 交付；#498 CLOSED；残留 DEFER-TT-01..08（含 DEFER-TT-08 `for-each-ref`/`describe` 嵌套 peel）；TT-01/03/04 废弃，TT-06/07 合并回 TT-02；EX-TT-01 已批准 |
 | [`issues/477b.md`](issues/477b.md) | 历史改写收口后续（#522/#523/#525/#526/#527/#533/#536；#528 并入 #495） | 未启动 | HW-01..HW-07（7 卡） |
 | [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
@@ -406,6 +406,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 - plan-20260715：历史封存；Code 专属 `DEFER-01..08` 已由 plan-20260824 交付后拆除或由 plan-20260920 直接墓碑化，`DEFER-09/10` 已完成关闭；无现行可重启项。
 - plan-20260824：历史封存；全部 Code 专属 DEFER 已由 plan-20260920 墓碑化，无现行可重启项。
 - plan-20260825：历史封存；Code 专属 `DEFER-PS-01..04` 已墓碑化；`DEFER-PS-05` 已由 plan-20260917 关闭。仅通用测试基础设施 `DEFER-PS-06/07` 保留为另立计划候选，不得用于恢复 Code。
+- issues/498：`DEFER-TT-01..08`（tree/blob 目标、nested-tag advice、`-f` 覆盖措辞、show/log 嵌套展示、传输非 commit tag、`-n` gpgsig 标题、umask 敏感测试、`for-each-ref`/`describe` 嵌套 peel）。计划已收口；DEFER-TT-02/03/06 → 477b HW-05；DEFER-TT-04 → 478；DEFER-TT-05 → 474/480；DEFER-TT-08 待新建 issue。
 
 ---
 
@@ -448,5 +449,5 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 日期计划：`plan-20260708`、`plan-20260713`、`plan-20260714`、`plan-20260715`（历史完成、Code 产品面已拆除）、`plan-20260818`、`plan-20260821`、`plan-20260824`（历史完成、Code 产品面已拆除）、`plan-20260825`（历史完成、PS 产品轴已拆除；TA 测试轴保留历史）、`plan-20260827`、`plan-20260901`、`plan-20260910`、`plan-20260917`、`plan-20260920`。
 
-Issue 计划：`issues/477`（31 卡，v0.22.49）、`issues/486`（AB-01，v0.22.31）。各自完成判据见对应计划文件。
+Issue 计划：`issues/477`（31 卡，v0.22.49）、`issues/486`（AB-01，v0.22.31）、`issues/498`（TT-05/TT-02，v0.30.22 / v0.30.23；#498 CLOSED）。各自完成判据见对应计划文件。
 
