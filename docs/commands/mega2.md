@@ -113,6 +113,7 @@ the forms available in this release.
 | `m` | `--move-dir <NAME> <PARENT-PATH>` (PATH is NAME's current parent; the name is kept) | `POST /api/v1/move-entry` |
 | `R` | `--rename-dir <NAME> <NEW-NAME>` (PATH is the parent, which is kept) | `POST /api/v1/move-entry` |
 | `t`, then `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]` (PATH must be `/`) | `GET /api/v1/tags/list` |
+| `t`, then `+` | `--create-tag <NAME> [--message <TEXT>]` (PATH must be `/`) | `POST /api/v1/tags` |
 
 Every non-interactive call follows the same rules:
 
@@ -145,9 +146,12 @@ Every non-interactive call follows the same rules:
   response (`LBR-NET-001` with `details.transport` `timeout` or `request`),
   when the connection drops while the receipt is read (`LBR-NET-001` with
   `details.http_status`), or when a `2xx` carries an invalid receipt
-  (`LBR-NET-002` with a `2xx` `details.http_status`). Check the result with
-  `--list` before repeating the call. `details.transport` `connect` means the
-  request never reached the server.
+  (`LBR-NET-002` with a `2xx` `details.http_status`). Check the result before
+  repeating the call: with `--list` after a directory write; after a tag
+  write, with `--list-tags`, paging until `has_next` is `false` — an annotated
+  tag appears on one of the pages, but a lightweight tag can be missing from
+  all of them (see the paging note under `--list-tags`). `details.transport`
+  `connect` means the request never reached the server.
 - **Exit codes.** `0` on success; on failure the stable code's exit code
   (`129` for usage errors such as `LBR-CLI-002` and `LBR-CLI-003`, `128`
   otherwise), or the category code (`2`–`9`) when `LIBRA_FINE_EXIT_CODES=1`.
@@ -314,6 +318,41 @@ and differ from page to page, and `has_next` inherits that. Errors:
 | A rooted PATH other than `/`, `--ref`, a token flag, or another operation flag | `LBR-CLI-002` | none (no request) |
 | HTTP, transport or response failures | the failure's stable code (see Machine error details) | `http_status` or `transport` |
 
+`--create-tag <NAME>` creates root tag NAME with one `POST /api/v1/tags`
+(`path_context` `/`). Without `--message` the tag is lightweight;
+`--message <TEXT>` makes it annotated. Unlike the interactive panel, where an
+empty message means lightweight, a non-interactive `--message` must be
+non-empty, at most 1024 bytes and free of control characters, newlines
+included: it is refused, never rewritten. A root tag needs a write token whose
+paths cover `/`, or a `push_auth=none` server; a token limited to other paths
+gets HTTP 403 (`LBR-AUTH-002`). The plain-text summary is
+`created <kind> tag <name> -> <object_id>`; with `--json`/`--machine` the
+payload is:
+
+```json
+{
+  "operation": "create-tag",
+  "server": "https://mega2.example.com",
+  "target": { "name": "v1.0", "kind": "annotated", "path": "/" },
+  "receipt": { "name": "v1.0", "tag_id": "…", "object_id": "…", "object_type": "commit",
+               "tagger": "…", "message": "…", "created_at": "…" }
+}
+```
+
+`target.kind` is `lightweight` or `annotated`; `receipt` is the server's tag
+verbatim. Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME breaks the tag-name rules (see the tag panel) | `LBR-CLI-002` | none (no request) |
+| `--message` empty, over 1024 bytes or with a control character, or given without `--create-tag` | `LBR-CLI-002` | none (no request) |
+| A malformed PATH (not rooted, or with `.`/`..` components) | `LBR-CLI-003` | none (no request) |
+| A rooted PATH other than `/`, `--ref`, or another operation flag | `LBR-CLI-002` | none (no request) |
+| HTTP 400 (for example, the tag already exists), 405 or 422 | `LBR-CLI-002` | `http_status` |
+| HTTP 401 (server needs a write token) / 403 (the token does not cover `/`) | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 404 / 409 | `LBR-CLI-003` / `LBR-CONFLICT-002` | `http_status` |
+| Any other non-2xx or an invalid receipt / a timeout or dropped connection | `LBR-NET-002` / `LBR-NET-001`, as for `--create-dir` | `http_status` or `transport` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -386,6 +425,8 @@ terminal. The panel operates root tags only.
 | `--list-tags` | List one page of root tags without a terminal (one GET). |
 | `--page <N>` | With `--list-tags`: the page to list (1–1000; default 1). |
 | `--per-page <N>` | With `--list-tags`: tags per page (1–100; default 20). |
+| `--create-tag <NAME>` | Create root tag NAME without a terminal (one POST): lightweight, or annotated with `--message`. |
+| `--message <TEXT>` | With `--create-tag`: the annotated tag's message (non-empty, at most 1024 bytes, no control characters). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -465,6 +506,9 @@ libra --json mega2 browser --server https://mega2.example.com --rename-dir old n
 
 # Second page of root tags, 50 per page, as JSON
 libra --json mega2 browser --server https://mega2.example.com --list-tags --page 2 --per-page 50
+
+# Create annotated root tag v1.0 without a terminal
+libra --json mega2 browser --server https://mega2.example.com --create-tag v1.0 --message "release 1.0" --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

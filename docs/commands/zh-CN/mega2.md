@@ -98,6 +98,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | `m` | `--move-dir <NAME> <PARENT-PATH>`（PATH 为 NAME 当前的父目录；名称不变） | `POST /api/v1/move-entry` |
 | `R` | `--rename-dir <NAME> <NEW-NAME>`（PATH 为父目录，保持不变） | `POST /api/v1/move-entry` |
 | `t`，再按 `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]`（PATH 只能为 `/`） | `GET /api/v1/tags/list` |
+| `t`，再按 `+` | `--create-tag <NAME> [--message <TEXT>]`（PATH 只能为 `/`） | `POST /api/v1/tags` |
 
 所有非交互调用遵守同一组规则：
 
@@ -121,7 +122,9 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 - **写请求不重试。** 结果未知的写请求 Libra 绝不重发。以下情形结果未知：在收到任何
   响应之前超时或失败（`LBR-NET-001`，`details.transport` 为 `timeout` 或 `request`）；
   读取回执时连接中断（`LBR-NET-001`，带 `details.http_status`）；`2xx` 但回执不合规
-  （`LBR-NET-002`，`details.http_status` 为 `2xx`）。重新调用之前先用 `--list` 核对。
+  （`LBR-NET-002`，`details.http_status` 为 `2xx`）。重新调用之前先核对结果：目录写操作之后用
+  `--list`；tag 写操作之后用 `--list-tags` 翻页直到 `has_next` 为 `false`——annotated tag 一定出现在
+  某一页上，lightweight tag 却可能哪一页都不出现（见 `--list-tags` 的分页说明）。
   `details.transport` 为 `connect` 表示请求根本没有到达服务端。
 - **退出码。** 成功为 `0`；失败时取 stable code 的退出码（用法错误如
   `LBR-CLI-002`、`LBR-CLI-003` 为 `129`，其余为 `128`），设置
@@ -277,6 +280,37 @@ annotated 的计数上，因此可能大于实际不同 tag 的数目、随页�
 | PATH 是 `/` 以外的合规路径、带 `--ref`、带 token flag，或与另一个操作 flag 同用 | `LBR-CLI-002` | 无（不发请求） |
 | HTTP、传输或响应失败 | 该失败的 stable code（见「机器可读的错误细节」） | `http_status` 或 `transport` |
 
+`--create-tag <NAME>` 以一次 `POST /api/v1/tags`（`path_context` 为 `/`）建立 root tag
+NAME。不带 `--message` 时为 lightweight tag；`--message <TEXT>` 使它成为 annotated tag。
+与交互面板「空 message 即 lightweight」不同，非交互的 `--message` 必须非空、不超过 1024
+字节且不含控制字符（包括换行）：不合规即拒绝，绝不改写。root tag 需要 paths 覆盖 `/` 的
+写 token，或 `push_auth=none` 的服务端；只覆盖其它路径的 token 得到 HTTP 403
+（`LBR-AUTH-002`）。纯文本摘要为 `created <kind> tag <name> -> <object_id>`；带
+`--json`/`--machine` 时 payload 为：
+
+```json
+{
+  "operation": "create-tag",
+  "server": "https://mega2.example.com",
+  "target": { "name": "v1.0", "kind": "annotated", "path": "/" },
+  "receipt": { "name": "v1.0", "tag_id": "…", "object_id": "…", "object_type": "commit",
+               "tagger": "…", "message": "…", "created_at": "…" }
+}
+```
+
+`target.kind` 为 `lightweight` 或 `annotated`；`receipt` 是服务端返回的 tag 原样。错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 违反 tag 名规则（见 Tag 面板） | `LBR-CLI-002` | 无（不发请求） |
+| `--message` 为空、超过 1024 字节或含控制字符，或不带 `--create-tag` 而给出 `--message` | `LBR-CLI-002` | 无（不发请求） |
+| PATH 格式不合规（不是 rooted 路径，或含 `.`/`..` 组件） | `LBR-CLI-003` | 无（不发请求） |
+| PATH 是 `/` 以外的合规路径、带 `--ref`，或与另一个操作 flag 同用 | `LBR-CLI-002` | 无（不发请求） |
+| HTTP 400（例如 tag 已存在）、405 或 422 | `LBR-CLI-002` | `http_status` |
+| HTTP 401（服务端要求写 token）/ 403（token 未覆盖 `/`） | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 404 / 409 | `LBR-CLI-003` / `LBR-CONFLICT-002` | `http_status` |
+| 其它非 2xx 或回执不合规 / 超时或连接中断 | `LBR-NET-002` / `LBR-NET-001`，同 `--create-dir` | `http_status` 或 `transport` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -334,6 +368,8 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--list-tags` | 不用终端列出一页 root tag（一次 GET）。 |
 | `--page <N>` | 与 `--list-tags` 同用：要列出的页（1–1000；默认 1）。 |
 | `--per-page <N>` | 与 `--list-tags` 同用：每页 tag 数（1–100；默认 20）。 |
+| `--create-tag <NAME>` | 不用终端建立 root tag NAME（一次 POST）：lightweight，或带 `--message` 时为 annotated。 |
+| `--message <TEXT>` | 与 `--create-tag` 同用：annotated tag 的 message（非空，不超过 1024 字节，不含控制字符）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -408,6 +444,9 @@ libra --json mega2 browser --server https://mega2.example.com --rename-dir old n
 
 # root tag 的第 2 页，每页 50 个，输出 JSON
 libra --json mega2 browser --server https://mega2.example.com --list-tags --page 2 --per-page 50
+
+# 不用终端建立 annotated root tag v1.0
+libra --json mega2 browser --server https://mega2.example.com --create-tag v1.0 --message "release 1.0" --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

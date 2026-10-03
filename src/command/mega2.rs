@@ -117,7 +117,7 @@ pub struct BrowserArgs {
     pub operation: OperationArgs,
 
     #[command(flatten)]
-    pub tag_paging: TagPagingArgs,
+    pub tag: TagArgs,
 }
 
 /// Non-interactive operations (plan-20261001 ADR-MN-01): at most one per
@@ -148,11 +148,16 @@ pub struct OperationArgs {
     /// List one page of root tags and exit: one GET (see --page, --per-page)
     #[arg(long = "list-tags")]
     pub list_tags: bool,
+
+    /// Create root tag NAME: one POST (lightweight, or annotated with --message)
+    #[arg(long = "create-tag", value_name = "NAME")]
+    pub create_tag: Option<String>,
 }
 
-/// Paging for `--list-tags` (plan-20261001 MN-05); refused without it.
+/// Options of the tag operations (plan-20261001 MN-05, MN-06); each is
+/// refused without its operation.
 #[derive(Args, Debug, Default)]
-pub struct TagPagingArgs {
+pub struct TagArgs {
     /// Tag page to list with --list-tags (1..=1000; default 1)
     #[arg(long, value_name = "N", requires = "list_tags")]
     pub page: Option<u64>,
@@ -160,11 +165,15 @@ pub struct TagPagingArgs {
     /// Tags per page with --list-tags (1..=100; default 20)
     #[arg(long = "per-page", value_name = "N", requires = "list_tags")]
     pub per_page: Option<u64>,
+
+    /// Message of an annotated tag with --create-tag (non-empty, at most 1024 bytes, no control characters)
+    #[arg(long, value_name = "TEXT", requires = "create_tag")]
+    pub message: Option<String>,
 }
 
 impl OperationArgs {
-    /// The selected operation, if any; `paging` only applies to `--list-tags`.
-    fn selected(&self, paging: &TagPagingArgs) -> CliResult<Option<Operation>> {
+    /// The selected operation, if any, with the tag options it takes.
+    fn selected(&self, tag: &TagArgs) -> CliResult<Option<Operation>> {
         if self.list {
             return Ok(Some(Operation::List));
         }
@@ -185,8 +194,14 @@ impl OperationArgs {
         if self.list_tags {
             // The TUI panel's defaults: page 1, TAG_PAGE_SIZE per page.
             return Ok(Some(Operation::ListTags {
-                page: paging.page.unwrap_or(1),
-                per_page: paging.per_page.unwrap_or(TAG_PAGE_SIZE),
+                page: tag.page.unwrap_or(1),
+                per_page: tag.per_page.unwrap_or(TAG_PAGE_SIZE),
+            }));
+        }
+        if let Some(name) = &self.create_tag {
+            return Ok(Some(Operation::CreateTag {
+                name: name.clone(),
+                message: tag.message.clone(),
             }));
         }
         Ok(None)
@@ -293,7 +308,7 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
     // the refusal of token flags — run there, before the one request.
     if let Some(operation) = args
         .operation
-        .selected(&args.tag_paging)?
+        .selected(&args.tag)?
         .or_else(|| output.is_json().then_some(Operation::List))
     {
         let invocation = Invocation {

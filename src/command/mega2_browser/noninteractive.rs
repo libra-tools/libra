@@ -16,7 +16,7 @@ use std::{io::Write, path::Path};
 
 use serde::Serialize;
 
-use super::sanitize;
+use super::{sanitize, tag_panel::MAX_TAG_MESSAGE_BYTES};
 use crate::{
     command::mega2::browser_data,
     internal::protocol::{
@@ -27,7 +27,7 @@ use crate::{
             DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient,
             MoveReceipt as RemoteMoveReceipt,
         },
-        mega2_tag::{Mega2TagClient, TagPage},
+        mega2_tag::{CreateTagOptions, Mega2TagClient, TagInfo, TagPage},
         mega2_tree::{ContentType, Listing, Mega2TreeSession, normalize_path},
     },
     utils::{
@@ -123,6 +123,13 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Read,
         surface: Surface::Tag,
     },
+    OperationSpec {
+        name: "create-tag",
+        flag: "--create-tag",
+        endpoint: mega2_diag::CREATE_TAG,
+        access: Access::Write,
+        surface: Surface::Tag,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
@@ -150,6 +157,11 @@ pub enum Operation {
         page: u64,
         per_page: u64,
     },
+    /// Create root tag NAME: lightweight without `message`, annotated with it.
+    CreateTag {
+        name: String,
+        message: Option<String>,
+    },
 }
 
 impl Operation {
@@ -162,6 +174,7 @@ impl Operation {
             Operation::MoveDir { .. } => "move-dir",
             Operation::RenameDir { .. } => "rename-dir",
             Operation::ListTags { .. } => "list-tags",
+            Operation::CreateTag { .. } => "create-tag",
         }
     }
 
@@ -317,7 +330,56 @@ pub async fn execute(
                 write_human(output, &render_tags(page, per_page, &tags))
             }
         }
+        Operation::CreateTag { name, message } => {
+            if let Some(message) = &message {
+                validate_tag_message(message)?;
+            }
+            let client = Mega2TagClient::new(invocation.server, token)?;
+            let options = CreateTagOptions {
+                name: &name,
+                message: message.as_deref(),
+                ..CreateTagOptions::default()
+            };
+            let tag = client.create_tag(&options).await?;
+            let target = TagTarget {
+                name: &name,
+                kind: if message.is_some() {
+                    "annotated"
+                } else {
+                    "lightweight"
+                },
+                path: invocation.path,
+            };
+            let receipt = TagItem::from(&tag);
+            let summary = format!(
+                "created {} tag {} -> {}\n",
+                target.kind,
+                sanitize(target.name),
+                sanitize(receipt.object_id)
+            );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
+        }
     }
+}
+
+/// ADR-MN-06: a non-interactive tag message must be non-empty, at most
+/// [`MAX_TAG_MESSAGE_BYTES`] bytes and free of control characters (newlines
+/// included). It is refused, never rewritten; a lightweight tag omits
+/// `--message` instead of passing an empty one.
+fn validate_tag_message(message: &str) -> CliResult<()> {
+    let problem = if message.is_empty() {
+        "must not be empty; omit --message to create a lightweight tag".to_string()
+    } else if message.len() > MAX_TAG_MESSAGE_BYTES {
+        format!("exceeds the {MAX_TAG_MESSAGE_BYTES}-byte limit")
+    } else if message.chars().any(char::is_control) {
+        "must not contain control characters, including newlines".to_string()
+    } else {
+        return Ok(());
+    };
+    Err(
+        CliError::fatal(format!("mega2 browser: --message {problem}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+    )
 }
 
 /// Prints a successful write: the machine payload, or the one-line human
@@ -494,7 +556,18 @@ struct WriteData<'a, T, R> {
     receipt: &'a R,
 }
 
-/// One tag of a `list-tags` page, every field as the server sent it.
+/// What a tag write targeted, built only from validated local input
+/// (ADR-MN-03): the tag name, its kind and the root path.
+#[derive(Serialize, Debug)]
+struct TagTarget<'a> {
+    name: &'a str,
+    /// `lightweight` (no `--message`) or `annotated`.
+    kind: &'static str,
+    path: &'a str,
+}
+
+/// One tag as the server reports it, every field verbatim: an item of a
+/// `list-tags` page, or the receipt of `create-tag`.
 #[derive(Serialize, Debug)]
 struct TagItem<'a> {
     name: &'a str,
@@ -504,6 +577,20 @@ struct TagItem<'a> {
     tagger: &'a str,
     message: &'a str,
     created_at: &'a str,
+}
+
+impl<'a> From<&'a TagInfo> for TagItem<'a> {
+    fn from(tag: &'a TagInfo) -> Self {
+        Self {
+            name: &tag.name,
+            tag_id: &tag.tag_id,
+            object_id: &tag.object_id,
+            object_type: &tag.object_type,
+            tagger: &tag.tagger,
+            message: &tag.message,
+            created_at: &tag.created_at,
+        }
+    }
 }
 
 /// The `list-tags` machine payload: the page asked for, the server's total and
@@ -536,19 +623,7 @@ impl<'a> ListTagsData<'a> {
             per_page,
             total: tags.total,
             has_next: page.saturating_mul(per_page) < tags.total,
-            items: tags
-                .items
-                .iter()
-                .map(|tag| TagItem {
-                    name: &tag.name,
-                    tag_id: &tag.tag_id,
-                    object_id: &tag.object_id,
-                    object_type: &tag.object_type,
-                    tagger: &tag.tagger,
-                    message: &tag.message,
-                    created_at: &tag.created_at,
-                })
-                .collect(),
+            items: tags.items.iter().map(TagItem::from).collect(),
         }
     }
 }
@@ -694,6 +769,14 @@ mod tests {
         .expect("list-tags is registered");
         assert_eq!(spec.name, "list-tags");
         assert_eq!(spec.endpoint, mega2_diag::LIST_TAGS);
+        let spec = Operation::CreateTag {
+            name: "v1".to_string(),
+            message: None,
+        }
+        .spec()
+        .expect("create-tag is registered");
+        assert_eq!(spec.name, "create-tag");
+        assert_eq!(spec.endpoint, mega2_diag::CREATE_TAG);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -870,6 +953,69 @@ mod tests {
                 has_next(1, 20, 0),
             ),
             (true, false, true, false, false)
+        );
+    }
+
+    /// MN-06: the `create-tag` payload keeps local `target` (name, kind,
+    /// path) and the server's tag `receipt` apart.
+    #[test]
+    fn create_tag_payload_separates_target_and_receipt() {
+        let tag = TagInfo {
+            name: "v1".to_string(),
+            tag_id: "t1".to_string(),
+            object_id: "o1".to_string(),
+            object_type: "commit".to_string(),
+            tagger: "Ann <ann@example.com>".to_string(),
+            message: "release one".to_string(),
+            created_at: "2026-10-02T00:00:00Z".to_string(),
+        };
+        let target = TagTarget {
+            name: "v1",
+            kind: "annotated",
+            path: "/",
+        };
+        let receipt = TagItem::from(&tag);
+        let data = WriteData {
+            operation: "create-tag",
+            server: "https://mega2.example.com",
+            target: &target,
+            receipt: &receipt,
+        };
+        assert_eq!(
+            serde_json::to_value(&data).expect("serialize"),
+            serde_json::json!({
+                "operation": "create-tag",
+                "server": "https://mega2.example.com",
+                "target": {"name": "v1", "kind": "annotated", "path": "/"},
+                "receipt": {
+                    "name": "v1",
+                    "tag_id": "t1",
+                    "object_id": "o1",
+                    "object_type": "commit",
+                    "tagger": "Ann <ann@example.com>",
+                    "message": "release one",
+                    "created_at": "2026-10-02T00:00:00Z",
+                },
+            })
+        );
+    }
+
+    /// MN-06 (ADR-MN-06): `--message` is refused when empty, longer than
+    /// 1024 bytes or carrying a control character; a bounded printable
+    /// message passes.
+    #[test]
+    fn tag_message_rules() {
+        let long = "a".repeat(MAX_TAG_MESSAGE_BYTES + 1);
+        let at_limit = "a".repeat(MAX_TAG_MESSAGE_BYTES);
+        assert_eq!(
+            [
+                validate_tag_message("").is_err(),
+                validate_tag_message(&long).is_err(),
+                validate_tag_message("a\nb").is_err(),
+                validate_tag_message(&at_limit).is_ok(),
+                validate_tag_message("release one").is_ok(),
+            ],
+            [true; 5]
         );
     }
 }

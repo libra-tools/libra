@@ -42,7 +42,7 @@
     维护唯一的操作登记表 `OPERATIONS`（每个操作一行：flag、`mega2_diag` 端点、读/写与
     目录/tag 类别），ADR-MN-08 的通用规则按类别实现一次（不碰终端、不读 stdin、本地校验后
     恰好一次请求、不 reload/preflight/重试、读操作拒绝 token flag 且不读 `LIBRA_MEGA2_TOKEN`）；
-    `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 `--list`，MN-03 `--create-dir`，MN-04 `--delete-dir`，MN-08 `--move-dir`，MN-12 `--rename-dir`，MN-05 `--list-tags`；其分页参数 `--page`/`--per-page` 在 `TagPagingArgs`，以 clap `requires` 绑定 `--list-tags`）；
+    `BrowserArgs` 的互斥参数组 `operation` 选择操作（MN-02 `--list`，MN-03 `--create-dir`，MN-04 `--delete-dir`，MN-08 `--move-dir`，MN-12 `--rename-dir`，MN-05 `--list-tags`，MN-06 `--create-tag`；tag 操作的选项 `--page`/`--per-page`/`--message` 在 `TagArgs`，各以 clap `requires` 绑定其操作）；
     写类操作由类别规则拒绝 `--ref`（R8），并按 ADR-MN-05（MN-11）取凭据：读类拒绝 token flag、
     不读 `LIBRA_MEGA2_TOKEN`，写类以 `resolve_token_from_process` 取至多一个 token，
     经 `Mega2EntryClient::create_directory`（建目录）、`Mega2MutateClient::delete_directory`（删目录）、
@@ -51,7 +51,9 @@
     POST（`known_type` 传 `None`：目标是否存在、是否为目录由服务端回答；无 token 来源时匿名），
     写操作的 payload 把本地 `target` 与服务端 `receipt` 分开。tag 类操作另由类别规则只接受 PATH `/`（R10a），
     读 tag 操作拒绝 `--ref`（R10b）；`--list-tags` 经 `Mega2TagClient::list_tags` 发一次匿名 GET，payload 带
-    `page`/`per_page`/`total`/`has_next` 与原样的 `items`，人读按行渲染并经 `sanitize`。
+    `page`/`per_page`/`total`/`has_next` 与原样的 `items`，人读按行渲染并经 `sanitize`；`--create-tag` 经
+    `Mega2TagClient::create_tag` 发一次 POST（`path_context` 为 `/`，凭据按写类别），`--message` 先按 ADR-MN-06
+    校验（非空、不超过 1024 字节、无控制字符），payload 的 `target` 为 `{name, kind, path}`。
 - 执行路径：
   1. `execute_safe` → `validate_server_url` + `normalize_path`（都在终端/网络之前）；
   2. 带操作 flag，或 `output.is_json()` 为真（等同 `--list`）→ `noninteractive::execute`：
@@ -119,7 +121,7 @@ flowchart TD
 - 非交互操作（plan-20261001 MN-02 起）：`cargo test --test command_test
   mega2_browser_noninteractive_test` 以真实二进制（清空环境、stdin 为 `/dev/null`）对 loopback
   mock 断言请求记录；ADR-MN-08 的规则按函数写一次，由 `op_rule!` 宏展开为
-  `op_rule_<op>_<rule>`（`list`：R1–R6；`create_dir`、`delete_dir`、`move_dir`、`rename_dir`：R1–R4b、R7、R8、R9a–R9c；`list_tags`：R1–R7、R10a、R10b），另有各操作的请求记录、
+  `op_rule_<op>_<rule>`（`list`：R1–R6；`create_dir`、`delete_dir`、`move_dir`、`rename_dir`：R1–R4b、R7、R8、R9a–R9c；`list_tags`：R1–R7、R10a、R10b；`create_tag`：R1–R4b、R7、R8、R9a–R9c、R10a），另有各操作的请求记录、
   payload、人读输出与本地拒绝/服务端失败 fixture；`cargo test --lib command::mega2` 覆盖登记表
   与 CLI 操作 flag 一一对应、payload 形状，以及帮助、命令文档与网站页（`LIBRA_SITE_MEGA2_DOC`，
   被忽略的测试需显式运行）示例的 PATH 都 rooted。
@@ -134,4 +136,4 @@ flowchart TD
 - 终端渲染不引入第三方 TUI 依赖（G-05）。
 - 目录删除/移动/tag 属后续卡（MB-07/08、MB-10/11）；不带操作 flag 的 `--json` 与
   `--list` 是「一次 GET」；写操作与 tag 的非交互形式由 plan-20261001 MN-03 起各卡以操作 flag
-  加入（MN-03：`--create-dir`；MN-04：`--delete-dir`；MN-08：`--move-dir`；MN-12：`--rename-dir`；MN-05：`--list-tags`），仍没有 `mega2 mkdir` 一类子命令。
+  加入（MN-03：`--create-dir`；MN-04：`--delete-dir`；MN-08：`--move-dir`；MN-12：`--rename-dir`；MN-05：`--list-tags`；MN-06：`--create-tag`），仍没有 `mega2 mkdir` 一类子命令。

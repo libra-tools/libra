@@ -2161,3 +2161,319 @@ fn list_tags_per_page_requires_list_tags_no_request() {
     assert!(!output.status.success());
     assert!(mock.records().is_empty(), "records: {:?}", mock.records());
 }
+
+// ---- create_tag (MN-06): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c, R10a ----
+
+fn tag_receipt(object_id: &str, message: &str) -> String {
+    envelope(json!({
+        "name": "v1",
+        "tag_id": "t-1",
+        "object_id": object_id,
+        "object_type": "commit",
+        "tagger": "Ann <ann@example.com>",
+        "message": message,
+        "created_at": "2026-10-02T00:00:00Z",
+    }))
+}
+
+/// The rule fixture's `object_id` carries an ESC, so R2 proves the human
+/// summary sanitizes server strings.
+fn create_tag_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, tag_receipt("o-\u{1b}[31m-1", ""))
+}
+
+fn create_tag_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, tag_receipt("o-1", "release one"))
+}
+
+const CREATE_TAG_CASE: OpCase = OpCase {
+    op_args: &["--create-tag", "v1"],
+    method: "POST",
+    route: "/api/v1/tags",
+    path: "/api/v1/tags",
+    ok: create_tag_ok,
+};
+
+op_rule!(op_rule_create_tag_r1, rule_r1, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r1b, rule_r1b, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r2, rule_r2, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r3, rule_r3, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r4a, rule_r4a, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r4b, rule_r4b, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r7_code, rule_r7_code, CREATE_TAG_CASE);
+op_rule!(
+    op_rule_create_tag_r7_no_request,
+    rule_r7_no_request,
+    CREATE_TAG_CASE
+);
+op_rule!(op_rule_create_tag_r8_code, rule_r8_code, CREATE_TAG_CASE);
+op_rule!(
+    op_rule_create_tag_r8_no_request,
+    rule_r8_no_request,
+    CREATE_TAG_CASE
+);
+op_rule!(op_rule_create_tag_r9a, rule_r9a, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r9b, rule_r9b, CREATE_TAG_CASE);
+op_rule!(op_rule_create_tag_r9c, rule_r9c, CREATE_TAG_CASE);
+op_rule!(
+    op_rule_create_tag_r10a_code,
+    rule_r10a_code,
+    CREATE_TAG_CASE
+);
+op_rule!(
+    op_rule_create_tag_r10a_no_request,
+    rule_r10a_no_request,
+    CREATE_TAG_CASE
+);
+
+// ---- create_tag (MN-06): operation-specific behavior ----
+
+/// Runs `args` (after `--server <url>`) against `mock`.
+fn tag_op_output(mock: &MockMega2, args: &[&str]) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = mock.url();
+    let mut argv = vec!["mega2", "browser", "--server", &url];
+    argv.extend_from_slice(args);
+    run(dir.path(), &argv, &[])
+}
+
+/// AC-1: without `--message`, one anonymous POST creates a lightweight tag
+/// at the root.
+#[test]
+fn create_tag_request_record_lightweight() {
+    let mock = MockMega2::start(create_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--create-tag", "v1", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/tags".to_string(),
+            None,
+            Some(json!({"name": "v1", "path_context": "/"})),
+        )]
+    );
+}
+
+/// AC-2: `--message` adds the message, which makes the tag annotated.
+#[test]
+fn create_tag_request_record_annotated() {
+    let mock = MockMega2::start(create_tag_clean_ok);
+    let output = tag_op_output(
+        &mock,
+        &["--create-tag", "v1", "--message", "release one", "--json"],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "POST".to_string(),
+            "/api/v1/tags".to_string(),
+            None,
+            Some(json!({"name": "v1", "path_context": "/", "message": "release one"})),
+        )]
+    );
+}
+
+/// AC-3: `target` (name, kind, path) comes from local input, `receipt` is
+/// the server's tag verbatim.
+#[test]
+fn create_tag_json_payload() {
+    let mock = MockMega2::start(create_tag_clean_ok);
+    let output = tag_op_output(
+        &mock,
+        &["--create-tag", "v1", "--message", "release one", "--json"],
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "create-tag",
+            "server": mock.url(),
+            "target": {"name": "v1", "kind": "annotated", "path": "/"},
+            "receipt": {
+                "name": "v1",
+                "tag_id": "t-1",
+                "object_id": "o-1",
+                "object_type": "commit",
+                "tagger": "Ann <ann@example.com>",
+                "message": "release one",
+                "created_at": "2026-10-02T00:00:00Z",
+            },
+        })
+    );
+}
+
+/// mega2's receipt for a lightweight tag: `tag_id` is `object_id`, the message
+/// is empty and the tagger defaults to `unknown`.
+fn create_tag_lightweight_ok(_method: &str, _path: &str) -> (u16, String) {
+    (
+        200,
+        envelope(json!({
+            "name": "v1",
+            "tag_id": "o-1",
+            "object_id": "o-1",
+            "object_type": "commit",
+            "tagger": "unknown",
+            "message": "",
+            "created_at": "2026-10-02T00:00:00Z",
+        })),
+    )
+}
+
+/// AC-3 for the other kind: without `--message` the payload's `target.kind`
+/// is `lightweight`.
+#[test]
+fn create_tag_json_payload_lightweight() {
+    let mock = MockMega2::start(create_tag_lightweight_ok);
+    let output = tag_op_output(&mock, &["--create-tag", "v1", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "create-tag",
+            "server": mock.url(),
+            "target": {"name": "v1", "kind": "lightweight", "path": "/"},
+            "receipt": {
+                "name": "v1",
+                "tag_id": "o-1",
+                "object_id": "o-1",
+                "object_type": "commit",
+                "tagger": "unknown",
+                "message": "",
+                "created_at": "2026-10-02T00:00:00Z",
+            },
+        })
+    );
+}
+
+/// The tag client maps HTTP 400 (for example an existing tag), 405 and 422
+/// to `LBR-CLI-002` and keeps the status in `details`.
+#[test]
+fn create_tag_rejections_map_to_cli_002() {
+    let outcomes: Vec<(Value, Value)> = [400u16, 405, 422]
+        .into_iter()
+        .map(|status| {
+            let mock = MockMega2::start(fail_on(&CREATE_TAG_CASE, status, ""));
+            let output = tag_op_output(&mock, &["--create-tag", "v1", "--machine"]);
+            assert!(!output.status.success());
+            let envelope = error_envelope(&output);
+            (
+                envelope["error_code"].clone(),
+                envelope["details"]["http_status"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            (json!("LBR-CLI-002"), json!(400)),
+            (json!("LBR-CLI-002"), json!(405)),
+            (json!("LBR-CLI-002"), json!(422)),
+        ]
+    );
+}
+
+/// AC-4: the human summary is one sanitized line naming the kind.
+#[test]
+fn create_tag_human_output() {
+    let mock = MockMega2::start(create_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--create-tag", "v1"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "created lightweight tag v1 -> o-1\n");
+}
+
+/// Runs `args` under `--machine` against a successful mock, returning the
+/// output and the mock (for its request record).
+fn create_tag_machine(args: &[&str]) -> (Output, MockMega2) {
+    let mock = MockMega2::start(create_tag_clean_ok);
+    let mut with_machine = args.to_vec();
+    with_machine.push("--machine");
+    let output = tag_op_output(&mock, &with_machine);
+    (output, mock)
+}
+
+/// G16: NAME `bad..name` (delegated to `validate_tag_name`) fails with
+/// `LBR-CLI-002`.
+#[test]
+fn create_tag_rejects_bad_name_code() {
+    let (output, _mock) = create_tag_machine(&["--create-tag", "bad..name"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G17: the same refusal sends no request.
+#[test]
+fn create_tag_rejects_bad_name_no_request() {
+    let (output, mock) = create_tag_machine(&["--create-tag", "bad..name"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G18: `--message` without `--create-tag` fails with `LBR-CLI-002`.
+#[test]
+fn create_tag_message_requires_create_tag_code() {
+    let (output, _mock) = create_tag_machine(&["--message", "x"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G19: the same refusal sends no request.
+#[test]
+fn create_tag_message_requires_create_tag_no_request() {
+    let (output, mock) = create_tag_machine(&["--message", "x"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G20: an empty `--message` fails with `LBR-CLI-002` (ADR-MN-06).
+#[test]
+fn create_tag_rejects_empty_message_code() {
+    let (output, _mock) = create_tag_machine(&["--create-tag", "v1", "--message", ""]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G21: the same refusal sends no request.
+#[test]
+fn create_tag_rejects_empty_message_no_request() {
+    let (output, mock) = create_tag_machine(&["--create-tag", "v1", "--message", ""]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G22: a 1025-byte `--message` fails with `LBR-CLI-002`.
+#[test]
+fn create_tag_rejects_long_message_code() {
+    let long = "a".repeat(1025);
+    let (output, _mock) = create_tag_machine(&["--create-tag", "v1", "--message", &long]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G23: the same refusal sends no request.
+#[test]
+fn create_tag_rejects_long_message_no_request() {
+    let long = "a".repeat(1025);
+    let (output, mock) = create_tag_machine(&["--create-tag", "v1", "--message", &long]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// G24: a `--message` with a newline fails with `LBR-CLI-002`.
+#[test]
+fn create_tag_rejects_control_message_code() {
+    let (output, _mock) = create_tag_machine(&["--create-tag", "v1", "--message", "a\nb"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G25: the same refusal sends no request.
+#[test]
+fn create_tag_rejects_control_message_no_request() {
+    let (output, mock) = create_tag_machine(&["--create-tag", "v1", "--message", "a\nb"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
