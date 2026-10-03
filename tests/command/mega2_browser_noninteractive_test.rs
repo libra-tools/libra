@@ -2647,3 +2647,841 @@ fn delete_tag_rejections_map_to_cli_002() {
         ]
     );
 }
+
+// ---- live interop gates (MN-07): env-gated, against a real Mega2 ----
+//
+// `live_gate_*` run only when `LIBRA_TEST_MEGA2_SERVER` and
+// `LIBRA_TEST_MEGA2_WRITE_ROOT` name a writable storage-only instance
+// (DEP-MN-04); otherwise they print `skipped (...)` and pass. Each gate is
+// self-contained: it creates its own `<run>-<suffix>` objects, judges one
+// observed result, then deletes every object it recorded for its run. The
+// `live_harness_*` cases check the harness itself against loopback mocks.
+
+/// What a live gate prints when the instance is not configured.
+const LIVE_SKIP: &str =
+    "skipped (set LIBRA_TEST_MEGA2_SERVER and LIBRA_TEST_MEGA2_WRITE_ROOT to run)";
+
+/// Root tags a tag-writing gate accepts on the instance before writing.
+const LIVE_MAX_ROOT_TAGS: u64 = 900;
+
+/// Why a live gate did not run.
+#[derive(Debug, PartialEq, Eq)]
+struct Skip(String);
+
+/// A failed `libra` step: the message (with the step's stderr verbatim) and
+/// the HTTP status the server answered, when it answered.
+#[derive(Debug)]
+struct StepError {
+    message: String,
+    http_status: Option<u64>,
+}
+
+impl From<StepError> for String {
+    fn from(error: StepError) -> Self {
+        error.message
+    }
+}
+
+/// An object a live gate created and cleanup must delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveObject {
+    Dir { parent: String, name: String },
+    Tag(String),
+}
+
+/// One live run against the instance: its configuration, run id, the objects
+/// it created and everything the harness printed.
+struct Live {
+    server: String,
+    root: String,
+    token_file: Option<String>,
+    run: String,
+    dir: tempfile::TempDir,
+    created: std::cell::RefCell<Vec<LiveObject>>,
+    log: std::cell::RefCell<String>,
+}
+
+/// Reads the live configuration through `lookup` (the process environment
+/// for the gates); an unset or empty required variable skips.
+fn live_from(lookup: impl Fn(&str) -> Option<String>) -> Result<Live, Skip> {
+    let get = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    let (Some(server), Some(root)) = (
+        get("LIBRA_TEST_MEGA2_SERVER"),
+        get("LIBRA_TEST_MEGA2_WRITE_ROOT"),
+    ) else {
+        return Err(Skip(LIVE_SKIP.to_string()));
+    };
+    let token_file = get("LIBRA_TEST_MEGA2_TOKEN_FILE").map(absolute_path);
+    Ok(Live::new(&server, &root, token_file))
+}
+
+/// `path` resolved against this process's working directory: every `libra`
+/// call runs in its own temporary directory, where a relative token-file
+/// path would name a different file.
+fn absolute_path(path: String) -> String {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    std::env::current_dir()
+        .expect("current directory")
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl Live {
+    fn new(server: &str, root: &str, token_file: Option<String>) -> Self {
+        // UTC timestamp plus 64 random bits: unique per run, valid as a
+        // directory and a tag name.
+        let run = format!(
+            "lg{}{:016x}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S"),
+            rand::random::<u64>()
+        );
+        Self {
+            server: server.to_string(),
+            root: root.to_string(),
+            token_file,
+            run,
+            dir: tempfile::tempdir().expect("tempdir"),
+            created: std::cell::RefCell::new(Vec::new()),
+            log: std::cell::RefCell::new(String::new()),
+        }
+    }
+
+    /// `<run>-<suffix>`.
+    fn name(&self, suffix: &str) -> String {
+        format!("{}-{suffix}", self.run)
+    }
+
+    fn note(&self, line: &str) {
+        let mut log = self.log.borrow_mut();
+        log.push_str(line);
+        log.push('\n');
+    }
+
+    /// Records an object before the call that creates it.
+    fn track(&self, object: LiveObject) {
+        self.created.borrow_mut().push(object);
+    }
+
+    /// Forgets an object whose create the server rejected before writing
+    /// (HTTP 400: an invalid or already existing name), so cleanup never
+    /// deletes an object this run did not create.
+    fn untrack(&self, object: &LiveObject) {
+        self.created
+            .borrow_mut()
+            .retain(|recorded| recorded != object);
+    }
+
+    /// One `libra --machine mega2 browser` call; a write carries
+    /// `--token-file` when one is configured. Returns `data` of the success
+    /// envelope, or the step's failure with its stderr verbatim.
+    fn call(&self, args: &[&str], write: bool) -> Result<Value, StepError> {
+        let mut argv = vec!["--machine", "mega2", "browser", "--server", &self.server];
+        argv.extend_from_slice(args);
+        if write && let Some(file) = &self.token_file {
+            argv.extend_from_slice(&["--token-file", file]);
+        }
+        let output = run(self.dir.path(), &argv, &[]);
+        let step = args.join(" ");
+        if !output.status.success() {
+            let stderr = text(&output.stderr);
+            let message = format!("step `{step}` failed: {}", stderr.trim());
+            self.note(&message);
+            let http_status = stderr
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+                .and_then(|envelope| envelope["details"]["http_status"].as_u64());
+            return Err(StepError {
+                message,
+                http_status,
+            });
+        }
+        self.note(&format!("step `{step}` ok"));
+        let envelope: Value =
+            serde_json::from_slice(&output.stdout).map_err(|error| StepError {
+                message: format!("step `{step}`: stdout is not JSON: {error}"),
+                http_status: None,
+            })?;
+        Ok(envelope["data"].clone())
+    }
+
+    fn read(&self, args: &[&str]) -> Result<Value, String> {
+        self.call(args, false).map_err(String::from)
+    }
+
+    fn write(&self, args: &[&str]) -> Result<Value, String> {
+        self.call(args, true).map_err(String::from)
+    }
+
+    /// A create: the object is recorded before the call. Only an HTTP 400 —
+    /// mega2's answer to an invalid or already existing name, given before
+    /// it writes anything — proves the object is not this run's, so only then
+    /// is the record dropped. Any other failure, including an error the server
+    /// returns after it already wrote, keeps the record: cleanup then deletes
+    /// the object, or finds it gone (404), or reports it as residue.
+    fn create(&self, object: LiveObject, args: &[&str]) -> Result<(), String> {
+        self.track(object.clone());
+        match self.call(args, true) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if error.http_status == Some(400) {
+                    self.untrack(&object);
+                }
+                Err(error.message)
+            }
+        }
+    }
+
+    /// Fails, before a directory gate touches anything, when the write root
+    /// already lists an entry of this run: it was not created here, and
+    /// mega2 answers a duplicate directory with an ambiguous 500, so it must
+    /// never reach cleanup.
+    fn require_fresh_root(&self) -> Result<(), String> {
+        let prefix = format!("{}-", self.run);
+        match self
+            .list(&self.root)?
+            .into_iter()
+            .find(|(name, _)| name.starts_with(&prefix))
+        {
+            Some((name, _)) => Err(format!(
+                "{name} already exists before this run created it; refusing to touch it"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The `(name, field)` pairs of a payload's `items`; a missing or
+    /// non-array `items`, or an entry without both string fields, is an error,
+    /// so an absence is only ever judged on a valid listing.
+    fn entries(items: &Value, field: &str) -> Result<Vec<(String, String)>, String> {
+        items
+            .as_array()
+            .ok_or_else(|| format!("invalid listing: items is not an array: {items}"))?
+            .iter()
+            .map(|item| match (item["name"].as_str(), item[field].as_str()) {
+                (Some(name), Some(value)) => Ok((name.to_string(), value.to_string())),
+                _ => Err(format!("invalid listing entry: {item}")),
+            })
+            .collect()
+    }
+
+    /// The `(name, content_type)` entries listed directly under `path`.
+    fn list(&self, path: &str) -> Result<Vec<(String, String)>, String> {
+        Self::entries(&self.read(&["--list", path])?["items"], "content_type")
+    }
+
+    /// Whether `path` lists a directory named `name`.
+    fn lists_dir(&self, path: &str, name: &str) -> Result<bool, String> {
+        Ok(self
+            .list(path)?
+            .iter()
+            .any(|(entry, kind)| entry == name && kind == "directory"))
+    }
+
+    /// Whether `path` lists any entry named `name`.
+    fn lists_name(&self, path: &str, name: &str) -> Result<bool, String> {
+        Ok(self.list(path)?.iter().any(|(entry, _)| entry == name))
+    }
+
+    /// Creates directory `name` under the write root, recorded for cleanup.
+    fn create_dir(&self, name: &str) -> Result<(), String> {
+        let object = LiveObject::Dir {
+            parent: self.root.clone(),
+            name: name.to_string(),
+        };
+        self.create(object, &["--create-dir", name, &self.root])
+    }
+
+    /// Creates root tag `name` (annotated when `message` is given), recorded
+    /// for cleanup.
+    fn create_tag(&self, name: &str, message: Option<&str>) -> Result<(), String> {
+        let object = LiveObject::Tag(name.to_string());
+        match message {
+            Some(message) => self.create(object, &["--create-tag", name, "--message", message]),
+            None => self.create(object, &["--create-tag", name]),
+        }
+    }
+
+    /// Fails before any tag write when the instance holds more root tags than
+    /// a gate may page through.
+    fn require_tag_capacity(&self) -> Result<(), String> {
+        let data = self.read(&["--list-tags", "--per-page", "1"])?;
+        let total = data["total"]
+            .as_u64()
+            .ok_or_else(|| format!("capacity check: invalid total in {data}"))?;
+        if total > LIVE_MAX_ROOT_TAGS {
+            return Err("实例 root tag 超过 900，请改用隔离实例（DEP-MN-04）".to_string());
+        }
+        Ok(())
+    }
+
+    /// One anonymous `GET /api/v1/tags/{name}?path=%2F`, outside libra:
+    /// returns the status and `data` as the server reports them.
+    fn get_tag(&self, name: &str) -> Result<(u16, Value), String> {
+        let mut url = reqwest::Url::parse(&self.server)
+            .map_err(|error| format!("bad LIBRA_TEST_MEGA2_SERVER: {error}"))?;
+        url.path_segments_mut()
+            .map_err(|()| "LIBRA_TEST_MEGA2_SERVER cannot be a base URL".to_string())?
+            .pop_if_empty()
+            .extend(["api", "v1", "tags", name]);
+        url.query_pairs_mut().append_pair("path", "/");
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("http client: {error}"))?
+            .get(url)
+            .send()
+            .map_err(|error| format!("GET tag {name}: {error}"))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().unwrap_or(Value::Null);
+        self.note(&format!("GET tag {name}: HTTP {status}"));
+        Ok((status, body["data"].clone()))
+    }
+
+    /// Deletes every recorded object of this run, newest first (names starting
+    /// with `<run>-`; anything else is never touched). A delete answered with
+    /// 404 means the object is already gone. Returns the names it could not
+    /// delete.
+    fn cleanup(&self) -> Vec<String> {
+        let prefix = format!("{}-", self.run);
+        let created = self.created.borrow().clone();
+        let mut residue = Vec::new();
+        for object in created.iter().rev() {
+            let (name, result) = match object {
+                LiveObject::Dir { name, .. } | LiveObject::Tag(name)
+                    if !name.starts_with(&prefix) =>
+                {
+                    continue;
+                }
+                LiveObject::Dir { parent, name } => {
+                    (name, self.call(&["--delete-dir", name, parent], true))
+                }
+                LiveObject::Tag(name) => (name, self.call(&["--delete-tag", name], true)),
+            };
+            if let Err(error) = result
+                && error.http_status != Some(404)
+            {
+                residue.push(name.clone());
+            }
+        }
+        if !residue.is_empty() {
+            self.note(&format!("cleanup left: {}", residue.join(", ")));
+        }
+        residue
+    }
+}
+
+/// Runs one gate body, then cleanup; any failing step fails the gate.
+fn run_live_gate(
+    live: &Live,
+    body: impl FnOnce(&Live) -> Result<(), String>,
+) -> Result<(), String> {
+    let outcome = body(live);
+    let residue = live.cleanup();
+    let cleanup = if residue.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("cleanup left: {}", residue.join(", ")))
+    };
+    match (outcome, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}\n{cleanup}")),
+    }
+}
+
+/// A live gate: skips without the instance, otherwise runs `body` and
+/// cleanup and fails on the first failing step.
+fn live_gate(body: impl FnOnce(&Live) -> Result<(), String>) {
+    let live = match live_from(|name| std::env::var(name).ok()) {
+        Ok(live) => live,
+        Err(Skip(message)) => {
+            eprintln!("{message}");
+            return;
+        }
+    };
+    let result = run_live_gate(&live, body);
+    eprint!("{}", live.log.borrow());
+    if let Err(message) = result {
+        panic!("{message}");
+    }
+}
+
+fn check(condition: bool, what: &str) -> Result<(), String> {
+    if condition {
+        Ok(())
+    } else {
+        Err(format!("criterion failed: {what}"))
+    }
+}
+
+// Gate bodies (G1–G12): each ends with its single criterion.
+
+fn gate_list(live: &Live) -> Result<(), String> {
+    let data = live.read(&["--list", &live.root])?;
+    check(data["operation"] == "list", "data.operation == \"list\"")
+}
+
+fn gate_create_dir(live: &Live) -> Result<(), String> {
+    live.require_fresh_root()?;
+    let name = live.name("c");
+    live.create_dir(&name)?;
+    check(
+        live.lists_dir(&live.root, &name)?,
+        "the root lists directory <run>-c",
+    )
+}
+
+fn gate_delete_dir(live: &Live) -> Result<(), String> {
+    live.require_fresh_root()?;
+    let name = live.name("d");
+    live.create_dir(&name)?;
+    live.write(&["--delete-dir", &name, &live.root])?;
+    check(
+        !live.lists_name(&live.root, &name)?,
+        "the root no longer lists <run>-d",
+    )
+}
+
+/// Prepares `<run>-m` and `<run>-dst` and moves the first into the second.
+fn move_dir(live: &Live) -> Result<(String, String), String> {
+    live.require_fresh_root()?;
+    let (moved, dst) = (live.name("m"), live.name("dst"));
+    live.create_dir(&moved)?;
+    live.create_dir(&dst)?;
+    let parent = format!("{}/{dst}", live.root.trim_end_matches('/'));
+    live.write(&["--move-dir", &moved, &parent, &live.root])?;
+    Ok((moved, parent))
+}
+
+fn gate_move_dir_arrives(live: &Live) -> Result<(), String> {
+    let (moved, parent) = move_dir(live)?;
+    check(
+        live.lists_dir(&parent, &moved)?,
+        "<run>-dst lists directory <run>-m",
+    )
+}
+
+fn gate_move_dir_leaves_source(live: &Live) -> Result<(), String> {
+    let (moved, _) = move_dir(live)?;
+    check(
+        !live.lists_name(&live.root, &moved)?,
+        "the root no longer lists <run>-m",
+    )
+}
+
+/// Prepares `<run>-r` and renames it to `<run>-r2`.
+fn rename_dir(live: &Live) -> Result<(String, String), String> {
+    live.require_fresh_root()?;
+    let (old, new) = (live.name("r"), live.name("r2"));
+    live.create_dir(&old)?;
+    // The rename brings `<run>-r2` into being: recorded like a create.
+    let renamed = LiveObject::Dir {
+        parent: live.root.clone(),
+        name: new.clone(),
+    };
+    live.create(renamed, &["--rename-dir", &old, &new, &live.root])?;
+    Ok((old, new))
+}
+
+fn gate_rename_dir_new_name(live: &Live) -> Result<(), String> {
+    let (_, new) = rename_dir(live)?;
+    check(
+        live.lists_dir(&live.root, &new)?,
+        "the root lists directory <run>-r2",
+    )
+}
+
+fn gate_rename_dir_old_name_gone(live: &Live) -> Result<(), String> {
+    let (old, _) = rename_dir(live)?;
+    check(
+        !live.lists_name(&live.root, &old)?,
+        "the root no longer lists <run>-r",
+    )
+}
+
+fn gate_list_tags(live: &Live) -> Result<(), String> {
+    let data = live.read(&["--list-tags"])?;
+    check(
+        data["operation"] == "list-tags",
+        "data.operation == \"list-tags\"",
+    )
+}
+
+fn gate_create_tag_lightweight(live: &Live) -> Result<(), String> {
+    live.require_tag_capacity()?;
+    let name = live.name("lw");
+    live.create_tag(&name, None)?;
+    let (status, data) = live.get_tag(&name)?;
+    let (tag_id, object_id) = (data["tag_id"].as_str(), data["object_id"].as_str());
+    check(
+        status == 200 && tag_id.is_some_and(|id| !id.is_empty()) && tag_id == object_id,
+        "GET tag reports a non-empty tag_id equal to object_id",
+    )
+}
+
+fn gate_create_tag_annotated(live: &Live) -> Result<(), String> {
+    live.require_tag_capacity()?;
+    let name = live.name("an");
+    let message = format!("libra live gate {}", live.run);
+    live.create_tag(&name, Some(&message))?;
+    let (_, data) = live.get_tag(&name)?;
+    check(
+        data["message"] == message.as_str(),
+        "GET tag reports the message",
+    )
+}
+
+fn gate_delete_tag(live: &Live) -> Result<(), String> {
+    live.require_tag_capacity()?;
+    let name = live.name("del");
+    live.create_tag(&name, None)?;
+    live.write(&["--delete-tag", &name])?;
+    let (status, _) = live.get_tag(&name)?;
+    check(status == 404, "GET tag answers 404 after the delete")
+}
+
+fn gate_list_tags_reaches_annotated(live: &Live) -> Result<(), String> {
+    live.require_tag_capacity()?;
+    let name = live.name("pg");
+    live.create_tag(&name, Some("libra live gate paging"))?;
+    let mut seen = Vec::new();
+    let mut ended = false;
+    for page in 1..=10u32 {
+        let page = page.to_string();
+        let data = live.read(&["--list-tags", "--per-page", "100", "--page", &page])?;
+        seen.extend(Live::entries(&data["items"], "object_type")?);
+        match data["has_next"].as_bool() {
+            Some(true) => {}
+            Some(false) => {
+                ended = true;
+                break;
+            }
+            None => return Err(format!("invalid has_next on page {page}: {data}")),
+        }
+    }
+    if !ended {
+        return Err("the tag listing still has a next page after 10 pages".to_string());
+    }
+    check(
+        seen.iter().any(|(entry, _)| *entry == name),
+        "the paged listing contains <run>-pg",
+    )
+}
+
+#[test]
+fn live_gate_list() {
+    live_gate(gate_list);
+}
+
+#[test]
+fn live_gate_create_dir() {
+    live_gate(gate_create_dir);
+}
+
+#[test]
+fn live_gate_delete_dir() {
+    live_gate(gate_delete_dir);
+}
+
+#[test]
+fn live_gate_move_dir_arrives() {
+    live_gate(gate_move_dir_arrives);
+}
+
+#[test]
+fn live_gate_move_dir_leaves_source() {
+    live_gate(gate_move_dir_leaves_source);
+}
+
+#[test]
+fn live_gate_rename_dir_new_name() {
+    live_gate(gate_rename_dir_new_name);
+}
+
+#[test]
+fn live_gate_rename_dir_old_name_gone() {
+    live_gate(gate_rename_dir_old_name_gone);
+}
+
+#[test]
+fn live_gate_list_tags() {
+    live_gate(gate_list_tags);
+}
+
+#[test]
+fn live_gate_create_tag_lightweight() {
+    live_gate(gate_create_tag_lightweight);
+}
+
+#[test]
+fn live_gate_create_tag_annotated() {
+    live_gate(gate_create_tag_annotated);
+}
+
+#[test]
+fn live_gate_delete_tag() {
+    live_gate(gate_delete_tag);
+}
+
+#[test]
+fn live_gate_list_tags_reaches_annotated() {
+    live_gate(gate_list_tags_reaches_annotated);
+}
+
+// ---- live harness (MN-07): checked against loopback mocks ----
+
+/// G13: without `LIBRA_TEST_MEGA2_SERVER` the harness skips.
+#[test]
+fn live_harness_skips_without_server() {
+    let live =
+        live_from(|name| (name == "LIBRA_TEST_MEGA2_WRITE_ROOT").then(|| "/project".to_string()));
+    assert_eq!(live.err(), Some(Skip(LIVE_SKIP.to_string())));
+}
+
+/// G14: without `LIBRA_TEST_MEGA2_WRITE_ROOT` the harness skips.
+#[test]
+fn live_harness_skips_without_write_root() {
+    let live = live_from(|name| {
+        (name == "LIBRA_TEST_MEGA2_SERVER").then(|| "http://127.0.0.1:9".to_string())
+    });
+    assert_eq!(live.err(), Some(Skip(LIVE_SKIP.to_string())));
+}
+
+/// Answers every delete with an empty success receipt.
+fn delete_ok(method: &str, path: &str) -> (u16, String) {
+    match (method, path) {
+        ("POST", "/api/v1/delete-entry") => (200, delete_entry_receipt("c-1")),
+        ("DELETE", _) => (200, delete_tag_receipt("x")),
+        _ => (418, String::new()),
+    }
+}
+
+/// G15: cleanup deletes exactly this run's recorded objects; an object of
+/// another run is never touched.
+#[test]
+fn live_harness_cleanup_targets_only_run_objects() {
+    let mock = MockMega2::start(delete_ok);
+    let live = Live::new(&mock.url(), "/project", None);
+    let (dir, tag) = (live.name("a"), live.name("t"));
+    live.track(LiveObject::Dir {
+        parent: "/project".to_string(),
+        name: dir.clone(),
+    });
+    live.track(LiveObject::Dir {
+        parent: "/project".to_string(),
+        name: "lg20000101000000beef-other".to_string(),
+    });
+    live.track(LiveObject::Tag(tag.clone()));
+    assert!(live.cleanup().is_empty(), "log: {}", live.log.borrow());
+    assert_eq!(
+        request_tuples(&mock),
+        vec![
+            (
+                "DELETE".to_string(),
+                format!("/api/v1/tags/{tag}?path=%2F"),
+                None,
+                None,
+            ),
+            (
+                "POST".to_string(),
+                "/api/v1/delete-entry".to_string(),
+                None,
+                Some(json!({"path": "/project", "name": dir, "skip_build": true})),
+            ),
+        ]
+    );
+}
+
+/// G16: deletes the server refuses are reported by name.
+#[test]
+fn live_harness_reports_residue() {
+    let mock = MockMega2::start(|_method: &str, _path: &str| (500, String::new()));
+    let live = Live::new(&mock.url(), "/project", None);
+    let (dir, tag) = (live.name("a"), live.name("t"));
+    live.track(LiveObject::Dir {
+        parent: "/project".to_string(),
+        name: dir.clone(),
+    });
+    live.track(LiveObject::Tag(tag.clone()));
+    assert_eq!(live.cleanup(), vec![tag, dir]);
+}
+
+/// G17: with more than 900 root tags a tag-writing gate fails after the one
+/// capacity read, before any write.
+#[test]
+fn live_harness_capacity_precheck() {
+    let mock = MockMega2::start(|_method: &str, _path: &str| (200, tags_page(901, json!([]))));
+    let live = Live::new(&mock.url(), "/project", None);
+    assert!(run_live_gate(&live, gate_create_tag_lightweight).is_err());
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "GET".to_string(),
+            "/api/v1/tags/list?page=1&per_page=1&path=%2F".to_string(),
+            None,
+            None,
+        )]
+    );
+}
+
+/// G18: a failing step's message carries that step's stderr JSON error
+/// envelope verbatim.
+#[test]
+fn live_harness_reports_error_envelope() {
+    let mock = MockMega2::start(fail_on(&LIST_CASE, 500, ""));
+    let live = Live::new(&mock.url(), "/project", None);
+    let expected = run(
+        live.dir.path(),
+        &[
+            "--machine",
+            "mega2",
+            "browser",
+            "--server",
+            &mock.url(),
+            "--list",
+            "/project",
+        ],
+        &[],
+    );
+    let envelope = text(&expected.stderr).trim().to_string();
+    let message = run_live_gate(&live, gate_list).expect_err("the listing fails");
+    assert!(
+        message.contains(&envelope),
+        "message: {message}\nenvelope: {envelope}"
+    );
+}
+
+/// G19: with a token file, nothing the harness prints carries the token.
+#[test]
+fn live_harness_never_echoes_token() {
+    let mock = MockMega2::start(|method: &str, _path: &str| match method {
+        "GET" => (200, root_listing(&[])),
+        _ => (401, String::new()),
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = token_file(dir.path(), "g19-secret-token");
+    let live = Live::new(&mock.url(), "/project", Some(file));
+    let message = run_live_gate(&live, gate_create_dir).expect_err("the write is refused");
+    let output = format!("{message}\n{}", live.log.borrow());
+    assert!(
+        !output.contains("g19-secret-token"),
+        "token echoed: {output}"
+    );
+}
+
+/// A fixed run id for the harness cases that script the write root.
+const HARNESS_RUN: &str = "lg20261002000000feedfacecafebeef";
+
+/// The write root's listing: `names` as directories.
+fn root_listing(names: &[&str]) -> String {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|name| json!({"name": name, "path": "/project", "content_type": "directory"}))
+        .collect();
+    envelope(json!({"tree_items": items}))
+}
+
+/// Requests as `(method, path and query)`.
+fn request_lines(mock: &MockMega2) -> Vec<(String, String)> {
+    request_tuples(mock)
+        .into_iter()
+        .map(|(method, target, _, _)| (method, target))
+        .collect()
+}
+
+/// An entry of this run that already exists is never touched: the gate
+/// fails after the one listing, with no create and no delete.
+#[test]
+fn live_harness_existing_run_entry_is_not_touched() {
+    let existing = format!("{HARNESS_RUN}-c");
+    let mock = MockMega2::start(move |method: &str, path: &str| match (method, path) {
+        ("GET", "/api/v1/tree") => (200, root_listing(&[existing.as_str()])),
+        _ => (418, String::new()),
+    });
+    let mut live = Live::new(&mock.url(), "/project", None);
+    live.run = HARNESS_RUN.to_string();
+    let message = run_live_gate(&live, gate_create_dir).expect_err("the run entry exists");
+    assert!(message.contains("already exists"), "message: {message}");
+    assert_eq!(
+        request_lines(&mock),
+        vec![(
+            "GET".to_string(),
+            "/api/v1/tree?path=%2Fproject".to_string()
+        )]
+    );
+}
+
+/// A create that fails after the server may already have written (mega2
+/// can answer 500 after committing) stays recorded: cleanup deletes it.
+#[test]
+fn live_harness_uncertain_create_is_cleaned() {
+    let mock = MockMega2::start(|method: &str, path: &str| match (method, path) {
+        ("GET", "/api/v1/tree") => (200, root_listing(&[])),
+        ("POST", "/api/v1/create-entry") => (500, String::new()),
+        ("POST", "/api/v1/delete-entry") => (200, delete_entry_receipt("c-1")),
+        _ => (418, String::new()),
+    });
+    let mut live = Live::new(&mock.url(), "/project", None);
+    live.run = HARNESS_RUN.to_string();
+    let message = run_live_gate(&live, gate_create_dir).expect_err("the create fails");
+    assert!(!message.contains("cleanup left"), "message: {message}");
+    assert_eq!(
+        request_lines(&mock),
+        vec![
+            (
+                "GET".to_string(),
+                "/api/v1/tree?path=%2Fproject".to_string()
+            ),
+            ("POST".to_string(), "/api/v1/create-entry".to_string()),
+            ("POST".to_string(), "/api/v1/delete-entry".to_string()),
+        ]
+    );
+}
+
+/// A relative `LIBRA_TEST_MEGA2_TOKEN_FILE` is resolved against the test
+/// process's working directory before any `libra` call.
+#[test]
+fn live_harness_resolves_relative_token_file() {
+    let live = live_from(|name| match name {
+        "LIBRA_TEST_MEGA2_SERVER" => Some("http://127.0.0.1:9".to_string()),
+        "LIBRA_TEST_MEGA2_WRITE_ROOT" => Some("/project".to_string()),
+        "LIBRA_TEST_MEGA2_TOKEN_FILE" => Some("token-dir/token".to_string()),
+        _ => None,
+    })
+    .expect("configured");
+    assert_eq!(
+        live.token_file.map(std::path::PathBuf::from),
+        Some(
+            std::env::current_dir()
+                .expect("current directory")
+                .join("token-dir/token")
+        )
+    );
+}
+
+/// With a token file, a gate's write carries exactly that token.
+#[test]
+fn live_harness_writes_carry_token_file() {
+    let mock = MockMega2::start(|method: &str, _path: &str| match method {
+        "GET" => (200, root_listing(&[])),
+        _ => (401, String::new()),
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = token_file(dir.path(), "g19-secret-token");
+    let live = Live::new(&mock.url(), "/project", Some(file));
+    assert!(run_live_gate(&live, gate_create_dir).is_err());
+    let create = mock
+        .records()
+        .into_iter()
+        .find(|record| record.target == "/api/v1/create-entry")
+        .expect("the create was sent");
+    assert_eq!(
+        create.authorization.as_deref(),
+        Some("Bearer g19-secret-token")
+    );
+}

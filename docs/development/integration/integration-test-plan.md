@@ -252,6 +252,12 @@ cargo test --features test-network --test network_remotes_test -- --test-threads
 
 通过标准：green。若外网抖动，允许重试一次后再判定。
 
+`mega2 browser` live 门（plan-20261001 MN-07）：运行前先把 `LIBRA_TEST_MEGA2_SERVER`、`LIBRA_TEST_MEGA2_WRITE_ROOT` 导出为 `DEP-MN-04` 当日核对过的实例 URL 与写根（`push_auth=token` 的实例另导出 `LIBRA_TEST_MEGA2_TOKEN_FILE`）；缺任一必填变量时下面的命令直接失败，不会落入跳过分支：
+
+```bash
+source .env.test && : "${LIBRA_TEST_MEGA2_SERVER:?}" "${LIBRA_TEST_MEGA2_WRITE_ROOT:?}" && cargo test --test command_test mega2_browser_noninteractive_test::live_gate_ -- --test-threads=1
+```
+
 ## 4.4 Wave 4：Live AI（可选，按成本启用）
 
 > **成本警告**：本 wave 调用真实 LLM。开跑前必须设置成本闸门 env（见 §9.3）。

@@ -20,7 +20,7 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | **实施中** | **2026-10-03 05:25:14 UTC**：MN-10、MN-01、MN-02、MN-03、MN-11、MN-04、MN-08、MN-12、MN-05 `done`/`complete`（v0.30.14–v0.30.21、v0.30.24）；MN-06 `in-progress`/`remote-pending`（v0.30.25 已发布，D 组跟踪中）；MN-09 `in-progress`/`locally-accepted`（0.30.26 候选）；MN-07 `pending`。2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
+| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | **实施中** | **2026-10-03 10:57:41 UTC**：MN-10、MN-01、MN-02、MN-03、MN-11、MN-04、MN-08、MN-12、MN-05 `done`/`complete`（v0.30.14–v0.30.21、v0.30.24）；MN-06 `done`/`complete`（v0.30.25）；MN-09 `done`/`complete`（v0.30.26，D 组全绿）；MN-07 `in-progress`（C 组推进）。2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
 | [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
@@ -122,7 +122,7 @@
 
 ### plan-20261001-mega-browser-noninteractive（mega2 browser 非交互操作，12 卡全串行）
 
-发布窗口顺序 MN-10 → MN-01 → MN-02 → MN-03 → MN-11 → MN-04 → MN-08 → MN-12 → MN-05 → MN-06 → MN-09 → MN-07；单一发布者为 Claude Code 会话 `eb4841ea`（ER-12）。开工前置：`DEP-MN-02`（`../libra-backend` 为 Git 且在 `cf`，MN-01 起）；MN-03 起按 GC-MN-08 重核 `DEP-MN-01`（mega2@`8ff880c`）；MN-03 另需 `DEP-MN-06`；MN-07 另需 `DEP-MN-04`。
+发布窗口顺序 MN-10 → MN-01 → MN-02 → MN-03 → MN-11 → MN-04 → MN-08 → MN-12 → MN-05 → MN-06 → MN-09 → MN-07；单一发布者为 Codex goal 线程 `01a1015b`（ER-12；移交见计划修订历史）。开工前置：`DEP-MN-02`（`../libra-backend` 为 Git 且在 `cf`，MN-01 起）；MN-03 起按 GC-MN-08 重核 `DEP-MN-01`（mega2@`8ff880c`）；MN-03 另需 `DEP-MN-06`；MN-07 另需 `DEP-MN-04`。
 
 | 卡 | Lifecycle / Acceptance | 版本 / 证据 |
 |---|---|---|
@@ -135,9 +135,9 @@
 | MN-08 | `done` / `complete` | v0.30.20；PR #600 squash `36e826a`（首轮 network-remotes 败于外网抖动，重跑后 12/12）；release `37024751607` 8/8、CodeQL main `37024735662` 绿、下载 200、网站标记计数 5（`cf@cea2d47`）；2026-10-02 15:40:05 UTC |
 | MN-12 | `done` / `complete` | v0.30.21；PR #601 squash `fb1cf80`；release `37035218493` 8/8、CodeQL main `37035206595` 绿、下载 200、网站标记计数 5（`cf@8f0e356`）；2026-10-02 17:09:37 UTC |
 | MN-05 | `done` / `complete` | v0.30.24；PR #603 squash `9507623`（v0.30.22、v0.30.23 先后被并发发布占用，两次重建：`a4d05cb` → `98f1e84` → `4116c7f`）；release `37094701957` 8/8、CodeQL main `37094694927` 绿、下载 200、网站标记计数 11（`cf@57b7d12`）；2026-10-03 04:18:34 UTC |
-| MN-06 | `in-progress` / `remote-pending` | v0.30.25；PR #605 squash `cdd32b7`；release `37099685600`、CodeQL main `37099680422` 跟踪中；网站 `cf@57b7d12`；2026-10-03 05:25:14 UTC |
-| MN-09 | `in-progress` / `locally-accepted` | 0.30.26 候选；门族 19/19；Codex R1 `PASS`（P2×2 已采纳）→R2 `PASS`；在 `cdd32b7` 基线上 A 组全绿；2026-10-03 05:25:14 UTC |
-| MN-07 | `pending` / （空） | harness/live 门代码评审 `PASS`（R4），live 门已在 `DEP-MN-04` 实例预跑 12/12 |
+| MN-06 | `done` / `complete` | v0.30.25；PR #605 squash `cdd32b7`；release `37099685600` 8/8、CodeQL main `37099680422` 绿、下载 200、网站 `--create-tag` 计数 7（`cf@57b7d12`）；2026-10-03 10:57:41 UTC |
+| MN-09 | `done` / `complete` | v0.30.26；PR #606 squash `fc85e6e`；release `37104652942` 8/8、CodeQL main `37104701999` 绿、下载 200、网站 `--delete-tag` 计数 5（`cf@a56bce3`）、stable manifest 0.30.26；2026-10-03 10:57:41 UTC |
+| MN-07 | `in-progress` / `locally-accepted` | 0.30.27 候选；bump 后 fmt、Clippy 绿，nextest harness 11/11、live 12/12；整体 Codex review 字面 `VERDICT: PASS`；release 构建、隔离安装及真实列表冒烟通过，准备提交/推送/PR；2026-10-03 11:18:55 UTC |
 
 ### issues/577（SSH 公钥认证拒绝诊断与设置指南）
 
