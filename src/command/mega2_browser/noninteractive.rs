@@ -27,7 +27,10 @@ use crate::{
             DeleteReceipt as RemoteDeleteReceipt, Mega2MutateClient,
             MoveReceipt as RemoteMoveReceipt,
         },
-        mega2_tag::{CreateTagOptions, Mega2TagClient, TagInfo, TagPage},
+        mega2_tag::{
+            CreateTagOptions, DeleteTagReceipt as RemoteDeleteTagReceipt, Mega2TagClient, TagInfo,
+            TagPage,
+        },
         mega2_tree::{ContentType, Listing, Mega2TreeSession, normalize_path},
     },
     utils::{
@@ -130,6 +133,13 @@ pub const OPERATIONS: &[OperationSpec] = &[
         access: Access::Write,
         surface: Surface::Tag,
     },
+    OperationSpec {
+        name: "delete-tag",
+        flag: "--delete-tag",
+        endpoint: mega2_diag::DELETE_TAG,
+        access: Access::Write,
+        surface: Surface::Tag,
+    },
 ];
 
 /// An operation selected on the command line, with its own arguments.
@@ -162,6 +172,10 @@ pub enum Operation {
         name: String,
         message: Option<String>,
     },
+    /// Delete root tag NAME.
+    DeleteTag {
+        name: String,
+    },
 }
 
 impl Operation {
@@ -175,6 +189,7 @@ impl Operation {
             Operation::RenameDir { .. } => "rename-dir",
             Operation::ListTags { .. } => "list-tags",
             Operation::CreateTag { .. } => "create-tag",
+            Operation::DeleteTag { .. } => "delete-tag",
         }
     }
 
@@ -357,6 +372,16 @@ pub async fn execute(
                 sanitize(target.name),
                 sanitize(receipt.object_id)
             );
+            emit_write(spec, invocation, output, &target, &receipt, &summary)
+        }
+        Operation::DeleteTag { name } => {
+            let client = Mega2TagClient::new(invocation.server, token)?;
+            let receipt = DeleteTagReceipt::from(client.delete_tag(&name, invocation.path).await?);
+            let target = TagSelector {
+                name: &name,
+                path: invocation.path,
+            };
+            let summary = format!("deleted tag {}\n", sanitize(target.name));
             emit_write(spec, invocation, output, &target, &receipt, &summary)
         }
     }
@@ -564,6 +589,29 @@ struct TagTarget<'a> {
     /// `lightweight` (no `--message`) or `annotated`.
     kind: &'static str,
     path: &'a str,
+}
+
+/// Which tag a delete targeted: the validated name and the root path.
+#[derive(Serialize, Debug)]
+struct TagSelector<'a> {
+    name: &'a str,
+    path: &'a str,
+}
+
+/// The server's tag-delete receipt, verbatim.
+#[derive(Serialize, Debug)]
+struct DeleteTagReceipt {
+    deleted_tag: String,
+    message: String,
+}
+
+impl From<RemoteDeleteTagReceipt> for DeleteTagReceipt {
+    fn from(receipt: RemoteDeleteTagReceipt) -> Self {
+        Self {
+            deleted_tag: receipt.deleted_tag,
+            message: receipt.message,
+        }
+    }
 }
 
 /// One tag as the server reports it, every field verbatim: an item of a
@@ -777,6 +825,13 @@ mod tests {
         .expect("create-tag is registered");
         assert_eq!(spec.name, "create-tag");
         assert_eq!(spec.endpoint, mega2_diag::CREATE_TAG);
+        let spec = Operation::DeleteTag {
+            name: "v1".to_string(),
+        }
+        .spec()
+        .expect("delete-tag is registered");
+        assert_eq!(spec.name, "delete-tag");
+        assert_eq!(spec.endpoint, mega2_diag::DELETE_TAG);
     }
 
     /// MN-11: token flags are refused for read operations only.
@@ -1016,6 +1071,35 @@ mod tests {
                 validate_tag_message("release one").is_ok(),
             ],
             [true; 5]
+        );
+    }
+
+    /// MN-09: the `delete-tag` payload keeps local `target` (name, path) and
+    /// the server's `receipt` apart.
+    #[test]
+    fn delete_tag_payload_separates_target_and_receipt() {
+        let target = TagSelector {
+            name: "v1",
+            path: "/",
+        };
+        let receipt = DeleteTagReceipt {
+            deleted_tag: "v1".to_string(),
+            message: "Tag deleted".to_string(),
+        };
+        let data = WriteData {
+            operation: "delete-tag",
+            server: "https://mega2.example.com",
+            target: &target,
+            receipt: &receipt,
+        };
+        assert_eq!(
+            serde_json::to_value(&data).expect("serialize"),
+            serde_json::json!({
+                "operation": "delete-tag",
+                "server": "https://mega2.example.com",
+                "target": {"name": "v1", "path": "/"},
+                "receipt": {"deleted_tag": "v1", "message": "Tag deleted"},
+            })
         );
     }
 }

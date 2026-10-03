@@ -114,6 +114,7 @@ the forms available in this release.
 | `R` | `--rename-dir <NAME> <NEW-NAME>` (PATH is the parent, which is kept) | `POST /api/v1/move-entry` |
 | `t`, then `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]` (PATH must be `/`) | `GET /api/v1/tags/list` |
 | `t`, then `+` | `--create-tag <NAME> [--message <TEXT>]` (PATH must be `/`) | `POST /api/v1/tags` |
+| `t`, then `d` | `--delete-tag <NAME>` (PATH must be `/`) | `DELETE /api/v1/tags/{name}` |
 
 Every non-interactive call follows the same rules:
 
@@ -353,6 +354,34 @@ verbatim. Errors:
 | HTTP 404 / 409 | `LBR-CLI-003` / `LBR-CONFLICT-002` | `http_status` |
 | Any other non-2xx or an invalid receipt / a timeout or dropped connection | `LBR-NET-002` / `LBR-NET-001`, as for `--create-dir` | `http_status` or `transport` |
 
+`--delete-tag <NAME>` deletes root tag NAME with one
+`DELETE /api/v1/tags/{name}?path=/` (NAME percent-encoded), with no
+confirmation line and no reload. Like creating one, deleting a root tag needs
+a write token whose paths cover `/`, or a `push_auth=none` server. The
+plain-text summary is `deleted tag <name>`; with `--json`/`--machine` the
+payload is:
+
+```json
+{
+  "operation": "delete-tag",
+  "server": "https://mega2.example.com",
+  "target": { "name": "v1.0", "path": "/" },
+  "receipt": { "deleted_tag": "v1.0", "message": "…" }
+}
+```
+
+Errors:
+
+| Situation | Stable code | `details` |
+|-----------|-------------|-----------|
+| NAME breaks the tag-name rules (see the tag panel) | `LBR-CLI-002` | none (no request) |
+| A malformed PATH (not rooted, or with `.`/`..` components) | `LBR-CLI-003` | none (no request) |
+| A rooted PATH other than `/`, `--ref`, or another operation flag | `LBR-CLI-002` | none (no request) |
+| The tag does not exist (HTTP 404) | `LBR-CLI-003` | `http_status: 404` |
+| HTTP 401 (server needs a write token) / 403 (the token does not cover `/`) | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 400, 405 or 422 / 409 | `LBR-CLI-002` / `LBR-CONFLICT-002` | `http_status` |
+| Any other non-2xx or an invalid receipt / a timeout or dropped connection | `LBR-NET-002` / `LBR-NET-001`, as for `--create-dir` | `http_status` or `transport` |
+
 ### Creating a directory (`+`, interactive only)
 
 Press `+` to open a single-line name editor for a new subdirectory of the
@@ -427,6 +456,7 @@ terminal. The panel operates root tags only.
 | `--per-page <N>` | With `--list-tags`: tags per page (1–100; default 20). |
 | `--create-tag <NAME>` | Create root tag NAME without a terminal (one POST): lightweight, or annotated with `--message`. |
 | `--message <TEXT>` | With `--create-tag`: the annotated tag's message (non-empty, at most 1024 bytes, no control characters). |
+| `--delete-tag <NAME>` | Delete root tag NAME without a terminal (one DELETE, no confirmation). |
 | `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
 | `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
@@ -509,6 +539,9 @@ libra --json mega2 browser --server https://mega2.example.com --list-tags --page
 
 # Create annotated root tag v1.0 without a terminal
 libra --json mega2 browser --server https://mega2.example.com --create-tag v1.0 --message "release 1.0" --token-file ~/.mega2-token
+
+# Delete root tag v1.0 without a terminal (no confirmation)
+libra --json mega2 browser --server https://mega2.example.com --delete-tag v1.0 --token-file ~/.mega2-token
 
 # List a specific commit or tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2

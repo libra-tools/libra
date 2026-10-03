@@ -152,6 +152,10 @@ pub struct OperationArgs {
     /// Create root tag NAME: one POST (lightweight, or annotated with --message)
     #[arg(long = "create-tag", value_name = "NAME")]
     pub create_tag: Option<String>,
+
+    /// Delete root tag NAME: one DELETE, no confirmation
+    #[arg(long = "delete-tag", value_name = "NAME")]
+    pub delete_tag: Option<String>,
 }
 
 /// Options of the tag operations (plan-20261001 MN-05, MN-06); each is
@@ -203,6 +207,9 @@ impl OperationArgs {
                 name: name.clone(),
                 message: tag.message.clone(),
             }));
+        }
+        if let Some(name) = &self.delete_tag {
+            return Ok(Some(Operation::DeleteTag { name: name.clone() }));
         }
         Ok(None)
     }

@@ -2477,3 +2477,173 @@ fn create_tag_rejects_control_message_no_request() {
     assert!(!output.status.success());
     assert!(mock.records().is_empty(), "records: {:?}", mock.records());
 }
+
+// ---- delete_tag (MN-09): R1, R1b, R2, R3, R4a, R4b, R7, R8, R9a, R9b, R9c, R10a ----
+
+fn delete_tag_receipt(deleted_tag: &str) -> String {
+    envelope(json!({"deleted_tag": deleted_tag, "message": "Tag deleted"}))
+}
+
+/// The rule fixture's receipt carries an ESC; the human summary prints only
+/// the validated local name, so R2 holds.
+fn delete_tag_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, delete_tag_receipt("v1\u{1b}[31m"))
+}
+
+fn delete_tag_clean_ok(_method: &str, _path: &str) -> (u16, String) {
+    (200, delete_tag_receipt("v1"))
+}
+
+const DELETE_TAG_CASE: OpCase = OpCase {
+    op_args: &["--delete-tag", "v1"],
+    method: "DELETE",
+    route: "/api/v1/tags/{name}",
+    path: "/api/v1/tags/v1",
+    ok: delete_tag_ok,
+};
+
+op_rule!(op_rule_delete_tag_r1, rule_r1, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r1b, rule_r1b, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r2, rule_r2, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r3, rule_r3, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r4a, rule_r4a, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r4b, rule_r4b, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r7_code, rule_r7_code, DELETE_TAG_CASE);
+op_rule!(
+    op_rule_delete_tag_r7_no_request,
+    rule_r7_no_request,
+    DELETE_TAG_CASE
+);
+op_rule!(op_rule_delete_tag_r8_code, rule_r8_code, DELETE_TAG_CASE);
+op_rule!(
+    op_rule_delete_tag_r8_no_request,
+    rule_r8_no_request,
+    DELETE_TAG_CASE
+);
+op_rule!(op_rule_delete_tag_r9a, rule_r9a, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r9b, rule_r9b, DELETE_TAG_CASE);
+op_rule!(op_rule_delete_tag_r9c, rule_r9c, DELETE_TAG_CASE);
+op_rule!(
+    op_rule_delete_tag_r10a_code,
+    rule_r10a_code,
+    DELETE_TAG_CASE
+);
+op_rule!(
+    op_rule_delete_tag_r10a_no_request,
+    rule_r10a_no_request,
+    DELETE_TAG_CASE
+);
+
+// ---- delete_tag (MN-09): operation-specific behavior ----
+
+/// AC-1: one anonymous DELETE with the percent-encoded name and the root
+/// selector.
+#[test]
+fn delete_tag_request_record() {
+    let mock = MockMega2::start(delete_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--delete-tag", "rel/1.0", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(
+        request_tuples(&mock),
+        vec![(
+            "DELETE".to_string(),
+            "/api/v1/tags/rel%2F1.0?path=%2F".to_string(),
+            None,
+            None,
+        )]
+    );
+}
+
+/// AC-2: `target` comes from local input, `receipt` is the server's receipt.
+#[test]
+fn delete_tag_json_payload() {
+    let mock = MockMega2::start(delete_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--delete-tag", "v1", "--json"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        envelope["data"],
+        json!({
+            "operation": "delete-tag",
+            "server": mock.url(),
+            "target": {"name": "v1", "path": "/"},
+            "receipt": {"deleted_tag": "v1", "message": "Tag deleted"},
+        })
+    );
+}
+
+/// AC-3: the human summary is one line.
+#[test]
+fn delete_tag_human_output() {
+    let mock = MockMega2::start(delete_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--delete-tag", "v1"]);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "deleted tag v1\n");
+}
+
+/// G16: NAME `bad..name` (delegated to `validate_tag_name`) fails with
+/// `LBR-CLI-002`.
+#[test]
+fn delete_tag_rejects_bad_name_code() {
+    let mock = MockMega2::start(delete_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--delete-tag", "bad..name", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+}
+
+/// G17: the same refusal sends no request.
+#[test]
+fn delete_tag_rejects_bad_name_no_request() {
+    let mock = MockMega2::start(delete_tag_clean_ok);
+    let output = tag_op_output(&mock, &["--delete-tag", "bad..name", "--machine"]);
+    assert!(!output.status.success());
+    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+}
+
+/// mega2 answers a missing tag with HTTP 404.
+const MISSING_TAG: &str = r#"{"req_result":false,"data":null,"err_message":"Tag not found"}"#;
+
+/// G18: a missing tag (server 404) fails with `LBR-CLI-003`.
+#[test]
+fn delete_tag_missing_code() {
+    let mock = MockMega2::start(fail_on(&DELETE_TAG_CASE, 404, MISSING_TAG));
+    let output = tag_op_output(&mock, &["--delete-tag", "v1", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-003");
+}
+
+/// G19: the same failure carries `details.http_status` 404.
+#[test]
+fn delete_tag_missing_http_status() {
+    let mock = MockMega2::start(fail_on(&DELETE_TAG_CASE, 404, MISSING_TAG));
+    let output = tag_op_output(&mock, &["--delete-tag", "v1", "--machine"]);
+    assert!(!output.status.success());
+    assert_eq!(error_envelope(&output)["details"]["http_status"], 404);
+}
+
+/// The tag client maps HTTP 400, 405 and 422 to `LBR-CLI-002` and keeps the
+/// status in `details`.
+#[test]
+fn delete_tag_rejections_map_to_cli_002() {
+    let outcomes: Vec<(Value, Value)> = [400u16, 405, 422]
+        .into_iter()
+        .map(|status| {
+            let mock = MockMega2::start(fail_on(&DELETE_TAG_CASE, status, ""));
+            let output = tag_op_output(&mock, &["--delete-tag", "v1", "--machine"]);
+            assert!(!output.status.success());
+            let envelope = error_envelope(&output);
+            (
+                envelope["error_code"].clone(),
+                envelope["details"]["http_status"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            (json!("LBR-CLI-002"), json!(400)),
+            (json!("LBR-CLI-002"), json!(405)),
+            (json!("LBR-CLI-002"), json!(422)),
+        ]
+    );
+}

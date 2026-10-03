@@ -99,6 +99,7 @@ browser 的功能另有非交互形式，供脚本、CI 与黑盒测试使用：
 | `R` | `--rename-dir <NAME> <NEW-NAME>`（PATH 为父目录，保持不变） | `POST /api/v1/move-entry` |
 | `t`，再按 `n`/`p` | `--list-tags [--page <N>] [--per-page <N>]`（PATH 只能为 `/`） | `GET /api/v1/tags/list` |
 | `t`，再按 `+` | `--create-tag <NAME> [--message <TEXT>]`（PATH 只能为 `/`） | `POST /api/v1/tags` |
+| `t`，再按 `d` | `--delete-tag <NAME>`（PATH 只能为 `/`） | `DELETE /api/v1/tags/{name}` |
 
 所有非交互调用遵守同一组规则：
 
@@ -311,6 +312,32 @@ NAME。不带 `--message` 时为 lightweight tag；`--message <TEXT>` 使它成�
 | HTTP 404 / 409 | `LBR-CLI-003` / `LBR-CONFLICT-002` | `http_status` |
 | 其它非 2xx 或回执不合规 / 超时或连接中断 | `LBR-NET-002` / `LBR-NET-001`，同 `--create-dir` | `http_status` 或 `transport` |
 
+`--delete-tag <NAME>` 以一次 `DELETE /api/v1/tags/{name}?path=/`（NAME 经百分号编码）删除
+root tag NAME，没有确认行，之后不重新列出。与建立 root tag 相同，删除也需要 paths 覆盖
+`/` 的写 token，或 `push_auth=none` 的服务端。纯文本摘要为 `deleted tag <name>`；带
+`--json`/`--machine` 时 payload 为：
+
+```json
+{
+  "operation": "delete-tag",
+  "server": "https://mega2.example.com",
+  "target": { "name": "v1.0", "path": "/" },
+  "receipt": { "deleted_tag": "v1.0", "message": "…" }
+}
+```
+
+错误：
+
+| 情形 | stable code | `details` |
+|------|-------------|-----------|
+| NAME 违反 tag 名规则（见 Tag 面板） | `LBR-CLI-002` | 无（不发请求） |
+| PATH 格式不合规（不是 rooted 路径，或含 `.`/`..` 组件） | `LBR-CLI-003` | 无（不发请求） |
+| PATH 是 `/` 以外的合规路径、带 `--ref`，或与另一个操作 flag 同用 | `LBR-CLI-002` | 无（不发请求） |
+| tag 不存在（HTTP 404） | `LBR-CLI-003` | `http_status: 404` |
+| HTTP 401（服务端要求写 token）/ 403（token 未覆盖 `/`） | `LBR-AUTH-001` / `LBR-AUTH-002` | `http_status` |
+| HTTP 400、405 或 422 / 409 | `LBR-CLI-002` / `LBR-CONFLICT-002` | `http_status` |
+| 其它非 2xx 或回执不合规 / 超时或连接中断 | `LBR-NET-002` / `LBR-NET-001`，同 `--create-dir` | `http_status` 或 `transport` |
+
 ### 建目录（`+`，仅交互模式）
 
 按 `+` 打开单行名称编辑器，在当前路径下建立子目录（位于根目录时发送的
@@ -370,6 +397,7 @@ ADR-MB-03 的会话写入 token。渲染时对 tagger/message 做消毒，敌意
 | `--per-page <N>` | 与 `--list-tags` 同用：每页 tag 数（1–100；默认 20）。 |
 | `--create-tag <NAME>` | 不用终端建立 root tag NAME（一次 POST）：lightweight，或带 `--message` 时为 annotated。 |
 | `--message <TEXT>` | 与 `--create-tag` 同用：annotated tag 的 message（非空，不超过 1024 字节，不含控制字符）。 |
+| `--delete-tag <NAME>` | 不用终端删除 root tag NAME（一次 DELETE，无确认行）。 |
 | `--token-file <PATH>` | 写操作（交互或非交互）：从文件读取写入 token（优先级最高）。读操作拒绝此 flag。 |
 | `--token <TOKEN>` | 写操作：内联写入 token（优先级最低；会留在 shell history，建议用 `--token-file`）。读操作拒绝此 flag。 |
 | `--json[=<FORMAT>]` | 全局标志：单次请求 + JSON envelope（`pretty`/`compact`/`ndjson`）。 |
@@ -447,6 +475,9 @@ libra --json mega2 browser --server https://mega2.example.com --list-tags --page
 
 # 不用终端建立 annotated root tag v1.0
 libra --json mega2 browser --server https://mega2.example.com --create-tag v1.0 --message "release 1.0" --token-file ~/.mega2-token
+
+# 不用终端删除 root tag v1.0（没有确认行）
+libra --json mega2 browser --server https://mega2.example.com --delete-tag v1.0 --token-file ~/.mega2-token
 
 # 列出指定 commit 或 tag
 libra mega2 browser --server https://mega2.example.com --ref v1.2
