@@ -364,7 +364,7 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_MIN_STACK: "16777216"
-      LIBRA_LINUX_SANDBOX_EXE: /opt/libra-bubblewrap/bin/bwrap
+      LIBRA_LINUX_SANDBOX_EXE: /usr/bin/libra-bwrap
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -396,17 +396,18 @@ jobs:
             | sha256sum --check --status
           tar -C /tmp -xf "$archive"
           meson setup /tmp/libra-bubblewrap-build "/tmp/bubblewrap-${version}" \
-            --prefix=/opt/libra-bubblewrap \
+            --prefix=/usr \
             -Dtests=false -Dman=disabled -Dselinux=disabled \
             -Dbash_completion=disabled -Dzsh_completion=disabled
-          sudo meson install -C /tmp/libra-bubblewrap-build
+          sudo install -o root -g root -m 0755 \
+            /tmp/libra-bubblewrap-build/bwrap "$LIBRA_LINUX_SANDBOX_EXE"
           # Ubuntu 24.04 restricts unprivileged user namespaces by default.
           # This runner is an ephemeral VM; enable the namespace mode used by
           # modern non-setuid bubblewrap for this CI job only.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           test -x "$LIBRA_LINUX_SANDBOX_EXE"
           test ! -w "$LIBRA_LINUX_SANDBOX_EXE"
-          stat -c '%U:%G %a %n' "$LIBRA_LINUX_SANDBOX_EXE"
+          stat -c '%U:%G %a %n' /usr /usr/bin "$LIBRA_LINUX_SANDBOX_EXE"
           "$LIBRA_LINUX_SANDBOX_EXE" --version
           "$LIBRA_LINUX_SANDBOX_EXE" --help | grep -F -- '--bind-fd'
           "$LIBRA_LINUX_SANDBOX_EXE" --help | grep -F -- '--ro-bind-fd'
