@@ -399,6 +399,7 @@ jobs:
             --prefix=/usr \
             -Dtests=false -Dman=disabled -Dselinux=disabled \
             -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson compile -C /tmp/libra-bubblewrap-build
           sudo install -o root -g root -m 0755 \
             /tmp/libra-bubblewrap-build/bwrap "$LIBRA_LINUX_SANDBOX_EXE"
           # Ubuntu 24.04 restricts unprivileged user namespaces by default.
