@@ -385,15 +385,44 @@ async fn opencode_export_durable_snapshot_uses_repository_keyed_hmac() {
     let metadata_json: String = rows[0].try_get_by("metadata_json").unwrap();
     let metadata: Value =
         serde_json::from_str(&metadata_json).expect("OpenCode metadata is valid JSON");
-    let digest = metadata["transcript_snapshot"]["source"]["digest_sha256"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "successful OpenCode snapshot has a durable source commitment; stdout: {}; metadata: {metadata_json}; stderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+    let Some(digest) = metadata["transcript_snapshot"]["source"]["digest_sha256"].as_str() else {
+        let jobs = repo
+            .query_rows(
+                "SELECT state, observed_generation, processed_generation, last_error_code \
+                 FROM agent_export_job WHERE provider_session_id = 'ses_hmac_snapshot'",
+            )
+            .await;
+        let job = jobs.first().map(|row| {
+            format!(
+                "state={:?}, observed={:?}, processed={:?}, last_error={:?}",
+                row.try_get_by::<String, _>("state"),
+                row.try_get_by::<i64, _>("observed_generation"),
+                row.try_get_by::<i64, _>("processed_generation"),
+                row.try_get_by::<Option<String>, _>("last_error_code")
             )
         });
+        let sessions = repo
+            .query_rows(
+                "SELECT state, sync_revision, stopped_at FROM agent_session \
+                 WHERE provider_session_id = 'ses_hmac_snapshot'",
+            )
+            .await;
+        let session = sessions.first().map(|row| {
+            format!(
+                "state={:?}, revision={:?}, stopped_at={:?}",
+                row.try_get_by::<String, _>("state"),
+                row.try_get_by::<i64, _>("sync_revision"),
+                row.try_get_by::<Option<i64>, _>("stopped_at")
+            )
+        });
+        let checkpoints = repo.checkpoints();
+        panic!(
+            "successful OpenCode snapshot has a durable source commitment; stdout: {}; metadata: {metadata_json}; job: {job:?}; session: {session:?}; checkpoints: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            checkpoints.len(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
     assert!(
         digest.strip_prefix("source/hmac-v2/").is_some_and(|hex| {
             hex.len() == 64
