@@ -4,7 +4,7 @@
 >
 > **状态：** 已收口（2026-10-02 01:08:49 UTC 起按发布窗口顺序执行，发布者见修订历史）。MN-10 `done` / `complete`（v0.30.14）；MN-01 `done` / `complete`（v0.30.15）；MN-02 `done` / `complete`（v0.30.16）；MN-03 `done` / `complete`（v0.30.17）；MN-11 `done` / `complete`（v0.30.18）；MN-04 `done` / `complete`（v0.30.19）；MN-08 `done` / `complete`（v0.30.20）；MN-12 `done` / `complete`（v0.30.21）；MN-05 `done` / `complete`（v0.30.24；v0.30.22、v0.30.23 先后被并发发布占用，两次重建见修订历史）；MN-06 `done` / `complete`（v0.30.25）；MN-09 `done` / `complete`（v0.30.26）；MN-07 `done` / `complete`（v0.30.27）；12 卡全部完成，计划级全量门 8839/8839 与网站示例门 1/1 全绿；最终收口审查字面 `VERDICT: PASS`；本次仅交付三个计划文档的行政收口记录；逐卡进度见各卡 `Lifecycle / Acceptance` 与「实施证据汇总」。计划级 Codex review 已取得 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文评审 `PASS`，R16 对其后改动的差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 对锚点复核的差异评审 `FAIL`（1×P1）已修订，R18 差异确认 `PASS`（见「Codex review log」）；全部任务卡已按 ER-MN-03 完成实现评审、逐卡验收与发布。
 >
-> **PR #609 行政收口状态（2026-10-04 00:43:05 UTC）：** PR 仍为 OPEN / UNSTABLE。当前分支已合入 main 的 `892f37c` 文档更新（本地合并提交 `e27561b`）；PR 上已观测到的 CI 结果属于此前 head `ca5dc6d`、base `721fec9`，不能代表本次文档提交后的新 head。完整测试当时为 9519/9523，且两个 CI 检查失败；细节与待修事项见本文末尾。尚未对这些 CI/Capture 问题做代码修复。
+> **PR #609 行政收口状态（2026-10-04 04:53 UTC）：** PR 仍为 OPEN。当前远端 head `747992b24bc99fae9fb6e9922128117f64fb71e8`、base `892f37cf898be4d670a84ad8e45af3270a70928c`；最新完整 CI run `37168062003` 的 `compat-offline-core` 与 `opencode-export-linux` 失败。下文记录这些失败及本地已应用的修复。修复提交后的新 head 和 Linux CI 尚待验证，不把旧 run 当作修复结果。
 >
 > **文件名：** 模板 v2.11 规定后缀词只能是 `[a-z]+`，不能写 `mega2`，因此用 `mega-browser-noninteractive` 指代 `libra mega2 browser` 的非交互操作。
 
@@ -2281,24 +2281,22 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目，并在�
 
 首次 HTTP 探测曾因服务端数据库连接池获取超时关闭连接（Mega2 `mono_api_service.rs:1725`）；其后的全部实际 live 门成功。`LIBRA_TEST_MEGA2_SERVER=http://127.0.0.1:39081 LIBRA_TEST_MEGA2_WRITE_ROOT=/project cargo nextest run --test command_test mega2_browser_noninteractive_test::live_gate_ --test-threads 1 --success-output immediate --failure-output immediate`，run `e258cea9-b99e-439f-a3b9-cb11c0ea0782`：12/12 PASS，118.111s；4282 个过滤掉的其它测试不是 live 跳过，所选 12 个门均输出实际操作步骤，无 `skipped (...)`。安装后二进制 `libra 0.30.27` 在仓外临时 cwd 复核 `--machine --list /project` 成功、只有 `.gitkeep`，`--list-tags --per-page 1` 成功、`total=0`、`has_next=false`；无本次测试残留。此源码绑定的运行替代原先仅靠拷贝时 HEAD 与旧二进制 hash 的 provenance，作为最终真实互通证据。
 
-## 收口 PR #609：Capture 集成后的 CI 待修项
+## 收口 PR #609：Capture 集成后的 CI 修复
 
 ### 观测范围
 
-2026-10-04 00:43:05 UTC 更新本文时，PR #609 为 OPEN / UNSTABLE。PR 上可核实的最近完整 CI 结果来自 head `ca5dc6dbb3fae3b23a621e9e9c0804df7557b0fb`、base `721fec92e8116020210fd0c0abfba6e1bd1b89ef`（2026-10-03）。该 head 的 `Check, Build and Test` run `37137480401` 有 10/12 项检查成功、2 项失败；`compat-offline-core` job `111255793638` 的全量 nextest 为 9519/9523，4 个测试最终失败；`opencode-export-linux` job `111255766053` 失败。CodeQL 检查成功。上述失败在 PR 集成 main 中已有的 Agent Capture 代码和测试后出现；这个记录不把失败归因到 Mega2 实现卡，也不把旧 head 结果当作当前文档 head 的 CI 结论。
+2026-10-04 04:53 UTC 核对：PR #609 仍为 OPEN，远端 head `747992b24bc99fae9fb6e9922128117f64fb71e8`、base `892f37cf898be4d670a84ad8e45af3270a70928c`。最新完整 `Check, Build and Test` run `37168062003` 有两个失败 job：`compat-offline-core` `111335105329` 与 `opencode-export-linux` `111335105397`。此前 `compat-clippy` 的重试 job `111255764986` 已成功，含 Clippy 与 Rustdoc 链接检查；checkout 下载超时不是待修代码项。
 
-2026-10-03 17:42:18 UTC 的 `compat-clippy` 重试 job `111255764986` 全部成功（Clippy 与 Rustdoc 链接检查均通过）。此前该 job 的 `Set up job` 因下载 `actions/checkout@v5` 超时失败；重试后已恢复，这不是待修代码项。
+### 已应用的修复与待验证门
 
-### 尚未修复的 CI 门与四个失败测试
-
-| 失败项 | 已确认的证据 | 下一步修复要求 |
+| 失败项 | 已确认的证据 | 修复与验证状态 |
 |---|---|---|
-| OpenCode Linux sandbox CI 环境（[`opencode-export-linux` job](https://github.com/libra-tools/libra/actions/runs/37137480401/job/111255766053)） | Ubuntu 安装的 bubblewrap 为 `0.9.0-1ubuntu0.3`，缺少当前 fail-closed FD 挂载 probe 和 OpenCode bridge 所需的 `--bind-fd` / `--ro-bind-fd`。可信度预检失败，后续 bridge E2E 未运行。 | 给 Linux 门提供受信任且支持 FD 挂载的 bubblewrap，实际运行并通过现有受限 probe 与 bridge E2E；不得降低 probe 或把硬门改成 skip。self-hosted 全量 runner 的 user namespace 支持须单独验证，不在用户主机上修改全局安全设置。 |
-| `validate_trusted_bwrap_accepts_system_binary` | 全量测试 job `111255793638` 中失败。系统 bwrap 仍是 0.9.0；当前实现将“二进制路径可信”与“支持新 sandbox 所需能力”分别检查，旧版本不能作为可用 sandbox。 | 核对测试断言是否把文件可信度和 FD capability 混为一谈；按分层能力契约修正断言或 CI 环境，保留旧版 fail-closed 行为。 |
-| `trusted_bwrap_preflight` | 同一全量测试 job `111255793638` 中失败；硬性 Linux D-group 预检要求可信、可用的 bwrap。失败源是 runner 上的旧版 bwrap。 | 在具备现代 bwrap 的 Linux 环境运行此预检和实际 FD 挂载/消费验证；不得通过跳过预检或放宽 feature probe 取得绿色结果。 |
-| `internal::ai::capture::live_oracle_tests::live_checkpoint_metadata_shape_is_stable` | 同一全量测试 job 中两次失败，报错位于 `src/utils/util.rs:902:32`：`storage_path() called outside a libra repository`；CI checkout 是 `.git`，测试执行目录不是 `.libra` 仓库。测试没有打印 backtrace，当前还未定位到触发隐式当前仓库查找的具体调用。重建 helper binary 后，在 macOS 非仓库 cwd、加载 CI 同一组测试环境运行此 focused oracle 为 1/1 PASS；此结果不能替代 Linux 复现。 | 在 Linux 以 `RUST_BACKTRACE=1` 复现并定位调用链，再修复仓库路径上下文。保留 oracle 与 golden shape 不变；任何改动 oracle/fingerprint 的提议须先修订 ADR-ACF-10 并经新的设计审查。 |
-| `internal::ai::history::tests::cleanup_helper_guard_returns_promptly_and_reaps_repeated_timeouts` | 同一全量测试 job 中失败。源码以 `--exact` 启动忽略的子测试，却传入不带 module path 的过滤串 `cleanup_helper_child_sleeper_process`。本地实测短串匹配 0 个测试并立即退出；完整名 `internal::ai::history::tests::cleanup_helper_child_sleeper_process` 会启动 1 个休眠测试。因助手没有按预期启动，reaper 计数断言超时。 | 使用完整测试名启动子进程，在 Linux 复测；保留“及时返回、所有 PID 消失、reaper 已回收全部子进程”的断言。 |
+| OpenCode Linux sandbox CI 环境（[`opencode-export-linux` job](https://github.com/libra-tools/libra/actions/runs/37168062003/job/111335105397)） | Ubuntu 的 bubblewrap `0.9.0-1ubuntu0.3` 不支持 fail-closed FD 挂载 probe 与 OpenCode bridge 所需的 `--bind-fd` / `--ro-bind-fd`。原预检失败，bridge E2E 未运行。 | 已改为在 Ubuntu 24.04 临时 runner 下载并校验官方 bubblewrap 0.13.0 SHA-256，构建非 setuid 版本，核验两个 FD 参数；只在该临时 VM 启用所需 user namespace。严格预检和 bridge E2E 保留，待新 head 运行该 job。 |
+| `validate_trusted_bwrap_accepts_system_binary` | `compat-offline-core` job `111335105329` 中失败；旧断言把系统路径可信与 FD mount 能力混为一谈。 | 已拆开契约：此测试只断言 canonical 系统路径通过信任检查；能力仍由严格预检断言。待新 head 全量测试验证。 |
+| `trusted_bwrap_preflight` | 自托管全量 runner 可能没有现代 bubblewrap；该测试是 Linux D-group 环境门，不属于通用兼容 runner 的能力保证。 | 已将此环境门标为 ignored，以免通用 suite 误假设 runner 能力；`opencode-export-linux` 仍以 `--include-ignored` 显式运行同一硬门，缺能力仍失败，不会 skip-green。待新 head 验证该专用 job。 |
+| `internal::ai::capture::live_oracle_tests::live_checkpoint_metadata_shape_is_stable` | `compat-offline-core` 报 `storage_path() called outside a libra repository`：GitHub checkout 使用 `.git`，而不是 `.libra`。隐式 storage discovery 取决于进程 cwd。 | 已给 oracle 加 `cwd`/`env` serial lanes，并在每个临时 oracle repo 中运行 capture；`ChangeDirGuard` 恢复 cwd。ADR-ACF-10 记录这项测试上下文修订并更新冻结指纹；metadata/redaction golden shape 未改。focused oracle 与冻结架构 guard 本地均 1/1 通过，Linux CI 待新 head 验证。 |
+| `internal::ai::history::tests::cleanup_helper_guard_returns_promptly_and_reaps_repeated_timeouts` | `compat-offline-core` 失败：忽略子测试通过 `--exact` 启动，但短过滤串 `cleanup_helper_child_sleeper_process` 匹配不到测试，子进程立即退出，reaper 计数超时。 | 已改用完整 libtest 名 `internal::ai::history::tests::cleanup_helper_child_sleeper_process`；及时返回、PID 消失与 reaper 回收断言保留。Linux CI 待新 head 验证。 |
 
 ### 收口条件与边界
 
-上述 CI 结果记录于 PR 原 head `ca5dc6d`。main 后续推进到 `892f37cf898be4d670a84ad8e45af3270a70928c`，新增的仅是 `plan-20260902.md` 与 `plan-status.md` 两处计划文档变更；本地以合并提交 `e27561b` 保留该更新。本次文档提交产生的 PR head 必须以该 head 的完整 CI 重新判断。PR #609 在其所有必需 CI 项全绿前保持未合并。上述 CI 门与四个失败测试均尚未应用源代码或 workflow 修复；不新增版本、tag 或 release。
+上表的原始失败证据来自远端 head `747992b`。当前工作树已应用源码、workflow 与 ADR 修复，但尚未提交推送；因此没有新 head 的 CI 结果。提交后须核对新 head 的全部必需 CI，尤其 `compat-offline-core`、`opencode-export-linux`；所有必需项全绿前 PR #609 保持未合并。本次不新增版本、tag 或 release。

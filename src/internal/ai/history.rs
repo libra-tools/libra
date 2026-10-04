@@ -7210,7 +7210,8 @@ mod tests {
             let child = Command::new(&executable)
                 .arg("--ignored")
                 .arg("--exact")
-                .arg("cleanup_helper_child_sleeper_process")
+                // libtest's exact test name omits the crate name.
+                .arg("internal::ai::history::tests::cleanup_helper_child_sleeper_process")
                 .arg("--nocapture")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

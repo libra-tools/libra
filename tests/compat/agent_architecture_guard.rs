@@ -8743,7 +8743,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn oracle_tree_blob",
                 "struct OracleEnvGuard",
             ],
-            "a1bf4daac211dde6204a1840967e234287f912eee8e86ee60515357cd71924e3",
+            "71d9f1664e413488f14ca66de5a482b3355954fa70d18afcf6fa70019cc7c970",
         ),
     ];
     const FROZEN_HARNESS_SIGNATURE: &str =

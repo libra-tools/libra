@@ -353,11 +353,11 @@ jobs:
   # plan-20260830 SBX-03 / DEP-SBX-03: Linux-only export-bridge e2e with a
   # trusted bwrap preflight. compat-offline-core is self-hosted and does not
   # guarantee Linux+apt+bwrap, so this job is the D-group oracle
-  # (`runs-on: ubuntu-latest`, uname pin, apt install bubblewrap, named
+  # (`runs-on: ubuntu-24.04`, uname pin, pinned bubblewrap build, named
   # gates must not skip).
   opencode-export-linux:
     name: opencode-export-linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
@@ -385,14 +385,27 @@ jobs:
       - name: Install bubblewrap
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap_path=$(command -v bwrap)
-          # GitHub-hosted Ubuntu runners may disable unprivileged user
-          # namespaces. Bubblewrap's documented setuid mode keeps this
-          # D-group probe usable without running the test suite as root.
-          sudo chmod u+s "$bwrap_path"
+          sudo apt-get install -y curl libcap-dev meson ninja-build pkg-config xz-utils
+          version=0.13.0
+          archive="/tmp/bubblewrap-${version}.tar.xz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/containers/bubblewrap/releases/download/v${version}/bubblewrap-${version}.tar.xz" \
+            --output "$archive"
+          echo "4734237473c0e5d695e4e9034a34e43b2dbf5164655bd13fa59ae376b2b7a765  $archive" \
+            | sha256sum --check --status
+          tar -C /tmp -xf "$archive"
+          meson setup /tmp/libra-bubblewrap-build "/tmp/bubblewrap-${version}" \
+            -Dtests=false -Dman=disabled -Dselinux=disabled \
+            -Dbash_completion=disabled -Dzsh_completion=disabled
+          sudo meson install -C /tmp/libra-bubblewrap-build
+          # Ubuntu 24.04 restricts unprivileged user namespaces by default.
+          # This runner is an ephemeral VM; enable the namespace mode used by
+          # modern non-setuid bubblewrap for this CI job only.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           command -v bwrap
           bwrap --version
+          bwrap --help | grep -F -- '--bind-fd'
+          bwrap --help | grep -F -- '--ro-bind-fd'
 
       - name: Run Linux export sandbox gates
         run: |

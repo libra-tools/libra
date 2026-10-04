@@ -2843,25 +2843,20 @@ wait"#
         assert!(format!("{err:#}").contains("refusing"), "got {err:#}");
     }
 
-    /// Codex M3 R3 P2: the integrity policy must ACCEPT a legitimately packaged
-    /// bwrap (root-owned ancestry, not user-writable) so trusted deployments do
-    /// not silently degrade. When the host has such a bwrap, `trusted_bwrap_
-    /// available()` is true and `validate_trusted_bwrap` accepts it; otherwise
-    /// the case is skipped rather than asserted.
+    /// Accept a packaged bwrap that is not user-writable independently of
+    /// whether it supports this export's descriptor-native mount capability.
+    /// The strict capability check is covered by `trusted_bwrap_preflight`.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn validate_trusted_bwrap_accepts_system_binary() {
+    #[test]
+    fn validate_trusted_bwrap_accepts_system_binary() {
         let Some(bwrap) = which_bwrap() else {
             eprintln!("skipped (no bwrap on PATH)");
             return;
         };
-        if validate_trusted_bwrap(&bwrap).is_ok() {
-            assert!(
-                trusted_bwrap_available().await,
-                "a validatable system bwrap must report available"
-            );
-        } else {
-            eprintln!("skipped (system bwrap is under a user-writable path here)");
+        let canonical = bwrap.canonicalize().expect("resolve the system bwrap path");
+        match validate_trusted_bwrap(&bwrap) {
+            Ok(trusted) => assert_eq!(trusted, canonical),
+            Err(_) => eprintln!("skipped (system bwrap is under a user-writable path here)"),
         }
     }
 
@@ -3395,8 +3390,12 @@ printf 'tty=detached'"#,
     }
 
     /// SBX-03 D-group: a trusted, usable bwrap must be present. Missing or
-    /// user-writable bwrap is a hard failure (never a skip-green).
+    /// user-writable bwrap is a hard failure (never a skip-green). The broad
+    /// self-hosted compatibility suite does not guarantee this environment;
+    /// opencode-export-linux explicitly runs this ignored gate with
+    /// `--include-ignored` on its pinned Linux runner.
     #[cfg(target_os = "linux")]
+    #[ignore = "Linux D-group environment gate; run via opencode-export-linux"]
     #[serial_test::serial(export_sandbox_env)]
     #[tokio::test]
     async fn trusted_bwrap_preflight() {

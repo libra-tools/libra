@@ -283,7 +283,7 @@ fn oracle_normalize(value: &mut Value, repo: &str) {
 /// checkpoint for a Claude session with an authorized source, a Codex session
 /// without one, and an OpenCode session whose export bridge is unavailable.
 #[tokio::test(flavor = "current_thread")]
-#[serial(env)]
+#[serial(cwd, env)]
 async fn live_checkpoint_metadata_shape_is_stable() {
     let home = tempfile::tempdir().expect("create oracle provider home");
     let _env = OracleEnvGuard::set(&[
@@ -313,6 +313,10 @@ async fn live_checkpoint_metadata_shape_is_stable() {
     let mut observed = Vec::new();
     for (label, provider, events) in cases {
         let (_dir, repo, conn) = oracle_repository().await;
+        // Capture helpers that resolve repository storage from the process
+        // cwd must see this oracle's fixture, not the developer checkout (or
+        // GitHub's plain .git checkout, which has no .libra directory).
+        let _cwd = crate::utils::test::ChangeDirGuard::new(&repo);
         let session_id = format!("oracle-{label}");
         if label == "claude-source" {
             let source_dir = crate::internal::ai::observed_agents::claude_session_dir(&repo)
