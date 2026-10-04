@@ -42,7 +42,7 @@
 | [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 未启动 | CC-00..CC-06 全部 `pending`；`DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接 |
 | [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 未启动 | 6 張 RG + 29 張已定義 CX 卡（共 35 卡）全部 `pending`；`DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接 |
 | [`plan-20260903.md`](plan-20260903.md) | A（LR-05 merge） | 实施中（收尾） | MG-01..MG-21 卡片全部 `done/complete`；最终计划收口与 deferred 差异仍待完成 |
-| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 未启动 | OG-00..OG-15 全部 `pending`；`DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接 |
+| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 未启动 | OG-00..OG-15 全部 `pending`；`DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接。2026-10-03 15:37:28 UTC：捕获插件写操作永久禁止（GC-OG-03）；`DEFER-OG-01` 仍只延期 checkpoint 回灌。2026-10-03 15:47:05 UTC：计划口径对齐模板 v2.12。2026-10-03 15:53:30 UTC：唯一 pin 为 OpenCode 2.0.22；成功门为 Linux 与 macOS 都捕获到内容。Codex R72 `VERDICT: PASS`（2026-10-03 16:54:47 UTC）
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | **已收口** | 全部卡 `done/complete`；最新 v0.22.47 |
 | [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | **已收口** | SBX-01..05 `done/locally-accepted`（发布步按 DEFER-SBX-06 延后）；ER-13 收口门绿 |
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度） | **已收口** | NP-00..05 全部 `complete` |
@@ -100,7 +100,7 @@
 |---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | ACF-01..20 与 FIX-ACF-01 `done`/`complete` | **已收口**（ACF-09 `Lifecycle=done`、`Acceptance=complete`）；`DEP-ACF-MIRROR` 已交接 |
 | [`plan-20260926.md`](plan-20260926.md) | DM-00..DM-13（14 卡，全部 pending） | R11 字面 `VERDICT: PASS`（`P0=0` / `P1=0`）。`DM-00` 保持 `pending`。`DEP-DM-06` 正式 handoff 已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）完成；DM-05 仍 `pending` 并须在开工日按 ER-02 重核 |
-| [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；OG-00/04 以各自 review gate 为准 |
+| [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；OG-00/04 以各自 review gate 为准。捕获插件写操作按 GC-OG-03 永久禁止；`DEFER-OG-01` 仍只延期 checkpoint 回灌。计划口径已对齐模板 v2.12（2026-10-03 15:47:05 UTC）。唯一 pin 为 OpenCode 2.0.22；成功门为 Linux 与 macOS 都捕获到内容（2026-10-03 15:53:30 UTC）。Codex R72 `VERDICT: PASS`（2026-10-03 16:54:47 UTC）
 | [`plan-20260904.md`](plan-20260904.md) | 6 張 RG + 29 張已定義 CX 卡（共 35 卡） | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；CX-00/12 以原 Phase 0 gate 为准；CX-30 另受 DEP-CLI-mirror |
 | [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | `DEP-ACF-MIRROR` 前置已由 ACF-09（`Lifecycle=done`、`Acceptance=complete`）交接；CC-00 以原 review gate 为准，reasoning 卡保留 RG 前置 |
 | [`plan-20260923.md`](plan-20260923.md) | CP-00..20 pending; expand bounded domain cards after inventory if needed | Audit handoff, required review PASS and DEP-CP-01..07; dynamic implementation requires CP-06 done/complete |
@@ -342,7 +342,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260904`](plan-20260904.md) | CX-00 | codex-cli 0.152 基线探测与 ADR go/no-go | 无 | **未过**（R5 `FAIL`；Claude 亦未出 verdict） | CX-30 另受 DEP-CLI-mirror | ❌ 禁止开工 |
 | [`plan-20260905`](plan-20260905.md) | CC-00 | Claude Code 2.1.259 Hook source 契约探测 | 无 | **未过**（须 Claude `PASS`） | 无 | ❌ 禁止开工 |
 | [`plan-20260906`](plan-20260906.md) | SC-01 / SC-02（可并发） | SC-01 `base.yml` 最小权限加固；SC-02 会话入口 id 守卫 | 无 | **未定稿**（R2 PASS 已作废；R22 `FAIL`） | SC-04 受 DEP-SC-01/04/05/06；SC-07 受 DEP-SC-07 | ❌ 禁止开工 |
-| [`plan-20260902`](plan-20260902.md) | OG-00 | opencode 1.18.29 Hook/export 契约探测 | 无 | **未取得双 PASS**（Claude 限额，Codex 仍在 FAIL 循环） | 无（Phase 1 与 RG 六卡解耦） | ❌ 禁止开工 |
+| [`plan-20260902`](plan-20260902.md) | OG-00 | opencode 2.0.22 Hook/export 契约探测 | 无 | Codex R72 字面 `VERDICT: PASS`（2026-10-03 16:54:47 UTC）。本轮没有新的 Claude 复审 | 无（Phase 1 与 RG 六卡解耦） | ❌ 禁止开工 |
 | [`plan-20260911`](plan-20260911.md) | PI-01 | Repository-only `agent_kind=pi` migration | 无（DEP-PI-04 已满足：9/10 已收口） | **Claude Code 429 无 verdict，禁止开工** | DEP-PI-01/03 | ❌ 禁止开工 |
 | [`plan-20260925`](plan-20260925.md) | SCAP-01 | AgentTraces ingest 改调 `decide`。`v0.23.55` / `fa3849e` D 组全绿 | SCAP-02（登记已核对） | R9 双 `PASS` | 已收口 | `done`/`complete` |
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal`（保持 `=0.10.2`）并引入 `object_format` 事实源 | 无 | **双评审已 PASS** | focused VER 绿；T-1 全量进行中 | `in-progress` |
@@ -399,6 +399,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 - plan-20260923: DEFER-CP-01 additional shells; DEFER-CP-02 network suggestions; DEFER-CP-03 unimplemented underlying capabilities. Existing local Libra capabilities may not be hidden by these deferrals.
 - plan-20260924：DEFER-ACF-01..04 保留；DEFER-ACF-05 为 TurnEnd/nonterminal 自主恢复，按用户选择方案 1 延后，不保证 provider 重投或 turn-level checkpoint 补齐；DEFER-ACF-06（snapshot/extraction 既有 AgentKind dispatch，计数 ratchet 冻结）、DEFER-ACF-07（live_capture → subagent_content 依赖边）、DEFER-ACF-08（provider live capture 实现迁至各 builtin adapter）为 ACF-06 拆分新登记。
 - plan-20260925：`DEFER-SCAP-01` 已按用户指示删除，ID 不再复用；`DEFER-SCAP-03` 不引入 Entire git phase；`DEFER-SCAP-04` 不改 `docs/development/tracing/agent.md`，也不向其它计划派发该文件。owner 的 SessionStart/TurnStart 豁免已经存在，本计划不改。
+- plan-20260902：`DEFER-OG-01` 仍只延期 checkpoint 回灌（import，以及回灌流程中的 session delete / `session.remove`）。捕获插件在采集路径上调用 `remove`、`compact`、`create` 或其他会改会话的方法，以及填写会改变提示、压缩结果、标题、重试或网络帧的钩子字段，按 GC-OG-03 永久禁止，无 ADR 重启。观察并转发 `session.compacted` 留在本计划。读取 `parentID` 仍是 `DEFER-OG-02`。2026-10-03 15:47:05 UTC 起，未执行卡按模板 v2.12：nextest 全量门、三处版本面、每卡 ER-06a 文档字段、验收记录只写在计划文件内。2026-10-03 15:53:30 UTC：唯一 pin 为 OpenCode 2.0.22 @ `527f0b931d1f9b3ebd34e106c51b31ce5db5b075`；成功门为 Linux 与 macOS 都捕获到内容，macOS 还要先满足 export 子进程及其后代的取消安全隔离。Codex R72 字面 `VERDICT: PASS`（2026-10-03 16:54:47 UTC）。
 
 - plan-20260830：`DEFER-SBX-06` 发布步延后（DEP-SBX-05 未就绪）。
 - plan-20260729：`DEFER-09`（CT3-07 转换轴）——已被 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭。
