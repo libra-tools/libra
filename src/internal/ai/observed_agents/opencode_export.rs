@@ -452,6 +452,7 @@ type PinnedFds = Vec<std::convert::Infallible>;
 /// staging path until bwrap has resolved and mounted `/proc/self/fd/N`; the
 /// FD itself remains the authority, and bwrap verifies the mounted inode.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct PinnedFd {
     fd: std::os::fd::OwnedFd,
     _staging_path: Option<tempfile::TempPath>,
@@ -477,8 +478,6 @@ impl PinnedFd {
 #[cfg(target_os = "linux")]
 impl std::os::fd::AsRawFd for PinnedFd {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd;
-
         self.fd.as_raw_fd()
     }
 }
@@ -1511,7 +1510,7 @@ fn opencode_bwrap_read_only_paths(sandbox_cwd: &Path) -> Vec<PathBuf> {
 async fn pin_revalidated_opencode_exporter_until(
     binary: &Path,
     deadline: tokio::time::Instant,
-) -> Result<std::os::fd::OwnedFd> {
+) -> Result<PinnedFd> {
     pin_trusted_opencode_exporter_for_path_until(Some(binary.to_path_buf()), deadline).await
 }
 
@@ -1521,9 +1520,7 @@ async fn pin_revalidated_opencode_exporter_until(
 /// capture passes none, so no unbounded path-returning trust lookup precedes
 /// this descriptor boundary.
 #[cfg(target_os = "linux")]
-async fn pin_trusted_opencode_exporter_until(
-    deadline: tokio::time::Instant,
-) -> Result<std::os::fd::OwnedFd> {
+async fn pin_trusted_opencode_exporter_until(deadline: tokio::time::Instant) -> Result<PinnedFd> {
     pin_trusted_opencode_exporter_for_path_until(None, deadline).await
 }
 
@@ -1531,7 +1528,7 @@ async fn pin_trusted_opencode_exporter_until(
 async fn pin_trusted_opencode_exporter_for_path_until(
     expected_path: Option<PathBuf>,
     deadline: tokio::time::Instant,
-) -> Result<std::os::fd::OwnedFd> {
+) -> Result<PinnedFd> {
     match tokio::time::timeout_at(deadline, async move {
         let provenance = trusted_opencode_provenance().await?;
         if let Some(expected_path) = expected_path
@@ -3024,7 +3021,7 @@ wait"#
             "store-probe",
             ExportLimits::default(),
             tokio::time::Instant::now() + ExportLimits::default().deadline,
-            vec![fd],
+            vec![PinnedFd::new(fd)],
         )
         .await
         .expect("bwrap must consume the store capability before payload exec");
@@ -3356,7 +3353,7 @@ printf 'tty=detached'"#,
                 "s1",
                 ExportLimits::default(),
                 default_deadline,
-                vec![fd],
+                vec![PinnedFd::new(fd)],
             )
             .await
             .expect("runner must accept caller-held keep_fds");
