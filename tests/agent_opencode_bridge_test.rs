@@ -145,7 +145,14 @@ impl BridgeRepo {
     }
 
     fn run(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.run_with_log(args, stdin, None)
+    }
+
+    fn run_with_log(&self, args: &[&str], stdin: Option<&str>, log_filter: Option<&str>) -> Output {
         let mut cmd = self.command();
+        if let Some(log_filter) = log_filter {
+            cmd.env("LIBRA_LOG", log_filter);
+        }
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -165,13 +172,21 @@ impl BridgeRepo {
     }
 
     fn stop(&self, session_id: &str) -> Output {
+        self.stop_with_log(session_id, None)
+    }
+
+    fn stop_with_log(&self, session_id: &str, log_filter: Option<&str>) -> Output {
         let envelope = json!({
             "hook_event_name": "session.idle",
             "session_id": session_id,
             "cwd": self.repo.to_string_lossy(),
         })
         .to_string();
-        self.run(&["agent", "hooks", "opencode", "stop"], Some(&envelope))
+        self.run_with_log(
+            &["agent", "hooks", "opencode", "stop"],
+            Some(&envelope),
+            log_filter,
+        )
     }
 
     /// Make object publication fail after the checkpoint writer owns its
@@ -353,7 +368,7 @@ async fn opencode_export_durable_snapshot_uses_repository_keyed_hmac() {
     let Some(repo) = BridgeRepo::init(EXPORT_HELLO).await else {
         return;
     };
-    let output = repo.stop("ses_hmac_snapshot");
+    let output = repo.stop_with_log("ses_hmac_snapshot", Some("debug"));
     assert!(
         output.status.success(),
         "successful export: {}",
@@ -374,7 +389,8 @@ async fn opencode_export_durable_snapshot_uses_repository_keyed_hmac() {
         .as_str()
         .unwrap_or_else(|| {
             panic!(
-                "successful OpenCode snapshot has a durable source commitment; metadata: {metadata_json}; stderr: {}",
+                "successful OpenCode snapshot has a durable source commitment; stdout: {}; metadata: {metadata_json}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             )
         });
