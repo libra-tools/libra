@@ -364,6 +364,7 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_MIN_STACK: "16777216"
+      LIBRA_LINUX_SANDBOX_EXE: /opt/libra-bubblewrap/bin/bwrap
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -395,6 +396,7 @@ jobs:
             | sha256sum --check --status
           tar -C /tmp -xf "$archive"
           meson setup /tmp/libra-bubblewrap-build "/tmp/bubblewrap-${version}" \
+            --prefix=/opt/libra-bubblewrap \
             -Dtests=false -Dman=disabled -Dselinux=disabled \
             -Dbash_completion=disabled -Dzsh_completion=disabled
           sudo meson install -C /tmp/libra-bubblewrap-build
@@ -402,11 +404,13 @@ jobs:
           # This runner is an ephemeral VM; enable the namespace mode used by
           # modern non-setuid bubblewrap for this CI job only.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          command -v bwrap
-          bwrap --version
-          bwrap --help | grep -F -- '--bind-fd'
-          bwrap --help | grep -F -- '--ro-bind-fd'
-          bwrap --unshare-all --die-with-parent --ro-bind / / -- /bin/true
+          test -x "$LIBRA_LINUX_SANDBOX_EXE"
+          test ! -w "$LIBRA_LINUX_SANDBOX_EXE"
+          stat -c '%U:%G %a %n' "$LIBRA_LINUX_SANDBOX_EXE"
+          "$LIBRA_LINUX_SANDBOX_EXE" --version
+          "$LIBRA_LINUX_SANDBOX_EXE" --help | grep -F -- '--bind-fd'
+          "$LIBRA_LINUX_SANDBOX_EXE" --help | grep -F -- '--ro-bind-fd'
+          "$LIBRA_LINUX_SANDBOX_EXE" --unshare-all --die-with-parent --ro-bind / / -- /bin/true
 
       - name: Run Linux export sandbox gates
         run: |

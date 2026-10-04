@@ -4,7 +4,7 @@
 >
 > **状态：** 已收口（2026-10-02 01:08:49 UTC 起按发布窗口顺序执行，发布者见修订历史）。MN-10 `done` / `complete`（v0.30.14）；MN-01 `done` / `complete`（v0.30.15）；MN-02 `done` / `complete`（v0.30.16）；MN-03 `done` / `complete`（v0.30.17）；MN-11 `done` / `complete`（v0.30.18）；MN-04 `done` / `complete`（v0.30.19）；MN-08 `done` / `complete`（v0.30.20）；MN-12 `done` / `complete`（v0.30.21）；MN-05 `done` / `complete`（v0.30.24；v0.30.22、v0.30.23 先后被并发发布占用，两次重建见修订历史）；MN-06 `done` / `complete`（v0.30.25）；MN-09 `done` / `complete`（v0.30.26）；MN-07 `done` / `complete`（v0.30.27）；12 卡全部完成，计划级全量门 8839/8839 与网站示例门 1/1 全绿；最终收口审查字面 `VERDICT: PASS`；本次仅交付三个计划文档的行政收口记录；逐卡进度见各卡 `Lifecycle / Acceptance` 与「实施证据汇总」。计划级 Codex review 已取得 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文评审 `PASS`，R16 对其后改动的差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 对锚点复核的差异评审 `FAIL`（1×P1）已修订，R18 差异确认 `PASS`（见「Codex review log」）；全部任务卡已按 ER-MN-03 完成实现评审、逐卡验收与发布。
 >
-> **PR #609 行政收口状态（2026-10-04 07:48 UTC）：** PR 仍为 OPEN，当前远端 head `870cbbc602c5964d9a31cea771ab3c5c7d71bad1`、base `892f37cf898be4d670a84ad8e45af3270a70928c`。修复 head 的 `compat-clippy`、`compat-rustfmt` 与 Code Quality 已通过；`opencode-export-linux` 的 bubblewrap 安装及参数检查通过，但 `trusted_bwrap_preflight` 仍失败，bridge E2E 未运行；其他完整测试仍在运行。下文追加最新证据与诊断修订，不把未完成的 run 当作通过。
+> **PR #609 行政收口状态（2026-10-04 08:27 UTC）：** PR 仍为 OPEN，当前远端 head `85776a561420211e9f807ead770f31fe165cd902`、base `892f37cf898be4d670a84ad8e45af3270a70928c`。新诊断确认 `opencode-export-linux` 拒绝 `/usr/local/bin/bwrap` 是因为 `/usr/local/bin` 对 runner 可写；现将下一版 workflow 改为 root 安装到 `/opt/libra-bubblewrap/bin/bwrap` 并通过 `LIBRA_LINUX_SANDBOX_EXE` 指定，等待提交后的 Linux 验证。格式、actionlint、全目标全特性 Clippy 已通过；最新 Actions run 尚有其他 job 在运行。
 >
 > **文件名：** 模板 v2.11 规定后缀词只能是 `[a-z]+`，不能写 `mega2`，因此用 `mega-browser-noninteractive` 指代 `libra mega2 browser` 的非交互操作。
 
@@ -2287,18 +2287,18 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目，并在�
 
 2026-10-04 04:53 UTC 核对：PR #609 远端 head `747992b24bc99fae9fb6e9922128117f64fb71e8` 的完整 `Check, Build and Test` run `37168062003` 有两个失败 job：`compat-offline-core` `111335105329` 与 `opencode-export-linux` `111335105397`。此前 `compat-clippy` 的重试 job `111255764986` 已成功，含 Clippy 与 Rustdoc 链接检查；checkout 下载超时不是待修代码项。
 
-2026-10-04 07:48 UTC 核对：修复 head `870cbbc602c5964d9a31cea771ab3c5c7d71bad1` 的 run `37186577139` 中 `compat-clippy`、`compat-rustfmt` 与独立 Code Quality 已成功。专用 Linux job `111389653654` 下载并验证 bubblewrap 0.13.0 成功，AppArmor userns sysctl 设为 0，随后 `trusted_bwrap_preflight` 仍报告“trusted, usable bwrap”不可用，bridge E2E 按依赖关系未运行。失败测试把 probe 子进程 stderr 丢弃，现补充只在测试构建继承 stderr，并在 workflow 增加基础 namespace smoke，以让下一次 Linux 运行显出真实失败原因；这仍是诊断性修订，不能算 sandbox 门通过。
+2026-10-04 07:48 UTC 核对：head `870cbbc602c5964d9a31cea771ab3c5c7d71bad1` 的 run `37186577139` 中 `compat-clippy`、`compat-rustfmt` 与独立 Code Quality 已成功。专用 Linux job `111389653654` 下载并验证 bubblewrap 0.13.0 成功，AppArmor userns sysctl 设为 0，随后 `trusted_bwrap_preflight` 失败，bridge E2E 未运行。08:27 UTC 的诊断 head `85776a561420211e9f807ead770f31fe165cd902` 进一步确认失败不是 namespace：严格信任检查拒绝 `/usr/local/bin`，具体错误为该路径组件可被当前 runner 用户修改。该路径来自 Meson 默认 prefix，因此下一修订把已验证的 bubblewrap root 安装到 `/opt/libra-bubblewrap/bin/bwrap`，并通过绝对环境变量路径交给信任检查和 sandbox smoke；保留只测试构建继承 bwrap stderr 与 strict preflight，以供后续诊断。
 
 ### 已应用的修复与待验证门
 
 | 失败项 | 已确认的证据 | 修复与验证状态 |
 |---|---|---|
-| OpenCode Linux sandbox CI 环境（[`opencode-export-linux` job](https://github.com/libra-tools/libra/actions/runs/37186577139/job/111389653654)） | 旧 Ubuntu bubblewrap 0.9.0 缺少 FD flags；修复 head 已构建并校验 bubblewrap 0.13.0，安装及 flags 检查通过，sysctl 写入成功，但完整 descriptor capability probe 返回 false。测试此前静默丢弃 bwrap stderr，无法区分 namespace 限制和 FD setup 错误。 | 已保留版本与哈希 pin、严格能力断言及 bridge E2E；新增基础 `--unshare-all` smoke，并让仅测试构建继承 probe stderr、失败信息显示受信任 bwrap 路径。待后续 head 的专用 Linux job 验证并据输出修复实际原因。 |
+| OpenCode Linux sandbox CI 环境（[`opencode-export-linux` job](https://github.com/libra-tools/libra/actions/runs/37188804471/job/111396498650)） | 旧 Ubuntu bubblewrap 0.9.0 缺少 FD flags。0.13.0 安装到默认 `/usr/local/bin` 后，job `111396498650` 的失败日志确认其父目录对 runner 可写，因此 trust guard 正确 fail-closed；namespace smoke 尚未运行。 | 保留版本与哈希 pin、严格能力断言及 bridge E2E；改用 root 安装目录 `/opt/libra-bubblewrap/bin/bwrap` 并通过 `LIBRA_LINUX_SANDBOX_EXE` 固定使用该二进制。只有后续专用 Linux job 通过 trust guard、FD probe 和 bridge E2E 后，才算修复完成。 |
 | `validate_trusted_bwrap_accepts_system_binary` | `compat-offline-core` job `111335105329` 中失败；旧断言把系统路径可信与 FD mount 能力混为一谈。 | 已拆开契约：此测试只断言 canonical 系统路径通过信任检查；能力仍由严格预检断言。待新 head 全量测试验证。 |
-| `trusted_bwrap_preflight` | 自托管全量 runner 可能没有现代 bubblewrap；另在 head `870cbbc` 的 GitHub Linux job 中，官方 0.13.0 与 userns sysctl 均就绪，真实 FD probe 仍失败。 | 已将此环境门标为 ignored，以免通用 suite 误假设 runner 能力；`opencode-export-linux` 仍以 `--include-ignored` 显式运行同一硬门，缺能力仍失败，不会 skip-green。诊断输出加入后须继续保持硬门并修复失败原因。 |
+| `trusted_bwrap_preflight` | 自托管全量 runner 可能没有现代 bubblewrap；head `85776a5` 的 GitHub Linux job 未到 FD probe 即因 `/usr/local/bin` 可写而被严格 trust guard 拒绝。 | 已将此环境门标为 ignored，以免通用 suite 误假设 runner 能力；`opencode-export-linux` 仍以 `--include-ignored` 显式运行同一硬门，缺能力仍失败，不会 skip-green。切换到不可写的 root 安装目录后待远端验证。 |
 | `internal::ai::capture::live_oracle_tests::live_checkpoint_metadata_shape_is_stable` | `compat-offline-core` 报 `storage_path() called outside a libra repository`：GitHub checkout 使用 `.git`，而不是 `.libra`。隐式 storage discovery 取决于进程 cwd。 | 已给 oracle 加 `cwd`/`env` serial lanes，并在每个临时 oracle repo 中运行 capture；`ChangeDirGuard` 恢复 cwd。ADR-ACF-10 记录这项测试上下文修订并更新冻结指纹；metadata/redaction golden shape 未改。focused oracle 与冻结架构 guard 本地均 1/1 通过，Linux CI 待新 head 验证。 |
 | `internal::ai::history::tests::cleanup_helper_guard_returns_promptly_and_reaps_repeated_timeouts` | `compat-offline-core` 失败：忽略子测试通过 `--exact` 启动，但短过滤串 `cleanup_helper_child_sleeper_process` 匹配不到测试，子进程立即退出，reaper 计数超时。 | 已改用完整 libtest 名 `internal::ai::history::tests::cleanup_helper_child_sleeper_process`；及时返回、PID 消失与 reaper 回收断言保留。Linux CI 待新 head 验证。 |
 
 ### 收口条件与边界
 
-原始全量失败证据来自 head `747992b`；源码、workflow 与 ADR 修复已推送为 `870cbbc`。该 head 的完整 Actions run 尚未结束，且 Linux sandbox 硬门已失败；本段新增的诊断修订尚未提交。最终须继续修复并核对最新 head 的全部必需 CI，尤其 `compat-offline-core` 与 `opencode-export-linux`；所有必需项全绿前 PR #609 保持未合并。本次不新增版本、tag 或 release。
+原始全量失败证据来自 head `747992b`；第一轮源码修复推送为 `870cbbc`，诊断修订为 `85776a5`，二者的 Linux sandbox 硬门仍失败。当前本地 workflow 已改用 root 安装的 `/opt/libra-bubblewrap/bin/bwrap`，尚未提交推送。最终须继续核对最新 head 的全部必需 CI，尤其 `compat-offline-core` 与 `opencode-export-linux`；所有必需项全绿前 PR #609 保持未合并。本次不新增版本、tag 或 release。
