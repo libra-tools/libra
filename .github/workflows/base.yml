@@ -406,6 +406,7 @@ jobs:
           bwrap --version
           bwrap --help | grep -F -- '--bind-fd'
           bwrap --help | grep -F -- '--ro-bind-fd'
+          bwrap --unshare-all --die-with-parent --ro-bind / / -- /bin/true
 
       - name: Run Linux export sandbox gates
         run: |

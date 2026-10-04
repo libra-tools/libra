@@ -1963,7 +1963,11 @@ async fn trusted_bwrap_supports_fd_mounts_until(
         .current_dir(OPENCODE_SANDBOX_OUTER_CWD)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(if cfg!(test) {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        })
         .kill_on_drop(true);
     // SAFETY: the callback sees only a preallocated raw-fd array and invokes
     // syscall/fcntl/setsid. It does not touch parent state after fork.
@@ -3399,9 +3403,16 @@ printf 'tty=detached'"#,
     #[serial_test::serial(export_sandbox_env)]
     #[tokio::test]
     async fn trusted_bwrap_preflight() {
+        let bwrap = resolve_trusted_bwrap_unprobed()
+            .expect("Linux D-group requires a trusted bwrap binary on PATH");
         assert!(
-            trusted_bwrap_available().await,
-            "Linux D-group requires a trusted, usable bwrap (install bubblewrap)"
+            trusted_bwrap_supports_fd_mounts_until(
+                &bwrap,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )
+            .await,
+            "Linux D-group requires a usable FD-mount bwrap at {}",
+            bwrap.display()
         );
     }
 
