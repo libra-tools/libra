@@ -441,10 +441,47 @@ pub(crate) async fn run_export_subprocess(
 /// Fds the caller pinned that must stay open (and inheritable) until the
 /// child has been spawned. File descriptors only exist on Unix; elsewhere the
 /// alias is an uninhabited placeholder so the runner signature stays portable.
-#[cfg(all(unix, any(target_os = "linux", test)))]
+#[cfg(target_os = "linux")]
+type PinnedFds = Vec<PinnedFd>;
+#[cfg(all(unix, not(target_os = "linux"), test))]
 type PinnedFds = Vec<std::os::fd::OwnedFd>;
 #[cfg(all(not(unix), any(target_os = "linux", test)))]
 type PinnedFds = Vec<std::convert::Infallible>;
+
+/// Parent-owned FD capability. Exporter capabilities also retain the named
+/// staging path until bwrap has resolved and mounted `/proc/self/fd/N`; the
+/// FD itself remains the authority, and bwrap verifies the mounted inode.
+#[cfg(target_os = "linux")]
+struct PinnedFd {
+    fd: std::os::fd::OwnedFd,
+    _staging_path: Option<tempfile::TempPath>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedFd {
+    fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            fd,
+            _staging_path: None,
+        }
+    }
+
+    fn with_staging_path(fd: std::os::fd::OwnedFd, staging_path: tempfile::TempPath) -> Self {
+        Self {
+            fd,
+            _staging_path: Some(staging_path),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsRawFd for PinnedFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+
+        self.fd.as_raw_fd()
+    }
+}
 
 /// Fork-child-only descriptor boundary for the Linux bwrap invocation. Mark
 /// every non-stdio inherited descriptor CLOEXEC in one raw syscall, then
@@ -918,7 +955,7 @@ async fn run_export_subprocess_sandboxed_for_test(
 
 #[cfg(target_os = "linux")]
 async fn run_export_subprocess_sandboxed_with_exporter_fd(
-    exporter_fd: std::os::fd::OwnedFd,
+    exporter_fd: PinnedFd,
     session_id: &str,
     limits: ExportLimits,
     deadline: tokio::time::Instant,
@@ -970,7 +1007,7 @@ struct AssembledExport {
 /// parent directory.
 #[cfg(target_os = "linux")]
 fn assemble_sandboxed_export(
-    exporter_fd: std::os::fd::OwnedFd,
+    exporter_fd: PinnedFd,
     trusted_bwrap: Option<&std::path::Path>,
 ) -> Result<AssembledExport> {
     use std::os::fd::AsRawFd;
@@ -1002,6 +1039,7 @@ fn assemble_sandboxed_export(
     // O_PATH directory descriptor reachable by the exporter.
     match pin_opencode_store() {
         Ok(Some(fd)) => {
+            let fd = PinnedFd::new(fd);
             let dest_path = PathBuf::from(OPENCODE_SANDBOX_STORE);
             let source = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
             writable_binds.push(WritableBind {
@@ -1509,8 +1547,8 @@ async fn pin_trusted_opencode_exporter_for_path_until(
         // indefinitely on FUSE, so keep it on the blocking pool and let the
         // public capture deadline decide whether its result may progress to
         // bwrap. If the deadline wins, dropping this JoinHandle cannot cancel
-        // a started blocking task, but that task owns its anonymous
-        // tempfile/fd and drops them before returning; no exporter or sandbox
+        // a started blocking task, but that task owns its named staging file
+        // and descriptor and drops them before returning; no exporter or sandbox
         // child has been spawned.
         let seal_path = provenance.canonical_path.clone();
         let sealed_provenance = provenance.clone();
@@ -1530,16 +1568,13 @@ async fn pin_trusted_opencode_exporter_for_path_until(
 
 /// Await a blocking sealed-exporter operation under the caller's one absolute
 /// capture deadline. If the timer wins, the task has not produced a capability
-/// that can reach bwrap; if it is already running, its owned anonymous
-/// tempfile/fd is dropped with its eventual result rather than being accepted
+/// that can reach bwrap; if it is already running, its owned staging file and
+/// descriptor are dropped with its eventual result rather than being accepted
 /// by a later capture attempt.
 #[cfg(target_os = "linux")]
-async fn seal_exporter_fd_until<F>(
-    deadline: tokio::time::Instant,
-    seal: F,
-) -> Result<std::os::fd::OwnedFd>
+async fn seal_exporter_fd_until<F>(deadline: tokio::time::Instant, seal: F) -> Result<PinnedFd>
 where
-    F: FnOnce() -> Result<std::os::fd::OwnedFd> + Send + 'static,
+    F: FnOnce() -> Result<PinnedFd> + Send + 'static,
 {
     match tokio::time::timeout_at(deadline, tokio::task::spawn_blocking(seal)).await {
         Ok(Ok(result)) => result,
@@ -1552,8 +1587,10 @@ where
     }
 }
 
-/// Open a regular, non-symlink exporter and copy it into a private anonymous
-/// executable descriptor. When provenance is supplied, compare the opened
+/// Open a regular, non-symlink exporter and copy it into a private named
+/// executable staging file plus a read-only descriptor. Bubblewrap resolves
+/// `--ro-bind-fd` through `/proc/self/fd/N`, so the staging pathname must stay
+/// linked until bwrap consumes the setup descriptor. When provenance is supplied, compare the opened
 /// fd's device/inode/mtime and the bytes copied into that descriptor to the
 /// trust record first. The copy closes both replacement and same-inode
 /// post-hash mutation races: bwrap receives bytes owned only by Libra, not a
@@ -1562,7 +1599,7 @@ where
 fn pin_exporter_fd(
     binary: &Path,
     expected: Option<&crate::internal::ai::observed_agents::trust::Provenance>,
-) -> Result<std::os::fd::OwnedFd> {
+) -> Result<PinnedFd> {
     use std::{
         io::{Read as _, Seek as _, Write as _},
         os::{
@@ -1616,7 +1653,8 @@ fn pin_exporter_fd(
         );
     }
 
-    let mut sealed = tempfile::tempfile().context("create sealed OpenCode exporter descriptor")?;
+    let mut sealed =
+        tempfile::NamedTempFile::new().context("create sealed OpenCode exporter staging file")?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 32 * 1024];
     let mut copied = 0_u64;
@@ -1635,6 +1673,7 @@ fn pin_exporter_fd(
         }
         hasher.update(&buffer[..read]);
         sealed
+            .as_file_mut()
             .write_all(&buffer[..read])
             .context("seal trusted OpenCode exporter bytes")?;
     }
@@ -1644,19 +1683,22 @@ fn pin_exporter_fd(
         );
     }
     sealed
+        .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o500))
         .context("make sealed OpenCode exporter executable")?;
     sealed
+        .as_file_mut()
         .rewind()
         .context("rewind sealed OpenCode exporter descriptor")?;
 
-    // The sealing handle is O_RDWR. Re-open the anonymous descriptor through
+    // The sealing handle is O_RDWR. Re-open the named staging file through
     // procfs as O_RDONLY, then drop the writable handle before handing the
     // capability to bwrap: the exporter must never inherit a writable alias
     // to Libra's sealed executable bytes.
-    let sealed_path = std::ffi::CString::new(format!("/proc/self/fd/{}", sealed.as_raw_fd()))
-        .context("format sealed OpenCode exporter descriptor path")?;
-    // SAFETY: `sealed_path` names this process's still-owned anonymous file;
+    let sealed_path =
+        std::ffi::CString::new(format!("/proc/self/fd/{}", sealed.as_file().as_raw_fd()))
+            .context("format sealed OpenCode exporter descriptor path")?;
+    // SAFETY: `sealed_path` names this process's still-owned staging file;
     // the returned descriptor is immediately wrapped for RAII.
     let readonly_raw =
         unsafe { libc::open(sealed_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -1666,8 +1708,9 @@ fn pin_exporter_fd(
     }
     // SAFETY: `readonly_raw` is a fresh owned fd returned by open(2).
     let readonly = unsafe { OwnedFd::from_raw_fd(readonly_raw) };
-    drop(sealed);
-    duplicate_capability_fd_at_least_three(readonly, "sealed OpenCode exporter")
+    let staging_path = sealed.into_temp_path();
+    let readonly = duplicate_capability_fd_at_least_three(readonly, "sealed OpenCode exporter")?;
+    Ok(PinnedFd::with_staging_path(readonly, staging_path))
 }
 
 /// Move a capability descriptor above stdio and make it close-on-exec until
@@ -1841,8 +1884,8 @@ pub async fn trusted_bwrap_available() -> bool {
 #[cfg(target_os = "linux")]
 struct BwrapFdMountProbe {
     temp: tempfile::TempDir,
-    store_fd: std::os::fd::OwnedFd,
-    exporter_fd: std::os::fd::OwnedFd,
+    store_fd: PinnedFd,
+    exporter_fd: PinnedFd,
     store_fd_text: String,
     exporter_fd_text: String,
     script: String,
@@ -1858,7 +1901,7 @@ fn new_bwrap_fd_mount_probe() -> Option<BwrapFdMountProbe> {
     {
         return None;
     }
-    let store_fd = pin_store_under(temp.path()).ok()?;
+    let store_fd = PinnedFd::new(pin_store_under(temp.path()).ok()?);
     let exporter_source = temp.path().join("sealed-exporter-probe");
     if std::fs::write(&exporter_source, b"libra-sealed-exporter-probe").is_err()
         || std::fs::set_permissions(&exporter_source, std::fs::Permissions::from_mode(0o500))
@@ -1885,9 +1928,9 @@ fn new_bwrap_fd_mount_probe() -> Option<BwrapFdMountProbe> {
          for candidate in /proc/self/fd/[0-9]*; do \
            test ! -e \"$candidate/../host-only-sibling\" || exit 99; \
          done; \
-         test \"$(cat /libra-opencode-exporter-probe)\" = libra-sealed-exporter-probe || exit 100; \
-         if printf mutated > /libra-opencode-exporter-probe 2>/dev/null; then exit 101; fi; \
-         printf probe > /mnt/probe"
+         test \"$(cat /tmp/libra-opencode-exporter-probe)\" = libra-sealed-exporter-probe || exit 100; \
+         if printf mutated > /tmp/libra-opencode-exporter-probe 2>/dev/null; then exit 101; fi; \
+         printf probe > /tmp/opencode-store/probe"
     );
     Some(BwrapFdMountProbe {
         temp,
@@ -1948,12 +1991,19 @@ async fn trusted_bwrap_supports_fd_mounts_until(
             "--ro-bind",
             "/",
             "/",
+            // `--bind-fd` resolves its `/proc/self/fd/N` source during
+            // namespace setup; mirror the production profile's proc mount so
+            // this probe exercises that same descriptor path.
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
             "--bind-fd",
             &probe.store_fd_text,
-            "/mnt",
+            "/tmp/opencode-store",
             "--ro-bind-fd",
             &probe.exporter_fd_text,
-            "/libra-opencode-exporter-probe",
+            "/tmp/libra-opencode-exporter-probe",
             "--",
             "/bin/sh",
             "-c",
@@ -3955,6 +4005,32 @@ printf 'tty=detached'"#,
         );
     }
 
+    /// Bubblewrap resolves `--ro-bind-fd` to the source pathname before it
+    /// creates the sandbox mounts. Keep the randomized staging pathname alive
+    /// for that resolution, then remove it with the owned capability.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_exporter_retains_named_source_until_capability_drop() {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = fake_exporter(dir.path(), "exit 0");
+        let fd = pin_exporter_fd(&binary, None).expect("seal test exporter");
+        let proc_path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .expect("read sealed exporter proc link");
+        assert!(proc_path.is_absolute(), "staging path must be absolute");
+        assert!(
+            !proc_path.to_string_lossy().ends_with(" (deleted)"),
+            "bwrap must be able to resolve a live named source path"
+        );
+        assert!(proc_path.is_file(), "staging pathname must remain linked");
+        drop(fd);
+        assert!(
+            !proc_path.exists(),
+            "dropping the capability must remove its staging file"
+        );
+    }
+
     /// R85: the sealed copy must accept a realistic single-file exporter.
     /// The stock OpenCode CLI is a ~171 MiB Bun binary; a 200 MiB exporter is
     /// trusted, sealed in full and still matched against its provenance, so a
@@ -3975,7 +4051,7 @@ printf 'tty=detached'"#,
 
         let fd = pin_exporter_fd(&binary, Some(&provenance))
             .expect("large trusted exporter must be sealed for bwrap");
-        let sealed_len = std::fs::File::from(fd)
+        let sealed_len = std::fs::File::from(fd.fd)
             .metadata()
             .expect("stat sealed exporter")
             .len();
