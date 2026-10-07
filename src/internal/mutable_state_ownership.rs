@@ -505,6 +505,11 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "legacy_operation_view_workspace__staging",
     "layer__down_guard_2026072303",
     "layer__legacy_rows_need_explicit_adopt_2026072303",
+    // plan-20260926 DM-01 projection tables (zero-authority, rebuildable;
+    // repository-scoped, not worktree-scoped => no MUTABLE_STATE_OWNERSHIP entry).
+    "memory_episode",
+    "memory_episode_evidence",
+    "memory_projection_state",
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
     "operation_scope_provenance_down_guard",

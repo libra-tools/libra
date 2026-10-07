@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.30.31] — 2026-10-07
+
+### Memory core projection schema (plan-20260926 DM-01)
+
+- Add the internal `2026092901_memory_core` forward-only migration creating
+  three zero-authority, rebuildable projection tables (`memory_episode`,
+  `memory_episode_evidence`, `memory_projection_state`) that back the upcoming
+  `libra memory` determinism surface. No public CLI behavior changes; this
+  releases the internal schema seam ahead of the `libra memory` commands.
+
 ## [0.30.30] — 2026-10-06
 
 ### Skip-worktree entry points (issues/490 SW-07)
