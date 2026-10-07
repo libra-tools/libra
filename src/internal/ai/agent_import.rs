@@ -7069,7 +7069,8 @@ mod tests {
             ),
         );
         let pid = async {
-            for _ in 0..100 {
+            // Full-suite scheduling can delay fixture startup beyond one second.
+            for _ in 0..500 {
                 if let Ok(value) = std::fs::read_to_string(&pid_file)
                     && let Ok(pid) = value.trim().parse::<libc::pid_t>()
                 {
@@ -7137,7 +7138,8 @@ mod tests {
             ),
         );
         let descendant = async {
-            for _ in 0..100 {
+            // Only the fixture startup window grows; the reap check is unchanged.
+            for _ in 0..500 {
                 if let Ok(value) = std::fs::read_to_string(&descendant_file)
                     && let Ok(pid) = value.trim().parse::<libc::pid_t>()
                 {

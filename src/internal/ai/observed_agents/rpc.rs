@@ -1277,7 +1277,7 @@ mod tests {
         let bin = plant_script(dir.path(), "early-exit", "#!/bin/sh\nexit 0\n");
         let mut agent = RpcAgent::spawn(bin).unwrap();
         let err = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(2))
+            .invoke_with_timeout("capabilities", None, RPC_DEFAULT_TIMEOUT)
             .expect_err("must fail");
         let msg = format!("{err:#}");
         // Either "closed stdout before answering" (reader saw EOF
@@ -1303,7 +1303,7 @@ mod tests {
         // deadline turns a busy machine into a spurious "rpc timeout" failure
         // before the malformed line is ever delivered.
         let err = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(30))
+            .invoke_with_timeout("capabilities", None, RPC_DEFAULT_TIMEOUT)
             .expect_err("must fail");
         assert!(
             format!("{err:#}").contains("parse RPC response line"),
@@ -1324,7 +1324,7 @@ mod tests {
         );
         let mut agent = RpcAgent::spawn(bin).unwrap();
         let err = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(2))
+            .invoke_with_timeout("capabilities", None, RPC_DEFAULT_TIMEOUT)
             .expect_err("must fail");
         let msg = format!("{err:#}");
         assert!(
@@ -1345,7 +1345,7 @@ mod tests {
         );
         let mut agent = RpcAgent::spawn(bin).unwrap();
         let err = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(2))
+            .invoke_with_timeout("capabilities", None, RPC_DEFAULT_TIMEOUT)
             .expect_err("must fail");
         assert!(
             format!("{err:#}").contains("unsupported jsonrpc version"),
@@ -1365,7 +1365,7 @@ mod tests {
         );
         let mut agent = RpcAgent::spawn(bin).unwrap();
         let value = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(2))
+            .invoke_with_timeout("capabilities", None, RPC_DEFAULT_TIMEOUT)
             .expect("must succeed");
         assert_eq!(
             value

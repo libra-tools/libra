@@ -475,3 +475,8 @@ plan-20260904新增ER10前驱FIX-RG-SSH-01，in-progress/locally-accepted，7/7A
 仅SSH cfg(test)期限切片、三版本面与toolchain self-lock、FIX卡/status文档，既有upstream代码不成为本卡I写集。完整patch zero-offset/fuzz准入，尚待本最终冻结树的focused/full/fmt/strictClippy/build/install及fresh独立双审、签名commit/push/PR检查/tag/release/D证据；不得提前complete。用户已授权0.30.36发布，Linux功能仍由用户后验；Source A native NO-GO及其它任务卡门不变。
 
 上游.35 tag与package补交提交不一致的事实独立保留；本卡既不改写他人tag也不冒认该窗口绿色。窗口terminal后前滚发布自有0.30.36；发布前重新核对main/tag与串行占用。
+
+
+### 2026-10-07 22:04:44 UTC：FIX-RG-01 最终基线与全量事实
+
+R2 FIX-RG-01当前独立0.30.38候选基于实际上游84442ee658bff007f9eed5b7b996638990610b45；保留CP-00已发布四路径，不回退上游审计交付。修复owned仅两cfg(test)期限、三version面/工具链lock、本卡plan及本status。R1旧f59 full与originals冻结保留，不宣称最终全量/C-D完成。原审两个P3修正为caller-supplied reader deadline和六特有AC/8、五VER/8，强制full另列，.37保留。本1985文件冻结源的fmt/strict/focused与双环境默认并发Nextest已结束：exit0、9514/9514passed、13slow、4LEAK、5skip、0flaky，817.894s；四LEAK根因未明，待逐项隔离复验，不宣称零泄漏。两原审已各自CLOSED PASS；只在full结束后修正本卡I五处RPC参数事实及本状态UTC标题，1983非记录文件与模式保持一致。新文档双审、最终树绑定、build/install/签名提交及实际C/D仍未完成；本卡继续in-progress/空。
