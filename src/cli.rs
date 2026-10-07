@@ -4918,3 +4918,58 @@ mod tests {
         );
     }
 }
+
+/// CP-00 (plan-20260923) inventory helper: walk the compiled clap command
+/// tree and emit a flat, exhaustive row per command node and per argument.
+/// Output is TSV so a script can build the reviewed coverage ledger.
+/// Columns: kind, command_path, arg_id, num_args, value_names, is_flag.
+#[test]
+fn cp00_dump_cli_tree_for_coverage_ledger() {
+    use std::io::Write;
+
+    use clap::{ArgAction, CommandFactory};
+
+    fn walk(cmd: &clap::Command, prefix: &str, out: &mut String) {
+        let path = if prefix.is_empty() {
+            cmd.get_name().to_string()
+        } else {
+            format!("{prefix} {}", cmd.get_name())
+        };
+        out.push_str(&format!("node\t{path}\t-\t\t\t\n"));
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().to_string();
+            let kind = match arg.get_action() {
+                ArgAction::Set
+                | ArgAction::SetTrue
+                | ArgAction::Append
+                | ArgAction::Count
+                | ArgAction::SetFalse
+                | ArgAction::Help
+                | ArgAction::Version => "flag",
+                _ => "arg",
+            };
+            let num = arg
+                .get_num_args()
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let names = arg
+                .get_value_names()
+                .map(|v| v.join(","))
+                .unwrap_or_default();
+            out.push_str(&format!("arg\t{path}\t{id}\t{num}\t{names}\t{kind}\n"));
+        }
+        for sub in cmd.get_subcommands() {
+            walk(sub, &path, out);
+        }
+    }
+
+    let cli = <Cli as CommandFactory>::command();
+    let mut out = String::new();
+    for sub in cli.get_subcommands() {
+        walk(sub, "", &mut out);
+    }
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(out.as_bytes())
+        .expect("write cli tree dump");
+}
