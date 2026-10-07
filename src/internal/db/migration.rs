@@ -1895,6 +1895,18 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026090701_ai_task_run_base_commit_ref.sql"),
             include_str!("../../../sql/migrations/2026090701_ai_task_run_base_commit_ref_down.sql"),
         ),
+        // plan-20260926 DM-01 (migration A): core Episode projection schema.
+        // Zero-authority, rebuildable side tables (GC-DM-01); forward-only
+        // (ADR-DM-13). `memory_episode` / `memory_episode_evidence` /
+        // `memory_projection_state`. Registered above the current tip (2026092701)
+        // so `run_pending` applies it; the `_down.sql` is a controlled test/ops
+        // tool, not the published rollback path.
+        sql_migration(
+            2026092901,
+            "memory_core",
+            include_str!("../../../sql/migrations/2026092901_memory_core.sql"),
+            include_str!("../../../sql/migrations/2026092901_memory_core_down.sql"),
+        ),
     ]
 }
 
@@ -2355,9 +2367,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 66);
+        assert_eq!(runner.len(), 67);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026092701));
+        assert_eq!(runner.max_registered_version(), Some(2026092901));
     }
 
     #[test]

@@ -7,9 +7,13 @@
 use std::{ffi::OsStr, panic::AssertUnwindSafe, path::PathBuf};
 
 use libra::{
-    internal::db::migration::{
-        Migration, MigrationError, MigrationRunner, builtin_migrations,
-        builtin_runner as all_builtin_runner, run_builtin_migrations as run_all_builtin_migrations,
+    internal::db::{
+        self, DatabaseRole,
+        migration::{
+            Migration, MigrationError, MigrationRunner, builtin_migrations,
+            builtin_runner as all_builtin_runner,
+            run_builtin_migrations as run_all_builtin_migrations,
+        },
     },
     utils::test::{ConfigDbFixture, ScopedEnvVar},
 };
@@ -5310,4 +5314,361 @@ async fn approved_permission_old_reader_rejects_migrated_schema() {
         rendered.contains("2126081301"),
         "refusal must name the unsupported version: {rendered}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260926 DM-01: `2026092901_memory_core` core Episode projection schema
+// ---------------------------------------------------------------------------
+
+/// Stored `CREATE TABLE` body from `sqlite_master`. SQLite records the exact
+/// text of the original `CREATE TABLE` statement, so the frozen CHECK / UNIQUE /
+/// PK / FK vocabulary from the plan's "Schema 规范" must appear verbatim.
+async fn table_sql(conn: &DatabaseConnection, name: &str) -> String {
+    conn.query_one_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        [name.into()],
+    ))
+    .await
+    .expect("query sqlite_master")
+    .expect("table exists in schema")
+    .try_get_by_index(0)
+    .expect("CREATE TABLE text")
+}
+
+#[derive(Debug, PartialEq)]
+struct ColumnInfo {
+    name: String,
+    ty: String,
+    notnull: bool,
+    pk: i64,
+}
+
+async fn columns_of(conn: &DatabaseConnection, table: &str) -> Vec<ColumnInfo> {
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("PRAGMA table_info(`{table}`)"),
+        ))
+        .await
+        .expect("PRAGMA table_info");
+    rows.into_iter()
+        .map(|row| ColumnInfo {
+            name: row.try_get_by_index(1).expect("column name"),
+            ty: row.try_get_by_index(2).expect("column type"),
+            notnull: row.try_get_by_index(3).expect("notnull flag"),
+            pk: row.try_get_by_index(5).expect("pk ordinal"),
+        })
+        .collect()
+}
+
+/// DM-01 up must create exactly the three zero-authority projection tables
+/// listed in the plan's "Schema 规范" (DM-01 rows only). `memory_episode_path`
+/// and `memory_episode_search_doc` belong to DM-10 and must NOT appear here.
+#[tokio::test]
+async fn memory_core_creates_three_tables() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(table_exists(&conn, "memory_episode").await);
+    assert!(table_exists(&conn, "memory_episode_evidence").await);
+    assert!(table_exists(&conn, "memory_projection_state").await);
+    assert!(
+        !table_exists(&conn, "memory_episode_path").await,
+        "DM-10 tables must not be created by DM-01"
+    );
+    assert!(
+        !table_exists(&conn, "memory_episode_search_doc").await,
+        "DM-10 tables must not be created by DM-01"
+    );
+}
+
+/// Every column, type, nullability, CHECK vocabulary and UNIQUE/PK/FK
+/// constraint must match the plan's frozen "Schema 规范" (DM-01 rows) exactly.
+#[tokio::test]
+async fn memory_core_check_vocabularies() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+
+    let episode = columns_of(&conn, "memory_episode").await;
+    assert_eq!(
+        episode
+            .iter()
+            .map(|col| col.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "episode_id",
+            "repo_id",
+            "source_kind",
+            "source_key",
+            "outcome",
+            "actor",
+            "started_at",
+            "ended_at",
+            "anchor_commit",
+            "change_id",
+            "title",
+            "body",
+            "content_digest",
+            "producer",
+            "rules_version",
+        ]
+    );
+    assert_eq!(episode.iter().filter(|col| col.pk > 0).count(), 1);
+    assert_eq!(
+        episode[0].pk, 1,
+        "episode_id is the single-column primary key"
+    );
+    assert_eq!(episode[0].ty, "TEXT");
+    assert_eq!(episode[5].ty, "TEXT");
+    assert!(!episode[5].notnull, "actor is nullable");
+    assert_eq!(episode[6].ty, "INTEGER");
+    assert!(episode[6].notnull, "started_at is NOT NULL");
+    let episode_sql = table_sql(&conn, "memory_episode").await;
+    assert!(
+        episode_sql.contains("'commit','agent_session','agent_run','bridge_operation'"),
+        "source_kind CHECK vocabulary is frozen: {episode_sql}"
+    );
+    assert!(
+        episode_sql.contains("'succeeded','failed','aborted','partial','unknown'"),
+        "outcome CHECK vocabulary is frozen: {episode_sql}"
+    );
+    assert!(
+        episode_sql.contains("UNIQUE(`repo_id`, `source_kind`, `source_key`)"),
+        "episode UNIQUE(repo_id, source_kind, source_key) is frozen: {episode_sql}"
+    );
+    assert!(
+        episode_sql.contains("DEFAULT 'derived-v1'"),
+        "producer default is frozen: {episode_sql}"
+    );
+
+    let evidence = columns_of(&conn, "memory_episode_evidence").await;
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|col| col.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "episode_id",
+            "ordinal",
+            "kind",
+            "ref_id",
+            "link_confidence",
+            "resolution_status"
+        ]
+    );
+    assert_eq!(
+        evidence.iter().filter(|col| col.pk > 0).count(),
+        2,
+        "composite PK"
+    );
+    let evidence_sql = table_sql(&conn, "memory_episode_evidence").await;
+    assert!(
+        evidence_sql.contains("'commit','checkpoint','review_run','operation'"),
+        "kind CHECK vocabulary is frozen: {evidence_sql}"
+    );
+    assert!(
+        evidence_sql.contains("'identity','operation','temporal'"),
+        "link_confidence CHECK vocabulary is frozen: {evidence_sql}"
+    );
+    assert!(
+        evidence_sql.contains("'resolved','unresolved'"),
+        "resolution_status CHECK vocabulary is frozen: {evidence_sql}"
+    );
+    assert!(
+        evidence_sql.contains("PRIMARY KEY (`episode_id`, `ordinal`)"),
+        "evidence composite primary key is frozen: {evidence_sql}"
+    );
+    assert!(
+        evidence_sql.contains(
+            "FOREIGN KEY (`episode_id`) REFERENCES `memory_episode`(`episode_id`) ON DELETE CASCADE"
+        ),
+        "evidence FK CASCADE to memory_episode is frozen: {evidence_sql}"
+    );
+
+    let state = columns_of(&conn, "memory_projection_state").await;
+    assert_eq!(
+        state
+            .iter()
+            .map(|col| col.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "repo_id",
+            "source_kind",
+            "cursor_json",
+            "fingerprint",
+            "rules_version",
+            "schema_version",
+            "horizon_truncated",
+            "revoked_count",
+            "aged_out_count",
+            "rebuilt_at",
+        ]
+    );
+    assert_eq!(
+        state.iter().filter(|col| col.pk > 0).count(),
+        2,
+        "composite PK"
+    );
+    let state_sql = table_sql(&conn, "memory_projection_state").await;
+    assert!(
+        state_sql.contains("PRIMARY KEY (`repo_id`, `source_kind`)"),
+        "projection_state composite primary key is frozen: {state_sql}"
+    );
+    assert!(
+        state_sql.contains("'commit','agent_session','agent_run','bridge_operation'"),
+        "projection_state source_kind CHECK vocabulary is frozen: {state_sql}"
+    );
+    assert!(
+        state_sql.contains("IN (0,1)"),
+        "projection_state horizon_truncated CHECK (0,1) is frozen: {state_sql}"
+    );
+    assert!(
+        state_sql.contains("`revoked_count`      INTEGER NOT NULL DEFAULT 0")
+            && state_sql.contains("`aged_out_count`     INTEGER NOT NULL DEFAULT 0"),
+        "revoked_count / aged_out_count persisted defaults are frozen: {state_sql}"
+    );
+}
+
+/// Re-running the migration on a database that already has it applied is a
+/// no-op: no error, no new `schema_versions` receipt, no schema change.
+#[tokio::test]
+async fn memory_core_second_run_is_noop() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("first run");
+
+    let receipts_before: i64 = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) FROM schema_versions",
+        ))
+        .await
+        .expect("count receipts")
+        .expect("count row")
+        .try_get_by_index(0)
+        .expect("count value");
+
+    let second = run_all_builtin_migrations(&conn)
+        .await
+        .expect("second run must not error");
+    assert!(
+        second.is_empty(),
+        "second run must apply nothing: {second:?}"
+    );
+
+    let receipts_after: i64 = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) FROM schema_versions",
+        ))
+        .await
+        .expect("count receipts")
+        .expect("count row")
+        .try_get_by_index(0)
+        .expect("count value");
+    assert_eq!(
+        receipts_before, receipts_after,
+        "schema_versions must be unchanged"
+    );
+    assert!(table_exists(&conn, "memory_episode").await);
+    assert!(table_exists(&conn, "memory_episode_evidence").await);
+    assert!(table_exists(&conn, "memory_projection_state").await);
+}
+
+/// `_down.sql` drops the three tables in FK-reverse order (evidence before
+/// episode, projection_state last) and leaves no memory table behind.
+#[tokio::test]
+async fn memory_core_down_drops_all() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+    assert!(table_exists(&conn, "memory_episode").await);
+    assert!(table_exists(&conn, "memory_episode_evidence").await);
+    assert!(table_exists(&conn, "memory_projection_state").await);
+
+    // The DM-01 migration is registered above the pre-DM-01 tip (2026092701);
+    // rolling back to that tip applies only the memory_core down.
+    let runner = all_builtin_runner().expect("builtin registry must build clean");
+    let rolled = runner
+        .rollback_to(&conn, 2026092701)
+        .await
+        .expect("rollback to pre-DM-01 tip");
+    assert_eq!(
+        rolled,
+        vec![2026092901],
+        "only DM-01 is above the target tip"
+    );
+
+    assert!(!table_exists(&conn, "memory_episode").await);
+    assert!(!table_exists(&conn, "memory_episode_evidence").await);
+    assert!(!table_exists(&conn, "memory_projection_state").await);
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026092701)
+    );
+}
+
+/// DM-01 registers to the Repository role only. Creating (and upgrading) the
+/// repository database must never write a receipt into (or add memory tables
+/// to) the global / system configuration databases.
+#[tokio::test]
+#[serial(env)]
+async fn memory_core_is_repository_role_only() {
+    let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    for (role, path) in [
+        (
+            DatabaseRole::GlobalConfig,
+            fixture.global_db().to_path_buf(),
+        ),
+        (
+            DatabaseRole::SystemConfig,
+            fixture.system_db().to_path_buf(),
+        ),
+    ] {
+        let conn = db::create_database_for_role(path.to_str().unwrap(), role)
+            .await
+            .expect("create config database");
+        assert_eq!(
+            columns_of(&conn, "configuration_schema_versions")
+                .await
+                .iter()
+                .map(|col| col.name.as_str())
+                .collect::<Vec<_>>(),
+            ["version", "name", "applied_at"],
+            "configuration ledger shape must be unchanged by DM-01"
+        );
+        assert!(
+            !table_exists(&conn, "memory_episode").await,
+            "config database must not contain repository memory tables"
+        );
+        assert!(
+            !table_exists(&conn, "memory_projection_state").await,
+            "config database must not contain repository memory tables"
+        );
+        conn.close().await.expect("close config database");
+    }
+
+    let repo_path = fixture.root().join("repo.db");
+    let conn = db::create_database(repo_path.to_str().unwrap())
+        .await
+        .expect("create repository database");
+    assert!(table_exists(&conn, "memory_episode").await);
+    assert!(table_exists(&conn, "memory_episode_evidence").await);
+    assert!(table_exists(&conn, "memory_projection_state").await);
+    let current = db::migration::current_builtin_schema_version_readonly(&conn)
+        .await
+        .expect("read repository tip")
+        .expect("repository applied tip");
+    assert_eq!(
+        Some(current),
+        all_builtin_runner().unwrap().max_registered_version(),
+        "repository tip must be the DM-01 migration"
+    );
+    conn.close().await.expect("close repository database");
 }
