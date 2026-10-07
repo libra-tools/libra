@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.30.35] — 2026-10-07
+
+### Memory path / search-document projection schema (plan-20260926 DM-10)
+
+- Add the internal `2026092902_memory_path_search` forward-only migration
+  creating two zero-authority, rebuildable projection tables
+  (`memory_episode_path` for path recall and `memory_episode_search_doc` as the
+  FTS5 external-content content table) that back the upcoming `libra memory`
+  determinism surface. No public CLI behavior changes.
+
 ## [0.30.34] — 2026-10-07
 
 ### User hook config path alignment (plan-20260919 GCX-04)
