@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.30.34] — 2026-10-07
+
+### User hook config path alignment (plan-20260919 GCX-04)
+
+- User-tier hook configuration now resolves under the same XDG directory as
+  the global config (`<XDG_CONFIG_HOME or ~/.config>/libra/hooks.json`) instead
+  of `dirs::config_dir()`, so all per-user state lives in one place. A
+  read-only fallback to the legacy location is kept on any platform where the
+  native config directory differs from the new path; on Linux the two coincide
+  (no-op), and the behavior is generalized from the ADR's macOS case to also
+  cover Windows. Hooks are loaded read-only.
+
 ## [0.30.33] — 2026-10-07
 
 ### Global vault unseal key relocation (plan-20260919 GCX-03)
