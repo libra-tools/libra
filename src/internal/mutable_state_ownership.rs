@@ -510,6 +510,10 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "memory_episode",
     "memory_episode_evidence",
     "memory_projection_state",
+    // plan-20260926 DM-10 path + search-document projection tables (same
+    // zero-authority, rebuildable, repository-scoped classification).
+    "memory_episode_path",
+    "memory_episode_search_doc",
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
     "operation_scope_provenance_down_guard",

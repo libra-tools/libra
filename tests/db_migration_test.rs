@@ -8,7 +8,7 @@ use std::{ffi::OsStr, panic::AssertUnwindSafe, path::PathBuf};
 
 use libra::{
     internal::db::{
-        self, DatabaseRole,
+        self, DatabaseRole, SchemaCompatibility,
         migration::{
             Migration, MigrationError, MigrationRunner, builtin_migrations,
             builtin_runner as all_builtin_runner,
@@ -5364,12 +5364,17 @@ async fn columns_of(conn: &DatabaseConnection, table: &str) -> Vec<ColumnInfo> {
 
 /// DM-01 up must create exactly the three zero-authority projection tables
 /// listed in the plan's "Schema 规范" (DM-01 rows only). `memory_episode_path`
-/// and `memory_episode_search_doc` belong to DM-10 and must NOT appear here.
+/// and `memory_episode_search_doc` belong to DM-10 and must NOT appear at this
+/// point, so this test applies the registry only up to the DM-01 tip.
 #[tokio::test]
 async fn memory_core_creates_three_tables() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
-    run_all_builtin_migrations(&conn).await.expect("migrations");
+    all_builtin_runner()
+        .expect("builtin registry must build clean")
+        .run_pending_up_to(&conn, 2026092901)
+        .await
+        .expect("apply up to DM-01");
 
     assert!(table_exists(&conn, "memory_episode").await);
     assert!(table_exists(&conn, "memory_episode_evidence").await);
@@ -5589,22 +5594,24 @@ async fn memory_core_down_drops_all() {
     assert!(table_exists(&conn, "memory_episode_evidence").await);
     assert!(table_exists(&conn, "memory_projection_state").await);
 
-    // The DM-01 migration is registered above the pre-DM-01 tip (2026092701);
-    // rolling back to that tip applies only the memory_core down.
+    // Rolling back to the pre-memory tip (2026092701) applies the DM-10 down
+    // first (2026092902) then the DM-01 down (2026092901), both above the tip.
     let runner = all_builtin_runner().expect("builtin registry must build clean");
     let rolled = runner
         .rollback_to(&conn, 2026092701)
         .await
-        .expect("rollback to pre-DM-01 tip");
+        .expect("rollback to pre-memory tip");
     assert_eq!(
         rolled,
-        vec![2026092901],
-        "only DM-01 is above the target tip"
+        vec![2026092902, 2026092901],
+        "both memory migrations are above the target tip"
     );
 
     assert!(!table_exists(&conn, "memory_episode").await);
     assert!(!table_exists(&conn, "memory_episode_evidence").await);
     assert!(!table_exists(&conn, "memory_projection_state").await);
+    assert!(!table_exists(&conn, "memory_episode_path").await);
+    assert!(!table_exists(&conn, "memory_episode_search_doc").await);
     assert_eq!(
         runner
             .current_version(&conn)
@@ -5669,6 +5676,253 @@ async fn memory_core_is_repository_role_only() {
         Some(current),
         all_builtin_runner().unwrap().max_registered_version(),
         "repository tip must be the DM-01 migration"
+    );
+    conn.close().await.expect("close repository database");
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260926 DM-10: `2026092902_memory_path_search` path + search-doc schema
+// ---------------------------------------------------------------------------
+
+/// DM-10 up must create exactly the two path/search-document projection tables
+/// listed in the plan's "Schema 规范" (DM-10 rows only), alongside the DM-01
+/// core tables (which are the FK targets). The FTS5 virtual table is DM-08.
+#[tokio::test]
+async fn memory_path_search_creates_two_tables() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+
+    assert!(table_exists(&conn, "memory_episode_path").await);
+    assert!(table_exists(&conn, "memory_episode_search_doc").await);
+    // DM-01 core tables are the FK targets and must still be present.
+    assert!(table_exists(&conn, "memory_episode").await);
+    // DM-08 owns the FTS5 virtual table, not this migration.
+    assert!(
+        !table_exists(&conn, "memory_episode_fts").await,
+        "the FTS5 virtual table is created by DM-08, not DM-10"
+    );
+}
+
+/// The `(code_path, ended_at DESC)` index must serve the DM-04 recall query
+/// rather than triggering a full table scan.
+#[tokio::test]
+async fn memory_path_index_is_used_by_recall_query() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+
+    let plan = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "EXPLAIN QUERY PLAN \
+             SELECT episode_id FROM memory_episode_path \
+             WHERE code_path = X'2F737263' \
+             ORDER BY ended_at DESC LIMIT 1",
+        ))
+        .await
+        .expect("explain");
+    let detail: String = plan
+        .iter()
+        .filter_map(|row| row.try_get_by::<String, _>("detail").ok())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        detail.contains("idx_memory_episode_path_code_path_ended_at"),
+        "the path recall query must use its composite index: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN memory_episode_path"),
+        "the path recall query must not scan the path table: {detail}"
+    );
+}
+
+/// Re-running the migration on an already-applied database is a no-op.
+#[tokio::test]
+async fn memory_path_search_second_run_is_noop() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("first run");
+
+    let receipts_before: i64 = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) FROM schema_versions",
+        ))
+        .await
+        .expect("count receipts")
+        .expect("count row")
+        .try_get_by_index(0)
+        .expect("count value");
+
+    let second = run_all_builtin_migrations(&conn)
+        .await
+        .expect("second run must not error");
+    assert!(
+        second.is_empty(),
+        "second run must apply nothing: {second:?}"
+    );
+
+    let receipts_after: i64 = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) FROM schema_versions",
+        ))
+        .await
+        .expect("count receipts")
+        .expect("count row")
+        .try_get_by_index(0)
+        .expect("count value");
+    assert_eq!(
+        receipts_before, receipts_after,
+        "schema_versions must be unchanged"
+    );
+    assert!(table_exists(&conn, "memory_episode_path").await);
+    assert!(table_exists(&conn, "memory_episode_search_doc").await);
+}
+
+/// `_down.sql` drops the two path/search-document tables in FK-reverse order,
+/// leaving the DM-01 core tables intact.
+#[tokio::test]
+async fn memory_path_search_down_drops_all() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+    assert!(table_exists(&conn, "memory_episode_path").await);
+    assert!(table_exists(&conn, "memory_episode_search_doc").await);
+
+    // The DM-10 migration is registered immediately above the DM-01 tip
+    // (2026092901); rolling back to that tip applies only the DM-10 down.
+    let runner = all_builtin_runner().expect("builtin registry must build clean");
+    let rolled = runner
+        .rollback_to(&conn, 2026092901)
+        .await
+        .expect("rollback to the DM-01 tip");
+    assert_eq!(
+        rolled,
+        vec![2026092902],
+        "only DM-10 is above the target tip"
+    );
+
+    assert!(!table_exists(&conn, "memory_episode_path").await);
+    assert!(!table_exists(&conn, "memory_episode_search_doc").await);
+    // DM-01 core tables survive the DM-10 down.
+    assert!(table_exists(&conn, "memory_episode").await);
+    assert!(table_exists(&conn, "memory_projection_state").await);
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026092901)
+    );
+}
+
+/// A binary whose registry is truncated at the pre-memory tip (2026092701) must
+/// treat a repository already at the DM-10 tip (2026092902) as a future schema
+/// (UnsupportedFuture), while the full-resolved binary can still open it.
+#[tokio::test]
+async fn memory_path_search_simulated_old_runner_rejects_future_schema() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_all_builtin_migrations(&conn).await.expect("migrations");
+    assert_eq!(
+        all_builtin_runner()
+            .expect("full runner")
+            .current_version_readonly(&conn)
+            .await
+            .expect("read current"),
+        Some(2026092902),
+        "the full-resolved binary sees the repository at the DM-10 tip"
+    );
+
+    // The pretend old binary: registry truncated to the pre-memory tip.
+    let mut old = MigrationRunner::new();
+    old.extend(
+        builtin_migrations()
+            .into_iter()
+            .filter(|migration| migration.version <= 2026092701),
+    )
+    .expect("truncated registry must be strictly monotonic");
+    let current = old
+        .current_version_readonly(&conn)
+        .await
+        .expect("old runner reads the DB version")
+        .expect("an applied version is recorded");
+    let latest = old
+        .max_registered_version()
+        .expect("old binary registry tip");
+    assert_eq!(current, 2026092902);
+    assert_eq!(latest, 2026092701);
+
+    // The old binary's future-schema predicate (current > latest) is exactly
+    // the UnsupportedFuture branch used by `schema::inspect_schema_for_connection`.
+    let compatibility = if current > latest {
+        SchemaCompatibility::UnsupportedFuture {
+            current_version: current,
+            latest_version: Some(latest),
+        }
+    } else {
+        SchemaCompatibility::Compatible {
+            current_version: Some(current),
+            latest_version: Some(latest),
+        }
+    };
+    assert!(
+        matches!(
+            compatibility,
+            SchemaCompatibility::UnsupportedFuture {
+                current_version: 2026092902,
+                latest_version: Some(2026092701)
+            }
+        ),
+        "the old binary must refuse the DM-10-schema repository as UnsupportedFuture"
+    );
+}
+
+/// DM-10 registers to the Repository role only; config databases stay untouched.
+#[tokio::test]
+#[serial(env)]
+async fn memory_path_search_is_repository_role_only() {
+    let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    for (role, path) in [
+        (
+            DatabaseRole::GlobalConfig,
+            fixture.global_db().to_path_buf(),
+        ),
+        (
+            DatabaseRole::SystemConfig,
+            fixture.system_db().to_path_buf(),
+        ),
+    ] {
+        let conn = db::create_database_for_role(path.to_str().unwrap(), role)
+            .await
+            .expect("create config database");
+        assert!(
+            !table_exists(&conn, "memory_episode_path").await,
+            "config database must not contain repository memory tables"
+        );
+        assert!(
+            !table_exists(&conn, "memory_episode_search_doc").await,
+            "config database must not contain repository memory tables"
+        );
+        conn.close().await.expect("close config database");
+    }
+
+    let repo_path = fixture.root().join("repo.db");
+    let conn = db::create_database(repo_path.to_str().unwrap())
+        .await
+        .expect("create repository database");
+    assert!(table_exists(&conn, "memory_episode_path").await);
+    assert!(table_exists(&conn, "memory_episode_search_doc").await);
+    let current = db::migration::current_builtin_schema_version_readonly(&conn)
+        .await
+        .expect("read repository tip")
+        .expect("repository applied tip");
+    assert_eq!(
+        Some(current),
+        all_builtin_runner().unwrap().max_registered_version(),
+        "repository tip must be the DM-10 migration"
     );
     conn.close().await.expect("close repository database");
 }

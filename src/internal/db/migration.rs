@@ -1907,6 +1907,19 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026092901_memory_core.sql"),
             include_str!("../../../sql/migrations/2026092901_memory_core_down.sql"),
         ),
+        // plan-20260926 DM-10 (migration B): path + search-document projection
+        // schema. Two zero-authority, rebuildable side tables (GC-DM-01);
+        // forward-only (ADR-DM-13). `memory_episode_path` serves DM-04 path
+        // recall; `memory_episode_search_doc` is the DM-08 FTS5 external-content
+        // content table. Registered above the current tip (2026092901); the
+        // `_down.sql` is a controlled test/ops tool, not the published rollback
+        // path. Older binaries reopen this database as UnsupportedFuture.
+        sql_migration(
+            2026092902,
+            "memory_path_search",
+            include_str!("../../../sql/migrations/2026092902_memory_path_search.sql"),
+            include_str!("../../../sql/migrations/2026092902_memory_path_search_down.sql"),
+        ),
     ]
 }
 
@@ -2367,9 +2380,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 67);
+        assert_eq!(runner.len(), 68);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026092901));
+        assert_eq!(runner.max_registered_version(), Some(2026092902));
     }
 
     #[test]

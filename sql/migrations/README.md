@@ -190,6 +190,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026091802` | `operation_v2_dedup_index` | `2026091802_operation_v2_dedup_index.sql` (OL-15 follow-up repair for the v2 five-second duplicate-operation lookup.) |
 | `2026092701` | `ai_task_run_base_commit_ref` | `2026090701_ai_task_run_base_commit_ref{,_down}.sql` (B3-16: additive nullable `base_commit_ref` on `ai_index_task_run`; the SQL filename keeps the #456-era `2026090701` while the registered version is `2026092701`, which must sit above the then-current tip `2026091901` so `run_pending` replays it.) |
 | `2026092901` | `memory_core` | `2026092901_memory_core{,_down}.sql` (plan-20260926 DM-01 / migration A: zero-authority, rebuildable Episode projection schema — `memory_episode`, `memory_episode_evidence`, `memory_projection_state`; forward-only per ADR-DM-13; the `_down.sql` is a controlled test/ops tool, not the published rollback path.) |
+| `2026092902` | `memory_path_search` | `2026092902_memory_path_search{,_down}.sql` (plan-20260926 DM-10 / migration B: zero-authority, rebuildable path + search-document projection schema — `memory_episode_path` and `memory_episode_search_doc`; forward-only per ADR-DM-13; the `_down.sql` is a controlled test/ops tool, not the published rollback path.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
