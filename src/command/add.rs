@@ -77,7 +77,7 @@ EXAMPLES:
 // at the bottom of `libra add --help`. The meta-commentary that used to live
 // here as a `///` line leaked into clap's `--help` body (see
 // `tests/command/add_test.rs::test_add_help_does_not_leak_impl_meta`).
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(after_help = ADD_EXAMPLES)]
 pub struct AddArgs {
     /// pathspec... files & dir to add content from.

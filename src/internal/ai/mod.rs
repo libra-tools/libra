@@ -22,6 +22,10 @@ pub mod capture;
 pub mod subagent_content;
 // Canonical repo/worktree/workspace ownership for capture/import/export rows.
 pub mod capture_scope;
+// plan-20260926 MEM-01/02 deterministic Episode projection (doc-hidden; the
+// `memory` command surface is added in DM-03, so this is not user-visible yet).
+#[doc(hidden)]
+pub mod memory;
 // PD-02 checkpoint-scoped review/investigate input materialization.
 pub mod checkpoint_input;
 // Completion-model trait and request/response types.
