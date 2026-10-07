@@ -1803,6 +1803,10 @@ pub(crate) mod tests {
     use super::*;
 
     const PKT11_SENTINEL: &str = "PKT11_REMOTE_SECRET_8dcbf3\x1b[31m\rspoof";
+    #[cfg(unix)]
+    const PKT11_FIXTURE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+    #[cfg(unix)]
+    const PKT11_FIXTURE_OUTER_TIMEOUT: Duration = Duration::from_secs(45);
 
     #[derive(Clone, Default)]
     struct Pkt11Trace(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1977,10 +1981,10 @@ pub(crate) mod tests {
         let _ssh = ScopedEnvVar::set("LIBRA_SSH_COMMAND", &fixture.script);
         let client = SshClient::from_ssh_spec("git@fixture.invalid:repo")
             .unwrap()
-            .with_idle_timeout(Duration::from_secs(2));
+            .with_idle_timeout(PKT11_FIXTURE_IDLE_TIMEOUT);
         let trace = Pkt11Trace::default();
         let error = tokio::time::timeout(
-            Duration::from_secs(10),
+            PKT11_FIXTURE_OUTER_TIMEOUT,
             async {
                 match phase {
                     "discovery" => client
@@ -3840,7 +3844,7 @@ pub(crate) mod tests {
             .with_strict_host_key_checking("ask".to_string())
             .unwrap()
             .with_host_key_confirmation(confirmation)
-            .with_idle_timeout(Duration::from_secs(2));
+            .with_idle_timeout(PKT11_FIXTURE_IDLE_TIMEOUT);
         (client, ssh_guard, keyscan_guard)
     }
 
@@ -4050,7 +4054,7 @@ pub(crate) mod tests {
             .with_strict_host_key_checking("ask".to_string())
             .unwrap()
             .with_host_key_confirmation(confirmation)
-            .with_idle_timeout(Duration::from_secs(2));
+            .with_idle_timeout(PKT11_FIXTURE_IDLE_TIMEOUT);
         let error = client
             .discovery_reference(ServiceType::UploadPack)
             .await

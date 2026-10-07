@@ -455,3 +455,23 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 日期计划：`plan-20260708`、`plan-20260713`、`plan-20260714`、`plan-20260715`（历史完成、Code 产品面已拆除）、`plan-20260818`、`plan-20260821`、`plan-20260824`（历史完成、Code 产品面已拆除）、`plan-20260825`（历史完成、PS 产品轴已拆除；TA 测试轴保留历史）、`plan-20260827`、`plan-20260901`、`plan-20260910`、`plan-20260917`、`plan-20260920`。
 
 Issue 计划：`issues/477`（31 卡，v0.22.49）、`issues/486`（AB-01，v0.22.31）、`issues/497`（CD-01..CD-04，v0.27.2；PR #581 squash merge `859d7fb`）、`issues/498`（TT-05/TT-02，v0.30.22 / v0.30.23；#498 CLOSED）。各自完成判据见对应计划文件。
+
+### 2026-10-07：FIX-RG-SSH-01 独立0.30.35发布提案（审批前）
+
+plan-20260904新增ER10前驱FIX-RG-SSH-01，in-progress/locally-accepted，7/7AC、3/3VER。实际main c0eaae5/package0.30.34上的test-only SSH及版本面0.30.35五文件候选macOS全量9507/9507 PASS（13slow、2LEAK、5skip、817.873s、exit0）；SSH族32/32仅single-threaded diagnostic，旧并发31/32历史保留。两LEAK各三次无重试孤立PASS、根因未明；完整R2 blob diff及installer LF/未改hook EOL/PTY parent边界见任务卡。R2限定发布提案只追加本卡和本状态段，不引入尚未交付的RG/OG实现或aggregate dirty写集；七文件最终树C组未执行、独立双审材料修订待复核，未commit/push/PR/merge/tag/release，不能记done/complete。Linux功能由用户后验；新版本不是tag预留，发布前重新核对actual refs。
+
+### 2026-10-07 14:00:42 UTC：用户指定#618顺序后的当前0.30.36发布候选
+
+用户明确要求「上游已经有一个PR更新到0.30.35，#618编号，请顺延发布新的版本」；当前active版本改为0.30.36，0.30.35留给#618。该指令授权当前独立FIX-RG-SSH-01发布及必要签名提交/推送/PR/checks/merge/tag/release步骤，先完成具体候选验收与双审，不再把旧“未获发布授权”的历史状态当当前决定。只处理本卡切片，保留root其它dirty及native Source A NO-GO；Linux功能仍由用户后验。
+
+最新只读事实：#618 open/head5a5e5e2b4dca21e2e1e7357075c7f806286291f9当前三版本面仍0.30.34；main仍c0eaae5d9bf4e9cfae035d61b759b0ac80799db7，refs查询未返回v0.30.35/v0.30.36。0.30.35是按用户发布顺序留给该PR，不冒称已有tag或已合并。本0.30.36树目前只是c0eaae5上provisional准备；正式C组必须重新pin到#618实际合入且package0.30.35的main，按真实patch+1重新检验，并等待其发布窗口结束后发布本卡。不得把未合并#618 migration夹带进本卡I或替别人merge该PR。
+
+旧完整0.30.35五文件候选9507/9507绿保留为历史；追加卡/status后的七文件重验已因本次顺延仅向owned Nextest SIGINT，中止结果7396/9507 passed（10slow、3LEAK、5skip）、2111未运行、exit100、源1982/1982字节/mode MATCH，明确CANCELLED/SUPERSEDED而非PASS，未运行该轮release/private install。新0.30.36只改三版本面，Cargo metadata --offline由工具链刷新self package lock一行，无依赖变化；SSH代码逐byte相同。当前无正式C/D完成或publication事实。
+
+### 2026-10-07T15:30:36.955151+00:00：0.30.36最终基线准备
+
+实际merged main=9a92e7fbf3af34ce8cbf9b1a7a5b9574b18ef83f、package0.30.35，包含#618 merge=c384bc7757ccea6f47b70df2cdd72fb528860713；v0.30.35 tag=c384bc7757ccea6f47b70df2cdd72fb528860713，唯一release workflow=37641579067 completed/failure，先前窗口已结束；不把其失败写成绿色。本候选是该真实基线上的0.30.36 patch+1；此前c0/package0.30.34只是provisional历史，未用旧全量绿代替本树验收。
+
+仅SSH cfg(test)期限切片、三版本面与toolchain self-lock、FIX卡/status文档，既有upstream代码不成为本卡I写集。完整patch zero-offset/fuzz准入，尚待本最终冻结树的focused/full/fmt/strictClippy/build/install及fresh独立双审、签名commit/push/PR检查/tag/release/D证据；不得提前complete。用户已授权0.30.36发布，Linux功能仍由用户后验；Source A native NO-GO及其它任务卡门不变。
+
+上游.35 tag与package补交提交不一致的事实独立保留；本卡既不改写他人tag也不冒认该窗口绿色。窗口terminal后前滚发布自有0.30.36；发布前重新核对main/tag与串行占用。
