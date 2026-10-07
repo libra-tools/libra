@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.37] — 2026-10-08
+
+### Commit/change Episode derivation (plan-20260926 DM-02)
+
+- Add the internal `src/internal/ai/memory/` deterministic Episode projection
+  layer (doc-hidden): Episode domain types, deterministic `episode_id`
+  (UUIDv5) + `content_digest`, the commit/change adapter (current revision
+  selection, multi-revision aggregation, frozen outcome mapping, `commit`
+  evidence edges), and a projection writer into the DM-01/DM-10 tables. No
+  public CLI behavior change (the `memory` command is DM-03).
+
 ## [0.30.35] — 2026-10-07
 
 ### Memory path / search-document projection schema (plan-20260926 DM-10)
