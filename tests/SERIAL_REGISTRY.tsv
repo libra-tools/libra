@@ -913,3 +913,4 @@ opencode_export_whole_session_idempotent	lane:opencode_export_bridge	shares envi
 opencode_historical_import_e2e_uses_trusted_export_bytes	lane:opencode_export_bridge	shares environment and repository state with OpenCode export bridge integration tests
 opencode_registered_failure_releases_dirty_job_claim_and_marker	lane:opencode_export_bridge	shares environment and repository state with OpenCode export bridge integration tests
 memory_core_is_repository_role_only	lane:env	uses the shared config database fixture to prove DM-01 registers to Repository role only
+memory_path_search_is_repository_role_only	lane:env	uses the shared config database fixture to prove DM-10 registers to Repository role only

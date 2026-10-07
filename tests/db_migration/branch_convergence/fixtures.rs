@@ -18,6 +18,7 @@ pub(super) const CHANGE_IDENTITY_PREFIX_INDEX_REPAIR: i64 = 2026090803;
 pub(super) const BOUNDARY_CLAIM_COLUMNS: i64 = 2026091901;
 pub(super) const AI_TASK_RUN_BASE_COMMIT_REF: i64 = 2026092701;
 pub(super) const MEMORY_CORE: i64 = 2026092901;
+pub(super) const MEMORY_PATH_SEARCH: i64 = 2026092902;
 
 pub(super) async fn branch_database(tip: i64) -> (TempDir, PathBuf, DatabaseConnection) {
     assert!([OPERATION_V2, CONFIG_REPAIR].contains(&tip));
