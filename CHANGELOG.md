@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.32] — 2026-10-07
+
+### Global config database auto-migration (plan-20260919 GCX-02)
+
+- The legacy `~/.libra/config.db` is migrated on first use into the XDG global
+  configuration directory (`<XDG_CONFIG_HOME or ~/.config>/libra/config.db`)
+  under an exclusive cross-process lock, using a `VACUUM INTO` snapshot plus
+  integrity and row checks and an atomic same-directory rename. The legacy file
+  is never modified or deleted; a failed migration falls back to the legacy
+  read path with a one-time warning and fails closed on writes (`LBR-IO-002`).
+
 ## [0.30.31] — 2026-10-07
 
 ### Memory core projection schema (plan-20260926 DM-01)
