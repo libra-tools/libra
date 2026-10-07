@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.30.33] — 2026-10-07
+
+### Global vault unseal key relocation (plan-20260919 GCX-03)
+
+- The per-user global vault unseal key is moved alongside the global config
+  into the XDG directory (`<XDG_CONFIG_HOME or ~/.config>/libra/vault-unseal-key`)
+  and migrated on first use (0600 key / 0700 directory, atomic temp+rename). The
+  legacy `~/.libra/vault-unseal-key` is preserved untouched; a readable-but-
+  wrong-length key now fails closed (no silent rotation), and only the active
+  key is repaired for 0600 mode. Decryption of previously written global values
+  is unchanged by the migration.
+
 ## [0.30.32] — 2026-10-07
 
 ### Global config database auto-migration (plan-20260919 GCX-02)
