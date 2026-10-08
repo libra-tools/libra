@@ -239,12 +239,26 @@ attestation；这也不是完整健康诊断。默认 doctor 的只读报告与 
 
 设置配置值。如果省略 `<value>` 且 key 是敏感 key，Libra 会交互式提示输入（隐藏回显）。在非交互上下文（CI/CD）中，使用 `--stdin` 管道传入值。
 
+配置键按字面匹配：`_`、`%` 和 `\` 不会选中邻近键。例如，设置
+`custom.cache%name.value` 不会改动 `custom.cache_name.value`。存在完全相同
+拼写的键时原位更新；不带 `--add` 时，该键若有多个值则拒绝写入。没有完全相同
+拼写时，`set` 保持原有的 ASCII 大小写不敏感替换行为。完全匹配更新和大小写等价
+替换都会保留已有的加密标记。
+
 | 标志 | 说明 |
 |------|------|
 | `--add` | 将该 key 作为额外值添加，允许重复（类似 Git 的多值 key，如 `remote.origin.fetch`） |
 | `--encrypt` | 即使 key 不匹配敏感 key 启发式，也强制 vault 加密 |
-| `--plaintext` | 强制明文存储，即使看起来像敏感 key 也跳过自动加密 |
+| `--plaintext` | 新键即使看起来敏感也以明文存储；拒绝替换已有加密值或 vault 内部／secret 键 |
 | `--stdin` | 从 stdin 读取值，而不是位置参数（适合在 CI/CD 中管道传 secrets） |
+
+`set` 替换普通的已加密键时，会使用所选 local 或 global 作用域的 vault 保持值加密，
+包括 ASCII 大小写回退。精确键优先于其他拼写；精确键有多个值时仍需先 `unset-all`
+才能单值赋值。`--plaintext` 不能替换已有加密值，会以 `LBR-REPO-003`（exit 128）
+拒绝并保持原配置行。若确实要把普通键改为新的明文值，请用已存储的拼写和作用域执行
+`libra config unset --all [--local | --global] <key>`，再使用 `--plaintext` 设置新值。
+新普通键仍支持明文；vault 内部／secret 键和 system 作用域加密值仍拒绝。
+本修复不会自动恢复旧版本已损坏的值。
 
 ```bash
 # 基本设置
@@ -350,6 +364,8 @@ libra config import --global
 # 导入到本地配置
 libra config import
 ```
+
+若导入条目会把已有的加密普通值替换为明文（例如曾用 `--encrypt` 存储、但不被自动识别为敏感的键），导入会在该键处停止并返回 `LBR-REPO-003`（exit 128）及与 `config set` 相同的恢复提示（含该键名）；本次已写入的条目保留，其余条目不再导入。先用 `config unset --all` 清除该键的每个已存拼写，再重新导入。
 
 #### `path`
 

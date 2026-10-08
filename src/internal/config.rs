@@ -29,8 +29,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ModelTrait,
-    QueryFilter, QueryOrder, entity::ActiveModelTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, ModelTrait, QueryFilter, QueryOrder, entity::ActiveModelTrait,
+    sea_query::LikeExpr,
 };
 
 use crate::{
@@ -75,6 +76,25 @@ impl ConfigKvEntry {
             value: m.value.clone(),
             encrypted: m.encrypted != 0,
         }
+    }
+}
+
+pub(crate) const PLAINTEXT_ENCRYPTED_REPLACEMENT: &str =
+    "cannot replace an encrypted configuration value with plaintext";
+
+/// Physical replacement rows; exact singleton updates preserve its identity.
+pub(crate) struct ConfigSetReplacement {
+    exact: bool,
+    rows: Vec<config_kv::Model>,
+}
+
+impl ConfigSetReplacement {
+    pub(crate) fn entries(&self) -> Vec<ConfigKvEntry> {
+        self.rows.iter().map(ConfigKvEntry::from_model).collect()
+    }
+
+    fn has_encrypted(&self) -> bool {
+        self.rows.iter().any(|row| row.encrypted != 0)
     }
 }
 
@@ -231,6 +251,16 @@ impl ConfigKv {
         value: &str,
         encrypted: bool,
     ) -> Result<()> {
+        let replacement = Self::select_set_replacement_with_conn(db, key).await?;
+        Self::write_set_replacement_with_conn(db, key, value, encrypted, replacement).await
+    }
+
+    /// Select exactly the records a single-value assignment will replace.
+    /// Reads and `add` deliberately retain their own exact-match semantics.
+    pub(crate) async fn select_set_replacement_with_conn<C: ConnectionTrait>(
+        db: &C,
+        key: &str,
+    ) -> Result<ConfigSetReplacement> {
         // Exact-case matches first: a genuinely multi-valued key (built with
         // `add`) refuses `set`, as before.
         let exact = config_kv::Entity::find()
@@ -245,9 +275,61 @@ impl ConfigKv {
                 exact.len()
             ));
         }
-        if let Some(row) = exact.into_iter().next() {
-            // Inherit encryption from the existing exact-case entry.
-            let effective_encrypted = encrypted || row.encrypted != 0;
+        if !exact.is_empty() {
+            return Ok(ConfigSetReplacement {
+                exact: true,
+                rows: exact,
+            });
+        }
+        // No exact-case row: Git config variable names are case-insensitive, so
+        // `set` to a different casing of the same logical key must replace the
+        // other-cased row(s) (e.g. a default `remote.<n>.fetch` written by
+        // `remote add` is superseded by `config set remote.<n>.Fetch`). SQLite
+        // `LIKE` matches ASCII case-insensitively. Escape its pattern characters
+        // so `%`, `_`, and the escape character itself remain literal key bytes.
+        let literal_key = key
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let other_cased = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.like(LikeExpr::new(literal_key).escape('\\')))
+            .all(db)
+            .await
+            .context("failed to query config_kv for case-insensitive set")?;
+        Ok(ConfigSetReplacement {
+            exact: false,
+            rows: other_cased,
+        })
+    }
+
+    /// Recheck prepared ciphertext under the caller's existing SQLite writer lock.
+    /// The caller owns rollback, including its configuration compatibility barrier.
+    pub(crate) async fn set_prepared_with_conn(
+        db: &DatabaseTransaction,
+        key: &str,
+        value: &str,
+        encrypted: bool,
+    ) -> Result<()> {
+        let replacement = Self::select_set_replacement_with_conn(db, key).await?;
+        if !encrypted && replacement.has_encrypted() {
+            return Err(anyhow!(PLAINTEXT_ENCRYPTED_REPLACEMENT));
+        }
+        Self::write_set_replacement_with_conn(db, key, value, encrypted, replacement).await
+    }
+
+    async fn write_set_replacement_with_conn<C: ConnectionTrait>(
+        db: &C,
+        key: &str,
+        value: &str,
+        encrypted: bool,
+        replacement: ConfigSetReplacement,
+    ) -> Result<()> {
+        // The raw storage API retains its historical flag-inheritance contract.
+        let effective_encrypted = encrypted || replacement.has_encrypted();
+        if replacement.exact {
+            let row = replacement.rows.into_iter().next().ok_or_else(|| {
+                anyhow!("exact configuration replacement is missing its selected row")
+            })?;
             let mut active: config_kv::ActiveModel = row.into();
             active.value = Set(value.to_owned());
             active.encrypted = Set(if effective_encrypted { 1 } else { 0 });
@@ -257,19 +339,7 @@ impl ConfigKv {
                 .context("failed to update config_kv")?;
             return Ok(());
         }
-        // No exact-case row: Git config variable names are case-insensitive, so
-        // `set` to a different casing of the same logical key must replace the
-        // other-cased row(s) (e.g. a default `remote.<n>.fetch` written by
-        // `remote add` is superseded by `config set remote.<n>.Fetch`). SQLite
-        // `LIKE` matches ASCII case-insensitively; config keys never contain
-        // `%`/`_`.
-        let other_cased = config_kv::Entity::find()
-            .filter(config_kv::Column::Key.like(key))
-            .all(db)
-            .await
-            .context("failed to query config_kv for case-insensitive set")?;
-        let inherit_encrypted = other_cased.iter().any(|e| e.encrypted != 0);
-        for row in other_cased {
+        for row in replacement.rows {
             row.delete(db)
                 .await
                 .context("failed to remove other-cased config_kv row")?;
@@ -277,7 +347,7 @@ impl ConfigKv {
         let entry = config_kv::ActiveModel {
             key: Set(key.to_owned()),
             value: Set(value.to_owned()),
-            encrypted: Set(if encrypted || inherit_encrypted { 1 } else { 0 }),
+            encrypted: Set(if effective_encrypted { 1 } else { 0 }),
             ..Default::default()
         };
         entry.save(db).await.context("failed to insert config_kv")?;
@@ -3285,6 +3355,461 @@ mod tests {
 
     mod env_restore_tests {
         include!("config/env_restore_tests.rs");
+    }
+
+    #[tokio::test]
+    async fn fix_npr_config_replacement_set() {
+        use crate::internal::db::{begin_write_transaction, create_database};
+        let temp = tempfile::tempdir().unwrap();
+        let db = create_database(temp.path().join("config.db").to_str().unwrap())
+            .await
+            .unwrap();
+        for key in ["probe.under_score", "probe.percent%", r"probe.back\slash"] {
+            let other_case = key.to_ascii_uppercase();
+            let nearby = key.replace('_', "X").replace('%', "Y").replace('\\', "Z");
+            ConfigKv::add_with_conn(&db, &other_case, "synthetic-encrypted", true)
+                .await
+                .unwrap();
+            ConfigKv::add_with_conn(&db, &nearby, "nearby-bytes", false)
+                .await
+                .unwrap();
+            let nearby_before = config_kv::Entity::find()
+                .filter(config_kv::Column::Key.eq(&nearby))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let replacement = ConfigKv::select_set_replacement_with_conn(&db, key)
+                .await
+                .unwrap();
+            assert!(!replacement.exact);
+            assert_eq!(replacement.rows.len(), 1);
+            assert_eq!(replacement.rows[0].key, other_case);
+            assert!(replacement.has_encrypted());
+            // The public raw-storage API retains historical flag inheritance.
+            ConfigKv::set_with_conn(&db, key, "synthetic-raw-bytes", false)
+                .await
+                .unwrap();
+            let exact = ConfigKv::select_set_replacement_with_conn(&db, key)
+                .await
+                .unwrap();
+            assert!(exact.exact && exact.has_encrypted());
+            let before = exact.rows[0].clone();
+            let txn = begin_write_transaction(&db).await.unwrap();
+            let error = ConfigKv::set_prepared_with_conn(&txn, key, "rejected-plaintext", false)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "cannot replace an encrypted configuration value with plaintext"
+            );
+            txn.rollback().await.unwrap();
+            assert_eq!(
+                ConfigKv::select_set_replacement_with_conn(&db, key)
+                    .await
+                    .unwrap()
+                    .rows[0],
+                before
+            );
+            let txn = begin_write_transaction(&db).await.unwrap();
+            ConfigKv::set_prepared_with_conn(&txn, key, "prepared-ciphertext", true)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let after = ConfigKv::select_set_replacement_with_conn(&db, key)
+                .await
+                .unwrap()
+                .rows
+                .remove(0);
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.encrypted, 1);
+            assert_eq!(
+                config_kv::Entity::find_by_id(nearby_before.id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                nearby_before
+            );
+        }
+        ConfigKv::add_with_conn(&db, "multi.value", "first", false)
+            .await
+            .unwrap();
+        ConfigKv::add_with_conn(&db, "multi.value", "second", false)
+            .await
+            .unwrap();
+        let before = ConfigKv::get_all_with_conn(&db, "multi.value")
+            .await
+            .unwrap();
+        assert!(
+            ConfigKv::select_set_replacement_with_conn(&db, "multi.value")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ConfigKv::get_all_with_conn(&db, "multi.value")
+                .await
+                .unwrap(),
+            before
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fix_npr_config_transaction_encryption_recheck() {
+        use sea_orm::Statement;
+
+        use crate::internal::db::{
+            begin_write_transaction, write_configuration_barrier as write_real_barrier_for_fixture,
+        };
+        async fn receipts(
+            db: &DatabaseConnection,
+            table: &str,
+        ) -> Option<Vec<(i64, String, String)>> {
+            let exists: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    [table.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            if exists == 0 {
+                return None;
+            }
+            Some(
+                db.query_all_raw(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT version, name, applied_at FROM {table} ORDER BY version"),
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get_by_index(0).unwrap(),
+                        row.try_get_by_index(1).unwrap(),
+                        row.try_get_by_index(2).unwrap(),
+                    )
+                })
+                .collect(),
+            )
+        }
+        for spelling in ["probe.value", "PROBE.Value"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("global.db");
+            let a = schema::create_configuration_database(&path, DatabaseRole::GlobalConfig)
+                .await
+                .unwrap();
+            let b = schema::open_configuration_database(&path, DatabaseRole::GlobalConfig)
+                .await
+                .unwrap();
+            let barrier = schema::schema_manifest().configuration_barrier;
+            ConfigKv::set_with_conn(&a, "probe.value", "original-plaintext", false)
+                .await
+                .unwrap();
+            assert!(
+                !ConfigKv::select_set_replacement_with_conn(&a, spelling)
+                    .await
+                    .unwrap()
+                    .has_encrypted()
+            );
+            // Connection B commits the real state change after A's preflight,
+            // before A acquires its writer lock. No sleeps or mock database.
+            let change = begin_write_transaction(&b).await.unwrap();
+            ConfigKv::set_with_conn(&change, "probe.value", "synthetic-new-ciphertext", true)
+                .await
+                .unwrap();
+            change.commit().await.unwrap();
+            let rows_before = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&a)
+                .await
+                .unwrap();
+            let legacy_before = receipts(&a, "schema_versions").await;
+            let scoped_before = receipts(&a, "configuration_schema_versions").await;
+            let txn = begin_write_transaction(&a).await.unwrap();
+            // Use the real barrier writer; this cfg(test) fixture is not an
+            // additional production mutation entrypoint.
+            write_real_barrier_for_fixture(&txn, DatabaseRole::GlobalConfig)
+                .await
+                .unwrap();
+            let barrier_count: i64 = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    txn.get_database_backend(),
+                    "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
+                    [barrier.version.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get_by_index(0)
+                .unwrap();
+            assert_eq!(
+                barrier_count, 1,
+                "exercise a real pending barrier write before rollback"
+            );
+            let error =
+                ConfigKv::set_prepared_with_conn(&txn, spelling, "stale-prepared-plaintext", false)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.to_string(), PLAINTEXT_ENCRYPTED_REPLACEMENT);
+            txn.rollback().await.unwrap();
+            assert_eq!(
+                config_kv::Entity::find()
+                    .order_by_asc(config_kv::Column::Id)
+                    .all(&a)
+                    .await
+                    .unwrap(),
+                rows_before
+            );
+            assert_eq!(receipts(&a, "schema_versions").await, legacy_before);
+            assert_eq!(
+                receipts(&a, "configuration_schema_versions").await,
+                scoped_before
+            );
+            b.close().await.unwrap();
+            a.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn npr_19_literal() {
+        let temp = tempfile::tempdir().expect("isolated config database directory");
+        let path = temp.path().join("config.db");
+        let db = crate::internal::db::create_database(path.to_str().expect("UTF-8 database path"))
+            .await
+            .expect("create isolated config database");
+        for (requested, nearby) in [
+            (
+                "probe.under_score.value",
+                [
+                    "probe.underXscore.value",
+                    "probe.under%score.value",
+                    r"probe.under\score.value",
+                ],
+            ),
+            (
+                "probe.per%cent.value",
+                [
+                    "probe.percent.value",
+                    "probe.per_cent.value",
+                    r"probe.per\cent.value",
+                ],
+            ),
+            (
+                r"probe.back\slash.value",
+                [
+                    "probe.backslash.value",
+                    r"probe.back\\slash.value",
+                    r"probe.back\other.value",
+                ],
+            ),
+        ] {
+            for (index, key) in nearby.into_iter().enumerate() {
+                ConfigKv::add_with_conn(
+                    &db,
+                    key,
+                    &format!("neighbor-byte-canary:{index}\0\n雪"),
+                    index % 2 == 0,
+                )
+                .await
+                .expect("seed distinct nearby key");
+            }
+            let before = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("snapshot all physical config rows");
+            ConfigKv::set_with_conn(&db, requested, "new literal value", false)
+                .await
+                .expect("set literal key");
+            let after = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("read physical config rows after set");
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|row| row.key != requested)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                before,
+                "nearby key IDs, value bytes and encryption flags must remain unchanged: {requested}"
+            );
+            assert_eq!(
+                ConfigKv::get_all_with_conn(&db, requested)
+                    .await
+                    .expect("read newly inserted literal key"),
+                [ConfigKvEntry {
+                    key: requested.to_owned(),
+                    value: "new literal value".to_owned(),
+                    encrypted: false,
+                }],
+                "encrypted nearby keys must not promote the distinct new key"
+            );
+        }
+        db.close().await.expect("close isolated config database");
+    }
+
+    #[tokio::test]
+    async fn npr_19_case() {
+        let temp = tempfile::tempdir().expect("isolated config database directory");
+        let path = temp.path().join("config.db");
+        let db = crate::internal::db::create_database(path.to_str().expect("UTF-8 database path"))
+            .await
+            .expect("create isolated config database");
+        for (name, inherited, explicit) in [
+            ("inherited", true, false),
+            ("explicit", false, true),
+            ("plaintext", false, false),
+        ] {
+            let aliases = [format!("CASE.{name}.Value"), format!("case.{name}.VALUE")];
+            let requested = format!("CaSe.{name}.value");
+            ConfigKv::add_with_conn(&db, &aliases[0], "first alias", false)
+                .await
+                .expect("seed first case alias");
+            ConfigKv::add_with_conn(&db, &aliases[1], "second alias", inherited)
+                .await
+                .expect("seed second case alias");
+            ConfigKv::add_with_conn(
+                &db,
+                &format!("case.{name}.value-extra"),
+                "unrelated encrypted canary",
+                true,
+            )
+            .await
+            .expect("seed distinct neighboring key");
+            let unrelated_before = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("snapshot before case replacement")
+                .into_iter()
+                .filter(|row| !aliases.contains(&row.key))
+                .collect::<Vec<_>>();
+            ConfigKv::set_with_conn(&db, &requested, "replacement", explicit)
+                .await
+                .expect("replace ASCII case-equivalent aliases");
+            let after = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("read case replacement rows");
+            assert!(after.iter().all(|row| !aliases.contains(&row.key)));
+            assert_eq!(
+                after
+                    .into_iter()
+                    .filter(|row| row.key != requested)
+                    .collect::<Vec<_>>(),
+                unrelated_before,
+                "case replacement must retain all unrelated physical rows"
+            );
+            assert_eq!(
+                ConfigKv::get_all_with_conn(&db, &requested)
+                    .await
+                    .expect("read replacement"),
+                [ConfigKvEntry {
+                    key: requested,
+                    value: "replacement".to_owned(),
+                    encrypted: inherited || explicit,
+                }]
+            );
+        }
+        db.close().await.expect("close isolated config database");
+    }
+
+    #[tokio::test]
+    async fn npr_19_exact() {
+        let temp = tempfile::tempdir().expect("isolated config database directory");
+        let path = temp.path().join("config.db");
+        let db = crate::internal::db::create_database(path.to_str().expect("UTF-8 database path"))
+            .await
+            .expect("create isolated config database");
+        let exact_key = "case.exact.Value";
+        ConfigKv::add_with_conn(&db, exact_key, "initial", false)
+            .await
+            .expect("seed exact row");
+        ConfigKv::add_with_conn(&db, "CASE.EXACT.VALUE", "case alias must stay", true)
+            .await
+            .expect("seed case alias beside exact row");
+        let original = config_kv::Entity::find()
+            .order_by_asc(config_kv::Column::Id)
+            .all(&db)
+            .await
+            .expect("snapshot exact overwrite fixture");
+        let exact_id = original
+            .iter()
+            .find(|row| row.key == exact_key)
+            .expect("exact fixture row")
+            .id;
+        for (value, requested_encrypted, expected_encrypted) in [
+            ("plain update", false, 0),
+            ("encrypted update", true, 1),
+            ("inherited encrypted update", false, 1),
+        ] {
+            ConfigKv::set_with_conn(&db, exact_key, value, requested_encrypted)
+                .await
+                .expect("overwrite exact row");
+            let after = config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("read exact overwrite");
+            let updated = after
+                .iter()
+                .find(|row| row.key == exact_key)
+                .expect("updated row");
+            assert_eq!(updated.id, exact_id, "exact overwrite keeps the row ID");
+            assert_eq!(updated.value, value);
+            assert_eq!(updated.encrypted, expected_encrypted);
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|row| row.key != exact_key)
+                    .collect::<Vec<_>>(),
+                original
+                    .iter()
+                    .filter(|row| row.key != exact_key)
+                    .collect::<Vec<_>>(),
+                "exact overwrite must not touch differently cased rows"
+            );
+        }
+        let multi_key = "case.multi.Value";
+        for value in ["first multi value", "second multi value"] {
+            ConfigKv::add_with_conn(&db, multi_key, value, true)
+                .await
+                .expect("seed exact multi-value rows");
+        }
+        ConfigKv::add_with_conn(&db, "CASE.MULTI.VALUE", "case alias canary", false)
+            .await
+            .expect("seed alias beside multi-value rows");
+        let before_rejection = config_kv::Entity::find()
+            .order_by_asc(config_kv::Column::Id)
+            .all(&db)
+            .await
+            .expect("snapshot before multi-value rejection");
+        let error = ConfigKv::set_with_conn(&db, multi_key, "must not replace", false)
+            .await
+            .expect_err("exact multi-value set must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "cannot set 'case.multi.Value': 2 values exist for this key (use `unset-all` to clear)"
+        );
+        assert_eq!(
+            config_kv::Entity::find()
+                .order_by_asc(config_kv::Column::Id)
+                .all(&db)
+                .await
+                .expect("read after multi-value rejection"),
+            before_rejection,
+            "refused set must preserve every row ID, value byte and encryption flag"
+        );
+        db.close().await.expect("close isolated config database");
     }
 
     /// plan-20260825 PS-06: `locate_env_for_target` tags the hit layer and
