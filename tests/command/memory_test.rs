@@ -18,7 +18,7 @@ async fn memory_writes_no_operation_row() {
         .expect("open repo DB");
 
     async fn operation_count<C: sea_orm::ConnectionTrait>(conn: &C) -> i64 {
-        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm::Statement;
         let row = conn
             .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
