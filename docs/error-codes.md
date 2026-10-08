@@ -61,7 +61,7 @@ Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2
 
 - `branch -d` / `--delete` refusals (not fully merged, missing branch, currently checked-out branch) exit **1**. Codes stay `LBR-REPO-003` or `LBR-CLI-003`.
 
-Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` remain reserved for the retired controlled-fix execution outcomes and still map to exit `128`.
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` remain in `StableErrorCode` for retired controlled-fix outcomes; the removed `review --fix` and `investigate fix` paths no longer emit them. Their former CLI exit mapping was `128`.
 
 ## Migration From Fine-Grained Exit Codes
 
@@ -156,8 +156,8 @@ structured report is always present.
 | `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
 | `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
-| `128` | `LBR-AGENT-039` | `internal` | `review --fix` or `investigate fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied | answering `deny` to a pending tool or sandbox approval |
-| `128` | `LBR-AGENT-040` | `internal` | `review --fix` or `investigate fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree | an invalid terminal response, an unexpected runtime state, a patch observed before a later denial, or controlled-execution timeout |
+| `128` | `LBR-AGENT-039` | `internal` | Reserved historical outcome: a removed controlled-fix path was denied at a Code-runtime tool or sandbox approval gate; no patch was applied | former `review --fix` / `investigate fix` denial |
+| `128` | `LBR-AGENT-040` | `internal` | Reserved historical outcome: a removed controlled-fix path stopped without a clean patch or deterministic repair result | former invalid terminal response, later denial after a patch, or controlled-execution timeout |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -296,8 +296,8 @@ evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-lega
 | `LBR-AGENT-036` | Bridge request exceeded its deadline |
 | `LBR-AGENT-037` | Bridge internal error (DB/VCS/generic failure) |
 | `LBR-AGENT-038` | Bridge mutation fence drifted (HEAD moved or the index/worktree is dirty); refused before any write |
-| `LBR-AGENT-039` | `review --fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied |
-| `LBR-AGENT-040` | `review --fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree |
+| `LBR-AGENT-039` | Reserved historical controlled-fix approval denial; the removed `review --fix` / `investigate fix` paths no longer emit it |
+| `LBR-AGENT-040` | Reserved historical controlled-fix failure without a clean patch or deterministic repair result; the removed paths no longer emit it |
 
 ### Unsupported
 
@@ -329,26 +329,29 @@ patterns continue to match them.
 | --- | --- |
 | `LBR-WARN-001` | Command completed with warnings (`--exit-code-on-warning`) |
 
-## Code UI And Control Wire Codes
+## Historical Code UI And Control Wire Codes
 
-The Code UI and `code --control stdio` surfaces use `{ error: { code, message } }`
-wire errors rather than CLI `LBR-*` stable codes. JSON-RPC exposes these HTTP
-failures as `-32000` with `data.status` and `data.code`.
+The Code UI and `code --control stdio` were removed in `0.23.0`. This table
+records their former wire errors for interpreting archived responses and older
+client integrations. They used `{ error: { code, message } }` instead of CLI
+`LBR-*` stable codes; the former control JSON-RPC client exposed HTTP failures
+as `-32000` with `data.status` and `data.code`. The current
+`libra agent bridge --stdio` has its own `LBR-AGENT-024..038` frame errors above.
 
 | Wire code | HTTP | Meaning |
 | --- | --- | --- |
-| `SESSION_BUSY` | `409` | A turn is already running, no turn exists for the requested cancel, or a fresh explicit-direct command was submitted while IntentSpec revision authority is active. Exact terminal retries and matching live `commandId` retries are the only revision-gate exceptions; they are idempotent acknowledgements and append nothing. A padded or otherwise non-exact `/intent cancel` is a fresh explicit-direct command and receives this 409 while the revision remains pending. |
-| `INVALID_QUERY_PARAM` | `400` | Query or interaction-response validation failed. IntentSpec Modify notes are limited to 16 KiB (16,384 UTF-8 bytes); oversized plain notes and `/intent modify <changes>` suffixes are rejected before Claiming, Runtime admission, or any workflow append, so revision authority remains pending and unconsumed. |
-| `PHASE1_WORKSPACE_CHANGED` | `409` | Execute's exact checkout identity/content no longer matches the reviewed Plan, or Libra cannot verify/recapture it. A metadata-only `workspaceWarning` may pass that exact recheck and does not itself produce this error. No mutation starts; stale Execute preserves the pending gate. Modify may regenerate for a new HEAD in the same repository, while a different repository requires Cancel and a new request/IntentSpec review. Failed recapture leaves the note unconsumed. |
-| `PLAN_EXECUTION_NOT_AVAILABLE` | `409` | Historical Web 409 while confirmed-plan execution was unwired. After W2-04, Network Allow admits execution onto the serialized runtime queue instead of producing this code. Older clients may still decode the catalogued 409. |
-| `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority remains pending and unconsumed; send a non-empty change description or Cancel. |
-| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
-| `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart the agent bridge / capture session or fix redactor configuration, then retry. |
-| `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `2`/`v2` (the only wire; `1`/`v1` was removed in 0.22.0 — the error names `v0.21.29` as the last release serving wire v1). |
-| `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested but no SessionStore-backed workflow hub is mounted (today: default Web headless persistence; managed Codex Web does not yet expose one). |
-| `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (reconnecting with an ahead cursor would permanently skip live events). |
-| `WIRE_V2_RESYNC_REQUIRED` | SSE `event: resync` then stream end | Transport backlog exceeded (1,024 events or 8 MiB, whichever first) on bootstrap or lagged catch-up. Fetch a session snapshot, then reconnect with `?wire=2&cursor=<durableTail>` — do not invent a sequencer. |
-| `WIRE_V2_REPLAY_FAILED` | `500` / SSE `event: error` | Durable workflow replay for wire v2 failed for a non-capacity reason (gap or I/O). Create a projection checkpoint or retry from a known-good cursor. |
+| `SESSION_BUSY` | `409` | A turn was already running, no turn existed for the requested cancel, or a fresh explicit-direct command arrived while IntentSpec revision authority was active. Exact terminal retries and matching live `commandId` retries were idempotent exceptions. A non-exact `/intent cancel` received this 409 while revision remained pending. |
+| `INVALID_QUERY_PARAM` | `400` | Query or interaction-response validation failed. Oversized IntentSpec Modify notes and `/intent modify <changes>` suffixes were rejected at the 16 KiB (16,384 UTF-8 byte) limit before Claiming, Runtime admission, or workflow append, leaving revision authority pending. |
+| `PHASE1_WORKSPACE_CHANGED` | `409` | Execute's exact checkout identity/content no longer matched the reviewed Plan, or Libra could not verify/recapture it. A metadata-only `workspaceWarning` could pass the exact recheck. No mutation started; the pending gate remained. Modify could regenerate for a new HEAD in the same repository, while a different repository required Cancel and a new review. |
+| `PLAN_EXECUTION_NOT_AVAILABLE` | `409` | Earlier Web 409 while confirmed-plan execution was unwired. After W2-04, Network Allow queued execution instead of producing this code; older clients could still decode it. |
+| `PLAN_REVISION_NOTE_REQUIRED` | `400` | The message after Plan Modify was empty or whitespace-only. Revision authority stayed pending and unconsumed until a non-empty change description or Cancel arrived. |
+| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. Code UI/control clients could retry with a higher `maxAttempts`, supply manual revision guidance, or cancel the repair. |
+| `REDACTION_FAILED` | `500` | Session, diagnostics, or SSE projection could not apply the secret redactor (empty rules or serialization failure). The former HTTP body or SSE payload omitted unredacted content. |
+| `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` received a `wire` query or `Accept;libra-wire=` value other than `2`/`v2`. Wire v1 had been removed in `0.22.0`; the error named `v0.21.29` as the last release serving it. |
+| `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested without a SessionStore-backed workflow hub mounted. |
+| `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` was ahead of the durable workflow tail; clients had to drop the cursor and resync to avoid skipping live events. |
+| `WIRE_V2_RESYNC_REQUIRED` | SSE `event: resync` then stream end | Transport backlog exceeded 1,024 events or 8 MiB on bootstrap or lagged catch-up. Clients had to fetch a session snapshot before reconnecting at its durable tail. |
+| `WIRE_V2_REPLAY_FAILED` | `500` / SSE `event: error` | Durable workflow replay for wire v2 failed for a non-capacity reason (gap or I/O); clients could retry from a known-good cursor or use a projection checkpoint. |
 
 ## How To Use Codes
 

@@ -135,7 +135,6 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|------|------|------|
 | `libra code` | | 已移除。外部 agent 捕获请用 `libra agent` | [code.md](code.md) |
 | `libra code-control` | | 已随 `libra code` 移除。请用 `libra agent` | [code-control.md](code-control.md) |
-| Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | 已移除。用量统计只服务已拆除的开发 agent | [usage.md](usage.md) |
 | `libra graph` | | 已移除。捕获图请用 `libra --json agent graph <session>` | [graph.md](graph.md) |

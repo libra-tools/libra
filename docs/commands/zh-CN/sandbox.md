@@ -11,7 +11,7 @@ libra --json sandbox status
 
 ## 说明
 
-`libra sandbox status` 报告 Libra 会用于 AI shell 执行诊断的沙箱后端。它不需要仓库，因此可以在运行 `libra code` 前用于调试提供商或 CI 主机。
+`libra sandbox status` 报告 Libra 会用于 AI shell 执行诊断的沙箱后端。它不需要仓库，可用于排查外部 agent 捕获与只读 review 所在的 provider 或 CI 主机。
 
 默认运行时采用 best-effort 策略：Linux 使用 `LIBRA_LINUX_SANDBOX_EXE` 配置的外部 helper；如果该 helper 不可用，`libra` 会尝试内置 `bwrap` 后端（可由 `LIBRA_BWRAP_BINARY` 覆盖）。当 `/usr/bin/sandbox-exec` 可用时，macOS 使用 Seatbelt；不支持或未配置的主机会报告警告，而不是声称提供隔离。设置 `LIBRA_SANDBOX_ENFORCEMENT=required` 后，当请求 Libra 内部沙箱但没有可应用的受支持后端时，命令会失败。
 

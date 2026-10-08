@@ -734,18 +734,15 @@ The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and reda
 - `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (a legacy `~/.libra/config.db` stays the active fallback until the first access migrates it)
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
-## The `code.defaultProvider` Key
+## Legacy `code.defaultProvider` Key
 
-`libra code` resolves its effective provider once at startup; `code.defaultProvider` is the persisted slot in that ladder (explicit `--provider` → `--agent` binding → resumed thread's recorded provider (`--resume`) → **`code.defaultProvider`** → credential detection):
-
-```bash
-libra config set --global code.defaultProvider deepseek   # global default
-libra config set code.defaultProvider zhipu               # repo-local override
-libra config get code.defaultProvider
-libra config unset --global code.defaultProvider
-```
-
-Valid values are the provider ids accepted by `libra code --provider`: `anthropic`, `codex`, `deepseek`, `gemini`, `kimi`, `ollama`, `openai`, `zhipu`. A configured value skips credential detection; an unset or empty value falls through to it; an unrecognized id makes `libra code` exit 129 (`LBR-CLI-002`) listing the valid ids without echoing the stored value. The key lives in this SQLite config database only — it is unrelated to the `[code.*]` profile sections of `agents.toml` (`[code.multi_agent]`, `[code.goal]`, …), and neither carrier falls back to the other. See [code.md](code.md) for the full resolution ladder.
+`code.defaultProvider` was the persisted provider selection for the removed
+`libra code` command. The command's `--provider` resolution ladder and credential
+detection were removed with the Code UI. Existing values remain as inert legacy
+configuration data; Libra no longer reads this key to select a provider. The
+generic `libra config get` and `unset` commands can still inspect or remove a
+stored value. Setting the key does not configure external-agent capture; see
+[agent.md](agent.md) for the current `libra agent` command.
 
 ## The `core.filemode` Key
 

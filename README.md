@@ -10,9 +10,9 @@
 
 </div>
 
-Libra is an AI-native version control system that extends traditional version control from tracking code changes to capturing the entire software creation process. It records development context, AI agent interactions, generated code, and validation history, transforming ephemeral coding sessions into reusable and traceable engineering knowledge. As a result, Libra enables developers and AI agents to understand the context behind code, replay previous workflows, and reuse proven solutions across projects. It improves reliability and collaboration for AI-assisted software development, especially in agentic coding, long-context workflows, and large-scale codebases.
+Libra is an AI-native version control system that combines Git-compatible code history with capture of external AI coding sessions. It records supported agents' session and checkpoint metadata and, when transcript content is available, stores redacted snapshots in `refs/libra/traces`, so developers can inspect the context behind changes and carry that history with a repository.
 
-Libra is built to fit into existing developer workflows. It is Git-compatible and works with popular AI coding tools including Claude Code, Codex, and Gemini CLI, allowing developers to gradually adopt AI-native version control without changing their existing repositories or development environments.
+Libra fits into existing developer workflows through Git-compatible objects and wire protocols. Its capture hooks support Claude Code, Codex, and OpenCode; those tools run the coding agents, while Libra records their work.
 
 <div align="center">
 
@@ -30,12 +30,12 @@ Libra is built to fit into existing developer workflows. It is Git-compatible an
 
 | Capability | Traditional VCS (Git) | Libra |
 |-----------|----------------------|-------|
-| **Versioned Artifacts** | Source code only | Code + AI reasoning + decisions + validation reports + session transcripts |
-| **AI Collaboration** | Manual commit messages | Native AI agent threads with full audit trail |
-| **Knowledge Reuse** | Code snapshots | Reusable intelligence assets across projects |
+| **Versioned Artifacts** | Code history | Code history + captured agent checkpoints and redacted transcripts |
+| **AI Collaboration** | Manual commit messages | External-agent session and checkpoint history |
+| **Knowledge Reuse** | Code snapshots | Inspectable captured context alongside repository history |
 | **Security** | External GPG/SSH setup | Built-in vault with per-repo key isolation |
-| **Provider Lock-in** | N/A | 7+ AI providers, switch freely |
-| **Automation** | External CI/CD | Built-in cron-driven agent automation |
+| **Agent Integrations** | N/A | Capture hooks for Claude Code, Codex, and OpenCode |
+| **Automation** | External CI/CD | Repository rules for cron and VCS events |
 
 ---
 
@@ -115,17 +115,18 @@ libra agent checkpoint list
 
 ## Core Features
 
-### 🧠 AI-Native Threading & Persistence
+### 🧠 External Agent Capture & Trace History
 
-Every AI agent session is a first-class citizen in Libra. Threads, plans, tasks, decisions, validation reports, tool invocations, and patchset snapshots are all persisted directly in the repository alongside your code. No out-of-band state — everything is durable, queryable, and replayable.
+`libra agent` records sessions and checkpoints from supported external coding agents. Checkpoint metadata is indexed locally; when transcript content is available, redacted snapshots are stored as repository objects reachable from `refs/libra/traces`. Use `libra agent session`, `checkpoint`, and `doctor` to inspect captured state, and `libra agent push` to share traces with a remote.
+
+The built-in `libra code` UI and runtime, its MCP `--stdio` entry point, and the `libra publish` site host were removed in the 0.23.x release line. External-agent capture continues through `libra agent`; repository backup uses `libra cloud`.
 
 ```
 .libra/
-├── libra.db              # SQLite: Git core + AI threads + runtime contracts
-├── vault.db              # Encrypted secrets (provider keys, signing keys)
+├── libra.db              # SQLite: VCS state + agent capture metadata
+├── vault.db              # Encrypted signing keys and credentials
 ├── objects/              # Object store (loose + pack, compatible with Git)
-├── sessions/             # AI conversation transcripts in JSONL
-└── ai/                   # AI runtime working files
+└── sessions/agent/       # Local agent capture event logs
 ```
 
 ### 🔄 Git-Compatible Foundation
@@ -136,16 +137,15 @@ Key difference: Git manages files. Libra manages **creation**.
 
 ### 🔐 Vault-Backed Security
 
-Every `libra init` automatically creates a per-repository vault for encrypted key management:
+By default, `libra init` creates a per-repository vault for encrypted key management:
 - **GPG signing keys** for commit verification
 - **SSH keys** for remote authentication
-- **AI provider credentials** securely stored
 
-No external key management setup required. Keys are isolated per repository and never leave the vault.
+Signing and authentication keys are isolated per repository.
 
-### 🛡️ Command Safety Sandbox
+### 🛡️ Sandbox Diagnostics
 
-Every tool invocation from an AI agent passes through a configurable safety sandbox with command preflight checks, network policy enforcement, and optional seccomp/seatbelt restrictions. Define what agents can and cannot do.
+`libra sandbox status` reports the backend and enforcement available for Libra operations that request its internal sandbox. External coding agents keep their own execution and safety policies.
 
 ### ☁️ Tiered Cloud Storage & Backup
 
@@ -155,11 +155,11 @@ Every tool invocation from an AI agent passes through a configurable safety sand
 
 ---
 
-## Supported AI Providers
+## Supported External Agents
 
-Libra already works with Claude Code, CodeX and OpenCode; support for other mainstream Agents will be released gradually.
+Libra supports hook-based capture for Claude Code, Codex, and OpenCode. The built-in model-provider runner was removed with `libra code` in 0.23.x.
 
-> See [docs.libra.tools](https://docs.libra.tools/en/docs/getting-started/agent) for provider setup and configuration details.
+> See the [agent command guide](docs/commands/agent.md) for capture setup and supported agents.
 
 ---
 
@@ -188,7 +188,7 @@ cargo +nightly fmt --all --check
 cargo +nightly fmt --all
 ```
 
-For Windows builds, please see the [Windows build guide](docs/installation/windows.md) for OpenSSL setup instructions.
+For Windows installation, see the [Windows installation instructions](docs/installation.md#windows).
 
 For detailed contribution guidelines, see [docs/contributing.md](docs/contributing.md).
 

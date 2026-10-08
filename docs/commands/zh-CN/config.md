@@ -644,18 +644,13 @@ libra config remove-gpg-key --force
 - `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在首次访问迁移之前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
-## `code.defaultProvider` 键
+## 历史 `code.defaultProvider` 键
 
-`libra code` 在启动时一次性解析生效 provider；`code.defaultProvider` 是该阶梯中的持久化槽位（显式 `--provider` → `--agent` 绑定 → 被恢复线程记录的 provider（`--resume`）→ **`code.defaultProvider`** → 凭据探测）：
-
-```bash
-libra config set --global code.defaultProvider deepseek   # global 默认
-libra config set code.defaultProvider zhipu               # repo-local 覆盖
-libra config get code.defaultProvider
-libra config unset --global code.defaultProvider
-```
-
-合法取值即 `libra code --provider` 接受的 provider id：`anthropic`、`codex`、`deepseek`、`gemini`、`kimi`、`ollama`、`openai`、`zhipu`。配置命中时跳过凭据探测；未设置或空值下探到探测；无法识别的 id 使 `libra code` 以 129（`LBR-CLI-002`）退出并列出合法取值，且不回显已存储的值。该键只存放于本 SQLite config 数据库——与 `agents.toml` 的 `[code.*]` profile 段（`[code.multi_agent]`、`[code.goal]` 等）无关，两个载体互不回退。完整解析阶梯见 [code.md](code.md)。
+`code.defaultProvider` 曾为已移除的 `libra code` 命令保存 provider 选择。
+该命令的 `--provider` 解析阶梯和凭据探测已随 Code UI 一起移除。
+既有值仍作为不生效的历史配置数据保留；Libra 不再读取此键来选择
+provider。通用的 `libra config get` 和 `unset` 命令仍可查看或删除已存储的值。
+设置此键不会配置外部 agent 捕获；现行命令见 [agent.md](agent.md)。
 
 ## `core.filemode` 键
 

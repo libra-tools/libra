@@ -504,7 +504,7 @@ impl Drop for ControlLockGuard {
     }
 }
 
-/// Errors returned while acquiring the write-control single-instance lock.
+/// Errors returned while acquiring a local single-instance lock.
 #[derive(Debug)]
 pub enum ControlLockError {
     AlreadyHeld {
@@ -525,7 +525,7 @@ impl fmt::Display for ControlLockError {
             } => {
                 write!(
                     f,
-                    "CONTROL_INSTANCE_CONFLICT: another `libra code --control write` instance is active"
+                    "CONTROL_INSTANCE_CONFLICT: another `libra service run` instance is active"
                 )?;
                 write!(f, " (pid: {}", existing.pid)?;
                 if let Some(base_url) = &existing.base_url {
@@ -533,10 +533,9 @@ impl fmt::Display for ControlLockError {
                 }
                 write!(
                     f,
-                    "). info: {}, lock: {}. Stop the existing instance (Ctrl-C / kill {}) or pass `--control-token-file` and `--control-info-file` to use separate paths.",
+                    "). info: {}, lock: {}. Check `libra service status`, stop the existing service (Ctrl-C or its supervisor), then retry `libra service run`.",
                     info_path.display(),
                     lock_path.display(),
-                    existing.pid
                 )
             }
             Self::AlreadyHeld {
@@ -545,7 +544,7 @@ impl fmt::Display for ControlLockError {
                 lock_path,
             } => write!(
                 f,
-                "CONTROL_INSTANCE_CONFLICT: another `libra code --control write` instance holds the control lock. info: {}, lock: {}. Stop the existing instance or pass `--control-token-file` and `--control-info-file` to use separate paths.",
+                "CONTROL_INSTANCE_CONFLICT: another `libra service run` instance holds the service lock. info: {}, lock: {}. Check `libra service status`, stop the existing service (Ctrl-C or its supervisor), then retry `libra service run`.",
                 info_path.display(),
                 lock_path.display()
             ),
@@ -2084,15 +2083,15 @@ mod tests {
                 base_url: Some("http://127.0.0.1:6788".to_string()),
                 started_at: None,
             }),
-            info_path: PathBuf::from("/tmp/control.json"),
-            lock_path: PathBuf::from("/tmp/control.lock"),
+            info_path: PathBuf::from("/tmp/service.json"),
+            lock_path: PathBuf::from("/tmp/service.lock"),
         };
         assert_eq!(
             with_existing.to_string(),
-            "CONTROL_INSTANCE_CONFLICT: another `libra code --control write` instance is active \
-             (pid: 4242, baseUrl: http://127.0.0.1:6788). info: /tmp/control.json, \
-             lock: /tmp/control.lock. Stop the existing instance (Ctrl-C / kill 4242) or pass \
-             `--control-token-file` and `--control-info-file` to use separate paths.",
+            "CONTROL_INSTANCE_CONFLICT: another `libra service run` instance is active \
+             (pid: 4242, baseUrl: http://127.0.0.1:6788). info: /tmp/service.json, \
+             lock: /tmp/service.lock. Check `libra service status`, stop the existing service \
+             (Ctrl-C or its supervisor), then retry `libra service run`.",
         );
 
         let with_existing_no_url = ControlLockError::AlreadyHeld {
@@ -2101,28 +2100,27 @@ mod tests {
                 base_url: None,
                 started_at: None,
             }),
-            info_path: PathBuf::from("/tmp/control.json"),
-            lock_path: PathBuf::from("/tmp/control.lock"),
+            info_path: PathBuf::from("/tmp/service.json"),
+            lock_path: PathBuf::from("/tmp/service.lock"),
         };
         assert_eq!(
             with_existing_no_url.to_string(),
-            "CONTROL_INSTANCE_CONFLICT: another `libra code --control write` instance is active \
-             (pid: 1234). info: /tmp/control.json, lock: /tmp/control.lock. \
-             Stop the existing instance (Ctrl-C / kill 1234) or pass `--control-token-file` and \
-             `--control-info-file` to use separate paths.",
+            "CONTROL_INSTANCE_CONFLICT: another `libra service run` instance is active \
+             (pid: 1234). info: /tmp/service.json, lock: /tmp/service.lock. \
+             Check `libra service status`, stop the existing service (Ctrl-C or its supervisor), \
+             then retry `libra service run`.",
         );
 
         let without_existing = ControlLockError::AlreadyHeld {
             existing: None,
-            info_path: PathBuf::from("/tmp/control.json"),
-            lock_path: PathBuf::from("/tmp/control.lock"),
+            info_path: PathBuf::from("/tmp/service.json"),
+            lock_path: PathBuf::from("/tmp/service.lock"),
         };
         assert_eq!(
             without_existing.to_string(),
-            "CONTROL_INSTANCE_CONFLICT: another `libra code --control write` instance holds the \
-             control lock. info: /tmp/control.json, lock: /tmp/control.lock. Stop the existing \
-             instance or pass `--control-token-file` and `--control-info-file` to use separate \
-             paths.",
+            "CONTROL_INSTANCE_CONFLICT: another `libra service run` instance holds the service \
+             lock. info: /tmp/service.json, lock: /tmp/service.lock. Check `libra service status`, \
+             stop the existing service (Ctrl-C or its supervisor), then retry `libra service run`.",
         );
     }
 }

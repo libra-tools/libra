@@ -377,7 +377,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | 忽略错误 | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A（未实现） |
 | 交互式 patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
-| 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` Web Code UI） |
+| 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（未实现） |
 | 暂存前编辑 diff | `git add -e` / `--edit` | N/A | N/A |
 | 仅 chmod | `git add --chmod=+x` | `libra add --chmod=+x`（非普通索引条目会被拒绝并以 exit 1 结束） | N/A |
 | Sparse checkout 路径 | `git add --sparse` | N/A | N/A |
