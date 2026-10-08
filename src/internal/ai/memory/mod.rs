@@ -21,4 +21,4 @@ pub use episode::{
     SourceKind, content_digest, episode_id,
 };
 pub use error::MemoryError;
-pub use projection::project_episodes;
+pub use projection::{RebuildReport, commit_fingerprint, meta, project_episodes, rebuild};

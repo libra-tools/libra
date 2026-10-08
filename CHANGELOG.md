@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.38] — 2026-10-08
+
+### Commit-source freshness, horizon window and rebuild equivalence (plan-20260926 DM-13)
+
+- Add the internal commit-source freshness / horizon / rebuild-equivalence
+  surface: a deterministic fingerprint over the horizon-window operation set
+  (not `max(end_ts)`), a horizon-bounded rebuild that re-derives the
+  zero-authority projection and persists `memory_projection_state`
+  (`fingerprint`, `horizon_truncated`, revoked/aged-out counts), and a meta
+  reader. No public CLI behavior change (`libra memory` is DM-03).
+
 ## [0.30.37] — 2026-10-08
 
 ### Commit/change Episode derivation (plan-20260926 DM-02)
