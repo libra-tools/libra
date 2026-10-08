@@ -480,3 +480,13 @@ plan-20260904新增ER10前驱FIX-RG-SSH-01，in-progress/locally-accepted，7/7A
 ### 2026-10-07 22:04:44 UTC：FIX-RG-01 最终基线与全量事实
 
 R2 FIX-RG-01当前独立0.30.38候选基于实际上游84442ee658bff007f9eed5b7b996638990610b45；保留CP-00已发布四路径，不回退上游审计交付。修复owned仅两cfg(test)期限、三version面/工具链lock、本卡plan及本status。R1旧f59 full与originals冻结保留，不宣称最终全量/C-D完成。原审两个P3修正为caller-supplied reader deadline和六特有AC/8、五VER/8，强制full另列，.37保留。本1985文件冻结源的fmt/strict/focused与双环境默认并发Nextest已结束：exit0、9514/9514passed、13slow、4LEAK、5skip、0flaky，817.894s；四LEAK根因未明，待逐项隔离复验，不宣称零泄漏。两原审已各自CLOSED PASS；只在full结束后修正本卡I五处RPC参数事实及本状态UTC标题，1983非记录文件与模式保持一致。新文档双审、最终树绑定、build/install/签名提交及实际C/D仍未完成；本卡继续in-progress/空。
+
+
+### 2026-10-08 03:40 UTC：#620 发布前置已满足，#621 合并后重新验收
+
+使用者要求的顺序已满足：#620 merge 125657b 与 v0.30.37 release run 37721401960 八作业全部 success。#621 私有候选从 a242401 正常合并实际上游 e95b8bd（含 DM-02 六新增文件及发布状态），版本四面冲突保留 0.30.38；签名 DCO merge 742517d。原 9514/9514 与旧双审不代替新增功能合并后的 full/fresh 双审，当前均待执行；FIX-RG-01 继续 in-progress/空，实际 C/D 及发布未完成。
+
+
+### 2026-10-08 03:57 UTC：#621 合并后本地门通过，发布仍未完成
+
+FIX-RG-01 R4实际1991源逐门前后MATCH：fmt/strict/聚焦与双环境默认并发Nextest exit0、9522/9522、13slow/1LEAK/5skip/0FLAKY（798.323s测试、832.229s进程）。唯一LEAK为未改merge_ext_driver_clean_result_is_read_from_percent_a，一次精确隔离1/1无LEAK，根因未明、不称修复。独立Codex/Claude两原稿CLOSED PASS，Claude既有RPC注释一P3非阻断；两原稿先关闭后父级完整读取，final树/文档门和构建/安装/签名、实际PR CI/merge/release八作业与线上安装尚待关闭。full之后仅本卡两处记录变更，1989非记录源字节/模式不变。旧9514原记录不改，本卡in-progress/空。
