@@ -95,13 +95,12 @@ async fn committed_operations<C: ConnectionTrait>(
 fn load_commit_fields(
     commit_oid: &str,
 ) -> Result<(String, String, Option<String>), git_internal::errors::GitError> {
-    use git_internal::{errors::GitError, hash::ObjectHash, internal::object::commit::Commit};
+    use git_internal::{errors::GitError, internal::object::commit::Commit};
 
     use crate::command::load_object;
 
-    let oid = commit_oid.parse::<ObjectHash>().map_err(|error| {
-        GitError::InvalidObjectType(format!("invalid commit oid {commit_oid}: {error}"))
-    })?;
+    let oid = crate::internal::object_format::parse_repo_oid(commit_oid)
+        .map_err(|error| GitError::InvalidObjectType(error.to_string()))?;
     let commit: Commit = load_object(&oid)?;
     let normalized = render_untrusted_findings(&commit.message);
     // Git commit objects begin the message after a blank line; the decoder may
