@@ -111,6 +111,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "logfile",
     "cache",
     "metadata",
+    "memory",
     "dirty",
     "service",
     "revision",

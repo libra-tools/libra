@@ -964,6 +964,7 @@ mod mega2_entry_transport_test;
 mod mega2_mutate_transport_test;
 mod mega2_tag_transport_test;
 mod mega2_tree_transport_test;
+mod memory_test;
 mod merge_base_test;
 mod merge_file_test;
 mod merge_test;

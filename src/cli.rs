@@ -61,7 +61,7 @@ Command Groups:
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami, mega2
-  AI And Automation       automation, sandbox, agent, review, investigate, service
+  AI And Automation       automation, memory, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
@@ -445,6 +445,11 @@ enum Commands {
         after_help = command::metadata::METADATA_EXAMPLES
     )]
     Metadata(command::metadata::MetadataArgs),
+    #[command(
+        about = "Inspect or rebuild the deterministic Agent development-history projection",
+        after_help = command::memory::MEMORY_EXAMPLES
+    )]
+    Memory(command::memory::MemoryArgs),
     #[command(
         about = "Mark paths dirty in the dirty-set cache, or list it (Libra extension)",
         after_help = command::dirty::DIRTY_EXAMPLES
@@ -1823,6 +1828,7 @@ fn command_scope(command: &Commands) -> CommandScope {
         // `stash list/show` only inspect the shared stash namespace; they
         // must not acquire a writer boundary or create operation-log state.
         Commands::Stash(Stash::List) | Commands::Stash(Stash::Show { .. }) => ReadOnly,
+        Commands::Memory(_) => ReadOnly,
         Commands::Stash(_)
         // These run tools that edit the working tree.
         | Commands::Automation(_)
@@ -3569,6 +3575,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::Metadata(cmd_args) => {
                 command::metadata::execute_safe(cmd_args, &output).await?
             }
+            Commands::Memory(cmd_args) => command::memory::execute(cmd_args).await?,
             Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
             Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
             Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,

@@ -93,9 +93,8 @@ pub fn classify_command(name: &str) -> Result<MutationClass, ClassificationError
     let name = name.trim().to_ascii_lowercase();
     let class = match name.as_str() {
         "status" | "log" | "diff" | "show" | "ls-files" | "branch-list" | "config-get"
-        | "sparse-view-list" | "sparse-view-status" | "worktree-list" | "worktree-doctor" => {
-            MutationClass::ReadOnly
-        }
+        | "sparse-view-list" | "sparse-view-status" | "worktree-list" | "worktree-doctor"
+        | "memory" => MutationClass::ReadOnly,
         "add" | "rm" | "mv" | "restore" | "clean" | "checkout" | "switch" | "apply"
         | "read-tree" | "update-index" | "hydrate" => MutationClass::WorkspaceMutation,
         "branch" | "tag" | "commit" | "reset" | "fetch" | "pull" | "config-set" | "metadata"
