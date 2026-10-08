@@ -32,7 +32,7 @@ libra service events
 |---|---|---|
 | `GET /api/health` | loopback | Liveness probe. |
 | `GET /api/service/events` | token | SSE notification stream. |
-| `POST /api/service/dirty/mark` | token | `{"paths":[...],"scope":{...}}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). `scope` is a TAGGED worktree scope: `{"kind":"main"}`, or `{"kind":"linked","worktree_id":"wt-…","workdir":"/abs/path","epoch":<n>}` — `workdir` and `epoch` are REQUIRED for a linked scope and both are validated against the registry entry under the registry lock. Instance ids are path-derived and paths repeat, so a worktree removed and re-added in place looks identical to its predecessor; `epoch` (reported by `libra worktree list`) is the fence that tells the two registrations apart, and a request carrying a stale one is rejected. The named scope is validated against the registry — an unknown id, a registry with duplicate linked ids, or one whose linked entry uses the reserved id `main`, is rejected with **409**. A request WITHOUT `scope` is still accepted only in a single-main repository: in a multi-worktree repository (or when the registry is corrupt/unreadable — including parseable states without exactly one main entry) it is rejected with **409**, because the dirty cache is per-worktree and the caller's scope is unknown; name the scope, or run `libra dirty <paths>` in the target worktree. |
+| `POST /api/service/dirty/mark` | token | `{"paths":[...],"scope":{...}}` — advisory dirty marks through the validated owner API (whole batch refused if any path escapes the repo; over-report-only). `scope` is a TAGGED worktree scope: `{"kind":"main","repo_id":"…"}`, or `{"kind":"linked","repo_id":"…","worktree_id":"wt-…","workdir":"/abs/path","epoch":<n>}`. `repo_id` is REQUIRED for both scopes and must identify this repository (`libra config get libra.repoid`); the running service also writes it as `repoId` in the common `.libra/service/service.json`. `workdir` and `epoch` are also REQUIRED for a linked scope and are validated against the registry entry under the registry lock. Instance ids are path-derived and paths repeat, so a worktree removed and re-added in place looks identical to its predecessor; `epoch` (reported by `libra worktree list`) is the fence that tells the two registrations apart, and a request carrying a stale one is rejected. The named scope is validated against the registry — an unknown id, a registry with duplicate linked ids, or one whose linked entry uses the reserved id `main`, is rejected with **409**. A request WITHOUT `scope` is still accepted only in a single-main repository: in a multi-worktree repository (or when the registry is corrupt/unreadable — including parseable states without exactly one main entry) it is rejected with **409**, because the dirty cache is per-worktree and the caller's scope is unknown; name the scope, or run `libra dirty <paths>` in the target worktree. |
 | `POST /api/service/notify` | token | `{"type":"...","data":{...}}` — publish a custom notification (automation triggers). |
 
 **Notification v1 semantics**: events are `{seq,type,at,data}` with `seq`
@@ -45,6 +45,10 @@ everything on the bus is derivable. Request bodies are capped at 256 KiB.
 `libra service status` reports the running instance (pid, URL, health; exits
 1 when none). `libra service events` tails the stream (human lines; NDJSON
 under `--json`; exits cleanly when the server goes away).
+If `libra service run` reports `CONTROL_INSTANCE_CONFLICT`, check
+`libra service status`, stop the existing foreground service with Ctrl-C (or
+through its supervisor), then retry. The diagnostic includes the service info
+and lock paths.
 
 ## Exit codes
 
@@ -63,8 +67,10 @@ libra service status                   # pid, URL, health
 libra service events                   # tail notifications
 TOKEN=$(cat .libra/service/service-token)
 URL=$(libra --json service status | jq -r .data.base_url)
+REPO_ID=$(libra config get libra.repoid)
 curl -H "X-Libra-Service-Token: $TOKEN" -X POST "$URL/api/service/dirty/mark" \
-     -H 'content-type: application/json' -d '{"paths":["src/main.rs"],"scope":{"kind":"main"}}'
+     -H 'content-type: application/json' \
+     -d "{\"paths\":[\"src/main.rs\"],\"scope\":{\"kind\":\"main\",\"repo_id\":\"$REPO_ID\"}}"
 ```
 
 ## Comparison with Git

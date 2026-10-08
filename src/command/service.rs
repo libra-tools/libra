@@ -241,8 +241,9 @@ struct MarkRequest {
     paths: Vec<String>,
     /// §C.4.1.1 service contract: which worktree these paths belong to.
     ///
-    /// A TAGGED scope, not a magic id string: `{"kind":"main"}` or
-    /// `{"kind":"linked","worktree_id":"wt-…"}`. Spelling main as a reserved
+    /// A TAGGED scope, not a magic id string: `{"kind":"main","repo_id":"…"}`
+    /// or `{"kind":"linked","repo_id":"…","worktree_id":"wt-…",…}`.
+    /// Spelling main as a reserved
     /// id would mean a corrupt registry with a linked entry literally called
     /// `main` could redirect an explicit main request into that worktree.
     ///

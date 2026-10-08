@@ -68,10 +68,10 @@ Checked-out entries carry the tree mode's permission bits (`100755` executable, 
 The remote repository URL to clone from. Supports Git (`git://host/user/repo.git`),
 SSH (`git@host:user/repo.git`), and HTTP(S) (`https://host/user/repo.git`)
 protocols, as well as local filesystem paths.
-The former Cloudflare publish restore source was removed with the Publish product;
-cloning that source is a usage error (exit 129) and points at a git remote or
-`libra cloud` for repository backup. The matching clone-domain config keys are
-frozen and are no longer read.
+The former Cloudflare Publish restore source (`libra+cloud://…`) was removed with
+the Publish product. Such a URL is rejected as a usage error (exit 129), with a
+hint to clone a Git remote or use `libra cloud` for repository backup. The
+`cloud.clone_domains.*` config keys are frozen and are no longer read.
 
 ```bash
 libra clone git@github.com:user/repo.git
@@ -481,7 +481,7 @@ Empty remote returns `"branch": null` and a warning:
 - `branch` is the actual checked-out branch; `null` when the remote has no refs
 - `shallow` reports whether an effective `--depth` fetch was used; `false` does not rule out inherited shallow boundaries from the source
 - `gitignore_converted` lists the worktree-relative `.libraignore` files written from converted `.gitignore` files; always present (empty for bare clones or when the source has no `.gitignore`)
-- `source_kind` and `cloud_site` are omitted for ordinary Git/local clones
+- `source_kind` and `cloud_site` are reserved optional fields and are omitted for every currently supported clone source
 - `ref_format` and `converted_from` from init are intentionally excluded
 - `objects_fetched` / `bytes_received` report the fetch pack's object count and byte size for Git sources
 
@@ -561,9 +561,9 @@ not, because its operation-log model fetches all refs by design.
 | Single branch | `--single-branch` | N/A | `--single-branch` |
 | No single branch | `--no-single-branch` | N/A | `--no-single-branch` (countermands `--single-branch`; all branches is the default) |
 | Bare clone | `--bare` | N/A | `--bare` |
-| Shallow clone (depth) | `--depth <n>` | N/A | supported for Git remotes; local Libra sources fail closed (`LBR-REPO-002`); cloud rejects |
-| Shallow since date | `--shallow-since=<date>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved); rejected for cloud |
-| Shallow exclude | `--shallow-exclude=<rev>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved); rejected for cloud |
+| Shallow clone (depth) | `--depth <n>` | N/A | supported for Git remotes; local Libra sources fail closed (`LBR-REPO-002`) |
+| Shallow since date | `--shallow-since=<date>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |
+| Shallow exclude | `--shallow-exclude=<rev>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |
 | Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`; maps advertised `refs/*` verbatim including notes/mr, no tracking refs, sets `remote.<name>.mirror=true` and `remote.<name>.fetch=+refs/*:refs/*`) |
 | Reference repository | `--reference <repo>` / `--reference-if-able <repo>` | N/A | accepted no-op (no fetch-side alternate negotiation); `--reference` warns, `--reference-if-able` silent |
 | Shared object store | `--shared` / `-s` | N/A | guarded alternate for local Libra source; v1 still copies objects; explicit use on other sources warns |
@@ -577,7 +577,7 @@ not, because its operation-log model fetches all refs by design.
 | Verbose / progress | `--progress` / `--verbose` | N/A | Phased stderr progress (default) |
 | No checkout | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | Sparse checkout | `--sparse` | N/A | N/A |
-| Filter (partial clone) | `--filter=<spec>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved); rejected for cloud |
+| Filter (partial clone) | `--filter=<spec>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |
 | Bundle URI | `--bundle-uri=<uri>` | N/A | N/A |
 | Vault signing bootstrap | N/A | N/A | Always enabled (matches init) |
 | SSH key detection | N/A | N/A | Automatic detection + hint |

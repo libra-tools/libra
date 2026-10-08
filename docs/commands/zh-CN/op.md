@@ -264,26 +264,27 @@ libra op restore @{1} --dry-run
 group/all/数值 shared 仓库，由一个用户首次创建的锁仍能被 shared mode
 允许的其他用户打开；default/false/umask 模式继续遵循进程 umask。
 
-### 隔离 agent 任务的 sync-back operation
+### 历史：已移除 Code UI 的隔离任务 sync-back operation
 
-隔离的 `libra code` DAG 任务在临时 copy 或 FUSE workspace 中运行工具，
-而不是在具有独立 operation scope 的真实 linked worktree 中运行。该
-workspace 内的变更工具仍然经过 permission、hardening、audit、redaction
-与 sandbox 检查，但不会针对主 workspace 为每次调用分别发布
-`agent.tool.*` operation。
+以下记录的是已移除的 `libra code` DAG 任务行为，不表示现行
+`libra agent` 会执行这种任务或发布 `agent.task.sync-back`。这些任务曾在
+临时 copy 或 FUSE workspace 中运行工具，而非使用具有独立 operation scope
+的真实 linked worktree。该 workspace 内的变更工具当时仍经过 permission、
+hardening、audit、redaction 与 sandbox 检查，但不会针对主 workspace 为每次
+调用分别发布 `agent.tool.*` operation。
 
-任务完成后，Libra 会串行地把变更 replay 到主 workspace。成功且改变了
-捕获 view 的 replay 会发布一个 `agent.task.sync-back`
-`WorkspaceMutation`；其 `causal_context_id` 保存任务 UUID，以便把该
-operation 归因到具体任务。若 replay 后 view 不变，则不会创建 operation。
+任务完成后，Libra 当时会串行地把变更 replay 到主 workspace。成功且改变了
+捕获 view 的 replay 会发布一个 `agent.task.sync-back` `WorkspaceMutation`；
+其 `causal_context_id` 保存任务 UUID，以便把该 operation 归因到具体任务。
+若 replay 后 view 不变，则不会创建 operation。
 
-如果主 scope lease 正忙，scheduler 会先使用短暂且有上限的退避，仅重试
-sync-back；已完成的任务 workspace 会被保留，也不会消耗任务的 fresh-baseline
-重试预算。持续争用之后才可能回落到普通任务重试策略。若 operation
-pointer/CAS 在 replay 开始前发生变化，则仍须从新的 baseline 重新运行。
-如果 replay 已完成、但 post-snapshot 或 operation publication 失败，Libra
-**不会**自动重试：主 workspace 可能已经包含任务变更。请按错误提示先检查
-`libra status` 与 `libra op log`，再决定恢复还是重新运行。
+如果主 scope lease 正忙，当时的 scheduler 会先使用短暂且有上限的退避，
+仅重试 sync-back；已完成的任务 workspace 会被保留，也不会消耗任务的
+fresh-baseline 重试预算。持续争用之后才可能回落到普通任务重试策略。
+若 operation pointer/CAS 在 replay 开始前发生变化，则仍须从新的 baseline
+重新运行。如果 replay 已完成、但 post-snapshot 或 operation publication
+失败，Libra **不会**自动重试：主 workspace 可能已经包含任务变更。历史
+错误处理要求先检查 `libra status` 与 `libra op log`，再决定恢复还是重新运行。
 
 ### HEAD 捕获的权威来源
 

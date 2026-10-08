@@ -278,29 +278,29 @@ repository, a lock first created by one user remains openable by the users that
 the shared mode permits; the default/false/umask modes continue to follow the
 process umask.
 
-### Isolated agent task sync-back operations
+### Historical Code UI isolated-task sync-back operations
 
-An isolated agent task (plan-20260920 removed `libra code`; this section is
-historical for the removed Code UI) runs its tools in a temporary copy or FUSE
-workspace, not a true linked worktree with its own operation scope. Mutating
-tool calls there still pass permission, hardening, audit, redaction, and
-sandbox checks, but they do not each publish an `agent.tool.*` operation
-against the main workspace.
+This section records behavior of the removed `libra code` DAG tasks. Current
+`libra agent` does not run these tasks or publish `agent.task.sync-back` through
+this flow. Those tasks ran tools in a temporary copy or FUSE workspace, not a
+true linked worktree with its own operation scope. Mutating tool calls there
+still passed permission, hardening, audit, redaction, and sandbox checks, but
+did not each publish an `agent.tool.*` operation against the main workspace.
 
-When the task finishes, Libra serializes replay into the main workspace. A
-successful replay that changes the captured view publishes one
-`agent.task.sync-back` `WorkspaceMutation`; its `causal_context_id` stores the
-task UUID so the operation can be attributed to the task. A replay that leaves
-the view unchanged does not create an operation.
+After a task finished, Libra serialized replay into the main workspace. A
+successful replay that changed the captured view published one
+`agent.task.sync-back` `WorkspaceMutation`; its `causal_context_id` stored the
+task UUID so the operation could be attributed to the task. A replay that left
+the view unchanged did not create an operation.
 
-If the main scope lease is busy, the scheduler first retries only sync-back
-with a short bounded backoff, preserving the completed task workspace and not
-consuming the task's fresh-baseline retry budget. Persistent contention may
+If the main scope lease was busy, the scheduler first retried only sync-back
+with a short bounded backoff, preserving the completed task workspace without
+consuming the task's fresh-baseline retry budget. Persistent contention could
 then use the normal task retry policy. An operation pointer/CAS change before
-replay instead requires a fresh baseline. If replay has completed but
-post-snapshot or operation publication fails, Libra does **not** retry
-automatically: the main workspace may already contain the task changes. Follow
-the error guidance and inspect `libra status` plus `libra op log` before
+replay instead required a fresh baseline. If replay completed but post-snapshot
+or operation publication failed, Libra did **not** retry automatically: the
+main workspace might already have contained the task changes. Historical
+recovery guidance was to inspect `libra status` and `libra op log` before
 deciding whether to recover or rerun.
 
 ### HEAD capture authority

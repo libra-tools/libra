@@ -1,4 +1,6 @@
 # `libra agent` 开发设计
+> **现行边界（2026-09-20 起）：** 本文保留 AG 系列实施时的设计与历史对比；其中关于内部 `libra code` AgentRuntime、Web Code UI、MCP/control 和 mutating fix bridge 的现在时叙述均是拆除前的历史状态，不能作为当前可用命令或执行路径。当前只保留外部 Agent 捕获与 `refs/libra/traces`；命令以 [`agent.md`](../../commands/agent.md)、移除范围以 [`plan-20260920.md`](../plan/plan-20260920.md) 为准。
+
 > **B3-10:** repository commit references are Libra tagged `repo-commit:<kind>:<kind-native hex>` (stored on `ai_index_task_run.base_commit_ref`); agent-bridge/traces/checkpoint OID parsers accept tagged or bare kind-native hex under the repository kind. git-internal `IntegrityHash` stays SHA-256-only.
 
 
@@ -248,11 +250,11 @@ OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**—
 
 **状态（2026-07-05）**：Codex HookProvider 已实现（`src/internal/ai/hooks/providers/codex/`），Codex 进入第一批 supported roster，`hook_installable=true`。本节契约以真实 `codex-cli 0.142.4` 实测固定，并与上游源码 `rust-v0.142.4`（commit `57d253ad`）逐字节核对（trusted_hash 算法外部复现全部命中）。Gemini 可安装只是历史实现事实，不属于本文第一批支持目标。
 
-Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结果写入 `agent_session` / `agent_checkpoint` / `agent_usage_stats`，并把 checkpoint blob 推送到 `refs/libra/traces`。这里描述的是外部 Codex 捕获路径；内部受控执行、tool approval、sandbox 和 workspace mutation 仍属于 `libra code` AgentRuntime。
+Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结果写入 `agent_session` / `agent_checkpoint` / `agent_usage_stats`，并把 checkpoint blob 推送到 `refs/libra/traces`。这里描述的是外部 Codex 捕获路径；内部受控执行、tool approval、sandbox 和 workspace mutation 曾属于现已拆除的 `libra code` AgentRuntime，不属于现行 `libra agent` 捕获命令。
 
 1. **注册与可见性检查**
 
-   Codex 的注册来自内置 adapter / capability registry，而不是用户手动创建一条 DB 记录。当前源码事实是 `agent_for(AgentKind::Codex)` 返回 stable-promoted adapter；当前 CLI 尚无 `list` 子命令，`status` 只输出 session/checkpoint 聚合，不输出 per-agent capability matrix。AG-16/AG-17 落地 capability matrix 与 `list` 后，用户才应通过以下命令确认 Codex 已进入 `libra agent` 目录，并且不得把 `registered` / `transcript_readable` 误读为已可安装 hook：
+   Codex 的注册来自内置 adapter / capability registry，而不是用户手动创建一条 DB 记录。`agent_for(AgentKind::Codex)` 返回 stable-promoted adapter；AG-16/AG-17 已落地 capability matrix 与 `list`。当前用户可通过以下命令确认 Codex 已进入 `libra agent` 目录，并且不得把 `registered` / `transcript_readable` 误读为已可安装 hook：
 
    ```bash
    libra agent list

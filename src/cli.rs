@@ -1352,55 +1352,6 @@ fn top_level_unknown_command_hints(err: &clap::Error) -> Vec<String> {
     hints
 }
 
-const REMOVED_CODE_CLAUDECODE_FLAGS: &[&str] = &[
-    "--resume-session",
-    "--fork-session",
-    "--session-id",
-    "--resume-at",
-    "--helper-path",
-    "--python-binary",
-    "--timeout-seconds",
-    "--permission-mode",
-];
-
-fn removed_code_claudecode_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
-    let Some((subcommand_index, _)) = find_subcommand_index(argv) else {
-        return Vec::new();
-    };
-    if !matches!(
-        argv.get(subcommand_index).and_then(|arg| arg.to_str()),
-        Some("code")
-    ) {
-        return Vec::new();
-    }
-
-    let mut hints = Vec::new();
-    let has_removed_provider = argv.windows(2).any(
-        |window| matches!(window, [flag, value] if flag == "--provider" && value == "claudecode"),
-    ) || argv.iter().any(|arg| arg == "--provider=claudecode");
-    if has_removed_provider {
-        hints.push(
-            "`libra code --provider claudecode` was removed; use `--provider codex` for the managed agent runtime or `--provider anthropic` for direct Anthropic chat completions."
-                .to_string(),
-        );
-    }
-
-    let has_removed_flag = argv.iter().any(|arg| {
-        REMOVED_CODE_CLAUDECODE_FLAGS.iter().any(|flag| {
-            arg.to_str()
-                .is_some_and(|text| text == *flag || text.starts_with(&format!("{flag}=")))
-        })
-    });
-    if has_removed_flag {
-        hints.push(
-            "Claude Code provider-session flags were removed with the managed runtime; start a new Codex or generic-provider session and use Libra's canonical `--resume <thread_id>` flow."
-                .to_string(),
-        );
-    }
-
-    hints
-}
-
 fn parse_error_components(err: &clap::Error) -> (String, Option<String>, Vec<String>) {
     let rendered = err.to_string();
     let mut message = None;
@@ -2965,7 +2916,6 @@ fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliEr
     }
 
     let (message, usage, mut hints) = parse_error_components(err);
-    hints.extend(removed_code_claudecode_hints(argv));
     hints.extend(crate::utils::error::removed_code_web_alias_hints(argv));
     let mut cli_error = if find_subcommand_index(argv).is_some() {
         match err.kind() {
@@ -4482,6 +4432,26 @@ mod tests {
             msg.contains("You probably want `libra config --import`."),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn removed_code_provider_points_to_agent_capture() {
+        for provider_arg in [
+            vec!["code", "--provider", "claudecode"],
+            vec!["code", "--provider=claudecode"],
+        ] {
+            let argv: Vec<std::ffi::OsString> = std::iter::once("libra")
+                .chain(provider_arg)
+                .map(Into::into)
+                .collect();
+            let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
+            let msg = classify_parse_error(&argv, &clap_err).render();
+            assert!(msg.contains("`libra code` was removed"), "got: {msg}");
+            assert!(msg.contains("`libra agent`"), "got: {msg}");
+            assert!(!msg.contains("--provider codex"), "got: {msg}");
+            assert!(!msg.contains("--provider anthropic"), "got: {msg}");
+            assert!(!msg.contains("--resume <thread_id>"), "got: {msg}");
+        }
     }
 
     /// Scenario: the `branch` command advertises a `br` alias for ergonomics. This

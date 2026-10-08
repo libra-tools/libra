@@ -34,7 +34,7 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 ### `<REMOTE_REPO>`（必需）
 
-要克隆的远程仓库 URL。支持 Git（`git://host/user/repo.git`）、SSH（`git@host:user/repo.git`）和 HTTP(S)（`https://host/user/repo.git`）协议，也支持本地文件系统路径。原 Cloudflare 发布站点恢复源已随 Publish 产品拆除；再使用该源会得到用法错误（退出码 129），并提示改用 git remote 或 `libra cloud` 做仓库备份。对应的 clone-domain 配置键已冷冻，不再读取。
+要克隆的远程仓库 URL。支持 Git（`git://host/user/repo.git`）、SSH（`git@host:user/repo.git`）和 HTTP(S)（`https://host/user/repo.git`）协议，也支持本地文件系统路径。原 Cloudflare Publish 站点恢复源（`libra+cloud://…`）已随 Publish 产品拆除；使用该 URL 会得到用法错误（退出码 129），并提示改为克隆 Git 远端或使用 `libra cloud` 做仓库备份。`cloud.clone_domains.*` 配置键已冷冻，不再读取。
 
 ```bash
 libra clone git@github.com:user/repo.git
@@ -308,7 +308,7 @@ warning: You appear to have cloned an empty repository.
 - `branch` 是实际检出的分支；远程没有 refs 时为 `null`
 - `gitignore_converted` 列出从 `.gitignore` 转换写出的 `.libraignore` 文件（工作区相对路径）；始终存在（裸克隆或源无 `.gitignore` 时为空）
 - `shallow` 表示本次是否实际使用 `--depth` 抓取；`false` 不代表源中继承的浅边界不存在
-- 普通 Git/本地克隆会省略 `source_kind` 和 `cloud_site`
+- `source_kind` 与 `cloud_site` 是保留的可选字段；目前所有受支持的克隆源均会省略它们
 - init 中的 `ref_format` 和 `converted_from` 被有意排除
 - `objects_fetched` / `bytes_received` 给出 Git 源 fetch pack 的对象数与字节大小
 
@@ -352,9 +352,9 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 单分支 | `--single-branch` | N/A | `--single-branch` |
 | 不限单分支 | `--no-single-branch` | N/A | `--no-single-branch`（撤销 `--single-branch`；默认即所有分支） |
 | 裸克隆 | `--bare` | N/A | `--bare` |
-| 浅克隆（depth） | `--depth <n>` | N/A | Git 远程支持；本地 Libra 源 fail-closed (`LBR-REPO-002`)；云端拒绝 |
-| 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
-| 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
+| 浅克隆（depth） | `--depth <n>` | N/A | Git 远程支持；本地 Libra 源 fail-closed (`LBR-REPO-002`) |
+| 按日期浅克隆 | `--shallow-since=<date>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界） |
+| 排除浅边界 | `--shallow-exclude=<rev>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界） |
 | 镜像克隆 | `--mirror` | N/A | `--mirror`（隐含 `--bare`；原样映射全部 `refs/*`，无 tracking ref，设 `remote.<name>.mirror` 与 `+refs/*:refs/*`） |
 | 引用仓库 | `--reference <repo>` / `--reference-if-able <repo>` | N/A | 接受式 no-op（无 fetch 侧 alternate 协商）；`--reference` 告警，`--reference-if-able` 静默 |
 | 共享对象库 | `--shared` / `-s` | N/A | 本地 Libra 源可注册受保护 alternate；v1 仍拷贝对象；其它源显式使用时告警 |
@@ -368,7 +368,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | Verbose / 进度 | `--progress` / `--verbose` | N/A | 分阶段 stderr 进度（默认） |
 | 不检出 | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | 稀疏检出 | `--sparse` | N/A | N/A |
-| Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界）；云端拒绝 |
+| Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界） |
 | Bundle URI | `--bundle-uri=<uri>` | N/A | N/A |
 | Vault 签名引导 | N/A | N/A | 始终启用（匹配 init） |
 | SSH key 检测 | N/A | N/A | 自动检测 + 提示 |

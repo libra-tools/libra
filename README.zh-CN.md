@@ -10,9 +10,9 @@
 
 </div>
 
-Libra 是 AI 原生软件开发的版本控制系统。它将版本控制从代码变更记录扩展为软件创建过程管理，通过捕获需求上下文、AI Agent 交互、代码生成过程和验证记录，将不可见的开发过程转化为可追溯、可复用的工程知识。因此，Libra 可以帮助开发者理解代码为何产生、如何演进，并支持 AI Agent 在不同任务和项目之间复用已有上下文，从而提升 AI 开发的可靠性和协作效率，特别适用于 AI Coding、Agent Workflow 和大型软件工程场景。
+Libra 是 AI 原生版本控制系统，将兼容 Git 的代码历史与外部 AI 编程 Agent 捕获结合起来。它记录受支持 Agent 的会话、检查点元数据，并在会话内容可捕获时将脱敏快照存入 `refs/libra/traces`，让开发者可以查阅变更背景，并随仓库保存这些历史。
 
-Libra 与现有 Git 生态兼容，并支持主流 AI 编程工具。开发者可以在不改变现有工作流的情况下，引入 AI 原生版本控制能力。
+Libra 的对象格式和传输协议兼容 Git，可融入现有开发流程。捕获 hook 支持 Claude Code、Codex 和 OpenCode；这些工具负责运行编程 Agent，Libra 负责记录其工作。
 
 <div align="center">
 
@@ -30,12 +30,12 @@ Libra 与现有 Git 生态兼容，并支持主流 AI 编程工具。开发者�
 
 | 能力 | 传统版本控制（Git） | Libra |
 |-----------|----------------------|-------|
-| **版本化内容** | 仅源代码 | 代码 + AI 推理 + 决策 + 验证报告 + 会话记录 |
-| **AI 协作** | 手动提交信息 | 原生 AI Agent 线程，完整审计追踪 |
-| **知识复用** | 代码快照 | 跨项目可复用的智能资产 |
+| **版本化内容** | 代码历史 | 代码历史 + 捕获的 Agent 检查点和脱敏会话记录 |
+| **AI 协作** | 手动提交信息 | 外部 Agent 会话与检查点历史 |
+| **知识复用** | 代码快照 | 可随仓库历史查阅的捕获上下文 |
 | **安全** | 外部 GPG/SSH 配置 | 内置 Vault，每个仓库独立隔离密钥 |
-| **供应商锁定** | 不适用 | 7+ 家 AI 提供商，自由切换 |
-| **自动化** | 外部 CI/CD | 内置 Cron 驱动的 Agent 自动化 |
+| **Agent 集成** | 不适用 | Claude Code、Codex 和 OpenCode 捕获 hook |
+| **自动化** | 外部 CI/CD | 仓库级 Cron 与 VCS 事件规则 |
 
 ---
 
@@ -94,17 +94,18 @@ libra agent checkpoint list
 
 ## 核心特性
 
-### 🧠 AI 原生线程与持久化
+### 🧠 外部 Agent 捕获与 traces 历史
 
-每一个 AI Agent 会话都是 Libra 中的一等公民。线程、计划、任务、决策、验证报告、工具调用和代码补丁快照都直接持久化在仓库中，与代码共存。没有外部状态——一切都是可持久化、可查询、可回放的。
+`libra agent` 记录受支持的外部编程 Agent 的会话和检查点。检查点元数据保存在本地索引中；会话内容可捕获时，脱敏快照作为仓库对象存储，可从 `refs/libra/traces` 到达。可用 `libra agent session`、`checkpoint` 和 `doctor` 查阅捕获状态，用 `libra agent push` 将 traces 推送到远端。
+
+内置 `libra code` UI 与执行器、其 MCP `--stdio` 入口及 `libra publish` 站点宿主已在 0.23.x 版本线移除。外部 Agent 捕获由 `libra agent` 提供；仓库备份使用 `libra cloud`。
 
 ```
 .libra/
-├── libra.db              # SQLite：Git 核心 + AI 线程 + 运行时合约
-├── vault.db              # 加密密钥库（提供商密钥、签名密钥）
+├── libra.db              # SQLite：VCS 状态 + Agent 捕获元数据
+├── vault.db              # 加密的签名密钥与认证凭据
 ├── objects/              # 对象存储（loose + pack，与 Git 兼容）
-├── sessions/             # AI 会话记录（JSONL 格式）
-└── ai/                   # AI 运行时工作文件
+└── sessions/agent/       # 本地 Agent 捕获事件日志
 ```
 
 ### 🔄 Git 兼容基础
@@ -115,16 +116,15 @@ Libra 使用 Git 的语言。磁盘格式（objects、index、pack、pack-index�
 
 ### 🔐 Vault 安全
 
-每次 `libra init` 自动创建仓库级加密密钥管理：
+默认情况下，`libra init` 会创建仓库级加密密钥库：
 - **GPG 签名密钥**用于提交验证
 - **SSH 密钥**用于远程认证
-- **AI 提供商凭证**安全存储
 
-无需外部密钥管理配置。每个仓库的密钥独立隔离，永不离库。
+签名和认证密钥按仓库隔离。
 
-### 🛡️ 命令安全沙箱
+### 🛡️ 沙箱诊断
 
-每个 AI Agent 的工具调用都经过可配置的安全沙箱，包含命令预检、网络策略执行和可选的 seccomp/seatbelt 限制。定义 Agent 能做什么、不能做什么。
+`libra sandbox status` 报告申请使用 Libra 内部沙箱的操作可用的后端与执行策略。外部编程 Agent 仍使用各自的执行与安全策略。
 
 ### ☁️ 分层云存储与备份
 
@@ -132,29 +132,13 @@ Libra 使用 Git 的语言。磁盘格式（objects、index、pack、pack-index�
 - **云端备份**：将完整仓库状态（含 AI 历史）同步到 Cloudflare D1 + R2
 - **可移植**：在不同机器之间迁移 Libra 仓库，AI 上下文完整保留
 
-### 🌐 原生 MCP 协议支持
-
-Libra 原生支持 [Model Context Protocol](https://modelcontextprotocol.io/)，可直接与 Claude Desktop、Cursor 和任何 MCP 兼容客户端集成。配置一次，到处使用。
-
-```json
-{
-  "mcpServers": {
-    "libra": {
-      "command": "/path/to/libra",
-      "args": ["code", "--stdio"],
-      "cwd": "/path/to/your/libra/repo"
-    }
-  }
-}
-```
-
 ---
 
-## 支持的 AI 提供商
+## 支持的外部 Agent
 
-Libra 目前已支持 Claude Code、CodeX 和 OpenCode；对其他主流 Agent 的支持将陆续发布。
+Libra 支持 Claude Code、Codex 和 OpenCode 的 hook 捕获。内置模型提供商执行器已随 `libra code` 在 0.23.x 版本线移除。
 
-> 前往 [docs.libra.tools](https://docs.libra.tools/en/docs/getting-started/agent) 查看提供商配置详情。
+> 查看 [Agent 命令指南](docs/commands/zh-CN/agent.md)，了解捕获配置和支持的 Agent。
 
 ---
 
@@ -183,9 +167,9 @@ cargo +nightly fmt --all --check
 cargo +nightly fmt --all
 ```
 
-Windows 构建用户请查看 [Windows 构建指南](docs/installation/windows.md) 了解 OpenSSL 配置。
+Windows 安装方法见 [Windows 安装说明](docs/installation.zh-CN.md#windows)。
 
-详细贡献指南请参见 [docs/development/contributing.md](docs/development/contributing.md)。
+详细贡献指南请参见 [贡献指南](docs/contributing.md)。
 
 ---
 
