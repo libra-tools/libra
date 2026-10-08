@@ -324,12 +324,30 @@ commit state and rerun diagnosis when the outcome is uncertain.
 
 Set a configuration value. If `<value>` is omitted and the key is sensitive, Libra prompts for interactive input (hidden echo). In non-interactive contexts (CI/CD), use `--stdin` to pipe the value.
 
+Keys are literal: `_`, `%`, and `\` do not select neighboring keys. For example,
+setting `custom.cache%name.value` leaves `custom.cache_name.value` unchanged.
+An exact spelling is updated in place; without `--add`, an exact key with
+multiple values is refused. When no exact spelling exists, `set` retains its
+ASCII case-insensitive replacement behavior. Both exact updates and
+case-equivalent replacements preserve an existing encryption flag.
+
 | Flag | Description |
 |------|-------------|
 | `--add` | Add as an additional value for the key, allowing duplicates (like Git's multi-valued keys such as `remote.origin.fetch`) |
 | `--encrypt` | Force vault encryption even if the key does not match sensitive-key heuristics |
-| `--plaintext` | Force plaintext storage, skipping auto-encryption even for sensitive-looking keys |
+| `--plaintext` | Store a new key as plaintext even if it looks sensitive; rejects replacement of existing encrypted values and vault internal/secret keys |
 | `--stdin` | Read the value from stdin instead of a positional argument (useful for piping secrets in CI/CD) |
+
+When `set` replaces an ordinary encrypted key, it keeps the value encrypted using
+the vault for the selected local or global scope, including ASCII case fallback.
+An exact key takes precedence over other spellings; multiple exact values still
+require `unset-all` before a single-value assignment. `--plaintext` cannot replace
+an existing encrypted value and fails with `LBR-REPO-003` (exit 128), leaving its
+rows unchanged. To deliberately store a new plaintext value for an ordinary key,
+first run `libra config unset --all [--local | --global] <key>` using the stored
+spelling and scope, then set the value again with `--plaintext`. New ordinary keys
+still accept plaintext; vault internal/secret keys and system-scope encrypted
+values remain rejected. This does not repair values damaged by an older writer.
 
 ```bash
 # Basic set
@@ -435,6 +453,8 @@ libra config import --global
 # Import into local config
 libra config import
 ```
+
+If an imported entry would replace an existing encrypted ordinary value with plaintext (for example a key that was stored with `--encrypt` but is not auto-detected as sensitive), the import stops at that key with `LBR-REPO-003` (exit 128) and the same recovery hint as `config set`, naming the key; entries the run had already written are kept and the remaining entries are not imported. Clear every stored spelling of that key with `config unset --all` and re-run the import.
 
 #### `path`
 

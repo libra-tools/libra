@@ -189,6 +189,13 @@ structured report is always present.
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
 | `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
 
+`config set --plaintext` refuses an existing encrypted value with `LBR-REPO-003`
+(exit 128), including ASCII case fallback. Clear that ordinary key with
+`config unset --all` using its stored spelling and scope, then set the new value
+explicitly. A concurrent encryption-state change also rejects a stale plaintext
+assignment and rolls back its configuration transaction; check the current state
+before retrying. No configuration value is included in this error.
+
 ### Config
 
 | Stable code | Meaning |

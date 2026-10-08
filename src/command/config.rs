@@ -13,7 +13,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     internal::{
-        config::{ConfigKv, ConfigKvEntry, is_sensitive_key, is_vault_internal_key},
+        config::{
+            ConfigKv, ConfigKvEntry, PLAINTEXT_ENCRYPTED_REPLACEMENT, is_sensitive_key,
+            is_vault_internal_key,
+        },
         db::{
             DatabaseRole, begin_write_transaction, get_db_conn_instance,
             schema::{
@@ -266,6 +269,17 @@ impl ScopedConfig {
             .map_err(|e| e.to_string())
     }
 
+    async fn get_set_replacement_entries(
+        scope: ConfigScope,
+        key: &str,
+    ) -> Result<Vec<ConfigKvEntry>, String> {
+        let conn = Self::get_connection(scope).await?;
+        ConfigKv::select_set_replacement_with_conn(&conn, key)
+            .await
+            .map(|replacement| replacement.entries())
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn set(
         scope: ConfigScope,
         key: &str,
@@ -279,9 +293,12 @@ impl ScopedConfig {
             );
         }
         let txn = Self::begin_mutation(scope).await?;
-        ConfigKv::set_with_conn(&txn, key, value, encrypted)
-            .await
-            .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+        if let Err(error) = ConfigKv::set_prepared_with_conn(&txn, key, value, encrypted).await {
+            txn.rollback().await.map_err(|rollback| {
+                format!("failed to roll back rejected configuration update ({error}): {rollback}")
+            })?;
+            return Err(format!("failed to set config '{key}': {error}"));
+        }
         txn.commit()
             .await
             .map_err(|e| format!("failed to commit config update: {e}"))
@@ -1801,14 +1818,38 @@ async fn handle_set(
     }
 
     // Check encryption state inheritance from existing entries.
-    let existing_entries = ScopedConfig::get_all(scope, key).await.map_err(|e| {
+    let assignment_selection =
+        !add && (value.is_some() || stdin || encrypt || (!plaintext && is_sensitive_key(key)));
+    let existing_entries = if assignment_selection {
+        ScopedConfig::get_set_replacement_entries(scope, key).await
+    } else {
+        ScopedConfig::get_all(scope, key).await
+    }
+    .map_err(|e| {
+        if assignment_selection && e.contains("values exist") {
+            return CliError::from_legacy_string(e).with_exit_code(5);
+        }
         config_read_cli_error(format!(
             "failed to read {} config while checking existing values for key '{}': {e}",
             scope_name(scope),
             key
         ))
     })?;
-    let has_encrypted = existing_entries.iter().any(|e| e.encrypted);
+    // A missing-value explicit set may require protected input for an older
+    // differently-cased encrypted key. Bare reads and add retain exact lookup.
+    let existing_entries = if !assignment_selection
+        && !add
+        && explicit_set
+        && !plaintext
+        && existing_entries.is_empty()
+    {
+        ScopedConfig::get_set_replacement_entries(scope, key)
+            .await
+            .map_err(config_read_cli_error)?
+    } else {
+        existing_entries
+    };
+    let mut has_encrypted = existing_entries.iter().any(|e| e.encrypted);
     let has_plaintext = existing_entries.iter().any(|e| !e.encrypted);
 
     // The system scope holds no vault, so an existing encrypted row should never
@@ -1822,6 +1863,13 @@ async fn handle_set(
             "vault-encrypted secrets are not supported in --system scope",
         )
         .with_hint("this key already has an encrypted value; use --global or --local"));
+    }
+
+    if assignment_selection && plaintext && has_encrypted {
+        return Err(config_plaintext_replacement_error_for(
+            key,
+            scope_name(scope),
+        ));
     }
 
     // Resolve the value
@@ -1904,6 +1952,34 @@ async fn handle_set(
         None => resolved_value,
     };
 
+    // A protected-input assignment has now resolved a value; perform the same
+    // multi-value/scope checks before accessing the vault. Ordinary bare reads
+    // returned above and never enter this assignment path.
+    if !add && !assignment_selection {
+        let replacements = ScopedConfig::get_set_replacement_entries(scope, key)
+            .await
+            .map_err(|error| {
+                if error.contains("values exist") {
+                    CliError::from_legacy_string(error).with_exit_code(5)
+                } else {
+                    config_read_cli_error(error)
+                }
+            })?;
+        has_encrypted = replacements.iter().any(|entry| entry.encrypted);
+        if scope == ConfigScope::System && has_encrypted {
+            return Err(CliError::command_usage(
+                "vault-encrypted secrets are not supported in --system scope",
+            )
+            .with_hint("this key already has an encrypted value; use --global or --local"));
+        }
+        if plaintext && has_encrypted {
+            return Err(config_plaintext_replacement_error_for(
+                key,
+                scope_name(scope),
+            ));
+        }
+    }
+
     // Determine encryption
     let should_encrypt = if encrypt {
         true
@@ -1974,6 +2050,9 @@ async fn handle_set(
                 if e.contains("core.objectformat cannot be changed") {
                     return core_objectformat_mutation_error("config set");
                 }
+                if let Some(err) = map_scoped_set_guard_error(&e, scope_name(scope), Some(key)) {
+                    return err;
+                }
                 let err = CliError::from_legacy_string(&e);
                 if e.contains("values exist") {
                     err.with_exit_code(5)
@@ -1984,6 +2063,71 @@ async fn handle_set(
         emit_set_ack("set", scope, key, should_encrypt, output)?;
     }
     Ok(())
+}
+
+fn config_plaintext_replacement_error() -> CliError {
+    CliError::failure(PLAINTEXT_ENCRYPTED_REPLACEMENT)
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint("use config list in the same scope to find each stored spelling, then use config unset --all (or --unset-all) for each spelling of this ordinary key before setting the new value explicitly; retry a concurrent update after checking its encryption state")
+}
+
+/// Same refusal as [`config_plaintext_replacement_error`], naming the affected
+/// ordinary key and scope (never the value) so that a multi-entry operation
+/// such as `config import` tells the user which stored spellings to clear.
+fn config_plaintext_replacement_error_for(key: &str, scope: &str) -> CliError {
+    CliError::failure(format!(
+        "{PLAINTEXT_ENCRYPTED_REPLACEMENT} (key '{key}' in {scope} scope)"
+    ))
+    .with_stable_code(StableErrorCode::RepoStateInvalid)
+    .with_hint(format!(
+        "use config list {scope_flag} to find each stored spelling of '{key}', then use config unset --all {scope_flag} <spelling> (or --unset-all) for each one before setting or importing the new value; retry a concurrent update after checking its encryption state",
+        scope_flag = scope_cli_flag(scope)
+    ))
+}
+
+fn scope_cli_flag(scope: &str) -> &'static str {
+    match scope {
+        "global" => "--global",
+        "system" => "--system",
+        _ => "--local",
+    }
+}
+
+/// Classify the error string returned by [`ScopedConfig::set`] for the CLI.
+///
+/// Returns `Some` for the two outcomes of the shared writer guard that need a
+/// stable, actionable presentation: a plaintext-over-encrypted refusal (mapped
+/// to `LBR-REPO-003` with the affected key) and a *failed rollback* of such a
+/// refusal, which must stay visible as a transaction-cleanup failure instead of
+/// being presented as a routine refusal. Any other error returns `None` so the
+/// caller keeps its existing mapping.
+fn map_scoped_set_guard_error(error: &str, scope: &str, key: Option<&str>) -> Option<CliError> {
+    if error.starts_with("failed to roll back rejected configuration update") {
+        return Some(
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint(format!(
+                    "the refused configuration update could not be rolled back cleanly; run config list {flag} and config get {flag} <key> to inspect the stored row before retrying, and report the rollback error if the row looks inconsistent",
+                    flag = scope_cli_flag(scope)
+                )),
+        );
+    }
+    if error.contains(PLAINTEXT_ENCRYPTED_REPLACEMENT) {
+        // The guard reports `failed to set config '<key>': <reason>`; keys may
+        // contain apostrophes (subsections), so strip the known prefix and the
+        // known `': <reason>` suffix instead of splitting inside the key.
+        let key = key.map(str::to_string).or_else(|| {
+            error
+                .split_once("failed to set config '")
+                .and_then(|(_, rest)| rest.rsplit_once("': "))
+                .map(|(k, _)| k.to_string())
+        });
+        return Some(match key {
+            Some(key) => config_plaintext_replacement_error_for(&key, scope),
+            None => config_plaintext_replacement_error(),
+        });
+    }
+    None
 }
 
 /// Decrypt a hex-encoded ciphertext from a config value using the vault unseal key.
@@ -3120,6 +3264,12 @@ async fn handle_import(scope: ConfigScope, output: &OutputConfig) -> CliResult<(
     let summary = import_git_config(scope).await.map_err(|e| {
         if e.contains("core.objectformat cannot be changed") {
             core_objectformat_mutation_error("config import")
+        } else if let Some(err) = map_scoped_set_guard_error(&e, scope_name(scope), None) {
+            // The shared writer guard refused to replace an existing encrypted
+            // ordinary value with plaintext (or could not roll that refusal
+            // back); surface the same stable code, the affected key and the
+            // recovery hint as `config set` instead of the raw guard message.
+            err
         } else {
             CliError::from_legacy_string(e)
         }
@@ -4414,6 +4564,69 @@ mod acquire_passphrase_tests {
         assert!(
             !message.contains("s3cret"),
             "the error must never echo passphrase material: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod guard_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failure_stays_visible_and_keeps_the_refusal_reason() {
+        let raw = format!(
+            "failed to roll back rejected configuration update ({PLAINTEXT_ENCRYPTED_REPLACEMENT}): database is locked"
+        );
+        let err = map_scoped_set_guard_error(&raw, "local", Some("probe.value"))
+            .expect("rollback failure is classified");
+        assert!(
+            err.message()
+                .starts_with("failed to roll back rejected configuration update")
+        );
+        assert!(err.message().contains(PLAINTEXT_ENCRYPTED_REPLACEMENT));
+        assert!(err.message().contains("database is locked"));
+        assert!(matches!(
+            err.stable_code(),
+            StableErrorCode::RepoStateInvalid
+        ));
+        assert!(!err.hints().is_empty());
+    }
+
+    #[test]
+    fn plaintext_refusal_names_key_and_scope_without_the_value() {
+        let raw = format!("failed to set config 'probe.value': {PLAINTEXT_ENCRYPTED_REPLACEMENT}");
+        let err = map_scoped_set_guard_error(&raw, "global", None).expect("refusal is classified");
+        assert!(err.message().contains(PLAINTEXT_ENCRYPTED_REPLACEMENT));
+        assert!(err.message().contains("key 'probe.value' in global scope"));
+        assert!(matches!(
+            err.stable_code(),
+            StableErrorCode::RepoStateInvalid
+        ));
+        let hints = format!("{:?}", err.hints());
+        assert!(hints.contains("--global") && hints.contains("unset --all"));
+        assert!(!err.message().contains("synthetic"));
+    }
+
+    #[test]
+    fn parsed_key_keeps_apostrophes_in_subsections() {
+        let raw = format!(
+            "failed to set config 'custom.o'connor.value': {PLAINTEXT_ENCRYPTED_REPLACEMENT}"
+        );
+        let err = map_scoped_set_guard_error(&raw, "local", None).expect("refusal is classified");
+        assert!(
+            err.message()
+                .contains("key 'custom.o'connor.value' in local scope")
+        );
+    }
+
+    #[test]
+    fn explicit_key_takes_precedence_over_parsing_and_other_errors_pass_through() {
+        let raw = format!("failed to set config 'other.key': {PLAINTEXT_ENCRYPTED_REPLACEMENT}");
+        let err = map_scoped_set_guard_error(&raw, "local", Some("explicit.key")).unwrap();
+        assert!(err.message().contains("key 'explicit.key' in local scope"));
+        assert!(
+            map_scoped_set_guard_error("failed to set config 'x': values exist", "local", None)
+                .is_none()
         );
     }
 }

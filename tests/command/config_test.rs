@@ -13,6 +13,513 @@ use super::*;
 
 mod git_import;
 
+async fn fix_npr_config_rows(
+    path: &std::path::Path,
+) -> Vec<libra::internal::model::config_kv::Model> {
+    use libra::internal::{db::open_database_without_migrations, model::config_kv};
+    use sea_orm::{EntityTrait, QueryOrder};
+    let db = open_database_without_migrations(path)
+        .await
+        .expect("open isolated config");
+    let rows = config_kv::Entity::find()
+        .order_by_asc(config_kv::Column::Id)
+        .all(&db)
+        .await
+        .expect("snapshot config rows");
+    db.close().await.expect("close config snapshot");
+    rows
+}
+
+#[tokio::test]
+async fn fix_npr_config_encrypted_case_replacement() {
+    for scope in ["--local", "--global"] {
+        let repo = tempdir().expect("isolated encrypted replacement");
+        let call = |args: &[&str]| run_libra_command_with_env(args, repo.path(), &[]);
+        assert_cli_success(&call(&["init", "--vault=false"]), "init without vault");
+        assert_cli_success(
+            &call(&[
+                "config",
+                "set",
+                scope,
+                "--encrypt",
+                "probe.value",
+                "initial-synthetic",
+            ]),
+            "seed encrypted ordinary key",
+        );
+        let db = if scope == "--local" {
+            repo.path().join(".libra/libra.db")
+        } else {
+            repo.path().join(".libra-test-home/.libra/config.db")
+        };
+        for (spelling, input, value) in [
+            ("probe.value", "yes", "true"),
+            ("PROBE.Value", "no", "false"),
+        ] {
+            assert_cli_success(
+                &call(&["config", "--type=bool", scope, spelling, input]),
+                "inherit encryption with exact or ASCII case replacement",
+            );
+            let rows = fix_npr_config_rows(&db).await;
+            let row = rows
+                .iter()
+                .find(|r| r.key == spelling)
+                .expect("replacement exists");
+            assert_eq!(row.encrypted, 1);
+            assert_ne!(row.value, value, "at-rest value must be ciphertext");
+            let reveal = call(&["config", "get", scope, "--reveal", spelling]);
+            assert_cli_success(&reveal, "reveal canonical value");
+            assert_eq!(String::from_utf8_lossy(&reveal.stdout).trim(), value);
+            for args in [
+                vec!["config", "get", scope, spelling],
+                vec!["--json", "config", "get", scope, spelling],
+            ] {
+                let redacted = call(&args);
+                assert_cli_success(&redacted, "redacted read");
+                assert!(String::from_utf8_lossy(&redacted.stdout).contains("REDACTED"));
+                assert!(!String::from_utf8_lossy(&redacted.stdout).contains(&row.value));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fix_npr_config_plaintext_existing_encrypted_rejected() {
+    for scope in ["--local", "--global"] {
+        let repo = tempdir().expect("isolated plaintext refusal");
+        let call = |args: &[&str]| run_libra_command_with_env(args, repo.path(), &[]);
+        assert_cli_success(&call(&["init", "--vault=false"]), "init without vault");
+        assert_cli_success(
+            &call(&[
+                "config",
+                "set",
+                scope,
+                "--encrypt",
+                "probe.value",
+                "synthetic-preserved",
+            ]),
+            "seed encryption",
+        );
+        let db = if scope == "--local" {
+            repo.path().join(".libra/libra.db")
+        } else {
+            repo.path().join(".libra-test-home/.libra/config.db")
+        };
+        let before = fix_npr_config_rows(&db).await;
+        for spelling in ["probe.value", "PROBE.Value"] {
+            let result = call(&[
+                "config",
+                "set",
+                scope,
+                "--plaintext",
+                spelling,
+                "synthetic-rejected",
+            ]);
+            assert_eq!(
+                result.status.code(),
+                Some(128),
+                "plain encrypted overwrite must fail"
+            );
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains("LBR-REPO-003") && stderr.contains("unset-all"));
+            assert!(!stderr.contains("synthetic-rejected"));
+            assert_eq!(
+                fix_npr_config_rows(&db).await,
+                before,
+                "rejection must preserve all physical rows"
+            );
+        }
+        let reveal = call(&["config", "get", scope, "--reveal", "probe.value"]);
+        assert_cli_success(&reveal, "original ciphertext still reveals");
+        assert_eq!(
+            String::from_utf8_lossy(&reveal.stdout).trim(),
+            "synthetic-preserved"
+        );
+        assert_cli_success(
+            &call(&[
+                "config",
+                "set",
+                scope,
+                "--plaintext",
+                "fresh.value",
+                "ordinary",
+            ]),
+            "new ordinary plaintext remains supported",
+        );
+        assert!(
+            !call(&[
+                "config",
+                "set",
+                scope,
+                "--plaintext",
+                "vault.env.SYNTHETIC",
+                "rejected"
+            ])
+            .status
+            .success()
+        );
+        assert_cli_success(
+            &call(&["config", "unset", "--all", scope, "probe.value"]),
+            "explicit ordinary-key recovery using the real supported CLI",
+        );
+        assert_cli_success(
+            &call(&[
+                "config",
+                "set",
+                scope,
+                "--plaintext",
+                "probe.value",
+                "new-ordinary",
+            ]),
+            "reset after explicit clearing",
+        );
+        let rows = fix_npr_config_rows(&db).await;
+        let plain = rows.iter().find(|row| row.key == "probe.value").unwrap();
+        assert_eq!(plain.encrypted, 0);
+        assert_eq!(plain.value, "new-ordinary");
+    }
+}
+
+#[tokio::test]
+async fn fix_npr_config_import_refuses_plaintext_over_encrypted() {
+    // `config import` goes through the same shared writer guard as `set`:
+    // an imported ordinary key whose stored row is encrypted (and which the
+    // importer does not auto-encrypt) must be refused with LBR-REPO-003, the
+    // affected key named, the value absent, the encrypted row untouched and
+    // the entries imported before it kept.
+    for scope in ["--local", "--global"] {
+        let repo = tempdir().expect("isolated import refusal");
+        let git_global = repo.path().join("import-source.gitconfig");
+        std::fs::write(&git_global, "").expect("seed git global file");
+        let env: Vec<(&str, &str)> = vec![("GIT_CONFIG_GLOBAL", git_global.to_str().unwrap())];
+        let call = |args: &[&str]| run_libra_command_with_env(args, repo.path(), &env);
+        assert_cli_success(&call(&["init", "--vault=false"]), "init without vault");
+        assert_cli_success(
+            &call(&[
+                "config",
+                "set",
+                scope,
+                "--encrypt",
+                "probe.value",
+                "synthetic-preserved",
+            ]),
+            "seed encrypted ordinary key",
+        );
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", &git_global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("run git")
+        };
+        if scope == "--local" {
+            assert!(git(&["init"]).status.success(), "git init for local import");
+        }
+        let git_scope = if scope == "--local" {
+            "--local"
+        } else {
+            "--global"
+        };
+        // A known multi-value key is written by the importer before any
+        // single-value entry, so it proves "entries already written are kept".
+        assert!(
+            git(&[
+                "config",
+                git_scope,
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*"
+            ])
+            .status
+            .success()
+        );
+        assert!(
+            git(&["config", git_scope, "alpha.first", "imported-first"])
+                .status
+                .success()
+        );
+        assert!(
+            git(&[
+                "config",
+                git_scope,
+                "probe.value",
+                "synthetic-import-plaintext"
+            ])
+            .status
+            .success()
+        );
+        let db = if scope == "--local" {
+            repo.path().join(".libra/libra.db")
+        } else {
+            repo.path().join(".libra-test-home/.libra/config.db")
+        };
+        let before = fix_npr_config_rows(&db).await;
+        let encrypted_before = before
+            .iter()
+            .find(|row| row.key == "probe.value")
+            .cloned()
+            .expect("seeded encrypted row");
+        assert_eq!(encrypted_before.encrypted, 1);
+
+        let result = if scope == "--local" {
+            call(&["config", "import"])
+        } else {
+            call(&["config", "--global", "import"])
+        };
+        assert_eq!(
+            result.status.code(),
+            Some(128),
+            "import must refuse replacing an encrypted ordinary key with plaintext ({scope})"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("LBR-REPO-003"), "stable code: {stderr}");
+        assert!(
+            stderr.contains("probe.value"),
+            "affected key named: {stderr}"
+        );
+        assert!(
+            stderr.contains("unset --all") || stderr.contains("unset-all"),
+            "recovery hint: {stderr}"
+        );
+        assert!(!stderr.contains("synthetic-import-plaintext"));
+        assert!(!stderr.contains("synthetic-preserved"));
+
+        let after = fix_npr_config_rows(&db).await;
+        let encrypted_after = after
+            .iter()
+            .find(|row| row.key == "probe.value")
+            .cloned()
+            .expect("encrypted row still present");
+        assert_eq!(
+            encrypted_after, encrypted_before,
+            "encrypted row must be byte-identical"
+        );
+        // Multi-value entries are imported first (add semantics), so this one is
+        // written before the refusal and must survive it exactly.
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row.key == "remote.origin.fetch")
+                .map(|row| row.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["+refs/heads/*:refs/remotes/origin/*"],
+            "entry written before the refusal is kept"
+        );
+        // Single-value entries are written from a last-one-wins map, so the
+        // refusal may land before or after other single-value keys; whatever
+        // was already written stays and no row is half-written.
+        assert!(
+            after
+                .iter()
+                .all(|row| row.key != "alpha.first" || row.value == "imported-first")
+        );
+        let reveal = call(&["config", "get", scope, "--reveal", "probe.value"]);
+        assert_cli_success(&reveal, "original ciphertext still reveals");
+        assert_eq!(
+            String::from_utf8_lossy(&reveal.stdout).trim(),
+            "synthetic-preserved"
+        );
+        // Documented recovery: clear every stored spelling, then re-run the import.
+        assert_cli_success(
+            &call(&["config", "unset", "--all", scope, "probe.value"]),
+            "explicit ordinary-key recovery",
+        );
+        let retry = if scope == "--local" {
+            call(&["config", "import"])
+        } else {
+            call(&["config", "--global", "import"])
+        };
+        assert_cli_success(&retry, "import succeeds after the encrypted key is cleared");
+        let recovered = fix_npr_config_rows(&db).await;
+        let plain = recovered
+            .iter()
+            .find(|row| row.key == "probe.value")
+            .expect("imported plaintext row");
+        assert_eq!(plain.encrypted, 0);
+        assert_eq!(plain.value, "synthetic-import-plaintext");
+        assert_eq!(
+            recovered
+                .iter()
+                .find(|row| row.key == "alpha.first")
+                .map(|row| row.value.as_str()),
+            Some("imported-first")
+        );
+        assert_eq!(
+            recovered
+                .iter()
+                .filter(|row| row.key == "remote.origin.fetch")
+                .count(),
+            1,
+            "re-import skips the already present multi-value entry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fix_npr_config_selection_and_system_guard() {
+    use libra::internal::{config::ConfigKv, db::open_database_without_migrations};
+    let repo = tempdir().expect("isolated selection controls");
+    let call = |args: &[&str]| run_libra_command_with_env(args, repo.path(), &[]);
+    assert_cli_success(&call(&["init", "--vault=false"]), "init without vault");
+    let path = repo.path().join(".libra/libra.db");
+    let db = open_database_without_migrations(&path)
+        .await
+        .expect("open isolated repo");
+    ConfigKv::add_with_conn(&db, "probe.value", "exact", false)
+        .await
+        .unwrap();
+    ConfigKv::add_with_conn(&db, "PROBE.Value", "synthetic-other-ciphertext", true)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    let before = fix_npr_config_rows(&path).await;
+    assert_cli_success(
+        &call(&["config", "set", "--plaintext", "probe.value", "replacement"]),
+        "exact plaintext row precedes encrypted other case",
+    );
+    let after = fix_npr_config_rows(&path).await;
+    assert_eq!(
+        after.iter().find(|r| r.key == "PROBE.Value"),
+        before.iter().find(|r| r.key == "PROBE.Value")
+    );
+    assert_eq!(
+        after.iter().find(|r| r.key == "probe.value").unwrap().id,
+        before.iter().find(|r| r.key == "probe.value").unwrap().id
+    );
+    assert_cli_success(
+        &call(&["config", "--add", "probe.value", "second"]),
+        "make actual exact multi value",
+    );
+    let multi_before = fix_npr_config_rows(&path).await;
+    let multi = call(&["config", "set", "--encrypt", "probe.value", "rejected"]);
+    assert_eq!(multi.status.code(), Some(5));
+    assert_eq!(
+        fix_npr_config_rows(&path).await,
+        multi_before,
+        "multi refusal must precede vault initialization"
+    );
+    let fallback = call(&["config", "set", "--plaintext", "PrObE.VaLuE", "rejected"]);
+    assert_eq!(fallback.status.code(), Some(128));
+    assert_eq!(fix_npr_config_rows(&path).await, multi_before);
+
+    assert_cli_success(
+        &call(&["config", "set", "--system", "guard.value", "synthetic"]),
+        "create isolated system database",
+    );
+    let system_path = repo.path().join(".libra-test-home/.libra/system-config.db");
+    let system = open_database_without_migrations(&system_path)
+        .await
+        .unwrap();
+    ConfigKv::set_with_conn(&system, "guard.value", "synthetic-ciphertext", true)
+        .await
+        .unwrap();
+    system.close().await.unwrap();
+    let system_before = fix_npr_config_rows(&system_path).await;
+    let local_before = fix_npr_config_rows(&path).await;
+    for spelling in ["guard.value", "GUARD.Value"] {
+        for plain in [false, true] {
+            let mut args = vec!["config", "set", "--system"];
+            if plain {
+                args.push("--plaintext");
+            }
+            args.extend([spelling, "rejected"]);
+            let output = call(&args);
+            assert_eq!(output.status.code(), Some(129));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--system"));
+            assert_eq!(fix_npr_config_rows(&system_path).await, system_before);
+            assert_eq!(
+                fix_npr_config_rows(&path).await,
+                local_before,
+                "system refusal must not initialize the local vault"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn npr_19_cli_registry() {
+    use libra::internal::{db::open_database_without_migrations, model::config_kv};
+    use sea_orm::{EntityTrait, QueryOrder};
+
+    let repo = tempdir().expect("isolated config CLI repository");
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "initialize isolated config repository",
+    );
+    let registry_key = "agent.native_origin.opencode.v1";
+    let nearby_key = "agent.native%origin.opencode.v1";
+    // Synthetic registry-shaped data exercises storage isolation and grants no native authority.
+    let registry_bytes = " {\"epoch\":19,\"records\":[],\"tombstones\":[\"synthetic-retired\"]}\n";
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", registry_key, registry_bytes],
+            repo.path(),
+        ),
+        "seed synthetic registry through the actual CLI",
+    );
+    let path = repo.path().join(".libra/libra.db");
+    let before_db = open_database_without_migrations(&path)
+        .await
+        .expect("open the actual CLI repository database");
+    let before = config_kv::Entity::find()
+        .order_by_asc(config_kv::Column::Id)
+        .all(&before_db)
+        .await
+        .expect("snapshot physical config rows");
+    before_db
+        .close()
+        .await
+        .expect("close before actual CLI write");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", nearby_key, "ordinary-neighbor"],
+            repo.path(),
+        ),
+        "set a distinct literal key through the actual CLI",
+    );
+    let after_db = open_database_without_migrations(&path)
+        .await
+        .expect("reopen actual CLI database after write");
+    let after = config_kv::Entity::find()
+        .order_by_asc(config_kv::Column::Id)
+        .all(&after_db)
+        .await
+        .expect("read actual CLI config result");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|row| row.key != nearby_key)
+            .cloned()
+            .collect::<Vec<_>>(),
+        before,
+        "the real CLI must preserve existing row IDs, bytes and encryption flags"
+    );
+    let registry = after
+        .iter()
+        .find(|row| row.key == registry_key)
+        .expect("registry row preserved");
+    assert_eq!(registry.value.as_bytes(), registry_bytes.as_bytes());
+    let decoded: serde_json::Value =
+        serde_json::from_str(&registry.value).expect("synthetic registry JSON");
+    assert_eq!(decoded["epoch"], 19);
+    assert_eq!(
+        decoded["tombstones"],
+        serde_json::json!(["synthetic-retired"])
+    );
+    let nearby = after
+        .iter()
+        .find(|row| row.key == nearby_key)
+        .expect("distinct key inserted");
+    assert_eq!(nearby.value, "ordinary-neighbor");
+    assert_eq!(nearby.encrypted, 0);
+    after_db
+        .close()
+        .await
+        .expect("close isolated config CLI database");
+}
+
 async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str) {
     use libra::internal::{
         config::ConfigKv,
