@@ -127,11 +127,16 @@ jobs:
             throw 'Cannot verify pull merge parents'
           }
           $parents = $parentLine[0].Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
-          if ($parents.Count -ne 2 -or $parents[0] -ne $env:EXPECTED_BASE_SHA -or
-              $parents[1] -ne $env:EXPECTED_PR_HEAD_SHA) {
-            throw 'Pull merge parents do not match the actual PR base and head'
+          # The merge commit's second parent is the PR head. Its first parent is
+          # the base GitHub actually merged. pull_request.base.sha can lag that
+          # parent when main moves after the event payload is snapshotted.
+          if ($parents.Count -ne 2 -or $parents[1] -ne $env:EXPECTED_PR_HEAD_SHA) {
+            throw "Pull merge parents do not match the PR head. parents=$($parentLine[0].Trim()) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA)"
           }
-          Write-Output "Scoped Windows source: merge=$($env:EXPECTED_MERGE_SHA) head=$($env:EXPECTED_PR_HEAD_SHA) base=$($env:EXPECTED_BASE_SHA) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
+          if ($parents[0] -ne $env:EXPECTED_BASE_SHA) {
+            Write-Output "Event base $($env:EXPECTED_BASE_SHA) lagged the merge base $($parents[0]); testing the merge GitHub built."
+          }
+          Write-Output "Scoped Windows source: merge=$($env:EXPECTED_MERGE_SHA) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA) mergeBase=$($parents[0]) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
 
           $fixtures = @(
             'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_readonly_cleanup',
