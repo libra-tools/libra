@@ -103,6 +103,15 @@ pub async fn materialize_validated_checkpoint_input(
     if spec.checkpoint_id.is_empty() {
         return Err("checkpoint input spec is missing its checkpoint id".to_string());
     }
+    // Pin the caller's paths before the confined API checks ancestors. A
+    // macOS temp repo is reached through the /var symlink; resolving it once
+    // names the real directory, and the no-follow check still applies there.
+    let storage = std::fs::canonicalize(storage).map_err(|error| {
+        format!("checkpoint input storage path is not a real directory: {error}")
+    })?;
+    let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
+        format!("checkpoint input run directory is not a real directory: {error}")
+    })?;
     let run_id = run_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -111,11 +120,6 @@ pub async fn materialize_validated_checkpoint_input(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| "checkpoint input run directory has no trusted runs root".to_string())?;
-    if !runs_root.is_absolute() {
-        return Err(
-            "checkpoint input runs root must be absolute; refusing a cwd-relative run".to_string(),
-        );
-    }
     let budget = scoped_io::ScopedIoBudget {
         deadline,
         cancelled,
@@ -127,7 +131,7 @@ pub async fn materialize_validated_checkpoint_input(
     let root = run_dir.join(CHECKPOINT_INPUT_DIR);
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("failed to create checkpoint input dir: {error}"))?;
-    write_checkpoint_input_files(storage, spec, &root)?;
+    write_checkpoint_input_files(&storage, spec, &root)?;
     Ok(root)
 }
 
