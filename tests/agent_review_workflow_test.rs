@@ -1502,3 +1502,83 @@ async fn review_checkpoint_scoped() {
         "no run residue for a missing checkpoint"
     );
 }
+
+/// Wrapped ordinary input materializes, and a parent-escaping spec is refused
+/// before any byte is written outside the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fix_rg_scoped_02_review_revalidation() {
+    use libra::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
+    let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
+    let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
+    let (metadata_oid, transcript_oid) =
+        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+    let outside = repo.join("outside.txt");
+    std::fs::write(&outside, b"UNTOUCHED").unwrap();
+    let store = store_for(&repo);
+    let mut hostile = ReviewRunRequest::new(
+        repo.clone(),
+        "list the workspace",
+        format!("checkpoint:{checkpoint_id}"),
+        "0000000000000000000000000000000000000000",
+        vec![fake_reviewer(
+            "lister",
+            Path::new("/bin/sh"),
+            &["-c", "echo should-not-run"],
+            Duration::from_secs(30),
+        )],
+    );
+    hostile.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![CheckpointInputFile {
+            rel_path: "../outside.txt".to_string(),
+            oid: metadata_oid.clone(),
+        }],
+    });
+    let refused = run_bounded(&store, hostile, ReviewCancelHandle::new(), 60).await;
+    assert_eq!(refused.terminal_state, ReviewTerminalState::Error);
+    assert_eq!(std::fs::read(&outside).unwrap(), b"UNTOUCHED");
+
+    let mut request = ReviewRunRequest::new(
+        repo.clone(),
+        "list the workspace",
+        format!("checkpoint:{checkpoint_id}"),
+        "0000000000000000000000000000000000000000",
+        vec![fake_reviewer(
+            "lister",
+            Path::new("/bin/sh"),
+            &["-c", "ls {workspace}"],
+            Duration::from_secs(30),
+        )],
+    );
+    request.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid,
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid,
+            },
+        ],
+    });
+    let outcome = run_bounded(&store, request, ReviewCancelHandle::new(), 60).await;
+    assert_eq!(outcome.terminal_state, ReviewTerminalState::Success);
+    assert_eq!(
+        std::fs::read(
+            outcome
+                .run_dir
+                .join("checkpoint-input")
+                .join("metadata.json")
+        )
+        .unwrap(),
+        metadata.to_vec()
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"UNTOUCHED");
+    assert_no_leaked_workspace(&repo);
+}

@@ -1914,3 +1914,102 @@ async fn investigate_checkpoint_scoped() {
         "{doc}"
     );
 }
+
+/// A paused scoped run keeps its spec. Continue re-materializes through the
+/// validating wrapper without chmod, and the ordinary bytes stay put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fix_rg_scoped_02_persisted_spec_resume() {
+    use libra::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
+    let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
+    let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
+    let (metadata_oid, transcript_oid) =
+        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+    let store = store_for(&repo);
+    let fixtures = temp.path().join("fixtures");
+    let silent = stage_fixture(&fixtures, "investigator-silent.sh");
+    let conclude = stage_fixture(&fixtures, "investigator-conclude.sh");
+    let mut request = InvestigateRunRequest::new(
+        repo.clone(),
+        "review the captured transcript",
+        "0000000000000000000000000000000000000000",
+        vec![fake_investigator(
+            "inv-a",
+            &silent,
+            &[],
+            Duration::from_secs(30),
+        )],
+        4,
+        1,
+    );
+    request.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid,
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid,
+            },
+        ],
+    });
+    let paused = run_bounded(&store, request, InvestigateCancelHandle::new(), 60).await;
+    assert_eq!(paused.terminal_state, None, "silent investigator pauses");
+    assert_eq!(paused.pause_reason, Some(PauseReason::Stalled));
+    let input = paused
+        .run_dir
+        .join("checkpoint-input")
+        .join("metadata.json");
+    assert_eq!(
+        std::fs::read(&input).expect("first materialize"),
+        metadata.to_vec()
+    );
+    let resumed = continue_investigate_with_sources(
+        &store,
+        &paused.run_id,
+        vec![fake_investigator(
+            "inv-a",
+            &conclude,
+            &[],
+            Duration::from_secs(30),
+        )],
+        &repo,
+        DEFAULT_INVESTIGATOR_TIMEOUT,
+        true,
+        DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD,
+        InvestigateCancelHandle::new(),
+    )
+    .await
+    .expect("continue re-materializes the persisted spec");
+    assert_eq!(
+        resumed.terminal_state,
+        Some(InvestigateTerminalState::Quorum)
+    );
+    assert_eq!(
+        std::fs::read(
+            resumed
+                .run_dir
+                .join("checkpoint-input")
+                .join("metadata.json")
+        )
+        .expect("second materialize"),
+        metadata.to_vec()
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(resumed.run_dir.join("state.json")).expect("state.json"),
+    )
+    .expect("state json");
+    assert!(
+        state["workspace_root"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("checkpoint-input"),
+        "{state}"
+    );
+    assert_no_leaked_workspace(&repo);
+}
