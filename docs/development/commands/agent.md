@@ -222,3 +222,7 @@ same identity count by simulating coverage removal in a rolled-back transaction.
   so a bridge session cannot starve a deletion phase while still being ordered
   against one (§C.4.3 writer-vs-deleter). Regression:
   `agent_bridge_vcs_test::commit_create_waits_for_a_deletion_phase_before_publishing`.
+
+## FIX-RG-SCOPED-04 confined checkpoint-input API
+
+`checkpoint_input.rs` owns `open_scoped_run_root`, `read_run_metadata`, and `cleanup_checkpoint_input`. The helper reads `state.json` and `manifest.json` as regular no-follow leaves (64 MiB each, 128 MiB together) and clears only `checkpoint-input` under a trusted absolute runs root. Budgets are 8192 entries, 4096 files, 4096 directories, depth 64, 4096 path bytes, and 8 MiB total path bytes. It does not decide run kind or terminal state. Windows execution is the `compat-scoped-input-windows` job; a Windows release build is not that evidence. Linux operator review of this helper stays UNRUN.

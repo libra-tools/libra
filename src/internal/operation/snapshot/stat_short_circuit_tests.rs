@@ -161,6 +161,7 @@ fn track_unchanged_file(fixture: &ShortCircuitFixture, relative: &str, bytes: &[
     track_files(fixture, &[(relative, bytes)]);
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn load_index(fixture: &ShortCircuitFixture) -> Index {
     Index::from_file(fixture.gitdir.join("index")).expect("load index")
 }

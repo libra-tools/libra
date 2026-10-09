@@ -802,6 +802,7 @@ pub(crate) fn global_unseal_key_path() -> Option<PathBuf> {
 ///
 /// Callers that harden permissions use this so a migrated legacy file — a
 /// backup Libra no longer reads — is left exactly as the user left it.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn active_global_unseal_key_path() -> Option<PathBuf> {
     let new_path = global_unseal_key_path();
     if new_path.as_deref().is_some_and(Path::exists) {

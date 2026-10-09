@@ -178,6 +178,7 @@ impl CaptureSnapshotProjection {
     /// Recover the helper-produced checksum only while this projection remains
     /// transient. Callers must replace it with a repository-scoped commitment
     /// before serializing the projection into catalog or checkpoint metadata.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn redacted_digest_preimage(&self) -> Option<[u8; 32]> {
         redacted_digest_preimage(self.source.as_ref())
     }

@@ -37,7 +37,7 @@ pub(crate) use registry::{
     DETACHED_MARKER, WorktreeEntry, WorktreeEntryState, WorktreeState, local_gitdir_for_scope,
     registry_knows_linked_worktree, registry_knows_linked_worktree_in_storage,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use registry::{REGISTRY_SCHEMA_VERSION, WorktreeStateV1};
 use registry::{
     RegistryShape, canonicalize, ensure_main_entry, find_entry, load_state, load_state_for_repair,

@@ -5,8 +5,10 @@
 //! serializable request/event contract, framing, path encoding, and the two
 //! distinct read-only filesystem capabilities used by that contract.
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
 };

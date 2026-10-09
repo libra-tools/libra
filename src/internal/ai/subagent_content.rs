@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
@@ -24,11 +25,17 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 
+#[cfg(unix)]
+use super::authorized_read::{
+    CancellationSafeChild, StrictBoundedRead, configure_private_helper_process_group,
+    read_async_strictly_bounded, read_strictly_bounded,
+};
+#[cfg(unix)]
+use super::observed_agents::{
+    claude_project_slug, claude_session_dir, open_file_beneath_pinned_provider_directory,
+    open_provider_directory_for_discovery,
+};
 use super::{
-    authorized_read::{
-        CancellationSafeChild, StrictBoundedRead, configure_private_helper_process_group,
-        read_async_strictly_bounded, read_strictly_bounded,
-    },
     capture::snapshot::{CaptureSnapshot, CaptureSnapshotPolicy, CaptureSnapshotService},
     capture_scope::{
         CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
@@ -44,10 +51,9 @@ use super::{
     observed_agents::{
         ClaudeCodeObservedAgent, ExportAuthorized, MAX_REDACTION_MATCH_SAMPLES, RedactedBytes,
         RedactionReport, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
-        claude_project_slug, claude_session_dir, claude_session_id_is_safe_path_component,
-        normalize_claude_transcript, normalize_claude_transcript_until,
-        open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-        parse_canon_value, redact_turns_with_report, safe_turn_projection,
+        claude_session_id_is_safe_path_component, normalize_claude_transcript,
+        normalize_claude_transcript_until, parse_canon_value, redact_turns_with_report,
+        safe_turn_projection,
     },
 };
 use crate::utils::client_storage::ClientStorage;
@@ -97,10 +103,13 @@ pub const SUBAGENT_PROJECTION_HELPER_OUTPUT_CAP: u64 = SUBAGENT_PROJECTION_TRANS
 const SUBAGENT_PROJECTION_COMPLETE: u8 = 0;
 const SUBAGENT_PROJECTION_FAILED: u8 = 1;
 const SUBAGENT_CONTENT_LEASE_MS: i64 = 60_000;
+#[cfg_attr(windows, allow(dead_code))]
 const MAX_SUBAGENT_DIRECTORY_ENTRIES: usize = 2_048;
 pub(crate) const MAX_SUBAGENT_SOURCES_PER_CAPTURE: usize = 16;
 const SUBAGENT_PARENT_PERSISTENCE_RESERVE: Duration = Duration::from_secs(20);
 const SUBAGENT_RESERVATION_RELEASE_GRACE: Duration = Duration::from_millis(250);
+const SUBAGENT_LIVE_WRITER_RETRY: &str =
+    "another writer still owns the subagent content source; retry the capture";
 
 #[derive(Debug, thiserror::Error)]
 #[error("subagent discovery exhausted its parent-preservation deadline")]
@@ -282,6 +291,20 @@ fn ensure_before_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
+/// A reservation probe that has already observed a live owner can still miss
+/// the caller's budget inside the next SQLite wait. Keep that overrun
+/// retryable as writer contention; other probe failures stay unchanged.
+fn live_writer_retry(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<SubagentCaptureDeadline>().is_some())
+    {
+        error.context(SUBAGENT_LIVE_WRITER_RETRY)
+    } else {
+        error
+    }
+}
+
 fn normalize_subagent_marker_deadline(error: anyhow::Error) -> anyhow::Error {
     if error
         .chain()
@@ -433,6 +456,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) async fn with_subagent_discovery_helper_program<F>(
     program: PathBuf,
     future: F,
@@ -446,6 +470,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 async fn with_subagent_discovery_helper_output_cap<F>(cap: u64, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -456,6 +481,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 async fn with_subagent_projection_helper_program<F>(program: PathBuf, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -593,6 +619,7 @@ fn helper_program() -> Option<PathBuf> {
     crate::internal::ai::authorized_read::helper_program()
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn subagent_discovery_helper_output_cap() -> u64 {
     #[cfg(test)]
     if let Ok(Some(cap)) = TEST_SUBAGENT_DISCOVERY_HELPER_OUTPUT_CAP.try_with(|cap| *cap) {
@@ -605,6 +632,7 @@ fn subagent_discovery_helper_output_cap() -> u64 {
 /// entrypoint. Unlike the historical discovery helper, this shares the
 /// process-registered program fact so a supported `--binary-path` rename is
 /// still safe and an embedded host never receives a private argv token.
+#[cfg_attr(windows, allow(dead_code))]
 fn projection_helper_program() -> Option<PathBuf> {
     #[cfg(test)]
     if let Ok(Some(program)) = TEST_SUBAGENT_PROJECTION_HELPER_PROGRAM.try_with(Clone::clone) {
@@ -2399,6 +2427,7 @@ impl SafeSubagentProjection {
         )
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn into_parts_with_digest(self) -> (RedactedBytes, serde_json::Value, bool, usize, String) {
         (
             self.transcript,
@@ -3211,10 +3240,10 @@ async fn capture_discovered_subagent_contents_inner(
         let owner = format!("subagent:{}:{}", std::process::id(), uuid::Uuid::new_v4());
         let now_ms = Utc::now().timestamp_millis();
         let mut durability_proof_refreshes = 0_usize;
+        let mut saw_live_writer = false;
         let reservation = loop {
-            ensure_before_deadline(Some(projection_deadline)).context(
-                "another writer still owns the subagent content source; retry the capture",
-            )?;
+            ensure_before_deadline(Some(projection_deadline))
+                .context(SUBAGENT_LIVE_WRITER_RETRY)?;
             let outcome = reserve_source(
                 conn,
                 scope,
@@ -3228,9 +3257,17 @@ async fn capture_discovered_subagent_contents_inner(
                 &durability_proof,
                 effective_deadline,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if saw_live_writer {
+                    live_writer_retry(error)
+                } else {
+                    error
+                }
+            })?;
             match outcome {
                 ReservationOutcome::Inflight { lease_expires_at } => {
+                    saw_live_writer = true;
                     let now = Utc::now().timestamp_millis();
                     let until_lease_ms = lease_expires_at.saturating_sub(now).max(1);
                     let wait_ms = u64::try_from(until_lease_ms).unwrap_or(25).min(25);
@@ -6702,10 +6739,13 @@ mod tests {
         )
         .await
         .expect("seed live reservation");
-        let deadline = Some(CaptureCommitDeadline::from_test_pair(
-            Instant::now() + Duration::from_millis(30),
-            Utc::now().timestamp_millis().saturating_add(30),
-        ));
+        // The seeded lease is 60s. This budget has to outlast scope proof,
+        // projection, and the first reservation probe under parallel nextest
+        // load. A 30ms pair expired inside that work on compat-offline-core
+        // (run 37915284178, three attempts) and the error never carried the
+        // retryable writer text. Five seconds still ends while the lease is
+        // held, so the wait stays a retry instead of a skip or a takeover.
+        let deadline = Some(test_mutation_deadline());
         let error = capture_discovered_subagent_contents(
             &conn,
             &storage_root,
@@ -6717,7 +6757,10 @@ mod tests {
         .await
         .expect_err("busy source must not be reported as a successful skip");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("another writer"));
+        assert!(
+            rendered.contains("another writer"),
+            "live reservation must stay retryable, rendered: {rendered}"
+        );
         assert!(rendered.contains("retry"));
         assert_eq!(
             scalar(

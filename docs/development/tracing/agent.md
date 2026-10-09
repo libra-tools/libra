@@ -2423,3 +2423,7 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 | `STABLE_AGENT_SLUGS` | （历史）旧 CLI roster 常量（曾为 `claude-code`、`gemini`）；2026-07-04 AG-17 落地时删除，CLI roster 从 AG-16 registry `supported_slugs()` 派生。 |
 | AG-16 ~ AG-24a | Gate 8 任务卡编号，覆盖 capability、CLI alias、RPC、安全、lifecycle、checkpoint/export、transcript intelligence、review/investigate、合规实现和 docs/compat closeout；AG-24a 是实现卡，AG-24 是收口卡。 |
 | E1 ~ E10 | 与 entireio/cli 对齐的 wire 契约编号，覆盖 capability、external protocol、lifecycle、checkpoint/export、chunking、usage、skill event、review/investigate、roster 和稳定错误码。 |
+
+## FIX-RG-SCOPED-04 confined checkpoint-input API
+
+The scoped input helper pins a trusted runs-root handle and refuses symlink or reparse components while opening the run, `checkpoint-input`, and metadata leaves. Cleanup and metadata reads share one caller deadline and cancel check. Over-budget input is refused before permission changes or deletion. The helper returns typed errors and does not report removal when confinement cannot be proved.

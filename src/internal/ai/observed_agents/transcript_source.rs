@@ -27,10 +27,12 @@
 //! deferred path check; unsupported platforms fail closed. The writer then
 //! consumes only that held descriptor and never re-opens the source path.
 
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     fmt,
     io::Seek,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -950,6 +952,7 @@ mod test_support {
         PAUSE.get_or_init(|| Mutex::new(None))
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(super) struct PauseReset;
 
     impl Drop for PauseReset {
@@ -961,6 +964,7 @@ mod test_support {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(super) fn install_secure_open_pause() -> (mpsc::Receiver<()>, mpsc::Sender<()>, PauseReset)
     {
         let (reached_tx, reached_rx) = mpsc::channel();
@@ -1185,6 +1189,7 @@ pub fn resolve_import_transcript_source(
     resolve_transcript_source_with_policy(adapter, ctx, true, true, None, true)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn resolve_import_transcript_source_until(
     adapter: &dyn ObservedAgent,
     ctx: &AgentSessionCtx,

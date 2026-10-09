@@ -1442,6 +1442,7 @@ impl Drop for ReviewWorkspaceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::internal::ai::review::store::REVIEW_RUN_KIND;
 
     fn test_store() -> (tempfile::TempDir, ReviewRunStore, PathBuf) {

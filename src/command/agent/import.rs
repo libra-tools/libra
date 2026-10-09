@@ -1,9 +1,12 @@
 //! `libra agent import` — consented historical transcript backfill (M4).
 
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
-    io::{self, IsTerminal, Seek, SeekFrom, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -14,6 +17,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
+#[cfg_attr(windows, allow(unused_imports))]
 use crate::{
     internal::{
         ai::{
@@ -1028,6 +1032,7 @@ fn codex_sessions_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
 }
 
+#[cfg_attr(windows, allow(unused_variables))]
 fn discover_codex(since: Option<i64>, deadline: Instant) -> Result<Vec<Candidate>> {
     ensure_before_deadline(deadline)?;
     let Some(root) = codex_sessions_root() else {
@@ -1622,6 +1627,7 @@ fn wait_for_consent_fd(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Re
     }
 }
 
+#[cfg_attr(windows, allow(unused_variables, unreachable_code))]
 fn require_consent(
     args: &ImportArgs,
     output: &OutputConfig,
@@ -1687,6 +1693,7 @@ fn require_consent(
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 async fn resolve_candidate_source(
     candidate: &Candidate,
     repo_root: &Path,
@@ -2389,6 +2396,8 @@ fn require_registered_import_helper_command(
 /// pinned provider descriptor (or anonymous export file); unlike the retired
 /// V1 protocol, neither stdin nor the control frame carries a locator,
 /// provider session id, repository path, storage path, or existing metadata.
+#[cfg_attr(windows, allow(unused_mut))]
+#[cfg_attr(windows, allow(dead_code))]
 async fn run_import_preparation_descriptor_helper_bounded(
     mut command: tokio::process::Command,
     control: PreparationDescriptorControl,
@@ -3292,6 +3301,7 @@ mod tests {
         assert_eq!(BatchResult::complete(import_summary(0, 0)).status, "noop");
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     struct ImportIndexRepairCheckpointFixture {
         checkpoint_id: String,
         tree_oid: String,
@@ -3301,6 +3311,7 @@ mod tests {
 
     /// Write the smallest E4 checkpoint layout that import replay recognizes:
     /// a manifest-bearing checkpoint tree plus a valid traces commit.
+    #[cfg_attr(windows, allow(dead_code))]
     fn write_import_index_repair_checkpoint(
         repo_path: &Path,
         checkpoint_id: &str,
@@ -3727,9 +3738,11 @@ mod tests {
         wait_for_import_helper_exit(descendant_pid).await;
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     struct TestHomeGuard(Option<std::ffi::OsString>);
 
     impl TestHomeGuard {
+        #[cfg_attr(windows, allow(dead_code))]
         fn set(path: &Path) -> Self {
             let previous = std::env::var_os("LIBRA_TEST_HOME");
             // SAFETY: serial test below restores the process environment.

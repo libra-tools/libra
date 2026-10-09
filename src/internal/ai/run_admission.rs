@@ -237,6 +237,7 @@ impl AdmissionDirs {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn ensure(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.slots)?;
         std::fs::create_dir_all(&self.queue)?;
@@ -340,6 +341,7 @@ pub struct RejectedAdmission {
 
 /// Create a ticket file whose name sorts by creation time and carries the
 /// creating pid (for stale reclaim). Name: `<epoch_nanos>-<pid>-<rand>`.
+#[cfg_attr(windows, allow(dead_code))]
 fn create_ticket(dir: &Path) -> Result<PathBuf> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -443,6 +445,7 @@ fn process_alive(_pid: i32) -> bool {
 /// across processes. Released on drop (including process death). Mirrors the
 /// run-store `RunLock` flock pattern.
 struct AdmissionLock {
+    #[cfg_attr(windows, allow(dead_code))]
     file: std::fs::File,
 }
 

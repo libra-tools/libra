@@ -9879,6 +9879,7 @@ mod ext_driver {
 
     use super::*;
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn input<'a>(path: &'a Path, labels: ExternalMergeLabels<'a>) -> ExternalMergeInput<'a> {
         ExternalMergeInput {
             path,

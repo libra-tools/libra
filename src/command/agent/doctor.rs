@@ -2651,6 +2651,7 @@ async fn scan_checkpoint_store(
 /// Exercise the production doctor classification-and-repair orchestrator from
 /// in-crate recovery fixtures without making its internal report a public API.
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) async fn scan_checkpoint_store_for_test(
     conn: &DatabaseConnection,
     schema_present: bool,
@@ -2665,6 +2666,7 @@ pub(crate) async fn scan_checkpoint_store_for_test(
 /// Same orchestrator with a widened cooperative replay budget, for fixtures
 /// that assert repair semantics rather than timing under full-suite load.
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) async fn scan_checkpoint_store_with_replay_budget_for_test(
     conn: &DatabaseConnection,
     schema_present: bool,

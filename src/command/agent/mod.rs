@@ -26,6 +26,7 @@ pub(crate) mod checkpoint;
 mod clean;
 mod doctor;
 #[cfg(test)]
+#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use doctor::scan_checkpoint_store_with_replay_budget_for_test;
 mod graph;
 mod hooks;

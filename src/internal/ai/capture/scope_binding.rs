@@ -63,6 +63,7 @@ mod test_support {
     /// begins blocking. Production never delays or re-anchors a deadline;
     /// this lets the regression prove a short deadline after the child has
     /// actually started rather than relying on scheduler luck during spawn.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) async fn with_scope_binding_helper_ready<F>(
         pid_file: PathBuf,
         post_ready_budget: Duration,
@@ -76,6 +77,7 @@ mod test_support {
             .await
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) async fn deadline_after_scope_binding_helper_ready(
         initial_deadline: HookExecutionDeadline,
     ) -> Result<HookExecutionDeadline> {
@@ -282,6 +284,7 @@ pub(crate) fn is_capture_unsupported_platform_error(error: &anyhow::Error) -> bo
 /// require their local gitdir, common storage, root, and logical scope to
 /// agree. Every filesystem failure maps to a stable generic validation error
 /// so an attacker-controlled path never reaches stderr or tracing.
+#[cfg_attr(windows, allow(dead_code))]
 fn bind_capture_scope_cwd(scope_input: &CaptureScopeInput) -> Result<CaptureIngressBinding> {
     bind_capture_scope_cwd_with_mutation_deadline(scope_input, None)
 }
@@ -290,6 +293,7 @@ fn bind_capture_scope_cwd(scope_input: &CaptureScopeInput) -> Result<CaptureIngr
 /// wall-clock deadline comes exclusively from the parent-created managed
 /// capture deadline; it is rechecked immediately before the only local key
 /// mutation, while the parent monotonic deadline remains liveness authority.
+#[cfg_attr(windows, allow(dead_code))]
 fn bind_capture_scope_cwd_with_mutation_deadline(
     scope_input: &CaptureScopeInput,
     mutation_deadline_millis: Option<i64>,
@@ -302,8 +306,11 @@ fn bind_capture_scope_cwd_with_mutation_deadline(
 /// or created. Keeping this proof separate lets the helper publish its
 /// trusted phase before it crosses the key I/O boundary.
 struct VerifiedCaptureScope {
+    #[cfg_attr(windows, allow(dead_code))]
     verified_cwd: String,
+    #[cfg_attr(windows, allow(dead_code))]
     storage_path: PathBuf,
+    #[cfg_attr(windows, allow(dead_code))]
     worktree_root: PathBuf,
 }
 

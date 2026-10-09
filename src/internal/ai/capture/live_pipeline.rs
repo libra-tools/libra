@@ -92,10 +92,12 @@ pub(super) mod test_support {
     /// test. This is deliberately thread-local and unavailable from a hook
     /// environment, so a user-controlled process environment cannot steer a
     /// production capture deadline.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) struct SubagentDiscoveryDeadlineOverride {
         prior: Option<u64>,
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn override_subagent_discovery_deadline(
         deadline_ms: u64,
     ) -> SubagentDiscoveryDeadlineOverride {
@@ -230,10 +232,12 @@ pub(super) mod test_support {
     /// before its outcome is consumed. This proves an elapsed terminal
     /// deadline abandons acquired claims rather than acknowledging a late
     /// covered/no-op result. It is task-local test state, not a hook knob.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) struct LiveCoverageAfterReservationDelay {
         prior: Option<u64>,
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn delay_live_coverage_after_reservation(
         delay_ms: u64,
     ) -> LiveCoverageAfterReservationDelay {

@@ -1919,6 +1919,7 @@ pub(crate) fn write_detached_marker(target: &Path, worktree_id: &str) -> Worktre
     })
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn fsync_parent_strict(target: &Path) -> io::Result<()> {
     let parent = target
         .parent()

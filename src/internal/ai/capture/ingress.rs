@@ -23,19 +23,18 @@ use ring::{digest, hmac};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::internal::ai::authorized_read::{
+    AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, CancellationSafeChild,
+    configure_private_helper_process_group, helper_program, read_async_strictly_bounded,
+};
 pub(crate) use crate::internal::ai::capture::runtime_scope::CaptureRuntimeScope;
-use crate::internal::ai::{
-    authorized_read::{
-        AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, CancellationSafeChild,
-        configure_private_helper_process_group, helper_program, read_async_strictly_bounded,
+use crate::internal::ai::hooks::{
+    lifecycle::{
+        LifecycleEvent, LifecycleEventKind, LifecycleIdentityScheme, SessionHookEnvelope,
+        validate_session_hook_envelope,
     },
-    hooks::{
-        lifecycle::{
-            LifecycleEvent, LifecycleEventKind, LifecycleIdentityScheme, SessionHookEnvelope,
-            validate_session_hook_envelope,
-        },
-        provider::{HookProvider, ProviderHookCommand},
-    },
+    provider::{HookProvider, ProviderHookCommand},
 };
 
 /// Maximum bytes accepted from a hook frame before parsing.
@@ -238,6 +237,7 @@ impl CaptureIngressBinding {
     /// is intentionally separate from [`Self::into_scope_binding_parts`] so
     /// no caller can accidentally recover a key from an opaque binding.
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn into_verified_scope_parts(self) -> (String, CaptureRuntimeScope) {
         (self.verified_cwd, self.runtime_scope)
     }

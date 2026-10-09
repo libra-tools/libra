@@ -173,6 +173,7 @@ impl PendingPayloadProjection {
     }
 
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         preflight(bytes, MAX_ENVELOPE, MAX_DEPTH)?;
         parse_canon_value(bytes).map_err(|_| failure())?;

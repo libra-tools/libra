@@ -590,6 +590,7 @@ pub fn flush_wait_file(file: &fs::File, budget: Duration, poll: Duration) -> Flu
 /// killable capture helper. The helper, not the hook parent, owns every
 /// metadata/clone/seek/read operation in this probe; it rewinds the same held
 /// descriptor before its bounded reader consumes it.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn prepare_held_file_for_capture(file: &fs::File) {
     let _ = flush_wait_file(file, FLUSH_WAIT_BUDGET, FLUSH_POLL_INTERVAL);
 }

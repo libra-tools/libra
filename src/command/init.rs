@@ -1692,8 +1692,9 @@ fn detect_system_ssh_key() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
     use std::{
-        fs,
         io::{Read, Write},
         path::PathBuf,
     };
