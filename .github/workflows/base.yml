@@ -74,6 +74,97 @@ jobs:
       - name: Run the claim-owner liveness tests
         run: cargo test --lib -- claim_owner_tests --test-threads=1
 
+
+  scoped-input-windows:
+    # FIX-RG-SCOPED-04: execute the four confined-input safety fixtures on
+    # Windows. Release Windows builds are not evidence of these tests.
+    name: compat-scoped-input-windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}
+      EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      EXPECTED_MERGE_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout the exact pull merge
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Verify PR source and execute all four exact fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PR_NUMBER) -or
+              $env:GITHUB_REF -ne "refs/pull/$($env:EXPECTED_PR_NUMBER)/merge") {
+            throw 'Scoped Windows tests require the actual pull merge ref'
+          }
+          $actualHead = @(& git rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0 -or $actualHead.Count -ne 1 -or
+              $actualHead[0].Trim() -ne $env:EXPECTED_MERGE_SHA) {
+            throw 'Checked-out source does not match the event merge SHA'
+          }
+          $parentLine = @(& git show -s --format=%P HEAD)
+          if ($LASTEXITCODE -ne 0 -or $parentLine.Count -ne 1) {
+            throw 'Cannot verify pull merge parents'
+          }
+          $parents = $parentLine[0].Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          if ($parents.Count -ne 2 -or $parents[0] -ne $env:EXPECTED_BASE_SHA -or
+              $parents[1] -ne $env:EXPECTED_PR_HEAD_SHA) {
+            throw 'Pull merge parents do not match the actual PR base and head'
+          }
+          Write-Output "Scoped Windows source: merge=$($env:EXPECTED_MERGE_SHA) head=$($env:EXPECTED_PR_HEAD_SHA) base=$($env:EXPECTED_BASE_SHA) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
+
+          $fixtures = @(
+            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_readonly_cleanup',
+            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_metadata_boundary',
+            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_preflight_budget',
+            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_deadline_cancel_owner'
+          )
+          $listed = @(& cargo test --locked --lib -- --list --color never)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Listing the scoped Windows fixtures failed'
+          }
+          $ignored = @(& cargo test --locked --lib -- --list --ignored --color never)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Listing ignored Windows fixtures failed'
+          }
+          foreach ($fixture in $fixtures) {
+            $pattern = '^' + [regex]::Escape($fixture) + ': test$'
+            $fixtureEntries = @($listed | Where-Object { $_ -cmatch $pattern })
+            $ignoredMatches = @($ignored | Where-Object { $_ -cmatch $pattern })
+            if ($fixtureEntries.Count -ne 1 -or $ignoredMatches.Count -ne 0) {
+              throw "Fixture missing, duplicated, or ignored: $fixture"
+            }
+          }
+          foreach ($fixture in $fixtures) {
+            $executed = @(& cargo test --locked --lib $fixture -- --exact --nocapture --color never --test-threads=1)
+            $testExit = $LASTEXITCODE
+            $executed | Write-Output
+            if ($testExit -ne 0) {
+              throw "Fixture failed: $fixture (exit $testExit)"
+            }
+            $passed = @($executed | Where-Object {
+              $_ -cmatch '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$'
+            })
+            if ($passed.Count -ne 1) {
+              throw "Fixture did not report exactly one nonignored passing test: $fixture"
+            }
+          }
+
   redundancy:
     name: compat-redundancy
     runs-on: [self-hosted]
