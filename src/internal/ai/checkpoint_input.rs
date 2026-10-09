@@ -24,10 +24,15 @@
 //! this module only turns an already-validated spec into files.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+use git_internal::internal::object::{
+    ObjectTrait,
+    tree::{Tree, TreeItemMode},
+};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 use serde::{Deserialize, Serialize};
 
@@ -135,7 +140,7 @@ async fn confirm_catalog_checkpoint(
     checkpoint_id: &str,
     deadline: Instant,
     cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<(), ValidatedMaterializeError> {
+) -> Result<String, ValidatedMaterializeError> {
     stop_if_inactive(deadline, cancelled)?;
     let query_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(200));
     let remaining = query_deadline.saturating_duration_since(Instant::now());
@@ -173,7 +178,7 @@ async fn confirm_catalog_checkpoint(
     let queried = conn
         .query_one_raw(Statement::from_sql_and_values(
             backend,
-            "SELECT checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            "SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
             [checkpoint_id.into()],
         ))
         .await;
@@ -187,7 +192,22 @@ async fn confirm_catalog_checkpoint(
     }
     stop_if_inactive(deadline, cancelled)?;
     match queried {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(row)) => {
+            let tree_oid = row.try_get_by::<String, _>("tree_oid").map_err(|_| {
+                ValidatedMaterializeError::Catalog(
+                    "checkpoint catalog row could not be read; keep the run and retry when the \
+                     repository database can be read"
+                        .to_string(),
+                )
+            })?;
+            if tree_oid.is_empty() {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' has no tree in the explicit catalog; refusing \
+                     to materialize a saved spec"
+                )));
+            }
+            Ok(tree_oid)
+        }
         Ok(None) => Err(ValidatedMaterializeError::Refused(format!(
             "checkpoint '{checkpoint_id}' is not in the explicit catalog; refusing to materialize \
              a saved spec the catalog does not name"
@@ -198,6 +218,159 @@ async fn confirm_catalog_checkpoint(
                 .to_string(),
         )),
     }
+}
+
+const CATALOG_TREE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CATALOG_WALK_MAX_ENTRIES: usize = 8192;
+const CATALOG_WALK_MAX_DEPTH: u32 = 64;
+const CATALOG_PATH_MAX_BYTES: usize = 4096;
+
+fn refuse_unless_saved_spec_matches_catalog(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    tree_oid: &str,
+) -> Result<(), ValidatedMaterializeError> {
+    let current = catalog_ordinary_leaves(storage, tree_oid, &spec.checkpoint_id)?;
+    let mut saved = BTreeMap::new();
+    for file in &spec.files {
+        if saved
+            .insert(file.rel_path.clone(), file.oid.clone())
+            .is_some()
+        {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{}' saved spec repeats path '{}'; refusing to materialize",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
+    }
+    if saved != current {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{}' saved spec does not match the catalog leaves; refusing to \
+             materialize",
+            spec.checkpoint_id
+        )));
+    }
+    Ok(())
+}
+
+fn catalog_ordinary_leaves(
+    storage: &Path,
+    tree_oid: &str,
+    checkpoint_id: &str,
+) -> Result<BTreeMap<String, String>, ValidatedMaterializeError> {
+    if checkpoint_id.len() < 2
+        || checkpoint_id.contains(['/', '\\'])
+        || !checkpoint_id.is_char_boundary(2)
+    {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{checkpoint_id}' is not a catalog leaf id; refusing to materialize"
+        )));
+    }
+    let root = read_catalog_tree(storage, tree_oid)?;
+    let checkpoint = catalog_subtree(storage, &root, "checkpoint")?;
+    let prefix = catalog_subtree(storage, &checkpoint, &checkpoint_id[..2])?;
+    let inner = catalog_subtree(storage, &prefix, &checkpoint_id[2..])?;
+    let mut pending = vec![(String::new(), inner, 0_u32)];
+    let mut leaves = BTreeMap::new();
+    let mut walked = 0_usize;
+    while let Some((prefix, tree, depth)) = pending.pop() {
+        if depth > CATALOG_WALK_MAX_DEPTH {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{checkpoint_id}' tree is deeper than the ordinary leaf budget; \
+                 refusing to materialize"
+            )));
+        }
+        for item in &tree.tree_items {
+            walked += 1;
+            if walked > CATALOG_WALK_MAX_ENTRIES {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' tree exceeds the ordinary leaf budget; refusing \
+                     to materialize"
+                )));
+            }
+            let rel_path = if prefix.is_empty() {
+                item.name.clone()
+            } else {
+                format!("{prefix}/{}", item.name)
+            };
+            if rel_path.len() > CATALOG_PATH_MAX_BYTES {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' leaf path exceeds the ordinary path budget; \
+                     refusing to materialize"
+                )));
+            }
+            match item.mode {
+                TreeItemMode::Tree => {
+                    let child = read_catalog_tree(storage, &item.id.to_string())?;
+                    pending.push((rel_path, child, depth + 1));
+                }
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable => {
+                    if leaves.insert(rel_path, item.id.to_string()).is_some() {
+                        return Err(ValidatedMaterializeError::Refused(format!(
+                            "checkpoint '{checkpoint_id}' catalog tree repeats a leaf path; \
+                             refusing to materialize"
+                        )));
+                    }
+                }
+                TreeItemMode::Commit | TreeItemMode::Link => {
+                    return Err(ValidatedMaterializeError::Refused(format!(
+                        "checkpoint '{checkpoint_id}' catalog tree contains a non-blob entry; \
+                         refusing to materialize"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(leaves)
+}
+
+fn catalog_subtree(
+    storage: &Path,
+    tree: &Tree,
+    name: &str,
+) -> Result<Tree, ValidatedMaterializeError> {
+    let item = tree
+        .tree_items
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(format!(
+                "checkpoint catalog tree is missing '{name}'; refusing to materialize"
+            ))
+        })?;
+    if item.mode != TreeItemMode::Tree {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint catalog entry '{name}' is not a tree; refusing to materialize"
+        )));
+    }
+    read_catalog_tree(storage, &item.id.to_string())
+}
+
+fn read_catalog_tree(storage: &Path, oid_str: &str) -> Result<Tree, ValidatedMaterializeError> {
+    let oid = crate::internal::object_format::parse_repo_oid(oid_str).map_err(|_| {
+        ValidatedMaterializeError::Refused(
+            "checkpoint catalog tree id is not an object id; refusing to materialize".to_string(),
+        )
+    })?;
+    let (body, truncated) = read_git_object_bounded(storage, &oid, CATALOG_TREE_MAX_BYTES)
+        .map_err(|_| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint catalog tree is not readable from the explicit object store; refusing \
+                 to materialize"
+                    .to_string(),
+            )
+        })?;
+    if truncated {
+        return Err(ValidatedMaterializeError::Refused(
+            "checkpoint catalog tree exceeds the 16MiB child-tree budget; refusing to materialize"
+                .to_string(),
+        ));
+    }
+    Tree::from_bytes(&body, oid).map_err(|_| {
+        ValidatedMaterializeError::Refused(
+            "checkpoint catalog object is not a tree; refusing to materialize".to_string(),
+        )
+    })
 }
 
 fn map_scoped_io(error: scoped_io::CheckpointInputIoError) -> ValidatedMaterializeError {
@@ -240,7 +413,10 @@ pub async fn materialize_validated_checkpoint_input(
             "checkpoint input storage path is not a real directory: {error}"
         ))
     })?;
-    confirm_catalog_checkpoint(&storage, &spec.checkpoint_id, deadline, cancelled.as_ref()).await?;
+    let tree_oid =
+        confirm_catalog_checkpoint(&storage, &spec.checkpoint_id, deadline, cancelled.as_ref())
+            .await?;
+    refuse_unless_saved_spec_matches_catalog(&storage, spec, &tree_oid)?;
     let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
         ValidatedMaterializeError::Refused(format!(
             "checkpoint input run directory is not a real directory: {error}"
@@ -436,6 +612,12 @@ pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Write as _, str::FromStr as _};
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::tree::{Tree, TreeItem, TreeItemMode},
+    };
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 
     use super::*;
@@ -443,8 +625,6 @@ mod tests {
     /// Write a loose blob into `storage` and return its spec entry.
     #[cfg_attr(windows, allow(dead_code))]
     fn write_blob(storage: &Path, rel_path: &str, content: &[u8]) -> CheckpointInputFile {
-        use std::io::Write as _;
-
         let blob = git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec());
         let oid = blob.id.to_string();
         let dir = storage.join("objects").join(&oid[..2]);
@@ -461,7 +641,8 @@ mod tests {
         }
     }
 
-    fn seed_catalog(storage: &Path, checkpoint_id: &str) {
+    fn seed_catalog(storage: &Path, checkpoint_id: &str, files: &[CheckpointInputFile]) {
+        let tree_oid = catalog_root_for(storage, checkpoint_id, files);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -476,20 +657,85 @@ mod tests {
             let backend = conn.get_database_backend();
             conn.execute_raw(Statement::from_string(
                 backend,
-                "CREATE TABLE IF NOT EXISTS agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)"
-                    .to_string(),
+                "CREATE TABLE IF NOT EXISTS agent_checkpoint (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    tree_oid TEXT NOT NULL
+                 )"
+                .to_string(),
             ))
             .await
             .expect("create catalog table");
             conn.execute_raw(Statement::from_sql_and_values(
                 backend,
-                "INSERT INTO agent_checkpoint (checkpoint_id) VALUES (?)",
-                [checkpoint_id.into()],
+                "INSERT INTO agent_checkpoint (checkpoint_id, tree_oid) VALUES (?, ?)",
+                [checkpoint_id.into(), tree_oid.into()],
             ))
             .await
             .expect("insert catalog row");
             conn.close().await.expect("close catalog");
         });
+    }
+
+    fn catalog_root_for(
+        storage: &Path,
+        checkpoint_id: &str,
+        files: &[CheckpointInputFile],
+    ) -> String {
+        fn store_tree(storage: &Path, items: Vec<TreeItem>) -> String {
+            let tree = Tree::from_tree_items(items).expect("tree");
+            let mut body = Vec::new();
+            for item in &tree.tree_items {
+                body.extend_from_slice(item.to_data().as_slice());
+            }
+            let mut raw = format!("tree {}\0", body.len()).into_bytes();
+            raw.extend_from_slice(&body);
+            let oid = tree.id.to_string();
+            let dir = storage.join("objects").join(&oid[..2]);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&raw).unwrap();
+            std::fs::write(dir.join(&oid[2..]), encoder.finish().unwrap()).unwrap();
+            oid
+        }
+
+        let mut leaves = Vec::new();
+        for file in files {
+            assert!(
+                !file.rel_path.contains('/'),
+                "unit catalog seed only builds a flat inner tree"
+            );
+            leaves.push(TreeItem::new(
+                TreeItemMode::Blob,
+                ObjectHash::from_str(&file.oid).expect("blob oid"),
+                file.rel_path.clone(),
+            ));
+        }
+        let inner = store_tree(storage, leaves);
+        let prefix = store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&inner).expect("inner"),
+                checkpoint_id[2..].to_string(),
+            )],
+        );
+        let checkpoint = store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&prefix).expect("prefix"),
+                checkpoint_id[..2].to_string(),
+            )],
+        );
+        store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&checkpoint).expect("checkpoint"),
+                "checkpoint".to_string(),
+            )],
+        )
     }
 
     /// PD-02: the materialized input must be READ-ONLY in the sense that
@@ -671,7 +917,7 @@ mod tests {
             checkpoint_id: "ckpt-typed".to_string(),
             files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
         };
-        seed_catalog(&storage, "ckpt-typed");
+        seed_catalog(&storage, "ckpt-typed", &spec.files);
         let error =
             validated_materialize(Path::new("relative-storage"), &spec, &run_dir).unwrap_err();
         assert!(error.contains("absolute"), "{error}");
@@ -752,6 +998,29 @@ mod tests {
     }
 
     #[test]
+    fn fix_rg_scoped_02_catalog_leaf_mismatch_skips_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let file = write_blob(&storage, "metadata.json", b"ORDINARY");
+        let checkpoint_id = "ckpt-mismatch";
+        seed_catalog(&storage, checkpoint_id, &[file.clone()]);
+        let mut spec = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![file],
+        };
+        spec.files[0].oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let error = validated_materialize(&storage, &spec, &run_dir).unwrap_err();
+        assert!(
+            error.contains("does not match the catalog leaves"),
+            "{error}"
+        );
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
     fn fix_rg_scoped_02_second_materialization() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -762,7 +1031,7 @@ mod tests {
             checkpoint_id: "ckpt-second".to_string(),
             files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
         };
-        seed_catalog(&storage, "ckpt-second");
+        seed_catalog(&storage, "ckpt-second", &spec.files);
         let first = validated_materialize(&storage, &spec, &run_dir).expect("first");
         assert_eq!(
             std::fs::read(first.join("metadata.json")).unwrap(),
