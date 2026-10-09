@@ -665,9 +665,17 @@ async fn drive(
     let workspace_root;
     if let Some(spec) = state.checkpoint_input.clone() {
         let storage = repo_root.join(crate::utils::util::ROOT_DIR);
-        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
-            &storage, &spec, &run_dir,
-        ) {
+        let cancel_probe = cancel.clone();
+        let cancelled = std::sync::Arc::new(move || cancel_probe.is_cancelled());
+        match crate::internal::ai::checkpoint_input::materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            Instant::now() + remaining_budget,
+            cancelled,
+        )
+        .await
+        {
             Ok(root) => {
                 guard = InvestigateWorkspaceGuard { workspace: None };
                 workspace_root = root;

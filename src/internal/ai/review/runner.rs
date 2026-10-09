@@ -402,9 +402,18 @@ async fn run_review_inner(
     let workspace_root;
     if let Some(spec) = &request.checkpoint_input {
         let storage = request.repo_root.join(crate::utils::util::ROOT_DIR);
-        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
-            &storage, spec, &run_dir,
-        ) {
+        let phase_started = Instant::now();
+        let cancel_probe = cancel.clone();
+        let cancelled = std::sync::Arc::new(move || cancel_probe.is_cancelled());
+        match crate::internal::ai::checkpoint_input::materialize_validated_checkpoint_input(
+            &storage,
+            spec,
+            &run_dir,
+            phase_started + request.reviewer_timeout,
+            cancelled,
+        )
+        .await
+        {
             Ok(root) => {
                 workspace_guard = ReviewWorkspaceGuard { workspace: None };
                 workspace_root = root;

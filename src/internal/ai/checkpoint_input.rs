@@ -79,6 +79,63 @@ pub fn materialize_checkpoint_input(
     }
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("failed to create checkpoint input dir: {e}"))?;
+    write_checkpoint_input_files(storage, spec, &root)?;
+    Ok(root)
+}
+
+/// Production entry for investigate and review. Re-reads every blob from the
+/// explicit absolute object store, clears any previous input through the
+/// confined cleanup API, then writes the ordinary payload. A relative store
+/// path is refused so a changed cwd cannot choose the bytes.
+pub async fn materialize_validated_checkpoint_input(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    run_dir: &Path,
+    deadline: std::time::Instant,
+    cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<PathBuf, String> {
+    if !storage.is_absolute() {
+        return Err(
+            "checkpoint input storage path must be absolute; refusing a cwd-relative store"
+                .to_string(),
+        );
+    }
+    if spec.checkpoint_id.is_empty() {
+        return Err("checkpoint input spec is missing its checkpoint id".to_string());
+    }
+    let run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "checkpoint input run directory name is not valid".to_string())?;
+    let runs_root = run_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "checkpoint input run directory has no trusted runs root".to_string())?;
+    if !runs_root.is_absolute() {
+        return Err(
+            "checkpoint input runs root must be absolute; refusing a cwd-relative run".to_string(),
+        );
+    }
+    let budget = scoped_io::ScopedIoBudget {
+        deadline,
+        cancelled,
+    };
+    let root_handle = scoped_io::open_scoped_run_root(runs_root, run_id, &budget)
+        .map_err(|error| error.to_string())?;
+    scoped_io::cleanup_checkpoint_input(&root_handle, &budget)
+        .map_err(|error| error.to_string())?;
+    let root = run_dir.join(CHECKPOINT_INPUT_DIR);
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("failed to create checkpoint input dir: {error}"))?;
+    write_checkpoint_input_files(storage, spec, &root)?;
+    Ok(root)
+}
+
+fn write_checkpoint_input_files(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    root: &Path,
+) -> Result<(), String> {
     let mut total: u64 = 0;
     let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
@@ -166,12 +223,14 @@ pub fn materialize_checkpoint_input(
         use std::os::unix::fs::PermissionsExt;
         dirs.sort();
         dirs.dedup();
-        for dir in dirs.iter().rev().chain(std::iter::once(&root)) {
+        for dir in dirs.iter().rev() {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
                 .map_err(|e| format!("failed to make checkpoint input dir read-only: {e}"))?;
         }
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .map_err(|e| format!("failed to make checkpoint input dir read-only: {e}"))?;
     }
-    Ok(root)
+    Ok(())
 }
 
 /// Reject absolute/parent-escaping components: the spec's rel paths come
@@ -390,6 +449,77 @@ mod tests {
     #[test]
     fn fix_rg_scoped_04_deadline_cancel_owner() {
         scoped_io::test_support::deadline_cancel_owner();
+    }
+
+    fn validated_materialize(
+        storage: &Path,
+        spec: &CheckpointInputSpec,
+        run_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(materialize_validated_checkpoint_input(
+            storage,
+            spec,
+            run_dir,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|| false),
+        ))
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_typed_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let missing_id = CheckpointInputSpec {
+            checkpoint_id: String::new(),
+            files: Vec::new(),
+        };
+        let error = validated_materialize(&storage, &missing_id, &run_dir).unwrap_err();
+        assert!(error.contains("checkpoint id"), "{error}");
+
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-typed".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let error =
+            validated_materialize(Path::new("relative-storage"), &spec, &run_dir).unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
+
+        let root = validated_materialize(&storage, &spec, &run_dir).expect("typed materialize");
+        assert_eq!(
+            std::fs::read(root.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_second_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-second".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let first = validated_materialize(&storage, &spec, &run_dir).expect("first");
+        assert_eq!(
+            std::fs::read(first.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+        let second =
+            validated_materialize(&storage, &spec, &run_dir).expect("second without chmod");
+        assert_eq!(
+            std::fs::read(second.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
     }
 }
 
