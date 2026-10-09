@@ -83,55 +83,105 @@ pub fn materialize_checkpoint_input(
     Ok(root)
 }
 
+/// Why a production scoped materialization stopped before the ordinary payload
+/// was written. Cancel and deadline stay distinct so review can finish a
+/// cancel as cancelled and a setup deadline as the existing infrastructure
+/// error.
+#[derive(Debug)]
+pub enum ValidatedMaterializeError {
+    /// The caller cancel handle or the run's cancel marker was already set.
+    Cancelled,
+    /// The caller deadline passed before the ordinary payload was written.
+    Deadline,
+    /// The spec, store path, or object bytes were refused.
+    Refused(String),
+}
+
+impl std::fmt::Display for ValidatedMaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "{}", scoped_io::CheckpointInputIoError::Cancelled),
+            Self::Deadline => write!(f, "{}", scoped_io::CheckpointInputIoError::Deadline),
+            Self::Refused(message) => f.write_str(message),
+        }
+    }
+}
+
+fn map_scoped_io(error: scoped_io::CheckpointInputIoError) -> ValidatedMaterializeError {
+    match error {
+        scoped_io::CheckpointInputIoError::Cancelled => ValidatedMaterializeError::Cancelled,
+        scoped_io::CheckpointInputIoError::Deadline => ValidatedMaterializeError::Deadline,
+        other => ValidatedMaterializeError::Refused(other.to_string()),
+    }
+}
+
 /// Production entry for investigate and review. Re-reads every blob from the
 /// explicit absolute object store, clears any previous input through the
 /// confined cleanup API, then writes the ordinary payload. A relative store
-/// path is refused so a changed cwd cannot choose the bytes.
+/// path is refused so a changed cwd cannot choose the bytes. An already
+/// expired deadline or a raised cancel stops before that cleanup.
 pub async fn materialize_validated_checkpoint_input(
     storage: &Path,
     spec: &CheckpointInputSpec,
     run_dir: &Path,
     deadline: std::time::Instant,
     cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, ValidatedMaterializeError> {
     if !storage.is_absolute() {
-        return Err(
+        return Err(ValidatedMaterializeError::Refused(
             "checkpoint input storage path must be absolute; refusing a cwd-relative store"
                 .to_string(),
-        );
+        ));
     }
     if spec.checkpoint_id.is_empty() {
-        return Err("checkpoint input spec is missing its checkpoint id".to_string());
+        return Err(ValidatedMaterializeError::Refused(
+            "checkpoint input spec is missing its checkpoint id".to_string(),
+        ));
     }
     // Pin the caller's paths before the confined API checks ancestors. A
     // macOS temp repo is reached through the /var symlink; resolving it once
     // names the real directory, and the no-follow check still applies there.
     let storage = std::fs::canonicalize(storage).map_err(|error| {
-        format!("checkpoint input storage path is not a real directory: {error}")
+        ValidatedMaterializeError::Refused(format!(
+            "checkpoint input storage path is not a real directory: {error}"
+        ))
     })?;
     let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
-        format!("checkpoint input run directory is not a real directory: {error}")
+        ValidatedMaterializeError::Refused(format!(
+            "checkpoint input run directory is not a real directory: {error}"
+        ))
     })?;
     let run_id = run_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "checkpoint input run directory name is not valid".to_string())?;
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint input run directory name is not valid".to_string(),
+            )
+        })?;
     let runs_root = run_dir
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| "checkpoint input run directory has no trusted runs root".to_string())?;
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint input run directory has no trusted runs root".to_string(),
+            )
+        })?;
     let budget = scoped_io::ScopedIoBudget {
         deadline,
         cancelled,
     };
-    let root_handle = scoped_io::open_scoped_run_root(runs_root, run_id, &budget)
-        .map_err(|error| error.to_string())?;
-    scoped_io::cleanup_checkpoint_input(&root_handle, &budget)
-        .map_err(|error| error.to_string())?;
+    let root_handle =
+        scoped_io::open_scoped_run_root(runs_root, run_id, &budget).map_err(map_scoped_io)?;
+    scoped_io::cleanup_checkpoint_input(&root_handle, &budget).map_err(map_scoped_io)?;
     let root = run_dir.join(CHECKPOINT_INPUT_DIR);
-    std::fs::create_dir_all(&root)
-        .map_err(|error| format!("failed to create checkpoint input dir: {error}"))?;
-    write_checkpoint_input_files(&storage, spec, &root)?;
+    std::fs::create_dir_all(&root).map_err(|error| {
+        ValidatedMaterializeError::Refused(format!(
+            "failed to create checkpoint input dir: {error}"
+        ))
+    })?;
+    write_checkpoint_input_files(&storage, spec, &root)
+        .map_err(ValidatedMaterializeError::Refused)?;
     Ok(root)
 }
 
@@ -464,13 +514,15 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        runtime.block_on(materialize_validated_checkpoint_input(
-            storage,
-            spec,
-            run_dir,
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-            std::sync::Arc::new(|| false),
-        ))
+        runtime
+            .block_on(materialize_validated_checkpoint_input(
+                storage,
+                spec,
+                run_dir,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::sync::Arc::new(|| false),
+            ))
+            .map_err(|error| error.to_string())
     }
 
     #[test]
@@ -500,6 +552,45 @@ mod tests {
             std::fs::read(root.join("metadata.json")).unwrap(),
             b"ORDINARY"
         );
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_deadline_and_cancel_leave_input_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-stop".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancelled = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|| true),
+        ));
+        assert!(matches!(
+            cancelled,
+            Err(ValidatedMaterializeError::Cancelled)
+        ));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let expired = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now(),
+            std::sync::Arc::new(|| false),
+        ));
+        assert!(matches!(expired, Err(ValidatedMaterializeError::Deadline)));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
     }
 
     #[test]

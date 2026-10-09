@@ -1582,3 +1582,76 @@ async fn fix_rg_scoped_02_review_revalidation() {
     assert_eq!(std::fs::read(&outside).unwrap(), b"UNTOUCHED");
     assert_no_leaked_workspace(&repo);
 }
+
+/// A zero setup budget and a cancel raised before scoped materialization both
+/// stop before the ordinary payload exists. The zero budget stays an
+/// infrastructure error; cancel stays cancelled. Neither launches the reviewer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fix_rg_scoped_02_review_revalidation_setup_stop() {
+    use libra::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
+    let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
+    let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
+    let (metadata_oid, transcript_oid) =
+        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+    let spec = CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid,
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid,
+            },
+        ],
+    };
+    let store = store_for(&repo);
+    let reviewer = fake_reviewer(
+        "lister",
+        Path::new("/bin/sh"),
+        &["-c", "echo RAN"],
+        Duration::from_secs(30),
+    );
+
+    let mut expired = ReviewRunRequest::new(
+        repo.clone(),
+        "list the workspace",
+        format!("checkpoint:{checkpoint_id}"),
+        "0000000000000000000000000000000000000000",
+        vec![reviewer.clone()],
+    );
+    expired.checkpoint_input = Some(spec.clone());
+    expired.reviewer_timeout = Duration::ZERO;
+    let outcome = run_bounded(&store, expired, ReviewCancelHandle::new(), 60).await;
+    assert_eq!(outcome.terminal_state, ReviewTerminalState::Error);
+    let infra = outcome
+        .infra_error
+        .expect("setup deadline is an infra error");
+    assert!(infra.contains("deadline"), "{infra}");
+    assert!(!outcome.run_dir.join("checkpoint-input").exists());
+    let findings = std::fs::read_to_string(outcome.run_dir.join("findings.md")).unwrap();
+    assert!(!findings.contains("RAN"), "{findings}");
+
+    let mut request = ReviewRunRequest::new(
+        repo.clone(),
+        "list the workspace",
+        format!("checkpoint:{checkpoint_id}"),
+        "0000000000000000000000000000000000000000",
+        vec![reviewer],
+    );
+    request.checkpoint_input = Some(spec);
+    let cancel = ReviewCancelHandle::new();
+    cancel.cancel();
+    let outcome = run_bounded(&store, request, cancel, 60).await;
+    assert_eq!(outcome.terminal_state, ReviewTerminalState::Cancelled);
+    assert!(outcome.infra_error.is_none());
+    assert!(!outcome.run_dir.join("checkpoint-input").exists());
+    let findings = std::fs::read_to_string(outcome.run_dir.join("findings.md")).unwrap();
+    assert!(!findings.contains("RAN"), "{findings}");
+    assert_no_leaked_workspace(&repo);
+}
