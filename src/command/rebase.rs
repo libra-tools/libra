@@ -4822,15 +4822,18 @@ mod tests {
 
     use clap::Parser;
     use git_internal::internal::object::tree::TreeItemMode;
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[cfg(unix)]
     use super::path_to_index_key;
+    #[cfg(unix)]
+    use super::write_workdir_blob;
     use super::{
         InteractiveReplayError, RebaseArgs, RebaseAuxState, RebaseError, RebaseState,
         RebaseTodoAction, ReplayErrorKind, decode_todo_actions_blob, encode_todo_actions_blob,
         index_mode_to_tree_item_mode, interactive_replay_items, rebase_start_spec,
-        rerere_autoupdate_override, write_workdir_blob,
+        rerere_autoupdate_override,
     };
     use crate::utils::error::{CliError, StableErrorCode};
 

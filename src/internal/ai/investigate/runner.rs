@@ -1399,9 +1399,11 @@ impl Drop for InvestigateWorkspaceGuard {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::{super::store::StanceDisposition, *};
+    #[cfg(unix)]
     use crate::internal::ai::review::ReviewerCommand;
 
     fn test_store() -> (tempfile::TempDir, InvestigateRunStore, PathBuf) {

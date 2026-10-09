@@ -1,9 +1,12 @@
 //! `libra agent import` — consented historical transcript backfill (M4).
 
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
-    io::{self, IsTerminal, Seek, SeekFrom, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -14,6 +17,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
+#[cfg_attr(windows, allow(unused_imports))]
 use crate::{
     internal::{
         ai::{
@@ -1028,6 +1032,7 @@ fn codex_sessions_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
 }
 
+#[cfg_attr(windows, allow(unused_variables))]
 fn discover_codex(since: Option<i64>, deadline: Instant) -> Result<Vec<Candidate>> {
     ensure_before_deadline(deadline)?;
     let Some(root) = codex_sessions_root() else {
@@ -1622,6 +1627,7 @@ fn wait_for_consent_fd(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Re
     }
 }
 
+#[cfg_attr(windows, allow(unused_variables, unreachable_code))]
 fn require_consent(
     args: &ImportArgs,
     output: &OutputConfig,
@@ -2389,6 +2395,7 @@ fn require_registered_import_helper_command(
 /// pinned provider descriptor (or anonymous export file); unlike the retired
 /// V1 protocol, neither stdin nor the control frame carries a locator,
 /// provider session id, repository path, storage path, or existing metadata.
+#[cfg_attr(windows, allow(unused_mut))]
 async fn run_import_preparation_descriptor_helper_bounded(
     mut command: tokio::process::Command,
     control: PreparationDescriptorControl,

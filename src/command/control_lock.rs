@@ -42,11 +42,13 @@
 //!   (see `legacy_record_names_this_repository`).
 
 #[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 

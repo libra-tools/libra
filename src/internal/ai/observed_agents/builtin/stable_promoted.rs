@@ -758,6 +758,7 @@ impl Default for RolloutDiscoveryLimits {
 
 /// [`find_codex_rollout`] with injectable bounds. Every bound fails LOUDLY —
 /// a truncated walk must never silently claim "newest" or "not found".
+#[cfg_attr(windows, allow(unused_variables))]
 pub fn find_codex_rollout_bounded(
     session_id: &str,
     limits: RolloutDiscoveryLimits,

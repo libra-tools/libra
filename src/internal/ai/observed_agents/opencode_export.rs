@@ -3519,7 +3519,7 @@ printf 'tty=detached'"#,
     /// process group, 3s wall clock).
     /// Linux retained exporter/store fds remain CLOEXEC in the parent until
     /// the fork-child allowlist restores only those exact capabilities.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn runner_controls_preserved() {

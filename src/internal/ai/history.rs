@@ -59,6 +59,10 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
+#[cfg(unix)]
+use crate::internal::ai::authorized_read::{
+    RegisteredHelperOutput, registered_helper_command, run_registered_bounded_helper_until,
+};
 #[cfg(test)]
 use crate::internal::ai::observed_agents::RedactedBytes;
 #[cfg(test)]
@@ -66,10 +70,7 @@ use crate::utils::storage::tiered::verify_fetched_object;
 use crate::{
     internal::{
         ai::{
-            authorized_read::{
-                RegisteredHelperOutput, StrictBoundedRead, read_strictly_bounded,
-                registered_helper_command, run_registered_bounded_helper_until,
-            },
+            authorized_read::{StrictBoundedRead, read_strictly_bounded},
             capture_scope::{
                 CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
                 authorize_final_capture_commit,

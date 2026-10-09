@@ -5,10 +5,11 @@
 //! they are strictly parsed into typed turns, redacted field-by-field, and
 //! re-serialized as an allowlist-only per-turn projection before persistence.
 
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -19,12 +20,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(unix)]
+use super::authorized_read::{
+    AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, CancellationSafeChild,
+    configure_private_helper_process_group, read_async_strictly_bounded, registered_helper_command,
+};
 use super::{
-    authorized_read::{
-        AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, CancellationSafeChild,
-        configure_private_helper_process_group, read_async_strictly_bounded,
-        registered_helper_command,
-    },
     capture::{
         catalog::{
             CaptureCatalogError, CaptureCatalogRedactionReport, CaptureCatalogSession,

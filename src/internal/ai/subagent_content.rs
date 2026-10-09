@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
@@ -24,11 +25,17 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 
+#[cfg(unix)]
+use super::authorized_read::{
+    CancellationSafeChild, StrictBoundedRead, configure_private_helper_process_group,
+    read_async_strictly_bounded, read_strictly_bounded,
+};
+#[cfg(unix)]
+use super::observed_agents::{
+    claude_project_slug, claude_session_dir, open_file_beneath_pinned_provider_directory,
+    open_provider_directory_for_discovery,
+};
 use super::{
-    authorized_read::{
-        CancellationSafeChild, StrictBoundedRead, configure_private_helper_process_group,
-        read_async_strictly_bounded, read_strictly_bounded,
-    },
     capture::snapshot::{CaptureSnapshot, CaptureSnapshotPolicy, CaptureSnapshotService},
     capture_scope::{
         CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
@@ -44,10 +51,9 @@ use super::{
     observed_agents::{
         ClaudeCodeObservedAgent, ExportAuthorized, MAX_REDACTION_MATCH_SAMPLES, RedactedBytes,
         RedactionReport, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
-        claude_project_slug, claude_session_dir, claude_session_id_is_safe_path_component,
-        normalize_claude_transcript, normalize_claude_transcript_until,
-        open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-        parse_canon_value, redact_turns_with_report, safe_turn_projection,
+        claude_session_id_is_safe_path_component, normalize_claude_transcript,
+        normalize_claude_transcript_until, parse_canon_value, redact_turns_with_report,
+        safe_turn_projection,
     },
 };
 use crate::utils::client_storage::ClientStorage;

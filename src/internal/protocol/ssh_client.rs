@@ -1798,6 +1798,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
     use super::*;

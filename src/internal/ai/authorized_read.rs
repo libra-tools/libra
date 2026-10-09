@@ -4,16 +4,19 @@
 //! Library callers use it when a trusted descriptor can block in filesystem
 //! I/O and an in-process cancellation point cannot enforce the host deadline.
 
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::OnceLock,
     time::Instant,
 };
 
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
 
 use crate::internal::ai::observed_agents::{
     MAX_REDACTION_MATCH_SAMPLES, RedactedBytes, RedactionReport, Redactor,
@@ -452,6 +455,7 @@ pub(crate) async fn read_live_claude_source_until(
 /// controls are limited to fixed mode/cap values by the caller. This mirrors
 /// the import descriptor handoff rather than re-addressing a provider path in
 /// the child.
+#[cfg_attr(windows, allow(unused_mut))]
 async fn run_registered_descriptor_helper_until(
     mut command: tokio::process::Command,
     source: std::fs::File,
@@ -545,6 +549,7 @@ async fn run_registered_descriptor_helper_until(
 /// frame under an absolute deadline. Both source I/O and CPU-only workers use
 /// this path so they cannot diverge on pipe draining, kill/reap, or deadline
 /// behavior.
+#[cfg_attr(windows, allow(unused_mut))]
 pub(crate) async fn run_registered_bounded_helper_until(
     mut command: tokio::process::Command,
     request_parts: &[&[u8]],
@@ -862,6 +867,7 @@ impl LiveClaudeHelperResponse {
     }
 }
 
+#[cfg_attr(windows, allow(unused_mut, unused_variables, unreachable_code))]
 fn run_live_claude_source_read(mut file: std::fs::File, cap: u64) -> LiveClaudeHelperResponse {
     #[cfg(unix)]
     {
@@ -1022,12 +1028,14 @@ mod tests {
     use regex::bytes::Regex;
     use sha2::{Digest, Sha256};
 
+    #[cfg(unix)]
+    use super::run_registered_bounded_helper_until;
     use super::{
         AUTHORIZED_READ_HELPER_MAX_CAP, LIVE_SOURCE_COMPLETE, LIVE_SOURCE_OVERSIZE,
         LiveClaudeSourceRead, SOURCE_IDENTITY_NOT_RETAINED, StrictBoundedRead,
         capture_redacted_output_cap, decode_live_claude_frame, helper_program_from_registered,
         provider_file_identity, read_strictly_bounded, redact_live_claude_source,
-        run_registered_bounded_helper_until, valid_helper_redaction_report,
+        valid_helper_redaction_report,
     };
     use crate::internal::ai::observed_agents::{RedactionRule, Redactor};
 

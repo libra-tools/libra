@@ -27,10 +27,12 @@
 //! deferred path check; unsupported platforms fail closed. The writer then
 //! consumes only that held descriptor and never re-opens the source path.
 
+#[cfg(unix)]
+use std::path::Component;
 use std::{
     fmt,
     io::Seek,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};

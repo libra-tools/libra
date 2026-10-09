@@ -851,8 +851,6 @@ fn wait_stdout_readable(
         // Anonymous pipe handles are not waitable synchronization objects;
         // `WaitForSingleObject` returns WAIT_FAILED. PeekNamedPipe reports
         // pending bytes (or ERROR_BROKEN_PIPE on EOF).
-        use std::os::windows::io::AsRawHandle;
-
         use windows_sys::Win32::{
             Foundation::{ERROR_BROKEN_PIPE, HANDLE},
             System::Pipes::PeekNamedPipe,
