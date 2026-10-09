@@ -685,6 +685,11 @@ async fn drive(
                 guard = InvestigateWorkspaceGuard { workspace: None };
                 workspace_root = root;
             }
+            Err(ValidatedMaterializeError::Catalog(message)) if state.pending_turn.is_some() => {
+                // A paused continue must surface a catalog transport failure
+                // before any state or input mutation and must not launch.
+                return Err(InvestigateRunError::Store(std::io::Error::other(message)));
+            }
             Err(err) => {
                 // Cancel outranks a deadline or a refused spec. A deadline here
                 // is the persisted run budget, so it ends as timeout. Any other

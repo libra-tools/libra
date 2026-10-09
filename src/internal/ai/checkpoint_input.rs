@@ -23,8 +23,12 @@
 //! checkpoint is missing, malformed, or not locally materializable);
 //! this module only turns an already-validated spec into files.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::object::read_git_object_bounded;
@@ -95,6 +99,9 @@ pub enum ValidatedMaterializeError {
     Deadline,
     /// The spec, store path, or object bytes were refused.
     Refused(String),
+    /// The explicit repository catalog could not be opened, queried, or closed.
+    /// This is a transport failure, not a role mismatch.
+    Catalog(String),
 }
 
 impl std::fmt::Display for ValidatedMaterializeError {
@@ -102,8 +109,94 @@ impl std::fmt::Display for ValidatedMaterializeError {
         match self {
             Self::Cancelled => write!(f, "{}", scoped_io::CheckpointInputIoError::Cancelled),
             Self::Deadline => write!(f, "{}", scoped_io::CheckpointInputIoError::Deadline),
-            Self::Refused(message) => f.write_str(message),
+            Self::Refused(message) | Self::Catalog(message) => f.write_str(message),
         }
+    }
+}
+
+fn stop_if_inactive(
+    deadline: Instant,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(), ValidatedMaterializeError> {
+    if cancelled() {
+        return Err(ValidatedMaterializeError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ValidatedMaterializeError::Deadline);
+    }
+    Ok(())
+}
+
+/// Read the named checkpoint from the explicit store's catalog, then close
+/// that connection before any cleanup or payload write. The query budget is
+/// one shot: the caller's deadline, capped at 200ms from this phase.
+async fn confirm_catalog_checkpoint(
+    storage: &Path,
+    checkpoint_id: &str,
+    deadline: Instant,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(), ValidatedMaterializeError> {
+    stop_if_inactive(deadline, cancelled)?;
+    let query_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(200));
+    let remaining = query_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ValidatedMaterializeError::Deadline);
+    }
+    let db_path = storage.join(crate::utils::util::DATABASE);
+    if !db_path.is_file() {
+        return Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog is not available in the explicit object store; keep the run and \
+             retry when the repository database can be opened"
+                .to_string(),
+        ));
+    }
+    let mut options = ConnectOptions::new("sqlite://checkpoint-catalog");
+    options.max_connections(1);
+    options.connect_timeout(remaining);
+    options.acquire_timeout(remaining);
+    options.sqlx_logging(false);
+    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+    options.map_sqlx_sqlite_opts(move |opts| {
+        opts.filename(&db_path)
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(remaining)
+    });
+    let conn = Database::connect(options).await.map_err(|_| {
+        ValidatedMaterializeError::Catalog(
+            "checkpoint catalog could not be opened; keep the run and retry when the repository \
+             database is readable"
+                .to_string(),
+        )
+    })?;
+    let backend = conn.get_database_backend();
+    let queried = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [checkpoint_id.into()],
+        ))
+        .await;
+    let closed = conn.close().await;
+    if closed.is_err() {
+        return Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog could not be closed; keep the run and retry when the repository \
+             database releases its connection"
+                .to_string(),
+        ));
+    }
+    stop_if_inactive(deadline, cancelled)?;
+    match queried {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{checkpoint_id}' is not in the explicit catalog; refusing to materialize \
+             a saved spec the catalog does not name"
+        ))),
+        Err(_) => Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog query failed; keep the run and retry when the repository \
+             database can be read"
+                .to_string(),
+        )),
     }
 }
 
@@ -138,6 +231,7 @@ pub async fn materialize_validated_checkpoint_input(
             "checkpoint input spec is missing its checkpoint id".to_string(),
         ));
     }
+    stop_if_inactive(deadline, cancelled.as_ref())?;
     // Pin the caller's paths before the confined API checks ancestors. A
     // macOS temp repo is reached through the /var symlink; resolving it once
     // names the real directory, and the no-follow check still applies there.
@@ -146,6 +240,7 @@ pub async fn materialize_validated_checkpoint_input(
             "checkpoint input storage path is not a real directory: {error}"
         ))
     })?;
+    confirm_catalog_checkpoint(&storage, &spec.checkpoint_id, deadline, cancelled.as_ref()).await?;
     let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
         ValidatedMaterializeError::Refused(format!(
             "checkpoint input run directory is not a real directory: {error}"
@@ -341,6 +436,8 @@ pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
     use super::*;
 
     /// Write a loose blob into `storage` and return its spec entry.
@@ -362,6 +459,37 @@ mod tests {
             rel_path: rel_path.to_string(),
             oid,
         }
+    }
+
+    fn seed_catalog(storage: &Path, checkpoint_id: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("catalog runtime");
+        runtime.block_on(async {
+            let db_path = storage.join("libra.db");
+            let url = format!("sqlite://{}?mode=rwc", db_path.display());
+            let mut options = ConnectOptions::new(url);
+            options.max_connections(1);
+            options.sqlx_logging(false);
+            let conn = Database::connect(options).await.expect("create catalog");
+            let backend = conn.get_database_backend();
+            conn.execute_raw(Statement::from_string(
+                backend,
+                "CREATE TABLE IF NOT EXISTS agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)"
+                    .to_string(),
+            ))
+            .await
+            .expect("create catalog table");
+            conn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO agent_checkpoint (checkpoint_id) VALUES (?)",
+                [checkpoint_id.into()],
+            ))
+            .await
+            .expect("insert catalog row");
+            conn.close().await.expect("close catalog");
+        });
     }
 
     /// PD-02: the materialized input must be READ-ONLY in the sense that
@@ -543,6 +671,7 @@ mod tests {
             checkpoint_id: "ckpt-typed".to_string(),
             files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
         };
+        seed_catalog(&storage, "ckpt-typed");
         let error =
             validated_materialize(Path::new("relative-storage"), &spec, &run_dir).unwrap_err();
         assert!(error.contains("absolute"), "{error}");
@@ -594,6 +723,35 @@ mod tests {
     }
 
     #[test]
+    fn fix_rg_scoped_02_catalog_unavailable_skips_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-missing-catalog".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let missing = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|| false),
+        ));
+        assert!(matches!(
+            missing,
+            Err(ValidatedMaterializeError::Catalog(_))
+        ));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
     fn fix_rg_scoped_02_second_materialization() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -604,6 +762,7 @@ mod tests {
             checkpoint_id: "ckpt-second".to_string(),
             files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
         };
+        seed_catalog(&storage, "ckpt-second");
         let first = validated_materialize(&storage, &spec, &run_dir).expect("first");
         assert_eq!(
             std::fs::read(first.join("metadata.json")).unwrap(),

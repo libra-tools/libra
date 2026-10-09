@@ -2013,3 +2013,98 @@ async fn fix_rg_scoped_02_persisted_spec_resume() {
     );
     assert_no_leaked_workspace(&repo);
 }
+
+/// A paused continue whose catalog cannot be opened returns the store error
+/// before any state or input mutation and does not launch an investigator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fix_rg_scoped_02_persisted_spec_resume_catalog_unavailable() {
+    use libra::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_committed_repo(temp.path());
+    let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
+    let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
+    let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
+    let (metadata_oid, transcript_oid) =
+        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+    let store = store_for(&repo);
+    let fixtures = temp.path().join("fixtures");
+    let silent = stage_fixture(&fixtures, "investigator-silent.sh");
+    let conclude = stage_fixture(&fixtures, "investigator-conclude.sh");
+    let mut request = InvestigateRunRequest::new(
+        repo.clone(),
+        "review the captured transcript",
+        "0000000000000000000000000000000000000000",
+        vec![fake_investigator(
+            "inv-a",
+            &silent,
+            &[],
+            Duration::from_secs(30),
+        )],
+        4,
+        1,
+    );
+    request.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid,
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid,
+            },
+        ],
+    });
+    let paused = run_bounded(&store, request, InvestigateCancelHandle::new(), 60).await;
+    assert_eq!(paused.terminal_state, None, "silent investigator pauses");
+    let input = paused
+        .run_dir
+        .join("checkpoint-input")
+        .join("metadata.json");
+    let state_before = std::fs::read(paused.run_dir.join("state.json")).expect("state");
+    let bytes_before = std::fs::read(&input).expect("input");
+    let mode_before = std::fs::metadata(&input)
+        .expect("mode")
+        .permissions()
+        .mode();
+    std::fs::remove_file(repo.join(".libra").join("libra.db")).expect("remove catalog");
+    let err = continue_investigate_with_sources(
+        &store,
+        &paused.run_id,
+        vec![fake_investigator(
+            "inv-a",
+            &conclude,
+            &[],
+            Duration::from_secs(30),
+        )],
+        &repo,
+        DEFAULT_INVESTIGATOR_TIMEOUT,
+        true,
+        DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD,
+        InvestigateCancelHandle::new(),
+    )
+    .await
+    .expect_err("missing catalog must not continue");
+    assert!(
+        matches!(err, InvestigateRunError::Store(_)),
+        "catalog transport failure stays a store error: {err}"
+    );
+    assert!(
+        err.to_string().contains("catalog"),
+        "actionable catalog error: {err}"
+    );
+    assert_eq!(
+        std::fs::read(paused.run_dir.join("state.json")).expect("state after"),
+        state_before
+    );
+    assert_eq!(std::fs::read(&input).expect("input after"), bytes_before);
+    assert_eq!(
+        std::fs::metadata(&input)
+            .expect("mode after")
+            .permissions()
+            .mode(),
+        mode_before
+    );
+}
