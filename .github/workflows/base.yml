@@ -105,6 +105,11 @@ jobs:
 
       - name: Verify PR source and execute all four exact fixtures
         shell: pwsh
+        env:
+          # Keep rustc lints denied. Also drop LNK4099: openssl-sys's static
+          # lib has no PDB, and MSVC prints that on every lib-test link.
+          # This job is windows-latest (MSVC); the flag is not used elsewhere.
+          RUSTFLAGS: "-D warnings -C link-arg=/IGNORE:4099"
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
