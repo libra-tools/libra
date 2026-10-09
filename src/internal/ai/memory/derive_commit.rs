@@ -103,6 +103,12 @@ fn load_commit_fields(
         .map_err(|error| GitError::InvalidObjectType(error.to_string()))?;
     let commit: Commit = load_object(&oid)?;
     let normalized = render_untrusted_findings(&commit.message);
+    // Git commit objects may carry a `gpgsig`/`gpgsig-sha256` header block
+    // before the human message (Libra signs commits by default). The decoder
+    // surfaces it as part of `message`, so strip any leading signing-header
+    // block (a header line plus its indented continuation lines, terminated by
+    // a blank line) before splitting subject/body (ADR-DM-05 / GC-DM-02).
+    let normalized = strip_commit_signing_headers(&normalized);
     // Git commit objects begin the message after a blank line; the decoder may
     // surface a leading newline, so trim leading newlines before splitting.
     let normalized = normalized.trim_start_matches('\n');
@@ -116,6 +122,42 @@ fn load_commit_fields(
         })
         .unwrap_or((normalized.to_string(), String::new()));
     Ok((subject, body, Some(commit_oid.to_string())))
+}
+
+/// Remove a leading `gpgsig`/`gpgsig-sha256` header block from a decoded commit
+/// message. The block is a multi-line header value terminated by the
+/// `-----END PGP SIGNATURE-----` marker; the human-readable message follows it
+/// after any blank separator and is preserved verbatim. When no such header is
+/// present, the input is returned unchanged.
+fn strip_commit_signing_headers(message: &str) -> String {
+    // The encoding/decoding headers can legitimately contain a blank line inside
+    // the raw signature (base85 continuation), so a blank-line-only detection is
+    // unreliable. Detect the block by its start marker and terminate at the
+    // `END PGP SIGNATURE` marker instead.
+    let lines: Vec<&str> = message.lines().collect();
+    if lines.first().is_none_or(|line| !line.starts_with("gpgsig")) {
+        return message.to_string();
+    }
+
+    let Some(end_pos) = lines
+        .iter()
+        .position(|line| line.contains("-----END PGP SIGNATURE-----"))
+    else {
+        // Malformed / unexpected header; keep everything (old behavior).
+        return message.to_string();
+    };
+
+    // The message begins after the END marker; drop the separator blank lines.
+    let rest = &lines[end_pos + 1..];
+    let mut start = 0;
+    while start < rest.len() && rest[start].trim().is_empty() {
+        start += 1;
+    }
+    let tail = &rest[start..];
+    if tail.is_empty() {
+        return String::new();
+    }
+    tail.join("\n")
 }
 
 /// Derive commit Episodes for a repository's changes within `horizon`.
@@ -219,4 +261,29 @@ pub async fn derive_commit_episodes(
         episodes.push(episode);
     }
     Ok(episodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_commit_signing_headers;
+
+    #[test]
+    fn strips_leading_gpgsig_block_and_keeps_message() {
+        let message = "gpgsig -----BEGIN PGP SIGNATURE-----\n\n iQEzBAABCAAdFiEE...\n =abcd\n -----END PGP SIGNATURE-----\n\nbase subject\n\nbody text";
+        let stripped = strip_commit_signing_headers(message);
+        assert_eq!(stripped, "base subject\n\nbody text");
+    }
+
+    #[test]
+    fn leaves_unpaginated_message_unchanged() {
+        let message = "plain subject\n\nplain body";
+        assert_eq!(strip_commit_signing_headers(message), message);
+    }
+
+    #[test]
+    fn empty_message_after_strip_returns_empty() {
+        let message =
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n\n------\n -----END PGP SIGNATURE-----\n\n";
+        assert_eq!(strip_commit_signing_headers(message), "");
+    }
 }

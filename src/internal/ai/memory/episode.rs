@@ -44,6 +44,19 @@ impl fmt::Display for SourceKind {
     }
 }
 
+impl TryFrom<&str> for SourceKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "commit" => Ok(Self::Commit),
+            "agent_session" => Ok(Self::AgentSession),
+            "agent_run" => Ok(Self::AgentRun),
+            "bridge_operation" => Ok(Self::BridgeOperation),
+            other => Err(format!("unknown source_kind '{other}'")),
+        }
+    }
+}
+
 /// Terminal outcome (matches the `memory_episode.outcome` CHECK vocabulary).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +83,20 @@ impl Outcome {
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for Outcome {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "aborted" => Ok(Self::Aborted),
+            "partial" => Ok(Self::Partial),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("unknown outcome '{other}'")),
+        }
     }
 }
 

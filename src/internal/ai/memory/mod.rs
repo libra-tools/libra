@@ -14,11 +14,16 @@ mod derive_commit;
 mod episode;
 mod error;
 mod projection;
+pub mod reader;
 
 pub use derive_commit::derive_commit_episodes;
 pub use episode::{
-    Episode, EvidenceEdge, MEMORY_EPISODE_NAMESPACE_V1, MemoryConfidence, Outcome, PathRow,
-    SourceKind, content_digest, episode_id,
+    Episode, EvidenceEdge, MemoryConfidence, Outcome, PathRow, SourceKind, content_digest,
+    episode_id,
 };
 pub use error::MemoryError;
 pub use projection::{RebuildReport, commit_fingerprint, meta, project_episodes, rebuild};
+pub use reader::{
+    EPISODE_SELECTOR_VERSION, EpisodeView, ProjectionStatus, list_episodes, normalize_path_text,
+    projection_is_stale, read_episode, read_status, render_code_path,
+};
