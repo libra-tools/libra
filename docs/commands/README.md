@@ -146,6 +146,7 @@ Every Libra command accepts the following global flags:
 | `libra usage` | | Removed. Usage stats only served the deleted developer agent | [usage.md](usage.md) |
 | `libra graph` | | Removed. Use `libra --json agent graph <session>` for the capture graph | [graph.md](graph.md) |
 | `libra sandbox` | | Inspect AI sandbox diagnostics, including OS backend availability and downgrade warnings | [sandbox.md](sandbox.md) |
+| `libra memory` | | Inspect / rebuild the deterministic Agent development-history projection (read-only) | [memory.md](memory.md) |
 | `libra agent` | | Manage external-agent capture, checkpoints, hooks, and RPC adapters | [agent.md](agent.md) |
 
 ### Low-Level & Inspection

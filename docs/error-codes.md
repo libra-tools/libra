@@ -158,6 +158,8 @@ structured report is always present.
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
 | `128` | `LBR-AGENT-039` | `internal` | Reserved historical outcome: a removed controlled-fix path was denied at a Code-runtime tool or sandbox approval gate; no patch was applied | former `review --fix` / `investigate fix` denial |
 | `128` | `LBR-AGENT-040` | `internal` | Reserved historical outcome: a removed controlled-fix path stopped without a clean patch or deterministic repair result | former invalid terminal response, later denial after a patch, or controlled-execution timeout |
+| `128` | `LBR-MEMORY-001` | `repo` | Memory projection is stale and refuses to answer (ADR-DM-10 fail-closed) | `libra memory status`/`list`/`show` after a commit/change advanced beyond the last rebuild; pass `--allow-stale` to read anyway |
+| `128` | `LBR-MEMORY-002` | `repo` | Requested memory episode id is absent from the current window projection | `libra memory show <id>` with an unknown episode id |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -188,6 +190,8 @@ structured report is always present.
 | `LBR-REPO-003` | Repository state blocks the operation |
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
 | `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
+| `LBR-MEMORY-001` | The memory projection is stale and refuses to answer (ADR-DM-10); run `libra memory rebuild` or pass `--allow-stale` |
+| `LBR-MEMORY-002` | The requested memory episode id is absent from the current window projection |
 
 `config set --plaintext` refuses an existing encrypted value with `LBR-REPO-003`
 (exit 128), including ASCII case fallback. Clear that ordinary key with
