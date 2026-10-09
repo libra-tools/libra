@@ -207,7 +207,9 @@ pub(crate) enum LiveClaudeSourceRead {
 /// their own strictly bounded frame after this lifecycle layer has enforced
 /// the absolute deadline and reaped a timed-out child.
 pub(crate) enum RegisteredHelperOutput {
+    #[cfg_attr(windows, allow(dead_code))]
     Output(Vec<u8>),
+    #[cfg_attr(windows, allow(dead_code))]
     DeadlineExceeded,
     Failed,
 }
@@ -244,6 +246,7 @@ impl CancellationSafeChild {
     /// Construct a guard for a helper whose command was configured with
     /// `process_group(0)` before `spawn`.  The direct child PID is then also
     /// the dedicated PGID while its leader remains unreaped.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn new_process_group(child: tokio::process::Child) -> Self {
         Self {
             process_group: child.id(),
@@ -326,6 +329,7 @@ impl CancellationSafeChild {
 /// The group makes it possible to terminate forked descendants that inherit
 /// a raw descriptor or a response pipe. Non-Unix callers must fail closed at
 /// their raw-source boundary rather than rely on this no-op.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn configure_private_helper_process_group(command: &mut tokio::process::Command) {
     #[cfg(unix)]
     {
@@ -994,6 +998,7 @@ pub(crate) fn provider_file_identity(_source_id: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) async fn with_test_helper_program<F>(program: PathBuf, future: F) -> F::Output
 where
     F: std::future::Future,

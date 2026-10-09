@@ -58,11 +58,13 @@ pub(crate) enum CaptureSourceCommitmentDomain {
     /// Import ownership is deliberately separate from snapshot content: it
     /// binds the authorized locator/session preimage used by V2 migration and
     /// recovery markers.
+    #[cfg_attr(windows, allow(dead_code))]
     ImportSourceV2,
     SubagentSourceV2,
 }
 
 impl CaptureSourceCommitmentDomain {
+    #[cfg_attr(windows, allow(dead_code))]
     fn tag(self) -> &'static [u8] {
         match self {
             Self::SnapshotContentV2 => b"libra-agent-snapshot-content-hmac-v2\0",
@@ -71,6 +73,7 @@ impl CaptureSourceCommitmentDomain {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn prefix(self) -> &'static str {
         match self {
             Self::SnapshotContentV2 | Self::ImportSourceV2 => "source/hmac-v2/",

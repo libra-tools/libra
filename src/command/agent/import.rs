@@ -1693,6 +1693,7 @@ fn require_consent(
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 async fn resolve_candidate_source(
     candidate: &Candidate,
     repo_root: &Path,
@@ -2396,6 +2397,7 @@ fn require_registered_import_helper_command(
 /// V1 protocol, neither stdin nor the control frame carries a locator,
 /// provider session id, repository path, storage path, or existing metadata.
 #[cfg_attr(windows, allow(unused_mut))]
+#[cfg_attr(windows, allow(dead_code))]
 async fn run_import_preparation_descriptor_helper_bounded(
     mut command: tokio::process::Command,
     control: PreparationDescriptorControl,
@@ -3299,6 +3301,7 @@ mod tests {
         assert_eq!(BatchResult::complete(import_summary(0, 0)).status, "noop");
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     struct ImportIndexRepairCheckpointFixture {
         checkpoint_id: String,
         tree_oid: String,
@@ -3308,6 +3311,7 @@ mod tests {
 
     /// Write the smallest E4 checkpoint layout that import replay recognizes:
     /// a manifest-bearing checkpoint tree plus a valid traces commit.
+    #[cfg_attr(windows, allow(dead_code))]
     fn write_import_index_repair_checkpoint(
         repo_path: &Path,
         checkpoint_id: &str,
@@ -3734,9 +3738,11 @@ mod tests {
         wait_for_import_helper_exit(descendant_pid).await;
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     struct TestHomeGuard(Option<std::ffi::OsString>);
 
     impl TestHomeGuard {
+        #[cfg_attr(windows, allow(dead_code))]
         fn set(path: &Path) -> Self {
             let previous = std::env::var_os("LIBRA_TEST_HOME");
             // SAFETY: serial test below restores the process environment.

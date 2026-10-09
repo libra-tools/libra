@@ -1035,6 +1035,7 @@ pub(crate) fn import_provider_commitment(provider_session_id: &str) -> [u8; 32] 
 /// Construct the transient source preimage from the parent-held authorized
 /// source identity. It is never serialized into metadata or helper control;
 /// only the later repository-keyed HMAC may become durable.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn import_source_preimage(
     agent_kind: AgentKind,
     source_kind: &str,
@@ -1612,6 +1613,7 @@ pub(crate) fn prepare_import_projection(
 /// Reconstruct the parent-owned compatibility fields after it has checked the
 /// helper's fixed storage commitment and derived the opaque V2 source
 /// commitment inside the scoped repository.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn import_request_from_projection(
     agent_kind: AgentKind,
     provider_session_id: String,

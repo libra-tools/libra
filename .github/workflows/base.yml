@@ -102,16 +102,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          # The action's default `-D warnings` denies Unix-only helpers that
-          # this Windows lib-test target never calls, so `--list` fails before
-          # the four fixtures. Empty rustflags keeps that default off this job.
-          # Linux clippy still passes `-D warnings` itself.
-          rustflags: ""
 
       - name: Verify PR source and execute all four exact fixtures
         shell: pwsh
-        env:
-          RUSTFLAGS: ""
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false

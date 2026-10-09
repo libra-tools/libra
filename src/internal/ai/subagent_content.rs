@@ -103,6 +103,7 @@ pub const SUBAGENT_PROJECTION_HELPER_OUTPUT_CAP: u64 = SUBAGENT_PROJECTION_TRANS
 const SUBAGENT_PROJECTION_COMPLETE: u8 = 0;
 const SUBAGENT_PROJECTION_FAILED: u8 = 1;
 const SUBAGENT_CONTENT_LEASE_MS: i64 = 60_000;
+#[cfg_attr(windows, allow(dead_code))]
 const MAX_SUBAGENT_DIRECTORY_ENTRIES: usize = 2_048;
 pub(crate) const MAX_SUBAGENT_SOURCES_PER_CAPTURE: usize = 16;
 const SUBAGENT_PARENT_PERSISTENCE_RESERVE: Duration = Duration::from_secs(20);
@@ -439,6 +440,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) async fn with_subagent_discovery_helper_program<F>(
     program: PathBuf,
     future: F,
@@ -452,6 +454,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 async fn with_subagent_discovery_helper_output_cap<F>(cap: u64, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -462,6 +465,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 async fn with_subagent_projection_helper_program<F>(program: PathBuf, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -599,6 +603,7 @@ fn helper_program() -> Option<PathBuf> {
     crate::internal::ai::authorized_read::helper_program()
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn subagent_discovery_helper_output_cap() -> u64 {
     #[cfg(test)]
     if let Ok(Some(cap)) = TEST_SUBAGENT_DISCOVERY_HELPER_OUTPUT_CAP.try_with(|cap| *cap) {
@@ -611,6 +616,7 @@ fn subagent_discovery_helper_output_cap() -> u64 {
 /// entrypoint. Unlike the historical discovery helper, this shares the
 /// process-registered program fact so a supported `--binary-path` rename is
 /// still safe and an embedded host never receives a private argv token.
+#[cfg_attr(windows, allow(dead_code))]
 fn projection_helper_program() -> Option<PathBuf> {
     #[cfg(test)]
     if let Ok(Some(program)) = TEST_SUBAGENT_PROJECTION_HELPER_PROGRAM.try_with(Clone::clone) {
@@ -2405,6 +2411,7 @@ impl SafeSubagentProjection {
         )
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn into_parts_with_digest(self) -> (RedactedBytes, serde_json::Value, bool, usize, String) {
         (
             self.transcript,

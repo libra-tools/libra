@@ -105,6 +105,7 @@ pub use transcript_source::{
     resolve_import_transcript_source, resolve_transcript_source,
     transcript_path_within_provider_root,
 };
+#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use transcript_source::{
     TranscriptSourceResolution, open_file_beneath_pinned_provider_directory,
     open_provider_directory_for_discovery, resolve_import_transcript_source_until,

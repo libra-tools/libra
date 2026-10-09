@@ -44,9 +44,11 @@ fn worktree_permissions(executable: bool) -> Option<Permissions> {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A unique same-directory sibling used as the rename source for symlinks.
+#[cfg_attr(windows, allow(dead_code))]
 fn temp_sibling_path(dest: &Path) -> PathBuf {
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = dest

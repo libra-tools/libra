@@ -237,6 +237,7 @@ impl CaptureIngressBinding {
     /// is intentionally separate from [`Self::into_scope_binding_parts`] so
     /// no caller can accidentally recover a key from an opaque binding.
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn into_verified_scope_parts(self) -> (String, CaptureRuntimeScope) {
         (self.verified_cwd, self.runtime_scope)
     }

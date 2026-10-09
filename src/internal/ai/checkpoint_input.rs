@@ -231,6 +231,7 @@ mod tests {
     use super::*;
 
     /// Write a loose blob into `storage` and return its spec entry.
+    #[cfg_attr(windows, allow(dead_code))]
     fn write_blob(storage: &Path, rel_path: &str, content: &[u8]) -> CheckpointInputFile {
         use std::io::Write as _;
 

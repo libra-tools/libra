@@ -77,6 +77,7 @@ struct RepoState {
 /// independent claims — the second acquisition blocking on the first, inside
 /// the very mutex that has to be released for the first to finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(windows, allow(dead_code))]
 struct LockIdentity {
     #[cfg(unix)]
     device: u64,
