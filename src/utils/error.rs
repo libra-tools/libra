@@ -332,6 +332,15 @@ pub enum StableErrorCode {
     /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
     /// reserved `upgrade.*` namespace are plain usage errors (`LBR-CLI-002`).
     UpgradeSettingsInvalid,
+    /// `libra memory` read subcommands (`status`/`list`/`show`) were asked to
+    /// answer from a projection whose fingerprint no longer matches the
+    /// current horizon-window state; the stale index refuses to answer
+    /// (ADR-DM-10 fail-closed). Pass `--allow-stale` to read anyway (which
+    /// marks `stale: true` in the `--json` envelope).
+    MemoryProjectionStale,
+    /// `libra memory show <id>` was given an `episode_id` that is absent from
+    /// the current window projection (GC-DM-01; identity is ADR-DM-01).
+    MemoryEpisodeNotFound,
 }
 
 impl Serialize for StableErrorCode {
@@ -402,6 +411,8 @@ impl StableErrorCode {
             Self::WorktreeCursorInvalid => "LBR-WORKTREE-001",
             Self::WorktreeScopeCorrupt => "LBR-WORKTREE-002",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
+            Self::MemoryProjectionStale => "LBR-MEMORY-001",
+            Self::MemoryEpisodeNotFound => "LBR-MEMORY-002",
         }
     }
 
@@ -420,7 +431,9 @@ impl StableErrorCode {
             | Self::RepoCorrupt
             | Self::RepoStateInvalid
             | Self::WorktreeCursorInvalid
-            | Self::WorktreeScopeCorrupt => CliErrorCategory::Repo,
+            | Self::WorktreeScopeCorrupt
+            | Self::MemoryProjectionStale
+            | Self::MemoryEpisodeNotFound => CliErrorCategory::Repo,
             Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
@@ -652,6 +665,12 @@ impl StableErrorCode {
             }
             Self::UpgradeSettingsInvalid => {
                 "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
+            }
+            Self::MemoryProjectionStale => {
+                "The memory projection is stale and cannot answer; run libra memory rebuild (or pass --allow-stale to read anyway)."
+            }
+            Self::MemoryEpisodeNotFound => {
+                "The requested memory episode id is absent from the current window projection."
             }
         }
     }
@@ -2256,6 +2275,8 @@ mod tests {
             (StableErrorCode::AgentFixExecutionFailed, "LBR-AGENT-040"),
             (StableErrorCode::WorktreeCursorInvalid, "LBR-WORKTREE-001"),
             (StableErrorCode::WorktreeScopeCorrupt, "LBR-WORKTREE-002"),
+            (StableErrorCode::MemoryProjectionStale, "LBR-MEMORY-001"),
+            (StableErrorCode::MemoryEpisodeNotFound, "LBR-MEMORY-002"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2312,6 +2333,16 @@ mod tests {
         );
         assert_eq!(
             StableErrorCode::WorktreeScopeCorrupt.category(),
+            CliErrorCategory::Repo,
+        );
+        // The memory projection pair reuses `repo`: both describe repository-side
+        // projection data state a caller must repair, never a CLI usage error.
+        assert_eq!(
+            StableErrorCode::MemoryProjectionStale.category(),
+            CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::MemoryEpisodeNotFound.category(),
             CliErrorCategory::Repo,
         );
         assert_eq!(

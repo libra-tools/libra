@@ -3525,7 +3525,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::Metadata(cmd_args) => {
                 command::metadata::execute_safe(cmd_args, &output).await?
             }
-            Commands::Memory(cmd_args) => command::memory::execute(cmd_args).await?,
+            Commands::Memory(cmd_args) => command::memory::execute_safe(cmd_args, &output).await?,
             Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
             Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
             Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,

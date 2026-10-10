@@ -116,7 +116,7 @@ pub fn commit_fingerprint(operations: &[(String, String, Option<i64>)]) -> Strin
 }
 
 /// Report returned by a commit rebuild.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct RebuildReport {
     pub repo_id: String,
     pub projected: usize,
