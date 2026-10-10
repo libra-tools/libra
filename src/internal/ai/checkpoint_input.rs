@@ -225,6 +225,16 @@ const CATALOG_WALK_MAX_ENTRIES: usize = 8192;
 const CATALOG_WALK_MAX_DEPTH: u32 = 64;
 const CATALOG_PATH_MAX_BYTES: usize = 4096;
 
+/// Closed reasoning ciphertext is stored at `reasoning/encrypted/<64 hex>`.
+/// That leaf is not ordinary checkpoint input, so a saved spec must not name
+/// it and the catalog comparison must not require it.
+fn is_closed_reasoning_artifact_path(rel_path: &str) -> bool {
+    let Some(name) = rel_path.strip_prefix("reasoning/encrypted/") else {
+        return false;
+    };
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn refuse_unless_saved_spec_matches_catalog(
     storage: &Path,
     spec: &CheckpointInputSpec,
@@ -233,6 +243,13 @@ fn refuse_unless_saved_spec_matches_catalog(
     let current = catalog_ordinary_leaves(storage, tree_oid, &spec.checkpoint_id)?;
     let mut saved = BTreeMap::new();
     for file in &spec.files {
+        if is_closed_reasoning_artifact_path(&file.rel_path) {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{}' saved spec names closed reasoning artifact '{}'; ordinary \
+                 materialization does not read it",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
         if saved
             .insert(file.rel_path.clone(), file.oid.clone())
             .is_some()
@@ -305,6 +322,9 @@ fn catalog_ordinary_leaves(
                     pending.push((rel_path, child, depth + 1));
                 }
                 TreeItemMode::Blob | TreeItemMode::BlobExecutable => {
+                    if is_closed_reasoning_artifact_path(&rel_path) {
+                        continue;
+                    }
                     if leaves.insert(rel_path, item.id.to_string()).is_some() {
                         return Err(ValidatedMaterializeError::Refused(format!(
                             "checkpoint '{checkpoint_id}' catalog tree repeats a leaf path; \
@@ -612,7 +632,7 @@ pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write as _, str::FromStr as _};
+    use std::{collections::BTreeMap, io::Write as _, str::FromStr as _};
 
     use git_internal::{
         hash::ObjectHash,
@@ -699,19 +719,56 @@ mod tests {
             oid
         }
 
-        let mut leaves = Vec::new();
-        for file in files {
-            assert!(
-                !file.rel_path.contains('/'),
-                "unit catalog seed only builds a flat inner tree"
-            );
-            leaves.push(TreeItem::new(
-                TreeItemMode::Blob,
-                ObjectHash::from_str(&file.oid).expect("blob oid"),
-                file.rel_path.clone(),
-            ));
+        #[derive(Default)]
+        struct CatalogDir {
+            blobs: Vec<(String, String)>,
+            dirs: BTreeMap<String, CatalogDir>,
         }
-        let inner = store_tree(storage, leaves);
+
+        fn insert_catalog_file<'a>(
+            dir: &mut CatalogDir,
+            name: &str,
+            mut rest: impl Iterator<Item = &'a str>,
+            oid: &str,
+        ) {
+            match rest.next() {
+                None => dir.blobs.push((name.to_string(), oid.to_string())),
+                Some(next) => {
+                    let child = dir.dirs.entry(name.to_string()).or_default();
+                    insert_catalog_file(child, next, rest, oid);
+                }
+            }
+        }
+
+        fn store_catalog_dir(storage: &Path, dir: &CatalogDir) -> String {
+            let mut items = Vec::new();
+            for (name, oid) in &dir.blobs {
+                items.push(TreeItem::new(
+                    TreeItemMode::Blob,
+                    ObjectHash::from_str(oid).expect("blob oid"),
+                    name.clone(),
+                ));
+            }
+            for (name, child) in &dir.dirs {
+                let child_oid = store_catalog_dir(storage, child);
+                items.push(TreeItem::new(
+                    TreeItemMode::Tree,
+                    ObjectHash::from_str(&child_oid).expect("child tree"),
+                    name.clone(),
+                ));
+            }
+            store_tree(storage, items)
+        }
+
+        let mut root = CatalogDir::default();
+        for file in files {
+            let mut parts = file.rel_path.split('/').filter(|part| !part.is_empty());
+            let Some(first) = parts.next() else {
+                panic!("catalog seed path is empty");
+            };
+            insert_catalog_file(&mut root, first, parts, &file.oid);
+        }
+        let inner = store_catalog_dir(storage, &root);
         let prefix = store_tree(
             storage,
             vec![TreeItem::new(
@@ -1018,6 +1075,48 @@ mod tests {
             "{error}"
         );
         assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_ordinary_leaf_skips_reasoning_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let ordinary = write_blob(&storage, "metadata.json", b"ORDINARY");
+        let artifact_name = "ab".repeat(32);
+        let artifact = write_blob(
+            &storage,
+            &format!("reasoning/encrypted/{artifact_name}"),
+            b"SECRET",
+        );
+        let checkpoint_id = "ckpt-ordinary";
+        seed_catalog(
+            &storage,
+            checkpoint_id,
+            &[ordinary.clone(), artifact.clone()],
+        );
+        let spec = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![ordinary],
+        };
+        let root = validated_materialize(&storage, &spec, &run_dir).expect("ordinary leaves");
+        assert_eq!(
+            std::fs::read(root.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+        assert!(!root.join("reasoning").exists());
+
+        let refused_dir = base.join("runs").join("run-2");
+        std::fs::create_dir_all(&refused_dir).unwrap();
+        let refused = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![artifact],
+        };
+        let error = validated_materialize(&storage, &refused, &refused_dir).unwrap_err();
+        assert!(error.contains("closed reasoning artifact"), "{error}");
+        assert!(!refused_dir.join(CHECKPOINT_INPUT_DIR).exists());
     }
 
     #[test]
