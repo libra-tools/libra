@@ -733,3 +733,21 @@ Claude Code唯一源码评审exit0/is_error=false/53turns/PASS，stdout SHA256 7
 非阻断P3跟踪：invalid_creation_time测试当前依赖object_index表尚未创建；空artifact重试原wall-clock时间行为按scope保留；旧六role narrative对应无artifact形状，未来文档可再补条件。PASS后生产/测试源码保持已审SHA，除上述已复核说明及本次真实计划勾选。RG06 locally-accepted；签名DCO ordinary Push main随后取证，无bump/PR/release。FAST-RG-01本地交付将为4/10，正式固定队列仍4/61=6.56%；最终full/安全CI/CodeQL/patch四平台/manifest/安装/网站C-D未关闭，Linux功能用户后验，native SourceA未放行。下一卡FIX-RG-SCOPED-01。旧620-621提醒已删除；plan05原dirty不纳入。
 
 原始证据：/private/tmp/libra-main-resumption-20261010/rg06-main-r1/（first-compile-gates、gates.json、focused/fmt/strict logs、Claude原稿与窄复核、layout-gates.json）。
+
+### 2026-10-10：FIX-RG-SCOPED-01 main 开工与必要写集纠错
+
+RG06 signed-DCO main dafda7c1a5ba45e8749eac464a7b98bef57a7762普通Push exit0、remote同SHA；vault签名实际验证PASS，GitHub unknown_key不称Verified。阶段本地4/10，正式4/61=6.56%，无新版本/PR，旧620-621提醒已删除。
+
+按USER-MAIN自动推荐决策，本卡core消费已关闭R4本地源而不复用其最终验收：reader SHA9dbe3eb75be7e7d97dd0b89348498043522246018691a2341ded1fcc664fd7b0迁入，command仅移入自身角色验证/读取与原R4门，当前raw/audit/rewind/pagination/summary保持。current main未含R4的RG03 public artifact字段/CLI，不提前引入；show/list为无object访问的白名单，R4 metadata projection门保留test-only并如实标注，不冒称已接实际show。既有skill单OID接口不能证明named checkpoint：必要写集补skill.rs传同row的id/tree_oid/metadata_oid，prod-files3→4/落点仍2/scope M；无新卡/target/schema/stablecode。
+
+实际canonical reasoning/encrypted/前缀20字节，加64hex共84bytes，总路径上界8MiB+512*84=8431616；计划83/8431104为算术笔误。仅纠正当前谓词，ordinary 4096file/8MiB预算不变，历史原文与运行记录保留。本卡无直接linked Issue，继承授权计划及source限定依赖；所有本次门/Claude Code单审尚待，T1 full未关闭不complete，Linux功能另机后验。原plan05 dirty字节保持且不纳入。
+
+### 2026-10-10：FIX-RG-SCOPED-01 main 本地 API 交付与 Claude Code 单审 PASS
+
+基线 main dafda7c1a5ba45e8749eac464a7b98bef57a7762。最终15个own路径：四生产/两个既有测试/两源码serial登记/四文档/三plan-status；原plan05 dirty逐字节保留，index开工前为空。原R4共享reader提取后，metadata严格解析类型归shared core唯一owner，当前main未有RG03公开字段/参数，不提前引入。生产resume materializer仍未消费新core，AC1跨consumer接线保持未勾；该接线归02/RG03，不能把本API localD当整个SCOPED族或本卡formal complete。
+
+macOS双env最终nextest82/82（含25个serial guards，8274过滤；既有page_cursor_round_trips 1次LEAK保留，不称零LEAK）；fmt0；all-target/all-feature strict Clippy -D warnings0，proc-macro-error2既有future-incompat仍报告。真实init参数/生产init writer建立SHA256/BLAKE3仓库后，将测试ambient HashKind设为SHA1，再从显式storage catalog证明格式、普通闭包和payload读；源码serial属性cwd+env与registry/census一致。Skill具名metadata ID/mode先验，真实alias门只读四wrapper/leaf树，artifact decodedbody=0；EN/zh累计16MiB childtree/选中metadata16MiB成本由现有docs契约门pin。完整blob验OID，truncated仅header-checked prefix且不给完整identity authority。
+
+首编译E0425/exit101、初fixture EmptyTreeItems、初真实init重复create已存DB的81/82红、原冻结old-materializer真正运行RED、第一Claude FAIL及两轮PASS全部保留在 /private/tmp/libra-main-resumption-20261010/scoped01-main-r1。第二次narrow PASS原stdout SHA732028e8aa2e80b1a91cdcbcb4fce9bdd8be2562428c4ab62c8370e0ea57ab95；最终第三次narrow PASS（30turn/is_error=false/exit0）SHA22a3a7a72365a6644f38d816425f22091f27a0335cfe9473d312a673e9c357ae，最终P0/P1/P2=0、新P3=2；缺库retry文字、构造函数名和配置key字面重复等既有非阻断P3仍跟踪。只有Claude Code一名正式评审，无新Codex/parent review。
+
+必要写集纠错：新增源码serial站点登记tests/SRC_SERIAL_REGISTRY.tsv与tests/SRC_SERIAL_CENSUS.tsv；现有generator实跑，.config/nextest.toml字节无变化，不纳入提交。剩余own AC6/7、VER6/6勾选反映已实现API，AC1跨卡接线及T1/T2 full、全部最终安全CI/四平台release/manifest/install/网站C-D仍UNRUN。Native SourceA不放行，Linux功能由用户后验。逐卡signed-DCO ordinary Push main随后存证，无PR/bump/release。阶段本地交付将为5/10=50%，正式固定队列仍4/61=6.56%，下一卡FIX-RG-SCOPED-04。

@@ -2487,3 +2487,12 @@ RG-06 保证 artifact 与所属 checkpoint 同 attempt 原子写入：artifact b
 仍被 manifest oid 引用的 artifact；中断/ref CAS 失败不留悬空 object_index 或
 catalog 行，重试幂等。
 append_checkpoint_commit 初次写入非空 artifact checkpoint，以及相同 payload、未变 parent 的重试，其 author/committer 使用已封存 metadata.created_at 的 Unix 秒和固定 UTC；该时间表示 checkpoint 创建/历史边界时间，不是重试时钟或 native 来源证明。创建时间限于 0..=17179869183 Unix 秒（Git commit-graph 的 34 位时间范围），同时必须能由当前平台 usize 表示；缺失、重复、错型、负值或越界时间在任何对象写入前拒绝。同一 payload 与未变 parent 跨秒、重开数据库及新 writer generation 重试会复用原 commit OID；空 artifact 保留既有提交时间策略。retention 重写仍使用既有提交时间策略。lease、deadline 和 generation fence 仍使用各自原有授权时钟。
+
+
+## 共享 checkpoint 普通角色复验（FIX-RG-SCOPED-01）
+
+内部 owner 为 `src/internal/ai/checkpoint_reader.rs`，命令层保留 raw 授权和独立审计，仅将普通角色闭包、typed header/OID 验证及有界读取交给共享模块。Fresh scoped 读取使用显式 resolved repository storage 的 `storage.join(util::DATABASE)`；专用 SQLx 连接只读且禁止创建缺库，不初始化或迁移 schema，不调用 cwd writer pool。open/acquire/query 共用 query phase 开始时确定的绝对 deadline（200 ms 与调用者真实 remaining deadline 的较小者）；close 始终实际 await 结束，不以丢弃 future 假装 join，超过 deadline 完成的 authority 仍拒绝。暂态 SQLite 写锁立即返回可重试拒绝，不另起 busy 等待预算。成功关闭 lease/pool 后才交给 filesystem owner；失败不授权 payload 或 cleanup。同步读取 scope 恢复原 thread-local HashKind，不能跨 await 持有。
+
+旧保存 spec 在 normalization/map 分配前先保留总条数 4608、每路径 4096 UTF-8 bytes、总路径 8431616 bytes 的上界。named wrapped checkpoint 的完整 ordinary path→OID 集合必须精确相等；顺序可变，普通不同路径可复用同 OID。ordinary 自身仍受 4096 files/8 MiB paths 限制，既有 expanded entries/trees/depth/child-tree 预算不放宽。旧 full list 中最多 512 个 artifact 仅在 exact 84-byte canonical path、OID、manifest 与 tree 一致时排除；prefix/OID-alone 不作为排除授权。proof metadata 读取与 ordinary body 尝试分别计数，artifact body 尝试必须为零。
+
+支持有证明的 wrapped-v1 无 manifest 和 wrapped canonical；direct-leaf 的既有 show/export 不变，scoped start/resume 不采用未经证明的形状。保存恢复的实际 production consumer 由 FIX-RG-SCOPED-02 接入，no-follow/owned join 由 FIX-RG-SCOPED-04 承接。此接口设计和 synthetic 验证不能代替 native producer 来源证明、后续恢复验收或最终来源限定组合树的 full/C-D。

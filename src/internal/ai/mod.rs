@@ -28,6 +28,8 @@ pub mod capture_scope;
 pub mod memory;
 // PD-02 checkpoint-scoped review/investigate input materialization.
 pub mod checkpoint_input;
+// Shared typed checkpoint role proof and explicit readonly catalog.
+pub(crate) mod checkpoint_reader;
 // Completion-model trait and request/response types.
 pub mod completion;
 // Per-turn coverage claim gate for external-agent checkpoint writers.

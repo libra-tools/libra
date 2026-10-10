@@ -904,3 +904,6 @@ without recompression.
 
 Artifact tree reachability is added by RG-06; controlled read and export
 surfaces are added by RG-03.
+
+
+Checkpoint readers verify the object type, content-addressed identity and ordinary-role bindings before consuming a manifest or metadata body. Skill search skips metadata that does not belong to the catalog's named checkpoint. The fresh `--checkpoint` resolver uses the explicit repository catalog in read-only mode and refuses missing or inconsistent stores without creating a run. Saved-input resume uses its existing path until the separately tracked recovery card is delivered. Default checkpoint show/list summaries and raw-export authorization/audit remain unchanged. Each skill candidate is checked independently: ordinary child trees are capped at 16 MiB and the selected metadata blob at 16 MiB; the checkpoint binding is checked before walking the ordinary closure.

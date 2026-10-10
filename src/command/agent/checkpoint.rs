@@ -5,12 +5,13 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+use git_internal::internal::object::tree::TreeItem;
 use git_internal::{
     hash::ObjectHash,
     internal::object::{
-        ObjectTrait,
         commit::Commit,
-        tree::{Tree, TreeItem, TreeItemMode},
+        tree::{Tree, TreeItemMode},
     },
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
@@ -25,7 +26,6 @@ use crate::{
     internal::db::get_db_conn_instance,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        object::read_git_object_bounded,
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
         util,
@@ -67,6 +67,59 @@ struct CheckpointShowSummary {
     scope: CheckpointShowScope,
     created_at: i64,
     parent_snapshot_recorded: bool,
+}
+
+#[cfg(test)]
+use crate::internal::ai::checkpoint_reader::{
+    CHECKPOINT_BODY_READS, CHECKPOINT_ORDINARY_MAX_DEPTH, CHECKPOINT_ORDINARY_MAX_FILES,
+    CHECKPOINT_ORDINARY_MAX_PATH_BYTES, CHECKPOINT_ORDINARY_MAX_TREES, CheckpointTraversalLimits,
+    checkpoint_plain_files_with_limits, read_tree_object_with_cap,
+};
+use crate::internal::ai::checkpoint_reader::{
+    checkpoint_plain_files, checkpoint_plain_manifest, checkpoint_transcript_oids,
+    read_checkpoint_object_bounded, read_tree_object, reasoning_artifact_tree_oids,
+    reject_artifact_alias, subtree, tree_entry,
+};
+#[cfg(test)]
+use crate::internal::ai::checkpoint_reader::{
+    reasoning_artifact_metadata, resolve_checkpoint_input_spec_from_storage,
+};
+
+impl From<crate::internal::ai::checkpoint_reader::CheckpointReaderError> for CliError {
+    fn from(error: crate::internal::ai::checkpoint_reader::CheckpointReaderError) -> Self {
+        match error {
+            crate::internal::ai::checkpoint_reader::CheckpointReaderError::RoleProof
+            | crate::internal::ai::checkpoint_reader::CheckpointReaderError::Budget => {
+                checkpoint_show_store_inconsistent()
+            }
+            crate::internal::ai::checkpoint_reader::CheckpointReaderError::InvalidSavedSpec(
+                message,
+            ) => Self::fatal(message),
+            crate::internal::ai::checkpoint_reader::CheckpointReaderError::CatalogUnavailable => {
+                Self::fatal(
+                    "checkpoint catalog is unavailable; retry after the repository writer finishes, or run `libra agent doctor`",
+                )
+            }
+            error => Self::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent),
+        }
+    }
+}
+
+fn checkpoint_scoped_reader_error(
+    checkpoint_id: &str,
+    error: crate::internal::ai::checkpoint_reader::CheckpointReaderError,
+) -> CliError {
+    use crate::internal::ai::checkpoint_reader::CheckpointReaderError;
+
+    match error {
+        CheckpointReaderError::UnknownLayout
+        | CheckpointReaderError::ObjectIntegrity
+        | CheckpointReaderError::Budget => CliError::fatal(format!(
+            "checkpoint '{checkpoint_id}' cannot be materialized as a scoped input: {error}"
+        )),
+        error => error.into(),
+    }
 }
 
 /// `agent_checkpoint.scope` is constrained by the current schema, but old or
@@ -805,178 +858,14 @@ pub(crate) fn build_rewind_plan(commit_oid: &ObjectHash) -> Result<RewindPlan, a
 /// generous cap never trips on legitimate data but stops a corrupt/hostile
 /// object from forcing an unbounded decompression + allocation on the
 /// show/export paths (AG-24a; codex review R2).
-const CHECKPOINT_METADATA_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
-
-fn read_tree_object(storage: &Path, oid_str: &str) -> Result<Tree, String> {
-    let oid = crate::internal::object_format::parse_repo_oid(oid_str)
-        .map_err(|e| format!("invalid tree oid '{oid_str}' in the checkpoint catalog: {e}"))?;
-    let (body, truncated) =
-        read_git_object_bounded(storage, &oid, CHECKPOINT_METADATA_READ_MAX_BYTES).map_err(
-            |e| {
-                format!(
-                    "checkpoint tree {oid_str} is not readable from the local object \
-                     store ({e}); layout unknown — metadata-first summary only"
-                )
-            },
-        )?;
-    if truncated {
-        return Err(format!(
-            "checkpoint tree {oid_str} exceeds the {CHECKPOINT_METADATA_READ_MAX_BYTES}-byte \
-             metadata cap; refusing to load (corrupt or hostile object)"
-        ));
-    }
-    Tree::from_bytes(&body, oid)
-        .map_err(|e| format!("object {oid_str} did not parse as a tree: {e:?}"))
-}
-
-fn tree_entry<'t>(tree: &'t Tree, name: &str) -> Option<&'t TreeItem> {
-    tree.tree_items.iter().find(|item| item.name == name)
-}
-
-/// PD-02: resolve `--checkpoint <id>` (review/investigate scoped input)
-/// into a validated materialization spec. Every failure — unknown id,
-/// malformed tree, non-local blob — fails closed HERE, before the caller
-/// creates any run state, so an invalid checkpoint never leaves run
-/// residue. The returned spec lists the checkpoint's ENTIRE inner tree
-/// (metadata, manifest, transcript parts), each blob verified locally
-/// present.
 pub(crate) async fn resolve_checkpoint_input_spec(
     checkpoint_id: &str,
 ) -> CliResult<crate::internal::ai::checkpoint_input::CheckpointInputSpec> {
-    use crate::internal::ai::checkpoint_input::{CheckpointInputFile, CheckpointInputSpec};
-
-    let conn = get_db_conn_instance().await;
-    if !table_exists(&conn, "agent_checkpoint").await? {
-        return Err(CliError::fatal(format!(
-            "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
-             (run `libra init`?)"
-        )));
-    }
-    let backend = conn.get_database_backend();
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
-                    metadata_blob_oid, traces_commit, created_at \
-             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
-            [checkpoint_id.into()],
-        ))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
-    let Some(row) = row else {
-        return Err(CliError::fatal(format!(
-            "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
-             `libra agent checkpoint list`"
-        )));
-    };
-    let tree_oid: String = row.try_get_by("tree_oid").unwrap_or_default();
     let storage = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
-    let scoped = |reason: String| {
-        CliError::fatal(format!(
-            "checkpoint '{checkpoint_id}' cannot be materialized as a scoped input: {reason}"
-        ))
-    };
-    let root = read_tree_object(&storage, &tree_oid).map_err(scoped)?;
-    let checkpoint_tree = subtree(&storage, &root, "checkpoint").map_err(scoped)?;
-    let prefix = checkpoint_id
-        .get(..2)
-        .ok_or_else(|| scoped(format!("checkpoint id '{checkpoint_id}' is too short")))?;
-    let prefix_tree = subtree(&storage, &checkpoint_tree, prefix).map_err(scoped)?;
-    let inner = subtree(&storage, &prefix_tree, &checkpoint_id[2..]).map_err(scoped)?;
-
-    // Walk the inner tree breadth-first, collecting every blob. Blob
-    // presence is verified with the same loose-object stat the layout
-    // summary uses — a checkpoint whose content is not locally present
-    // must fail before any run exists, not midway through a run.
-    let mut files: Vec<CheckpointInputFile> = Vec::new();
-    let mut pending: Vec<(String, Tree)> = vec![(String::new(), inner)];
-    while let Some((prefix, tree)) = pending.pop() {
-        for item in &tree.tree_items {
-            let rel_path = if prefix.is_empty() {
-                item.name.clone()
-            } else {
-                format!("{prefix}/{}", item.name)
-            };
-            if item.mode == TreeItemMode::Tree {
-                let child = read_tree_object(&storage, &item.id.to_string()).map_err(scoped)?;
-                pending.push((rel_path, child));
-            } else {
-                // A gitlink has no content to materialize; a checkpoint
-                // tree carrying one is malformed, not a submodule.
-                if item.mode == TreeItemMode::Commit {
-                    return Err(scoped(format!(
-                        "entry {rel_path} is a gitlink, which has no content to materialize"
-                    )));
-                }
-                // Re-validate the path HERE, not only in the materializer:
-                // the acceptance criterion is that a malformed checkpoint
-                // fails before any run exists, and a path the materializer
-                // would refuse must not first cost the caller an error run.
-                crate::internal::ai::checkpoint_input::sanitize_rel_path(&rel_path)
-                    .map_err(scoped)?;
-                let oid = item.id.to_string();
-                let object_path = storage.join("objects").join(&oid[..2]).join(&oid[2..]);
-                if !object_path.exists() {
-                    return Err(scoped(format!(
-                        "blob {oid} ({rel_path}) is not present in the local object store"
-                    )));
-                }
-                files.push(CheckpointInputFile { rel_path, oid });
-            }
-        }
-    }
-    if files.is_empty() {
-        return Err(scoped("the checkpoint tree carries no files".to_string()));
-    }
-    // Presence is not readability. Decode every blob under the SAME caps
-    // the materializer enforces, so a corrupt, wrong-typed, or oversized
-    // checkpoint is refused here — before a run row exists — instead of
-    // failing halfway through materialization and leaving an error run
-    // behind for the user to clean up.
-    let mut total: u64 = 0;
-    for file in &files {
-        let oid = crate::internal::object_format::parse_repo_oid(&file.oid)
-            .map_err(|e| scoped(format!("invalid blob oid '{}': {e}", file.oid)))?;
-        let (bytes, truncated) = read_git_object_bounded(
-            &storage,
-            &oid,
-            crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES,
-        )
-        .map_err(|e| {
-            scoped(format!(
-                "blob {} ({}) is not readable from the local object store: {e}",
-                file.oid, file.rel_path
-            ))
-        })?;
-        if truncated {
-            return Err(scoped(format!(
-                "blob {} ({}) exceeds the {}-byte per-file cap",
-                file.oid,
-                file.rel_path,
-                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES
-            )));
-        }
-        total = total.saturating_add(bytes.len() as u64);
-        if total > crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES {
-            return Err(scoped(format!(
-                "the checkpoint's files exceed the {}-byte total cap",
-                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES
-            )));
-        }
-    }
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok(CheckpointInputSpec {
-        checkpoint_id: checkpoint_id.to_string(),
-        files,
-    })
-}
-
-fn subtree(storage: &Path, tree: &Tree, name: &str) -> Result<Tree, String> {
-    let item = tree_entry(tree, name).ok_or_else(|| {
-        format!("tree entry '{name}' missing while resolving the checkpoint tree")
-    })?;
-    read_tree_object(storage, &item.id.to_string())
+    crate::internal::ai::checkpoint_reader::resolve_fresh_checkpoint_input(&storage, checkpoint_id)
+        .await
+        .map_err(|error| checkpoint_scoped_reader_error(checkpoint_id, error))
 }
 
 /// `libra agent checkpoint export <id>` (AG-24a). Redacted export is the
@@ -1142,73 +1031,29 @@ pub(super) fn load_checkpoint_transcript_bytes_from_storage(
     let prefix_tree = subtree(storage, &checkpoint_tree, prefix).map_err(CliError::fatal)?;
     let inner = subtree(storage, &prefix_tree, &checkpoint_id[2..]).map_err(CliError::fatal)?;
 
-    let manifest_item = tree_entry(&inner, "manifest.json").ok_or_else(|| {
-        CliError::fatal(
-            "checkpoint has no manifest.json (legacy layout not exportable)".to_string(),
-        )
-    })?;
-    // Bounded read: manifest.json is small JSON; refuse an oversized
-    // (corrupt/hostile) one rather than inflate it unbounded.
-    let (manifest_bytes, manifest_truncated) = read_git_object_bounded(
-        storage,
-        &manifest_item.id,
-        CHECKPOINT_METADATA_READ_MAX_BYTES,
-    )
-    .map_err(|e| CliError::fatal(format!("read manifest.json: {e}")))?;
-    if manifest_truncated {
-        return Err(CliError::fatal(
-            "manifest.json exceeds the metadata size cap; refusing (corrupt or hostile checkpoint)"
-                .to_string(),
-        ));
-    }
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| CliError::fatal(format!("manifest.json invalid JSON: {e}")))?;
-    let transcript = manifest
-        .get("entries")
-        .and_then(|e| e.get("transcript"))
-        .ok_or_else(|| CliError::fatal("manifest has no transcript entry".to_string()))?;
-
-    // Collect the ordered list of blob OIDs (single or chunked).
-    let mut oids: Vec<String> = Vec::new();
-    if transcript
-        .get("chunked")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        for part in transcript
-            .get("parts")
-            .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            if let Some(oid) = part.get("oid").and_then(|v| v.as_str()) {
-                oids.push(oid.to_string());
-            }
-        }
-    } else if let Some(oid) = transcript.get("oid").and_then(|v| v.as_str()) {
-        oids.push(oid.to_string());
-    }
-    if oids.is_empty() {
-        return Err(CliError::fatal(
-            "manifest transcript entry declares no blob oid".to_string(),
-        ));
-    }
+    let artifacts = reasoning_artifact_tree_oids(storage, &inner)?;
+    let ordinary = checkpoint_plain_files(storage, &inner, &artifacts)?;
+    let manifest =
+        checkpoint_plain_manifest(storage, &inner, &artifacts, &ordinary)?.ok_or_else(|| {
+            CliError::fatal(
+                "checkpoint has no manifest.json (legacy layout not exportable)".to_string(),
+            )
+        })?;
+    let oids = checkpoint_transcript_oids(storage, &inner, &manifest, &artifacts)?;
 
     let mut bytes: Vec<u8> = Vec::new();
     let mut truncated = false;
-    for oid in oids {
+    for hash in oids {
         let remaining = cap.saturating_sub(bytes.len() as u64);
         if remaining == 0 {
             truncated = true;
             break;
         }
-        let hash = crate::internal::object_format::parse_repo_oid(&oid)
-            .map_err(|e| CliError::fatal(format!("invalid transcript oid '{oid}': {e}")))?;
         // Bounded read: never decompress more than `remaining` content
         // bytes into memory, so a hostile/corrupt blob whose inflated size
         // dwarfs the cap cannot force an unbounded allocation.
-        let (part, part_truncated) = read_git_object_bounded(storage, &hash, remaining)
-            .map_err(|e| CliError::fatal(format!("read transcript blob {oid}: {e}")))?;
+        let (part, part_truncated) = read_checkpoint_object_bounded(storage, &hash, remaining)
+            .map_err(|e| CliError::fatal(format!("read transcript blob {hash}: {e}")))?;
         bytes.extend_from_slice(&part);
         if part_truncated {
             truncated = true;
@@ -1257,19 +1102,72 @@ async fn write_export_audit(
         .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))
 }
 
-pub(super) fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
-    let hash = crate::internal::object_format::parse_repo_oid(oid)
-        .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
+pub(super) fn load_checkpoint_metadata_blob(
+    checkpoint_id: &str,
+    tree_oid: &str,
+    oid: &str,
+) -> Result<String, CliError> {
     let storage = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
-    let (raw, truncated) =
-        read_git_object_bounded(&storage, &hash, CHECKPOINT_METADATA_READ_MAX_BYTES).map_err(
-            |e| {
-                CliError::fatal(format!(
-                    "failed to read metadata blob {oid} from object store: {e}"
-                ))
-            },
-        )?;
+    load_checkpoint_metadata_blob_from_storage(&storage, checkpoint_id, tree_oid, oid)
+}
+
+fn load_checkpoint_metadata_blob_from_storage(
+    storage: &Path,
+    checkpoint_id: &str,
+    tree_oid: &str,
+    oid: &str,
+) -> Result<String, CliError> {
+    let hash = crate::internal::object_format::parse_repo_oid(oid)
+        .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
+    let root = read_tree_object(storage, tree_oid).map_err(CliError::fatal)?;
+    // Historical v1 catalog rows may point directly at the checkpoint leaf.
+    // This exception is restricted to layouts that predate reasoning artifacts.
+    let inner = if tree_entry(&root, "checkpoint").is_none()
+        && tree_entry(&root, "metadata.json").is_some_and(|item| item.mode == TreeItemMode::Blob)
+        && tree_entry(&root, "transcript").is_some_and(|item| item.mode == TreeItemMode::Tree)
+        && tree_entry(&root, "manifest.json").is_none()
+        && tree_entry(&root, "reasoning").is_none()
+    {
+        root
+    } else {
+        let checkpoint = subtree(storage, &root, "checkpoint").map_err(CliError::fatal)?;
+        let prefix = checkpoint_id.get(..2).ok_or_else(|| {
+            CliError::fatal("checkpoint id is too short to resolve metadata".to_string())
+        })?;
+        let prefix_tree = subtree(storage, &checkpoint, prefix).map_err(CliError::fatal)?;
+        subtree(storage, &prefix_tree, &checkpoint_id[2..]).map_err(CliError::fatal)?
+    };
+    let metadata =
+        tree_entry(&inner, "metadata.json").ok_or_else(checkpoint_show_store_inconsistent)?;
+    if metadata.mode != TreeItemMode::Blob || metadata.id != hash {
+        return Err(checkpoint_show_store_inconsistent());
+    }
+    let artifacts = reasoning_artifact_tree_oids(storage, &inner)?;
+    reject_artifact_alias(&hash, &artifacts)?;
+    let ordinary = checkpoint_plain_files(storage, &inner, &artifacts)?;
+    if let Some(manifest) = checkpoint_plain_manifest(storage, &inner, &artifacts, &ordinary)? {
+        let binding = manifest
+            .get("entries")
+            .and_then(|entries| entries.get("metadata"))
+            .ok_or_else(checkpoint_show_store_inconsistent)?;
+        if binding.get("path").and_then(serde_json::Value::as_str) != Some("metadata.json")
+            || binding.get("oid").and_then(serde_json::Value::as_str) != Some(oid)
+        {
+            return Err(checkpoint_show_store_inconsistent());
+        }
+        checkpoint_transcript_oids(storage, &inner, &manifest, &artifacts)?;
+    }
+    let (raw, truncated) = read_checkpoint_object_bounded(
+        storage,
+        &hash,
+        crate::internal::ai::checkpoint_reader::CHECKPOINT_METADATA_READ_MAX_BYTES,
+    )
+    .map_err(|e| {
+        CliError::fatal(format!(
+            "failed to read metadata blob {oid} from object store: {e}"
+        ))
+    })?;
     if truncated {
         return Err(CliError::fatal(format!(
             "metadata blob {oid} exceeds the metadata size cap; refusing (corrupt or hostile checkpoint)"
@@ -1277,6 +1175,38 @@ pub(super) fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
     }
     String::from_utf8(raw)
         .map_err(|e| CliError::fatal(format!("metadata blob {oid} is not UTF-8: {e}")))
+}
+
+#[cfg(test)]
+fn load_checkpoint_manifest_metadata_only(
+    storage: &Path,
+    tree_oid: &str,
+    checkpoint_id: &str,
+) -> Result<serde_json::Value, CliError> {
+    let root = read_tree_object(storage, tree_oid).map_err(CliError::fatal)?;
+    // A v1 catalog tree may point directly at the checkpoint leaf. Such
+    // checkpoints predate artifact manifests and retain their safe summary.
+    if tree_entry(&root, "checkpoint").is_none()
+        && tree_entry(&root, "metadata.json").is_some_and(|item| item.mode == TreeItemMode::Blob)
+        && tree_entry(&root, "transcript").is_some_and(|item| item.mode == TreeItemMode::Tree)
+        && tree_entry(&root, "manifest.json").is_none()
+        && tree_entry(&root, "reasoning").is_none()
+    {
+        return Ok(serde_json::json!([]));
+    }
+    let checkpoint_tree = subtree(storage, &root, "checkpoint").map_err(CliError::fatal)?;
+    let prefix = checkpoint_id
+        .get(..2)
+        .ok_or_else(|| CliError::fatal(format!("checkpoint id '{checkpoint_id}' too short")))?;
+    let prefix_tree = subtree(storage, &checkpoint_tree, prefix).map_err(CliError::fatal)?;
+    let inner = subtree(storage, &prefix_tree, &checkpoint_id[2..]).map_err(CliError::fatal)?;
+    let artifacts = reasoning_artifact_tree_oids(storage, &inner)?;
+    let ordinary = checkpoint_plain_files(storage, &inner, &artifacts)?;
+    let Some(manifest) = checkpoint_plain_manifest(storage, &inner, &artifacts, &ordinary)? else {
+        return Ok(serde_json::json!([]));
+    };
+    let metadata = reasoning_artifact_metadata(&manifest)?;
+    serde_json::to_value(metadata).map_err(|_| checkpoint_show_store_inconsistent())
 }
 
 fn emit_list(page: &CheckpointListPage, output: &OutputConfig) -> CliResult<()> {
@@ -1354,9 +1284,679 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::internal::db::{
-        ensure_ai_runtime_contract_schema, migration::run_builtin_migrations,
+    use crate::internal::{
+        ai::checkpoint_reader::test_helpers::*,
+        db::{ensure_ai_runtime_contract_schema, migration::run_builtin_migrations},
     };
+
+    #[tokio::test]
+    async fn fix_rg_scoped_01_fresh_error_mapping() {
+        use std::time::{Duration, Instant};
+
+        use crate::internal::ai::checkpoint_reader::{
+            CheckpointReadBudget, CheckpointReaderError, load_checkpoint_catalog,
+            resolve_fresh_checkpoint_input,
+        };
+        let legacy_default = checkpoint_show_store_inconsistent();
+        let default_budget = CliError::from(CheckpointReaderError::Budget);
+        assert_eq!(default_budget.message(), legacy_default.message());
+        assert_eq!(default_budget.stable_code(), legacy_default.stable_code());
+        for reader_error in [
+            CheckpointReaderError::UnknownLayout,
+            CheckpointReaderError::ObjectIntegrity,
+            CheckpointReaderError::Budget,
+        ] {
+            let expected = format!(
+                "checkpoint 'mapper-checkpoint' cannot be materialized as a scoped input: {reader_error}"
+            );
+            let error = checkpoint_scoped_reader_error("mapper-checkpoint", reader_error);
+            assert_eq!(error.message(), expected);
+            assert_eq!(error.stable_code(), CliError::fatal(expected).stable_code());
+            assert_ne!(
+                error.stable_code(),
+                StableErrorCode::AgentCheckpointStoreInconsistent
+            );
+        }
+        let role =
+            checkpoint_scoped_reader_error("mapper-checkpoint", CheckpointReaderError::RoleProof);
+        assert_eq!(role.message(), legacy_default.message());
+        assert_eq!(role.stable_code(), legacy_default.stable_code());
+        let mut failures = Vec::new();
+        for shape in ["traversal_limit", "empty_leaf", "payload_cap"] {
+            let (fixture, writer) = fresh_db().await;
+            let tree_oid = if shape == "traversal_limit" {
+                rg04_root_with_extra_tree(fixture.path(), rg04_shared_dag(fixture.path(), 13)).0
+            } else {
+                let leaf = if shape == "empty_leaf" {
+                    crate::utils::object::write_git_object(fixture.path(), "tree", b"")
+                        .expect("valid empty Git tree fixture")
+                } else {
+                    let bytes = vec![
+                        b'p';
+                        (crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES + 1)
+                            as usize
+                    ];
+                    let blob = rg03_blob(fixture.path(), &bytes);
+                    rg03_tree(
+                        fixture.path(),
+                        vec![TreeItem::new(TreeItemMode::Blob, blob, "large.txt".into())],
+                    )
+                };
+                let prefix = rg03_tree(
+                    fixture.path(),
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        leaf,
+                        RG03_CHECKPOINT_ID[2..].into(),
+                    )],
+                );
+                let checkpoints = rg03_tree(
+                    fixture.path(),
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        prefix,
+                        RG03_CHECKPOINT_ID[..2].into(),
+                    )],
+                );
+                rg03_tree(
+                    fixture.path(),
+                    vec![TreeItem::new(
+                        TreeItemMode::Tree,
+                        checkpoints,
+                        "checkpoint".into(),
+                    )],
+                )
+                .to_string()
+            };
+            let backend = writer.get_database_backend();
+            writer.execute_raw(Statement::from_string(backend,
+                "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, working_dir, metadata_json, redaction_report, started_at, last_event_at) VALUES ('mapper-fixture', 'claude_code', 'mapper-fixture', 'stopped', 'synthetic', '{}', '{}', 0, 0)"
+            )).await.unwrap();
+            writer.execute_raw(Statement::from_sql_and_values(backend,
+                "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, tree_oid, metadata_blob_oid, traces_commit, created_at) VALUES (?, 'mapper-fixture', 'committed', NULL, ?, ?, ?, 0)",
+                [RG03_CHECKPOINT_ID.into(), tree_oid.clone().into(), tree_oid.clone().into(), tree_oid.into()],
+            )).await.unwrap();
+            writer.close().await.unwrap();
+            let result = resolve_fresh_checkpoint_input(fixture.path(), RG03_CHECKPOINT_ID).await;
+            let error = match result {
+                Ok(_) => {
+                    failures.push(format!(
+                        "{shape}: unexpectedly returned materialization authority"
+                    ));
+                    continue;
+                }
+                Err(error) => checkpoint_scoped_reader_error(RG03_CHECKPOINT_ID, error),
+            };
+            let matched = match shape {
+                "traversal_limit" => {
+                    error.message() == legacy_default.message()
+                        && error.stable_code() == StableErrorCode::AgentCheckpointStoreInconsistent
+                }
+                "empty_leaf" => {
+                    error.message()
+                        == format!(
+                            "checkpoint '{RG03_CHECKPOINT_ID}' cannot be materialized as a scoped input: the checkpoint tree carries no files"
+                        )
+                        && error.stable_code() == StableErrorCode::InternalInvariant
+                }
+                "payload_cap" => error.message().starts_with(&format!(
+                    "checkpoint '{RG03_CHECKPOINT_ID}' cannot be materialized as a scoped input: "
+                )) && error.stable_code() == StableErrorCode::InternalInvariant,
+                _ => unreachable!(),
+            };
+            eprintln!(
+                "FRESH_ERROR_PHASE shape={shape} matched={matched} code={:?}",
+                error.stable_code()
+            );
+            if !matched {
+                failures.push(format!(
+                    "{shape}: {} ({:?})",
+                    error.message(),
+                    error.stable_code()
+                ));
+            }
+        }
+        let (dir, conn) = fresh_db().await;
+        let budget = CheckpointReadBudget::new(
+            Instant::now() + Duration::from_secs(2),
+            std::sync::Arc::new(|| false),
+        );
+        let error = match load_checkpoint_catalog(dir.path(), "unknown-checkpoint", &budget).await {
+            Ok(_) => panic!("unknown checkpoint must not return authority"),
+            Err(error) => CliError::from(error),
+        };
+        let expected = "no checkpoint matches id 'unknown-checkpoint'; list captured checkpoints with `libra agent checkpoint list`";
+        assert_eq!(error.message(), expected);
+        assert_eq!(error.stable_code(), CliError::fatal(expected).stable_code());
+        assert_ne!(
+            error.stable_code(),
+            StableErrorCode::AgentCheckpointStoreInconsistent
+        );
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "DROP TABLE agent_checkpoint",
+        ))
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+        let error = match load_checkpoint_catalog(dir.path(), "unknown-checkpoint", &budget).await {
+            Ok(_) => panic!("missing table must not return authority"),
+            Err(error) => CliError::from(error),
+        };
+        let expected = "no checkpoint matches 'unknown-checkpoint': agent_checkpoint table not yet present (run `libra init`?)";
+        assert_eq!(error.message(), expected);
+        assert_eq!(error.stable_code(), CliError::fatal(expected).stable_code());
+        assert_ne!(
+            error.stable_code(),
+            StableErrorCode::AgentCheckpointStoreInconsistent
+        );
+        assert!(
+            failures.is_empty(),
+            "fresh resolver compatibility failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn rg04_actual_readers_reject_content_addressed_dag_before_ordinary_body_reads() {
+        let dir = TempDir::new().unwrap();
+        let dag = rg04_shared_dag(dir.path(), 13);
+        let (root, artifact) = rg04_root_with_extra_tree(dir.path(), dag);
+        let metadata = rg03_blob(dir.path(), b"{}");
+        let transcript = rg03_blob(dir.path(), b"ordinary transcript");
+        let ordinary = rg03_blob(dir.path(), b"ordinary DAG payload");
+        let mut failures = Vec::new();
+        for caller in [
+            "default_transcript",
+            "metadata_projection_gate",
+            "skill_metadata",
+            "scoped_input",
+        ] {
+            rg03_clear_body_reads();
+            let rejected = match caller {
+                "default_transcript" => load_checkpoint_transcript_bytes_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                    1024,
+                )
+                .is_err(),
+                "metadata_projection_gate" => {
+                    load_checkpoint_manifest_metadata_only(dir.path(), &root, RG03_CHECKPOINT_ID)
+                        .is_err()
+                }
+                "skill_metadata" => load_checkpoint_metadata_blob_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                    &metadata.to_string(),
+                )
+                .is_err(),
+                _ => resolve_checkpoint_input_spec_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                )
+                .is_err(),
+            };
+            let reads = CHECKPOINT_BODY_READS.with(|reads| reads.borrow().clone());
+            let ordinary_reads = reads
+                .iter()
+                .filter(|oid| {
+                    [
+                        metadata.to_string(),
+                        transcript.to_string(),
+                        ordinary.to_string(),
+                    ]
+                    .contains(oid)
+                })
+                .count();
+            let artifact_reads = reads
+                .iter()
+                .filter(|oid| *oid == &artifact.to_string())
+                .count();
+            eprintln!(
+                "RG04_DAG_ACTUAL_CALLER caller={caller} paths=8195 unique_DAG_trees=14 rejected={rejected} ordinary_payload_attempts={ordinary_reads} artifact_payload_attempts={artifact_reads} total_payload_attempts={}",
+                reads.len()
+            );
+            if !rejected
+                || ordinary_reads != 0
+                || artifact_reads != 0
+                || reads.len() > CHECKPOINT_ORDINARY_MAX_TREES + 6
+            {
+                failures.push(caller);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unbounded DAG accepted/read by actual checkpoint callers: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn rg04_traversal_limits_have_real_boundary_controls() {
+        let dir = TempDir::new().unwrap();
+        let blob = rg03_blob(dir.path(), b"budget ordinary body");
+        let child_items = vec![
+            TreeItem::new(TreeItemMode::Blob, blob, "a".into()),
+            TreeItem::new(TreeItemMode::Blob, blob, "b".into()),
+        ];
+        let child = rg03_tree(dir.path(), child_items);
+        let inner_oid = rg03_tree(
+            dir.path(),
+            vec![TreeItem::new(TreeItemMode::Tree, child, "dir".into())],
+        );
+        let inner = read_tree_object(dir.path(), &inner_oid.to_string()).unwrap();
+        let child_bytes = read_tree_object_with_cap(dir.path(), &child.to_string(), 1024)
+            .unwrap()
+            .1;
+        let artifacts = std::collections::BTreeSet::new();
+        let exact = CheckpointTraversalLimits {
+            entries: 3,
+            files: 2,
+            trees: 2,
+            depth: 2,
+            path_bytes: 5,
+            total_path_bytes: 13,
+            child_tree_bytes: child_bytes,
+        };
+        for axis in [
+            "entries",
+            "files",
+            "trees",
+            "depth",
+            "path_bytes",
+            "total_path_bytes",
+            "child_tree_bytes",
+        ] {
+            let mut limits = exact;
+            rg03_clear_body_reads();
+            let accepted =
+                checkpoint_plain_files_with_limits(dir.path(), &inner, &artifacts, limits).unwrap();
+            assert_eq!(accepted.len(), 2, "accepted exact {axis} boundary");
+            CHECKPOINT_BODY_READS.with(|reads| {
+                assert!(
+                    reads.borrow().contains(&child.to_string()),
+                    "actual permitted tree decode"
+                )
+            });
+            match axis {
+                "entries" => limits.entries -= 1,
+                "files" => limits.files -= 1,
+                "trees" => limits.trees -= 1,
+                "depth" => limits.depth -= 1,
+                "path_bytes" => limits.path_bytes -= 1,
+                "total_path_bytes" => limits.total_path_bytes -= 1,
+                _ => limits.child_tree_bytes -= 1,
+            }
+            rg03_clear_body_reads();
+            assert!(
+                checkpoint_plain_files_with_limits(dir.path(), &inner, &artifacts, limits).is_err(),
+                "over {axis} budget must refuse"
+            );
+            CHECKPOINT_BODY_READS.with(|reads| {
+                assert!(
+                    !reads.borrow().contains(&blob.to_string()),
+                    "ordinary body0 at {axis} limit"
+                );
+                if matches!(axis, "trees" | "child_tree_bytes") {
+                    assert!(
+                        !reads.borrow().contains(&child.to_string()),
+                        "rejected tree was decoded before reservation/header limit"
+                    );
+                }
+            });
+            eprintln!(
+                "RG04_BUDGET_BOUNDARY axis={axis} exact_accepted=2 over_refused=true ordinary_payload_attempts=0"
+            );
+        }
+    }
+
+    #[test]
+    fn rg04_production_bounds_reject_wide_deep_and_long_paths_before_blobs() {
+        let dir = TempDir::new().unwrap();
+        let blob = rg03_blob(dir.path(), b"budget body canary");
+        let wide = rg03_tree(
+            dir.path(),
+            (0..=CHECKPOINT_ORDINARY_MAX_FILES)
+                .map(|n| TreeItem::new(TreeItemMode::Blob, blob, format!("file-{n:05}")))
+                .collect(),
+        );
+        let mut deep = rg03_tree(
+            dir.path(),
+            vec![TreeItem::new(TreeItemMode::Blob, blob, "leaf".into())],
+        );
+        for _ in 0..CHECKPOINT_ORDINARY_MAX_DEPTH {
+            deep = rg03_tree(
+                dir.path(),
+                vec![TreeItem::new(TreeItemMode::Tree, deep, "dir".into())],
+            );
+        }
+        let long = rg03_tree(
+            dir.path(),
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                blob,
+                "x".repeat(CHECKPOINT_ORDINARY_MAX_PATH_BYTES + 1),
+            )],
+        );
+        let artifacts = std::collections::BTreeSet::new();
+        for (shape, oid) in [
+            ("wide_files", wide),
+            ("deep_chain", deep),
+            ("long_path", long),
+        ] {
+            let inner = read_tree_object(dir.path(), &oid.to_string()).unwrap();
+            rg03_clear_body_reads();
+            assert!(
+                checkpoint_plain_files(dir.path(), &inner, &artifacts).is_err(),
+                "production limit {shape}"
+            );
+            CHECKPOINT_BODY_READS
+                .with(|reads| assert!(!reads.borrow().contains(&blob.to_string())));
+            eprintln!(
+                "RG04_PRODUCTION_BUDGET shape={shape} rejected=true ordinary_payload_attempts=0"
+            );
+        }
+    }
+
+    #[test]
+    fn rg03_skill_metadata_rejects_catalog_artifact_alias_before_body_read() {
+        for chunked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (root, artifact) = rg03_read_fixture(dir.path(), "normal", chunked);
+            rg03_clear_body_reads();
+            let result = load_checkpoint_metadata_blob_from_storage(
+                dir.path(),
+                RG03_CHECKPOINT_ID,
+                &root,
+                &artifact.to_string(),
+            );
+            let reads = CHECKPOINT_BODY_READS.with(|reads| reads.borrow().clone());
+            eprintln!(
+                "RG03_SKILL_CATALOG_ALIAS chunked={chunked} rejected={} artifact_payload_attempts={}",
+                result.is_err(),
+                reads
+                    .iter()
+                    .filter(|oid| *oid == &artifact.to_string())
+                    .count()
+            );
+            assert!(
+                result.is_err(),
+                "skill catalog must not authorize a reasoning artifact"
+            );
+            // Only the four wrapper/leaf trees are needed to reject an
+            // unbound metadata OID; no ordinary child or manifest is read.
+            assert_eq!(reads.len(), 4);
+            rg03_assert_no_artifact_body_reads(artifact);
+        }
+    }
+
+    #[test]
+    fn rg03_skill_metadata_preserves_bound_and_legacy_metadata() {
+        for chunked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (root_oid, artifact) = rg03_read_fixture(dir.path(), "normal", chunked);
+            let root = read_tree_object(dir.path(), &root_oid).unwrap();
+            let checkpoints = subtree(dir.path(), &root, "checkpoint").unwrap();
+            let prefix = subtree(dir.path(), &checkpoints, &RG03_CHECKPOINT_ID[..2]).unwrap();
+            let leaf = subtree(dir.path(), &prefix, &RG03_CHECKPOINT_ID[2..]).unwrap();
+            let metadata_oid = tree_entry(&leaf, "metadata.json").unwrap().id;
+            let legacy_leaf = rg03_tree(
+                dir.path(),
+                leaf.tree_items
+                    .into_iter()
+                    .filter(|item| !matches!(item.name.as_str(), "manifest.json" | "reasoning"))
+                    .collect(),
+            );
+            let legacy_prefix = rg03_tree(
+                dir.path(),
+                vec![TreeItem::new(
+                    TreeItemMode::Tree,
+                    legacy_leaf,
+                    RG03_CHECKPOINT_ID[2..].into(),
+                )],
+            );
+            let legacy_checkpoints = rg03_tree(
+                dir.path(),
+                vec![TreeItem::new(
+                    TreeItemMode::Tree,
+                    legacy_prefix,
+                    RG03_CHECKPOINT_ID[..2].into(),
+                )],
+            );
+            let legacy_root = rg03_tree(
+                dir.path(),
+                vec![TreeItem::new(
+                    TreeItemMode::Tree,
+                    legacy_checkpoints,
+                    "checkpoint".into(),
+                )],
+            );
+            for (layout, tree_oid) in [
+                ("canonical", root_oid),
+                ("legacy_direct", legacy_leaf.to_string()),
+                ("legacy_wrapped", legacy_root.to_string()),
+            ] {
+                rg03_clear_body_reads();
+                let metadata = load_checkpoint_metadata_blob_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &tree_oid,
+                    &metadata_oid.to_string(),
+                )
+                .unwrap();
+                assert_eq!(metadata, "{}");
+                CHECKPOINT_BODY_READS.with(|reads| {
+                    assert!(
+                        reads.borrow().contains(&metadata_oid.to_string()),
+                        "live ordinary metadata read hook"
+                    )
+                });
+                rg03_assert_no_artifact_body_reads(artifact);
+                eprintln!(
+                    "RG03_SKILL_BOUND_POSITIVE chunked={chunked} layout={layout} metadata_body_observed=true artifact_payload_attempts=0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rg03_skill_metadata_rejects_wrong_roles_and_unknown_layouts_before_payload() {
+        for chunked in [false, true] {
+            for shape in [
+                "manifest_metadata_alias",
+                "metadata_body_alias",
+                "manifest_body_alias",
+                "unknown_reasoning",
+                "reasoning_root_alias",
+                "encrypted_root_alias",
+                "manifest_metadata_other",
+                "manifest_metadata_path",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (root, artifact) = rg03_read_fixture(dir.path(), shape, chunked);
+                let metadata = rg03_blob(dir.path(), b"{}");
+                rg03_clear_body_reads();
+                let result = load_checkpoint_metadata_blob_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                    &metadata.to_string(),
+                );
+                assert!(
+                    result.is_err(),
+                    "skill metadata role/layout must fail closed: {shape}"
+                );
+                rg03_assert_no_artifact_body_reads(artifact);
+                CHECKPOINT_BODY_READS.with(|reads| {
+                    assert!(
+                        !reads.borrow().contains(&metadata.to_string()),
+                        "metadata read before binding: {shape}"
+                    )
+                });
+                eprintln!(
+                    "RG03_SKILL_ROLE_REJECTION chunked={chunked} shape={shape} metadata_payload_attempts=0 artifact_payload_attempts=0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rg03_default_transcript_rejects_artifact_aliases_before_body_read() {
+        let mut failures = Vec::new();
+        for chunked in [false, true] {
+            for shape in [
+                "manifest_alias",
+                "tree_alias",
+                "transcript_root_alias",
+                "manifest_body_alias",
+                "metadata_body_alias",
+                "nested_tree_alias",
+                "unknown_reasoning",
+                "manifest_metadata_alias",
+                "reasoning_root_alias",
+                "encrypted_root_alias",
+            ] {
+                let dir = TempDir::new().unwrap();
+                let (root, artifact) = rg03_read_fixture(dir.path(), shape, chunked);
+                rg03_clear_body_reads();
+                let result = load_checkpoint_transcript_bytes_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                    1024,
+                );
+                let body_reads = CHECKPOINT_BODY_READS.with(|reads| {
+                    reads
+                        .borrow()
+                        .iter()
+                        .filter(|oid| **oid == artifact.to_string())
+                        .count()
+                });
+                eprintln!(
+                    "default shape={shape} chunked={chunked} rejected={} artifact_payload_attempts={body_reads}",
+                    result.is_err()
+                );
+                if result.is_ok() || body_reads != 0 {
+                    failures.push(format!(
+                        "{shape} chunked={chunked} rejected={} body_reads={body_reads}",
+                        result.is_err()
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "default isolation failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn rg03_scoped_input_omits_reasoning_body_and_preserves_plain_content() {
+        for chunked in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (root, artifact) = rg03_read_fixture(dir.path(), "canonical", chunked);
+            rg03_clear_body_reads();
+            let spec =
+                resolve_checkpoint_input_spec_from_storage(dir.path(), RG03_CHECKPOINT_ID, &root)
+                    .expect("normal scoped input");
+            rg03_assert_no_artifact_body_reads(artifact);
+            assert!(
+                spec.files
+                    .iter()
+                    .all(|file| !file.rel_path.starts_with("reasoning/"))
+            );
+            assert!(
+                spec.files
+                    .iter()
+                    .any(|file| file.rel_path == "manifest.json")
+            );
+            assert!(
+                spec.files
+                    .iter()
+                    .any(|file| file.rel_path.starts_with("transcript/"))
+            );
+            // The same observable hook must record a real permitted body read.
+            CHECKPOINT_BODY_READS.with(|reads| assert!(reads.borrow().len() >= 7));
+            let run = TempDir::new().unwrap();
+            let materialized = crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
+                dir.path(),
+                &spec,
+                run.path(),
+            )
+            .expect("plain materialization");
+            assert!(!materialized.join("reasoning").exists());
+            let name = if chunked {
+                "claude_code.jsonl.001"
+            } else {
+                "claude_code.jsonl"
+            };
+            assert_eq!(
+                std::fs::read(materialized.join("transcript").join(name)).unwrap(),
+                b"ordinary transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn rg03_scoped_input_rejects_artifact_aliases_before_body_read() {
+        let mut failures = Vec::new();
+        for chunked in [false, true] {
+            for shape in [
+                "manifest_alias",
+                "tree_alias",
+                "transcript_root_alias",
+                "manifest_body_alias",
+                "metadata_body_alias",
+                "nested_tree_alias",
+                "unknown_reasoning",
+                "manifest_metadata_alias",
+                "reasoning_root_alias",
+                "encrypted_root_alias",
+            ] {
+                let dir = TempDir::new().unwrap();
+                let (root, artifact) = rg03_read_fixture(dir.path(), shape, chunked);
+                rg03_clear_body_reads();
+                let result = resolve_checkpoint_input_spec_from_storage(
+                    dir.path(),
+                    RG03_CHECKPOINT_ID,
+                    &root,
+                );
+                let body_reads = CHECKPOINT_BODY_READS.with(|reads| {
+                    reads
+                        .borrow()
+                        .iter()
+                        .filter(|oid| **oid == artifact.to_string())
+                        .count()
+                });
+                eprintln!(
+                    "scoped shape={shape} chunked={chunked} rejected={} artifact_payload_attempts={body_reads}",
+                    result.is_err()
+                );
+                if result.is_ok() || body_reads != 0 {
+                    failures.push(format!(
+                        "{shape} chunked={chunked} rejected={} body_reads={body_reads}",
+                        result.is_err()
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "scoped isolation failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn rg03_metadata_show_rejects_manifest_body_alias_without_reading_it() {
+        let dir = TempDir::new().unwrap();
+        let (root, artifact) = rg03_read_fixture(dir.path(), "manifest_body_alias", false);
+        rg03_clear_body_reads();
+        assert!(
+            load_checkpoint_manifest_metadata_only(dir.path(), &root, RG03_CHECKPOINT_ID).is_err()
+        );
+        rg03_assert_no_artifact_body_reads(artifact);
+    }
 
     const LEGACY_BOOTSTRAP_SQL: &str = include_str!("../../../sql/sqlite_20260309_init.sql");
 

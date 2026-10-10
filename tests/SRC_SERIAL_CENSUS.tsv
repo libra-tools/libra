@@ -2931,3 +2931,4 @@ src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_
 src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_d2	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	config_generate_gpg_key_after_import_inject_failure_after_e	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-14);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
 src/internal/vault.rs	history_public_keys_verify_replaced_key_signatures	lane:cwd+env	env+cwd	lane:cwd+env (plan-20260921 VG-05);env:ConfigDbFixture,setup_with_new_libra_in;cwd:ChangeDirGuard
+src/internal/ai/checkpoint_reader.rs	fix_rg_scoped_01_catalog_identity	keyed:cwd+env	env+cwd	ChangeDirGuard and production init read HOME/global configuration while proving explicit storage catalog format independently of cwd and ambient HashKind

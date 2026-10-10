@@ -283,3 +283,18 @@ more disk and mirror bytes; ordinary objects keep default compression, and
 valid existing objects are reused without rewriting.
 
 RG-06 adds artifact tree reachability; RG-03 adds controlled read and export.
+
+
+## Shared checkpoint input proof (FIX-RG-SCOPED-01)
+
+`internal::ai::checkpoint_reader` owns the typed header and content-addressed identity check, ordinary-role traversal, and manifest/tree closure. Command readers use this owner; the fresh scoped resolver queries `storage.join(util::DATABASE)` through a dedicated SQLx readonly connection with creation disabled. The query phase has one absolute deadline capped at 200 ms and the caller's remaining budget; it does not initialize schema or reuse the cwd-selected writer pool. Filesystem work receives authority only after the query lease and dedicated pool have closed. Failures refuse the input and cannot authorize materialization.
+
+SQLite contention is refused immediately (`busy_timeout(0)`). Acquired connection and pool closure are always awaited; an authority that finishes after the deadline is refused. The 200 ms phase deadline does not promise a 200 ms bound on awaited cleanup or that a timed-out lazy connection establishment thread has already exited. Default reader budget refusals keep their existing store-inconsistent message; fresh scoped layout, integrity and payload-cap failures retain the checkpoint-specific fatal context and inferred error code.
+
+Fresh scoped traversal-limit refusals keep the existing store-inconsistent message and `LBR-AGENT-009`, while an empty wrapped leaf keeps its original scoped fatal message. Shared role proof returns its complete map; both fresh and saved consumers refuse an empty map before granting materialization authority.
+
+The saved-spec proof API reserves at most 4608 saved entries, 4096 UTF-8 bytes per path and 8431616 cumulative path bytes before path normalization or map allocation. It then requires the complete ordinary path-to-OID map of the named wrapped checkpoint. Ordinary files retain their separate 4096-file and 8 MiB path budgets. A legacy full list may exclude at most 512 entries only when each exact 84-byte `reasoning/encrypted/<sha256>` path and OID agrees with both the manifest and artifact tree. Prefixes, OIDs alone and ordinary subsets are insufficient. Proof metadata reads are recorded separately from ordinary-body reads, and proof never reads artifact bodies.
+
+This card supplies the shared internal API. Persisted review/investigate recovery is connected by FIX-RG-SCOPED-02, and filesystem ownership is supplied by FIX-RG-SCOPED-04. Their acceptance and the final aggregation full suite remain separate requirements. Synthetic role fixtures do not establish a native producer origin or authorize OpenCode reasoning archival.
+
+The existing public `checkpoint show`/`list` summary remains a closed whitelist and does not load checkpoint payloads. The R4 metadata projection gate is preserved as a test-only helper until RG-03 enables its public metadata contract. Skill projection now passes checkpoint id, tree oid and metadata oid to the shared role proof; corrupt or unbound metadata is skipped without exposing its body. Raw export authorization and audit are unchanged.

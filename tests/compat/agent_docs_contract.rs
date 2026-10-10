@@ -804,3 +804,22 @@ fn rg06_artifact_atomicity_docs_contract() {
         "retention 重写仍使用既有提交时间策略",
     );
 }
+
+#[test]
+fn scoped01_shared_reader_docs_pin_role_and_catalog_bounds() {
+    let command = include_str!("../../docs/development/commands/agent.md");
+    let tracing = include_str!("../../docs/development/tracing/agent.md");
+    for text in [command, tracing] {
+        assert!(text.contains("checkpoint_reader"));
+        assert!(text.contains("4608"));
+        assert!(text.contains("8431616"));
+        assert!(text.contains("84-byte"));
+        assert!(text.contains("200 ms"));
+    }
+    assert!(command.contains("closed whitelist"));
+    assert!(command.contains("Raw export authorization and audit are unchanged"));
+    assert!(AGENT_CMD_DOC_EN.contains("ordinary child trees are capped at 16 MiB"));
+    assert!(AGENT_CMD_DOC_EN.contains("selected metadata blob at 16 MiB"));
+    assert!(AGENT_CMD_DOC_ZH.contains("普通子树累计上限为 16 MiB"));
+    assert!(AGENT_CMD_DOC_ZH.contains("metadata blob 上限为 16 MiB"));
+}

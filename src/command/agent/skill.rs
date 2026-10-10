@@ -18,7 +18,7 @@ use clap::{Args, Subcommand};
 use sea_orm::{ConnectionTrait, Statement};
 use serde::Serialize;
 
-use super::checkpoint::{encode_page_cursor, load_metadata_blob, resolve_page_limit};
+use super::checkpoint::{encode_page_cursor, load_checkpoint_metadata_blob, resolve_page_limit};
 use crate::{
     internal::{
         ai::observed_agents::{
@@ -228,14 +228,14 @@ async fn build_projection(session: Option<&str>) -> CliResult<SkillEventProjecti
     let backend = conn.get_database_backend();
     let (sql, values): (String, Vec<sea_orm::Value>) = if let Some(session) = session {
         (
-            "SELECT checkpoint_id, session_id, metadata_blob_oid FROM agent_checkpoint \
+            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
              WHERE session_id = ? ORDER BY created_at DESC, checkpoint_id DESC"
                 .to_string(),
             vec![session.into()],
         )
     } else {
         (
-            "SELECT checkpoint_id, session_id, metadata_blob_oid FROM agent_checkpoint \
+            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
              ORDER BY created_at DESC, checkpoint_id DESC"
                 .to_string(),
             Vec::new(),
@@ -253,7 +253,10 @@ async fn build_projection(session: Option<&str>) -> CliResult<SkillEventProjecti
         if metadata_blob_oid.is_empty() {
             continue;
         }
-        let Ok(metadata) = load_metadata_blob(&metadata_blob_oid) else {
+        let tree_oid: String = row.try_get_by("tree_oid").unwrap_or_default();
+        let Ok(metadata) =
+            load_checkpoint_metadata_blob(&checkpoint_id, &tree_oid, &metadata_blob_oid)
+        else {
             continue;
         };
         let events = match parse_skill_events(&metadata) {

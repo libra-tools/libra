@@ -472,3 +472,4 @@ src/internal/ai/observed_agents/builtin/stable_promoted.rs	codex_rollout_discove
 src/internal/ai/observed_agents/builtin/stable_promoted.rs	codex_rollout_discovery_bounds_fail_loudly	lane:env	uses test-local LIBRA_TEST_HOME and CODEX_HOME while bounding Codex rollout discovery
 src/internal/ai/observed_agents/builtin/stable_promoted.rs	codex_rollout_discovery_hardening	lane:env	uses test-local LIBRA_TEST_HOME and CODEX_HOME while hardening Codex rollout discovery
 src/internal/ai/observed_agents/builtin/stable_promoted.rs	codex_rollout_discovery_rejects_symlinked_sessions_root	lane:env	uses test-local LIBRA_TEST_HOME and CODEX_HOME while rejecting a symlinked Codex sessions root
+src/internal/ai/checkpoint_reader.rs	fix_rg_scoped_01_catalog_identity	lane:cwd+env	uses ChangeDirGuard and the real init writer to verify explicit storage catalog format and identity independently of cwd

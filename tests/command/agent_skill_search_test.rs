@@ -56,6 +56,41 @@ async fn seed_skill_checkpoint(
             .expect("write metadata blob")
             .to_string();
 
+    // The projection now proves metadata against its named checkpoint leaf.
+    // Seed a real wrapped-v1 tree, rather than a placeholder catalog OID.
+    fn write_tree(storage: &Path, entries: &[(&str, &str, &str)]) -> String {
+        let mut body = Vec::new();
+        for (mode, name, oid) in entries {
+            body.extend_from_slice(mode.as_bytes());
+            body.push(b' ');
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(&hex::decode(oid).expect("fixture oid"));
+        }
+        libra::utils::object::write_git_object(storage, "tree", &body)
+            .expect("write fixture tree")
+            .to_string()
+    }
+    let storage = repo.join(".libra");
+    let transcript_oid =
+        libra::utils::object::write_git_object(&storage, "blob", b"ordinary transcript")
+            .expect("fixture transcript")
+            .to_string();
+    let transcript_tree = write_tree(
+        &storage,
+        &[("100644", "claude_code.jsonl", &transcript_oid)],
+    );
+    let leaf = write_tree(
+        &storage,
+        &[
+            ("100644", "metadata.json", &oid),
+            ("40000", "transcript", &transcript_tree),
+        ],
+    );
+    let prefix = write_tree(&storage, &[("40000", &checkpoint_id[2..], &leaf)]);
+    let checkpoints = write_tree(&storage, &[("40000", &checkpoint_id[..2], &prefix)]);
+    let root = write_tree(&storage, &[("40000", "checkpoint", &checkpoints)]);
+
     // agent_kind is the DB enum form (underscores), NOT the CLI slug — a
     // CHECK constraint rejects the hyphenated slug, and INSERT OR IGNORE would
     // then silently drop the row and break the checkpoint FK.
@@ -81,11 +116,12 @@ async fn seed_skill_checkpoint(
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
             metadata_blob_oid, traces_commit, created_at
          ) VALUES (?, ?, 'committed', NULL,
-                   '2222222222222222222222222222222222222222', ?,
+                   ?, ?,
                    '3333333333333333333333333333333333333333', ?)",
         vec![
             Value::from(checkpoint_id),
             Value::from(session_id),
+            Value::from(root),
             Value::from(oid),
             Value::from(created_at),
         ],
@@ -131,9 +167,34 @@ async fn agent_skill_search() {
     )
     .await;
 
+    // A decodable metadata blob with skill events does not establish its role.
+    // Bind the catalog to another checkpoint's real tree and ensure this event
+    // is skipped rather than leaking an unbound metadata projection.
+    const UNBOUND_SKILL: &str = "/unbound-metadata-canary";
+    seed_skill_checkpoint(
+        &conn,
+        &repo,
+        "sess-unbound",
+        "claude-code",
+        "ckpt-unbound",
+        300,
+        &[skill_event_json(
+            "t4",
+            UNBOUND_SKILL,
+            "claude-code",
+            "2026-07-09T04:00:00Z",
+        )],
+    )
+    .await;
+    conn.execute_raw(Statement::from_string(conn.get_database_backend(),
+        "UPDATE agent_checkpoint SET tree_oid = (SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-claude') WHERE checkpoint_id = 'ckpt-unbound'"))
+        .await.expect("unbound catalog fixture");
+
     // Unfiltered search returns all three, newest first.
     let out = run_libra_command(&["agent", "skill", "search", "--json"], &repo);
     assert_cli_success(&out, "agent skill search");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(UNBOUND_SKILL));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(UNBOUND_SKILL));
     let json = parse_json_stdout(&out);
     let events = json["data"]["skill_events"]
         .as_array()
