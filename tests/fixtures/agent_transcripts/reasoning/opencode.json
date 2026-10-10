@@ -1,0 +1,13 @@
+{
+  "fixture": "opencode",
+  "note": "synthetic OpenCode 2.0.22 shape with the open `state` member (never proof of ciphertext)",
+  "records": [
+    {
+      "provider": "opencode",
+      "source_kind": null,
+      "field": "reasoning",
+      "reasoning_like": true,
+      "state": { "open": "member shapes are not part of the pinned contract" }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "fixture": "provider_visible",
+  "note": "synthetic provider-neutral readable reasoning (no real provider content)",
+  "records": [
+    {
+      "provider": "opencode",
+      "source_kind": "reasoning",
+      "reasoning_text": "synthetic"
+    }
+  ]
+}

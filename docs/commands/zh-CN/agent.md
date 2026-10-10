@@ -514,3 +514,16 @@ reasoning 类型契约区分受限元数据、经来源验证的内存 opaque �
 形状正确的 JSON 不是 provider 身份凭据。OpenCode 2.0.24 的
 `reasoning.state` 是开放记录，不能仅凭它识别密文。此类型尚未接入持久化；当前尚无 live provider adapter 产生 artifact。
 OpenCode 密文采集仍待注册经验证的 provider 字段。
+
+本类型校验器仅接受最小合成 envelope；真实会话记录及额外 metadata 须在对应 provider adapter 卡审查后接入，当前不声称真实 JSONL 已支持。
+
+## Readable reasoning projection (RG-04)
+
+RG-04 加入可读 reasoning 投影路径：`provider_visible` 的 reasoning 文本是
+唯一能进入 coverage 投影的 reasoning 内容，且必先经过 typed redaction ——
+reasoning 文本中的 canary 秘密会计入 redaction report 并在投影、checkpoint
+持久化或任何 metadata/digest 写入前移除。可读 reasoning 以独立的
+`reasoning` 记录类型投影，携带 `provider` 与 `source_kind` 元数据；
+它从不冒充 assistant 回答，也绝不写入未脱敏的 metadata 或日志。
+
+`ProviderVisibleText` 的 serde 序列化/反序列化明确拒绝；调用者须经分类与 typed redaction 后使用 `canonical_turn_bytes` 或 `safe_turn_projection`。RG-04 不接入真实 provider adapter。

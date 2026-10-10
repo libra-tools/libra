@@ -31,6 +31,29 @@ use serde::{
 };
 use sha2::{Digest, Sha256};
 
+use super::reasoning;
+
+/// Wire tag for a reasoning provider (coverage-v1 canonical form).
+fn reasoning_provider_tag(provider: reasoning::ReasoningProvider) -> &'static str {
+    match provider {
+        reasoning::ReasoningProvider::ClaudeCode => "claude_code",
+        reasoning::ReasoningProvider::Codex => "codex",
+        reasoning::ReasoningProvider::OpenCode => "opencode",
+    }
+}
+
+/// Wire tag for a reasoning source kind (coverage-v1 canonical form).
+fn reasoning_source_kind_tag(kind: reasoning::ReasoningSourceKind) -> &'static str {
+    match kind {
+        reasoning::ReasoningSourceKind::Reasoning => "reasoning",
+        reasoning::ReasoningSourceKind::Thinking => "thinking",
+        reasoning::ReasoningSourceKind::Summary => "summary",
+        reasoning::ReasoningSourceKind::Signature => "signature",
+        reasoning::ReasoningSourceKind::RedactedThinkingData => "redacted_thinking_data",
+        reasoning::ReasoningSourceKind::EncryptedContent => "encrypted_content",
+    }
+}
+
 /// Coverage schema version this module implements (`coverage-v1.md`).
 pub const COVERAGE_SCHEMA_VERSION: i64 = 1;
 
@@ -267,6 +290,15 @@ pub enum SemanticRecord {
         content: String,
         is_error: bool,
     },
+    /// Provider-visible readable reasoning (ADR-RG-01 layer 2). The text is
+    /// gated behind [`reasoning::ProviderVisibleText`]: only the classification path
+    /// that proved `ProviderVisible` availability can mint the variant, and
+    /// the text reaches persistence only through typed redaction.
+    Reasoning {
+        provider: reasoning::ReasoningProvider,
+        source_kind: Option<reasoning::ReasoningSourceKind>,
+        text: reasoning::ProviderVisibleText,
+    },
 }
 
 fn write_opt_string(out: &mut Vec<u8>, value: &Option<String>) {
@@ -316,6 +348,28 @@ impl SemanticRecord {
                 out.extend_from_slice(b",\"is_error\":");
                 out.extend_from_slice(if *is_error { b"true" } else { b"false" });
                 out.extend_from_slice(b",\"role\":\"tool_result\"}");
+            }
+            SemanticRecord::Reasoning {
+                provider,
+                source_kind,
+                text,
+            } => {
+                // Key order is alphabetical (coverage-v1.md §3): provider,
+                // role, source_kind, text.
+                out.extend_from_slice(b"{\"provider\":\"");
+                out.extend_from_slice(reasoning_provider_tag(*provider).as_bytes());
+                out.extend_from_slice(b"\",\"role\":\"reasoning\",\"source_kind\":");
+                match source_kind {
+                    Some(kind) => {
+                        out.push(b'"');
+                        out.extend_from_slice(reasoning_source_kind_tag(*kind).as_bytes());
+                        out.push(b'"');
+                    }
+                    None => out.extend_from_slice(b"null"),
+                }
+                out.extend_from_slice(b",\"text\":");
+                write_canon_string(out, text.as_str());
+                out.push(b'}');
             }
         }
     }
@@ -1380,6 +1434,13 @@ pub fn redact_turns_with_report(
                     }
                     redact_string(content, &redactor, &mut aggregate);
                 }
+                SemanticRecord::Reasoning { text, .. } => {
+                    // OG-11/RG-04: canary hits in readable reasoning count
+                    // toward the report; the redaction rewrites the gated
+                    // text in place (no arbitrary-text minting route).
+                    let report = text.redact_with(&redactor);
+                    merge_report(&mut aggregate, report);
+                }
             }
         }
     }
@@ -1434,6 +1495,16 @@ pub fn safe_turn_projection(agent_kind: &str, turn: &NormalizedTurn) -> serde_js
             } => serde_json::json!({
                 "type": if *is_error { "tool_error" } else { "tool_result" },
                 "call_id": call_id, "content": content,
+            }),
+            SemanticRecord::Reasoning {
+                provider,
+                source_kind,
+                text,
+            } => serde_json::json!({
+                "type": "reasoning",
+                "provider": reasoning_provider_tag(*provider),
+                "source_kind": source_kind.map(reasoning_source_kind_tag),
+                "text": text.as_str(),
             }),
         })
         .collect::<Vec<_>>();
@@ -2115,5 +2186,189 @@ mod tests {
                 ..
             } if input == "printf hello"
         ));
+    }
+
+    /// RG-04 readable-reasoning projection: canary in provider-visible
+    /// reasoning text fires the anthropic rule in the report, the gated text
+    /// is redacted in place, and the projection/canonical bytes stay clean.
+    #[test]
+    fn rg04_readable_reasoning_redaction_and_projection() {
+        let (record, text) = reasoning::classify_provider_visible_reasoning(
+            reasoning::ReasoningProvider::OpenCode,
+            reasoning::ReasoningSourceKind::Reasoning,
+            "readable reasoning with sk-ant-EXAMPLE0000000000000000 inside".to_string(),
+        );
+        assert_eq!(
+            record.availability(),
+            reasoning::ReasoningAvailability::ProviderVisible
+        );
+        assert!(record.warning().is_none());
+
+        let mut turn = NormalizedTurn {
+            logical_turn_key: "rg04-lib-turn".to_string(),
+            ordinal: 0,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: vec![SemanticRecord::Reasoning {
+                provider: reasoning::ReasoningProvider::OpenCode,
+                source_kind: Some(reasoning::ReasoningSourceKind::Reasoning),
+                text,
+            }],
+        };
+        let report = redact_turns_with_report(std::slice::from_mut(&mut turn));
+        assert!(
+            report
+                .matches
+                .iter()
+                .any(|hit| hit.rule_id == "anthropic-api-key"),
+            "the anthropic rule must fire on reasoning text: {:?}",
+            report.matches
+        );
+        let projection = safe_turn_projection("opencode", &turn);
+        let rendered = serde_json::to_string(&projection).unwrap();
+        assert!(!rendered.contains("sk-ant-"), "projection leak: {rendered}");
+        assert_eq!(projection["records"][0]["type"], "reasoning");
+        assert_eq!(projection["records"][0]["provider"], "opencode");
+
+        let canonical = canonical_turn_bytes(&turn.records);
+        assert!(
+            !String::from_utf8_lossy(&canonical).contains("sk-ant-"),
+            "canonical bytes must carry the redacted text only"
+        );
+
+        // AC 7 metadata sink: the serialized record tags (provider/source_kind)
+        // must never carry the canary; the visible-reasoning warning is None.
+        let metadata_tags = match &turn.records[0] {
+            SemanticRecord::Reasoning {
+                provider,
+                source_kind,
+                ..
+            } => serde_json::to_string(&(provider, source_kind)).unwrap(),
+            other => panic!("expected reasoning record, got {other:?}"),
+        };
+        assert!(
+            !metadata_tags.contains("sk-ant-") && !metadata_tags.contains("CANARY"),
+            "metadata tags must never carry reasoning text: {metadata_tags}"
+        );
+    }
+
+    /// RG-04 fixture conformance (provider_visible half): the synthetic
+    /// fixture's reasoning_text drives the classification path and the
+    /// projected record matches the frozen canonical form.
+    #[test]
+    fn rg04_fixture_provider_visible_conformance() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent_transcripts/reasoning/provider_visible.json"
+        ))
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+        let record_json = &value["records"][0];
+        let text = record_json["reasoning_text"]
+            .as_str()
+            .expect("reasoning_text");
+        let (record, gated) = reasoning::classify_provider_visible_reasoning(
+            reasoning::ReasoningProvider::OpenCode,
+            reasoning::ReasoningSourceKind::Reasoning,
+            text.to_string(),
+        );
+        assert_eq!(
+            record.availability(),
+            reasoning::ReasoningAvailability::ProviderVisible
+        );
+        let mut turn = NormalizedTurn {
+            logical_turn_key: "fixture-turn".to_string(),
+            ordinal: 0,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: vec![SemanticRecord::Reasoning {
+                provider: reasoning::ReasoningProvider::OpenCode,
+                source_kind: Some(reasoning::ReasoningSourceKind::Reasoning),
+                text: gated,
+            }],
+        };
+        redact_turns_with_report(std::slice::from_mut(&mut turn));
+        let projection = safe_turn_projection("opencode", &turn);
+        assert_eq!(projection["records"][0]["source_kind"], "reasoning");
+        assert_eq!(projection["records"][0]["provider"], "opencode");
+        assert_eq!(projection["records"][0]["type"], "reasoning");
+        // Codex re-review P1: the WHOLE projection must equal the frozen
+        // contract.snap value (shape AND text), not just three fields.
+        let snap = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent_transcripts/reasoning/contract.snap"
+        ))
+        .unwrap();
+        let snap_value: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        assert_eq!(
+            projection, snap_value["semantic_reasoning_projection"],
+            "whole projection diverges from the frozen contract.snap"
+        );
+    }
+
+    /// RG-04 AC 7 (tracing half): no tracing output emitted while a
+    /// canary-bearing readable-reasoning record is redacted and projected may
+    /// contain the canary — a regression that logs reasoning text would fail
+    /// here (Codex re-review P1).
+    #[test]
+    fn rg04_tracing_never_emits_reasoning_text() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let (_, text) = reasoning::classify_provider_visible_reasoning(
+                reasoning::ReasoningProvider::OpenCode,
+                reasoning::ReasoningSourceKind::Reasoning,
+                "reasoning with sk-ant-EXAMPLE0000000000000000 embedded".to_string(),
+            );
+            let mut turn = NormalizedTurn {
+                logical_turn_key: "tracing-turn".to_string(),
+                ordinal: 0,
+                completeness: Completeness::Complete,
+                started_at: None,
+                ended_at: None,
+                records: vec![SemanticRecord::Reasoning {
+                    provider: reasoning::ReasoningProvider::OpenCode,
+                    source_kind: Some(reasoning::ReasoningSourceKind::Reasoning),
+                    text,
+                }],
+            };
+            tracing::debug!(?turn, "before typed reasoning redaction");
+            tracing::info!(logical_turn_key = %turn.logical_turn_key, "projecting turn");
+            redact_turns_with_report(std::slice::from_mut(&mut turn));
+            let _ = safe_turn_projection("opencode", &turn);
+        });
+        let captured_bytes = sink.0.lock().unwrap();
+        let captured = String::from_utf8_lossy(&captured_bytes).to_string();
+        assert!(captured.contains("before typed reasoning redaction"));
+        assert!(captured.contains("projecting turn"));
+        assert!(
+            !captured.contains("sk-ant-"),
+            "tracing must never carry reasoning text: {captured}"
+        );
     }
 }

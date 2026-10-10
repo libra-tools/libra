@@ -683,3 +683,19 @@ https://libra.tools/en/docs/commands/config 返回 HTTP 200，`content-type: tex
 按用户PASS即通过的最新授权，非阻断建议实名接受并保留：责任人为本会话Codex执行者（依用户自动决策授权），确认当前没有live调用，最小synthetic envelope不是任意真实Claude JSONL支持；真实record额外metadata必须在相应adapter卡先审schema再接线，不可偷偷放宽来源A。负例当前证明整体failclosed，但未单独隔离UniqueJsonKeys或钉各错误variant，后续RG04 shared contract在原own写集中补这一回归；裸compile-fail error-code、16MiB Display常量漂移与future preserve_order是测试维护建议。空JSON-string仅通过当前syntactic字段shape分类，不证明非空有效密文，RG02 sink仍须独立拒绝空artifact；perf仅约4%余量，实际记录保留，不调宽预算或用重试掩盖失败。
 
 单写者/源代码及生产行为未在PASS后变动；仅本地验收勾选、评审事实和交付状态补记。RG-01 locally-accepted，签名main commit/Push随后取证；仍非done/complete。最终完整full、实际mainCI/CodeQL、FAST-RG-01 patch发布四平台/安装/网站C-D未关闭；不能把61 focused当计划61卡完成。下一卡RG-04；固定队列正式4/61=6.56%。每15分钟的620-621旧提醒已按用户请求删除，工具deleteStatus=deleted。
+
+### 2026-10-10：RG-01 实际main Push；RG-04 开工
+
+RG-01 signedDCO commit45c2a21a45f69e9b9d414776621636ba0f105203普通Push main exit0，GitHub remote ref同SHA。本地Libra merge --verify-signatures --ff-only HEAD exit0/Already up to date，against本仓库vault公钥真正验证签名，不改变HEAD/index/05原dirty。GitHub verification=false/reason=unknown_key，保留此区别，不称GitHub Verified，不上传或改写账号密钥。main CodeQuality run38042622482已success；CodeQL Advanced38042622632当时in_progress；base main/full仍未取得。
+
+RG04在main迁入own生产差异，coverage前像逐字节等于RG01stage；reasoning前像精确核对并保留RG01 header、2.0.24与格式修订。测试索引保留当前memory/DM等其他行，只加own target；补真实SHA黄金值，不用digest长度冒称不变；补RG01单审建议的unselected sibling重复键独立负例/唯一键正对照、Display cap owner pin与最小synthetic envelope说明。无live/native归档声明，未改版本，未改RG02后续源码；当前门UNRUN，不标完成。旧620-621提醒已删除。
+
+### 2026-10-10：RG-04 本次macOS本地交付门闭合，Claude Code单审PASS
+
+基于main45c2a21的17个own路径，初审冻结23输入manifest SHAb3f9dd7666057ea84afb9964f19227c88f9848610adca7a5dde87dd4151e6cdd。macOS最终相关nextest92/92、3864过滤；8/8 compile-fail doctest（2其他过滤）；fmt exit0；clippy all-targets/all-features -D warnings exit0，仍保留proc-macro-error2既有future-incompat。完整full/CI/release/native本轮未声称PASS。
+
+Claude Code单审exit0/is_error=false/31turn，REVIEW VERDICT: PASS，原输出SHA177eaa4b16bbcc240f8bf86c51d2a3389b53aaf913da985150b5549fbf65db07，无P0/P1。两个P2已关闭：INDEX只列本target的digest/状态表/warning检查，门/serde/canary/golden准确归lib；补跑agent_import_test49/49、零ignored/filtered，并四fixture jq验证exit0。同一Claude评审的仅INDEX/证据补充确认PASS（10turn，输出SHAc0d48d0804c31629f00f6e603458f5058d3ce8fe3f934aedceb952f9c0358e9d）；未新增第二Codex审或parent裁决。所有原生产/测试输入SHA仍与初审相同，INDEX与补充冻结输入逐字节相同；PASS后只补实际状态记录。
+
+非阻断P3接受并跟踪于后续shared contract拥有者：fixture表部分手工期望、provider/source wire tag漂移pin、dead_code注释措辞、snapshot synthetic未redact调用、常量ProviderVisible构造的INVARIANT panic可简化；不藉此放宽native/typed/redaction契约。本卡现有真实tracing事件与非空捕获断言、serde泄漏负例及旧digest金值通过。contract.snap追加面作为本卡必要shared写集补记，未新增业务轴。此前开工记录的UNRUN为历史时点，本记录才是当前实际门。
+
+RG04 locally-accepted，签名DCO提交并普通Push main随后取证；暂非done/complete，最终FAST-RG-01 full与实际main安全CI、patch四平台/manifest/安装/网站C-D仍开。下一卡RG-02；固定61卡正式4/61=6.56%。plan-20260905原dirty不混入。RG01 main CodeQL38042622632现已completed/success（精确45c2a21），不冒称未触发的base/full也绿。旧620-621每15分钟提醒已经实际删除，deleteStatus=deleted。

@@ -112,6 +112,135 @@ pub fn classify_unrecognized_field(
     }
 }
 
+/// Classify a provider-supported, readable reasoning field: the record is
+/// marked `ProviderVisible` and the text is returned behind the gated
+/// [`ProviderVisibleText`] type so only the typed-redaction path can read it.
+/// The source text is stored as-is (no decode/re-encode); redaction and
+/// projection run before any persistence.
+///
+/// `pub(crate)` (Codex re-review P2): arbitrary external callers must not be
+/// able to mint readable reasoning; adapters live in-crate and the type gate
+/// (private `inner`, fail-closed `Serialize`) keeps the variant unforgeable
+/// from outside the crate.
+#[allow(dead_code)] // RG-04 adapters (claude/opencode classifier wiring) consume this entry.
+pub(crate) fn classify_provider_visible_reasoning(
+    provider: ReasoningProvider,
+    source_kind: ReasoningSourceKind,
+    text: String,
+) -> (ReasoningRecord, ProviderVisibleText) {
+    let record = ReasoningRecord {
+        provider,
+        source_kind: Some(source_kind),
+        availability: ReasoningAvailability::ProviderVisible,
+        warning: None,
+    };
+    let text = ProviderVisibleText::from_classification(&record, text);
+    match text {
+        Some(text) => (record, text),
+        // INVARIANT: the record was constructed two lines above with
+        // `availability: ReasoningAvailability::ProviderVisible`, so
+        // `from_classification` cannot return None for it.
+        None => unreachable!("record was just constructed with ProviderVisible availability"),
+    }
+}
+
+/// Provider-visible reasoning text, constructible only through the
+/// classification path that proved `ReasoningAvailability::ProviderVisible`.
+///
+/// The inner string is private and the type has no `From<String>`/`Display`
+/// impl: external code cannot mint provider-visible reasoning by struct
+/// literal or conversion (RG-04 compile_fail gate). Projection and redaction
+/// read it via [`ProviderVisibleText::as_str`].
+///
+/// # Construction gate (RG-04 compile_fail)
+///
+/// ```compile_fail
+/// use libra::internal::ai::observed_agents::coverage::SemanticRecord;
+/// use libra::internal::ai::observed_agents::reasoning::{
+///     ProviderVisibleText, ReasoningProvider, ReasoningSourceKind,
+/// };
+/// // The `inner` field is private and there is no public constructor or
+/// // `From<String>` impl, so this struct literal cannot compile:
+/// let text = ProviderVisibleText {
+///     inner: "minted reasoning".to_string(),
+/// };
+/// let _ = SemanticRecord::Reasoning {
+///     provider: ReasoningProvider::ClaudeCode,
+///     source_kind: Some(ReasoningSourceKind::Reasoning),
+///     text,
+/// };
+/// ```
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderVisibleText {
+    inner: String,
+}
+
+impl fmt::Debug for ProviderVisibleText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Codex re-review P1: `{:?}` must never leak the (possibly
+        // unredacted) inner reasoning text into logs or diagnostics.
+        f.debug_struct("ProviderVisibleText")
+            .field("len", &self.inner.len())
+            .field("inner", &"<redacted>".to_string())
+            .finish()
+    }
+}
+
+impl Serialize for ProviderVisibleText {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        // Codex re-review P1: serialization is deliberately unsupported. The
+        // derived SemanticRecord::Serialize would otherwise provide a
+        // pre-redaction persistence bypass; the sanctioned outputs are the
+        // canonical writer and safe_turn_projection, which read `as_str()`
+        // only after typed redaction has run.
+        Err(serde::ser::Error::custom(
+            "provider-visible reasoning text must be redacted first; use the canonical/projection writers",
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderVisibleText {
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        // Fail closed: provider-visible reasoning text can only be minted by
+        // the classification path. Deserializing one from persisted JSON
+        // would bypass the gate.
+        Err(de::Error::custom(
+            "provider-visible reasoning text cannot be deserialized; use the classification path",
+        ))
+    }
+}
+
+impl ProviderVisibleText {
+    /// Constructible only from the classification path: the record must
+    /// already carry `ReasoningAvailability::ProviderVisible`. Returns `None`
+    /// when the availability is not `ProviderVisible` — the gate holds in
+    /// release builds too (Codex re-review P1, not just a debug assert).
+    #[allow(dead_code)] // RG-04 adapters consume this gated constructor.
+    pub(crate) fn from_classification(record: &ReasoningRecord, text: String) -> Option<Self> {
+        if record.availability() != ReasoningAvailability::ProviderVisible {
+            return None;
+        }
+        Some(Self { inner: text })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+
+    /// In-crate trusted path for the typed-redaction step: redaction
+    /// rewrites the text in place through the shared Redactor and returns its
+    /// report. The inner string can only ever be redacted, never replaced
+    /// with arbitrary text (Codex re-review P1).
+    pub(crate) fn redact_with(
+        &mut self,
+        redactor: &super::redaction::Redactor,
+    ) -> super::redaction::RedactionReport {
+        let (bytes, report) = redactor.redact(self.inner.as_bytes());
+        self.inner = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+        report
+    }
+}
+
 /// Errors do not include source field names, values, or raw provider JSON.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ReasoningFieldError {
@@ -265,6 +394,8 @@ fn json_string_field_bytes(raw: &RawValue) -> Option<&[u8]> {
 /// The caller must first authorize and pin the source through the existing
 /// provider-root/import path. This function verifies the official content
 /// block shape; it does not authenticate a caller-supplied JSON document.
+/// This type-contract verifier accepts the minimal synthetic envelope only;
+/// real session metadata envelopes belong to the provider adapter contract.
 /// Unknown or wrong-typed reasoning blocks fail closed without logging data.
 /// No OpenCode field is registered: the pinned 2.0.24 `state` is an open record, not
 /// proof of ciphertext. A selected non-reasoning block is also rejected;
@@ -437,9 +568,46 @@ mod tests {
             availability: ReasoningAvailability::EncryptedUnavailable,
             warning: None,
         };
+        // RG-04 additive freeze: the canonical bytes of a synthetic
+        // SemanticRecord::Reasoning record are pinned alongside the metadata
+        // contract. The variant's serde serialization is deliberately
+        // fail-closed (ProviderVisibleText::serialize always errors), so the
+        // canonical writer is the frozen persistence face.
+        let (_, reasoning_text) = classify_provider_visible_reasoning(
+            ReasoningProvider::OpenCode,
+            ReasoningSourceKind::Reasoning,
+            "synthetic".to_string(),
+        );
+        let reasoning_record =
+            crate::internal::ai::observed_agents::coverage::SemanticRecord::Reasoning {
+                provider: ReasoningProvider::OpenCode,
+                source_kind: Some(ReasoningSourceKind::Reasoning),
+                text: reasoning_text,
+            };
+        let reasoning_canonical = String::from_utf8(
+            crate::internal::ai::observed_agents::coverage::canonical_turn_bytes(
+                std::slice::from_ref(&reasoning_record),
+            ),
+        )
+        .expect("canonical bytes are UTF-8");
+        let projected = crate::internal::ai::observed_agents::coverage::safe_turn_projection(
+            "opencode",
+            &crate::internal::ai::observed_agents::coverage::NormalizedTurn {
+                logical_turn_key: "fixture-turn".to_string(),
+                ordinal: 0,
+                completeness:
+                    crate::internal::ai::observed_agents::coverage::Completeness::Complete,
+                started_at: None,
+                ended_at: None,
+                records: vec![reasoning_record],
+            },
+        );
         let actual = serde_json::to_string_pretty(&serde_json::json!({
             "availability": statuses,
             "records": [absent, unknown, encrypted],
+            "semantic_reasoning_canonical": reasoning_canonical,
+            "semantic_reasoning_projection": projected,
+            "semantic_reasoning_note": "RG-04 additive freeze: canonical bytes of a synthetic Reasoning record (write_canonical) and the full safe_turn_projection output; provider_visible text is redacted before any persistence and serde serialization of the variant is fail-closed.",
         }))
         .expect("fixed contract types serialize");
         assert_eq!(
@@ -552,7 +720,55 @@ mod tests {
     }
 
     #[test]
+    fn readable_text_cannot_bypass_classification_or_serde() {
+        let canary = "sk-ant-EXAMPLE0000000000000000";
+        let (_, text) = classify_provider_visible_reasoning(
+            ReasoningProvider::OpenCode,
+            ReasoningSourceKind::Reasoning,
+            canary.to_string(),
+        );
+        assert_eq!(text.as_str(), canary);
+        let record = crate::internal::ai::observed_agents::coverage::SemanticRecord::Reasoning {
+            provider: ReasoningProvider::OpenCode,
+            source_kind: Some(ReasoningSourceKind::Reasoning),
+            text,
+        };
+        let error = serde_json::to_value(&record).expect_err("unredacted serde must fail closed");
+        assert!(!error.to_string().contains(canary));
+        assert!(serde_json::from_str::<ProviderVisibleText>("\"synthetic\"").is_err());
+        for availability in [
+            ReasoningAvailability::EncryptedUnavailable,
+            ReasoningAvailability::OpaqueArchived,
+            ReasoningAvailability::NotPresent,
+            ReasoningAvailability::UnsupportedShape,
+        ] {
+            let classification = ReasoningRecord {
+                provider: ReasoningProvider::OpenCode,
+                source_kind: None,
+                availability,
+                warning: None,
+            };
+            assert!(
+                ProviderVisibleText::from_classification(&classification, canary.to_string())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_in_unselected_block_are_rejected() {
+        let source = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first","text":"second"},{"type":"thinking","thinking":"","signature":"CANARY_PRIVATE_REASONING"}]}}"#;
+        let error = verify_claude_encrypted_field(source, 1)
+            .expect_err("duplicate key in an unselected sibling must fail closed");
+        assert_eq!(error, ReasoningFieldError::MalformedSource);
+        assert!(!format!("{error:?}").contains("CANARY_PRIVATE_REASONING"));
+        let unique = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"thinking","thinking":"","signature":"CANARY_PRIVATE_REASONING"}]}}"#;
+        assert!(verify_claude_encrypted_field(unique, 1).is_ok());
+    }
+
+    #[test]
     fn reasoning_field_error_display_is_stable() {
+        assert_eq!(TRANSCRIPT_READ_HARD_CAP_BYTES, 16 * 1024 * 1024);
         for (error, expected) in [
             (
                 ReasoningFieldError::SourceTooLarge,

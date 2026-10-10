@@ -1,0 +1,12 @@
+{
+  "fixture": "generic_encrypted",
+  "note": "synthetic undeclared high-entropy field; entropy is never evidence of ciphertext",
+  "records": [
+    {
+      "provider": "opencode",
+      "source_kind": null,
+      "field": "undeclared_blob",
+      "opaque_like_blob": "c2FtcGxlLWJhc2U2NC1lbmNvZGVkLXN5bnRoZXRpYy1oaWdoLWVudHJvcHktY2FuYXJ5"
+    }
+  ]
+}

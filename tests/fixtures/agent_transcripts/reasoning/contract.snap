@@ -21,5 +21,22 @@
       "provider": "claude_code",
       "source_kind": "signature"
     }
-  ]
+  ],
+  "semantic_reasoning_canonical": "[{\"provider\":\"opencode\",\"role\":\"reasoning\",\"source_kind\":\"reasoning\",\"text\":\"synthetic\"}]",
+  "semantic_reasoning_note": "RG-04 additive freeze: canonical bytes of a synthetic Reasoning record (write_canonical) and the full safe_turn_projection output; provider_visible text is redacted before any persistence and serde serialization of the variant is fail-closed.",
+  "semantic_reasoning_projection": {
+    "agent_kind": "opencode",
+    "completeness": "complete",
+    "logical_turn_key": "fixture-turn",
+    "ordinal": 0,
+    "records": [
+      {
+        "provider": "opencode",
+        "source_kind": "reasoning",
+        "text": "synthetic",
+        "type": "reasoning"
+      }
+    ],
+    "schema_version": 1
+  }
 }

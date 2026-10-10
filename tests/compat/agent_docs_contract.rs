@@ -686,3 +686,45 @@ fn reasoning_type_docs_pin_metadata_only_and_five_states() {
         assert_contains(document, label, "reasoning.state");
     }
 }
+
+#[test]
+fn reasoning_readable_projection_docs_pin_typed_redaction() {
+    for (label, document) in [
+        ("agent EN", AGENT_CMD_DOC_EN),
+        ("agent zh-CN", AGENT_CMD_DOC_ZH),
+        ("developer EN", AGENT_DEV_DOC),
+        ("tracing zh-CN", AGENT_DOC),
+    ] {
+        for term in [
+            "ProviderVisibleText",
+            "serde",
+            "canonical_turn_bytes",
+            "safe_turn_projection",
+        ] {
+            assert_contains(document, label, term);
+        }
+    }
+
+    // RG-04: readable reasoning projection — typed redaction before any
+    // persistence; own `reasoning` record type; never in unredacted metadata.
+    assert_contains(
+        AGENT_CMD_DOC_EN,
+        "RG-04 readable reasoning",
+        "always passes typed redaction first",
+    );
+    assert_contains(
+        AGENT_CMD_DOC_ZH,
+        "RG-04 可读 reasoning",
+        "必先经过 typed redaction",
+    );
+    assert_contains(
+        AGENT_DEV_DOC,
+        "RG-04 adds the readable-reasoning projection path",
+        "always passes typed redaction first",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-04 加入可读 reasoning",
+        "必先经过 typed redaction",
+    );
+}

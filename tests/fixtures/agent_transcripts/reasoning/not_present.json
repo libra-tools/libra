@@ -1,0 +1,12 @@
+{
+  "fixture": "not_present",
+  "note": "synthetic record without any reasoning field",
+  "records": [
+    {
+      "provider": "opencode",
+      "source_kind": null,
+      "field": "user_text",
+      "text": "ordinary user prompt, no reasoning member present"
+    }
+  ]
+}

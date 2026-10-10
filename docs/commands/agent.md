@@ -870,3 +870,18 @@ automatically trusted — a matching JSON shape is not
 proof of provider identity.
 OpenCode 2.0.24 `reasoning.state` is open-ended and cannot establish a verified encrypted source.
 No live provider adapter yet produces artifacts from this type contract.
+
+This type-contract verifier accepts only the minimal synthetic envelope; real session records and additional metadata are deferred to the reviewed provider adapter contract.
+
+## Readable reasoning projection (RG-04)
+
+RG-04 adds the readable-reasoning projection path:
+`ProviderVisible` reasoning text is the only reasoning content that can enter
+the coverage projection, and it always passes typed redaction first — canary
+secrets inside reasoning text are counted in the redaction report and removed
+before projection, checkpoint persistence or any metadata/digest write. Readable
+reasoning projects under its own `reasoning` record type with `provider` and
+`source_kind` metadata; it never impersonates an assistant answer, and it is
+never written to unredacted metadata or logs.
+
+Direct serde serialization/deserialization of `ProviderVisibleText` is deliberately rejected. Callers must use classification and typed redaction followed by `canonical_turn_bytes` or `safe_turn_projection`. RG-04 does not wire a live provider adapter.

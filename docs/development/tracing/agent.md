@@ -2454,3 +2454,16 @@ provider-state 密文字段。opaque 类型不实现普通序列化/显示/
 `RedactedBytes` 转换；此类型尚未归档任何 provider 密文：RG-04 才加入
 可读内容的 typed redaction 投影，RG-02/03/05 才负责 artifact 写入、
 授权读取、镜像和擦除。当前 traces 布局仍由上述既有捕获路径定义。
+
+本类型校验器仅接受最小合成 envelope；真实会话记录及额外 metadata 须在对应 provider adapter 卡审查后接入，当前不声称真实 JSONL 已支持。
+
+## Readable reasoning projection (RG-04)
+
+RG-04 加入可读 reasoning 投影路径：`provider_visible` 的 reasoning 文本是
+唯一能进入 coverage 投影的 reasoning 内容，且必先经过 typed redaction ——
+reasoning 文本中的 canary 秘密会计入 redaction report 并在投影、checkpoint
+持久化或任何 metadata/digest 写入前移除；可读 reasoning 以独立的
+`reasoning` 记录类型投影，携带 `provider` 与 `source_kind` 元数据，
+从不冒充 assistant 回答，也绝不写入未脱敏的 metadata 或日志。
+
+`ProviderVisibleText` 的 serde 序列化/反序列化明确拒绝；调用者须经分类与 typed redaction 后使用 `canonical_turn_bytes` 或 `safe_turn_projection`。RG-04 不接入真实 provider adapter。
