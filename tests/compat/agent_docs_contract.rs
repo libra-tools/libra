@@ -773,3 +773,34 @@ fn rg02_artifact_docs_contract() {
         "`content_hash` 四角色不变",
     );
 }
+
+#[test]
+fn rg06_artifact_atomicity_docs_contract() {
+    // RG-06: artifact blobs ride the same attempt as the checkpoint and are
+    // ref-reachable tree entries (GC-safe), pinned in the tracing doc.
+    assert_contains(
+        AGENT_DOC,
+        "RG-06 同 attempt 原子性",
+        "RG-06 保证 artifact 与所属 checkpoint 同 attempt 原子写入",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-06 immutable signature time",
+        "append_checkpoint_commit 初次写入非空 artifact checkpoint，以及相同 payload、未变 parent 的重试",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-06 immutable signature time",
+        "author/committer 使用已封存 metadata.created_at 的 Unix 秒和固定 UTC",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-06 commit graph timestamp bound",
+        "创建时间限于 0..=17179869183 Unix 秒（Git commit-graph 的 34 位时间范围）",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-06 retention timestamp scope",
+        "retention 重写仍使用既有提交时间策略",
+    );
+}

@@ -154,6 +154,43 @@ fn ensure_checkpoint_append_before_deadline(deadline: Option<CaptureCommitDeadli
     Ok(())
 }
 
+/// Artifact retries must reuse the sealed checkpoint's creation time. A fresh
+/// marker timestamp or local timezone would change the commit OID after recovery.
+fn artifact_checkpoint_signature_timestamp(
+    metadata: &crate::internal::ai::observed_agents::RedactedBytes,
+) -> Result<usize> {
+    #[derive(serde::Deserialize)]
+    struct CreationTime {
+        created_at: i64,
+    }
+    let invalid = || {
+        anyhow!(
+            "reasoning artifact checkpoint requires a valid created_at in Unix seconds; recreate the checkpoint from its source"
+        )
+    };
+    // Derived structs also accept JSON sequences. Require a named field
+    // in an object while retaining duplicate-field rejection in the narrow parse.
+    if metadata
+        .bytes()
+        .iter()
+        .copied()
+        .find(|byte| !matches!(*byte, b' ' | b'\t' | b'\n' | b'\r'))
+        != Some(b'{')
+    {
+        return Err(invalid());
+    }
+    let metadata: CreationTime = serde_json::from_slice(metadata.bytes()).map_err(|_| invalid())?;
+    // Git commit-graph CDAT stores only 34 timestamp bits. Trace refs are
+    // local Branch roots, so a larger sealed time would be silently truncated.
+    const COMMIT_GRAPH_MAX_TIMESTAMP: i64 = (1_i64 << 34) - 1;
+    if !(0..=COMMIT_GRAPH_MAX_TIMESTAMP).contains(&metadata.created_at)
+        || chrono::DateTime::from_timestamp(metadata.created_at, 0).is_none()
+    {
+        return Err(invalid());
+    }
+    usize::try_from(metadata.created_at).map_err(|_| invalid())
+}
+
 /// Keep the historical-import deadline surface stable when its marker helper
 /// uses the shared traces deadline type internally.
 fn normalize_checkpoint_marker_deadline(error: anyhow::Error) -> anyhow::Error {
@@ -2901,6 +2938,7 @@ impl HistoryManager {
     ///   transcript/<agent_kind>.jsonl        (or `.jsonl.001…` chunks, E5)
     ///   redaction_report.json
     ///   content_hash.txt
+    ///   reasoning/encrypted/<sha256>        (only when artifacts present)
     /// ```
     ///
     /// and merges it into the parent commit's tree so successive checkpoints
@@ -3060,6 +3098,13 @@ impl HistoryManager {
                 bail!("reasoning artifact manifest bytes exceed the metadata budget");
             }
         }
+        let artifact_signature_timestamp = if params.reasoning_artifacts.is_empty() {
+            None
+        } else {
+            Some(artifact_checkpoint_signature_timestamp(
+                params.metadata_json,
+            )?)
+        };
         let mut object_count: u64 = 0;
         let mut object_index_intents = Vec::new();
         let metadata_blob_oid = self
@@ -3183,6 +3228,10 @@ impl HistoryManager {
         // sha256 (two locators with identical bytes share one object); the
         // empty set writes nothing and leaves the tree byte-identical.
         let mut reasoning_artifacts_manifest: Vec<ManifestArtifactRef> = Vec::new();
+        // RG-06: unique artifact objects become checkpoint trace-tree entries
+        // under reasoning/encrypted/<sha256> so they are ref-reachable and
+        // survive GC. Empty set → no reasoning subtree (byte-identical tree).
+        let mut artifact_encrypted_items: Vec<TreeItem> = Vec::new();
         if !params.reasoning_artifacts.is_empty() {
             let mut written_oids: HashMap<String, ObjectHash> = HashMap::new();
             for (artifact, sha256) in params.reasoning_artifacts.iter().zip(artifact_digests) {
@@ -3207,6 +3256,11 @@ impl HistoryManager {
                     object_count += 1;
                     ensure_deadline()?;
                     written_oids.insert(sha256.clone(), oid);
+                    artifact_encrypted_items.push(TreeItem::new(
+                        TreeItemMode::Blob,
+                        oid,
+                        sha256.clone(),
+                    ));
                     oid
                 };
                 reasoning_artifacts_manifest.push(ManifestArtifactRef {
@@ -3315,7 +3369,40 @@ impl HistoryManager {
                 &mut object_index_intents,
             )
             .await?;
-        object_count += 2;
+        // RG-06: reasoning/encrypted/<sha256> subtree with the unique
+        // artifact blobs; the manifest oids point at these same objects so
+        // the tree entry and manifest agree (AC 1/2). Empty set → None.
+        let mut reasoning_subtree: Option<ObjectHash> = None;
+        if !artifact_encrypted_items.is_empty() {
+            artifact_encrypted_items.sort_by(|a, b| a.name.cmp(&b.name));
+            let encrypted_subtree = self
+                .write_tree_indexed_for_attempt(
+                    &artifact_encrypted_items,
+                    writer_fence,
+                    params.capture_scope,
+                    params.deadline,
+                    newly_written,
+                    &mut object_index_intents,
+                )
+                .await?;
+            let reasoning_items = vec![TreeItem::new(
+                TreeItemMode::Tree,
+                encrypted_subtree,
+                "encrypted".to_string(),
+            )];
+            reasoning_subtree = Some(
+                self.write_tree_indexed_for_attempt(
+                    &reasoning_items,
+                    writer_fence,
+                    params.capture_scope,
+                    params.deadline,
+                    newly_written,
+                    &mut object_index_intents,
+                )
+                .await?,
+            );
+        }
+        object_count += 2 + u64::from(!artifact_encrypted_items.is_empty()) * 2;
 
         let mut inner_items = vec![
             TreeItem::new(
@@ -3345,6 +3432,13 @@ impl HistoryManager {
             ),
             TreeItem::new(TreeItemMode::Tree, events_subtree, "events".to_string()),
         ];
+        if let Some(reasoning) = reasoning_subtree {
+            inner_items.push(TreeItem::new(
+                TreeItemMode::Tree,
+                reasoning,
+                "reasoning".to_string(),
+            ));
+        }
         inner_items.sort_by(|a, b| a.name.cmp(&b.name));
         let inner_tree = self
             .write_tree_indexed_for_attempt(
@@ -3406,16 +3500,22 @@ impl HistoryManager {
                 params.scope.as_str(),
                 params.checkpoint_id,
             );
-            let author = Signature::new(
-                SignatureType::Author,
-                "Libra".to_string(),
-                "traces@libra".to_string(),
-            );
-            let committer = Signature::new(
-                SignatureType::Committer,
-                "Libra".to_string(),
-                "traces@libra".to_string(),
-            );
+            let signature = |signature_type| match artifact_signature_timestamp {
+                Some(timestamp) => Signature {
+                    signature_type,
+                    name: "Libra".to_string(),
+                    email: "traces@libra".to_string(),
+                    timestamp,
+                    timezone: "+0000".to_string(),
+                },
+                None => Signature::new(
+                    signature_type,
+                    "Libra".to_string(),
+                    "traces@libra".to_string(),
+                ),
+            };
+            let author = signature(SignatureType::Author);
+            let committer = signature(SignatureType::Committer);
             let parents = parent.into_iter().collect::<Vec<_>>();
             let commit = Commit::new(author, committer, new_root, parents, &message);
             let commit_data = commit
@@ -11777,6 +11877,7 @@ mod tests {
     }
 
     fn artifact_params<'a>(
+        metadata: &'a RedactedBytes,
         capture_scope: &'a CaptureScope,
         checkpoint_id: &'a str,
         marker_generation: &'a str,
@@ -11792,7 +11893,11 @@ mod tests {
             parent_commit: None,
             scope: CheckpointScope::Committed,
             tool_use_id: None,
-            metadata_json: blobs,
+            metadata_json: if artifacts.is_empty() {
+                blobs
+            } else {
+                metadata
+            },
             transcript_redacted: blobs,
             lifecycle_events_jsonl: blobs,
             redaction_report_json: blobs,
@@ -11804,6 +11909,98 @@ mod tests {
 
     fn artifact_redactor() -> crate::internal::ai::observed_agents::Redactor {
         crate::internal::ai::observed_agents::Redactor::new_default()
+    }
+
+    fn artifact_test_metadata() -> RedactedBytes {
+        artifact_redactor()
+            .redact(br#"{"created_at":1788307200}"#)
+            .0
+    }
+
+    #[tokio::test]
+    async fn artifact_invalid_creation_time_fails_before_object_write() {
+        let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
+        for metadata in [
+            br#"{}"#.as_slice(),
+            br#"[1788307200]"#,
+            br#"[0]"#,
+            br#"{"created_at":"creation-time-canary"}"#,
+            br#"{"created_at":null}"#,
+            br#"{"created_at":-1}"#,
+            br#"{"created_at":1.5}"#,
+            br#"{"created_at":9223372036854775807}"#,
+            br#"{"created_at":1788307200000}"#,
+            br#"{"created_at":17179869184}"#,
+            br#"{"created_at":1,"created_at":2}"#,
+        ] {
+            let id = "artifact-invalid-time";
+            let (_dir, _repo, conn, manager, fence) = artifact_test_fixture(id).await;
+            let (plain, _) = artifact_redactor().redact(b"safe transcript");
+            let (metadata, _) = artifact_redactor().redact(metadata);
+            let artifacts = [test_artifact(
+                "claude_code:msg=0/part=0/metadata=signature",
+                b"creation-time-artifact-canary",
+            )];
+            let mut params = artifact_params(
+                &artifact_metadata,
+                &test_scope,
+                id,
+                &fence.generation,
+                &plain,
+                &artifacts,
+            );
+            params.metadata_json = &metadata;
+            let error = manager
+                .append_checkpoint_commit(params)
+                .await
+                .expect_err("invalid immutable creation time");
+            assert_eq!(
+                error.to_string(),
+                "reasoning artifact checkpoint requires a valid created_at in Unix seconds; recreate the checkpoint from its source"
+            );
+            assert!(!format!("{error:#}").contains("canary"));
+            assert!(
+                conn.query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'object_index'"
+                        .to_string()
+                ))
+                .await
+                .expect("probe untouched object-index schema")
+                .is_none()
+            );
+            assert_eq!(
+                walkdir::WalkDir::new(manager.repo_path.join("objects"))
+                    .into_iter()
+                    .map(|entry| entry.expect("enumerate untouched loose objects"))
+                    .filter(|entry| entry.file_type().is_file())
+                    .count(),
+                0
+            );
+            assert!(
+                manager
+                    .resolve_history_head()
+                    .await
+                    .expect("unchanged head")
+                    .is_none()
+            );
+        }
+        let (epoch, _) = artifact_redactor().redact(br#"{"created_at":0}"#);
+        assert_eq!(artifact_checkpoint_signature_timestamp(&epoch).unwrap(), 0);
+        let (max_time, _) = artifact_redactor().redact(br#"{"created_at":17179869183}"#);
+        match usize::try_from(17179869183_i64) {
+            Ok(expected) => assert_eq!(
+                artifact_checkpoint_signature_timestamp(&max_time).unwrap(),
+                expected
+            ),
+            Err(_) => assert!(artifact_checkpoint_signature_timestamp(&max_time).is_err()),
+        }
+        let (spaced_epoch, _) = artifact_redactor().redact(b" \t\r\n{\"created_at\":0}");
+        assert_eq!(
+            artifact_checkpoint_signature_timestamp(&spaced_epoch).unwrap(),
+            0
+        );
     }
 
     fn test_artifact(locator: &str, bytes: &[u8]) -> ReasoningArtifactParam {
@@ -11824,6 +12021,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_invalid_metadata_fails_before_object_write() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         use crate::internal::ai::observed_agents::reasoning::{
             ReasoningAvailability, ReasoningProvider, ReasoningSourceKind,
         };
@@ -11855,6 +12053,7 @@ mod tests {
             let artifacts = [artifact];
             let error = manager
                 .append_checkpoint_commit(artifact_params(
+                    &artifact_metadata,
                     &test_scope,
                     id,
                     &fence.generation,
@@ -11896,6 +12095,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_unscoped_write_fails_before_object_index_or_loose_object() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let id = "unscoped-artifact";
         let (_dir, _repo, conn, manager, fence) = artifact_test_fixture(id).await;
         let (plain, _) = artifact_redactor().redact(b"safe transcript");
@@ -11903,7 +12103,14 @@ mod tests {
             "claude_code:msg=0/part=0/metadata=signature",
             b"opaque artifact",
         )];
-        let mut params = artifact_params(&test_scope, id, &fence.generation, &plain, &artifacts);
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
         params.capture_scope = None;
         let error = manager
             .append_checkpoint_commit(params)
@@ -12010,7 +12217,7 @@ mod tests {
             let (_dir, _, _, manager, fence) = artifact_test_fixture(id).await;
             let (plain, _) = artifact_redactor().redact(b"safe transcript");
             let artifacts = [test_artifact(&locator, bytes)];
-            let params = artifact_params(&scope, id, &fence.generation, &plain, &artifacts);
+            let params = artifact_params(&plain, &scope, id, &fence.generation, &plain, &artifacts);
             let error = manager
                 .append_checkpoint_commit(params)
                 .await
@@ -12042,6 +12249,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_manifest_snapshot_and_dedup_and_sha256() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-checkpoint-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
@@ -12056,6 +12264,7 @@ mod tests {
             test_artifact("claude_code:msg=2/part=0/metadata=signature", cipher_a),
         ];
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-checkpoint-01",
             &fence.generation,
@@ -12102,6 +12311,52 @@ mod tests {
             object, cipher_a,
             "artifact object bytes equal the verified input"
         );
+        // RG-06 AC 1/2: the artifact blob is a checkpoint trace-tree entry at
+        // reasoning/encrypted/<sha256>, and the manifest oid equals the tree
+        // entry's blob oid (ref-reachable, GC-safe).
+        let root = manager
+            .load_commit_tree(&commit.commit_hash)
+            .expect("load checkpoint root");
+        let inner_oid = manager
+            .checkpoint_inner_tree_from_root(&root, "artifact-checkpoint-01")
+            .expect("locate checkpoint leaf")
+            .expect("leaf");
+        let inner = manager.load_tree(&inner_oid).expect("leaf tree");
+        let reasoning_tree = inner
+            .iter()
+            .find(|entry| entry.name == "reasoning")
+            .expect("reasoning tree entry");
+        let reasoning = manager
+            .load_tree(&reasoning_tree.id)
+            .expect("reasoning tree");
+        let encrypted_entry = reasoning
+            .iter()
+            .find(|entry| entry.name == "encrypted")
+            .expect("encrypted tree entry");
+        let encrypted = manager
+            .load_tree(&encrypted_entry.id)
+            .expect("encrypted tree");
+        let sha_a_entry = encrypted
+            .iter()
+            .find(|entry| entry.name == sha_a)
+            .expect("sha256 artifact tree entry");
+        let sha_b_entry = encrypted
+            .iter()
+            .find(|entry| entry.name == sha_b)
+            .expect("sha256 artifact tree entry");
+        assert_eq!(
+            sha_a_entry.id, artifact_oid,
+            "manifest oid must equal the reasoning/encrypted tree blob oid (a)"
+        );
+        assert_eq!(
+            sha_b_entry.id,
+            list[1]["oid"]
+                .as_str()
+                .expect("oid")
+                .parse::<git_internal::hash::ObjectHash>()
+                .expect("valid oid"),
+            "manifest oid must equal the reasoning/encrypted tree blob oid (b)"
+        );
     }
 
     /// RG-02 AC 2: empty artifact set leaves the tree byte-identical — the
@@ -12109,11 +12364,13 @@ mod tests {
     #[tokio::test]
     async fn empty_artifact_set_manifest_has_no_reasoning_key() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-empty-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
         let (blobs, _) = redactor.redact(b"plain transcript, no artifacts");
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-empty-01",
             &fence.generation,
@@ -12140,6 +12397,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_locator_is_rejected() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-dup-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
@@ -12149,6 +12407,7 @@ mod tests {
             test_artifact("claude_code:msg=0/part=0/metadata=signature", b"second"),
         ];
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-dup-01",
             &fence.generation,
@@ -12166,6 +12425,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_count_budget_fails_closed() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-count-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
@@ -12179,6 +12439,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-count-01",
             &fence.generation,
@@ -12196,6 +12457,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_total_bytes_budget_fails_closed() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-total-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
@@ -12206,6 +12468,7 @@ mod tests {
             &huge,
         )];
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-total-01",
             &fence.generation,
@@ -12223,6 +12486,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_manifest_bytes_budget_fails_closed() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-manifest-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let redactor = artifact_redactor();
@@ -12247,6 +12511,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-manifest-01",
             &fence.generation,
@@ -12264,6 +12529,7 @@ mod tests {
     #[tokio::test]
     async fn plain_roles_have_zero_ciphertext_hits() {
         let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
         let checkpoint_id = "artifact-roles-01";
         let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
         let cipher = b"ciphertext-canary-ROLE-SEPARATION-9f2a";
@@ -12274,6 +12540,7 @@ mod tests {
             cipher,
         )];
         let params = artifact_params(
+            &artifact_metadata,
             &test_scope,
             "artifact-roles-01",
             &fence.generation,
@@ -12331,5 +12598,313 @@ mod tests {
                 "transcript part must not contain ciphertext bytes"
             );
         }
+    }
+
+    struct ArtifactCatalogExtra<'a>(&'a str);
+
+    #[async_trait::async_trait]
+    impl TracesTxnExtra for ArtifactCatalogExtra<'_> {
+        async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
+            txn.execute_raw(Statement::from_sql_and_values(txn.get_database_backend(),
+                "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid, traces_commit, created_at) VALUES (?, 'claude_code__s1', 'committed', ?, ?, ?, 1)",
+                [self.0.to_string().into(), ctx.tree_oid.clone().into(), ctx.metadata_blob_oid.clone().into(), ctx.commit_hash.clone().into()]
+            )).await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_interrupted_write_leaves_no_dangling_object_index() {
+        let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
+        let id = "artifact-interrupted-01";
+        let (_dir, conn, mut manager, fence, scope) = scoped_artifact_fixture(id).await;
+        manager.fail_once_before_checkpoint_ref_cas();
+        let (plain, _) = artifact_redactor().redact(b"safe transcript");
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            b"opaque-interrupt-canary",
+        )];
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
+        params.capture_scope = Some(&scope);
+        let catalog = ArtifactCatalogExtra(id);
+        params.txn_extra = Some(&catalog);
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("injected interruption");
+        assert!(format!("{error:#}").contains("injected checkpoint object-store failure"));
+        assert_eq!(test_table_row_count(&conn, "object_index").await, 0);
+        assert_eq!(test_table_row_count(&conn, "agent_checkpoint").await, 0);
+        assert!(
+            manager
+                .resolve_history_head()
+                .await
+                .expect("head")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_ref_cas_failure_leaves_no_catalog_row() {
+        let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
+        let id = "artifact-cas-failure-01";
+        let (_dir, conn, mut manager, fence, scope) = scoped_artifact_fixture(id).await;
+        manager.lose_every_checkpoint_ref_cas();
+        let (plain, _) = artifact_redactor().redact(b"safe transcript");
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            b"opaque-cas-canary",
+        )];
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
+        params.capture_scope = Some(&scope);
+        let catalog = ArtifactCatalogExtra(id);
+        params.txn_extra = Some(&catalog);
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("exhausted real CAS retries");
+        assert!(error.downcast_ref::<CheckpointAppendConflict>().is_some());
+        assert_eq!(test_table_row_count(&conn, "agent_checkpoint").await, 0);
+        assert_eq!(test_table_row_count(&conn, "object_index").await, 0);
+        let head = manager
+            .resolve_history_head()
+            .await
+            .expect("head")
+            .expect("competing head");
+        let root = manager.load_commit_tree(&head).expect("competing tree");
+        assert!(
+            manager
+                .checkpoint_inner_tree_from_root(&root, id)
+                .expect("checkpoint lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_retry_after_interrupt_is_idempotent() {
+        let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
+        let id = "artifact-retry-01";
+        let (dir, conn, mut manager, fence, scope) = scoped_artifact_fixture(id).await;
+        let prepared_commit = Arc::new(std::sync::Mutex::new(None));
+        let interrupted_commit = prepared_commit.clone();
+        manager.test_before_checkpoint_ref_cas = Some(Arc::new(move |snapshot| {
+            let interrupted_commit = interrupted_commit.clone();
+            Box::pin(async move {
+                *interrupted_commit.lock().expect("capture prepared commit") =
+                    Some(snapshot.commit_hash);
+                bail!("injected checkpoint object-store failure before ref CAS")
+            })
+        }));
+        let (plain, _) = artifact_redactor().redact(b"retry safe transcript");
+        let cipher = b"retry opaque artifact canary";
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            cipher,
+        )];
+        let catalog = ArtifactCatalogExtra(id);
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
+        params.capture_scope = Some(&scope);
+        params.txn_extra = Some(&catalog);
+        manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("interruption");
+        let objects = manager.repo_path.join("objects");
+        let object_count = || {
+            walkdir::WalkDir::new(&objects)
+                .into_iter()
+                .map(|entry| entry.expect("enumerate loose objects"))
+                .filter(|entry| entry.file_type().is_file())
+                .count()
+        };
+        let interrupted_count = object_count();
+        assert!(interrupted_count > 0);
+        // Cross a real signature timestamp boundary: same-second retries
+        // must not hide a new loose commit produced from identical inputs.
+        let interrupted_second = chrono::Utc::now().timestamp();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(chrono::Utc::now().timestamp() > interrupted_second);
+        assert!(
+            manager
+                .repair_expired_traces_inflight_marker_for_test(
+                    "claude_code__s1",
+                    id,
+                    chrono::Utc::now().timestamp_millis()
+                )
+                .await
+                .expect("repair interrupted marker")
+        );
+        drop(manager);
+        conn.as_ref()
+            .clone()
+            .close()
+            .await
+            .expect("close interrupted writer database");
+        drop(conn);
+        let conn = Arc::new(
+            db::establish_connection(&dir.path().join(".libra/libra.db").to_string_lossy())
+                .await
+                .expect("reopen database after recovery"),
+        );
+        let manager = traces_manager(&dir, conn.clone());
+        let stale_generation = fence.generation.clone();
+        let fence = seed_test_writer_fence(&conn, "claude_code__s1", id).await;
+        assert_ne!(fence.generation, stale_generation);
+        // A distinct payload would create new objects if fencing happened late.
+        let (stale_plain, _) = artifact_redactor().redact(b"distinct stale generation transcript");
+        let error = manager
+            .append_checkpoint_commit(artifact_params(
+                &artifact_metadata,
+                &test_scope,
+                id,
+                &stale_generation,
+                &stale_plain,
+                &artifacts,
+            ))
+            .await
+            .expect_err("old generation remains fenced after restart");
+        assert!(matches!(
+            error.downcast_ref::<CheckpointAppendConflict>(),
+            Some(CheckpointAppendConflict::MarkerFenced(_))
+        ));
+        assert_eq!(object_count(), interrupted_count);
+        assert_eq!(test_table_row_count(&conn, "object_index").await, 0);
+        assert_eq!(test_table_row_count(&conn, "agent_checkpoint").await, 0);
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
+        params.capture_scope = Some(&scope);
+        params.txn_extra = Some(&catalog);
+        let commit = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect("retry artifact write");
+        assert_eq!(
+            object_count(),
+            interrupted_count,
+            "recovery and retry do not accumulate objects"
+        );
+        assert_eq!(test_table_row_count(&conn, "agent_checkpoint").await, 1);
+        assert_eq!(
+            test_table_row_count(&conn, "object_index").await,
+            interrupted_count as i64
+        );
+        assert_eq!(
+            Some(commit.commit_hash),
+            *prepared_commit.lock().expect("read interrupted commit"),
+            "reopened writer reproduces the exact interrupted commit OID"
+        );
+        let commit_data = read_git_object(&manager.repo_path, &commit.commit_hash)
+            .expect("read retry commit signatures");
+        let commit_text = String::from_utf8(commit_data).expect("commit text");
+        assert!(commit_text.contains("author Libra <traces@libra> 1788307200 +0000\n"));
+        assert!(commit_text.contains("committer Libra <traces@libra> 1788307200 +0000\n"));
+        let manifest = read_checkpoint_manifest_value(&manager, &commit, id).await;
+        let oid = manifest["reasoning_artifacts"][0]["oid"]
+            .as_str()
+            .expect("artifact oid")
+            .parse()
+            .expect("parse artifact oid");
+        assert_eq!(
+            read_git_object(&manager.repo_path, &oid).expect("retried artifact"),
+            cipher
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_index_failure_keeps_transcript_ciphertext_free() {
+        let test_scope = artifact_test_scope();
+        let artifact_metadata = artifact_test_metadata();
+        let id = "artifact-index-failure-01";
+        let (_dir, conn, manager, fence, scope) = scoped_artifact_fixture(id).await;
+        let (plain, _) = artifact_redactor().redact(b"safe transcript");
+        let cipher = b"opaque-index-failure-canary";
+        let artifact_oid = git_object_hash("blob", cipher);
+        conn.execute_raw(Statement::from_string(conn.get_database_backend(),
+            format!("CREATE TRIGGER reject_artifact_index BEFORE INSERT ON object_index WHEN NEW.o_id = '{artifact_oid}' BEGIN SELECT RAISE(ABORT, 'artifact index rejected'); END")
+        )).await.expect("install artifact-only index failure");
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            cipher,
+        )];
+        let mut params = artifact_params(
+            &artifact_metadata,
+            &test_scope,
+            id,
+            &fence.generation,
+            &plain,
+            &artifacts,
+        );
+        params.capture_scope = Some(&scope);
+        let catalog = ArtifactCatalogExtra(id);
+        params.txn_extra = Some(&catalog);
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("artifact index rejection");
+        assert!(format!("{error:#}").contains("artifact index rejected"));
+        assert_eq!(test_table_row_count(&conn, "object_index").await, 0);
+        assert_eq!(test_table_row_count(&conn, "agent_checkpoint").await, 0);
+        assert!(
+            manager
+                .resolve_history_head()
+                .await
+                .expect("head")
+                .is_none()
+        );
+        let transcript_oid = git_object_hash("blob", plain.as_ref());
+        let transcript =
+            read_git_object(&manager.repo_path, &transcript_oid).expect("plain transcript object");
+        assert!(
+            !transcript
+                .windows(cipher.len())
+                .any(|window| window == cipher)
+        );
+        assert_eq!(transcript, b"safe transcript");
+    }
+
+    /// RG-06 AC 8: the manifest's content_hash.coverage equals the writer
+    /// constant (four plain roles, never the reasoning artifact role).
+    #[test]
+    fn content_hash_coverage_matches_constant() {
+        assert_eq!(
+            CHECKPOINT_CONTENT_HASH_COVERAGE.to_vec(),
+            vec![
+                "metadata",
+                "lifecycle_events",
+                "transcript",
+                "redaction_report"
+            ],
+            "the writer constant is the four-role coverage set"
+        );
     }
 }

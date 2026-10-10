@@ -6,6 +6,15 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
+use git_internal::{
+    hash::ObjectHash,
+    internal::object::{
+        ObjectTrait,
+        commit::Commit,
+        signature::{Signature, SignatureType},
+        tree::{Tree, TreeItem, TreeItemMode},
+    },
+};
 use libra::{
     internal::{
         ai::{
@@ -17,9 +26,14 @@ use libra::{
         },
         branch::TRACES_BRANCH,
     },
-    utils::client_storage::ClientStorage,
+    utils::{
+        client_storage::ClientStorage,
+        object::{read_git_object, write_git_object},
+    },
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, Value};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::{init_repo_via_cli, run_libra_command};
 
@@ -266,4 +280,362 @@ async fn allow_raw_without_raw_is_redacted_no_audit() {
         audit_rows(repo.path()).await.is_empty(),
         "--allow-raw without --raw takes the redacted path and writes no audit"
     );
+}
+
+const ARTIFACT_CANARY: &[u8] = br#"opaque-signature-keep-\\u0041-byte-exact"#;
+
+fn load_fixture_tree(storage: &Path, oid: ObjectHash) -> Vec<TreeItem> {
+    Tree::from_bytes(
+        &read_git_object(storage, &oid).expect("read fixture tree"),
+        oid,
+    )
+    .expect("parse fixture tree")
+    .tree_items
+}
+
+fn write_fixture_tree(storage: &Path, mut items: Vec<TreeItem>) -> ObjectHash {
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    let tree = Tree::from_tree_items(items).expect("build fixture tree");
+    write_git_object(
+        storage,
+        "tree",
+        &tree.to_data().expect("encode fixture tree"),
+    )
+    .expect("write fixture tree")
+}
+
+fn artifact_object_path(repo: &Path, oid: &str) -> std::path::PathBuf {
+    repo.join(".libra/objects").join(&oid[..2]).join(&oid[2..])
+}
+
+async fn seed_temporary_gc_checkpoint(repo: &Path) -> (String, ObjectHash) {
+    let conn = connect_repo_db(repo).await;
+    let storage = repo.join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(storage.join("objects"))),
+        storage,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let marker = TracesInflightMarker::new("sess-x", &id, chrono::Utc::now().timestamp_millis());
+    write_traces_inflight_marker(&conn, &marker)
+        .await
+        .expect("register temporary GC checkpoint");
+    let redactor = Redactor::new_default();
+    let metadata = serde_json::to_vec(&json!({
+        "checkpoint_id": id, "session_id": "sess-x", "agent_kind": "claude_code",
+        "scope": "temporary", "created_at": 100,
+    }))
+    .expect("temporary GC metadata");
+    let (metadata, _) = redactor.redact(&metadata);
+    let (transcript, _) = redactor.redact(b"temporary checkpoint GC control");
+    let (events, _) = redactor.redact(b"{}\n");
+    let (report, _) = redactor.redact(b"{}");
+    let written = history
+        .append_checkpoint_commit(CheckpointCommitParams {
+            checkpoint_id: &id,
+            session_id: "sess-x",
+            marker_generation: marker.generation.as_deref().expect("temporary generation"),
+            capture_scope: None,
+            agent_kind: "claude_code",
+            parent_commit: None,
+            scope: CheckpointScope::Temporary,
+            tool_use_id: None,
+            metadata_json: &metadata,
+            transcript_redacted: &transcript,
+            lifecycle_events_jsonl: &events,
+            redaction_report_json: &report,
+            txn_extra: None,
+            deadline: None,
+            reasoning_artifacts: &[],
+        })
+        .await
+        .expect("append temporary GC checkpoint");
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid, traces_commit, created_at) VALUES (?, 'sess-x', 'temporary', ?, ?, ?, 100)",
+        [id.clone().into(), written.tree_oid.to_string().into(), written.metadata_blob_oid.to_string().into(), written.commit_hash.to_string().into()],
+    ))
+    .await
+    .expect("catalog temporary GC checkpoint");
+    clear_traces_inflight_marker_if_generation(&conn, "sess-x", &id, &written.marker_generation)
+        .await
+        .expect("retire temporary GC marker");
+    assert!(
+        ClientStorage::wait_for_background_tasks_until(
+            std::time::Instant::now() + Duration::from_secs(10)
+        )
+        .await,
+        "temporary GC fixture indexing must settle"
+    );
+    conn.close().await.expect("close temporary GC database");
+    (id, written.commit_hash)
+}
+
+/// Exercise both quarantine scans in an isolated fixture without waiting an
+/// hour. Only the fixture object mtimes and derivable candidate clock change.
+fn run_two_gc_scans(repo: &Path) {
+    for entry in walkdir::WalkDir::new(repo.join(".libra/objects")) {
+        let entry = entry.expect("enumerate fixture objects");
+        if entry.file_type().is_file() {
+            std::fs::File::open(entry.path())
+                .expect("open fixture object")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+                .expect("age fixture object");
+        }
+    }
+    let args = ["maintenance", "run", "--task", "gc"];
+    let first = run_libra_command(&args, repo);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let ledger_path = repo.join(".libra/gc-prune-candidates.json");
+    let mut ledger: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&ledger_path).expect("first GC created candidate ledger"),
+    )
+    .expect("candidate ledger");
+    for first_seen in ledger.as_object_mut().expect("candidate map").values_mut() {
+        *first_seen = json!(1);
+    }
+    std::fs::write(
+        &ledger_path,
+        serde_json::to_vec(&ledger).expect("encode aged ledger"),
+    )
+    .expect("age quarantine candidates");
+    let second = run_libra_command(&args, repo);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[tokio::test]
+async fn agent_clean_gc_keeps_reachable_reasoning_artifact() {
+    let repo = tempfile::tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    let (id, sha, artifact_oid) = seed_reasoning_artifact(repo.path()).await;
+    let (temporary_id, previous_head) = seed_temporary_gc_checkpoint(repo.path()).await;
+    let orphan = write_git_object(
+        &repo.path().join(".libra"),
+        "blob",
+        b"unreachable GC control",
+    )
+    .expect("seed unreachable GC control");
+    run_two_gc_scans(repo.path());
+    assert!(
+        !artifact_object_path(repo.path(), &orphan.to_string()).exists(),
+        "GC must collect the control object"
+    );
+    assert!(
+        artifact_object_path(repo.path(), &artifact_oid.to_string()).exists(),
+        "reachable artifact survives real GC"
+    );
+    let out = run_libra_command(&["agent", "clean", "--gc"], repo.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let post_prune_orphan = write_git_object(
+        &repo.path().join(".libra"),
+        "blob",
+        b"post-retention unreachable GC control",
+    )
+    .expect("seed post-retention GC control");
+    run_two_gc_scans(repo.path());
+    assert!(
+        !artifact_object_path(repo.path(), &post_prune_orphan.to_string()).exists(),
+        "real GC after retention rewrite must collect its control object"
+    );
+    // RG-06 precedes RG-03's authorized export option. Read the actual
+    // surviving checkpoint manifest so this GC gate verifies its own
+    // reachability contract without requiring a later card's reader API.
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        conn.query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
+            [temporary_id.into()],
+        ))
+        .await
+        .expect("temporary checkpoint removal")
+        .is_none(),
+        "clean must actually prune the temporary checkpoint"
+    );
+    let ref_row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT \"commit\" FROM reference WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
+            [TRACES_BRANCH.into()],
+        ))
+        .await
+        .expect("post-retention traces reference")
+        .expect("traces reference survives");
+    assert_ne!(
+        ref_row
+            .try_get_by::<String, _>("commit")
+            .expect("rewritten traces head"),
+        previous_head.to_string(),
+        "clean must actually rewrite traces before post-retention object GC"
+    );
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = ?",
+            [id.clone().into()],
+        ))
+        .await
+        .expect("post-GC checkpoint tree")
+        .expect("checkpoint survives GC");
+    let root_oid: ObjectHash = row
+        .try_get_by::<String, _>("tree_oid")
+        .expect("post-GC tree oid")
+        .parse()
+        .expect("valid post-GC tree oid");
+    let storage = repo.path().join(".libra");
+    let mut tree = load_fixture_tree(&storage, root_oid);
+    for name in ["checkpoint", &id[..2], &id[2..]] {
+        let subtree = tree
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("post-GC checkpoint subtree")
+            .id;
+        tree = load_fixture_tree(&storage, subtree);
+    }
+    let manifest_oid = tree
+        .iter()
+        .find(|entry| entry.name == "manifest.json")
+        .expect("post-GC checkpoint manifest")
+        .id;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &read_git_object(&storage, &manifest_oid).expect("post-GC manifest bytes"),
+    )
+    .expect("post-GC manifest JSON");
+    let artifact = &manifest["reasoning_artifacts"][0];
+    assert_eq!(artifact["sha256"], sha);
+    assert_eq!(artifact["oid"], artifact_oid.to_string());
+    let declared_oid: ObjectHash = artifact["oid"]
+        .as_str()
+        .expect("manifest artifact oid")
+        .parse()
+        .expect("valid manifest artifact oid");
+    assert_eq!(
+        read_git_object(&storage, &declared_oid).expect("artifact survives GC"),
+        ARTIFACT_CANARY
+    );
+    conn.close().await.expect("close post-GC database");
+}
+
+async fn seed_reasoning_artifact(repo: &Path) -> (String, String, ObjectHash) {
+    let id = seed_checkpoint_with_secret(repo).await;
+    let storage = repo.join(".libra");
+    let conn = connect_repo_db(repo).await;
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = ?",
+            [id.clone().into()],
+        ))
+        .await
+        .expect("checkpoint tree")
+        .expect("checkpoint row");
+    let root_oid: ObjectHash = row
+        .try_get_by::<String, _>("tree_oid")
+        .expect("tree oid")
+        .parse()
+        .expect("parse tree oid");
+    let mut root = load_fixture_tree(&storage, root_oid);
+    let checkpoint_entry = root
+        .iter_mut()
+        .find(|item| item.name == "checkpoint")
+        .expect("checkpoint subtree");
+    let mut checkpoints = load_fixture_tree(&storage, checkpoint_entry.id);
+    let prefix_entry = checkpoints
+        .iter_mut()
+        .find(|item| item.name == id[..2])
+        .expect("prefix subtree");
+    let mut prefix = load_fixture_tree(&storage, prefix_entry.id);
+    let inner_entry = prefix
+        .iter_mut()
+        .find(|item| item.name == id[2..])
+        .expect("checkpoint leaf");
+    let mut inner = load_fixture_tree(&storage, inner_entry.id);
+    let sha = format!("{:x}", Sha256::digest(ARTIFACT_CANARY));
+    let oid =
+        write_git_object(&storage, "blob", ARTIFACT_CANARY).expect("write synthetic ciphertext");
+    let leaf = TreeItem::new(TreeItemMode::Blob, oid, sha.clone());
+    let encrypted = write_fixture_tree(&storage, vec![leaf]);
+    let reasoning = write_fixture_tree(
+        &storage,
+        vec![TreeItem::new(
+            TreeItemMode::Tree,
+            encrypted,
+            "encrypted".to_string(),
+        )],
+    );
+    inner.push(TreeItem::new(
+        TreeItemMode::Tree,
+        reasoning,
+        "reasoning".to_string(),
+    ));
+    let manifest_entry = inner
+        .iter_mut()
+        .find(|item| item.name == "manifest.json")
+        .expect("manifest");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &read_git_object(&storage, &manifest_entry.id).expect("manifest bytes"),
+    )
+    .expect("manifest JSON");
+    manifest["reasoning_artifacts"] = json!([{
+        "path": format!("reasoning/encrypted/{sha}"), "oid": oid.to_string(), "sha256": sha,
+        "locator": "claude_code:msg=0/part=0/metadata=signature", "provider": "claude_code",
+        "source_kind": "signature", "availability": "encrypted_unavailable", "decrypt_capability": "none", "byte_len": ARTIFACT_CANARY.len()
+    }]);
+    manifest_entry.id = write_git_object(
+        &storage,
+        "blob",
+        &serde_json::to_vec(&manifest).expect("encode artifact manifest"),
+    )
+    .expect("artifact manifest blob");
+    inner_entry.id = write_fixture_tree(&storage, inner);
+    prefix_entry.id = write_fixture_tree(&storage, prefix);
+    checkpoint_entry.id = write_fixture_tree(&storage, checkpoints);
+    let tree_oid = write_fixture_tree(&storage, root);
+    let signature = |kind| Signature::new(kind, "Libra".to_string(), "traces@libra".to_string());
+    let message = format!(
+        "traces: committed checkpoint {id}\n\nLibra-Session: sess-x\nLibra-Agent: claude_code\nLibra-Checkpoint-ID: {id}\nLibra-Scope: committed\n"
+    );
+    let commit = Commit::new(
+        signature(SignatureType::Author),
+        signature(SignatureType::Committer),
+        tree_oid,
+        vec![],
+        &message,
+    );
+    let commit_oid = write_git_object(
+        &storage,
+        "commit",
+        &commit.to_data().expect("encode artifact fixture commit"),
+    )
+    .expect("write artifact fixture commit");
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE agent_checkpoint SET tree_oid = ?, traces_commit = ?, created_at = ? WHERE checkpoint_id = ?",
+        [tree_oid.to_string().into(), commit_oid.to_string().into(), chrono::Utc::now().timestamp_millis().into(), id.clone().into()],
+    ))
+    .await
+    .expect("install reader fixture");
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE reference SET \"commit\" = ? WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
+        [commit_oid.to_string().into(), TRACES_BRANCH.into()],
+    ))
+    .await
+    .expect("make artifact ref-reachable");
+    conn.close().await.expect("close artifact fixture database");
+    (id, sha, oid)
 }

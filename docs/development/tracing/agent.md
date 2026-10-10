@@ -756,6 +756,7 @@ checkpoint/<checkpoint_id[0..2]>/<checkpoint_id[2..]>/
     <agent_kind>.jsonl
   redaction_report.json
   content_hash.txt
+  reasoning/encrypted/<sha256>  (only when artifacts present)
 ```
 
 - `metadata.json`：checkpoint-level 摘要，包含 `schema_version`、`checkpoint_id`、`session_id`、`agent_kind`、`provider_session_id`、`scope`、`working_dir`、`parent_commit`、`created_at`、`model`、`token_usage`、`files_touched`、`partial`、`redaction_report_oid`、`events_oid`、`transcript_oid`、`content_hash`。
@@ -958,6 +959,7 @@ provider hook/RPC stdin
     transcript/<agent_kind>.jsonl
     redaction_report.json
     content_hash.txt
+    reasoning/encrypted/<sha256>  (only when artifacts present)
   ```
 
 - `metadata.json`：checkpoint-level 摘要；**不**复制 entire per-session `CommittedMetadata` 全字段。
@@ -2479,3 +2481,9 @@ byte_len/locator/provider/source_kind/availability/decrypt_capability），对�
 已有有效对象复用且不重写。
 
 RG-06 接入 artifact 树可达性；RG-03 接入受控读取和导出。
+
+RG-06 保证 artifact 与所属 checkpoint 同 attempt 原子写入：artifact blob 作为
+`reasoning/encrypted/<sha256>` 树条目，经 ref 可达，`agent clean --gc` 不会回收
+仍被 manifest oid 引用的 artifact；中断/ref CAS 失败不留悬空 object_index 或
+catalog 行，重试幂等。
+append_checkpoint_commit 初次写入非空 artifact checkpoint，以及相同 payload、未变 parent 的重试，其 author/committer 使用已封存 metadata.created_at 的 Unix 秒和固定 UTC；该时间表示 checkpoint 创建/历史边界时间，不是重试时钟或 native 来源证明。创建时间限于 0..=17179869183 Unix 秒（Git commit-graph 的 34 位时间范围），同时必须能由当前平台 usize 表示；缺失、重复、错型、负值或越界时间在任何对象写入前拒绝。同一 payload 与未变 parent 跨秒、重开数据库及新 writer generation 重试会复用原 commit OID；空 artifact 保留既有提交时间策略。retention 重写仍使用既有提交时间策略。lease、deadline 和 generation fence 仍使用各自原有授权时钟。
