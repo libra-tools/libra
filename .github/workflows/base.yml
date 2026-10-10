@@ -1,11 +1,13 @@
 on:
   pull_request:
+  push:
+    branches: [main]
 
 name: Check, Build and Test
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   format:
@@ -76,8 +78,9 @@ jobs:
 
 
   scoped-input-windows:
-    # FIX-RG-SCOPED-04: execute the four confined-input safety fixtures on
-    # Windows. Release Windows builds are not evidence of these tests.
+    # FIX-RG-SCOPED-04: execute the four active bounded/static-no-follow
+    # fixtures. Concurrent relocation proof is DEFER-RG-SCOPED-04, not PASS.
+    # Windows release builds are not evidence of these tests.
     name: compat-scoped-input-windows
     runs-on: windows-latest
     timeout-minutes: 60
@@ -85,12 +88,13 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      EXPECTED_EVENT_NAME: ${{ github.event_name }}
+      EXPECTED_EVENT_SHA: ${{ github.sha }}
       EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}
       EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      EXPECTED_MERGE_SHA: ${{ github.sha }}
     steps:
-      - name: Checkout the exact pull merge
+      - name: Checkout the exact event commit
         uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
@@ -103,7 +107,7 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Verify PR source and execute all four exact fixtures
+      - name: Verify event source and execute all four active exact fixtures
         shell: pwsh
         env:
           # Keep rustc lints denied. Also drop LNK4099: openssl-sys's static
@@ -113,35 +117,40 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
-          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PR_NUMBER) -or
-              $env:GITHUB_REF -ne "refs/pull/$($env:EXPECTED_PR_NUMBER)/merge") {
-            throw 'Scoped Windows tests require the actual pull merge ref'
-          }
           $actualHead = @(& git rev-parse HEAD)
           if ($LASTEXITCODE -ne 0 -or $actualHead.Count -ne 1 -or
-              $actualHead[0].Trim() -ne $env:EXPECTED_MERGE_SHA) {
-            throw 'Checked-out source does not match the event merge SHA'
+              $actualHead[0].Trim() -ne $env:EXPECTED_EVENT_SHA) {
+            throw 'Checked-out source does not match the event SHA'
           }
-          $parentLine = @(& git show -s --format=%P HEAD)
-          if ($LASTEXITCODE -ne 0 -or $parentLine.Count -ne 1) {
-            throw 'Cannot verify pull merge parents'
+          if ($env:EXPECTED_EVENT_NAME -eq 'push') {
+            if ($env:GITHUB_REF -ne 'refs/heads/main') {
+              throw 'Scoped Windows push tests require the actual main ref'
+            }
+            Write-Output "Scoped Windows source: main=$($env:EXPECTED_EVENT_SHA) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
+          } elseif ($env:EXPECTED_EVENT_NAME -eq 'pull_request') {
+            if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PR_NUMBER) -or
+                $env:GITHUB_REF -ne "refs/pull/$($env:EXPECTED_PR_NUMBER)/merge") {
+              throw 'Scoped Windows PR tests require the actual pull merge ref'
+            }
+            $parentLine = @(& git show -s --format=%P HEAD)
+            if ($LASTEXITCODE -ne 0 -or $parentLine.Count -ne 1) {
+              throw 'Cannot verify pull merge parents'
+            }
+            $parents = $parentLine[0].Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+            # The first parent is the base GitHub actually merged; the event
+            # base can lag it. The second parent must be the exact PR head.
+            if ($parents.Count -ne 2 -or $parents[1] -ne $env:EXPECTED_PR_HEAD_SHA) {
+              throw "Pull merge parents do not match the PR head. parents=$($parentLine[0].Trim()) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA)"
+            }
+            Write-Output "Scoped Windows source: merge=$($env:EXPECTED_EVENT_SHA) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA) mergeBase=$($parents[0]) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
+          } else {
+            throw 'Unsupported event for scoped Windows acceptance'
           }
-          $parents = $parentLine[0].Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
-          # The merge commit's second parent is the PR head. Its first parent is
-          # the base GitHub actually merged. pull_request.base.sha can lag that
-          # parent when main moves after the event payload is snapshotted.
-          if ($parents.Count -ne 2 -or $parents[1] -ne $env:EXPECTED_PR_HEAD_SHA) {
-            throw "Pull merge parents do not match the PR head. parents=$($parentLine[0].Trim()) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA)"
-          }
-          if ($parents[0] -ne $env:EXPECTED_BASE_SHA) {
-            Write-Output "Event base $($env:EXPECTED_BASE_SHA) lagged the merge base $($parents[0]); testing the merge GitHub built."
-          }
-          Write-Output "Scoped Windows source: merge=$($env:EXPECTED_MERGE_SHA) head=$($env:EXPECTED_PR_HEAD_SHA) eventBase=$($env:EXPECTED_BASE_SHA) mergeBase=$($parents[0]) workflow=$($env:GITHUB_WORKFLOW_SHA) run=$($env:GITHUB_RUN_ID) attempt=$($env:GITHUB_RUN_ATTEMPT)"
 
           $fixtures = @(
             'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_readonly_cleanup',
             'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_metadata_boundary',
-            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_preflight_budget',
+            'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_preflight_limits',
             'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_deadline_cancel_owner'
           )
           $listed = @(& cargo test --locked --lib -- --list --color never)
@@ -152,6 +161,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Listing ignored Windows fixtures failed'
           }
+          # Preserve the original combined relocation/budget regression, but do
+          # not execute it: the user moved relocation proof outside this plan.
+          $deferred = 'internal::ai::checkpoint_input::tests::fix_rg_scoped_04_preflight_budget'
+          $deferredPattern = '^' + [regex]::Escape($deferred) + ': test$'
+          if (@($listed | Where-Object { $_ -cmatch $deferredPattern }).Count -ne 1 -or
+              @($ignored | Where-Object { $_ -cmatch $deferredPattern }).Count -ne 1) {
+            throw 'Deferred relocation regression must remain present and ignored'
+          }
+          Write-Output "DEFER-RG-SCOPED-04: $deferred is retained and not executed; concurrent relocation is not qualified."
           foreach ($fixture in $fixtures) {
             $pattern = '^' + [regex]::Escape($fixture) + ': test$'
             $fixtureEntries = @($listed | Where-Object { $_ -cmatch $pattern })

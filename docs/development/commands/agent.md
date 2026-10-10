@@ -225,7 +225,11 @@ same identity count by simulating coverage removal in a rolled-back transaction.
 
 ## FIX-RG-SCOPED-04 confined checkpoint-input API
 
-`checkpoint_input.rs` owns `open_scoped_run_root`, `read_run_metadata`, and `cleanup_checkpoint_input`. The helper reads `state.json` and `manifest.json` as regular no-follow leaves (64 MiB each, 128 MiB together) and clears only `checkpoint-input` under a trusted absolute runs root. Budgets are 8192 entries, 4096 files, 4096 directories, depth 64, 4096 path bytes, and 8 MiB total path bytes. It does not decide run kind or terminal state. Windows execution is the `compat-scoped-input-windows` job; a Windows release build is not that evidence. Linux operator review of this helper stays UNRUN.
+`checkpoint_input.rs` owns `open_scoped_run_root`, `read_run_metadata`, and `cleanup_checkpoint_input`. The helper reads `state.json` and `manifest.json` as regular no-follow leaves (64 MiB each, 128 MiB together) and clears `checkpoint-input` under a trusted absolute runs root while the directory namespace remains stable. Budgets are 8192 entries, 4096 files, 4096 directories, depth 64, 4096 path bytes, and 8 MiB total path bytes. It does not decide run kind or terminal state.
+
+On Unix, held descriptors pin objects, not their current ancestry. The helper rechecks identities but cannot atomically bind those checks to chmod/unlink. A concurrent directory move in that last gap can affect an object after it leaves the trusted root; detecting the move afterward does not undo the effect. This unresolved guarantee and the complete ownership/exit protocol are outside this plan as `DEFER-RG-SCOPED-04`, by the user's 2026-10-10 decision. Callers must keep the namespace stable; the API does not enforce that precondition. This qualification also applies to scoped resume and store cleanup consumers.
+
+The original `fix_rg_scoped_04_preflight_budget` combined regression remains present and ignored/UNRUN. The active `fix_rg_scoped_04_preflight_limits` retains its size-boundary and detectable input-change assertions, without running the deferred relocation cases. Neither its PASS nor a default full-suite PASS qualifies concurrent relocation. Windows execution is the `compat-scoped-input-windows` job on the actual main push SHA or verified PR merge/head. Its four active fixtures must be present, nonignored and actually pass; the original deferred fixture must remain listed as ignored. A Windows release build is not that evidence. Linux operator review stays UNRUN.
 
 ## FIX-RG-SCOPED-02 scoped resume caller
 

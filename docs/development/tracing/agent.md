@@ -2428,7 +2428,9 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 
 ## FIX-RG-SCOPED-04 confined checkpoint-input API
 
-The scoped input helper pins a trusted runs-root handle and refuses symlink or reparse components while opening the run, `checkpoint-input`, and metadata leaves. Cleanup and metadata reads share one caller deadline and cancel check. Over-budget input is refused before permission changes or deletion. The helper returns typed errors and does not report removal when confinement cannot be proved.
+The scoped input helper pins a trusted runs-root handle and refuses symlink or reparse components while opening the run, `checkpoint-input`, and metadata leaves. Cleanup and metadata reads share one caller deadline and cancel check. Over-budget input is refused before permission changes or deletion. Detected identity changes return typed errors. On Unix, the final ancestry check and chmod/unlink are separate operations: a concurrent directory move can produce an outside effect before a later check reports the change. The API does not enforce a stable namespace or prove all writers have exited. That unresolved guarantee, its ownership protocol and reparent regressions are `DEFER-RG-SCOPED-04`, moved outside this plan by the user's 2026-10-10 decision; callers and final publication inherit this limitation.
+
+The original combined `fix_rg_scoped_04_preflight_budget` fixture and its assertions remain ignored/UNRUN. Four active gates cover readonly cleanup, metadata boundaries, `fix_rg_scoped_04_preflight_limits`, and deadline/cancel owner completion. Limits retains every original budget assertion without invoking the deferred reparent cases. The Windows CI job checks all four active names as nonignored and the deferred original as ignored, then executes the four active gates against the actual main push SHA or verified PR merge/head. Default full-suite results retain the explicit ignored legacy gate; they do not qualify concurrent relocation. Windows readonly NTFS positive cases and static link/reparse checks remain mandatory; Linux operator acceptance stays UNRUN.
 
 ## FIX-RG-SCOPED-02 scoped resume caller
 
