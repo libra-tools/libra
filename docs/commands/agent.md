@@ -86,12 +86,46 @@ and a declared role must be `user`. Neither `message` nor `user_prompt` fills a
 missing prompt. The deprecated `session.idle` alias remains accepted, with a
 content-free `legacy_event_alias` tracing warning.
 
-The current managed plugin still forwards the legacy event set. Refresh it with
-`libra agent enable --agent opencode` to supply an explicit empty prompt on every legacy user message. Older unrefreshed plugins that omit prompt
-are rejected until refreshed. Full current-event subscription, prompt
-pairing, and Node/Bun transport are the subsequent OG-02 change; this parser
-update alone does not prove live OpenCode capture. `opencode --pure` disables
-external plugins and therefore hook capture.
+The managed plugin uses the OpenCode 2.0.26 `setup(ctx)` API, a
+location-scoped event subscription and an observe-only tool hook. Refresh it
+with `libra agent enable --agent opencode`: status reports old or edited
+templates, and duplicate managed copies, as not installed until refreshed.
+Node and Bun use the same `node:child_process` transport with the pinned
+absolute Libra filename and `shell:false`. Session/turn boundaries run
+synchronously; tool and compaction observations run asynchronously and never
+change host arguments or return context/control output.
+
+User inbox enqueue/delivery pairs open one turn per classified inbox ID within
+the bounded live history window. Frames also carry a stable `message_id` for
+Libra’s existing bounded receipt ledger; this is not an unlimited historical
+replay guarantee. Legacy
+user messages pair with their first text part, or send an explicit empty string
+before the next unrelated event or cleanup. Assistant step events supply the
+model. Buffers are bounded: 64 tracked sessions process-wide, 128 pending prompts, 128 early
+text parts, 256 classified inbox/message IDs and 16 observation children;
+prompts are limited to 16,384 UTF-16 units without a split surrogate. Capacity
+or unavailable text produces a fixed, content-free diagnostic at most once per
+reason per plugin instance; truncated
+prompts carry `prompt_truncated=true`. ID history is a rolling 256-entry window and is pruned when a session ends;
+new prompts keep flowing after the window fills. When the session window fills,
+the least recently observed session is flushed with `server.instance.disposed`
+and the new session is admitted. A later observation can reopen an evicted
+session; this closes Libra tracking only and does not delete or stop the OpenCode
+session. Early text also uses a rolling window.
+
+Cleanup and process exit flush all tracked sessions using one shared deadline
+per cleanup or process exit, respectively. Forwarding is best effort and fails
+open for the OpenCode host. Nonzero child exit or timeout emits only a fixed
+`forward_failed` / `forward_timeout` diagnostic, at most once per reason per plugin instance. Each child has the current export deadline plus
+15 seconds (currently 18 seconds), with `SIGKILL` at timeout. Install checks both
+plugin layouts, rejects symlinks and special files before reading, preserves
+user-owned files and rolls back its canonical update if managed duplicate
+removal fails. These checks assume stable directory names; concurrent directory
+relocation and edits after the final ownership check remain deferred.
+`opencode --pure` / `OPENCODE_PURE=1` disables all external plugins and hook
+capture. Local Node/Bun tests use synthetic events and a controlled exporter;
+real OpenCode content capture and native reasoning proof require their separate
+acceptance gates.
 
 ## Subcommands
 

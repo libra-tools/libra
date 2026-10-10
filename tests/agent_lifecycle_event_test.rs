@@ -5014,3 +5014,257 @@ async fn opencode_legacy_alias_transition_forwarded() {
         assert_eq!(checkpoints[0]["scope"], "committed");
     }
 }
+
+// OG-02 uses only this target's private harness; the frozen dispatcher/oracle
+// helpers above remain unchanged. This is a real local child-process test,
+// with a controlled exporter and synthetic events, not a live model proof.
+fn og02_run_lifecycle_plugin(hung: bool, exit: bool) -> (Vec<Value>, Duration, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let version = Command::new("node")
+        .args(["-e", "process.stdout.write(process.execPath)"])
+        .output()
+        .expect("Node required for macOS local acceptance");
+    assert!(version.status.success());
+    let interpreter = String::from_utf8(version.stdout).unwrap();
+    let repo = HookRepo::init();
+    let enable = repo.run(&["agent", "enable", "--agent", "opencode"], None);
+    assert!(enable.status.success(), "{}", describe(&enable));
+    let fake = repo.repo.join("controlled-exporter.mjs");
+    let log = repo.repo.join("frames.jsonl");
+    let pid_file = repo.repo.join("hung.pid");
+    let fake_source = format!(
+        r#"#!{interpreter}
+import {{ readFileSync, appendFileSync, writeFileSync }} from 'node:fs';
+const frame=JSON.parse(readFileSync(0,'utf8'));
+appendFileSync(process.env.LIBRA_TEST_FORWARD_LOG,JSON.stringify(frame)+'\n');
+if ({hung} && process.argv[5]==='stop') {{
+ writeFileSync(process.env.LIBRA_TEST_HUNG_PID,String(process.pid));
+ process.on('SIGTERM',()=>{{}});
+ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);
+}}
+if(!{hung} && process.argv[5]==='session-start') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,150);
+"#
+    );
+    std::fs::write(&fake, fake_source).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source =
+        std::fs::read_to_string(repo.repo.join(".opencode/plugin/libra-hooks.js")).unwrap();
+    let old = format!(
+        "const LIBRA_COMMAND = {};",
+        serde_json::to_string(&std::fs::canonicalize(env!("CARGO_BIN_EXE_libra")).unwrap())
+            .unwrap()
+    );
+    let new = format!(
+        "const LIBRA_COMMAND = {};",
+        serde_json::to_string(&fake).unwrap()
+    );
+    assert_eq!(source.matches(&old).count(), 1);
+    std::fs::write(repo.repo.join("plugin.mjs"), source.replacen(&old, &new, 1)).unwrap();
+    let end = if exit {
+        "process.exit(0);"
+    } else {
+        "await cleanup();"
+    };
+    let runner = format!(
+        r#"
+import plugin from './plugin.mjs';
+let finish;const finished=new Promise(resolve=>{{finish=resolve;}});
+const cleanup=await plugin.setup({{
+ location:{{directory:{cwd}}},tool:{{hook:async()=>({{dispose:async()=>{{}}}})}},
+ event:{{subscribe:()=> (async function*(){{ try{{
+ yield {{type:'session.created',data:{{sessionID:'synthetic-budget'}}}};
+ {terminal}
+ }}finally{{finish();}} }})()}}
+}});
+await finished; {end}
+"#,
+        cwd = serde_json::to_string(&repo.repo).unwrap(),
+        terminal = if hung {
+            "yield {type:'session.execution.succeeded',data:{sessionID:'synthetic-budget'}};"
+        } else {
+            ""
+        }
+    );
+    std::fs::write(repo.repo.join("runner.mjs"), runner).unwrap();
+    let start = Instant::now();
+    let out = Command::new(interpreter)
+        .arg("--no-warnings")
+        .arg(repo.repo.join("runner.mjs"))
+        .current_dir(&repo.repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &repo.home)
+        .env("LIBRA_TEST_FORWARD_LOG", &log)
+        .env("LIBRA_TEST_HUNG_PID", &pid_file)
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(out.stdout.is_empty(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        if hung {
+            "libra opencode: forward_timeout\n"
+        } else {
+            ""
+        }
+    );
+    if hung {
+        let pid = std::fs::read_to_string(pid_file)
+            .expect("hung stop child actually executed")
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "hung child still exists after SIGKILL timeout"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    let frames = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    println!(
+        "[executed] OG-02 production timeout/exit runtime: hung={hung}, exit={exit}, elapsed={elapsed:?}"
+    );
+    (frames, elapsed, source)
+}
+
+#[test]
+fn opencode_plugin_sync_forward_within_deadline_budget() {
+    let (frames, elapsed, source) = og02_run_lifecycle_plugin(false, false);
+    assert_eq!(frames.len(), 2);
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "local metadata budget {elapsed:?}"
+    );
+    let ms = libra::internal::ai::observed_agents::opencode_export::EXPORT_DEADLINE.as_millis();
+    assert!(source.contains(&format!("const EXPORT_DEADLINE_MS = {ms};")));
+    assert!(source.contains("const FORWARD_TIMEOUT_MS = EXPORT_DEADLINE_MS + 15000;"));
+}
+#[test]
+fn opencode_spawn_sync_timeout_kills_hung_gate() {
+    let (frames, elapsed, _) = og02_run_lifecycle_plugin(true, false);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[1]["hook_event_name"], "session.execution.succeeded");
+    let timeout = libra::internal::ai::observed_agents::opencode_export::EXPORT_DEADLINE
+        + Duration::from_secs(15);
+    assert!(
+        elapsed >= timeout,
+        "hung gate did not exercise the production timeout"
+    );
+    assert!(
+        elapsed < timeout + Duration::from_secs(4),
+        "hung gate not bounded: {elapsed:?}"
+    );
+}
+#[test]
+fn exit_flush_orders_after_sync_session_start() {
+    let (frames, elapsed, _) = og02_run_lifecycle_plugin(false, true);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0]["hook_event_name"], "session.created");
+    assert_eq!(frames[1]["hook_event_name"], "server.instance.disposed");
+    assert_eq!(frames[0]["session_id"], frames[1]["session_id"]);
+    assert!(elapsed < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn opencode_produced_frames_reach_real_ingress_and_survive_history_rollover() {
+    let repo = HookRepo::init();
+    let installed = repo.run(&["agent", "enable", "--agent", "opencode"], None);
+    assert!(installed.status.success(), "{}", describe(&installed));
+    // The installed real binary literal remains byte-identical: no fake exporter.
+    let plugin =
+        std::fs::read_to_string(repo.repo.join(".opencode/plugin/libra-hooks.js")).unwrap();
+    std::fs::write(repo.repo.join("plugin.mjs"), &plugin).unwrap();
+    let runner = format!(
+        r#"
+import plugin from './plugin.mjs';
+let finish;const finished=new Promise(resolve=>{{finish=resolve;}});let tool;
+const id='synthetic-real-ingress';
+const cleanup=await plugin.setup({{
+ location:{{directory:{cwd}}},
+ tool:{{hook:async(_name,callback)=>{{tool=callback;return {{dispose:async()=>{{}}}};}}}},
+ event:{{subscribe:()=> (async function*(){{try{{
+ yield {{type:'session.created',data:{{sessionID:id}}}};
+ yield {{type:'session.step.started',data:{{sessionID:id,model:{{id:'synthetic-model'}}}}}};
+ for(let i=0;i<260;i++){{
+  const inboxID='synthetic-u-'+i;
+  yield {{type:'session.inbox.enqueued',data:{{sessionID:id,inboxID,item:{{type:'user',payload:{{text:i===259?'a'.repeat(16385):'Synthetic prompt '+i}}}}}}}};
+  yield {{type:'session.inbox.delivered',data:{{sessionID:id,inboxID}}}};
+ }}
+ // Duplicate inside the bounded live history never opens another turn.
+ yield {{type:'session.inbox.delivered',data:{{sessionID:id,inboxID:'synthetic-u-259'}}}};
+ yield {{type:'message.updated',data:{{info:{{sessionID:id,id:'synthetic-legacy',role:'user'}}}}}};
+ yield {{type:'message.part.updated',data:{{part:{{sessionID:id,messageID:'synthetic-legacy',type:'text',text:'Synthetic legacy'}}}}}};
+ yield {{type:'session.execution.interrupted',data:{{sessionID:id,reason:'user'}}}};
+ yield {{type:'session.execution.succeeded',data:{{sessionID:id}}}};
+ }}finally{{finish();}} }})()}}
+}});
+await finished;
+tool({{sessionID:id,tool:'synthetic-tool',id:'synthetic-call',input:{{private:'PRIVATE-UNOBSERVED'}},status:'completed',result:{{private:'PRIVATE-UNOBSERVED'}}}});
+await new Promise(resolve=>setTimeout(resolve,250));
+await cleanup();
+"#,
+        cwd = serde_json::to_string(&repo.repo).unwrap()
+    );
+    std::fs::write(repo.repo.join("real-ingress.mjs"), runner).unwrap();
+    let node = Command::new("node")
+        .args(["-e", "process.stdout.write(process.execPath)"])
+        .output()
+        .expect("Node required for producer ingress");
+    assert!(node.status.success());
+    let out = Command::new(String::from_utf8(node.stdout).unwrap())
+        .arg("--no-warnings")
+        .arg(repo.repo.join("real-ingress.mjs"))
+        .current_dir(&repo.repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &repo.home)
+        .env("LIBRA_TEST_HOME", &repo.home)
+        .output()
+        .expect("Node required for producer-to-real-ingress gate");
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(out.stdout.is_empty(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "libra opencode: prompt_truncated\n",
+        "real ingress must not emit forward_failed/forward_timeout"
+    );
+    let state = repo
+        .durable_session("opencode__synthetic-real-ingress")
+        .await;
+    assert_eq!(state.state, "stopped");
+    assert!(state.stopped_at.is_some());
+    // 1 start + 260 user inbox prompts + 1 legacy prompt + 2 terminal events +
+    // 1 tool observation + 1 session end. SessionEnd reserves then finalizes
+    // the deferred terminal, adding one more revision (catalog completion);
+    // no cliff after the 256-entry JS ring.
+    assert_eq!(
+        state.sync_revision, 267,
+        "all unique producer frames must reach the real catalog"
+    );
+    assert_eq!(state.working_dir, repo.repo.display().to_string());
+    let checkpoints = repo.checkpoints();
+    assert!(
+        !checkpoints.is_empty(),
+        "real stop/end ingress creates committed checkpoints"
+    );
+    assert!(checkpoints.iter().all(|c| c["scope"] == "committed"));
+    let receipts = state.metadata["capture_catalog_receipts_v1"]["entries"]
+        .as_array()
+        .expect("stable message IDs reach the existing bounded receipt ledger");
+    assert_eq!(
+        receipts.len(),
+        128,
+        "existing catalog receipt ring remains bounded"
+    );
+    println!(
+        "[executed] OG-02 unchanged installed module -> real Libra ingress, 260 prompts, model/reason/truncation/tool fields and durable stopped/checkpoints"
+    );
+}

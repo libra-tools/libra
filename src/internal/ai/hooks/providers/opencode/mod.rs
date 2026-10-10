@@ -1,8 +1,8 @@
 //! OpenCode hook provider and audited 2.0.26 event registry.
 //!
 //! Parsing and recognition consume the same OpenCode-only registry. The
-//! currently rendered managed plugin still uses the legacy API/event set;
-//! OG-02 owns its current subscription and Node/Bun transport update. The
+//! managed plugin uses the current subscription API and Node/Bun transport,
+//! retaining bounded legacy input compatibility. The
 //! six existing lifecycle verbs and install/status interfaces are unchanged.
 
 pub mod events;

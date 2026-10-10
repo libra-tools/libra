@@ -795,3 +795,21 @@ OG-01 AC8/8、VER15/15：focused89/89、真实Node模板marker1/1、fmt/strict/s
 ### 2026-10-10：OG-01 signed-DCO main源码交付完成，进入OG02
 
 实际main source 2bcea258e4ac8e559d172fc53ccd528be81a7545，parent befaa45，17 owned路径PGP header/DCO一次、committed blobs17/17 MATCH、ordinary push exit0/远端main一致。focused89/89、producerNode1/1、fmt/strict/site0、full9645/9645与Claude single PASS覆盖同冻结实现；full1flaky/3leaky/9skip如实保留。基础组13成员local交付2/13=15.38%，正式4/61=6.56%（C/D仍FAST-OG01）。下一OG02双运行时插件，接续FOLLOWUP-OG02-STALE01；无真实native/Bun/Linux证明提前放行。plan05原bytes保留、backend cf只本地event段增量保留未deploy；本轮无版本发布。
+
+### 2026-10-10：OG-02 current-main 开工
+
+基线main28aef04/GitHub ref MATCH、OG-01 signed Deliverables2bcea258已Push；当前OG-02 in-progress/空，原2.0.24私有AC/VER不复用。单writer保持plan05原hash；DEP-OG-01/03/08按当前clean+MG complete ready。Node/Bun新API插件、prompt配对、deadline/退出清理、完整模板陈旧status识别和安装路径门重验中；Claude单审/fmt/strict/本卡Push待。DEFER-OG-INSTALL-01记checks后reparent/末次快照后叶替换的对抗性并发归属证明，按用户策略移至本计划外，未证明不记PASS。正式4/61、基础local2/13不变；下张OG-03须OG-02最终local Deliverables。
+
+### 2026-10-10：OG-02 R1 PASS、基础补强重验中
+
+Claude单审R1字面PASS（0P0/0P1/2P2/7P3），两个基础P2前滚为滚动live ID窗口+稳定message_id和真实producer→Libra ingress门；不无限历史去重，catalog128receipt上限不改。25 VER（Linux1 UNRUN），新增Bun真实exit flush，简单P3同轴前滚；DEFER-OG-PORTABILITY-01仅非四平台其它目标。新harness PATH/括号/terminal revision断言实际失败留存并修，不改catalog/frozenoracle。补强后源码待Claude R2/实际focused/fmt/strict，OG02未localAccepted、未Push；正式4/61、基础local2/13维持。
+
+
+### 2026-10-11：OG-02 R2 PASS，容量窗口前滚
+
+Claude R2实际PASS/0P0/0P1/1P2/4P3；旧138/138与Bun sync/async timeout实际证明保留。64进程级跟踪改滚动收尾/新会话继续，early text滚动与结束后ID清理补门；27VER（Linux1UNRUN），28AC/唯一settings逻辑写集不变。当前新源验收与R3未闭合，不继承旧PASS。temp-link hygiene按DEFER-OG-TEMP-01延期；基础local2/13与正式4/61保持，下一仍OG03。
+
+
+### 2026-10-11 00:16 CST：OG-02当前门通过、source Push准备
+
+AC28/28、26/27VER实际适用通过（Linux1UNRUN），focused140/140/零重试零LEAK，Node/Bun真实运行、finalBun sync/async挂起PID终止、synthetic260prompt实际installed producer→真实ingress/catalog/stopped，fmt/严格Clippy/site均exit0。Claude R3字面PASS/0P0/0P1/0P2/4P3，原稿SHA859de99c297ff1f58cbc830c4b98f96e2d1dcfd00a8ccb52374457a6fa0bcadc。容量LRU/早到文本滚动已修；DEFER-OG-EVICTION01 pending/model恢复等非阻断残余及双转发预算具名记录，核心source/隐私/native准入不降。无全量/liveOpenCode/native/Linux证明误记。13owned路径待signedDCO/mainPush；plan05原bytes保留，backend仅owned插件段本地未部署，0.30.42无发布。正式4/61，签名交付前基础local2/13，下一OG03。

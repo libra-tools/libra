@@ -1,7 +1,7 @@
 //! Pinned OpenCode event taxonomy shared by parsing and plugin conformance.
 //!
-//! The OG-00 source record pins the native 2.0.26 `data` envelope. The OG-02 plugin consumer will
-//! lower that envelope to Libra's bounded hook frame before this registry is
+//! The OG-00 source record pins the native 2.0.26 `data` envelope. The plugin
+//! lowers that envelope to Libra's bounded hook frame before this registry is
 //! consulted. Legacy names remain separate from the current forwarding set.
 
 use crate::internal::ai::hooks::{LifecycleEventKind, ProviderHookCommand};
@@ -32,8 +32,8 @@ pub enum OpenCodePayloadPolicy {
     ExecutionInterrupted,
     ToolObservation,
     /// Required string prompt (empty allowed); an omitted role is accepted.
-    /// The current legacy forwarder always sends an empty prompt.
-    /// Text-part pairing belongs to OG-02; missing prompt is malformed.
+    /// Legacy text-part pairing supplies text or an explicit empty fallback;
+    /// a missing prompt is malformed.
     LegacyPrompt,
     NotForwarded,
 }

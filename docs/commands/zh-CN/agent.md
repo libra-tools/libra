@@ -63,11 +63,32 @@ enqueue 由插件内部合并，不作为独立 lifecycle 输入。
 role 只能为 `user`。`message` 和 `user_prompt` 不会填补缺失 prompt。独立弃用
 alias `session.idle` 仍接受，只记录不含内容的 `legacy_event_alias` tracing 警告。
 
-当前 managed plugin 仍转发旧事件集。执行 `libra agent enable --agent opencode`
-刷新插件，会对每个旧 user message 显式提供空 prompt；未刷新且省略 prompt
-的旧插件信封会被拒绝。完整新事件订阅、文本
-配对及 Node/Bun transport 由后续 OG-02 验收；本次 parser 更新不作为真实
-OpenCode 采集证明。`opencode --pure` 会关闭外部插件，从而关闭 hook 采集。
+managed plugin 使用 OpenCode 2.0.26 的 `setup(ctx)` API、location-scoped
+事件订阅和只观察的工具 hook。执行 `libra agent enable --agent opencode`
+刷新；旧模板、修改过的模板或双目录 managed 重复副本均不报告 installed=true。
+Node/Bun 共用 `node:child_process`，固定绝对二进制文件名、`shell:false`；
+session/turn 边界同步转发，tool/compaction 异步观察，不修改宿主参数或返回控制字段。
+
+user inbox enqueue/delivery 在有界 live 窗口内按 session/inbox ID 配对一次，并转发稳定 `message_id`
+供 Libra 既有的有界 receipt ledger 消费；这不是无限历史重放去重保证；旧 user message
+取首个 text part，没有文本时在下一无关事件或 cleanup 前显式发送空字符串。
+assistant step 跟踪 model。上限为进程级 64 个跟踪会话、128 个 pending prompt、
+128 个先到 text part、256 个已分类 ID、16 个异步子进程；prompt 最多 16,384
+个 UTF-16 单元且不拆 surrogate。容量耗尽或文本缺失只输出固定、不含内容的
+诊断，同一 reason 每插件实例最多一次；截断带 `prompt_truncated=true`。ID 历史为滚动 256 条窗口，session 结束后释放；窗口满后仍采集新的 prompt。会话窗口满时，
+以 `server.instance.disposed` 收尾最久未观察的会话，再接纳新会话；后续事件
+可重新打开被移出的跟踪。这仅结束 Libra 跟踪，不删除或停止 OpenCode 会话。
+early text 同样使用滚动窗口。
+
+cleanup 与 process exit 遍历所有跟踪会话，各使用一个共享总 deadline。
+转发失败不阻断 OpenCode 宿主；非零退出/超时只输出固定的
+`forward_failed` / `forward_timeout`，每个原因在每个插件实例中最多一次，不回显错误内容。每个子进程的上限为 export deadline + 15 秒
+（当前 18 秒），超时用 `SIGKILL`。installer 预检两个目录，读取前拒绝 symlink
+和特殊文件，保留用户文件；managed 重复副本删除失败时回滚本次 canonical
+更新。当前检查以目录命名空间稳定为前提，检查后目录移动及末次归属检查后的
+并发叶替换仍延后。`opencode --pure` / `OPENCODE_PURE=1` 关闭外部插件和
+hook 采集。Node/Bun 测试使用 synthetic 事件与受控 exporter；真实 OpenCode
+内容采集和 native reasoning 来源仍由各自验收门证明。
 
 ## 子命令
 

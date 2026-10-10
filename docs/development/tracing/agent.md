@@ -219,7 +219,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 ### OpenCode 安装流程契约（第一批必须满足）
 
-**状态（OG-01当前parser / AG-19历史installer）**：HookProvider已注册；当前事件registry使用OG-00审计的2.0.26 source/fixture。以下旧installer API/layout来自2026-07-05的1.17.13实测，完整新模板由OG-02更新验收；本卡只补旧message.updated合法空prompt，不能据此声称2.0.26真实插件已采集。
+**状态（OG-02 当前实现）**：HookProvider 已注册；registry/parser 与新插件使用 OG-00 审计的 2.0.26 API/source。Node/Bun actual runtime 的 synthetic exporter 门证明模板执行与转发，不独自证明真实 OpenCode 内容或 native 来源。
 
 1. **注册与状态输出**
 
@@ -229,16 +229,13 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
    `libra agent enable --agent opencode` / `add opencode`：解析 CLI slug → 映射 `AgentKind::OpenCode` → **经 registry adapter `as_hooks()` 取得 `HookProvider`（AG-19 已删除 provider-name 字符串桥）** → 构造 `ProviderInstallOptions`（二进制路径同 Claude Code 契约：`resolve_hook_binary_path` canonicalize 绝对路径，禁止裸 `libra` PATH 查找）→ 原子写 Libra-managed plugin 文件（临时文件 + rename）→ 重新读取验证。任一步失败 fail-closed，不得把 `installed` 标为 true。
 
-3. **安装配置目标形态（1.17.13 实测固定）**
+3. **安装配置目标形态（2.0.26 当前契约）**
 
-   实测结论：`<project>/.opencode/plugin/`（单数）、`.opencode/plugins/`（复数）与 `opencode.json` 的 `"plugin"` 数组条目**同时全部加载**（无优先级互斥）；plugin 为 JS/TS 模块，导出 `async ({ project, client, directory, worktree, serverUrl, $ }) => Hooks` 工厂（SDK typings：`@opencode-ai/plugin`）。加载失败按 plugin 粒度非致命，仅 `--print-logs` 可见；`--pure` / `OPENCODE_PURE=1` 关闭全部外部 plugin（安装文档必须注明该盲区）。
+   默认导出 `{ id, setup(ctx) }`，通过 `ctx.event.subscribe({signal})` 订阅本 location 的事件并注册 `ctx.tool.hook("execute.after", callback)`；返回 cleanup。插件只观察，不调用修改会话/提示/模型的方法。`--pure` / `OPENCODE_PURE=1` 关闭全部外部 plugin。
 
-   - **Libra 唯一写入目标**：`.opencode/plugin/libra-hooks.js`（上游 SDK 文档使用的规范目录），文件首行携带 Libra-managed 标记注释；install/uninstall 同时检测 `.opencode/plugins/` 下携带标记的重复受管文件并清理（双目录同载会导致事件双发）。不携带标记的用户文件在任何路径下都不触碰（同名用户文件导致 install 硬错误而非覆盖）。
-   - plugin 内 forward 命令以 canonicalize 绝对路径起始（`<binary> agent hooks opencode <verb>`），事件转发 best-effort、handler 全 try/catch 永不抛出。
+   Libra 唯一写入 `.opencode/plugin/libra-hooks.js`，首行 marker 保留 ownership，第二行 revision 和完整渲染内容用于 current status。`.opencode/plugins/` 仅检查/清理 managed 重复副本；不带 marker 的用户文件不删除、不覆盖。新模板不发送弃用的 `session.idle`；parser 仍接受其历史输入。非普通路径快速拒绝、读取/写入使用 no-follow、快照复核和整体原子更新；legacy cleanup 失败回滚 canonical 更新。对检查后 reparent/末次归属检查后叶替换的对抗性证明登记 DEFER-OG-INSTALL-01，不作本卡通过。
 
-   **旧managed模板事件映射（历史installer形态；不是当前parser全集）**：`session.created -> SessionStart`；`message.updated`（`properties.info.role == "user"`，plugin 侧过滤）`-> TurnStart`；`tool.execute.after -> ToolUse`；`session.idle -> TurnEnd`（**Libra 侧推断规则**：headless run 的可靠 turn 完成信号，非 OpenCode 官方 terminal event）；`session.deleted -> SessionEnd`；`session.compacted -> Compaction`。流式事件（`message.part.updated/delta`、`session.status/updated/diff` 等）一律不转发。
-
-### OpenCode event input contract
+   **OpenCode event input contract**
 
 The OpenCode parser targets the audited **2.0.26** vocabulary. Its current
 lifecycle inputs are `session.created`, user `session.inbox.delivered`,
@@ -258,12 +255,46 @@ and a declared role must be `user`. Neither `message` nor `user_prompt` fills a
 missing prompt. The deprecated `session.idle` alias remains accepted, with a
 content-free `legacy_event_alias` tracing warning.
 
-The current managed plugin still forwards the legacy event set. Refresh it with
-`libra agent enable --agent opencode` to supply an explicit empty prompt on every legacy user message. Older unrefreshed plugins that omit prompt
-are rejected until refreshed. Full current-event subscription, prompt
-pairing, and Node/Bun transport are the subsequent OG-02 change; this parser
-update alone does not prove live OpenCode capture. `opencode --pure` disables
-external plugins and therefore hook capture.
+The managed plugin uses the OpenCode 2.0.26 `setup(ctx)` API, a
+location-scoped event subscription and an observe-only tool hook. Refresh it
+with `libra agent enable --agent opencode`: status reports old or edited
+templates, and duplicate managed copies, as not installed until refreshed.
+Node and Bun use the same `node:child_process` transport with the pinned
+absolute Libra filename and `shell:false`. Session/turn boundaries run
+synchronously; tool and compaction observations run asynchronously and never
+change host arguments or return context/control output.
+
+User inbox enqueue/delivery pairs open one turn per classified inbox ID within
+the bounded live history window. Frames also carry a stable `message_id` for
+Libra’s existing bounded receipt ledger; this is not an unlimited historical
+replay guarantee. Legacy
+user messages pair with their first text part, or send an explicit empty string
+before the next unrelated event or cleanup. Assistant step events supply the
+model. Buffers are bounded: 64 tracked sessions process-wide, 128 pending prompts, 128 early
+text parts, 256 classified inbox/message IDs and 16 observation children;
+prompts are limited to 16,384 UTF-16 units without a split surrogate. Capacity
+or unavailable text produces a fixed, content-free diagnostic at most once per
+reason per plugin instance; truncated
+prompts carry `prompt_truncated=true`. ID history is a rolling 256-entry window and is pruned when a session ends;
+new prompts keep flowing after the window fills. When the session window fills,
+the least recently observed session is flushed with `server.instance.disposed`
+and the new session is admitted. A later observation can reopen an evicted
+session; this closes Libra tracking only and does not delete or stop the OpenCode
+session. Early text also uses a rolling window.
+
+Cleanup and process exit flush all tracked sessions using one shared deadline
+per cleanup or process exit, respectively. Forwarding is best effort and fails
+open for the OpenCode host. Nonzero child exit or timeout emits only a fixed
+`forward_failed` / `forward_timeout` diagnostic, at most once per reason per plugin instance. Each child has the current export deadline plus
+15 seconds (currently 18 seconds), with `SIGKILL` at timeout. Install checks both
+plugin layouts, rejects symlinks and special files before reading, preserves
+user-owned files and rolls back its canonical update if managed duplicate
+removal fails. These checks assume stable directory names; concurrent directory
+relocation and edits after the final ownership check remain deferred.
+`opencode --pure` / `OPENCODE_PURE=1` disables all external plugins and hook
+capture. Local Node/Bun tests use synthetic events and a controlled exporter;
+real OpenCode content capture and native reasoning proof require their separate
+acceptance gates.
 
 4. **停用与移除（已实现）**
 

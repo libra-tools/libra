@@ -855,3 +855,47 @@ fn opencode_docs_pin_current_parser_and_legacy_alias_policy() {
         assert_contains(AGENT_CMD_DOC_ZH, "commands/zh-CN/agent.md", required);
     }
 }
+
+#[test]
+fn opencode_docs_disclose_current_template_upgrade_and_bounds() {
+    for (label, doc) in [
+        ("tracing/agent.md", AGENT_DOC),
+        ("commands/agent.md", AGENT_CMD_DOC_EN),
+    ] {
+        for required in [
+            "setup(ctx)",
+            "node:child_process",
+            "shell:false",
+            "SIGKILL",
+            "not installed",
+            "16,384",
+            "256",
+            "concurrent directory",
+            "synthetic events",
+            "OPENCODE_PURE=1",
+        ] {
+            assert_contains(doc, label, required);
+        }
+        assert!(!doc.contains("The current managed plugin still forwards the legacy event set"));
+    }
+    for required in [
+        "setup(ctx)",
+        "node:child_process",
+        "shell:false",
+        "SIGKILL",
+        "16,384",
+        "256",
+        "目录命名空间稳定",
+        "synthetic",
+        "OPENCODE_PURE=1",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "commands/zh-CN/agent.md", required);
+    }
+    for required in [
+        "exact current rendered template",
+        "post-check relocation/leaf replacement remains deferred",
+        "synthetic runtime conformance",
+    ] {
+        assert_contains(COMPATIBILITY_DOC, "COMPATIBILITY.md", required);
+    }
+}
