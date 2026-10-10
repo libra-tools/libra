@@ -337,7 +337,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260916`](plan-20260916.md) | CAP-01 | Agent Capture wire types、URL、uid、transport trait | 无 | **双评审已 PASS**（Codex R3 / Claude R3） | DEP-CAP-01：monoengine `2b8f365` capture HTTP pin 重核（ER-CAP-02） | ⚠️ 需重核 DEP-CAP-01 |
 | [`plan-20260924`](plan-20260924.md) | ACF-01 | Agent Capture validated ingress contract | `DEP-ACF-01`（既有執行基線） | R91 字面 `VERDICT: PASS` | ACF-09 `Lifecycle=done`、`Acceptance=complete`；`DEP-ACF-MIRROR` 已交接 | ✅ **已收口**；ACF-01..20 与 FIX-ACF-01 `done`/`complete` |
 | [`plan-20260913`](plan-20260913.md) | FL-00 | 核实 Media 前提与热路径（audit，no-release） | 无 | 联合 review 已 PASS（U2 `VERDICT: PASS`） | DEP-FL-04：plan-20260907 **已完整收口** | ✅ 已 `done`/`complete`（FL-05 亦完成；本计划仅剩计划级收口门） |
-| [`plan-20260904`](plan-20260904.md) | CX-00 | codex-cli 0.152 基线探测与 ADR go/no-go | 无 | **未过**（R5 `FAIL`；Claude 亦未出 verdict） | CX-30 另受 DEP-CLI-mirror | ❌ 禁止开工 |
+| [`plan-20260904`](plan-20260904.md) | CX-00 | codex-cli 0.162.1 基线探测与 ADR go/no-go | 无 | **未过**（R5 `FAIL`；Claude 亦未出 verdict） | CX-30 另受 DEP-CLI-mirror | ❌ 禁止开工 |
 | [`plan-20260905`](plan-20260905.md) | CC-00 | Claude Code 2.1.259 Hook source 契约探测 | 无 | **未过**（须 Claude `PASS`） | 无 | ❌ 禁止开工 |
 | [`plan-20260906`](plan-20260906.md) | SC-01 / SC-02（可并发） | SC-01 `base.yml` 最小权限加固；SC-02 会话入口 id 守卫 | 无 | **未定稿**（R2 PASS 已作废；R22 `FAIL`） | SC-04 受 DEP-SC-01/04/05/06；SC-07 受 DEP-SC-07 | ❌ 禁止开工 |
 | [`plan-20260902`](plan-20260902.md) | OG-00 | opencode 2.0.22 Hook/export 契约探测 | 无 | Codex R72 字面 `VERDICT: PASS`（2026-10-03 16:54:47 UTC）。本轮没有新的 Claude 复审 | 无（Phase 1 与 RG 六卡解耦） | ❌ 禁止开工 |
@@ -643,6 +643,10 @@ https://libra.tools/en/docs/commands/config 返回 HTTP 200，`content-type: tex
 ### 2026-10-10 08:27:47 UTC：CX-00 因 Codex 版本漂移 blocked
 
 2026-10-10 08:27:47 UTC：`/Users/eli/.local/bin/codex --version` 打印 `codex-cli 0.160.0`。DEP-CX-01 要求 `codex-cli 0.152.0`。CX-00 改为 blocked / 空。未创建 `plan-20260904-cx00-probe.md`，未填 ADR go/no-go。0.160.0 只作为 pin 候选登记，不替换 0.152.0。同一时刻 `/Users/eli/.opencode/bin/opencode --version` 打印 `opencode v2.0.25`，不是计划 pin 2.0.24，因此 FIX-OG-CP-01 的当前 pin 门仍 UNRUN。未开始 RG-01、FIX-RG-SCOPED-03 或 FAST-RG-01。
+
+### 2026-10-10 08:33:48 UTC：Codex 基线 pin 改为 0.162.1
+
+2026-10-10 08:33:48 UTC：用户决定本计划使用本机 Codex。`/Users/eli/.local/bin/codex --version` 打印 `codex-cli 0.162.1`。`plan-20260904` 的 DEP-CX-01、ADR-CX-01、CX-00 和后续真实会话门改为 0.162.1。CX-00 从 blocked 回到 pending / 空。隔离 home 探测、证据文件和 go/no-go 仍 UNRUN。2026-09-03 的 0.152 普查和 08:27:47 UTC 的 0.160.0 观察保留为历史。未开始 RG-01。
 
 ### 2026-10-10 08:29:54 UTC：SCOPED-02 线上页面已含非 blob 句子
 
