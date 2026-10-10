@@ -841,3 +841,13 @@ DEFER-OG-EXTRACT-01：R3 marker否定例/宽松引号及空白parity、缺locati
 ### 2026-10-11：OG-03签名源码与main普通Push完成
 
 source9ad5fa486e47cc64835d27bc4c6b46bce18d6192、parent7b6ef27，14blob（13owned变更+bridge原样）postimage匹配，PGP header与DCO一次；普通Push exit0/实际GitHubmain同ref。原plan05未进本次tree delta，工作区SHAa705585dcb951a8d1452f87a607eefae1313d660b4c53c8d86ea75a024915b32保持，其他owned clean。最后实现仍为116聚焦、9688全量exit0、fmt/严格Clippy/site0与ClaudeR4 PASS证明源。3LEAK/9skip如实保留；synthetic不冒称liveMac/native/Linux。0.30.42无发布，FASTOG01阶段C/D待；基础4/13=30.77%、formal4/61=6.56%，下一OG09 current2.0.26正常化part/完整性。
+
+### 2026-10-11：OG-09 current-main重新开工
+
+OG03 signed source9ad5fa486与receipt0f4a6bdb已普通Push main；当前coverage只支持classic info/parts，旧native/三具名测试不存在，历史AC16/VER3不继承。OG09重置in-progress/空，当前pin2.0.26，Claude单审/main逐卡/阶段patch规则覆盖旧私有双审文案。DEP01/03/08逐文件无并发writer，可消费OG02/03最终local交付；无独立linked Issue，不新增远端Issue。仅OpenCode私有分支不因文件多provider触发T1，若实际共同SSOT变化则full；阶段及最终全量保留。正式4/61=6.56%，基础4/13=30.77%；Linux/native实证仍UNRUN，plan05保护。
+
+### 2026-10-11：OG-09 Claude单审与本地验收通过
+
+Claude R1实际PASS（0P0/0P1/1P2/5P3，31turn，SHA1e37d7eb236f565bf3727d9a50fee2bae1f5523e6a38126a6c43ed41a2e5f188）。125/125聚焦（32architecture+3原冻结oracle；零retry），fmt/严格all-target/all-feature Clippy、site typecheck/build均exit0；当前native human key/time、idle结束与保守Incomplete、tool text/error.message与附件不复制、classic九已知parts no projection完成。SourceA不降，无real export/model/native/Linux证明；当前树未跑full，原OG03全量不能继承为本卡full，阶段及最终full必须。10owned实际冻结稿，plan05原bytes保持；网站仅fresh preimage owned插入，无commit/deploy。signedDCO main Push待，基础4/13、正式4/61，下一OG11。
+
+- **DEFER-OG-NORMALIZER-01（本计划外外围口径/兼容补强）：** R1非阻断P2为shell command/output及synthetic/system模型可见text目前按已识别metadata排除，Complete只描述ordinary allowlist表示，并非完整模型上下文；是否扩展投影/改为Incomplete后续另行评估，不移入OG11、不冒称已证明全上下文。P3为classic reasoning现保守Incomplete的既有claim迁移说明、未来native ID漂移兼容、error缺type/agents错型等额外负例与更强具名turn断言、assistant级error无content仅user记录的口径。当前实际PASS可放行；native 来源要求、未支持附件/未知reasoning的Incomplete和最终full不变。R1 preflight vs frozen plan hash差异仅证据生成时序，修正root candidate receipt并保留旧版，不改已审源码。

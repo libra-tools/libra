@@ -929,3 +929,32 @@ fn opencode_docs_disclose_export_projection_and_provenance_limits() {
         "invalid/missing provenance or counters stays partial",
     );
 }
+
+#[test]
+fn opencode_docs_disclose_normalizer_completeness_and_attachment_limits() {
+    for (label, document) in [("tracing", AGENT_DOC), ("agent English", AGENT_CMD_DOC_EN)] {
+        for required in [
+            "Each human message starts its own stable logical turn",
+            "Complete describes captured representation, not task success",
+            "Unknown/malformed",
+            "they mark Incomplete without copying attachment bytes or URIs",
+            "error.message, never response.body",
+        ] {
+            assert_contains(document, label, required);
+        }
+    }
+    for required in [
+        "每条 human message",
+        "Complete 表示采集表示完整，不等于任务成功",
+        "idle 不会洗白",
+        "不向语义记录复制附件字节或 URI",
+        "不投影 response.body",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "agent Chinese", required);
+    }
+    assert_contains(
+        COMPATIBILITY_DOC,
+        "compatibility",
+        "Native error fallback projects error.message, never response.body",
+    );
+}

@@ -235,6 +235,21 @@ alias limits also mark partial; at the ID cap later messages are omitted.
 Extraction does not read files or archive reasoning content, and synthetic
 fixtures do not prove real macOS content capture or native reasoning origin.
 
+OpenCode coverage normalization accepts native 2.0.26 messages and classic
+`info/parts`. Each human message starts its own stable logical turn. A valid
+native `idle` settles all pending human splits, including failed/interrupted
+outcomes; Complete describes captured representation, not task success.
+Semantic messages after the last valid idle stay Incomplete. Unknown/malformed
+content and reasoning stay Incomplete and are never repaired by idle. The nine
+classic metadata parts (step-finish, patch, step-start, snapshot, retry,
+compaction, agent, subtask, file) are recognized without semantic projection.
+Native user attachments, skill text, and tool file results are unsupported:
+they mark Incomplete without copying attachment bytes or URIs into records.
+Valid agent/skill metadata, model/usage and provider state do not change the
+digest. Native tools use name/id/state.input and text state.content; an error
+without content projects only its structured error.message, never response.body.
+No reasoning bytes or provider state establish trusted native origin here.
+
 ### OpenCode 安装流程契约（第一批必须满足）
 
 **状态（OG-02 当前实现）**：HookProvider 已注册；registry/parser 与新插件使用 OG-00 审计的 2.0.26 API/source。Node/Bun actual runtime 的 synthetic exporter 门证明模板执行与转发，不独自证明真实 OpenCode 内容或 native 来源。

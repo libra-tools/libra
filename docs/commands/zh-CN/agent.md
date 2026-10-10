@@ -103,6 +103,18 @@ assistant 聚合用量优先，没有聚合时才累计去重的 step-finish 明
 ID 容量耗尽后不再消费后续消息。本提取不读取文件、不归档 reasoning 正文；合成 fixture
 不能证明真实 macOS 内容采集或 native reasoning 来源。
 
+OpenCode coverage normalizer 接受 2.0.26 原生 messages 与旧 `info/parts`。
+每条 human message 开始独立且稳定的 logical turn；有效 native `idle` 结束本区间
+所有待定分轮，包括 failed/interrupted。Complete 表示采集表示完整，不等于任务成功。
+最后有效 idle 后的语义消息保持 Incomplete；未知、错型内容与 reasoning 保持
+Incomplete，idle 不会洗白。旧格式 step-finish、patch、step-start、snapshot、retry、
+compaction、agent、subtask、file 九类元数据只识别、不投影。
+native 用户附件、skill text 与工具文件结果尚不支持：标记 Incomplete，
+不向语义记录复制附件字节或 URI。良构 agent/skill 元数据、model/usage 和 provider state
+不改变 digest。原生工具使用 name/id/state.input 与文本 state.content；error 无 content 时
+只投影结构化 error.message，不投影 response.body。本卡不凭 reasoning 字节或 state 证明
+可信 native 来源。
+
 ## 子命令
 
 | 子命令 | 说明 |

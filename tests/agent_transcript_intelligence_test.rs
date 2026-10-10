@@ -7,8 +7,346 @@
 
 use libra::internal::ai::observed_agents::{
     AgentKind, agent_for,
+    coverage::{Completeness, SemanticRecord, normalize_opencode_export},
     extract::{self, CLAUDE_CODE_SKILL_REGISTRY, CODEX_SKILL_REGISTRY, OPENCODE_SKILL_REGISTRY},
 };
+
+fn opencode_turns(
+    messages: serde_json::Value,
+) -> Vec<libra::internal::ai::observed_agents::coverage::NormalizedTurn> {
+    normalize_opencode_export(
+        &serde_json::to_vec(&serde_json::json!({"messages":messages})).unwrap(),
+    )
+}
+
+fn native_user(id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({"type":"user","id":id,"text":text})
+}
+
+fn native_idle(outcome: &str) -> serde_json::Value {
+    serde_json::json!({"type":"idle","id":"msg_idle","outcome":outcome})
+}
+
+#[test]
+fn opencode_known_parts_not_poisoned() {
+    let user = serde_json::json!({"info":{"role":"user","id":"msg_u"},"parts":[{"type":"text","text":"hi"}]});
+    let baseline = opencode_turns(serde_json::json!([user.clone()]));
+    for kind in [
+        "step-finish",
+        "patch",
+        "step-start",
+        "snapshot",
+        "retry",
+        "compaction",
+        "agent",
+        "subtask",
+        "file",
+    ] {
+        let turns = opencode_turns(
+            serde_json::json!([user.clone(),{"info":{"role":"assistant"},"parts":[{"type":kind,"text":"not semantic","tokens":{"input":900},"path":"not projected","url":"private://not-read"}]}]),
+        );
+        assert_eq!(turns.len(), 1, "{kind}");
+        assert_eq!(turns[0].completeness, Completeness::Complete, "{kind}");
+        assert_eq!(
+            turns[0].records, baseline[0].records,
+            "{kind}: no projection"
+        );
+        assert_eq!(
+            turns[0].digest_hex(),
+            baseline[0].digest_hex(),
+            "{kind}: no metadata in digest"
+        );
+    }
+}
+
+#[test]
+fn opencode_unknown_part_incomplete() {
+    for part in [
+        serde_json::json!({"type":"reasoning","text":"opaque not consumed"}),
+        serde_json::json!({"type":"future","text":"not consumed"}),
+        serde_json::json!({"type":3}),
+        serde_json::json!({"type":"text","text":3}),
+        serde_json::json!(null),
+    ] {
+        let turns = opencode_turns(
+            serde_json::json!([{"info":{"role":"user","id":"msg_u"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant"},"parts":[part]}]),
+        );
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+        assert_eq!(
+            turns[0].records,
+            vec![SemanticRecord::User { text: "hi".into() }]
+        );
+    }
+}
+
+#[test]
+fn opencode_native_human_keys_timestamps_and_metadata_digest() {
+    let mut u1 = native_user("msg_u1", "hi");
+    u1["time"] = serde_json::json!({"created":1790000000000i64});
+    let mut a = opencode_assistant(
+        "msg_a1",
+        serde_json::json!([{"type":"text","text":"hello"}]),
+    );
+    a["time"] = serde_json::json!({"created":"2026-09-21T19:33:22Z"});
+    let turns = opencode_turns(serde_json::json!([
+        u1.clone(),
+        a.clone(),
+        native_user("msg_u2", "next"),
+        native_idle("succeeded")
+    ]));
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].logical_turn_key, "msg_u1");
+    assert_eq!(turns[1].logical_turn_key, "msg_u2");
+    assert_eq!(turns[1].ordinal, 1);
+    assert!(
+        turns
+            .iter()
+            .all(|t| t.completeness == Completeness::Complete)
+    );
+    assert_eq!(turns[0].started_at, Some(1790000000));
+    assert_eq!(turns[0].ended_at, Some(1790019202));
+    let classic = opencode_turns(
+        serde_json::json!([{"info":{"id":"msg_u1","role":"user"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant"},"parts":[{"type":"text","text":"hello"}]}]),
+    );
+    assert_eq!(turns[0].digest_hex(), classic[0].digest_hex());
+    a["providerState"] = serde_json::json!({"signature":"never-consumed"});
+    a["tokens"] = opencode_tokens(100);
+    a["model"] = serde_json::json!({"id":"another"});
+    let mut decorated = vec![u1];
+    for kind in [
+        "agent-switched",
+        "model-switched",
+        "location-switched",
+        "synthetic",
+        "system",
+        "skill",
+        "shell",
+        "compaction",
+    ] {
+        decorated.push(serde_json::json!({"type":kind,"id":format!("msg_{kind}"),"text":"not human","metadata":{"private":"not digest"}}));
+    }
+    decorated.extend([a, native_idle("succeeded")]);
+    let metadata = opencode_turns(serde_json::json!(decorated));
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].completeness, Completeness::Complete);
+    assert_eq!(metadata[0].records, turns[0].records);
+    assert_eq!(metadata[0].digest_hex(), turns[0].digest_hex());
+}
+
+#[test]
+fn opencode_native_idle_closes_capture_without_washing_violations() {
+    for outcome in ["succeeded", "failed", "interrupted"] {
+        let clean = opencode_turns(serde_json::json!([
+            native_user("msg_u", "hi"),
+            native_idle(outcome)
+        ]));
+        assert_eq!(clean[0].completeness, Completeness::Complete);
+        for content in [
+            serde_json::json!([{"type":"reasoning","text":"not consumed"}]),
+            serde_json::json!([{"type":"future"}]),
+            serde_json::json!("wrong"),
+        ] {
+            let turns = opencode_turns(serde_json::json!([
+                native_user("msg_u", "hi"),
+                opencode_assistant("msg_a", content),
+                native_idle(outcome)
+            ]));
+            assert_eq!(turns[0].completeness, Completeness::Incomplete);
+            assert_eq!(turns[0].records.len(), 1);
+        }
+    }
+    for idle in [
+        serde_json::json!(null),
+        native_idle("future"),
+        serde_json::json!({"type":"idle","id":3,"outcome":"succeeded"}),
+    ] {
+        let turns = opencode_turns(serde_json::json!([native_user("msg_u", "hi"), idle]));
+        assert!(
+            turns
+                .iter()
+                .any(|t| t.completeness == Completeness::Incomplete)
+        );
+    }
+    let trailing = opencode_turns(serde_json::json!([
+        native_user("msg_u", "hi"),
+        native_idle("succeeded"),
+        native_user("msg_next", "waiting")
+    ]));
+    assert_eq!(trailing[0].completeness, Completeness::Complete);
+    assert_eq!(trailing[1].completeness, Completeness::Incomplete);
+    let no_idle = opencode_turns(serde_json::json!([native_user("msg_u", "hi")]));
+    assert_eq!(no_idle[0].completeness, Completeness::Incomplete);
+}
+
+#[test]
+fn opencode_native_user_attachments_skills_and_agents_fail_visible() {
+    let baseline = opencode_turns(serde_json::json!([
+        native_user("msg_u", "hi"),
+        native_idle("succeeded")
+    ]));
+    for (field, value) in [
+        (
+            "files",
+            serde_json::json!([{"data":"c2VjcmV0","source":{"type":"uri","uri":"private://secret"}}]),
+        ),
+        ("files", serde_json::json!({})),
+        ("files", serde_json::json!(null)),
+        (
+            "skills",
+            serde_json::json!([{"id":"skill_s","name":"s","text":"secret"}]),
+        ),
+        (
+            "skills",
+            serde_json::json!([{"id":"skill_s","name":"s","text":""}]),
+        ),
+        ("skills", serde_json::json!([{"id":3,"name":"s"}])),
+        ("skills", serde_json::json!("wrong")),
+        ("agents", serde_json::json!([{"name":3}])),
+    ] {
+        let mut u = native_user("msg_u", "hi");
+        u[field] = value;
+        let turns = opencode_turns(serde_json::json!([u, native_idle("succeeded")]));
+        assert_eq!(turns[0].completeness, Completeness::Incomplete, "{field}");
+        assert_eq!(
+            turns[0].records, baseline[0].records,
+            "attachment bytes never projected"
+        );
+    }
+    let mut u = native_user("msg_u", "hi");
+    u["files"] = serde_json::json!([]);
+    u["skills"] = serde_json::json!([{"id":"skill_s","name":"s"}]);
+    u["agents"] = serde_json::json!([{"name":"a","mention":{"start":0,"end":1,"text":"a"}}]);
+    let clean = opencode_turns(serde_json::json!([u, native_idle("succeeded")]));
+    assert_eq!(clean[0].completeness, Completeness::Complete);
+    assert_eq!(clean[0].digest_hex(), baseline[0].digest_hex());
+}
+
+#[test]
+fn opencode_native_tool_content_error_and_inflight() {
+    let tool = serde_json::json!({"type":"tool","id":"call_1","name":"read","state":{"status":"completed","input":{"path":"src/lib.rs"},"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]}});
+    let capture = |tool: serde_json::Value| {
+        opencode_turns(serde_json::json!([
+            native_user("msg_u", "read"),
+            opencode_assistant("msg_a", serde_json::json!([tool])),
+            native_idle("succeeded")
+        ]))
+    };
+    let turns = capture(tool.clone());
+    assert_eq!(turns[0].completeness, Completeness::Complete);
+    assert_eq!(turns[0].records.len(), 3);
+    assert!(
+        matches!(&turns[0].records[1],SemanticRecord::ToolCall{call_id:Some(id),name,..}if id=="call_1"&&name=="read")
+    );
+    assert_eq!(
+        turns[0].records[2],
+        SemanticRecord::ToolResult {
+            call_id: Some("call_1".into()),
+            content: "first\nsecond".into(),
+            is_error: false
+        }
+    );
+    let mut error = tool.clone();
+    error["state"] = serde_json::json!({"status":"error","input":{},"error":{"type":"Tool.Error","message":"failed","response":{"body":"not semantic"}}});
+    let turns = capture(error.clone());
+    assert_eq!(turns[0].completeness, Completeness::Complete);
+    assert_eq!(
+        turns[0].records[2],
+        SemanticRecord::ToolResult {
+            call_id: Some("call_1".into()),
+            content: "failed".into(),
+            is_error: true
+        }
+    );
+    error["state"]["content"] = serde_json::json!([{"type":"text","text":"explicit failure"}]);
+    assert!(
+        matches!(&capture(error)[0].records[2],SemanticRecord::ToolResult{content,is_error:true,..}if content=="explicit failure")
+    );
+    for (field, value) in [
+        ("status", serde_json::json!("running")),
+        ("status", serde_json::json!("streaming")),
+        ("content", serde_json::json!([])),
+        ("content", serde_json::json!("wrong")),
+        (
+            "content",
+            serde_json::json!([{"type":"file","uri":"private://secret","mime":"text/plain"}]),
+        ),
+        ("content", serde_json::json!([{"type":"future"}])),
+        ("input", serde_json::json!({"ratio":1.5})),
+        ("input", serde_json::json!("wrong")),
+    ] {
+        let mut bad = tool.clone();
+        bad["state"][field] = value;
+        let turns = capture(bad);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete, "{field}");
+        assert!(!format!("{:?}", turns[0].records).contains("private://secret"));
+    }
+    for field in ["id", "name", "state"] {
+        let mut bad = tool.clone();
+        bad[field] = serde_json::json!(3);
+        assert_eq!(
+            capture(bad)[0].completeness,
+            Completeness::Incomplete,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn opencode_native_malformed_and_mixed_messages_are_incomplete() {
+    for bad in [
+        serde_json::json!({"type":"user","id":3,"text":"hi"}),
+        serde_json::json!({"type":"user","id":"msg_bad","text":3}),
+        serde_json::json!({"type":"future","id":"msg_bad"}),
+        serde_json::json!({"type":3,"id":"msg_bad"}),
+        serde_json::json!({"info":{"role":"assistant"},"parts":[{"type":"text","text":"mixed"}]}),
+    ] {
+        let turns = opencode_turns(serde_json::json!([
+            native_user("msg_u", "hi"),
+            bad,
+            native_idle("succeeded")
+        ]));
+        assert!(
+            turns
+                .iter()
+                .any(|t| t.completeness == Completeness::Incomplete)
+        );
+    }
+}
+
+#[test]
+fn opencode_native_text_and_tool_match_classic_coverage_records() {
+    let tool = serde_json::json!({"type":"tool","id":"call_1","name":"read","state":{"status":"completed","input":{},"content":[{"type":"text","text":"result"}]}});
+    let native = opencode_turns(serde_json::json!([
+        native_user("msg_u", "hi"),
+        opencode_assistant(
+            "msg_a",
+            serde_json::json!([{"type":"text","text":"before"},tool,{"type":"text","text":"after"}])
+        ),
+        native_idle("succeeded")
+    ]));
+    let classic = opencode_turns(
+        serde_json::json!([{"info":{"role":"user","id":"msg_u"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant"},"parts":[{"type":"text","text":"before"},{"type":"tool","tool":"read","callID":"call_1","state":{"status":"completed","input":{},"output":"result"}},{"type":"text","text":"after"}]}]),
+    );
+    assert_eq!(native[0].completeness, Completeness::Complete);
+    assert_eq!(native[0].records, classic[0].records);
+    assert_eq!(native[0].digest_hex(), classic[0].digest_hex());
+    let empty = opencode_turns(serde_json::json!([
+        native_user("msg_u", "hi"),
+        opencode_assistant("msg_a", serde_json::json!([{"type":"text","text":""}])),
+        native_idle("succeeded")
+    ]));
+    assert_eq!(
+        empty[0].records,
+        vec![SemanticRecord::User { text: "hi".into() }]
+    );
+    let trailing = opencode_turns(serde_json::json!([
+        native_user("msg_u", "hi"),
+        native_idle("succeeded"),
+        opencode_assistant("msg_a", serde_json::json!([{"type":"text","text":"later"}]))
+    ]));
+    assert_eq!(trailing[0].completeness, Completeness::Incomplete);
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

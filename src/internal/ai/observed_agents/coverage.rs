@@ -1054,19 +1054,15 @@ fn normalize_codex_rollout_inner(
     Some(turns)
 }
 
-/// Split an `opencode export` JSON document into normalized turns
-/// (plan-20260713 DR-04b; probe: opencode 1.17.x `{info, messages:[{info:
-/// {role,id,…}, parts:[{type:"text",text}|{type:"tool",tool,callID,state:
-/// {input,output,status,…}}]}]}`).
-///
-/// Mapping: a `user`-role message opens a turn (`logical_turn_key` = its
-/// validated `info.id`, else ordinal); its text parts join as the user
-/// record. Assistant messages contribute one Assistant record (joined text
-/// parts) plus, per completed tool part, a ToolCall (callID/tool/state.input)
-/// AND a ToolResult (state.output, is_error = status=="error"). A tool part
-/// still `running`/`pending` marks the turn `incomplete` (a later export
-/// upgrades it — ADR-DR-16); wrong-typed semantic fields fail closed exactly
-/// like the Claude splitter.
+/// Split native OpenCode 2.0.26 or classic `info/parts` exports into turns.
+/// Each human message opens a turn keyed by its validated native `id` or
+/// classic `info.id` (otherwise ordinal). Assistant text blocks join with
+/// newlines, followed by ordered tool call/results, matching coverage-v1.
+/// Native tools use `name/id/state.input/content`, classic tools use
+/// `tool/callID/state.input/output`. In-flight tools, unsupported semantic
+/// fields and unknown/reasoning content keep their turn incomplete.
+/// Native idle settles all pending human splits but never clears violations;
+/// native semantic messages without a subsequent valid idle stay incomplete.
 pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
     // INVARIANT: `None` disables the only early-exit condition.
     let Some(turns) = normalize_opencode_export_inner(data, None) else {
@@ -1143,10 +1139,259 @@ fn normalize_opencode_export_inner(
         turns.last_mut().expect("non-empty checked") // INVARIANT: checked above
     }
 
+    fn valid_mention(value: Option<&CanonValue>) -> bool {
+        let Some(value) = value else {
+            return true;
+        };
+        let number = |key| match value.get(key) {
+            Some(CanonValue::Int(_)) => true,
+            Some(CanonValue::Float(bits)) => f64::from_bits(*bits).is_finite(),
+            _ => false,
+        };
+        number("start") && number("end") && value.get("text").and_then(CanonValue::as_str).is_some()
+    }
+
+    fn native_user_attachments_supported(message: &CanonValue) -> bool {
+        let files_supported = match message.get("files") {
+            None => true,
+            Some(CanonValue::Array(files)) => files.is_empty(),
+            _ => false,
+        };
+        let agents_supported = match message.get("agents") {
+            None => true,
+            Some(CanonValue::Array(agents)) => agents.iter().all(|agent| {
+                agent.get("name").and_then(CanonValue::as_str).is_some()
+                    && valid_mention(agent.get("mention"))
+            }),
+            _ => false,
+        };
+        let skills_supported = match message.get("skills") {
+            None => true,
+            Some(CanonValue::Array(skills)) => skills.iter().all(|skill| {
+                skill.get("id").and_then(CanonValue::as_str).is_some()
+                    && skill.get("name").and_then(CanonValue::as_str).is_some()
+                    && skill.get("text").is_none()
+                    && valid_mention(skill.get("mention"))
+            }),
+            _ => false,
+        };
+        files_supported && agents_supported && skills_supported
+    }
+
+    fn native_tool(
+        turn: &mut NormalizedTurn,
+        part: &CanonValue,
+        deadline: Option<Instant>,
+    ) -> Option<()> {
+        let mut violation = false;
+        let name = match part.get("name") {
+            Some(CanonValue::Str(name)) => name.clone(),
+            _ => {
+                violation = true;
+                String::new()
+            }
+        };
+        let call_id = match part.get("id") {
+            Some(CanonValue::Str(id)) => Some(id.clone()),
+            _ => {
+                violation = true;
+                None
+            }
+        };
+        let state = part.get("state");
+        let status = state
+            .and_then(|s| s.get("status"))
+            .and_then(CanonValue::as_str);
+        let mut input = match state.and_then(|s| s.get("input")) {
+            Some(value @ CanonValue::Object(_)) => value.clone(),
+            _ => {
+                violation = true;
+                CanonValue::Null
+            }
+        };
+        if contains_float(&input) {
+            violation = true;
+            sanitize_floats(&mut input);
+        }
+        turn.records.push(SemanticRecord::ToolCall {
+            call_id: call_id.clone(),
+            input,
+            name,
+        });
+        match status {
+            Some("completed" | "error") => {
+                let is_error = status == Some("error");
+                let error = state.and_then(|s| s.get("error"));
+                let error_message = error
+                    .and_then(|e| e.get("message"))
+                    .and_then(CanonValue::as_str);
+                if is_error
+                    && (error
+                        .and_then(|e| e.get("type"))
+                        .and_then(CanonValue::as_str)
+                        .is_none()
+                        || error_message.is_none())
+                {
+                    violation = true;
+                }
+                let mut fragments = Vec::new();
+                match state.and_then(|s| s.get("content")) {
+                    Some(CanonValue::Array(content)) if !content.is_empty() => {
+                        for item in content {
+                            if deadline.is_some_and(|d| Instant::now() >= d) {
+                                return None;
+                            }
+                            match item.get("type").and_then(CanonValue::as_str) {
+                                Some("text") => match item.get("text").and_then(CanonValue::as_str)
+                                {
+                                    Some(text) => fragments.push(text),
+                                    None => violation = true,
+                                },
+                                // Attachment URIs/bytes and future content cannot be represented
+                                // by coverage-v1 text. Do not silently claim a complete result.
+                                _ => violation = true,
+                            }
+                        }
+                    }
+                    None if is_error => {
+                        if let Some(text) = error_message {
+                            fragments.push(text);
+                        }
+                    }
+                    _ => violation = true,
+                }
+                turn.records.push(SemanticRecord::ToolResult {
+                    call_id,
+                    content: fragments.join("\n"),
+                    is_error,
+                });
+            }
+            _ => violation = true,
+        }
+        if violation {
+            turn.completeness = Completeness::Incomplete;
+        }
+        Some(())
+    }
+
+    let mut native_seen = false;
+    let mut classic_seen = false;
+    let mut pending_native = BTreeSet::new();
+
     for message in messages {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return None;
         }
+        if message.get("type").is_some() {
+            native_seen = true;
+            let kind = message.get("type").and_then(CanonValue::as_str);
+            let id = message.get("id").and_then(CanonValue::as_str);
+            let mut violation = id.is_none_or(|id| {
+                id.is_empty()
+                    || id.len() > 64
+                    || !id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            }) || message.get("info").is_some()
+                || message.get("parts").is_some();
+            let timestamp = message.get("time").and_then(|time| {
+                timestamp_seconds(time.get("created"))
+                    .or_else(|| timestamp_seconds(time.get("completed")))
+            });
+            match kind {
+                Some("user") => {
+                    let text = match message.get("text").and_then(CanonValue::as_str) {
+                        Some(text) => text.to_owned(),
+                        None => {
+                            violation = true;
+                            String::new()
+                        }
+                    };
+                    violation |= !native_user_attachments_supported(message);
+                    let turn = open_turn(&mut turns, id.map(str::to_owned));
+                    if violation {
+                        turn.completeness = Completeness::Incomplete;
+                    }
+                    turn.records.push(SemanticRecord::User { text });
+                    observe_turn_timestamp(turn, timestamp);
+                    pending_native.insert(turn.ordinal);
+                }
+                Some("assistant") => {
+                    let turn = current_or_open(&mut turns);
+                    // Human-message keys remain stable when several prompts are steered
+                    // in during one native busy→idle interval.
+                    pending_native.insert(turn.ordinal);
+                    if violation {
+                        turn.completeness = Completeness::Incomplete;
+                    }
+                    match message.get("content").and_then(CanonValue::as_array) {
+                        Some(content) => {
+                            let mut fragments = Vec::new();
+                            for part in content {
+                                if deadline.is_some_and(|d| Instant::now() >= d) {
+                                    return None;
+                                }
+                                match part.get("type").and_then(CanonValue::as_str) {
+                                    Some("text") => {
+                                        match part.get("text").and_then(CanonValue::as_str) {
+                                            Some(text) => fragments.push(text),
+                                            None => turn.completeness = Completeness::Incomplete,
+                                        }
+                                    }
+                                    Some("tool") => {}
+                                    // Reasoning has a separate verified-source owner. Its bytes
+                                    // and provider state never enter this ordinary projection.
+                                    _ => turn.completeness = Completeness::Incomplete,
+                                }
+                            }
+                            // coverage-v1 joins all text blocks in one message; retain
+                            // the same record order as the classic and live projections.
+                            let text = fragments.join("\n");
+                            if !text.is_empty() {
+                                turn.records.push(SemanticRecord::Assistant { text });
+                            }
+                            for part in content {
+                                if deadline.is_some_and(|d| Instant::now() >= d) {
+                                    return None;
+                                }
+                                if part.get("type").and_then(CanonValue::as_str) == Some("tool") {
+                                    native_tool(turn, part, deadline)?;
+                                }
+                            }
+                        }
+                        None => turn.completeness = Completeness::Incomplete,
+                    }
+                    observe_turn_timestamp(turn, timestamp);
+                }
+                Some("idle") => {
+                    let valid_outcome = matches!(
+                        message.get("outcome").and_then(CanonValue::as_str),
+                        Some("succeeded" | "failed" | "interrupted")
+                    );
+                    if violation || !valid_outcome {
+                        current_or_open(&mut turns).completeness = Completeness::Incomplete;
+                    } else {
+                        // Idle settles capture, not task success. It never upgrades a
+                        // structurally incomplete turn; all human splits in this interval settle.
+                        pending_native.clear();
+                    }
+                    if let Some(turn) = turns.last_mut() {
+                        observe_turn_timestamp(turn, timestamp);
+                    }
+                }
+                Some(
+                    "agent-switched" | "model-switched" | "location-switched" | "synthetic"
+                    | "system" | "skill" | "shell" | "compaction",
+                ) if !violation => {}
+                _ => {
+                    let turn = current_or_open(&mut turns);
+                    turn.completeness = Completeness::Incomplete;
+                    pending_native.insert(turn.ordinal);
+                }
+            }
+            continue;
+        }
+        classic_seen = true;
         // Structural validation: a message must be an object with an object
         // `info` carrying a string `role`, and an array `parts`. Anything
         // else poisons the enclosing turn instead of defaulting away
@@ -1195,11 +1440,17 @@ fn normalize_opencode_export_inner(
                 violation = true;
                 continue;
             }
-            if part.get("type").and_then(CanonValue::as_str) == Some("text") {
-                match part.get("text") {
+            match part.get("type").and_then(CanonValue::as_str) {
+                Some("text") => match part.get("text") {
                     Some(CanonValue::Str(t)) => text_fragments.push(t),
                     Some(_) | None => violation = true,
-                }
+                },
+                Some("tool") => violation |= role != "assistant",
+                Some(
+                    "step-finish" | "patch" | "step-start" | "snapshot" | "retry" | "compaction"
+                    | "agent" | "subtask" | "file",
+                ) => {}
+                _ => violation = true,
             }
         }
         let text = text_fragments.join("\n");
@@ -1297,6 +1548,17 @@ fn normalize_opencode_export_inner(
         }
         if let Some(turn) = turns.last_mut() {
             observe_turn_timestamp(turn, message_timestamp);
+        }
+    }
+
+    for index in pending_native {
+        if let Some(turn) = turns.get_mut(index) {
+            turn.completeness = Completeness::Incomplete;
+        }
+    }
+    if native_seen && classic_seen {
+        for turn in &mut turns {
+            turn.completeness = Completeness::Incomplete;
         }
     }
 
