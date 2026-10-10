@@ -109,6 +109,7 @@ async fn seed_temporary_checkpoint(
     let (report_redacted, _) = redactor.redact(b"{}");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
+            reasoning_artifacts: &[],
             checkpoint_id,
             session_id: "span-session",
             marker_generation: marker.generation.as_deref().expect("new marker generation"),

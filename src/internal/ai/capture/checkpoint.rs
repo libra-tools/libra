@@ -1921,6 +1921,7 @@ impl<'a> TracesCheckpointStore<'a> {
         request: &'request CheckpointWriteRequest<'request>,
     ) -> CheckpointCommitParams<'request> {
         CheckpointCommitParams {
+            reasoning_artifacts: &[],
             checkpoint_id: request.checkpoint_id(),
             session_id: request.session_id(),
             marker_generation: &self.marker_generation,

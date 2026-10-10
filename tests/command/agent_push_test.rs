@@ -221,6 +221,7 @@ async fn seed_checkpoint_commit(
         .expect("register seeded checkpoint writer marker");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
+            reasoning_artifacts: &[],
             checkpoint_id,
             session_id,
             marker_generation: marker.generation.as_deref().expect("new marker generation"),

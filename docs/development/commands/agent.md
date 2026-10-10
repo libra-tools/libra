@@ -270,3 +270,16 @@ Readable reasoning projects under its own `reasoning` record type with
 answer and is never written to unredacted metadata or logs.
 
 Direct serde serialization/deserialization of `ProviderVisibleText` is deliberately rejected. Callers must use classification and typed redaction followed by `canonical_turn_bytes` or `safe_turn_projection`. RG-04 does not wire a live provider adapter.
+
+
+RG-02 adds the artifact archive: verified ciphertext is stored byte-exact under
+`reasoning/encrypted/<sha256>` and declared in the manifest's `reasoning_artifacts[]`
+array; dedup by sha256, duplicate-locator rejection, and 512/256 KiB/32 MiB
+fan-out budgets are all fail-closed. `content_hash` coverage stays four-role.
+
+Opaque artifact writes alone use standard zlib stored blocks (level 0).
+Canonical blob bytes and Git OIDs are unchanged. High-entropy ciphertext uses
+more disk and mirror bytes; ordinary objects keep default compression, and
+valid existing objects are reused without rewriting.
+
+RG-06 adds artifact tree reachability; RG-03 adds controlled read and export.

@@ -3444,6 +3444,7 @@ async fn capture_discovered_subagent_contents_inner(
             observe_subagent_final_append_deadline(append_deadline);
             manager
                 .append_checkpoint_commit(CheckpointCommitParams {
+                    reasoning_artifacts: &[],
                     checkpoint_id: &checkpoint_id,
                     session_id: parent_session_id,
                     marker_generation,

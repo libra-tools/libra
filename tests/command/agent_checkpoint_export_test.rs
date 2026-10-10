@@ -68,6 +68,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
         .expect("register seeded checkpoint writer marker");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
+            reasoning_artifacts: &[],
             checkpoint_id: &checkpoint_id,
             session_id: "sess-x",
             marker_generation: marker.generation.as_deref().expect("new marker generation"),

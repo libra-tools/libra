@@ -10,7 +10,11 @@ use std::{
 };
 
 use flate2::read::ZlibDecoder;
-use git_internal::{errors::GitError, hash::ObjectHash, utils::HashAlgorithm};
+use git_internal::{
+    errors::GitError,
+    hash::{HashKind, ObjectHash},
+    utils::HashAlgorithm,
+};
 
 use crate::utils::atomic_write::{self, ensure_dir_exists};
 
@@ -979,10 +983,15 @@ pub fn write_git_object(
 /// Writers that need crash-durable ownership can persist this id before the
 /// corresponding object becomes visible in the shared object database.
 pub(crate) fn git_object_hash(object_type: &str, data: &[u8]) -> ObjectHash {
+    git_object_hash_for_kind(object_type, data, git_internal::hash::get_hash_kind())
+}
+
+fn git_object_hash_for_kind(object_type: &str, data: &[u8], kind: HashKind) -> ObjectHash {
     let header = format!("{} {}\0", object_type, data.len());
-    let mut content = header.into_bytes();
-    content.extend_from_slice(data);
-    ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &content)
+    let mut hasher = HashAlgorithm::new_for_kind(kind);
+    hasher.update(header.as_bytes());
+    hasher.update(data);
+    hasher.finalize_object_hash()
 }
 
 /// Write one loose object and report whether this call created its payload.
@@ -1007,10 +1016,56 @@ fn write_git_object_with_status_inner(
     data: &[u8],
     sync_data: bool,
 ) -> Result<(ObjectHash, bool), GitError> {
+    write_git_object_with_status_compressed(
+        git_dir,
+        object_type,
+        data,
+        sync_data,
+        flate2::Compression::default(),
+        git_internal::hash::get_hash_kind(),
+    )
+}
+
+/// Archive a verified opaque payload using zlib stored blocks.
+/// Ciphertext compression is deliberately skipped to keep hashing and writing
+/// within the capture CPU budget; the canonical loose-object format is retained.
+/// Provenance is checked by the reasoning writer before this blob-only entry
+/// or its private helper is called. Existing objects are validated and reused
+/// unchanged, regardless of the compression used when they were first written.
+pub(crate) fn write_opaque_blob_with_status(
+    git_dir: &Path,
+    data: &[u8],
+    kind: HashKind,
+) -> Result<(ObjectHash, bool), GitError> {
+    write_git_object_with_status_compressed(
+        git_dir,
+        "blob",
+        data,
+        atomic_write::sync_data_enabled(),
+        flate2::Compression::none(),
+        kind,
+    )
+}
+
+fn write_git_object_with_status_compressed(
+    git_dir: &Path,
+    object_type: &str,
+    data: &[u8],
+    sync_data: bool,
+    compression: flate2::Compression,
+    kind: HashKind,
+) -> Result<(ObjectHash, bool), GitError> {
     let header = format!("{} {}\0", object_type, data.len());
-    let mut content = header.into_bytes();
-    content.extend_from_slice(data);
-    let hash = git_object_hash(object_type, data);
+    let canonical_bytes = || {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(data);
+        bytes
+    };
+    // Ordinary compression keeps its original single-buffer write. A new
+    // opaque blob needs no extra full-payload copy; build that comparison
+    // buffer only when validating an existing or concurrently published file.
+    let mut content = (compression.level() != 0).then(canonical_bytes);
+    let hash = git_object_hash_for_kind(object_type, data, kind);
     let hash_str = hash.to_string();
 
     #[cfg(not(unix))]
@@ -1054,12 +1109,12 @@ fn write_git_object_with_status_inner(
     )?;
     #[cfg(unix)]
     if let Some(existing) = open_existing_loose_object_at(&directories.shard, &hash_str[2..])? {
-        validate_existing_object_file(existing, &content)?;
+        validate_existing_object_file(existing, content.get_or_insert_with(canonical_bytes))?;
         return Ok((hash, false));
     }
     #[cfg(not(unix))]
     if object_path.exists() {
-        validate_existing_object(&object_path, &content)?;
+        validate_existing_object(&object_path, content.get_or_insert_with(canonical_bytes))?;
         return Ok((hash, false));
     }
 
@@ -1074,9 +1129,12 @@ fn write_git_object_with_status_inner(
         LooseObjectTempFile::create(&directories.temporary, &temporary_name)?;
     #[cfg(not(unix))]
     let (file, mut temporary) = LooseObjectTempFile::create(&temporary_dir, &temporary_name)?;
-    let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
-    if let Err(error) = encoder.write_all(&content) {
-        return Err(error.into());
+    let mut encoder = flate2::write::ZlibEncoder::new(file, compression);
+    if let Some(content) = &content {
+        encoder.write_all(content)?;
+    } else {
+        encoder.write_all(header.as_bytes())?;
+        encoder.write_all(data)?;
     }
     let completed = encoder.finish()?;
     if let Err(error) = sync_loose_object_file(&completed, sync_data) {
@@ -1099,10 +1157,10 @@ fn write_git_object_with_status_inner(
                         )
                     },
                 )?,
-                &content,
+                content.get_or_insert_with(canonical_bytes),
             )?;
             #[cfg(not(unix))]
-            validate_existing_object(&object_path, &content)?;
+            validate_existing_object(&object_path, content.get_or_insert_with(canonical_bytes))?;
             false
         }
         Err(error) => return Err(error.into()),
@@ -1315,10 +1373,247 @@ mod bounded_read_tests {
     #[cfg(target_os = "linux")]
     use super::scavenge_stale_loose_object_temps_in_dir;
     use super::{
-        git_object_hash, read_git_object_bounded, reset_test_loose_object_sync_calls,
-        test_loose_object_sync_calls, validate_git_object_streaming_file, write_git_object,
-        write_git_object_with_status, write_git_object_with_status_inner,
+        git_object_hash, read_git_object, read_git_object_bounded,
+        reset_test_loose_object_sync_calls, test_loose_object_sync_calls,
+        validate_git_object_streaming_file, write_git_object, write_git_object_with_status,
+        write_git_object_with_status_inner, write_opaque_blob_with_status,
     };
+
+    #[test]
+    fn opaque_blob_entry_is_confined_to_typed_history_writer_and_helper() {
+        use syn::visit::{self, Visit};
+
+        #[derive(Default)]
+        struct Calls {
+            function: String,
+            direct_call_operand: bool,
+            calls: Vec<String>,
+            violations: Vec<String>,
+        }
+        fn names_opaque_entry(tokens: proc_macro2::TokenStream) -> bool {
+            tokens.into_iter().any(|token| match token {
+                proc_macro2::TokenTree::Ident(ident) => ident == "write_opaque_blob_with_status",
+                proc_macro2::TokenTree::Group(group) => names_opaque_entry(group.stream()),
+                proc_macro2::TokenTree::Literal(literal) => literal
+                    .to_string()
+                    .contains("write_opaque_blob_with_status"),
+                _ => false,
+            })
+        }
+        impl<'ast> Visit<'ast> for Calls {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                // Test modules may exercise the IO seam directly.
+                if let syn::Item::Mod(module) = item
+                    && module.attrs.iter().any(|attr| {
+                        attr.path().is_ident("cfg")
+                            && attr
+                                .parse_args::<syn::Ident>()
+                                .is_ok_and(|cfg| cfg == "test")
+                    })
+                {
+                    return;
+                }
+                visit::visit_item(self, item);
+            }
+
+            fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+                let previous =
+                    std::mem::replace(&mut self.function, function.sig.ident.to_string());
+                visit::visit_item_fn(self, function);
+                self.function = previous;
+            }
+
+            fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+                let previous =
+                    std::mem::replace(&mut self.function, function.sig.ident.to_string());
+                visit::visit_impl_item_fn(self, function);
+                self.function = previous;
+            }
+
+            fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+                if rename.ident == "write_opaque_blob_with_status" {
+                    self.violations
+                        .push("opaque entry must not be renamed".to_string());
+                }
+                visit::visit_use_rename(self, rename);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if names_opaque_entry(mac.tokens.clone()) {
+                    self.violations
+                        .push("opaque entry must not be forwarded by a macro".to_string());
+                }
+                visit::visit_macro(self, mac);
+            }
+
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                let previous = self.direct_call_operand;
+                self.direct_call_operand = matches!(&*call.func, syn::Expr::Path(_));
+                self.visit_expr(&call.func);
+                self.direct_call_operand = false;
+                for argument in &call.args {
+                    self.visit_expr(argument);
+                }
+                self.direct_call_operand = previous;
+            }
+
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "write_opaque_blob_with_status")
+                {
+                    self.calls.push(self.function.clone());
+                    if !self.direct_call_operand {
+                        self.violations.push(
+                            "opaque entry must not escape through a pointer or alias".to_string(),
+                        );
+                    }
+                }
+                visit::visit_expr_path(self, path);
+            }
+        }
+        for bypass in [
+            "use crate::utils::object::write_opaque_blob_with_status as fast; fn rogue(){ fast(); }",
+            "fn rogue(){ let fast = crate::utils::object::write_opaque_blob_with_status; fast(); }",
+            "fn rogue(){ invoke!(crate::utils::object::write_opaque_blob_with_status); }",
+        ] {
+            let mut visitor = Calls::default();
+            visitor.visit_file(&syn::parse_file(bypass).unwrap());
+            assert!(
+                !visitor.violations.is_empty(),
+                "guard accepted a forwarding bypass: {bypass}"
+            );
+        }
+
+        fn scan(directory: &std::path::Path, calls: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, calls);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let ast = syn::parse_file(&source).unwrap();
+                    let mut visitor = Calls::default();
+                    visitor.visit_file(&ast);
+                    assert!(
+                        visitor.violations.is_empty(),
+                        "{}: {:?}",
+                        path.display(),
+                        visitor.violations
+                    );
+                    for function in visitor.calls {
+                        calls.push((path.to_string_lossy().into_owned(), function));
+                    }
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut calls = Vec::new();
+        scan(&root.join("src"), &mut calls);
+        calls.sort();
+        let history = root
+            .join("src/internal/ai/history.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    history.clone(),
+                    "run_checkpoint_object_io_helper".to_string()
+                ),
+                (
+                    history,
+                    "write_indexed_object_payload_for_attempt".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn opaque_fast_blob_preserves_oid_bytes_and_existing_compression() {
+        for kind in [
+            git_internal::hash::HashKind::Sha1,
+            git_internal::hash::HashKind::Sha256,
+            git_internal::hash::HashKind::Blake3,
+        ] {
+            let _kind = git_internal::hash::set_hash_kind_for_test(kind);
+            let ordinary = tempfile::tempdir().unwrap();
+            let opaque = tempfile::tempdir().unwrap();
+            let payload = vec![b'x'; 128 * 1024];
+            let (normal_oid, normal_created) =
+                write_git_object_with_status(ordinary.path(), "blob", &payload).unwrap();
+            let (fast_oid, fast_created) = write_opaque_blob_with_status(
+                opaque.path(),
+                &payload,
+                git_internal::hash::get_hash_kind(),
+            )
+            .unwrap();
+            assert!(normal_created && fast_created);
+            assert_eq!(normal_oid, fast_oid);
+            let mut canonical = format!("blob {}\0", payload.len()).into_bytes();
+            canonical.extend_from_slice(&payload);
+            assert_eq!(
+                fast_oid,
+                git_internal::hash::ObjectHash::new_for_kind(kind, &canonical)
+            );
+            assert_eq!(read_git_object(opaque.path(), &fast_oid).unwrap(), payload);
+            let oid = fast_oid.to_string();
+            let relative = std::path::Path::new("objects")
+                .join(&oid[..2])
+                .join(&oid[2..]);
+            let normal_wire = std::fs::read(ordinary.path().join(&relative)).unwrap();
+            let fast_wire = std::fs::read(opaque.path().join(&relative)).unwrap();
+            // Zlib's FLEVEL header distinguishes the policies without relying on
+            // the byte stream produced by a particular compressor implementation.
+            assert_eq!(normal_wire[1] >> 6, 2);
+            assert_eq!(fast_wire[1] >> 6, 0);
+            // DEFLATE BTYPE=00 is a stored block; even compressible ciphertext
+            // fixtures must not silently regain a compression CPU cost.
+            assert_eq!((fast_wire[2] >> 1) & 3, 0);
+            assert!(fast_wire.len() > payload.len());
+            assert_eq!(
+                write_opaque_blob_with_status(
+                    ordinary.path(),
+                    &payload,
+                    git_internal::hash::get_hash_kind()
+                )
+                .unwrap(),
+                (normal_oid, false)
+            );
+            assert_eq!(
+                write_git_object_with_status(opaque.path(), "blob", &payload).unwrap(),
+                (fast_oid, false)
+            );
+            assert_eq!(
+                std::fs::read(ordinary.path().join(&relative)).unwrap(),
+                normal_wire
+            );
+            assert_eq!(
+                std::fs::read(opaque.path().join(&relative)).unwrap(),
+                fast_wire
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_fast_blob_rejects_corrupt_existing_object_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"synthetic opaque archive";
+        let oid = git_object_hash("blob", payload).to_string();
+        let path = dir.path().join("objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let corrupt = b"not a complete zlib object";
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(
+            write_opaque_blob_with_status(dir.path(), payload, git_internal::hash::get_hash_kind())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+    }
 
     /// Bounded reads never return more than the cap, flag truncation only
     /// when real content exceeds the cap, and truncation detection does not

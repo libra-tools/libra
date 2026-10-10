@@ -49,6 +49,52 @@ pub enum ReasoningSourceKind {
     EncryptedContent,
 }
 
+/// Safe artifact locators contain only provider coordinates and a registered
+/// source field. They are metadata, never a free-form provider string.
+pub(crate) fn artifact_locator_is_valid(
+    provider: ReasoningProvider,
+    source_kind: Option<ReasoningSourceKind>,
+    locator: &str,
+) -> bool {
+    fn ordinal(value: &str) -> bool {
+        !value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+    }
+    if locator.len() > 4096 {
+        return false;
+    }
+    match (provider, source_kind) {
+        (ReasoningProvider::ClaudeCode, Some(kind)) => {
+            let field = match kind {
+                ReasoningSourceKind::Signature => "signature",
+                ReasoningSourceKind::RedactedThinkingData => "data",
+                _ => return false,
+            };
+            let Some(rest) = locator.strip_prefix("claude_code:msg=") else {
+                return false;
+            };
+            let Some((message, rest)) = rest.split_once("/part=") else {
+                return false;
+            };
+            let Some((part, metadata)) = rest.split_once("/metadata=") else {
+                return false;
+            };
+            ordinal(message) && ordinal(part) && metadata == field
+        }
+        (ReasoningProvider::Codex, Some(ReasoningSourceKind::EncryptedContent)) => {
+            let Some(rest) = locator.strip_prefix("codex:ordinal=") else {
+                return false;
+            };
+            if let Some((record, history)) = rest.split_once("/replacement_history[") {
+                ordinal(record) && history.strip_suffix(']').is_some_and(ordinal)
+            } else {
+                ordinal(rest)
+            }
+        }
+        // OpenCode has no source-proven opaque field at the current pin.
+        _ => false,
+    }
+}
+
 /// Diagnostic codes never contain a field path or source payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -453,6 +499,8 @@ pub(crate) fn verify_claude_encrypted_field(
         },
         bytes: OpaqueEncryptedBytes {
             data: data.to_vec(),
+            provider: ReasoningProvider::ClaudeCode,
+            source_kind: kind,
         },
     })
 }
@@ -505,6 +553,8 @@ pub(crate) fn verify_claude_encrypted_field(
 #[derive(Clone)]
 pub struct OpaqueEncryptedBytes {
     data: Vec<u8>,
+    provider: ReasoningProvider,
+    source_kind: ReasoningSourceKind,
 }
 
 impl OpaqueEncryptedBytes {
@@ -513,7 +563,15 @@ impl OpaqueEncryptedBytes {
     /// tests) can construct verified-looking ciphertext for the writer.
     #[cfg(test)]
     pub(crate) fn from_verified_test_field(data: Vec<u8>) -> Self {
-        Self { data }
+        Self {
+            data,
+            provider: ReasoningProvider::ClaudeCode,
+            source_kind: ReasoningSourceKind::Signature,
+        }
+    }
+
+    pub(crate) fn verified_source(&self) -> (ReasoningProvider, ReasoningSourceKind) {
+        (self.provider, self.source_kind)
     }
 
     pub fn len(&self) -> usize {
@@ -527,6 +585,13 @@ impl OpaqueEncryptedBytes {
     /// Hash the original wire bytes without decoding or serializing them.
     pub fn sha256_hex(&self) -> String {
         hex::encode(Sha256::digest(&self.data))
+    }
+
+    /// Byte-exact artifact view for the RG-02 checkpoint writer. `pub(crate)`
+    /// so only the in-crate artifact sink (never an external caller) can
+    /// obtain the raw ciphertext bytes for a single object write.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.data
     }
 }
 

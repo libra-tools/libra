@@ -527,3 +527,17 @@ reasoning 文本中的 canary 秘密会计入 redaction report 并在投影、ch
 它从不冒充 assistant 回答，也绝不写入未脱敏的 metadata 或日志。
 
 `ProviderVisibleText` 的 serde 序列化/反序列化明确拒绝；调用者须经分类与 typed redaction 后使用 `canonical_turn_bytes` 或 `safe_turn_projection`。RG-04 不接入真实 provider adapter。
+
+
+RG-02 将已核验的密文归档为 opaque artifact：每个 checkpoint manifest 可携带
+`reasoning_artifacts[]` 数组（path/oid/sha256/byte_len/locator/provider/source_kind/
+availability/decrypt_capability），以 `reasoning/encrypted/<sha256>` 存储逐字节精确对象；
+相同密文字节去重为单对象、重复 locator 被拒绝、扇出有界且 fail-closed（512 条 /
+256 KiB manifest / 32 MiB 总量）。`content_hash` 仍只覆盖四个普通角色；空 artifact
+集保持 checkpoint 树逐字节不变。
+
+新建 opaque artifact 对象使用标准 zlib stored blocks（level 0）以限制压缩 CPU；
+canonical blob 字节和 Git OID 不变。高熵密文因此占用更多存储及镜像带宽；
+普通对象仍用默认压缩，已存在的有效对象直接复用，不重新压缩。
+
+artifact 的树可达性由 RG-06 接入；受控读取及导出由 RG-03 接入。

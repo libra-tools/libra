@@ -259,3 +259,5 @@ relevant source entry above.
 - Renames must update both this index and the plan; `compat_matrix_alignment`
   will fail CI on dangling references.
 - TODO rows are tracked as `BASELINE_GAP-INTEG-007` — the index pass.
+
+RG-02 artifact format and budget gates run in the existing lib `history`/`traces` modules; release CPU gates remain ignored unless explicitly selected. No additional integration target is introduced.

@@ -30,6 +30,7 @@
 //! caller.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
     io::{Seek, SeekFrom, Write},
@@ -75,13 +76,18 @@ use crate::{
                 CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
                 authorize_final_capture_commit,
             },
+            observed_agents::reasoning::OpaqueEncryptedBytes,
+            traces::{
+                ManifestArtifactRef, REASONING_ARTIFACT_MANIFEST_MAX_BYTES,
+                REASONING_ARTIFACT_MAX_ENTRIES, REASONING_ARTIFACT_TOTAL_MAX_BYTES,
+            },
         },
         model::reference::{self, ConfigKind},
     },
     utils::{
         object::{
             git_object_hash, read_git_object, read_git_object_bounded_validated, write_git_object,
-            write_git_object_with_status,
+            write_git_object_with_status, write_opaque_blob_with_status,
         },
         storage::Storage,
     },
@@ -412,15 +418,16 @@ struct RejectedCleanupIndexHelperResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckpointObjectIoHelperRequest {
+struct CheckpointObjectIoHelperRequest<'a> {
     /// Standard-base64 encoding of the native path bytes (UTF-8 off Unix).
     repo_path_base64: String,
-    operation: CheckpointObjectIoOperation,
+    #[serde(borrow)]
+    operation: CheckpointObjectIoOperation<'a>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum CheckpointObjectIoOperation {
+enum CheckpointObjectIoOperation<'a> {
     Read {
         oid: String,
         expected_type: String,
@@ -429,11 +436,55 @@ enum CheckpointObjectIoOperation {
         object_type: String,
         data_base64: String,
     },
+    WriteOpaqueBlob {
+        #[serde(borrow)]
+        data_base64: Cow<'a, str>,
+        object_format: CheckpointOpaqueObjectFormat,
+    },
     VerifySnapshot {
         head: String,
         cataloged_commits: Vec<String>,
         checkpoints: Vec<CheckpointDurabilityHelperSpec>,
     },
+}
+
+/// Private opaque writes carry the parent's preclaimed object algorithm.
+/// Helper processes start before CLI configuration, so their ambient default
+/// must never decide the repository namespace for a verified artifact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CheckpointOpaqueObjectFormat {
+    Sha1,
+    Sha256,
+    Blake3,
+}
+
+impl CheckpointOpaqueObjectFormat {
+    fn from_kind(kind: git_internal::hash::HashKind) -> Self {
+        match kind {
+            git_internal::hash::HashKind::Sha1 => Self::Sha1,
+            git_internal::hash::HashKind::Sha256 => Self::Sha256,
+            git_internal::hash::HashKind::Blake3 => Self::Blake3,
+        }
+    }
+
+    fn hash_kind(self) -> git_internal::hash::HashKind {
+        match self {
+            Self::Sha1 => git_internal::hash::HashKind::Sha1,
+            Self::Sha256 => git_internal::hash::HashKind::Sha256,
+            Self::Blake3 => git_internal::hash::HashKind::Blake3,
+        }
+    }
+}
+
+/// Only an already verified reasoning field can select fast blob compression.
+/// Ordinary checkpoint objects retain the general writer's compression policy.
+enum CheckpointObjectWritePayload<'a> {
+    Object {
+        object_type: &'a str,
+        data: &'a [u8],
+    },
+    Opaque(&'a OpaqueEncryptedBytes),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1129,22 +1180,44 @@ pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
                         }
                     }
                 }
-                CheckpointObjectIoOperation::Write {
-                    object_type,
-                    data_base64,
-                } => {
+                operation @ (CheckpointObjectIoOperation::Write { .. }
+                | CheckpointObjectIoOperation::WriteOpaqueBlob { .. }) => {
+                    let (object_type, data_base64, opaque_format) = match operation {
+                        CheckpointObjectIoOperation::Write {
+                            object_type,
+                            data_base64,
+                        } => (object_type, Cow::Owned(data_base64), None),
+                        CheckpointObjectIoOperation::WriteOpaqueBlob {
+                            data_base64,
+                            object_format,
+                        } => ("blob".to_string(), data_base64, Some(object_format)),
+                        _ => {
+                            return serde_json::to_vec(&CheckpointObjectIoHelperResponse::Error {
+                                code: CheckpointObjectIoHelperError::InvalidRequest,
+                            })
+                            .context("encode checkpoint object-I/O helper response");
+                        }
+                    };
                     if !matches!(object_type.as_str(), "blob" | "tree" | "commit") {
                         CheckpointObjectIoHelperResponse::Error {
                             code: CheckpointObjectIoHelperError::UnsupportedObjectType,
                         }
                     } else {
-                        match STANDARD.decode(data_base64) {
+                        match STANDARD.decode(data_base64.as_bytes()) {
                             Err(_) => CheckpointObjectIoHelperResponse::Error {
                                 code: CheckpointObjectIoHelperError::InvalidPayload,
                             },
                             Ok(data) => {
-                                match write_git_object_with_status(&repo_path, &object_type, &data)
-                                {
+                                let written = if let Some(format) = opaque_format {
+                                    write_opaque_blob_with_status(
+                                        &repo_path,
+                                        &data,
+                                        format.hash_kind(),
+                                    )
+                                } else {
+                                    write_git_object_with_status(&repo_path, &object_type, &data)
+                                };
+                                match written {
                                     Ok((oid, was_created)) => {
                                         CheckpointObjectIoHelperResponse::Written {
                                             oid: oid.to_string(),
@@ -1204,7 +1277,7 @@ pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
 
 async fn invoke_checkpoint_object_helper(
     repo_path: &Path,
-    operation: CheckpointObjectIoOperation,
+    operation: CheckpointObjectIoOperation<'_>,
     deadline: Instant,
 ) -> Result<CheckpointObjectIoHelperResponse> {
     #[cfg(not(unix))]
@@ -1222,7 +1295,24 @@ async fn invoke_checkpoint_object_helper(
             repo_path_base64: encode_checkpoint_object_path(repo_path)?,
             operation,
         };
-        let frame = serde_json::to_vec(&request).context("encode checkpoint object-I/O request")?;
+        let frame = if let CheckpointObjectIoOperation::WriteOpaqueBlob { data_base64, .. } =
+            &request.operation
+        {
+            // Base64 contains no JSON escapes. Reserve the bounded payload once
+            // instead of repeatedly growing and copying the opaque request.
+            let capacity = data_base64
+                .len()
+                .checked_add(request.repo_path_base64.len())
+                .and_then(|bytes| bytes.checked_add(192))
+                .filter(|bytes| *bytes as u64 <= CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP)
+                .ok_or_else(|| anyhow!("checkpoint object-I/O request exceeds its helper limit"))?;
+            let mut frame = Vec::with_capacity(capacity);
+            serde_json::to_writer(&mut frame, &request)
+                .context("encode checkpoint object-I/O request")?;
+            frame
+        } else {
+            serde_json::to_vec(&request).context("encode checkpoint object-I/O request")?
+        };
         if frame.len() as u64 > CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP {
             bail!(
                 "checkpoint object-I/O request exceeds the {}-byte helper limit",
@@ -2149,6 +2239,37 @@ impl HistoryManager {
         newly_written: &mut HashSet<String>,
         object_index_intents: &mut Vec<CheckpointObjectIndexIntent>,
     ) -> Result<ObjectHash> {
+        self.write_indexed_object_payload_for_attempt(
+            CheckpointObjectWritePayload::Object { object_type, data },
+            index_type,
+            what,
+            fence,
+            capture_scope,
+            deadline,
+            newly_written,
+            object_index_intents,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_indexed_object_payload_for_attempt(
+        &self,
+        payload: CheckpointObjectWritePayload<'_>,
+        index_type: &str,
+        what: &str,
+        fence: &TracesWriterFence,
+        capture_scope: Option<&CaptureScope>,
+        deadline: Option<CaptureCommitDeadline>,
+        newly_written: &mut HashSet<String>,
+        object_index_intents: &mut Vec<CheckpointObjectIndexIntent>,
+    ) -> Result<ObjectHash> {
+        let (object_type, data, opaque) = match payload {
+            CheckpointObjectWritePayload::Object { object_type, data } => {
+                (object_type, data, false)
+            }
+            CheckpointObjectWritePayload::Opaque(bytes) => ("blob", bytes.as_bytes(), true),
+        };
         let expected_oid = git_object_hash(object_type, data);
         let oid_string = expected_oid.to_string();
         let needs_preclaim = if deadline.is_some() {
@@ -2174,19 +2295,33 @@ impl HistoryManager {
         let (oid, was_created) = if let Some(deadline) = deadline {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-            let response = invoke_checkpoint_object_helper(
-                &self.repo_path,
+            let operation = if opaque {
+                CheckpointObjectIoOperation::WriteOpaqueBlob {
+                    data_base64: Cow::Owned(STANDARD.encode(data)),
+                    object_format: CheckpointOpaqueObjectFormat::from_kind(expected_oid.kind()),
+                }
+            } else {
                 CheckpointObjectIoOperation::Write {
                     object_type: object_type.to_string(),
                     data_base64: STANDARD.encode(data),
-                },
-                deadline.monotonic(),
-            )
-            .await
-            .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?;
+                }
+            };
+            let response =
+                invoke_checkpoint_object_helper(&self.repo_path, operation, deadline.monotonic())
+                    .await
+                    .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?;
             match response {
                 CheckpointObjectIoHelperResponse::Written { oid, was_created } => (
-                    crate::internal::ai::util::parse_repo_object_id(&oid).map_err(|error| {
+                    (if opaque {
+                        crate::internal::object_format::parse_hex_for_kind(
+                            expected_oid.kind(),
+                            &oid,
+                        )
+                        .map_err(|error| error.to_string())
+                    } else {
+                        crate::internal::ai::util::parse_repo_object_id(&oid)
+                    })
+                    .map_err(|error| {
                         anyhow!("helper returned invalid checkpoint oid '{oid}': {error}")
                     })?,
                     was_created,
@@ -2205,8 +2340,12 @@ impl HistoryManager {
                 }
             }
         } else {
-            write_git_object_with_status(&self.repo_path, object_type, data)
-                .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?
+            let written = if opaque {
+                write_opaque_blob_with_status(&self.repo_path, data, expected_oid.kind())
+            } else {
+                write_git_object_with_status(&self.repo_path, object_type, data)
+            };
+            written.with_context(|| format!("failed to write checkpoint {what} {object_type}"))?
         };
         if oid != expected_oid {
             bail!("checkpoint object hash changed between ownership registration and write");
@@ -2848,6 +2987,79 @@ impl HistoryManager {
             Ok(())
         };
         ensure_deadline()?;
+        if !params.reasoning_artifacts.is_empty() && params.capture_scope.is_none() {
+            bail!(
+                "reasoning artifacts require a repository capture scope so object indexes commit with the checkpoint"
+            );
+        }
+        let mut artifact_digests = Vec::new();
+        // Validate the complete artifact metadata before writing any object.
+        if !params.reasoning_artifacts.is_empty() {
+            if params.reasoning_artifacts.len() > REASONING_ARTIFACT_MAX_ENTRIES {
+                bail!(
+                    "reasoning artifact count {} exceeds the {} entry budget",
+                    params.reasoning_artifacts.len(),
+                    REASONING_ARTIFACT_MAX_ENTRIES
+                );
+            }
+            let total_bytes: u64 = params
+                .reasoning_artifacts
+                .iter()
+                .map(|artifact| artifact.bytes.len() as u64)
+                .sum();
+            if total_bytes > REASONING_ARTIFACT_TOTAL_MAX_BYTES {
+                bail!(
+                    "reasoning artifact bytes {total_bytes} exceed the {} byte budget",
+                    REASONING_ARTIFACT_TOTAL_MAX_BYTES
+                );
+            }
+            let mut seen_locators: HashSet<String> = HashSet::new();
+            for artifact in params.reasoning_artifacts {
+                if artifact.bytes.is_empty() {
+                    bail!(
+                        "reasoning artifact payload is empty; require a non-empty verified encrypted source"
+                    );
+                }
+                if !crate::internal::ai::observed_agents::reasoning::artifact_locator_is_valid(
+                    artifact.provider, artifact.source_kind, &artifact.locator,
+                ) || !matches!(artifact.availability,
+                    crate::internal::ai::observed_agents::reasoning::ReasoningAvailability::EncryptedUnavailable
+                    | crate::internal::ai::observed_agents::reasoning::ReasoningAvailability::OpaqueArchived)
+                    || artifact.decrypt_capability != "none"
+                    || (artifact.provider, artifact.source_kind) != {
+                        let (provider, kind) = artifact.bytes.verified_source(); (provider, Some(kind))
+                    }
+                {
+                    bail!("reasoning artifact metadata is invalid; use verified provider coordinates and an unavailable decrypt capability");
+                }
+                // RG-02 AC 4: duplicate locator within one checkpoint is
+                // rejected fail-closed (a locator must uniquely identify its
+                // source field for this checkpoint).
+                if !seen_locators.insert(artifact.locator.clone()) {
+                    bail!("duplicate reasoning artifact locator in one checkpoint");
+                }
+            }
+            artifact_digests = params
+                .reasoning_artifacts
+                .iter()
+                .map(|artifact| artifact.bytes.sha256_hex())
+                .collect::<Vec<_>>();
+            let oid_width = crate::utils::object::git_object_hash("blob", b"")
+                .to_string()
+                .len();
+            let projected = serde_json::json!({"reasoning_artifacts": params.reasoning_artifacts.iter().zip(&artifact_digests).map(|(artifact, sha)| serde_json::json!({
+                "path": format!("reasoning/encrypted/{sha}"),
+                "oid": "0".repeat(oid_width),
+                "sha256": sha, "byte_len": artifact.bytes.len(),
+                "locator": artifact.locator, "provider": artifact.provider,
+                "source_kind": artifact.source_kind, "availability": artifact.availability,
+                "decrypt_capability": artifact.decrypt_capability,
+            })).collect::<Vec<_>>()});
+            if serde_json::to_vec_pretty(&projected)?.len() > REASONING_ARTIFACT_MANIFEST_MAX_BYTES
+            {
+                bail!("reasoning artifact manifest bytes exceed the metadata budget");
+            }
+        }
         let mut object_count: u64 = 0;
         let mut object_index_intents = Vec::new();
         let metadata_blob_oid = self
@@ -2966,6 +3178,79 @@ impl HistoryManager {
         object_count += 1;
         ensure_deadline()?;
 
+        // RG-02: verified opaque ciphertext artifacts. Budgets are enforced
+        // fail-closed (no silent truncation); objects are deduplicated by
+        // sha256 (two locators with identical bytes share one object); the
+        // empty set writes nothing and leaves the tree byte-identical.
+        let mut reasoning_artifacts_manifest: Vec<ManifestArtifactRef> = Vec::new();
+        if !params.reasoning_artifacts.is_empty() {
+            let mut written_oids: HashMap<String, ObjectHash> = HashMap::new();
+            for (artifact, sha256) in params.reasoning_artifacts.iter().zip(artifact_digests) {
+                ensure_deadline()?;
+                let oid = if let Some(oid) = written_oids.get(&sha256) {
+                    // Same ciphertext bytes: a single object serves both
+                    // locators; both still appear in the manifest.
+                    *oid
+                } else {
+                    let oid = self
+                        .write_indexed_object_payload_for_attempt(
+                            CheckpointObjectWritePayload::Opaque(&artifact.bytes),
+                            "blob",
+                            &format!("reasoning/encrypted/{sha256}"),
+                            writer_fence,
+                            params.capture_scope,
+                            params.deadline,
+                            newly_written,
+                            &mut object_index_intents,
+                        )
+                        .await?;
+                    object_count += 1;
+                    ensure_deadline()?;
+                    written_oids.insert(sha256.clone(), oid);
+                    oid
+                };
+                reasoning_artifacts_manifest.push(ManifestArtifactRef {
+                    path: format!("reasoning/encrypted/{sha256}"),
+                    oid,
+                    sha256: sha256.clone(),
+                    byte_len: artifact.bytes.len() as u64,
+                    locator: artifact.locator.clone(),
+                    provider: artifact.provider,
+                    source_kind: artifact.source_kind,
+                    availability: artifact.availability,
+                    decrypt_capability: artifact.decrypt_capability.clone(),
+                });
+            }
+            // Reasoning-related manifest bytes budget (fail-closed).
+            // Codex/Claude re-review: measure the array exactly as it is
+            // nested in manifest.json (under the "reasoning_artifacts" key),
+            // so indentation and the key name count toward the budget.
+            let reasoning_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "reasoning_artifacts": reasoning_artifacts_manifest
+                    .iter()
+                    .map(|artifact| serde_json::json!({
+                        "path": artifact.path,
+                        "oid": artifact.oid.to_string(),
+                        "sha256": artifact.sha256,
+                        "byte_len": artifact.byte_len,
+                        "locator": artifact.locator,
+                        "provider": artifact.provider,
+                        "source_kind": artifact.source_kind,
+                        "availability": artifact.availability,
+                        "decrypt_capability": artifact.decrypt_capability,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .context("serialize reasoning artifacts manifest bytes")?;
+            if reasoning_bytes.len() > REASONING_ARTIFACT_MANIFEST_MAX_BYTES {
+                bail!(
+                    "reasoning artifact manifest bytes {} exceed the {} byte budget",
+                    reasoning_bytes.len(),
+                    REASONING_ARTIFACT_MANIFEST_MAX_BYTES
+                );
+            }
+        }
+
         // manifest.json is written LAST among the blobs: it declares every
         // other entry's OID/length (including content_hash.txt), so nothing
         // can hash or list the manifest itself without circularity.
@@ -2978,6 +3263,7 @@ impl HistoryManager {
             transcript_bytes.len(),
             ManifestBlobRef::new(report_blob_oid, params.redaction_report_json.len()),
             ManifestBlobRef::new(content_hash_blob_oid, content_hash.len()),
+            &reasoning_artifacts_manifest,
         )?;
         let manifest_blob_oid = self
             .write_indexed_object_for_attempt(
@@ -6157,6 +6443,8 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::sleep;
 
+    use crate::internal::ai::traces::ReasoningArtifactParam;
+
     /// Ownership-only erasure fixture: intentionally no replay authority.
     /// The full payload/MAC round trip is tested by capture::pending; deletion
     /// must also work when the key and evictable receipt ledger are gone.
@@ -7471,6 +7759,7 @@ mod tests {
             session_id: "claude_code__s1",
             marker_generation,
             capture_scope: None,
+            reasoning_artifacts: &[],
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Committed,
@@ -7864,6 +8153,7 @@ mod tests {
                 session_id: "history-retry-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -8074,6 +8364,7 @@ mod tests {
                 session_id: "history-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -8223,6 +8514,7 @@ mod tests {
                 session_id: "history-index-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -8350,6 +8642,7 @@ mod tests {
                 session_id: "history-extra-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -8531,6 +8824,7 @@ mod tests {
                 session_id: "history-recheck-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -8689,6 +8983,7 @@ mod tests {
                 session_id: "history-post-index-scope-session",
                 marker_generation: &marker_generation,
                 capture_scope: Some(&scope),
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Committed,
@@ -9449,6 +9744,7 @@ mod tests {
                 session_id: "fenced-session",
                 marker_generation: &stale_fence.generation,
                 capture_scope: None,
+                reasoning_artifacts: &[],
                 agent_kind: "claude_code",
                 parent_commit: None,
                 scope: CheckpointScope::Subagent,
@@ -11210,5 +11506,830 @@ mod tests {
             super::parse_cleanup_index_roots(&patched, 32, "held blake3 index").is_err(),
             "corrupt blake3 index checksum must fail"
         );
+    }
+
+    #[test]
+    fn checkpoint_object_helper_opaque_blob_is_fast_exact_and_rejects_type_override() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let repo = tempdir().unwrap();
+        let payload = vec![b'x'; 128 * 1024];
+        let request = CheckpointObjectIoHelperRequest {
+            repo_path_base64: encode_checkpoint_object_path(repo.path()).unwrap(),
+            operation: CheckpointObjectIoOperation::WriteOpaqueBlob {
+                data_base64: Cow::Owned(STANDARD.encode(&payload)),
+                object_format: CheckpointOpaqueObjectFormat::Sha1,
+            },
+        };
+        let frame = serde_json::to_vec(&request).unwrap();
+        let decoded: CheckpointObjectIoHelperRequest<'_> = serde_json::from_slice(&frame).unwrap();
+        let CheckpointObjectIoOperation::WriteOpaqueBlob { data_base64, .. } = decoded.operation
+        else {
+            panic!("opaque request changed operation")
+        };
+        assert!(matches!(data_base64, Cow::Borrowed(_)));
+        assert_eq!(STANDARD.decode(data_base64.as_bytes()).unwrap(), payload);
+        for kind in [
+            git_internal::hash::HashKind::Sha1,
+            git_internal::hash::HashKind::Sha256,
+            git_internal::hash::HashKind::Blake3,
+        ] {
+            let ambient = if kind == git_internal::hash::HashKind::Sha1 {
+                git_internal::hash::HashKind::Blake3
+            } else {
+                git_internal::hash::HashKind::Sha1
+            };
+            let _ambient = git_internal::hash::set_hash_kind_for_test(ambient);
+            let mut value = serde_json::to_value(&request).unwrap();
+            value["operation"]["object_format"] =
+                serde_json::to_value(CheckpointOpaqueObjectFormat::from_kind(kind)).unwrap();
+            let wire =
+                run_checkpoint_object_io_helper(&serde_json::to_vec(&value).unwrap()).unwrap();
+            let response: CheckpointObjectIoHelperResponse = serde_json::from_slice(&wire).unwrap();
+            let CheckpointObjectIoHelperResponse::Written { oid, was_created } = response else {
+                panic!("valid explicit-kind opaque helper write rejected")
+            };
+            assert!(was_created);
+            let parsed = crate::internal::object_format::parse_hex_for_kind(kind, &oid).unwrap();
+            let mut canonical = format!("blob {}\0", payload.len()).into_bytes();
+            canonical.extend_from_slice(&payload);
+            assert_eq!(
+                parsed,
+                git_internal::hash::ObjectHash::new_for_kind(kind, &canonical)
+            );
+            let compressed =
+                std::fs::read(repo.path().join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+            let mut decoded = Vec::new();
+            std::io::Read::read_to_end(
+                &mut flate2::read::ZlibDecoder::new(&compressed[..]),
+                &mut decoded,
+            )
+            .unwrap();
+            assert_eq!(decoded, canonical);
+            assert_eq!(compressed[1] >> 6, 0);
+            assert_eq!((compressed[2] >> 1) & 3, 0);
+        }
+        for value in [
+            None,
+            Some(serde_json::json!("PRIVATE-INVALID-ALGORITHM")),
+            Some(serde_json::json!(null)),
+        ] {
+            let mut invalid = serde_json::to_value(&request).unwrap();
+            if let Some(value) = value {
+                invalid["operation"]["object_format"] = value;
+            } else {
+                invalid["operation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("object_format");
+            }
+            let response =
+                run_checkpoint_object_io_helper(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(!String::from_utf8_lossy(&response).contains("PRIVATE-INVALID-ALGORITHM"));
+            assert!(matches!(
+                serde_json::from_slice::<CheckpointObjectIoHelperResponse>(&response).unwrap(),
+                CheckpointObjectIoHelperResponse::Error {
+                    code: CheckpointObjectIoHelperError::InvalidRequest
+                }
+            ));
+        }
+        for override_field in ["object_type", "compression"] {
+            let mut invalid = serde_json::to_value(&request).unwrap();
+            invalid["operation"][override_field] = serde_json::json!("PRIVATE-HELPER-CANARY");
+            let response =
+                run_checkpoint_object_io_helper(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(!String::from_utf8_lossy(&response).contains("PRIVATE-HELPER-CANARY"));
+            assert!(matches!(
+                serde_json::from_slice::<CheckpointObjectIoHelperResponse>(&response).unwrap(),
+                CheckpointObjectIoHelperResponse::Error {
+                    code: CheckpointObjectIoHelperError::InvalidRequest
+                }
+            ));
+        }
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["operation"]["data_base64"] = serde_json::json!("PRIVATE!INVALID!PAYLOAD");
+        let response =
+            run_checkpoint_object_io_helper(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<CheckpointObjectIoHelperResponse>(&response).unwrap(),
+            CheckpointObjectIoHelperResponse::Error {
+                code: CheckpointObjectIoHelperError::InvalidPayload
+            }
+        ));
+        assert!(!String::from_utf8_lossy(&response).contains("PRIVATE!INVALID!PAYLOAD"));
+    }
+
+    async fn artifact_test_fixture(
+        checkpoint_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<DatabaseConnection>,
+        HistoryManager,
+        TracesWriterFence,
+    ) {
+        let dir = tempdir().expect("artifact fixture tempdir");
+        let repo_path = dir.path().join(".libra");
+        let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        let marker = TracesInflightMarker::new(
+            "claude_code__s1",
+            checkpoint_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        write_traces_inflight_marker(db_conn.as_ref(), &marker)
+            .await
+            .expect("seed artifact writer marker generation");
+        let fence = TracesWriterFence {
+            session_id: "claude_code__s1".to_string(),
+            attempt_id: checkpoint_id.to_string(),
+            generation: marker.generation.expect("new marker generation"),
+        };
+        (dir, repo_path, db_conn, manager, fence)
+    }
+
+    /// Measures hashing plus the actual owned/indexed opaque write, excluding
+    /// fixture construction, readback and the final checkpoint transaction.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "macOS release CPU acceptance; run alone with --release --ignored"]
+    async fn artifact_16_mib_hash_and_indexed_write_cpu_budget() {
+        artifact_indexed_write_cpu_budget(false).await;
+    }
+
+    /// Includes the real private helper process and its IPC in the CPU budget.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "macOS release CPU acceptance; build the release CLI and run alone"]
+    async fn artifact_16_mib_deadline_hash_and_indexed_write_cpu_budget() {
+        artifact_indexed_write_cpu_budget(true).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn artifact_indexed_write_cpu_budget(with_deadline: bool) {
+        if cfg!(debug_assertions) {
+            panic!("run this CPU gate with --release");
+        }
+        fn cpu_us(who: libc::c_int) -> i128 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            // SAFETY: getrusage initializes the correctly sized output on success.
+            assert_eq!(unsafe { libc::getrusage(who, usage.as_mut_ptr()) }, 0);
+            // SAFETY: the successful call initialized the entire output.
+            let usage = unsafe { usage.assume_init() };
+            (i128::from(usage.ru_utime.tv_sec) + i128::from(usage.ru_stime.tv_sec)) * 1_000_000
+                + i128::from(usage.ru_utime.tv_usec)
+                + i128::from(usage.ru_stime.tv_usec)
+        }
+        let helper = if with_deadline {
+            let path = PathBuf::from(
+                std::env::var_os("LIBRA_RG_PERF_HELPER")
+                    .expect("set LIBRA_RG_PERF_HELPER to the freshly built release Libra CLI"),
+            );
+            assert!(path.is_absolute() && path.is_file(), "release helper path");
+            Some(path)
+        } else {
+            None
+        };
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for repetition in 0..9u64 {
+            let kind = [
+                git_internal::hash::HashKind::Sha1,
+                git_internal::hash::HashKind::Sha256,
+                git_internal::hash::HashKind::Blake3,
+            ][repetition as usize / 3];
+            let _kind = git_internal::hash::set_hash_kind_for_test(kind);
+            let mut state = 0x9e3779b97f4a7c15u64 ^ repetition;
+            let mut payload = vec![0u8; 16 * 1024 * 1024];
+            for byte in &mut payload {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = alphabet[(state & 63) as usize];
+            }
+            let checkpoint = format!("rg-perf-artifact-{repetition}");
+            let (_dir, _conn, manager, fence, scope) = scoped_artifact_fixture(&checkpoint).await;
+            let artifact = test_artifact("claude_code:msg=0/part=0/metadata=signature", &payload);
+            let mut newly_written = HashSet::new();
+            let mut intents = Vec::new();
+            let deadline = with_deadline.then(|| {
+                CaptureCommitDeadline::from_budget(Duration::from_secs(30))
+                    .expect("paired capture deadline")
+            });
+            let cpu_start = cpu_us(libc::RUSAGE_SELF);
+            let children_start = cpu_us(libc::RUSAGE_CHILDREN);
+            let wall_start = Instant::now();
+            let digest = artifact.bytes.sha256_hex();
+            let what = format!("reasoning/encrypted/{digest}");
+            let write = manager.write_indexed_object_payload_for_attempt(
+                CheckpointObjectWritePayload::Opaque(&artifact.bytes),
+                "blob",
+                &what,
+                &fence,
+                Some(&scope),
+                deadline,
+                &mut newly_written,
+                &mut intents,
+            );
+            let oid = if let Some(helper) = &helper {
+                crate::internal::ai::authorized_read::with_test_helper_program(
+                    helper.clone(),
+                    write,
+                )
+                .await
+            } else {
+                write.await
+            }
+            .expect("write verified high-entropy artifact once");
+            let wall = wall_start.elapsed();
+            let parent_cpu = cpu_us(libc::RUSAGE_SELF) - cpu_start;
+            let child_cpu = cpu_us(libc::RUSAGE_CHILDREN) - children_start;
+            let cpu = parent_cpu + child_cpu;
+            assert_eq!(newly_written.len(), 1);
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].oid, oid.to_string());
+            assert_eq!(intents[0].size, payload.len() as i64);
+            assert_eq!(read_git_object(&manager.repo_path, &oid).unwrap(), payload);
+            eprintln!(
+                "RG-02 deadline={} algorithm={} sample={} bytes=16777216 CPU_us={} parent_us={} child_us={} wall_ms={:.3}",
+                with_deadline,
+                kind,
+                repetition + 1,
+                cpu,
+                parent_cpu,
+                child_cpu,
+                wall.as_secs_f64() * 1000.0
+            );
+            assert!(
+                cpu <= 100_000,
+                "RG-02 extra CPU budget exceeded: {cpu}us > 100000us"
+            );
+        }
+    }
+
+    fn artifact_test_scope() -> CaptureScope {
+        CaptureScope {
+            repo_id: "artifact-test-repository".to_string(),
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        }
+    }
+
+    fn artifact_params<'a>(
+        capture_scope: &'a CaptureScope,
+        checkpoint_id: &'a str,
+        marker_generation: &'a str,
+        blobs: &'a RedactedBytes,
+        artifacts: &'a [ReasoningArtifactParam],
+    ) -> CheckpointCommitParams<'a> {
+        CheckpointCommitParams {
+            checkpoint_id,
+            session_id: "claude_code__s1",
+            marker_generation,
+            capture_scope: Some(capture_scope),
+            agent_kind: "claude_code",
+            parent_commit: None,
+            scope: CheckpointScope::Committed,
+            tool_use_id: None,
+            metadata_json: blobs,
+            transcript_redacted: blobs,
+            lifecycle_events_jsonl: blobs,
+            redaction_report_json: blobs,
+            txn_extra: None,
+            deadline: None,
+            reasoning_artifacts: artifacts,
+        }
+    }
+
+    fn artifact_redactor() -> crate::internal::ai::observed_agents::Redactor {
+        crate::internal::ai::observed_agents::Redactor::new_default()
+    }
+
+    fn test_artifact(locator: &str, bytes: &[u8]) -> ReasoningArtifactParam {
+        ReasoningArtifactParam {
+            locator: locator.to_string(),
+            provider: crate::internal::ai::observed_agents::reasoning::ReasoningProvider::ClaudeCode,
+            source_kind: Some(
+                crate::internal::ai::observed_agents::reasoning::ReasoningSourceKind::Signature,
+            ),
+            availability: crate::internal::ai::observed_agents::reasoning::ReasoningAvailability::
+                EncryptedUnavailable,
+            decrypt_capability: "none".to_string(),
+            bytes: crate::internal::ai::observed_agents::reasoning::OpaqueEncryptedBytes::
+                from_verified_test_field(bytes.to_vec()),
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_invalid_metadata_fails_before_object_write() {
+        let test_scope = artifact_test_scope();
+        use crate::internal::ai::observed_agents::reasoning::{
+            ReasoningAvailability, ReasoningProvider, ReasoningSourceKind,
+        };
+        for case in 0..8 {
+            let id = "invalid-artifact-metadata";
+            let (_dir, _repo, conn, manager, fence) = artifact_test_fixture(id).await;
+            let (plain, _) = artifact_redactor().redact(b"safe transcript");
+            let mut artifact = test_artifact(
+                "claude_code:msg=0/part=0/metadata=signature",
+                b"opaque bytes",
+            );
+            match case {
+                0 => artifact.locator = "x".repeat(4097),
+                1 => artifact.locator = "metadata payload canary".to_string(),
+                2 => artifact.availability = ReasoningAvailability::ProviderVisible,
+                3 => artifact.decrypt_capability = "unverified decrypt capability".to_string(),
+                4 => artifact.source_kind = Some(ReasoningSourceKind::Thinking),
+                5 => artifact.source_kind = None,
+                6 => {
+                    artifact.source_kind = Some(ReasoningSourceKind::RedactedThinkingData);
+                    artifact.locator = "claude_code:msg=0/part=0/metadata=data".to_string();
+                }
+                _ => {
+                    artifact.provider = ReasoningProvider::Codex;
+                    artifact.source_kind = Some(ReasoningSourceKind::EncryptedContent);
+                    artifact.locator = "codex:ordinal=0".to_string();
+                }
+            }
+            let artifacts = [artifact];
+            let error = manager
+                .append_checkpoint_commit(artifact_params(
+                    &test_scope,
+                    id,
+                    &fence.generation,
+                    &plain,
+                    &artifacts,
+                ))
+                .await
+                .expect_err("invalid artifact metadata");
+            assert!(format!("{error:#}").contains("reasoning artifact metadata is invalid"));
+            assert!(!format!("{error:#}").contains("metadata payload canary"));
+            assert!(
+                conn.query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'object_index'"
+                        .to_string()
+                ))
+                .await
+                .expect("probe untouched object-index schema")
+                .is_none()
+            );
+            assert_eq!(
+                walkdir::WalkDir::new(manager.repo_path.join("objects"))
+                    .into_iter()
+                    .map(|entry| entry.expect("enumerate untouched loose objects"))
+                    .filter(|entry| entry.file_type().is_file())
+                    .count(),
+                0
+            );
+            assert!(
+                manager
+                    .resolve_history_head()
+                    .await
+                    .expect("unchanged head")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_unscoped_write_fails_before_object_index_or_loose_object() {
+        let test_scope = artifact_test_scope();
+        let id = "unscoped-artifact";
+        let (_dir, _repo, conn, manager, fence) = artifact_test_fixture(id).await;
+        let (plain, _) = artifact_redactor().redact(b"safe transcript");
+        let artifacts = [test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            b"opaque artifact",
+        )];
+        let mut params = artifact_params(&test_scope, id, &fence.generation, &plain, &artifacts);
+        params.capture_scope = None;
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("scope required");
+        assert!(format!("{error:#}").contains("require a repository capture scope"));
+        assert!(
+            conn.query_one_raw(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'object_index'"
+                    .to_string()
+            ))
+            .await
+            .expect("probe untouched object-index schema")
+            .is_none()
+        );
+        assert_eq!(
+            walkdir::WalkDir::new(manager.repo_path.join("objects"))
+                .into_iter()
+                .map(|entry| entry.expect("enumerate untouched loose objects"))
+                .filter(|entry| entry.file_type().is_file())
+                .count(),
+            0
+        );
+        assert!(
+            manager
+                .resolve_history_head()
+                .await
+                .expect("head")
+                .is_none()
+        );
+    }
+
+    async fn read_checkpoint_manifest_value(
+        manager: &HistoryManager,
+        commit: &CheckpointCommit,
+        checkpoint_id: &str,
+    ) -> serde_json::Value {
+        let root = manager
+            .load_commit_tree(&commit.commit_hash)
+            .expect("load checkpoint root");
+        let inner_oid = manager
+            .checkpoint_inner_tree_from_root(&root, checkpoint_id)
+            .expect("locate checkpoint leaf")
+            .expect("checkpoint leaf exists");
+        let inner = manager.load_tree(&inner_oid).expect("load checkpoint leaf");
+        let manifest = inner
+            .iter()
+            .find(|entry| entry.name == "manifest.json")
+            .expect("manifest entry");
+        let manifest_bytes =
+            read_git_object(&manager.repo_path, &manifest.id).expect("read checkpoint manifest");
+        serde_json::from_slice(&manifest_bytes).expect("parse checkpoint manifest")
+    }
+
+    async fn scoped_artifact_fixture(
+        checkpoint_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<DatabaseConnection>,
+        HistoryManager,
+        TracesWriterFence,
+        CaptureScope,
+    ) {
+        let dir = tempdir().expect("artifact transaction fixture");
+        let repo = dir.path().join(".libra");
+        std::fs::create_dir_all(&repo).expect("artifact repository");
+        let conn = Arc::new(
+            db::create_database(&repo.join("libra.db").to_string_lossy())
+                .await
+                .expect("artifact database"),
+        );
+        conn.execute_raw(Statement::from_string(conn.get_database_backend(),
+            "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, working_dir, metadata_json, redaction_report, started_at, last_event_at, stopped_at) VALUES ('claude_code__s1', 'claude_code', 'artifact-provider-session', 'stopped', '/artifact-fixture', '{}', '{}', 1, 2, 3)".to_string()
+        )).await.expect("seed artifact session");
+        let fence = seed_test_writer_fence(&conn, "claude_code__s1", checkpoint_id).await;
+        let manager = traces_manager(&dir, conn.clone());
+        let scope = CaptureScope {
+            repo_id: "artifact-transaction-test".to_string(),
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        };
+        (dir, conn, manager, fence, scope)
+    }
+
+    #[tokio::test]
+    async fn artifact_empty_payload_and_unbounded_metadata_fail_before_object_write() {
+        for (id, locator, bytes, expected) in [
+            (
+                "artifact-empty-payload",
+                "claude_code:msg=0/part=0/metadata=signature".to_string(),
+                &b""[..],
+                "payload is empty",
+            ),
+            (
+                "artifact-unbounded-metadata",
+                "PRIVATE_LOCATOR_CANARY".repeat(1024),
+                &b"opaque"[..],
+                "metadata is invalid",
+            ),
+        ] {
+            let scope = artifact_test_scope();
+            let (_dir, _, _, manager, fence) = artifact_test_fixture(id).await;
+            let (plain, _) = artifact_redactor().redact(b"safe transcript");
+            let artifacts = [test_artifact(&locator, bytes)];
+            let params = artifact_params(&scope, id, &fence.generation, &plain, &artifacts);
+            let error = manager
+                .append_checkpoint_commit(params)
+                .await
+                .expect_err("invalid artifact must fail closed");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("PRIVATE_LOCATOR_CANARY"));
+            assert_eq!(
+                walkdir::WalkDir::new(manager.repo_path.join("objects"))
+                    .into_iter()
+                    .map(|entry| entry.expect("enumerate untouched loose objects"))
+                    .filter(|entry| entry.file_type().is_file())
+                    .count(),
+                0,
+            );
+            assert!(
+                manager
+                    .resolve_history_head()
+                    .await
+                    .expect("history head")
+                    .is_none()
+            );
+        }
+    }
+
+    /// RG-02 AC 1/3/5: manifest snapshot with deduplicated objects, artifact
+    /// object bytes whose sha256 matches the input, and same-bytes locators
+    /// sharing one object.
+    #[tokio::test]
+    async fn artifact_manifest_snapshot_and_dedup_and_sha256() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-checkpoint-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"plain transcript for artifact test");
+        let cipher_a = b"ciphertext-bytes-a-0123456789";
+        let cipher_b = b"ciphertext-bytes-b-0123456789";
+        // locator 1 and locator 3 share the same bytes (dedup); locator 2 is
+        // distinct.
+        let artifacts = vec![
+            test_artifact("claude_code:msg=0/part=0/metadata=signature", cipher_a),
+            test_artifact("claude_code:msg=1/part=0/metadata=signature", cipher_b),
+            test_artifact("claude_code:msg=2/part=0/metadata=signature", cipher_a),
+        ];
+        let params = artifact_params(
+            &test_scope,
+            "artifact-checkpoint-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let commit = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect("append checkpoint with artifacts");
+        let manifest =
+            read_checkpoint_manifest_value(&manager, &commit, "artifact-checkpoint-01").await;
+        let list = manifest["reasoning_artifacts"]
+            .as_array()
+            .expect("reasoning_artifacts array");
+        assert_eq!(list.len(), 3, "all three locators appear in the manifest");
+        use sha2::Digest as _;
+        let sha_a = hex::encode(sha2::Sha256::digest(cipher_a));
+        let sha_b = hex::encode(sha2::Sha256::digest(cipher_b));
+        assert_eq!(list[0]["sha256"], sha_a);
+        assert_eq!(list[1]["sha256"], sha_b);
+        assert_eq!(list[2]["sha256"], sha_a);
+        // Dedup: locators 0 and 2 share one object oid.
+        assert_eq!(
+            list[0]["oid"], list[2]["oid"],
+            "same bytes share one object"
+        );
+        assert_ne!(list[0]["oid"], list[1]["oid"]);
+        assert_eq!(list[0]["path"], format!("reasoning/encrypted/{sha_a}"));
+        assert_eq!(list[0]["provider"], "claude_code");
+        assert_eq!(list[0]["source_kind"], "signature");
+        assert_eq!(list[0]["availability"], "encrypted_unavailable");
+        assert_eq!(list[0]["decrypt_capability"], "none");
+        // The artifact object is readable (via the manifest-declared oid) and
+        // its bytes match the input.
+        let artifact_oid: git_internal::hash::ObjectHash = list[0]["oid"]
+            .as_str()
+            .expect("oid")
+            .parse()
+            .expect("valid oid");
+        let object =
+            read_git_object(&manager.repo_path, &artifact_oid).expect("read artifact object");
+        assert_eq!(
+            object, cipher_a,
+            "artifact object bytes equal the verified input"
+        );
+    }
+
+    /// RG-02 AC 2: empty artifact set leaves the tree byte-identical — the
+    /// manifest has no `reasoning_artifacts` key at all.
+    #[tokio::test]
+    async fn empty_artifact_set_manifest_has_no_reasoning_key() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-empty-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"plain transcript, no artifacts");
+        let params = artifact_params(
+            &test_scope,
+            "artifact-empty-01",
+            &fence.generation,
+            &blobs,
+            &[],
+        );
+        let commit = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect("append checkpoint without artifacts");
+        let manifest = read_checkpoint_manifest_value(&manager, &commit, "artifact-empty-01").await;
+        assert!(
+            manifest.get("reasoning_artifacts").is_none(),
+            "empty artifact set must omit the key entirely (byte-identical tree)"
+        );
+        assert_eq!(
+            manifest["entries"].as_object().expect("entries").len(),
+            5,
+            "the five pre-RG-02 roles are unchanged"
+        );
+    }
+
+    /// RG-02 AC 4: duplicate locator in one checkpoint is rejected.
+    #[tokio::test]
+    async fn duplicate_locator_is_rejected() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-dup-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"dup locator transcript");
+        let artifacts = vec![
+            test_artifact("claude_code:msg=0/part=0/metadata=signature", b"first"),
+            test_artifact("claude_code:msg=0/part=0/metadata=signature", b"second"),
+        ];
+        let params = artifact_params(
+            &test_scope,
+            "artifact-dup-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("duplicate locator must fail closed");
+        assert!(format!("{error:#}").contains("duplicate reasoning artifact locator"));
+    }
+
+    /// RG-02 AC 7: entry count over the budget fails closed.
+    #[tokio::test]
+    async fn artifact_count_budget_fails_closed() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-count-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"count budget transcript");
+        let artifacts = (0..=REASONING_ARTIFACT_MAX_ENTRIES)
+            .map(|i| {
+                test_artifact(
+                    &format!("claude_code:msg={i}/part=0/metadata=signature"),
+                    &[i as u8],
+                )
+            })
+            .collect::<Vec<_>>();
+        let params = artifact_params(
+            &test_scope,
+            "artifact-count-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("entry budget exceeded must fail closed");
+        assert!(format!("{error:#}").contains("entry budget"));
+    }
+
+    /// RG-02 AC 9: total artifact bytes over the budget fails closed.
+    #[tokio::test]
+    async fn artifact_total_bytes_budget_fails_closed() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-total-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"total bytes budget transcript");
+        let huge = vec![0x5a_u8; (REASONING_ARTIFACT_TOTAL_MAX_BYTES as usize) + 1];
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            &huge,
+        )];
+        let params = artifact_params(
+            &test_scope,
+            "artifact-total-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("total byte budget exceeded must fail closed");
+        assert!(format!("{error:#}").contains("byte budget"));
+    }
+
+    /// RG-02 AC 8: reasoning manifest bytes over the budget fail closed.
+    #[tokio::test]
+    async fn artifact_manifest_bytes_budget_fails_closed() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-manifest-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"manifest bytes budget transcript");
+        // Legal 20-digit provider coordinates exceed the manifest byte
+        // budget while count and total payload remain within their limits.
+        let artifacts = (0..REASONING_ARTIFACT_MAX_ENTRIES)
+            .map(|i| {
+                let locator = format!(
+                    "claude_code:msg={}/part={}/metadata=signature",
+                    u64::MAX,
+                    u64::MAX - i as u64,
+                );
+                assert!(
+                    crate::internal::ai::observed_agents::reasoning::artifact_locator_is_valid(
+                        crate::internal::ai::observed_agents::reasoning::ReasoningProvider::ClaudeCode,
+                        Some(crate::internal::ai::observed_agents::reasoning::ReasoningSourceKind::Signature),
+                        &locator,
+                    )
+                );
+                test_artifact(&locator, &[i as u8])
+            })
+            .collect::<Vec<_>>();
+        let params = artifact_params(
+            &test_scope,
+            "artifact-manifest-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let error = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect_err("manifest byte budget exceeded must fail closed");
+        assert!(format!("{error:#}").contains("manifest bytes"));
+    }
+
+    /// RG-02 AC 6: the plain four roles never carry ciphertext bytes.
+    #[tokio::test]
+    async fn plain_roles_have_zero_ciphertext_hits() {
+        let test_scope = artifact_test_scope();
+        let checkpoint_id = "artifact-roles-01";
+        let (_dir, _, _db_conn, manager, fence) = artifact_test_fixture(checkpoint_id).await;
+        let cipher = b"ciphertext-canary-ROLE-SEPARATION-9f2a";
+        let redactor = artifact_redactor();
+        let (blobs, _) = redactor.redact(b"transcript must not contain ciphertext");
+        let artifacts = vec![test_artifact(
+            "claude_code:msg=0/part=0/metadata=signature",
+            cipher,
+        )];
+        let params = artifact_params(
+            &test_scope,
+            "artifact-roles-01",
+            &fence.generation,
+            &blobs,
+            &artifacts,
+        );
+        let commit = manager
+            .append_checkpoint_commit(params)
+            .await
+            .expect("append checkpoint");
+        let root = manager.load_commit_tree(&commit.commit_hash).expect("root");
+        let inner_oid = manager
+            .checkpoint_inner_tree_from_root(&root, "artifact-roles-01")
+            .expect("locate leaf")
+            .expect("leaf");
+        let inner = manager.load_tree(&inner_oid).expect("leaf tree");
+        for role in ["metadata.json", "redaction_report.json"] {
+            let entry = inner.iter().find(|entry| entry.name == role).expect(role);
+            let bytes = read_git_object(&manager.repo_path, &entry.id).expect("read role blob");
+            assert!(
+                !bytes.windows(cipher.len()).any(|w| w == cipher),
+                "{role} must not contain ciphertext bytes"
+            );
+        }
+        // lifecycle lives under events/lifecycle.jsonl.
+        let events_tree = inner
+            .iter()
+            .find(|entry| entry.name == "events")
+            .expect("events tree");
+        let events = manager
+            .load_tree(&events_tree.id)
+            .expect("events tree entries");
+        let lifecycle_entry = events
+            .iter()
+            .find(|entry| entry.name == "lifecycle.jsonl")
+            .expect("lifecycle.jsonl");
+        let lifecycle_bytes =
+            read_git_object(&manager.repo_path, &lifecycle_entry.id).expect("read lifecycle blob");
+        assert!(
+            !lifecycle_bytes.windows(cipher.len()).any(|w| w == cipher),
+            "lifecycle.jsonl must not contain ciphertext bytes"
+        );
+        let transcript_entry = inner
+            .iter()
+            .find(|entry| entry.name == "transcript")
+            .expect("transcript tree");
+        let transcript_tree = manager
+            .load_tree(&transcript_entry.id)
+            .expect("transcript parts");
+        for part in transcript_tree {
+            let bytes =
+                read_git_object(&manager.repo_path, &part.id).expect("read transcript part");
+            assert!(
+                !bytes.windows(cipher.len()).any(|w| w == cipher),
+                "transcript part must not contain ciphertext bytes"
+            );
+        }
     }
 }

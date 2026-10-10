@@ -885,3 +885,22 @@ reasoning projects under its own `reasoning` record type with `provider` and
 never written to unredacted metadata or logs.
 
 Direct serde serialization/deserialization of `ProviderVisibleText` is deliberately rejected. Callers must use classification and typed redaction followed by `canonical_turn_bytes` or `safe_turn_projection`. RG-04 does not wire a live provider adapter.
+
+
+RG-02 archives verified ciphertext as opaque artifacts: each checkpoint
+manifest may carry a `reasoning_artifacts[]` array (path/oid/sha256/byte_len/locator/
+provider/source_kind/availability/decrypt_capability) storing byte-exact
+objects under `reasoning/encrypted/<sha256>`; duplicate ciphertext bytes are
+deduplicated to one object, duplicate locators are rejected, and fan-out is
+bounded fail-closed (512 entries / 256 KiB manifest / 32 MiB total). The
+`content_hash` still covers only the four plain roles; an empty artifact set
+leaves the checkpoint tree byte-identical.
+
+New opaque artifact objects use standard zlib stored blocks (level 0) to bound
+compression CPU. Their canonical blob bytes and Git OID stay unchanged. This
+uses more storage and mirror bandwidth for high-entropy ciphertext; ordinary
+objects retain default compression, and valid existing objects are reused
+without recompression.
+
+Artifact tree reachability is added by RG-06; controlled read and export
+surfaces are added by RG-03.

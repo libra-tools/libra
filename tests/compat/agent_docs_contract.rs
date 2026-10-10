@@ -728,3 +728,48 @@ fn reasoning_readable_projection_docs_pin_typed_redaction() {
         "必先经过 typed redaction",
     );
 }
+
+#[test]
+fn rg02_artifact_docs_contract() {
+    // RG-02: the artifact manifest role, dedup and fan-out budgets, and the
+    // unchanged four-role content_hash coverage are pinned in all four docs.
+    for (label, document) in [
+        ("agent EN", AGENT_CMD_DOC_EN),
+        ("agent zh-CN", AGENT_CMD_DOC_ZH),
+        ("developer EN", AGENT_DEV_DOC),
+        ("tracing zh-CN", AGENT_DOC),
+    ] {
+        assert_contains(document, label, "reasoning_artifacts[]");
+        assert_contains(document, label, "reasoning/encrypted/<sha256>");
+        assert_contains(document, label, "512");
+        assert_contains(document, label, "256 KiB");
+        assert_contains(document, label, "32 MiB");
+    }
+    assert_contains(
+        AGENT_CMD_DOC_EN,
+        "RG-02 archives verified ciphertext",
+        "leaves the checkpoint tree byte-identical",
+    );
+    // Codex re-review P1: the docs must pin that content_hash coverage stays
+    // the four plain roles (never the artifact role) in EN/zh/developer/tracing.
+    assert_contains(
+        AGENT_CMD_DOC_EN,
+        "RG-02 archives verified ciphertext",
+        "content_hash` still covers only the four plain roles",
+    );
+    assert_contains(
+        AGENT_CMD_DOC_ZH,
+        "RG-02 将已核验的密文归档",
+        "`content_hash` 仍只覆盖四个普通角色",
+    );
+    assert_contains(
+        AGENT_DEV_DOC,
+        "RG-02 adds the artifact archive",
+        "content_hash` coverage stays four-role",
+    );
+    assert_contains(
+        AGENT_DOC,
+        "RG-02 归档 opaque 密文 artifact",
+        "`content_hash` 四角色不变",
+    );
+}

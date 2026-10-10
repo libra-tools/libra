@@ -746,6 +746,7 @@ async fn seed_live_agent_checkpoint(
         .expect("register isolated checkpoint writer");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
+            reasoning_artifacts: &[],
             checkpoint_id,
             session_id,
             marker_generation: marker.generation.as_deref().expect("writer generation"),

@@ -257,6 +257,10 @@ pub struct CheckpointCommitParams<'a> {
     /// pass `None`; import object construction and CAS use the monotonic half,
     /// while final SQLite authorization uses the immutable wall-clock half.
     pub deadline: Option<CaptureCommitDeadline>,
+    /// RG-02: verified opaque ciphertext artifacts to archive with this
+    /// checkpoint. Empty by convention (callers pass `&[]`) — an empty set
+    /// must not change the checkpoint tree or manifest bytes at all.
+    pub reasoning_artifacts: &'a [ReasoningArtifactParam],
 }
 
 /// Per-attempt commit identifiers handed to [`TracesTxnExtra::apply`] — the
@@ -560,6 +564,47 @@ pub const CHECKPOINT_CONTENT_HASH_COVERAGE: [&str; 4] = [
     "redaction_report",
 ];
 
+/// RG-02 fan-out budgets for reasoning ciphertext artifacts (ADR-RG-01
+/// layer 3): per-checkpoint entry count, manifest-byte and total-byte caps.
+/// Exceeding any budget fails the write closed — never a silent truncation.
+pub const REASONING_ARTIFACT_MAX_ENTRIES: usize = 512;
+pub const REASONING_ARTIFACT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+pub const REASONING_ARTIFACT_TOTAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// One opaque ciphertext artifact declared by the RG-02 writer: the
+/// byte-exact object plus the metadata tags that describe its verified
+/// source. `locator` is the stable provider-relative locator
+/// (`<provider>:msg=<ordinal>/part=<id>/metadata=<keypath>`); the manifest
+/// entry carries the same fields so readers never re-derive them.
+#[derive(Debug, Clone)]
+pub struct ReasoningArtifactParam {
+    pub locator: String,
+    pub provider: crate::internal::ai::observed_agents::reasoning::ReasoningProvider,
+    pub source_kind: Option<crate::internal::ai::observed_agents::reasoning::ReasoningSourceKind>,
+    pub availability: crate::internal::ai::observed_agents::reasoning::ReasoningAvailability,
+    pub decrypt_capability: String,
+    pub bytes: crate::internal::ai::observed_agents::reasoning::OpaqueEncryptedBytes,
+}
+
+// INVARIANT: the writer reads artifact bytes through the crate-private
+// `as_bytes()` and deduplicates by sha256; it never deserializes or redacts
+// the ciphertext (performance budget: hash + single object write only).
+
+/// The deduplicated, written form of one artifact as it appears in
+/// `manifest.json` under `reasoning_artifacts`.
+#[derive(Debug, Clone)]
+pub struct ManifestArtifactRef {
+    pub path: String,
+    pub oid: ObjectHash,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub locator: String,
+    pub provider: crate::internal::ai::observed_agents::reasoning::ReasoningProvider,
+    pub source_kind: Option<crate::internal::ai::observed_agents::reasoning::ReasoningSourceKind>,
+    pub availability: crate::internal::ai::observed_agents::reasoning::ReasoningAvailability,
+    pub decrypt_capability: String,
+}
+
 #[cfg(test)]
 tokio::task_local! {
     /// A test-only, task-scoped override for the fixed writer threshold.
@@ -740,6 +785,7 @@ pub(crate) fn build_checkpoint_manifest_json(
     transcript_total_len: usize,
     redaction_report: ManifestBlobRef,
     content_hash: ManifestBlobRef,
+    reasoning_artifacts: &[ManifestArtifactRef],
 ) -> Result<Vec<u8>> {
     let transcript_logical_path = format!("transcript/{transcript_file_name}");
     let mut transcript_entry = serde_json::json!({
@@ -816,7 +862,42 @@ pub(crate) fn build_checkpoint_manifest_json(
             "none",
             1,
         )}});
-    serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
+    // RG-02: reasoning ciphertext artifacts are a top-level manifest ARRAY
+    // (one entry per deduplicated object). Empty set → the key is omitted
+    // entirely so the pre-RG-02 manifest bytes are unchanged.
+    if !reasoning_artifacts.is_empty() {
+        let mut manifest = manifest;
+        // INVARIANT: `manifest` is constructed two statements above via
+        // `serde_json::json!({ ... })` with object-only members, so it is
+        // always a JSON object here.
+        let obj = manifest
+            .as_object_mut()
+            .expect("checkpoint manifest is a JSON object");
+        obj.insert(
+            "reasoning_artifacts".to_string(),
+            serde_json::json!(
+                reasoning_artifacts
+                    .iter()
+                    .map(|artifact| {
+                        serde_json::json!({
+                            "path": artifact.path,
+                            "oid": artifact.oid.to_string(),
+                            "sha256": artifact.sha256,
+                            "byte_len": artifact.byte_len,
+                            "locator": artifact.locator,
+                            "provider": artifact.provider,
+                            "source_kind": artifact.source_kind,
+                            "availability": artifact.availability,
+                            "decrypt_capability": artifact.decrypt_capability,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
+    } else {
+        serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2872,5 +2953,103 @@ mod tests {
             format!("{error:#}").contains("object-id entries"),
             "OID-count failure must identify the bounded field class: {error:#}"
         );
+    }
+
+    /// RG-02 AC 1 (Codex re-review P1): the `reasoning_artifacts[]` manifest
+    /// snapshot equals the frozen golden file byte-for-byte.
+    #[test]
+    fn reasoning_artifact_manifest_snapshot() {
+        let artifacts = vec![
+            ManifestArtifactRef {
+                path: "reasoning/encrypted/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                oid: "1111111111111111111111111111111111111111".parse().unwrap(),
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                byte_len: 7,
+                locator: "claude_code:msg=0/part=0/metadata=signature".to_string(),
+                provider: crate::internal::ai::observed_agents::reasoning::ReasoningProvider::ClaudeCode,
+                source_kind: Some(crate::internal::ai::observed_agents::reasoning::ReasoningSourceKind::Signature),
+                availability: crate::internal::ai::observed_agents::reasoning::ReasoningAvailability::EncryptedUnavailable,
+                decrypt_capability: "none".to_string(),
+            },
+        ];
+        let manifest = build_checkpoint_manifest_json(
+            "ckpt-golden",
+            "claude_code.jsonl",
+            ManifestBlobRef::new(
+                "1111111111111111111111111111111111111111".parse().unwrap(),
+                3,
+            ),
+            ManifestBlobRef::new(
+                "2222222222222222222222222222222222222222".parse().unwrap(),
+                4,
+            ),
+            &[],
+            0,
+            ManifestBlobRef::new(
+                "3333333333333333333333333333333333333333".parse().unwrap(),
+                5,
+            ),
+            ManifestBlobRef::new(
+                "4444444444444444444444444444444444444444".parse().unwrap(),
+                6,
+            ),
+            &artifacts,
+        )
+        .expect("build manifest");
+        let golden = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent_transcripts/reasoning/manifest_artifacts.snap"
+        ))
+        .expect("frozen artifact manifest snapshot");
+        assert_eq!(
+            manifest, golden,
+            "reasoning_artifacts[] manifest diverges from the frozen snapshot"
+        );
+    }
+
+    /// RG-02 AC 2: an empty artifact set leaves the manifest byte-identical —
+    /// no `reasoning_artifacts` key and exactly the five pre-RG-02 roles.
+    #[test]
+    fn empty_artifact_set_manifest_is_byte_identical() {
+        let manifest = build_checkpoint_manifest_json(
+            "ckpt-golden",
+            "claude_code.jsonl",
+            ManifestBlobRef::new(
+                "1111111111111111111111111111111111111111".parse().unwrap(),
+                3,
+            ),
+            ManifestBlobRef::new(
+                "2222222222222222222222222222222222222222".parse().unwrap(),
+                4,
+            ),
+            &[],
+            0,
+            ManifestBlobRef::new(
+                "3333333333333333333333333333333333333333".parse().unwrap(),
+                5,
+            ),
+            ManifestBlobRef::new(
+                "4444444444444444444444444444444444444444".parse().unwrap(),
+                6,
+            ),
+            &[],
+        )
+        .expect("build manifest");
+        let golden = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent_transcripts/reasoning/manifest_empty.snap"
+        ))
+        .expect("frozen empty manifest snapshot");
+        assert_eq!(
+            manifest, golden,
+            "empty artifact set must be byte-identical to the pre-RG-02 manifest"
+        );
+    }
+
+    /// RG-02 AC 8: pin only the public 256 KiB manifest budget constant.
+    /// The history writer's legal-coordinate regression covers fail-closed I/O.
+    #[test]
+    fn reasoning_manifest_bytes_budget_constant() {
+        assert_eq!(REASONING_ARTIFACT_MANIFEST_MAX_BYTES, 256 * 1024);
     }
 }

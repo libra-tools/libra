@@ -1,0 +1,62 @@
+{
+  "checkpoint_id": "ckpt-golden",
+  "content_hash": {
+    "algorithm": "sha256",
+    "coverage": [
+      "metadata",
+      "lifecycle_events",
+      "transcript",
+      "redaction_report"
+    ],
+    "path": "content_hash.txt"
+  },
+  "entries": {
+    "content_hash": {
+      "byte_len": 6,
+      "compression": "none",
+      "media_type": "text/plain",
+      "oid": "4444444444444444444444444444444444444444",
+      "path": "content_hash.txt",
+      "redaction": "none",
+      "schema_version": 1
+    },
+    "lifecycle_events": {
+      "byte_len": 4,
+      "compression": "none",
+      "media_type": "application/x-ndjson",
+      "oid": "2222222222222222222222222222222222222222",
+      "path": "events/lifecycle.jsonl",
+      "redaction": "redacted",
+      "schema_version": 2
+    },
+    "metadata": {
+      "byte_len": 3,
+      "compression": "none",
+      "media_type": "application/json",
+      "oid": "1111111111111111111111111111111111111111",
+      "path": "metadata.json",
+      "redaction": "redacted",
+      "schema_version": 2
+    },
+    "redaction_report": {
+      "byte_len": 5,
+      "compression": "none",
+      "media_type": "application/json",
+      "oid": "3333333333333333333333333333333333333333",
+      "path": "redaction_report.json",
+      "redaction": "report",
+      "schema_version": 1
+    },
+    "transcript": {
+      "byte_len": 0,
+      "chunked": true,
+      "compression": "none",
+      "media_type": "application/x-ndjson",
+      "parts": [],
+      "path": "transcript/claude_code.jsonl",
+      "redaction": "redacted",
+      "schema_version": 1
+    }
+  },
+  "schema_version": 1
+}
