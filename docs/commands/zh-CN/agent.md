@@ -47,6 +47,28 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 移除所报告的日志后再重试。日志只记录有限的事务元数据（schema 版本、操作、阶段和恢复围栏）
 以及域隔离的文件指纹，不含原始 hook 或 config 内容；未知指纹状态会刻意保持零写入，而非自动修复。
 
+### OpenCode 事件输入契约
+
+OpenCode parser 使用已审计的 **2.0.26** 事件表：`session.created`、用户
+`session.inbox.delivered`、`session.execution.succeeded`、
+`session.execution.failed`、`session.execution.interrupted`、`session.deleted`
+和 `session.compaction.ended`；`tool.execute.after` 是独立的工具观察 hook。
+delivery 必须带 `role="user"` 和字符串 prompt，允许空字符串。只有 `user`、
+`superseded`、`inactivity` interruption 会结束 turn；`shutdown` 保留重启连续性。
+enqueue 由插件内部合并，不作为独立 lifecycle 输入。
+
+兼容输入是 `session.status(idle)`、`message.updated`、`session.compacted` 和带
+跟踪 session ID 的 `server.instance.disposed`；busy/retry status 拒绝写入。旧
+`message.updated` 的 prompt 必须是字符串，允许空字符串；role 可以省略，显式
+role 只能为 `user`。`message` 和 `user_prompt` 不会填补缺失 prompt。独立弃用
+alias `session.idle` 仍接受，只记录不含内容的 `legacy_event_alias` tracing 警告。
+
+当前 managed plugin 仍转发旧事件集。执行 `libra agent enable --agent opencode`
+刷新插件，会对每个旧 user message 显式提供空 prompt；未刷新且省略 prompt
+的旧插件信封会被拒绝。完整新事件订阅、文本
+配对及 Node/Bun transport 由后续 OG-02 验收；本次 parser 更新不作为真实
+OpenCode 采集证明。`opencode --pure` 会关闭外部插件，从而关闭 hook 采集。
+
 ## 子命令
 
 | 子命令 | 说明 |

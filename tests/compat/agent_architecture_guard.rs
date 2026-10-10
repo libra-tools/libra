@@ -8679,8 +8679,9 @@ fn public_signature_fingerprint(relative_path: &str, function: &str) -> String {
 /// requires an ADR-ACF-10 revision and a fresh design review first.
 #[test]
 fn capture_runtime_extraction_oracles_are_frozen() {
-    // Digests computed at ACF-17 on the unmodified runtime, before the first
-    // move (ADR-ACF-10 "Oracle freeze"); ACF-18/19/20 must not change them.
+    // First digest: OG-01 input-only Contract A revision after fresh Claude
+    // design PASS. Other digests remain ACF-17; helpers/output/signature are
+    // unchanged. ADR-ACF-10 records the bounded exception.
     const FROZEN_ORACLES: [(&str, &str, &[&str], &str); 3] = [
         (
             "tests/agent_lifecycle_event_test.rs",
@@ -8700,7 +8701,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn hook_contract_projection",
                 "struct HookRepo",
             ],
-            "1abe93f409ff34e94649f545abdb845bb255b2cd3c721031b627dc7a8c5b883a",
+            "797636312e8468779a9819255111fdb4acabf7fa7cef896ec756c44cff5cb8ae",
         ),
         (
             "tests/agent_hook_crash_test.rs",

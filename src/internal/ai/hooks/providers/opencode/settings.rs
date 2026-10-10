@@ -111,11 +111,12 @@ export const LibraHooks = async ({ project, client, directory, worktree, serverU
           case "message.updated": {
             const info = properties.info;
             // Only user messages open a turn; assistant updates are dropped
-            // here so the parser can map message.updated unconditionally.
+            // here; the parser also validates the explicit prompt/role fields.
             if (!info || info.role !== "user") return;
             envelope.role = "user";
-            // Message text arrives via message.part.updated (streaming), so
-            // a prompt string is not cheaply available here and is omitted.
+            // Legacy text is unavailable here. Contract A requires an
+            // explicit string; OG-02 owns text-part pairing and transport.
+            envelope.prompt = "";
             await forward("prompt", envelope);
             break;
           }
@@ -559,5 +560,65 @@ mod tests {
     fn render_embeds_command_as_json_literal() {
         let rendered = render_opencode_plugin("'/tmp/dir with spaces/libra'").expect("render");
         assert!(rendered.contains(r#"const LIBRA_COMMAND = "'/tmp/dir with spaces/libra'";"#));
+    }
+    // Executes the actual old template handler with a controlled BunShell
+    // transport. This proves its wire field, not OpenCode 2.0.26 integration.
+    #[test]
+    fn legacy_prompt_forwarding_supplies_explicit_string() {
+        let dir = TempDir::new().expect("isolated Node harness");
+        let source = OPENCODE_PLUGIN_TEMPLATE.replace(
+            "__LIBRA_COMMAND_JSON__",
+            &serde_json::to_string("/synthetic/libra").expect("synthetic command"),
+        );
+        let harness = r#"
+const frames = [];
+const shell = (_strings, raw, verb, body) => ({
+  quiet() { return this; },
+  async nothrow() { frames.push({verb, payload:JSON.parse(await body.text())}); }
+});
+const plugin = await LibraHooks({directory:"/synthetic-project", $:shell});
+await plugin.event({event:{type:"message.updated", properties:{sessionID:"synthetic-user", info:{role:"user"}}}});
+await plugin.event({event:{type:"message.updated", properties:{sessionID:"synthetic-assistant", info:{role:"assistant"}}}});
+console.log(JSON.stringify(frames));
+"#;
+        let script = dir.path().join("legacy-prompt.mjs");
+        fs::write(&script, format!("{source}\n{harness}")).expect("write actual-template harness");
+        let output = match std::process::Command::new("node")
+            .arg("--no-warnings")
+            .arg(&script)
+            .current_dir(dir.path())
+            .env_remove("NODE_OPTIONS")
+            .env_remove("NODE_PATH")
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[skip] OG-01 actual-template runtime: Node is not installed; no producer proof recorded"
+                );
+                return;
+            }
+            Err(error) => panic!("run Node template harness: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "actual template failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "unexpected template diagnostic");
+        let actual: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("runtime frames JSON");
+        assert_eq!(
+            actual,
+            serde_json::json!([{
+                "verb":"prompt",
+                "payload": {
+                    "hook_event_name":"message.updated", "session_id":"synthetic-user",
+                    "cwd":"/synthetic-project", "role":"user", "prompt":""
+                }
+            }]),
+            "user forwards once with explicit empty-string prompt; assistant never forwards"
+        );
+        println!("[executed] OG-01 actual-template Node legacy prompt wire contract");
     }
 }

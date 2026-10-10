@@ -66,6 +66,33 @@ operation, phase, and a recovery fence) plus domain-separated file
 fingerprints, never raw hook or config contents; an unknown fingerprint state
 is intentionally zero-write rather than an automatic repair.
 
+### OpenCode event input contract
+
+The OpenCode parser targets the audited **2.0.26** vocabulary. Its current
+lifecycle inputs are `session.created`, user `session.inbox.delivered`,
+`session.execution.succeeded`, `session.execution.failed`,
+`session.execution.interrupted`, `session.deleted`, and
+`session.compaction.ended`; `tool.execute.after` is a separate observation hook.
+Delivery requires `role="user"` and a prompt string, including an empty string.
+Only `user`, `superseded`, and `inactivity` interruptions end a turn; `shutdown`
+keeps restart continuity. An enqueue is merged by the plugin and is never a
+standalone lifecycle input.
+
+Compatibility inputs are `session.status(idle)`, `message.updated`,
+`session.compacted`, and `server.instance.disposed` with a tracked session ID.
+Busy/retry status frames are rejected. The parser requires a prompt string for
+legacy `message.updated`; an empty string and an omitted role are accepted,
+and a declared role must be `user`. Neither `message` nor `user_prompt` fills a
+missing prompt. The deprecated `session.idle` alias remains accepted, with a
+content-free `legacy_event_alias` tracing warning.
+
+The current managed plugin still forwards the legacy event set. Refresh it with
+`libra agent enable --agent opencode` to supply an explicit empty prompt on every legacy user message. Older unrefreshed plugins that omit prompt
+are rejected until refreshed. Full current-event subscription, prompt
+pairing, and Node/Bun transport are the subsequent OG-02 change; this parser
+update alone does not prove live OpenCode capture. `opencode --pure` disables
+external plugins and therefore hook capture.
+
 ## Subcommands
 
 | Subcommand | Description |

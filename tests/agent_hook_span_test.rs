@@ -436,3 +436,39 @@ fn finalizer_diagnostics_are_content_free() {
         );
     }
 }
+
+#[test]
+fn opencode_legacy_alias_span_emits_legacy_event_alias_warning() {
+    let provider = libra::internal::ai::hooks::providers::opencode_provider();
+    let frame = serde_json::from_slice(&envelope(
+        "session.idle",
+        "synthetic-alias",
+        json!({"prompt":"PRIVATE-ALIAS-CANARY"}),
+    ))
+    .expect("synthetic alias frame");
+    let captured = capture_spans(|| {
+        let event = provider
+            .parse_hook_event("session.idle", &frame)
+            .expect("old alias without status stays accepted");
+        assert_eq!(event.kind, LifecycleEventKind::TurnEnd);
+    });
+    assert_eq!(
+        captured.matches("legacy_event_alias").count(),
+        1,
+        "one content-free warning required: {captured}"
+    );
+    assert!(captured.contains("opencode"));
+    assert!(!captured.contains("PRIVATE-ALIAS-CANARY"));
+    let captured = capture_spans(|| {
+        let frame = serde_json::from_slice(&envelope(
+            "session.execution.succeeded",
+            "synthetic-current",
+            json!({}),
+        ))
+        .expect("current frame");
+        provider
+            .parse_hook_event("session.execution.succeeded", &frame)
+            .expect("current event");
+    });
+    assert!(!captured.contains("legacy_event_alias"));
+}

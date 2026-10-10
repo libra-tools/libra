@@ -771,3 +771,23 @@ SCOPED04修订范围AC5/6、VER4/4；相关44/44含2 leaky，fmt/strict及frozen
 ### 2026-10-10 13:59:26 UTC：OG-00 当前localD验收
 
 OG00 AC18/18、九审计门9/9、fmt/strict各exit0，Claude Code R2实际PASS/0P0/0P1/0P2/4P3，原FAIL及计数修正保留历史；当前43官方源逐blob/mode MATCH，78锚点，三合成审计产物恢复，无live/native/capture实现证明。按原no-code I＋状态路径signed-DCO ordinary Push main后进入OG-01；正式4/61=6.56%，RG本地6/10=60%，FAST-OG-01实际C/D和最终full仍待。plan05无关dirty保持。
+
+### 2026-10-10：OG-01当前main开工/设计修订
+
+当前main的OG01 AC/VER已重置为未运行，旧私有2.0.24通过仅历史。Claude设计R1 FAIL（4P1/5P2），已准备R2：旧模板显式空prompt契约前置补丁与严格parser同卡，保留完整OG02模板后续单写者；先取得fresh Claude设计PASS再改oracle/源码。本轮正式仍4/61=6.56%。
+
+- **DEFER-OG-DOC-01（外围文档漂移）：** 网站agent.en.md已有未提交工作提前描述2.0.24导出/可用macOS Seatbelt路径；本卡只同步event/parser段并保留其它原始字节，当前不将它记作macOS/native PASS。由既有OG03/OG15在各自功能实际验收后同步清除；不增加正式卡计数、不放宽发布/来源/最终全量。
+
+### 2026-10-10：OG-01当前源码focused通过，full/实现review进行
+
+当前2.0.26 registry/parser/旧模板显式空prompt源已实际实现，focused89/89、producer实际Node执行marker1/1、fmt/strict与网站typecheck/build通过；全量运行中，Claude实现review随后同冻结源审查。正式仍4/61=6.56%，本卡尚非locally-accepted/complete，source commit/push尚待实际门完成。
+
+### 2026-10-10：OG-01 Claude实现单审PASS
+
+R1实际PASS（0P0/0P1/1P2/5P3），非阻断P2为已批准ContractA下旧模板陈旧提示缺失，FOLLOWUP-OG02-STALE-01由下一OG02安装升级验收接续；当前不改冻结源。full默认9645 cases正在运行，既有deadline首轮失败/TRY2通过和git-client LEAK标记如实保留；不是最终全量PASS。正式仍4/61=6.56%，signed-DCO源码交付待真实full完成。
+
+### 2026-10-10 15:05 UTC：OG-01当前2.0.26 local验收通过
+
+OG-01 AC8/8、VER15/15：focused89/89、真实Node模板marker1/1、fmt/strict/site0、full9645/9645（13slow/1flaky/3leaky/9skip，run34a9e98a）、Claude单审PASS（0P0/0P1/1非阻断P2/5P3）。全部15实现/doc hashes与测试/peer冻结源一致；源提交交付中，完成后下一优先OG02，完整新插件/Node-Bun/native证据仍后验。FAST-OG01 C/D待执行，正式仍4/61=6.56%。
+
+- **DEFER-OG-TEST-01（外围验收检测标记）：** 本轮未修改git-client/storage_r2_test cases出现3LEAK标记，既有deadline case first-fail/TRY2-PASS；full exit0并按受控重试通过。标记原样保存于acceptance-receipt/full日志，根因未定，不称实际泄漏或已修复，后续独立诊断，不改本计划基本采集/来源/实际full标准。

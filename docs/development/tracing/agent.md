@@ -219,7 +219,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 ### OpenCode 安装流程契约（第一批必须满足）
 
-**状态（2026-07-05，AG-19 已落地）**：OpenCode HookProvider 已实现（`src/internal/ai/hooks/providers/opencode/`），capability row 为 `supported=true`、`hook_installable=true`、`capabilities.hooks=true`。以下契约以真实 `opencode 1.17.13` 实测固定（探测记录见 plan.md A4 行）。
+**状态（OG-01当前parser / AG-19历史installer）**：HookProvider已注册；当前事件registry使用OG-00审计的2.0.26 source/fixture。以下旧installer API/layout来自2026-07-05的1.17.13实测，完整新模板由OG-02更新验收；本卡只补旧message.updated合法空prompt，不能据此声称2.0.26真实插件已采集。
 
 1. **注册与状态输出**
 
@@ -236,7 +236,34 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
    - **Libra 唯一写入目标**：`.opencode/plugin/libra-hooks.js`（上游 SDK 文档使用的规范目录），文件首行携带 Libra-managed 标记注释；install/uninstall 同时检测 `.opencode/plugins/` 下携带标记的重复受管文件并清理（双目录同载会导致事件双发）。不携带标记的用户文件在任何路径下都不触碰（同名用户文件导致 install 硬错误而非覆盖）。
    - plugin 内 forward 命令以 canonicalize 绝对路径起始（`<binary> agent hooks opencode <verb>`），事件转发 best-effort、handler 全 try/catch 永不抛出。
 
-   **事件映射（实测固定）**：`session.created -> SessionStart`；`message.updated`（`properties.info.role == "user"`，plugin 侧过滤）`-> TurnStart`；`tool.execute.after -> ToolUse`；`session.idle -> TurnEnd`（**Libra 侧推断规则**：headless run 的可靠 turn 完成信号，非 OpenCode 官方 terminal event）；`session.deleted -> SessionEnd`；`session.compacted -> Compaction`。流式事件（`message.part.updated/delta`、`session.status/updated/diff` 等）一律不转发。
+   **旧managed模板事件映射（历史installer形态；不是当前parser全集）**：`session.created -> SessionStart`；`message.updated`（`properties.info.role == "user"`，plugin 侧过滤）`-> TurnStart`；`tool.execute.after -> ToolUse`；`session.idle -> TurnEnd`（**Libra 侧推断规则**：headless run 的可靠 turn 完成信号，非 OpenCode 官方 terminal event）；`session.deleted -> SessionEnd`；`session.compacted -> Compaction`。流式事件（`message.part.updated/delta`、`session.status/updated/diff` 等）一律不转发。
+
+### OpenCode event input contract
+
+The OpenCode parser targets the audited **2.0.26** vocabulary. Its current
+lifecycle inputs are `session.created`, user `session.inbox.delivered`,
+`session.execution.succeeded`, `session.execution.failed`,
+`session.execution.interrupted`, `session.deleted`, and
+`session.compaction.ended`; `tool.execute.after` is a separate observation hook.
+Delivery requires `role="user"` and a prompt string, including an empty string.
+Only `user`, `superseded`, and `inactivity` interruptions end a turn; `shutdown`
+keeps restart continuity. An enqueue is merged by the plugin and is never a
+standalone lifecycle input.
+
+Compatibility inputs are `session.status(idle)`, `message.updated`,
+`session.compacted`, and `server.instance.disposed` with a tracked session ID.
+Busy/retry status frames are rejected. The parser requires a prompt string for
+legacy `message.updated`; an empty string and an omitted role are accepted,
+and a declared role must be `user`. Neither `message` nor `user_prompt` fills a
+missing prompt. The deprecated `session.idle` alias remains accepted, with a
+content-free `legacy_event_alias` tracing warning.
+
+The current managed plugin still forwards the legacy event set. Refresh it with
+`libra agent enable --agent opencode` to supply an explicit empty prompt on every legacy user message. Older unrefreshed plugins that omit prompt
+are rejected until refreshed. Full current-event subscription, prompt
+pairing, and Node/Bun transport are the subsequent OG-02 change; this parser
+update alone does not prove live OpenCode capture. `opencode --pure` disables
+external plugins and therefore hook capture.
 
 4. **停用与移除（已实现）**
 
@@ -244,7 +271,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 5. **采集完成态（默认 lifecycle-only，A6.5 实测固定；DR-04b 后可升级为内容捕获）**
 
-OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。未注册 exporter 信任时，hook 采集产生的 checkpoint 以**空 transcript 快照**为合法（降级）完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源，其环境不注册 exporter 信任）。**DR-04b 落地后（Linux）**：当操作者已固定受信 `opencode` exporter（`libra agent rpc trust --dir <path>` + `libra agent rpc trust opencode`）且 Required bwrap sandbox 可用时，`session.idle` hook 路径经沙箱化 `opencode export <session>` bridge 取得授权 Bytes（seam → normalize → redact → claim），产生携带内容的 checkpoint；exporter 不可信/不可用时保持上述降级完成态并告警。这里的 `bwrap` 必须是受信实现且通过 descriptor-native `--bind-fd` 运行时安全探测；不支持该能力的旧版/受限安装一律报告 unavailable，操作者应安装或升级系统 `bwrap`，不得降级为未沙箱化 exporter。装配层经 `SandboxManager::transform` 以 `trusted_bwrap_exe` 注入受信 bwrap；执行仍走 `run_bounded_exporter`（文件备份 stdout、`RLIMIT_FSIZE`、进程组、3s 墙钟、16 MiB）。exporter 本体在同一 capture deadline 内先复验 trust record 的 sha256/device/inode/mtime，再以 `O_NOFOLLOW` 打开、核对该 descriptor 的 device/inode/mtime 后流式复制进 Libra 私有的只读匿名 descriptor（复制字节再核对 sha256），bwrap 只经 `--ro-bind-fd` 映射该副本；受信 binary 不设固定大小上限（真实 OpenCode Bun 单文件约 171 MiB），hash 与复制均以该 descriptor 自身 stat 长度为界，读出超过报告长度即 fail-closed。**macOS 不支持 OpenCode 内容导出**：Seatbelt 无法对可 fork 的 exporter 提供外层 hook 取消后的安全后代收束，因此 Libra 会在启动 `sandbox-exec` 或 exporter **之前** fail-closed，capture 始终保持 **metadata-only**，绝无 unsandboxed 回落。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`）。
+OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。未注册 exporter 信任时，hook 采集产生的 checkpoint 以**空 transcript 快照**为合法（降级）完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源，其环境不注册 exporter 信任）。**DR-04b 落地后（Linux）**：当操作者已固定受信 `opencode` exporter（`libra agent rpc trust --dir <path>` + `libra agent rpc trust opencode`）且 Required bwrap sandbox 可用时，turn-end hook 路径（含兼容 `session.idle`）经沙箱化 `opencode export <session>` bridge 取得授权 Bytes（seam → normalize → redact → claim），产生携带内容的 checkpoint；exporter 不可信/不可用时保持上述降级完成态并告警。这里的 `bwrap` 必须是受信实现且通过 descriptor-native `--bind-fd` 运行时安全探测；不支持该能力的旧版/受限安装一律报告 unavailable，操作者应安装或升级系统 `bwrap`，不得降级为未沙箱化 exporter。装配层经 `SandboxManager::transform` 以 `trusted_bwrap_exe` 注入受信 bwrap；执行仍走 `run_bounded_exporter`（文件备份 stdout、`RLIMIT_FSIZE`、进程组、3s 墙钟、16 MiB）。exporter 本体在同一 capture deadline 内先复验 trust record 的 sha256/device/inode/mtime，再以 `O_NOFOLLOW` 打开、核对该 descriptor 的 device/inode/mtime 后流式复制进 Libra 私有的只读匿名 descriptor（复制字节再核对 sha256），bwrap 只经 `--ro-bind-fd` 映射该副本；受信 binary 不设固定大小上限（真实 OpenCode Bun 单文件约 171 MiB），hash 与复制均以该 descriptor 自身 stat 长度为界，读出超过报告长度即 fail-closed。**macOS 不支持 OpenCode 内容导出**：Seatbelt 无法对可 fork 的 exporter 提供外层 hook 取消后的安全后代收束，因此 Libra 会在启动 `sandbox-exec` 或 exporter **之前** fail-closed，capture 始终保持 **metadata-only**，绝无 unsandboxed 回落。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`）。
 
 ### Codex 捕获目标契约（AG-19 已落地）
 

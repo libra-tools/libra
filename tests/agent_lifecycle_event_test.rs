@@ -4718,7 +4718,12 @@ async fn hook_public_contract_byte_compat_matrix() {
                     native_event,
                     &session,
                     None,
-                    json!({ "event_id": format!("{session}-{verb}") }),
+                    if surface.label == "agent-hooks-opencode" && native_event == "message.updated"
+                    {
+                        json!({ "event_id": format!("{session}-{verb}"), "prompt": "" })
+                    } else {
+                        json!({ "event_id": format!("{session}-{verb}") })
+                    },
                 )
             ));
         }
@@ -4752,4 +4757,260 @@ async fn hook_public_contract_byte_compat_matrix() {
         "public hook contract drifted; observed matrix:\n{}",
         observed.join("\n")
     );
+}
+
+// OG-01 inputs are synthetic Libra envelopes, not upstream/native provenance.
+type Og01DurableSnapshot = (
+    std::collections::BTreeMap<String, Vec<String>>,
+    std::collections::BTreeMap<PathBuf, Vec<u8>>,
+);
+
+async fn og01_durable_snapshot(repo: &HookRepo) -> Og01DurableSnapshot {
+    let conn = repo.db().await;
+    let backend = conn.get_database_backend();
+    let tables = conn.query_all_raw(Statement::from_string(backend,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name".to_owned()
+    )).await.expect("list durable tables");
+    let mut rows = std::collections::BTreeMap::new();
+    for table in tables {
+        let name: String = table.try_get_by("name").expect("table name");
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let columns = conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                format!("PRAGMA table_info({quoted})"),
+            ))
+            .await
+            .expect("table columns");
+        let expressions: Vec<_> = columns
+            .iter()
+            .map(|column| {
+                let name: String = column.try_get_by("name").expect("column name");
+                format!("quote(\"{}\")", name.replace('"', "\"\""))
+            })
+            .collect();
+        assert!(!expressions.is_empty(), "a table must have columns");
+        let image = expressions.join(" || char(31) || ");
+        let values = conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                format!("SELECT {image} AS image FROM {quoted} ORDER BY image"),
+            ))
+            .await
+            .expect("durable rows")
+            .into_iter()
+            .map(|row| row.try_get_by("image").expect("row image"))
+            .collect();
+        rows.insert(name, values);
+    }
+    conn.close()
+        .await
+        .expect("close read-only snapshot connection");
+    let mut files = std::collections::BTreeMap::new();
+    for subtree in ["objects", "refs", "sessions"] {
+        let base = repo.repo.join(".libra").join(subtree);
+        if !base.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(base).sort_by_file_name() {
+            let entry = entry.expect("walk durable capture files");
+            if entry.file_type().is_file() {
+                files.insert(
+                    entry
+                        .path()
+                        .strip_prefix(&repo.repo)
+                        .expect("repo-relative file")
+                        .to_path_buf(),
+                    std::fs::read(entry.path()).expect("read durable file"),
+                );
+            }
+        }
+    }
+    (rows, files)
+}
+
+#[tokio::test]
+async fn opencode_status_idle_maps_turn_end() {
+    let repo = HookRepo::init();
+    let start = repo.envelope(
+        "session.created",
+        "synthetic-idle",
+        None,
+        json!({"event_id":"synthetic-idle-start"}),
+    );
+    let started = repo.run(
+        &["agent", "hooks", "opencode", "session-start"],
+        Some(&start),
+    );
+    assert!(started.status.success(), "{}", describe(&started));
+    let envelope = repo.envelope(
+        "session.status",
+        "synthetic-idle",
+        None,
+        json!({"status":{"type":"idle"}, "event_id":"synthetic-idle-stop"}),
+    );
+    let out = repo.run(&["agent", "hooks", "opencode", "stop"], Some(&envelope));
+    assert!(out.status.success(), "{}", describe(&out));
+    let state = repo.durable_session("opencode__synthetic-idle").await;
+    assert_eq!(state.state, "active");
+    assert_eq!(state.sync_revision, 2);
+    assert_eq!(
+        state.metadata["capture_catalog_receipts_v1"]["entries"]
+            .as_array()
+            .expect("receipts")
+            .len(),
+        2
+    );
+    let checkpoints = repo.checkpoints();
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "turn end writes a metadata-only checkpoint"
+    );
+    assert_eq!(checkpoints[0]["scope"], "committed");
+}
+
+#[tokio::test]
+async fn opencode_status_busy_retry_fails_closed() {
+    let repo = HookRepo::init();
+    let baseline = og01_durable_snapshot(&repo).await;
+    for status in [
+        json!({"type":"busy"}),
+        json!({"type":"retry"}),
+        json!(null),
+        json!("idle"),
+        json!({"type":"PRIVATE-STATUS-CANARY"}),
+    ] {
+        let payload = repo.envelope(
+            "session.status",
+            "synthetic-status",
+            None,
+            json!({"status":status}),
+        );
+        let out = repo.run(&["agent", "hooks", "opencode", "stop"], Some(&payload));
+        assert_eq!(out.status.code(), Some(128), "{}", describe(&out));
+        assert!(out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE-STATUS-CANARY"));
+        assert_eq!(
+            og01_durable_snapshot(&repo).await,
+            baseline,
+            "status rejection before durable writes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn opencode_message_updated_is_single_envelope_turn_start() {
+    for mut extra in [
+        json!({"prompt":""}),
+        json!({"prompt":"synthetic prompt", "role":"user"}),
+        json!({"prompt":"", "message":"SYNTHETIC-FALLBACK"}),
+    ] {
+        let repo = HookRepo::init();
+        extra["event_id"] = json!("synthetic-legacy-prompt");
+        let payload = repo.envelope("message.updated", "synthetic-prompt", None, extra);
+        let out = repo.run(&["agent", "hooks", "opencode", "prompt"], Some(&payload));
+        assert!(out.status.success(), "{}", describe(&out));
+        assert!(out.stdout.is_empty());
+        assert_eq!(repo.sessions().len(), 1);
+        let state = repo.durable_session("opencode__synthetic-prompt").await;
+        assert_eq!(state.state, "active");
+        assert_eq!(state.sync_revision, 1);
+        assert_eq!(
+            state.metadata["capture_catalog_receipts_v1"]["entries"]
+                .as_array()
+                .expect("receipts")
+                .len(),
+            1,
+            "one envelope creates exactly one capture receipt"
+        );
+        assert!(repo.checkpoints().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn opencode_missing_legacy_prompt_fails_before_writes() {
+    for active in [false, true] {
+        let repo = HookRepo::init();
+        let session = "synthetic-missing-prompt";
+        if active {
+            let payload = repo.envelope("session.created", session, None, json!({}));
+            let out = repo.run(
+                &["agent", "hooks", "opencode", "session-start"],
+                Some(&payload),
+            );
+            assert!(out.status.success(), "{}", describe(&out));
+        }
+        let baseline = og01_durable_snapshot(&repo).await;
+        for extra in [
+            json!({}),
+            json!({"role":"user"}),
+            json!({"message":"PRIVATE-PROMPT-CANARY"}),
+            json!({"user_prompt":"PRIVATE-PROMPT-CANARY"}),
+            json!({"role":"user", "message":"PRIVATE-PROMPT-CANARY"}),
+            json!({"prompt":null}),
+            json!({"prompt":42}),
+            json!({"prompt":"", "role":"assistant"}),
+            json!({"prompt":"", "role":null}),
+        ] {
+            let payload = repo.envelope("message.updated", session, None, extra);
+            let out = repo.run(&["agent", "hooks", "opencode", "prompt"], Some(&payload));
+            assert_eq!(out.status.code(), Some(128), "{}", describe(&out));
+            assert!(out.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            const PUBLIC_ERROR: &str = "fatal: agent hook ingestion failed: capture could not be completed; retry the hook or inspect the local repository\nError-Code: LBR-INTERNAL-001\n{\"ok\":false,\"error_code\":\"LBR-INTERNAL-001\",\"category\":\"internal\",\"exit_code\":128,\"severity\":\"fatal\",\"message\":\"agent hook ingestion failed: capture could not be completed; retry the hook or inspect the local repository\"}\n";
+            assert_eq!(stderr, PUBLIC_ERROR, "public masked error bytes changed");
+            assert!(!stderr.contains("PRIVATE-PROMPT-CANARY"));
+            assert!(!stderr.contains("requires a prompt string"));
+            assert_eq!(
+                og01_durable_snapshot(&repo).await,
+                baseline,
+                "active={active}: rejection must precede every durable write"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn opencode_legacy_alias_transition_forwarded() {
+    for stable_id in [false, true] {
+        let repo = HookRepo::init();
+        let session = "synthetic-legacy-alias";
+        for (name, verb, mut extra) in [
+            ("session.created", "session-start", json!({})),
+            ("message.updated", "prompt", json!({"prompt":""})),
+            ("session.idle", "stop", json!({})),
+        ] {
+            // Real older plugin frames may have no dedup ID. Also prove the
+            // receipt path with an explicit synthetic stable identity.
+            if stable_id {
+                extra["event_id"] = json!(format!("synthetic-{name}"));
+            }
+            let payload = repo.envelope(name, session, None, extra);
+            let out = repo.run(&["agent", "hooks", "opencode", verb], Some(&payload));
+            assert!(out.status.success(), "{}", describe(&out));
+            assert!(out.stdout.is_empty());
+        }
+        let state = repo
+            .durable_session("opencode__synthetic-legacy-alias")
+            .await;
+        assert_eq!(state.state, "active");
+        assert_eq!(state.sync_revision, 3);
+        let receipts = state.metadata["capture_catalog_receipts_v1"]["entries"].as_array();
+        if stable_id {
+            assert_eq!(receipts.expect("stable identity receipts").len(), 3);
+        } else {
+            assert!(
+                receipts.is_none(),
+                "no stable event identity creates no receipt ledger"
+            );
+        }
+        let checkpoints = repo.checkpoints();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "legacy turn end writes one metadata-only checkpoint"
+        );
+        assert_eq!(checkpoints[0]["scope"], "committed");
+    }
 }

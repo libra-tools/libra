@@ -1,34 +1,11 @@
-//! OpenCode lifecycle hook provider facade (AG-19).
+//! OpenCode hook provider and audited 2.0.26 event registry.
 //!
-//! Wires the canonical [`HookProvider`] trait to the OpenCode-specific parser
-//! (`parser`) and the `.opencode/plugin/libra-hooks.js` installer
-//! (`settings`). All OpenCode-specific decoding logic lives in those
-//! submodules; this module contains only the singleton plumbing.
-//!
-//! # Verified upstream contract (opencode 1.17.13, probed live 2026-07-05)
-//!
-//! - **Plugin file**: a JS module in `<project>/.opencode/plugin/*.js`
-//!   (singular directory). The plural `.opencode/plugins/` directory and
-//!   `opencode.json` `"plugin"` array entries also load, but Libra writes only
-//!   `.opencode/plugin/libra-hooks.js` as its managed file; uninstall/status
-//!   additionally detect a stray Libra-managed copy under
-//!   `.opencode/plugins/` to warn about / clean duplicates.
-//! - **Plugin API**: `export const LibraHooks = async ({ project, client,
-//!   directory, worktree, serverUrl, $ }) => ({ event: async ({ event }) =>
-//!   { ... }, "tool.execute.after": async (input, output) => { ... } })`,
-//!   where `$` is a BunShell.
-//! - **Bus events observed live**: `session.created` (properties.sessionID +
-//!   info.directory…), `session.updated`, `message.updated`
-//!   (properties.info.role user/assistant), `message.part.updated`/delta
-//!   (streaming — never forwarded), `session.status`, `session.idle` (fires at
-//!   the end of each headless run — the reliable turn-complete marker),
-//!   `session.diff`. Declared in the SDK but not observed headless:
-//!   `session.deleted`, `session.error`, `session.compacted`.
-//! - **Load errors** are per-plugin and non-fatal, visible only with
-//!   `opencode --print-logs`.
-//! - **`--pure` caveat**: `opencode --pure` / `OPENCODE_PURE=1` disables all
-//!   external plugins, including the Libra forwarder — no lifecycle events are
-//!   captured in that mode.
+//! Parsing and recognition consume the same OpenCode-only registry. The
+//! currently rendered managed plugin still uses the legacy API/event set;
+//! OG-02 owns its current subscription and Node/Bun transport update. The
+//! six existing lifecycle verbs and install/status interfaces are unchanged.
+
+pub mod events;
 
 mod parser;
 mod settings;
@@ -84,7 +61,7 @@ impl HookProvider for OpenCodeProvider {
     }
 
     fn recognizes_event(&self, hook_event_name: &str) -> bool {
-        parser::OPENCODE_HOOK_EVENT_NAMES.contains(&hook_event_name)
+        events::recognizes_event(hook_event_name)
     }
 
     fn dedup_identity_keys(&self) -> &'static [&'static str] {
@@ -133,7 +110,11 @@ mod tests {
         ] {
             assert!(provider.recognizes_event(name), "must recognize '{name}'");
         }
-        for name in ["message.part.updated", "session.status", "session.diff"] {
+        for name in [
+            "message.part.updated",
+            "session.inbox.enqueued",
+            "session.diff",
+        ] {
             assert!(
                 !provider.recognizes_event(name),
                 "must not recognize '{name}'",

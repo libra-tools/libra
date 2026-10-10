@@ -823,3 +823,35 @@ fn scoped01_shared_reader_docs_pin_role_and_catalog_bounds() {
     assert!(AGENT_CMD_DOC_ZH.contains("普通子树累计上限为 16 MiB"));
     assert!(AGENT_CMD_DOC_ZH.contains("metadata blob 上限为 16 MiB"));
 }
+
+#[test]
+fn opencode_docs_pin_current_parser_and_legacy_alias_policy() {
+    for (label, document) in [
+        ("tracing/agent.md", AGENT_DOC),
+        ("commands/agent.md", AGENT_CMD_DOC_EN),
+        ("COMPATIBILITY.md", COMPATIBILITY_DOC),
+    ] {
+        for required in [
+            "2.0.26",
+            "requires a prompt string",
+            "empty string",
+            "omitted role",
+            "libra agent enable --agent opencode",
+            "session.status(idle)",
+            "legacy_event_alias",
+        ] {
+            assert_contains(document, label, required);
+        }
+    }
+    for required in [
+        "2.0.26",
+        "prompt 必须是字符串",
+        "允许空字符串",
+        "role 可以省略",
+        "libra agent enable --agent opencode",
+        "session.status(idle)",
+        "legacy_event_alias",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "commands/zh-CN/agent.md", required);
+    }
+}
