@@ -644,6 +644,10 @@ https://libra.tools/en/docs/commands/config 返回 HTTP 200，`content-type: tex
 
 2026-10-10 08:27:47 UTC：`/Users/eli/.local/bin/codex --version` 打印 `codex-cli 0.160.0`。DEP-CX-01 要求 `codex-cli 0.152.0`。CX-00 改为 blocked / 空。未创建 `plan-20260904-cx00-probe.md`，未填 ADR go/no-go。0.160.0 只作为 pin 候选登记，不替换 0.152.0。同一时刻 `/Users/eli/.opencode/bin/opencode --version` 打印 `opencode v2.0.25`，不是计划 pin 2.0.24，因此 FIX-OG-CP-01 的当前 pin 门仍 UNRUN。未开始 RG-01、FIX-RG-SCOPED-03 或 FAST-RG-01。
 
+### 2026-10-10 08:29:54 UTC：SCOPED-02 线上页面已含非 blob 句子
+
+2026-10-10 08:29:54 UTC：https://libra.tools/en/docs/commands/agent HTTP 200，`content-type: text/html; charset=utf-8`，cf-ray `a48442916ae8b865-SIN`。正文含 “A saved id that is not a blob, or whose bytes do not hash to that id, is refused before that directory is cleared.” 这补上 06:07:03 UTC 线上还没有该句的观察。未标 FIX-RG-SCOPED-02 done/complete。人工红绿对照、修订双审、Linux 与 FAST-RG-01 仍未做。
+
 ### 2026-10-09 09:25:29 UTC：IGNORE:4099 之后四夹具通过且无 LNK4099
 
 2026-10-09 09:25:29 UTC：compat-scoped-input-windows job https://github.com/libra-tools/libra/actions/runs/37905150212/job/113737033866 结论 success（completed 2026-10-09T08:58:48Z）。run https://github.com/libra-tools/libra/actions/runs/37905150212 当时仍 in_progress。head 469a426e404314869d457dd2bbe83a3a66810dc5，merge b30c0acbc3bdeb4fdeceb1a637ba9937f6d3799f，base 426d2165cf9fd03fad629bf106515051c73b825a。步骤 `RUSTFLAGS=-D warnings -C link-arg=/IGNORE:4099`。四夹具各 `test result: ok. 1 passed; 0 failed; 0 ignored`：readonly_cleanup 0.02s，metadata_boundary 0.14s，preflight_budget 67.72s，deadline_cancel_owner 0.28s。日志中 `LNK4099` 出现 0 次，`generated 1 warning` 出现 0 次。未标 FIX-RG-SCOPED-04 done/complete。修订双审未勾。未开始 02/03/FAST-RG-01。Lifecycle / Acceptance 仍为 in-progress / 空。
