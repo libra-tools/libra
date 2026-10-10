@@ -881,3 +881,7 @@ main0e0b149a、OG11 signed source0d6f35c9已交付；旧AC3/VER4不继承，三i
 ### 2026-10-11：OG-14最终全量与Claude单审PASS，待签名main交付
 
 AC3/VER4当前具名门重建；final focused133/133、fmt/strict/site各0；双envdefault Nextest full9705/9705、830.938s（13slow/1flaky/9skipped/0leaky/0最终failed），SHA d387f5581c172b2be38b323ca894926e40884656adcfb23ac83eb89500d87a93。Claude R1实际PASS，0P0/0P1/1P2/4P3，35turn，rawSHA f8554015ec994d57e4170b4214fbc73c86d11c4493ef1fea66dc7083d3b1b955；非阻断空messages/info错型与新增count回归按本计划DEFER-OG-CONTAINMENT-01计划外登记，未实现/不称全部形状闭合。legacy角色partial文档已披露，serial疑虑由full实际src/registry全门PASS闭合，style不作门。DEFER-OG-TEST01追加本轮既有mirror fetch TRY1 I/O worker error→TRY2 PASS，未修复；旧OG11flaky/leak仅历史。三frozen oracle/helper和32架构门未改，source/full已审12SHA MATCH；postreview只写plan/status事实。synthetic exporter+真实SQLite/objects仍不是实际OpenCode/mac内容/native或Linux证据。0.30.42不变、网站未提交部署、阶段C/D与最终full保留。plan05原bytes排除；formal4/61=6.56%，基础6/13=46.15%，signed Push后7/13=53.85%，下一OG15。
+
+### 2026-10-11：OG-14 signed source普通Push main完成
+
+source `c578b69a2724f5dedc346cae63cb938c5170635b`已ordinary Push main，实际GitHub main同ref；PGP签名+DCO一次、12owned blobs MATCH，plan05原bytes未入delta。当前133focused/9705full/strict/fmt/site0与Claude R1 PASS有效，DEFER-OG-CONTAINMENT01及TEST01未修复如实保留；formalC/D阶段待、0.30.42未bump/release。基础7/13=53.85%，formal4/61=6.56%；下一OG15 current2.0.26 PREP核对，旧mac内容PASS不沿用。
