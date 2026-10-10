@@ -1,0 +1,163 @@
+{
+  "provenance": "synthetic hand-authored vocabulary; not live event or native evidence",
+  "opencode_pin": "2.0.26",
+  "opencode_commit": "9b4ec5714d481559990db0a816d5dec19541a814",
+  "payload_member": "data",
+  "events": [
+    {
+      "name": "session.created",
+      "lifecycle": "SessionStart",
+      "verb": "session-start",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.created",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        }
+      }
+    },
+    {
+      "name": "session.inbox.delivered",
+      "lifecycle": "TurnStart",
+      "verb": "prompt",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.inbox.delivered",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session",
+          "inboxID": "synthetic-inbox"
+        },
+        "prompt": "synthetic user text",
+        "role": "user",
+        "inbox_type": "user"
+      }
+    },
+    {
+      "name": "session.execution.succeeded",
+      "lifecycle": "TurnEnd",
+      "verb": "stop",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.execution.succeeded",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        }
+      }
+    },
+    {
+      "name": "session.execution.failed",
+      "lifecycle": "TurnEnd",
+      "verb": "stop",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.execution.failed",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        }
+      }
+    },
+    {
+      "name": "session.execution.interrupted",
+      "lifecycle": "TurnEnd",
+      "verb": "stop",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.execution.interrupted",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session",
+          "reason": "user"
+        },
+        "reason": "user"
+      }
+    },
+    {
+      "name": "session.deleted",
+      "lifecycle": "SessionEnd",
+      "verb": "session-end",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.deleted",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        }
+      }
+    },
+    {
+      "name": "session.compaction.ended",
+      "lifecycle": "Compaction",
+      "verb": "compaction",
+      "forwarding": "standalone",
+      "envelope": {
+        "hook_event_name": "session.compaction.ended",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        }
+      }
+    },
+    {
+      "name": "tool.execute.after",
+      "lifecycle": "ToolUse",
+      "verb": "tool-use",
+      "forwarding": "plugin-hook",
+      "envelope": {
+        "hook_event_name": "tool.execute.after",
+        "session_id": "synthetic-session",
+        "cwd": "/synthetic-project",
+        "data": {
+          "sessionID": "synthetic-session"
+        },
+        "tool_name": "synthetic-tool",
+        "tool_status": "completed",
+        "tool_call_id": "synthetic-call"
+      }
+    }
+  ],
+  "standalone_events": [
+    "session.created",
+    "session.inbox.delivered",
+    "session.execution.succeeded",
+    "session.execution.failed",
+    "session.execution.interrupted",
+    "session.deleted",
+    "session.compaction.ended"
+  ],
+  "plugin_hook_events": [
+    "tool.execute.after"
+  ],
+  "plugin_merged_events": [
+    "session.inbox.enqueued"
+  ],
+  "compatibility_events": [
+    "session.status",
+    "message.updated",
+    "session.compacted",
+    "server.instance.disposed"
+  ],
+  "deprecated_aliases": [
+    "session.idle"
+  ],
+  "terminal_interruption_reasons": [
+    "user",
+    "superseded",
+    "inactivity"
+  ],
+  "status_filtered": [
+    "busy",
+    "retry"
+  ],
+  "idle_status": "idle"
+}
