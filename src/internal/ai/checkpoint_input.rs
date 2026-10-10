@@ -1006,11 +1006,11 @@ mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         let file = write_blob(&storage, "metadata.json", b"ORDINARY");
         let checkpoint_id = "ckpt-mismatch";
-        seed_catalog(&storage, checkpoint_id, &[file.clone()]);
         let mut spec = CheckpointInputSpec {
             checkpoint_id: checkpoint_id.to_string(),
             files: vec![file],
         };
+        seed_catalog(&storage, checkpoint_id, &spec.files);
         spec.files[0].oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let error = validated_materialize(&storage, &spec, &run_dir).unwrap_err();
         assert!(
