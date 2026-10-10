@@ -851,3 +851,7 @@ OG03 signed source9ad5fa486与receipt0f4a6bdb已普通Push main；当前coverage
 Claude R1实际PASS（0P0/0P1/1P2/5P3，31turn，SHA1e37d7eb236f565bf3727d9a50fee2bae1f5523e6a38126a6c43ed41a2e5f188）。125/125聚焦（32architecture+3原冻结oracle；零retry），fmt/严格all-target/all-feature Clippy、site typecheck/build均exit0；当前native human key/time、idle结束与保守Incomplete、tool text/error.message与附件不复制、classic九已知parts no projection完成。SourceA不降，无real export/model/native/Linux证明；当前树未跑full，原OG03全量不能继承为本卡full，阶段及最终full必须。10owned实际冻结稿，plan05原bytes保持；网站仅fresh preimage owned插入，无commit/deploy。signedDCO main Push待，基础4/13、正式4/61，下一OG11。
 
 - **DEFER-OG-NORMALIZER-01（本计划外外围口径/兼容补强）：** R1非阻断P2为shell command/output及synthetic/system模型可见text目前按已识别metadata排除，Complete只描述ordinary allowlist表示，并非完整模型上下文；是否扩展投影/改为Incomplete后续另行评估，不移入OG11、不冒称已证明全上下文。P3为classic reasoning现保守Incomplete的既有claim迁移说明、未来native ID漂移兼容、error缺type/agents错型等额外负例与更强具名turn断言、assistant级error无content仅user记录的口径。当前实际PASS可放行；native 来源要求、未支持附件/未知reasoning的Incomplete和最终full不变。R1 preflight vs frozen plan hash差异仅证据生成时序，修正root candidate receipt并保留旧版，不改已审源码。
+
+### 2026-10-11：OG-09签名交付、开始OG-11准备
+
+source `2e7a8e22d4a269c04f09116fc71a666fa81c3d05` parent0f4a6bdb，10owned postimage blobs MATCH、PGP+DCO一次、普通Push exit0与实际GitHub main MATCH。125聚焦/严格Clippy/fmt/site exit0，实际Claude R1 PASS保持；DEFER-OG-NORMALIZER01不在本计划扩展，无true export/native/Linux/full当前候选冒称。plan05原hasha705585d保留且本tree delta排除，网站cf原4dirty保留。0.30.42无发布，阶段与最终full/C-D仍待。基础5/13=38.46%，正式4/61=6.56%；下一OG11自持注入前缀表和normalization/extraction共用过滤。
