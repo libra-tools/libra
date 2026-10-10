@@ -2427,3 +2427,7 @@ preflight 与运行前后 capture/import/export 表零变化均由 `agent_graph_
 ## FIX-RG-SCOPED-04 confined checkpoint-input API
 
 The scoped input helper pins a trusted runs-root handle and refuses symlink or reparse components while opening the run, `checkpoint-input`, and metadata leaves. Cleanup and metadata reads share one caller deadline and cancel check. Over-budget input is refused before permission changes or deletion. The helper returns typed errors and does not report removal when confinement cannot be proved.
+
+## FIX-RG-SCOPED-02 scoped resume caller
+
+Investigate and review call `materialize_validated_checkpoint_input` instead of the synchronous materializer when a checkpoint spec is present. The caller opens the explicit catalog read-only, closes it, then asks the SCOPED-04 helper to clear `checkpoint-input` before writing ordinary blobs. Saved path/id pairs must match the catalog's ordinary leaves. `reasoning/encrypted/<64 hex>` is excluded and is not read. A paused continue with a catalog transport failure returns the store error without mutating the run. Review setup uses `phase_started + reviewer_timeout` and does not reduce the later per-reviewer timeout. Catalog tree reads use a 16 MiB cap; ordinary file bytes remain 64 MiB each and 256 MiB total. Linux functional acceptance of this caller stays UNRUN.
