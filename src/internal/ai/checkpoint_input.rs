@@ -23,8 +23,17 @@
 //! checkpoint is missing, malformed, or not locally materializable);
 //! this module only turns an already-validated spec into files.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
+use git_internal::internal::object::{
+    ObjectTrait,
+    tree::{Tree, TreeItemMode},
+};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::object::read_git_object_bounded;
@@ -79,6 +88,399 @@ pub fn materialize_checkpoint_input(
     }
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("failed to create checkpoint input dir: {e}"))?;
+    write_checkpoint_input_files(storage, spec, &root)?;
+    Ok(root)
+}
+
+/// Why a production scoped materialization stopped before the ordinary payload
+/// was written. Cancel and deadline stay distinct so review can finish a
+/// cancel as cancelled and a setup deadline as the existing infrastructure
+/// error.
+#[derive(Debug)]
+pub enum ValidatedMaterializeError {
+    /// The caller cancel handle or the run's cancel marker was already set.
+    Cancelled,
+    /// The caller deadline passed before the ordinary payload was written.
+    Deadline,
+    /// The spec, store path, or object bytes were refused.
+    Refused(String),
+    /// The explicit repository catalog could not be opened, queried, or closed.
+    /// This is a transport failure, not a role mismatch.
+    Catalog(String),
+}
+
+impl std::fmt::Display for ValidatedMaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "{}", scoped_io::CheckpointInputIoError::Cancelled),
+            Self::Deadline => write!(f, "{}", scoped_io::CheckpointInputIoError::Deadline),
+            Self::Refused(message) | Self::Catalog(message) => f.write_str(message),
+        }
+    }
+}
+
+fn stop_if_inactive(
+    deadline: Instant,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(), ValidatedMaterializeError> {
+    if cancelled() {
+        return Err(ValidatedMaterializeError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ValidatedMaterializeError::Deadline);
+    }
+    Ok(())
+}
+
+/// Read the named checkpoint from the explicit store's catalog, then close
+/// that connection before any cleanup or payload write. The query budget is
+/// one shot: the caller's deadline, capped at 200ms from this phase.
+async fn confirm_catalog_checkpoint(
+    storage: &Path,
+    checkpoint_id: &str,
+    deadline: Instant,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<String, ValidatedMaterializeError> {
+    stop_if_inactive(deadline, cancelled)?;
+    let query_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(200));
+    let remaining = query_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ValidatedMaterializeError::Deadline);
+    }
+    let db_path = storage.join(crate::utils::util::DATABASE);
+    if !db_path.is_file() {
+        return Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog is not available in the explicit object store; keep the run and \
+             retry when the repository database can be opened"
+                .to_string(),
+        ));
+    }
+    let mut options = ConnectOptions::new("sqlite://checkpoint-catalog");
+    options.max_connections(1);
+    options.connect_timeout(remaining);
+    options.acquire_timeout(remaining);
+    options.sqlx_logging(false);
+    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+    options.map_sqlx_sqlite_opts(move |opts| {
+        opts.filename(&db_path)
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(remaining)
+    });
+    let conn = Database::connect(options).await.map_err(|_| {
+        ValidatedMaterializeError::Catalog(
+            "checkpoint catalog could not be opened; keep the run and retry when the repository \
+             database is readable"
+                .to_string(),
+        )
+    })?;
+    let backend = conn.get_database_backend();
+    let queried = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [checkpoint_id.into()],
+        ))
+        .await;
+    let closed = conn.close().await;
+    if closed.is_err() {
+        return Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog could not be closed; keep the run and retry when the repository \
+             database releases its connection"
+                .to_string(),
+        ));
+    }
+    stop_if_inactive(deadline, cancelled)?;
+    match queried {
+        Ok(Some(row)) => {
+            let tree_oid = row.try_get_by::<String, _>("tree_oid").map_err(|_| {
+                ValidatedMaterializeError::Catalog(
+                    "checkpoint catalog row could not be read; keep the run and retry when the \
+                     repository database can be read"
+                        .to_string(),
+                )
+            })?;
+            if tree_oid.is_empty() {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' has no tree in the explicit catalog; refusing \
+                     to materialize a saved spec"
+                )));
+            }
+            Ok(tree_oid)
+        }
+        Ok(None) => Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{checkpoint_id}' is not in the explicit catalog; refusing to materialize \
+             a saved spec the catalog does not name"
+        ))),
+        Err(_) => Err(ValidatedMaterializeError::Catalog(
+            "checkpoint catalog query failed; keep the run and retry when the repository \
+             database can be read"
+                .to_string(),
+        )),
+    }
+}
+
+const CATALOG_TREE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CATALOG_WALK_MAX_ENTRIES: usize = 8192;
+const CATALOG_WALK_MAX_DEPTH: u32 = 64;
+const CATALOG_PATH_MAX_BYTES: usize = 4096;
+
+/// Closed reasoning ciphertext is stored at `reasoning/encrypted/<64 hex>`.
+/// That leaf is not ordinary checkpoint input, so a saved spec must not name
+/// it and the catalog comparison must not require it.
+fn is_closed_reasoning_artifact_path(rel_path: &str) -> bool {
+    let Some(name) = rel_path.strip_prefix("reasoning/encrypted/") else {
+        return false;
+    };
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn refuse_unless_saved_spec_matches_catalog(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    tree_oid: &str,
+) -> Result<(), ValidatedMaterializeError> {
+    let current = catalog_ordinary_leaves(storage, tree_oid, &spec.checkpoint_id)?;
+    let mut saved = BTreeMap::new();
+    for file in &spec.files {
+        if is_closed_reasoning_artifact_path(&file.rel_path) {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{}' saved spec names closed reasoning artifact '{}'; ordinary \
+                 materialization does not read it",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
+        if saved
+            .insert(file.rel_path.clone(), file.oid.clone())
+            .is_some()
+        {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{}' saved spec repeats path '{}'; refusing to materialize",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
+    }
+    if saved != current {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{}' saved spec does not match the catalog leaves; refusing to \
+             materialize",
+            spec.checkpoint_id
+        )));
+    }
+    Ok(())
+}
+
+fn catalog_ordinary_leaves(
+    storage: &Path,
+    tree_oid: &str,
+    checkpoint_id: &str,
+) -> Result<BTreeMap<String, String>, ValidatedMaterializeError> {
+    if checkpoint_id.len() < 2
+        || checkpoint_id.contains(['/', '\\'])
+        || !checkpoint_id.is_char_boundary(2)
+    {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint '{checkpoint_id}' is not a catalog leaf id; refusing to materialize"
+        )));
+    }
+    let root = read_catalog_tree(storage, tree_oid)?;
+    let checkpoint = catalog_subtree(storage, &root, "checkpoint")?;
+    let prefix = catalog_subtree(storage, &checkpoint, &checkpoint_id[..2])?;
+    let inner = catalog_subtree(storage, &prefix, &checkpoint_id[2..])?;
+    let mut pending = vec![(String::new(), inner, 0_u32)];
+    let mut leaves = BTreeMap::new();
+    let mut walked = 0_usize;
+    while let Some((prefix, tree, depth)) = pending.pop() {
+        if depth > CATALOG_WALK_MAX_DEPTH {
+            return Err(ValidatedMaterializeError::Refused(format!(
+                "checkpoint '{checkpoint_id}' tree is deeper than the ordinary leaf budget; \
+                 refusing to materialize"
+            )));
+        }
+        for item in &tree.tree_items {
+            walked += 1;
+            if walked > CATALOG_WALK_MAX_ENTRIES {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' tree exceeds the ordinary leaf budget; refusing \
+                     to materialize"
+                )));
+            }
+            let rel_path = if prefix.is_empty() {
+                item.name.clone()
+            } else {
+                format!("{prefix}/{}", item.name)
+            };
+            if rel_path.len() > CATALOG_PATH_MAX_BYTES {
+                return Err(ValidatedMaterializeError::Refused(format!(
+                    "checkpoint '{checkpoint_id}' leaf path exceeds the ordinary path budget; \
+                     refusing to materialize"
+                )));
+            }
+            match item.mode {
+                TreeItemMode::Tree => {
+                    let child = read_catalog_tree(storage, &item.id.to_string())?;
+                    pending.push((rel_path, child, depth + 1));
+                }
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable => {
+                    if is_closed_reasoning_artifact_path(&rel_path) {
+                        continue;
+                    }
+                    if leaves.insert(rel_path, item.id.to_string()).is_some() {
+                        return Err(ValidatedMaterializeError::Refused(format!(
+                            "checkpoint '{checkpoint_id}' catalog tree repeats a leaf path; \
+                             refusing to materialize"
+                        )));
+                    }
+                }
+                TreeItemMode::Commit | TreeItemMode::Link => {
+                    return Err(ValidatedMaterializeError::Refused(format!(
+                        "checkpoint '{checkpoint_id}' catalog tree contains a non-blob entry; \
+                         refusing to materialize"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(leaves)
+}
+
+fn catalog_subtree(
+    storage: &Path,
+    tree: &Tree,
+    name: &str,
+) -> Result<Tree, ValidatedMaterializeError> {
+    let item = tree
+        .tree_items
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(format!(
+                "checkpoint catalog tree is missing '{name}'; refusing to materialize"
+            ))
+        })?;
+    if item.mode != TreeItemMode::Tree {
+        return Err(ValidatedMaterializeError::Refused(format!(
+            "checkpoint catalog entry '{name}' is not a tree; refusing to materialize"
+        )));
+    }
+    read_catalog_tree(storage, &item.id.to_string())
+}
+
+fn read_catalog_tree(storage: &Path, oid_str: &str) -> Result<Tree, ValidatedMaterializeError> {
+    let oid = crate::internal::object_format::parse_repo_oid(oid_str).map_err(|_| {
+        ValidatedMaterializeError::Refused(
+            "checkpoint catalog tree id is not an object id; refusing to materialize".to_string(),
+        )
+    })?;
+    let (body, truncated) = read_git_object_bounded(storage, &oid, CATALOG_TREE_MAX_BYTES)
+        .map_err(|_| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint catalog tree is not readable from the explicit object store; refusing \
+                 to materialize"
+                    .to_string(),
+            )
+        })?;
+    if truncated {
+        return Err(ValidatedMaterializeError::Refused(
+            "checkpoint catalog tree exceeds the 16MiB child-tree budget; refusing to materialize"
+                .to_string(),
+        ));
+    }
+    Tree::from_bytes(&body, oid).map_err(|_| {
+        ValidatedMaterializeError::Refused(
+            "checkpoint catalog object is not a tree; refusing to materialize".to_string(),
+        )
+    })
+}
+
+fn map_scoped_io(error: scoped_io::CheckpointInputIoError) -> ValidatedMaterializeError {
+    match error {
+        scoped_io::CheckpointInputIoError::Cancelled => ValidatedMaterializeError::Cancelled,
+        scoped_io::CheckpointInputIoError::Deadline => ValidatedMaterializeError::Deadline,
+        other => ValidatedMaterializeError::Refused(other.to_string()),
+    }
+}
+
+/// Production entry for investigate and review. Re-reads every blob from the
+/// explicit absolute object store, clears any previous input through the
+/// confined cleanup API, then writes the ordinary payload. A relative store
+/// path is refused so a changed cwd cannot choose the bytes. An already
+/// expired deadline or a raised cancel stops before that cleanup.
+pub async fn materialize_validated_checkpoint_input(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    run_dir: &Path,
+    deadline: std::time::Instant,
+    cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<PathBuf, ValidatedMaterializeError> {
+    if !storage.is_absolute() {
+        return Err(ValidatedMaterializeError::Refused(
+            "checkpoint input storage path must be absolute; refusing a cwd-relative store"
+                .to_string(),
+        ));
+    }
+    if spec.checkpoint_id.is_empty() {
+        return Err(ValidatedMaterializeError::Refused(
+            "checkpoint input spec is missing its checkpoint id".to_string(),
+        ));
+    }
+    stop_if_inactive(deadline, cancelled.as_ref())?;
+    // Pin the caller's paths before the confined API checks ancestors. A
+    // macOS temp repo is reached through the /var symlink; resolving it once
+    // names the real directory, and the no-follow check still applies there.
+    let storage = std::fs::canonicalize(storage).map_err(|error| {
+        ValidatedMaterializeError::Refused(format!(
+            "checkpoint input storage path is not a real directory: {error}"
+        ))
+    })?;
+    let tree_oid =
+        confirm_catalog_checkpoint(&storage, &spec.checkpoint_id, deadline, cancelled.as_ref())
+            .await?;
+    refuse_unless_saved_spec_matches_catalog(&storage, spec, &tree_oid)?;
+    let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
+        ValidatedMaterializeError::Refused(format!(
+            "checkpoint input run directory is not a real directory: {error}"
+        ))
+    })?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint input run directory name is not valid".to_string(),
+            )
+        })?;
+    let runs_root = run_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            ValidatedMaterializeError::Refused(
+                "checkpoint input run directory has no trusted runs root".to_string(),
+            )
+        })?;
+    let budget = scoped_io::ScopedIoBudget {
+        deadline,
+        cancelled,
+    };
+    let root_handle =
+        scoped_io::open_scoped_run_root(runs_root, run_id, &budget).map_err(map_scoped_io)?;
+    scoped_io::cleanup_checkpoint_input(&root_handle, &budget).map_err(map_scoped_io)?;
+    let root = run_dir.join(CHECKPOINT_INPUT_DIR);
+    std::fs::create_dir_all(&root).map_err(|error| {
+        ValidatedMaterializeError::Refused(format!(
+            "failed to create checkpoint input dir: {error}"
+        ))
+    })?;
+    write_checkpoint_input_files(&storage, spec, &root)
+        .map_err(ValidatedMaterializeError::Refused)?;
+    Ok(root)
+}
+
+fn write_checkpoint_input_files(
+    storage: &Path,
+    spec: &CheckpointInputSpec,
+    root: &Path,
+) -> Result<(), String> {
     let mut total: u64 = 0;
     let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
@@ -166,12 +568,14 @@ pub fn materialize_checkpoint_input(
         use std::os::unix::fs::PermissionsExt;
         dirs.sort();
         dirs.dedup();
-        for dir in dirs.iter().rev().chain(std::iter::once(&root)) {
+        for dir in dirs.iter().rev() {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
                 .map_err(|e| format!("failed to make checkpoint input dir read-only: {e}"))?;
         }
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .map_err(|e| format!("failed to make checkpoint input dir read-only: {e}"))?;
     }
-    Ok(root)
+    Ok(())
 }
 
 /// Reject absolute/parent-escaping components: the spec's rel paths come
@@ -228,13 +632,19 @@ pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, io::Write as _, str::FromStr as _};
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::tree::{Tree, TreeItem, TreeItemMode},
+    };
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
     use super::*;
 
     /// Write a loose blob into `storage` and return its spec entry.
     #[cfg_attr(windows, allow(dead_code))]
     fn write_blob(storage: &Path, rel_path: &str, content: &[u8]) -> CheckpointInputFile {
-        use std::io::Write as _;
-
         let blob = git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec());
         let oid = blob.id.to_string();
         let dir = storage.join("objects").join(&oid[..2]);
@@ -249,6 +659,140 @@ mod tests {
             rel_path: rel_path.to_string(),
             oid,
         }
+    }
+
+    fn seed_catalog(storage: &Path, checkpoint_id: &str, files: &[CheckpointInputFile]) {
+        let tree_oid = catalog_root_for(storage, checkpoint_id, files);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("catalog runtime");
+        runtime.block_on(async {
+            let db_path = storage.join("libra.db");
+            let url = format!("sqlite://{}?mode=rwc", db_path.display());
+            let mut options = ConnectOptions::new(url);
+            options.max_connections(1);
+            options.sqlx_logging(false);
+            let conn = Database::connect(options).await.expect("create catalog");
+            let backend = conn.get_database_backend();
+            conn.execute_raw(Statement::from_string(
+                backend,
+                "CREATE TABLE IF NOT EXISTS agent_checkpoint (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    tree_oid TEXT NOT NULL
+                 )"
+                .to_string(),
+            ))
+            .await
+            .expect("create catalog table");
+            conn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO agent_checkpoint (checkpoint_id, tree_oid) VALUES (?, ?)",
+                [checkpoint_id.into(), tree_oid.into()],
+            ))
+            .await
+            .expect("insert catalog row");
+            conn.close().await.expect("close catalog");
+        });
+    }
+
+    fn catalog_root_for(
+        storage: &Path,
+        checkpoint_id: &str,
+        files: &[CheckpointInputFile],
+    ) -> String {
+        fn store_tree(storage: &Path, items: Vec<TreeItem>) -> String {
+            let tree = Tree::from_tree_items(items).expect("tree");
+            let mut body = Vec::new();
+            for item in &tree.tree_items {
+                body.extend_from_slice(item.to_data().as_slice());
+            }
+            let mut raw = format!("tree {}\0", body.len()).into_bytes();
+            raw.extend_from_slice(&body);
+            let oid = tree.id.to_string();
+            let dir = storage.join("objects").join(&oid[..2]);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&raw).unwrap();
+            std::fs::write(dir.join(&oid[2..]), encoder.finish().unwrap()).unwrap();
+            oid
+        }
+
+        #[derive(Default)]
+        struct CatalogDir {
+            blobs: Vec<(String, String)>,
+            dirs: BTreeMap<String, CatalogDir>,
+        }
+
+        fn insert_catalog_file<'a>(
+            dir: &mut CatalogDir,
+            name: &str,
+            mut rest: impl Iterator<Item = &'a str>,
+            oid: &str,
+        ) {
+            match rest.next() {
+                None => dir.blobs.push((name.to_string(), oid.to_string())),
+                Some(next) => {
+                    let child = dir.dirs.entry(name.to_string()).or_default();
+                    insert_catalog_file(child, next, rest, oid);
+                }
+            }
+        }
+
+        fn store_catalog_dir(storage: &Path, dir: &CatalogDir) -> String {
+            let mut items = Vec::new();
+            for (name, oid) in &dir.blobs {
+                items.push(TreeItem::new(
+                    TreeItemMode::Blob,
+                    ObjectHash::from_str(oid).expect("blob oid"),
+                    name.clone(),
+                ));
+            }
+            for (name, child) in &dir.dirs {
+                let child_oid = store_catalog_dir(storage, child);
+                items.push(TreeItem::new(
+                    TreeItemMode::Tree,
+                    ObjectHash::from_str(&child_oid).expect("child tree"),
+                    name.clone(),
+                ));
+            }
+            store_tree(storage, items)
+        }
+
+        let mut root = CatalogDir::default();
+        for file in files {
+            let mut parts = file.rel_path.split('/').filter(|part| !part.is_empty());
+            let Some(first) = parts.next() else {
+                panic!("catalog seed path is empty");
+            };
+            insert_catalog_file(&mut root, first, parts, &file.oid);
+        }
+        let inner = store_catalog_dir(storage, &root);
+        let prefix = store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&inner).expect("inner"),
+                checkpoint_id[2..].to_string(),
+            )],
+        );
+        let checkpoint = store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&prefix).expect("prefix"),
+                checkpoint_id[..2].to_string(),
+            )],
+        );
+        store_tree(
+            storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                ObjectHash::from_str(&checkpoint).expect("checkpoint"),
+                "checkpoint".to_string(),
+            )],
+        )
     }
 
     /// PD-02: the materialized input must be READ-ONLY in the sense that
@@ -390,6 +934,214 @@ mod tests {
     #[test]
     fn fix_rg_scoped_04_deadline_cancel_owner() {
         scoped_io::test_support::deadline_cancel_owner();
+    }
+
+    fn validated_materialize(
+        storage: &Path,
+        spec: &CheckpointInputSpec,
+        run_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime
+            .block_on(materialize_validated_checkpoint_input(
+                storage,
+                spec,
+                run_dir,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::sync::Arc::new(|| false),
+            ))
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_typed_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let missing_id = CheckpointInputSpec {
+            checkpoint_id: String::new(),
+            files: Vec::new(),
+        };
+        let error = validated_materialize(&storage, &missing_id, &run_dir).unwrap_err();
+        assert!(error.contains("checkpoint id"), "{error}");
+
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-typed".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        seed_catalog(&storage, "ckpt-typed", &spec.files);
+        let error =
+            validated_materialize(Path::new("relative-storage"), &spec, &run_dir).unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
+
+        let root = validated_materialize(&storage, &spec, &run_dir).expect("typed materialize");
+        assert_eq!(
+            std::fs::read(root.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_deadline_and_cancel_leave_input_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-stop".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancelled = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|| true),
+        ));
+        assert!(matches!(
+            cancelled,
+            Err(ValidatedMaterializeError::Cancelled)
+        ));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let expired = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now(),
+            std::sync::Arc::new(|| false),
+        ));
+        assert!(matches!(expired, Err(ValidatedMaterializeError::Deadline)));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_catalog_unavailable_skips_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-missing-catalog".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let missing = runtime.block_on(materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|| false),
+        ));
+        assert!(matches!(
+            missing,
+            Err(ValidatedMaterializeError::Catalog(_))
+        ));
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_catalog_leaf_mismatch_skips_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let file = write_blob(&storage, "metadata.json", b"ORDINARY");
+        let checkpoint_id = "ckpt-mismatch";
+        let mut spec = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![file],
+        };
+        seed_catalog(&storage, checkpoint_id, &spec.files);
+        spec.files[0].oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let error = validated_materialize(&storage, &spec, &run_dir).unwrap_err();
+        assert!(
+            error.contains("does not match the catalog leaves"),
+            "{error}"
+        );
+        assert!(!run_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_ordinary_leaf_skips_reasoning_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let ordinary = write_blob(&storage, "metadata.json", b"ORDINARY");
+        let artifact_name = "ab".repeat(32);
+        let artifact = write_blob(
+            &storage,
+            &format!("reasoning/encrypted/{artifact_name}"),
+            b"SECRET",
+        );
+        let checkpoint_id = "ckpt-ordinary";
+        seed_catalog(
+            &storage,
+            checkpoint_id,
+            &[ordinary.clone(), artifact.clone()],
+        );
+        let spec = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![ordinary],
+        };
+        let root = validated_materialize(&storage, &spec, &run_dir).expect("ordinary leaves");
+        assert_eq!(
+            std::fs::read(root.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+        assert!(!root.join("reasoning").exists());
+
+        let refused_dir = base.join("runs").join("run-2");
+        std::fs::create_dir_all(&refused_dir).unwrap();
+        let refused = CheckpointInputSpec {
+            checkpoint_id: checkpoint_id.to_string(),
+            files: vec![artifact],
+        };
+        let error = validated_materialize(&storage, &refused, &refused_dir).unwrap_err();
+        assert!(error.contains("closed reasoning artifact"), "{error}");
+        assert!(!refused_dir.join(CHECKPOINT_INPUT_DIR).exists());
+    }
+
+    #[test]
+    fn fix_rg_scoped_02_second_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let storage = base.join("storage");
+        let run_dir = base.join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-second".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"ORDINARY")],
+        };
+        seed_catalog(&storage, "ckpt-second", &spec.files);
+        let first = validated_materialize(&storage, &spec, &run_dir).expect("first");
+        assert_eq!(
+            std::fs::read(first.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
+        let second =
+            validated_materialize(&storage, &spec, &run_dir).expect("second without chmod");
+        assert_eq!(
+            std::fs::read(second.join("metadata.json")).unwrap(),
+            b"ORDINARY"
+        );
     }
 }
 

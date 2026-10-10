@@ -73,6 +73,7 @@ use super::{
 };
 use crate::internal::ai::{
     agent_run::AgentRunId,
+    checkpoint_input::ValidatedMaterializeError,
     workspace_isolation::{
         FuseProvisionState, SubAgentWorkspace, WorkspaceIsolationConfig,
         materialize_isolated_workspace,
@@ -402,14 +403,51 @@ async fn run_review_inner(
     let workspace_root;
     if let Some(spec) = &request.checkpoint_input {
         let storage = request.repo_root.join(crate::utils::util::ROOT_DIR);
-        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
-            &storage, spec, &run_dir,
-        ) {
+        let phase_started = Instant::now();
+        let store_for_cancel = store.clone();
+        let run_for_cancel = run_id_str.clone();
+        let cancel_probe = cancel.clone();
+        let cancelled = std::sync::Arc::new(move || {
+            cancel_probe.is_cancelled() || store_for_cancel.cancel_requested(&run_for_cancel)
+        });
+        match crate::internal::ai::checkpoint_input::materialize_validated_checkpoint_input(
+            &storage,
+            spec,
+            &run_dir,
+            phase_started + request.reviewer_timeout,
+            cancelled,
+        )
+        .await
+        {
             Ok(root) => {
                 workspace_guard = ReviewWorkspaceGuard { workspace: None };
                 workspace_root = root;
             }
             Err(err) => {
+                // Setup expiry stays the infrastructure error. Cancel, including
+                // a marker that appears during cleanup, stays the cancelled
+                // terminal and does not launch reviewers. The reviewer timeout
+                // below is still the original request budget.
+                let cancelled_now = matches!(err, ValidatedMaterializeError::Cancelled)
+                    || cancel.is_cancelled()
+                    || store.cancel_requested(&run_id_str);
+                if cancelled_now {
+                    let reports = cancelled_reports(&slugs);
+                    let outcome = finalize(
+                        store,
+                        &run_id_str,
+                        &run_dir,
+                        true,
+                        reports,
+                        HashMap::new(),
+                        RedactionReportSummary::default(),
+                        &request,
+                        started,
+                        None,
+                    )?;
+                    finish(outcome.terminal_state);
+                    return Ok(outcome);
+                }
                 let outcome = finalize(
                     store,
                     &run_id_str,

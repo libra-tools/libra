@@ -46,6 +46,7 @@ pub use crate::internal::ai::review::DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD;
 pub use crate::internal::ai::review::DEFAULT_REVIEWER_TIMEOUT as DEFAULT_INVESTIGATOR_TIMEOUT;
 use crate::internal::ai::{
     agent_run::AgentRunId,
+    checkpoint_input::ValidatedMaterializeError,
     observed_agents::launchable_investigate_slugs,
     review::{
         BoundedSinkBuffer, REVIEW_SINK_BUFFER_BYTES, REVIEW_SINK_TRUNCATION_MARKER,
@@ -665,22 +666,55 @@ async fn drive(
     let workspace_root;
     if let Some(spec) = state.checkpoint_input.clone() {
         let storage = repo_root.join(crate::utils::util::ROOT_DIR);
-        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
-            &storage, &spec, &run_dir,
-        ) {
+        let store_for_cancel = store.clone();
+        let run_for_cancel = run_id.to_string();
+        let cancel_probe = cancel.clone();
+        let cancelled = std::sync::Arc::new(move || {
+            cancel_probe.is_cancelled() || store_for_cancel.cancel_requested(&run_for_cancel)
+        });
+        match crate::internal::ai::checkpoint_input::materialize_validated_checkpoint_input(
+            &storage,
+            &spec,
+            &run_dir,
+            Instant::now() + remaining_budget,
+            cancelled,
+        )
+        .await
+        {
             Ok(root) => {
                 guard = InvestigateWorkspaceGuard { workspace: None };
                 workspace_root = root;
             }
+            Err(ValidatedMaterializeError::Catalog(message)) if state.pending_turn.is_some() => {
+                // A paused continue must surface a catalog transport failure
+                // before any state or input mutation and must not launch.
+                return Err(InvestigateRunError::Store(std::io::Error::other(message)));
+            }
             Err(err) => {
+                // Cancel outranks a deadline or a refused spec. A deadline here
+                // is the persisted run budget, so it ends as timeout. Any other
+                // refusal stays the infrastructure error.
+                let cancelled_now = matches!(err, ValidatedMaterializeError::Cancelled)
+                    || cancel.is_cancelled()
+                    || store.cancel_requested(run_id);
+                let (terminal, infra_error) = if cancelled_now {
+                    (InvestigateTerminalState::Cancelled, None)
+                } else if matches!(err, ValidatedMaterializeError::Deadline) {
+                    (InvestigateTerminalState::Timeout, None)
+                } else {
+                    (
+                        InvestigateTerminalState::Error,
+                        Some(format!("checkpoint input materialization failed: {err}")),
+                    )
+                };
                 return finalize_terminal(
                     store,
                     run_id,
                     &run_dir,
                     &mut state,
-                    InvestigateTerminalState::Error,
+                    terminal,
                     redaction,
-                    Some(format!("checkpoint input materialization failed: {err}")),
+                    infra_error,
                     started,
                 );
             }
