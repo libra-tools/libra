@@ -1,0 +1,25 @@
+{
+  "availability": [
+    "provider_visible",
+    "encrypted_unavailable",
+    "opaque_archived",
+    "not_present",
+    "unsupported_shape"
+  ],
+  "records": [
+    {
+      "availability": "not_present",
+      "provider": "opencode"
+    },
+    {
+      "availability": "unsupported_shape",
+      "provider": "opencode",
+      "warning": "unsupported_shape"
+    },
+    {
+      "availability": "encrypted_unavailable",
+      "provider": "claude_code",
+      "source_kind": "signature"
+    }
+  ]
+}

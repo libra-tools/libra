@@ -659,3 +659,27 @@ https://libra.tools/en/docs/commands/config 返回 HTTP 200，`content-type: tex
 ### 2026-10-09 09:25:29 UTC：IGNORE:4099 之后四夹具通过且无 LNK4099
 
 2026-10-09 09:25:29 UTC：compat-scoped-input-windows job https://github.com/libra-tools/libra/actions/runs/37905150212/job/113737033866 结论 success（completed 2026-10-09T08:58:48Z）。run https://github.com/libra-tools/libra/actions/runs/37905150212 当时仍 in_progress。head 469a426e404314869d457dd2bbe83a3a66810dc5，merge b30c0acbc3bdeb4fdeceb1a637ba9937f6d3799f，base 426d2165cf9fd03fad629bf106515051c73b825a。步骤 `RUSTFLAGS=-D warnings -C link-arg=/IGNORE:4099`。四夹具各 `test result: ok. 1 passed; 0 failed; 0 ignored`：readonly_cleanup 0.02s，metadata_boundary 0.14s，preflight_budget 67.72s，deadline_cancel_owner 0.28s。日志中 `LNK4099` 出现 0 次，`generated 1 warning` 出现 0 次。未标 FIX-RG-SCOPED-04 done/complete。修订双审未勾。未开始 02/03/FAST-RG-01。Lifecycle / Acceptance 仍为 in-progress / 空。
+
+### 2026-10-10：main 直接交付恢复，RG-01 开始迁入
+
+用户授权 main 开发、逐卡签名 DCO Push、patch-only 阶段发布，并由执行者采用推荐决策；停用旧 620→621 跟进。main fast-forward 到 acee4ad6809c5a29d9f72c1c19400184c5ddda3e，原两个 dirty 计划 autostash 复回。exact 默认全局 installer exit0，Ed25519 manifest/sha256/size 检查通过，libra0.30.42。R10六RG与四scoped定义仅相关块恢复；当前CX/Codex0.162.1与计划05原改动保留。RG-01迁入type/source-shape契约、raw_value显式feature、自己的fixture/docs guard；本轮测试/审查/签名Push尚未执行，不计done/complete、不代替native来源。
+
+### 2026-10-10：FIX-RG-01 actual successor 0.30.42 补充 C/D
+
+最新用户授权执行者采用推荐方案。0.30.39 GitHub Release page 只读 GET 仍 HTTP404，旧被拒的元数据创建动作未重试，不能记为 PASS。采用实际已发布 successor 0.30.42 的补充交付覆盖此历史缺口，而非虚构 .39 页面或省略安全门：FIX-RG-01 自有 agent_import.rs 与 observed_agents/rpc.rs 在正式 .39 merge9b8fc5c7057e6e317edd88f1518ba1bb25f2929f 与 .42 merge4a557df5163d7b3ebed50ca53859498774bf37d8 的整文件逐字节相同，SHA256分别 ef40489d7271a85000f44c7f15567fd9b771b4f1f2fd24f30da8a3122f3fe605 / 77713bcd51d1cb54f146304ba2e366181e32c8e4856e7eef5df1dab67fcb5bf4。
+
+.42 PR627 base run37876625067/offline-core job113646606435 实际两 descriptor cancellation 与 RPC EOF/wrong-version/wrong-id/result/timeout/malformed 均 PASS；该 CI Summary9587/9587、14slow、7skip。原 macOS full9545/9545、22slow、2flaky、2LEAK、5skip保持另一条证据，不能混为同一全量。.42真实非draft Release page、CodeQL PR37876625016/main37882008811、release37882123871八job（含四平台）、stable签名manifest/部署/install与网站记录已核实；.42 merge commit signature verified=true/valid，但 v0.30.42 是 lightweight tag，绝不称 signed annotated tag。
+
+本轮 exact 全局命令 `curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh` exit0，Ed25519 manifest/libra-release-1、SHA256与size、official-install标记核对，实际 `libra --version` 为0.30.42。FIX-RG-01 保留 done/complete，以本 successor source-qualified 补充覆盖为当前 C/D 判据；.39 page缺失历史保留。NPR-19/FIX-NPR-CONFIG-01/FIX-RG-DOC-TEST-01实交付同时核实，固定队列正式完成4/61=6.56%，57张待完成。下一张 RG-01，当前仅迁入，未标 complete。
+
+### 2026-10-10：USER-CLAUDE-SINGLE — 后续全部 Claude Code 单审
+
+依据用户最新明确指令，本计划尚未关闭的设计、实现、修订、发布收口评审全部改为单一 Claude Code 评审；实际最终评审输入的 Claude Code 输出 PASS 即通过，不再新增 Codex 第二审、双审裁决或以未做双审阻塞任务。原有卡字段/工程约束中的“独立 Codex/Claude 双审”“Codex review”“parent verdict”等后续评审要求均按本具体授权覆盖；历史原稿、FAIL/PASS 和审计事实不改写。执行者仍核对实际 source 身份、修复已知缺陷并重跑相关测试；未运行/失败/synthetic 证据不得称验收通过，native 来源和实际 C/D 仍保留。
+
+### 2026-10-10：RG-01 main 本地交付门闭合，Claude Code 单审 PASS
+
+最终代码输入 manifest SHA983ffeedb386e3b318496b55d49d1aec7a1278af6f1c8b7bb0428e0d88cb46ef，19/19 root source SHA 与冻结评审输入一致。macOS：双env nextest reasoning/redaction/compat docs共61/61（3886其他过滤，不是full）；7/7 compile-fail doctest；fmt exit0；clippy all-targets/all-features -D warnings exit0（Cargo仍报告proc-macro-error2既有future-incompat，不称零警告）；release性能单门1/1、16MiB来源验证+原字节SHA256实测47.9115ms<=50ms。单一Claude Code执行exit0/is_error=false，44turn，REVIEW VERDICT: PASS（原输出SHA4f6a27bbe0e96a2e4023bf4026c3661e283e85bfb1ded98d50fc6ab82790b793），无P0/P1；本轮未做第二Codex评审或parent review。
+
+按用户PASS即通过的最新授权，非阻断建议实名接受并保留：责任人为本会话Codex执行者（依用户自动决策授权），确认当前没有live调用，最小synthetic envelope不是任意真实Claude JSONL支持；真实record额外metadata必须在相应adapter卡先审schema再接线，不可偷偷放宽来源A。负例当前证明整体failclosed，但未单独隔离UniqueJsonKeys或钉各错误variant，后续RG04 shared contract在原own写集中补这一回归；裸compile-fail error-code、16MiB Display常量漂移与future preserve_order是测试维护建议。空JSON-string仅通过当前syntactic字段shape分类，不证明非空有效密文，RG02 sink仍须独立拒绝空artifact；perf仅约4%余量，实际记录保留，不调宽预算或用重试掩盖失败。
+
+单写者/源代码及生产行为未在PASS后变动；仅本地验收勾选、评审事实和交付状态补记。RG-01 locally-accepted，签名main commit/Push随后取证；仍非done/complete。最终完整full、实际mainCI/CodeQL、FAST-RG-01 patch发布四平台/安装/网站C-D未关闭；不能把61 focused当计划61卡完成。下一卡RG-04；固定队列正式4/61=6.56%。每15分钟的620-621旧提醒已按用户请求删除，工具deleteStatus=deleted。

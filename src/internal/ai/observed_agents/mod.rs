@@ -39,6 +39,7 @@ pub mod extract;
 pub(crate) mod live_capture;
 pub mod opencode_export;
 pub mod preview;
+pub mod reasoning;
 pub mod redaction;
 pub mod registry;
 pub mod rpc;
@@ -78,6 +79,10 @@ pub(crate) use coverage::{
 };
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
+pub use reasoning::{
+    OpaqueEncryptedBytes, ReasoningAvailability, ReasoningProvider, ReasoningRecord,
+    ReasoningSourceKind, ReasoningWarning, UnrecognizedReasoningField, classify_unrecognized_field,
+};
 pub use redaction::{
     MAX_REDACTION_MATCH_SAMPLES, RedactedBytes, RedactedSink, RedactionMatch, RedactionReport,
     RedactionRule, Redactor,

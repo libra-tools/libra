@@ -624,3 +624,65 @@ fn scoped_checkpoint_resume_docs_keep_ordinary_revalidation() {
         "不新增稳定错误码",
     );
 }
+
+#[test]
+fn reasoning_type_docs_pin_metadata_only_and_five_states() {
+    for (label, document) in [
+        ("docs/commands/agent.md", AGENT_CMD_DOC_EN),
+        ("docs/commands/zh-CN/agent.md", AGENT_CMD_DOC_ZH),
+        ("docs/development/commands/agent.md", AGENT_DEV_DOC),
+        ("docs/development/tracing/agent.md", AGENT_DOC),
+    ] {
+        for state in [
+            "provider_visible",
+            "encrypted_unavailable",
+            "opaque_archived",
+            "not_present",
+            "unsupported_shape",
+        ] {
+            assert_contains(document, label, state);
+        }
+        assert_contains(document, label, "OpaqueEncryptedBytes");
+        assert_contains(document, label, "RedactedBytes");
+    }
+    assert_contains(
+        AGENT_CMD_DOC_EN,
+        "reasoning contract",
+        "not that capture failed",
+    );
+    assert_contains(AGENT_CMD_DOC_ZH, "reasoning contract", "不是采集失败");
+    assert_contains(AGENT_DEV_DOC, "reasoning contract", "not a capture failure");
+    assert_contains(AGENT_DOC, "reasoning contract", "不是采集失败");
+    assert_contains(AGENT_CMD_DOC_EN, "RG-01 scope", "metadata-only");
+    assert_contains(
+        AGENT_CMD_DOC_EN,
+        "runtime artifact capture scope",
+        "No live provider adapter yet produces artifacts",
+    );
+    assert_contains(
+        AGENT_CMD_DOC_ZH,
+        "runtime artifact capture scope",
+        "尚无 live provider adapter 产生 artifact",
+    );
+    assert_contains(
+        AGENT_CMD_DOC_ZH,
+        "RG-01 verified source scope",
+        "OpenCode 密文采集仍待注册经验证的 provider 字段",
+    );
+    assert_contains(
+        AGENT_DEV_DOC,
+        "RG-01 scope",
+        "does not yet capture or store",
+    );
+    assert_contains(AGENT_DOC, "RG-01 scope", "未接存储");
+    for (label, document) in [
+        ("agent EN", AGENT_CMD_DOC_EN),
+        ("agent zh-CN", AGENT_CMD_DOC_ZH),
+        ("developer EN", AGENT_DEV_DOC),
+        ("tracing zh-CN", AGENT_DOC),
+    ] {
+        assert_contains(document, label, "thinking.signature");
+        assert_contains(document, label, "redacted_thinking.data");
+        assert_contains(document, label, "reasoning.state");
+    }
+}

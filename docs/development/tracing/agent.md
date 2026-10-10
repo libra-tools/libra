@@ -2431,3 +2431,26 @@ The scoped input helper pins a trusted runs-root handle and refuses symlink or r
 ## FIX-RG-SCOPED-02 scoped resume caller
 
 Investigate and review call `materialize_validated_checkpoint_input` instead of the synchronous materializer when a checkpoint spec is present. The caller opens the explicit catalog read-only, closes it, checks ordinary leaves, and reads those blobs with the typed blob reader before asking the SCOPED-04 helper to clear `checkpoint-input`. Saved path/id pairs must match the catalog's ordinary leaves. A saved id that is not a blob, or whose bytes do not hash to that id, stops before that cleanup. `reasoning/encrypted/<64 hex>` is excluded and is not read. A paused continue with a catalog transport failure returns the store error without mutating the run. Review setup uses `phase_started + reviewer_timeout` and does not reduce the later per-reviewer timeout. Catalog tree reads use a 16 MiB cap; ordinary file bytes remain 64 MiB each and 256 MiB total. Linux functional acceptance of this caller stays UNRUN.
+
+## Reasoning type contract (RG-01)
+
+**RG-01 reasoning 类型契约（仅元数据，未接存储）**：
+`ReasoningAvailability` 五态为 `provider_visible`、`encrypted_unavailable`、
+`opaque_archived`、`not_present`、`unsupported_shape`。
+`encrypted_unavailable` 不是采集失败：它仅说明 provider 已声明密文但当前
+没有获授权的 decryptor。未声明字段上的高熵/base64 内容不是密文证据，
+仍返回 `not_present`；未知 reasoning-like 形状返回 `unsupported_shape` 并附
+无 payload warning，后续 adapter 须把 turn 标为 partial。**被选入密文字段
+校验器的 text/tool 块也返回 `unsupported_shape`**，即使带有未声明的
+signature-like 键；adapter 必须先将普通内容分派到普通路径，不能在该校验器内
+把选中的块静默记为 `not_present`。
+`ReasoningRecord` 仅有受限枚举元数据；reasoning 模块只在既有来源授权之后，
+核对 Claude assistant `thinking.signature` / `redacted_thinking.data` 的
+记录/块类型和 JSON-string 字段类型，才构造内存 `OpaqueEncryptedBytes`。
+原始转义 UTF-8 字节不经过 JSON 重序列化或 base64 解码；匹配 schema
+并不证明来源身份。OpenCode 2.0.24 的 `reasoning.state` 是开放记录，
+不能单独作为密文证据；Libra 尚未注册经过 OG-04/05 来源审计与接线的
+provider-state 密文字段。opaque 类型不实现普通序列化/显示/
+`RedactedBytes` 转换；此类型尚未归档任何 provider 密文：RG-04 才加入
+可读内容的 typed redaction 投影，RG-02/03/05 才负责 artifact 写入、
+授权读取、镜像和擦除。当前 traces 布局仍由上述既有捕获路径定义。

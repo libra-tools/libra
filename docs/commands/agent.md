@@ -848,3 +848,25 @@ Additional rules:
   work the second time. With `--repair`, one `agent.doctor.repair` tracing
   span is emitted per repair attempt (`inconsistency_type`, `repaired`,
   `manual_required`); transcript content never reaches the log.
+
+## Reasoning type contract (RG-01)
+
+The RG-01 reasoning type contract is currently metadata-only for durable
+capture; it does not change the capture/export behavior above. Its five states are
+`provider_visible`, `encrypted_unavailable`, `opaque_archived`, `not_present`,
+and `unsupported_shape`. `encrypted_unavailable` means a provider-declared
+ciphertext has no authorized decryptor, not that capture failed. Unknown
+reasoning-like shapes require a payload-free warning and a partial turn when
+provider wiring is added. A text/tool block selected for encrypted-field
+verification is rejected as `unsupported_shape`, even with an undeclared
+signature-like key; ordinary content is classified before that verifier.
+`OpaqueEncryptedBytes` cannot be serialized into an
+ordinary transcript or converted into `RedactedBytes`. Only the reasoning
+module can construct it, after verifying the shape and JSON-string type of a
+Claude assistant `thinking.signature` or `redacted_thinking.data` field from
+an already authorized source; its original escaped UTF-8 bytes are kept without
+JSON re-serialization or base64 decoding. A syntactically valid record is not
+automatically trusted — a matching JSON shape is not
+proof of provider identity.
+OpenCode 2.0.24 `reasoning.state` is open-ended and cannot establish a verified encrypted source.
+No live provider adapter yet produces artifacts from this type contract.

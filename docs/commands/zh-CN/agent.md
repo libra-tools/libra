@@ -496,3 +496,21 @@ libra agent --json status
 - 已捕获的 **gemini 行保持可读**且绝不被标记；残留的 gemini hook **配置**会得到指向仅卸载通道（`libra agent remove gemini`）的提示。
 - 对属于 **scoped** captured session 的 catalog 行修复，会把该 session 的 durable workspace lease 复核放在最终数据库写入处。若 lease 已 release、过期或被重新 fence，doctor 保持 finding 未修复并标为 `manual_required`；只有显式 `legacy_unknown` 行继续走历史上的无 fence 兼容修复路径。
 - 所有修复均幂等——连续两次运行 `doctor --repair`，第二次不会做任何事。带 `--repair` 时，每次修复尝试发出一个 `agent.doctor.repair` tracing span（`inconsistency_type`、`repaired`、`manual_required`），transcript 内容绝不进入日志。
+
+## Reasoning type contract (RG-01)
+
+reasoning 类型契约区分受限元数据、经来源验证的内存 opaque 字节和
+持久化 artifact；当前类型契约不改变上述运行时采集行为。
+五态是 `provider_visible`、`encrypted_unavailable`、`opaque_archived`、
+`not_present` 和 `unsupported_shape`。`encrypted_unavailable` 表示 provider
+已声明密文但没有获授权的 decryptor，**不是采集失败**。未知 reasoning-like
+形状在后续 provider 接线时必须使 turn partial 并写无 payload warning。
+被选入密文字段校验器的 text/tool 块也按 `unsupported_shape` 拒绝，
+即使带有未声明的 signature-like 键；普通内容须在调用校验器前分派。
+`OpaqueEncryptedBytes` 不能序列化进普通 transcript，也不能转换为
+`RedactedBytes`。只有 reasoning 模块能在已授权的来源上验证 Claude assistant
+`thinking.signature` / `redacted_thinking.data` 的字段形状与 JSON 字符串类型后
+构造该内存类型；原始转义 UTF-8 字节不重序列化、不做 base64 解码。
+形状正确的 JSON 不是 provider 身份凭据。OpenCode 2.0.24 的
+`reasoning.state` 是开放记录，不能仅凭它识别密文。此类型尚未接入持久化；当前尚无 live provider adapter 产生 artifact。
+OpenCode 密文采集仍待注册经验证的 provider 字段。
