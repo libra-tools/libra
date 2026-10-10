@@ -837,3 +837,7 @@ DEFER-OG-COMPAT-01：top-level parts单message alias与typed JSONL未支持，�
 15AC/7VER、116相关与完整架构守卫/3冻结oracle、fmt/严格Clippy、双envfull9688/9688（0failed/13slow/3leaky/9skip）和实际ClaudeR4字面PASS关闭，同最后实现源。review原稿SHA0660bda3c96258199844a7eb8ad5322622c8e2a4369a2a8fe54ba6382d5cfbaa，fullSHA98801fccc0a8d5930012e021f623581c638b7881c172a30693d4ebd8a5833e96。13owned待精确signedDCO/mainPush，plan05原bytes保留；版本0.30.42未发布。基础Push后4/13=30.77%、formal4/61=6.56%（阶段C/D待）。下一OG09当前2.0.26 native/classic normalizer；field audit及可信producer/verifier保持优先。SourceA不降低；synthetic不是liveMac/native/Linux证明，OG15/用户后验保留。
 
 DEFER-OG-EXTRACT-01：R3 marker否定例/宽松引号及空白parity、缺location断言强化、unknown-type负例为非阻断外围测试/精确parity遗留，不在当前基本采集链展开；R4的定义/规范指针澄清已仅以事实文档修正，不增实现。DEFER-OG-COMPAT-01：不支持top-level parts alias与typed JSONL的partial降级，以本条为唯一规范指针；不冒称完整空结果。DEFER-OG-TEST-01：本轮3个既有测试LEAK提示不称修复，finalfull仍真实exit0。
+
+### 2026-10-11：OG-03签名源码与main普通Push完成
+
+source9ad5fa486e47cc64835d27bc4c6b46bce18d6192、parent7b6ef27，14blob（13owned变更+bridge原样）postimage匹配，PGP header与DCO一次；普通Push exit0/实际GitHubmain同ref。原plan05未进本次tree delta，工作区SHAa705585dcb951a8d1452f87a607eefae1313d660b4c53c8d86ea75a024915b32保持，其他owned clean。最后实现仍为116聚焦、9688全量exit0、fmt/严格Clippy/site0与ClaudeR4 PASS证明源。3LEAK/9skip如实保留；synthetic不冒称liveMac/native/Linux。0.30.42无发布，FASTOG01阶段C/D待；基础4/13=30.77%、formal4/61=6.56%，下一OG09 current2.0.26正常化part/完整性。
