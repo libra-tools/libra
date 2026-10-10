@@ -25,6 +25,7 @@
 
 use std::{
     collections::BTreeMap,
+    io::Write as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -36,7 +37,7 @@ use git_internal::internal::object::{
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 use serde::{Deserialize, Serialize};
 
-use crate::utils::object::read_git_object_bounded;
+use crate::utils::object::{read_git_object_bounded, read_git_object_bounded_validated};
 
 /// Directory name of the materialized input inside the run directory.
 pub const CHECKPOINT_INPUT_DIR: &str = "checkpoint-input";
@@ -76,6 +77,15 @@ pub fn materialize_checkpoint_input(
     spec: &CheckpointInputSpec,
     run_dir: &Path,
 ) -> Result<PathBuf, String> {
+    let loaded = load_ordinary_payload(
+        storage,
+        spec,
+        None,
+        None,
+        CHECKPOINT_INPUT_MAX_FILE_BYTES,
+        CHECKPOINT_INPUT_MAX_TOTAL_BYTES,
+    )
+    .map_err(payload_load_message)?;
     let root = run_dir.join(CHECKPOINT_INPUT_DIR);
     // Start from nothing. A paused investigate re-materializes into the
     // SAME run directory, so anything the previous turn's agent left here
@@ -88,7 +98,7 @@ pub fn materialize_checkpoint_input(
     }
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("failed to create checkpoint input dir: {e}"))?;
-    write_checkpoint_input_files(storage, spec, &root)?;
+    write_loaded_checkpoint_files(spec, &root, &loaded)?;
     Ok(root)
 }
 
@@ -437,6 +447,14 @@ pub async fn materialize_validated_checkpoint_input(
         confirm_catalog_checkpoint(&storage, &spec.checkpoint_id, deadline, cancelled.as_ref())
             .await?;
     refuse_unless_saved_spec_matches_catalog(&storage, spec, &tree_oid)?;
+    let loaded = load_ordinary_payload(
+        &storage,
+        spec,
+        Some(deadline),
+        Some(cancelled.as_ref()),
+        CHECKPOINT_INPUT_MAX_FILE_BYTES,
+        CHECKPOINT_INPUT_MAX_TOTAL_BYTES,
+    )?;
     let run_dir = std::fs::canonicalize(run_dir).map_err(|error| {
         ValidatedMaterializeError::Refused(format!(
             "checkpoint input run directory is not a real directory: {error}"
@@ -471,51 +489,140 @@ pub async fn materialize_validated_checkpoint_input(
             "failed to create checkpoint input dir: {error}"
         ))
     })?;
-    write_checkpoint_input_files(&storage, spec, &root)
+    write_loaded_checkpoint_files(spec, &root, &loaded)
         .map_err(ValidatedMaterializeError::Refused)?;
     Ok(root)
 }
 
-fn write_checkpoint_input_files(
+/// Counts typed-reader attempts whose path is a closed reasoning artifact.
+/// Ordinary materialization must leave this at zero. Integration tests do not
+/// read it; they prove the same fact by deleting the loose artifact object.
+#[cfg(test)]
+static ARTIFACT_BLOB_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn note_typed_blob_read(rel_path: &str) {
+    #[cfg(test)]
+    if is_closed_reasoning_artifact_path(rel_path) {
+        ARTIFACT_BLOB_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(test))]
+    let _ = rel_path;
+}
+
+#[derive(Debug)]
+enum PayloadLoadError {
+    Cancelled,
+    Deadline,
+    Refused(String),
+}
+
+fn payload_load_message(error: PayloadLoadError) -> String {
+    match error {
+        PayloadLoadError::Cancelled => scoped_io::CheckpointInputIoError::Cancelled.to_string(),
+        PayloadLoadError::Deadline => scoped_io::CheckpointInputIoError::Deadline.to_string(),
+        PayloadLoadError::Refused(message) => message,
+    }
+}
+
+impl From<PayloadLoadError> for ValidatedMaterializeError {
+    fn from(error: PayloadLoadError) -> Self {
+        match error {
+            PayloadLoadError::Cancelled => Self::Cancelled,
+            PayloadLoadError::Deadline => Self::Deadline,
+            PayloadLoadError::Refused(message) => Self::Refused(message),
+        }
+    }
+}
+
+/// Read every ordinary blob, including its type and content hash, before any
+/// input directory is created or cleared.
+fn load_ordinary_payload(
     storage: &Path,
     spec: &CheckpointInputSpec,
-    root: &Path,
-) -> Result<(), String> {
+    deadline: Option<Instant>,
+    cancelled: Option<&(dyn Fn() -> bool + Sync)>,
+    max_file: u64,
+    max_total: u64,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, PayloadLoadError> {
+    let mut seen = BTreeMap::new();
+    let mut loaded = Vec::with_capacity(spec.files.len());
     let mut total: u64 = 0;
-    let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
-        let rel = sanitize_rel_path(&file.rel_path)?;
-        let oid = crate::internal::ai::util::parse_repo_object_id(&file.oid).map_err(|e| {
-            format!(
-                "invalid blob oid '{}' in checkpoint input spec: {e}",
+        if let Some(cancelled) = cancelled {
+            let deadline = deadline.ok_or_else(|| {
+                PayloadLoadError::Refused(
+                    "checkpoint input load is missing its deadline".to_string(),
+                )
+            })?;
+            stop_if_inactive(deadline, cancelled).map_err(|error| match error {
+                ValidatedMaterializeError::Cancelled => PayloadLoadError::Cancelled,
+                ValidatedMaterializeError::Deadline => PayloadLoadError::Deadline,
+                ValidatedMaterializeError::Refused(message)
+                | ValidatedMaterializeError::Catalog(message) => PayloadLoadError::Refused(message),
+            })?;
+        }
+        if is_closed_reasoning_artifact_path(&file.rel_path) {
+            return Err(PayloadLoadError::Refused(format!(
+                "checkpoint '{}' saved spec names closed reasoning artifact '{}'; ordinary \
+                 materialization does not read it",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
+        if seen.insert(file.rel_path.clone(), ()).is_some() {
+            return Err(PayloadLoadError::Refused(format!(
+                "checkpoint '{}' saved spec repeats path '{}'; refusing to materialize",
+                spec.checkpoint_id, file.rel_path
+            )));
+        }
+        let rel = sanitize_rel_path(&file.rel_path).map_err(PayloadLoadError::Refused)?;
+        let oid = crate::internal::ai::util::parse_repo_object_id(&file.oid).map_err(|error| {
+            PayloadLoadError::Refused(format!(
+                "invalid blob oid '{}' in checkpoint input spec: {error}",
                 file.oid
-            )
+            ))
         })?;
-        let (bytes, truncated) =
-            read_git_object_bounded(storage, &oid, CHECKPOINT_INPUT_MAX_FILE_BYTES).map_err(
-                |e| {
-                    format!(
-                        "checkpoint blob {} ({}) is not readable from the local object store: {e}",
-                        file.oid, file.rel_path
-                    )
-                },
-            )?;
-        if truncated {
-            return Err(format!(
-                "checkpoint blob {} ({}) exceeds the {CHECKPOINT_INPUT_MAX_FILE_BYTES}-byte \
-                 per-file cap; refusing to materialize",
-                file.oid, file.rel_path
-            ));
-        }
+        let bytes = read_typed_checkpoint_blob(storage, &oid, &file.rel_path, max_file)
+            .map_err(PayloadLoadError::Refused)?;
         total = total.saturating_add(bytes.len() as u64);
-        if total > CHECKPOINT_INPUT_MAX_TOTAL_BYTES {
-            return Err(format!(
-                "checkpoint {} materialization exceeds the \
-                 {CHECKPOINT_INPUT_MAX_TOTAL_BYTES}-byte total cap; refusing",
+        if total > max_total {
+            return Err(PayloadLoadError::Refused(format!(
+                "checkpoint {} materialization exceeds the {max_total}-byte total cap; refusing",
                 spec.checkpoint_id
-            ));
+            )));
         }
-        let dest = root.join(&rel);
+        loaded.push((rel, bytes));
+    }
+    Ok(loaded)
+}
+
+fn read_typed_checkpoint_blob(
+    storage: &Path,
+    oid: &git_internal::hash::ObjectHash,
+    rel_path: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    note_typed_blob_read(rel_path);
+    let (object_type, bytes) =
+        read_git_object_bounded_validated(storage, oid, max_bytes).map_err(|error| {
+            format!("checkpoint blob {oid} ({rel_path}) failed the typed blob check: {error}")
+        })?;
+    if object_type != "blob" {
+        return Err(format!(
+            "checkpoint blob {oid} ({rel_path}) is a {object_type}, not a blob; refusing to \
+             materialize"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_loaded_checkpoint_files(
+    spec: &CheckpointInputSpec,
+    root: &Path,
+    loaded: &[(PathBuf, Vec<u8>)],
+) -> Result<(), String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for (file, (rel, bytes)) in spec.files.iter().zip(loaded.iter()) {
+        let dest = root.join(rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create checkpoint input subdir: {e}"))?;
@@ -538,8 +645,7 @@ fn write_checkpoint_input_files(
                     file.rel_path
                 )
             })?;
-        use std::io::Write as _;
-        handle.write_all(&bytes).map_err(|e| {
+        handle.write_all(bytes).map_err(|e| {
             format!(
                 "failed to write checkpoint input file {}: {e}",
                 file.rel_path
@@ -632,7 +738,7 @@ pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, io::Write as _, str::FromStr as _};
+    use std::{collections::BTreeMap, str::FromStr as _};
 
     use git_internal::{
         hash::ObjectHash,
@@ -659,6 +765,27 @@ mod tests {
             rel_path: rel_path.to_string(),
             oid,
         }
+    }
+
+    fn write_tree_oid(storage: &Path, blob_oid: &str) -> String {
+        let item = TreeItem::new(
+            TreeItemMode::Blob,
+            ObjectHash::from_str(blob_oid).expect("blob oid"),
+            "leaf".to_string(),
+        );
+        let tree = Tree::from_tree_items(vec![item.clone()]).expect("tree");
+        let mut body = Vec::new();
+        body.extend_from_slice(item.to_data().as_slice());
+        let mut raw = format!("tree {}\0", body.len()).into_bytes();
+        raw.extend_from_slice(&body);
+        let oid = tree.id.to_string();
+        let dir = storage.join("objects").join(&oid[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        std::fs::write(dir.join(&oid[2..]), encoder.finish().unwrap()).unwrap();
+        oid
     }
 
     fn seed_catalog(storage: &Path, checkpoint_id: &str, files: &[CheckpointInputFile]) {
@@ -984,6 +1111,183 @@ mod tests {
             std::fs::read(root.join("metadata.json")).unwrap(),
             b"ORDINARY"
         );
+        assert_eq!(CHECKPOINT_INPUT_MAX_FILE_BYTES, 64 * 1024 * 1024);
+        assert_eq!(CHECKPOINT_INPUT_MAX_TOTAL_BYTES, 256 * 1024 * 1024);
+
+        let artifact_path = format!("reasoning/encrypted/{}", "ab".repeat(32));
+        ARTIFACT_BLOB_READS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let hooked = read_typed_checkpoint_blob(
+            &storage,
+            &git_internal::hash::ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap(),
+            &artifact_path,
+            16,
+        );
+        assert!(
+            hooked.is_err(),
+            "missing artifact blob is not ordinary input"
+        );
+        assert_eq!(
+            ARTIFACT_BLOB_READS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the typed reader records an artifact-path attempt"
+        );
+        ARTIFACT_BLOB_READS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let over_file = CheckpointInputSpec {
+            checkpoint_id: "ckpt-file-cap".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"0123456789")],
+        };
+        let over_file = load_ordinary_payload(&storage, &over_file, None, None, 4, 100)
+            .expect_err("per-file cap");
+        assert!(
+            payload_load_message(over_file).contains("typed blob check"),
+            "a declared size above the cap never becomes a file"
+        );
+        let left = write_blob(&storage, "left.txt", b"012345");
+        let right = write_blob(&storage, "right.txt", b"abcdef");
+        let over_total = CheckpointInputSpec {
+            checkpoint_id: "ckpt-total-cap".to_string(),
+            files: vec![left, right],
+        };
+        let over_total = load_ordinary_payload(&storage, &over_total, None, None, 64, 10)
+            .expect_err("total cap");
+        assert!(
+            payload_load_message(over_total).contains("exceeds the 10-byte total cap"),
+            "the total cap is the same reader budget"
+        );
+
+        let tree_oid = write_tree_oid(&storage, &spec.files[0].oid);
+        let tree_run = base.join("runs").join("run-tree");
+        std::fs::create_dir_all(&tree_run).unwrap();
+        let tree_file = CheckpointInputFile {
+            rel_path: "metadata.json".to_string(),
+            oid: tree_oid,
+        };
+        let tree_spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-tree".to_string(),
+            files: vec![tree_file.clone()],
+        };
+        seed_catalog(&storage, "ckpt-tree", &tree_spec.files);
+        let tree_error = validated_materialize(&storage, &tree_spec, &tree_run).unwrap_err();
+        assert!(
+            tree_error.contains("not a blob"),
+            "a tree object is refused before the input dir exists: {tree_error}"
+        );
+        assert!(!tree_run.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let corrupt_run = base.join("runs").join("run-corrupt");
+        std::fs::create_dir_all(&corrupt_run).unwrap();
+        let original = write_blob(&storage, "metadata.json", b"ORDINARY");
+        let replacement = write_blob(&storage, "other.json", b"DIFFERENT");
+        let original_path = storage
+            .join("objects")
+            .join(&original.oid[..2])
+            .join(&original.oid[2..]);
+        let replacement_path = storage
+            .join("objects")
+            .join(&replacement.oid[..2])
+            .join(&replacement.oid[2..]);
+        std::fs::write(&original_path, std::fs::read(&replacement_path).unwrap()).unwrap();
+        let corrupt_spec = CheckpointInputSpec {
+            checkpoint_id: "ckpt-corrupt".to_string(),
+            files: vec![original.clone()],
+        };
+        seed_catalog(&storage, "ckpt-corrupt", &corrupt_spec.files);
+        let corrupt_error =
+            validated_materialize(&storage, &corrupt_spec, &corrupt_run).unwrap_err();
+        assert!(
+            corrupt_error.contains("typed blob check"),
+            "a byte swap is refused before cleanup: {corrupt_error}"
+        );
+        assert!(!corrupt_run.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let alias_run = base.join("runs").join("run-alias");
+        std::fs::create_dir_all(&alias_run).unwrap();
+        let ordinary = write_blob(&storage, "metadata.json", b"ORDINARY");
+        seed_catalog(&storage, "ckpt-alias", std::slice::from_ref(&ordinary));
+        let alias = CheckpointInputSpec {
+            checkpoint_id: "ckpt-alias".to_string(),
+            files: vec![CheckpointInputFile {
+                rel_path: "./metadata.json".to_string(),
+                oid: ordinary.oid.clone(),
+            }],
+        };
+        let alias_error = validated_materialize(&storage, &alias, &alias_run).unwrap_err();
+        assert!(
+            alias_error.contains("does not match the catalog leaves"),
+            "a path alias is not the catalog leaf: {alias_error}"
+        );
+        assert!(!alias_run.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let unknown_run = base.join("runs").join("run-unknown");
+        std::fs::create_dir_all(&unknown_run).unwrap();
+        let extra = write_blob(&storage, "notes.txt", b"EXTRA");
+        let unknown = CheckpointInputSpec {
+            checkpoint_id: "ckpt-alias".to_string(),
+            files: vec![ordinary.clone(), extra],
+        };
+        let unknown_error = validated_materialize(&storage, &unknown, &unknown_run).unwrap_err();
+        assert!(
+            unknown_error.contains("does not match the catalog leaves"),
+            "an unknown leaf is refused: {unknown_error}"
+        );
+        assert!(!unknown_run.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let duplicate = CheckpointInputSpec {
+            checkpoint_id: "ckpt-alias".to_string(),
+            files: vec![ordinary.clone(), ordinary.clone()],
+        };
+        let duplicate_run = base.join("runs").join("run-duplicate");
+        std::fs::create_dir_all(&duplicate_run).unwrap();
+        let duplicate_error =
+            validated_materialize(&storage, &duplicate, &duplicate_run).unwrap_err();
+        assert!(
+            duplicate_error.contains("repeats path"),
+            "a repeated path is refused before write: {duplicate_error}"
+        );
+        assert!(!duplicate_run.join(CHECKPOINT_INPUT_DIR).exists());
+
+        let planted = base.join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("metadata.json"), b"KEEP").unwrap();
+        let loaded = load_ordinary_payload(
+            &storage,
+            &CheckpointInputSpec {
+                checkpoint_id: "ckpt-planted".to_string(),
+                files: vec![ordinary],
+            },
+            None,
+            None,
+            CHECKPOINT_INPUT_MAX_FILE_BYTES,
+            CHECKPOINT_INPUT_MAX_TOTAL_BYTES,
+        )
+        .expect("planted load");
+        let planted_error = write_loaded_checkpoint_files(
+            &CheckpointInputSpec {
+                checkpoint_id: "ckpt-planted".to_string(),
+                files: vec![CheckpointInputFile {
+                    rel_path: "metadata.json".to_string(),
+                    oid: "unused".to_string(),
+                }],
+            },
+            &planted,
+            &loaded,
+        )
+        .unwrap_err();
+        assert!(
+            planted_error.contains("already exists"),
+            "create_new refuses an occupied path: {planted_error}"
+        );
+        assert_eq!(
+            std::fs::read(planted.join("metadata.json")).unwrap(),
+            b"KEEP"
+        );
+        assert_eq!(
+            ARTIFACT_BLOB_READS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ordinary reads do not count as artifact body reads"
+        );
     }
 
     #[test]
@@ -1097,6 +1401,11 @@ mod tests {
             checkpoint_id,
             &[ordinary.clone(), artifact.clone()],
         );
+        let artifact_loose = storage
+            .join("objects")
+            .join(&artifact.oid[..2])
+            .join(&artifact.oid[2..]);
+        std::fs::remove_file(&artifact_loose).expect("remove closed artifact object");
         let spec = CheckpointInputSpec {
             checkpoint_id: checkpoint_id.to_string(),
             files: vec![ordinary],
@@ -1107,6 +1416,10 @@ mod tests {
             b"ORDINARY"
         );
         assert!(!root.join("reasoning").exists());
+        assert!(
+            !artifact_loose.exists(),
+            "ordinary materialization must not recreate the missing artifact object"
+        );
 
         let refused_dir = base.join("runs").join("run-2");
         std::fs::create_dir_all(&refused_dir).unwrap();

@@ -1559,11 +1559,11 @@ async fn fix_rg_scoped_02_review_revalidation() {
         files: vec![
             CheckpointInputFile {
                 rel_path: "metadata.json".to_string(),
-                oid: metadata_oid,
+                oid: metadata_oid.clone(),
             },
             CheckpointInputFile {
                 rel_path: "transcript/claude_code".to_string(),
-                oid: transcript_oid,
+                oid: transcript_oid.clone(),
             },
         ],
     });
@@ -1580,6 +1580,40 @@ async fn fix_rg_scoped_02_review_revalidation() {
         metadata.to_vec()
     );
     assert_eq!(std::fs::read(&outside).unwrap(), b"UNTOUCHED");
+
+    std::fs::remove_file(repo.join(".libra").join("libra.db")).expect("remove catalog");
+    let mut missing_catalog = ReviewRunRequest::new(
+        repo.clone(),
+        "list the workspace",
+        format!("checkpoint:{checkpoint_id}"),
+        "0000000000000000000000000000000000000000",
+        vec![fake_reviewer(
+            "lister",
+            Path::new("/bin/sh"),
+            &["-c", "echo should-not-run"],
+            Duration::from_secs(30),
+        )],
+    );
+    missing_catalog.checkpoint_input = Some(CheckpointInputSpec {
+        checkpoint_id: checkpoint_id.to_string(),
+        files: vec![
+            CheckpointInputFile {
+                rel_path: "metadata.json".to_string(),
+                oid: metadata_oid,
+            },
+            CheckpointInputFile {
+                rel_path: "transcript/claude_code".to_string(),
+                oid: transcript_oid,
+            },
+        ],
+    });
+    let refused_catalog = run_bounded(&store, missing_catalog, ReviewCancelHandle::new(), 60).await;
+    assert_eq!(refused_catalog.terminal_state, ReviewTerminalState::Error);
+    let infra = refused_catalog
+        .infra_error
+        .expect("catalog transport stays an infrastructure error");
+    assert!(infra.contains("catalog"), "{infra}");
+    assert!(!refused_catalog.run_dir.join("checkpoint-input").exists());
     assert_no_leaked_workspace(&repo);
 }
 

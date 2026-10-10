@@ -447,6 +447,10 @@ Every structured failure report includes:
 Once a release ships a `details` key, the key is part of the public contract.
 Commands that populate `details` document their keys here.
 
+### Scoped checkpoint resume
+
+`investigate continue` and `review --checkpoint` do not add a stable code for scoped revalidation. A paused continue whose catalog cannot be opened, queried, or closed stays the existing investigate store failure. A saved spec that does not match ordinary catalog leaves, names `reasoning/encrypted/<64 hex>`, or fails the typed blob check (not a blob, or bytes that do not hash to the saved id) ends as the existing review infrastructure error or the investigate terminal error. `LBR-IO-002` is not reused for that refusal.
+
 ### `mega2 browser`
 
 Every failure of a Mega2 HTTP request adds these keys, so automation can tell

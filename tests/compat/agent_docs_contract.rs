@@ -15,6 +15,7 @@ const HOOKS_CMD_DOC_EN: &str = include_str!("../../docs/commands/hooks.md");
 const HOOKS_CMD_DOC_ZH: &str = include_str!("../../docs/commands/zh-CN/hooks.md");
 const AGENT_DEV_DOC: &str = include_str!("../../docs/development/commands/agent.md");
 const COMPATIBILITY_DOC: &str = include_str!("../../COMPATIBILITY.md");
+const ERROR_CODES_DOC: &str = include_str!("../../docs/error-codes.md");
 
 fn assert_contains(document: &str, label: &str, required: &str) {
     assert!(
@@ -585,5 +586,41 @@ fn codex_capture_doc_pins_all_eleven_installed_hook_events() {
         AGENT_DOC,
         "docs/development/tracing/agent.md",
         "但默认不安装转发",
+    );
+}
+
+#[test]
+fn scoped_checkpoint_resume_docs_keep_ordinary_revalidation() {
+    for (label, document) in [
+        ("docs/commands/agent.md", AGENT_CMD_DOC_EN),
+        ("docs/commands/zh-CN/agent.md", AGENT_CMD_DOC_ZH),
+        ("docs/development/commands/agent.md", AGENT_DEV_DOC),
+        ("docs/development/tracing/agent.md", AGENT_DOC),
+        ("COMPATIBILITY.md", COMPATIBILITY_DOC),
+    ] {
+        assert_contains(document, label, "reasoning/encrypted/<64 hex>");
+        assert!(
+            document.contains("ordinary") || document.contains("普通"),
+            "{label} must describe ordinary checkpoint leaves"
+        );
+        assert!(
+            document.contains("not a blob") || document.contains("不是 blob"),
+            "{label} must refuse a saved id that is not a blob"
+        );
+    }
+    assert_contains(
+        ERROR_CODES_DOC,
+        "docs/error-codes.md",
+        "do not add a stable code for scoped revalidation",
+    );
+    assert_contains(
+        ERROR_CODES_DOC,
+        "docs/error-codes.md",
+        "`LBR-IO-002` is not reused for that refusal",
+    );
+    assert_contains(
+        AGENT_CMD_DOC_ZH,
+        "docs/commands/zh-CN/agent.md",
+        "不新增稳定错误码",
     );
 }

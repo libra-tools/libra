@@ -1769,6 +1769,78 @@ async fn seed_v1_checkpoint(
     (metadata_oid, transcript_oid)
 }
 
+/// Same v1 catalog as [`seed_v1_checkpoint`], plus one closed reasoning leaf.
+/// Returns `(metadata_oid, transcript_oid, artifact_oid)`.
+async fn seed_v1_checkpoint_with_closed_artifact(
+    repo: &Path,
+    checkpoint_id: &str,
+    metadata: &[u8],
+    transcript: &[u8],
+    artifact: &[u8],
+) -> (String, String, String) {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+    let libra_dir = repo.join(".libra");
+    let metadata_oid = libra::utils::object::write_git_object(&libra_dir, "blob", metadata)
+        .expect("write metadata blob")
+        .to_string();
+    let transcript_oid = libra::utils::object::write_git_object(&libra_dir, "blob", transcript)
+        .expect("write transcript blob")
+        .to_string();
+    let artifact_oid = libra::utils::object::write_git_object(&libra_dir, "blob", artifact)
+        .expect("write artifact blob")
+        .to_string();
+    let artifact_name = "ab".repeat(32);
+    let encrypted_tree =
+        write_tree_object(&libra_dir, &[("100644", &artifact_name, &artifact_oid)]);
+    let reasoning_tree = write_tree_object(&libra_dir, &[("40000", "encrypted", &encrypted_tree)]);
+    let transcript_tree =
+        write_tree_object(&libra_dir, &[("100644", "claude_code", &transcript_oid)]);
+    let inner_tree = write_tree_object(
+        &libra_dir,
+        &[
+            ("100644", "metadata.json", &metadata_oid),
+            ("40000", "reasoning", &reasoning_tree),
+            ("40000", "transcript", &transcript_tree),
+        ],
+    );
+    let prefix_tree = write_tree_object(&libra_dir, &[("40000", &checkpoint_id[2..], &inner_tree)]);
+    let checkpoint_tree =
+        write_tree_object(&libra_dir, &[("40000", &checkpoint_id[..2], &prefix_tree)]);
+    let root_tree = write_tree_object(&libra_dir, &[("40000", "checkpoint", &checkpoint_tree)]);
+
+    let url = format!("sqlite://{}", libra_dir.join("libra.db").display());
+    let mut opts = ConnectOptions::new(url);
+    opts.sqlx_logging(false);
+    let conn = Database::connect(opts).await.expect("open repo db");
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, \
+         working_dir, started_at, last_event_at) \
+         VALUES ('sess-pd02-inv', 'claude_code', 'sess-pd02-inv-provider', 'stopped', \
+                 '/tmp/repo', 1, 1)",
+        [],
+    ))
+    .await
+    .expect("seed agent_session");
+    conn.execute_raw(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
+         tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES (?, 'sess-pd02-inv', 'committed', NULL, ?, ?, \
+                 '64c851d2df4228ecd86e0d7aa54d1ba8c4fa4efc', 1783206712)",
+        [
+            checkpoint_id.into(),
+            root_tree.into(),
+            metadata_oid.clone().into(),
+        ],
+    ))
+    .await
+    .expect("seed agent_checkpoint");
+    (metadata_oid, transcript_oid, artifact_oid)
+}
+
 /// PD-02 acceptance for `investigate`: a checkpoint-scoped run consumes
 /// ONLY the named checkpoint — the investigators' workspace is the
 /// materialized checkpoint content, the scope is persisted in the run
@@ -1926,8 +1998,21 @@ async fn fix_rg_scoped_02_persisted_spec_resume() {
     let checkpoint_id = "cafe75d2-4c53-465a-b890-a9f861a50cc7";
     let metadata = br#"{"schema_version":1,"agent_kind":"claude_code"}"#;
     let transcript = b"{\"role\":\"user\",\"text\":\"captured turn\"}\n";
-    let (metadata_oid, transcript_oid) =
-        seed_v1_checkpoint(&repo, checkpoint_id, metadata, transcript).await;
+    let artifact = b"CLOSED-ARTIFACT-CANARY";
+    let (metadata_oid, transcript_oid, artifact_oid) = seed_v1_checkpoint_with_closed_artifact(
+        &repo,
+        checkpoint_id,
+        metadata,
+        transcript,
+        artifact,
+    )
+    .await;
+    let artifact_loose = repo
+        .join(".libra")
+        .join("objects")
+        .join(&artifact_oid[..2])
+        .join(&artifact_oid[2..]);
+    std::fs::remove_file(&artifact_loose).expect("drop the closed artifact object");
     let store = store_for(&repo);
     let fixtures = temp.path().join("fixtures");
     let silent = stage_fixture(&fixtures, "investigator-silent.sh");
@@ -1968,6 +2053,18 @@ async fn fix_rg_scoped_02_persisted_spec_resume() {
     assert_eq!(
         std::fs::read(&input).expect("first materialize"),
         metadata.to_vec()
+    );
+    assert!(
+        !paused
+            .run_dir
+            .join("checkpoint-input")
+            .join("reasoning")
+            .exists(),
+        "the missing closed artifact is not materialized"
+    );
+    assert!(
+        !artifact_loose.exists(),
+        "the loose artifact object stays absent"
     );
     let resumed = continue_investigate_with_sources(
         &store,
@@ -2010,6 +2107,14 @@ async fn fix_rg_scoped_02_persisted_spec_resume() {
             .unwrap_or("")
             .ends_with("checkpoint-input"),
         "{state}"
+    );
+    assert!(
+        state["checkpoint_input"].get("root_oid").is_none(),
+        "resume does not invent a historical root id: {state}"
+    );
+    assert!(
+        !artifact_loose.exists(),
+        "continue does not read the artifact"
     );
     assert_no_leaked_workspace(&repo);
 }

@@ -107,7 +107,7 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 
 ## 范围化 checkpoint 的暂停恢复
 
-`review --checkpoint <id>` 与 `investigate start --checkpoint <id>` 仍把普通 checkpoint 文件以只读形式物化到 `<run_dir>/checkpoint-input/`。`investigate continue` 只有在显式仓库 catalog 的普通叶子具有相同路径和 blob id 时，才会再次写入已保存的 spec。路径 `reasoning/encrypted/<64 hex>` 不是普通输入：它不会被写入；已保存 spec 若点名该路径，会在清掉上一次输入目录之前拒绝。catalog 无法打开、查询或关闭时，暂停中的 continue 返回既有存储错误，且不改变该 run 的 state 与已有输入字节。review 的设置预算为零时，按既有基础设施错误结束，且不启动 reviewer；取消则按既有 cancelled 结束。不新增稳定错误码。普通 payload 仍是单文件 64 MiB、合计 256 MiB。每次 catalog 树读取单独限制为 16 MiB，不并入上述 payload 上限。
+`review --checkpoint <id>` 与 `investigate start --checkpoint <id>` 仍把普通 checkpoint 文件以只读形式物化到 `<run_dir>/checkpoint-input/`。`investigate continue` 只有在显式仓库 catalog 的普通叶子具有相同路径和 blob id 时，才会再次写入已保存的 spec。路径 `reasoning/encrypted/<64 hex>` 不是普通输入：它不会被写入；已保存 spec 若点名该路径，会在清掉上一次输入目录之前拒绝。已保存 id 若不是 blob，或字节与该 id 的内容哈希不一致，也会在清掉该目录之前拒绝。catalog 无法打开、查询或关闭时，暂停中的 continue 返回既有存储错误，且不改变该 run 的 state 与已有输入字节。review 的设置预算为零时，按既有基础设施错误结束，且不启动 reviewer；取消则按既有 cancelled 结束。不新增稳定错误码。普通 payload 仍是单文件 64 MiB、合计 256 MiB。每次 catalog 树读取单独限制为 16 MiB，不并入上述 payload 上限。
 
 ## JSON 输出
 
