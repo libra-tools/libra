@@ -366,3 +366,239 @@ fn generic_e6_path_carries_api_count_and_subagent_tokens() {
     assert_eq!(subagent.input_tokens, 30);
     assert_eq!(subagent.total_tokens, Some(30));
 }
+
+fn opencode_export(messages: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"info":{"id":"session-synthetic","location":{"directory":"/project"}},"messages":messages})
+}
+
+fn opencode_assistant(id: &str, content: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id":id,"type":"assistant","model":{"id":"claude-sonnet-5","providerID":"synthetic"},"content":content})
+}
+
+fn opencode_tokens(input: u64) -> serde_json::Value {
+    serde_json::json!({"input":input,"output":3,"reasoning":4,"cache":{"read":5,"write":6}})
+}
+
+fn opencode_summary(doc: &serde_json::Value) -> extract::ExtractionSummary {
+    extract::extract_opencode(&serde_json::to_vec(doc).expect("synthetic export"))
+}
+
+#[test]
+fn opencode_nested_export_prompts_model_extracted() {
+    let doc = opencode_export(serde_json::json!([
+        {"id":"u1","type":"user","text":"/review synthetic changes","model":{"id":"wrong-user-model"}},
+        opencode_assistant("a1", serde_json::json!([])),
+        {"id":"u2","type":"user","text":"Explain the result"}
+    ]));
+    let summary = opencode_summary(&doc);
+    assert_eq!(
+        summary.prompts,
+        ["/review synthetic changes", "Explain the result"]
+    );
+    assert_eq!(summary.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(summary.skill_events.len(), 1);
+    assert!(!summary.partial, "{:?}", summary.warnings);
+    let mut settled = doc.clone();
+    for (index, kind) in [
+        "idle",
+        "model-switched",
+        "synthetic",
+        "system",
+        "skill",
+        "agent-switched",
+        "shell",
+        "compaction",
+    ]
+    .iter()
+    .enumerate()
+    {
+        settled["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":format!("metadata-{index}"),"type":kind,"text":"not a human prompt"
+            }));
+    }
+    let result = opencode_summary(&settled);
+    assert!(!result.partial, "{:?}", result.warnings);
+    assert_eq!(result.prompts, summary.prompts);
+    let mut missing_location = doc.clone();
+    missing_location["info"]
+        .as_object_mut()
+        .unwrap()
+        .remove("location");
+    assert!(opencode_summary(&missing_location).partial);
+    let mut missing_info = doc.clone();
+    missing_info.as_object_mut().unwrap().remove("info");
+    assert!(opencode_summary(&missing_info).partial);
+    let flat = serde_json::json!({"messages":[{"role":"user","content":"hello","model":"wrong"},{"role":"assistant","model":"right"}]});
+    assert_eq!(opencode_summary(&flat).model.as_deref(), Some("right"));
+    let legacy = serde_json::json!({"info":{"id":"s","directory":"/project"},"messages":[
+        {"info":{"id":"u","role":"user","model":"wrong"},"parts":[{"type":"text","text":"first"},{"type":"text","text":"hidden","synthetic":true},{"type":"text","text":"second"}]},
+        {"info":{"id":"a","role":"assistant","modelID":"legacy"},"parts":[]}
+    ]});
+    let summary = opencode_summary(&legacy);
+    assert_eq!(summary.prompts, ["first\nsecond"]);
+    assert_eq!(summary.model.as_deref(), Some("legacy"));
+}
+
+#[test]
+fn opencode_usage_reasoning_tokens_aggregation_first() {
+    let mut assistant = opencode_assistant("a", serde_json::json!([]));
+    assistant["tokens"] = opencode_tokens(2);
+    let mut doc = opencode_export(serde_json::json!([assistant.clone(), assistant]));
+    doc["info"]["tokens"] = opencode_tokens(10000);
+    let summary = opencode_summary(&doc);
+    let usage = summary.usage.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (2, 3));
+    assert_eq!(usage.reasoning_tokens, Some(4));
+    assert_eq!(usage.cached_tokens, Some(11));
+    assert_eq!(usage.total_tokens, Some(20));
+    assert_eq!(summary.api_call_count, 1);
+    assert!(!summary.partial);
+    let part = serde_json::json!({"id":"p","type":"step-finish","tokens":opencode_tokens(2)});
+    let legacy = serde_json::json!({"info":{"id":"s"},"messages":[
+        {"info":{"id":"a","role":"assistant","tokens":opencode_tokens(2)},"parts":[part.clone()]},
+        {"info":{"id":"b","role":"assistant"},"parts":[part.clone(),part]}
+    ]});
+    let summary = opencode_summary(&legacy);
+    assert_eq!(summary.usage.unwrap().total_tokens, Some(40));
+    assert_eq!(summary.api_call_count, 2);
+    for invalid in [
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(u64::MAX),
+        serde_json::json!(9007199254740994.0),
+    ] {
+        let mut doc = doc.clone();
+        doc["messages"][0]["tokens"]["input"] = invalid;
+        doc["messages"].as_array_mut().unwrap().truncate(1);
+        let result = opencode_summary(&doc);
+        assert!(result.partial);
+        assert!(result.usage.is_none());
+    }
+    let mut decimal = doc.clone();
+    decimal["messages"][0]["tokens"]["input"] = serde_json::json!(2.0);
+    assert_eq!(opencode_summary(&decimal).usage.unwrap().input_tokens, 2);
+}
+
+#[test]
+fn opencode_modified_files_tool_whitelist_and_patch() {
+    let mut assistant = opencode_assistant(
+        "a",
+        serde_json::json!([
+            {"id":"t1","type":"tool","name":"edit","state":{"status":"completed","input":{"path":"src/lib.rs"},"metadata":{"files":[{"file":"src/lib.rs"}]}}},
+            {"id":"t2","type":"tool","name":"read","state":{"status":"completed","input":{"path":"secret.txt"}}},
+            {"id":"t3","type":"tool","name":"patch","state":{"status":"completed","input":{"patchText":"*** Begin Patch\n*** Environment ID: synthetic\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n-old\n+new\n*** End of File\n*** End Patch"},"metadata":{"files":[{"file":"src/new.rs"}]}}}
+        ]),
+    );
+    assistant["snapshot"] = serde_json::json!({"files":["src/lib.rs","docs/readme.md"]});
+    let doc = opencode_export(serde_json::json!([assistant]));
+    let summary = opencode_summary(&doc);
+    assert_eq!(
+        summary.modified_files,
+        ["src/lib.rs", "src/new.rs", "src/old.rs", "docs/readme.md"]
+    );
+    assert!(!summary.partial, "{:?}", summary.warnings);
+    let mut outside = doc.clone();
+    outside["messages"][0]["content"][0]["state"]["input"]["path"] =
+        serde_json::json!("/outside/private-canary");
+    let result = opencode_summary(&outside);
+    assert!(result.partial);
+    assert!(!format!("{result:?}").contains("private-canary"));
+    let mut moved = doc.clone();
+    moved["info"]["location"]["directory"] = serde_json::json!("/new/project/sub");
+    moved["info"]["subpath"] = serde_json::json!("sub");
+    moved["messages"].as_array_mut().unwrap().insert(1, serde_json::json!({"id":"switch","type":"location-switched","location":{"directory":"/new/project/sub"},"subpath":"sub","previous":{"location":{"directory":"/old/project/sub"},"subpath":"sub"}}));
+    let result = opencode_summary(&moved);
+    assert!(result.modified_files.contains(&"sub/src/lib.rs".into()));
+    assert!(result.modified_files.contains(&"docs/readme.md".into()));
+}
+
+#[test]
+fn opencode_completed_file_tool_without_verified_path_is_partial() {
+    for tool in ["edit", "write"] {
+        for state in [
+            serde_json::json!({"status":"completed","input":{}}),
+            serde_json::json!({"status":"completed","input":{},"metadata":{"files":[{}]}}),
+            serde_json::json!({"status":"error","input":{"path":"src/lib.rs"}}),
+        ] {
+            let doc = opencode_export(serde_json::json!([opencode_assistant(
+                "a",
+                serde_json::json!([{"type":"tool","id":"t","name":tool,"state":state}])
+            )]));
+            let result = opencode_summary(&doc);
+            assert!(result.partial, "{tool} {doc}");
+            assert!(result.modified_files.is_empty());
+        }
+    }
+    let doc = opencode_export(serde_json::json!([opencode_assistant(
+        "a",
+        serde_json::json!([{"type":"tool","id":"t","name":"write","state":{"status":"completed","input":{},"metadata":{"files":[{"file":"src/lib.rs"}]}}}])
+    )]));
+    let result = opencode_summary(&doc);
+    assert_eq!(result.modified_files, ["src/lib.rs"]);
+    assert!(!result.partial);
+    let sanitized = opencode_export(serde_json::json!([opencode_assistant(
+        "a",
+        serde_json::json!([{"type":"tool","id":"t","name":"write","state":{"status":"completed","input":{"redacted":"tool-input:t"},"metadata":{"redacted":"tool-metadata:t"}}}])
+    )]));
+    assert!(opencode_summary(&sanitized).partial);
+    assert!(opencode_summary(&sanitized).modified_files.is_empty());
+}
+
+#[test]
+fn opencode_aggregate_overflow_missing_components_and_mixed_shapes_are_partial() {
+    let mut first = opencode_assistant("a", serde_json::json!([]));
+    first["tokens"] = opencode_tokens(2);
+    let mut second = opencode_assistant("b", serde_json::json!([]));
+    second["tokens"] = opencode_tokens(u64::MAX - 18);
+    let result = opencode_summary(&opencode_export(serde_json::json!([first.clone(), second])));
+    assert!(result.partial);
+    assert_eq!(result.usage.unwrap().total_tokens, Some(20));
+    assert_eq!(result.api_call_count, 1);
+    first["tokens"]["cache"]
+        .as_object_mut()
+        .unwrap()
+        .remove("write");
+    let result = opencode_summary(&opencode_export(serde_json::json!([first])));
+    assert!(result.partial);
+    assert!(result.usage.is_none());
+    let result = opencode_summary(&opencode_export(serde_json::json!([
+        {"id":"u","type":"user","text":"native"},
+        {"info":{"id":"u2","role":"user"},"parts":[{"type":"text","text":"classic"}]},
+        {"role":"user","content":"ambiguous"}
+    ])));
+    assert!(result.partial);
+    assert_eq!(result.prompts, ["native", "classic"]);
+}
+
+#[test]
+fn opencode_legacy_apply_patch_and_location_aliases_are_project_relative() {
+    let patch =
+        "*** Begin Patch\n*** Update File: a\n*** Move to: b\n@@\n-old\n+new\n*** End Patch";
+    let legacy = serde_json::json!({"info":{"id":"s","directory":"/project"},"messages":[
+        {"info":{"id":"a","role":"assistant","modelID":"legacy"},"parts":[
+            {"id":"t","type":"tool","tool":"apply_patch","state":{"status":"completed","input":{"patchText":patch}}},
+            {"id":"p","type":"patch","files":["c"]}
+        ]}
+    ]});
+    let result = opencode_summary(&legacy);
+    assert_eq!(result.modified_files, ["a", "b", "c"]);
+    assert!(!result.partial);
+    let switched = serde_json::json!({"info":{"id":"s","location":{"directory":"/repo2/sub"},"subpath":"sub"},"messages":[
+        {"id":"switch","type":"location-switched","location":{"directory":"/repo2/sub"},"subpath":"sub","previous":{"location":{"directory":"/repo/sub"},"subpath":"sub"}},
+        opencode_assistant("a",serde_json::json!([
+            {"type":"tool","id":"t","name":"write","state":{"status":"completed","input":{"path":"/repo2/sub/a"},"metadata":{"files":[{"file":"/repo/sub/a"}]}}}
+        ]))
+    ]});
+    let result = opencode_summary(&switched);
+    assert_eq!(result.modified_files, ["sub/a"]);
+    assert!(!result.partial);
+    let mut missing = switched.clone();
+    missing["messages"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("previous");
+    assert!(opencode_summary(&missing).partial);
+}

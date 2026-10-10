@@ -1,24 +1,75 @@
 {
-  "version": "1",
+  "info": {
+    "id": "session-synthetic",
+    "location": {
+      "directory": "/project"
+    }
+  },
   "messages": [
     {
-      "role": "user",
-      "timestamp": "2026-07-03T08:00:00Z",
-      "content": "/review this session's changes"
+      "id": "u1",
+      "type": "user",
+      "text": "/review synthetic changes",
+      "time": {
+        "created": 1
+      }
     },
     {
-      "role": "assistant",
-      "model": "claude-sonnet-5",
-      "content": "Reviewing the session changes."
+      "id": "a1",
+      "type": "assistant",
+      "agent": "build",
+      "model": {
+        "id": "claude-sonnet-5",
+        "providerID": "synthetic"
+      },
+      "time": {
+        "created": 2,
+        "completed": 3
+      },
+      "tokens": {
+        "input": 2,
+        "output": 3,
+        "reasoning": 4,
+        "cache": {
+          "read": 5,
+          "write": 6
+        }
+      },
+      "content": [
+        {
+          "id": "t1",
+          "type": "tool",
+          "name": "write",
+          "state": {
+            "status": "completed",
+            "input": {
+              "path": "src/lib.rs"
+            },
+            "content": "synthetic output",
+            "metadata": {
+              "files": [
+                {
+                  "file": "src/lib.rs"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "snapshot": {
+        "files": [
+          "src/lib.rs",
+          "docs/readme.md"
+        ]
+      }
     },
     {
-      "role": "user",
-      "timestamp": "2026-07-03T08:02:00Z",
-      "content": "Thanks, list the follow-ups."
-    },
-    {
-      "role": "assistant",
-      "content": "Follow-ups listed."
+      "id": "u2",
+      "type": "user",
+      "text": "Explain the result",
+      "time": {
+        "created": 4
+      }
     }
   ]
 }

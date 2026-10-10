@@ -15,7 +15,7 @@ real agent sessions. Each file exercises exactly the values the test pins.
 |---|---|---|
 | `claude_code.jsonl` | Claude Code session JSONL (`type`/`uuid`/`timestamp` envelope, `message.content` string or block array, Claude-native `usage` keys `cache_creation_input_tokens`/`cache_read_input_tokens`, `tool_use` blocks with `input.file_path`) | 2 prompts; 1 `/review` skill event (`input_slash_command`); merged usage input=200 output=65 cached=40; model `claude-sonnet-5`; modified files `src/lib.rs`, `docs/readme.md` (in order); no `Task` tool so subagent-aware total equals session usage |
 | `codex.jsonl` | Codex rollout JSONL (generic `message` wrapper records; E6 wire `usage` keys) | 2 prompts; 1 `/review` skill event; merged `total_tokens=260` (155+105); model `gpt-5.3-codex` |
-| `opencode.json` | OpenCode whole-document session export (`messages` array) | 2 prompts; 1 `/review` skill event; model `claude-sonnet-5` |
+| `opencode.json` | Synthetic OpenCode 2.0.26 native `{info,messages}` export; fixed official commit `9b4ec5714d481559990db0a816d5dec19541a814`, schema session-message.ts/session-transfer.ts, core session/transfer.ts and token-usage.ts; never live/native-origin proof | 2 user.text prompts; 1 `/review` skill event; assistant model.id `claude-sonnet-5`; tokens input=2 output=3 reasoning=4 cache.read=5 cache.write=6, cached=11 total=20 api_call_count=1; modified files `src/lib.rs`, `docs/readme.md`; snapshot files are project-relative |
 
 Editing rules:
 

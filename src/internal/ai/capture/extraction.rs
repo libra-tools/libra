@@ -272,6 +272,20 @@ pub(crate) fn build_extraction_projection(
         _ => None,
     };
     if let Some(summary) = format_summary {
+        if !object.contains_key("modified_files") && !summary.modified_files.is_empty() {
+            let files: Vec<String> = summary
+                .modified_files
+                .iter()
+                .map(|path| redact_extracted_string(path))
+                .collect();
+            insert_extraction_value(
+                object,
+                "modified_files",
+                &files,
+                &mut partial,
+                &mut warnings,
+            );
+        }
         if summary.partial {
             partial = true;
         }
@@ -773,6 +787,38 @@ fn finalize_extraction(value: &mut Value, partial: bool, warnings: Vec<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_projection_reaches_ordinary_and_deadline_capture() {
+        let parent = RedactedBytes::new_unchecked(
+            include_bytes!("../../../../tests/fixtures/agent_transcripts/opencode.json").to_vec(),
+        );
+        let ordinary = build_extraction_projection("opencode", Some(&parent), &[], &[]);
+        let deadline =
+            build_deadline_extraction_projection(AgentKind::OpenCode, Some(&parent), false);
+        for projection in [&ordinary, &deadline] {
+            assert_eq!(projection["prompt_count"], 2);
+            assert_eq!(projection["model"], "claude-sonnet-5");
+            assert_eq!(projection["token_usage"]["reasoning_tokens"], 4);
+            assert!(
+                projection["modified_files"]
+                    .as_array()
+                    .is_some_and(|files| files.iter().any(|file| file == "src/lib.rs"))
+            );
+            assert_eq!(projection["partial"], false);
+        }
+        let broken = RedactedBytes::new_unchecked(
+            br#"{"messages":[{"id":"a","type":"assistant","content":[] }]}"#.to_vec(),
+        );
+        assert_eq!(
+            build_extraction_projection("opencode", Some(&broken), &[], &[])["partial"],
+            true
+        );
+        assert_eq!(
+            build_deadline_extraction_projection(AgentKind::OpenCode, Some(&broken), false)["partial"],
+            true
+        );
+    }
 
     struct FailingSerialization;
 

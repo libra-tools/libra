@@ -127,6 +127,24 @@ capture. Local Node/Bun tests use synthetic events and a controlled exporter;
 real OpenCode content capture and native reasoning proof require their separate
 acceptance gates.
 
+OpenCode 2.0.26 export metadata uses `user.text`, assistant `model.id`,
+`tokens` and successful file tools. The assistant token total is
+`input + output + reasoning + cache.read + cache.write`; cached tokens are
+`cache.read + cache.write`. Session-level totals are not added again. Classic
+`info/parts` exports remain compatible: assistant aggregate tokens take
+precedence over deduplicated step-finish details. User model fields are ignored.
+Modified files combine successful edit/write/patch paths and snapshot files,
+with validated patch move sources and destinations. Output paths are project
+relative with forward slashes; location-relative tool paths use the session's
+proven location, while snapshots already use the project root. Missing history,
+external or invalid paths, unsupported shapes, invalid token numbers and
+collection limits produce partial metadata with content-free warnings.
+Idle, model/agent switches, synthetic/system/skill messages, shell and compaction
+are recognized metadata and do not become human prompts. Internal ID, path and
+alias limits also mark partial; at the ID cap later messages are omitted.
+Extraction does not read files or archive reasoning content, and synthetic
+fixtures do not prove real macOS content capture or native reasoning origin.
+
 ## Subcommands
 
 | Subcommand | Description |

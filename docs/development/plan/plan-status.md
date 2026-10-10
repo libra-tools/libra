@@ -818,3 +818,22 @@ AC28/28、26/27VER实际适用通过（Linux1UNRUN），focused140/140/零重试
 ### 2026-10-11：OG-02 signed-DCO源码与main普通Push完成，下一OG03
 
 实际source commit80fb17a86c886c47ecc8a9445702b288d21526bc，parent28aef04；13owned路径全部committed blob与最终publication SHA匹配，PGP签名header与DCO一次已核验，普通libra push origin main exit0、GitHub实际main ref一致（2026-10-10 16:17 UTC后核验）。plan05树未提交该文件本地delta，工作区原SHAa705585dcb951a8d1452f87a607eefae1313d660b4c53c8d86ea75a024915b32保持；其余owned工作区clean。AC28/28、macOS适用VER26/26（Linux VER18 UNRUN）、focused140/140、finalfmt/strict/site0、ClaudeR3 PASS均覆盖同最终实现/产品doc source，后置只回填事实plan/status不改实现/测试。Node/Bun为真实解释器的controlled exporter证明；260synthetic prompts另走真实Libra ingress；均不冒称真实OpenCode/native。FAST-OG01 stage全量/网站实际交付/必要CI与四平台发布尚未执行，正式4/61=6.56%保持；基础13成员本地交付3/13=23.08%。下一张优先OG03当前2.0.26 shape-exact extraction，不去scoped02/03复杂链；无bump/release，0.30.42保持。
+
+
+### 2026-10-11：OG-03新pin/current-main开工核对
+
+OG02 source80fb17a/receipt7b6ef27已Push且当前main一致。OG03旧private14AC/6VER归历史，本次in-progress/空；当前generic extractor缺现行nested字段。固定2.0.26源码与4额外immutable blobs核验，提出OpenCode-private投影/有界collection/overflow partial/文件位置规范设计，待Claude。真实Mac内容非零仍由OG15最后实际证明，不以synthetic替代。无独立Issue，不新增remoteIssue；plan05原bytes保留、单writer/main逐卡Push/patch策略保持。基础local3/13、正式4/61，下卡仍待本卡完成的OG09。
+
+### 2026-10-11：OG-03遗留登记与最后候选
+
+DEFER-OG-COMPAT-01：top-level parts单message alias与typed JSONL未支持，只固定partial，不造完整零投影；本plan-status同名条目为规范记录，计划progress只引用。DEFER-OG-DOC-01网站旧版/未来seatbelt段等待OG15/阶段owner，OG03只替换自己owned投影段；DEFER-OG-TEST-01中止暂行full的LEAK不冒称已修。用户要求类似困难外围问题延后，继续OpenCode基础采集/字段审计及可信producer/verifier；核心native allowlist/缺location/真实失败cat回归均已前滚，最后gate仍待，进度3/13与4/61保持。R2实际Claude FAIL的唯一P1为cat未真正落地，现按格式化分支修正，具名单元实际1/1 PASS；需要R3实际PASS以及最终fmt/strict/full，签名Push未做。两个并行暂行full日志混写且中止，不作验收证据，最终唯一序列化日志另记full-final。
+
+### 2026-10-11：OG-03 final全量暴露neutral守卫，基础前滚
+
+全量9687/9688通过，唯一架构neutral分支计数失败；原守卫19条不放宽，文件衔接改成通用summary fallback，当前provider外观以冻结oracle和全量重验。2LEAK继续DEFER-OG-TEST01。本卡未signed/Push，进度仍3/13、4/61；Claude R4、fmt/strict/focused/full最后源待。DEFER-OG-COMPAT01与DEFER-OG-EXTRACT01以本status登记为规范，plan progress只引用；R3的marker负例/宽松parity及两个弱断言为非阻断外围遗留。
+
+### 2026-10-11：OG-03最终验收通过、待signed source Push
+
+15AC/7VER、116相关与完整架构守卫/3冻结oracle、fmt/严格Clippy、双envfull9688/9688（0failed/13slow/3leaky/9skip）和实际ClaudeR4字面PASS关闭，同最后实现源。review原稿SHA0660bda3c96258199844a7eb8ad5322622c8e2a4369a2a8fe54ba6382d5cfbaa，fullSHA98801fccc0a8d5930012e021f623581c638b7881c172a30693d4ebd8a5833e96。13owned待精确signedDCO/mainPush，plan05原bytes保留；版本0.30.42未发布。基础Push后4/13=30.77%、formal4/61=6.56%（阶段C/D待）。下一OG09当前2.0.26 native/classic normalizer；field audit及可信producer/verifier保持优先。SourceA不降低；synthetic不是liveMac/native/Linux证明，OG15/用户后验保留。
+
+DEFER-OG-EXTRACT-01：R3 marker否定例/宽松引号及空白parity、缺location断言强化、unknown-type负例为非阻断外围测试/精确parity遗留，不在当前基本采集链展开；R4的定义/规范指针澄清已仅以事实文档修正，不增实现。DEFER-OG-COMPAT-01：不支持top-level parts alias与typed JSONL的partial降级，以本条为唯一规范指针；不冒称完整空结果。DEFER-OG-TEST-01：本轮3个既有测试LEAK提示不称修复，finalfull仍真实exit0。

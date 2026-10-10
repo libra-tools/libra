@@ -90,6 +90,19 @@ cleanup 与 process exit 遍历所有跟踪会话，各使用一个共享总 dea
 hook 采集。Node/Bun 测试使用 synthetic 事件与受控 exporter；真实 OpenCode
 内容采集和 native reasoning 来源仍由各自验收门证明。
 
+OpenCode 2.0.26 export 元数据读取 `user.text`、assistant `model.id`、
+`tokens` 与成功的文件工具。assistant token 总量为
+`input + output + reasoning + cache.read + cache.write`，cached 为
+`cache.read + cache.write`，不再叠加 session 总量。兼容旧 `info/parts`：
+assistant 聚合用量优先，没有聚合时才累计去重的 step-finish 明细；user 模型字段不被采用。
+文件清单合并成功的 edit/write/patch 与 snapshot，patch 移动需验证源和目标。
+输出为项目相对路径并使用正斜杠；工具路径依 session 已证明的 location，snapshot 已相对项目根。
+历史位置缺失、项目外或非法路径、不支持的形状、无效 token 数值及容量上限均标记 partial，
+仅输出不含内容的诊断。idle、model/agent 切换、synthetic/system/skill、shell 与 compaction
+是已识别的元数据，不进入用户 prompt。内部 ID、路径和别名超限也标记 partial，
+ID 容量耗尽后不再消费后续消息。本提取不读取文件、不归档 reasoning 正文；合成 fixture
+不能证明真实 macOS 内容采集或 native reasoning 来源。
+
 ## 子命令
 
 | 子命令 | 说明 |

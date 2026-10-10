@@ -17,8 +17,8 @@
 //! - Codex: rollout JSONL with heterogeneous records; user prompts carry
 //!   `role:"user"` (string or block content), model ids appear under a
 //!   `model` key, token counts under `usage`/`token_usage`-style objects.
-//! - OpenCode: JSON session exports with `parts`/`messages` arrays; the
-//!   same generic heuristics apply.
+//! - OpenCode: 2.0.26 session exports with typed `messages`, plus classic
+//!   `info`/`parts` envelopes and best-effort flat JSONL compatibility.
 
 use std::collections::HashSet;
 
@@ -620,8 +620,9 @@ pub(crate) fn extract_codex_bounded(
     extract_generic_jsonl(data, "codex", CODEX_SKILL_REGISTRY, Some(limits))
 }
 
-/// OpenCode session export → prompts / model / skills. Accepts either
-/// JSONL or a single JSON document with a `messages`/`parts` array.
+/// OpenCode session export → prompts / model / tokens / modified files / skills.
+/// Native message usage totals all five counters; session-level totals are omitted.
+/// Classic envelopes and flat JSONL remain best-effort compatibility inputs.
 pub fn extract_opencode(data: &[u8]) -> ExtractionSummary {
     extract_opencode_with_limits(data, None)
 }
@@ -634,35 +635,731 @@ pub(crate) fn extract_opencode_bounded(
     extract_opencode_with_limits(data, Some(limits))
 }
 
+const OPENCODE_SHAPE_WARNING: &str =
+    "OpenCode export contained an unsupported or incomplete message shape";
+const OPENCODE_TOKEN_WARNING: &str = "OpenCode token counts could not be represented exactly";
+const OPENCODE_FILE_WARNING: &str = "OpenCode modified-file provenance was incomplete";
+const OPENCODE_STATE_WARNING: &str = "OpenCode extraction exceeded its internal state budget";
+const OPENCODE_MAX_KEY_BYTES: usize = 4096;
+const OPENCODE_MAX_ROOTS: usize = 16;
+
+fn opencode_partial(out: &mut ExtractionSummary, warning: &'static str) {
+    out.partial = true;
+    if !out.warnings.iter().any(|existing| existing == warning) {
+        out.warnings.push(warning.to_string());
+    }
+}
+
+fn opencode_seen<'a>(
+    seen: &mut HashSet<&'a str>,
+    value: Option<&'a str>,
+    cap: usize,
+    out: &mut ExtractionSummary,
+) -> bool {
+    let Some(id) = value.filter(|id| !id.is_empty() && id.len() <= OPENCODE_MAX_KEY_BYTES) else {
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+        return false;
+    };
+    if seen.contains(id) {
+        return true;
+    }
+    if seen.len() >= cap {
+        opencode_partial(out, OPENCODE_STATE_WARNING);
+        return true;
+    }
+    seen.insert(id);
+    false
+}
+
+fn opencode_counter(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(integer) = value.as_u64() {
+        return Some(integer);
+    }
+    let number = value.as_f64()?;
+    // IEEE-754 decimal encodings are admitted only within the exact integer range.
+    (number.is_finite()
+        && (0.0..=9_007_199_254_740_992.0).contains(&number)
+        && number.fract() == 0.0)
+        .then_some(number as u64)
+}
+
+fn opencode_usage(tokens: &Value) -> Option<CompletionUsageSummary> {
+    let input = opencode_counter(tokens.get("input"))?;
+    let output = opencode_counter(tokens.get("output"))?;
+    let reasoning = opencode_counter(tokens.get("reasoning"))?;
+    let read = opencode_counter(tokens.get("cache")?.get("read"))?;
+    let write = opencode_counter(tokens.get("cache")?.get("write"))?;
+    let cached = read.checked_add(write)?;
+    let total = input
+        .checked_add(output)?
+        .checked_add(reasoning)?
+        .checked_add(cached)?;
+    Some(CompletionUsageSummary {
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: Some(cached),
+        reasoning_tokens: Some(reasoning),
+        total_tokens: Some(total),
+        cost_usd: None,
+    })
+}
+
+fn opencode_add_usage(out: &mut ExtractionSummary, tokens: &Value) {
+    let Some(usage) = opencode_usage(tokens) else {
+        opencode_partial(out, OPENCODE_TOKEN_WARNING);
+        return;
+    };
+    let merged = match out.usage.as_ref() {
+        None => Some(usage),
+        Some(old) => (|| {
+            Some(CompletionUsageSummary {
+                input_tokens: old.input_tokens.checked_add(usage.input_tokens)?,
+                output_tokens: old.output_tokens.checked_add(usage.output_tokens)?,
+                cached_tokens: Some(old.cached_tokens?.checked_add(usage.cached_tokens?)?),
+                reasoning_tokens: Some(old.reasoning_tokens?.checked_add(usage.reasoning_tokens?)?),
+                total_tokens: Some(old.total_tokens?.checked_add(usage.total_tokens?)?),
+                cost_usd: None,
+            })
+        })(),
+    };
+    let Some(merged) = merged else {
+        opencode_partial(out, OPENCODE_TOKEN_WARNING);
+        return;
+    };
+    let Some(count) = out.api_call_count.checked_add(1) else {
+        opencode_partial(out, OPENCODE_TOKEN_WARNING);
+        return;
+    };
+    out.usage = Some(merged);
+    out.api_call_count = count;
+}
+
+// Pure lexical projection: it never reads provider files or guesses a host home.
+fn opencode_path(value: &str, absolute: bool) -> Option<String> {
+    if value.is_empty()
+        || value.len() > OPENCODE_MAX_KEY_BYTES
+        || value.contains(['\0', '\\'])
+        || value.contains("[redacted:")
+        || value.starts_with('~')
+        || value.contains("://")
+        || value.starts_with('/') != absolute
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => (),
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return absolute.then(|| "/".to_string());
+    }
+    Some(format!(
+        "{}{}",
+        if absolute { "/" } else { "" },
+        parts.join("/")
+    ))
+}
+
+#[derive(Clone)]
+struct OpenCodeLocation {
+    directory: String,
+    root: String,
+}
+
+impl OpenCodeLocation {
+    fn from_record(record: &Value) -> Option<Self> {
+        let directory = record
+            .get("location")
+            .and_then(|v| v.get("directory"))
+            .or_else(|| record.get("directory"))?
+            .as_str()?;
+        let directory = opencode_path(directory, true)?;
+        let subpath = match record.get("subpath") {
+            None => String::new(),
+            Some(value) if value.as_str() == Some("") => String::new(),
+            Some(value) => opencode_path(value.as_str()?, false)?,
+        };
+        let root = if subpath.is_empty() {
+            directory.clone()
+        } else {
+            directory.strip_suffix(&format!("/{subpath}"))?.to_string()
+        };
+        Some(Self {
+            directory,
+            root: if root.is_empty() { "/".into() } else { root },
+        })
+    }
+}
+
+struct OpenCodeFiles {
+    current: Option<OpenCodeLocation>,
+    roots: Vec<String>,
+    seen_files: Option<HashSet<String>>,
+}
+
+impl OpenCodeFiles {
+    fn new(info: Option<&Value>, messages: &[Value], out: &mut ExtractionSummary) -> Self {
+        let mut files = Self {
+            current: info.and_then(OpenCodeLocation::from_record),
+            roots: Vec::new(),
+            seen_files: Some(HashSet::new()),
+        };
+        if let Some(current) = files.current.clone() {
+            files.register(&current, out);
+        } else if info.is_some_and(Value::is_object) {
+            opencode_partial(out, OPENCODE_FILE_WARNING);
+        }
+        // Export info is the final location. The first switch's previous location
+        // is the authoritative context for messages preceding that switch.
+        if let Some(first) = messages.iter().find(|message| {
+            message.get("type").and_then(Value::as_str) == Some("location-switched")
+        }) {
+            files.current = first
+                .get("previous")
+                .and_then(OpenCodeLocation::from_record);
+            if files.current.is_none() {
+                opencode_partial(out, OPENCODE_FILE_WARNING);
+            }
+            if let Some(current) = files.current.clone() {
+                files.register(&current, out);
+            }
+        }
+        files
+    }
+
+    fn register(&mut self, location: &OpenCodeLocation, out: &mut ExtractionSummary) {
+        if self.roots.contains(&location.root) {
+            return;
+        }
+        if self.roots.len() >= OPENCODE_MAX_ROOTS {
+            opencode_partial(out, OPENCODE_STATE_WARNING);
+            return;
+        }
+        self.roots.push(location.root.clone());
+    }
+
+    fn switch(&mut self, record: &Value, out: &mut ExtractionSummary) {
+        self.current = OpenCodeLocation::from_record(record);
+        if let Some(current) = self.current.clone() {
+            self.register(&current, out);
+        } else {
+            opencode_partial(out, OPENCODE_FILE_WARNING);
+        }
+    }
+
+    fn relative(&self, raw: &str, snapshot: bool) -> Option<String> {
+        if snapshot {
+            return opencode_path(raw, false);
+        }
+        let absolute = if raw.starts_with('/') {
+            opencode_path(raw, true)?
+        } else {
+            let current = self.current.as_ref()?;
+            if raw.len() > OPENCODE_MAX_KEY_BYTES
+                || raw.contains(['\0', '\\'])
+                || raw.starts_with('~')
+                || raw.contains("[redacted:")
+            {
+                return None;
+            }
+            opencode_path(
+                &format!("{}/{}", current.directory.trim_end_matches('/'), raw),
+                true,
+            )?
+        };
+        self.roots
+            .iter()
+            .filter_map(|root| {
+                let prefix = format!("{}/", root.trim_end_matches('/'));
+                absolute
+                    .strip_prefix(&prefix)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| (root.len(), path))
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, path)| path.to_string())
+    }
+
+    fn add(
+        &mut self,
+        value: &Value,
+        snapshot: bool,
+        out: &mut ExtractionSummary,
+        limiter: &mut Option<ExtractionCollectionLimiter>,
+    ) -> bool {
+        let Some(path) = value.as_str().and_then(|raw| self.relative(raw, snapshot)) else {
+            opencode_partial(out, OPENCODE_FILE_WARNING);
+            return false;
+        };
+        if out.modified_files.len() >= 4096 {
+            opencode_partial(out, OPENCODE_STATE_WARNING);
+            return false;
+        }
+        push_modified_file(out, limiter, &mut self.seen_files, &path);
+        true
+    }
+
+    fn list(
+        &mut self,
+        value: &Value,
+        snapshot: bool,
+        out: &mut ExtractionSummary,
+        limiter: &mut Option<ExtractionCollectionLimiter>,
+    ) {
+        let Some(paths) = value.as_array() else {
+            opencode_partial(out, OPENCODE_FILE_WARNING);
+            return;
+        };
+        for path in paths {
+            self.add(path, snapshot, out, limiter);
+            if collection_exhausted(limiter) {
+                break;
+            }
+        }
+    }
+}
+
+/// Validate the file-header/hunk grammar before deriving patch destinations.
+/// Unsupported grammar is partial, even when a tool metadata destination exists.
+fn opencode_patch_paths(text: &str) -> Option<Vec<&str>> {
+    if text.len() > 1024 * 1024 {
+        return None;
+    }
+    let mut lines: Vec<&str> = text
+        .trim()
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let first = *lines.first()?;
+    let prefix = first
+        .strip_prefix("cat")
+        .filter(|suffix| suffix.starts_with(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(first);
+    if let Some(marker) = prefix.strip_prefix("<<") {
+        let marker = marker.trim().trim_matches(['\'', '"']);
+        if marker.is_empty()
+            || !marker
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || lines.last()?.trim() != marker
+        {
+            return None;
+        }
+        lines.remove(0);
+        lines.pop();
+    }
+    if lines.first()?.trim() != "*** Begin Patch" || lines.last()?.trim() != "*** End Patch" {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut kind = "";
+    let mut has_chunk = false;
+    let mut has_body = false;
+    let mut after_eof = false;
+    let mut moved = false;
+    for (index, line) in lines[1..lines.len() - 1].iter().enumerate() {
+        let header = line.trim();
+        if index == 0
+            && header
+                .strip_prefix("*** Environment ID:")
+                .is_some_and(|id| !id.trim().is_empty())
+        {
+            continue;
+        }
+        let file = [
+            ("*** Add File: ", "add"),
+            ("*** Delete File: ", "delete"),
+            ("*** Update File: ", "update"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, next)| header.strip_prefix(prefix).map(|path| (next, path.trim())));
+        if let Some((next, path)) = file {
+            if kind == "update" && !has_body {
+                return None;
+            }
+            if path.is_empty() || path.len() > OPENCODE_MAX_KEY_BYTES || paths.len() >= 256 {
+                return None;
+            }
+            paths.push(path);
+            kind = next;
+            has_chunk = false;
+            has_body = false;
+            after_eof = false;
+            moved = false;
+            continue;
+        }
+        if kind == "update" && !has_chunk && !moved && header.starts_with("*** Move to: ") {
+            let path = header.strip_prefix("*** Move to: ")?.trim();
+            if path.is_empty() || path.len() > OPENCODE_MAX_KEY_BYTES || paths.len() >= 256 {
+                return None;
+            }
+            paths.push(path);
+            moved = true;
+            continue;
+        }
+        match kind {
+            "add" if line.starts_with('+') => (),
+            "update" if line.trim_end() == "*** End of File" => {
+                if has_chunk && !has_body {
+                    return None;
+                }
+                after_eof = has_chunk;
+            }
+            "update" if line.trim_end() == "@@" || line.trim_end().starts_with("@@ ") => {
+                if has_chunk && !has_body {
+                    return None;
+                }
+                has_chunk = true;
+                has_body = false;
+                after_eof = false;
+            }
+            "update" if !after_eof && (line.is_empty() || line.starts_with([' ', '+', '-'])) => {
+                has_chunk = true;
+                has_body = true;
+            }
+            "update" if after_eof && line.trim().is_empty() => (),
+            _ => return None,
+        }
+    }
+    if kind == "update" && !has_body {
+        return None;
+    }
+    Some(paths)
+}
+
+fn opencode_tool(
+    part: &Value,
+    files: &mut OpenCodeFiles,
+    legacy: bool,
+    out: &mut ExtractionSummary,
+    limiter: &mut Option<ExtractionCollectionLimiter>,
+) {
+    let name = part
+        .get(if legacy { "tool" } else { "name" })
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !matches!(name, "edit" | "write" | "patch" | "apply_patch") {
+        return;
+    }
+    let Some(state) = part
+        .get("state")
+        .filter(|state| state.get("status").and_then(Value::as_str) == Some("completed"))
+    else {
+        opencode_partial(out, OPENCODE_FILE_WARNING);
+        return;
+    };
+    let mut found = false;
+    if let Some(metadata) = state
+        .get("metadata")
+        .and_then(|metadata| metadata.get("files"))
+    {
+        if let Some(entries) = metadata.as_array() {
+            for entry in entries {
+                found |= files.add(
+                    entry.get("file").unwrap_or(&Value::Null),
+                    false,
+                    out,
+                    limiter,
+                );
+                if collection_exhausted(limiter) {
+                    break;
+                }
+            }
+        } else {
+            opencode_partial(out, OPENCODE_FILE_WARNING);
+        }
+    }
+    if let Some(input) = state.get("input") {
+        if let Some(path) = input.get("path").or_else(|| input.get("filePath")) {
+            found |= files.add(path, false, out, limiter);
+        }
+        if matches!(name, "patch" | "apply_patch") {
+            let paths = input
+                .get("patchText")
+                .or_else(|| input.get("patch"))
+                .and_then(Value::as_str)
+                .and_then(opencode_patch_paths);
+            if let Some(paths) = paths {
+                for path in paths {
+                    if out.modified_files.len() >= 4096 {
+                        opencode_partial(out, OPENCODE_STATE_WARNING);
+                        break;
+                    }
+                    if let Some(relative) = files.relative(path, false) {
+                        push_modified_file(out, limiter, &mut files.seen_files, &relative);
+                        found = true;
+                    } else {
+                        opencode_partial(out, OPENCODE_FILE_WARNING);
+                    }
+                    if collection_exhausted(limiter) {
+                        break;
+                    }
+                }
+            } else {
+                opencode_partial(out, OPENCODE_FILE_WARNING);
+            }
+        }
+    } else {
+        opencode_partial(out, OPENCODE_FILE_WARNING);
+    }
+    if !found {
+        opencode_partial(out, OPENCODE_FILE_WARNING);
+    }
+}
+
+fn opencode_prompt(
+    text: &str,
+    ordinal: usize,
+    out: &mut ExtractionSummary,
+    limiter: &mut Option<ExtractionCollectionLimiter>,
+) {
+    if limiter
+        .as_ref()
+        .is_some_and(|limiter| text.len() > limiter.max_string_bytes())
+    {
+        mark_collection_limit(out, limiter);
+        return;
+    }
+    if text.contains("[redacted:") {
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+        return;
+    }
+    if let Some((skill, signal)) = match_skill(text, OPENCODE_SKILL_REGISTRY) {
+        push_skill_event(
+            out,
+            limiter,
+            SkillEventInput {
+                agent_slug: "opencode",
+                skill,
+                signal,
+                turn_id: &format!("record-{ordinal}"),
+                timestamp: "",
+                anchor: Some(format!("record:{ordinal}")),
+                native: false,
+            },
+        );
+    }
+    push_prompt(out, limiter, text.to_string());
+}
+
 fn extract_opencode_with_limits(
     data: &[u8],
     limits: Option<ExtractionCollectionLimits>,
 ) -> ExtractionSummary {
-    // Whole-document form first.
-    if let Ok(doc) = serde_json::from_slice::<Value>(data)
-        && let Some(messages) = doc
-            .get("messages")
-            .or_else(|| doc.get("parts"))
-            .and_then(Value::as_array)
-    {
-        let mut out = ExtractionSummary::default();
-        let mut limiter = limits.map(ExtractionCollectionLimiter::new);
-        for (idx, message) in messages.iter().enumerate() {
+    let Ok(doc) = serde_json::from_slice::<Value>(data) else {
+        return extract_generic_jsonl(data, "opencode", OPENCODE_SKILL_REGISTRY, limits);
+    };
+    let Some(messages) = doc
+        .get("messages")
+        .or_else(|| doc.get("parts"))
+        .and_then(Value::as_array)
+    else {
+        // A native envelope cannot silently fall through to a generic zero result.
+        if doc.get("info").is_some() || doc.get("messages").is_some() || doc.get("type").is_some() {
+            let mut out = ExtractionSummary::default();
+            opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+            return out;
+        }
+        return extract_generic_jsonl(data, "opencode", OPENCODE_SKILL_REGISTRY, limits);
+    };
+    let mut out = ExtractionSummary::default();
+    let mut limiter = limits.map(ExtractionCollectionLimiter::new);
+    let mut seen = HashSet::new();
+    let id_cap = if limits.is_some() { 256 } else { 65_536 };
+    let mut files = OpenCodeFiles::new(doc.get("info"), messages, &mut out);
+    let native = messages.iter().any(|message| message.get("type").is_some());
+    let classic = messages.iter().any(|message| message.get("info").is_some());
+    if (native || classic) && !doc.get("info").is_some_and(Value::is_object) {
+        opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+    }
+    if native && classic {
+        opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+    }
+    for (ordinal, message) in messages.iter().enumerate() {
+        if collection_exhausted(&limiter) {
+            break;
+        }
+        if let Some(kind) = message.get("type").and_then(Value::as_str) {
+            if opencode_seen(
+                &mut seen,
+                message.get("id").and_then(Value::as_str),
+                id_cap,
+                &mut out,
+            ) {
+                continue;
+            }
+            match kind {
+                "user" => {
+                    if let Some(text) = message.get("text").and_then(Value::as_str) {
+                        opencode_prompt(text, ordinal, &mut out, &mut limiter);
+                    } else {
+                        opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+                    }
+                }
+                "assistant" => {
+                    if out.model.is_none() {
+                        if let Some(model) = message
+                            .get("model")
+                            .and_then(|model| model.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            set_model(&mut out, &mut limiter, model);
+                        } else {
+                            opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+                        }
+                    }
+                    if let Some(tokens) = message.get("tokens") {
+                        opencode_add_usage(&mut out, tokens);
+                    }
+                    if let Some(content) = message.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            if part.get("type").and_then(Value::as_str) == Some("tool") {
+                                opencode_tool(part, &mut files, false, &mut out, &mut limiter);
+                            }
+                            if collection_exhausted(&limiter) {
+                                break;
+                            }
+                        }
+                    } else {
+                        opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+                    }
+                    if let Some(snapshot) = message
+                        .get("snapshot")
+                        .and_then(|snapshot| snapshot.get("files"))
+                    {
+                        files.list(snapshot, true, &mut out, &mut limiter);
+                    }
+                }
+                "location-switched" => files.switch(message, &mut out),
+                // Coverage/status semantics are owned by OG-09, not this projection.
+                "agent-switched" | "model-switched" | "synthetic" | "system" | "skill"
+                | "shell" | "compaction" | "idle" => (),
+                _ => opencode_partial(&mut out, OPENCODE_SHAPE_WARNING),
+            }
+        } else if let Some(info) = message.get("info").filter(|info| info.is_object()) {
+            if opencode_seen(
+                &mut seen,
+                info.get("id").and_then(Value::as_str),
+                id_cap,
+                &mut out,
+            ) {
+                continue;
+            }
+            let Some(parts) = message.get("parts").and_then(Value::as_array) else {
+                opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+                continue;
+            };
+            match info.get("role").and_then(Value::as_str) {
+                Some("user") => {
+                    let mut text = String::new();
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) != Some("text")
+                            || part.get("synthetic").and_then(Value::as_bool) == Some(true)
+                            || part.get("ignored").and_then(Value::as_bool) == Some(true)
+                        {
+                            continue;
+                        }
+                        let Some(next) = part.get("text").and_then(Value::as_str) else {
+                            opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
+                            continue;
+                        };
+                        let next_len = text
+                            .len()
+                            .checked_add(next.len())
+                            .and_then(|len| len.checked_add(usize::from(!text.is_empty())));
+                        if next_len.is_none_or(|len| {
+                            limiter
+                                .as_ref()
+                                .is_some_and(|limit| len > limit.max_string_bytes())
+                        }) {
+                            mark_collection_limit(&mut out, &mut limiter);
+                            break;
+                        }
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(next);
+                    }
+                    if !text.is_empty() {
+                        opencode_prompt(&text, ordinal, &mut out, &mut limiter);
+                    }
+                }
+                Some("assistant") => {
+                    if out.model.is_none()
+                        && let Some(model) = info
+                            .get("modelID")
+                            .or_else(|| {
+                                info.get("model").and_then(|model| {
+                                    model.get("modelID").or_else(|| model.get("id"))
+                                })
+                            })
+                            .and_then(Value::as_str)
+                    {
+                        set_model(&mut out, &mut limiter, model);
+                    }
+                    let aggregate = info.get("tokens");
+                    if let Some(tokens) = aggregate {
+                        opencode_add_usage(&mut out, tokens);
+                    }
+                    let mut parts_seen = HashSet::new();
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("step-finish") if aggregate.is_none() => {
+                                if opencode_seen(
+                                    &mut parts_seen,
+                                    part.get("id").and_then(Value::as_str),
+                                    id_cap,
+                                    &mut out,
+                                ) {
+                                    continue;
+                                }
+                                if let Some(tokens) = part.get("tokens") {
+                                    opencode_add_usage(&mut out, tokens);
+                                } else {
+                                    opencode_partial(&mut out, OPENCODE_TOKEN_WARNING);
+                                }
+                            }
+                            Some("tool") => {
+                                opencode_tool(part, &mut files, true, &mut out, &mut limiter)
+                            }
+                            Some("patch") => {
+                                if let Some(paths) = part.get("files") {
+                                    files.list(paths, true, &mut out, &mut limiter);
+                                } else {
+                                    opencode_partial(&mut out, OPENCODE_FILE_WARNING);
+                                }
+                            }
+                            _ => (),
+                        }
+                        if collection_exhausted(&limiter) {
+                            break;
+                        }
+                    }
+                }
+                _ => opencode_partial(&mut out, OPENCODE_SHAPE_WARNING),
+            }
+        } else if !native && !classic {
             ingest_generic_record(
                 message,
-                idx,
+                ordinal,
                 "opencode",
                 OPENCODE_SKILL_REGISTRY,
                 &mut out,
                 &mut limiter,
             );
-            if collection_exhausted(&limiter) {
-                break;
-            }
+        } else {
+            opencode_partial(&mut out, OPENCODE_SHAPE_WARNING);
         }
-        return out;
     }
-    extract_generic_jsonl(data, "opencode", OPENCODE_SKILL_REGISTRY, limits)
+    out
 }
 
 fn extract_generic_jsonl(
@@ -706,6 +1403,14 @@ fn ingest_generic_record(
     out: &mut ExtractionSummary,
     limiter: &mut Option<ExtractionCollectionLimiter>,
 ) {
+    if slug == "opencode"
+        && (entry.get("type").is_some()
+            || entry.get("info").is_some()
+            || entry.get("messages").is_some())
+    {
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+        return;
+    }
     let record = entry.get("message").unwrap_or(entry);
     let role = record
         .get("role")
@@ -750,6 +1455,7 @@ fn ingest_generic_record(
         }
     }
     if out.model.is_none()
+        && !(slug == "opencode" && role == "user")
         && let Some(model) = record
             .get("model")
             .or_else(|| entry.get("model"))
@@ -765,17 +1471,52 @@ fn ingest_generic_record(
     {
         // Consume ALL six E6 wire keys — the count/subagent fields are
         // additive rather than dropped (agent.md E6).
+        if slug == "opencode"
+            && (usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .checked_add(
+                    usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+                .is_none()
+                || usage
+                    .get("cache_creation_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .checked_add(
+                        usage
+                            .get("cache_read_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .is_none())
+        {
+            opencode_partial(out, OPENCODE_TOKEN_WARNING);
+            return;
+        }
         let e6 = map_e6_token_usage_full(usage);
         if e6.summary.input_tokens > 0 || e6.summary.output_tokens > 0 {
             merge_usage(&mut out.usage, &e6.summary);
         }
-        // `api_call_count` is taken from the wire when present, else one
-        // per usage object (each usage object is one API call).
-        out.api_call_count += if e6.api_call_count > 0 {
+        // `api_call_count` is taken from the wire, else one per usage object.
+        let calls = if e6.api_call_count > 0 {
             e6.api_call_count
         } else {
             1
         };
+        if slug == "opencode" {
+            if let Some(count) = out.api_call_count.checked_add(calls) {
+                out.api_call_count = count;
+            } else {
+                opencode_partial(out, OPENCODE_TOKEN_WARNING);
+            }
+        } else {
+            out.api_call_count += calls;
+        }
         if e6.subagent_tokens > 0 {
             let subagent = CompletionUsageSummary {
                 input_tokens: e6.subagent_tokens,
@@ -876,6 +1617,58 @@ mod tests {
         assert_eq!(out2.prompts, ["hello"]);
         assert_eq!(out2.model.as_deref(), Some("claude-sonnet-5"));
         assert!(!out2.partial);
+    }
+
+    #[test]
+    fn opencode_bounded_native_collections_and_internal_state_are_partial() {
+        let messages: Vec<Value> = (0..400)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("m-{index}"), "type":"user", "text": "synthetic"
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({"info":{"id":"s","location":{"directory":"/project"}},"messages": messages});
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let result =
+            extract_opencode_bounded(&bytes, ExtractionCollectionLimits::new(128, 4096, 32768));
+        assert!(result.partial);
+        assert_eq!(result.prompts.len(), 128);
+        assert_eq!(result.warnings, [COLLECTION_LIMIT_WARNING]);
+        let messages: Vec<Value> = (0..400).map(|index| serde_json::json!({
+            "id":format!("m-{index}"),"type":"assistant","model":{"id":"synthetic"},"content":[]
+        })).collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({"info":{"id":"s","location":{"directory":"/project"}},"messages":messages}))
+            .unwrap();
+        let result =
+            extract_opencode_bounded(&bytes, ExtractionCollectionLimits::new(128, 4096, 32768));
+        assert!(result.partial);
+        assert_eq!(result.warnings, [OPENCODE_STATE_WARNING]);
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"info":{"id":"s","location":{"directory":"/project"}},"messages":[
+                {"id":"u","type":"user","text":"x".repeat(4097)}
+            ]}),
+        )
+        .unwrap();
+        let result =
+            extract_opencode_bounded(&bytes, ExtractionCollectionLimits::new(128, 4096, 32768));
+        assert!(result.prompts.is_empty());
+        assert_eq!(result.warnings, [COLLECTION_LIMIT_WARNING]);
+    }
+
+    #[test]
+    fn opencode_patch_grammar_rejects_empty_or_malformed_updates() {
+        for patch in [
+            "*** Begin Patch\n*** Update File: a\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a\n@@\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: a\n-unexpected\n*** End Patch",
+        ] {
+            assert!(opencode_patch_paths(patch).is_none(), "{patch}");
+        }
+        let patch = "<<'PATCH'\r\n*** Begin Patch\r\n*** Add File: a\r\n+new\r\n*** Delete File: b\r\n*** End Patch\r\nPATCH";
+        assert_eq!(opencode_patch_paths(patch).unwrap(), ["a", "b"]);
+        let cat = patch.replacen("<<'PATCH'", "cat <<'PATCH'", 1);
+        assert_eq!(opencode_patch_paths(&cat).unwrap(), ["a", "b"]);
     }
 
     #[test]

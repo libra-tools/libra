@@ -899,3 +899,33 @@ fn opencode_docs_disclose_current_template_upgrade_and_bounds() {
         assert_contains(COMPATIBILITY_DOC, "COMPATIBILITY.md", required);
     }
 }
+
+#[test]
+fn opencode_docs_disclose_export_projection_and_provenance_limits() {
+    for (label, document) in [("tracing", AGENT_DOC), ("agent English", AGENT_CMD_DOC_EN)] {
+        for required in [
+            "assistant `model.id`",
+            "input + output + reasoning + cache.read + cache.write",
+            "with forward slashes",
+            "partial metadata",
+            "native reasoning origin",
+        ] {
+            assert_contains(document, label, required);
+        }
+    }
+    for required in [
+        "assistant `model.id`",
+        "input + output + reasoning + cache.read + cache.write",
+        "项目相对路径",
+        "标记 partial",
+        "native reasoning 来源",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "agent Chinese", required);
+    }
+    assert_contains(COMPATIBILITY_DOC, "compatibility", "five-component tokens");
+    assert_contains(
+        COMPATIBILITY_DOC,
+        "compatibility",
+        "invalid/missing provenance or counters stays partial",
+    );
+}
