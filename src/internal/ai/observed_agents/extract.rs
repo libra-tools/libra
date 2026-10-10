@@ -1234,7 +1234,11 @@ fn extract_opencode_with_limits(
     limits: Option<ExtractionCollectionLimits>,
 ) -> ExtractionSummary {
     let Ok(doc) = serde_json::from_slice::<Value>(data) else {
-        return extract_generic_jsonl(data, "opencode", OPENCODE_SKILL_REGISTRY, limits);
+        let mut summary = extract_generic_jsonl(data, "opencode", OPENCODE_SKILL_REGISTRY, limits);
+        if data.iter().all(u8::is_ascii_whitespace) {
+            opencode_partial(&mut summary, OPENCODE_SHAPE_WARNING);
+        }
+        return summary;
     };
     let Some(messages) = doc
         .get("messages")
@@ -1482,6 +1486,10 @@ fn ingest_generic_record(
     out: &mut ExtractionSummary,
     limiter: &mut Option<ExtractionCollectionLimiter>,
 ) {
+    if slug == "opencode" && !entry.is_object() {
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+        return;
+    }
     if slug == "opencode"
         && (entry.get("type").is_some()
             || entry.get("info").is_some()
@@ -1496,6 +1504,11 @@ fn ingest_generic_record(
         .or_else(|| entry.get("role"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    if slug == "opencode" && !matches!(role, "user" | "assistant") {
+        // Missing/unsupported role is incomplete even if independent model or
+        // usage fields can still be projected. Never drop those valid fields.
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+    }
     if role == "user"
         && let Some(content) = record
             .get("content")

@@ -122,6 +122,12 @@ OpenCode 用户文本在native/classic coverage与native/classic/flat-JSONL元�
 孤立结束标签保留并标记partial/Incomplete，idle不能洗白。只过滤用户文本，
 其它provider语义保持。此为字面标记过滤，不证明producer来源。
 
+OpenCode 提取对空输入、非法 JSON 和非法 export 形状显式标记
+`extraction.partial=true`，记录不含payload的固定警告。缺失或不支持的role仍可保留
+良构的独立flat model/token字段。合法空会话export与缺失transcript字节
+（`extraction.present=false`）不同。非关键提取错误不阻断原本允许的checkpoint写入；
+坏export不替换已有checkpoint。coverage、授权与native来源门仍然必须满足。
+
 ## 子命令
 
 | 子命令 | 说明 |

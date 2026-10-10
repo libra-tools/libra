@@ -786,6 +786,27 @@ fn finalize_extraction(value: &mut Value, partial: bool, warnings: Vec<String>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opencode_failure_projection_is_partial_in_both_capture_paths() {
+        let raw = RedactedBytes::new_unchecked(
+            b"{broken payload-private-fixture AKIAIOSFODNN7EXAMPLE".to_vec(),
+        );
+        for value in [
+            build_extraction_projection("opencode", Some(&raw), &[], &[]),
+            build_deadline_extraction_projection(AgentKind::OpenCode, Some(&raw), false),
+        ] {
+            assert_eq!(value["present"], true);
+            assert_eq!(value["partial"], true);
+            let warnings = value["warnings"].as_array().expect("warning vector");
+            assert!(!warnings.is_empty());
+            for warning in warnings {
+                let warning = warning.as_str().expect("warning string");
+                assert!(!warning.contains("payload-private-fixture"));
+                assert!(!warning.contains("AKIAIOSFODNN7EXAMPLE"));
+                assert!(!warning.contains("{broken"));
+            }
+        }
+    }
     use super::*;
 
     #[test]

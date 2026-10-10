@@ -869,3 +869,15 @@ AC6/6、VER1/1，127/127聚焦（零retry）、9699/9699双env默认Nextest（13
 ### 2026-10-11：OG-11签名main交付完成
 
 source `0d6f35c94894570b458c16eb0c6189df210a43a3`、parent e3d37842，11owned blobs postimage MATCH、PGP+DCO一次、普通Push exit0/GitHub main实ref MATCH。127聚焦、9699双env全量（13slow/1flaky/2leaky/9skip）与strict/fmt/site0及实际Claude R1 PASS保持有效，prod/source审稿与finalfull指纹一致。plan05原bytes未进delta，网站cf原4dirty保留且仅owned本地段；0.30.42无发布。基础6/13=46.15%，正式4/61=6.56%，阶段C/D待；下一OG14。NoGo/同难度外围按用户延期，基础与可信producer/verifier优先、native硬门不降、Linux实机UNRUN。
+
+### 2026-10-11：OG-14 current-main开工
+
+main0e0b149a、OG11 signed source0d6f35c9已交付；旧AC3/VER4不继承，三intelligence新门和实际typed checkpoint门须重建。现有capture普通/worker partial与固定warning保护已有，不重写生产pipeline；potential空bytes/valid非法形状零非partial缺口先负例真红确认。自动推荐必要写集调整：extract失败处置1prod，两个src tests-only新增独立case，冻结原oracle/helper不改；第四VER改真实lib typed persistence case，不借bwrap skip当mac真机证据；AC3/VER4不增计数。generic OpenCode failure branch按T1 full，Claude单审、fmt/strict、signed Push；plan05与网站原dirty保护。基础6/13、正式4/61不变，Linux/native真实正例UNRUN。
+
+### 2026-10-11：OG-14失败形状红复现与持久化聚焦通过
+
+当前0e0b149a main后继OG14 sole writer；3具名集成负例先1pass/2fail，空bytes及无role静默零结果已按OpenCode-only形状门修正，良构独立model/usage继续投影。ordinary/worker projection及typed pipeline真实SQLite/对象存储新持久化case通过：partial仍checkpoint、坏JSON不替换原metadata/tree。文档前focused132/132真实绿，三冻结oracle与所有32架构门保持。新增测试初轮缺serde_json::Value类型限定导致compile101已修复，失败不算通过。文档增量/网站fresh preimage保持其他dirty，最终focused/strict/fmt/site、Claude单审与当前源码T1 full待；synthetic无真实OpenCode/mac内容/native来源/Linux证明。正式4/61=6.56%，基础6/13=46.15%，完成交付OG14后下一OG15；plan05原bytes保持。
+
+### 2026-10-11：OG-14最终全量与Claude单审PASS，待签名main交付
+
+AC3/VER4当前具名门重建；final focused133/133、fmt/strict/site各0；双envdefault Nextest full9705/9705、830.938s（13slow/1flaky/9skipped/0leaky/0最终failed），SHA d387f5581c172b2be38b323ca894926e40884656adcfb23ac83eb89500d87a93。Claude R1实际PASS，0P0/0P1/1P2/4P3，35turn，rawSHA f8554015ec994d57e4170b4214fbc73c86d11c4493ef1fea66dc7083d3b1b955；非阻断空messages/info错型与新增count回归按本计划DEFER-OG-CONTAINMENT-01计划外登记，未实现/不称全部形状闭合。legacy角色partial文档已披露，serial疑虑由full实际src/registry全门PASS闭合，style不作门。DEFER-OG-TEST01追加本轮既有mirror fetch TRY1 I/O worker error→TRY2 PASS，未修复；旧OG11flaky/leak仅历史。三frozen oracle/helper和32架构门未改，source/full已审12SHA MATCH；postreview只写plan/status事实。synthetic exporter+真实SQLite/objects仍不是实际OpenCode/mac内容/native或Linux证据。0.30.42不变、网站未提交部署、阶段C/D与最终full保留。plan05原bytes排除；formal4/61=6.56%，基础6/13=46.15%，signed Push后7/13=53.85%，下一OG15。

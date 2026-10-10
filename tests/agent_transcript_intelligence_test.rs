@@ -453,6 +453,66 @@ fn opencode_system_reminder_stripped() {
     );
 }
 
+#[test]
+fn opencode_extraction_fail_open_partial() {
+    for bytes in [
+        b"".as_slice(),
+        b"   \n",
+        b"null",
+        b"[]",
+        b"42",
+        b"{}",
+        b"{\"message\":[]}",
+        b"{broken private-fixture",
+    ] {
+        let result = extract::extract_opencode(bytes);
+        assert!(
+            result.partial,
+            "invalid source must not become complete zero output: {bytes:?}"
+        );
+        assert!(result.prompts.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn opencode_extraction_partial_marker_asserted() {
+    let summary = extract::extract_opencode(
+        br#"{"model":"fixture-model","usage":{"input_tokens":12,"output_tokens":3}}"#,
+    );
+    assert!(
+        summary.partial,
+        "metadata without recognized role is incomplete"
+    );
+    assert_eq!(summary.model.as_deref(), Some("fixture-model"));
+    assert_eq!(
+        summary.usage.unwrap().total_tokens,
+        Some(15),
+        "independent valid metadata retained"
+    );
+    let valid = opencode_summary(&opencode_export(serde_json::json!([])));
+    assert!(
+        !valid.partial,
+        "a structurally valid empty export is distinct from failed parsing"
+    );
+}
+
+#[test]
+fn opencode_extraction_warnings_redacted_no_payload() {
+    for bytes in [
+        b"{broken payload-private-fixture AKIAIOSFODNN7EXAMPLE".as_slice(),
+        br#"{"info":7,"messages":"payload-private-fixture"}"#,
+    ] {
+        let result = extract::extract_opencode(bytes);
+        assert!(result.partial);
+        assert!(!result.warnings.is_empty());
+        let warnings = result.warnings.join("\n");
+        assert!(!warnings.contains("payload-private-fixture"));
+        assert!(!warnings.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!warnings.contains("{broken"));
+    }
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/agent_transcripts")

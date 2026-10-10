@@ -171,6 +171,15 @@ closing tag is retained and marks partial/Incomplete. Idle cannot clear these
 violations. Only user text is filtered, and other providers keep their existing
 semantics. This is a literal marker filter, not proof of producer origin.
 
+OpenCode extraction is fail-visible for empty input, invalid JSON, and illegal
+export shapes: `extraction.partial=true` and fixed payload-free warnings are
+recorded. Valid independent flat model/token fields remain projected even when
+the role is missing or unsupported. A valid empty session export is distinct
+from missing transcript bytes (`extraction.present=false`). Noncritical
+extraction errors do not block an otherwise admissible checkpoint; malformed
+exports do not replace an existing checkpoint. Coverage, authorization, and
+native-origin gates remain required.
+
 ## Subcommands
 
 | Subcommand | Description |

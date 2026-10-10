@@ -5545,6 +5545,85 @@ mod export_runner_lease {
         /// A different single turn, so a fresh delivery reserves new claims.
         const EXPORT_V2: &str = r#"{"info":{"id":"ses_lease"},"messages":[{"info":{"id":"msg_u9","role":"user"},"parts":[{"type":"text","text":"another question"}]},{"info":{"id":"msg_a9","role":"assistant"},"parts":[{"type":"text","text":"another answer"}]}]}"#;
 
+        /// Actual typed capture and durable object/catalog assertions with a
+        /// synthetic exporter; this is not a real OpenCode/native-origin gate.
+        #[tokio::test(flavor = "current_thread")]
+        #[serial(cwd, env)]
+        async fn opencode_extraction_failure_continues_checkpoint() {
+            const PARTIAL: &str = r#"{"info":{"id":"ses_og14","location":{"directory":"/project"}},"messages":[{"info":{"id":"msg_og14","role":"user"},"parts":[{"type":"text","text":"human"}]},{"info":{"role":"assistant","modelID":"fixture-model","tokens":{"input":"payload-private-fixture","output":3,"reasoning":0,"cache":{"read":0,"write":0}}},"parts":[{"type":"text","text":"answer"}]}]}"#;
+            let fixture = export_fixture().await;
+            let session = "og14-extraction";
+            start_session(&fixture, session).await;
+            deliver(
+                &fixture,
+                &FakeExportLease::default(),
+                ScriptedExport::Authorized(PARTIAL),
+                ProviderHookCommand::Stop,
+                session,
+                "og14-first",
+                120_000,
+            )
+            .await
+            .expect("noncritical extraction failure must not block checkpoint persistence");
+            assert_eq!(checkpoint_count(&fixture.conn, session).await, 1);
+            let row=fixture.conn.query_one_raw(Statement::from_sql_and_values(fixture.conn.get_database_backend(),"SELECT checkpoint_id, metadata_blob_oid, tree_oid FROM agent_checkpoint WHERE session_id = ?",[format!("opencode__{session}").into()])).await.unwrap().expect("real persisted checkpoint row");
+            let id: String = row.try_get_by("checkpoint_id").unwrap();
+            let oid: String = row.try_get_by("metadata_blob_oid").unwrap();
+            let tree: String = row.try_get_by("tree_oid").unwrap();
+            let read_blob = |oid: &str| {
+                assert!(oid.len() >= 4 && oid.bytes().all(|b| b.is_ascii_hexdigit()));
+                let raw =
+                    std::fs::read(fixture.repo.join("objects").join(&oid[..2]).join(&oid[2..]))
+                        .expect("read actual stored metadata blob");
+                let mut inflated = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::ZlibDecoder::new(raw.as_slice()),
+                    &mut inflated,
+                )
+                .unwrap();
+                let nul = inflated
+                    .iter()
+                    .position(|b| *b == 0)
+                    .expect("loose object header");
+                inflated.split_off(nul + 1)
+            };
+            let before = read_blob(&oid);
+            let metadata: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(metadata["extraction"]["present"], true);
+            assert_eq!(metadata["extraction"]["partial"], true);
+            let warnings = metadata["extraction"]["warnings"]
+                .as_array()
+                .expect("durable warnings");
+            assert!(!warnings.is_empty());
+            assert!(
+                !serde_json::to_string(warnings)
+                    .unwrap()
+                    .contains("payload-private-fixture")
+            );
+            deliver(
+                &fixture,
+                &FakeExportLease::default(),
+                ScriptedExport::Authorized("{broken payload-private-fixture"),
+                ProviderHookCommand::Stop,
+                session,
+                "og14-broken",
+                120_000,
+            )
+            .await
+            .expect("invalid JSON is contained without replacing committed data");
+            let after=fixture.conn.query_one_raw(Statement::from_sql_and_values(fixture.conn.get_database_backend(),"SELECT metadata_blob_oid, tree_oid FROM agent_checkpoint WHERE checkpoint_id = ?",[id.into()])).await.unwrap().expect("original committed row remains");
+            assert_eq!(
+                after.try_get_by::<String, _>("metadata_blob_oid").unwrap(),
+                oid
+            );
+            assert_eq!(after.try_get_by::<String, _>("tree_oid").unwrap(), tree);
+            assert_eq!(
+                read_blob(&oid),
+                before,
+                "original durable metadata is not replaced by invalid JSON"
+            );
+        }
+
         /// What the fake transcript exporter returns.
         #[derive(Clone, Copy)]
         enum ScriptedExport {

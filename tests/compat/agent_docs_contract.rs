@@ -986,3 +986,30 @@ fn opencode_docs_disclose_shared_literal_reminder_filter() {
         "malformed markers stay partial/Incomplete",
     );
 }
+
+#[test]
+fn opencode_docs_disclose_extraction_failure_containment() {
+    for (label, document) in [("tracing", AGENT_DOC), ("agent English", AGENT_CMD_DOC_EN)] {
+        for required in [
+            "empty input, invalid JSON, and illegal",
+            "fixed payload-free warnings",
+            "extraction errors do not block an otherwise admissible checkpoint",
+            "exports do not replace an existing checkpoint",
+            "native-origin gates remain required",
+        ] {
+            assert_contains(document, label, required);
+        }
+    }
+    for required in [
+        "不含payload的固定警告",
+        "坏export不替换已有checkpoint",
+        "native来源门仍然必须满足",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "agent Chinese", required);
+    }
+    assert_contains(
+        COMPATIBILITY_DOC,
+        "compatibility",
+        "OpenCode empty/invalid exports are partial with fixed payload-free warnings",
+    );
+}

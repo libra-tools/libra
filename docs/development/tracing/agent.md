@@ -261,6 +261,16 @@ closing tag is retained and marks partial/Incomplete. Idle cannot clear these
 violations. Only user text is filtered, and other providers keep their existing
 semantics. This is a literal marker filter, not proof of producer origin.
 
+OpenCode extraction is fail-visible for empty input, invalid JSON, and illegal
+export shapes: `extraction.partial=true` and fixed payload-free warnings are
+recorded. Valid independent flat model/token fields remain projected even when
+the role is missing or unsupported. A valid empty session export is distinct
+from missing transcript bytes (`extraction.present=false`). Noncritical
+extraction errors do not block an otherwise admissible checkpoint; malformed
+exports do not replace an existing checkpoint. Coverage, authorization, and
+native-origin gates remain required.
+
+
 ### OpenCode 安装流程契约（第一批必须满足）
 
 **状态（OG-02 当前实现）**：HookProvider 已注册；registry/parser 与新插件使用 OG-00 审计的 2.0.26 API/source。Node/Bun actual runtime 的 synthetic exporter 门证明模板执行与转发，不独自证明真实 OpenCode 内容或 native 来源。
