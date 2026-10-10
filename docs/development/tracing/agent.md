@@ -250,6 +250,17 @@ digest. Native tools use name/id/state.input and text state.content; an error
 without content projects only its structured error.message, never response.body.
 No reasoning bytes or provider state establish trusted native origin here.
 
+OpenCode user prompts pass through the same reminder filter for native/classic
+coverage and native/classic/flat-JSONL metadata extraction. Exact literal
+`<system-reminder>...</system-reminder>` blocks, including nested blocks, are
+removed wherever they occur; text outside them stays byte-for-byte unchanged.
+An injection-only message adds no user prompt or user semantic record. The
+filter also runs before skill matching; independent token metadata is retained.
+An unfinished block suppresses its tail and marks partial/Incomplete; a stray
+closing tag is retained and marks partial/Incomplete. Idle cannot clear these
+violations. Only user text is filtered, and other providers keep their existing
+semantics. This is a literal marker filter, not proof of producer origin.
+
 ### OpenCode 安装流程契约（第一批必须满足）
 
 **状态（OG-02 当前实现）**：HookProvider 已注册；registry/parser 与新插件使用 OG-00 审计的 2.0.26 API/source。Node/Bun actual runtime 的 synthetic exporter 门证明模板执行与转发，不独自证明真实 OpenCode 内容或 native 来源。

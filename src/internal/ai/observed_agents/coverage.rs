@@ -1301,10 +1301,18 @@ fn normalize_opencode_export_inner(
             match kind {
                 Some("user") => {
                     let text = match message.get("text").and_then(CanonValue::as_str) {
-                        Some(text) => text.to_owned(),
+                        Some(text) => {
+                            let filtered = super::extract::strip_injection_prefixes(text);
+                            violation |= filtered.malformed;
+                            if filtered.removed && filtered.text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(filtered.text.into_owned())
+                            }
+                        }
                         None => {
                             violation = true;
-                            String::new()
+                            Some(String::new())
                         }
                     };
                     violation |= !native_user_attachments_supported(message);
@@ -1312,7 +1320,9 @@ fn normalize_opencode_export_inner(
                     if violation {
                         turn.completeness = Completeness::Incomplete;
                     }
-                    turn.records.push(SemanticRecord::User { text });
+                    if let Some(text) = text {
+                        turn.records.push(SemanticRecord::User { text });
+                    }
                     observe_turn_timestamp(turn, timestamp);
                     pending_native.insert(turn.ordinal);
                 }
@@ -1457,11 +1467,16 @@ fn normalize_opencode_export_inner(
 
         match role {
             "user" => {
+                let filtered = super::extract::strip_injection_prefixes(&text);
                 let turn = open_turn(&mut turns, msg_id);
-                if violation {
+                if violation || filtered.malformed {
                     turn.completeness = Completeness::Incomplete;
                 }
-                turn.records.push(SemanticRecord::User { text });
+                if !filtered.removed || !filtered.text.trim().is_empty() {
+                    turn.records.push(SemanticRecord::User {
+                        text: filtered.text.into_owned(),
+                    });
+                }
             }
             "assistant" => {
                 let turn = current_or_open(&mut turns);

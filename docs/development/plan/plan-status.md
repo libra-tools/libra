@@ -855,3 +855,13 @@ Claude R1实际PASS（0P0/0P1/1P2/5P3，31turn，SHA1e37d7eb236f565bf3727d9a50fe
 ### 2026-10-11：OG-09签名交付、开始OG-11准备
 
 source `2e7a8e22d4a269c04f09116fc71a666fa81c3d05` parent0f4a6bdb，10owned postimage blobs MATCH、PGP+DCO一次、普通Push exit0与实际GitHub main MATCH。125聚焦/严格Clippy/fmt/site exit0，实际Claude R1 PASS保持；DEFER-OG-NORMALIZER01不在本计划扩展，无true export/native/Linux/full当前候选冒称。plan05原hasha705585d保留且本tree delta排除，网站cf原4dirty保留。0.30.42无发布，阶段与最终full/C-D仍待。基础5/13=38.46%，正式4/61=6.56%；下一OG11自持注入前缀表和normalization/extraction共用过滤。
+
+### 2026-10-11：OG-11 current-main开工与必要写集修订
+
+main e3d37842、OG09 signed source2e7a8e22已交付；原过滤表/helper/具名测试缺，历史5AC本地接受不继承。自动采用推荐必要修订：接OpenCode内部coverage与prompt extraction，移除失效runtime锚点/写集（该文件原样），prod/landing2、AC6/VER1（增加malformed标签fail-visible与嵌套不泄漏，同轴≤8）。GC02过滤SSOT与generic OpenCode分支命中T1，最终源码实际双env Nextest全量后Push；Claude单审PASS/fmt/strict，阶段最终全量保留。基础5/13、正式4/61；plan05和网站原dirty保留，native硬门/真实LinuxUNRUN不变。
+
+### 2026-10-11：OG-11最终全量与Claude单审通过
+
+AC6/6、VER1/1，127/127聚焦（零retry）、9699/9699双env默认Nextest（13slow/1flaky/2leaky/9skip）、fmt/严格all-target/all-feature Clippy/site0。full842.257s、18:26:30.171003–18:42:53.166084 UTC、SHAf525ab0bb70c6f67144889af5f4082908676e30353ab461abbbc7c9cee2bfdf8。实际Claude R1 PASS/0P0/0P1/0P2/4P3，40turn，原稿SHAb108af359d762c5e201a95f21626b42aa0b88661d311ff0dd257b8dbc6cdcdcf。11文件冻结全量与审稿原样；prod仅extract/coverage，旧runtime原样，其它provider/canonical/oracles原样。2LEAK及旧deadline用例TRY1FAIL/TRY2PASS沿DEFER-OG-TEST01未称修复。无real OpenCode/native/Linux证明，0.30.42无发布、网站cf仅owned段本地。plan05原bytes保持；signedPush待、基础5/13与formal4/61保持，下一OG14。
+
+- **DEFER-OG-FILTER-01（本计划外非阻断补强）：** R1的4P3为额外其它provider/assistant literal标签否定测试、既有covered文本遇此新过滤时coverage-v1 conflict的迁移说明、已移除block内redaction sentinel不再poison的先后口径、deadline string cap先于过滤而超限partial。当前精确字面/嵌套/malformed/两通路与独立usage/time已实际通过，未来另行补强；既有claim差异仍走原conflict，未称已迁移/免冲突。PASS可通过与外围延期按用户授权，不扩大此卡，不把字面标签当native来源证明。

@@ -115,6 +115,13 @@ native 用户附件、skill text 与工具文件结果尚不支持：标记 Inco
 只投影结构化 error.message，不投影 response.body。本卡不凭 reasoning 字节或 state 证明
 可信 native 来源。
 
+OpenCode 用户文本在native/classic coverage与native/classic/flat-JSONL元数据提取中
+共用reminder过滤。精确字面 `<system-reminder>...</system-reminder>` 块（含嵌套）
+在任何位置被移除；块外文本保持原字节。纯注入消息不产用户prompt或User语义记录，
+过滤先于skill匹配，独立token元数据仍保留。未闭合块隐藏尾部并标记partial/Incomplete；
+孤立结束标签保留并标记partial/Incomplete，idle不能洗白。只过滤用户文本，
+其它provider语义保持。此为字面标记过滤，不证明producer来源。
+
 ## 子命令
 
 | 子命令 | 说明 |

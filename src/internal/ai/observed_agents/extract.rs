@@ -20,7 +20,7 @@
 //! - OpenCode: 2.0.26 session exports with typed `messages`, plus classic
 //!   `info`/`parts` envelopes and best-effort flat JSONL compatibility.
 
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use serde_json::Value;
 
@@ -32,6 +32,77 @@ use crate::internal::ai::completion::CompletionUsageSummary;
 /// commands, so it shares the single-entry registry until upstream
 /// evidence says otherwise.
 pub const CLAUDE_CODE_SKILL_REGISTRY: &[&str] = &["/review", "/security-review", "/simplify"];
+
+/// OpenCode-only injection grammar; other providers keep their own transcript semantics.
+pub const OPENCODE_INJECTION_PREFIXES: &[&str] = &["<system-reminder>"];
+const OPENCODE_INJECTION_END: &str = "</system-reminder>";
+
+pub(crate) struct FilteredPrompt<'a> {
+    pub text: Cow<'a, str>,
+    pub removed: bool,
+    pub malformed: bool,
+}
+
+/// Strip exact reminder blocks in one linear scan. Nested blocks stay suppressed;
+/// an unfinished block suppresses its tail and is reported, never silently complete.
+pub(crate) fn strip_injection_prefixes(text: &str) -> FilteredPrompt<'_> {
+    if !OPENCODE_INJECTION_PREFIXES
+        .iter()
+        .any(|prefix| text.contains(prefix))
+        && !text.contains(OPENCODE_INJECTION_END)
+    {
+        return FilteredPrompt {
+            text: Cow::Borrowed(text),
+            removed: false,
+            malformed: false,
+        };
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut depth = 0usize;
+    let mut removed = false;
+    let mut malformed = false;
+    while let Some(offset) = text[cursor..].find('<') {
+        let start = cursor + offset;
+        if depth == 0 {
+            output.push_str(&text[cursor..start]);
+        }
+        let remaining = &text[start..];
+        if let Some(prefix) = OPENCODE_INJECTION_PREFIXES
+            .iter()
+            .find(|prefix| remaining.starts_with(**prefix))
+        {
+            // Each increment consumes a non-empty tag within this bounded input;
+            // nesting depth therefore cannot exceed the input's byte length.
+            depth += 1;
+            removed = true;
+            cursor = start + prefix.len();
+        } else if remaining.starts_with(OPENCODE_INJECTION_END) {
+            if depth == 0 {
+                malformed = true;
+                output.push_str(OPENCODE_INJECTION_END);
+            } else {
+                depth -= 1;
+            }
+            cursor = start + OPENCODE_INJECTION_END.len();
+        } else {
+            if depth == 0 {
+                output.push('<');
+            }
+            cursor = start + 1;
+        }
+    }
+    if depth == 0 {
+        output.push_str(&text[cursor..]);
+    } else {
+        malformed = true;
+    }
+    FilteredPrompt {
+        text: Cow::Owned(output),
+        removed,
+        malformed,
+    }
+}
 pub const CODEX_SKILL_REGISTRY: &[&str] = &["/review"];
 pub const OPENCODE_SKILL_REGISTRY: &[&str] = &["/review"];
 
@@ -1128,6 +1199,14 @@ fn opencode_prompt(
         mark_collection_limit(out, limiter);
         return;
     }
+    let filtered = strip_injection_prefixes(text);
+    if filtered.malformed {
+        opencode_partial(out, OPENCODE_SHAPE_WARNING);
+    }
+    if filtered.removed && filtered.text.trim().is_empty() {
+        return;
+    }
+    let text = filtered.text.as_ref();
     if text.contains("[redacted:") {
         opencode_partial(out, OPENCODE_SHAPE_WARNING);
         return;
@@ -1434,6 +1513,20 @@ fn ingest_generic_record(
                 None
             }
         };
+        let text = text.and_then(|text| {
+            if slug != "opencode" {
+                return Some(text);
+            }
+            let filtered = strip_injection_prefixes(&text);
+            if filtered.malformed {
+                opencode_partial(out, OPENCODE_SHAPE_WARNING);
+            }
+            if filtered.removed && filtered.text.trim().is_empty() {
+                None
+            } else {
+                Some(filtered.text.into_owned())
+            }
+        });
         if let Some(text) = text {
             if let Some((skill, signal)) = match_skill(&text, registry) {
                 let timestamp = entry.get("timestamp").and_then(Value::as_str).unwrap_or("");

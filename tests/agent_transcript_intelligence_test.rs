@@ -348,6 +348,111 @@ fn opencode_native_text_and_tool_match_classic_coverage_records() {
     assert_eq!(trailing[0].completeness, Completeness::Incomplete);
 }
 
+#[test]
+fn opencode_system_reminder_stripped() {
+    assert_eq!(extract::OPENCODE_INJECTION_PREFIXES, ["<system-reminder>"]);
+    for (source, expected, partial) in [
+        (
+            "<system-reminder>injected private instructions</system-reminder>",
+            None,
+            false,
+        ),
+        (
+            "<system-reminder>injected</system-reminder> /review human",
+            Some(" /review human"),
+            false,
+        ),
+        (
+            "human <system-reminder>injected</system-reminder> remainder",
+            Some("human  remainder"),
+            false,
+        ),
+        (
+            "<system-reminder>outer<system-reminder>inner</system-reminder>still private</system-reminder>human",
+            Some("human"),
+            false,
+        ),
+        (
+            "human<system-reminder>unterminated private",
+            Some("human"),
+            true,
+        ),
+        ("<system-reminder>unterminated private", None, true),
+        (
+            "human </system-reminder>",
+            Some("human </system-reminder>"),
+            true,
+        ),
+        ("普通 human text", Some("普通 human text"), false),
+    ] {
+        let native = opencode_export(serde_json::json!([
+            native_user("msg_u", source),
+            native_idle("succeeded")
+        ]));
+        let classic = serde_json::json!({"info":{"location":{"directory":"/project"}},"messages":[{"info":{"id":"msg_u","role":"user"},"parts":[{"type":"text","text":source}]}]});
+        for doc in [native, classic] {
+            let bytes = serde_json::to_vec(&doc).unwrap();
+            let summary = extract::extract_opencode(&bytes);
+            assert_eq!(
+                summary.prompts,
+                expected.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                "{source}"
+            );
+            assert_eq!(summary.partial, partial, "{source}");
+            let turns = normalize_opencode_export(&bytes);
+            let users = turns
+                .iter()
+                .flat_map(|t| &t.records)
+                .filter_map(|r| match r {
+                    SemanticRecord::User { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                users,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{source}: same filter in normalization"
+            );
+            assert_eq!(
+                turns
+                    .iter()
+                    .any(|t| t.completeness == Completeness::Incomplete),
+                partial,
+                "{source}: malformed not washed by idle"
+            );
+        }
+        let flat = serde_json::json!({"role":"user","content":source});
+        let summary = extract::extract_opencode(&serde_json::to_vec(&flat).unwrap());
+        assert_eq!(
+            summary.prompts,
+            expected.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        );
+        assert_eq!(summary.partial, partial);
+    }
+    let doc = opencode_export(serde_json::json!([native_user(
+        "msg_u",
+        "<system-reminder>/review not human</system-reminder>ordinary"
+    )]));
+    assert!(opencode_summary(&doc).skill_events.is_empty());
+    let doc = opencode_export(serde_json::json!([native_user(
+        "msg_u",
+        "<system-reminder>private</system-reminder>/review human"
+    )]));
+    assert_eq!(opencode_summary(&doc).skill_events.len(), 1);
+    let flat = serde_json::json!({"role":"user","timestamp":"2026-10-11T00:00:00Z","content":"<system-reminder>private</system-reminder>/review human","usage":{"input_tokens":12,"output_tokens":3}});
+    let result = extract::extract_opencode(&serde_json::to_vec(&flat).unwrap());
+    assert_eq!(result.usage.unwrap().total_tokens, Some(15));
+    assert_eq!(result.skill_events[0].timestamp, "2026-10-11T00:00:00Z");
+    let flat = serde_json::json!({"role":"user","content":"<system-reminder>private</system-reminder>","usage":{"input_tokens":12,"output_tokens":3}});
+    let result = extract::extract_opencode(&serde_json::to_vec(&flat).unwrap());
+    assert!(result.prompts.is_empty());
+    assert_eq!(
+        result.usage.unwrap().total_tokens,
+        Some(15),
+        "filtering prompt must not discard independent usage metadata"
+    );
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/agent_transcripts")

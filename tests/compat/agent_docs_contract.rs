@@ -958,3 +958,31 @@ fn opencode_docs_disclose_normalizer_completeness_and_attachment_limits() {
         "Native error fallback projects error.message, never response.body",
     );
 }
+
+#[test]
+fn opencode_docs_disclose_shared_literal_reminder_filter() {
+    for (label, document) in [("tracing", AGENT_DOC), ("agent English", AGENT_CMD_DOC_EN)] {
+        for required in [
+            "including nested blocks",
+            "text outside them stays byte-for-byte unchanged",
+            "independent token metadata is retained",
+            "unfinished block suppresses its tail and marks partial/Incomplete",
+            "literal marker filter, not proof of producer origin",
+        ] {
+            assert_contains(document, label, required);
+        }
+    }
+    for required in [
+        "块外文本保持原字节",
+        "独立token元数据仍保留",
+        "idle不能洗白",
+        "不证明producer来源",
+    ] {
+        assert_contains(AGENT_CMD_DOC_ZH, "agent Chinese", required);
+    }
+    assert_contains(
+        COMPATIBILITY_DOC,
+        "compatibility",
+        "malformed markers stay partial/Incomplete",
+    );
+}
