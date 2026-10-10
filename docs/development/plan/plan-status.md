@@ -314,7 +314,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **本对话当前指针（USER-PRIORITY-OPENCODE-20261010）：** SCOPED-04修订macOS功能localD已验收，OG-00当前2.0.26/官方9b4ec571 source-qualified localD已验收，下一优先OG-01 registry/parser，然后基础采集/字段审计→FAST-OG-01→可信producer/verifier两家族。scoped02/03/RG03/05复杂链后置；后续同类高复杂度非核心问题具名DEFER，不记PASS/完成。native Source A及实际验收/安全CI/四平台发布不放宽，正式仍4/61=6.56%。详细依赖优先规则见plan-20260902。
+- **本对话当前指针（USER-PRIORITY-OPENCODE-20261010）：** SCOPED-04修订macOS功能localD已验收，OG-00当前2.0.26/官方9b4ec571 source-qualified localD已验收，OG-01当前2.0.26 registry/parser localD已验收并signed source main push 2bcea258；下一优先OG-02 Node/Bun模板，然后基础采集/字段审计与可信producer/verifier两家族按依赖推进。scoped02/03/RG03/05复杂链后置；后续同类高复杂度非核心问题具名DEFER，不记PASS/完成。native Source A及实际验收/安全CI/四平台发布不放宽，正式仍4/61=6.56%。详细依赖优先规则见plan-20260902。
 
 - **当前正在执行：** `plan-20260907` 已收口（B3-00..B3-17 全 `done`/`complete`，`v0.23.68`→`v0.29.0`；最终 Codex/Claude R40 双 PASS；GC-B3-01/02 收口守卫绿；`DEP-B3-05` 已满足）。`plan-20260913`（Media）FL-00..FL-05 亦已 `done`/`complete`（`v0.30.0`..`v0.30.5`），仅剩计划级收口门。**`plan-20260926` DM-00 已 `done`/`complete`**（2026-10-07），`plan-20260819` 已登记取代；**`DM-01`、`DM-10`、`DM-02` 已 `done`/`complete`**（DM-01 → v0.30.31；DM-10 → v0.30.35；DM-02 → v0.30.37，均 REL-DM-01 独立发布 + D 组全绿；ER-05 评审待记录）。**下一个零依赖候选为 `plan-20260916` CAP-01（先重核 `DEP-CAP-01`）；plan-20260926 内的下一张为 `DM-13`**（新鲜度、horizon 窗口与重建等价）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿；2026-09-28 本地最终门 8241/8241 passed，本轮不 bump 版本）。
 - **本会话已收口：** `issues/577` SA-02/SA-01 已 `done`/`complete`；PR #578、v0.24.1、8/8 release jobs、网站 `cf` 与生产页 D 证据均完成，Issue #577 CLOSED。
@@ -791,3 +791,7 @@ R1实际PASS（0P0/0P1/1P2/5P3），非阻断P2为已批准ContractA下旧模板
 OG-01 AC8/8、VER15/15：focused89/89、真实Node模板marker1/1、fmt/strict/site0、full9645/9645（13slow/1flaky/3leaky/9skip，run34a9e98a）、Claude单审PASS（0P0/0P1/1非阻断P2/5P3）。全部15实现/doc hashes与测试/peer冻结源一致；源提交交付中，完成后下一优先OG02，完整新插件/Node-Bun/native证据仍后验。FAST-OG01 C/D待执行，正式仍4/61=6.56%。
 
 - **DEFER-OG-TEST-01（外围验收检测标记）：** 本轮未修改git-client/storage_r2_test cases出现3LEAK标记，既有deadline case first-fail/TRY2-PASS；full exit0并按受控重试通过。标记原样保存于acceptance-receipt/full日志，根因未定，不称实际泄漏或已修复，后续独立诊断，不改本计划基本采集/来源/实际full标准。
+
+### 2026-10-10：OG-01 signed-DCO main源码交付完成，进入OG02
+
+实际main source 2bcea258e4ac8e559d172fc53ccd528be81a7545，parent befaa45，17 owned路径PGP header/DCO一次、committed blobs17/17 MATCH、ordinary push exit0/远端main一致。focused89/89、producerNode1/1、fmt/strict/site0、full9645/9645与Claude single PASS覆盖同冻结实现；full1flaky/3leaky/9skip如实保留。基础组13成员local交付2/13=15.38%，正式4/61=6.56%（C/D仍FAST-OG01）。下一OG02双运行时插件，接续FOLLOWUP-OG02-STALE01；无真实native/Bun/Linux证明提前放行。plan05原bytes保留、backend cf只本地event段增量保留未deploy；本轮无版本发布。
