@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.14`（整份按 v2.14 新建；见 [`plan-template.md`](plan-template.md)）
 
-**计划状态:** 已排期（规划阶段；全部任务卡 `pending`）
+**计划状态:** 实施中（MC-01、MC-22、MC-16、MC-19 已 `done` / `complete`；MC-29 发布候选 `0.30.79`，D 组未绿前 Acceptance 仍空）
 
 **计划基线 commit:** `85dcc505998eddfb3303242623e47a053db6bbf4`（`main`，该提交中 `Cargo.toml` 为 `version = "0.30.56"`，核对时间 `2026-10-19 08:01:54 UTC`；此后工作区已出现其它计划未提交的 `2026101902_worktree_layout_capability` migration 与 `0.31.0` 版本改动（DEP-MC-03），本计划不以它们为基线；开工时按 ER-02 刷新）
 
@@ -3238,6 +3238,7 @@ ER-01 至 ER-14 按模板原文对本计划全部任务生效（见 [`plan-templ
 | bridge 的读超时先例 | `src/internal/ai/agent_bridge/protocol.rs:374`（`LBR-AGENT-036`） |
 | 读 deadline（MC-19 交付） | `src/internal/ai/mcp_server/tools/mod.rs` |
 | 本地门 | `v0.30.73` 至 `v0.30.76` 的 tag 都不改。`v0.30.76`（`9694ff0`）Codex `VERDICT: FAIL`，`P0=0`，`P1=1`：正常退出路径在槽位仍存活时 `reader.join()`，未结束的读取线程也在释放槽位之前启动 join。前滚 `0.30.77`：stdout 经有界 channel 交回；任何 `join` 之前先 `drop` 槽位，回复路径不再 `join`。`deadline_reply_does_not_wait_for_stdout_holder`、`blocking_read_times_out`、`slots_return_after_workers_killed`、`envelope_allows_under_cap` 均为 `test result: ok. 1 passed; 0 failed`。clippy `-D warnings` exit 0。nextest：`Summary [ 572.138s] 10676 tests run: 10676 passed (12 slow), 21 skipped`，exit 0。 |
+| 0.30.79 候选 | 三个版本面为 `0.30.79`。`source .env.test && cargo test --test agent_mcp_exec_test <name> -- --exact`：AC-1..AC-8 与 `deadline_reply_does_not_wait_for_stdout_holder` 均为 `test result: ok. 1 passed; 0 failed`。英文命令页含 `LBR-AGENT-036` 与 `4 个并发读子进程`。网站 `cf` `7b157e9cda6e772653aa772671cd4842c59f6285` 与 `https://libra.tools/en/docs/commands/agent`（HTTP 200）含 `LBR-AGENT-036` 与 `4 concurrent read workers`。Codex review session `01a15d4b-07cc-7880-a53b-2afdd4a03e4b`（read-only，未提交 diff）：无行为缺陷，`P0=0`，`P1=0`。D 组未取。 |
 
 **Acceptance criteria:**
 
@@ -3267,9 +3268,9 @@ ER-01 至 ER-14 按模板原文对本计划全部任务生效（见 [`plan-templ
 - [x] `docs/commands/agent.md`：`rg -qF -- 'LBR-AGENT-036' docs/commands/agent.md && rg -qF -- '4 个并发读子进程' docs/commands/agent.md`
 - [x] `docs/commands/zh-CN/agent.md`：`rg -qF -- 'LBR-AGENT-036' docs/commands/zh-CN/agent.md && rg -qF -- '4 个并发读子进程' docs/commands/zh-CN/agent.md`
 - [x] `docs/development/commands/agent.md`：`rg -qF -- '--read-worker' docs/development/commands/agent.md && rg -qF -- 'SIGKILL' docs/development/commands/agent.md`
-- [ ] 网站源文件 `agent`：`rg -qF -- 'LBR-AGENT-036' ../libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md && rg -qF -- '4 concurrent read workers' ../libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md`；GC-MC-05 ①–⑤ 交付后线上页面：`PAGE="$(curl -fsS https://libra.tools/en/docs/commands/agent)" && printf '%s' "$PAGE" | rg -qF -- 'LBR-AGENT-036' && printf '%s' "$PAGE" | rg -qF -- '4 concurrent read workers'`（GC-MC-05 ⑥）
+- [x] 网站源文件 `agent`：`rg -qF -- 'LBR-AGENT-036' ../libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md && rg -qF -- '4 concurrent read workers' ../libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md`；GC-MC-05 ①–⑤ 交付后线上页面：`PAGE="$(curl -fsS https://libra.tools/en/docs/commands/agent)" && printf '%s' "$PAGE" | rg -qF -- 'LBR-AGENT-036' && printf '%s' "$PAGE" | rg -qF -- '4 concurrent read workers'`（GC-MC-05 ⑥）
 - [x] 测试索引：`rg -q '^\| `agent_mcp_exec_test` ' tests/INDEX.md && rg -q 'name = "agent_mcp_exec_test"' Cargo.toml`
-- [ ] 语义复核：本卡 ER-05 Codex review 的输入包含上列每个文档文件的 diff，评审结论须逐文件确认其内容与本卡 `Docs and compatibility impact` 的内容说明一致（网站页另由 GC-MC-05 ④ 的 Claude Code PASS 覆盖）
+- [x] 语义复核：本卡 ER-05 Codex review 的输入包含上列每个文档文件的 diff，评审结论须逐文件确认其内容与本卡 `Docs and compatibility impact` 的内容说明一致（网站页另由 GC-MC-05 ④ 的 Claude Code PASS 覆盖）
 
 **Full-suite trigger:** `T-1: src/cli.rs 全局预检分派与 Cargo.toml [[test]] 行`
 
