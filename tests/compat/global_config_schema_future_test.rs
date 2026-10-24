@@ -724,7 +724,7 @@ fn config_doctor_uses_global_role() {
         .split_whitespace()
         .collect::<String>();
     assert!(cli.contains("if!schema_doctor{crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;enforce_global_config_schema_policy(&args.command).await?;}"));
-    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_)){run_auto_upgrade_check_hook();}"));
+    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_)|Commands::Ui(_)){run_auto_upgrade_check_hook();}"));
 }
 
 /// Pipe one synthetic provider hook frame into a hook entry of the fixture's
