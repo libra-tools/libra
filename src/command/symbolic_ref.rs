@@ -56,7 +56,8 @@ pub struct SymbolicRefArgs {
     #[clap(value_name = "NAME")]
     pub name: Option<String>,
 
-    /// New symbolic target. Must be refs/heads/<branch>.
+    #[cfg_attr(doc, doc = " New symbolic target. Must be refs/heads/`<branch>`.")]
+    #[cfg_attr(not(doc), doc = " New symbolic target. Must be refs/heads/<branch>.")]
     #[clap(value_name = "REF")]
     pub target: Option<String>,
 }

@@ -185,7 +185,7 @@ pub struct WorkspaceRecord {
     /// Set for linked worktrees (their lease identity); `None` for task and
     /// remote workspaces, which own their own directory.
     pub worktree_id: Option<String>,
-    /// Canonical absolute path — resolved by [`canonical_path_string`] before
+    /// Canonical absolute path — resolved by `canonical_path_string` before
     /// it is ever stored.
     pub path: String,
     pub owner_kind: WorkspaceOwnerKind,

@@ -12,7 +12,7 @@
 //! filesystem or the object store.
 //!
 //! BOTH commands go through [`match_pairs`]. `status` owns the
-//! [`ObjectReadBudget`]/[`WorktreeReadBudget`] instances (threaded through
+//! `ObjectReadBudget`/`WorktreeReadBudget` instances (threaded through
 //! the exact-stage OID streaming and the inexact content reads, and shared
 //! across its staged and unstaged passes); `diff` supplies its own
 //! [`RenameContentSource`] over tree/index/worktree blobs and runs unbudgeted

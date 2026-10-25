@@ -9,7 +9,7 @@
 //! - Maps low-level [`GitError`] / [`io::Error`] variants into structured
 //!   [`AddError`] cases that each carry stable error codes and human-readable
 //!   hints (see the `From<AddError> for CliError` impl).
-//! - Supports four output channels in [`render_add_output`]: JSON, quiet
+//! - Supports four output channels in `render_add_output`: JSON, quiet
 //!   (warnings only on stderr), normal (summary), and verbose (per-path).
 //! - Provides a "refresh-only" mode that updates index stat metadata without
 //!   rewriting blobs.
@@ -352,7 +352,7 @@ pub struct ChmodRejection {
 
 /// Structured result of a single `libra add` invocation.
 ///
-/// Built by [`run_add`] and consumed by [`render_add_output`] (text mode) or
+/// Built by [`run_add`] and consumed by `render_add_output` (text mode) or
 /// emitted directly through `output::emit_json_data` (JSON mode). The fields
 /// always reference paths relative to the working directory.
 #[derive(Debug, Clone, Serialize)]

@@ -709,7 +709,14 @@ pub struct CherryPickArgs {
     )]
     pub quit: bool,
 
-    /// Append a "(cherry picked from commit <oid>)" line to the commit message
+    #[cfg_attr(
+        doc,
+        doc = " Append a \"(cherry picked from commit `<oid>`)\" line to the commit message"
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Append a \"(cherry picked from commit <oid>)\" line to the commit message"
+    )]
     #[clap(short = 'x')]
     pub append_source: bool,
 

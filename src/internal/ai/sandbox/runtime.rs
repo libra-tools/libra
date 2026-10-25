@@ -504,7 +504,7 @@ pub struct SandboxTransformRequest<'a> {
     /// and the built-in bwrap path is selected,
     /// [`create_bwrap_command_args_with_seccomp`] adds
     /// `--seccomp <fd>` to the bwrap args and
-    /// [`install_seccomp_policy_pre_exec`] opens the file in the
+    /// `install_seccomp_policy_pre_exec` opens the file in the
     /// child to populate that FD. Ignored on non-Linux and when
     /// the external helper path is taken (the helper has its own
     /// seccomp story).
@@ -1026,7 +1026,7 @@ pub fn create_bwrap_command_args(
 /// includes `--seccomp <fd>` so bwrap loads the BPF policy from
 /// the inherited file descriptor. The caller is responsible for
 /// keeping the FD open across exec — see
-/// [`install_seccomp_policy_pre_exec`].
+/// `install_seccomp_policy_pre_exec`.
 #[allow(clippy::too_many_arguments)] // extra_ro_bind + writable_binds are the SBX-02 export seam
 pub fn create_bwrap_command_args_with_seccomp(
     command: Vec<String>,

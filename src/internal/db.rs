@@ -5,8 +5,8 @@
 //!   `~/.libra/config.db` (global), cached by path.
 //! - Bootstrap the schema from the embedded `sqlite_20260309_init.sql`.
 //! - Run idempotent schema upgrades only from explicit creation / upgrade paths:
-//!   - [`ensure_config_kv_schema`] adds the `config_kv` table to old DBs.
-//!   - [`ensure_ai_projection_schema`] adds the AI projection tables (using
+//!   - `ensure_config_kv_schema` adds the `config_kv` table to old DBs.
+//!   - `ensure_ai_projection_schema` adds the AI projection tables (using
 //!     the bootstrap section delimited by `BEGIN/END AI PROJECTION SCHEMA`).
 //!   - [`ensure_ai_runtime_contract_schema`] applies Phase 0 contract DDL.
 //!   - [`migration::run_builtin_migrations`] (CEX-12.5) applies every
@@ -14,7 +14,7 @@
 //!     [`migration::builtin_migrations`]. Future schema changes (CEX-13b /
 //!     CEX-15 / CEX-16) **must** add a [`migration::Migration`] there
 //!     instead of introducing a new ad-hoc `ensure_*_schema` helper.
-//! - Provide a process-wide cache ([`TEST_DB_CONNECTIONS`]) keyed by absolute
+//! - Provide a process-wide cache (`TEST_DB_CONNECTIONS`) keyed by absolute
 //!   path so concurrent callers share a single sea-orm `DbConn` per database
 //!   (matching SQLite's "one writer at a time" model).
 //!

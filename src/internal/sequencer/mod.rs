@@ -1286,7 +1286,7 @@ async fn scoped_rebase_state_active<C: ConnectionTrait>(
 /// Backward-compatible public facade for the pre-`am` enum surface. An active
 /// `am` cannot be represented by [`SequenceKind`], so callers receive an error
 /// instead of a misleading `None` while crate-internal consumers use
-/// [`detect_active_operation`].
+/// `detect_active_operation`.
 pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
     match detect_active_operation().await? {
         Some(ActiveSequenceKind::Known(kind)) => Ok(Some(kind)),

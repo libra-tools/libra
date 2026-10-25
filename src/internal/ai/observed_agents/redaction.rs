@@ -39,7 +39,7 @@ pub const MAX_REDACTION_MATCH_SAMPLES: usize = 256;
 ///
 /// The newtype is *transparent* (the inner `Vec<u8>` is reachable via
 /// [`Self::bytes`] / [`Self::into_inner`]) but not *constructible* from
-/// arbitrary input — only this module can call [`Self::new_unchecked`].
+/// arbitrary input — only this module can call `Self::new_unchecked`.
 ///
 /// Persistence APIs (`observed_agents::checkpoint::write_transcript_blob`, the
 /// cloud-sync transcript uploader, `HistoryManager::create_append_commit`'s
@@ -234,7 +234,7 @@ impl Redactor {
 
     /// Walk every rule across `input` and return the redacted bytes plus a
     /// report. Rules are applied in priority order (the order they appear in
-    /// [`DEFAULT_RULES`]) and replacements are non-overlapping — once a span
+    /// `DEFAULT_RULES`) and replacements are non-overlapping — once a span
     /// has been replaced, later rules don't re-scan the placeholder.
     pub fn redact(&self, input: &[u8]) -> (RedactedBytes, RedactionReport) {
         self.redact_owned(input.to_vec())

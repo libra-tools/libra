@@ -1179,7 +1179,7 @@ pub enum ObjectReadFailure {
 }
 
 /// Wraps a `dyn Storage` (local, remote, or tiered) and adapts every operation to a
-/// blocking call by routing through the dedicated [`RUNTIME`]. Cheap to clone —
+/// blocking call by routing through the dedicated `RUNTIME`. Cheap to clone —
 /// internally it is an `Arc` plus a `PathBuf`.
 #[derive(Clone)]
 pub struct ClientStorage {
@@ -1532,7 +1532,7 @@ impl ClientStorage {
     ///
     /// Functional scope:
     /// - Picks the storage backend based on env / vault config (see
-    ///   [`Self::create_storage_backend`]). Local-only when `LIBRA_STORAGE_TYPE` is
+    ///   `Self::create_storage_backend`). Local-only when `LIBRA_STORAGE_TYPE` is
     ///   absent.
     ///
     /// Boundary conditions:
@@ -1870,7 +1870,7 @@ impl ClientStorage {
     /// Wait for all background tasks (e.g. indexing) to complete.
     ///
     /// Functional scope:
-    /// - Polls [`PENDING_TASKS`] every 100 ms until it reaches zero; logs a progress
+    /// - Polls `PENDING_TASKS` every 100 ms until it reaches zero; logs a progress
     ///   line every 5 s so a stuck index update is visible to the user.
     ///
     /// Boundary conditions:
@@ -2344,7 +2344,7 @@ impl ClientStorage {
     ///
     /// Functional scope:
     /// - Writes the object via the configured backend (synchronously, on the storage
-    ///   runtime), records an atomic repair marker, then enqueues an [`IndexUpdateMsg`]
+    ///   runtime), records an atomic repair marker, then enqueues an `IndexUpdateMsg`
     ///   so the cloud-backup object index reflects the new entry.
     ///
     /// Boundary conditions:
@@ -2574,7 +2574,7 @@ impl ClientStorage {
     /// Functional scope:
     /// - Recognises `HEAD`, branch names, and Git navigation suffixes (`~`, `^`).
     /// - For navigation forms (`HEAD~3`, `main^^`) resolves the base ref then walks
-    ///   parent commits via [`Self::navigate_commit_path`].
+    ///   parent commits via `Self::navigate_commit_path`.
     /// - For prefix matches (e.g. an abbreviated SHA) delegates to the underlying
     ///   storage's `search`.
     ///

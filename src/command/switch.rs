@@ -93,7 +93,14 @@ pub struct SwitchArgs {
     #[clap(long = "ignore-other-worktrees")]
     pub ignore_other_worktrees: bool,
 
-    /// When <branch> is not a local branch but matches exactly one
+    #[cfg_attr(
+        doc,
+        doc = " When `<branch>` is not a local branch but matches exactly one"
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " When <branch> is not a local branch but matches exactly one"
+    )]
     /// remote-tracking branch, create a local branch tracking it and switch
     /// (Git's DWIM). Enabled by default; overrides `checkout.guess`.
     #[clap(long, overrides_with = "no_guess")]

@@ -301,7 +301,7 @@ pub(crate) async fn await_agent_traces_pure_read_until<T>(
 /// Functional scope: the resulting string is used as a directory name and as a
 /// metadata key, so it must round-trip without escaping. Both inputs are assumed
 /// to come from validated [`CaptureIngressCommand`](crate::internal::ai::capture::ingress::CaptureIngressCommand) values. This is a durable
-/// identity, not a telemetry value; log it only through [`redact_session_id`].
+/// identity, not a telemetry value; log it only through `redact_session_id`.
 pub fn build_ai_session_id(provider: &str, provider_session_id: &str) -> String {
     format!("{provider}{SESSION_ID_DELIMITER}{provider_session_id}")
 }

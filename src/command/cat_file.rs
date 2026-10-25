@@ -107,13 +107,27 @@ pub struct CatFileArgs {
     pub check_exist: bool,
 
     /// Read object names from stdin (one per line) and print
-    /// "<sha> <type> <size>" for each, or "<input> missing" when unresolved.
+    #[cfg_attr(
+        doc,
+        doc = " \"`<sha>` `<type>` `<size>`\" for each, or \"`<input>` missing\" when unresolved."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " \"<sha> <type> <size>\" for each, or \"<input> missing\" when unresolved."
+    )]
     /// Accepts an optional format string (e.g. `--batch-check="%(objectname) %(objecttype)"`).
     #[clap(long = "batch-check", group = "mode", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub batch_check: Option<String>,
 
     /// Read object names from stdin (one per line) and print
-    /// "<sha> <type> <size>\n<contents>\n" for each, or "<input> missing".
+    #[cfg_attr(
+        doc,
+        doc = " \"`<sha>` `<type>` `<size>`\\n`<contents>`\\n\" for each, or \"`<input>` missing\"."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " \"<sha> <type> <size>\\n<contents>\\n\" for each, or \"<input> missing\"."
+    )]
     /// Accepts an optional format string (e.g. `--batch="%(objectname) %(objecttype)"`).
     #[clap(long = "batch", group = "mode", num_args = 0..=1, require_equals = true, default_missing_value = "")]
     pub batch: Option<String>,

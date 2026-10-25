@@ -5,7 +5,7 @@
 //! and batch operations for efficient cloud backup.
 //!
 //! Authentication uses a Cloudflare account ID, API token, and D1 database ID,
-//! resolved through [`resolve_env`](crate::internal::config::resolve_env) so they
+//! resolved through [`resolve_env`] so they
 //! can come from local repo `vault.env.*` config, global config, or process env.
 //! The default client speaks HTTPS to `api.cloudflare.com`; the constructor enforces
 //! `https_only(true)`. Tests can inject a different API base URL through
@@ -358,7 +358,7 @@ pub struct D1Client {
 
 impl D1Client {
     /// Create a new D1 client from environment variables, using
-    /// [`resolve_env`](crate::internal::config::resolve_env) so that
+    /// [`resolve_env`] so that
     /// vault-stored secrets are picked up automatically.
     ///
     /// Resolution order per variable:

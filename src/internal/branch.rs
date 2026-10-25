@@ -15,7 +15,7 @@
 //!   `_with_conn` deadlock rule.
 //!
 //! Concurrency: SQLite serialises writers, so update/delete operations include
-//! a bounded retry loop ([`SQLITE_BUSY_MAX_RETRIES`]) for transient `database is
+//! a bounded retry loop (`SQLITE_BUSY_MAX_RETRIES`) for transient `database is
 //! locked` errors that show up under multi-task contention.
 
 use std::time::Duration;
@@ -523,8 +523,8 @@ impl Branch {
     /// - If a row exists for `(branch_name, remote)`, updates its `commit`.
     /// - Otherwise inserts a new `Branch`-kind row.
     /// - Each storage call is wrapped in a bounded retry loop that backs off
-    ///   linearly when SQLite reports `SQLITE_BUSY` ([`SQLITE_BUSY_MAX_RETRIES`]
-    ///   attempts at [`SQLITE_BUSY_RETRY_BASE_MS`] base delay).
+    ///   linearly when SQLite reports `SQLITE_BUSY` (`SQLITE_BUSY_MAX_RETRIES`
+    ///   attempts at `SQLITE_BUSY_RETRY_BASE_MS` base delay).
     ///
     /// Boundary conditions:
     /// - `commit_hash` is stored verbatim; this function does not validate it

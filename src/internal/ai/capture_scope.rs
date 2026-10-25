@@ -478,7 +478,7 @@ impl CaptureScope {
     }
 
     /// Compatibility wrapper for existing unbounded callers. New
-    /// deadline-aware writes must call [`Self::authorize_final_commit_until`]
+    /// deadline-aware writes must call `Self::authorize_final_commit_until`
     /// as their final SQL operation instead.
     pub async fn assert_workspace_fence_live_for_commit<C: ConnectionTrait>(
         &self,

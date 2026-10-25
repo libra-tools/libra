@@ -1,3 +1,7 @@
+> **2026-10-25 04:25:21 UTC 当前：** DOC-LTR-01源码已采纳、A/B实际通过（48命令、22组help相同、874.796秒），当前`in-progress/locally-accepted`；自己的本地Claude ER05、提交与PR/main D待，完整覆盖仍由FIX03承担。FIX01已合并f33be958并发布v0.30.87，release/CodeQL实际成功，main base仍待；三实现卡0/3。以下旧快照保留。
+
+> **2026-10-25T03:14:21.976945+00:00 PR635实际合并/发布触发与文档修复候选：** FIX-LTR-01本地C所需门/完整默认10761、release build/install已核；签名/DCO head2852497、PR635全部13 checks成功后gh squash merge `f33be958dcc3266df3a6ab796ed90d1766f3cd93`，树90ca1d20与最终C相同、GitHub签名/DCO已核；人工Release/tag v0.30.87已触发release run40157032761，main base40156941519及CodeQL40156941508仍待，未done。原attempt1 eli-MI fontconfig失败与本地retry/资源缺口保留；用户移除该runner，attempt2在Mechaevo成功，非证明eli-MI已修。用户要求Libra下一提交只修104条项目Rustdoc warning，明确排除第三方proc-macro-error2。DOC-LTR-01候选见文末；三张实现修复仍0/3，本新增文档卡独立记账、由FIX03覆盖。以下旧时点记录均保留。
+
 > **2026-10-24 21:42:59 UTC FIX-LTR-01本地A实际终态：** 独立clone的唯一结构oracle修复已通过nightly fmt、strict all-target/all-feature Clippy、exact1/1、完整target54/54及默认全量10761/10761的框架核验，exit均0；21原ignored不变，无失败/flake，3962.768/7200秒、2126输入无漂移。输出38个runtime skip标记已逐身份/逐文字归属，其中1个是缺interpreter的负向断言，37个是既有feature/live/工具/平台覆盖缺口，不能据此宣称所有live行为已测。唯一遗留worker归属当前status-pause无helper用例，已核PID/start identity并通过pidfd人工SIGTERM，确认exit/reap；原资源缺口保留，FIX03未修。A仅本卡locally-accepted，自己的真实Claude ER05、patch/C/D均待；版本仍0.30.86、无提交/push。三卡正式0/3，FIX02/03 pending。以下旧时点事实保留。**
 
 > **2026-10-24 20:23:39 UTC FIX-LTR-01实施入口：** 本计划工作副本位于独立原生clone `/media/eli/data/libra-qualification-20261025`，branch `fix/qualification-schema-doctor`，基线0ca47cc。FIX11实际done/complete且两个告警fixed；恢复R5方案/治理审查PASS。现仅改既有结构字串加入Ui排除，生产CLI、runtime断言和相邻startup guard不变。A未启动、自己的代码ER05未取得；没有bump/提交/push/Release/CI新结果。外部修复仍0/3。下方原时点快照保留。
@@ -379,3 +383,102 @@ R3真实session `82ca0f53-d8f6-4148-af66-13721b381b95`，output SHA256 `8f15fea4
 - P2-5由root承接：cold release、实际A耗时及C一次10800秒上限必须另获真实本地Claude执行准入；尚未claim、bump或预编译，超时/失败STOP，不追加或转移旧窗口。只冻结本次实际后置收据和本计划status行后，再由C审查绑定最终字节/执行器/环境控制。
 - 审查边界披露：Claude为核计数使用Grep读取full.stderr的Summary、两条MCP PASS和FLAKY/TRY计数，并读Clippy提示两行，超出原prompt禁止原始测试输出的约束；未读.env/credentials/JUnit正文。保留原输出及披露，不伪造为完全遵守；后续准入明确允许这些无secret的受限摘要。
 - 当前：源码及A通过、自身ER05 PASS，Lifecycle/Acceptance仍in-progress/locally-accepted；提交、push、CI/Release与C/D均未完成，正式0/3。本文收据为审查后的事实追加，不声称Claude事先审过自己的输出；未来C/D由FIX02按既定终止链补记。
+
+
+### Task DOC-LTR-01: 清除PR635暴露的项目Rustdoc警告
+
+**Task type:** `docs`
+
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（A/B实际通过；自己的Claude ER-05待，未提交/推送；完整C/D仍待FIX-LTR-03覆盖）
+
+**Description:** 用户要求“在 Libra 的下一个提交修复这些 warning”，随后明确排除第三方 `proc-macro-error2 2.0.1` future-incompatibility。只修PR635实际job 121059262116的104条项目Rustdoc诊断：72私有目标链接、28非法HTML占位符、4冗余显式链接。不改依赖、lock、可见性、运行逻辑、CLI输出或lint等级。
+
+**Out of scope:** 第三方未来相容性警告按用户指令保留；FIX02/03源码、原scoped-traces治理及功能未完成状态不借此关闭。本卡没有版本bump、tag、Release或release workflow。
+
+**Current evidence:** PR635 head2852497、被测tree90ca1d20、squash merge f33be958dcc3266df3a6ab796ed90d1766f3cd93；base40143598901 attempt2在Mechaevo的strict Clippy与Rustdoc均exit0但有104条文档warning。原attempt1在eli-MI缺fontconfig.pc失败保留；用户已移除该不一致runner，不能称已修复该机器。Cargo第三方警告出现两次，不计入104条项目warning。日志 https://github.com/libra-tools/libra/actions/runs/40143598901/job/121059262116 。精确源锚点：`src/command/remote.rs:139`（Add.master，不是set-head）、`src/utils/worktree_blob.rs:15`（私有与冗余诊断同处）、`src/command/auth.rs:66`（相对时间占位符）。
+
+**Acceptance criteria:**
+
+- [x] 私有目标的说明保留为代码字面量，不扩大生产可见性。
+- [x] HTML占位符在Rustdoc显示为原意字面量。
+- [x] 公开目标的3条冗余显式链接（sandbox/mod.rs:88、d1_client.rs:8/361）改为等价短链接；worktree_blob.rs:15同处私有目标已由AC1覆盖，保留代码字面量。
+- [x] 非文档源保持逐字节相同。
+- [x] 普通编译的Clap help文档输入与输出保持相同。
+- [x] 第三方依赖及lock保持原字节，不抑制lint。
+
+**Verification:**
+
+- [x] `source .env.test && source .env.live-test && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`；全部项目Rustdoc警告为0，唯一允许的Cargo级提示是用户排除的proc-macro-error2 future incompatibility，分开记录不称零诊断。
+- [x] 精确diff守卫：仅下列53文件的文档注释/文档属性变化；还原普通编译的cfg_attr(not(doc),doc=原文)后，去文档源码与基线逐字节相同；版本、Cargo.lock、依赖、配置、所有测试不变。
+- [x] 真实新二进制与已验收0.30.87二进制逐字节比较受影响命令的`--help`/`-h` stdout、stderr、exit：auth login、cat-file、cherry-pick、clone、commit、format-patch、rebase、remote add、show-ref、switch、symbolic-ref。help子进程不加载.env文件，以白名单环境运行在仓外空临时目录：stdout/stderr管道（非TTY），COLUMNS=100、LANG=LC_ALL=C.UTF-8、TZ=UTC、TERM=dumb、NO_COLOR=1、CLICOLOR=0、CLICOLOR_FORCE=0，隔离HOME/XDG/全局及系统config路径。旧binary是已核C树90ca1d20的`/tmp/fix-ltr01-C-20261025/install/bin/libra`，SHA256 `acc1e55fad788f8c809beeb2025b1b839842d51bb8151018571d5742d1ae985c`；新binary来自本卡实际debug build。所有调用必须exit0；debug/release或元数据差异也STOP，不能忽略。
+
+**Full-suite trigger:** `none`（本卡no-release，不自行执行C；完整覆盖仍继承FIX-LTR-03；本卡只有文档注释及cfg(doc)文档属性，没有CLI注册、参数/错误/配置/执行逻辑改动。若普通编译行为/元数据不再等价，则STOP、ER03重分类及所需全量，不能沿用本判定）。
+
+**Dependencies:** `DEP-DOC-PR635`（incoming：精确已合并f33be958/tree90ca1d20可读取；本卡只消费已保存源与本地A/C，不宣称FIX01远端D或整体来源资格已完成）。
+
+**Deliverables:** 下列53源文件内的Rustdoc注释/属性、本计划与plan-status本计划行；不新增仓库证据文件。
+
+**Implementation write set:** `src/cli.rs`；`src/command/add.rs`；`src/command/agent/investigate.rs`；`src/command/agent/review.rs`；`src/command/auth.rs`；`src/command/bisect.rs`；`src/command/blame.rs`；`src/command/branch.rs`；`src/command/cat_file.rs`；`src/command/cherry_pick.rs`；`src/command/clone.rs`；`src/command/cloud.rs`；`src/command/commit.rs`；`src/command/format_patch.rs`；`src/command/gc.rs`；`src/command/init.rs`；`src/command/rebase.rs`；`src/command/rebase/state.rs`；`src/command/remote.rs`；`src/command/rename_detect.rs`；`src/command/rerere.rs`；`src/command/shortlog.rs`；`src/command/show_ref.rs`；`src/command/status.rs`；`src/command/status/input.rs`；`src/command/switch.rs`；`src/command/symbolic_ref.rs`；`src/internal/ai/agent_bridge/vcs.rs`；`src/internal/ai/agent_run/event.rs`；`src/internal/ai/agent_run/workspace_strategy.rs`；`src/internal/ai/capture/ingress.rs`；`src/internal/ai/capture/live.rs`；`src/internal/ai/capture_scope.rs`；`src/internal/ai/history.rs`；`src/internal/ai/hooks/runner.rs`；`src/internal/ai/hooks/runtime.rs`；`src/internal/ai/observed_agents/builtin/gemini.rs`；`src/internal/ai/observed_agents/reasoning.rs`；`src/internal/ai/observed_agents/redaction.rs`；`src/internal/ai/sandbox/mod.rs`；`src/internal/ai/sandbox/proxy.rs`；`src/internal/ai/sandbox/runtime.rs`；`src/internal/alternates/mod.rs`；`src/internal/auth.rs`；`src/internal/branch.rs`；`src/internal/db.rs`；`src/internal/sequencer/mod.rs`；`src/internal/upgrade/txn.rs`；`src/internal/workspace.rs`；`src/utils/client_storage.rs`；`src/utils/d1_client.rs`；`src/utils/redact.rs`；`src/utils/worktree_blob.rs`；`docs/development/plan/plan-20261025-qualification.md`；`docs/development/plan/plan-status.md`仅本计划行。
+
+**Release write set:** `N/A`。
+
+**Files likely touched:** 与I相同。53源文件中只改Rustdoc；Clap消费的HTML占位符文档使用成对cfg_attr(doc)/cfg_attr(not(doc))保留普通编译原始doc字符串，不能改arg属性或产品分支。
+
+**Docs and compatibility impact:** 正式Rust API文档由源注释生成；CLI普通help逐字保持，不增加/删除命令、参数、配置或用户语义，因此双语命令指南、COMPATIBILITY、错误码、网站内容N/A。任何实际help变化先STOP，不能宣称文档-only继续。
+
+**Rollback mode:** `immutable-release`
+
+**Migration and rollback:** 无数据迁移；已推送只以精确后续提交前滚，不重置或force。保留原warning日志与两次CI事实。
+
+**Security and privacy:** 不动权限/可见性；只读隔离help，不传真实凭据；审查不读env值，原始证据位于仓外受控目录，仓内仅本计划摘要。
+
+**Performance budget:** 一次新的本卡A窗口3600秒（含nightlyfmt、strict all-target/all-feature Clippy、上述Rustdoc、debug build、help比对、B及资源检查）；不运行全量、不占用旧FIX01或FIX3预算，不自动重跑。与Mega C的Cargo/构建/提交/push/发布严格串行。失败STOP并保留真实终态后ER03。
+
+**Estimated scope:** `M`；按G-11文档-only的≤2人日口径，53源文件文档+2治理文件，预计≤1人日；不以生产代码卡的5文件上限伪装53文件实现。
+
+**Version increment:** `N/A`
+
+**Release boundary:** `no-release`；先精确signed/DCO本地提交（满足用户下一提交约束），可推短期docs分支并经本地Claude PASS、实际PR base/CodeQL后gh squash merge；不自行触发版本发布。作为现行资格计划文档，进入FIX-LTR-03唯一指定覆盖树，不把FIX01的旧C覆盖本次修改。
+
+**C/D coverage from:** `FIX-LTR-03`；本卡自己的PR/main D还须实际核验；FIX03最终C/完整D覆盖本卡后才done/complete。在此前只可locally-accepted，不新增资格实现卡计数（原三卡仍分开计0/3）。
+
+**Granularity:** `type=docs; axis=项目Rustdoc诊断收敛并保留CLI help; recovery=文档精确前滚; complete=yes; self-contained=yes; AC=6/20; VER=3/20; landing=1同主题Rust API文档集; prod-files=0; scope=M(≤2人日); deps=DEP-DOC-PR635; writeset=与FIX02/03共享计划行串行; release=no-release; split-from=用户指定PR635 warning后续提交; exception=N/A`
+
+**ER01/02/03与消费规则：** 独立原生clone，当前branch docs/pr635-rustdoc-warnings来自f33be958，不含原工作区unsigned merge或未发布治理。准入R2与执行器R2实际PASS后已采纳55路径，A/B实际通过；自己的Claude ER05仍须绑定当前最终源码及下述实际终态，通过后才精确提交。source候选的diff自动守卫不等于真实Rustdoc/二进制验收。模板G-03文档清单与G-11时间口径适用；没有G08/G12/G13聚合。root唯一写者与发布者。FIX02/03依赖不改，不制造DOC与覆盖点的执行依赖环；最终资格收口同时核本文档卡覆盖。
+
+**后置事实落点：** 本卡提交前冻结最终文档字节；自己的审查/A/commit/PR/main收据由FIX02的既有本计划/状态行写集补记，FIX03 C/D后补记覆盖。当前未知项不得预填PASS，后置事实不声称已被先前审查读取；不新建证据目录。若FIX02开始时本卡PR未完成，保持pending并补同步，不机械重跑未变源码。
+
+| 修订UTC | 来源 | 变化 | 状态 |
+|---|---|---|---|
+| 2026-10-25T03:14:21.976945+00:00 | 用户指定下一提交修PR635项目warning并明确排除第三方 | 新增DOC-LTR-01，53文件文档-only；无依赖升级/版本bump；FIX03承载C/D | 候选待Claude，未实施 |
+
+
+**DOC-LTR-01开工R1实际FAIL与R2前滚（2026-10-25）：** 本地Claude session `17ca5be0-55a2-4f0f-acc4-3821a4d22635`，ER03 FAIL / DOC_ONLY PASS / 总FAIL；输出SHA `ab500ad0f082f89210ab4e98f2a3cd2f8d661721000bde845c38d4eac07655ca`。两P1已在此候选改正：VER3必须测remote add，AC3区分3个公开短链接与1个私有字面量。R1精确126输入已仓外封存，源码候选53文件字节不变；仍未采纳、未运行A、未提交，R2待审。
+
+- root/P2-1：guard还原成对普通doc后，逐文件行数和每个原诊断行号/位置逐字比较，非文档源码仍逐字相同；最终help证据只能来自22次真实二进制调用。
+- root/P2-2：55个前置文件实际用`libra show f33be958:<path>`核blob SHA，HEAD/index/worktree清洁；采纳前再核前像，采纳后允许diff必须恰好55路径，Cargo/lock/配置及测试hash仍全量守卫。
+- root/P2-3：VER3具名旧二进制与固定隔离环境；Cargo门仍source双env，help自身用独立白名单env，不继承凭据或真实config。任何输出差异STOP，不删断言。
+- root/P2-4/5：B明确包括本计划结构/相对链接、I精确55路径及原历史记录保持；Rustdoc -D warnings承担源内部链接门。A比CI更严格；新lint不扩修，失败STOP/ER03。本次none仅文档注释，不改CLI注册/全局flag。
+- root/P2-6：cat_file.rs两处同句`<input>`虽不在104诊断里，Rustdoc会把它当HTML input元素；仅cfg(doc)侧同样按字面量呈现，普通help原字节保持，不作为删减旧诊断计数。
+- root/P2-7：首次claim前将执行器/控制项/源树真实Claude审查；A后若只追加收据，限此两治理文件并记录精确diff，最终ownER05仍须绑定实际终态及最终字节。不得在Mega C期间执行本卡Cargo/提交/push/发布。
+- root/P2-8：FIX02/03开工来源必须包含本卡实际merge SHA（待发生后填入），FIX03最终C树须含本卡最终55路径；不符STOP/ER03，不将未覆盖的DOC记done。此为来源入场门，不改变原两卡依赖边或制造覆盖循环。
+- root/P2-9：上方Current evidence补精确源行。默认debug build如出现原FIX01已审的capture-ingress两associated functions dead_code提示，需绑定未变源码、单列原诊断与具名P2审查，不称零诊断，不用allow或夹带生产修复。本卡目标仍为所给job的104项目Rustdoc警告；第三方警告按用户排除。
+
+
+| 2026-10-25T03:30:53.098949+00:00 | DOC-LTR-01准入R2 | 两P1已关闭，ER03/DOC_ONLY/总PASS，源码仍未采纳；执行器实审与A/ownER05待 | 准入通过，未验收 |
+
+**DOC-LTR-01准入R2实际收据（2026-10-25T03:30:53.098949+00:00）：** 本地Claude session `b2377d23-968e-469f-ad00-521220bdbdd1`，`ER03_VERDICT / DOC_ONLY_VERDICT / VERDICT: PASS`，输出SHA `47dd9c0d4d3be46a6b3b0d523655bfa1882d378543539f3f7c99be48353f633d`；132输入实核无漂移并仓外封存，原R1 FAIL保留。root具名承接R2六项P2：采纳前程序逐项比较55原生blob前像、采纳后精确55路径；22次真实help比对使用每次全新空HOME且相同固定路径/环境，不能忽略debug/release差异；本收据及状态行补记时点；旧binary先核SHA，缺失STOP；Cargo/构建/提交/push/发布仅在`/tmp/mtr99-C1-20261025/root-local-C-acceptance.json`实际成立后启动；R1 P2处置继续有效。上述仅准入PASS，不是实施、A、ER05、C或D结果。
+
+### DOC-LTR-01 A/B实际终态与最终审查入口（2026-10-25 04:25:21 UTC）
+
+一次A1从2026-10-25 04:08:57 UTC至04:23:30 UTC，实际874.796/3600秒，coordinator exit0、STOP=false。48命令全部exit0：nightly fmt无diff、strict all-target/all-feature Clippy、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`、debug build，以及11命令×2help选项×旧/新二进制44个进程。22组stdout/stderr/退出码逐字节相同，实际help与CLI语义未变化。四Cargo门加载双env；第三方proc-macro-error2提示按用户指令保留，Clippy/Rustdoc/build的项目warning均0（本次build没有出现先前已登记的capture-ingress dead_code提示）。不称所有诊断为零，不升级依赖、不抑制lint。
+
+53源文件仅文档变化、16组成对cfg_attr保留普通Clap输入；全部2126输入在A期间保持冻结，版本/lock/测试/配置不变。B实际55路径、190相对链接、6AC/3VER通过；剩余owned进程0、新孤儿0、无需人工清理。本卡按已审ER13不运行全量，不能替代FIX03完整C/D。终态SHA256 `72f9bcd758491d27bcbd27280d553897865d16ef4231ce5595281cd45b865847`；命令结果SHA256 `7d471fb2d5ace8d669828784c5eda1f1d2f88c90e4764c0dacbcb6248c8282ce`；help比对SHA256 `ad7afb84a0eb26ae65b37e0625876a5751f113dc832cc5fdfef24f762c5da680`；B SHA256 `34bf4a1954cfd0e936a11c874eb97bac67d1f7115d13a5fe25374000250146b0`；输入manifest SHA256 `b02b8ceadd197d69df767d20c9e95fc716f96fdcf6a705f8034eeb8a217e5ece`。原件仓外`/tmp/doc-ltr01-A1-20261025`。
+
+实际执行器R1 FAIL（status领先空格被strip）保留；该问题于claim之前修复，R2本地Claude session `8dda363f-cecb-48ea-9d67-6b5b01caefc1`，EXECUTION/DOC_ONLY/总PASS，输出SHA256 `8f9dd9147b5d3e921255c31e8dcf2aa36ac622809a4bb728ae0c6aab6bfea292`。源码准入R1 FAIL/R2 PASS同样保留。执行器审查不是自己的ER05；本节之后只变更本计划状态/实际证据与plan-status本计划行，源码/测试/配置/版本/lock与A相同，最终文档差异另做B并纳入真实Claude审查，不机械重跑未变编译/二进制。自己的审查、signed/DCO提交、push/PR/main D目前均待；审查以后事实按既定后置协议由FIX02补记，不预填结果。
+
+root继续承担准入与执行器P2：任何新源码/元数据/help变化先STOP重评，既有FAIL/预算不重置；环境/进程异常不得自动续窗或杀非owned进程；53文件文档范围不可扩大。DOC自己的PR/main必须实际核验，FIX03最终覆盖树必须含本卡最终55路径。FIX01的main base40156941519尚未终态前不合并DOC至main，以免取消前一卡适用D；CodeQL40156941508及release40157032761已实际success，FIX01仍未done。原计划三实现卡0/3不变。
+
+| 修订UTC | 来源 | 变化 | 状态 |
+|---|---|---|---|
+| 2026-10-25 04:25:21 UTC | DOC-LTR-01 A1实际终态 | 48命令/22help/B/资源通过，保留历史FAIL；仅两治理文件补事实 | locally-accepted，自身ER05及提交/PR/覆盖待 |

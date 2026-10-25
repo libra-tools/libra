@@ -120,7 +120,7 @@ pub type PostProbe<'a> = dyn Fn(&InstallDir) -> Result<bool, TxnError> + 'a;
 /// the journaled decision; `Ok(None)` VETOES the commit and the
 /// transaction rolls back exactly like a failed probe. A `None` fence
 /// (recovery, tests) does NOT commit unconditionally: it goes through
-/// [`default_fence`] — the same bounded floors-lock acquisition and
+/// `default_fence` — the same bounded floors-lock acquisition and
 /// persisted-floor comparison — so a superseding control decision vetoes
 /// recovery commits too.
 pub type CommitFence<'a> =

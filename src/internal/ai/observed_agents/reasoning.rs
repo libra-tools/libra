@@ -2628,7 +2628,7 @@ pub(crate) fn verify_claude_encrypted_field(
 /// Verified provider ciphertext, never a redacted transcript or JSON value.
 ///
 /// RG-01 exposes no conversion from arbitrary bytes. Construction happens
-/// only inside this module after [`verify_claude_encrypted_field`] checks a
+/// only inside this module after `verify_claude_encrypted_field` checks a
 /// provider-declared source field. RG-02 will add its artifact sink separately.
 ///
 /// ```compile_fail

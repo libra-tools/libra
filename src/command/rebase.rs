@@ -123,7 +123,7 @@ fn resolve_rebase_empty_mode(args: &RebaseArgs) -> CliResult<RebaseEmptyMode> {
 }
 
 /// Categorizes the cause of a non-conflict failure inside
-/// [`replay_commit_with_unified_merge`].
+/// `replay_commit_with_unified_merge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayErrorKind {
@@ -263,12 +263,33 @@ pub struct RebaseArgs {
     #[clap(required_unless_present_any = ["continue_rebase", "abort", "skip", "root", "edit_todo"])]
     pub upstream: Option<String>,
 
-    /// Replay the <upstream>..HEAD range onto <newbase> instead of onto
-    /// <upstream> (the replayed range is still <upstream>..HEAD).
+    #[cfg_attr(
+        doc,
+        doc = " Replay the `<upstream>`..HEAD range onto `<newbase>` instead of onto"
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Replay the <upstream>..HEAD range onto <newbase> instead of onto"
+    )]
+    #[cfg_attr(
+        doc,
+        doc = " `<upstream>` (the replayed range is still `<upstream>`..HEAD)."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " <upstream> (the replayed range is still <upstream>..HEAD)."
+    )]
     #[clap(long, value_name = "NEWBASE", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
     pub onto: Option<String>,
 
-    /// Check out <branch> before rebasing; defaults to the current branch.
+    #[cfg_attr(
+        doc,
+        doc = " Check out `<branch>` before rebasing; defaults to the current branch."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Check out <branch> before rebasing; defaults to the current branch."
+    )]
     #[clap(value_name = "BRANCH", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
     pub branch: Option<String>,
 

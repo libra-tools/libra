@@ -592,7 +592,7 @@ pub(crate) async fn run_init(args: InitArgs) -> Result<InitOutput, InitError> {
 /// Legacy initialization helper retained for tests and older call sites.
 ///
 /// # Side Effects
-/// Performs the same repository initialization writes as [`run_init`].
+/// Performs the same repository initialization writes as `run_init`.
 ///
 /// # Errors
 /// Returns the underlying [`InitError`] and discards the success metadata.

@@ -63,7 +63,14 @@ pub enum AuthCommand {
         /// Absolute expiry (RFC3339, e.g. 2027-01-01T00:00:00Z).
         #[arg(long, value_name = "WHEN", conflicts_with = "expires_in")]
         expires_at: Option<String>,
-        /// Relative expiry: <N>d / <N>h / <N>m / <N>s (single unit).
+        #[cfg_attr(
+            doc,
+            doc = " Relative expiry: `<N>d` / `<N>h` / `<N>m` / `<N>s` (single unit)."
+        )]
+        #[cfg_attr(
+            not(doc),
+            doc = " Relative expiry: <N>d / <N>h / <N>m / <N>s (single unit)."
+        )]
         #[arg(long, value_name = "DUR")]
         expires_in: Option<String>,
     },

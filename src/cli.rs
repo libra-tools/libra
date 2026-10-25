@@ -3191,11 +3191,11 @@ fn run_auto_upgrade_check_hook() {
 /// 3. Short-circuits the `help error-codes` topic before clap parsing because it
 ///    would otherwise be treated as an unknown subcommand.
 /// 4. Parses with clap and translates every parse failure into a structured
-///    [`CliError`] (see [`classify_parse_error`]).
+///    [`CliError`] (see `classify_parse_error`).
 /// 5. Validates command-specific arg constraints that clap cannot express (e.g.
-///    [`command::tag::validate_cli_args`]).
+///    `command::tag::validate_cli_args`).
 /// 6. For commands that operate on a repository, runs repository preflight,
-///    primes the global hash kind via [`set_local_hash_kind_for_storage`], and
+///    primes the global hash kind via `set_local_hash_kind_for_storage`, and
 ///    replays durable object-index repair markers.
 /// 7. Resolves the global output flags into a single [`OutputConfig`] and dispatches
 ///    to the matching `command::*::execute_safe` handler.

@@ -63,7 +63,7 @@ impl HostScope {
     ///
     /// A REQUEST url always carries a path, and usually a query — a smart-HTTP
     /// discovery is `https://host/owner/repo.git/info/refs?service=…`. Sharing
-    /// [`Self::from_url`] with [`Self::parse`] therefore rejected every real
+    /// `Self::from_url` with [`Self::parse`] therefore rejected every real
     /// request: the stored token was never attached, `libra push` over HTTPS
     /// answered `LBR-AUTH-001` no matter what `libra auth login` had stored,
     /// and the 401 hint that names the host printed the literal `<host>`. The

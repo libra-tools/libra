@@ -68,7 +68,8 @@ pub struct CloneArgs {
     /// The local path to clone the repository to
     pub local_path: Option<String>,
 
-    /// Checkout <BRANCH> instead of the remote's HEAD
+    #[cfg_attr(doc, doc = " Checkout `<BRANCH>` instead of the remote's HEAD")]
+    #[cfg_attr(not(doc), doc = " Checkout <BRANCH> instead of the remote's HEAD")]
     #[clap(short = 'b', long, required = false)]
     pub branch: Option<String>,
 

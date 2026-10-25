@@ -136,7 +136,14 @@ pub enum RemoteCmds {
         /// wildcard. Repeatable.
         #[clap(short = 't', long = "track", value_name = "BRANCH")]
         track: Vec<String>,
-        /// Point the remote's HEAD at <BRANCH> (`refs/remotes/<name>/HEAD`).
+        #[cfg_attr(
+            doc,
+            doc = " Point the remote's HEAD at `<BRANCH>` (`refs/remotes/<name>/HEAD`)."
+        )]
+        #[cfg_attr(
+            not(doc),
+            doc = " Point the remote's HEAD at <BRANCH> (`refs/remotes/<name>/HEAD`)."
+        )]
         #[clap(short = 'm', long = "master", value_name = "BRANCH")]
         master: Option<String>,
         /// Configure `remote.<name>.tagOpt = --tags` (fetch all tags).

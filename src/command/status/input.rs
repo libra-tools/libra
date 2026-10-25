@@ -170,7 +170,7 @@ pub struct StatusArgs {
     /// Resolved `status.relativePaths` (config-only, like Git): `true` (the
     /// default) renders human long/short paths relative to the current
     /// directory; `false` keeps repository-root-relative paths. Populated by
-    /// [`apply_status_config_defaults`], never by the CLI.
+    /// `apply_status_config_defaults`, never by the CLI.
     #[clap(skip = true)]
     pub relative_paths: bool,
 
@@ -178,7 +178,7 @@ pub struct StatusArgs {
     /// to `diff.renames`), config-only. `None` = unset (feature default 50%
     /// applies); `Some(false)` = disabled; `Some(true)` = enabled at 50%.
     /// CLI flags (`--no-renames`/`--find-renames`/`--renames`) always win.
-    /// Populated by [`apply_status_config_defaults`], never by the CLI.
+    /// Populated by `apply_status_config_defaults`, never by the CLI.
     #[clap(skip)]
     pub renames_config: Option<bool>,
 }

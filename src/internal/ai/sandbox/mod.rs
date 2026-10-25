@@ -85,7 +85,7 @@ pub struct SandboxRuntimeConfig {
     /// future enforcement / network denials). Defaults to `None` —
     /// the sandbox falls back to [`evidence::TracingSandboxEvidenceSink`]
     /// so existing log scrapers see no change. See
-    /// [`evidence`](self::evidence) for the full event vocabulary and
+    /// [`evidence`] for the full event vocabulary and
     /// `docs/development/commands/sandbox.md` lines 142-144 / 162 / 373 for
     /// the doc contract this hook satisfies.
     pub evidence_sink: Option<std::sync::Arc<dyn evidence::SandboxEvidenceSink>>,

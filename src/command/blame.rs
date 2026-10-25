@@ -263,12 +263,12 @@ pub async fn execute(args: BlameArgs) {
 /// Structured entry point used by `cli::parse` and integration tests.
 ///
 /// Functional scope:
-/// - Runs [`run_blame`] to produce a [`BlameOutput`], then renders to JSON,
+/// - Runs `run_blame` to produce a [`BlameOutput`], then renders to JSON,
 ///   stays silent in `--quiet` mode, prints "File is empty" for an empty
 ///   blob, or formats human-friendly lines and pipes them through [`Pager`].
 ///
 /// Boundary conditions:
-/// - Errors from [`run_blame`] are mapped to [`CliError`] via the
+/// - Errors from `run_blame` are mapped to [`CliError`] via the
 ///   `From<BlameError>` impl, preserving stable codes and hints.
 ///
 /// See: tests::blame_error_mapping_reports_repo_corrupt_for_storage_failures

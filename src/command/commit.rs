@@ -158,11 +158,25 @@ pub struct CommitArgs {
     #[arg(long, value_name = "DATE")]
     pub date: Option<String>,
 
-    /// Create a fixup commit targeting the specified commit. The message becomes "fixup! <subject>".
+    #[cfg_attr(
+        doc,
+        doc = " Create a fixup commit targeting the specified commit. The message becomes \"fixup! `<subject>`\"."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Create a fixup commit targeting the specified commit. The message becomes \"fixup! <subject>\"."
+    )]
     #[arg(long, value_name = "COMMIT", conflicts_with_all = ["message", "file", "squash", "reuse_message", "reedit_message"])]
     pub fixup: Option<String>,
 
-    /// Create a squash commit targeting the specified commit. The message becomes "squash! <subject>".
+    #[cfg_attr(
+        doc,
+        doc = " Create a squash commit targeting the specified commit. The message becomes \"squash! `<subject>`\"."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Create a squash commit targeting the specified commit. The message becomes \"squash! <subject>\"."
+    )]
     #[arg(long, value_name = "COMMIT", conflicts_with_all = ["message", "file", "fixup", "reuse_message", "reedit_message"])]
     pub squash: Option<String>,
 

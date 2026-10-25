@@ -290,7 +290,7 @@ fn borrower_is_provably_dead(entry: &Path) -> bool {
 /// `libra alternates prune`.
 ///
 /// Absence is not proof of death for the automatic gate — see
-/// [`borrower_is_provably_dead`] — but under an explicit prune the user is
+/// `borrower_is_provably_dead` — but under an explicit prune the user is
 /// the proof: they are asserting these borrowers are gone for good. The
 /// command reports each path before removing anything.
 pub fn absent_borrowers(objects_dir: &Path) -> std::io::Result<Vec<PathBuf>> {

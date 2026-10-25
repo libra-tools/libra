@@ -66,7 +66,7 @@ impl ObservedAgent for GeminiObservedAgent {
     /// Returns `Ok(None)` when the path is absent (caller hasn't
     /// pointed at a transcript yet) or when the file is missing
     /// (session that never produced output); returns an actionable
-    /// error when the file exceeds [`MAX_TRANSCRIPT_BYTES`] or the
+    /// error when the file exceeds `MAX_TRANSCRIPT_BYTES` or the
     /// `stat`/`read` system calls fail with anything other than
     /// `NotFound`. Empty files round-trip as `Ok(Some(Vec::new()))` so
     /// the caller can distinguish "empty transcript" from "no

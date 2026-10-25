@@ -14,11 +14,11 @@
 //!   name (if any) so `reset` can re-attach instead of leaving the user in a
 //!   detached state.
 //! - Working-tree safety: every `bisect good/bad/skip` calls
-//!   [`restore_to_commit`], which rewrites the per-worktree index AND the
+//!   `restore_to_commit`, which rewrites the per-worktree index AND the
 //!   working tree from the target commit via the canonical restore contract
 //!   (tracked paths only — untracked files survive a step, like `git bisect`).
 //!   `start` still refuses to run with uncommitted changes that could be lost.
-//! - Convergence semantics: [`BisectNext`] distinguishes between "more
+//! - Convergence semantics: `BisectNext` distinguishes between "more
 //!   candidates", "single culprit found", and "all candidates skipped" so
 //!   each handler can render the right user message.
 

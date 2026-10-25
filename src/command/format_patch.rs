@@ -97,7 +97,14 @@ Examples:
 pub struct FormatPatchArgs {
     /// Revision range expression: a single commit, or a range like A..B.
     /// When a single commit is given, all commits reachable from HEAD but not
-    /// from that commit are included (equivalent to <commit>..HEAD).
+    #[cfg_attr(
+        doc,
+        doc = " from that commit are included (equivalent to `<commit>`..HEAD)."
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " from that commit are included (equivalent to <commit>..HEAD)."
+    )]
     #[arg(value_name = "revision-range")]
     pub revision_range: Option<String>,
 
@@ -307,7 +314,14 @@ pub struct FormatPatchArgs {
     #[arg(long = "suffix", value_name = "SFX")]
     pub suffix: Option<String>,
 
-    /// Output an all-zero hash in each patch's "From <hash>" line instead of
+    #[cfg_attr(
+        doc,
+        doc = " Output an all-zero hash in each patch's \"From `<hash>`\" line instead of"
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Output an all-zero hash in each patch's \"From <hash>\" line instead of"
+    )]
     /// the commit hash (stable output for testing/reproducibility).
     #[arg(long = "zero-commit")]
     pub zero_commit: bool,

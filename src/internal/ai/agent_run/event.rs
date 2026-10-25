@@ -171,7 +171,7 @@ pub struct WorkspaceMaterialized {
     pub materialized_file_count: u64,
     pub source_repo_size: u64,
     /// Reason for fallback to a less-preferred strategy (e.g. "worktree
-    /// reservation failed: <error>"). Empty string when no fallback occurred.
+    /// reservation failed: `<error>`"). Empty string when no fallback occurred.
     #[serde(default)]
     pub fallback_reason: String,
 }

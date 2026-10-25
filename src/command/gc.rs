@@ -8,7 +8,7 @@
 //! 2. reflog expiry — `gc.reflogExpire` / `gc.reflogExpireUnreachable`;
 //! 3. `repack -a -d` — pack all reachable objects and drop the now-packed
 //!    loose copies;
-//! 4. unreachable loose-object pruning — the shared [`collect_reachable_objects`]
+//! 4. unreachable loose-object pruning — the shared `collect_reachable_objects`
 //!    inventory plus the same alternates-borrower refusal the maintenance `gc`
 //!    task uses (never a new traversal);
 //! 5. `worktree prune` — retire registry entries whose path vanished.

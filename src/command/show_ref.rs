@@ -106,7 +106,14 @@ pub struct ShowRefArgs {
     #[clap(long = "no-abbrev", overrides_with = "abbrev")]
     pub no_abbrev: bool,
 
-    /// Dereference annotated tags and include peeled refs/tags/<name>^{} entries
+    #[cfg_attr(
+        doc,
+        doc = " Dereference annotated tags and include peeled refs/tags/`<name>`^{} entries"
+    )]
+    #[cfg_attr(
+        not(doc),
+        doc = " Dereference annotated tags and include peeled refs/tags/<name>^{} entries"
+    )]
     #[clap(short = 'd', long = "dereference", overrides_with = "no_dereference")]
     pub dereference: bool,
 

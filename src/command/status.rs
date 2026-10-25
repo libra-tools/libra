@@ -466,7 +466,7 @@ pub struct StatusData {
 /// data}` envelope that `libra status --json` prints, so `/api/repo/status`
 /// stays byte-compatible with the CLI output.
 ///
-/// Internally re-uses [`collect_status_data`] + [`build_status_json`] with a
+/// Internally re-uses `collect_status_data` + [`build_status_json`] with a
 /// default [`StatusArgs`] (untracked files in normal mode, no porcelain v2,
 /// no ignored files, no stash count).
 ///

@@ -25,17 +25,17 @@
 //!     stream.
 //!
 //! - **Commit collection and filtering**:
-//!   - [`get_commits_for_shortlog`] resolves the current head and
+//!   - `get_commits_for_shortlog` resolves the current head and
 //!     obtains the relevant list of [`Commit`] objects to be included in the
 //!     report. The exact traversal strategy is delegated to the internal git
 //!     engine.
-//!   - [`passes_filter`] applies `since`/`until` constraints to each
+//!   - `passes_filter` applies `since`/`until` constraints to each
 //!     commit, converting user-supplied date strings via [`parse_date`] and
 //!     comparing them against the commit committer timestamp (to match `git log`).
 //!
 //! - **Aggregation and formatting**:
 //!   - Commits are grouped by author identity in an in-memory
-//!     `HashMap<String, AuthorStats>`, where [`AuthorStats`] tracks the
+//!     `HashMap<String, AuthorStats>`, where `AuthorStats` tracks the
 //!     author name, optional email address, total commit count, and a list
 //!     of commit subjects.
 //!   - If `-e` is provided, grouping is by `name <email>`. Otherwise, it is

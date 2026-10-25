@@ -1,11 +1,11 @@
 //! Branch management subcommand (`libra branch`).
 //!
 //! Implements creation, deletion, listing, renaming, upstream tracking, and
-//! current-branch reporting. The single [`run_branch`] entry inspects the
+//! current-branch reporting. The single `run_branch` entry inspects the
 //! parsed [`BranchArgs`] and delegates to one of the `*_impl` helpers.
 //!
 //! Non-obvious responsibilities:
-//! - Maps [`branch::BranchStoreError`] to the local [`BranchError`] domain so
+//! - Maps [`branch::BranchStoreError`] to the local `BranchError` domain so
 //!   the CLI surface is decoupled from the storage layer; see
 //!   `map_branch_store_error`.
 //! - For deletes, walks reachable commits from HEAD via
@@ -94,7 +94,7 @@ EXAMPLES:
 
 /// Tagged-union output type for `libra branch`.
 ///
-/// Each variant corresponds to one of the action paths in [`run_branch`].
+/// Each variant corresponds to one of the action paths in `run_branch`.
 /// JSON serialisation is driven by `#[serde(tag = "action")]` so each
 /// variant produces an object with a distinct `"action"` field.
 #[derive(Debug, Clone, Serialize)]
@@ -841,10 +841,10 @@ pub async fn execute(args: BranchArgs) {
 /// Structured entry: returns [`CliResult`] for the dispatcher.
 ///
 /// Functional scope:
-/// - Runs [`run_branch`] then forwards to [`render_branch_output`].
+/// - Runs `run_branch` then forwards to `render_branch_output`.
 ///
 /// Boundary conditions:
-/// - All [`BranchError`] variants are mapped to [`CliError`] via the
+/// - All `BranchError` variants are mapped to [`CliError`] via the
 ///   `From` impl which sets stable codes and hints.
 pub async fn execute_safe(args: BranchArgs, output: &OutputConfig) -> CliResult<()> {
     match args.subcommand {
@@ -3077,7 +3077,7 @@ pub async fn create_branch(new_branch: String, branch_or_commit: Option<String>)
 /// Structured variant of [`create_branch`].
 ///
 /// Functional scope:
-/// - Calls [`create_branch_impl`] and discards the [`BranchOutput`]; just
+/// - Calls `create_branch_impl` and discards the [`BranchOutput`]; just
 ///   returns success/failure.
 pub async fn create_branch_safe(
     new_branch: String,

@@ -164,7 +164,7 @@ pub struct StatusArgs {
 // `execute_sync` wraps this helper with `ConsoleCloudSyncProgress` so
 // `libra cloud sync` keeps its original output verbatim.
 
-/// Inputs for [`run_cloud_sync`].
+/// Inputs for `run_cloud_sync`.
 #[derive(Debug, Clone)]
 pub struct CloudSyncContext {
     /// Number of objects per batch when streaming to R2 / D1.

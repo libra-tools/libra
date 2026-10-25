@@ -1,7 +1,7 @@
 //! Credential redaction helpers shared across command output and network
 //! clients (fetch/remote/push, the D1 client, and the git-over-HTTPS client).
 //!
-//! The canonical entry point is [`redact_url_credentials`], which strips
+//! The canonical entry point is `redact_url_credentials`, which strips
 //! embedded userinfo (`user:token@`) from a URL before it is printed to a
 //! terminal, written to a log, or embedded in an error message. Historically
 //! this lived in `command::fetch`; it was hoisted here so `utils`-level network

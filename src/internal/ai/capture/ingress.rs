@@ -292,8 +292,8 @@ pub(crate) struct CaptureEventContext {
 /// A fully validated, canonical capture command.
 ///
 /// The command is constructed only by the ingress-owned
-/// [`CaptureIngressCommand::from_stdin`] or
-/// [`CaptureIngressCommand::from_payload`] lowering paths.
+/// `CaptureIngressCommand::from_stdin` or
+/// `CaptureIngressCommand::from_payload` lowering paths.
 /// It carries no database/ref handle and no raw stdin buffer, preventing an
 /// ingress consumer from accidentally coupling validation to durable writes.
 pub struct CaptureIngressCommand {

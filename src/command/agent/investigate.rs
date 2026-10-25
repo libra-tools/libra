@@ -3,7 +3,7 @@
 //!
 //! The CLI face is a **top-level** command (`Commands::Investigate` in
 //! `src/cli.rs`); the implementation lives under `command/agent/` so the
-//! AG-20 keyset-pagination helpers in [`super::checkpoint`]
+//! AG-20 keyset-pagination helpers in `super::checkpoint`
 //! (`resolve_page_limit` / `encode_page_cursor` / `decode_page_cursor`,
 //! all `pub(super)`) are reused verbatim for `investigate list` — the same
 //! reuse `libra review` makes.

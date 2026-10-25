@@ -160,7 +160,7 @@ pub fn resolve_after_preferred_attempt(
 /// `fallback_reason` is normalized: `None` (no fallback) maps to the
 /// empty string the `WorkspaceMaterialized` schema expects, and
 /// `Some(reason)` carries the human-readable explanation for using a
-/// less-preferred strategy (e.g. "worktree reservation failed: <err>").
+/// less-preferred strategy (e.g. "worktree reservation failed: `<err>`").
 pub fn record_materialization(
     strategy: WorkspaceStrategy,
     sizing: WorkspaceSizing,

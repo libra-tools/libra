@@ -99,7 +99,7 @@ fn effective_hook_capture_deadline(
 ///   lives on `refs/libra/traces`. Fully wired: the runtime ingests the
 ///   lifecycle event into `agent_session` and writes E4-libra checkpoint
 ///   commits on `TurnEnd`, `SessionEnd`, and subagent boundaries when
-///   repository storage is available (see [`ingest_agent_traces`]).
+///   repository storage is available (see `ingest_agent_traces`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookTarget {
     AiIntent,

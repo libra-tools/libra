@@ -12,7 +12,7 @@
 //!   through a directory).
 //!
 //! The temp-file/rename mechanics are the shared
-//! [`StreamingAtomicFile`](crate::utils::atomic_stream::StreamingAtomicFile)
+//! `StreamingAtomicFile`
 //! implementation; `util::write_file` stays in use for non-blob files (config,
 //! sidecars).
 

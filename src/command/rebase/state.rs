@@ -400,7 +400,7 @@ impl RebaseState {
     /// Reads the scoped row, then — for the main worktree with no ambiguity —
     /// READS a legacy directory without adopting it: no DB row is written and
     /// nothing is deleted (§C.4.2 / ADR-0714-08). Adoption is an explicit act,
-    /// performed by a control action through [`Self::adopt_legacy_state`].
+    /// performed by a control action through `Self::adopt_legacy_state`.
     pub async fn load() -> Result<Self, String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         if let Some(state) = Self::load_from_db(&db).await? {

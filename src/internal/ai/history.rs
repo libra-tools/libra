@@ -19,9 +19,9 @@
 //!    [`HistoryManager::resolve_history_head`].
 //! 2. Load that head's root tree, splice the new entry in beneath its type
 //!    subtree, write a fresh root tree, and create a child commit — see
-//!    [`HistoryManager::create_append_commit`].
+//!    `HistoryManager::create_append_commit`.
 //! 3. Compare-and-swap the ref forward, retrying on a stale head — see
-//!    [`HistoryManager::update_ref_if_matches`].
+//!    `HistoryManager::update_ref_if_matches`.
 //!
 //! Concurrency is handled via two retry loops: a SQLite-busy retry that
 //! covers transient lock contention, and a head-conflict retry that re-reads
@@ -1556,7 +1556,7 @@ type TestBeforeCheckpointRefCas = Arc<
 /// The manager is cheap to clone (all state lives behind `Arc` or owned
 /// `String`/`PathBuf`) and is safe to share across async tasks. Concurrent
 /// `append` calls on the same manager are serialised via the SQLite-side
-/// CAS in [`Self::update_ref_if_matches`].
+/// CAS in `Self::update_ref_if_matches`.
 pub struct HistoryManager {
     #[cfg_attr(not(test), allow(dead_code))] // read by cfg(test) reachability/get_storage paths
     storage: Arc<dyn Storage + Send + Sync>,
@@ -1919,11 +1919,11 @@ impl HistoryManager {
     ///   2. Write a new commit that adds `<object_type>/<object_id>`
     ///      (replacing any prior entry under that path).
     ///   3. CAS the ref forward.
-    /// - Reuses [`Self::create_append_commit`] for splice logic and
-    ///   [`Self::update_ref_if_matches`] for the optimistic ref update.
+    /// - Reuses `Self::create_append_commit` for splice logic and
+    ///   `Self::update_ref_if_matches` for the optimistic ref update.
     ///
     /// Boundary conditions:
-    /// - Retries up to [`HISTORY_HEAD_CONFLICT_MAX_RETRIES`] times when a
+    /// - Retries up to `HISTORY_HEAD_CONFLICT_MAX_RETRIES` times when a
     ///   concurrent writer advances the ref between read and CAS. After the
     ///   bound is exhausted the call fails with a contextual error so the
     ///   caller can decide whether to back off and retry.
@@ -2096,8 +2096,8 @@ impl HistoryManager {
     ///   `(name=ref_name, kind=Branch)` and parses its `commit` column into
     ///   an [`ObjectHash`].
     /// - Tolerates transient SQLite-busy errors with a bounded linear
-    ///   backoff governed by [`SQLITE_BUSY_MAX_RETRIES`] /
-    ///   [`SQLITE_BUSY_RETRY_BASE_MS`].
+    ///   backoff governed by `SQLITE_BUSY_MAX_RETRIES` /
+    ///   `SQLITE_BUSY_RETRY_BASE_MS`.
     ///
     /// Boundary conditions:
     /// - Returns `Ok(None)` when the ref row is missing or its `commit`

@@ -22,7 +22,7 @@
 //! whole-file-keyed entries deliberately coexist: an old key simply misses and
 //! is re-recorded under the normalized key.
 //!
-//! When `rerere.enabled` is set, [`auto_update`] is invoked automatically by the
+//! When `rerere.enabled` is set, `auto_update` is invoked automatically by the
 //! merge / rebase / cherry-pick sequencers (at both conflict and resolution
 //! time) so preimages are recorded, known resolutions replayed, and postimages
 //! recorded without a manual `libra rerere`. With `rerere.enabled` unset

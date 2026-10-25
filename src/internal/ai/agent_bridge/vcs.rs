@@ -866,7 +866,7 @@ pub mod supervisor {
         lock().iter().any(|entry| entry.run_id == run_id)
     }
 
-    /// Cancel every live run and drain within [`DRAIN_BUDGET`].
+    /// Cancel every live run and drain within `DRAIN_BUDGET`.
     ///
     /// Called when the bridge's stdio loop ends (EOF, broken pipe or fatal
     /// error). Cancellation is the same path `libra review cancel` uses, so

@@ -74,7 +74,7 @@ impl HookRunner {
     /// Run every enabled `PreToolUse` hook that matches `tool_name`.
     ///
     /// Functional scope: hooks are evaluated in the order they appear in the
-    /// merged config; the first hook to return [`HookResult::Block`] aborts the
+    /// merged config; the first hook to return `HookResult::Block` aborts the
     /// chain and the runner returns the corresponding [`HookAction::Block`].
     ///
     /// Boundary conditions:

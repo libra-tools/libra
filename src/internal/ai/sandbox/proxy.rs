@@ -2,7 +2,7 @@
 //! (`docs/development/commands/sandbox.md` §7.4).
 //!
 //! AI shell tools that need allowlisted outbound network access route through
-//! a short-lived local HTTP/CONNECT proxy in [`super::proxy_runtime`]. This
+//! a short-lived local HTTP/CONNECT proxy in `super::proxy_runtime`. This
 //! module keeps the policy decision surface pure and testable:
 //!
 //! 1. The sandbox runtime can route through a `&dyn NetworkProxy` without
