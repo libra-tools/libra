@@ -17,15 +17,22 @@ use super::{screens, view::SessionsWindow, widgets::*};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Capabilities,
     Lanes,
     History,
     Sessions,
 }
 
 impl Page {
-    pub const ALL: &'static [Self] = &[Self::History, Self::Sessions, Self::Lanes];
+    pub const ALL: &'static [Self] = &[
+        Self::History,
+        Self::Sessions,
+        Self::Lanes,
+        Self::Capabilities,
+    ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Capabilities => "capabilities",
             Self::Lanes => "lanes",
             Self::History => "history",
             Self::Sessions => "sessions",
@@ -33,6 +40,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Capabilities => "Capability map",
             Self::Lanes => "Lanes",
             Self::History => "History",
             Self::Sessions => "Sessions",
@@ -100,6 +108,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Capabilities => screens::capabilities::render(self, cx, &p),
             Page::Lanes => screens::lanes::render(self, cx, &p),
             Page::History => screens::history::render(self, cx, &p),
             Page::Sessions => self.sessions.clone().into_any_element(),
