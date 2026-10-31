@@ -45,3 +45,5 @@ pub mod settings;
 pub mod splash;
 
 pub mod splash_error;
+
+pub mod about;
