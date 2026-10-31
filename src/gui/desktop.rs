@@ -19,6 +19,7 @@ gpui::actions!(libra_desktop, [OpenSearch]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Rebase,
     Refs,
     Bisect,
     Blame,
@@ -57,9 +58,11 @@ impl Page {
         Self::Blame,
         Self::Bisect,
         Self::Refs,
+        Self::Rebase,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Rebase => "rebase",
             Self::Refs => "refs",
             Self::Bisect => "bisect",
             Self::Blame => "blame",
@@ -81,6 +84,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Rebase => "Rebase",
             Self::Refs => "Stashes, tags & worktrees",
             Self::Bisect => "Bisect",
             Self::Blame => "Blame",
@@ -108,6 +112,7 @@ pub struct Desktop {
     pub tab: usize,
     pub selected: usize,
     pub filter: usize,
+    pub rebase_actions: [usize; 6],
     pub notice: Option<String>,
     pub sessions: Entity<SessionsWindow>,
     pub input: Entity<TextInput>,
@@ -149,6 +154,7 @@ impl Desktop {
             tab: 0,
             selected: 0,
             filter: 0,
+            rebase_actions: [0, 4, 3, 1, 0, 5],
             notice: None,
             sessions,
             input,
@@ -168,6 +174,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Rebase => screens::rebase::render(self, cx, &p),
             Page::Refs => screens::refs::render(self, cx, &p),
             Page::Bisect => screens::bisect::render(self, cx, &p),
             Page::Blame => screens::blame::render(self, cx, &p),

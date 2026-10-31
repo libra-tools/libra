@@ -29,3 +29,5 @@ pub mod blame;
 pub mod bisect;
 
 pub mod refs;
+
+pub mod rebase;
