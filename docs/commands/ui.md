@@ -14,11 +14,18 @@ libra ui
 
 ## Description
 
-`libra ui` with no further arguments opens the Sessions window on the
-process main thread. The window uses [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)
-and the bundled sessions prototype: a session list, Overview / Conversation /
-Changes, search, and a capability map. The rows are demonstration data, not
-a live capture index. Close the window to exit.
+`libra ui` with no further arguments opens the Libra desktop on the process
+main thread. The macOS interface uses [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components),
+pinned to repository revision `dd727f4`, with `gpui-pre` 0.3.10. It opens on
+History, with a commit graph, author filters, and a creation-history inspector.
+Sessions remains available from the toolbar.
+
+This is an interface preview based on the supplied desktop design. All records
+and status indicators are bundled demonstration data. Navigation, selection,
+tabs and theme changes are local UI interactions. Repository, agent, trust,
+restore, network and account actions do not execute. Close the window to exit.
+The logo is bundled from `https://libra.tools/libra-logo-without-words.svg`;
+fonts and assets load offline. macOS is the current validation target.
 
 The command does not read or write a repository.
 

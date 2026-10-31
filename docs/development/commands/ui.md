@@ -3,7 +3,7 @@
 ## 命令实现目标
 
 `libra ui` 在同一个 `libra` 二进制里打开一个桌面窗口。窗口使用 Ely GPUI
-Components（GPUI 快照 `gpui-pre` 0.3.9）。feature `gui` 默认关闭，普通 CLI
+Components（GPUI 快照 `gpui-pre` 0.3.10）。feature `gui` 默认关闭，普通 CLI
 构建不链接 GPU UI。
 
 ## 对比 Git 与兼容性
@@ -26,7 +26,13 @@ Components（GPUI 快照 `gpui-pre` 0.3.9）。feature `gui` 默认关闭，普�
 
 ## 当前状态
 
-`libra ui` 打开 Sessions 窗口（浅色默认，可切到深色）。顶栏、会话列表、Overview / Conversation / Changes、搜索和能力地图按 `libra-sessions-v2` 原型交互。数据来自 `src/gui/sessions.json`，是原型里的 8 条演示会话，不读仓库。
+`libra ui` 打开桌面 History 页面。`src/gui/desktop.rs` 管理页面与本地预览状态，
+`src/gui/screens/` 放各设计页面，`widgets.rs` 提供原生 GPUI 布局和 Ely 控件。
+Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 Logo 内嵌在
+`src/gui/assets/libra-logo.svg`，通过组合 AssetSource 与 Ely 的字体、图标一起加载。
+
+2026-11-01 桌面设计来自 `libra-desktop-gui.zip`。`.dc.html` 是设计资料，
+不是运行时依赖；UI 不使用浏览器或 WebView。依赖更新到 Ely `dd727f4` 与 GPUI 0.3.10。
 
 ## 还未实现的功能
 

@@ -108,9 +108,9 @@ tempfile = "3.27.0"
 fastcdc = { version = "=3.2.1", optional = true }
 # Desktop window (`libra ui`). Ely pins this GPUI snapshot; the feature stays
 # out of `default` so ordinary CLI builds do not link a GPU UI.
-gpui = { package = "gpui-pre", version = "=0.3.9", optional = true }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", optional = true, features = ["font-kit", "wayland", "x11"] }
-ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "6b0d154dc5c3ec3daf3bf059cc77cd8ed11ba2df", optional = true }
+gpui = { package = "gpui-pre", version = "=0.3.10", optional = true }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", optional = true, features = ["font-kit", "wayland", "x11"] }
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "dd727f4dc3ff26c5aa0b233ac23cac7b5f41d6f6", optional = true }
 
 # Async stream helpers
 tokio-stream = { version = "0.1.18", features = ["sync"] }

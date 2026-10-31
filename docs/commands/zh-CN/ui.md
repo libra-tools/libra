@@ -13,10 +13,15 @@ libra ui
 
 ## 说明
 
-不带其它参数的 `libra ui` 在进程主线程打开 Sessions 窗口。窗口使用
-[Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)，
-按会话原型列出会话，并提供 Overview、Conversation、Changes、搜索和能力地图。
-这些记录是演示数据，不是实时捕获索引。关闭窗口后进程退出。
+不带其它参数的 `libra ui` 在进程主线程打开 Libra 桌面界面，默认显示 History。
+使用 [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)
+仓库版本 `dd727f4` 和 `gpui-pre` 0.3.10，实现提交图、作者筛选和创作历史检查器。
+顶栏可以进入 Sessions。
+
+这是桌面设计的界面预览，所有记录和状态均为内置演示数据。导航、选择、标签和
+主题切换仅改变界面状态；仓库、Agent、信任、恢复、网络和账户操作不会执行。
+Logo 来自官网，字体和图片内置，离线可用。当前以 macOS 为验证平台。
+关闭窗口后进程退出。
 
 此命令不读取、不写入仓库。
 
