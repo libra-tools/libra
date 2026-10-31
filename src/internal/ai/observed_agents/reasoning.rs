@@ -684,6 +684,7 @@ impl ImportTransportContext {
                 ReasoningProvider::Codex => b"codex".as_slice(),
                 ReasoningProvider::OpenCode => b"opencode".as_slice(),
                 ReasoningProvider::Hermes => b"hermes".as_slice(),
+                ReasoningProvider::Pi => b"pi".as_slice(),
             },
             self.capture_session.as_bytes(),
             self.source_session.as_bytes(),
@@ -1530,6 +1531,19 @@ pub(crate) fn invalidate_import_transport_native_proof_for_test(
     Ok(dto)
 }
 
+/// Whether `provider`'s reasoning can be archived opaque from a native proof:
+/// Claude Code only. Every new provider must decide here; Pi (PI-08),
+/// Hermes, OpenCode, and Codex transport no opaque value.
+fn native_opaque_provider(provider: ReasoningProvider) -> bool {
+    match provider {
+        ReasoningProvider::ClaudeCode => true,
+        ReasoningProvider::Codex
+        | ReasoningProvider::OpenCode
+        | ReasoningProvider::Hermes
+        | ReasoningProvider::Pi => false,
+    }
+}
+
 /// Consume the parent's one-use key before rebuilding any private native
 /// value. The MAC authenticates transport only; native authority is still
 /// checked by the fixed issuer/coordinate validator below.
@@ -1556,6 +1570,16 @@ pub(crate) fn verify_import_transport(
     verification_body.extend_from_slice(&(dto.items.len() as u64).to_le_bytes());
     hmac::verify(&signing_key, &verification_body, &dto.mac)
         .map_err(|_| ReasoningTransportError::Rejected)?;
+    // Refuse a provider that can never be native-proven before any opaque
+    // value is built (the MAC proves transport, not provider authority);
+    // `validate` below would refuse it anyway.
+    if !native_opaque_provider(context.provider)
+        || dto.items.iter().any(|item| {
+            item.provider != context.provider || item.proof.provider != context.provider
+        })
+    {
+        return Err(ReasoningTransportError::NativeProofRejected);
+    }
     use crate::internal::ai::traces::REASONING_ARTIFACT_TOTAL_MAX_BYTES;
     let mut total = 0_u64;
     let mut artifacts = Vec::with_capacity(dto.items.len());
@@ -1891,6 +1915,9 @@ pub enum ReasoningProvider {
     #[serde(rename = "opencode")]
     OpenCode,
     Hermes,
+    /// Pi readable thinking (plan-20260911 PI-08). Pi has no opaque or
+    /// decrypt capability: no native batch, locator, or decryptor names it.
+    Pi,
 }
 
 /// A future provider's explicitly authorized, checkpoint-scoped capability.
@@ -3463,5 +3490,183 @@ mod tests {
         let json = serde_json::to_string(&metadata).expect("safe metadata");
         assert!(!json.contains(&digest));
         assert!(!json.contains("private bytes"));
+    }
+
+    /// The transport-context digest of `provider` for the fixed synthetic
+    /// inputs, computed independently of `ImportTransportContext::digest`.
+    fn expected_context_digest(provider_tag: &[u8]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"libra/import-reasoning-context/v1\0");
+        for bytes in [
+            [1u8; 32].as_slice(),
+            [2u8; 32].as_slice(),
+            [3u8; 32].as_slice(),
+            [4u8; 32].as_slice(),
+            [5u8; 32].as_slice(),
+            provider_tag,
+            carrier_test_support::CAPTURE.as_bytes(),
+            carrier_test_support::SOURCE.as_bytes(),
+        ] {
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        digest.finalize().into()
+    }
+
+    fn context_for(provider: ReasoningProvider) -> ImportTransportContext {
+        ImportTransportContext::new(
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            [5; 32],
+            provider,
+            carrier_test_support::CAPTURE.to_owned(),
+            carrier_test_support::SOURCE.to_owned(),
+        )
+        .expect("valid synthetic context")
+    }
+
+    /// PI-08 AC1: the reasoning closed mapping registers Pi: its serde tag
+    /// and its transport-digest tag are both `pi`.
+    #[test]
+    fn pi_reasoning_codec_registers_the_pi_provider_tag() {
+        assert_eq!(
+            serde_json::to_string(&ReasoningProvider::Pi).unwrap(),
+            "\"pi\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReasoningProvider>("\"pi\"").unwrap(),
+            ReasoningProvider::Pi
+        );
+        assert_eq!(
+            context_for(ReasoningProvider::Pi).digest(),
+            expected_context_digest(b"pi")
+        );
+    }
+
+    /// PI-08 AC4 (reasoning side): the four legacy providers keep their
+    /// serde and transport-digest tags.
+    #[test]
+    fn pi_reasoning_codec_keeps_the_legacy_provider_tags() {
+        for (provider, tag) in [
+            (ReasoningProvider::ClaudeCode, "claude_code"),
+            (ReasoningProvider::Codex, "codex"),
+            (ReasoningProvider::OpenCode, "opencode"),
+            (ReasoningProvider::Hermes, "hermes"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&provider).unwrap(),
+                format!("\"{tag}\"")
+            );
+            assert_eq!(
+                context_for(provider).digest(),
+                expected_context_digest(tag.as_bytes()),
+                "{tag}"
+            );
+        }
+    }
+
+    /// PI-08 AC7: no path builds an opaque record for Pi. The only
+    /// `OpaqueArchived`/`OpaqueEncryptedBytes` construction from a transport
+    /// DTO runs after `validate_shape`, which refuses a DTO that names Pi,
+    /// and no Pi artifact locator is valid.
+    #[test]
+    fn pi_reasoning_codec_grants_pi_no_opaque_path() {
+        let native = synthetic_native_batch_for_turns(
+            carrier_test_support::CAPTURE,
+            carrier_test_support::SOURCE,
+            vec![(0, b"private-wire".to_vec())],
+        );
+        let binding = VerifiedCaptureBinding::from_validated_capture_context(
+            &native,
+            carrier_test_support::CAPTURE,
+            "claude_code",
+        )
+        .unwrap();
+        let control = PendingReasoningSourceDto::from_bound_native(&native, &binding).unwrap();
+        assert!(
+            control.validate_shape().is_ok(),
+            "the unmodified DTO is valid"
+        );
+        let mut dto = PendingReasoningSourceDto::from_bound_native(&native, &binding).unwrap();
+        dto.provider = ReasoningProvider::Pi;
+        for item in &mut dto.items {
+            item.provider = ReasoningProvider::Pi;
+            item.proof.provider = ReasoningProvider::Pi;
+        }
+        assert!(matches!(
+            dto.validate_shape(),
+            Err(ReasoningFieldError::UnsupportedShape)
+        ));
+        for kind in [
+            None,
+            Some(ReasoningSourceKind::Thinking),
+            Some(ReasoningSourceKind::Signature),
+            Some(ReasoningSourceKind::RedactedThinkingData),
+            Some(ReasoningSourceKind::EncryptedContent),
+        ] {
+            for locator in [
+                "pi:msg=0/part=0/metadata=signature",
+                "claude_code:msg=0/part=0/metadata=signature",
+            ] {
+                assert!(!artifact_locator_is_valid(
+                    ReasoningProvider::Pi,
+                    kind,
+                    locator
+                ));
+            }
+        }
+    }
+
+    /// PI-08 AC7: an authenticated import transport whose context or items
+    /// name Pi is refused before any opaque value is built, though its MAC
+    /// is valid.
+    #[test]
+    fn pi_reasoning_codec_refuses_a_signed_pi_transport() {
+        let key = || ImportTransportKey([7; 32]);
+        let claude = transport_context();
+        let sealed = seal_import_transport(key(), &claude, transport_native())
+            .expect("synthetic native seal");
+        let frame = serde_json::to_vec(&sealed).expect("encode transport");
+        for pi_context in [true, false] {
+            let context = if pi_context {
+                context_for(ReasoningProvider::Pi)
+            } else {
+                transport_context()
+            };
+            let mut dto: ImportTransportDto =
+                serde_json::from_slice(&frame).expect("decode transport");
+            for item in &mut dto.items {
+                item.provider = ReasoningProvider::Pi;
+                item.proof.provider = ReasoningProvider::Pi;
+            }
+            dto.context_sha256 = context.digest();
+            dto.collection_sha256 =
+                import_transport_collection_digest(&dto.items).expect("collection digest");
+            dto.mac = import_transport_mac(
+                &key(),
+                &dto.context_sha256,
+                &dto.collection_sha256,
+                dto.items.len(),
+            )
+            .expect("valid MAC over the Pi items");
+            assert!(
+                matches!(
+                    verify_import_transport(key(), context, dto),
+                    Err(ReasoningTransportError::NativeProofRejected)
+                ),
+                "pi context: {pi_context}"
+            );
+        }
+        // Control: the unmodified Claude transport still restores.
+        let control: ImportTransportDto = serde_json::from_slice(&frame).expect("decode");
+        assert!(verify_import_transport(key(), claude, control).is_ok());
+    }
+
+    /// PI-08 AC8: the decryptor registry grants Pi nothing.
+    #[test]
+    fn pi_reasoning_codec_grants_pi_no_decryptor() {
+        assert!(reasoning_decryptor(ReasoningProvider::Pi).is_none());
     }
 }

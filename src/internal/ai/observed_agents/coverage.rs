@@ -41,6 +41,7 @@ fn reasoning_provider_tag(provider: reasoning::ReasoningProvider) -> &'static st
         reasoning::ReasoningProvider::Codex => "codex",
         reasoning::ReasoningProvider::OpenCode => "opencode",
         reasoning::ReasoningProvider::Hermes => "hermes",
+        reasoning::ReasoningProvider::Pi => "pi",
     }
 }
 
@@ -3724,6 +3725,29 @@ pub(crate) fn import_runtime_has_typed_turns(dto: &RedactedImportCoverageRuntime
     })
 }
 
+/// Import kinds whose readable reasoning the import runtime carries:
+/// OpenCode `reasoning` and Pi `thinking` (plan-20260911 PI-08).
+fn import_runtime_reasoning_kind(agent_kind: &str) -> bool {
+    import_runtime_reasoning_pair(agent_kind).is_some()
+}
+
+/// The one readable provider and source kind each import kind carries.
+fn import_runtime_reasoning_pair(
+    agent_kind: &str,
+) -> Option<(reasoning::ReasoningProvider, reasoning::ReasoningSourceKind)> {
+    match agent_kind {
+        "opencode" => Some((
+            reasoning::ReasoningProvider::OpenCode,
+            reasoning::ReasoningSourceKind::Reasoning,
+        )),
+        "pi" => Some((
+            reasoning::ReasoningProvider::Pi,
+            reasoning::ReasoningSourceKind::Thinking,
+        )),
+        _ => None,
+    }
+}
+
 /// Sole production encoder: the held-descriptor preparation owner supplies
 /// snapshot-redacted turns. This emits only the versioned safe projection.
 pub(crate) fn encode_redacted_import_runtime(
@@ -3734,7 +3758,7 @@ pub(crate) fn encode_redacted_import_runtime(
     deadline: Instant,
 ) -> Result<RedactedImportCoverageRuntimeDto, reasoning::ReasoningFieldError> {
     use reasoning::ReasoningFieldError as Error;
-    if agent_kind != "opencode" || Instant::now() >= deadline {
+    if !import_runtime_reasoning_kind(agent_kind) || Instant::now() >= deadline {
         return Err(Error::UnsupportedShape);
     }
     let turns = turns.filter(|turns| {
@@ -3767,7 +3791,18 @@ pub(crate) fn encode_redacted_import_runtime(
                     SemanticRecord::User { text } | SemanticRecord::Assistant { text } => {
                         charge(&mut budget, 2, text.len())?
                     }
-                    SemanticRecord::Reasoning { text, .. } => {
+                    SemanticRecord::Reasoning {
+                        provider,
+                        source_kind,
+                        text,
+                    } => {
+                        // Only the import kind's own readable provider and
+                        // source kind; the decoder accepts nothing else.
+                        if import_runtime_reasoning_pair(agent_kind)
+                            != source_kind.map(|kind| (*provider, kind))
+                        {
+                            return Err(Error::UnsupportedShape);
+                        }
                         charge(&mut budget, 2, text.as_str().len())?
                     }
                     SemanticRecord::ToolResult {
@@ -3848,7 +3883,7 @@ pub(crate) fn decode_redacted_import_runtime(
     deadline: Instant,
 ) -> Result<(Option<Vec<NormalizedTurn>>, bool, bool), reasoning::ReasoningFieldError> {
     use reasoning::ReasoningFieldError as Error;
-    if agent_kind != "opencode"
+    if !import_runtime_reasoning_kind(agent_kind)
         || dto.version != 1
         || Instant::now() >= deadline
         || (dto.classifier_rejected && dto.turns.is_some())
@@ -3921,17 +3956,24 @@ pub(crate) fn decode_redacted_import_runtime(
                     source_kind,
                     text,
                 } => {
-                    if provider != "opencode" || source_kind.as_deref() != Some("reasoning") {
+                    // Each import kind restores only its own readable
+                    // provider and source kind.
+                    let Some((expected_provider, expected_kind)) =
+                        import_runtime_reasoning_pair(agent_kind)
+                    else {
+                        return Err(Error::UnsupportedShape);
+                    };
+                    if provider != reasoning_provider_tag(expected_provider)
+                        || source_kind.as_deref() != Some(reasoning_source_kind_tag(expected_kind))
+                    {
                         return Err(Error::UnsupportedShape);
                     }
-                    let (_, text) = reasoning::classify_provider_visible_reasoning(
-                        reasoning::ReasoningProvider::OpenCode,
-                        reasoning::ReasoningSourceKind::Reasoning,
-                        text,
-                    );
+                    let (provider, source_kind) = (expected_provider, expected_kind);
+                    let (_, text) =
+                        reasoning::classify_provider_visible_reasoning(provider, source_kind, text);
                     SemanticRecord::Reasoning {
-                        provider: reasoning::ReasoningProvider::OpenCode,
-                        source_kind: Some(reasoning::ReasoningSourceKind::Reasoning),
+                        provider,
+                        source_kind: Some(source_kind),
                         text,
                     }
                 }
@@ -4211,6 +4253,213 @@ mod tests {
                 text: "hello".to_string(),
             },
         ]
+    }
+
+    /// A synthetic Pi turn whose readable thinking is a typed reasoning
+    /// record of `provider` and `kind`.
+    fn pi_codec_turn(
+        provider: reasoning::ReasoningProvider,
+        kind: Option<reasoning::ReasoningSourceKind>,
+    ) -> NormalizedTurn {
+        let (_, text) = reasoning::classify_provider_visible_reasoning(
+            provider,
+            kind.unwrap_or(reasoning::ReasoningSourceKind::Thinking),
+            "weigh the options".to_owned(),
+        );
+        NormalizedTurn {
+            logical_turn_key: "pi-turn".to_owned(),
+            ordinal: 0,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: vec![
+                SemanticRecord::User {
+                    text: "hi".to_owned(),
+                },
+                SemanticRecord::Reasoning {
+                    provider,
+                    source_kind: kind,
+                    text,
+                },
+                SemanticRecord::Assistant {
+                    text: "hello".to_owned(),
+                },
+            ],
+        }
+    }
+
+    fn pi_thinking_turn() -> NormalizedTurn {
+        pi_codec_turn(
+            reasoning::ReasoningProvider::Pi,
+            Some(reasoning::ReasoningSourceKind::Thinking),
+        )
+    }
+
+    fn pi_legacy_of(turn: &NormalizedTurn) -> NormalizedTurn {
+        let mut legacy = turn.clone();
+        legacy
+            .records
+            .retain(|record| !matches!(record, SemanticRecord::Reasoning { .. }));
+        legacy.completeness = Completeness::Incomplete;
+        legacy
+    }
+
+    /// PI-08 AC2: the coverage closed mapping gives Pi the wire tag `pi`,
+    /// and a Pi reasoning record projects as `pi`/`thinking`.
+    #[test]
+    fn pi_reasoning_codec_registers_the_pi_wire_tag() {
+        assert_eq!(
+            reasoning_provider_tag(reasoning::ReasoningProvider::Pi),
+            "pi"
+        );
+        let projection = safe_turn_projection_for_schema(2, "pi", &pi_thinking_turn())
+            .expect("a Pi v2 turn projects");
+        let records = projection["records"].as_array().expect("records");
+        assert!(records.iter().any(|record| record["provider"] == "pi"
+            && record["source_kind"] == "thinking"
+            && record["type"] == "reasoning"));
+    }
+
+    /// PI-08 AC3: the production import encoder accepts a Pi reasoning
+    /// record and writes it as `pi`/`thinking`; it refuses any other
+    /// provider or source kind for `pi`, and Pi records for another kind.
+    #[test]
+    fn pi_reasoning_codec_encoder_accepts_pi_thinking() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let turn = pi_thinking_turn();
+        let wire = encode_redacted_import_runtime(
+            "pi",
+            Some(std::slice::from_ref(&turn)),
+            false,
+            false,
+            deadline,
+        )
+        .expect("the encoder accepts Pi thinking");
+        let json = serde_json::to_value(&wire).unwrap();
+        let reasoning = json["turns"][0]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["type"] == "reasoning")
+            .expect("a reasoning wire record")
+            .clone();
+        assert_eq!(reasoning["provider"], "pi");
+        assert_eq!(reasoning["source_kind"], "thinking");
+        for (agent_kind, refused) in [
+            ("opencode", pi_thinking_turn()),
+            ("pi", cov2_visible_turn("opencode reasoning")),
+            (
+                "pi",
+                pi_codec_turn(
+                    reasoning::ReasoningProvider::Pi,
+                    Some(reasoning::ReasoningSourceKind::Reasoning),
+                ),
+            ),
+            ("pi", pi_codec_turn(reasoning::ReasoningProvider::Pi, None)),
+            ("hermes", pi_thinking_turn()),
+        ] {
+            assert!(
+                encode_redacted_import_runtime(
+                    agent_kind,
+                    Some(std::slice::from_ref(&refused)),
+                    false,
+                    false,
+                    deadline,
+                )
+                .is_err(),
+                "{agent_kind}"
+            );
+        }
+    }
+
+    /// PI-08 AC4: the decoder restores a `pi`/`thinking` wire record the
+    /// production encoder wrote to the same typed record, and refuses it
+    /// under another kind or with another provider or source kind.
+    #[test]
+    fn pi_reasoning_codec_decoder_restores_pi_thinking() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let turn = pi_thinking_turn();
+        let legacy = pi_legacy_of(&turn);
+        let encode = || {
+            encode_redacted_import_runtime(
+                "pi",
+                Some(std::slice::from_ref(&turn)),
+                false,
+                false,
+                deadline,
+            )
+            .unwrap()
+        };
+        let (restored, rejected, partial) = decode_redacted_import_runtime(
+            encode(),
+            "pi",
+            std::slice::from_ref(&legacy),
+            "stopped",
+            deadline,
+        )
+        .expect("the decoder restores Pi thinking");
+        assert!(!rejected && !partial);
+        assert_eq!(restored.unwrap()[0].records, turn.records);
+        assert!(
+            decode_redacted_import_runtime(
+                encode(),
+                "opencode",
+                std::slice::from_ref(&legacy),
+                "stopped",
+                deadline
+            )
+            .is_err()
+        );
+        for (field, value) in [("provider", "opencode"), ("source_kind", "reasoning")] {
+            let mut json = serde_json::to_value(encode()).unwrap();
+            for record in json["turns"][0]["records"].as_array_mut().unwrap() {
+                if record["type"] == "reasoning" {
+                    record[field] = serde_json::Value::String(value.to_owned());
+                }
+            }
+            let tampered: RedactedImportCoverageRuntimeDto = serde_json::from_value(json).unwrap();
+            assert!(
+                decode_redacted_import_runtime(
+                    tampered,
+                    "pi",
+                    std::slice::from_ref(&legacy),
+                    "stopped",
+                    deadline
+                )
+                .is_err(),
+                "{field}={value}"
+            );
+        }
+    }
+
+    /// PI-08 AC5: the four legacy providers keep their coverage wire tags.
+    #[test]
+    fn pi_reasoning_codec_keeps_the_legacy_wire_tags() {
+        for (provider, tag) in [
+            (reasoning::ReasoningProvider::ClaudeCode, "claude_code"),
+            (reasoning::ReasoningProvider::Codex, "codex"),
+            (reasoning::ReasoningProvider::OpenCode, "opencode"),
+            (reasoning::ReasoningProvider::Hermes, "hermes"),
+        ] {
+            assert_eq!(reasoning_provider_tag(provider), tag);
+        }
+    }
+
+    /// PI-08 AC6: the frozen v2 golden (an OpenCode reasoning turn) still
+    /// encodes to the same canonical bytes and digest.
+    #[test]
+    fn pi_reasoning_codec_keeps_the_legacy_golden_digest() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/agent_transcripts/reasoning/coverage_v2_golden.json"
+        )))
+        .expect("independent v2 golden is valid JSON");
+        let encoded = encode_coverage_turn(&cov2_visible_turn("synthetic")).expect("golden turn");
+        assert_eq!(
+            encoded.canonical_bytes,
+            golden["canonical_utf8"].as_str().unwrap().as_bytes()
+        );
+        assert_eq!(encoded.digest_hex, golden["sha256"].as_str().unwrap());
     }
 
     #[test]
