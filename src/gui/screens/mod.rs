@@ -35,3 +35,5 @@ pub mod rebase;
 pub mod cloud;
 
 pub mod views;
+
+pub mod deps;

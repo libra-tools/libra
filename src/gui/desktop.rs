@@ -19,6 +19,7 @@ gpui::actions!(libra_desktop, [OpenSearch]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Deps,
     Views,
     Cloud,
     Rebase,
@@ -63,9 +64,11 @@ impl Page {
         Self::Rebase,
         Self::Cloud,
         Self::Views,
+        Self::Deps,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Deps => "deps",
             Self::Views => "views",
             Self::Cloud => "cloud",
             Self::Rebase => "rebase",
@@ -90,6 +93,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Deps => "Dependencies",
             Self::Views => "Views & layers",
             Self::Cloud => "Cloud & remotes",
             Self::Rebase => "Rebase",
@@ -182,6 +186,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Deps => screens::deps::render(self, cx, &p),
             Page::Views => screens::views::render(self, cx, &p),
             Page::Cloud => screens::cloud::render(self, cx, &p),
             Page::Rebase => screens::rebase::render(self, cx, &p),
