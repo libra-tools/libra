@@ -41,3 +41,5 @@ pub mod deps;
 pub mod mega;
 
 pub mod settings;
+
+pub mod splash;
