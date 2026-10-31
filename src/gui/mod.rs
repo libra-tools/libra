@@ -51,6 +51,7 @@ fn open_window(cx: &mut App) -> anyhow::Result<()> {
     light.border = gpui::rgb(0xe3e6eb).into();
     light.fg = gpui::rgb(0x111827).into();
     light.fg_muted = gpui::rgb(0x5b6474).into();
+    light.selection = gpui::rgb(0xeaf1ff).into();
     light.accent = gpui::rgb(0x2563eb).into();
     Theme::set_palette(Mode::Light, Some(light), cx);
     Theme::set_mode_now(Mode::Light, cx);

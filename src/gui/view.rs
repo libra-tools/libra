@@ -10,7 +10,7 @@ use ely_gpui_component::{
     data_display::{Badge, Tone},
     forms::{Choice, ChoiceChips, InputEvent, SearchInput, TextInput},
     overlays::Dialog,
-    theme::{ActiveTheme, ControlSize, Mode, Theme},
+    theme::{ActiveTheme, ControlSize},
     typography::{Heading, Paragraph},
 };
 use gpui::{
@@ -63,7 +63,6 @@ pub struct SessionsWindow {
     pane: Pane,
     drawer: Drawer,
     map_open: bool,
-    dark: bool,
     worktree: String,
     agents: Vec<String>,
     dates: Vec<String>,
@@ -91,7 +90,6 @@ impl SessionsWindow {
             pane: Pane::Overview,
             drawer: Drawer::None,
             map_open: false,
-            dark: false,
             worktree: "all".into(),
             agents: Vec::new(),
             dates: Vec::new(),
@@ -180,7 +178,6 @@ fn header(
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
     let worktrees = worktree_choices(catalog);
-    let theme_label = if window.dark { "Light" } else { "Dark" };
     div()
         .h(px(52.0))
         .flex()
@@ -194,26 +191,6 @@ fn header(
         .child(icon_button("sidebar", "≡", this.clone(), |window| {
             window.sidebar_open = !window.sidebar_open;
         }))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .size(px(26.0))
-                        .rounded(px(6.0))
-                        .bg(colors.accent)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(colors.on_accent)
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("L"),
-                )
-                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Libra"))
-                .child(div().text_color(colors.fg_muted).child("Sessions")),
-        )
         .child(
             ChoiceChips::new("worktree", worktrees)
                 .selected([SharedString::from(window.worktree.clone())])
@@ -265,17 +242,6 @@ fn header(
                 window.map_open = true;
             },
         ))
-        .child(text_button_cx(
-            "theme",
-            theme_label,
-            ButtonVariant::Ghost,
-            this,
-            |window, cx| {
-                window.dark = !window.dark;
-                let mode = if window.dark { Mode::Dark } else { Mode::Light };
-                Theme::set_mode_now(mode, cx);
-            },
-        ))
 }
 
 fn sidebar(
@@ -288,14 +254,14 @@ fn sidebar(
     let filters = filter_choices();
     let selected_filters = selected_filters(window);
     div()
-        .w(px(320.0))
+        .w(px(300.0))
         .flex_none()
         .h_full()
         .flex()
         .flex_col()
         .border_r_1()
         .border_color(colors.border)
-        .bg(colors.surface)
+        .bg(colors.bg)
         .child(
             div().p_2().child(
                 ChoiceChips::new("filters", filters)
@@ -390,94 +356,71 @@ fn main_column(
 }
 
 fn session_header(
-    window: &SessionsWindow,
+    state: &SessionsWindow,
     session: &Session,
     this: Entity<SessionsWindow>,
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
-    let summary = if session.summary.is_empty() {
-        "This session has no summary; identify it by agent and time."
-    } else {
-        session.summary.as_str()
-    };
-    div()
+    use super::widgets::{agent, column, mono, muted, row, title};
+    column()
         .flex_none()
-        .px_4()
-        .pt_3()
-        .pb_2()
+        .px_6()
+        .pt_4()
+        .pb_3()
         .border_b_1()
         .border_color(colors.border)
-        .flex()
-        .flex_col()
-        .gap_2()
         .child(
-            div()
-                .flex()
-                .items_start()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(Heading::h1(session.title.clone()))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Badge::new(session.agent.clone())
-                                        .tone(agent_tone(&session.agent)),
-                                )
-                                .child(Badge::new(session.model.clone()))
-                                .child(Badge::new(format!(
-                                    "{} – {}",
-                                    clock(&session.start),
-                                    clock(&session.end)
-                                )))
-                                .child(Badge::new(format!(
-                                    "libra @ {} · HEAD {}",
-                                    session.worktree, session.head
-                                ))),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(colors.fg_muted)
-                                .child(format!("{} · {summary}", session.summary_source)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(drawer_button(
-                            "info",
-                            "Session info",
-                            Drawer::Info,
-                            window.drawer,
-                            this.clone(),
-                        ))
-                        .child(drawer_button(
-                            "usage",
-                            "Usage",
-                            Drawer::Usage,
-                            window.drawer,
-                            this.clone(),
-                        ))
-                        .child(drawer_button(
-                            "capture",
-                            "Capture details",
-                            Drawer::Capture,
-                            window.drawer,
-                            this.clone(),
-                        )),
-                ),
+            row()
+                .child(agent(&session.agent))
+                .child(session.agent.clone())
+                .child(muted(
+                    format!(
+                        "{} · {} – {}",
+                        session.start.get(..10).unwrap_or(""),
+                        clock(&session.start),
+                        clock(&session.end)
+                    ),
+                    colors,
+                ))
+                .child(div().flex_1())
+                .child(drawer_button(
+                    "info",
+                    "Session info",
+                    Drawer::Info,
+                    state.drawer,
+                    this.clone(),
+                ))
+                .child(drawer_button(
+                    "usage",
+                    "Usage",
+                    Drawer::Usage,
+                    state.drawer,
+                    this.clone(),
+                ))
+                .child(drawer_button(
+                    "capture",
+                    "Capture details",
+                    Drawer::Capture,
+                    state.drawer,
+                    this.clone(),
+                )),
         )
+        .child(title(session.title.clone()))
+        .child(
+            mono(format!(
+                "libra @ {} · HEAD {} · {}",
+                session.worktree, session.head, session.model
+            ))
+            .text_color(colors.fg_muted),
+        )
+        .child(muted(
+            if session.summary.is_empty() {
+                "This session has no summary; identify it by agent and time.".to_string()
+            } else {
+                format!("{} · {}", session.summary_source, session.summary)
+            },
+            colors,
+        ))
         .child(
             ChoiceChips::new(
                 "pane",
@@ -487,16 +430,11 @@ fn session_header(
                     Choice::new("changes", "Changes"),
                 ],
             )
-            .selected([SharedString::from(window.pane.key())])
-            .on_change({
-                let this = this;
-                move |values, _, cx| {
-                    let Some(value) = values.first() else {
-                        return;
-                    };
-                    let pane = Pane::from_key(value);
-                    this.update(cx, |window, cx| {
-                        window.pane = pane;
+            .selected([SharedString::from(state.pane.key())])
+            .on_change(move |values, _, cx| {
+                if let Some(value) = values.first() {
+                    this.update(cx, |s, cx| {
+                        s.pane = Pane::from_key(value);
                         cx.notify();
                     });
                 }
@@ -1261,24 +1199,6 @@ fn text_button(
         .on_click(move |_, _, cx| {
             this.update(cx, |window, cx| {
                 apply(window);
-                cx.notify();
-            });
-        })
-}
-
-fn text_button_cx(
-    id: &'static str,
-    label: &'static str,
-    variant: ButtonVariant,
-    this: Entity<SessionsWindow>,
-    apply: impl Fn(&mut SessionsWindow, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    Button::new(id, label)
-        .variant(variant)
-        .size(ControlSize::Sm)
-        .on_click(move |_, _, cx| {
-            this.update(cx, |window, cx| {
-                apply(window, cx);
                 cx.notify();
             });
         })

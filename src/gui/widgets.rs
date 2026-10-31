@@ -9,7 +9,7 @@ use gpui::{Context, Div, FontWeight, ParentElement, SharedString, div, prelude::
 use super::desktop::{Desktop, Page};
 
 pub fn row() -> Div {
-    div().flex().items_center().gap_2()
+    div().flex().flex_none().items_center().gap_2()
 }
 pub fn column() -> Div {
     div().flex().flex_col().gap_3().min_w(px(0.0))
@@ -41,6 +41,7 @@ pub fn mono(text: impl Into<SharedString>) -> Div {
 }
 pub fn card(p: &Palette) -> Div {
     column()
+        .flex_none()
         .p_4()
         .rounded(px(10.0))
         .border_1()
@@ -140,6 +141,7 @@ pub fn tabs(labels: &[&'static str], selected: usize, cx: &Context<Desktop>) -> 
 }
 pub fn table(headers: &[&str], rows: &[Vec<&str>], p: &Palette) -> Div {
     column()
+        .flex_none()
         .gap_0()
         .border_1()
         .border_color(p.border)
