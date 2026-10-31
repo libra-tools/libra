@@ -43,3 +43,5 @@ pub mod mega;
 pub mod settings;
 
 pub mod splash;
+
+pub mod splash_error;
