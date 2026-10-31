@@ -15,3 +15,5 @@ pub mod agents;
 pub mod reviews;
 
 pub mod investigate;
+
+pub mod review;
