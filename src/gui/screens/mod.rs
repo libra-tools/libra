@@ -21,3 +21,5 @@ pub mod review;
 pub mod automation;
 
 pub mod welcome;
+
+pub mod conflict;
