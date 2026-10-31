@@ -19,6 +19,7 @@ gpui::actions!(libra_desktop, [OpenSearch]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Settings,
     Mega,
     Deps,
     Views,
@@ -67,9 +68,11 @@ impl Page {
         Self::Views,
         Self::Deps,
         Self::Mega,
+        Self::Settings,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Settings => "settings",
             Self::Mega => "mega",
             Self::Deps => "deps",
             Self::Views => "views",
@@ -96,6 +99,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Settings => "Settings",
             Self::Mega => "Mega2 browser",
             Self::Deps => "Dependencies",
             Self::Views => "Views & layers",
@@ -190,6 +194,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Settings => screens::settings::render(self, cx, &p),
             Page::Mega => screens::mega::render(self, cx, &p),
             Page::Deps => screens::deps::render(self, cx, &p),
             Page::Views => screens::views::render(self, cx, &p),

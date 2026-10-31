@@ -39,3 +39,5 @@ pub mod views;
 pub mod deps;
 
 pub mod mega;
+
+pub mod settings;
