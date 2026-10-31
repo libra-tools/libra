@@ -25,3 +25,5 @@ pub mod welcome;
 pub mod conflict;
 
 pub mod blame;
+
+pub mod bisect;

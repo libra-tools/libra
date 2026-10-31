@@ -19,6 +19,7 @@ gpui::actions!(libra_desktop, [OpenSearch]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Bisect,
     Blame,
     Conflict,
     Welcome,
@@ -53,9 +54,11 @@ impl Page {
         Self::Welcome,
         Self::Conflict,
         Self::Blame,
+        Self::Bisect,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Bisect => "bisect",
             Self::Blame => "blame",
             Self::Conflict => "conflict",
             Self::Welcome => "welcome",
@@ -75,6 +78,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Bisect => "Bisect",
             Self::Blame => "Blame",
             Self::Conflict => "Conflicts",
             Self::Welcome => "Welcome",
@@ -160,6 +164,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Bisect => screens::bisect::render(self, cx, &p),
             Page::Blame => screens::blame::render(self, cx, &p),
             Page::Conflict => screens::conflict::render(self, cx, &p),
             Page::Welcome => screens::welcome::render(self, cx, &p),
