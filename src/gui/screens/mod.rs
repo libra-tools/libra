@@ -37,3 +37,5 @@ pub mod cloud;
 pub mod views;
 
 pub mod deps;
+
+pub mod mega;
