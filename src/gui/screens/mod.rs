@@ -33,3 +33,5 @@ pub mod refs;
 pub mod rebase;
 
 pub mod cloud;
+
+pub mod views;
