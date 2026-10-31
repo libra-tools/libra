@@ -166,3 +166,34 @@ pub fn table(headers: &[&str], rows: &[Vec<&str>], p: &Palette) -> Div {
                 )
         }))
 }
+
+pub fn field(label_text: &'static str, value: &'static str, p: &Palette) -> Div {
+    column().gap_2().child(label(label_text, p)).child(
+        mono(value)
+            .px_3()
+            .py_2()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface),
+    )
+}
+
+pub fn check(
+    id: &'static str,
+    text: &'static str,
+    default: bool,
+    state: &Desktop,
+    cx: &Context<Desktop>,
+) -> ely_gpui_component::forms::Checkbox {
+    let checked = state.toggles.get(id).copied().unwrap_or(default);
+    let entity = cx.entity();
+    ely_gpui_component::forms::Checkbox::new(id, checked)
+        .label(text)
+        .on_change(move |on, _, cx| {
+            entity.update(cx, |s, cx| {
+                s.toggles.insert(id, on);
+                cx.notify();
+            });
+        })
+}

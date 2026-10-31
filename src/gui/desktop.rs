@@ -1,5 +1,7 @@
 //! Navigation and presentation-only state for the desktop design.
 
+use std::collections::HashMap;
+
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant},
     forms::{InputEvent, TextInput},
@@ -15,20 +17,23 @@ use super::{screens, view::SessionsWindow, widgets::*};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Lanes,
     History,
     Sessions,
 }
 
 impl Page {
-    pub const ALL: &'static [Self] = &[Self::History, Self::Sessions];
+    pub const ALL: &'static [Self] = &[Self::History, Self::Sessions, Self::Lanes];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Lanes => "lanes",
             Self::History => "history",
             Self::Sessions => "sessions",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Lanes => "Lanes",
             Self::History => "History",
             Self::Sessions => "Sessions",
         }
@@ -45,6 +50,8 @@ pub struct Desktop {
     pub sessions: Entity<SessionsWindow>,
     pub input: Entity<TextInput>,
     pub query: String,
+    pub toggles: HashMap<&'static str, bool>,
+    pub draft: Entity<TextInput>,
 }
 
 impl Desktop {
@@ -63,7 +70,11 @@ impl Desktop {
             }
         })
         .detach();
+        let draft = cx
+            .new(|cx| TextInput::new(window, cx).placeholder("What should this lane accomplish?"));
         Self {
+            toggles: HashMap::new(),
+            draft,
             query: String::new(),
             focus,
             page: Page::History,
@@ -89,6 +100,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Lanes => screens::lanes::render(self, cx, &p),
             Page::History => screens::history::render(self, cx, &p),
             Page::Sessions => self.sessions.clone().into_any_element(),
         };
