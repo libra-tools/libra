@@ -199,3 +199,12 @@ pub fn check(
             });
         })
 }
+
+pub fn banner(text: impl Into<SharedString>) -> Div {
+    row()
+        .px_4()
+        .py_3()
+        .bg(rgb(0xfffbeb))
+        .text_color(rgb(0x92400e))
+        .child(text.into())
+}
