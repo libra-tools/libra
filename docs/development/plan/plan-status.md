@@ -1,3 +1,9 @@
+> **2026-10-31 19:02:57 UTC GOV 本地复核：** 6d55f6b 同树的两份纠错文档 `diff --check`、nightly fmt、严格 Clippy、release build 均 exit0，项目0错误/警告；第三方 proc-macro-error2 未来相容性尾注按用户指令排除，282个相对链接无缺失。该本地检查不替代原0aa5cc5的同 SHA D；新main base 41231815755 仍在运行，本纠错未提交/推送，GOV `in-progress/remote-pending`。
+
+> **2026-10-31 18:58:08 UTC GOV 远端更新（现行）：** `8c9687c` base `41226220357` 因18:56:30Z 新 main `6d55f6b` 推送而于18:56:54Z cancelled（7/8 success、offline 未完）；新 base `41231815755` 正启动。`6d55f6b` 含 PI-11 源码/测试/版本與 PI-08/status 文档，仍不是 GOV 原 `0aa5cc5` 同树。独立 clone 已保存两份 GOV 草稿并原生快进 rebase 到最新上游，现行 GOV `in-progress/remote-pending`、0/1，`DEP-TR-CODEONLY-GOV` incoming；LTR 0/26、资格/H1/旧 D FAIL 不变。root 等新 main CI 退出及无推送窗口后才补原 SHA network，不推送抢占现有 run。
+
+> **2026-10-31 17:49:22 UTC GOV-LTR-CO-01 D 纠错（现行）：** `8c9687c` 的上一行闭合声明保留为历史，但后继 `f7c1c30` 改了 PI 源码/测试/版本与 `plan-status.md`，不符合 GOV 卡 D mapping 的“仅同树/同 SHA”承接条件。原 SHA `0aa5cc5` 的 base run `41217305547` attempt1/2/3 均 cancelled，第三次由 `8c` 新 main 推送取消；CodeQL `41217305521`、Code Quality `41217305338` success 不能替代 network。当前 GOV `in-progress/remote-pending`、0/1，`DEP-TR-CODEONLY-GOV` 仍 incoming；`8c` base `41226220357` 在运行，暂不重跑同并发组。取消时间、责任与 SHA256 原件在日期计划顶栏及 GOV 卡，正式 LTR 0/26、资格/H1/旧 D FAIL 不变。
+
 > **2026-10-31 GOV-LTR-CO-01 `done`/`complete`（现行）：** 七路径签名+DCO `0aa5cc5` 已在 main；其自身 run `41217305547` 被上游推进 superseded 取消（非失败），已原生前滚至 `f7c1c30` 并把 D 重绑到该 tip：`Check, Build and Test` `41221813772` success、`CodeQL Advanced` `41221813780` success；六份治理文件与 `0aa5cc5` 逐字节相同，`plan-status.md` 仅因上游 PI-03/PI-11 追加行不同。用户对本卡后续 Claude Review 的具名豁免保留（Review 栏无 PASS 判词，不外推）。正式 LTR 产品卡仍 0/26；`DEP-TR-H1` 仍 incoming，LTR-01 家族（10/11/12）不得开工。
 
 > **2026-10-31 GOV rebase 后门：** 七文档链接无缺失、20非治理路径同C3来源；nightly fmt、严格Clippy、release build均真exit0，项目警告/错误0，仅用户排除的第三方future-incompat尾注。最终提交前B/fmt/远端身份再核；签名提交/推送/D待。
