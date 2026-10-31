@@ -15,8 +15,11 @@ use gpui::{
 
 use super::{screens, view::SessionsWindow, widgets::*};
 
+gpui::actions!(libra_desktop, [OpenSearch]);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Search,
     Capabilities,
     Lanes,
     History,
@@ -29,9 +32,11 @@ impl Page {
         Self::Sessions,
         Self::Lanes,
         Self::Capabilities,
+        Self::Search,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Search => "search",
             Self::Capabilities => "capabilities",
             Self::Lanes => "lanes",
             Self::History => "history",
@@ -40,6 +45,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Search => "All tools",
             Self::Capabilities => "Capability map",
             Self::Lanes => "Lanes",
             Self::History => "History",
@@ -65,6 +71,12 @@ pub struct Desktop {
 impl Desktop {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        cx.bind_keys([gpui::KeyBinding::new(
+            "cmd-k",
+            OpenSearch,
+            Some("LibraDesktop"),
+        )]);
         let search = cx.new(|cx| {
             TextInput::new(window, cx).placeholder("Search redacted content and readable reasoning")
         });
@@ -108,67 +120,79 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Search => screens::search::render(self, cx, &p),
             Page::Capabilities => screens::capabilities::render(self, cx, &p),
             Page::Lanes => screens::lanes::render(self, cx, &p),
             Page::History => screens::history::render(self, cx, &p),
             Page::Sessions => self.sessions.clone().into_any_element(),
         };
-        FocusScope::new(&self.focus)
-            .root()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(p.bg)
-            .text_color(p.fg)
-            .font_family("Inter")
-            .text_size(px(13.0))
-            .child(
-                row()
-                    .flex_none()
-                    .h(px(58.0))
-                    .px_4()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .bg(p.surface)
-                    .child(img("libra/logo.svg").size(px(30.0)))
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .mr_3()
-                            .child("Libra"),
-                    )
-                    .children(Page::ALL.iter().take(6).map(|page| nav(*page, cx)))
-                    .child(div().flex_1())
-                    .child(badge("Design preview", 0x5b6474, 0xf4f5f7))
-                    .child(
-                        Button::new("theme", if dark { "Light" } else { "Dark" })
-                            .size(ControlSize::Sm)
-                            .variant(ButtonVariant::Ghost)
-                            .on_click(move |_, _, cx| {
-                                Theme::set_mode_now(if dark { Mode::Light } else { Mode::Dark }, cx)
-                            }),
-                    ),
-            )
-            .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
-            .when_some(self.notice.clone(), |root, text| {
-                root.child(
+        FocusScope::new(&self.focus).root().size_full().child(
+            div()
+                .id("desktop-root")
+                .key_context("LibraDesktop")
+                .on_action(cx.listener(|s, _: &OpenSearch, _, cx| {
+                    s.navigate(Page::Search);
+                    s.tab = 4;
+                    cx.notify();
+                }))
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(p.bg)
+                .text_color(p.fg)
+                .font_family("Inter")
+                .text_size(px(13.0))
+                .child(
                     row()
+                        .flex_none()
+                        .h(px(58.0))
                         .px_4()
-                        .py_2()
-                        .bg(p.surface)
-                        .border_t_1()
+                        .border_b_1()
                         .border_color(p.border)
-                        .child(muted(text, &p))
-                        .child(div().flex_1())
+                        .bg(p.surface)
+                        .child(img("libra/logo.svg").size(px(30.0)))
                         .child(
-                            Button::new("dismiss", "Dismiss")
+                            div()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .mr_3()
+                                .child("Libra"),
+                        )
+                        .children(Page::ALL.iter().take(6).map(|page| nav(*page, cx)))
+                        .child(div().flex_1())
+                        .child(badge("Design preview", 0x5b6474, 0xf4f5f7))
+                        .child(
+                            Button::new("theme", if dark { "Light" } else { "Dark" })
                                 .size(ControlSize::Sm)
-                                .on_click(cx.listener(|s, _, _, cx| {
-                                    s.notice = None;
-                                    cx.notify();
-                                })),
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(move |_, _, cx| {
+                                    Theme::set_mode_now(
+                                        if dark { Mode::Light } else { Mode::Dark },
+                                        cx,
+                                    )
+                                }),
                         ),
                 )
-            })
+                .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body))
+                .when_some(self.notice.clone(), |root, text| {
+                    root.child(
+                        row()
+                            .px_4()
+                            .py_2()
+                            .bg(p.surface)
+                            .border_t_1()
+                            .border_color(p.border)
+                            .child(muted(text, &p))
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("dismiss", "Dismiss")
+                                    .size(ControlSize::Sm)
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.notice = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                }),
+        )
     }
 }
