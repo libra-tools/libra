@@ -9,3 +9,5 @@ pub mod search;
 pub mod operations;
 
 pub mod memory;
+
+pub mod agents;
