@@ -19,6 +19,7 @@ gpui::actions!(libra_desktop, [OpenSearch]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
+    Investigate,
     Reviews,
     Agents,
     Memory,
@@ -41,9 +42,11 @@ impl Page {
         Self::Memory,
         Self::Agents,
         Self::Reviews,
+        Self::Investigate,
     ];
     pub fn key(self) -> &'static str {
         match self {
+            Self::Investigate => "investigate",
             Self::Reviews => "reviews",
             Self::Agents => "agents",
             Self::Memory => "memory",
@@ -57,6 +60,7 @@ impl Page {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Investigate => "Investigate",
             Self::Reviews => "Review runs",
             Self::Agents => "Agents",
             Self::Memory => "Memory",
@@ -136,6 +140,7 @@ impl Render for Desktop {
         let p = cx.theme().colors.clone();
         let dark = cx.theme().is_dark();
         let body = match self.page {
+            Page::Investigate => screens::investigate::render(self, cx, &p),
             Page::Reviews => screens::reviews::render(self, cx, &p),
             Page::Agents => screens::agents::render(self, cx, &p),
             Page::Memory => screens::memory::render(self, cx, &p),
