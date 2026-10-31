@@ -7,3 +7,5 @@ pub mod capabilities;
 pub mod search;
 
 pub mod operations;
+
+pub mod memory;
