@@ -31,3 +31,5 @@ pub mod bisect;
 pub mod refs;
 
 pub mod rebase;
+
+pub mod cloud;
