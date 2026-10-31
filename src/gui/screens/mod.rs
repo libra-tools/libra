@@ -19,3 +19,5 @@ pub mod investigate;
 pub mod review;
 
 pub mod automation;
+
+pub mod welcome;
