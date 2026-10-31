@@ -14,8 +14,8 @@ use ely_gpui_component::{
     typography::{Heading, Paragraph},
 };
 use gpui::{
-    Context, Entity, FocusHandle, IntoElement, ParentElement, Render, SharedString, Window, div,
-    prelude::*, px,
+    Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
 use super::model::{self, Catalog, Event, Session, clock, date_bucket};
@@ -125,11 +125,14 @@ impl Render for SessionsWindow {
             }
         };
         let visible = visible_sessions(catalog, self);
-        let selected = catalog
-            .sessions
+        let selected = visible
             .iter()
+            .copied()
             .find(|session| session.id == self.selected)
             .or_else(|| visible.first().copied());
+        if let Some(selected) = selected {
+            self.selected = selected.id.clone();
+        }
         let capture = selected
             .map(|session| session.capture_label.as_str())
             .unwrap_or("Capture status");
@@ -1090,7 +1093,8 @@ fn status_card(
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
     div()
-        .w(px(220.0))
+        .w(gpui::relative(0.48))
+        .flex_none()
         .p_3()
         .rounded(px(8.0))
         .bg(colors.surface)
@@ -1126,6 +1130,7 @@ fn quote_card(
 ) -> impl IntoElement {
     div()
         .flex_1()
+        .min_w(px(0.0))
         .p_3()
         .rounded(px(8.0))
         .bg(colors.surface)
@@ -1152,7 +1157,13 @@ fn quote_card(
                     |window| window.pane = Pane::Conversation,
                 )),
         )
-        .child(Paragraph::new(plain(body)))
+        .child(
+            div()
+                .id(SharedString::from(format!("quote-{title}")))
+                .max_h(px(140.0))
+                .overflow_y_scroll()
+                .child(plain(body)),
+        )
 }
 
 fn section(

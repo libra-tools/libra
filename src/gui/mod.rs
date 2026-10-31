@@ -14,7 +14,12 @@ mod view;
 mod widgets;
 
 use desktop::Desktop;
-use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
+    WindowOptions, px, size,
+};
+
+gpui::actions!(libra_application, [Quit]);
 
 /// Open one window and run until the user closes it.
 ///
@@ -53,8 +58,42 @@ fn open_window(cx: &mut App) -> anyhow::Result<()> {
     light.fg_muted = gpui::rgb(0x5b6474).into();
     light.selection = gpui::rgb(0xeaf1ff).into();
     light.accent = gpui::rgb(0x2563eb).into();
+    light.accent_hover = gpui::rgb(0x1d4ed8).into();
+    light.on_accent = gpui::rgb(0xffffff).into();
+    light.focus = light.accent;
+    light.link = light.accent;
+    light.hover = gpui::rgb(0xeef2f6).into();
     Theme::set_palette(Mode::Light, Some(light), cx);
+    let mut dark = Palette::dark(false);
+    dark.bg = gpui::rgb(0x0d1117).into();
+    dark.surface = gpui::rgb(0x151b23).into();
+    dark.sunken = gpui::rgb(0x1b222c).into();
+    dark.overlay = dark.surface;
+    dark.hover = gpui::rgb(0x222b38).into();
+    dark.active = gpui::rgb(0x1b2433).into();
+    dark.border = gpui::rgb(0x2a313c).into();
+    dark.fg = gpui::rgb(0xe6eaf0).into();
+    dark.fg_muted = gpui::rgb(0x9aa4b2).into();
+    dark.selection = gpui::rgb(0x17264a).into();
+    dark.accent = gpui::rgb(0x3b82f6).into();
+    dark.accent_hover = gpui::rgb(0x2563eb).into();
+    dark.on_accent = gpui::rgb(0xffffff).into();
+    dark.focus = dark.accent;
+    dark.link = dark.accent;
+    Theme::set_palette(Mode::Dark, Some(dark), cx);
     Theme::set_mode_now(Mode::Light, cx);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", Quit, None),
+    ]);
+    cx.set_menus([Menu::new("Libra").items([MenuItem::action("Quit Libra", Quit)])]);
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
     let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),

@@ -4,7 +4,8 @@ use ely_gpui_component::{
     theme::Palette,
 };
 use gpui::{
-    AnyElement, Context, IntoElement, ParentElement, SharedString, div, prelude::*, px, rgb,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
 use super::super::{
@@ -144,12 +145,57 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
             cx,
         ))
         .child(action("create-lane", "Create lane and launch", true, cx));
-    column().size_full().gap_0()
-        .child(row().px_5().py_3().bg(p.surface).border_b_1().border_color(p.border).child(muted("Target", p)).child(mono("origin/main")).child(div().flex_1()).child(action("integrate", "Integrate upstream", false, cx)).child(action("new-lane", "+ New lane", true, cx)))
-        .child(column().p_5().child(title("Working copy · 3 lanes applied")).child(muted("Each lane is a branch applied at the same time. Agents write into their own lane; you review, move hunks, and commit.", p)))
-        .child(row().id("lane-board").items_start().overflow_x_scroll().overflow_y_scroll().flex_1().px_5().pb_5().gap_4()
-            .child(card(p).w(px(190.0)).flex_none().child(title("Unassigned changes")).child(muted("Drag a file or hunk into a lane.", p)).child(mono("M  README.md")).child(mono("M  Cargo.lock")))
-            .child(human).child(claude).child(codex).child(new)).into_any_element()
+    column()
+        .size_full()
+        .gap_0()
+        .child(
+            row()
+                .px_5()
+                .py_3()
+                .bg(p.surface)
+                .border_b_1()
+                .border_color(p.border)
+                .child(muted("Target", p))
+                .child(mono("origin/main"))
+                .child(div().flex_1())
+                .child(action("integrate", "Integrate upstream", false, cx))
+                .child(action("new-lane", "+ New lane", true, cx)),
+        )
+        .child(
+            column()
+                .p_5()
+                .child(title("Working copy · 3 lanes applied"))
+                .child(muted(
+                    "Each lane is a branch applied at the same time. Agents write into their own lane; you review, \
+                     move hunks, and commit.",
+                    p,
+                )),
+        )
+        .child(
+            row()
+                .id("lane-board")
+                .items_start()
+                .overflow_x_scroll()
+                .overflow_y_scroll()
+                .flex_1()
+                .px_5()
+                .pb_5()
+                .gap_4()
+                .child(
+                    card(p)
+                        .w(px(190.0))
+                        .flex_none()
+                        .child(title("Unassigned changes"))
+                        .child(muted("Drag a file or hunk into a lane.", p))
+                        .child(mono("M  README.md"))
+                        .child(mono("M  Cargo.lock")),
+                )
+                .child(human)
+                .child(claude)
+                .child(codex)
+                .child(new),
+        )
+        .into_any_element()
 }
 fn file(path: &'static str, delta: &'static str, p: &Palette) -> impl IntoElement {
     row()

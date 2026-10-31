@@ -1,6 +1,6 @@
 //! The launch artboard is an inspectable preview, never a real startup check.
 use ely_gpui_component::theme::Palette;
-use gpui::{AnyElement, Context, IntoElement, ParentElement, div, img, prelude::*, px, rgb};
+use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, img, px, rgb};
 
 use super::super::{
     desktop::{Desktop, Page},
@@ -33,6 +33,7 @@ pub fn render(_: &Desktop, cx: &Context<Desktop>, _: &Palette) -> AnyElement {
                         .border_color(rgb(0x1c2a4d))
                         .child(
                             div()
+                                .w(px(116.0))
                                 .p_3()
                                 .rounded(px(22.0))
                                 .bg(rgb(0xffffff))

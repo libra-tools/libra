@@ -39,3 +39,29 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 - 把 status、log、diff 接进窗口。
 - 从窗口调用 Libra 库函数，而不是每次新建一个 Tokio runtime。
 - 发布构建是否带 `gui`。当前 release 流水线不启用这个 feature。
+
+## 桌面界面预览（2026-11-01）
+
+26 个设计入口由 `Page::ALL` 注册，并由枚举穷尽匹配分派到原生视图。
+History 为默认页，All tools / `⌘K` 是完整页面入口。各页单独存放在
+`src/gui/screens/`；Sessions 沿用 `view.rs` 和 `sessions.json` 的可读内容边界。
+Ely 提供按钮、输入框、复选框、选择标签、主题、焦点与弹层；GPUI 提供布局、
+提交图、代码与归因行。没有 HTML/WebView，也不加载 `.dc.html` 的画布脚本。
+
+所有状态均为演示状态；`widgets::action` 只显示预览提示，不调用命令、数据库、
+网络、凭据存储或外部 Agent。表单状态仅在窗口内存中存在。启动图示不会假装
+完成真实配置或安全检查，About 的版本、工具包、系统与架构来自构建信息。
+
+官网 Logo 的来源为 `https://libra.tools/libra-logo-without-words.svg`，
+获取日期为 2026-11-01。图标、字体、Logo 随二进制内嵌，不依赖在线资源。
+本次验收平台为 macOS；Linux、Windows 不在此次测试范围。
+
+## macOS 界面验证
+
+- `cargo build --features gui` 后运行 `./target/debug/libra ui`。从 All tools
+  打开全部 26 页，同时检查浅色和深色的 Sessions、字段编辑、复选框及无结果搜索。
+- `⌘K` 聚焦命令面板，`Esc` 返回；History 和全局搜索使用独立输入状态。
+  `⌘Q`、`⌘W` 与关闭最后一个窗口均结束 UI 进程。
+- `cargo test --features gui --lib gui::` 覆盖演示目录及 History 的组合筛选。
+- GPUI 调试构建会拒绝重复的无障碍节点 ID。导航栏、页面、搜索分类和重复卡片
+  各有独立 element ID；回归检查需包括搜索的 Everything 标签与 Welcome、Settings。

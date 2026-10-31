@@ -4,7 +4,7 @@ use ely_gpui_component::{
     buttons::{Button, ButtonVariant},
     theme::{ControlSize, Palette},
 };
-use gpui::{Context, Div, FontWeight, ParentElement, SharedString, div, prelude::*, px, rgb};
+use gpui::{Context, Div, FontWeight, ParentElement, SharedString, Styled, div, px, rgb};
 
 use super::desktop::{Desktop, Page};
 
@@ -91,9 +91,18 @@ pub fn nav(page: Page, cx: &Context<Desktop>) -> Button {
     )
     .size(ControlSize::Sm)
     .variant(ButtonVariant::Ghost)
-    .on_click(move |_, _, cx| {
+    .on_click(move |_, window, cx| {
         entity.update(cx, |s, cx| {
             s.navigate(page);
+            if page == Page::Search {
+                s.tab = 4;
+                s.input.update(cx, |input, cx| {
+                    input.set_text("", cx);
+                    window.focus(input.focus(), cx);
+                });
+            } else {
+                window.focus(&s.focus, cx);
+            }
             cx.notify();
         })
     })
@@ -169,16 +178,38 @@ pub fn table(headers: &[&str], rows: &[Vec<&str>], p: &Palette) -> Div {
         }))
 }
 
-pub fn field(label_text: &'static str, value: &'static str, p: &Palette) -> Div {
-    column().gap_2().child(label(label_text, p)).child(
-        mono(value)
-            .px_3()
-            .py_2()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(p.border)
-            .bg(p.surface),
-    )
+/// An editable, in-memory form field. No value is persisted or submitted.
+#[derive(gpui::IntoElement)]
+pub struct PreviewField {
+    label: &'static str,
+    initial: &'static str,
+}
+
+pub fn field(label_text: &'static str, value: &'static str, _p: &Palette) -> PreviewField {
+    PreviewField {
+        label: label_text,
+        initial: value,
+    }
+}
+
+impl gpui::RenderOnce for PreviewField {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl gpui::IntoElement {
+        use ely_gpui_component::{
+            forms::{Input, TextInput},
+            theme::ActiveTheme,
+        };
+        let id = SharedString::from(format!("preview-field:{}:{}", self.label, self.initial));
+        let input = window.use_keyed_state(id, cx, |window, cx| {
+            let mut input = TextInput::new(window, cx).label(self.label);
+            input.set_text(self.initial, cx);
+            input
+        });
+        column()
+            .flex_none()
+            .gap_2()
+            .child(label(self.label, &cx.theme().colors))
+            .child(Input::new(&input).size(ControlSize::Sm))
+    }
 }
 
 pub fn check(
@@ -200,11 +231,11 @@ pub fn check(
         })
 }
 
-pub fn banner(text: impl Into<SharedString>) -> Div {
+pub fn banner(text: impl Into<SharedString>, p: &Palette) -> Div {
     row()
         .px_4()
         .py_3()
-        .bg(rgb(0xfffbeb))
-        .text_color(rgb(0x92400e))
+        .bg(p.warning_subtle)
+        .text_color(p.warning)
         .child(text.into())
 }

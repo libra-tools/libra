@@ -1,6 +1,9 @@
 //! Per-line authorship and file history.
 use ely_gpui_component::theme::Palette;
-use gpui::{AnyElement, Context, IntoElement, ParentElement, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div, px,
+};
 
 use super::super::{
     desktop::{Desktop, Page},
