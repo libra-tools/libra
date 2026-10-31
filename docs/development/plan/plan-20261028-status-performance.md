@@ -112,7 +112,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-00 冻结 status 性能基线与修正审计口径 | P1 | 必选验收前置 | [#639](https://github.com/libra-tools/libra/issues/639) | done / complete |
 | SP-01 status 递归子树加载返回错误而非 panic | P1 | 必选正确性 | [#640](https://github.com/libra-tools/libra/issues/640) | done / complete |
 | SP-02 restore 区分 decoded size 与对象加载内存成本 | P1 | 必选正确性 | [#641](https://github.com/libra-tools/libra/issues/641) | done / complete |
-| SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | in-progress / remote-pending（本地完成，最终PR CI待验） |
+| SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | done / complete |
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
 | SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | pending / 空 |
 | SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | pending / 空 |
@@ -326,7 +326,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** in-progress / remote-pending（本地整改完成；按EX-SP-03-CLOSE-01等待本次最终PR head CI）
+**Lifecycle / Acceptance:** done / complete（最终 PR head CI 全绿并按 EX-SP-03-CLOSE-01 收口；网站与独立发布仍按延期/未执行跟踪）
 
 **Priority / Selection:** P1；本轮核心提速
 
@@ -336,7 +336,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Out of scope:** CE_VALID 永久不在本计划范围；其它行为轴按任务总览分别承接；pack 会话缓存/marker 合并/IPC 批处理登记为 DEFER-SP-01..03，未启用。
 
-**Current evidence:** src/command/restore.rs:684（restore_worktree_tracked）；src/command/restore.rs:776（restore_index_tracked）；src/command/restore.rs:942（restore_index_entry）；src/command/restore.rs:1899（stable_published_snapshot）；src/utils/stat_diff.rs:17,43。源码manifest与当前矩阵见下。
+**Current evidence:** PR #661 最终 head `dbd21ed8eaf6d0eaf42239ad1f928e60e663d32a` 的 base run `41227810790` 与 CodeQL run `41227810789` 全部适用检查 SUCCESS；PR 已于 2026-10-31T19:37:49Z 合并为 `b1b9c32259d5e2d972521e1cc30129e5319488d2`。源码 manifest 与两轮完整矩阵见下。
 
 **Acceptance criteria:**
 
@@ -354,7 +354,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 - [x] 既有 mode 与 flags 的合法语义保持不变；不处理 CE_VALID 策略。
 
-- [ ] ER-06a：文档清单逐文件同步并验收（全局必需门，不计入特有 AC）。
+- [x] ER-06a：本仓库四份 clone/restore 文档已随 PR #661 同步并验收；网站交付按 DEFER-SP-DOCS-03 保留且不计完成，本卡按 EX-SP-03-CLOSE-01 收口（全局必需门，不计入特有 AC）。
 
 
 **合并集成后当前验收摘要（2026-10-31 02:23:54 UTC；本节取代下方原候选历史摘要）：**
@@ -365,7 +365,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 - 严格SP-00完整16格、fixture d0a5c28、2125路径，每边每格5预热+20正式；共1200次调用、960正式样本，ABC/CBA逐对交替、新CLI/热页面缓存。所有exit0、stderr空、各工具原始输出稳定、index SHA不变；跨工具/索引规范化记录一致，独立重算median及nearest-rank p95通过。
 - 默认索引8格倍率下降30.03%–51.86%；refreshed8格倍率下降范围-4.15%至1.56%，不将小幅波动包装成确定收益。clone成本仍不列验收阻断。完整结果如下。
 - 原始临时证据 `/tmp/libra-sp03-full-matrix-fvrq4x63`；result.json SHA256 `7437da264ecc103b35fad52fc0afc3f0c826d75ebaacac5625a38b04f2de4c91`，samples.jsonl `a46838f6c1f702ebb0626054b3e053b5bf22b4dacff2c33757d8d894327b82e6`，sampler `9d9795644de7cb438c762e61c929968eb0a76fcc40b282e0a578378353e6c6ef`。主线ZIP `c48df74e925ce3804e6f938594eb3dc3c8ebb7236e580607e7c400ab5e9c9d03`，校验/构建日志 `/tmp/libra-sp03-merged-final-7dovzozl`。关键计数、hash及完整表已入本计划，临时文件不承诺永久保存。
-- 本地nextest仍not-run（16GiB及两份env缺失）；本次同一最终PR head的base.yml全量与CodeQL尚待推送后观察，不能把上述定向验证记为CI成功。按用户1→3→2，所有记录进入必要的冲突解决提交；成功回执留PR/Actions与交付答复，按v2.14在下一次例行状态同步登记，不另推成功记账提交。网站与独立发布仍未执行。
+- 本地 nextest 历史仍为 not-run（16 GiB 及两份 env 缺失）；最终 PR head `dbd21ed8` 的 base run `41227810790`（含 compat-offline-core 全量门）与 CodeQL run `41227810789` 全部适用检查 SUCCESS，满足 EX-SP-03-CLOSE-01。PR #661 已于 2026-10-31T19:37:49Z 合并为 `b1b9c32259d5e2d972521e1cc30129e5319488d2`；现按用户收口指令登记 done/complete。网站与独立发布仍未执行，不计完成。
 
 | 索引 | 未跟踪 | 重命名 | 输出 | Git median/p95 ms | 父版本 median/p95 ms | 候选 median/p95 ms | 父/Git | 候选/Git | 倍率下降 | 候选更快配对数 |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -453,7 +453,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 - [x] `临时源码副本的仓库发现调用计数` — 历史 f42 实现：父15334→候选13211，三次一致；根路径复用实现未再变动，此计数不计作最终候选重新插桩或release耗时证据。
 
-- [ ] T-1 全量 nextest：not-run；实际宿主16 GiB <32 GiB，按计划模板ER-13本卡全量门需先source .env.test与.env.live-test，两份均缺失；CI环境注入方式不同，不代替本地门；没有降并发绕过，也没有把focused或旧CI当全量通过。
+- [x] T-1 全量门：最终 PR head `dbd21ed8` 的 base run `41227810790` / `compat-offline-core` SUCCESS，满足 EX-SP-03-CLOSE-01；本机 nextest 历史仍 not-run（16 GiB <32 GiB 且两份 env 缺失），不以 focused 或旧 CI 冒充本机全量。
 
 **Full-suite trigger:** T-1: restore 物化/index helper 被 clone、worktree 和 agent bridge 共用。
 
@@ -481,7 +481,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self；本仓库定向、静态、release 构建与 SP-00 三边矩阵已验证；T-1 全量 nextest 未运行，网站门 DEFER-SP-DOCS-03 未执行；未提交/推送/发布，Lifecycle 保持 in-progress。
+**C/D coverage from:** self；本仓库定向、静态、release 构建、SP-00 三边矩阵及最终 PR head 全量 CI/CodeQL 均已验证，PR #661 已合并；网站门 DEFER-SP-DOCS-03 与独立发布仍未执行，不影响本次按 EX-SP-03-CLOSE-01 收口。
 
 **原候选历史验收摘要（ee598 / bb8e2c3，合并前；当前以本卡合并集成后摘要为准）：**
 
@@ -1050,7 +1050,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 ### 基线与实施证据汇总
 
-SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）现于 `codex/SP-03` in-progress；本仓库定向/静态与 SP-00 三边完整矩阵已验证；T-1 全量及网站门未通过，网站文档由 DEFER-SP-DOCS-03 暂搁；SP-04..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
+SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-04..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
 
 #### SP-00 冻结协议与环境
 
@@ -1174,3 +1174,5 @@ DEP-SP-DATA 按用户指定采用公开标准仓库 [`libra-tools/libra@d0a5c28`
 | 2026-10-31 01:12:32 UTC | 用户采用1→3→2，批准SP-03验证数量例外并授权统一提交/推送建PR；本地整改与CI后置判据预登记。 | EX-SP-03-VER-01、EX-SP-03-CLOSE-01生效；本地完成/remote-pending，CI不预记通过，不专建成功记账提交；网站与独立发布保留延期/未执行 |
 
 | 2026-10-31 02:23:54 UTC | PR #661必要的主线集成：合并98aa6be，保留双方serial登记；最终定向/静态、两release、新16格三边矩阵独立核验通过。 | 更新同一PR；最终head CI仍待验，不另建成功记账提交；历史bb8/ee598证据保留且明确版本边界 |
+
+| 2026-10-31 19:59:44 UTC | 用户授权新建 `codex/SP-03-closeout` 并直接完成 SP-03 收口；实核最终 head `dbd21ed8` 的 base run `41227810790` 与 CodeQL run `41227810789` 全部适用检查 SUCCESS，PR #661 已合并为 `b1b9c32259d5e2d972521e1cc30129e5319488d2`。 | SP-03 按 EX-SP-03-CLOSE-01 登记 done/complete；本机 nextest 历史 not-run 保留；网站与独立发布仍未执行，Issue #642 已关闭（completed） |
