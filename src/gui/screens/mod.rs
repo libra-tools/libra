@@ -23,3 +23,5 @@ pub mod automation;
 pub mod welcome;
 
 pub mod conflict;
+
+pub mod blame;
