@@ -1389,7 +1389,8 @@ fn branch_entry_line<'a>(
     Ok((text, fields))
 }
 
-/// The Pi coverage normalizer (PI-34): one [`NormalizedTurn`] per turn of
+/// The Pi coverage normalizer (PI-34): one
+/// [`NormalizedTurn`](super::super::coverage::NormalizedTurn) per turn of
 /// the active branch, in PI-03 order with PI-03's ordinal, holding the
 /// PI-11 records of the turn in coverage-v1 form (`coverage-v1.md` §2–§6).
 ///
@@ -1397,7 +1398,8 @@ fn branch_entry_line<'a>(
 /// assistant record (§3), present whenever the message has a text piece,
 /// even an empty one. An assistant message's joined text comes first,
 /// then its readable thinking and tool calls in block order, as for Claude
-/// Code. Readable thinking becomes a [`SemanticRecord::Reasoning`] of
+/// Code. Readable thinking becomes a
+/// [`SemanticRecord::Reasoning`](super::super::coverage::SemanticRecord::Reasoning) of
 /// provider Pi, never assistant text; redacted or empty thinking has no
 /// record. Context entries (system and bash execution messages, extension
 /// messages, branch and compaction summaries) have none either.
