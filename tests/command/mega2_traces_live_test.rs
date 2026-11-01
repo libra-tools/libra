@@ -41,3 +41,35 @@ async fn live_source_epoch_binding() {
     );
     assert_ne!(code.trim(), "000", "live service did not answer");
 }
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
+async fn live_scoped_git_transport() {
+    let fixture = LiveFixture::require().expect("live fixture");
+    assert!(fixture.ssh_uri.starts_with("ssh://traces@"));
+    let info = format!(
+        "{}/info/refs?service=git-upload-pack",
+        fixture.http_url.trim_end_matches('/')
+    );
+    let status = std::process::Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            &info,
+        ])
+        .output()
+        .expect("curl live git discovery");
+    assert!(
+        status.status.success(),
+        "live git discovery unreachable: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let code = String::from_utf8_lossy(&status.stdout);
+    assert_ne!(code.trim(), "000", "live git discovery did not answer");
+}

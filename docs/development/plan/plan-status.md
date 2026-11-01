@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-11 `in-progress`/`locally-accepted`：** typed TraceRepo URL、`traces` SSH login、能力拒绝与 force-rewrite 网络前拒绝已由 `scoped_git_transport_matrix` 1 passed 覆盖。公开入口仍未接线。Live fixture 缺席，live 门未跑。
+
 > **2026-11-02 LTR-10 `in-progress`/`locally-accepted`：** 仓库 source/epoch 绑定已在 `src/command/agent/mega2_stream.rs` 落地。库测试 `source_epoch_binding_matrix` 1 passed。公开 Mega2 push 入口仍未接线。`.env.live-test` 没有 `LIBRA_TRACES_LIVE_*`，live 门未跑，不记 PASS。未调用 Claude/Codex。C/D 仍由 LTR-01 承载。正式产品卡完成数仍不计本卡为 complete。
 
 > **2026-10-31 GOV-LTR-CO-01 `done`/`complete`（现行）：** 七路径签名+DCO `0aa5cc5` 已在 main；其自身 run `41217305547` 被上游推进 superseded 取消（非失败），已原生前滚至 `f7c1c30` 并把 D 重绑到该 tip：`Check, Build and Test` `41221813772` success、`CodeQL Advanced` `41221813780` success；六份治理文件与 `0aa5cc5` 逐字节相同，`plan-status.md` 仅因上游 PI-03/PI-11 追加行不同。用户对本卡后续 Claude Review 的具名豁免保留（Review 栏无 PASS 判词，不外推）。正式 LTR 产品卡仍 0/26；`DEP-TR-H1` 仍 incoming，LTR-01 家族（10/11/12）不得开工。

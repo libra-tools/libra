@@ -25,6 +25,11 @@ use crate::git_protocol::{
 
 const DEFAULT_GIT_PORT: u16 = 9418;
 
+/// Ordinary `git://` transports do not carry a Mega2 traces locator.
+pub(crate) fn ordinary_code_transport_allows(url: &str) -> Result<(), String> {
+    super::mega2_traces::reject_traces_locator_on_code_transport(url)
+}
+
 pub struct GitClient {
     host: String,
     port: u16,

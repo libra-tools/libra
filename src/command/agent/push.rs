@@ -30,6 +30,14 @@ const DEFAULT_TRACES_REMOTE: &str = "origin";
 const TRACES_REMOTE_REF: &str = "refs/libra/traces";
 
 pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()> {
+    // The public command is still the ordinary traces ref push. Mega2 mode
+    // stays false until LTR-12 wires `--mega2`. The guard itself rejects
+    // Mega2 force-rewrite before any network attempt.
+    if let Err(message) =
+        crate::internal::protocol::mega2_traces::admit_before_network(false, args.force_rewrite)
+    {
+        return Err(CliError::conflict(message));
+    }
     let remote = args
         .remote
         .unwrap_or_else(|| DEFAULT_TRACES_REMOTE.to_string());

@@ -1883,6 +1883,11 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Ordinary SSH transports do not carry a Mega2 traces locator.
+pub(crate) fn ordinary_code_transport_allows(url: &str) -> Result<(), String> {
+    super::mega2_traces::reject_traces_locator_on_code_transport(url)
+}
+
 /// Check if a remote spec looks like an SSH URL.
 pub fn is_ssh_spec(spec: &str) -> bool {
     if spec.starts_with("ssh://") {
