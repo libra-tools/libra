@@ -2041,3 +2041,362 @@ fn pi_coverage_normalizer_marks_unfaithful_turns_incomplete() {
     ]));
     assert!(branch.turns.is_empty() && turns.is_empty());
 }
+
+/// A v3 session whose user prompts interleave readable thinking, assistant
+/// text, a tool call and its result, and context entries (PI-31 AC1). Every
+/// non-user string carries `pi-private` so a leak is easy to find.
+fn pi_interleaved_session() -> Vec<u8> {
+    pi_session(&[
+        pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "part"},
+            ]}),
+        ),
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "pi-private thought"},
+                {"type": "text", "text": "pi-private answer"},
+                {"type": "toolCall", "id": "call-1", "name": "read",
+                    "arguments": {"path": "pi-private.rs"}},
+                {"type": "thinking", "thinking": "pi-private redacted", "redacted": true},
+            ]}),
+        ),
+        pi_message(
+            "t1",
+            Some("a1"),
+            serde_json::json!({"role": "toolResult", "toolCallId": "call-1", "toolName": "read",
+                "content": [{"type": "text", "text": "pi-private output"}], "isError": false}),
+        ),
+        pi_entry(
+            "custom_message",
+            "x1",
+            Some("t1"),
+            serde_json::json!({"customType": "note", "content": "pi-private note", "display": true}),
+        ),
+        pi_message(
+            "u2",
+            Some("x1"),
+            serde_json::json!({"role": "user", "content": "second"}),
+        ),
+        pi_message(
+            "b1",
+            Some("u2"),
+            serde_json::json!({"role": "bashExecution", "command": "pi-private ls",
+                "output": "pi-private listing", "exitCode": 0, "cancelled": false,
+                "truncated": false}),
+        ),
+        pi_message(
+            "s1",
+            Some("b1"),
+            serde_json::json!({"role": "system", "content": "pi-private system"}),
+        ),
+        pi_entry(
+            "branch_summary",
+            "bs1",
+            Some("s1"),
+            serde_json::json!({"fromId": "a1", "summary": "pi-private branch summary"}),
+        ),
+        pi_message(
+            "a2",
+            Some("bs1"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "pi-private second answer"},
+                {"type": "thinking", "thinking": "pi-private second thought"},
+            ]}),
+        ),
+        pi_message(
+            "u3",
+            Some("a2"),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": ""}]}),
+        ),
+        pi_message(
+            "u4",
+            Some("u3"),
+            serde_json::json!({"role": "user", "content": "third"}),
+        ),
+    ])
+}
+
+/// Send one request through the public deadline-bound extraction helper
+/// entry and return its metadata, or `None` for a failed frame. The request
+/// header is version 1, the agent code, flags (bit 0: parent present, bit 1:
+/// children omitted), and the parent length as u64 little endian.
+fn pi_helper_metadata(
+    code: u8,
+    parent: Option<&[u8]>,
+    children_omitted: bool,
+) -> Option<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+
+    let mut request = vec![
+        1,
+        code,
+        u8::from(parent.is_some()) | (u8::from(children_omitted) << 1),
+    ];
+    let parent = parent.unwrap_or_default();
+    request.extend_from_slice(&u64::try_from(parent.len()).expect("length").to_le_bytes());
+    request.extend_from_slice(parent);
+    let frame = libra::internal::ai::capture::snapshot::run_capture_extraction_helper(request);
+    if frame.first() != Some(&0) {
+        return None;
+    }
+    let length = u32::from_le_bytes(frame[1..5].try_into().expect("length field"));
+    let payload = &frame[37..];
+    assert_eq!(payload.len(), usize::try_from(length).expect("length"));
+    assert_eq!(&frame[5..37], Sha256::digest(payload).as_slice());
+    Some(serde_json::from_slice(payload).expect("metadata json"))
+}
+
+/// PI-31 AC1: the Pi bounded extraction branch keeps only user text as
+/// prompts, in turn order, and bounds the collection.
+#[test]
+fn pi_bounded_extraction_prompts_hold_only_user_text() {
+    use libra::internal::ai::capture::deadline_provider_extraction_summary;
+
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &pi_interleaved_session());
+    assert_eq!(summary.prompts, ["first\npart", "second", "third"]);
+    assert!(
+        summary
+            .prompts
+            .iter()
+            .chain(&summary.warnings)
+            .all(|text| !text.contains("pi-private"))
+    );
+    assert!(summary.model.is_none() && summary.usage.is_none());
+    assert!(summary.modified_files.is_empty() && summary.skill_events.is_empty());
+
+    // The deadline collection bound (128 items, 4 KiB per string) still
+    // applies: an oversized prompt ends the collection with a content-free
+    // warning, and so does the 129th prompt.
+    let mut lines = vec![pi_message(
+        "u0",
+        None,
+        serde_json::json!({"role": "user", "content": "kept"}),
+    )];
+    lines.push(pi_message(
+        "u1",
+        Some("u0"),
+        serde_json::json!({"role": "user", "content": "x".repeat(4097)}),
+    ));
+    lines.push(pi_message(
+        "u2",
+        Some("u1"),
+        serde_json::json!({"role": "user", "content": "dropped"}),
+    ));
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &pi_session(&lines));
+    assert_eq!(summary.prompts, ["kept"]);
+    assert_eq!(summary.warnings.len(), 1);
+    assert!(!summary.warnings[0].contains("xxxx"));
+
+    let mut lines = Vec::new();
+    for index in 0..130 {
+        let parent = (index > 0).then(|| format!("u{}", index - 1));
+        lines.push(pi_message(
+            &format!("u{index}"),
+            parent.as_deref(),
+            serde_json::json!({"role": "user", "content": format!("p{index}")}),
+        ));
+    }
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &pi_session(&lines));
+    assert_eq!(summary.prompts.len(), 128);
+    assert_eq!(summary.prompts.last().map(String::as_str), Some("p127"));
+    assert_eq!(summary.warnings.len(), 1);
+
+    // The 32 KiB retained bound: eight 4000-byte prompts fit (32000 bytes),
+    // the ninth would pass 32768, so the collection stops there.
+    let mut lines = Vec::new();
+    for index in 0..10 {
+        let parent = (index > 0).then(|| format!("u{}", index - 1));
+        lines.push(pi_message(
+            &format!("u{index}"),
+            parent.as_deref(),
+            serde_json::json!({"role": "user", "content": format!("{index}").repeat(4000)}),
+        ));
+    }
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &pi_session(&lines));
+    assert_eq!(summary.prompts.len(), 8);
+    assert_eq!(summary.prompts[7], "7".repeat(4000));
+    assert_eq!(summary.warnings.len(), 1);
+    assert!(!summary.warnings[0].contains("8888"));
+}
+
+/// PI-31: the helper accepts a complete redacted parent of up to 24 MiB, and
+/// redaction placeholders can push a raw session under the 16 MiB raw cap
+/// past it. The Pi branch reads such a session; past 24 MiB it refuses.
+#[test]
+fn pi_bounded_extraction_reads_a_redacted_session_past_the_raw_cap() {
+    use libra::internal::ai::{
+        capture::deadline_provider_extraction_summary, observed_agents::redaction::Redactor,
+    };
+
+    let session = |filler: String| {
+        pi_session(&[
+            pi_message(
+                "u1",
+                None,
+                serde_json::json!({"role": "user", "content": "first"}),
+            ),
+            pi_message(
+                "a1",
+                Some("u1"),
+                serde_json::json!({"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}},
+                ]}),
+            ),
+            pi_message(
+                "t1",
+                Some("a1"),
+                serde_json::json!({"role": "toolResult", "toolCallId": "call-1",
+                    "toolName": "read", "content": [{"type": "text", "text": filler}],
+                    "isError": false}),
+            ),
+            pi_message(
+                "u2",
+                Some("t1"),
+                serde_json::json!({"role": "user", "content": "second"}),
+            ),
+        ])
+    };
+    const MIB: usize = 1024 * 1024;
+    let secret = "AKIAIOSFODNN7EXAMPLE ";
+    let raw = session(secret.repeat(15 * MIB / secret.len()));
+    assert!(raw.len() < 16 * MIB);
+    let (redacted, _) = Redactor::new_default().redact(&raw);
+    let redacted = redacted.into_inner();
+    assert!(redacted.len() > 16 * MIB && redacted.len() <= 24 * MIB);
+    assert!(!String::from_utf8_lossy(&redacted).contains("AKIAIOSFODNN7EXAMPLE"));
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &redacted);
+    assert_eq!(summary.prompts, ["first", "second"]);
+    assert!(summary.partial && summary.warnings.is_empty());
+    let metadata = pi_helper_metadata(4, Some(&redacted), false).expect("pi frame");
+    assert_eq!(metadata["prompt_count"], 2);
+
+    let oversized = session("x".repeat(24 * MIB));
+    assert!(oversized.len() > 24 * MIB);
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &oversized);
+    assert!(summary.prompts.is_empty());
+    assert_eq!(summary.warnings, ["Pi session could not be normalized"]);
+    assert!(pi_helper_metadata(4, Some(&oversized), false).is_none());
+}
+
+/// PI-31 AC2: the Pi extraction is always partial, for a well-formed session
+/// and for bytes the normalizer refuses; a refusal yields no prompts and a
+/// content-free warning.
+#[test]
+fn pi_bounded_extraction_is_always_partial() {
+    use libra::internal::ai::capture::deadline_provider_extraction_summary;
+
+    let summary = deadline_provider_extraction_summary(AgentKind::Pi, &pi_interleaved_session());
+    assert!(summary.partial);
+    assert!(summary.warnings.is_empty());
+
+    let v2 = String::from_utf8(pi_session(&[pi_message(
+        "u1",
+        None,
+        serde_json::json!({"role": "user", "content": "pi-canary prompt"}),
+    )]))
+    .expect("utf8")
+    .replacen("\"version\":3", "\"version\":2", 1);
+    assert!(v2.contains("\"version\":2"));
+    let duplicate_id = pi_session(&[
+        pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": "pi-canary one"}),
+        ),
+        pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": "pi-canary two"}),
+        ),
+    ]);
+    let refused: [&[u8]; 5] = [
+        b"pi-canary-thought",
+        b"",
+        br#"{"type":"message","id":"u1","message":{"role":"user","content":"pi-canary"}}"#,
+        v2.as_bytes(),
+        &duplicate_id,
+    ];
+    for bytes in refused {
+        let summary = deadline_provider_extraction_summary(AgentKind::Pi, bytes);
+        assert!(summary.partial);
+        assert!(summary.prompts.is_empty());
+        assert_eq!(summary.warnings, ["Pi session could not be normalized"]);
+    }
+}
+
+/// PI-31 AC3: the helper request code 4 decodes to Pi. The same Pi bytes
+/// read as Claude Code (code 1) give a different result, and Hermes has no
+/// code (5 is unassigned).
+#[test]
+fn pi_bounded_extraction_helper_decodes_the_pi_code() {
+    let bytes = pi_interleaved_session();
+    let pi = pi_helper_metadata(4, Some(&bytes), false).expect("pi frame");
+    assert_eq!(pi["prompt_count"], 3);
+    assert_eq!(pi["partial"], true);
+    let claude = pi_helper_metadata(1, Some(&bytes), false).expect("claude frame");
+    assert_eq!(claude["prompt_count"], 0);
+    assert!(pi_helper_metadata(5, Some(&bytes), false).is_none());
+    assert!(pi_helper_metadata(0, Some(&bytes), false).is_none());
+}
+
+/// PI-31 AC4: for the same bytes, the helper's metadata is the projection of
+/// the direct branch's `ExtractionSummary` (prompt texts never cross the
+/// helper frame, only their count).
+#[test]
+fn pi_bounded_extraction_helper_matches_the_direct_branch() {
+    use libra::internal::ai::capture::deadline_provider_extraction_summary;
+
+    let inputs: [&[u8]; 3] = [
+        &pi_interleaved_session(),
+        b"pi-canary-thought",
+        &pi_session(&[]),
+    ];
+    for bytes in inputs {
+        let direct = deadline_provider_extraction_summary(AgentKind::Pi, bytes);
+        let metadata = pi_helper_metadata(4, Some(bytes), false).expect("pi frame");
+        let keys: Vec<&str> = metadata
+            .as_object()
+            .expect("metadata object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            [
+                "api_call_count",
+                "partial",
+                "present",
+                "prompt_count",
+                "schema_version",
+                "warnings"
+            ]
+        );
+        assert!(direct.model.is_none() && direct.usage.is_none());
+        assert!(direct.subagent_usage.is_none() && direct.modified_files.is_empty());
+        assert!(direct.skill_events.is_empty());
+        assert_eq!(metadata["present"], true);
+        assert_eq!(metadata["partial"], direct.partial);
+        assert_eq!(metadata["prompt_count"], direct.prompts.len());
+        assert_eq!(metadata["api_call_count"], direct.api_call_count);
+        let expected_warnings = if direct.warnings.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["transcript parser reported partial output"])
+        };
+        assert_eq!(metadata["warnings"], expected_warnings);
+        assert!(!metadata.to_string().contains("pi-canary"));
+        assert!(!metadata.to_string().contains("pi-private"));
+    }
+    // With no parent the helper reports the content-free skipped partial.
+    let metadata = pi_helper_metadata(4, None, false).expect("pi frame");
+    assert_eq!(metadata["present"], false);
+    assert_eq!(metadata["partial"], true);
+}

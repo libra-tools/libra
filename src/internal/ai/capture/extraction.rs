@@ -398,9 +398,10 @@ fn build_deadline_extraction_projection(
     value
 }
 
-/// Run the deadline extraction arm for one kind. Non-first-batch kinds,
-/// including `grok`, return a partial empty summary and do not copy the
-/// transcript into warnings or prompts.
+/// Run the deadline extraction arm for one kind. Hermes and Pi return their
+/// user prompts in a partial summary. Other non-first-batch kinds, including
+/// `grok`, return a partial empty summary. No arm copies the transcript into
+/// warnings.
 pub fn deadline_provider_extraction_summary(
     kind: AgentKind,
     transcript: &[u8],
@@ -434,10 +435,18 @@ fn extract_deadline_provider_once(
                 transcript, limits,
             )
         }
+        // PI-31: prompts from the PI-34 coverage normalizer's user records
+        // only; the summary is always partial. The byte bound is the one for
+        // the complete redacted parent this helper accepts.
+        AgentKind::Pi => crate::internal::ai::observed_agents::extract::extract_pi_bounded(
+            transcript,
+            limits,
+            CAPTURE_EXTRACTION_HELPER_PARENT_CAP,
+        ),
         // `decode_extraction_request` accepts only the first-batch provider
-        // codes, so this arm is defensive and cannot carry an error string.
-        // Formats without a registered extractor stay explicitly partial.
-        // The PI-01 `pi` identity has no extractor and stays in this arm.
+        // codes and Pi, so this arm is defensive and cannot carry an error
+        // string. Formats without a registered extractor stay explicitly
+        // partial.
         _ => crate::internal::ai::observed_agents::extract::ExtractionSummary {
             partial: true,
             ..Default::default()
@@ -735,24 +744,30 @@ fn valid_extraction_value(value: &Value, depth: usize, string_budget: &mut usize
     }
 }
 
+/// The helper frame's extraction provider codes, one table for both
+/// directions (the frozen `AgentKind::` baseline of this file may only fall,
+/// DEFER-ACF-06). Hermes has no code; any kind or code outside the table is
+/// refused.
+const EXTRACTION_AGENT_CODES: [(AgentKind, u8); 4] = [
+    (AgentKind::ClaudeCode, 1),
+    (AgentKind::Codex, 2),
+    (AgentKind::OpenCode, 3),
+    // PI-31: the Pi extraction branch.
+    (AgentKind::Pi, 4),
+];
+
 fn extraction_agent_code(agent_kind: AgentKind) -> Option<u8> {
-    match agent_kind {
-        AgentKind::ClaudeCode => Some(1),
-        AgentKind::Codex => Some(2),
-        AgentKind::OpenCode => Some(3),
-        // Hermes and the PI-01 `pi` identity have no extraction provider
-        // code. Keep them in this arm.
-        _ => None,
-    }
+    EXTRACTION_AGENT_CODES
+        .iter()
+        .find(|(kind, _)| *kind == agent_kind)
+        .map(|(_, code)| *code)
 }
 
 fn extraction_agent_kind(code: u8) -> Option<AgentKind> {
-    match code {
-        1 => Some(AgentKind::ClaudeCode),
-        2 => Some(AgentKind::Codex),
-        3 => Some(AgentKind::OpenCode),
-        _ => None,
-    }
+    EXTRACTION_AGENT_CODES
+        .iter()
+        .find(|(_, known)| *known == code)
+        .map(|(kind, _)| *kind)
 }
 
 fn redact_extracted_string(value: &str) -> String {
@@ -1077,6 +1092,204 @@ mod tests {
                 .expect("serialize redacted derived skill JSON")
                 .contains(&secret),
             "dynamic JSON keys must not bypass derived-field redaction"
+        );
+    }
+
+    /// PI-31: `EXTRACTION_AGENT_CODES` holds each kind and each code once, and
+    /// both lookups give exactly Claude Code 1, Codex 2, OpenCode 3, and Pi 4
+    /// for every kind and every byte. `expected_code` has no wildcard arm, so
+    /// a new kind must be given its code (or none) here.
+    #[test]
+    fn extraction_agent_codes_are_unique_and_pinned() {
+        fn expected_code(kind: AgentKind) -> Option<u8> {
+            match kind {
+                AgentKind::ClaudeCode => Some(1),
+                AgentKind::Codex => Some(2),
+                AgentKind::OpenCode => Some(3),
+                AgentKind::Pi => Some(4),
+                AgentKind::Cursor
+                | AgentKind::Gemini
+                | AgentKind::Copilot
+                | AgentKind::FactoryAi
+                | AgentKind::Grok
+                | AgentKind::Hermes => None,
+            }
+        }
+
+        let mut kinds = std::collections::HashSet::new();
+        let mut codes = std::collections::HashSet::new();
+        for (kind, code) in EXTRACTION_AGENT_CODES {
+            assert!(kinds.insert(kind), "{kind:?} appears twice in the table");
+            assert!(codes.insert(code), "code {code} appears twice in the table");
+        }
+        for kind in [
+            AgentKind::ClaudeCode,
+            AgentKind::Cursor,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::OpenCode,
+            AgentKind::Copilot,
+            AgentKind::FactoryAi,
+            AgentKind::Grok,
+            AgentKind::Hermes,
+            AgentKind::Pi,
+        ] {
+            assert_eq!(extraction_agent_code(kind), expected_code(kind), "{kind:?}");
+        }
+        for code in 0..=u8::MAX {
+            let kind = extraction_agent_kind(code);
+            assert_eq!(
+                kind.and_then(expected_code),
+                kind.map(|_| code),
+                "code {code}"
+            );
+            assert_eq!(
+                kind.is_some(),
+                (1..=4).contains(&code),
+                "code {code} decodes only inside 1..=4"
+            );
+        }
+    }
+
+    /// PI-31 AC3/AC4: the helper request carries Pi as code 4, decodes back
+    /// to Pi, and the helper's metadata equals the direct deadline projection
+    /// of the same bytes.
+    #[test]
+    fn pi_bounded_extraction_request_round_trips_through_the_helper_codec() {
+        let session = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-11-01T00:00:00.000Z","cwd":"/work"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-01T00:00:01.000Z","message":{"role":"user","content":"first prompt"}}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"pi-private-thought"},{"type":"text","text":"answer"}]}}"#,
+            "\n",
+        );
+        for (parent, children_omitted) in [
+            (Some(session.as_bytes().to_vec()), false),
+            (Some(session.as_bytes().to_vec()), true),
+            (Some(b"pi-thought-canary".to_vec()), false),
+            (None, false),
+        ] {
+            let parent = parent.map(RedactedBytes::new_unchecked);
+            let request = encode_extraction_request("pi", parent.as_ref(), children_omitted)
+                .expect("pi has a helper request code");
+            assert_eq!(request[1], 4);
+            let (kind, decoded, omitted) =
+                decode_extraction_request(request.clone()).expect("pi request decodes");
+            assert_eq!(kind, AgentKind::Pi);
+            assert_eq!(omitted, children_omitted);
+            assert_eq!(
+                decoded.as_ref().map(RedactedBytes::bytes),
+                parent.as_ref().map(RedactedBytes::bytes)
+            );
+            let DeadlineExtractionResult::Complete(metadata) =
+                decode_extraction_response(run_capture_extraction_helper(request))
+            else {
+                panic!("pi helper response must decode");
+            };
+            assert_eq!(
+                metadata,
+                build_deadline_extraction_projection(
+                    AgentKind::Pi,
+                    parent.as_ref(),
+                    children_omitted
+                )
+            );
+            assert_eq!(metadata["partial"], true);
+        }
+        let direct = build_deadline_extraction_projection(
+            AgentKind::Pi,
+            Some(&RedactedBytes::new_unchecked(session.as_bytes().to_vec())),
+            false,
+        );
+        assert_eq!(direct["prompt_count"], 1);
+        assert!(encode_extraction_request("hermes", None, false).is_none());
+        let mut unknown = encode_extraction_request("pi", None, false).expect("encode pi request");
+        unknown[1] = 5;
+        assert!(decode_extraction_request(unknown).is_none());
+    }
+
+    /// PI-31 AC4 end to end: the production deadline path launches the real
+    /// Libra helper subprocess for a Pi session that redaction expanded past
+    /// the 16 MiB raw cap and returns the direct projection within the
+    /// 9-second capture budget of a 10-second hook timeout. The helper
+    /// argument returns before CLI initialization, so it opens no repository.
+    #[tokio::test]
+    async fn pi_bounded_extraction_helper_subprocess_meets_the_capture_deadline() {
+        use std::time::Duration;
+
+        use crate::internal::ai::observed_agents::redaction::Redactor;
+
+        let program = std::env::current_exe()
+            .expect("locate the unit test binary")
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("locate the Cargo target directory")
+            .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            program.is_file(),
+            "the real Libra helper binary must be built before this unit test"
+        );
+        let entry = |id: &str, parent: Option<&str>, message: Value| {
+            json!({"type": "message", "id": id, "parentId": parent,
+                "timestamp": "2026-11-01T00:00:01.000Z", "message": message})
+            .to_string()
+        };
+        let secret = "AKIAIOSFODNN7EXAMPLE ";
+        let lines = [
+            json!({"type": "session", "version": 3, "id": "s1",
+                "timestamp": "2026-11-01T00:00:00.000Z", "cwd": "/work"})
+            .to_string(),
+            entry("u1", None, json!({"role": "user", "content": "first"})),
+            entry(
+                "a1",
+                Some("u1"),
+                json!({"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}}]}),
+            ),
+            entry(
+                "t1",
+                Some("a1"),
+                json!({"role": "toolResult", "toolCallId": "call-1", "toolName": "read",
+                    "content": [{"type": "text",
+                        "text": secret.repeat(15 * 1024 * 1024 / secret.len())}],
+                    "isError": false}),
+            ),
+            entry(
+                "u2",
+                Some("t1"),
+                json!({"role": "user", "content": "second"}),
+            ),
+        ];
+        let raw = format!("{}\n", lines.join("\n"));
+        assert!(raw.len() < 16 * 1024 * 1024);
+        let (parent, _) = Redactor::new_default().redact(raw.as_bytes());
+        assert!(parent.len() > 16 * 1024 * 1024);
+        assert!(
+            u64::try_from(parent.len()).expect("length") <= CAPTURE_EXTRACTION_HELPER_PARENT_CAP
+        );
+        let direct = build_deadline_extraction_projection(AgentKind::Pi, Some(&parent), false);
+        assert_eq!(direct["prompt_count"], 2);
+
+        let started = Instant::now();
+        let outcome = crate::internal::ai::authorized_read::with_test_helper_program(
+            program,
+            build_extraction_projection_until(
+                "pi",
+                Some(&parent),
+                false,
+                started + Duration::from_secs(9),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let DeadlineExtractionResult::Complete(metadata) = outcome else {
+            panic!("the Pi helper subprocess must complete within the capture deadline");
+        };
+        assert_eq!(metadata, direct);
+        eprintln!(
+            "pi helper subprocess on {} bytes: {elapsed:?}",
+            parent.len()
         );
     }
 }

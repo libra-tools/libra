@@ -800,6 +800,54 @@ pub(crate) fn extract_opencode_bounded(
     extract_opencode_with_limits(data, Some(limits))
 }
 
+const PI_REFUSED_WARNING: &str = "Pi session could not be normalized";
+
+/// Deadline-helper extraction for Pi (plan-20260911 PI-31). Prompts are the
+/// non-empty user text records of the PI-34 coverage normalizer, in turn
+/// order: readable thinking, assistant text, tool calls and results, and
+/// context entries never become prompts. Pi has no model, usage, file, or
+/// skill extraction, so the summary is always partial. A file the normalizer
+/// refuses gives no prompts and one content-free warning.
+///
+/// `max_source_bytes` replaces the normalizer's raw-file byte bound: the
+/// caller passes the bound of the redacted source it accepts, since
+/// redaction placeholders can make a file longer than its raw form.
+/// Redaction never adds lines, so the entry bound stays the default.
+pub(crate) fn extract_pi_bounded(
+    data: &[u8],
+    limits: ExtractionCollectionLimits,
+    max_source_bytes: u64,
+) -> ExtractionSummary {
+    use super::{
+        builtin::pi::{PiNormalizeLimits, normalize_pi_turns},
+        coverage::SemanticRecord,
+    };
+    let mut out = ExtractionSummary {
+        partial: true,
+        ..Default::default()
+    };
+    let normalize_limits = PiNormalizeLimits {
+        max_bytes: max_source_bytes,
+        ..PiNormalizeLimits::default()
+    };
+    let Ok(turns) = normalize_pi_turns(data, normalize_limits) else {
+        out.warnings.push(PI_REFUSED_WARNING.to_string());
+        return out;
+    };
+    let mut limiter = Some(ExtractionCollectionLimiter::new(limits));
+    for record in turns.into_iter().flat_map(|turn| turn.records) {
+        if let SemanticRecord::User { text } = record
+            && !text.is_empty()
+        {
+            push_prompt(&mut out, &mut limiter, text);
+        }
+        if collection_exhausted(&limiter) {
+            break;
+        }
+    }
+    out
+}
+
 const OPENCODE_SHAPE_WARNING: &str =
     "OpenCode export contained an unsupported or incomplete message shape";
 const OPENCODE_TOKEN_WARNING: &str = "OpenCode token counts could not be represented exactly";
