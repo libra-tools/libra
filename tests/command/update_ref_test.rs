@@ -145,10 +145,38 @@ fn delete_with_mismatched_old_fails() {
 }
 
 #[test]
-fn deleting_a_missing_ref_fails() {
+fn deleting_a_missing_ref_is_a_noop() {
     let (repo, _c1, _c2) = repo_with_two_commits();
+    // Git exits 0 for `update-ref -d <missing>`: nothing to delete, no CAS value.
     let del = run_libra_command(&["update-ref", "-d", "refs/heads/ghost"], repo.path());
-    assert_eq!(del.status.code(), Some(128));
+    assert_eq!(
+        del.status.code(),
+        Some(0),
+        "deleting an absent ref is a no-op: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+
+    // A non-zero CAS value on a missing ref is still a mismatch.
+    let cas = run_libra_command(
+        &[
+            "update-ref",
+            "-d",
+            "refs/heads/ghost",
+            "1111111111111111111111111111111111111111",
+        ],
+        repo.path(),
+    );
+    assert_ne!(
+        cas.status.code(),
+        Some(0),
+        "a CAS delete of an absent ref reports a mismatch: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&cas.stderr).contains("cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
 }
 
 #[test]
@@ -1514,6 +1542,105 @@ fn update_ref_stdin_ack_is_streamed_before_stdin_closes() {
         "streamed transaction exits 0 (rest of stdout: {rest:?}, wait error: {output})"
     );
     assert!(rest.contains("commit: ok"), "rest of stdout: {rest:?}");
+}
+
+/// Git lets `prepare` be closed by `abort` (UR-01 T2), and a `delete` of an
+/// absent ref is a no-op even inside a prepared transaction.
+#[test]
+fn update_ref_stdin_abort_after_prepare_and_delete_missing() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/pa1 {c1}\nprepare\nabort\n"),
+    );
+    assert!(
+        out.status.success(),
+        "abort must close a prepared transaction: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&out), "start: ok\nprepare: ok\nabort: ok");
+    assert!(
+        !ref_exists(&repo, "refs/heads/pa1"),
+        "abort applies nothing"
+    );
+
+    let missing = stdin_batch(
+        &repo,
+        &[],
+        "start\ndelete refs/heads/absent\nprepare\ncommit\n",
+    );
+    assert!(
+        missing.status.success(),
+        "deleting an absent ref is a no-op: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&missing),
+        "start: ok\nprepare: ok\ncommit: ok"
+    );
+}
+
+/// `--json` accumulates every transaction committed in the batch, even when a
+/// later transaction is aborted.
+#[test]
+fn update_ref_stdin_json_reports_all_committed_transactions() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &["--json"],
+        &format!("start\ncreate refs/heads/js1 {c1}\ncommit\nstart\nabort\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Protocol acknowledgements share stdout with the JSON envelope, so match
+    // the envelope fields instead of parsing the whole stream.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"committed\": true"),
+        "an earlier commit must still be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("refs/heads/js1"),
+        "the committed ref must be listed: {stdout}"
+    );
+}
+
+/// A closed stdout must be detected BEFORE the commit, so the refs never move.
+#[test]
+fn update_ref_stdin_refuses_commit_when_stdout_is_closed() {
+    use std::{io::Write as _, process::Stdio};
+
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let mut child = super::base_libra_command(&["update-ref", "--stdin"], repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libra update-ref --stdin");
+
+    let mut stdin = child.child.stdin.take().expect("child stdin");
+    // Close the read end before the transaction commits: a plain batch prints
+    // nothing before `commit: ok`, so only the pre-commit probe can catch this.
+    drop(child.child.stdout.take());
+    let _ = stdin.write_all(format!("create refs/heads/closed1 {c1}\ncommit\n").as_bytes());
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait for child");
+    assert!(
+        !output.status.success(),
+        "a closed stdout must fail the batch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !ref_exists(&repo, "refs/heads/closed1"),
+        "no ref may be written when the acknowledgement channel is gone"
+    );
 }
 
 /// `-z` handles a multi-command batch and the transaction commands.

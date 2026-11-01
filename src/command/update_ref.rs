@@ -659,7 +659,8 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     let message = args.message.clone().unwrap_or_default();
     let mut pending: Vec<StdinCommand> = Vec::new();
     let mut prepared: Vec<PreparedCommand> = Vec::new();
-    let mut committed_refs: Option<Vec<String>> = None;
+    let mut committed_refs: Vec<String> = Vec::new();
+    let mut any_committed = false;
 
     let ack = |stdout: &mut std::io::StdoutLock<'_>, line: &str| -> CliResult<()> {
         writeln!(stdout, "{line}")
@@ -706,7 +707,6 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                     pending.clear();
                     prepared.clear();
                     seen_refs.clear();
-                    committed_refs = None;
                     phase = StdinPhase::Open;
                     ack(&mut stdout, "start: ok")?;
                 }
@@ -740,13 +740,19 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                     prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
                 }
                 // Detect a broken stdout BEFORE the transaction commits: a
-                // failure afterwards must be reported as "committed".
+                // failure afterwards would move refs and then fail to report it.
                 stdout.flush().map_err(|error| {
                     stdin_fatal(
                         format!("failed to flush update-ref output before commit: {error}"),
                         128,
                     )
                 })?;
+                if stdout_pipe_closed() {
+                    return Err(stdin_fatal(
+                        "stdout is closed; refusing to commit the ref transaction".to_string(),
+                        128,
+                    ));
+                }
                 let ref_names =
                     apply_prepared_batch(std::mem::take(&mut prepared), &message).await?;
                 phase = StdinPhase::Closed;
@@ -760,20 +766,14 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                         128,
                     ));
                 }
-                committed_refs = Some(ref_names);
+                committed_refs.extend(ref_names);
+                any_committed = true;
             }
             StdinCommand::Abort => {
-                match phase {
-                    StdinPhase::Closed => {
-                        return Err(stdin_fatal("transaction is closed".to_string(), 128));
-                    }
-                    StdinPhase::Prepared => {
-                        return Err(stdin_fatal(
-                            "prepared transactions can only be closed".to_string(),
-                            128,
-                        ));
-                    }
-                    _ => {}
+                // Git lets `prepare` be closed by `abort` (UR-01 T2), and also
+                // closes a plain batch.
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
                 }
                 // Git prints `abort: ok` and keeps reading: a later command is
                 // rejected against the closed phase, and nothing is applied.
@@ -828,17 +828,15 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     // dropped silently; a plain batch applies implicitly.
     if phase == StdinPhase::Idle {
         let prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
-        committed_refs = Some(apply_prepared_batch(prepared, &message).await?);
+        let ref_names = apply_prepared_batch(prepared, &message).await?;
+        committed_refs.extend(ref_names);
+        any_committed = true;
     }
 
     if output.is_json() {
-        let (refs, committed) = match committed_refs {
-            Some(refs) => (refs, true),
-            None => (Vec::new(), false),
-        };
         emit_json_data(
             "update-ref",
-            &serde_json::json!({ "refs": refs, "committed": committed }),
+            &serde_json::json!({ "refs": committed_refs, "committed": any_committed }),
             output,
         )?;
     }
@@ -1075,6 +1073,29 @@ async fn apply_prepared_batch(
     Ok(ref_names)
 }
 
+/// True when stdout's pipe has no reader left, so the next acknowledgement
+/// would fail. Checked before a commit so a closed pipe cannot move refs and
+/// then fail to report it.
+#[cfg(unix)]
+fn stdout_pipe_closed() -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut probe = libc::pollfd {
+        fd: std::io::stdout().as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: `probe` is one valid pollfd for a live descriptor and poll only
+    // reads/writes it.
+    let ready = unsafe { libc::poll(&mut probe, 1, 0) };
+    ready > 0 && probe.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+}
+
+#[cfg(not(unix))]
+fn stdout_pipe_closed() -> bool {
+    false
+}
+
 /// Truncate an input line for error messages (GC-PL-02: never echo long lines).
 fn truncate_input(line: &str) -> String {
     const CAP: usize = 200;
@@ -1170,8 +1191,12 @@ async fn apply_ref_update<C: sea_orm::ConnectionTrait>(
         })
     } else {
         let Some(old) = current.clone() else {
-            return Err(UpdateRefTxError::DoesNotExist {
-                ref_name: full_ref.to_string(),
+            // Git treats `update-ref -d <missing>` (and a delete whose CAS value
+            // is the all-zero id) as a no-op; only an explicit non-zero CAS value
+            // makes the missing ref an error, and that is checked above.
+            return Ok(UpdateRefOutcome {
+                old: None,
+                new: None,
             });
         };
         Branch::delete_branch_result_with_conn(txn, branch_name, None)
