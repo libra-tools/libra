@@ -1374,6 +1374,148 @@ fn update_ref_stdin_keeps_earlier_acknowledgements_on_late_error() {
     assert!(!ref_exists(&repo, "refs/heads/late4"), "nothing is applied");
 }
 
+/// Git validates the queued updates during `prepare` (it locks the refs there),
+/// so a `create` of an existing ref must fail at `prepare` without `prepare: ok`.
+#[test]
+fn update_ref_stdin_prepare_validates_preconditions() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/main {c1}\nprepare\ncommit\n"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "prepare must validate the create"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("prepare: cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&out),
+        "start: ok",
+        "`prepare: ok` must not be printed for a failing prepare"
+    );
+
+    // A CAS mismatch is also reported at prepare.
+    let cas = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nupdate refs/heads/main {c1} {ZERO_SHA1}\nprepare\ncommit\n"),
+    );
+    assert_eq!(cas.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&cas.stderr).contains("prepare: cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
+    assert!(!stdout_trimmed(&cas).contains("prepare: ok"));
+}
+
+/// Git allows a fresh `start` after a finished transaction; per-transaction
+/// state must be reset. Commands after `commit`/`abort` (including
+/// `option no-deref`) are refused.
+#[test]
+fn update_ref_stdin_reopens_transaction_and_checks_closed_phase() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+
+    let reopened = stdin_batch(
+        &repo,
+        &[],
+        &format!(
+            "start\ncreate refs/heads/r1 {c1}\ncommit\nstart\ncreate refs/heads/r2 {c1}\ncommit\n"
+        ),
+    );
+    assert!(
+        reopened.status.success(),
+        "two transactions in one batch: {}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&reopened),
+        "start: ok\ncommit: ok\nstart: ok\ncommit: ok"
+    );
+    assert!(ref_exists(&repo, "refs/heads/r1"));
+    assert!(ref_exists(&repo, "refs/heads/r2"));
+
+    let after_abort = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nabort\ncreate refs/heads/r3 {c1}\n"),
+    );
+    assert_eq!(after_abort.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&after_abort.stderr).contains("transaction is closed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&after_abort.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/r3"));
+
+    let option_after_commit = stdin_batch(&repo, &[], "start\ncommit\noption no-deref\n");
+    assert_eq!(option_after_commit.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&option_after_commit.stderr).contains("transaction is closed"));
+}
+
+/// The protocol is interactive: `start: ok` must reach the caller while stdin is
+/// still open, or a client that waits for it would deadlock.
+#[test]
+fn update_ref_stdin_ack_is_streamed_before_stdin_closes() {
+    use std::{
+        io::{BufRead, BufReader, Read as _, Write as _},
+        process::Stdio,
+        time::Duration,
+    };
+
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    let mut child = super::base_libra_command(&["update-ref", "--stdin"], repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libra update-ref --stdin");
+
+    let mut stdin = child.child.stdin.take().expect("child stdin");
+    let stdout = child.child.stdout.take().expect("child stdout");
+    stdin.write_all(b"start\n").expect("write start");
+    stdin.flush().expect("flush start");
+
+    // The reader keeps stdout open until EOF: closing it after the first line
+    // would make the child's next acknowledgement fail with EPIPE (which the
+    // command reports as a fatal output error after committing).
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first = String::new();
+        let _ = reader.read_line(&mut first);
+        let _ = sender.send(first);
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        rest
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("`start: ok` must arrive before stdin is closed");
+    assert_eq!(line.trim(), "start: ok");
+
+    stdin.write_all(b"commit\n").expect("write commit");
+    drop(stdin);
+    let status = child.child.wait().expect("wait for child");
+    let rest = reader_thread.join().expect("reader thread");
+    let output = child
+        .wait_with_output()
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        status.success(),
+        "streamed transaction exits 0 (rest of stdout: {rest:?}, wait error: {output})"
+    );
+    assert!(rest.contains("commit: ok"), "rest of stdout: {rest:?}");
+}
+
 /// `-z` handles a multi-command batch and the transaction commands.
 #[test]
 fn update_ref_stdin_z_multi_command_batch() {
