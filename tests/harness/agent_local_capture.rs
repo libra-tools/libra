@@ -918,7 +918,15 @@ impl SmokeAgent {
                     "claude-code: user settings key must survive install"
                 );
                 for (event, verb) in CLAUDE_EVENT_VERBS {
-                    let expected = format!("{pinned} hooks claude {verb} --capture-budget-ms 9000");
+                    // Default 30s handlers carry 29000ms; the timeout-less
+                    // SessionEnd keeps 9000ms.
+                    let budget = if *event == "SessionEnd" {
+                        9_000
+                    } else {
+                        29_000
+                    };
+                    let expected =
+                        format!("{pinned} hooks claude {verb} --capture-budget-ms {budget}");
                     let found = settings["hooks"][event].as_array().is_some_and(|matchers| {
                         matchers.iter().any(|matcher| {
                             matcher["hooks"].as_array().is_some_and(|hooks| {

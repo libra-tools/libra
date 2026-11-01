@@ -213,6 +213,7 @@ async fn grok_agent_kind_round_trip_and_check() {
         AgentArgs {
             command: AgentSubcommand::Enable(EnableArgs {
                 agents: vec!["grok".to_string()],
+                hook_timeout: None,
             }),
         },
         &output,

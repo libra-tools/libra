@@ -216,7 +216,7 @@ libra agent status
 libra agent list [--schema-version <1|2>] [--json]
 libra agent import (--session <id> | --path <path> | --since <rfc3339> | --all) [--agent <name>] [--limit <n>] [--cursor <n>] --yes
 libra --json agent graph <session> [--repo <path>]
-libra agent enable [--agent <name>]...
+libra agent enable [--agent <name>]... [--hook-timeout <seconds>]
 libra agent add [<name>...]
 libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
@@ -459,6 +459,7 @@ Tool results are redacted before they are written. The server redacts `structure
 | Flag | Subcommand | Description |
 |------|------------|-------------|
 | `--agent <name>` | `enable`, `disable` | Select agent names; omit to target the supported roster (`add`/`remove` take the names positionally) |
+| `--hook-timeout <seconds>` | `enable` | Host handler timeout written into the installed Claude Code and Codex hooks (default 30). The hidden `--capture-budget-ms` is derived as the timeout minus up to 1000ms of cleanup margin (`30 → 29000`, `60 → 59000`). Claude `SessionEnd` keeps no timeout and a `9000` budget; Codex `SessionEnd` and `Interrupt` stay capped at `3s → 2000`. Every selected agent must take a host timeout: combining it with OpenCode, Grok, or Hermes fails with `LBR-CLI-002` before any hook is written. `0` or a non-number is rejected. Re-running `enable` without the flag restores the default |
 | `--schema-version <1\|2>` | `list` | Select the machine schema. Version 1 is the frozen legacy row; version 2 adds `methods[]` entries for `transcript_discoverable`, `importable`, and `export_bridge` availability |
 | `--session <id>` / `--path <path>` / `--since <rfc3339>` / `--all` | `import` | Select exactly one historical-import scope. `--path` also requires `--agent`; OpenCode supports explicit `--session` through its export bridge |
 | `--yes` | `import` | Required for JSON/non-TTY imports; confirms that Libra may read private provider session content, redact it, and write typed projections to this repository |
@@ -1164,6 +1165,9 @@ libra agent add claude-code
 # Enable Claude Code capture and install its hooks
 libra agent enable --agent claude
 
+# Install Claude Code hooks with a 60-second host timeout (capture budget 59000ms)
+libra agent enable --agent claude --hook-timeout 60
+
 # Enable every supported agent at once
 libra agent enable
 
@@ -1290,10 +1294,14 @@ on them:
 - Hook configs that `libra agent enable` installs for Claude Code and Codex
   invoke the top-level `libra hooks claude|codex <verb>` commands with an installer-owned bounded
   `--capture-budget-ms` argument derived from the handler timeout (default
-  Claude `10s → 9000`, Codex ordinary events `30s → 29000`, and Codex
+  Claude and Codex ordinary events `30s → 29000`; Claude `SessionEnd` has no
+  host timeout and keeps `9000`; Codex
   `SessionEnd` and `Interrupt` `3s → 2000` because that host event has a three-second
   maximum; a one-second legacy handler keeps a usable `500ms` capture slice
-  and up to 1000ms remains for terminal finalizer cleanup). Re-running enable refreshes older configs; the hidden
+  and up to 1000ms remains for terminal finalizer cleanup). Choose another
+  handler timeout with `libra agent enable --hook-timeout <seconds>`; hooks
+  written by the previous Claude default (`10s → 9000`) or another timeout
+  stay Libra-owned and are replaced in place. Re-running enable refreshes older configs; the hidden
   alias accepts the same argument for legacy installed commands. The installed
   OpenCode plugin (`.opencode/plugin/libra-hooks.js`) instead forwards every
   event through the hidden `libra agent hooks opencode <verb>` entry, without an

@@ -303,6 +303,14 @@ pub trait HookProvider: HookProviderIdentity + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    /// Whether [`Self::install_hooks`] writes
+    /// [`ProviderInstallOptions::timeout_secs`] as the host handler timeout
+    /// (and derives the hidden capture budget from it). Providers without a
+    /// host-side handler timeout keep this conservative default, so
+    /// `libra agent enable --hook-timeout` refuses them before any install.
+    fn supports_host_timeout(&self) -> bool {
+        false
+    }
     /// Materialise the provider's hook configuration files on disk.
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()>;
     /// Remove anything previously written by [`Self::install_hooks`].

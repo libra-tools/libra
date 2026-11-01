@@ -21,7 +21,7 @@ libra hooks gemini   <event>   # 拒绝并给出提示：gemini 已是 uninstall
 
 `libra hooks claude <verb>` 是 `libra agent enable --agent claude-code` 写入项目 `.claude/settings.json` 的稳定调用面；`libra hooks codex <verb>`（AG-19）是 `libra agent enable --agent codex` 写入 `$CODEX_HOME/hooks.json` 的稳定调用面。两者都记录到 AgentTraces 捕获存储（`refs/libra/traces`）；claude 历史上路由到 `refs/libra/intent` 写入器的行为已由 Task A6.5 本地采集 smoke 收敛（该 smoke 要求已安装 hook 的采集出现在 `libra agent session/checkpoint list` 中）。Codex 额外转发原生子代理边界（`subagent-start` / `subagent-end`）。
 
-安装器会为每条受管命令追加隐藏且受限的 `--capture-budget-ms` 参数：它由 provider handler timeout 推导，并为 terminal pending-finalizer 清理保留最多 1000ms（历史的一秒 handler 保留可用的 `500ms` capture slice；默认 Claude `10s → 9000`、Codex 普通事件 `30s → 29000`）。Codex `SessionEnd` 受宿主上限约束，即使其他 Codex timeout 更长也固定为 `3s → 2000`。这不是公开调参 flag；旧配置可通过重新运行 `libra agent enable --agent <provider>` 原位刷新。runtime 会在读取 hook stdin 前将该值换算为一对单次 deadline 时钟，限制数据库等待，且不会重锚 terminal receipt 的原始 wall-clock deadline。打开仓库数据库与其它仓库命令相同：先自动应用待处理的 schema 迁移（每个版本原子执行，锁等待受 hook 数据库时间片约束），较新 Libra 写入的数据库以下表所列不含路径的 `LBR-IO-001`（安装较新 Libra）拒绝。该预算约束可杀 helper、数据库和其它 deadline-aware 阶段；对当前每条 hook 独立进程而言，它不是严格端到端 wall-clock 保证。source 分类、canonicalize、安全打开和 rewind 都在 descriptor 交接前同步发生，NFS/FUSE stall 无法被强制取消。
+安装器会为每条受管命令追加隐藏且受限的 `--capture-budget-ms` 参数：它由 provider handler timeout 推导，并为 terminal pending-finalizer 清理保留最多 1000ms（历史的一秒 handler 保留可用的 `500ms` capture slice；Claude 与 Codex 普通事件默认均为 `30s → 29000`，Claude `SessionEnd` 不设宿主 timeout，保持 `9000`）。Codex `SessionEnd` 受宿主上限约束，即使其他 Codex timeout 更长也固定为 `3s → 2000`。预算本身不是公开调参 flag；可用 `libra agent enable --agent <provider> --hook-timeout <seconds>` 选择推导它的 handler timeout（仅 Claude Code 与 Codex）。旧配置可通过重新运行 `libra agent enable --agent <provider>` 原位刷新。runtime 会在读取 hook stdin 前将该值换算为一对单次 deadline 时钟，限制数据库等待，且不会重锚 terminal receipt 的原始 wall-clock deadline。打开仓库数据库与其它仓库命令相同：先自动应用待处理的 schema 迁移（每个版本原子执行，锁等待受 hook 数据库时间片约束），较新 Libra 写入的数据库以下表所列不含路径的 `LBR-IO-001`（安装较新 Libra）拒绝。该预算约束可杀 helper、数据库和其它 deadline-aware 阶段；对当前每条 hook 独立进程而言，它不是严格端到端 wall-clock 保证。source 分类、canonicalize、安全打开和 rewind 都在 descriptor 交接前同步发生，NFS/FUSE stall 无法被强制取消。
 
 只有可信的 `SessionEnd` 会创建用于 autonomous recovery 的 durable pending artifact handoff。后续
 `SessionStart` 会检查有界索引队列，并可能启动 detached、source-free recovery worker；hook 本身不会等待
@@ -188,12 +188,12 @@ libra hooks codex subagent-start
 ```json
 {
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-start --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude prompt --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "PreToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude stop --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-end --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-start --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude prompt --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude stop --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-end --capture-budget-ms 9000", "statusMessage": "libra capture"}]}]
   }
 }
 ```

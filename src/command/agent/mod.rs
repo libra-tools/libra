@@ -120,6 +120,7 @@ EXAMPLES:
     libra agent add                                 Enable every supported agent
     libra agent remove claude-code                  Disable Claude Code capture and uninstall its hooks (alias of disable)
     libra agent enable --agent claude               Enable Claude Code capture and install its hooks
+    libra agent enable --agent claude --hook-timeout 60  Install Claude Code hooks with a 60-second host timeout
     libra agent disable --agent claude              Disable Claude Code capture and uninstall its hooks
     libra agent session list                        List captured sessions
     libra agent checkpoint list                     List captured checkpoints
@@ -266,6 +267,30 @@ pub struct EnableArgs {
     /// One or more agent names. Empty means "every supported agent".
     #[arg(long = "agent", value_name = "NAME")]
     pub agents: Vec<String>,
+
+    /// Host handler timeout in whole seconds for the installed Claude Code
+    /// and Codex hooks (default: 30). The hidden capture budget is derived
+    /// from it, keeping up to one second for cleanup. Claude `SessionEnd`
+    /// keeps no timeout and Codex `SessionEnd` / `Interrupt` stay capped at
+    /// 3 seconds. Every selected agent must accept a host timeout. Re-running
+    /// enable without this flag restores the default.
+    #[arg(
+        long = "hook-timeout",
+        value_name = "SECONDS",
+        value_parser = parse_hook_timeout_secs
+    )]
+    pub hook_timeout: Option<u64>,
+}
+
+/// Parse `--hook-timeout`: a positive whole number of seconds whose derived
+/// capture budget is representable, checked before any agent is installed.
+fn parse_hook_timeout_secs(raw: &str) -> Result<u64, String> {
+    let secs = raw
+        .parse::<u64>()
+        .map_err(|_| format!("'{raw}' is not a whole number of seconds"))?;
+    crate::internal::ai::hooks::provider::capture_budget_millis_for_host_timeout(secs)
+        .map_err(|err| err.to_string())?;
+    Ok(secs)
 }
 
 #[derive(Args, Debug)]
@@ -475,8 +500,8 @@ pub async fn execute_safe(
         AgentSubcommand::List(args) => list::execute_safe(args, output).await,
         AgentSubcommand::Import(args) => import::execute_safe(args, output).await,
         AgentSubcommand::Graph(args) => graph::execute_safe(args, output).await,
-        AgentSubcommand::Enable(args) => enable_agents(&args.agents, output),
-        AgentSubcommand::Add(args) => enable_agents(&args.agents, output),
+        AgentSubcommand::Enable(args) => enable_agents(&args.agents, args.hook_timeout, output),
+        AgentSubcommand::Add(args) => enable_agents(&args.agents, None, output),
         AgentSubcommand::Disable(args) => disable_agents(&args.agents, output),
         AgentSubcommand::Remove(args) => disable_agents(&args.agents, output),
         AgentSubcommand::Session(cmd) => session::execute_safe(cmd, output).await,
@@ -495,17 +520,26 @@ pub async fn execute_safe(
     }
 }
 
-fn enable_agents(agents: &[String], output: &OutputConfig) -> CliResult<()> {
-    install_or_uninstall(agents, output, true)
+fn enable_agents(
+    agents: &[String],
+    hook_timeout: Option<u64>,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    install_or_uninstall(agents, output, true, hook_timeout)
 }
 
 pub(super) const CIPHERTEXT_ARCHIVE_DISCLOSURE: &str = "Provider-encrypted reasoning original bytes may be retained as ordinary transcript data without decryption and mirrored to cloud storage with their checkpoint; session erasure hides the references and local GC reclaims unreachable objects. Native artifacts still require source proof; unproven fields remain ordinary transcript data.";
 
 fn disable_agents(agents: &[String], output: &OutputConfig) -> CliResult<()> {
-    install_or_uninstall(agents, output, false)
+    install_or_uninstall(agents, output, false, None)
 }
 
-fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool) -> CliResult<()> {
+fn install_or_uninstall(
+    agents: &[String],
+    output: &OutputConfig,
+    install: bool,
+    hook_timeout: Option<u64>,
+) -> CliResult<()> {
     let verb_present = if install { "enable" } else { "disable" };
 
     let mut resolved = resolve_agent_kinds(agents)?;
@@ -557,6 +591,17 @@ fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool)
             }
         }
     }
+    // Fail closed before any side effect, like the roster check above: a
+    // provider that takes no host timeout would otherwise reject the option
+    // mid-batch, after earlier agents were already installed.
+    if let Some(secs) = hook_timeout
+        && let Some(slug) = resolved.iter().find_map(|kind| {
+            let row = registration_for(*kind);
+            (row.hook_installable && !accepts_hook_timeout(*kind)).then_some(row.slug)
+        })
+    {
+        return Err(hook_timeout_unsupported(slug, secs));
+    }
     if install && !output.quiet {
         eprintln!("{CIPHERTEXT_ARCHIVE_DISCLOSURE}");
     }
@@ -584,7 +629,7 @@ fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool)
                      HookProvider; run libra agent doctor and report this"
                 ))
             })?;
-            install_provider_hooks(provider)
+            install_provider_hooks(provider, hook_timeout)
                 .map_err(|err| CliError::fatal(format!("failed to enable '{slug}': {err}")))?;
             if !output.quiet {
                 println!("libra agent enable: enabled '{slug}' (provider hooks installed)");
@@ -660,16 +705,46 @@ fn unsupported_for_install(slug: &str) -> CliError {
     }
 }
 
-fn install_provider_hooks(provider: &dyn HookProvider) -> anyhow::Result<()> {
+/// Whether `kind`'s hook provider writes `--hook-timeout` as its host
+/// handler timeout. Resolved through the registry, never by slug.
+fn accepts_hook_timeout(kind: AgentKind) -> bool {
+    agent_for(kind)
+        .as_hooks()
+        .is_some_and(|provider| provider.supports_host_timeout())
+}
+
+/// Usage error for `--hook-timeout` combined with an agent whose hooks take
+/// no host timeout. Raised before any agent is installed.
+fn hook_timeout_unsupported(slug: &str, secs: u64) -> CliError {
+    let accepted = supported_slugs()
+        .into_iter()
+        .filter(|candidate| AgentKind::from_cli_slug(candidate).is_some_and(accepts_hook_timeout))
+        .collect::<Vec<_>>()
+        .join(", ");
+    CliError::command_usage(format!(
+        "--hook-timeout {secs} cannot be applied to agent '{slug}': its hooks take no host \
+         timeout (agents that accept one: {accepted}); no files were changed"
+    ))
+    .with_hint(format!(
+        "pass --agent for each of {accepted} together with --hook-timeout, and enable other \
+         agents in a separate run without it"
+    ))
+}
+
+fn install_provider_hooks(
+    provider: &dyn HookProvider,
+    hook_timeout: Option<u64>,
+) -> anyhow::Result<()> {
     // Use the running binary's path so installed hooks point at exactly the
     // libra the user is invoking — falling back to the bare `libra` symbol
     // (which `HookProvider`s will substitute) if `current_exe` fails.
     let binary_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string));
+    // `None` keeps each provider's own default (Claude Code and Codex: 30s).
     let opts = ProviderInstallOptions {
         binary_path,
-        timeout_secs: None,
+        timeout_secs: hook_timeout,
     };
     provider.install_hooks(&opts)
 }
@@ -702,6 +777,7 @@ fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::error::StableErrorCode;
 
     #[test]
     fn consent_text_discloses_ciphertext_archive() {
@@ -764,6 +840,49 @@ mod tests {
                 .to_string()
                 .contains("not in the supported roster")
         );
+    }
+
+    #[test]
+    fn hook_timeout_parser_accepts_positive_whole_seconds_only() {
+        assert_eq!(parse_hook_timeout_secs("1"), Ok(1));
+        assert_eq!(parse_hook_timeout_secs("30"), Ok(30));
+        assert_eq!(parse_hook_timeout_secs("601"), Ok(601));
+        for invalid in ["0", "-5", "1.5", "abc", "", "18446744073709551615"] {
+            assert!(
+                parse_hook_timeout_secs(invalid).is_err(),
+                "'{invalid}' must be rejected"
+            );
+        }
+    }
+
+    /// Only providers that write a host handler timeout accept
+    /// `--hook-timeout`; the rest of the roster is refused up front.
+    #[test]
+    fn hook_timeout_is_accepted_only_by_host_timeout_providers() {
+        assert!(accepts_hook_timeout(AgentKind::ClaudeCode));
+        assert!(accepts_hook_timeout(AgentKind::Codex));
+        for kind in [
+            AgentKind::OpenCode,
+            AgentKind::Grok,
+            AgentKind::Hermes,
+            AgentKind::Gemini,
+        ] {
+            assert!(
+                !accepts_hook_timeout(kind),
+                "{kind:?} takes no host timeout"
+            );
+        }
+
+        let err = hook_timeout_unsupported("opencode", 45);
+        assert_eq!(err.stable_code(), StableErrorCode::CliInvalidArguments);
+        let rendered = err.render();
+        assert!(rendered.contains("--hook-timeout 45"), "{rendered}");
+        assert!(rendered.contains("agent 'opencode'"), "{rendered}");
+        assert!(
+            rendered.contains("agents that accept one: claude-code, codex"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("no files were changed"), "{rendered}");
     }
 
     /// AG-19: hook dispatch goes AgentKind -> `agent_for` -> `as_hooks()`;
