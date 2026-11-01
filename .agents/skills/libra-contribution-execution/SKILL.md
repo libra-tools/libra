@@ -34,11 +34,12 @@ Inspect `libra status --short --branch` before edits. If the current branch is `
 
 ## Implement and verify
 
-1. Follow the card's scope and write set. If scope expands, dependencies change, or write sets overlap, update the plan or resolve sequencing with the maintainer first.
-2. Add or update focused tests and user documentation as required by the card and repository rules.
-3. Run the exact verification required by the card and current repository guidance. Follow current ER-13/ER-14 rules; do not copy obsolete commands from old plans.
-4. Report actual results. Do not mark a card complete while acceptance, release, or remote gates remain pending.
-5. Update the card and `plan-status.md` in the same change when lifecycle, acceptance, dependency, or deferred status changes.
+1. When beginning implementation of the authorized card, first update the task card's `Lifecycle` to `in-progress` (e.g., `Lifecycle / Acceptance: in-progress / 空` or matching current acceptance) and record in `plan-status.md` that the task is in-progress on its task branch with a UTC timestamp. This claims and locks the card's declared `Implementation write set` under repository governance (ER-03 / G-10), ensuring other agents preflighting their tasks are blocked from concurrent edits to the same write set.
+2. Follow the card's scope and write set. If scope expands, dependencies change, or write sets overlap, update the plan or resolve sequencing with the maintainer first.
+3. Add or update focused tests and user documentation as required by the card and repository rules.
+4. Run the exact verification required by the card and current repository guidance. Follow current ER-13/ER-14 rules; do not copy obsolete commands from old plans.
+5. Report actual results. Do not mark a card complete while acceptance, release, or remote gates remain pending.
+6. Update the card and `plan-status.md` in the same change when lifecycle, acceptance, dependency, or deferred status changes, marking `Lifecycle / Acceptance: done / complete` only when all required verification, acceptance criteria, and closure gates are met.
 
 Use the project's Libra command workflow for repository operations. Follow current DCO/signing and commit/push instructions in `AGENTS.md`. Do not commit, push, merge, tag, or publish unless the user explicitly authorized that operation.
 
