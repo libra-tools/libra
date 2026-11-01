@@ -4320,3 +4320,97 @@ fn test_status_intent_to_add_matrix() {
     );
     assert_eq!(parsed["data"]["is_clean"], false, "V8 is_clean");
 }
+
+fn run_status_with_head_expansion_log(
+    args: &[&str],
+    repo: &Path,
+    log: &Path,
+) -> std::process::Output {
+    run_libra_command_with_env(
+        args,
+        repo,
+        &[(
+            "LIBRA_TEST_HEAD_TREE_EXPANSION_LOG",
+            log.to_str()
+                .expect("head expansion log path should be UTF-8"),
+        )],
+    )
+}
+
+fn head_expansion_count(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .map(|contents| contents.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn status_head_expansion_is_shared_across_consumers() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("nested")).unwrap();
+    fs::write(repo.path().join("nested/old.txt"), "same contents\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "nested/old.txt"], repo.path()),
+        "stage original file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit original file",
+    );
+    fs::rename(
+        repo.path().join("nested/old.txt"),
+        repo.path().join("nested/new.txt"),
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "-A"], repo.path()),
+        "stage exact rename",
+    );
+
+    let cases: [(&[&str], &str); 4] = [
+        (&["status", "--porcelain=v2"], "default-v2"),
+        (
+            &["status", "--porcelain=v2", "--no-renames"],
+            "no-renames-v2",
+        ),
+        (&["status", "--porcelain"], "default-v1"),
+        (&["status", "--json"], "default-json"),
+    ];
+    for (args, name) in cases {
+        let log = repo.path().join(format!("{name}.head-expansions"));
+        let output = run_status_with_head_expansion_log(args, repo.path(), &log);
+        assert_cli_success(&output, name);
+        assert_eq!(
+            head_expansion_count(&log),
+            1,
+            "{name} should expand HEAD exactly once"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if name == "default-json" {
+            let document = parse_json_stdout(&output);
+            assert_eq!(document["data"]["renames"].as_array().unwrap().len(), 1);
+        } else if name == "no-renames-v2" {
+            assert!(stdout.lines().any(|line| line.starts_with("1 D.")));
+            assert!(stdout.lines().any(|line| line.starts_with("1 A.")));
+            assert!(!stdout.lines().any(|line| line.starts_with("2 R.")));
+        } else {
+            assert!(
+                stdout.contains("R") && stdout.contains("nested/new.txt"),
+                "{name} should preserve the staged rename: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn status_head_expansion_skips_unborn_head() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    let log = repo.path().join("unborn.head-expansions");
+    let output =
+        run_status_with_head_expansion_log(&["status", "--porcelain=v2"], repo.path(), &log);
+    assert_cli_success(&output, "unborn status");
+    assert_eq!(head_expansion_count(&log), 0);
+}

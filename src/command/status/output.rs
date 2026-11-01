@@ -1382,6 +1382,34 @@ pub fn build_porcelain_v2_data(
     })
 }
 
+pub(crate) fn build_porcelain_v2_data_with_head(
+    index: Index,
+    head_tree: Option<&HeadTreeSnapshot>,
+) -> PorcelainV2Data {
+    let head_tree_items = head_tree
+        .map(|snapshot| {
+            snapshot
+                .items
+                .iter()
+                .map(|(path, hash, mode)| {
+                    (
+                        path.clone(),
+                        FileInfo {
+                            mode: tree_item_mode_to_u32(*mode),
+                            hash: hash.to_string(),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    PorcelainV2Data {
+        index,
+        head_tree_items,
+    }
+}
+
 /// Emit a porcelain v2 `2 <xy> …` rename record (§B.6.4):
 /// `2 <xy> <sub> <mH> <mI> <mW> <hH> <hI> R<pct> <new>\t<old>`. Under `-z` the
 /// path field becomes `<new> NUL <old> NUL`.
