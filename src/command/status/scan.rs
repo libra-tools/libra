@@ -97,11 +97,15 @@ pub(super) async fn collect_status_data(
         .await
         .map_err(|error| status_branch_store_error("resolve HEAD commit", error))?;
     let has_commits = head_oid.is_some();
-
-    let mut staged = changes_to_be_committed_safe()
-        .await
-        .map(|c| c.to_relative())
+    let staged_index = load_status_index()?;
+    let head_tree = head_oid
+        .as_ref()
+        .map(load_head_tree_snapshot)
+        .transpose()
         .map_err(CliError::from)?;
+
+    let mut staged =
+        changes_to_be_committed_with_head(&staged_index, head_tree.as_ref()).to_relative();
     // ADR-FM-05 (FM-04): mode-only worktree changes are reported only when
     // core.fileMode is enabled.
     let file_mode = crate::internal::config::core_file_mode().await?;
@@ -175,11 +179,7 @@ pub(super) async fn collect_status_data(
     let mut unstaged_rename_details: RenameDetails = HashMap::new();
     let mut warnings: Vec<StatusWarning> = Vec::new();
     if let Some(threshold) = rename_threshold {
-        let head_blobs = head_oid
-            .as_ref()
-            .map(load_head_tree_blobs)
-            .transpose()?
-            .unwrap_or_default();
+        let head_blobs = head_tree.as_ref().map(head_tree_blobs).unwrap_or_default();
         let index_blobs = maybe_index
             .as_ref()
             .map(load_index_stage0_blobs)
@@ -367,10 +367,10 @@ pub(super) async fn collect_status_data(
         let index = maybe_index
             .take()
             .ok_or_else(|| CliError::internal("porcelain v2 metadata should be loaded"))?;
-        Some(std::sync::Arc::new(build_porcelain_v2_data(
+        Some(std::sync::Arc::new(build_porcelain_v2_data_with_head(
             index,
-            head_oid.as_ref(),
-        )?))
+            head_tree.as_ref(),
+        )))
     } else {
         None
     };
@@ -1325,13 +1325,12 @@ pub(crate) fn load_head_commit_tree(head_oid: &ObjectHash) -> CliResult<(Commit,
 
 /// HEAD tree blobs keyed by repo-relative path → (oid, mode) (§B.4.1 old side
 /// of the staged snapshot).
-fn load_head_tree_blobs(head_oid: &ObjectHash) -> CliResult<HashMap<PathBuf, (ObjectHash, u32)>> {
-    let (_, tree) = load_head_commit_tree(head_oid)?;
-    Ok(try_get_plain_items_with_mode(&tree)
-        .map_err(|source| StatusError::HeadTreeExpansion { source })?
-        .into_iter()
-        .map(|(path, hash, mode)| (path, (hash, tree_item_mode_to_unix(mode))))
-        .collect())
+fn head_tree_blobs(head_tree: &HeadTreeSnapshot) -> HashMap<PathBuf, (ObjectHash, u32)> {
+    head_tree
+        .items
+        .iter()
+        .map(|(path, hash, mode)| (path.clone(), (*hash, tree_item_mode_to_unix(*mode))))
+        .collect()
 }
 
 /// Index stage-0 blobs keyed by repo-relative path → (oid, mode) (index side

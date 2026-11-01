@@ -56,6 +56,13 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 - 默认 Docs and compatibility impact=N/A 仅适用于输出与错误完全不变的内部优化；公开行为变化卡须同卡双语与网站文档。网站路径为候选，DEP-SP-DOCS 核验后才允许开工；遵循用户 standing instruction 直接 cf，通过 Libra 提交推送，不能另建网站分支/PR/worktree。
 - 无家族合并发布；C/D coverage=self（实现卡），SP-09 继承下列具体实现卡。SP-00 按用户批准的 EX-SP-00-AUDIT-01 独立文档验收（见下）；该例外不免除评审、fmt、Clippy 或本卡 PR CI，也不授权其它卡开工。
 
+### SP-05 修复卡收口决策（EX-SP-05-CLOSE-01）
+
+2026-11-01T01:43:25Z，在实现、定向回归、fmt、严格 Clippy、双方 release 构建及 SP-00 完整 16 格矩阵通过后，用户明确要求“关闭任务卡片，然后提交，推送，生成 PR”。本次按修复卡口径将 SP-05 登记为 `done / complete`，这是对模板 ER-04/ER-08 完整发布切片及远端门顺序的本卡具名例外，不扩展至其它任务卡。
+
+- 本机 16 GiB 资源门槛及两份测试环境文件缺失使 nextest 保持 `not-run`；提交、推送和 PR 创建后的适用 CI 单独观察，不在提交前预称远端通过。
+- 本次未获版本递增、tag 或 Release 授权，保持当前版本；独立 patch 发布及后置门登记为 `DEFER-SP-REL-05`，不伪称完整发布 C/D 已通过。Issue #644 不由本决策手动关闭，避免将本地卡片状态与 GitHub 生命周期混同。
+
 ### SP-03 验证数量与CI收口决策（EX-SP-03-VER-01 / EX-SP-03-CLOSE-01）
 
 2026-10-31，用户在“批准数量例外→提交推送建PR跑CI→收口”的建议上明确要求顺序改为“1→3→2”：把本地整改结果、最终CI成功的完成判据及回执的后续登记方式先写进同一提交，以免CI成功后另建进度提交触发第二轮CI。本决策只针对SP-03本仓库修复交付；本机nextest仍not-run，网站与独立版本发布仍未执行，不冒充完整发布或网站部署完成。当前修复卡在同一最终PR head的适用base.yml与CodeQL全部成功后，满足本次用户批准的收口条件；成功回执按模板v2.14随下一次例行状态同步登记，不专建成功记账提交。
@@ -114,7 +121,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-02 restore 区分 decoded size 与对象加载内存成本 | P1 | 必选正确性 | [#641](https://github.com/libra-tools/libra/issues/641) | done / complete |
 | SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | done / complete |
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
-| SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | pending / 空 |
+| SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | done / complete |
 | SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | pending / 空 |
 | SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | pending / 空 |
 | SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | pending / 空 |
@@ -668,7 +675,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending / 空
+**Lifecycle / Acceptance:** done / complete
 
 **Priority / Selection:** P2；本轮核心提速：第一梯队
 
@@ -678,37 +685,45 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Out of scope:** CE_VALID 永久不在本计划范围；其它行为轴按任务总览分别承接；pack 会话缓存/marker 合并/IPC 批处理登记为 DEFER-SP-01..03，未启用。
 
-**Current evidence:** src/command/status/scan.rs:101,177；src/command/status.rs:1039；src/command/status/output.rs:1361（基线 380c262，开工刷新锚点）。
+**Current evidence:** `src/command/status.rs:1015`；`src/command/status/scan.rs:100,182,373`；`src/command/status/output.rs:1385`；`tests/command/status_test.rs:4325`（开工基线 `e1e853e3d18c793e93edc06791081482650da7d1`）。
 
 **Acceptance criteria:**
 
-- [ ] 有 HEAD 时单次 status 最多展开一次 HEAD tree。
+- [x] 有 HEAD 时单次 status 最多展开一次 HEAD tree。
 
-- [ ] 默认 rename 与 --no-renames 的原分类行为保持一致。
+- [x] 默认 rename 与 --no-renames 的原分类行为保持一致。
 
-- [ ] porcelain v1/v2 与 JSON 输出保持既有语义。
+- [x] porcelain v1/v2 与 JSON 输出保持既有语义。
 
-- [ ] unborn HEAD 和子树读取失败遵循既有错误处理。
+- [x] unborn HEAD 和子树读取失败遵循既有错误处理。
 
-- [ ] 在相同 packed fixture 上记录前后对象读取次数和无插桩墙钟。
+- [x] 在相同 packed fixture 上记录前后对象读取次数和无插桩墙钟。
 
 
 **Verification:**
 
-- [ ] `cargo test --test command_test status_test::`
+- [x] `cargo test --test command_test status_test::` — 最终源码 70 passed；隔离测试 HOME，未读取宿主签名配置。
 
-- [ ] `cargo test --test command_test status_wave0_test::`
+- [x] `cargo test --test command_test status_wave0::` — 最终源码 175 passed；原卡 `status_wave0_test::` 与当前注册模块名不符且实测零命中，已按 `tests/command/mod.rs` 的实际模块名修正，零命中未计通过。
 
-- [ ] `cargo test --test command_test status_test::status_head_expansion_ -- --nocapture` — `(new)` 测试前缀；须非零命中。
+- [x] `cargo test --test command_test status_test::status_head_expansion_ -- --nocapture` — `(new)` 非零命中，2 passed。
+
+- [x] `cargo test --test command_test status_error_test::` — 14 passed，覆盖缺失、损坏及非法子树和 unborn 相关错误边界。
+
+- [x] `cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` — exit 0；仅保留依赖 future-incompat 提示。
+
+- [x] SP-00 完整三方 16 格矩阵与临时插桩对象读取计数 — 1200 次无插桩调用、960 个正式样本及 16 格计数均通过独立复算。
+
+- [ ] 最终全量 nextest：not-run；本机 16 GiB <32 GiB，且 `.env.test` / `.env.live-test` 均缺失。不得以 focused 或矩阵冒充全量；后续以同一最终 PR head 的适用 CI 为远端门。
 
 
-**Full-suite trigger:** none
+**Full-suite trigger:** none；最终收口的本机资源限制与远端 CI 门如上保留
 
 **Dependencies:** SP-03
 
 **Deliverables:** 实现、同卡回归及列明文档
 
-**Implementation write set:** `src/command/status.rs`, `src/command/status/scan.rs`, `src/command/status/output.rs`, `tests/command/status_test.rs`, `tests/command/status_wave0_test.rs`
+**Implementation write set:** `src/command/status.rs`, `src/command/status/scan.rs`, `src/command/status/output.rs`, `tests/command/status_test.rs`, `tests/command/status_wave0_test.rs`（实际无需修改最后一项）；协调文件为本计划与 `plan-status.md`
 
 **Release write set:** Inherited
 
@@ -728,9 +743,38 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self；尚未运行。
+**C/D coverage from:** self（EX-SP-05-CLOSE-01 修复卡收口口径）；本地实现、定向回归、fmt、严格 Clippy、双方 release 构建和完整矩阵已验收，用户已授权关闭卡片并提交、推送、创建 PR。PR CI 在推送后单独观察；独立 patch 发布由 `DEFER-SP-REL-05` 跟踪，不称完整发布 C/D 通过。
 
-**Granularity:** type=implementation; axis=status 共享一次 HEAD tree 展开结果; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=3/8; landing=2; prod-files=3; scope=M; deps=SP-03; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=N/A
+**Granularity:** type=implementation; axis=status 共享一次 HEAD tree 展开结果; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=3/8; landing=2; prod-files=3; scope=M; deps=SP-03; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-05-CLOSE-01
+
+**SP-05 本地验收证据（2026-11-01T01:27:20Z）：**
+
+- macOS 27.0.1 (26A434) arm64、16 GiB；`rustc 1.100.0-nightly (574ff7d98 2026-09-14)`，双方均为 `cargo +nightly build --release --locked --bin libra`。父版本 `e1e853e3d18c793e93edc06791081482650da7d1` binary SHA-256 `7456bfe9b5fe59c10dd3e2d2930234dc28ae1802dbe132434fff672576a49ec2`；候选 binary SHA-256 `2910314db449eaa2cc2f02a6153fdcfed7be2235958334ea2f68bed5dac4ffdb`；Git 2.56.0。
+- 严格使用 SP-00 公开 packed fixture `d0a5c28a6b236421c14a38339b592fe37137585e`：2125 tracked paths、10 个暂存重命名、10 个未暂存修改、100 个未跟踪文件；pack SHA-256 `bf97acde98b4d9030bfe1f300b3eb44a6f82bfbd89add0a1fa3e991826350a25`。Git/父/候选按 ABC/CBA 交替，每边每格 5 预热 +20 正式，新 CLI 进程、热页面缓存；共 1200 次调用和 960 个正式样本。
+- 全部调用 exit 0、stderr 为空、各工具原始输出稳定、index SHA-256 不变；三方及默认/refreshed 的规范化记录集合一致，untracked 与 rename/no-renames 记录断言通过。独立脚本复算 median、nearest-rank p95、样本数和对象读取比例通过。
+- 临时 debug 插桩只统计 `try_get_plain_items_with_mode` 的 HEAD tree 对象展开，墙钟测量时未启用；探针已从最终源码移除并重新构建、重跑回归。每次展开为 205 个 tree 对象，父版本 staged/rename/v2 的重复路径精确呈现 205/410/615，候选全部为 205。
+- 临时结果 `matrix-result.json` SHA-256 `aaa5ef9bfe4b0ff92d1502fbf57d9a8ea78961820be5d42479e0bce77d0e952b`，`samples.jsonl` `a212715782829f104d37c5565df5b478be238afaeb5f5e7ef23733c152301382`，`object-result.json` `b5e36b63d58481df24e9c469a314ca8cd2373a7170e1e4d9ef5e2a9f82deb10c`；临时文件不承诺永久保留，关键结果在下表自包含登记。
+
+| 索引 | 未跟踪 | 重命名 | 输出 | 父 median/p95 ms | 候选 median/p95 ms | 中位数下降 | 候选更快配对 | HEAD tree reads 父→候选 |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| default | no | default | v1 | 430.395/436.415 | 323.478/328.861 | 24.84% | 20/20 | 410→205 |
+| default | no | default | v2 | 542.163/547.991 | 327.419/333.810 | 39.61% | 20/20 | 615→205 |
+| default | no | no-renames | v1 | 310.784/316.649 | 310.687/320.763 | 0.03% | 10/20 | 205→205 |
+| default | no | no-renames | v2 | 423.137/428.079 | 316.780/324.583 | 25.14% | 20/20 | 410→205 |
+| default | normal | default | v1 | 718.479/731.032 | 611.902/618.840 | 14.83% | 20/20 | 410→205 |
+| default | normal | default | v2 | 829.759/835.353 | 616.405/622.440 | 25.71% | 20/20 | 615→205 |
+| default | normal | no-renames | v1 | 599.536/605.563 | 599.439/612.623 | 0.02% | 9/20 | 205→205 |
+| default | normal | no-renames | v2 | 714.046/737.853 | 606.054/621.905 | 15.12% | 20/20 | 410→205 |
+| refreshed | no | default | v1 | 429.830/434.618 | 323.181/331.650 | 24.81% | 20/20 | 410→205 |
+| refreshed | no | default | v2 | 541.087/547.259 | 327.498/334.073 | 39.47% | 20/20 | 615→205 |
+| refreshed | no | no-renames | v1 | 310.987/315.663 | 311.153/320.720 | -0.05% | 7/20 | 205→205 |
+| refreshed | no | no-renames | v2 | 423.883/432.058 | 316.314/321.352 | 25.38% | 20/20 | 410→205 |
+| refreshed | normal | default | v1 | 718.748/726.934 | 612.328/621.069 | 14.81% | 20/20 | 410→205 |
+| refreshed | normal | default | v2 | 831.275/840.288 | 616.932/625.768 | 25.78% | 20/20 | 615→205 |
+| refreshed | normal | no-renames | v1 | 601.022/608.142 | 600.623/609.131 | 0.07% | 10/20 | 205→205 |
+| refreshed | normal | no-renames | v2 | 713.748/720.952 | 607.529/614.724 | 14.88% | 20/20 | 410→205 |
+
+结论限于本机该 fixture：默认 rename 的 v1/v2 均减少重复展开并稳定提速；`--no-renames` v1 本来就只展开一次，-0.05%–0.07% 为噪声内基本持平，不宣称额外收益。未将 Git 倍率设为通过目标，也未把单次矩阵外推为所有环境的绝对收益。
 
 ### Task SP-06: 对象读取复用请求级 storage scope
 
@@ -1050,7 +1094,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 ### 基线与实施证据汇总
 
-SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-04..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
+SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-05（#644）已为 `done / complete`，本地实现、定向/静态验证和 SP-00 完整 16 格矩阵通过，远端 CI 与独立发布未执行；SP-04、SP-06..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
 
 #### SP-00 冻结协议与环境
 

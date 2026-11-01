@@ -73,7 +73,8 @@ pub use output::{
 };
 #[allow(unused_imports)]
 pub(crate) use output::{
-    generate_short_format_status_with_unmerged, generate_short_status_entries_with_unmerged,
+    build_porcelain_v2_data_with_head, generate_short_format_status_with_unmerged,
+    generate_short_status_entries_with_unmerged,
 };
 #[allow(unused_imports)]
 pub(crate) use scan::head_object_unreadable;
@@ -1011,14 +1012,62 @@ pub async fn changes_to_be_committed() -> Changes {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct HeadTreeSnapshot {
+    pub(crate) items: Vec<(PathBuf, ObjectHash, TreeItemMode)>,
+}
+
+pub(crate) fn load_head_tree_snapshot(
+    head_oid: &ObjectHash,
+) -> Result<HeadTreeSnapshot, StatusError> {
+    let commit = Commit::try_load(head_oid).ok_or_else(|| StatusError::HeadObjectUnreadable {
+        what: "commit",
+        oid: head_oid.to_string(),
+    })?;
+    let tree =
+        Tree::try_load(&commit.tree_id).ok_or_else(|| StatusError::HeadObjectUnreadable {
+            what: "tree",
+            oid: commit.tree_id.to_string(),
+        })?;
+    let items = try_get_plain_items_with_mode(&tree)
+        .map_err(|source| StatusError::HeadTreeExpansion { source })?;
+
+    #[cfg(debug_assertions)]
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+        && let Some(path) = std::env::var_os("LIBRA_TEST_HEAD_TREE_EXPANSION_LOG")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "expanded");
+    }
+
+    Ok(HeadTreeSnapshot { items })
+}
+
 pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
-    let mut changes = Changes::default();
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    let head_commit = Head::current_commit().await;
+    let head_tree = Head::current_commit()
+        .await
+        .as_ref()
+        .map(load_head_tree_snapshot)
+        .transpose()?;
+    Ok(changes_to_be_committed_with_head(
+        &index,
+        head_tree.as_ref(),
+    ))
+}
+
+pub(crate) fn changes_to_be_committed_with_head(
+    index: &Index,
+    head_tree: Option<&HeadTreeSnapshot>,
+) -> Changes {
+    let mut changes = Changes::default();
     // WT-06/WT-07 (ADR-WT-05): an intent-to-add entry is an empty-blob
     // PLACEHOLDER for a new file, not staged content. Git never reports it as
     // `A ` and never writes it into a tree; excluding it here is the single
@@ -1035,27 +1084,11 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         .filter(|path| !intent_to_add.contains(path))
         .collect();
 
-    if head_commit.is_none() {
+    let Some(head_tree) = head_tree else {
         changes.new = tracked_files;
-        return Ok(changes);
-    }
-
-    let head_commit = match head_commit {
-        Some(head_commit) => head_commit,
-        None => return Ok(changes),
+        return changes;
     };
-    let commit =
-        Commit::try_load(&head_commit).ok_or_else(|| StatusError::HeadObjectUnreadable {
-            what: "commit",
-            oid: head_commit.to_string(),
-        })?;
-    let tree =
-        Tree::try_load(&commit.tree_id).ok_or_else(|| StatusError::HeadObjectUnreadable {
-            what: "tree",
-            oid: commit.tree_id.to_string(),
-        })?;
-    let tree_files = try_get_plain_items_with_mode(&tree)
-        .map_err(|source| StatusError::HeadTreeExpansion { source })?;
+    let tree_files = &head_tree.items;
 
     for (item_path, item_hash, item_mode) in tree_files.iter() {
         // §B.6.1: a tree path that is not valid UTF-8 cannot match an index
@@ -1085,13 +1118,13 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         }
     }
     let tree_files_set: HashSet<PathBuf> =
-        tree_files.into_iter().map(|(path, _, _)| path).collect();
+        tree_files.iter().map(|(path, _, _)| path.clone()).collect();
     changes.new = tracked_files
         .into_iter()
         .filter(|path| !tree_files_set.contains(path))
         .collect();
 
-    Ok(changes)
+    changes
 }
 
 /// Compare the difference between `index` and the `workdir` using the default ignore rules.
