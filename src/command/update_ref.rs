@@ -652,14 +652,36 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         }
     }
 
-    // First pass: state machine + scope/uniqueness validation. git prints the
-    // `<cmd>: ok` lines as the commands are processed (they stay on stdout
-    // even when a later command fails), so they are written immediately.
+    // Git's transaction protocol is a small state machine: `start` opens a
+    // transaction, `prepare` resolves and validates the queued commands,
+    // `commit` applies them, and `abort` drops them. A batch that uses no
+    // transaction command keeps the implicit "resolve and apply at end of
+    // input" behaviour, and an explicit transaction left uncommitted at end of
+    // input is dropped without applying anything (Git exits 0 there).
+    let mut phase = StdinPhase::Idle;
     let mut seen_refs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
-    let mut active = false;
-    let mut closed = false;
-    let mut aborted = false;
     let mut stdout = std::io::stdout().lock();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+    let message = args.message.clone().unwrap_or_default();
+    let mut pending: Vec<&StdinCommand> = Vec::new();
+    let ack = |stdout: &mut std::io::StdoutLock<'_>, line: &str| -> CliResult<()> {
+        writeln!(stdout, "{line}").map_err(|error| {
+            stdin_fatal(
+                format!("failed to write update-ref acknowledgement: {error}"),
+                128,
+            )
+        })
+    };
+    let emit_committed_json = |refs: &[String], committed: bool| -> CliResult<()> {
+        if output.is_json() {
+            emit_json_data(
+                "update-ref",
+                &serde_json::json!({ "refs": refs, "committed": committed }),
+                output,
+            )?;
+        }
+        Ok(())
+    };
 
     for parsed in &records {
         let command = match parsed {
@@ -667,39 +689,84 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             Err((message, code)) => return Err(stdin_fatal(message.clone(), *code)),
         };
         match command {
-            StdinCommand::Start => {
-                if active {
+            StdinCommand::Start => match phase {
+                StdinPhase::Idle => {
+                    phase = StdinPhase::Open;
+                    ack(&mut stdout, "start: ok")?;
+                }
+                StdinPhase::Open => {
                     return Err(stdin_fatal(
                         "cannot restart ongoing transaction".to_string(),
                         128,
                     ));
                 }
-                active = true;
-                let _ = writeln!(stdout, "start: ok");
-            }
+                StdinPhase::Prepared => {
+                    return Err(stdin_fatal(
+                        "prepared transactions can only be closed".to_string(),
+                        128,
+                    ));
+                }
+                StdinPhase::Closed => {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+            },
             StdinCommand::Prepare => {
-                let _ = writeln!(stdout, "prepare: ok");
+                match phase {
+                    StdinPhase::Closed => {
+                        return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                    }
+                    StdinPhase::Prepared => {
+                        return Err(stdin_fatal(
+                            "prepared transactions can only be closed".to_string(),
+                            128,
+                        ));
+                    }
+                    _ => {}
+                }
+                // Resolve before acknowledging: `prepare: ok` must mean the
+                // values parsed, not merely that the line was read.
+                resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+                phase = StdinPhase::Prepared;
+                ack(&mut stdout, "prepare: ok")?;
             }
             StdinCommand::Commit => {
-                closed = true;
-                let _ = writeln!(stdout, "commit: ok");
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+                let prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+                let ref_names = apply_prepared_batch(prepared, &message).await?;
+                phase = StdinPhase::Closed;
+                // Acknowledge only after the transaction actually committed.
+                ack(&mut stdout, "commit: ok")?;
+                emit_committed_json(&ref_names, true)?;
             }
             StdinCommand::Abort => {
-                closed = true;
-                aborted = true;
-                let _ = writeln!(stdout, "abort: ok");
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+                // Git prints the `<cmd>: ok` lines and applies nothing.
+                ack(&mut stdout, "abort: ok")?;
+                emit_committed_json(&[], false)?;
+                return Ok(());
             }
             StdinCommand::OptionNoDeref => {}
             StdinCommand::Update { ref_name, .. }
             | StdinCommand::Create { ref_name, .. }
             | StdinCommand::Delete { ref_name, .. }
             | StdinCommand::Verify { ref_name, .. } => {
-                if closed {
-                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                match phase {
+                    StdinPhase::Prepared => {
+                        return Err(stdin_fatal(
+                            "prepared transactions can only be closed".to_string(),
+                            128,
+                        ));
+                    }
+                    StdinPhase::Closed => {
+                        return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                    }
+                    _ => {}
                 }
-                let branch = parse_heads_ref(ref_name)
-                    .map_err(|message| stdin_fatal(message, 129))?
-                    .to_string();
+                parse_heads_ref(ref_name).map_err(|message| stdin_fatal(message, 129))?;
                 if !util::is_valid_refname(ref_name) {
                     return Err(stdin_fatal(format!("invalid ref name '{ref_name}'"), 129));
                 }
@@ -709,27 +776,42 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                         128,
                     ));
                 }
-                let _ = branch;
+                pending.push(command);
             }
         }
     }
 
-    if aborted {
-        // git prints the `<cmd>: ok` lines and applies nothing.
-        if output.is_json() {
-            emit_json_data(
-                "update-ref",
-                &serde_json::json!({ "refs": [], "committed": false }),
-                output,
-            )?;
+    // End of input. An explicit transaction that was never committed is
+    // dropped silently; a plain batch applies implicitly.
+    match phase {
+        StdinPhase::Idle => {
+            let prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+            let ref_names = apply_prepared_batch(prepared, &message).await?;
+            emit_committed_json(&ref_names, true)?;
         }
-        return Ok(());
+        StdinPhase::Open | StdinPhase::Prepared => emit_committed_json(&[], false)?,
+        StdinPhase::Closed => {}
     }
+    Ok(())
+}
 
-    // Second pass: resolve the values (async) and build the prepared list.
-    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+/// Transaction phases of `update-ref --stdin` (Git's protocol).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdinPhase {
+    Idle,
+    Open,
+    Prepared,
+    Closed,
+}
+
+/// Resolve the queued `--stdin` commands into transaction-ready entries.
+async fn resolve_stdin_batch(
+    pending: &[&StdinCommand],
+    zero: &str,
+    stdin_fatal: &impl Fn(String, i32) -> CliError,
+) -> CliResult<Vec<PreparedCommand>> {
     let mut prepared: Vec<PreparedCommand> = Vec::new();
-    for command in records.iter().filter_map(|parsed| parsed.as_ref().ok()) {
+    for command in pending {
         let resolved = match command {
             StdinCommand::Update {
                 ref_name,
@@ -739,9 +821,9 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 let branch = parse_heads_ref(ref_name)
                     .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let new = resolve_new_value(new_value, &zero, ref_name).await?;
+                let new = resolve_new_value(new_value, zero, ref_name).await?;
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
@@ -760,7 +842,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 let branch = parse_heads_ref(ref_name)
                     .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let new = resolve_new_value(new_value, &zero, ref_name).await?;
+                let new = resolve_new_value(new_value, zero, ref_name).await?;
                 PreparedCommand {
                     branch,
                     full_ref: ref_name.to_string(),
@@ -777,7 +859,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                     .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
@@ -798,7 +880,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 // "any value". An absent value therefore differs from `update`
                 // and `delete`, where it means "no CAS".
                 let old = match old_value.as_deref().filter(|value| !value.is_empty()) {
-                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
                     None => Some(OldValue::MustNotExist),
                 };
                 PreparedCommand {
@@ -811,7 +893,14 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         };
         prepared.push(resolved);
     }
+    Ok(prepared)
+}
 
+/// Apply a resolved batch atomically and return the refs it touched.
+async fn apply_prepared_batch(
+    prepared: Vec<PreparedCommand>,
+    message: &str,
+) -> CliResult<Vec<String>> {
     // Part C W0 (§C.11) per unique branch, fail closed.
     let mut checked: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
     for command in &prepared {
@@ -840,9 +929,9 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         }
     }
 
-    let message = args.message.clone().unwrap_or_default();
-    let db = get_db_conn_instance().await;
     let ref_names: Vec<String> = prepared.iter().map(|c| c.full_ref.clone()).collect();
+    let message = message.to_string();
+    let db = get_db_conn_instance().await;
     crate::internal::db::write_transaction(&db, move |txn| {
         Box::pin(async move {
             for command in &prepared {
@@ -900,15 +989,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
-
-    if output.is_json() {
-        emit_json_data(
-            "update-ref",
-            &serde_json::json!({ "refs": ref_names, "committed": true }),
-            output,
-        )?;
-    }
-    Ok(())
+    Ok(ref_names)
 }
 
 /// Truncate an input line for error messages (GC-PL-02: never echo long lines).

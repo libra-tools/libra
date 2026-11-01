@@ -1260,7 +1260,7 @@ fn update_ref_stdin_z_missing_field_is_fatal() {
 /// ref does NOT exist — the empty value is the all-zero id, not "any value".
 #[test]
 fn update_ref_verify_without_value_requires_absence() {
-    let (repo, _c1, c2) = repo_with_two_commits();
+    let (repo, c1, c2) = repo_with_two_commits();
     assert!(
         stdin_batch(&repo, &[], "verify refs/heads/main\n")
             .status
@@ -1294,7 +1294,21 @@ fn update_ref_verify_without_value_requires_absence() {
         stdin_batch(&repo, &["-z"], &format!("verify refs/heads/main\0{c2}\0"))
             .status
             .success(),
-        "an explicit matching <oldvalue> verifies"
+        "-z: an explicit matching <oldvalue> verifies"
+    );
+    // The stated matrix needs both modes: LF matching and mismatching values.
+    assert!(
+        stdin_batch(&repo, &[], &format!("verify refs/heads/main {c2}\n"))
+            .status
+            .success(),
+        "LF: an explicit matching <oldvalue> verifies"
+    );
+    assert_eq!(
+        stdin_batch(&repo, &[], &format!("verify refs/heads/main {c1}\n"))
+            .status
+            .code(),
+        Some(128),
+        "LF: a mismatching <oldvalue> fails"
     );
 }
 
@@ -1328,6 +1342,36 @@ fn update_ref_stdin_keeps_earlier_acknowledgements_on_late_error() {
     );
     assert!(!ref_exists(&repo, "refs/heads/late"), "nothing is applied");
     assert!(!ref_exists(&repo, "refs/heads/late2"), "nothing is applied");
+
+    // Both acknowledgements (`start: ok` AND `prepare: ok`) must survive a
+    // malformed command that follows the prepare, in BOTH input modes.
+    let lf_prepared = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/late3 {c1}\nprepare\nbogus\n"),
+    );
+    assert_eq!(lf_prepared.status.code(), Some(128));
+    assert_eq!(
+        stdout_trimmed(&lf_prepared),
+        "start: ok\nprepare: ok",
+        "LF acknowledgements: {}",
+        stdout_trimmed(&lf_prepared)
+    );
+
+    let z_prepared = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("start\0create refs/heads/late4\0{c1}\0prepare\0bogus\0"),
+    );
+    assert_eq!(z_prepared.status.code(), Some(128));
+    assert_eq!(
+        stdout_trimmed(&z_prepared),
+        "start: ok\nprepare: ok",
+        "-z acknowledgements: {}",
+        stdout_trimmed(&z_prepared)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/late3"), "nothing is applied");
+    assert!(!ref_exists(&repo, "refs/heads/late4"), "nothing is applied");
 }
 
 /// `-z` handles a multi-command batch and the transaction commands.
@@ -1365,10 +1409,11 @@ fn update_ref_stdin_z_multi_command_batch() {
 fn update_ref_stdin_transaction_matrix() {
     let (repo, c1, _c2) = repo_with_two_commits();
 
+    // Git's order: queue the commands, prepare, then commit.
     let committed = stdin_batch(
         &repo,
         &[],
-        &format!("start\nprepare\ncreate refs/heads/t1 {c1}\ncommit\n"),
+        &format!("start\ncreate refs/heads/t1 {c1}\nprepare\ncommit\n"),
     );
     assert!(
         committed.status.success(),
@@ -1416,6 +1461,66 @@ fn update_ref_stdin_transaction_matrix() {
         String::from_utf8_lossy(&nested.stderr).contains("cannot restart ongoing transaction"),
         "nested start message: {}",
         String::from_utf8_lossy(&nested.stderr)
+    );
+
+    // After `prepare` only commit/abort may follow (Git: "prepared transactions
+    // can only be closed") — a queued update in that window is refused and
+    // nothing is applied.
+    let late = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nprepare\ncreate refs/heads/t4 {c1}\ncommit\n"),
+    );
+    assert_eq!(late.status.code(), Some(128), "post-prepare update");
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("prepared transactions can only be closed"),
+        "prepared message: {}",
+        String::from_utf8_lossy(&late.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/t4"), "nothing is applied");
+
+    // A second `prepare` after a successful one is refused the same way.
+    let double_prepare = stdin_batch(&repo, &[], "start\nprepare\nprepare\n");
+    assert_eq!(double_prepare.status.code(), Some(128));
+
+    // An explicit transaction left uncommitted at end of input applies nothing
+    // but still exits 0, like Git.
+    let dangling = stdin_batch(&repo, &[], &format!("start\ncreate refs/heads/t5 {c1}\n"));
+    assert!(
+        dangling.status.success(),
+        "an uncommitted transaction exits 0: {}",
+        String::from_utf8_lossy(&dangling.stderr)
+    );
+    assert_eq!(stdout_trimmed(&dangling), "start: ok");
+    assert!(
+        !ref_exists(&repo, "refs/heads/t5"),
+        "an uncommitted transaction applies nothing"
+    );
+    let prepared_only = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/t6 {c1}\nprepare\n"),
+    );
+    assert!(prepared_only.status.success());
+    assert!(!ref_exists(&repo, "refs/heads/t6"));
+
+    // A plain batch with no `start` still commits on its `commit` line.
+    let implicit = stdin_batch(&repo, &[], &format!("create refs/heads/t7 {c1}\ncommit\n"));
+    assert!(implicit.status.success());
+    assert_eq!(stdout_trimmed(&implicit), "commit: ok");
+    assert!(ref_exists(&repo, "refs/heads/t7"));
+
+    // `commit: ok` must not be printed when the commit itself fails.
+    let failing = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nupdate refs/heads/main {c1} {ZERO_SHA1}\ncommit\n"),
+    );
+    assert_eq!(failing.status.code(), Some(128), "CAS failure is fatal");
+    assert!(
+        !stdout_trimmed(&failing).contains("commit: ok"),
+        "a failed commit must not acknowledge success: {}",
+        stdout_trimmed(&failing)
     );
 }
 
