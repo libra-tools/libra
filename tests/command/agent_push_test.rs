@@ -692,3 +692,19 @@ async fn agent_push_seed_readiness_accepts_missing_or_empty_marker_dir() {
         .await
         .expect("an empty marker directory is ready");
 }
+
+/// LTR-10 keeps the public Mega2 push flags unwired. LTR-12 is the only
+/// card that may expose them.
+#[test]
+fn agent_push_help_has_no_mega2_entry_before_ltr12() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["agent", "push", "--help"])
+        .output()
+        .expect("agent push help");
+    assert!(output.status.success(), "help failed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !text.contains("--mega2") && !text.contains("--new-stream"),
+        "LTR-10 must not publish the Mega2 push entry:\n{text}"
+    );
+}

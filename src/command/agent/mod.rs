@@ -33,6 +33,7 @@ mod graph;
 mod hooks;
 mod import;
 mod list;
+pub mod mega2_stream;
 mod push;
 mod workspace;
 // `libra review` is a TOP-LEVEL command (AG-22; `Commands::Review` in
