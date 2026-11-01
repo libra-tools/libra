@@ -136,6 +136,7 @@ Do not dismiss an issue only because:
 - This repository is a single Rust package; this checkout is a Libra repository (`.libra/`, no `.git/`), so all version-control operations go through `libra` commands — raw `git` does not work here.
 - Prefer this command flow for changes: `libra status` -> inspect diff -> `libra add <exact related paths>` -> `libra commit -s -m "<scope>: ..."` -> verify signature and DCO -> `libra push origin <branch>`. Never use `commit -a` for task-card work; it may stage another Agent's edits.
 - When a user requests version operations or release copy steps, follow the `libra` command workflow instead of `git` commands.
+- Libra binaries built within the project (e.g., under `target/debug/libra`, `target/release/libra`, or invoked via `cargo run`) may only be used for testing purposes; all routine version-control tasks that are not testing must use the system-installed Libra from the system PATH (`libra`). 项目中构建生成的 Libra 只能用于测试目的；非测试的日常版本管理工作，必须使用系统路径中的 Libra。
 
 ## Aggressive review bias
 
