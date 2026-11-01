@@ -507,21 +507,27 @@ pub enum PiEntryKind {
 
 impl PiEntryKind {
     fn from_entry(entry: &serde_json::Value) -> Self {
-        match entry.get("type").and_then(serde_json::Value::as_str) {
-            Some("message") => Self::Message(
-                match entry
-                    .get("message")
-                    .and_then(|message| message.get("role"))
-                    .and_then(serde_json::Value::as_str)
-                {
-                    Some("user") => PiMessageRole::User,
-                    Some("assistant") => PiMessageRole::Assistant,
-                    Some("toolResult") => PiMessageRole::ToolResult,
-                    Some("system") => PiMessageRole::System,
-                    Some("bashExecution") => PiMessageRole::BashExecution,
-                    _ => PiMessageRole::Unknown,
-                },
-            ),
+        Self::from_names(
+            entry.get("type").and_then(serde_json::Value::as_str),
+            entry
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(serde_json::Value::as_str),
+        )
+    }
+
+    /// The kind of an entry with this `type` and `message.role`, each
+    /// `None` when absent or not a string.
+    fn from_names(kind: Option<&str>, role: Option<&str>) -> Self {
+        match kind {
+            Some("message") => Self::Message(match role {
+                Some("user") => PiMessageRole::User,
+                Some("assistant") => PiMessageRole::Assistant,
+                Some("toolResult") => PiMessageRole::ToolResult,
+                Some("system") => PiMessageRole::System,
+                Some("bashExecution") => PiMessageRole::BashExecution,
+                _ => PiMessageRole::Unknown,
+            }),
             Some("custom_message") => Self::CustomMessage,
             Some("custom") => Self::Custom,
             Some("model_change") => Self::ModelChange,
@@ -606,6 +612,11 @@ pub struct PiTurn {
     /// model context (`session-manager.ts:468-515`), although the raw
     /// entries stay on disk.
     pub completeness: super::super::coverage::Completeness,
+    /// A line skipped as [`PiBranchPartialReason::MalformedLine`] may hold
+    /// this turn's content: the latest branch entry above it in the file
+    /// is in this turn, or, for the first turn, opens no turn or does not
+    /// exist.
+    pub skipped_lines: bool,
 }
 
 /// The v3 tree of one session file and its active branch.
@@ -662,6 +673,11 @@ pub fn normalize_pi_session(
     let mut partial_reasons = BTreeSet::new();
     let mut header: Option<String> = None;
     let mut entries: Vec<IndexedEntry> = Vec::new();
+    // The first line of each run of skipped lines between two indexed
+    // entries; a run has one latest branch entry above it, and there are
+    // at most one more runs than entries.
+    let mut skipped_runs: Vec<usize> = Vec::new();
+    let mut in_skipped_run = false;
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -674,6 +690,10 @@ pub fn normalize_pi_session(
             Ok(value) if !is_js_falsy(&value) => value,
             _ => {
                 partial_reasons.insert(PiBranchPartialReason::MalformedLine);
+                if !in_skipped_run {
+                    skipped_runs.push(index + 1);
+                    in_skipped_run = true;
+                }
                 continue;
             }
         };
@@ -728,6 +748,7 @@ pub fn normalize_pi_session(
             }
             _ => {}
         }
+        in_skipped_run = false;
         entries.push(IndexedEntry {
             id: id.to_owned(),
             parent_id,
@@ -815,7 +836,7 @@ pub fn normalize_pi_session(
         .map(|(index, _)| index)
         .collect();
     let preamble = 0..openings.first().copied().unwrap_or(branch.len());
-    let turns = openings
+    let mut turns: Vec<PiTurn> = openings
         .iter()
         .enumerate()
         .map(|(ordinal, &start)| {
@@ -829,9 +850,35 @@ pub fn normalize_pi_session(
                 } else {
                     Completeness::Complete
                 },
+                skipped_lines: false,
             }
         })
         .collect();
+    if !skipped_runs.is_empty() && !turns.is_empty() {
+        // A child may precede its parent in the file, so the branch is
+        // searched by line rather than walked.
+        let mut by_line: Vec<(usize, usize)> = branch
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.line, index))
+            .collect();
+        by_line.sort_unstable();
+        for line in skipped_runs {
+            let above = by_line.partition_point(|&(entry_line, _)| entry_line < line);
+            let turn = above
+                .checked_sub(1)
+                .and_then(|position| by_line.get(position))
+                .and_then(|&(_, index)| {
+                    openings
+                        .partition_point(|&start| start <= index)
+                        .checked_sub(1)
+                })
+                .unwrap_or(0);
+            if let Some(turn) = turns.get_mut(turn) {
+                turn.skipped_lines = true;
+            }
+        }
+    }
     Ok(PiActiveBranch {
         session_id,
         leaf_id: branch.last().map(|entry| entry.id.clone()),
@@ -1067,6 +1114,10 @@ pub struct PiProjectedTurn {
     pub ordinal: usize,
     pub completeness: super::super::coverage::Completeness,
     pub records: Vec<PiContentRecord>,
+    /// Each of the turn's entries that has records, in branch order: its
+    /// index into [`PiActiveBranch::entries`] and its records as a range
+    /// into `records`. The blocks of one message share one range.
+    pub entry_records: Vec<(usize, std::ops::Range<usize>)>,
 }
 
 /// The projected content of an active branch.
@@ -1084,6 +1135,16 @@ impl PiContentProjection {
     pub fn partial(&self) -> bool {
         !self.partial_reasons.is_empty()
     }
+}
+
+/// Why [`normalize_pi_turns`] gives no turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PiCoverageError {
+    /// The normalizer refused the file.
+    Refused(PiNormalizeRefusal),
+    /// The file did not project over its own branch, which the normalizer
+    /// built from the same bytes; not expected.
+    Projection(PiProjectionError),
 }
 
 /// Why `bytes` cannot be projected over a branch.
@@ -1164,6 +1225,7 @@ pub fn project_pi_content(
                 ordinal: turn.ordinal,
                 completeness: turn.completeness,
                 records: Vec::new(),
+                entry_records: Vec::new(),
             })
             .collect(),
         partial_reasons: BTreeSet::new(),
@@ -1177,21 +1239,7 @@ pub fn project_pi_content(
     }
     let mut call_ids = BTreeSet::new();
     for (index, entry) in branch.entries.iter().enumerate() {
-        let text = entry
-            .line
-            .checked_sub(1)
-            .and_then(|line| lines.get(line))
-            .and_then(|line| std::str::from_utf8(line).ok())
-            .ok_or(PiProjectionError::BranchMismatch)?;
-        let fields = raw_fields(text).ok_or(PiProjectionError::BranchMismatch)?;
-        if typed_field::<String>(&fields, "id")
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(entry.id.as_str())
-        {
-            return Err(PiProjectionError::BranchMismatch);
-        }
+        let (text, fields) = branch_entry_line(&lines, entry)?;
         let whole = || {
             serde_json::from_str::<Box<serde_json::value::RawValue>>(text)
                 .map(PiRawJson)
@@ -1301,11 +1349,247 @@ pub fn project_pi_content(
             | PiEntryKind::SessionInfo => continue,
         }
         match owner.get(index).copied().flatten() {
-            Some(turn) => projection.turns[turn].records.extend(records),
+            Some(turn) if !records.is_empty() => {
+                let turn = &mut projection.turns[turn];
+                let start = turn.records.len();
+                turn.records.extend(records);
+                turn.entry_records.push((index, start..turn.records.len()));
+            }
+            Some(_) => {}
             None => projection.preamble.extend(records),
         }
     }
     Ok(projection)
+}
+
+/// The line of a branch entry, with its fields, checked to hold that
+/// entry: other bytes than the branch was normalized from fail.
+fn branch_entry_line<'a>(
+    lines: &[&'a [u8]],
+    entry: &PiBranchEntry,
+) -> std::result::Result<(&'a str, RawFields<'a>), PiProjectionError> {
+    let text = entry
+        .line
+        .checked_sub(1)
+        .and_then(|line| lines.get(line))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .ok_or(PiProjectionError::BranchMismatch)?;
+    let fields = raw_fields(text).ok_or(PiProjectionError::BranchMismatch)?;
+    let string =
+        |fields: &RawFields<'_>, name: &str| typed_field::<String>(fields, name).ok().flatten();
+    let role = member(&fields, "message")
+        .and_then(|message| raw_fields(message.get()))
+        .and_then(|message| string(&message, "role"));
+    if string(&fields, "id").as_deref() != Some(entry.id.as_str())
+        || PiEntryKind::from_names(string(&fields, "type").as_deref(), role.as_deref())
+            != entry.kind
+    {
+        return Err(PiProjectionError::BranchMismatch);
+    }
+    Ok((text, fields))
+}
+
+/// The Pi coverage normalizer (PI-34): one [`NormalizedTurn`] per turn of
+/// the active branch, in PI-03 order with PI-03's ordinal, holding the
+/// PI-11 records of the turn in coverage-v1 form (`coverage-v1.md` §2–§6).
+///
+/// The text pieces of one message join with `\n` into one user or
+/// assistant record (§3), present whenever the message has a text piece,
+/// even an empty one. An assistant message's joined text comes first,
+/// then its readable thinking and tool calls in block order, as for Claude
+/// Code. Readable thinking becomes a [`SemanticRecord::Reasoning`] of
+/// provider Pi, never assistant text; redacted or empty thinking has no
+/// record. Context entries (system and bash execution messages, extension
+/// messages, branch and compaction summaries) have none either.
+///
+/// A turn is `Complete` only when PI-03 says so, no skipped line may hold
+/// its content ([`PiTurn::skipped_lines`], §6), and each of its user,
+/// assistant, and tool result messages was read faithfully. Any of these
+/// makes it `Incomplete`: a duplicate key in the message's line (§4.6),
+/// whether or not the message has records, a block or entry kept
+/// unprojected, a thinking block with an ill-typed `thinking` or
+/// `redacted`, a tool call without a string `id` and `name` or an object
+/// `arguments`, fractional or beyond-i64 numbers in `arguments` (which
+/// become `null`, §4.5), or a tool result without a string `toolCallId` or
+/// a boolean `isError`. Tool result metadata (`toolName`, `details`,
+/// `nestedCalls`) and an unmatched `toolCallId` do not count.
+///
+/// The turn key is the opening user message's entry id when it is a valid
+/// provider turn id, else the ordinal key. The branch, its turns, and
+/// their records all come from `bytes` ([`normalize_pi_session`] under
+/// `limits`, then [`project_pi_content`]); a file the normalizer refuses
+/// gives its refusal.
+pub fn normalize_pi_turns(
+    bytes: &[u8],
+    limits: PiNormalizeLimits,
+) -> std::result::Result<Vec<super::super::coverage::NormalizedTurn>, PiCoverageError> {
+    use super::super::{
+        coverage::{
+            CanonValue, Completeness, NormalizedTurn, SemanticRecord, contains_float, ordinal_key,
+            parse_canon_value, sanitize_floats, valid_provider_turn_id,
+        },
+        reasoning::{ReasoningProvider, ReasoningSourceKind, classify_provider_visible_reasoning},
+    };
+
+    let branch = &normalize_pi_session(bytes, limits).map_err(PiCoverageError::Refused)?;
+    let projection = project_pi_content(bytes, branch).map_err(PiCoverageError::Projection)?;
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    let mut turns = Vec::with_capacity(branch.turns.len());
+    for (turn, projected) in branch.turns.iter().zip(&projection.turns) {
+        let mut complete = turn.completeness == Completeness::Complete && !turn.skipped_lines;
+        let mut records = Vec::new();
+        // Every entry of the turn, with its records (none for most
+        // metadata entries and for an empty message).
+        let mut spans = projected.entry_records.iter().peekable();
+        for index in turn.entries.clone() {
+            let range = spans
+                .next_if(|(entry, _)| *entry == index)
+                .map_or(0..0, |(_, range)| range.clone());
+            let mismatch = PiCoverageError::Projection(PiProjectionError::BranchMismatch);
+            let entry = branch.entries.get(index).ok_or(mismatch)?;
+            let pieces = projected.records.get(range).ok_or(mismatch)?;
+            match entry.kind {
+                PiEntryKind::Message(
+                    PiMessageRole::User | PiMessageRole::Assistant | PiMessageRole::ToolResult,
+                ) => {}
+                // An entry outside the tables may hold turn content.
+                PiEntryKind::Message(PiMessageRole::Unknown) | PiEntryKind::Unknown => {
+                    complete = false;
+                    continue;
+                }
+                // Context: no coverage record.
+                _ => continue,
+            }
+            let (line, _) =
+                branch_entry_line(&lines, entry).map_err(PiCoverageError::Projection)?;
+            // coverage-v1.md §4.6: a duplicate key is a parse rejection,
+            // never "last one wins".
+            if parse_canon_value(line.as_bytes()).is_err() {
+                complete = false;
+            }
+            let mut user = Vec::new();
+            let mut assistant = Vec::new();
+            let mut ordered = Vec::new();
+            for piece in pieces {
+                match piece {
+                    PiContentRecord::User { text } => user.push(text.as_str()),
+                    PiContentRecord::Assistant { text } => assistant.push(text.as_str()),
+                    PiContentRecord::Reasoning {
+                        readable: Some(text),
+                        ..
+                    } => {
+                        let (_, text) = classify_provider_visible_reasoning(
+                            ReasoningProvider::Pi,
+                            ReasoningSourceKind::Thinking,
+                            text.as_str().to_owned(),
+                        );
+                        ordered.push(SemanticRecord::Reasoning {
+                            provider: ReasoningProvider::Pi,
+                            source_kind: Some(ReasoningSourceKind::Thinking),
+                            text,
+                        });
+                    }
+                    // Redacted or empty thinking has no record; an
+                    // ill-typed one was not read faithfully.
+                    PiContentRecord::Reasoning {
+                        readable: None,
+                        block,
+                    } => {
+                        if raw_fields(block.get())
+                            .is_none_or(|fields| readable_thinking(&fields).is_err())
+                        {
+                            complete = false;
+                        }
+                    }
+                    PiContentRecord::ToolCall {
+                        call_id,
+                        name,
+                        block,
+                        ..
+                    } => {
+                        let arguments =
+                            parse_canon_value(block.get().as_bytes())
+                                .ok()
+                                .and_then(|block| match block {
+                                    CanonValue::Object(mut fields) => fields.remove("arguments"),
+                                    _ => None,
+                                });
+                        let input = match arguments {
+                            Some(mut input @ CanonValue::Object(_)) => {
+                                if contains_float(&input) {
+                                    complete = false;
+                                    sanitize_floats(&mut input);
+                                }
+                                input
+                            }
+                            _ => {
+                                complete = false;
+                                CanonValue::Null
+                            }
+                        };
+                        if call_id.is_none() || name.is_none() {
+                            complete = false;
+                        }
+                        ordered.push(SemanticRecord::ToolCall {
+                            call_id: call_id.clone(),
+                            input,
+                            name: name.clone().unwrap_or_default(),
+                        });
+                    }
+                    PiContentRecord::ToolResult {
+                        call_id,
+                        text,
+                        is_error,
+                        ..
+                    } => {
+                        if call_id.is_none() || is_error.is_none() {
+                            complete = false;
+                        }
+                        ordered.push(SemanticRecord::ToolResult {
+                            call_id: call_id.clone(),
+                            content: text.join("\n"),
+                            is_error: is_error.unwrap_or(false),
+                        });
+                    }
+                    // An image or unknown block: content the records do not
+                    // hold. (A context record cannot come from these roles.)
+                    PiContentRecord::Unprojected { .. } | PiContentRecord::Context { .. } => {
+                        complete = false;
+                    }
+                }
+            }
+            if !user.is_empty() {
+                records.push(SemanticRecord::User {
+                    text: user.join("\n"),
+                });
+            }
+            // A text block keeps its record even when empty, as a user's
+            // does: it differs from a message without text.
+            if !assistant.is_empty() {
+                records.push(SemanticRecord::Assistant {
+                    text: assistant.join("\n"),
+                });
+            }
+            records.extend(ordered);
+        }
+        turns.push(NormalizedTurn {
+            logical_turn_key: if valid_provider_turn_id(&turn.opening_entry_id) {
+                turn.opening_entry_id.clone()
+            } else {
+                ordinal_key(turn.ordinal)
+            },
+            ordinal: turn.ordinal,
+            completeness: if complete {
+                Completeness::Complete
+            } else {
+                Completeness::Incomplete
+            },
+            started_at: None,
+            ended_at: None,
+            records,
+        });
+    }
+    Ok(turns)
 }
 
 /// A system message's content and sections as one context record.
@@ -1513,6 +1797,21 @@ impl<'de> serde::Deserialize<'de> for OrderedStringSections {
     }
 }
 
+/// A thinking block's readable text: its `thinking` when that is a
+/// non-empty string and `redacted` is a valid `false` or absent. `Err` when
+/// `thinking` is not a string or `redacted` not a boolean.
+fn readable_thinking(fields: &RawFields<'_>) -> std::result::Result<Option<PiReasoningText>, ()> {
+    match (
+        typed_field::<String>(fields, "thinking"),
+        typed_field::<bool>(fields, "redacted"),
+    ) {
+        (Ok(Some(text)), Ok(redacted)) => {
+            Ok((!text.is_empty() && redacted != Some(true)).then_some(PiReasoningText(text)))
+        }
+        _ => Err(()),
+    }
+}
+
 fn project_assistant(
     content: Option<&serde_json::value::RawValue>,
     records: &mut Vec<PiContentRecord>,
@@ -1537,18 +1836,10 @@ fn project_assistant(
                 _ => unprojected(block, Some(&fields), records, partial),
             },
             Some("thinking") => {
-                // Readable only when `thinking` is a string and the
-                // redaction state is a valid `false` or absent.
-                let thinking = typed_field::<String>(&fields, "thinking");
-                let redacted = typed_field::<bool>(&fields, "redacted");
-                let readable = match (thinking, redacted) {
-                    (Ok(Some(text)), Ok(redacted)) => (!text.is_empty() && redacted != Some(true))
-                        .then_some(PiReasoningText(text)),
-                    _ => {
-                        partial.insert(PiContentPartialReason::MalformedField);
-                        None
-                    }
-                };
+                let readable = readable_thinking(&fields).unwrap_or_else(|()| {
+                    partial.insert(PiContentPartialReason::MalformedField);
+                    None
+                });
                 records.push(PiContentRecord::Reasoning {
                     readable,
                     block: PiRawJson(block.to_owned()),

@@ -559,7 +559,7 @@ fn observe_turn_timestamp(turn: &mut NormalizedTurn, timestamp: Option<i64>) {
 }
 
 /// Does this (semantic-position) value contain any fractional number?
-fn contains_float(value: &CanonValue) -> bool {
+pub(crate) fn contains_float(value: &CanonValue) -> bool {
     match value {
         CanonValue::Float(_) => true,
         CanonValue::Array(items) => items.iter().any(contains_float),
@@ -570,7 +570,7 @@ fn contains_float(value: &CanonValue) -> bool {
 
 /// Replace every `Float` with `Null` so canonical bytes stay well-defined
 /// (the enclosing turn is already marked `incomplete` by the caller).
-fn sanitize_floats(value: &mut CanonValue) {
+pub(crate) fn sanitize_floats(value: &mut CanonValue) {
     match value {
         CanonValue::Float(_) => *value = CanonValue::Null,
         CanonValue::Array(items) => items.iter_mut().for_each(sanitize_floats),
@@ -596,7 +596,7 @@ pub(crate) fn supported_codex_cli_version(version: &str) -> bool {
     matches!(version, "0.162.1" | "0.163.0")
 }
 
-fn ordinal_key(ordinal: usize) -> String {
+pub(crate) fn ordinal_key(ordinal: usize) -> String {
     format!("ordinal:{ordinal}")
 }
 

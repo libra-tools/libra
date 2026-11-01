@@ -1256,3 +1256,788 @@ fn hermes_bounded_capture_rejects_a_bad_cancelled_or_oversize_frame() {
     );
     assert!(snapshot.hermes_readable_thinking().is_empty());
 }
+
+// ---- PI-34: Pi coverage normalizer ----
+
+/// A synthetic Pi v3 session file from entry lines. Entry shapes follow the
+/// pinned source (`session-manager.ts:43-194`, Pi `v1.4.0` `4a08025`); no
+/// real session is read.
+fn pi_session(lines: &[String]) -> Vec<u8> {
+    let header = serde_json::json!({
+        "type": "session",
+        "version": 3,
+        "id": "019a3c2e-7b10-7000-8000-0000000000aa",
+        "timestamp": "2026-10-31T00:00:00.000Z",
+        "cwd": "/work",
+    });
+    let mut file = header.to_string();
+    for line in lines {
+        file.push('\n');
+        file.push_str(line);
+    }
+    file.push('\n');
+    file.into_bytes()
+}
+
+/// An entry of `kind` with `id` and `parent`, plus `extra` fields.
+fn pi_entry(kind: &str, id: &str, parent: Option<&str>, extra: serde_json::Value) -> String {
+    let mut entry = serde_json::json!({
+        "type": kind,
+        "id": id,
+        "parentId": parent,
+        "timestamp": "2026-10-31T00:00:01.000Z",
+    });
+    if let (Some(entry), serde_json::Value::Object(extra)) = (entry.as_object_mut(), extra) {
+        entry.extend(extra);
+    }
+    entry.to_string()
+}
+
+fn pi_message(id: &str, parent: Option<&str>, message: serde_json::Value) -> String {
+    pi_entry(
+        "message",
+        id,
+        parent,
+        serde_json::json!({ "message": message }),
+    )
+}
+
+/// Normalize, project, and cover one session.
+fn pi_coverage(
+    bytes: &[u8],
+) -> (
+    libra::internal::ai::observed_agents::builtin::pi::PiActiveBranch,
+    Vec<libra::internal::ai::observed_agents::coverage::NormalizedTurn>,
+) {
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        normalize_pi_session, normalize_pi_turns,
+    };
+
+    let branch = normalize_pi_session(bytes, Default::default()).expect("normalize");
+    let turns = normalize_pi_turns(bytes, Default::default()).expect("cover");
+    (branch, turns)
+}
+
+fn pi_text_records(
+    turn: &libra::internal::ai::observed_agents::coverage::NormalizedTurn,
+) -> Vec<String> {
+    turn.records
+        .iter()
+        .map(|record| match record {
+            SemanticRecord::User { text } => format!("user: {text}"),
+            SemanticRecord::Assistant { text } => format!("assistant: {text}"),
+            SemanticRecord::ToolCall {
+                call_id,
+                input,
+                name,
+            } => format!(
+                "call {call_id:?} {name}: {}",
+                serde_json::to_string(input).expect("input")
+            ),
+            SemanticRecord::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => format!("result {call_id:?} {is_error}: {content}"),
+            SemanticRecord::Reasoning {
+                provider,
+                source_kind,
+                text,
+            } => format!("reasoning {provider:?} {source_kind:?}: {}", text.as_str()),
+        })
+        .collect()
+}
+
+/// PI-34 AC1: one turn per PI-03 turn, with PI-03's ordinal and
+/// completeness and the PI-11 records of the turn; context entries before
+/// and after a compaction have no record; mismatched inputs fail.
+#[test]
+fn pi_coverage_normalizer_keeps_pi03_turns_and_pi11_records() {
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        PiCoverageError, PiNormalizeLimits, PiNormalizeRefusal, normalize_pi_turns,
+    };
+
+    let bytes = pi_session(&[
+        pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "part"},
+            ]}),
+        ),
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "reading"},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {"path": "a.rs", "n": 2}},
+                {"type": "text", "text": "now"},
+            ], "usage": {"input": 10, "cost": {"total": 0.0123}}}),
+        ),
+        pi_message(
+            "t1",
+            Some("a1"),
+            serde_json::json!({"role": "toolResult", "toolCallId": "call-1", "toolName": "read",
+                "content": [{"type": "text", "text": "fn main"}, {"type": "text", "text": "}"}],
+                "isError": false}),
+        ),
+        pi_message(
+            "a2",
+            Some("t1"),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}),
+        ),
+        pi_message(
+            "u2",
+            Some("a2"),
+            serde_json::json!({"role": "user", "content": "second"}),
+        ),
+        pi_entry(
+            "custom_message",
+            "x1",
+            Some("u2"),
+            serde_json::json!({"customType": "note", "content": "extension note", "display": true}),
+        ),
+        pi_message(
+            "a3",
+            Some("x1"),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "second answer"}]}),
+        ),
+        pi_entry(
+            "compaction",
+            "c1",
+            Some("a3"),
+            serde_json::json!({"summary": "compaction summary", "firstKeptEntryId": "u2", "tokensBefore": 10}),
+        ),
+        pi_message(
+            "u3.x",
+            Some("c1"),
+            serde_json::json!({"role": "user", "content": "third"}),
+        ),
+        pi_message(
+            "b1",
+            Some("u3.x"),
+            serde_json::json!({"role": "bashExecution", "command": "ls -la", "output": "listing",
+                "exitCode": 0, "cancelled": false, "truncated": false}),
+        ),
+        pi_message(
+            "s1",
+            Some("b1"),
+            serde_json::json!({"role": "system", "content": "system prompt"}),
+        ),
+        pi_entry(
+            "branch_summary",
+            "bs1",
+            Some("s1"),
+            serde_json::json!({"fromId": "a3", "summary": "branch summary"}),
+        ),
+        pi_message(
+            "a4",
+            Some("bs1"),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "third answer"}]}),
+        ),
+    ]);
+    let (branch, turns) = pi_coverage(&bytes);
+    assert_eq!(turns.len(), branch.turns.len());
+    assert_eq!(
+        turns.iter().map(|turn| turn.ordinal).collect::<Vec<_>>(),
+        branch
+            .turns
+            .iter()
+            .map(|turn| turn.ordinal)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| turn.completeness)
+            .collect::<Vec<_>>(),
+        branch
+            .turns
+            .iter()
+            .map(|turn| turn.completeness)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| turn.completeness)
+            .collect::<Vec<_>>(),
+        vec![
+            Completeness::Incomplete,
+            Completeness::Complete,
+            Completeness::Complete
+        ]
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| turn.logical_turn_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u1", "u2", "ordinal:2"]
+    );
+    assert_eq!(
+        turns.iter().map(pi_text_records).collect::<Vec<_>>(),
+        vec![
+            vec![
+                "user: first\npart".to_string(),
+                "assistant: reading\nnow".to_string(),
+                r#"call Some("call-1") read: {"n":2,"path":"a.rs"}"#.to_string(),
+                "result Some(\"call-1\") false: fn main\n}".to_string(),
+                "assistant: done".to_string(),
+            ],
+            vec![
+                "user: second".to_string(),
+                "assistant: second answer".to_string(),
+            ],
+            vec![
+                "user: third".to_string(),
+                "assistant: third answer".to_string(),
+            ],
+        ]
+    );
+    let shown = format!("{:?}", pi_text_records_all(&turns));
+    for context in [
+        "extension note",
+        "compaction summary",
+        "ls -la",
+        "listing",
+        "system prompt",
+        "branch summary",
+    ] {
+        assert!(!shown.contains(context), "{context}");
+    }
+
+    // The branch comes from the bytes themselves: a file the normalizer
+    // refuses gives that refusal.
+    assert_eq!(
+        normalize_pi_turns(
+            b"{\"type\":\"message\",\"id\":\"u1\"}\n",
+            Default::default()
+        ),
+        Err(PiCoverageError::Refused(PiNormalizeRefusal::NotASession))
+    );
+    assert_eq!(
+        normalize_pi_turns(
+            &bytes,
+            PiNormalizeLimits {
+                max_bytes: 16,
+                ..Default::default()
+            }
+        ),
+        Err(PiCoverageError::Refused(PiNormalizeRefusal::TooLarge))
+    );
+}
+
+fn pi_text_records_all(
+    turns: &[libra::internal::ai::observed_agents::coverage::NormalizedTurn],
+) -> Vec<String> {
+    turns.iter().flat_map(pi_text_records).collect()
+}
+
+/// PI-34 AC2: readable thinking becomes a Pi reasoning record and never
+/// joins the answer, with thinking and text interleaved; redacted and
+/// empty thinking have no record.
+#[test]
+fn pi_coverage_normalizer_records_readable_thinking_as_pi_reasoning() {
+    use libra::internal::ai::observed_agents::{
+        coverage::{CoverageSchemaVersion, select_coverage_schema},
+        reasoning::{ReasoningProvider, ReasoningSourceKind},
+    };
+
+    let bytes = pi_session(&[
+        pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": "question"}),
+        ),
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "weigh the options", "thinkingSignature": "sig-1"},
+                {"type": "text", "text": "first"},
+                {"type": "thinking", "thinking": "", "thinkingSignature": "opaque-payload", "redacted": true},
+                {"type": "text", "text": "second"},
+                {"type": "thinking", "thinking": ""},
+                {"type": "toolCall", "id": "call-1", "name": "ls", "arguments": {}},
+                {"type": "thinking", "thinking": "after the call", "redacted": false},
+                {"type": "thinking", "thinking": "withheld reasoning", "thinkingSignature": "sig-2", "redacted": true},
+            ]}),
+        ),
+    ]);
+    let (_, turns) = pi_coverage(&bytes);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].completeness, Completeness::Complete);
+    assert_eq!(
+        pi_text_records(&turns[0]),
+        vec![
+            "user: question".to_string(),
+            "assistant: first\nsecond".to_string(),
+            "reasoning Pi Some(Thinking): weigh the options".to_string(),
+            r#"call Some("call-1") ls: {}"#.to_string(),
+            "reasoning Pi Some(Thinking): after the call".to_string(),
+        ]
+    );
+    for record in &turns[0].records {
+        match record {
+            SemanticRecord::Reasoning {
+                provider,
+                source_kind,
+                ..
+            } => {
+                assert_eq!(*provider, ReasoningProvider::Pi);
+                assert_eq!(*source_kind, Some(ReasoningSourceKind::Thinking));
+            }
+            SemanticRecord::Assistant { text } => {
+                assert!(!text.contains("weigh") && !text.contains("after the call"));
+            }
+            _ => {}
+        }
+    }
+    // Redacted thinking, even with text, never reaches a record.
+    let shown = format!("{:?}", pi_text_records(&turns[0]));
+    assert!(!shown.contains("opaque-payload") && !shown.contains("withheld"));
+    assert_eq!(select_coverage_schema(&turns[0]), CoverageSchemaVersion::V2);
+
+    // An empty text block is a record of its own, unlike no text, and
+    // thinking never fills it.
+    let answer_of = |content: serde_json::Value| {
+        let (_, turns) = pi_coverage(&pi_session(&[
+            pi_message(
+                "u1",
+                None,
+                serde_json::json!({"role": "user", "content": "question"}),
+            ),
+            pi_message(
+                "a1",
+                Some("u1"),
+                serde_json::json!({"role": "assistant", "content": content}),
+            ),
+        ]));
+        pi_text_records(&turns[0])
+    };
+    assert_eq!(
+        answer_of(serde_json::json!([
+            {"type": "thinking", "thinking": "only thinking"},
+            {"type": "text", "text": ""},
+        ])),
+        vec![
+            "user: question".to_string(),
+            "assistant: ".to_string(),
+            "reasoning Pi Some(Thinking): only thinking".to_string(),
+        ]
+    );
+    assert_eq!(
+        answer_of(serde_json::json!([{"type": "thinking", "thinking": "only thinking"}])),
+        vec![
+            "user: question".to_string(),
+            "reasoning Pi Some(Thinking): only thinking".to_string(),
+        ]
+    );
+}
+
+/// PI-34 AC3: Pi stays unsupported.
+#[test]
+fn pi_coverage_normalizer_keeps_pi_unsupported() {
+    use libra::internal::ai::observed_agents::{registration_for, supported_slugs};
+
+    let row = registration_for(AgentKind::Pi);
+    assert!(!row.supported);
+    assert!(!row.hook_installable);
+    assert!(!row.launchable_review && !row.launchable_investigate);
+    assert!(!row.transcript_readable);
+    assert!(!supported_slugs().contains(&"pi"));
+}
+
+/// PI-34 AC4: a turn whose messages were not read faithfully is
+/// incomplete (coverage-v1 §4–§6); fractional numbers in tool arguments
+/// become `null`; a float outside a semantic position does not count.
+#[test]
+fn pi_coverage_normalizer_marks_unfaithful_turns_incomplete() {
+    use libra::internal::ai::observed_agents::coverage::parse_canon_value;
+
+    let user = pi_message(
+        "u1",
+        None,
+        serde_json::json!({"role": "user", "content": "question"}),
+    );
+    let call = |arguments: &str| {
+        format!(
+            r#"{{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-31T00:00:01.000Z","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"call-1","name":"run","arguments":{arguments}}}]}}}}"#
+        )
+    };
+    let assistant = |content: serde_json::Value| {
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "content": content}),
+        )
+    };
+    let result = |parent: &str, fields: serde_json::Value| {
+        let mut message =
+            serde_json::json!({"role": "toolResult", "content": [{"type": "text", "text": "out"}]});
+        if let (Some(message), serde_json::Value::Object(fields)) =
+            (message.as_object_mut(), fields)
+        {
+            message.extend(fields);
+        }
+        pi_message("t1", Some(parent), message)
+    };
+    let completeness = |lines: Vec<String>| {
+        let (_, turns) = pi_coverage(&pi_session(&lines));
+        assert_eq!(turns.len(), 1);
+        turns[0].completeness
+    };
+
+    // Well-formed: complete, including a float in usage (provenance).
+    assert_eq!(
+        completeness(vec![
+            user.clone(),
+            call(r#"{"path":"a.rs","depth":2}"#),
+            result(
+                "a1",
+                serde_json::json!({"toolCallId": "call-1", "toolName": "run", "isError": false,
+                    "details": {"elapsed": 1.5}}),
+            ),
+        ]),
+        Completeness::Complete
+    );
+    // Tool result metadata and an unmatched call id are not coverage
+    // content: still complete.
+    let faithful: Vec<(&str, Vec<String>)> = vec![
+        (
+            "orphan tool result",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "toolName": "run", "isError": false}),
+                ),
+            ],
+        ),
+        (
+            "tool result without toolName",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "isError": true}),
+                ),
+            ],
+        ),
+        (
+            "incomplete nestedCalls",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "toolName": "run", "isError": false,
+                        "nestedCalls": {"calls": [{"name": "inner"}], "complete": false}}),
+                ),
+            ],
+        ),
+        (
+            "nestedCalls over the bound",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "toolName": "run", "isError": false,
+                        "nestedCalls": {"calls": vec![serde_json::json!({}); 300], "complete": true}}),
+                ),
+            ],
+        ),
+        (
+            "null nestedCalls",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "toolName": "run", "isError": false,
+                        "nestedCalls": null}),
+                ),
+            ],
+        ),
+    ];
+    for (case, lines) in faithful {
+        assert_eq!(completeness(lines), Completeness::Complete, "{case}");
+    }
+
+    let unfaithful: Vec<(&str, Vec<String>)> = vec![
+        (
+            "duplicate key in a message without records",
+            vec![
+                user.clone(),
+                r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-31T00:00:01.000Z","message":{"role":"assistant","content":[]},"x":1,"x":2}"#
+                    .to_string(),
+            ],
+        ),
+        (
+            "image block in a tool result",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-x", "toolName": "read", "isError": false,
+                        "content": [{"type": "text", "text": "out"},
+                            {"type": "image", "data": "AAAA", "mimeType": "image/png"}]}),
+                ),
+            ],
+        ),
+        (
+            "duplicate key in a message line",
+            vec![
+                r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-10-31T00:00:01.000Z","message":{"role":"user","content":"q","content":"q2"}}"#
+                    .to_string(),
+            ],
+        ),
+        (
+            "image block",
+            vec![pi_message(
+                "u1",
+                None,
+                serde_json::json!({"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                ]}),
+            )],
+        ),
+        (
+            "unknown block",
+            vec![
+                user.clone(),
+                assistant(serde_json::json!([{"type": "widget", "text": "w"}])),
+            ],
+        ),
+        (
+            "unknown entry type",
+            vec![
+                user.clone(),
+                pi_entry("future_kind", "f1", Some("u1"), serde_json::json!({})),
+            ],
+        ),
+        (
+            "unknown message role",
+            vec![
+                user.clone(),
+                pi_message(
+                    "n1",
+                    Some("u1"),
+                    serde_json::json!({"role": "narrator", "content": "n"}),
+                ),
+            ],
+        ),
+        (
+            "ill-typed thinking",
+            vec![
+                user.clone(),
+                assistant(serde_json::json!([{"type": "thinking", "thinking": 7}])),
+            ],
+        ),
+        (
+            "ill-typed redacted",
+            vec![
+                user.clone(),
+                assistant(
+                    serde_json::json!([{"type": "thinking", "thinking": "t", "redacted": "yes"}]),
+                ),
+            ],
+        ),
+        (
+            "tool call without id",
+            vec![
+                user.clone(),
+                assistant(
+                    serde_json::json!([{"type": "toolCall", "name": "run", "arguments": {}}]),
+                ),
+            ],
+        ),
+        (
+            "tool call without name",
+            vec![
+                user.clone(),
+                assistant(
+                    serde_json::json!([{"type": "toolCall", "id": "call-1", "arguments": {}}]),
+                ),
+            ],
+        ),
+        (
+            "arguments not an object",
+            vec![user.clone(), call(r#""ls""#)],
+        ),
+        (
+            "duplicate key in arguments",
+            vec![user.clone(), call(r#"{"a":1,"a":2}"#)],
+        ),
+        (
+            "fractional argument",
+            vec![user.clone(), call(r#"{"t":1.5}"#)],
+        ),
+        (
+            "beyond-i64 argument",
+            vec![user.clone(), call(r#"{"t":18446744073709551615}"#)],
+        ),
+        (
+            "tool result without isError",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-1", "toolName": "run"}),
+                ),
+            ],
+        ),
+        (
+            "ill-typed isError",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolCallId": "call-1", "toolName": "run", "isError": "no"}),
+                ),
+            ],
+        ),
+        (
+            "tool result without toolCallId",
+            vec![
+                user.clone(),
+                result(
+                    "u1",
+                    serde_json::json!({"toolName": "run", "isError": false}),
+                ),
+            ],
+        ),
+    ];
+    for (case, lines) in unfaithful {
+        assert_eq!(completeness(lines), Completeness::Incomplete, "{case}");
+    }
+
+    // A fractional or beyond-i64 argument never enters the record as a
+    // number.
+    for arguments in [
+        r#"{"t":1.5,"k":[2.5,3]}"#,
+        r#"{"t":18446744073709551615,"k":[2.5,3]}"#,
+    ] {
+        let (_, turns) = pi_coverage(&pi_session(&[user.clone(), call(arguments)]));
+        let inputs: Vec<_> = turns[0]
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                SemanticRecord::ToolCall { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            vec![parse_canon_value(br#"{"t":null,"k":[null,3]}"#).expect("canon")]
+        );
+    }
+
+    // A line PI-03 skipped may have held turn content: the turn holding
+    // the latest branch entry above it is incomplete, the others are not.
+    let second = pi_message(
+        "u2",
+        Some("a1"),
+        serde_json::json!({"role": "user", "content": "next"}),
+    );
+    let answer = assistant(serde_json::json!([{"type": "text", "text": "answer"}]));
+    let per_turn = |lines: Vec<String>| {
+        let (branch, turns) = pi_coverage(&pi_session(&lines));
+        assert_eq!(
+            branch
+                .turns
+                .iter()
+                .map(|turn| turn.skipped_lines)
+                .collect::<Vec<_>>(),
+            turns
+                .iter()
+                .map(|turn| turn.completeness == Completeness::Incomplete)
+                .collect::<Vec<_>>()
+        );
+        turns
+            .iter()
+            .map(|turn| turn.completeness)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        per_turn(vec![user.clone(), answer.clone(), second.clone()]),
+        vec![Completeness::Complete, Completeness::Complete]
+    );
+    // A truncated tail.
+    assert_eq!(
+        per_turn(vec![
+            user.clone(),
+            answer.clone(),
+            second.clone(),
+            r#"{"type":"message","id":"a2","parentId":"u2","message":{"role":"assi"#.to_string(),
+        ]),
+        vec![Completeness::Complete, Completeness::Incomplete]
+    );
+    // A corrupt line inside the first turn.
+    assert_eq!(
+        per_turn(vec![
+            user.clone(),
+            "{not json".to_string(),
+            answer.clone(),
+            second.clone(),
+        ]),
+        vec![Completeness::Incomplete, Completeness::Complete]
+    );
+    // A skipped line before any turn opens may have been its user message.
+    assert_eq!(
+        per_turn(vec![
+            pi_entry(
+                "model_change",
+                "m1",
+                None,
+                serde_json::json!({"provider": "p", "modelId": "m"})
+            ),
+            "null".to_string(),
+            pi_message(
+                "u1",
+                Some("m1"),
+                serde_json::json!({"role": "user", "content": "q"})
+            ),
+            pi_message(
+                "a1",
+                Some("u1"),
+                serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "a"}]})
+            ),
+            second.clone(),
+        ]),
+        vec![Completeness::Incomplete, Completeness::Complete]
+    );
+    // A child may precede its parent in the file: the skipped line below
+    // `a2` (on disk before its parent `u2`) belongs to the second turn.
+    assert_eq!(
+        per_turn(vec![
+            user.clone(),
+            answer.clone(),
+            pi_message(
+                "a2",
+                Some("u2"),
+                serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "early"}]})
+            ),
+            "{not json".to_string(),
+            second.clone(),
+            pi_message(
+                "a3",
+                Some("a2"),
+                serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "late"}]})
+            ),
+        ]),
+        vec![Completeness::Complete, Completeness::Incomplete]
+    );
+    // No turn: nothing to mark.
+    let (branch, turns) = pi_coverage(&pi_session(&[
+        pi_entry(
+            "model_change",
+            "m1",
+            None,
+            serde_json::json!({"provider": "p", "modelId": "m"}),
+        ),
+        "{not json".to_string(),
+    ]));
+    assert!(branch.turns.is_empty() && turns.is_empty());
+}
