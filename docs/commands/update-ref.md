@@ -37,10 +37,23 @@ reflog message; only the actual before/after object ids are.
 
 ### Batch transactions (`--stdin`)
 
-`--stdin` reads git's batch protocol, one command per line (`-z` for
-NUL-terminated records):
+`--stdin` reads git's batch protocol, one command per line. With `-z` the
+command's **arguments** are separated by NUL instead of whitespace — the
+command word and the ref stay in one space-separated field, so a value may
+contain spaces without quoting:
+
+```text
+create <ref> NUL <newvalue> NUL
+update <ref> NUL <newvalue> NUL <oldvalue> NUL
+delete <ref> NUL [<oldvalue>] NUL
+verify <ref> NUL [<oldvalue>] NUL
+```
+
+(`-z` differs from `ls-files -z` / `status --porcelain -z`, where NUL
+terminates whole records.)
 
 - `update <ref> <newvalue> [<oldvalue>]` — update with optional CAS;
+  under `-z` the `<oldvalue>` field is required;
 - `create <ref> <newvalue>` — create-only (the ref must not exist);
 - `delete <ref> [<oldvalue>]` — delete with optional CAS;
 - `verify <ref> [<oldvalue>]` — assert the current value without writing;
@@ -65,7 +78,7 @@ inside `refs/heads/*`.
 | `<newvalue>` | The new commit, as an object id or any revision expression (omit with `-d`). | `libra update-ref refs/heads/main HEAD~1` |
 | `<oldvalue>` | Expected current value for a compare-and-swap, as an id or revision (`0{40}` = must not exist). | `libra update-ref -d refs/heads/topic HEAD` |
 | `--stdin` | Read a batch of `update`/`create`/`delete`/`verify`/`option`/`start`/`prepare`/`commit`/`abort` commands from stdin; all updates commit atomically in one transaction. | `printf 'create refs/heads/x <oid>\n' \| libra update-ref --stdin` |
-| `-z`, `--null` | With `--stdin`, records are NUL-terminated. | `libra update-ref -z --stdin` |
+| `-z`, `--null` | With `--stdin`, separate the command's arguments with NUL (so values may contain spaces, e.g. `:/fix bug`). | `libra update-ref -z --stdin` |
 | `--no-deref` | Accepted for git parity; never changes the outcome (no symbolic refs in scope). | `libra update-ref --no-deref refs/heads/x <oid>` |
 | `--json` / `--machine` | Structured output: `{ ref, old, new, deleted }` (stdin: `{ refs, committed }`). | `libra --json update-ref refs/heads/main <oid>` |
 

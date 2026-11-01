@@ -429,6 +429,15 @@ pub(crate) async fn run_diff(
     for file in &mut files {
         apply_mode_metadata_to_patch(file);
     }
+    // issues/479 DF-01 / TC-0044: the status letter must follow ENTRY PRESENCE,
+    // not the rendered patch text. `parse_diff_item` classifies from the
+    // header, where a side whose content is empty is rendered as `/dev/null`;
+    // an empty blob is still an existing entry, so a stat-invalid worktree
+    // entry over an empty index blob used to be reported as `A` (and a
+    // worktree copy truncated to zero bytes as `D`). Git reports every
+    // stat-invalid entry as `M`, so the authoritative object metadata wins
+    // whenever both sides' presence is known.
+    refresh_status_from_modes(&mut files);
 
     // Textconv (`--textconv`, on by default unless `--no-textconv`): re-diff the
     // output of each file's `diff.<driver>.textconv` command instead of the raw
@@ -764,6 +773,38 @@ pub(crate) fn populate_diff_metadata(
             .flatten();
         file.old_mode = old_modes.get(&old_path).copied();
         file.new_mode = new_modes.get(&new_path).copied();
+    }
+}
+
+/// Derive each entry's status letter from the object metadata instead of the
+/// rendered patch text (issues/479 DF-01 / TC-0044).
+///
+/// `parse_diff_item` classifies from the patch header, where `git_internal`
+/// renders a side whose *content* is empty as `/dev/null`. An empty blob is
+/// still an existing entry, so an empty tracked file whose stat information
+/// was invalidated (`read-tree`, `reset --mixed`, checkout, ...) was reported
+/// as `A`, and a worktree copy truncated to zero bytes as `D`. Git classifies
+/// by entry presence: both sides present is `M`, including the "stat-invalid"
+/// case where the worktree object id is reported as the all-zero hash without
+/// reading (hashing) its content.
+///
+/// Only entries whose presence metadata is authoritative are rewritten.
+/// Unmerged (`diff --cc`), detected renames, and entries without any mode
+/// metadata keep the text-derived status.
+pub(crate) fn refresh_status_from_modes(files: &mut [DiffFileStat]) {
+    for file in files.iter_mut() {
+        if file.status == "renamed" || file.raw_diff.starts_with("diff --cc ") {
+            continue;
+        }
+        let derived = match (file.old_mode, file.new_mode) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "deleted",
+            // Both sides exist: modified (a type change is still `M` here;
+            // `diff_status_code` upgrades the letter to `T`).
+            (Some(_), Some(_)) => "modified",
+            (None, None) => continue,
+        };
+        file.status = derived.to_string();
     }
 }
 

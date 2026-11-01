@@ -1104,11 +1104,12 @@ fn update_ref_stdin_rejects_multiple_updates_of_one_ref() {
     assert!(!ref_exists(&repo, "refs/heads/x"));
 }
 
-/// UR-01 B4: `-z` NUL-terminated input applies exactly like the LF form.
+/// UR-01 B4: `-z` separates a command's ARGUMENTS with NUL (Git's wire
+/// format: `create SP <ref> NUL <newvalue> NUL`), not the records.
 #[test]
 fn update_ref_stdin_z_nul_records() {
     let (repo, c1, _c2) = repo_with_two_commits();
-    let body = format!("create refs/heads/z1 {c1}\0");
+    let body = format!("create refs/heads/z1\0{c1}\0");
     let out = stdin_batch(&repo, &["-z"], &body);
     assert!(
         out.status.success(),
@@ -1116,6 +1117,98 @@ fn update_ref_stdin_z_nul_records() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(ref_exists(&repo, "refs/heads/z1"));
+}
+
+/// The pre-fix Libra dialect (`create <ref> <newvalue>` NUL) is NOT Git's
+/// format: Git keeps `<newvalue>` in its own NUL-separated field and rejects a
+/// ref containing a space as `invalid ref format`, so Libra must reject it too.
+#[test]
+fn update_ref_stdin_z_rejects_space_separated_ref_field() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let body = format!("create refs/heads/z1 {c1}\0");
+    let out = stdin_batch(&repo, &["-z"], &body);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "non-Git -z layout must be fatal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid ref format"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/z1"), "nothing may be applied");
+}
+
+/// `-z` is the only mode that can carry a value containing spaces (Git applies
+/// no C-style quoting there). The revision syntax `:/fix bug` from RV-02 is the
+/// concrete case, and `update` requires the <oldvalue> field in `-z` mode.
+#[test]
+fn update_ref_stdin_z_value_with_spaces() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    fs::write(repo.path().join("spaced.txt"), "spaced\n").unwrap();
+    assert!(run_libra_command(&["add", "spaced.txt"], repo.path())
+        .status
+        .success());
+    let commit = run_libra_command(
+        &["commit", "-m", "fix bug", "--no-verify"],
+        repo.path(),
+    );
+    assert!(
+        commit.status.success(),
+        "commit with a spaced message failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("create refs/heads/sp1\0{c1}\0update refs/heads/sp2\0:/fix bug\0{ZERO_SHA1}\0"),
+    );
+    assert!(
+        out.status.success(),
+        "-z spaced-value batch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(ref_exists(&repo, "refs/heads/sp1"));
+    assert!(
+        ref_exists(&repo, "refs/heads/sp2"),
+        "`:/fix bug` should resolve in -z mode"
+    );
+    assert_eq!(
+        stdout_trimmed(&rev_parse(&repo, "refs/heads/sp2")),
+        stdout_trimmed(&rev_parse(&repo, "HEAD")),
+        "the spaced message search must select the matching commit"
+    );
+}
+
+/// `-z` handles a multi-command batch and the transaction commands.
+#[test]
+fn update_ref_stdin_z_multi_command_batch() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    let body = format!(
+        "create refs/heads/m1\0{c1}\0create refs/heads/m2\0{c2}\0verify refs/heads/main\0{c2}\0"
+    );
+    let out = stdin_batch(&repo, &["-z"], &body);
+    assert!(
+        out.status.success(),
+        "-z multi batch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Plain (non-transaction) batches are silent, like Git.
+    assert_eq!(stdout_trimmed(&out), "");
+    assert!(ref_exists(&repo, "refs/heads/m1"));
+    assert!(ref_exists(&repo, "refs/heads/m2"));
+
+    let txn = format!("start\0create refs/heads/m3\0{c1}\0prepare\0commit\0");
+    let out = stdin_batch(&repo, &["-z"], &txn);
+    assert!(
+        out.status.success(),
+        "-z transaction failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&out), "start: ok\nprepare: ok\ncommit: ok");
+    assert!(ref_exists(&repo, "refs/heads/m3"));
 }
 
 /// UR-01 T1/T2/T3: the start/prepare/commit/abort state machine prints

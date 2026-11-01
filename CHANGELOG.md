@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- `diff-index` / `diff-files` no longer mislabel a stat-invalid entry as added or
+  deleted. After `read-tree` (or any operation that invalidates the index `stat`
+  cache), an empty tracked file was reported as `A` and a worktree file truncated
+  to zero bytes as `D`; both are modifications (`M`) with an all-zero worktree
+  id, matching Git. The status letter now follows entry presence, never content
+  emptiness (issues/479 DF-01, TC-0044).
+- `update-ref --stdin -z` now uses Git's wire format: NUL separates a command's
+  **arguments** (`create <ref> NUL <newvalue> NUL`) instead of terminating
+  records, so Git-generated input parses, values may contain spaces (for example
+  `:/fix bug`) and `update` requires the `<oldvalue>` field under `-z`, as Git
+  does. The previous non-Git layout is rejected with `invalid ref format`
+  (issues/479 UR-01).
 - `LocalStorage::new(p)` is now `try_new(p)?`, `LocalStorage::new_with_alternates(p)` is now `try_new_with_alternates(p)?`, `ClientStorage::init(p)` is now `try_init(p)?`, and `ClientStorage::init_local(p)` is now `try_init_local(p)?`. These constructors return `std::io::Result` and include the path when `create_dir_all` fails, instead of panicking. There is no deprecation window: `utils` is not a stable embedding surface (GAP-SC-04).
 - Session store path entry points reject an unsafe session id before joining it onto the sessions directory. `SessionStore::file_history` now returns `io::Result<FileHistoryStore>`; callers write `file_history(id)?`. There is no deprecation window.
 - Index entries no longer carry Git's assume-unchanged bit (issues/637).

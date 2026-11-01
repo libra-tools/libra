@@ -52,7 +52,10 @@ pub struct UpdateRefArgs {
     #[clap(short = 'm', value_name = "REASON")]
     pub message: Option<String>,
 
-    /// With `--stdin`, records are NUL-terminated instead of newline-terminated.
+    /// With `--stdin`, separate the command's arguments with NUL instead of
+    /// whitespace (Git's `-z`). The command word and the ref stay in one
+    /// space-separated field — `create SP <ref> NUL <newvalue> NUL` — so a
+    /// value may contain spaces without C-style quoting.
     #[clap(short = 'z', long = "null")]
     pub nul_terminated: bool,
 
@@ -420,6 +423,149 @@ fn parse_stdin_command(line: &str) -> Result<StdinCommand, (String, i32)> {
     }
 }
 
+/// Parse `update-ref --stdin -z` input (Git's wire format, ADR-PL-07 /
+/// issues/479 UR-01).
+///
+/// Unlike `ls-files -z` and `status --porcelain -z` — where NUL terminates a
+/// RECORD — `update-ref --stdin -z` uses NUL as the separator between a
+/// command's ARGUMENTS. The command word and the ref stay in one
+/// space-separated field, so a value may contain spaces (for example the
+/// revision syntax `:/fix bug`) without C-style quoting:
+///
+/// ```text
+/// create SP <ref> NUL <newvalue> NUL
+/// update SP <ref> NUL <newvalue> NUL <oldvalue> NUL
+/// delete SP <ref> NUL [<oldvalue>] NUL
+/// verify SP <ref> NUL [<oldvalue>] NUL
+/// option no-deref NUL | start NUL | prepare NUL | commit NUL | abort NUL
+/// ```
+///
+/// Errors carry the exit class: malformed layouts and end-of-input are 128
+/// (Git's stdin fatals); `symref-*` stays the invalid-target class (129).
+fn parse_stdin_z(buf: &[u8]) -> Result<Vec<StdinCommand>, (String, i32)> {
+    let text = String::from_utf8_lossy(buf);
+    let fields: Vec<&str> = text.split('\0').filter(|field| !field.is_empty()).collect();
+    let mut records: Vec<StdinCommand> = Vec::new();
+    let mut index = 0usize;
+    while index < fields.len() {
+        let head = fields[index];
+        index += 1;
+        let (keyword, rest) = match head.split_once(' ') {
+            Some((keyword, rest)) => (keyword, Some(rest)),
+            None => (head, None),
+        };
+        let command = match keyword {
+            "update" | "create" | "delete" | "verify" => {
+                let ref_name = z_ref_field(keyword, rest)?;
+                let new_value = if keyword == "update" || keyword == "create" {
+                    Some(z_next_field(&fields, &mut index, keyword, "<newvalue>")?)
+                } else {
+                    None
+                };
+                let old_value = match keyword {
+                    // Git errors at end of input when an `update` batch ends
+                    // without the <oldvalue> field, so it stays required.
+                    "update" => Some(z_next_field(
+                        &fields,
+                        &mut index,
+                        keyword,
+                        "<oldvalue>",
+                    )?),
+                    // `delete`/`verify` take an optional <oldvalue>.
+                    "delete" | "verify" => fields.get(index).map(|field| {
+                        index += 1;
+                        (*field).to_string()
+                    }),
+                    // `create` takes exactly <ref> and <newvalue>.
+                    _ => None,
+                };
+                match keyword {
+                    "update" => StdinCommand::Update {
+                        ref_name,
+                        new_value: new_value.expect("set for update"),
+                        old_value,
+                    },
+                    "create" => StdinCommand::Create {
+                        ref_name,
+                        new_value: new_value.expect("set for create"),
+                    },
+                    "delete" => StdinCommand::Delete {
+                        ref_name,
+                        old_value,
+                    },
+                    _ => StdinCommand::Verify {
+                        ref_name,
+                        old_value,
+                    },
+                }
+            }
+            "option" => match rest {
+                Some("no-deref") => StdinCommand::OptionNoDeref,
+                Some(other) => return Err((format!("unknown option '{other}'"), 128)),
+                None => return Err(("option: missing value".to_string(), 128)),
+            },
+            "start" | "prepare" | "commit" | "abort" => {
+                if rest.is_some() {
+                    return Err((format!("{keyword}: too many arguments"), 128));
+                }
+                match keyword {
+                    "start" => StdinCommand::Start,
+                    "prepare" => StdinCommand::Prepare,
+                    "commit" => StdinCommand::Commit,
+                    _ => StdinCommand::Abort,
+                }
+            }
+            // DEFER-04: symbolic-ref update commands are out of scope.
+            "symref-update" | "symref-create" | "symref-delete" | "symref-verify" => {
+                return Err((
+                    format!("{keyword}: symbolic refs are not supported by update-ref"),
+                    129,
+                ));
+            }
+            other => {
+                return Err((
+                    format!("invalid update-ref stdin command '{other}'"),
+                    128,
+                ));
+            }
+        };
+        records.push(command);
+    }
+    Ok(records)
+}
+
+/// The `<cmd> SP <ref>` head field of a `-z` record. A space inside the ref
+/// means the caller used a non-Git layout (Git keeps the ref in the head field
+/// and rejects it as `invalid ref format`).
+fn z_ref_field(keyword: &str, rest: Option<&str>) -> Result<String, (String, i32)> {
+    let Some(ref_name) = rest else {
+        return Err((format!("{keyword}: missing ref"), 128));
+    };
+    if ref_name.is_empty() {
+        return Err((format!("{keyword}: missing ref"), 128));
+    }
+    if ref_name.contains(' ') || ref_name.contains('\t') {
+        return Err((format!("invalid ref format: {ref_name}"), 128));
+    }
+    Ok(ref_name.to_string())
+}
+
+fn z_next_field(
+    fields: &[&str],
+    index: &mut usize,
+    keyword: &str,
+    what: &str,
+) -> Result<String, (String, i32)> {
+    let Some(field) = fields.get(*index) else {
+        return Err((
+            format!("{keyword}: unexpected end of input when reading {what}"),
+            128,
+        ));
+    };
+    *index += 1;
+    Ok((*field).to_string())
+}
+
 /// A fully parsed and value-resolved batch command, ready for the transaction.
 enum PreparedKind {
     Update { new: String, old: Option<OldValue> },
@@ -453,29 +599,34 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             })
     };
 
-    // Stream the records (NUL-terminated with -z, newline otherwise).
-    let mut records: Vec<String> = Vec::new();
+    // Parse the input. `-z` separates the command's ARGUMENTS with NUL (git's
+    // format, ADR-PL-07 / issues/479 UR-01); the LF form splits on whitespace.
     let stdin = std::io::stdin();
-    if args.nul_terminated {
+    let records: Vec<StdinCommand> = if args.nul_terminated {
         let mut buf = Vec::new();
         stdin.lock().read_to_end(&mut buf).map_err(|error| {
             stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
         })?;
-        for record in buf.split(|byte| *byte == 0) {
-            if !record.is_empty() {
-                records.push(String::from_utf8_lossy(record).into_owned());
-            }
-        }
+        parse_stdin_z(&buf).map_err(|(message, code)| {
+            stdin_fatal(format!("{message} (input: -z)"), code)
+        })?
     } else {
+        let mut lines: Vec<StdinCommand> = Vec::new();
         for line in stdin.lock().lines() {
             let line = line.map_err(|error| {
                 stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
             })?;
-            if !line.trim().is_empty() {
-                records.push(line);
+            if line.trim().is_empty() {
+                continue;
             }
+            let command = parse_stdin_command(&line)
+                .map_err(|(message, code)| {
+                    stdin_fatal(format!("{message} (input: {})", truncate_input(&line)), code)
+                })?;
+            lines.push(command);
         }
-    }
+        lines
+    };
 
     // First pass: state machine + scope/uniqueness validation. git prints the
     // `<cmd>: ok` lines as the commands are processed (they stay on stdout
@@ -486,17 +637,8 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     let mut aborted = false;
     let mut stdout = std::io::stdout().lock();
 
-    for record in &records {
-        let cmd = match parse_stdin_command(record) {
-            Ok(cmd) => cmd,
-            Err((message, code)) => {
-                return Err(stdin_fatal(
-                    format!("{message} (input: {})", truncate_input(record)),
-                    code,
-                ));
-            }
-        };
-        match cmd {
+    for command in &records {
+        match command {
             StdinCommand::Start => {
                 if active {
                     return Err(stdin_fatal(
@@ -527,13 +669,13 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 if closed {
                     return Err(stdin_fatal("transaction is closed".to_string(), 128));
                 }
-                let branch = parse_heads_ref(&ref_name)
+                let branch = parse_heads_ref(ref_name)
                     .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                if !util::is_valid_refname(&ref_name) {
+                if !util::is_valid_refname(ref_name) {
                     return Err(stdin_fatal(format!("invalid ref name '{ref_name}'"), 129));
                 }
-                if seen_refs.insert(ref_name.clone(), ()).is_some() {
+                if seen_refs.insert(ref_name.to_string(), ()).is_some() {
                     return Err(stdin_fatal(
                         format!("multiple updates for ref '{ref_name}'"),
                         128,
@@ -559,27 +701,24 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     // Second pass: resolve the values (async) and build the prepared list.
     let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
     let mut prepared: Vec<PreparedCommand> = Vec::new();
-    for record in &records {
-        let Ok(cmd) = parse_stdin_command(record) else {
-            continue;
-        };
-        let resolved = match cmd {
+    for command in &records {
+        let resolved = match command {
             StdinCommand::Update {
                 ref_name,
                 new_value,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
+                let branch = parse_heads_ref(ref_name)
                     .expect("scope validated in the first pass")
                     .to_string();
-                let new = resolve_new_value(&new_value, &zero, &ref_name).await?;
+                let new = resolve_new_value(new_value, &zero, ref_name).await?;
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Update {
                         new: new.to_string(),
                         old,
@@ -590,13 +729,13 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 new_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
+                let branch = parse_heads_ref(ref_name)
                     .expect("scope validated in the first pass")
                     .to_string();
-                let new = resolve_new_value(&new_value, &zero, &ref_name).await?;
+                let new = resolve_new_value(new_value, &zero, ref_name).await?;
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Create {
                         new: new.to_string(),
                     },
@@ -606,16 +745,16 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
+                let branch = parse_heads_ref(ref_name)
                     .expect("scope validated in the first pass")
                     .to_string();
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Delete { old },
                 }
             }
@@ -623,16 +762,16 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
+                let branch = parse_heads_ref(ref_name)
                     .expect("scope validated in the first pass")
                     .to_string();
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Verify { old },
                 }
             }

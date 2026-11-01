@@ -307,3 +307,139 @@ fn diff_files_reports_stat_dirty_entry_with_zero_sha() {
         "stat-dirty entry must report M with all-zero worktree sha: {record}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// issues/479 DF-01 / TC-0044 (t3700-add.sh#24): the status letter follows ENTRY
+// PRESENCE, not the emptiness of a side's content. An empty tracked file whose
+// stat data was invalidated by `read-tree` is a MODIFICATION (`M` with an
+// all-zero worktree sha) — Git never reports `A`/`D` for it, because the path
+// exists in both the tree and the index.
+// ---------------------------------------------------------------------------
+
+/// Create `empty.txt` (a zero-byte blob) at HEAD, then invalidate the index
+/// stat cache without touching the file.
+fn repo_with_committed_empty_file() -> TempDir {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("empty.txt"), "").expect("create empty file");
+    assert_cli_success(
+        &run_libra_command(&["add", "empty.txt"], root),
+        "stage empty file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "empty", "--no-verify"], root),
+        "commit empty file",
+    );
+    assert_cli_success(&run_libra_command(&["read-tree", "HEAD"], root), "read-tree HEAD");
+    repo
+}
+
+#[test]
+fn diff_index_read_tree_empty_blob_is_modified_not_added() {
+    let repo = repo_with_committed_empty_file();
+    let root = repo.path();
+
+    let out = run_libra_command(&["diff-index", "HEAD", "--", "empty.txt"], root);
+    assert_eq!(out.status.code(), Some(0));
+    let record = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        record.starts_with(":100644 100644 e69de29"),
+        "the empty blob stays the old-side object id: {record}"
+    );
+    assert!(
+        record.ends_with(" M\tempty.txt"),
+        "an empty tracked file is a modification, never an addition: {record}"
+    );
+    assert!(
+        record.contains(" 0000000 M"),
+        "the stat-invalid worktree sha is all zeros: {record}"
+    );
+
+    // `--name-status` must agree on the letter.
+    let named = run_libra_command(&["diff-index", "HEAD", "--name-status", "--", "empty.txt"], root);
+    assert_eq!(
+        String::from_utf8_lossy(&named.stdout).trim(),
+        "M\tempty.txt",
+        "name-status letter: {}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+
+    // `status --porcelain` must stay consistent: nothing changed on disk.
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        status.stdout.is_empty(),
+        "status must not claim a change: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // The pessimistic record is cleared by `add --refresh`, like Git.
+    assert_cli_success(
+        &run_libra_command(&["add", "--refresh", "--", "empty.txt"], root),
+        "add --refresh",
+    );
+    let after = run_libra_command(&["diff-index", "HEAD", "--", "empty.txt"], root);
+    assert!(
+        after.stdout.is_empty(),
+        "the refreshed empty entry must produce no record: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}
+
+#[test]
+fn diff_files_read_tree_empty_blob_is_modified_not_added() {
+    let repo = repo_with_committed_empty_file();
+    let record = String::from_utf8_lossy(
+        &run_libra_command(&["diff-files", "--", "empty.txt"], repo.path()).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        record.ends_with(" M\tempty.txt"),
+        "diff-files must report M for an empty tracked file: {record}"
+    );
+}
+
+#[test]
+fn diff_index_read_tree_worktree_truncated_to_empty_is_modified_not_deleted() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    // Truncate the tracked file to zero bytes, then invalidate the stat cache.
+    fs::write(root.join("tracked.txt"), "").expect("truncate tracked file");
+    assert_cli_success(&run_libra_command(&["read-tree", "HEAD"], root), "read-tree HEAD");
+
+    let record = String::from_utf8_lossy(
+        &run_libra_command(&["diff-index", "HEAD", "--", "tracked.txt"], root).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        record.ends_with(" M\ttracked.txt"),
+        "an emptied worktree file is a modification, never a deletion: {record}"
+    );
+}
+
+/// Guard the other direction: real additions and deletions still report `A`/`D`.
+#[test]
+fn diff_status_keeps_real_additions_and_deletions() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("added.txt"), "added\n").expect("create added file");
+    assert_cli_success(&run_libra_command(&["add", "added.txt"], root), "stage added");
+    assert_cli_success(
+        &run_libra_command(&["rm", "--cached", "tracked.txt"], root),
+        "drop tracked.txt from the index",
+    );
+
+    let named = String::from_utf8_lossy(
+        &run_libra_command(&["diff-index", "--name-status", "HEAD"], root).stdout,
+    )
+    .to_string();
+    assert!(
+        named.contains("A\tadded.txt"),
+        "a path absent from the tree is added: {named}"
+    );
+    assert!(
+        named.contains("D\ttracked.txt"),
+        "a path absent from the index is deleted: {named}"
+    );
+}
