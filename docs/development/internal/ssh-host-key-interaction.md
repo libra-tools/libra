@@ -1,10 +1,10 @@
 # SSH Host-Key Interaction Design（issue #582, HKT-00）
 
 > 本文是 [`issues/582.md`](../plan/issues/582.md) HKT-00 的產物：固定外部參照、定義不回放遠端輸出的
-> host-key interaction state machine，並把既有重疊所有權正式移交給 #582。本文只做設計決策，不改任何
-> runtime，也不宣稱互動功能已可用；go/no-go 結論與實作 seam 由 HKT-02 消費。
+> host-key interaction state machine，並把既有重疊所有權正式移交給 #582。設計於 2026-09-28 定稿（GO）；
+> 實作與驗證由 HKT-01／HKT-02 依此 seam 交付，於 2026-11-01 以 Closed 收口，GitHub Issue #582 已關閉。
 >
-> **核對日期：** 2026-09-28。所有行號/版本/來源必須在 HKT-02 開工日重新核對（模板 ER-01..ER-03）。
+> **核對日期：** 2026-09-28（設計與實作 seam 固定於此日；實作落點與測試錨點於 HKT-01/HKT-02 開工日更新）。
 
 ## 固定參照
 
