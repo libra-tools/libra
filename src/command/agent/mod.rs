@@ -143,6 +143,7 @@ EXAMPLES:
     libra agent rpc trust --dir <path>              Register a trusted directory (binaries must live under one)
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
+    libra agent push --mega2 --remote origin        Push refs/libra/traces to the scoped Mega2 TraceRepo
     libra agent bridge --stdio                      Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)
     libra agent mcp --stdio                         Serve repository MCP tools over stdio (JSON-RPC 2.0 NDJSON)
     libra --json agent status                       Structured JSON output for agents";
@@ -391,8 +392,15 @@ pub struct PushArgs {
     /// rewritten as a whole chain). Uses force-with-lease semantics
     /// against the remote-tracking ref — never an unconditional force —
     /// so a rewrite from another machine still fails closed.
+    /// Mega2 mode rejects this flag before any network attempt.
     #[arg(long)]
     pub force_rewrite: bool,
+    /// Push to the scoped Mega2 TraceRepo instead of the ordinary code remote.
+    #[arg(long)]
+    pub mega2: bool,
+    /// Open a new traces epoch. Required only when replacing one that already exists.
+    #[arg(long)]
+    pub new_stream: bool,
 }
 
 #[derive(Subcommand, Debug)]

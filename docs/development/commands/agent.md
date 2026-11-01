@@ -1,5 +1,9 @@
 # Agent Command Development
 
+## Mega2 scoped push entry (LTR-12)
+
+`libra agent push --mega2` is the public entry. It calls the LTR-10 binding and then the LTR-11 transport planner. `--force-rewrite` together with `--mega2` returns before an epoch is replaced and before a socket is opened. A missing remote URL stops in the same way and prints the saved epoch so a retry can reuse it. `--new-stream` is explicit. The repository transaction around the receipt is the lease shared by linked worktrees. `confirm_push_attempt` keeps a successful tip idempotent when the acknowledgement is repeated, and a missing scope UUID records `scope_resolution_pending` without creating an epoch or flipping the push to failure. The stored code remote URL is not rewritten.
+
 ## Mega2 TraceRepo transport (LTR-11)
 
 Scoped HTTP paths are `/.traces/by-path/<base64url-target>/self/<base64url-source>/<epoch>/<sha1|sha256>.git` and `/.traces/by-scope/<stream-uuid>.git`. Dynamic path segments are unpadded base64url of the original UTF-8 bytes. Spaces in a target path are preserved inside that encoding. A scoped SSH URL is derived with login `traces` and the original code remote string is left unchanged. The first SSH push does not send an HTTP registration request. A write is refused when the advertisement lacks `libra-traces-v1`. `admit_before_network(true, true)` returns before any socket exists. A non-fast-forward rejection stays a rejection: no force, no new epoch, no code-remote fallback. Ordinary `git://`, HTTPS, and SSH clients refuse a URL that contains `/.traces/`. Server rejections keep the stable traces code.

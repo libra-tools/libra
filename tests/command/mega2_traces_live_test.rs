@@ -73,3 +73,17 @@ async fn live_scoped_git_transport() {
     let code = String::from_utf8_lossy(&status.stdout);
     assert_ne!(code.trim(), "000", "live git discovery did not answer");
 }
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
+async fn live_scoped_push_cli() {
+    let fixture = LiveFixture::require().expect("live fixture");
+    assert!(fixture.ssh_uri.starts_with("ssh://traces@"));
+    // The public command stops before network admission until a live
+    // advertisement is read. This case fails closed instead of treating
+    // help text as a push.
+    panic!(
+        "live scoped push was not admitted to {}; refusing to pass without a TraceRepo advertisement",
+        fixture.server_id
+    );
+}

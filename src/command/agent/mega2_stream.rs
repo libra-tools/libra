@@ -20,6 +20,12 @@ use crate::{
 
 pub const SOURCE_KEY: &str = "libra.traces.mega2.source";
 pub const EPOCH_KEY: &str = "libra.traces.mega2.epoch";
+pub const RECEIPT_TIP_KEY: &str = "libra.traces.mega2.receipt.tip";
+pub const RECEIPT_SCOPE_KEY: &str = "libra.traces.mega2.receipt.scope";
+pub const RECEIPT_STATE_KEY: &str = "libra.traces.mega2.receipt.state";
+pub const STATE_PENDING: &str = "pending";
+pub const STATE_CONFIRMED: &str = "confirmed";
+pub const STATE_SCOPE_PENDING: &str = "scope_resolution_pending";
 
 /// How the caller wants the persisted epoch to move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +64,14 @@ impl std::error::Error for Mega2StreamError {}
 
 /// Read `libra.repoid` for `workdir`, following a linked worktree's common
 /// storage. Does not create an identity or an epoch.
+pub async fn repository_config_at(
+    workdir: &Path,
+    key: &str,
+) -> Result<Option<String>, Mega2StreamError> {
+    let connection = open_repository(workdir).await?;
+    config_value(&connection, key).await
+}
+
 pub async fn read_repository_source_at(workdir: &Path) -> Result<String, Mega2StreamError> {
     let connection = open_repository(workdir).await?;
     let identity = RepoIdentity::resolve(&connection)
@@ -173,6 +187,142 @@ async fn config_value<C: ConnectionTrait>(
             Mega2StreamError::Store(format!("cannot read repository config `{key}`: {error}"))
         })?;
     Ok(entry.map(|entry| entry.value))
+}
+
+/// Result of recording a push that the remote already accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushReceipt {
+    pub epoch: String,
+    pub tip: String,
+    pub state: String,
+    pub scope: Option<String>,
+    /// False when this call did not rotate the epoch.
+    pub created_epoch: bool,
+}
+
+/// Remember a push attempt for `tip` and reuse the persisted epoch.
+///
+/// The repository transaction is the operation lease shared by linked
+/// worktrees. A retry does not mint another epoch.
+pub async fn begin_push_attempt<C>(
+    connection: &C,
+    intent: EpochIntent,
+    tip: &str,
+) -> Result<PushReceipt, Mega2StreamError>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    if tip.is_empty() {
+        return Err(Mega2StreamError::Epoch(
+            "the local traces tip is empty; create a checkpoint before pushing".to_string(),
+        ));
+    }
+    let before = config_value(connection, EPOCH_KEY).await?;
+    let binding = bind_source_epoch(connection, intent).await?;
+    let created_epoch = before.as_deref() != Some(binding.epoch.as_str());
+    let transaction = connection.begin().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot lock the traces push receipt: {error}"))
+    })?;
+    ConfigKv::set_with_conn(&transaction, RECEIPT_TIP_KEY, tip, false)
+        .await
+        .map_err(|error| Mega2StreamError::Store(format!("cannot record the push tip: {error}")))?;
+    ConfigKv::set_with_conn(&transaction, RECEIPT_STATE_KEY, STATE_PENDING, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the pending push receipt: {error}"))
+        })?;
+    transaction.commit().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot commit the pending push receipt: {error}"))
+    })?;
+    Ok(PushReceipt {
+        epoch: binding.epoch,
+        tip: tip.to_string(),
+        state: STATE_PENDING.to_string(),
+        scope: None,
+        created_epoch,
+    })
+}
+
+/// Record the outcome of a push the remote has already accepted.
+///
+/// A repeated confirmation of the same tip is idempotent. Missing scope
+/// discovery stores `scope_resolution_pending` and does not create an epoch
+/// or turn the push into a failure.
+pub async fn confirm_push_attempt<C>(
+    connection: &C,
+    tip: &str,
+    discovered_scope: Option<&str>,
+) -> Result<PushReceipt, Mega2StreamError>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    let transaction = connection.begin().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot lock the traces push confirmation: {error}"))
+    })?;
+    let epoch = config_value(&transaction, EPOCH_KEY)
+        .await?
+        .ok_or_else(|| {
+            Mega2StreamError::Epoch(
+                "cannot confirm a traces push because no epoch is stored".to_string(),
+            )
+        })?;
+    let stored_tip = config_value(&transaction, RECEIPT_TIP_KEY).await?;
+    let stored_state = config_value(&transaction, RECEIPT_STATE_KEY).await?;
+    let stored_scope = config_value(&transaction, RECEIPT_SCOPE_KEY).await?;
+    if stored_tip.as_deref() == Some(tip)
+        && stored_state.as_deref() == Some(STATE_CONFIRMED)
+        && discovered_scope.is_none()
+    {
+        transaction.commit().await.map_err(|error| {
+            Mega2StreamError::Store(format!(
+                "cannot finish the idempotent push receipt: {error}"
+            ))
+        })?;
+        return Ok(PushReceipt {
+            epoch,
+            tip: tip.to_string(),
+            state: STATE_CONFIRMED.to_string(),
+            scope: stored_scope,
+            created_epoch: false,
+        });
+    }
+    let (state, scope) = match discovered_scope {
+        Some(scope) if !scope.is_empty() => (STATE_CONFIRMED, Some(scope.to_string())),
+        _ => (STATE_SCOPE_PENDING, None),
+    };
+    ConfigKv::set_with_conn(&transaction, RECEIPT_TIP_KEY, tip, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the confirmed tip: {error}"))
+        })?;
+    ConfigKv::set_with_conn(&transaction, RECEIPT_STATE_KEY, state, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the push receipt state: {error}"))
+        })?;
+    if let Some(scope) = scope.as_deref() {
+        ConfigKv::set_with_conn(&transaction, RECEIPT_SCOPE_KEY, scope, false)
+            .await
+            .map_err(|error| {
+                Mega2StreamError::Store(format!("cannot record the traces scope: {error}"))
+            })?;
+    }
+    let epoch_after = config_value(&transaction, EPOCH_KEY).await?;
+    if epoch_after.as_deref() != Some(epoch.as_str()) {
+        return Err(Mega2StreamError::Epoch(
+            "confirmation changed the stored epoch; refusing to publish that receipt".to_string(),
+        ));
+    }
+    transaction.commit().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot commit the push receipt: {error}"))
+    })?;
+    Ok(PushReceipt {
+        epoch,
+        tip: tip.to_string(),
+        state: state.to_string(),
+        scope,
+        created_epoch: false,
+    })
 }
 
 async fn open_repository(workdir: &Path) -> Result<DatabaseConnection, Mega2StreamError> {
@@ -356,5 +506,38 @@ mod tests {
             file_stamp(Path::new("/etc/libra/config.db")),
             "system config must stay unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn push_receipt_reuses_epoch_and_keeps_success_when_scope_is_missing() {
+        let root = tempfile::tempdir().expect("receipt repository");
+        repository_with_identity(root.path(), Some("receipt-source")).await;
+        let connection = open_repository(root.path()).await.expect("open");
+        let first = begin_push_attempt(&connection, EpochIntent::Current, "tip-a")
+            .await
+            .expect("begin");
+        assert!(first.created_epoch);
+        let retry = begin_push_attempt(&connection, EpochIntent::Current, "tip-a")
+            .await
+            .expect("retry");
+        assert!(!retry.created_epoch);
+        assert_eq!(retry.epoch, first.epoch);
+        let pending = confirm_push_attempt(&connection, "tip-a", None)
+            .await
+            .expect("missing scope");
+        assert_eq!(pending.state, STATE_SCOPE_PENDING);
+        assert_eq!(pending.epoch, first.epoch);
+        assert!(!pending.created_epoch);
+        let confirmed = confirm_push_attempt(&connection, "tip-a", Some("stream-1"))
+            .await
+            .expect("scope");
+        assert_eq!(confirmed.state, STATE_CONFIRMED);
+        assert_eq!(confirmed.scope.as_deref(), Some("stream-1"));
+        let again = confirm_push_attempt(&connection, "tip-a", None)
+            .await
+            .expect("idempotent ack");
+        assert_eq!(again.state, STATE_CONFIRMED);
+        assert_eq!(again.scope.as_deref(), Some("stream-1"));
+        assert_eq!(again.epoch, first.epoch);
     }
 }

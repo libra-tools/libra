@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-12 长期索引：** 公开 `agent push --mega2`。force-rewrite 在网络前拒绝。epoch 重试复用。scope 解析失败记 `scope_resolution_pending` 且不新建 epoch。命令测试 1 passed。Live 未跑。
+
 > **2026-11-02 LTR-11 长期索引：** by-path/by-scope 路径、派生 `ssh://traces@`、缺 `libra-traces-v1` 拒绝、Mega2 force-rewrite 在网络前拒绝、非快进不转 force/不新建 epoch/不回退代码 push。库测试 1 passed。Live 未跑。
 
 > **2026-11-02 LTR-10 长期索引：** source 取 `RepoIdentity`，首次 epoch 在返回前写入仓库配置，显式 new-stream 才轮换；linked worktree 共用、独立 clone 分开。库测试 1 passed。Live fixture 缺席，live 门未执行。公开入口仍留给 LTR-12。无 Claude/Codex。

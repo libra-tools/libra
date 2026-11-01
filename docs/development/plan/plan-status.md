@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-12 `in-progress`/`locally-accepted`：** `--mega2`/`--new-stream` 已接入。`mega2_scoped_push_contract` 与收据库测试各 1 passed。无 remote URL 或无 `libra-traces-v1` 广告时在网络前停止。Live discovery 未跑。`COMPATIBILITY.md` 因另有未提交 UI 改动而未并入。
+
 > **2026-11-02 LTR-11 `in-progress`/`locally-accepted`：** typed TraceRepo URL、`traces` SSH login、能力拒绝与 force-rewrite 网络前拒绝已由 `scoped_git_transport_matrix` 1 passed 覆盖。公开入口仍未接线。Live fixture 缺席，live 门未跑。
 
 > **2026-11-02 LTR-10 `in-progress`/`locally-accepted`：** 仓库 source/epoch 绑定已在 `src/command/agent/mega2_stream.rs` 落地。库测试 `source_epoch_binding_matrix` 1 passed。公开 Mega2 push 入口仍未接线。`.env.live-test` 没有 `LIBRA_TRACES_LIVE_*`，live 门未跑，不记 PASS。未调用 Claude/Codex。C/D 仍由 LTR-01 承载。正式产品卡完成数仍不计本卡为 complete。
