@@ -442,103 +442,90 @@ fn parse_stdin_command(line: &str) -> Result<StdinCommand, (String, i32)> {
 ///
 /// Errors carry the exit class: malformed layouts and end-of-input are 128
 /// (Git's stdin fatals); `symref-*` stays the invalid-target class (129).
-fn parse_stdin_z(buf: &[u8]) -> Result<Vec<StdinCommand>, (String, i32)> {
+fn parse_stdin_z(buf: &[u8]) -> Vec<Result<StdinCommand, (String, i32)>> {
     let text = String::from_utf8_lossy(buf);
     // Keep EMPTY fields: Git distinguishes an absent field (end of input, which
-    // is an error) from an empty one, which means "no value" — `delete <ref> NUL
-    // NUL` is an unconditional delete, and `update <ref> NUL <new> NUL NUL` is an
-    // unconditional update. Only the empty fragment after the final NUL is an
-    // artifact of the terminator.
+    // is fatal) from an empty one, which means "no value" — `delete <ref> NUL
+    // NUL` is an unconditional delete, and `verify <ref> NUL NUL` asserts the
+    // ref does NOT exist (an empty value is the all-zero id). Only the empty
+    // fragment after the final NUL is an artifact of the terminator.
     let mut fields: Vec<&str> = text.split('\0').collect();
     if fields.last() == Some(&"") {
         fields.pop();
     }
-    let mut records: Vec<StdinCommand> = Vec::new();
+    let mut parsed: Vec<Result<StdinCommand, (String, i32)>> = Vec::new();
     let mut index = 0usize;
     while index < fields.len() {
         let head = fields[index];
         index += 1;
         if head.is_empty() {
-            return Err(("empty update-ref stdin command".to_string(), 128));
+            parsed.push(Err(("empty update-ref stdin command".to_string(), 128)));
+            break;
         }
-        let (keyword, rest) = match head.split_once(' ') {
-            Some((keyword, rest)) => (keyword, Some(rest)),
-            None => (head, None),
-        };
-        let command = match keyword {
-            "update" | "create" | "delete" | "verify" => {
-                let ref_name = z_ref_field(keyword, rest)?;
-                // Every value field must be PRESENT in `-z` mode (an absent one
-                // is end-of-input, which Git treats as fatal); an empty field
-                // carries "no value".
-                let new_value = if keyword == "update" || keyword == "create" {
-                    let value = z_field(&fields, &mut index, keyword, "<newvalue>")?;
-                    if value.is_empty() {
-                        return Err((format!("{keyword}: missing <newvalue>"), 128));
-                    }
-                    Some(value.to_string())
-                } else {
-                    None
-                };
-                let old_value = match keyword {
-                    // `update` requires the field; empty means "no CAS".
-                    "update" | "delete" | "verify" => {
-                        let value = z_field(&fields, &mut index, keyword, "<oldvalue>")?;
-                        (!value.is_empty()).then(|| value.to_string())
-                    }
-                    // `create` takes exactly <ref> and <newvalue>.
-                    _ => None,
-                };
-                match keyword {
-                    "update" => StdinCommand::Update {
-                        ref_name,
-                        new_value: new_value.expect("set for update"),
-                        old_value,
-                    },
-                    "create" => StdinCommand::Create {
-                        ref_name,
-                        new_value: new_value.expect("set for create"),
-                    },
-                    "delete" => StdinCommand::Delete {
-                        ref_name,
-                        old_value,
-                    },
-                    _ => StdinCommand::Verify {
-                        ref_name,
-                        old_value,
-                    },
-                }
-            }
-            "option" => match rest {
-                Some("no-deref") => StdinCommand::OptionNoDeref,
-                Some(other) => return Err((format!("unknown option '{other}'"), 128)),
-                None => return Err(("option: missing value".to_string(), 128)),
-            },
-            "start" | "prepare" | "commit" | "abort" => {
-                if rest.is_some() {
-                    return Err((format!("{keyword}: too many arguments"), 128));
-                }
-                match keyword {
-                    "start" => StdinCommand::Start,
-                    "prepare" => StdinCommand::Prepare,
-                    "commit" => StdinCommand::Commit,
-                    _ => StdinCommand::Abort,
-                }
-            }
-            // DEFER-04: symbolic-ref update commands are out of scope.
-            "symref-update" | "symref-create" | "symref-delete" | "symref-verify" => {
-                return Err((
-                    format!("{keyword}: symbolic refs are not supported by update-ref"),
-                    129,
-                ));
-            }
-            other => {
-                return Err((format!("invalid update-ref stdin command '{other}'"), 128));
-            }
-        };
-        records.push(command);
+        let command = parse_stdin_z_command(head, &fields, &mut index);
+        let failed = command.is_err();
+        parsed.push(command);
+        // A malformed command leaves the field cursor meaningless; Git stops at
+        // the first one, and the caller reports it after echoing the earlier
+        // acknowledgements.
+        if failed {
+            break;
+        }
     }
-    Ok(records)
+    parsed
+}
+
+/// Parse one `-z` command whose head field is `<keyword>[ SP<ref>]`.
+fn parse_stdin_z_command(
+    head: &str,
+    fields: &[&str],
+    index: &mut usize,
+) -> Result<StdinCommand, (String, i32)> {
+    let (keyword, rest) = match head.split_once(' ') {
+        Some((keyword, rest)) => (keyword, Some(rest)),
+        None => (head, None),
+    };
+    match keyword {
+        "create" => Ok(StdinCommand::Create {
+            ref_name: z_ref_field(keyword, rest)?,
+            new_value: z_required_value(fields, index, keyword, "<newvalue>")?,
+        }),
+        "update" => Ok(StdinCommand::Update {
+            ref_name: z_ref_field(keyword, rest)?,
+            new_value: z_required_value(fields, index, keyword, "<newvalue>")?,
+            old_value: z_optional_value(fields, index, keyword, "<oldvalue>")?,
+        }),
+        "delete" => Ok(StdinCommand::Delete {
+            ref_name: z_ref_field(keyword, rest)?,
+            old_value: z_optional_value(fields, index, keyword, "<oldvalue>")?,
+        }),
+        "verify" => Ok(StdinCommand::Verify {
+            ref_name: z_ref_field(keyword, rest)?,
+            old_value: z_optional_value(fields, index, keyword, "<oldvalue>")?,
+        }),
+        "option" => match rest {
+            Some("no-deref") => Ok(StdinCommand::OptionNoDeref),
+            Some(other) => Err((format!("unknown option '{other}'"), 128)),
+            None => Err(("option: missing value".to_string(), 128)),
+        },
+        "start" | "prepare" | "commit" | "abort" => {
+            if rest.is_some() {
+                return Err((format!("{keyword}: too many arguments"), 128));
+            }
+            Ok(match keyword {
+                "start" => StdinCommand::Start,
+                "prepare" => StdinCommand::Prepare,
+                "commit" => StdinCommand::Commit,
+                _ => StdinCommand::Abort,
+            })
+        }
+        // DEFER-04: symbolic-ref update commands are out of scope.
+        "symref-update" | "symref-create" | "symref-delete" | "symref-verify" => Err((
+            format!("{keyword}: symbolic refs are not supported by update-ref"),
+            129,
+        )),
+        other => Err((format!("invalid update-ref stdin command '{other}'"), 128)),
+    }
 }
 
 /// The `<cmd> SP <ref>` head field of a `-z` record. A space inside the ref
@@ -555,6 +542,33 @@ fn z_ref_field(keyword: &str, rest: Option<&str>) -> Result<String, (String, i32
         return Err((format!("invalid ref format: {ref_name}"), 128));
     }
     Ok(ref_name.to_string())
+}
+
+/// A required `-z` value field: it must be PRESENT (an absent field is
+/// end-of-input, which Git treats as fatal) and non-empty.
+fn z_required_value(
+    fields: &[&str],
+    index: &mut usize,
+    keyword: &str,
+    what: &str,
+) -> Result<String, (String, i32)> {
+    let value = z_field(fields, index, keyword, what)?;
+    if value.is_empty() {
+        return Err((format!("{keyword}: missing {what}"), 128));
+    }
+    Ok(value.to_string())
+}
+
+/// An optional `-z` value field: it must be PRESENT, and an empty field means
+/// "no value" (Git's absent-vs-empty distinction).
+fn z_optional_value(
+    fields: &[&str],
+    index: &mut usize,
+    keyword: &str,
+    what: &str,
+) -> Result<Option<String>, (String, i32)> {
+    let value = z_field(fields, index, keyword, what)?;
+    Ok((!value.is_empty()).then(|| value.to_string()))
 }
 
 fn z_field<'a>(
@@ -608,16 +622,20 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
 
     // Parse the input. `-z` separates the command's ARGUMENTS with NUL (git's
     // format, ADR-PL-07 / issues/479 UR-01); the LF form splits on whitespace.
+    //
+    // Parsing is done in input order and a malformed command is kept as an
+    // `Err` item instead of aborting here: Git acknowledges each command as it
+    // reads it (`start: ok`, `prepare: ok`, ...), so those lines must already be
+    // on stdout when a LATER command turns out to be malformed.
     let stdin = std::io::stdin();
-    let records: Vec<StdinCommand> = if args.nul_terminated {
+    let mut records: Vec<Result<StdinCommand, (String, i32)>> = Vec::new();
+    if args.nul_terminated {
         let mut buf = Vec::new();
         stdin.lock().read_to_end(&mut buf).map_err(|error| {
             stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
         })?;
-        parse_stdin_z(&buf)
-            .map_err(|(message, code)| stdin_fatal(format!("{message} (input: -z)"), code))?
+        records = parse_stdin_z(&buf);
     } else {
-        let mut lines: Vec<StdinCommand> = Vec::new();
         for line in stdin.lock().lines() {
             let line = line.map_err(|error| {
                 stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
@@ -625,16 +643,14 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             if line.trim().is_empty() {
                 continue;
             }
-            let command = parse_stdin_command(&line).map_err(|(message, code)| {
-                stdin_fatal(
+            records.push(parse_stdin_command(&line).map_err(|(message, code)| {
+                (
                     format!("{message} (input: {})", truncate_input(&line)),
                     code,
                 )
-            })?;
-            lines.push(command);
+            }));
         }
-        lines
-    };
+    }
 
     // First pass: state machine + scope/uniqueness validation. git prints the
     // `<cmd>: ok` lines as the commands are processed (they stay on stdout
@@ -645,7 +661,11 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     let mut aborted = false;
     let mut stdout = std::io::stdout().lock();
 
-    for command in &records {
+    for parsed in &records {
+        let command = match parsed {
+            Ok(command) => command,
+            Err((message, code)) => return Err(stdin_fatal(message.clone(), *code)),
+        };
         match command {
             StdinCommand::Start => {
                 if active {
@@ -709,7 +729,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
     // Second pass: resolve the values (async) and build the prepared list.
     let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
     let mut prepared: Vec<PreparedCommand> = Vec::new();
-    for command in &records {
+    for command in records.iter().filter_map(|parsed| parsed.as_ref().ok()) {
         let resolved = match command {
             StdinCommand::Update {
                 ref_name,
@@ -717,7 +737,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 old_value,
             } => {
                 let branch = parse_heads_ref(ref_name)
-                    .expect("scope validated in the first pass")
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
                 let new = resolve_new_value(new_value, &zero, ref_name).await?;
                 let old = match old_value {
@@ -738,7 +758,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 new_value,
             } => {
                 let branch = parse_heads_ref(ref_name)
-                    .expect("scope validated in the first pass")
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
                 let new = resolve_new_value(new_value, &zero, ref_name).await?;
                 PreparedCommand {
@@ -754,7 +774,7 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 old_value,
             } => {
                 let branch = parse_heads_ref(ref_name)
-                    .expect("scope validated in the first pass")
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
                 let old = match old_value {
                     Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
@@ -771,11 +791,15 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 old_value,
             } => {
                 let branch = parse_heads_ref(ref_name)
-                    .expect("scope validated in the first pass")
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let old = match old_value {
+                // Git: `verify` with no <oldvalue> (LF) or an empty one (`-z`)
+                // carries the all-zero id, so the ref must NOT exist — it is not
+                // "any value". An absent value therefore differs from `update`
+                // and `delete`, where it means "no CAS".
+                let old = match old_value.as_deref().filter(|value| !value.is_empty()) {
                     Some(value) => Some(resolve_old_value(value, &zero, ref_name).await?),
-                    None => None,
+                    None => Some(OldValue::MustNotExist),
                 };
                 PreparedCommand {
                     branch,

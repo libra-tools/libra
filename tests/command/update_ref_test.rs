@@ -1256,6 +1256,80 @@ fn update_ref_stdin_z_missing_field_is_fatal() {
     assert!(!ref_exists(&repo, "refs/heads/m2"));
 }
 
+/// Git: `verify` with NO `<oldvalue>` (LF) or an EMPTY one (`-z`) asserts the
+/// ref does NOT exist — the empty value is the all-zero id, not "any value".
+#[test]
+fn update_ref_verify_without_value_requires_absence() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    assert!(
+        stdin_batch(&repo, &[], "verify refs/heads/main\n")
+            .status
+            .code()
+            .is_some_and(|code| code != 0),
+        "LF `verify <ref>` on an existing ref must fail"
+    );
+    assert!(
+        stdin_batch(&repo, &[], "verify refs/heads/absent\n")
+            .status
+            .success(),
+        "LF `verify <ref>` on an absent ref must succeed"
+    );
+
+    assert_eq!(
+        stdin_batch(&repo, &["-z"], "verify refs/heads/main\0\0")
+            .status
+            .code(),
+        Some(128),
+        "-z `verify <ref> NUL NUL` on an existing ref must fail"
+    );
+    assert!(
+        stdin_batch(&repo, &["-z"], "verify refs/heads/absent\0\0")
+            .status
+            .success(),
+        "-z `verify <ref> NUL NUL` on an absent ref must succeed"
+    );
+
+    // A matching value still verifies the ref's current commit.
+    assert!(
+        stdin_batch(&repo, &["-z"], &format!("verify refs/heads/main\0{c2}\0"))
+            .status
+            .success(),
+        "an explicit matching <oldvalue> verifies"
+    );
+}
+
+/// Git acknowledges commands as it reads them, so a later malformed command must
+/// not swallow the earlier `<cmd>: ok` lines.
+#[test]
+fn update_ref_stdin_keeps_earlier_acknowledgements_on_late_error() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/late {c1}\nbogus\n"),
+    );
+    assert_eq!(out.status.code(), Some(128), "malformed command is fatal");
+    assert!(
+        stdout_trimmed(&out).contains("start: ok"),
+        "earlier acknowledgements must survive: {}",
+        stdout_trimmed(&out)
+    );
+
+    let z = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("start\0create refs/heads/late2\0{c1}\0bogus\0"),
+    );
+    assert_eq!(z.status.code(), Some(128));
+    assert!(
+        stdout_trimmed(&z).contains("start: ok"),
+        "-z acknowledgements must survive: {}",
+        stdout_trimmed(&z)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/late"), "nothing is applied");
+    assert!(!ref_exists(&repo, "refs/heads/late2"), "nothing is applied");
+}
+
 /// `-z` handles a multi-command batch and the transaction commands.
 #[test]
 fn update_ref_stdin_z_multi_command_batch() {
