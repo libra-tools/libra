@@ -202,7 +202,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `libra repack` | 公开命令 | 把仓库对象组合成 pack | [repack.md](repack.md) |
 | `libra review` | 公开命令 | 运行只读外部 agent 代码评审 | [review.md](review.md) |
 | `libra sparse-view` | 公开命令 | 管理只读稀疏视图筛选器 | [sparse-view.md](sparse-view.md) |
-| `libra ui` | 命令始终存在；窗口需要 `gui` feature | 打开桌面窗口 | [ui.md](ui.md) |
+| `libra ui` | 命令始终存在；桌面窗口始终编入 | 打开桌面窗口 | [ui.md](ui.md) |
 | `libra upgrade` | 公开命令 | 检查签名稳定通道并更新安装 | [upgrade.md](upgrade.md) |
 | `libra whoami` | 公开命令 | 查询当前 Libra host 会话身份 | [whoami.md](whoami.md) |
 

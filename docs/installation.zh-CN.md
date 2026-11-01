@@ -38,6 +38,17 @@ curl -fsSL https://download.libra.tools/install.sh | sh
 
 两个名称执行同一个二进制。整个 Libra home 目录移动后，相对目标仍有效。
 
+### Linux 运行时库
+
+Linux 二进制链接了 GPUI 桌面窗口，因此即使从不运行 `libra ui`，也必须安装以下
+共享库：
+
+- Debian/Ubuntu：`libfontconfig1`、`libxkbcommon0`、`libxkbcommon-x11-0`
+- Fedora：`fontconfig`、`libxkbcommon`、`libxkbcommon-x11`
+
+从源码构建还需要对应的开发头文件（Debian/Ubuntu 为 `libfontconfig1-dev`、
+`libxkbcommon-dev`、`libxkbcommon-x11-dev`）。
+
 ## Windows
 
 ```powershell

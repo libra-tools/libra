@@ -633,6 +633,7 @@ async fn prepare_existing_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::json::normalize_json_value;
 
     /// Actual export pending receipt replay through the shared authorized
     /// snapshot stage and real catalog/lease/checkpoint stores, no Session.
@@ -810,9 +811,13 @@ mod tests {
                 events.push(b'\n');
                 let ordinary = CheckpointRedactedPayload::from_snapshot(
                     snapshot,
-                    RedactedBytes::new_unchecked(serde_json::to_vec_pretty(&metadata).unwrap()),
+                    RedactedBytes::new_unchecked(
+                        serde_json::to_vec_pretty(&normalize_json_value(metadata)).unwrap(),
+                    ),
                     RedactedBytes::new_unchecked(events),
-                    RedactedBytes::new_unchecked(serde_json::to_vec_pretty(&report).unwrap()),
+                    RedactedBytes::new_unchecked(
+                        serde_json::to_vec_pretty(&normalize_json_value(report)).unwrap(),
+                    ),
                 )
                 .unwrap();
                 let payload = CheckpointRedactedPayload::from_redacted_capture_with_reasoning(

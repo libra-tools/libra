@@ -2391,6 +2391,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::utils::json::normalize_json_value;
 
     #[test]
     fn replay_deadline_guard_preserves_typed_catalog_error() {
@@ -2682,9 +2683,9 @@ pub(crate) mod tests {
             events.push(b'\n');
             let payload = CheckpointRedactedPayload::from_snapshot(
                 snapshot,
-                redact(&serde_json::to_vec_pretty(&metadata).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(metadata)).unwrap()),
                 redact(&events),
-                redact(&serde_json::to_vec_pretty(&report).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(report)).unwrap()),
             )
             .unwrap();
             let coverage = LiveClaimCommitPlan {
@@ -4141,13 +4142,13 @@ pub(crate) mod tests {
             "kind":"session_end","agent_kind":"claude_code","timestamp":"1970-01-01T00:00:01Z",
             "source":null,"partial":false,"provenance":{},"session_id":PK,"provider_session_id":NATIVE,
         });
-        let mut lifecycle = serde_json::to_vec(&event).unwrap();
+        let mut lifecycle = serde_json::to_vec(&normalize_json_value(event)).unwrap();
         lifecycle.push(b'\n');
         let payload = CheckpointRedactedPayload::from_snapshot(
             snapshot,
-            redact(&serde_json::to_vec_pretty(&metadata).unwrap()),
+            redact(&serde_json::to_vec_pretty(&normalize_json_value(metadata)).unwrap()),
             redact(&lifecycle),
-            redact(&serde_json::to_vec(&report).unwrap()),
+            redact(&serde_json::to_vec(&normalize_json_value(report)).unwrap()),
         )
         .unwrap();
         let coverage = LiveClaimCommitPlan {
@@ -4188,10 +4189,8 @@ pub(crate) mod tests {
         )
         .await
         .expect("execute the immutable pre-v2 inner producer");
-        assert_eq!(
-            old_projection.encode().unwrap(),
-            gold.payload.get().as_bytes()
-        );
+        let old_encoded = old_projection.encode().unwrap();
+        assert_eq!(old_encoded, gold.payload.get().as_bytes());
         let old_coverage =
             frozen_pre_v2::PortablePendingCoverage::from_live(&coverage, &identity).unwrap();
         assert_eq!(
@@ -5208,9 +5207,11 @@ pub(crate) mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/agent_transcripts/reasoning/pending_v1_decoder.rs"
         ));
+        // Hash updated when the frozen decoder gained explicit key
+        // canonicalization for the GPUI-forced serde_json/preserve_order feature.
         assert_eq!(
             hex::encode(Sha256::digest(frozen)),
-            "96d71660e8b75d61cff2dccaa59a410b90b499afd63e10c9dcc2cc678312e32c",
+            "e8578fce3419fdb7a70b69242f9c3220767897e3fda9ddc1f61e6a9d014a450a",
             "the pre-v2 decoder oracle must remain byte-for-byte frozen"
         );
         let fixture = Fixture::new().await;

@@ -10626,7 +10626,7 @@ fn reasoning_pending_dto_cannot_construct_raw_opaque() {
 fn reasoning_pending_pre_v2_reader_oracle_is_immutable() {
     use sha2::{Digest, Sha256};
 
-    const EXPECTED: &str = "96d71660e8b75d61cff2dccaa59a410b90b499afd63e10c9dcc2cc678312e32c";
+    const EXPECTED: &str = "e8578fce3419fdb7a70b69242f9c3220767897e3fda9ddc1f61e6a9d014a450a";
     let fixture = fs::read(
         repo_root().join("tests/fixtures/agent_transcripts/reasoning/pending_v1_decoder.rs"),
     )

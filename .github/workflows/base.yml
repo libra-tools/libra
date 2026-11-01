@@ -52,6 +52,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Ensure GPUI native libraries
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
+
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -359,6 +363,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Ensure GPUI native libraries
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
+
       - name: Ensure ripgrep is available
         shell: bash
         run: |
@@ -557,6 +565,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Ensure GPUI native libraries
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
+
       - name: Preserve Rust toolchain cache paths
         shell: bash
         run: |
@@ -609,6 +621,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+
+      - name: Ensure GPUI native libraries
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
 
       - name: Pin Linux platform
         run: |

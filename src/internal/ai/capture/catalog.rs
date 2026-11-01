@@ -9313,6 +9313,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::utils::json::normalize_json_value;
 
     #[test]
     fn reducer_revision_snapshot_must_match_catalog_precondition() {
@@ -9775,9 +9776,9 @@ mod tests {
             let redact = |bytes: &[u8]| Redactor::new_default().redact(bytes).0;
             let payload = CheckpointRedactedPayload::from_snapshot(
                 snapshot,
-                redact(&serde_json::to_vec_pretty(&metadata).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(metadata)).unwrap()),
                 redact(&events),
-                redact(&serde_json::to_vec_pretty(&report).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(report)).unwrap()),
             )
             .unwrap();
             let coverage = LiveClaimCommitPlan {

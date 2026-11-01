@@ -5734,7 +5734,7 @@ fn pi_discovery_refuses_non_regular_files() {
     {
         let acl = home.write_session("--acl--", "acl.jsonl");
         let acl_dir = acl.parent().expect("acl dir").to_path_buf();
-        let granted = Command::new("chmod")
+        let granted = Command::new("/bin/chmod")
             .args(["+a", "everyone allow add_file,delete_child"])
             .arg(&acl_dir)
             .status()

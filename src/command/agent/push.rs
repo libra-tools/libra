@@ -183,7 +183,7 @@ async fn execute_mega2(args: PushArgs, _output: &OutputConfig) -> CliResult<()> 
             hash_kind: crate::internal::protocol::mega2_traces::HashKind::Sha1,
         },
     )
-    .map_err(|message| CliError::fatal(message))?;
+    .map_err(CliError::fatal)?;
     // Capability discovery is a network read. This entry refuses to open it
     // until the remote advertisement is supplied by the live transport.
     // The typed URL is planned and the stored code remote is left unchanged.

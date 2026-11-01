@@ -23,37 +23,40 @@ use uuid::Uuid;
 #[cfg(test)]
 #[cfg(unix)]
 use crate::internal::ai::observed_agents::reasoning::VerifiedCaptureBinding;
-use crate::internal::{
-    ai::{
-        capture::{
-            checkpoint::{
-                AuthenticatedPendingEnvelope, CheckpointRedactedPayload,
-                NativeVersionedReasoningCoveragePlan, PreparedPendingNativeSeal,
-                ReasoningCoveragePlan, ReasoningTurnIdentity,
+use crate::{
+    internal::{
+        ai::{
+            capture::{
+                checkpoint::{
+                    AuthenticatedPendingEnvelope, CheckpointRedactedPayload,
+                    NativeVersionedReasoningCoveragePlan, PreparedPendingNativeSeal,
+                    ReasoningCoveragePlan, ReasoningTurnIdentity,
+                },
+                pending::{
+                    PendingBinding, VersionedPendingRehydrateMaterial,
+                    VersionedPendingReplayMaterial, VersionedPendingSealMaterial,
+                },
+                pending_identity::PreparedPendingAlias,
+                snapshot::CaptureSnapshotProjection,
             },
-            pending::{
-                PendingBinding, VersionedPendingRehydrateMaterial, VersionedPendingReplayMaterial,
-                VersionedPendingSealMaterial,
+            coverage_gate::{
+                LiveClaimCommitPlan, ReservedTurnClaim, VersionedLiveClaimCommitPlan,
+                VersionedReservedTurnClaim,
             },
-            pending_identity::PreparedPendingAlias,
-            snapshot::CaptureSnapshotProjection,
-        },
-        coverage_gate::{
-            LiveClaimCommitPlan, ReservedTurnClaim, VersionedLiveClaimCommitPlan,
-            VersionedReservedTurnClaim,
-        },
-        observed_agents::{
-            Completeness, MAX_REDACTION_MATCH_SAMPLES, RedactedBytes, Redactor,
-            coverage::CoverageSchemaVersion,
-            parse_canon_value,
-            reasoning::{
-                MAX_REASONING_TURN_KEY_BYTES, NativeProvenReasoning, PendingIntegrityStamp,
-                PendingIntegrityToken, PendingReasoningSourceDto, VerifiedPendingBinding,
-                seal_pending,
+            observed_agents::{
+                Completeness, MAX_REDACTION_MATCH_SAMPLES, RedactedBytes, Redactor,
+                coverage::CoverageSchemaVersion,
+                parse_canon_value,
+                reasoning::{
+                    MAX_REASONING_TURN_KEY_BYTES, NativeProvenReasoning, PendingIntegrityStamp,
+                    PendingIntegrityToken, PendingReasoningSourceDto, VerifiedPendingBinding,
+                    seal_pending,
+                },
             },
         },
+        metadata::ReasoningIdentityKind,
     },
-    metadata::ReasoningIdentityKind,
+    utils::json::normalize_json_value,
 };
 
 const VERSION: u8 = 1;
@@ -927,6 +930,7 @@ impl PendingPayloadProjection {
             fields,
             &["session_id", "provider_session_id", "working_dir"],
         )?;
+        let metadata = normalize_json_value(metadata);
         let lifecycle_bytes = payload.lifecycle_events_jsonl().bytes();
         ensure!(
             !lifecycle_bytes.is_empty() && lifecycle_bytes.ends_with(b"\n"),
@@ -940,6 +944,7 @@ impl PendingPayloadProjection {
                 value.as_object_mut().ok_or_else(failure)?,
                 &["session_id", "provider_session_id"],
             )?;
+            let value = normalize_json_value(value);
             lifecycle.push(value);
         }
         validate_report(&json(
@@ -1196,7 +1201,8 @@ impl PendingPayloadProjection {
             "working_dir".into(),
             Value::String(context.working_dir().into()),
         );
-        let metadata = serde_json::to_vec_pretty(&metadata).map_err(|_| failure())?;
+        let metadata =
+            serde_json::to_vec_pretty(&normalize_json_value(metadata)).map_err(|_| failure())?;
         ensure!(metadata.len() <= MAX_SIDECARS, REMEDY);
         let mut lifecycle = Vec::new();
         for event in &self.lifecycle {
@@ -1210,7 +1216,7 @@ impl PendingPayloadProjection {
                 "provider_session_id".into(),
                 Value::String(context.provider_session_id().into()),
             );
-            let line = serde_json::to_vec(&event).map_err(|_| failure())?;
+            let line = serde_json::to_vec(&normalize_json_value(event)).map_err(|_| failure())?;
             ensure!(
                 lifecycle
                     .len()
@@ -1944,9 +1950,9 @@ mod tests {
             jsonl.push(b'\n');
             CheckpointRedactedPayload::from_snapshot(
                 snapshot,
-                redact(&serde_json::to_vec_pretty(&metadata).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(metadata)).unwrap()),
                 redact(&jsonl),
-                redact(&serde_json::to_vec_pretty(&report).unwrap()),
+                redact(&serde_json::to_vec_pretty(&normalize_json_value(report)).unwrap()),
             )
             .unwrap()
         }

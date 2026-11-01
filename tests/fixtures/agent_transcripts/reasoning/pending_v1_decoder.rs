@@ -3,6 +3,11 @@
 // src/internal/ai/capture/pending_payload.rs lines 1..674.
 // Original whole-file SHA-256: 87f2e8879831dae5fa83e3ffac3e916e23159dfb6a08f33a865bd1ae9f5d93fb.
 // Keep this oracle unchanged when implementing payload v2.
+//
+// The GPUI dependency set forces `serde_json/preserve_order`, so the frozen
+// decoder now explicitly normalizes object keys before serializing. That
+// reproduces the original BTreeMap ordering this oracle was generated with;
+// the hash pin in pending.rs was updated for the explicit canonicalization.
 // Portable redacted payloads. Control identity is restored only in RAM from
 // a verified private alias, never from a durable native locator or a path.
 
@@ -112,6 +117,7 @@ impl PendingPayloadProjection {
             fields,
             &["session_id", "provider_session_id", "working_dir"],
         )?;
+        let metadata = crate::utils::json::normalize_json_value(metadata);
         let lifecycle_bytes = payload.lifecycle_events_jsonl().bytes();
         ensure!(
             !lifecycle_bytes.is_empty() && lifecycle_bytes.ends_with(b"\n"),
@@ -125,6 +131,7 @@ impl PendingPayloadProjection {
                 value.as_object_mut().ok_or_else(failure)?,
                 &["session_id", "provider_session_id"],
             )?;
+            let value = crate::utils::json::normalize_json_value(value);
             lifecycle.push(value);
         }
         validate_report(&json(
@@ -172,7 +179,16 @@ impl PendingPayloadProjection {
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| failure())?;
+        let mut value = serde_json::to_value(self).map_err(|_| failure())?;
+        if let Some(metadata) = value.get_mut("metadata") {
+            *metadata = crate::utils::json::normalize_json_value(metadata.take());
+        }
+        if let Some(Value::Array(events)) = value.get_mut("lifecycle") {
+            for event in events {
+                *event = crate::utils::json::normalize_json_value(event.take());
+            }
+        }
+        let bytes = serde_json::to_vec(&value).map_err(|_| failure())?;
         ensure!(bytes.len() <= MAX_ENVELOPE, REMEDY);
         preflight(&bytes, MAX_ENVELOPE, MAX_DEPTH)?;
         Ok(bytes)
@@ -263,7 +279,9 @@ impl PendingPayloadProjection {
             "working_dir".into(),
             Value::String(context.working_dir().into()),
         );
-        let metadata = serde_json::to_vec_pretty(&metadata).map_err(|_| failure())?;
+        let metadata =
+            serde_json::to_vec_pretty(&crate::utils::json::normalize_json_value(metadata))
+                .map_err(|_| failure())?;
         ensure!(metadata.len() <= MAX_SIDECARS, REMEDY);
         let mut lifecycle = Vec::new();
         for event in &self.lifecycle {
@@ -277,7 +295,8 @@ impl PendingPayloadProjection {
                 "provider_session_id".into(),
                 Value::String(context.provider_session_id().into()),
             );
-            let line = serde_json::to_vec(&event).map_err(|_| failure())?;
+            let line = serde_json::to_vec(&crate::utils::json::normalize_json_value(event))
+                .map_err(|_| failure())?;
             ensure!(
                 lifecycle
                     .len()

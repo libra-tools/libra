@@ -47,6 +47,18 @@ writes shell environment files, and creates the optional relative symlink:
 Both names execute the same binary. The relative target remains valid when the
 whole Libra home directory is moved.
 
+### Linux runtime libraries
+
+The Linux binary links the GPUI desktop window, so these shared libraries must
+be installed even when you never run `libra ui`:
+
+- Debian/Ubuntu: `libfontconfig1`, `libxkbcommon0`, `libxkbcommon-x11-0`
+- Fedora: `fontconfig`, `libxkbcommon`, `libxkbcommon-x11`
+
+Building from source additionally needs the matching development headers
+(`libfontconfig1-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev` on
+Debian/Ubuntu).
+
 ## Windows
 
 ```powershell

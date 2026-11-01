@@ -207,7 +207,7 @@ These entries complete the current CLI index. `media` requires a build with the 
 | `libra repack` | public | Combine repository objects into a pack | [repack.md](repack.md) |
 | `libra review` | public | Run read-only external-agent code reviews | [review.md](review.md) |
 | `libra sparse-view` | public | Manage read-only sparse view filters | [sparse-view.md](sparse-view.md) |
-| `libra ui` | public command; the window needs the `gui` feature | Open the desktop window | [ui.md](ui.md) |
+| `libra ui` | public command; the desktop window is always built | Open the desktop window | [ui.md](ui.md) |
 | `libra upgrade` | public | Check the signed stable channel and upgrade the installation | [upgrade.md](upgrade.md) |
 
 ## Structured Output Envelope

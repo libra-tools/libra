@@ -3,20 +3,20 @@
 ## 命令实现目标
 
 `libra ui` 在同一个 `libra` 二进制里打开一个桌面窗口。窗口使用 Ely GPUI
-Components（GPUI 快照 `gpui-pre` 0.3.10）。feature `gui` 默认关闭，普通 CLI
-构建不链接 GPU UI。
+Components（GPUI 快照 `gpui-pre` 0.3.10）。桌面窗口编进所有标准构建，不再由
+Cargo feature 控制。
 
 ## 对比 Git 与兼容性
 
 - 兼容级别：`intentionally-different`。Git 无对应命令。
-- 已支持：不带额外参数的 `libra ui`。带 `--features gui` 时在进程主线程打开一个窗口；否则退出 128 / `LBR-UNSUPPORTED-001`，并提示 `cargo build --features gui`。
+- 已支持：不带额外参数的 `libra ui` 在进程主线程打开一个窗口。
 - `libra ui --help` 只打印用法，不打开窗口。
 - 不需要仓库。
 
 ## 设计方案
 
 - GPUI 的 `Application::run` 必须在进程主线程上调用。`src/main.rs` 在 helper 提前返回和 tracing 初始化之后、启动 `libra-cli` 线程之前，用 `cli::ui_window_launch` 识别裸 `libra ui`（子命令前可以有全局 flag，子命令后不能有参数）。
-- 窗口实现在 `src/gui/mod.rs`，仅 `feature = "gui"` 编译。入口是 `gui::run`。
+- 窗口实现在 `src/gui/mod.rs`，始终参与编译。入口是 `gui::run`。
 - clap 命令始终存在：`Commands::Ui` → `command::ui::execute`。调度器路径不打开窗口。库嵌入（`libra::exec`）走到这里时返回说明，避免在错误线程上启动 GPUI。
 - 预检是 `CommandPreflight::none()`，scope 是 `ReadOnly`。不参与自动升级检查。
 
@@ -38,7 +38,8 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 
 - 把 status、log、diff 接进窗口。
 - 从窗口调用 Libra 库函数，而不是每次新建一个 Tokio runtime。
-- 发布构建是否带 `gui`。当前 release 流水线不启用这个 feature。
+- 发布构建现在默认包含桌面窗口；Linux release runner 需安装 fontconfig 与 xkbcommon 开发头文件。
+- Linux 运行时需要 fontconfig 与 xkbcommon 共享库；`install.sh` 在 `ldconfig` 可用时会检测并警告缺失项。
 
 ## 桌面界面预览（2026-11-01）
 
@@ -58,10 +59,10 @@ Ely 提供按钮、输入框、复选框、选择标签、主题、焦点与弹�
 
 ## macOS 界面验证
 
-- `cargo build --features gui` 后运行 `./target/debug/libra ui`。从 All tools
+- `cargo build` 后运行 `./target/debug/libra ui`。从 All tools
   打开全部 26 页，同时检查浅色和深色的 Sessions、字段编辑、复选框及无结果搜索。
 - `⌘K` 聚焦命令面板，`Esc` 返回；History 和全局搜索使用独立输入状态。
   `⌘Q`、`⌘W` 与关闭最后一个窗口均结束 UI 进程。
-- `cargo test --features gui --lib gui::` 覆盖演示目录及 History 的组合筛选。
+- `cargo test --lib gui::` 覆盖演示目录及 History 的组合筛选。
 - GPUI 调试构建会拒绝重复的无障碍节点 ID。导航栏、页面、搜索分类和重复卡片
   各有独立 element ID；回归检查需包括搜索的 Everything 标签与 Welcome、Settings。

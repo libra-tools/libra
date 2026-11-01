@@ -75,7 +75,7 @@ use crate::{
             reasoning::ReasoningSourceDisposition,
         },
     },
-    utils::util,
+    utils::{json::normalize_json_value, util},
 };
 
 /// Recognize only typed child waiting states, including coordinator fields
@@ -2473,7 +2473,7 @@ pub(super) async fn run_checkpoint_stage<P: LiveExportLeasePort>(
                 obj.insert("transcript_snapshot".to_string(), snapshot_value);
             }
         }
-        let metadata_bytes = match serde_json::to_vec_pretty(&metadata) {
+        let metadata_bytes = match serde_json::to_vec_pretty(&normalize_json_value(metadata)) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return uncommitted(conn, &cleanup, capture_deadline, None, || {
@@ -2520,7 +2520,8 @@ pub(super) async fn run_checkpoint_stage<P: LiveExportLeasePort>(
         lifecycle_events_jsonl.push(b'\n');
         let (lifecycle_events_redacted, _) =
             Redactor::new_default().redact(&lifecycle_events_jsonl);
-        let redaction_report_bytes = match serde_json::to_vec_pretty(&redaction_report_value) {
+        let redaction_report_bytes =
+            match serde_json::to_vec_pretty(&normalize_json_value(redaction_report_value)) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return uncommitted(conn, &cleanup, capture_deadline, None, || {
@@ -3491,6 +3492,7 @@ pub(super) async fn write_subagent_checkpoint(
             "partial_sources": summary.partial_sources,
         });
     }
+    let metadata = normalize_json_value(metadata);
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).context("serialize subagent checkpoint metadata")?;
     let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
@@ -3524,8 +3526,10 @@ pub(super) async fn write_subagent_checkpoint(
     lifecycle_events_jsonl.push(b'\n');
     let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
 
-    let report_value = serde_json::from_str::<serde_json::Value>(redaction_report_json)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let report_value = normalize_json_value(
+        serde_json::from_str::<serde_json::Value>(redaction_report_json)
+            .unwrap_or_else(|_| serde_json::json!({})),
+    );
     let redaction_report_bytes = serde_json::to_vec_pretty(&report_value)
         .context("serialize subagent checkpoint redaction_report.json")?;
     let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);

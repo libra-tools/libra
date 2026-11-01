@@ -17,6 +17,7 @@ use super::{
     OperationKind, OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2, RepoViewV2,
     StoreError, view::REPO_VIEW_SCHEMA_VERSION, working_copy::PinnedRequestScope,
 };
+use crate::utils::json::normalize_json_value;
 
 /// Machine-readable result of one reconcile attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -242,10 +243,10 @@ impl ReconcileEngine {
             merged_references.push(entry);
         }
 
-        let refs_bytes = serde_json::to_vec(&serde_json::json!({
+        let refs_bytes = serde_json::to_vec(&normalize_json_value(serde_json::json!({
             "schema_version": 1,
             "references": merged_references,
-        }))
+        })))
         .map_err(|error| ReconcileError::Storage(error.to_string()))?;
         let refs_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &refs_bytes);
         let converged_view = RepoViewV2 {

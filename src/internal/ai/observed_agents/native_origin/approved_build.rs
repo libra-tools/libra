@@ -916,12 +916,13 @@ mod tests {
     #[test]
     fn npr_15_no_key() {
         let compiled = serde_json::to_value(reviewed()).unwrap();
-        let keys: Vec<_> = compiled
+        let mut keys: Vec<_> = compiled
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
+        keys.sort_unstable();
         assert_eq!(
             keys,
             vec![

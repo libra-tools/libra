@@ -512,22 +512,37 @@ async fn run_available(
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("run `libra upgrade` again to see the current state"))
         }
-        ManualInstallReport::RolledBack => Err(CliError::failure(
-            "the previous binary was RESTORED — the downloaded version failed its \
-             post-install self-check, a newer publisher control decision superseded it at \
-             the last moment, or the policy fence could not obtain its lock in time; \
-             nothing changed",
-        )
-        .with_stable_code(StableErrorCode::RepoStateInvalid)
-        .with_hint(
-            "try again later; if this repeats, report it at github.com/libra-tools/libra/issues",
-        )),
-        ManualInstallReport::NotApplied => Err(CliError::failure(
-            "the upgrade was not applied: another libra process is upgrading concurrently, \
-             or the candidate failed its pre-install check",
-        )
-        .with_stable_code(StableErrorCode::RepoStateInvalid)
-        .with_hint("re-run `libra upgrade` in a moment")),
+        ManualInstallReport::RolledBack => {
+            let hint = if cfg!(target_os = "linux") {
+                "try again later; on Linux, ensure libfontconfig1, libxkbcommon0 and \
+                 libxkbcommon-x11-0 are installed; if this repeats, report it at \
+                 github.com/libra-tools/libra/issues"
+            } else {
+                "try again later; if this repeats, report it at github.com/libra-tools/libra/issues"
+            };
+            Err(CliError::failure(
+                "the previous binary was RESTORED — the downloaded version failed its \
+                 post-install self-check, a newer publisher control decision superseded it at \
+                 the last moment, or the policy fence could not obtain its lock in time; \
+                 nothing changed",
+            )
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(hint))
+        }
+        ManualInstallReport::NotApplied => {
+            let hint = if cfg!(target_os = "linux") {
+                "on Linux, ensure libfontconfig1, libxkbcommon0 and libxkbcommon-x11-0 are \
+                 installed, then re-run `libra upgrade` in a moment"
+            } else {
+                "re-run `libra upgrade` in a moment"
+            };
+            Err(CliError::failure(
+                "the upgrade was not applied: another libra process is upgrading concurrently, \
+                 or the candidate failed its pre-install check",
+            )
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(hint))
+        }
     }
 }
 

@@ -79,6 +79,11 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: rustup toolchain install stable --profile minimal
 
+      - name: Ensure GPUI native libraries
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
+
       - name: Run live cloud tests
         if: steps.gate.outputs.skip != 'true'
         env:
