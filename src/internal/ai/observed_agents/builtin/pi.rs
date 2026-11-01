@@ -9,7 +9,9 @@
 //! branch's message content, keeping thinking and tool-call blocks exactly
 //! as written; PI-16 totals a session's token and cost usage over every
 //! entry and attributes each assistant message to `responseModel ?? model`.
-//! Pi stays unsupported:
+//! PI-34 turns the branch into coverage turns, and PI-32 bounds a worker
+//! frame of those turns with the branch's thinking blocks under a byte
+//! budget and a deadline. Pi stays unsupported:
 //! nothing here imports a session, installs hooks, or reads a transcript for
 //! capture.
 //!
@@ -29,6 +31,17 @@ use std::{
 use anyhow::{Context, Result};
 
 use super::super::adapter::{AgentKind, AgentSessionCtx, AgentStability, ObservedAgent};
+
+/// One deadline check of a deadline-bound stage (PI-32): returns
+/// `Err(PiStop::Cancelled)` from the enclosing function once the
+/// [`PiDeadline`] has elapsed.
+macro_rules! poll {
+    ($deadline:expr) => {
+        if $deadline.elapsed() {
+            return Err(PiStop::Cancelled);
+        }
+    };
+}
 
 /// PI-01 identity stub. The db tag is accepted, but the registry row stays
 /// unsupported: discovery is internal (PI-02), and capture, hook install, and
@@ -663,12 +676,39 @@ pub fn normalize_pi_session(
     bytes: &[u8],
     limits: PiNormalizeLimits,
 ) -> std::result::Result<PiActiveBranch, PiNormalizeRefusal> {
+    // INVARIANT: without a deadline the normalizer is never cancelled, so the
+    // fallback refusal is never produced.
+    normalize_pi_session_until(bytes, limits, &NO_DEADLINE)
+        .unwrap_or(Err(PiNormalizeRefusal::TooLarge))
+}
+
+/// [`normalize_pi_session`] under a deadline (PI-32), checked before the
+/// work, at every step of each pass over its lines and entries (reading
+/// lines, indexing ids, linking parents, every step and finishing step of
+/// the cycle walk, the branch walk,
+/// the compaction and kept-entry searches, building the branch and its
+/// turns, and attributing skipped lines), and once more after the branch is
+/// built. `None` means the deadline elapsed; no branch is returned after it.
+pub fn normalize_pi_session_until(
+    bytes: &[u8],
+    limits: PiNormalizeLimits,
+    deadline: &dyn PiDeadline,
+) -> Option<std::result::Result<PiActiveBranch, PiNormalizeRefusal>> {
+    settle(normalize_session(bytes, limits, deadline))
+}
+
+fn normalize_session(
+    bytes: &[u8],
+    limits: PiNormalizeLimits,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<PiActiveBranch, PiStop<PiNormalizeRefusal>> {
     use serde_json::Value;
 
     use super::super::coverage::{Completeness, parse_canon_value};
 
+    poll!(deadline);
     if bytes.len() as u64 > limits.max_bytes {
-        return Err(PiNormalizeRefusal::TooLarge);
+        return Err(PiNormalizeRefusal::TooLarge.into());
     }
     let mut partial_reasons = BTreeSet::new();
     let mut header: Option<String> = None;
@@ -679,6 +719,7 @@ pub fn normalize_pi_session(
     let mut skipped_runs: Vec<usize> = Vec::new();
     let mut in_skipped_run = false;
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        poll!(deadline);
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -707,10 +748,10 @@ pub fn normalize_pi_session(
                 .and_then(Value::as_str)
                 .filter(|_| kind == Some("session"))
             else {
-                return Err(PiNormalizeRefusal::NotASession);
+                return Err(PiNormalizeRefusal::NotASession.into());
             };
             if value.get("version").and_then(Value::as_i64) != Some(PI_SESSION_VERSION) {
-                return Err(PiNormalizeRefusal::UnsupportedVersion);
+                return Err(PiNormalizeRefusal::UnsupportedVersion.into());
             }
             header = Some(session_id.to_owned());
             continue;
@@ -733,10 +774,10 @@ pub fn normalize_pi_session(
         let parent_id = match value.get("parentId") {
             None | Some(Value::Null) => None,
             Some(Value::String(parent)) if !parent.is_empty() => Some(parent.clone()),
-            Some(_) => return Err(PiNormalizeRefusal::UnrepresentableEntry),
+            Some(_) => return Err(PiNormalizeRefusal::UnrepresentableEntry.into()),
         };
         if entries.len() >= limits.max_entries {
-            return Err(PiNormalizeRefusal::TooLarge);
+            return Err(PiNormalizeRefusal::TooLarge.into());
         }
         let kind = PiEntryKind::from_entry(&value);
         match kind {
@@ -761,17 +802,19 @@ pub fn normalize_pi_session(
         });
     }
     let Some(session_id) = header else {
-        return Err(PiNormalizeRefusal::NotASession);
+        return Err(PiNormalizeRefusal::NotASession.into());
     };
 
     let mut by_id = std::collections::HashMap::with_capacity(entries.len());
     for (position, entry) in entries.iter().enumerate() {
+        poll!(deadline);
         if by_id.insert(entry.id.as_str(), position).is_some() {
-            return Err(PiNormalizeRefusal::DuplicateEntryId);
+            return Err(PiNormalizeRefusal::DuplicateEntryId.into());
         }
     }
     let mut parents = Vec::with_capacity(entries.len());
     for entry in &entries {
+        poll!(deadline);
         parents.push(match &entry.parent_id {
             None => None,
             Some(parent) => Some(
@@ -781,15 +824,23 @@ pub fn normalize_pi_session(
             ),
         });
     }
-    reject_parent_cycles(&parents)?;
+    reject_parent_cycles(&parents, deadline)?;
 
     let mut path = Vec::new();
     let mut current = entries.len().checked_sub(1);
     while let Some(position) = current {
+        poll!(deadline);
         path.push(position);
         current = parents[position];
     }
-    path.reverse();
+    // Root first: reversed in place, one swap per check.
+    let (mut low, mut high) = (0, path.len());
+    while low + 1 < high {
+        poll!(deadline);
+        high -= 1;
+        path.swap(low, high);
+        low += 1;
+    }
     let off_branch_entries = entries.len() - path.len();
 
     // Pi's context follows the latest compaction on the branch only: the
@@ -797,19 +848,29 @@ pub fn normalize_pi_session(
     // the summary, and without such an entry (retain-none names the
     // compaction itself) everything before the compaction is
     // (`buildContextEntries`, `session-manager.ts:468-515`).
-    let boundary = match path
-        .iter()
-        .rposition(|&position| entries[position].kind == PiEntryKind::Compaction)
-    {
+    let mut latest_compaction = None;
+    for (index, &position) in path.iter().enumerate().rev() {
+        poll!(deadline);
+        if entries[position].kind == PiEntryKind::Compaction {
+            latest_compaction = Some(index);
+            break;
+        }
+    }
+    let boundary = match latest_compaction {
         None => 0,
         Some(compaction) => {
             let entry = &entries[path[compaction]];
             let kept = entry.first_kept_entry_id.as_deref();
-            let found = kept.and_then(|kept| {
-                path[..compaction]
-                    .iter()
-                    .position(|&earlier| entries[earlier].id == kept)
-            });
+            let mut found = None;
+            if let Some(kept) = kept {
+                for (index, &earlier) in path[..compaction].iter().enumerate() {
+                    poll!(deadline);
+                    if entries[earlier].id == kept {
+                        found = Some(index);
+                        break;
+                    }
+                }
+            }
             if found.is_none() && kept != Some(entry.id.as_str()) {
                 partial_reasons.insert(PiBranchPartialReason::CompactionBoundaryNotOnBranch);
             }
@@ -817,53 +878,58 @@ pub fn normalize_pi_session(
         }
     };
 
-    let branch: Vec<PiBranchEntry> = path
-        .iter()
-        .map(|&position| {
-            let entry = &entries[position];
-            PiBranchEntry {
-                id: entry.id.clone(),
-                parent_id: entry.parent_id.clone(),
-                line: entry.line,
-                kind: entry.kind,
-            }
-        })
-        .collect();
-    let openings: Vec<usize> = branch
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.kind == PiEntryKind::Message(PiMessageRole::User))
-        .map(|(index, _)| index)
-        .collect();
+    let mut branch = Vec::with_capacity(path.len());
+    let mut openings = Vec::new();
+    for &position in &path {
+        poll!(deadline);
+        let entry = &entries[position];
+        if entry.kind == PiEntryKind::Message(PiMessageRole::User) {
+            openings.push(branch.len());
+        }
+        branch.push(PiBranchEntry {
+            id: entry.id.clone(),
+            parent_id: entry.parent_id.clone(),
+            line: entry.line,
+            kind: entry.kind,
+        });
+    }
     let preamble = 0..openings.first().copied().unwrap_or(branch.len());
-    let mut turns: Vec<PiTurn> = openings
-        .iter()
-        .enumerate()
-        .map(|(ordinal, &start)| {
-            let end = openings.get(ordinal + 1).copied().unwrap_or(branch.len());
-            PiTurn {
-                ordinal,
-                opening_entry_id: branch[start].id.clone(),
-                entries: start..end,
-                completeness: if start < boundary {
-                    Completeness::Incomplete
-                } else {
-                    Completeness::Complete
-                },
-                skipped_lines: false,
-            }
-        })
-        .collect();
+    let mut turns = Vec::with_capacity(openings.len());
+    for (ordinal, &start) in openings.iter().enumerate() {
+        poll!(deadline);
+        let end = openings.get(ordinal + 1).copied().unwrap_or(branch.len());
+        turns.push(PiTurn {
+            ordinal,
+            opening_entry_id: branch[start].id.clone(),
+            entries: start..end,
+            completeness: if start < boundary {
+                Completeness::Incomplete
+            } else {
+                Completeness::Complete
+            },
+            skipped_lines: false,
+        });
+    }
     if !skipped_runs.is_empty() && !turns.is_empty() {
         // A child may precede its parent in the file, so the branch is
-        // searched by line rather than walked.
-        let mut by_line: Vec<(usize, usize)> = branch
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.line, index))
-            .collect();
-        by_line.sort_unstable();
+        // searched by line rather than walked. The indexed entries are in
+        // file order already, so the branch entries are put in line order by
+        // marking each one's position and taking them in that order, without
+        // a sort and in memory bounded by the entries.
+        let mut on_branch = vec![None; entries.len()];
+        for (index, &position) in path.iter().enumerate() {
+            poll!(deadline);
+            on_branch[position] = Some(index);
+        }
+        let mut by_line = Vec::with_capacity(branch.len());
+        for (entry, index) in entries.iter().zip(on_branch) {
+            poll!(deadline);
+            if let Some(index) = index {
+                by_line.push((entry.line, index));
+            }
+        }
         for line in skipped_runs {
+            poll!(deadline);
             let above = by_line.partition_point(|&(entry_line, _)| entry_line < line);
             let turn = above
                 .checked_sub(1)
@@ -879,16 +945,21 @@ pub fn normalize_pi_session(
             }
         }
     }
-    Ok(PiActiveBranch {
+    let leaf_id = branch.last().map(|entry| entry.id.clone());
+    let normalized = PiActiveBranch {
         session_id,
-        leaf_id: branch.last().map(|entry| entry.id.clone()),
+        leaf_id,
         entries: branch,
         preamble,
         turns,
         before_compaction: 0..boundary,
         off_branch_entries,
         partial_reasons,
-    })
+    };
+    // Last, after everything is built, so no branch is returned after the
+    // deadline.
+    poll!(deadline);
+    Ok(normalized)
 }
 
 /// Whether `JSON.parse` would give a value Pi's loader drops (`if (entry)`).
@@ -905,7 +976,10 @@ fn is_js_falsy(value: &serde_json::Value) -> bool {
 
 /// Refuse a parent graph with a cycle. Each entry is walked toward its root
 /// once; meeting an entry still on the current walk is a cycle.
-fn reject_parent_cycles(parents: &[Option<usize>]) -> std::result::Result<(), PiNormalizeRefusal> {
+fn reject_parent_cycles(
+    parents: &[Option<usize>],
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<(), PiStop<PiNormalizeRefusal>> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
         Unvisited,
@@ -915,11 +989,13 @@ fn reject_parent_cycles(parents: &[Option<usize>]) -> std::result::Result<(), Pi
     let mut state = vec![State::Unvisited; parents.len()];
     let mut walk = Vec::new();
     for start in 0..parents.len() {
+        poll!(deadline);
         let mut current = Some(start);
         while let Some(position) = current {
+            poll!(deadline);
             match state[position] {
                 State::Done => break,
-                State::OnWalk => return Err(PiNormalizeRefusal::Cycle),
+                State::OnWalk => return Err(PiNormalizeRefusal::Cycle.into()),
                 State::Unvisited => {
                     state[position] = State::OnWalk;
                     walk.push(position);
@@ -928,6 +1004,7 @@ fn reject_parent_cycles(parents: &[Option<usize>]) -> std::result::Result<(), Pi
             }
         }
         for position in walk.drain(..) {
+            poll!(deadline);
             state[position] = State::Done;
         }
     }
@@ -1215,30 +1292,59 @@ pub fn project_pi_content(
     bytes: &[u8],
     branch: &PiActiveBranch,
 ) -> std::result::Result<PiContentProjection, PiProjectionError> {
-    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    // INVARIANT: without a deadline the projection is never cancelled, so
+    // the fallback error is never produced.
+    project_pi_content_until(bytes, branch, &NO_DEADLINE)
+        .unwrap_or(Err(PiProjectionError::BranchMismatch))
+}
+
+/// [`project_pi_content`] under a deadline (PI-32), checked before the work,
+/// at every branch entry and every line of the bytes as it indexes the
+/// branch's lines, every turn and turn entry it sets up,
+/// every branch entry it reads, every content block of an entry, and right
+/// before it returns the projection. `None` means the deadline elapsed; no
+/// projection is returned after it.
+pub fn project_pi_content_until(
+    bytes: &[u8],
+    branch: &PiActiveBranch,
+    deadline: &dyn PiDeadline,
+) -> Option<std::result::Result<PiContentProjection, PiProjectionError>> {
+    settle(project_content(bytes, branch, deadline))
+}
+
+fn project_content(
+    bytes: &[u8],
+    branch: &PiActiveBranch,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<PiContentProjection, PiStop<PiProjectionError>> {
+    poll!(deadline);
+    let lines = branch_lines(bytes, branch, deadline)?;
+    let mut turns = Vec::with_capacity(branch.turns.len());
+    for turn in &branch.turns {
+        poll!(deadline);
+        turns.push(PiProjectedTurn {
+            ordinal: turn.ordinal,
+            completeness: turn.completeness,
+            records: Vec::new(),
+            entry_records: Vec::new(),
+        });
+    }
     let mut projection = PiContentProjection {
         preamble: Vec::new(),
-        turns: branch
-            .turns
-            .iter()
-            .map(|turn| PiProjectedTurn {
-                ordinal: turn.ordinal,
-                completeness: turn.completeness,
-                records: Vec::new(),
-                entry_records: Vec::new(),
-            })
-            .collect(),
+        turns,
         partial_reasons: BTreeSet::new(),
     };
     // The turn of each branch entry; `None` for the preamble.
     let mut owner = vec![None; branch.entries.len()];
     for (ordinal, turn) in branch.turns.iter().enumerate() {
         for slot in owner.get_mut(turn.entries.clone()).into_iter().flatten() {
+            poll!(deadline);
             *slot = Some(ordinal);
         }
     }
     let mut call_ids = BTreeSet::new();
     for (index, entry) in branch.entries.iter().enumerate() {
+        poll!(deadline);
         let (text, fields) = branch_entry_line(&lines, entry)?;
         let whole = || {
             serde_json::from_str::<Box<serde_json::value::RawValue>>(text)
@@ -1259,26 +1365,25 @@ pub fn project_pi_content(
                     }
                     (PiMessageRole::User, Some(message)) => {
                         // Text and kept blocks stay in block order.
-                        records.extend(
-                            content_pieces(content_member(&message), partial)
-                                .into_iter()
-                                .map(|piece| match piece {
-                                    ContentPiece::Text(text) => PiContentRecord::User { text },
-                                    ContentPiece::Kept(record) => record,
-                                }),
-                        );
+                        for piece in content_pieces(content_member(&message), partial, deadline)? {
+                            records.push(match piece {
+                                ContentPiece::Text(text) => PiContentRecord::User { text },
+                                ContentPiece::Kept(record) => record,
+                            });
+                        }
                     }
                     (PiMessageRole::Assistant, Some(message)) => project_assistant(
                         content_member(&message),
                         &mut records,
                         &mut call_ids,
                         partial,
-                    ),
+                        deadline,
+                    )?,
                     (PiMessageRole::ToolResult, Some(message)) => {
-                        project_tool_result(&message, &mut records, &call_ids, partial)
+                        project_tool_result(&message, &mut records, &call_ids, partial, deadline)?
                     }
                     (PiMessageRole::System, Some(message)) => {
-                        system_context(&message, whole()?, &mut records, partial)
+                        system_context(&message, whole()?, &mut records, partial, deadline)?
                     }
                     (PiMessageRole::BashExecution, Some(message)) => {
                         let text = ["command", "output"]
@@ -1295,7 +1400,7 @@ pub fn project_pi_content(
             }
             PiEntryKind::CustomMessage => {
                 let mut trailing = Vec::new();
-                let text = content_text(content_member(&fields), &mut trailing, partial);
+                let text = content_text(content_member(&fields), &mut trailing, partial, deadline)?;
                 records.push(PiContentRecord::Context {
                     kind: PiContextKind::CustomMessage,
                     text,
@@ -1315,7 +1420,8 @@ pub fn project_pi_content(
                                 PiRawJson(system.to_owned()),
                                 &mut records,
                                 partial,
-                            ),
+                                deadline,
+                            )?,
                             None => {
                                 partial.insert(PiContentPartialReason::MalformedField);
                             }
@@ -1359,19 +1465,47 @@ pub fn project_pi_content(
             None => projection.preamble.extend(records),
         }
     }
+    poll!(deadline);
     Ok(projection)
+}
+
+/// The lines of `bytes` that hold the branch's entries, by 1-based line
+/// number; `None` for a line the bytes do not have.
+type BranchLines<'a> = std::collections::HashMap<usize, Option<&'a [u8]>>;
+
+/// Read the lines of `bytes` that hold the branch's entries under the
+/// deadline (PI-32): one check per branch entry, then one per line of the
+/// bytes. Only those lines are kept, so blank or skipped lines never grow
+/// the index.
+fn branch_lines<'a, E>(
+    bytes: &'a [u8],
+    branch: &PiActiveBranch,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<BranchLines<'a>, PiStop<E>> {
+    let mut lines = BranchLines::with_capacity(branch.entries.len());
+    for entry in &branch.entries {
+        poll!(deadline);
+        lines.insert(entry.line, None);
+    }
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        poll!(deadline);
+        if let Some(slot) = lines.get_mut(&(index + 1)) {
+            *slot = Some(line);
+        }
+    }
+    Ok(lines)
 }
 
 /// The line of a branch entry, with its fields, checked to hold that
 /// entry: other bytes than the branch was normalized from fail.
 fn branch_entry_line<'a>(
-    lines: &[&'a [u8]],
+    lines: &BranchLines<'a>,
     entry: &PiBranchEntry,
 ) -> std::result::Result<(&'a str, RawFields<'a>), PiProjectionError> {
-    let text = entry
-        .line
-        .checked_sub(1)
-        .and_then(|line| lines.get(line))
+    let text = lines
+        .get(&entry.line)
+        .copied()
+        .flatten()
         .and_then(|line| std::str::from_utf8(line).ok())
         .ok_or(PiProjectionError::BranchMismatch)?;
     let fields = raw_fields(text).ok_or(PiProjectionError::BranchMismatch)?;
@@ -1425,25 +1559,45 @@ pub fn normalize_pi_turns(
     bytes: &[u8],
     limits: PiNormalizeLimits,
 ) -> std::result::Result<Vec<super::super::coverage::NormalizedTurn>, PiCoverageError> {
+    let branch = normalize_pi_session(bytes, limits).map_err(PiCoverageError::Refused)?;
+    let projection = project_pi_content(bytes, &branch).map_err(PiCoverageError::Projection)?;
+    // INVARIANT: without a deadline the turns are never cancelled, so the
+    // fallback error is never produced.
+    settle(coverage_turns(bytes, &branch, &projection, &NO_DEADLINE)).unwrap_or(Err(
+        PiCoverageError::Projection(PiProjectionError::BranchMismatch),
+    ))
+}
+
+/// The coverage turns of [`normalize_pi_turns`] from a branch and its
+/// projection of the same bytes, under a deadline checked at every branch
+/// entry and every line of the bytes as it indexes the branch's lines, at
+/// every turn, every entry of a turn, every record of an entry, and right
+/// before the turns are returned.
+fn coverage_turns(
+    bytes: &[u8],
+    branch: &PiActiveBranch,
+    projection: &PiContentProjection,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Vec<super::super::coverage::NormalizedTurn>, PiStop<PiCoverageError>> {
     use super::super::{
         coverage::{
-            CanonValue, Completeness, NormalizedTurn, SemanticRecord, contains_float, ordinal_key,
-            parse_canon_value, sanitize_floats, valid_provider_turn_id,
+            CanonValue, Completeness, NormalizedTurn, SemanticRecord, ordinal_key,
+            parse_canon_value, valid_provider_turn_id,
         },
         reasoning::{ReasoningProvider, ReasoningSourceKind, classify_provider_visible_reasoning},
     };
 
-    let branch = &normalize_pi_session(bytes, limits).map_err(PiCoverageError::Refused)?;
-    let projection = project_pi_content(bytes, branch).map_err(PiCoverageError::Projection)?;
-    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    let lines = branch_lines(bytes, branch, deadline)?;
     let mut turns = Vec::with_capacity(branch.turns.len());
     for (turn, projected) in branch.turns.iter().zip(&projection.turns) {
+        poll!(deadline);
         let mut complete = turn.completeness == Completeness::Complete && !turn.skipped_lines;
         let mut records = Vec::new();
         // Every entry of the turn, with its records (none for most
         // metadata entries and for an empty message).
         let mut spans = projected.entry_records.iter().peekable();
         for index in turn.entries.clone() {
+            poll!(deadline);
             let range = spans
                 .next_if(|(entry, _)| *entry == index)
                 .map_or(0..0, |(_, range)| range.clone());
@@ -1473,6 +1627,7 @@ pub fn normalize_pi_turns(
             let mut assistant = Vec::new();
             let mut ordered = Vec::new();
             for piece in pieces {
+                poll!(deadline);
                 match piece {
                     PiContentRecord::User { text } => user.push(text.as_str()),
                     PiContentRecord::Assistant { text } => assistant.push(text.as_str()),
@@ -1518,9 +1673,8 @@ pub fn normalize_pi_turns(
                                 });
                         let input = match arguments {
                             Some(mut input @ CanonValue::Object(_)) => {
-                                if contains_float(&input) {
+                                if sanitize_floats_until(&mut input, deadline)? {
                                     complete = false;
-                                    sanitize_floats(&mut input);
                                 }
                                 input
                             }
@@ -1591,7 +1745,270 @@ pub fn normalize_pi_turns(
             records,
         });
     }
+    poll!(deadline);
     Ok(turns)
+}
+
+/// Replace every fractional or beyond-i64 number in `value` with `null` and
+/// report whether there was one, as `coverage::contains_float` followed by
+/// `coverage::sanitize_floats` do (coverage-v1.md §4.5), checking the
+/// deadline at every node of the tree (PI-32). A container's children are
+/// taken one at a time from its iterator, so no child is reached without a
+/// check before it.
+fn sanitize_floats_until(
+    value: &mut super::super::coverage::CanonValue,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<bool, PiStop<PiCoverageError>> {
+    use super::super::coverage::CanonValue;
+
+    /// The children of a container not yet visited.
+    enum Children<'a> {
+        Items(std::slice::IterMut<'a, CanonValue>),
+        Fields(std::collections::btree_map::ValuesMut<'a, String, CanonValue>),
+    }
+
+    /// Visit one node: replace a fractional number, or give a container's
+    /// children.
+    fn visit<'a>(node: &'a mut CanonValue, found: &mut bool) -> Option<Children<'a>> {
+        match node {
+            CanonValue::Float(_) => {
+                *node = CanonValue::Null;
+                *found = true;
+                None
+            }
+            CanonValue::Array(items) => Some(Children::Items(items.iter_mut())),
+            CanonValue::Object(fields) => Some(Children::Fields(fields.values_mut())),
+            CanonValue::Null | CanonValue::Bool(_) | CanonValue::Int(_) | CanonValue::Str(_) => {
+                None
+            }
+        }
+    }
+
+    let mut found = false;
+    let mut open = Vec::new();
+    poll!(deadline);
+    open.extend(visit(value, &mut found));
+    while let Some(children) = open.last_mut() {
+        let next = match children {
+            Children::Items(items) => items.next(),
+            Children::Fields(fields) => fields.next(),
+        };
+        match next {
+            None => {
+                open.pop();
+            }
+            Some(child) => {
+                poll!(deadline);
+                open.extend(visit(child, &mut found));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Bound for the bytes one Pi worker frame reads. The frame reads redacted
+/// bytes, which can be longer than the raw file: this is the redacted
+/// output bound of a transcript at the raw read cap (1.5×, the bound the
+/// capture extraction helper also gives its parent).
+pub const PI_WORKER_FRAME_MAX_BYTES: u64 = PI_NORMALIZE_MAX_BYTES / 2 * 3;
+
+/// Closed readable tag for the Pi ordinary worker: the tag of Pi's readable
+/// reasoning provider. It does not change any other provider's tag.
+pub fn pi_readable_tag() -> &'static str {
+    "pi"
+}
+
+/// One assistant `thinking` block of the active branch, carrying exactly
+/// the fields the PI-21 frozen table gives a thinking block (AC10):
+/// `thinking`, `thinkingSignature`, and `redacted`, each byte for byte as
+/// written (the last value of a repeated key, as `JSON.parse` keeps it). No
+/// other field of the block is carried. `Debug` shows only lengths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiRetainedThinking {
+    /// The logical key of the ordinary turn that holds the block; `None`
+    /// before the first user message, which opens no turn.
+    pub turn_key: Option<String>,
+    pub thinking: Option<PiRawJson>,
+    pub thinking_signature: Option<PiRawJson>,
+    pub redacted: Option<PiRawJson>,
+    /// The readable text, as [`PiContentRecord::Reasoning`] gives it.
+    pub readable: Option<PiReasoningText>,
+}
+
+/// One bounded ordinary frame (PI-32): the coverage turns of
+/// [`normalize_pi_turns`] and the thinking blocks of the same active
+/// branch, in source order. Thinking is carried beside the answer, never
+/// in it. `acquisition_gate_passed` stays false until a real session
+/// comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiWorkerFrame {
+    pub tag: &'static str,
+    pub source_state: &'static str,
+    pub partial: bool,
+    pub acquisition_gate_passed: bool,
+    pub ordinary: Vec<super::super::coverage::NormalizedTurn>,
+    pub thinking: Vec<PiRetainedThinking>,
+}
+
+/// Content-free worker failure. No byte of the input is copied into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PiWorkerError {
+    /// The input is larger than [`PI_WORKER_FRAME_MAX_BYTES`], or has more
+    /// entries than [`PI_NORMALIZE_MAX_ENTRIES`].
+    Budget,
+    /// The deadline elapsed before the frame was complete.
+    Cancelled,
+    /// The normalizer refused the bytes, or they did not project.
+    BadFrame,
+}
+
+impl std::fmt::Display for PiWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Budget => "pi worker frame exceeded its budget",
+            Self::Cancelled => "pi worker frame was cancelled",
+            Self::BadFrame => "pi worker frame is unusable",
+        })
+    }
+}
+
+/// The worker frame of bytes that were already authorized (PI-32). The
+/// deadline is checked before the work (so an elapsed deadline wins over the
+/// budget), at every step of the normalizer's passes, every branch entry the
+/// projection reads, every turn and entry the coverage records come from,
+/// every record whose thinking may be carried, and once more after the frame
+/// is built, so no frame is returned after it.
+pub fn pi_worker_frame_authorized(
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> std::result::Result<PiWorkerFrame, PiWorkerError> {
+    pi_worker_frame_with_deadline(bytes, &deadline)
+}
+
+/// [`pi_worker_frame_authorized`] under any [`PiDeadline`].
+pub fn pi_worker_frame_with_deadline(
+    bytes: &[u8],
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<PiWorkerFrame, PiWorkerError> {
+    if deadline.elapsed() {
+        return Err(PiWorkerError::Cancelled);
+    }
+    if bytes.len() as u64 > PI_WORKER_FRAME_MAX_BYTES {
+        return Err(PiWorkerError::Budget);
+    }
+    let limits = PiNormalizeLimits {
+        max_bytes: PI_WORKER_FRAME_MAX_BYTES,
+        ..PiNormalizeLimits::default()
+    };
+    let branch = match normalize_session(bytes, limits, deadline) {
+        Ok(branch) => branch,
+        Err(PiStop::Cancelled) => return Err(PiWorkerError::Cancelled),
+        Err(PiStop::Failed(PiNormalizeRefusal::TooLarge)) => return Err(PiWorkerError::Budget),
+        Err(PiStop::Failed(_)) => return Err(PiWorkerError::BadFrame),
+    };
+    let projection = project_content(bytes, &branch, deadline).map_err(worker_error)?;
+    let ordinary = coverage_turns(bytes, &branch, &projection, deadline).map_err(worker_error)?;
+    let mut thinking = Vec::new();
+    let sources = std::iter::once((None, projection.preamble.as_slice())).chain(
+        projection
+            .turns
+            .iter()
+            .zip(&ordinary)
+            .map(|(turn, covered)| {
+                (
+                    Some(covered.logical_turn_key.as_str()),
+                    turn.records.as_slice(),
+                )
+            }),
+    );
+    for (turn_key, records) in sources {
+        for record in records {
+            if deadline.elapsed() {
+                return Err(PiWorkerError::Cancelled);
+            }
+            let PiContentRecord::Reasoning { readable, block } = record else {
+                continue;
+            };
+            // The block came from `raw_fields`, so it is an object.
+            let fields = raw_fields(block.get()).ok_or(PiWorkerError::BadFrame)?;
+            let carried = |name: &str| member(&fields, name).map(|raw| PiRawJson(raw.to_owned()));
+            thinking.push(PiRetainedThinking {
+                turn_key: turn_key.map(str::to_owned),
+                thinking: carried("thinking"),
+                thinking_signature: carried("thinkingSignature"),
+                redacted: carried("redacted"),
+                readable: readable.clone(),
+            });
+        }
+    }
+    let frame = PiWorkerFrame {
+        tag: pi_readable_tag(),
+        source_state: "unproven",
+        partial: true,
+        acquisition_gate_passed: false,
+        ordinary,
+        thinking,
+    };
+    if deadline.elapsed() {
+        return Err(PiWorkerError::Cancelled);
+    }
+    Ok(frame)
+}
+
+/// A deadline the Pi stages check (PI-32): before their work, once per item
+/// of every loop that reads, parses, or walks the input (lines, entries,
+/// parent-chain steps, turns, content blocks, and records, and the items of
+/// an array or object nested in an entry as they are parsed: content
+/// blocks, system sections, and nested calls; and every node of a parsed
+/// tree that is walked, such as a tool call's arguments), and once more
+/// after the result is built. Parsing one JSON value read from an entry's
+/// line (the line, or a member of it) is one step, as an entry is the unit
+/// of the stages. A loop that only moves values a checked loop already
+/// produced is not checked again. The production form is
+/// `Option<Instant>`, where `None` never elapses; a test may implement it to
+/// elapse at a chosen check. It must stay elapsed once it has elapsed.
+pub trait PiDeadline {
+    /// Whether the deadline has elapsed. Called once per check.
+    fn elapsed(&self) -> bool;
+}
+
+impl PiDeadline for Option<std::time::Instant> {
+    fn elapsed(&self) -> bool {
+        self.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+}
+
+/// The deadline of the forms that take none.
+const NO_DEADLINE: Option<std::time::Instant> = None;
+
+/// Why a deadline-bound stage stopped: its own error, or the deadline.
+enum PiStop<E> {
+    Failed(E),
+    Cancelled,
+}
+
+impl<E> From<E> for PiStop<E> {
+    fn from(error: E) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// A projection or coverage stage's stop as a worker error: the bytes
+/// already normalized, so any failure of these stages is a bad frame.
+fn worker_error<E>(stop: PiStop<E>) -> PiWorkerError {
+    match stop {
+        PiStop::Cancelled => PiWorkerError::Cancelled,
+        PiStop::Failed(_) => PiWorkerError::BadFrame,
+    }
+}
+
+/// A stage's result for its public `_until` form: `None` when cancelled.
+fn settle<T, E>(result: std::result::Result<T, PiStop<E>>) -> Option<std::result::Result<T, E>> {
+    match result {
+        Ok(value) => Some(Ok(value)),
+        Err(PiStop::Failed(error)) => Some(Err(error)),
+        Err(PiStop::Cancelled) => None,
+    }
 }
 
 /// A system message's content and sections as one context record.
@@ -1600,24 +2017,100 @@ fn system_context(
     entry: PiRawJson,
     records: &mut Vec<PiContentRecord>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<(), PiStop<PiProjectionError>> {
     let mut trailing = Vec::new();
-    let mut text = content_text(content_member(message), &mut trailing, partial);
-    text.extend(system_sections(member(message, "sections"), partial));
+    let mut text = content_text(content_member(message), &mut trailing, partial, deadline)?;
+    text.extend(system_sections(
+        member(message, "sections"),
+        partial,
+        deadline,
+    )?);
     records.push(PiContentRecord::Context {
         kind: PiContextKind::System,
         text,
         entry,
     });
     records.extend(trailing);
+    Ok(())
 }
 
-/// The blocks of a `content` array, each kept as written; `None` when the
-/// content is not an array.
-fn content_blocks(
-    content: &serde_json::value::RawValue,
-) -> Option<Vec<&serde_json::value::RawValue>> {
-    serde_json::from_str(content.get()).ok()
+/// The blocks of a `content` array, each kept as written and parsed one at
+/// a time under the deadline (PI-32); `Ok(None)` when the content is not an
+/// array.
+fn content_blocks<'a>(
+    content: &'a serde_json::value::RawValue,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Option<Vec<&'a serde_json::value::RawValue>>, PiStop<PiProjectionError>> {
+    struct Blocks<'c, 'd>(&'c ItemChecks<'d>);
+
+    impl<'de> serde::de::Visitor<'de> for Blocks<'_, '_> {
+        type Value = Vec<&'de serde_json::value::RawValue>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut blocks = Vec::new();
+            loop {
+                self.0.check()?;
+                match seq.next_element()? {
+                    Some(block) => blocks.push(block),
+                    None => return Ok(blocks),
+                }
+            }
+        }
+    }
+
+    let checks = ItemChecks::new(deadline);
+    let mut parser = serde_json::Deserializer::from_str(content.get());
+    let parsed = serde::Deserializer::deserialize_seq(&mut parser, Blocks(&checks))
+        .and_then(|blocks| parser.end().map(|()| blocks));
+    checks.outcome(parsed)
+}
+
+/// The deadline of a parser that consumes a nested array or object item by
+/// item (PI-32). A JSON error cannot carry the cancellation, so it is kept
+/// here and read back when the parse fails. (The name `settle` is kept for
+/// `LiveExportRunner`, whose callers a guard counts by method name.)
+struct ItemChecks<'d> {
+    deadline: &'d dyn PiDeadline,
+    cancelled: std::cell::Cell<bool>,
+}
+
+impl<'d> ItemChecks<'d> {
+    fn new(deadline: &'d dyn PiDeadline) -> Self {
+        Self {
+            deadline,
+            cancelled: std::cell::Cell::new(false),
+        }
+    }
+
+    /// One check, before each item.
+    fn check<E: serde::de::Error>(&self) -> std::result::Result<(), E> {
+        if self.deadline.elapsed() {
+            self.cancelled.set(true);
+            return Err(E::custom("the deadline elapsed"));
+        }
+        Ok(())
+    }
+
+    /// A parse's result: `Cancelled` when a check stopped it, `Ok(None)`
+    /// when the value has another shape.
+    fn outcome<T>(
+        &self,
+        parsed: std::result::Result<T, serde_json::Error>,
+    ) -> std::result::Result<Option<T>, PiStop<PiProjectionError>> {
+        match parsed {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if self.cancelled.get() => Err(PiStop::Cancelled),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 /// A `content` of a JSON type the message does not allow, kept whole.
@@ -1662,18 +2155,22 @@ enum ContentPiece {
 fn content_pieces(
     content: Option<&serde_json::value::RawValue>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) -> Vec<ContentPiece> {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Vec<ContentPiece>, PiStop<PiProjectionError>> {
     let Some(content) = content else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if let Ok(text) = serde_json::from_str::<String>(content.get()) {
-        return vec![ContentPiece::Text(text)];
+        return Ok(vec![ContentPiece::Text(text)]);
     }
-    let Some(blocks) = content_blocks(content) else {
-        return vec![ContentPiece::Kept(unsupported_content(content, partial))];
+    let Some(blocks) = content_blocks(content, deadline)? else {
+        return Ok(vec![ContentPiece::Kept(unsupported_content(
+            content, partial,
+        ))]);
     };
     let mut pieces = Vec::new();
     for block in blocks {
+        poll!(deadline);
         let fields = raw_fields(block.get());
         match fields.as_ref().map(|fields| {
             (
@@ -1691,7 +2188,7 @@ fn content_pieces(
             }
         }
     }
-    pieces
+    Ok(pieces)
 }
 
 /// The texts of a content, in order, for a record that holds them all;
@@ -1701,15 +2198,16 @@ fn content_text(
     content: Option<&serde_json::value::RawValue>,
     trailing: &mut Vec<PiContentRecord>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) -> Vec<String> {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Vec<String>, PiStop<PiProjectionError>> {
     let mut text = Vec::new();
-    for piece in content_pieces(content, partial) {
+    for piece in content_pieces(content, partial, deadline)? {
         match piece {
             ContentPiece::Text(part) => text.push(part),
             ContentPiece::Kept(record) => trailing.push(record),
         }
     }
-    text
+    Ok(text)
 }
 
 /// A system message's section texts, in JavaScript enumeration order; a
@@ -1717,19 +2215,20 @@ fn content_text(
 fn system_sections(
     sections: Option<&serde_json::value::RawValue>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) -> Vec<String> {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Vec<String>, PiStop<PiProjectionError>> {
     let Some(sections) = sections else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if sections.get() == "null" {
         partial.insert(PiContentPartialReason::MalformedField);
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    match serde_json::from_str::<OrderedStringSections>(sections.get()) {
-        Ok(OrderedStringSections(values)) => values.into_iter().flatten().collect(),
-        Err(_) => {
+    match ordered_sections(sections.get(), deadline)? {
+        Some(values) => Ok(values.into_iter().flatten().collect()),
+        None => {
             partial.insert(PiContentPartialReason::MalformedField);
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -1746,57 +2245,74 @@ fn js_array_index(name: &str) -> Option<u32> {
     name.parse::<u32>().ok().filter(|index| *index != u32::MAX)
 }
 
-/// `Record<string, string | null>` in the order `JSON.parse` then
-/// enumerates it: array-index names ascending, then the others in file
-/// order, a repeated name keeping its first position and last value.
-struct OrderedStringSections(Vec<Option<String>>);
+/// The values of a `Record<string, string | null>` in the order
+/// `JSON.parse` then enumerates it: array-index names ascending, then the
+/// others in file order, a repeated name keeping its first position and last
+/// value. Each entry is parsed under the deadline (PI-32); `Ok(None)` for
+/// another shape.
+fn ordered_sections(
+    text: &str,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Option<Vec<Option<String>>>, PiStop<PiProjectionError>> {
+    struct Sections<'c, 'd>(&'c ItemChecks<'d>);
 
-impl<'de> serde::Deserialize<'de> for OrderedStringSections {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Sections;
+    impl<'de> serde::de::Visitor<'de> for Sections<'_, '_> {
+        type Value = Vec<Option<String>>;
 
-        impl<'de> serde::de::Visitor<'de> for Sections {
-            type Value = OrderedStringSections;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an object of string or null sections")
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut names: Vec<String> = Vec::new();
-                let mut values: Vec<Option<String>> = Vec::new();
-                let mut positions = std::collections::HashMap::new();
-                while let Some((name, value)) = map.next_entry::<String, Option<String>>()? {
-                    match positions.get(&name) {
-                        Some(&position) => values[position] = value,
-                        None => {
-                            positions.insert(name.clone(), names.len());
-                            names.push(name);
-                            values.push(value);
-                        }
-                    }
-                }
-                // JavaScript enumerates array-index names first, ascending,
-                // then the other names in insertion order.
-                let mut order: Vec<usize> = (0..names.len()).collect();
-                order.sort_by_key(|&position| match js_array_index(&names[position]) {
-                    Some(index) => (0, u64::from(index)),
-                    None => (1, position as u64),
-                });
-                Ok(OrderedStringSections(
-                    order
-                        .into_iter()
-                        .map(|position| values[position].take())
-                        .collect(),
-                ))
-            }
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object of string or null sections")
         }
 
-        deserializer.deserialize_map(Sections)
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut names: Vec<String> = Vec::new();
+            let mut values: Vec<Option<String>> = Vec::new();
+            let mut positions = std::collections::HashMap::new();
+            loop {
+                self.0.check()?;
+                let Some((name, value)) = map.next_entry::<String, Option<String>>()? else {
+                    break;
+                };
+                match positions.get(&name) {
+                    Some(&position) => values[position] = value,
+                    None => {
+                        positions.insert(name.clone(), names.len());
+                        names.push(name);
+                        values.push(value);
+                    }
+                }
+            }
+            // JavaScript enumerates array-index names first, ascending, then
+            // the other names in insertion order. Each index name enters an
+            // ordered map with a check (two names never share an index), the
+            // others keep their order, and each value is taken with a check.
+            let mut indexed = BTreeMap::new();
+            let mut others = Vec::new();
+            for (position, name) in names.iter().enumerate() {
+                self.0.check()?;
+                match js_array_index(name) {
+                    Some(index) => {
+                        indexed.insert(index, position);
+                    }
+                    None => others.push(position),
+                }
+            }
+            let mut ordered = Vec::with_capacity(names.len());
+            for position in indexed.into_values().chain(others) {
+                self.0.check()?;
+                ordered.push(values[position].take());
+            }
+            Ok(ordered)
+        }
     }
+
+    let checks = ItemChecks::new(deadline);
+    let mut parser = serde_json::Deserializer::from_str(text);
+    let parsed = serde::Deserializer::deserialize_map(&mut parser, Sections(&checks))
+        .and_then(|values| parser.end().map(|()| values));
+    checks.outcome(parsed)
 }
 
 /// A thinking block's readable text: its `thinking` when that is a
@@ -1819,15 +2335,17 @@ fn project_assistant(
     records: &mut Vec<PiContentRecord>,
     call_ids: &mut BTreeSet<String>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<(), PiStop<PiProjectionError>> {
     let Some(content) = content else {
-        return;
+        return Ok(());
     };
-    let Some(blocks) = content_blocks(content) else {
+    let Some(blocks) = content_blocks(content, deadline)? else {
         records.push(unsupported_content(content, partial));
-        return;
+        return Ok(());
     };
     for block in blocks {
+        poll!(deadline);
         let Some(fields) = raw_fields(block.get()) else {
             unprojected(block, None, records, partial);
             continue;
@@ -1875,6 +2393,7 @@ fn project_assistant(
             _ => unprojected(block, Some(&fields), records, partial),
         }
     }
+    Ok(())
 }
 
 /// A `toolResult` message: the result record first, then any of its blocks
@@ -1884,7 +2403,8 @@ fn project_tool_result(
     records: &mut Vec<PiContentRecord>,
     call_ids: &BTreeSet<String>,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<(), PiStop<PiProjectionError>> {
     let call_id = match typed_field::<String>(message, "toolCallId") {
         Ok(call_id) => call_id,
         Err(()) => {
@@ -1904,13 +2424,14 @@ fn project_tool_result(
         }
     };
     let mut blocks = Vec::new();
-    let text = content_text(content_member(message), &mut blocks, partial);
+    let text = content_text(content_member(message), &mut blocks, partial, deadline)?;
     let nested_calls = match member(message, "nestedCalls") {
         Some(nested) if nested.get() == "null" => {
             partial.insert(PiContentPartialReason::MalformedField);
             None
         }
-        nested => nested.map(|nested| bound_nested_calls(nested, partial)),
+        Some(nested) => Some(bound_nested_calls(nested, partial, deadline)?),
+        None => None,
     };
     records.push(PiContentRecord::ToolResult {
         call_id,
@@ -1921,36 +2442,44 @@ fn project_tool_result(
         nested_calls,
     });
     records.extend(blocks);
+    Ok(())
 }
 
-/// The number of elements of a JSON array, counted without keeping them.
-struct CountedArray(usize);
+/// The number of items in a JSON array, counted in constant memory with a
+/// check before each item (PI-32); `Ok(None)` for another shape.
+fn count_array(
+    text: &str,
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<Option<usize>, PiStop<PiProjectionError>> {
+    struct Count<'c, 'd>(&'c ItemChecks<'d>);
 
-impl<'de> serde::Deserialize<'de> for CountedArray {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Count;
+    impl<'de> serde::de::Visitor<'de> for Count<'_, '_> {
+        type Value = usize;
 
-        impl<'de> serde::de::Visitor<'de> for Count {
-            type Value = CountedArray;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an array")
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut count = 0usize;
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    count += 1;
-                }
-                Ok(CountedArray(count))
-            }
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array")
         }
 
-        deserializer.deserialize_seq(Count)
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut count = 0usize;
+            loop {
+                self.0.check()?;
+                match seq.next_element::<serde::de::IgnoredAny>()? {
+                    Some(_) => count += 1,
+                    None => return Ok(count),
+                }
+            }
+        }
     }
+
+    let checks = ItemChecks::new(deadline);
+    let mut parser = serde_json::Deserializer::from_str(text);
+    let parsed = serde::Deserializer::deserialize_seq(&mut parser, Count(&checks))
+        .and_then(|count| parser.end().map(|()| count));
+    checks.outcome(parsed)
 }
 
 /// Keep `nestedCalls` as bounded metadata of its tool result. Its calls are
@@ -1959,7 +2488,8 @@ impl<'de> serde::Deserialize<'de> for CountedArray {
 fn bound_nested_calls(
     nested: &serde_json::value::RawValue,
     partial: &mut BTreeSet<PiContentPartialReason>,
-) -> PiNestedCalls {
+    deadline: &dyn PiDeadline,
+) -> std::result::Result<PiNestedCalls, PiStop<PiProjectionError>> {
     let fields = raw_fields(nested.get());
     let complete = fields
         .as_ref()
@@ -1967,21 +2497,20 @@ fn bound_nested_calls(
     if complete != Some(true) {
         partial.insert(PiContentPartialReason::NestedCallsIncomplete);
     }
-    let calls = fields.as_ref().and_then(|fields| {
-        member(fields, "calls")
-            .and_then(|calls| serde_json::from_str::<CountedArray>(calls.get()).ok())
-            .map(|CountedArray(count)| count)
-    });
+    let calls = match fields.as_ref().and_then(|fields| member(fields, "calls")) {
+        Some(calls) => count_array(calls.get(), deadline)?,
+        None => None,
+    };
     let within = nested.get().len() <= PI_NESTED_CALLS_MAX_BYTES
         && calls.is_some_and(|count| count <= PI_NESTED_CALLS_MAX_CALLS);
     if !within {
         partial.insert(PiContentPartialReason::NestedCallsOverBound);
     }
-    PiNestedCalls {
+    Ok(PiNestedCalls {
         calls: calls.unwrap_or(0),
         complete,
         raw: within.then(|| PiRawJson(nested.to_owned())),
-    }
+    })
 }
 
 /// Session token and cost totals, as Pi's `UsageTotals`
