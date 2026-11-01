@@ -330,7 +330,10 @@ fn repo_with_committed_empty_file() -> TempDir {
         &run_libra_command(&["commit", "-m", "empty", "--no-verify"], root),
         "commit empty file",
     );
-    assert_cli_success(&run_libra_command(&["read-tree", "HEAD"], root), "read-tree HEAD");
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "read-tree HEAD",
+    );
     repo
 }
 
@@ -356,7 +359,10 @@ fn diff_index_read_tree_empty_blob_is_modified_not_added() {
     );
 
     // `--name-status` must agree on the letter.
-    let named = run_libra_command(&["diff-index", "HEAD", "--name-status", "--", "empty.txt"], root);
+    let named = run_libra_command(
+        &["diff-index", "HEAD", "--name-status", "--", "empty.txt"],
+        root,
+    );
     assert_eq!(
         String::from_utf8_lossy(&named.stdout).trim(),
         "M\tempty.txt",
@@ -385,6 +391,51 @@ fn diff_index_read_tree_empty_blob_is_modified_not_added() {
     );
 }
 
+/// Git emits NO `-p` body for a stat-invalid entry whose content is unchanged,
+/// even though `--raw`/`--name-status` still report `M`. Printing a
+/// `--- /dev/null` header here would contradict the letter (issues/479 DF-01).
+#[test]
+fn diff_patch_omits_unchanged_stat_invalid_entry() {
+    let repo = repo_with_committed_empty_file();
+    let root = repo.path();
+
+    let patch = run_libra_command(&["diff-index", "-p", "HEAD", "--", "empty.txt"], root);
+    assert_eq!(patch.status.code(), Some(0));
+    assert!(
+        patch.stdout.is_empty(),
+        "an unchanged entry has no patch body: {}",
+        String::from_utf8_lossy(&patch.stdout)
+    );
+
+    let files_patch = run_libra_command(&["diff-files", "-p", "--", "empty.txt"], root);
+    assert!(
+        files_patch.stdout.is_empty(),
+        "diff-files -p must also be empty: {}",
+        String::from_utf8_lossy(&files_patch.stdout)
+    );
+
+    // The raw record still reports the pessimistic `M` with the zero worktree id.
+    let raw = run_libra_command(&["diff-index", "HEAD", "--", "empty.txt"], root);
+    assert!(
+        String::from_utf8_lossy(&raw.stdout).contains(" 0000000 M"),
+        "raw must keep the pessimistic record: {}",
+        String::from_utf8_lossy(&raw.stdout)
+    );
+
+    // A real content change still renders a patch.
+    fs::write(root.join("tracked.txt"), "changed\n").expect("modify tracked file");
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "read-tree HEAD",
+    );
+    let changed = run_libra_command(&["diff-index", "-p", "HEAD", "--", "tracked.txt"], root);
+    let changed_text = String::from_utf8_lossy(&changed.stdout);
+    assert!(
+        changed_text.contains("\n@@ ") && changed_text.contains("-tracked"),
+        "a real change keeps its hunk: {changed_text}"
+    );
+}
+
 #[test]
 fn diff_files_read_tree_empty_blob_is_modified_not_added() {
     let repo = repo_with_committed_empty_file();
@@ -405,7 +456,10 @@ fn diff_index_read_tree_worktree_truncated_to_empty_is_modified_not_deleted() {
     let root = repo.path();
     // Truncate the tracked file to zero bytes, then invalidate the stat cache.
     fs::write(root.join("tracked.txt"), "").expect("truncate tracked file");
-    assert_cli_success(&run_libra_command(&["read-tree", "HEAD"], root), "read-tree HEAD");
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "read-tree HEAD",
+    );
 
     let record = String::from_utf8_lossy(
         &run_libra_command(&["diff-index", "HEAD", "--", "tracked.txt"], root).stdout,
@@ -424,7 +478,10 @@ fn diff_status_keeps_real_additions_and_deletions() {
     let repo = create_committed_repo_via_cli();
     let root = repo.path();
     fs::write(root.join("added.txt"), "added\n").expect("create added file");
-    assert_cli_success(&run_libra_command(&["add", "added.txt"], root), "stage added");
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], root),
+        "stage added",
+    );
     assert_cli_success(
         &run_libra_command(&["rm", "--cached", "tracked.txt"], root),
         "drop tracked.txt from the index",

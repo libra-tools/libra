@@ -1138,7 +1138,10 @@ fn update_ref_stdin_z_rejects_space_separated_ref_field() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!ref_exists(&repo, "refs/heads/z1"), "nothing may be applied");
+    assert!(
+        !ref_exists(&repo, "refs/heads/z1"),
+        "nothing may be applied"
+    );
 }
 
 /// `-z` is the only mode that can carry a value containing spaces (Git applies
@@ -1148,13 +1151,12 @@ fn update_ref_stdin_z_rejects_space_separated_ref_field() {
 fn update_ref_stdin_z_value_with_spaces() {
     let (repo, c1, _c2) = repo_with_two_commits();
     fs::write(repo.path().join("spaced.txt"), "spaced\n").unwrap();
-    assert!(run_libra_command(&["add", "spaced.txt"], repo.path())
-        .status
-        .success());
-    let commit = run_libra_command(
-        &["commit", "-m", "fix bug", "--no-verify"],
-        repo.path(),
+    assert!(
+        run_libra_command(&["add", "spaced.txt"], repo.path())
+            .status
+            .success()
     );
+    let commit = run_libra_command(&["commit", "-m", "fix bug", "--no-verify"], repo.path());
     assert!(
         commit.status.success(),
         "commit with a spaced message failed: {}",
@@ -1180,6 +1182,78 @@ fn update_ref_stdin_z_value_with_spaces() {
         stdout_trimmed(&rev_parse(&repo, "HEAD")),
         "the spaced message search must select the matching commit"
     );
+}
+
+/// Git distinguishes an ABSENT field (end of input: fatal) from an EMPTY field
+/// (meaning "no value"): `update <ref> NUL <new> NUL NUL` is an unconditional
+/// update, and an empty `<oldvalue>` must not swallow the next command.
+#[test]
+fn update_ref_stdin_z_empty_oldvalue_field() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    // Empty trailing field -> no CAS at all. (One command per ref per batch:
+    // Git rejects a second update of the same ref in one batch.)
+    let created = stdin_batch(&repo, &["-z"], &format!("create refs/heads/e1\0{c1}\0"));
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let out = stdin_batch(&repo, &["-z"], &format!("update refs/heads/e1\0{c2}\0\0"));
+    assert!(
+        out.status.success(),
+        "empty <oldvalue> must mean \"no CAS\": {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&rev_parse(&repo, "refs/heads/e1")), c2);
+
+    // An empty <oldvalue> must not consume the following command.
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("delete refs/heads/e1\0\0create refs/heads/e2\0{c1}\0"),
+    );
+    assert!(
+        out.status.success(),
+        "empty <oldvalue> before another command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/e1"), "e1 must be deleted");
+    assert!(ref_exists(&repo, "refs/heads/e2"), "e2 must be created");
+}
+
+/// An ABSENT field is end-of-input, which Git treats as fatal.
+#[test]
+fn update_ref_stdin_z_missing_field_is_fatal() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("create refs/heads/m1\0{c1}\0delete refs/heads/m1\0"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "absent <oldvalue> is fatal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected end of input"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ref_exists(&repo, "refs/heads/m1"),
+        "the whole batch must apply nothing"
+    );
+
+    let empty_new = stdin_batch(&repo, &["-z"], "create refs/heads/m2\0\0");
+    assert_eq!(empty_new.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&empty_new.stderr).contains("missing <newvalue>"),
+        "stderr: {}",
+        String::from_utf8_lossy(&empty_new.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/m2"));
 }
 
 /// `-z` handles a multi-command batch and the transaction commands.

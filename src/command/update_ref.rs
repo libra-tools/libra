@@ -444,12 +444,23 @@ fn parse_stdin_command(line: &str) -> Result<StdinCommand, (String, i32)> {
 /// (Git's stdin fatals); `symref-*` stays the invalid-target class (129).
 fn parse_stdin_z(buf: &[u8]) -> Result<Vec<StdinCommand>, (String, i32)> {
     let text = String::from_utf8_lossy(buf);
-    let fields: Vec<&str> = text.split('\0').filter(|field| !field.is_empty()).collect();
+    // Keep EMPTY fields: Git distinguishes an absent field (end of input, which
+    // is an error) from an empty one, which means "no value" — `delete <ref> NUL
+    // NUL` is an unconditional delete, and `update <ref> NUL <new> NUL NUL` is an
+    // unconditional update. Only the empty fragment after the final NUL is an
+    // artifact of the terminator.
+    let mut fields: Vec<&str> = text.split('\0').collect();
+    if fields.last() == Some(&"") {
+        fields.pop();
+    }
     let mut records: Vec<StdinCommand> = Vec::new();
     let mut index = 0usize;
     while index < fields.len() {
         let head = fields[index];
         index += 1;
+        if head.is_empty() {
+            return Err(("empty update-ref stdin command".to_string(), 128));
+        }
         let (keyword, rest) = match head.split_once(' ') {
             Some((keyword, rest)) => (keyword, Some(rest)),
             None => (head, None),
@@ -457,25 +468,24 @@ fn parse_stdin_z(buf: &[u8]) -> Result<Vec<StdinCommand>, (String, i32)> {
         let command = match keyword {
             "update" | "create" | "delete" | "verify" => {
                 let ref_name = z_ref_field(keyword, rest)?;
+                // Every value field must be PRESENT in `-z` mode (an absent one
+                // is end-of-input, which Git treats as fatal); an empty field
+                // carries "no value".
                 let new_value = if keyword == "update" || keyword == "create" {
-                    Some(z_next_field(&fields, &mut index, keyword, "<newvalue>")?)
+                    let value = z_field(&fields, &mut index, keyword, "<newvalue>")?;
+                    if value.is_empty() {
+                        return Err((format!("{keyword}: missing <newvalue>"), 128));
+                    }
+                    Some(value.to_string())
                 } else {
                     None
                 };
                 let old_value = match keyword {
-                    // Git errors at end of input when an `update` batch ends
-                    // without the <oldvalue> field, so it stays required.
-                    "update" => Some(z_next_field(
-                        &fields,
-                        &mut index,
-                        keyword,
-                        "<oldvalue>",
-                    )?),
-                    // `delete`/`verify` take an optional <oldvalue>.
-                    "delete" | "verify" => fields.get(index).map(|field| {
-                        index += 1;
-                        (*field).to_string()
-                    }),
+                    // `update` requires the field; empty means "no CAS".
+                    "update" | "delete" | "verify" => {
+                        let value = z_field(&fields, &mut index, keyword, "<oldvalue>")?;
+                        (!value.is_empty()).then(|| value.to_string())
+                    }
                     // `create` takes exactly <ref> and <newvalue>.
                     _ => None,
                 };
@@ -523,10 +533,7 @@ fn parse_stdin_z(buf: &[u8]) -> Result<Vec<StdinCommand>, (String, i32)> {
                 ));
             }
             other => {
-                return Err((
-                    format!("invalid update-ref stdin command '{other}'"),
-                    128,
-                ));
+                return Err((format!("invalid update-ref stdin command '{other}'"), 128));
             }
         };
         records.push(command);
@@ -550,12 +557,12 @@ fn z_ref_field(keyword: &str, rest: Option<&str>) -> Result<String, (String, i32
     Ok(ref_name.to_string())
 }
 
-fn z_next_field(
-    fields: &[&str],
+fn z_field<'a>(
+    fields: &[&'a str],
     index: &mut usize,
     keyword: &str,
     what: &str,
-) -> Result<String, (String, i32)> {
+) -> Result<&'a str, (String, i32)> {
     let Some(field) = fields.get(*index) else {
         return Err((
             format!("{keyword}: unexpected end of input when reading {what}"),
@@ -563,7 +570,7 @@ fn z_next_field(
         ));
     };
     *index += 1;
-    Ok((*field).to_string())
+    Ok(field)
 }
 
 /// A fully parsed and value-resolved batch command, ready for the transaction.
@@ -607,9 +614,8 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         stdin.lock().read_to_end(&mut buf).map_err(|error| {
             stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
         })?;
-        parse_stdin_z(&buf).map_err(|(message, code)| {
-            stdin_fatal(format!("{message} (input: -z)"), code)
-        })?
+        parse_stdin_z(&buf)
+            .map_err(|(message, code)| stdin_fatal(format!("{message} (input: -z)"), code))?
     } else {
         let mut lines: Vec<StdinCommand> = Vec::new();
         for line in stdin.lock().lines() {
@@ -619,10 +625,12 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             if line.trim().is_empty() {
                 continue;
             }
-            let command = parse_stdin_command(&line)
-                .map_err(|(message, code)| {
-                    stdin_fatal(format!("{message} (input: {})", truncate_input(&line)), code)
-                })?;
+            let command = parse_stdin_command(&line).map_err(|(message, code)| {
+                stdin_fatal(
+                    format!("{message} (input: {})", truncate_input(&line)),
+                    code,
+                )
+            })?;
             lines.push(command);
         }
         lines
