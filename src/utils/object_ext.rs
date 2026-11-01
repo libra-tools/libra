@@ -18,7 +18,7 @@ use git_internal::{
     },
 };
 
-use crate::utils::{lfs, util};
+use crate::utils::{client_storage::ClientStorage, lfs, util};
 
 /// A recursive tree expansion failed before a complete snapshot was available.
 #[derive(Debug, thiserror::Error)]
@@ -41,8 +41,28 @@ pub trait TreeExt {
 
 /// Expand nested trees without panicking or returning a partial snapshot.
 /// Gitlinks remain leaf entries; their commit objects need not exist locally.
+///
+/// Storage is resolved the first time a nested tree is actually read, then
+/// reused for the rest of this expansion. An empty tree does not open storage.
+/// The first read failure is still attributed to the subtree being expanded.
 pub fn try_get_plain_items_with_mode(
     tree: &Tree,
+) -> Result<Vec<(PathBuf, ObjectHash, TreeItemMode)>, TreeExpansionError> {
+    let mut storage = None;
+    try_get_plain_items_with_mode_cached(tree, &mut storage)
+}
+
+pub(crate) fn try_get_plain_items_with_storage(
+    tree: &Tree,
+    storage: &ClientStorage,
+) -> Result<Vec<(PathBuf, ObjectHash, TreeItemMode)>, TreeExpansionError> {
+    let mut storage = Some(storage.clone());
+    try_get_plain_items_with_mode_cached(tree, &mut storage)
+}
+
+fn try_get_plain_items_with_mode_cached(
+    tree: &Tree,
+    storage: &mut Option<ClientStorage>,
 ) -> Result<Vec<(PathBuf, ObjectHash, TreeItemMode)>, TreeExpansionError> {
     let mut items = Vec::new();
     for item in &tree.tree_items {
@@ -51,16 +71,19 @@ pub fn try_get_plain_items_with_mode(
             continue;
         }
 
-        let load = || {
-            let storage = util::try_objects_storage().map_err(GitError::IOError)?;
-            let data = storage.get(&item.id)?;
+        let mut load = || {
+            let resolved = match storage {
+                Some(storage) => storage,
+                None => storage.insert(util::try_objects_storage().map_err(GitError::IOError)?),
+            };
+            let data = resolved.get(&item.id)?;
             Tree::from_bytes(&data, item.id)
         };
         let subtree = load().map_err(|source| TreeExpansionError {
             oid: item.id,
             source,
         })?;
-        let entries = try_get_plain_items_with_mode(&subtree)?;
+        let entries = try_get_plain_items_with_mode_cached(&subtree, storage)?;
         items.extend(
             entries
                 .into_iter()
@@ -68,6 +91,38 @@ pub fn try_get_plain_items_with_mode(
         );
     }
     Ok(items)
+}
+
+pub(crate) fn load_tree_with_storage(
+    storage: &ClientStorage,
+    hash: &ObjectHash,
+) -> io::Result<Tree> {
+    let tree_data = storage.get(hash).map_err(|err| {
+        io::Error::other(format!(
+            "Tree::load({hash}): failed to read object from storage: {err}"
+        ))
+    })?;
+    Tree::from_bytes(&tree_data, *hash).map_err(|err| {
+        io::Error::other(format!(
+            "Tree::load({hash}): failed to decode tree bytes: {err:?}"
+        ))
+    })
+}
+
+pub(crate) fn load_commit_with_storage(
+    storage: &ClientStorage,
+    hash: &ObjectHash,
+) -> io::Result<Commit> {
+    let commit_data = storage.get(hash).map_err(|err| {
+        io::Error::other(format!(
+            "Commit::load({hash}): failed to read object from storage: {err}"
+        ))
+    })?;
+    Commit::from_bytes(&commit_data, *hash).map_err(|err| {
+        io::Error::other(format!(
+            "Commit::load({hash}): failed to decode commit bytes: {err:?}"
+        ))
+    })
 }
 
 pub trait CommitExt {
@@ -91,17 +146,7 @@ impl TreeExt for Tree {
     /// A missing object, a storage read failure, or corrupt bytes returns
     /// `Err` naming the hash. [`TreeExt::try_load`] maps those failures to `None`.
     fn load(hash: &ObjectHash) -> io::Result<Tree> {
-        let storage = util::try_objects_storage()?;
-        let tree_data = storage.get(hash).map_err(|err| {
-            io::Error::other(format!(
-                "Tree::load({hash}): failed to read object from storage: {err}"
-            ))
-        })?;
-        Tree::from_bytes(&tree_data, *hash).map_err(|err| {
-            io::Error::other(format!(
-                "Tree::load({hash}): failed to decode tree bytes: {err:?}"
-            ))
-        })
+        load_tree_with_storage(&util::try_objects_storage()?, hash)
     }
 
     fn try_load(hash: &ObjectHash) -> Option<Tree> {
@@ -198,17 +243,7 @@ impl CommitExt for Commit {
     /// A missing object, a storage read failure, or corrupt bytes returns
     /// `Err` naming the hash. [`CommitExt::try_load`] maps those failures to `None`.
     fn load(hash: &ObjectHash) -> io::Result<Commit> {
-        let storage = util::try_objects_storage()?;
-        let commit_data = storage.get(hash).map_err(|err| {
-            io::Error::other(format!(
-                "Commit::load({hash}): failed to read object from storage: {err}"
-            ))
-        })?;
-        Commit::from_bytes(&commit_data, *hash).map_err(|err| {
-            io::Error::other(format!(
-                "Commit::load({hash}): failed to decode commit bytes: {err:?}"
-            ))
-        })
+        load_commit_with_storage(&util::try_objects_storage()?, hash)
     }
 
     fn try_load(hash: &ObjectHash) -> Option<Commit> {

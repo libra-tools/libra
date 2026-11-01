@@ -21,8 +21,8 @@
 use std::path::PathBuf;
 
 mod context;
-pub use context::ScopeOverrideGuard;
-pub(crate) use context::{with_request_scope, with_request_scope_sync};
+pub(crate) use context::with_request_scope;
+pub use context::{ScopeOverrideGuard, with_request_scope_sync};
 
 /// What an invocation resolved about itself, once.
 #[derive(Debug, Clone, PartialEq, Eq)]

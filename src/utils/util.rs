@@ -1140,6 +1140,18 @@ pub fn request_storage_path() -> PathBuf {
     }
 }
 
+/// [`request_storage_path`] for callers that can report a missing repository.
+///
+/// A pinned request uses the storage resolved at pin time. An unpinned caller
+/// keeps the existing cwd discovery and returns the same error
+/// [`try_get_storage_path`] already returns outside a repository.
+pub fn try_request_storage_path() -> io::Result<PathBuf> {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => Ok(pinned.storage.clone()),
+        None => try_get_storage_path(None),
+    }
+}
+
 /// The working-tree ROOT this invocation is acting on (§C.4.2).
 ///
 /// [`working_dir`] re-reads the cwd; a rebase that resolved its plan against
@@ -1365,10 +1377,38 @@ pub fn objects_storage() -> io::Result<ClientStorage> {
     cached_objects_storage(path::objects())
 }
 
-/// Get `ClientStorage` for the `objects` directory, returning a Result
+/// Get `ClientStorage` for the `objects` directory, returning a Result.
+///
+/// The objects directory comes from [`path::try_objects`], so a pinned request
+/// reuses its storage instead of rediscovering the repository from the cwd.
+/// Only the unpinned fallback records an ambient discovery.
 pub fn try_objects_storage() -> io::Result<ClientStorage> {
-    let storage = try_get_storage_path(None)?;
-    cached_objects_storage(storage.join("objects"))
+    let objects = path::try_objects()?;
+    if crate::internal::worktree_scope::WorktreeScope::request_scope().is_none() {
+        record_objects_storage_ambient_discovery();
+    }
+    cached_objects_storage(objects)
+}
+
+/// Append one line when object storage falls back to cwd discovery.
+///
+/// Active only in debug builds while `LIBRA_TEST` is set and
+/// `LIBRA_TEST_STORAGE_DISCOVERY_LOG` names a file. Release builds and
+/// ordinary runs do not write. The probe does not count repository discovery
+/// that is unrelated to object storage.
+fn record_objects_storage_ambient_discovery() {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+            return;
+        }
+        let Some(path) = std::env::var_os("LIBRA_TEST_STORAGE_DISCOVERY_LOG") else {
+            return;
+        };
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "ambient");
+        }
+    }
 }
 
 /// Resolve object storage for a caller that can handle configuration failure.

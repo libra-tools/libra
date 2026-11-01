@@ -36,7 +36,11 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         ignore::IgnorePolicy,
-        object_ext::{CommitExt, TreeExpansionError, TreeExt, try_get_plain_items_with_mode},
+        object_ext::{
+            CommitExt, TreeExpansionError, TreeExt, load_commit_with_storage,
+            load_tree_with_storage, try_get_plain_items_with_mode,
+            try_get_plain_items_with_storage,
+        },
         output::{OutputConfig, emit_json_data},
         path,
         pathspec::{PathspecError, PathspecSet},
@@ -1020,16 +1024,27 @@ pub(crate) struct HeadTreeSnapshot {
 pub(crate) fn load_head_tree_snapshot(
     head_oid: &ObjectHash,
 ) -> Result<HeadTreeSnapshot, StatusError> {
-    let commit = Commit::try_load(head_oid).ok_or_else(|| StatusError::HeadObjectUnreadable {
+    // One storage client covers the commit, root tree, and every nested tree.
+    // A configuration rejection still fails on this first object read and is
+    // mapped through the existing HEAD-unreadable error; unborn HEAD never
+    // reaches this function.
+    let storage = util::try_objects_storage().map_err(|_| StatusError::HeadObjectUnreadable {
         what: "commit",
         oid: head_oid.to_string(),
     })?;
-    let tree =
-        Tree::try_load(&commit.tree_id).ok_or_else(|| StatusError::HeadObjectUnreadable {
+    let commit = load_commit_with_storage(&storage, head_oid).map_err(|_| {
+        StatusError::HeadObjectUnreadable {
+            what: "commit",
+            oid: head_oid.to_string(),
+        }
+    })?;
+    let tree = load_tree_with_storage(&storage, &commit.tree_id).map_err(|_| {
+        StatusError::HeadObjectUnreadable {
             what: "tree",
             oid: commit.tree_id.to_string(),
-        })?;
-    let items = try_get_plain_items_with_mode(&tree)
+        }
+    })?;
+    let items = try_get_plain_items_with_storage(&tree, &storage)
         .map_err(|source| StatusError::HeadTreeExpansion { source })?;
 
     #[cfg(debug_assertions)]
