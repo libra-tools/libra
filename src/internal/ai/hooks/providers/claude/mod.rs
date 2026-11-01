@@ -89,6 +89,10 @@ impl HookProvider for ClaudeProvider {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }
 
+    fn supports_host_timeout(&self) -> bool {
+        true
+    }
+
     fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
         settings::install_claude_hooks(options)
     }
