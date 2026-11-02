@@ -2400,3 +2400,837 @@ fn pi_bounded_extraction_helper_matches_the_direct_branch() {
     assert_eq!(metadata["present"], false);
     assert_eq!(metadata["partial"], true);
 }
+
+// ---- PI-32: Pi bounded worker frame ----
+
+/// The values a frame carries, as text: every ordinary record field and
+/// every carried thinking value, byte for byte. A field the frame does not
+/// carry cannot appear here.
+fn pi_frame_text(
+    frame: &libra::internal::ai::observed_agents::builtin::pi::PiWorkerFrame,
+) -> String {
+    let mut text = pi_text_records_all(&frame.ordinary).join("\n");
+    for turn in &frame.ordinary {
+        text.push('\n');
+        text.push_str(&turn.logical_turn_key);
+    }
+    for item in &frame.thinking {
+        for raw in [&item.thinking, &item.thinking_signature, &item.redacted]
+            .into_iter()
+            .flatten()
+        {
+            text.push('\n');
+            text.push_str(raw.get());
+        }
+        if let Some(readable) = &item.readable {
+            text.push('\n');
+            text.push_str(readable.as_str());
+        }
+        if let Some(key) = &item.turn_key {
+            text.push('\n');
+            text.push_str(key);
+        }
+    }
+    text
+}
+
+/// PI-32 AC1: every thinking block of the active branch enters the frame
+/// in source order, with its `thinking`, `thinkingSignature`, and
+/// `redacted` values as written and its readable text.
+#[test]
+fn pi_worker_frame_carries_thinking_in_source_order() {
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        normalize_pi_turns, pi_worker_frame_authorized,
+    };
+
+    let bytes = pi_session(&[
+        // Before the first user message: no turn.
+        pi_message(
+            "a0",
+            None,
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "preamble thought"},
+            ]}),
+        ),
+        pi_message(
+            "u1",
+            Some("a0"),
+            serde_json::json!({"role": "user", "content": "first"}),
+        ),
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "one", "thinkingSignature": "sig-one"},
+                {"type": "text", "text": "answer"},
+                {"type": "thinking", "thinking": "", "thinkingSignature": "sig-two", "redacted": true},
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {"path": "a.rs"}},
+                {"type": "thinking", "thinking": "three", "redacted": false},
+            ]}),
+        ),
+        pi_message(
+            "t1",
+            Some("a1"),
+            serde_json::json!({"role": "toolResult", "toolCallId": "call-1", "toolName": "read",
+                "content": [{"type": "text", "text": "out"}], "isError": false}),
+        ),
+        pi_message(
+            "u2",
+            Some("t1"),
+            serde_json::json!({"role": "user", "content": "second"}),
+        ),
+        pi_message(
+            "a2",
+            Some("u2"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": 7},
+                {"type": "thinking", "thinking": "four", "thinkingSignature": {"nested": [1, 2]}},
+            ]}),
+        ),
+    ]);
+    let frame = pi_worker_frame_authorized(&bytes, None).expect("frame");
+    assert_eq!(frame.tag, "pi");
+    assert_eq!(frame.source_state, "unproven");
+    assert!(frame.partial);
+    assert!(!frame.acquisition_gate_passed);
+    assert_eq!(
+        frame.ordinary,
+        normalize_pi_turns(&bytes, Default::default()).expect("turns")
+    );
+    let carried: Vec<_> = frame
+        .thinking
+        .iter()
+        .map(|item| {
+            (
+                item.turn_key.clone(),
+                item.thinking.as_ref().map(|raw| raw.get().to_string()),
+                item.thinking_signature
+                    .as_ref()
+                    .map(|raw| raw.get().to_string()),
+                item.redacted.as_ref().map(|raw| raw.get().to_string()),
+                item.readable.as_ref().map(|text| text.as_str().to_string()),
+            )
+        })
+        .collect();
+    let s = |text: &str| Some(text.to_string());
+    assert_eq!(
+        carried,
+        vec![
+            (
+                None,
+                s("\"preamble thought\""),
+                None,
+                None,
+                s("preamble thought")
+            ),
+            (s("u1"), s("\"one\""), s("\"sig-one\""), None, s("one")),
+            (s("u1"), s("\"\""), s("\"sig-two\""), s("true"), None),
+            (s("u1"), s("\"three\""), None, s("false"), s("three")),
+            (s("u2"), s("7"), None, None, None),
+            (
+                s("u2"),
+                s("\"four\""),
+                s("{\"nested\":[1,2]}"),
+                None,
+                s("four")
+            ),
+        ]
+    );
+}
+
+/// PI-32 AC2: fields and entries outside the PI-20/PI-21 frozen tables, and
+/// table fields that are not carried values (metadata, opaque, unsupported,
+/// extension data), never enter the frame; the carried values do.
+#[test]
+fn pi_worker_frame_carries_no_field_outside_the_allowlist() {
+    use libra::internal::ai::observed_agents::builtin::pi::pi_worker_frame_authorized;
+
+    let bytes = pi_session(&[
+        pi_entry(
+            "vendor_note",
+            "v1",
+            None,
+            serde_json::json!({"text": "pi-private unknown entry"}),
+        ),
+        pi_message(
+            "u1",
+            Some("v1"),
+            serde_json::json!({"role": "user", "vendorField": "pi-private user field",
+            "content": [
+                {"type": "text", "text": "pi-allowed prompt", "textSignature": "pi-private text sig"},
+                {"type": "image", "data": "pi-private-image-data", "mimeType": "image/png"},
+                {"type": "vendor_block", "data": "pi-private unknown block"},
+            ]}),
+        ),
+        pi_message(
+            "a1",
+            Some("u1"),
+            serde_json::json!({"role": "assistant", "model": "pi-private-model",
+            "deferred": {"id": "pi-private-deferred", "data": "pi-private deferred data"},
+            "diagnostics": "pi-private diagnostics",
+            "content": [
+                {"type": "thinking", "thinking": "pi-allowed thought",
+                    "thinkingSignature": "pi-allowed signature",
+                    "vendorThinking": "pi-private thinking field"},
+                {"type": "text", "text": "pi-allowed answer", "textSignature": "pi-private answer sig"},
+                {"type": "toolCall", "id": "call-1", "name": "read",
+                    "arguments": {"path": "pi-allowed.rs"},
+                    "argumentsError": "pi-private arguments error",
+                    "thoughtSignature": "pi-private thought signature",
+                    "namespace": "pi-private-namespace"},
+                {"type": "vendor_block", "data": "pi-private assistant block"},
+            ]}),
+        ),
+        pi_message(
+            "t1",
+            Some("a1"),
+            serde_json::json!({"role": "toolResult", "toolCallId": "call-1", "toolName": "read",
+                "details": {"x": "pi-private details"},
+                "nestedCalls": {"calls": [{"name": "pi-private nested"}], "complete": true},
+                "content": [{"type": "text", "text": "pi-allowed output"}], "isError": false}),
+        ),
+        pi_message(
+            "r1",
+            Some("t1"),
+            serde_json::json!({"role": "vendorRole", "content": "pi-private unknown role"}),
+        ),
+        pi_entry(
+            "custom",
+            "c1",
+            Some("r1"),
+            serde_json::json!({"customType": "x", "data": "pi-private custom data"}),
+        ),
+    ]);
+    let frame = pi_worker_frame_authorized(&bytes, None).expect("frame");
+    let text = pi_frame_text(&frame);
+    assert!(
+        !text.contains("pi-private"),
+        "frame carried a field outside the allowlist: {text}"
+    );
+    for allowed in [
+        "pi-allowed prompt",
+        "pi-allowed thought",
+        "pi-allowed signature",
+        "pi-allowed answer",
+        "pi-allowed.rs",
+        "pi-allowed output",
+    ] {
+        assert!(
+            text.contains(allowed),
+            "{allowed} is missing from the frame"
+        );
+    }
+}
+
+/// PI-32 AC3: input over the frame's byte budget is refused as `Budget`.
+/// The budget is the 24 MiB redacted bound, not the 16 MiB raw cap; the
+/// normalizer's entry bound is a budget too.
+#[test]
+fn pi_worker_frame_refuses_an_over_budget_input() {
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        PI_NORMALIZE_MAX_ENTRIES, PI_WORKER_FRAME_MAX_BYTES, PiWorkerError,
+        pi_worker_frame_authorized,
+    };
+
+    assert_eq!(PI_WORKER_FRAME_MAX_BYTES, 24 * 1024 * 1024);
+    let session = |filler: usize| {
+        pi_session(&[pi_message(
+            "u1",
+            None,
+            serde_json::json!({"role": "user", "content": "x".repeat(filler)}),
+        )])
+    };
+    let base = session(0).len();
+    let fits = session(PI_WORKER_FRAME_MAX_BYTES as usize - base);
+    assert_eq!(fits.len() as u64, PI_WORKER_FRAME_MAX_BYTES);
+    let frame = pi_worker_frame_authorized(&fits, None).expect("a session at the budget");
+    assert_eq!(frame.ordinary.len(), 1);
+    let over = session(PI_WORKER_FRAME_MAX_BYTES as usize - base + 1);
+    assert_eq!(over.len() as u64, PI_WORKER_FRAME_MAX_BYTES + 1);
+    assert_eq!(
+        pi_worker_frame_authorized(&over, None),
+        Err(PiWorkerError::Budget)
+    );
+    // Past the default raw cap but within the budget: still a frame.
+    let past_raw = session(17 * 1024 * 1024);
+    assert!(pi_worker_frame_authorized(&past_raw, None).is_ok());
+
+    let mut entries = vec![pi_message(
+        "u1",
+        None,
+        serde_json::json!({"role": "user", "content": "q"}),
+    )];
+    let mut parent = "u1".to_string();
+    for index in 0..PI_NORMALIZE_MAX_ENTRIES {
+        let id = format!("l{index}");
+        entries.push(pi_entry("label", &id, Some(&parent), serde_json::json!({})));
+        parent = id;
+    }
+    let many = pi_session(&entries);
+    assert!((many.len() as u64) < PI_WORKER_FRAME_MAX_BYTES);
+    assert_eq!(
+        pi_worker_frame_authorized(&many, None),
+        Err(PiWorkerError::Budget)
+    );
+}
+
+/// A long, valid session: `turns` user/assistant pairs.
+fn pi_long_session(turns: usize) -> Vec<u8> {
+    let mut lines = Vec::with_capacity(turns * 2);
+    let mut parent: Option<String> = None;
+    for index in 0..turns {
+        let user = format!("u{index}");
+        let assistant = format!("a{index}");
+        lines.push(pi_message(
+            &user,
+            parent.as_deref(),
+            serde_json::json!({"role": "user", "content": format!("prompt {index}")}),
+        ));
+        lines.push(pi_message(
+            &assistant,
+            Some(&user),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("thought {index}")},
+                {"type": "text", "text": format!("answer {index}")},
+            ]}),
+        ));
+        parent = Some(assistant);
+    }
+    pi_session(&lines)
+}
+
+/// A deadline that counts its checks and elapses from check `at` on; with
+/// `at` of `None` it never elapses.
+struct PiCountingDeadline {
+    checks: std::cell::Cell<usize>,
+    at: Option<usize>,
+}
+
+impl PiCountingDeadline {
+    fn at(at: Option<usize>) -> Self {
+        Self {
+            checks: std::cell::Cell::new(0),
+            at,
+        }
+    }
+
+    fn checks(&self) -> usize {
+        self.checks.get()
+    }
+}
+
+impl libra::internal::ai::observed_agents::builtin::pi::PiDeadline for PiCountingDeadline {
+    fn elapsed(&self) -> bool {
+        let check = self.checks.get() + 1;
+        self.checks.set(check);
+        self.at.is_some_and(|at| check >= at)
+    }
+}
+
+/// PI-32 AC4: an elapsed deadline cancels the frame, both before the call
+/// and while a large session is processed. A counting [`PiDeadline`] pins
+/// the checks without a clock. Single cases pin a check whose input ends
+/// otherwise when it is missing (a refusal found later, or a result); the
+/// growth of the check count with the session pins the check of every pass
+/// over lines and entries, since a pass without its check grows the count
+/// less.
+#[test]
+fn pi_worker_frame_cancels_at_the_deadline() {
+    use std::time::{Duration, Instant};
+
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        PI_WORKER_FRAME_MAX_BYTES, PiNormalizeRefusal, PiProjectionError, PiWorkerError,
+        normalize_pi_session_until, pi_worker_frame_authorized, pi_worker_frame_with_deadline,
+        project_pi_content_until,
+    };
+
+    let none: Option<Instant> = None;
+    let lines = |bytes: &[u8]| bytes.split(|byte| *byte == b'\n').count();
+    let normalizer_checks = |bytes: &[u8]| {
+        let deadline = PiCountingDeadline::at(None);
+        assert!(matches!(
+            normalize_pi_session_until(bytes, Default::default(), &deadline),
+            Some(Ok(_))
+        ));
+        deadline.checks()
+    };
+    let frame_checks = |bytes: &[u8]| {
+        let deadline = PiCountingDeadline::at(None);
+        assert!(pi_worker_frame_with_deadline(bytes, &deadline).is_ok());
+        deadline.checks()
+    };
+
+    // Before the call.
+    let small = pi_interleaved_session();
+    let past = Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past"),
+    );
+    assert_eq!(
+        pi_worker_frame_authorized(&small, past),
+        Err(PiWorkerError::Cancelled)
+    );
+    assert_eq!(
+        normalize_pi_session_until(&small, Default::default(), &past),
+        None
+    );
+    let branch = normalize_pi_session_until(&small, Default::default(), &none)
+        .expect("not cancelled")
+        .expect("branch");
+    assert_eq!(project_pi_content_until(&small, &branch, &past), None);
+    assert!(pi_worker_frame_authorized(&small, None).is_ok());
+    // The frame checks before its budget: an elapsed deadline wins.
+    let oversized = vec![b' '; (PI_WORKER_FRAME_MAX_BYTES + 1) as usize];
+    assert_eq!(
+        pi_worker_frame_authorized(&oversized, None),
+        Err(PiWorkerError::Budget)
+    );
+    assert_eq!(
+        pi_worker_frame_authorized(&oversized, past),
+        Err(PiWorkerError::Cancelled)
+    );
+
+    // Normalizer, line scan: the last line is refused while it is read, so
+    // only a check in the line loop cancels a large session halfway. Check
+    // 1 is before the work, checks 2..=lines+1 are one per line.
+    let large = pi_long_session(2_000);
+    let mut bad_tail = large.clone();
+    bad_tail.extend_from_slice(br#"{"type":"label","id":""}"#);
+    assert_eq!(
+        normalize_pi_session_until(&bad_tail, Default::default(), &none),
+        Some(Err(PiNormalizeRefusal::UnrepresentableEntry))
+    );
+    let halfway = lines(&bad_tail) / 2;
+    let deadline = PiCountingDeadline::at(Some(halfway));
+    assert_eq!(
+        normalize_pi_session_until(&bad_tail, Default::default(), &deadline),
+        None
+    );
+    assert_eq!(deadline.checks(), halfway, "stops at the elapsed check");
+
+    // Normalizer, after the scan: a duplicate id is found only when the
+    // entries are indexed, so only a check there cancels at the first check
+    // after the line scan.
+    let mut duplicate = large.clone();
+    duplicate.extend_from_slice(
+        pi_message(
+            "u0",
+            Some("a1999"),
+            serde_json::json!({"role": "user", "content": "again"}),
+        )
+        .as_bytes(),
+    );
+    duplicate.push(b'\n');
+    assert_eq!(
+        normalize_pi_session_until(&duplicate, Default::default(), &none),
+        Some(Err(PiNormalizeRefusal::DuplicateEntryId))
+    );
+    let deadline = PiCountingDeadline::at(Some(lines(&duplicate) + 2));
+    assert_eq!(
+        normalize_pi_session_until(&duplicate, Default::default(), &deadline),
+        None
+    );
+
+    // Normalizer, after the branch is built: a header-only session has no
+    // entries, so the first check after the line scan is the last one.
+    let header_only = pi_session(&[]);
+    let deadline = PiCountingDeadline::at(Some(lines(&header_only) + 2));
+    assert_eq!(
+        normalize_pi_session_until(&header_only, Default::default(), &deadline),
+        None
+    );
+
+    // Normalizer, every pass: one more user/assistant pair adds, per entry,
+    // its line, its index, its parent link, its cycle-walk start, two walk
+    // steps (the entry, then its finished parent), its walk finish, its
+    // branch-walk step, its compaction-search step, and its branch build
+    // (10), one turn, and one swap of the root-first reversal: 2 × 10 + 2.
+    let per_pair = 2 * 10 + 2;
+    assert_eq!(
+        normalizer_checks(&pi_long_session(200)) - normalizer_checks(&pi_long_session(100)),
+        100 * per_pair
+    );
+    // With a compaction at the end whose kept entry is missing, the
+    // compaction search stops at once and the kept-entry search walks the
+    // whole branch instead: the same growth, now through that search.
+    let compacted = |pairs: usize| {
+        let mut bytes = pi_long_session(pairs);
+        bytes.extend_from_slice(
+            pi_entry(
+                "compaction",
+                "c0",
+                Some(&format!("a{}", pairs - 1)),
+                serde_json::json!({"summary": "s", "firstKeptEntryId": "missing", "tokensBefore": 1}),
+            )
+            .as_bytes(),
+        );
+        bytes.push(b'\n');
+        bytes
+    };
+    assert_eq!(
+        normalizer_checks(&compacted(200)) - normalizer_checks(&compacted(100)),
+        100 * per_pair
+    );
+    // Skipped lines: each malformed line adds its line check and one run
+    // to attribute, and attributing any run puts the branch in line order
+    // once (one check per branch entry, then one per indexed entry).
+    let pairs = 100;
+    let clean = pi_long_session(pairs);
+    let mut skipped = Vec::new();
+    let mut runs = 0;
+    for (index, line) in clean.split(|byte| *byte == b'\n').enumerate() {
+        if index > 0 {
+            skipped.push(b'\n');
+        }
+        skipped.extend_from_slice(line);
+        if index > 0 && index % 10 == 0 {
+            skipped.extend_from_slice(b"\n{truncated");
+            runs += 1;
+        }
+    }
+    assert!(runs > 1);
+    assert_eq!(
+        normalizer_checks(&skipped) - normalizer_checks(&clean),
+        2 * runs + 2 * pairs + 2 * pairs
+    );
+    // A child-before-parent chain: the first cycle walk follows the whole
+    // chain and finishes it, and every later start meets a finished entry,
+    // so each entry adds its line, index, parent link, walk start, walk
+    // step, walk finish, and later finished-entry step (7); the branch is
+    // only the root.
+    let chain = |length: usize| {
+        let mut entries = Vec::with_capacity(length);
+        for index in 0..length {
+            let parent = (index + 1 < length).then(|| format!("e{}", index + 1));
+            entries.push(pi_entry(
+                "label",
+                &format!("e{index}"),
+                parent.as_deref(),
+                serde_json::json!({}),
+            ));
+        }
+        pi_session(&entries)
+    };
+    assert_eq!(
+        normalizer_checks(&chain(4_000)) - normalizer_checks(&chain(2_000)),
+        2_000 * 7
+    );
+    // Cancelled halfway through that first walk, and stopped there: after
+    // check 1, the lines, the index, the parent links, and the first walk
+    // start come its steps.
+    let long_chain = chain(4_000);
+    let at = 1 + lines(&long_chain) + 4_000 + 4_000 + 1 + 2_000;
+    let deadline = PiCountingDeadline::at(Some(at));
+    assert_eq!(
+        normalize_pi_session_until(&long_chain, Default::default(), &deadline),
+        None
+    );
+    assert_eq!(deadline.checks(), at, "stops inside the walk");
+
+    // Projection, entry by entry: the last entry's line no longer holds that
+    // entry, so only a check in the entry loop cancels halfway.
+    let branch = normalize_pi_session_until(&large, Default::default(), &none)
+        .expect("not cancelled")
+        .expect("branch");
+    let entries = branch.entries.len();
+    let renamed = String::from_utf8(large.clone())
+        .expect("utf-8")
+        .replace("\"id\":\"a1999\"", "\"id\":\"z1999\"")
+        .into_bytes();
+    assert_eq!(
+        project_pi_content_until(&renamed, &branch, &none),
+        Some(Err(PiProjectionError::BranchMismatch))
+    );
+    let deadline = PiCountingDeadline::at(Some(entries / 2));
+    assert_eq!(project_pi_content_until(&renamed, &branch, &deadline), None);
+    assert_eq!(deadline.checks(), entries / 2, "stops at the elapsed check");
+
+    // Projection, exactly: check 1, one per branch entry and one per line as
+    // it indexes the branch's lines, one per turn and per turn entry it sets
+    // up, one per entry, five per assistant
+    // content array of a thinking and a text block (one per block as the
+    // array is parsed, one at its end, and one per block projected; a user's
+    // string content has no array), and the last, after it is built.
+    let turns = 2_000;
+    let projection_checks =
+        |bytes: &[u8],
+         branch: &libra::internal::ai::observed_agents::builtin::pi::PiActiveBranch| {
+            let deadline = PiCountingDeadline::at(None);
+            assert!(matches!(
+                project_pi_content_until(bytes, branch, &deadline),
+                Some(Ok(_))
+            ));
+            deadline.checks()
+        };
+    let projected = projection_checks(&large, &branch);
+    assert_eq!(
+        projected,
+        1 + entries + lines(&large) + turns + entries + entries + 5 * turns + 1
+    );
+    let deadline = PiCountingDeadline::at(Some(projected));
+    assert_eq!(project_pi_content_until(&large, &branch, &deadline), None);
+
+    // Many blocks in one entry: each more block adds two projection checks
+    // (as the array is parsed, and as the block is projected) and, in the
+    // frame, one coverage record and one thinking record check.
+    let one_entry = |role: &str, blocks: usize| {
+        let content: Vec<_> = (0..blocks)
+            .map(|index| serde_json::json!({"type": "text", "text": format!("b{index}")}))
+            .collect();
+        let mut entries = vec![pi_message(
+            "u0",
+            None,
+            serde_json::json!({"role": "user", "content": "q"}),
+        )];
+        if role == "user" {
+            entries[0] = pi_message(
+                "u0",
+                None,
+                serde_json::json!({"role": "user", "content": content}),
+            );
+        } else {
+            entries.push(pi_message(
+                "a0",
+                Some("u0"),
+                serde_json::json!({"role": role, "content": content}),
+            ));
+        }
+        pi_session(&entries)
+    };
+    for role in ["assistant", "user"] {
+        let small_entry = one_entry(role, 2_000);
+        let large_entry = one_entry(role, 4_000);
+        let small_branch = normalize_pi_session_until(&small_entry, Default::default(), &none)
+            .expect("not cancelled")
+            .expect("branch");
+        let large_branch = normalize_pi_session_until(&large_entry, Default::default(), &none)
+            .expect("not cancelled")
+            .expect("branch");
+        assert_eq!(
+            projection_checks(&large_entry, &large_branch)
+                - projection_checks(&small_entry, &small_branch),
+            2_000 * 2,
+            "{role} blocks"
+        );
+        assert_eq!(
+            frame_checks(&large_entry) - frame_checks(&small_entry),
+            2_000 * 4,
+            "{role} blocks in the frame"
+        );
+    }
+    // Nested collections in one entry, parsed item by item: each more system
+    // section adds three projection checks (its entry, its enumeration key,
+    // and taking its value in order), and each more nested call one.
+    let nested = |sections: usize, calls: usize| {
+        let sections: serde_json::Map<String, serde_json::Value> = (0..sections)
+            .map(|index| (format!("s{index}"), serde_json::json!(format!("v{index}"))))
+            .collect();
+        let calls: Vec<_> = (0..calls).map(|_| serde_json::json!({})).collect();
+        let bytes = pi_session(&[
+            pi_message(
+                "u0",
+                None,
+                serde_json::json!({"role": "user", "content": "q"}),
+            ),
+            pi_message(
+                "s0",
+                Some("u0"),
+                serde_json::json!({"role": "system", "content": "sys", "sections": sections}),
+            ),
+            pi_message(
+                "t0",
+                Some("s0"),
+                serde_json::json!({"role": "toolResult", "toolCallId": "c", "toolName": "read",
+                    "content": [], "isError": false,
+                    "nestedCalls": {"calls": calls, "complete": true}}),
+            ),
+        ]);
+        let branch = normalize_pi_session_until(&bytes, Default::default(), &none)
+            .expect("not cancelled")
+            .expect("branch");
+        projection_checks(&bytes, &branch)
+    };
+    assert_eq!(nested(4_000, 0) - nested(2_000, 0), 2_000 * 3, "sections");
+    assert_eq!(nested(0, 4_000) - nested(0, 2_000), 2_000, "nested calls");
+    // One tool call's arguments, walked node by node for fractional numbers:
+    // each more array item adds one frame check, and a deadline that elapses
+    // halfway through the walk stops it there. After the frame's first
+    // check, the normalizer, and the projection come the coverage line index,
+    // the turn, the user entry and its record, the assistant entry and its
+    // tool call record, then the walk.
+    let tool_call = |items: usize| {
+        let values: Vec<_> = (0..items).map(|index| serde_json::json!(index)).collect();
+        pi_session(&[
+            pi_message(
+                "u0",
+                None,
+                serde_json::json!({"role": "user", "content": "q"}),
+            ),
+            pi_message(
+                "a0",
+                Some("u0"),
+                serde_json::json!({"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "c", "name": "read",
+                        "arguments": {"values": values, "ratio": 0.5}},
+                ]}),
+            ),
+        ])
+    };
+    assert_eq!(
+        frame_checks(&tool_call(4_000)) - frame_checks(&tool_call(2_000)),
+        2_000,
+        "argument nodes"
+    );
+    let arguments = tool_call(4_000);
+    let arguments_branch = normalize_pi_session_until(&arguments, Default::default(), &none)
+        .expect("not cancelled")
+        .expect("branch");
+    let at = 1
+        + normalizer_checks(&arguments)
+        + projection_checks(&arguments, &arguments_branch)
+        + arguments_branch.entries.len()
+        + lines(&arguments)
+        + 5
+        + 2_000;
+    let deadline = PiCountingDeadline::at(Some(at));
+    assert_eq!(
+        pi_worker_frame_with_deadline(&arguments, &deadline),
+        Err(PiWorkerError::Cancelled)
+    );
+    assert_eq!(deadline.checks(), at, "stops inside the walk");
+    // The same frame, exactly, which also pins the check before the walk's
+    // root: the frame's first check, the normalizer, the projection, then
+    // coverage (a line-index key per entry and each line, the turn, each
+    // entry and its record, the walk's root, `ratio`, `values`, and each
+    // item, and the last), one thinking check per record, and the last.
+    assert_eq!(
+        frame_checks(&arguments),
+        1 + normalizer_checks(&arguments)
+            + projection_checks(&arguments, &arguments_branch)
+            + (arguments_branch.entries.len() + lines(&arguments) + 1 + 2 * 2 + (3 + 4_000) + 1)
+            + 2
+            + 1
+    );
+
+    // One turn holding many entries: each more assistant message with a
+    // thinking block adds 10 normalizer checks (as above; and every second
+    // one a reversal swap), 7 projection checks (its line index key and
+    // line, its turn-entry setup, its entry, its block as the array is
+    // parsed, the array's end, and its block projected), 4 coverage checks
+    // (its line index key and line, its entry, its record), and one thinking
+    // record check.
+    let single_turn = |messages: usize| {
+        let mut entries = vec![pi_message(
+            "u0",
+            None,
+            serde_json::json!({"role": "user", "content": "q"}),
+        )];
+        let mut parent = "u0".to_string();
+        for index in 0..messages {
+            let id = format!("a{index}");
+            entries.push(pi_message(
+                &id,
+                Some(&parent),
+                serde_json::json!({"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": format!("t{index}")},
+                ]}),
+            ));
+            parent = id;
+        }
+        pi_session(&entries)
+    };
+    assert_eq!(
+        frame_checks(&single_turn(400)) - frame_checks(&single_turn(200)),
+        200 * (10 + 7 + 4 + 1) + 100
+    );
+    // Cancelled while that turn's coverage records are built, and stopped
+    // there: after the frame's first check, the normalizer, the projection,
+    // the coverage line index (a key per entry, then each line), and the
+    // turn's own check come its entries.
+    let one_turn = single_turn(400);
+    let one_branch = normalize_pi_session_until(&one_turn, Default::default(), &none)
+        .expect("not cancelled")
+        .expect("branch");
+    let projection = PiCountingDeadline::at(None);
+    assert!(matches!(
+        project_pi_content_until(&one_turn, &one_branch, &projection),
+        Some(Ok(_))
+    ));
+    let at = 1
+        + normalizer_checks(&one_turn)
+        + projection.checks()
+        + one_branch.entries.len()
+        + lines(&one_turn)
+        + 1
+        + 200;
+    let deadline = PiCountingDeadline::at(Some(at));
+    assert_eq!(
+        pi_worker_frame_with_deadline(&one_turn, &deadline),
+        Err(PiWorkerError::Cancelled)
+    );
+    assert_eq!(deadline.checks(), at, "stops inside the turn");
+
+    // The whole frame, exactly: its first check, the normalizer, the
+    // projection, the coverage records (one per branch entry and per line
+    // of its line index, per turn, per entry of a turn, per record, and the last), one per
+    // projected record for thinking (each turn holds a user, a thinking, and
+    // an answer record), and its last check.
+    let total = frame_checks(&large);
+    assert_eq!(
+        total,
+        1 + normalizer_checks(&large)
+            + projected
+            + (entries + lines(&large) + turns + entries + 3 * turns + 1)
+            + 3 * turns
+            + 1
+    );
+    // Cancelled at the first check, halfway, and at the last check, and
+    // stopped there each time.
+    for at in [1, total / 2, total] {
+        let deadline = PiCountingDeadline::at(Some(at));
+        assert_eq!(
+            pi_worker_frame_with_deadline(&large, &deadline),
+            Err(PiWorkerError::Cancelled),
+            "frame cancelled at check {at} of {total}"
+        );
+        assert_eq!(deadline.checks(), at, "frame stops at check {at}");
+    }
+}
+
+/// PI-32 AC5: bytes the normalizer refuses give `BadFrame`.
+#[test]
+fn pi_worker_frame_rejects_what_the_normalizer_refuses() {
+    use libra::internal::ai::observed_agents::builtin::pi::{
+        PiWorkerError, pi_worker_frame_authorized,
+    };
+
+    let header = |version: i64| {
+        serde_json::json!({"type": "session", "version": version,
+            "id": "019a3c2e-7b10-7000-8000-0000000000aa", "cwd": "/work"})
+        .to_string()
+    };
+    let user = |id: &str, parent: Option<&str>| {
+        pi_message(
+            id,
+            parent,
+            serde_json::json!({"role": "user", "content": "q"}),
+        )
+    };
+    let version_two = format!("{}\n{}\n", header(2), user("u1", None)).into_bytes();
+    let duplicate = pi_session(&[user("u1", None), user("u1", None)]);
+    let cycle = pi_session(&[user("u1", Some("u2")), user("u2", Some("u1"))]);
+    for (name, bytes) in [
+        ("version 2", version_two),
+        ("duplicate id", duplicate),
+        ("parent cycle", cycle),
+        ("not a session", b"not json".to_vec()),
+        ("empty", Vec::new()),
+    ] {
+        assert_eq!(
+            pi_worker_frame_authorized(&bytes, None),
+            Err(PiWorkerError::BadFrame),
+            "{name}"
+        );
+    }
+}

@@ -8,14 +8,23 @@
   window. The `libra` binary therefore requires `libfontconfig.so.1`,
   `libxkbcommon.so.0`, and `libxkbcommon-x11.so.0` at runtime even when
   `libra ui` is never used. Minimal and headless Linux hosts must install the
-  runtime packages described in `docs/installation.md`. The `gui` Cargo feature
-  no longer gates compilation.
+  runtime packages described in `docs/installation.md`. The empty `gui`
+  Cargo feature has been removed, so `--features gui` is not accepted.
+
+### Added
+
+- `libra mega2 traces` reads scoped Mega2 history (`capabilities`, `targets`,
+  `streams`, `sessions`, `show`, `checkpoints`, `search`, `transcript`) and
+  `fetch` writes one verified archive ref at
+  `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`. Ordinary code clone
+  still refuses a `/.traces/` locator, and a Mega2 code mirror still fetches
+  branch tips only. This note records the code delivery. It is not a GitHub
+  Release, and the live HTTP/SSH audit is not claimed here.
 
 ### Changed
 
 - `libra ui` and the GPUI desktop window are now part of every standard build.
-  The `gui` Cargo feature remains only as a deprecated no-op for existing build
-  scripts. Linux source builds need the fontconfig and xkbcommon development
+  Linux source builds need the fontconfig and xkbcommon development
   headers (`libfontconfig1-dev`, `libxkbcommon-dev`, and
   `libxkbcommon-x11-dev` on Debian/Ubuntu).
 

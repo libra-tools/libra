@@ -1632,9 +1632,10 @@ fn update_ref_stdin_refuses_commit_when_stdout_is_closed() {
     drop(stdin);
 
     let output = child.wait_with_output().expect("wait for child");
-    assert!(
-        !output.status.success(),
-        "a closed stdout must fail the batch: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "a closed stdout must fail the batch with exit code 128: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(

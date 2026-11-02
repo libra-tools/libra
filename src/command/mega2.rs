@@ -93,7 +93,7 @@ pub struct Mega2Args {
     pub command: Mega2Subcommand,
 }
 
-/// The only registered `mega2` subcommand.
+/// Registered `mega2` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Mega2Subcommand {
     #[command(
@@ -101,6 +101,9 @@ pub enum Mega2Subcommand {
         after_help = MEGA2_BROWSER_EXAMPLES
     )]
     Browser(BrowserArgs),
+    /// Read scoped traces metadata or fetch one verified stream.
+    #[command(about = "Query or fetch Mega2 traces")]
+    Traces(crate::command::mega2_traces::TracesArgs),
 }
 
 /// Arguments for the single public browser surface.
@@ -313,6 +316,9 @@ pub(crate) fn browser_data<'a>(
 pub async fn execute_safe(args: Mega2Args, output: &OutputConfig) -> CliResult<()> {
     match args.command {
         Mega2Subcommand::Browser(browser) => execute_browser(browser, output).await,
+        Mega2Subcommand::Traces(traces) => {
+            crate::command::mega2_traces::execute_safe(traces, output).await
+        }
     }
 }
 

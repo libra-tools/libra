@@ -4,7 +4,7 @@
 //! and it does not substitute a stub server. Secret values stay out of
 //! assertions and logs.
 
-use std::env;
+use std::{env, path::PathBuf};
 
 /// Environment names required by GC-LTR-LIVE. Values are checked for
 /// presence only.
@@ -27,6 +27,10 @@ pub const LIVE_KEYS: &[&str] = &[
 pub struct LiveFixture {
     pub http_url: String,
     pub ssh_uri: String,
+    pub token_file: PathBuf,
+    pub peer_token_file: PathBuf,
+    pub ssh_key_file: PathBuf,
+    pub peer_ssh_key_file: PathBuf,
     pub target: String,
     pub other_target: String,
     pub server_id: String,
@@ -63,6 +67,10 @@ impl LiveFixture {
         Ok(Self {
             http_url: values[1].clone(),
             ssh_uri,
+            token_file: PathBuf::from(&values[3]),
+            peer_token_file: PathBuf::from(&values[4]),
+            ssh_key_file: PathBuf::from(&values[5]),
+            peer_ssh_key_file: PathBuf::from(&values[6]),
             target: values[7].clone(),
             other_target: values[8].clone(),
             server_id: values[9].clone(),

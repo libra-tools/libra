@@ -2,6 +2,8 @@
 
 Clone a repository into a new directory.
 
+A Mega2 code URL (`https`, `http`, or `ssh`, path under `/project/`, ending in `.git`) is a code view. `libra clone`, including `--bare` and `--mirror`, does not fetch `refs/libra/traces`. A Mega2 mirror records `+refs/heads/*:refs/heads/*`. Any other mirror, including ordinary Git, still records `+refs/*:refs/*`. A `/.traces/` locator is refused before discovery; use `libra mega2 traces fetch` for that stream.
+
 ## Synopsis
 
 ```
