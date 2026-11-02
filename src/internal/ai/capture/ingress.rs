@@ -733,18 +733,23 @@ fn parse_capture_ingress_payload(
         }
         return Err(HookEnvelopeInvalid("hook input is empty".to_string()).into());
     }
-    let envelope: SessionHookEnvelope = match serde_json::from_str(stdin) {
-        Ok(envelope) => envelope,
-        Err(_) if observe => return Ok(observe_partial(payload.len())),
-        Err(error) => {
-            return Err(HookEnvelopeInvalid(format!(
+    // A provider with its own wire form lowers it to the shared envelope
+    // here, so the generic checks below still apply to every frame.
+    let lowered = match provider.lower_native_frame(stdin) {
+        Some(lowered) => lowered.map_err(|error| HookEnvelopeInvalid(error.to_string())),
+        None => serde_json::from_str::<SessionHookEnvelope>(stdin).map_err(|error| {
+            HookEnvelopeInvalid(format!(
                 "invalid hook JSON payload ({:?} at line {} column {})",
                 error.classify(),
                 error.line(),
                 error.column()
             ))
-            .into());
-        }
+        }),
+    };
+    let envelope = match lowered {
+        Ok(envelope) => envelope,
+        Err(_) if observe => return Ok(observe_partial(payload.len())),
+        Err(error) => return Err(error.into()),
     };
     if let Err(error) = validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES) {
         if observe {

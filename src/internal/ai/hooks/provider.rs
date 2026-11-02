@@ -218,6 +218,15 @@ pub trait HookProvider: HookProviderIdentity + Sync {
     fn source_name(&self) -> &'static str;
     /// Hook commands this provider knows how to install and parse.
     fn supported_commands(&self) -> &'static [ProviderHookCommand];
+    /// Lower a provider-native hook frame into the shared envelope before
+    /// the generic envelope checks run. `None` (the default) means the frame
+    /// already uses the [`SessionHookEnvelope`] wire form. This is the same
+    /// untrusted, pure decoding boundary as [`Self::parse_hook_event`]: no
+    /// file reads, no persisted state. An `Err` must carry fixed text that
+    /// does not echo frame content.
+    fn lower_native_frame(&self, _frame: &str) -> Option<Result<SessionHookEnvelope>> {
+        None
+    }
     /// Translate a provider envelope into the canonical [`LifecycleEvent`].
     /// This is an untrusted decoding boundary: do not read source files, persist
     /// observer state, or acquire repository scope here. Content capture belongs

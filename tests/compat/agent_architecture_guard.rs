@@ -2588,6 +2588,7 @@ fn live_capture_port_and_store_boundaries() {
         "hermes::HermesProvider",
         "opencode::OpenCodeProvider",
         "grok::GrokProvider",
+        "pi::PiProvider",
     ]
     .into_iter()
     .map(|self_type| {

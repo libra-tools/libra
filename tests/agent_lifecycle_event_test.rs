@@ -6045,3 +6045,717 @@ fn hermes_observe_plugin_forwards_only_the_allowlist() {
         "plugin forwarded a parent secret: {child_env}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PI-04: Pi observe extension and receiver (`pi_observe_*`).
+// ---------------------------------------------------------------------------
+
+const PI_SESSION_ID: &str = "019a0c3e-7b1d-7c2e-9f10-5a6b7c8d9e0f";
+
+/// The absolute path of the Node interpreter on `PATH`.
+fn pi_node() -> String {
+    let out = Command::new("node")
+        .args(["-e", "process.stdout.write(process.execPath)"])
+        .output()
+        .expect("Node is required to run the Pi extension");
+    assert!(out.status.success(), "node -e failed: {}", describe(&out));
+    String::from_utf8(out.stdout).expect("node path is UTF-8")
+}
+
+/// A fake libra executable that logs its argv and stdin frame.
+fn pi_fake_libra(repo: &HookRepo, node: &str, exit_code: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = repo.home.join(format!("fake-libra-{exit_code}.mjs"));
+    std::fs::write(
+        &fake,
+        format!(
+            "#!{node}\nimport {{ readFileSync, appendFileSync }} from 'node:fs';\n\
+             const frame = readFileSync(0, 'utf8');\n\
+             appendFileSync(process.env.LIBRA_TEST_PI_LOG, JSON.stringify({{ argv: process.argv.slice(2), frame: JSON.parse(frame) }}) + '\\n');\n\
+             process.exit({exit_code});\n"
+        ),
+    )
+    .expect("write fake libra");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
+        .expect("make fake libra executable");
+    fake
+}
+
+/// Events, in ADR-PI-06 order, with payloads carrying every field Pi sends,
+/// including bodies that must never be forwarded.
+fn pi_event_payloads(nested: bool) -> Vec<(&'static str, Value)> {
+    let parent = if nested { json!("call-1") } else { Value::Null };
+    let tool_id = if nested { "call-1/1" } else { "call-1" };
+    vec![
+        (
+            "session_start",
+            if nested {
+                json!({"type": "session_start", "reason": "resume", "previousSessionFile": "/tmp/prev.jsonl"})
+            } else {
+                json!({"type": "session_start", "reason": "startup"})
+            },
+        ),
+        (
+            "before_agent_start",
+            json!({"type": "before_agent_start", "messageType": "user", "prompt": "PI_CANARY_PROMPT", "systemPrompt": "PI_CANARY_SYSTEM"}),
+        ),
+        ("tool_call", {
+            let mut call = json!({"type": "tool_call", "toolCallId": tool_id, "toolName": "bash", "input": {"command": "PI_CANARY_INPUT"}});
+            if nested {
+                call["parentToolCallId"] = parent.clone();
+            }
+            call
+        }),
+        ("tool_result", {
+            let mut result = json!({"type": "tool_result", "toolCallId": tool_id, "toolName": "bash", "input": {}, "content": [{"type": "text", "text": "PI_CANARY_OUTPUT"}], "isError": false});
+            if nested {
+                result["parentToolCallId"] = parent.clone();
+            }
+            result
+        }),
+        (
+            "turn_end",
+            json!({"type": "turn_end", "turnIndex": 0, "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "PI_CANARY_THINKING"}, {"type": "text", "text": "PI_CANARY_ANSWER"}]}, "toolResults": [], "messageEntryId": "entry-2", "toolResultEntryIds": ["entry-3"], "outcome": "completed"}),
+        ),
+        (
+            "agent_settled",
+            json!({"type": "agent_settled", "aborted": false}),
+        ),
+        (
+            "session_shutdown",
+            if nested {
+                json!({"type": "session_shutdown", "reason": "new", "targetSessionFile": "/tmp/next.jsonl"})
+            } else {
+                json!({"type": "session_shutdown", "reason": "quit"})
+            },
+        ),
+    ]
+}
+
+struct PiExtensionRun {
+    registered: Vec<String>,
+    returned_undefined: Vec<bool>,
+    forwarded: Vec<Value>,
+    output: Output,
+}
+
+/// Load the rendered extension in Node with a fake Pi API, fire `events`
+/// and collect what each handler returned and what reached `command`.
+/// `ctx` is a JavaScript object expression for the extension context.
+fn pi_run_extension(
+    repo: &HookRepo,
+    node: &str,
+    command: &Path,
+    ctx: &str,
+    events: &[(&str, Value)],
+) -> PiExtensionRun {
+    let asset = libra::internal::ai::hooks::providers::pi::settings::render_pi_asset(command)
+        .expect("render the Pi extension");
+    let work = repo.home.join("pi-ext");
+    std::fs::create_dir_all(&work).expect("extension work dir");
+    std::fs::write(work.join("extension.mjs"), asset).expect("write extension module");
+    let log = work.join("forwarded.jsonl");
+    let _ = std::fs::remove_file(&log);
+    let events = serde_json::to_string(
+        &events
+            .iter()
+            .map(|(name, payload)| json!([name, payload]))
+            .collect::<Vec<_>>(),
+    )
+    .expect("events");
+    let runner = format!(
+        r#"import factory from './extension.mjs';
+const handlers = new Map();
+factory({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const ctx = {ctx};
+const returned = [];
+for (const [name, payload] of {events}) {{
+  const value = handlers.get(name)(payload, ctx);
+  returned.push(value === undefined);
+}}
+process.stdout.write(JSON.stringify({{ registered: [...handlers.keys()], returned }}));
+"#
+    );
+    std::fs::write(work.join("runner.mjs"), runner).expect("write runner");
+    let output = Command::new(node)
+        .arg("--no-warnings")
+        .arg(work.join("runner.mjs"))
+        .current_dir(&work)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &repo.home)
+        .env("LIBRA_TEST_PI_LOG", &log)
+        .output()
+        .expect("run the Pi extension");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    let forwarded = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("forwarded line"))
+        .collect();
+    PiExtensionRun {
+        registered: report["registered"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| name.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        returned_undefined: report["returned"]
+            .as_array()
+            .map(|values| values.iter().map(|value| value == &json!(true)).collect())
+            .unwrap_or_default(),
+        forwarded,
+        output,
+    }
+}
+
+fn pi_ctx(repo: &HookRepo, trusted: &str, session_file: &str) -> String {
+    format!(
+        "{{ cwd: {cwd}, isProjectTrusted: () => {trusted}, sessionManager: {{ getSessionId: () => {id}, getSessionFile: () => {session_file} }} }}",
+        cwd = serde_json::to_string(&repo.repo).unwrap(),
+        id = serde_json::to_string(PI_SESSION_ID).unwrap(),
+    )
+}
+
+/// One receiver frame per ADR-PI-06 event.
+fn pi_frame(repo: &HookRepo, event: &str) -> Value {
+    let mut frame = json!({
+        "schema": 1,
+        "event": event,
+        "sessionId": PI_SESSION_ID,
+        "sessionFile": null,
+        "cwd": repo.repo.display().to_string(),
+        "emittedAt": "2026-11-02T17:00:00.000Z",
+    });
+    let fields = match event {
+        "session_start" => json!({"reason": "startup", "previousSessionFile": null}),
+        "session_shutdown" => json!({"reason": "quit", "targetSessionFile": null}),
+        "before_agent_start" => json!({"messageType": "user"}),
+        "turn_end" => {
+            json!({"turnIndex": 0, "messageEntryId": "entry-2", "toolResultEntryIds": [], "outcome": "completed"})
+        }
+        "tool_call" | "tool_result" => {
+            json!({"toolCallId": "call-1", "parentToolCallId": null, "toolName": "bash"})
+        }
+        "agent_settled" => json!({"aborted": false}),
+        other => panic!("no fixture for {other}"),
+    };
+    for (key, value) in fields.as_object().unwrap() {
+        frame[key] = value.clone();
+    }
+    frame
+}
+
+/// ADR-PI-06 field sets, written out here rather than taken from the parser
+/// so a matching omission in both the extension and the receiver still fails.
+fn pi_expected_keys(event: &str) -> std::collections::BTreeSet<String> {
+    let common = [
+        "schema",
+        "event",
+        "sessionId",
+        "sessionFile",
+        "cwd",
+        "emittedAt",
+    ];
+    let specific: &[&str] = match event {
+        "session_start" => &["reason", "previousSessionFile"],
+        "session_shutdown" => &["reason", "targetSessionFile"],
+        "before_agent_start" => &["messageType"],
+        "turn_end" => &[
+            "turnIndex",
+            "messageEntryId",
+            "toolResultEntryIds",
+            "outcome",
+        ],
+        "tool_call" | "tool_result" => &["toolCallId", "parentToolCallId", "toolName"],
+        "agent_settled" => &["aborted"],
+        other => panic!("ADR-PI-06 has no field set for {other}"),
+    };
+    common
+        .iter()
+        .chain(specific.iter())
+        .map(|key| key.to_string())
+        .collect()
+}
+
+#[test]
+fn pi_observe_forwards_only_while_the_project_is_trusted() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_fake_libra(&repo, &node, 0);
+    let events = pi_event_payloads(false);
+    for ctx in [
+        pi_ctx(&repo, "false", "undefined"),
+        // A context without the trust API, or one that throws, is untrusted.
+        format!(
+            "{{ cwd: {}, sessionManager: {{ getSessionId: () => 'x', getSessionFile: () => undefined }} }}",
+            serde_json::to_string(&repo.repo).unwrap()
+        ),
+        pi_ctx(
+            &repo,
+            "{ throw new Error('trust unavailable'); }",
+            "undefined",
+        ),
+        pi_ctx(&repo, "'yes'", "undefined"),
+    ] {
+        let run = pi_run_extension(&repo, &node, &fake, &ctx, &events);
+        assert!(run.output.status.success(), "{}", describe(&run.output));
+        assert!(
+            run.forwarded.is_empty(),
+            "an untrusted project forwarded {:?}",
+            run.forwarded
+        );
+    }
+    let run = pi_run_extension(
+        &repo,
+        &node,
+        &fake,
+        &pi_ctx(&repo, "true", "undefined"),
+        &events,
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    assert_eq!(
+        run.forwarded.len(),
+        events.len(),
+        "a trusted project forwards every observed event"
+    );
+}
+
+#[test]
+fn pi_observe_asset_write_leaves_unmanaged_and_drifted_files() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiAssetOwnership, PiAssetWrite, pi_asset_ownership, pi_asset_path, render_pi_asset,
+        write_owned_pi_asset,
+    };
+    let repo = HookRepo::init();
+    let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_libra")).expect("libra binary");
+    let path = pi_asset_path(&repo.repo);
+    assert_eq!(
+        pi_asset_ownership(&repo.repo).unwrap(),
+        PiAssetOwnership::Absent
+    );
+    assert_eq!(
+        write_owned_pi_asset(&repo.repo, &binary).unwrap(),
+        PiAssetWrite::Created
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        render_pi_asset(&binary).unwrap()
+    );
+    assert_eq!(
+        write_owned_pi_asset(&repo.repo, &binary).unwrap(),
+        PiAssetWrite::Unchanged
+    );
+    // An existing file is never replaced, even an owned asset for another
+    // binary: replacing a path cannot prove who owns it at that moment.
+    let other = repo.home.join("other-libra");
+    let older = render_pi_asset(&other).unwrap();
+    std::fs::write(&path, &older).unwrap();
+    assert_eq!(
+        pi_asset_ownership(&repo.repo).unwrap(),
+        PiAssetOwnership::Owned
+    );
+    let error = write_owned_pi_asset(&repo.repo, &binary)
+        .expect_err("an existing owned asset must not be replaced");
+    assert!(
+        error
+            .to_string()
+            .contains("does not replace an existing file"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), older);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        write_owned_pi_asset(&repo.repo, &binary).unwrap(),
+        PiAssetWrite::Created
+    );
+
+    let user_file = "export default function mine(pi) {}\n";
+    let mut drifted = render_pi_asset(&binary).unwrap();
+    drifted.push_str("// local edit\n");
+    for (label, bytes) in [("unmanaged", user_file.to_string()), ("drifted", drifted)] {
+        std::fs::write(&path, &bytes).unwrap();
+        let error = write_owned_pi_asset(&repo.repo, &binary)
+            .expect_err("a user or drifted file must not be overwritten");
+        assert!(
+            error.to_string().contains("leaves it as it is"),
+            "{label}: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bytes,
+            "{label} file changed"
+        );
+    }
+
+    // A symlink in the slot, or a symlinked extensions directory, is never followed.
+    #[cfg(unix)]
+    {
+        let target = repo.home.join("target.ts");
+        std::fs::write(&target, user_file).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(write_owned_pi_asset(&repo.repo, &binary).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), user_file);
+        std::fs::remove_file(&path).unwrap();
+        let extensions = path.parent().unwrap().to_path_buf();
+        std::fs::remove_dir(&extensions).unwrap();
+        let elsewhere = repo.home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &extensions).unwrap();
+        assert!(write_owned_pi_asset(&repo.repo, &binary).is_err());
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing may be written through a symlinked directory"
+        );
+
+        // A directory swapped for a link after the slot is checked does not
+        // redirect the write: the file lands in the directory that was checked.
+        use libra::internal::ai::hooks::providers::pi::settings::write_owned_pi_asset_pausing_for_test;
+        let project = repo.home.join("swap-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside = repo.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let extensions = pi_asset_path(&project).parent().unwrap().to_path_buf();
+        let moved = extensions.with_file_name("extensions-checked");
+        let written = write_owned_pi_asset_pausing_for_test(&project, &binary, &mut || {
+            std::fs::rename(&extensions, &moved).unwrap();
+            std::os::unix::fs::symlink(&outside, &extensions).unwrap();
+        })
+        .expect("the write goes to the checked directory");
+        assert_eq!(written, PiAssetWrite::Created);
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "a swapped-in link redirected the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join("libra-hooks.ts")).unwrap(),
+            render_pi_asset(&binary).unwrap()
+        );
+    }
+}
+
+#[test]
+fn pi_observe_callbacks_return_undefined() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_fake_libra(&repo, &node, 0);
+    let events = pi_event_payloads(false);
+    for trusted in ["true", "false"] {
+        let run = pi_run_extension(
+            &repo,
+            &node,
+            &fake,
+            &pi_ctx(&repo, trusted, "undefined"),
+            &events,
+        );
+        assert!(run.output.status.success(), "{}", describe(&run.output));
+        assert_eq!(
+            run.registered,
+            [
+                "session_start",
+                "session_shutdown",
+                "before_agent_start",
+                "turn_end",
+                "tool_call",
+                "tool_result",
+                "agent_settled"
+            ],
+            "the extension subscribes to exactly the ADR-PI-06 events"
+        );
+        assert_eq!(
+            run.returned_undefined,
+            vec![true; events.len()],
+            "every handler must return undefined (trusted={trusted})"
+        );
+    }
+}
+
+#[test]
+fn pi_observe_delivery_errors_keep_the_provider_result() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let events = pi_event_payloads(false);
+    let failing = pi_fake_libra(&repo, &node, 3);
+    let missing = repo.home.join("no-such-libra");
+    for (command, ctx) in [
+        (missing.clone(), pi_ctx(&repo, "true", "undefined")),
+        (failing.clone(), pi_ctx(&repo, "true", "undefined")),
+        (
+            failing.clone(),
+            format!(
+                "{{ cwd: {}, isProjectTrusted: () => true, sessionManager: {{ getSessionId: () => {{ throw new Error('boom'); }}, getSessionFile: () => undefined }} }}",
+                serde_json::to_string(&repo.repo).unwrap()
+            ),
+        ),
+        (
+            failing.clone(),
+            format!(
+                "{{ cwd: {}, isProjectTrusted: () => true, sessionManager: {{ getSessionId: () => {}, getSessionFile: () => undefined }} }}",
+                serde_json::to_string(&repo.home.join("gone")).unwrap(),
+                serde_json::to_string(PI_SESSION_ID).unwrap()
+            ),
+        ),
+    ] {
+        let run = pi_run_extension(&repo, &node, &command, &ctx, &events);
+        assert!(
+            run.output.status.success(),
+            "a delivery error must not fail the provider: {}",
+            describe(&run.output)
+        );
+        assert!(
+            run.output.stderr.is_empty(),
+            "a delivery error must not surface in Pi: {}",
+            describe(&run.output)
+        );
+        assert_eq!(run.returned_undefined, vec![true; events.len()]);
+    }
+}
+
+#[test]
+fn pi_observe_envelope_fields_match_adr_pi_06() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_fake_libra(&repo, &node, 0);
+    for (nested, session_file) in [(false, "undefined"), (true, "'/tmp/current.jsonl'")] {
+        let events = pi_event_payloads(nested);
+        let run = pi_run_extension(
+            &repo,
+            &node,
+            &fake,
+            &pi_ctx(&repo, "true", session_file),
+            &events,
+        );
+        assert!(run.output.status.success(), "{}", describe(&run.output));
+        assert_eq!(run.forwarded.len(), events.len());
+        // Children finish in any order; match each frame by its event name.
+        for (event, _) in &events {
+            let matching: Vec<&Value> = run
+                .forwarded
+                .iter()
+                .filter(|forwarded| forwarded["frame"]["event"] == json!(event))
+                .collect();
+            assert_eq!(matching.len(), 1, "{event}: {:?}", run.forwarded);
+            let forwarded = matching[0];
+            assert_eq!(
+                forwarded["argv"],
+                json!(["agent", "hooks", "pi", "observe"])
+            );
+            let frame = &forwarded["frame"];
+            let keys: std::collections::BTreeSet<String> =
+                frame.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, pi_expected_keys(event), "{event}: {frame}");
+            assert_eq!(frame["event"], json!(event));
+            assert_eq!(frame["schema"], json!(1));
+            assert_eq!(frame["sessionId"], json!(PI_SESSION_ID));
+            assert_eq!(frame["cwd"], json!(repo.repo.display().to_string()));
+            if nested {
+                assert_eq!(frame["sessionFile"], json!("/tmp/current.jsonl"));
+            } else {
+                assert_eq!(frame["sessionFile"], Value::Null, "{event}");
+            }
+            match *event {
+                "session_start" => assert_eq!(
+                    frame["previousSessionFile"],
+                    if nested {
+                        json!("/tmp/prev.jsonl")
+                    } else {
+                        Value::Null
+                    }
+                ),
+                "session_shutdown" => assert_eq!(
+                    frame["targetSessionFile"],
+                    if nested {
+                        json!("/tmp/next.jsonl")
+                    } else {
+                        Value::Null
+                    }
+                ),
+                "tool_call" | "tool_result" => assert_eq!(
+                    frame["parentToolCallId"],
+                    if nested { json!("call-1") } else { Value::Null }
+                ),
+                _ => {}
+            }
+            // The extension's output is what the receiver accepts.
+            let out = repo.hook("pi", "observe", &frame.to_string());
+            assert!(out.status.success(), "{event}: {}", describe(&out));
+        }
+        let text = serde_json::to_string(&run.forwarded).unwrap();
+        for canary in [
+            "PI_CANARY_PROMPT",
+            "PI_CANARY_SYSTEM",
+            "PI_CANARY_INPUT",
+            "PI_CANARY_OUTPUT",
+            "PI_CANARY_THINKING",
+            "PI_CANARY_ANSWER",
+        ] {
+            assert!(!text.contains(canary), "{canary} was forwarded");
+        }
+    }
+}
+
+#[test]
+fn pi_observe_receiver_refuses_frames_outside_adr_pi_06() {
+    let repo = HookRepo::init();
+    let mut refused = Vec::new();
+    let start = pi_frame(&repo, "session_start");
+    let mut extra = start.clone();
+    extra["prompt"] = json!("hello");
+    refused.push(("extra field", extra));
+    let mut missing = start.clone();
+    missing.as_object_mut().unwrap().remove("reason");
+    refused.push(("missing required field", missing));
+    let mut no_nullable = start.clone();
+    no_nullable
+        .as_object_mut()
+        .unwrap()
+        .remove("previousSessionFile");
+    refused.push(("missing nullable key", no_nullable));
+    let mut empty = start.clone();
+    empty["reason"] = json!("");
+    refused.push(("empty required field", empty));
+    let mut schema = start.clone();
+    schema["schema"] = json!(2);
+    refused.push(("unknown schema", schema));
+    let mut snake = start.clone();
+    snake["hook_event_name"] = json!("session_start");
+    refused.push(("shared envelope field", snake));
+    let mut tool = pi_frame(&repo, "tool_call");
+    tool["toolCallId"] = json!(7);
+    refused.push(("wrong type", tool));
+    for (label, frame) in &refused {
+        let out = repo.hook("pi", "observe", &frame.to_string());
+        assert!(out.status.success(), "{label}: {}", describe(&out));
+        assert!(
+            repo.sessions().is_empty(),
+            "{label}: a refused frame wrote a session"
+        );
+    }
+    // A repeated key is refused rather than resolved to its last value.
+    let text = start.to_string();
+    let duplicated = text.replacen("{", "{\"reason\":\"startup\",", 1);
+    assert_ne!(duplicated, text);
+    let out = repo.hook("pi", "observe", &duplicated);
+    assert!(out.status.success(), "repeated key: {}", describe(&out));
+    assert!(
+        repo.sessions().is_empty(),
+        "a frame with a repeated key wrote a session"
+    );
+    assert!(repo.checkpoints().is_empty());
+}
+
+#[tokio::test]
+async fn pi_observe_receiver_records_adr_frames() {
+    let repo = HookRepo::init();
+    let start = pi_frame(&repo, "session_start");
+    let out = repo.hook("pi", "observe", &start.to_string());
+    assert!(out.status.success(), "{}", describe(&out));
+    let sessions = repo.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0]["agent_kind"], json!("pi"), "{sessions:?}");
+    // The recorded projection: lifecycle kind, tool name, and no content.
+    {
+        use libra::internal::ai::{
+            capture::ingress::CaptureIngressOutcome, hooks::providers::pi_provider,
+        };
+        let provider = pi_provider();
+        for (event, kind, tool) in [
+            ("session_start", LifecycleEventKind::SessionStart, None),
+            ("tool_call", LifecycleEventKind::ToolUse, Some("bash")),
+            ("tool_result", LifecycleEventKind::ToolUse, Some("bash")),
+        ] {
+            let frame = pi_frame(&repo, event).to_string();
+            match lower_in_process_capture_frame_for_test(
+                frame.as_bytes(),
+                ProviderHookCommand::Observe,
+                ProviderHookCommand::Observe.lifecycle_event_kind(),
+                provider,
+                Some(&repo.repo),
+            )
+            .expect("valid frame passes ingress")
+            {
+                CaptureIngressOutcome::Command(command) => {
+                    assert_eq!(command.event_kind(), kind, "{event}");
+                    assert_eq!(command.provider_kind(), "pi");
+                }
+                CaptureIngressOutcome::UnknownEvent { .. } => {
+                    panic!("{event} must be recorded")
+                }
+            }
+            let envelope = provider
+                .lower_native_frame(&frame)
+                .expect("pi lowers its own frame")
+                .expect("valid frame lowers");
+            let parsed = provider
+                .parse_hook_event(event, &envelope)
+                .expect("recorded event parses");
+            assert_eq!(parsed.kind, kind, "{event}");
+            assert_eq!(parsed.tool_name.as_deref(), tool, "{event}");
+            assert!(
+                parsed.prompt.is_none()
+                    && parsed.tool_input.is_none()
+                    && parsed.tool_response.is_none()
+                    && parsed.assistant_message.is_none()
+                    && parsed.session_ref.is_none(),
+                "{event} must carry no content"
+            );
+        }
+        for event in [
+            "session_shutdown",
+            "before_agent_start",
+            "turn_end",
+            "agent_settled",
+        ] {
+            let frame = pi_frame(&repo, event).to_string();
+            assert!(
+                matches!(
+                    lower_in_process_capture_frame_for_test(
+                        frame.as_bytes(),
+                        ProviderHookCommand::Observe,
+                        ProviderHookCommand::Observe.lifecycle_event_kind(),
+                        provider,
+                        Some(&repo.repo),
+                    )
+                    .expect("valid frame passes ingress"),
+                    CaptureIngressOutcome::UnknownEvent { .. }
+                ),
+                "{event} is accepted on the wire but not recorded yet"
+            );
+        }
+    }
+
+    let libra_session = format!("pi__{PI_SESSION_ID}");
+    let mut revision = repo.durable_session(&libra_session).await.sync_revision;
+    for event in ["tool_call", "tool_result"] {
+        let out = repo.hook("pi", "observe", &pi_frame(&repo, event).to_string());
+        assert!(out.status.success(), "{event}: {}", describe(&out));
+        let after = repo.durable_session(&libra_session).await;
+        assert!(
+            after.sync_revision > revision,
+            "{event} must be recorded on the durable session, not skipped"
+        );
+        assert_eq!(after.state, "active");
+        revision = after.sync_revision;
+    }
+    // A wire event this receiver does not record leaves the session as it is.
+    let out = repo.hook("pi", "observe", &pi_frame(&repo, "turn_end").to_string());
+    assert!(out.status.success(), "turn_end: {}", describe(&out));
+    assert_eq!(
+        repo.durable_session(&libra_session).await.sync_revision,
+        revision
+    );
+    assert_eq!(repo.sessions().len(), 1);
+    assert!(
+        repo.checkpoints().is_empty(),
+        "tool events and session start write no checkpoint"
+    );
+    let verb = repo.hook("pi", "session-start", &start.to_string());
+    assert!(
+        !verb.status.success(),
+        "pi registers only the observe entry"
+    );
+}

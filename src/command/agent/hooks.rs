@@ -23,7 +23,7 @@ use crate::{
             provider::ProviderHookCommand,
             providers::{
                 claude_provider, codex, codex_provider, grok_provider, hermes_provider,
-                opencode_provider,
+                opencode_provider, pi_provider,
             },
         },
     },
@@ -68,6 +68,13 @@ pub enum AgentHooksSubcommand {
     /// `libra agent hooks hermes observe` (HM-05). Installation stays disabled.
     #[command(about = "Hermes observe-only hook entry")]
     Hermes {
+        #[command(subcommand)]
+        command: HookCommandKind,
+    },
+    /// `libra agent hooks pi observe` (PI-04). Pi stays unsupported and its
+    /// extension is not installed by `libra agent enable`.
+    #[command(about = "Pi observe-only hook entry")]
+    Pi {
         #[command(subcommand)]
         command: HookCommandKind,
     },
@@ -179,6 +186,28 @@ pub async fn execute_safe(
                 ProviderHookCommand::Observe,
                 LifecycleEventKind::TurnEnd,
                 hermes_provider(),
+                HookTarget::AgentTraces,
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                map_capture_ingest_error(
+                    error,
+                    "agent hook ingestion failed",
+                    CaptureErrorSurface::FailClosed,
+                )
+            })
+        }
+        AgentHooksSubcommand::Pi { command } => {
+            if !matches!(command, HookCommandKind::Observe) {
+                return Err(CliError::fatal("pi registers only the observe entry"));
+            }
+            // The parsed frame selects the lifecycle kind; this one is only
+            // the non-terminal placeholder the observe command carries.
+            process_hook_event_with_target(
+                ProviderHookCommand::Observe,
+                ProviderHookCommand::Observe.lifecycle_event_kind(),
+                pi_provider(),
                 HookTarget::AgentTraces,
                 deadline,
             )

@@ -1829,6 +1829,100 @@ fn codex_ordinary_attached_and_legacy_repair_docs_stay_visible() {
 /// import as local-only and its result as partial, and none still says the
 /// import refuses `pi`.
 #[test]
+fn pi_observe_docs_disclose_trust_gate_and_no_install() {
+    for (label, document, required) in [
+        (
+            "docs/commands/agent.md",
+            AGENT_CMD_DOC_EN,
+            &[
+                "`libra agent hooks pi observe`",
+                "only while Pi reports the project as trusted",
+                "stores only lifecycle metadata",
+                "no Pi content",
+                "`agent enable` does not install that extension yet",
+            ][..],
+        ),
+        (
+            "docs/commands/zh-CN/agent.md",
+            AGENT_CMD_DOC_ZH,
+            &[
+                "`libra agent hooks pi observe`",
+                "只在 Pi 报告项目受信时",
+                "只为会话开始与 tool 事件保存生命周期元数据",
+                "不保存任何 Pi 内容",
+                "`agent enable` 暂不安装该 extension",
+            ][..],
+        ),
+        (
+            "COMPATIBILITY.md",
+            COMPATIBILITY_DOC,
+            &[
+                "`agent hooks pi observe`",
+                "while the project is trusted",
+                "`agent enable` does not install the extension yet",
+            ][..],
+        ),
+        (
+            "docs/development/commands/agent.md",
+            AGENT_DEV_DOC,
+            &[
+                "`HookProvider::lower_native_frame`",
+                "`write_owned_pi_asset`",
+            ][..],
+        ),
+        (
+            "docs/development/tracing/agent.md",
+            AGENT_DOC,
+            &[
+                "`agent hooks pi observe`",
+                "`HookProvider::lower_native_frame`",
+            ][..],
+        ),
+    ] {
+        for text in required {
+            assert!(
+                document.contains(text),
+                "{label} must disclose the Pi observe hook: {text}"
+            );
+        }
+    }
+    // The observe hook stores lifecycle metadata, so no page may still say
+    // that only the explicit import stores Pi sessions at all.
+    for (label, document, stale) in [
+        (
+            "docs/commands/agent.md",
+            AGENT_CMD_DOC_EN,
+            "only an explicit import stores its sessions.",
+        ),
+        (
+            "docs/commands/agent.md",
+            AGENT_CMD_DOC_EN,
+            "The one way to store a `pi` session is",
+        ),
+        (
+            "docs/commands/zh-CN/agent.md",
+            AGENT_CMD_DOC_ZH,
+            "只有显式 import 会写入其会话。",
+        ),
+        (
+            "COMPATIBILITY.md",
+            COMPATIBILITY_DOC,
+            "The only writer is an explicit",
+        ),
+        (
+            "docs/development/commands/agent.md",
+            AGENT_DEV_DOC,
+            "only the explicit import of PI-10 stores its sessions.",
+        ),
+    ] {
+        assert!(
+            !document.contains(stale),
+            "{label} still says only the import stores Pi sessions: {stale}"
+        );
+    }
+}
+
+#[test]
 fn pi_explicit_import_docs_disclose_local_only_and_partial() {
     for (label, document, required) in [
         (

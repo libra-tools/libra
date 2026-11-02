@@ -19,8 +19,10 @@ pub mod gemini;
 pub mod grok;
 pub mod hermes;
 pub mod opencode;
+pub mod pi;
 
 pub use hermes::hermes_provider;
+pub use pi::pi_provider;
 
 use super::provider::{HookProvider, HookProviderIdentity};
 use crate::internal::ai::observed_agents::AgentKind;
@@ -58,6 +60,12 @@ impl HookProviderIdentity for grok::GrokProvider {
 impl HookProviderIdentity for hermes::HermesProvider {
     fn agent_kind(&self) -> AgentKind {
         AgentKind::Hermes
+    }
+}
+
+impl HookProviderIdentity for pi::PiProvider {
+    fn agent_kind(&self) -> AgentKind {
+        AgentKind::Pi
     }
 }
 
@@ -102,5 +110,7 @@ mod tests {
         assert_eq!(opencode_provider().provider_name(), "opencode");
         assert_eq!(grok_provider().provider_name(), "grok");
         assert_eq!(grok_provider().agent_kind(), AgentKind::Grok);
+        assert_eq!(pi_provider().provider_name(), "pi");
+        assert_eq!(pi_provider().agent_kind(), AgentKind::Pi);
     }
 }
