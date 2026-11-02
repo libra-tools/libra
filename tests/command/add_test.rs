@@ -4724,9 +4724,16 @@ fn test_add_refresh_with_pathspec_tc0021() {
         String::from_utf8_lossy(&index_info.stderr)
     );
 
-    // chmtime -60 bar baz: same content, older stat than the index records.
-    fs::write(root.join("bar"), "\n").expect("stat-dirty bar");
-    fs::write(root.join("baz"), "\n").expect("stat-dirty baz");
+    // Same bytes as the index, but an older mtime so the stat cache is dirty
+    // even on a filesystem whose timestamp resolution would hide a rewrite.
+    for name in ["bar", "baz"] {
+        let file = fs::File::options()
+            .write(true)
+            .open(root.join(name))
+            .expect("open fixture");
+        file.set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .expect("backdate fixture");
+    }
 
     let refresh = run_libra_command(&["add", "--refresh", "bar"], root);
     assert_eq!(
@@ -4751,6 +4758,10 @@ fn test_add_refresh_with_pathspec_tc0021() {
     assert!(
         listed.lines().any(|l| l == "baz"),
         "stat-dirty baz must be listed: {listed}"
+    );
+    assert!(
+        listed.lines().any(|l| l == "foo"),
+        "stage-3 foo must be listed: {listed}"
     );
 }
 

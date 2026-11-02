@@ -7,7 +7,7 @@ rename defaults.
 ## Synopsis
 
 ```
-libra diff-tree [-r] [-p] [-s] [--raw] [--name-only] [--name-status] [-c]
+libra diff-tree [-r] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet] [-c]
                 <tree-a> <tree-b> [-- <path>...]
 ```
 
@@ -31,6 +31,8 @@ Like Git's plumbing, the **default output is raw** (`:<old-mode> <new-mode>
 | `--raw` | Force raw records (the default). | `libra diff-tree --raw a b` |
 | `--name-only` | Print changed path names only. | `libra diff-tree --name-only a b` |
 | `--name-status` | Print path names with status letters. | `libra diff-tree --name-status a b` |
+| `--exit-code` | Exit 1 when there are differences instead of the default 0. | `libra diff-tree --exit-code a b` |
+| `--quiet` | Print nothing and exit 1 when there are differences. | `libra diff-tree --quiet a b` |
 | `-s`, `--no-patch` | Suppress the diff body entirely. | `libra diff-tree -s a b` |
 | `-c`, `--cc` | Combined-diff spelling; accepted (unmerged/combined rendering is a documented narrowing). | `libra diff-tree -c a b` |
 | `-- <path>...` | Limit the diff to paths. | `libra diff-tree a b -- src/` |
@@ -42,9 +44,10 @@ The remaining porcelain flag surface (`-t`/`--stdin`) is not exposed.
 
 | Code | Meaning |
 |------|---------|
-| `0` | No differences. |
-| `1` | There are differences (the diff is printed) — Git plumbing exit convention. |
-| `128` | A tree-ish could not be resolved, or not inside a repository. |
+| `0` | No differences, or differences without `--exit-code`/`--quiet`. |
+| `1` | There are differences and `--exit-code`/`--quiet` was given. |
+| `128` | Not inside a repository. |
+| `129` | Invalid arguments (`LBR-CLI-002`) or an unresolved revision (`LBR-CLI-003`). |
 
 ## Examples
 

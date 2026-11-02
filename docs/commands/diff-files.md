@@ -20,7 +20,10 @@ Like Git's plumbing, the **default output is raw**. `--name-status` prints Git's
 `A`/`M`/`D`/`R` letters (for example `A\tnew.txt` for an intent-to-add entry).
 The worktree side is **stat-based**: a stat-dirty entry whose content is
 unchanged is reported `M` with an all-zero worktree sha, without hashing — the
-same contract behind `git diff-files` and `t3700-add.sh#24`.
+same contract behind `git diff-files` and `t3700-add.sh#24`. The status letter
+follows entry presence, not content emptiness: an empty tracked blob whose stat
+was invalidated (for example by `read-tree`) is `M`, not `A`, and a worktree
+file truncated to zero bytes is `M`, not `D`.
 
 ## Options
 
@@ -45,6 +48,7 @@ The remaining porcelain flag surface (`-1`/`-2`/`-3` stage selection) is not exp
 | `0` | No differences, or differences without `--exit-code`/`--quiet` (Git plumbing convention). |
 | `1` | There are differences and `--exit-code`/`--quiet` was given. |
 | `128` | Not inside a repository. |
+| `129` | Invalid arguments (`LBR-CLI-002`). |
 
 ## Examples
 

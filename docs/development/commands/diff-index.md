@@ -7,13 +7,13 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`diff-index <tree> [-- <path>...]`（= `diff --old <tree>`，tree 对工作树），所有 `diff` 全局标志与 `--json`。
-- **未公开**：`--cached`（tree 对 index）→ 退出 128 并指引用 `diff --staged`（Libra `diff --staged` 仅 HEAD 对 index，不支持任意 tree 对 index）。raw 输出、`-m` 延后。
+- 已支持：`diff-index [--cached] <tree> [-- <path>...]`、`-p`/`--patch`、`-s`/`--no-patch`、`--raw`、`--name-only`、`--name-status`、`--exit-code`、`--quiet`。`--cached` 把 tree 与 index 比较。工作树一侧与 `diff-files` 一样按条目存在性给状态字母（空 blob stat-invalid 为 `M` 不是 `A`，工作树截断为空为 `M` 不是 `D`）。ADR-PL-09：默认有差异也 0，`--exit-code`/`--quiet` 才转 1。
+- **未公开**：`-m` 与其余 porcelain 标志面。
 
 ## 设计方案
 
 - 入口与分发：`src/cli.rs::Commands::DiffIndex` → `command::diff_plumbing::execute_index_safe`。
-- 源码分层：`src/command/diff_plumbing.rs`：`DiffIndexArgs`（`cached`/`tree`/`paths`）。`--cached` → `command_usage` + `Unsupported` + 128；否则合成 `["diff","--old",tree,"--",paths...]` → `DiffArgs::try_parse_from` → `command::diff::execute_safe`。复用唯一 diff 引擎。
+- 源码分层：`src/command/diff_plumbing.rs`：`DiffIndexArgs`（`cached`/`tree`/`paths` 及输出模式）。`--cached` 比较 index；否则比较工作树。合成 argv 后走 `command::diff::execute_safe`。复用唯一 diff 引擎。
 - 底层操作对象：对象库 + 工作树（经 diff 引擎读）。无写入。
 
 ## 实现历史
@@ -23,16 +23,16 @@
 ## 当前状态
 
 - 公开状态：已公开（`Commands::DiffIndex`）。
-- 测试：`tests/command/diff_plumbing_test.rs`（diff-index tree 对工作树、`--cached` → 128）。
+- 测试：`tests/command/diff_plumbing_test.rs`（名称输出、退出码、TC-0044 空 blob 为 `M`）。
 - 用户文档：`docs/commands/diff-index.md`（EN + zh-CN）。
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | `--cached`（任意 tree 对 index）、raw、`-m` | `--cached` → 128 指引 `diff --staged`；Libra diff 引擎暂无「任意 tree 对 index」模式。 |
+| 兼容差异项 | `-m` 与其余 porcelain 标志面 | `--cached`、raw、`--name-only`/`--name-status`、`--exit-code`/`--quiet` 已公开。 |
 
 ## 维护要求
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
-- 必须继续复用 `command::diff` 引擎；若未来支持 `--cached`，应在 diff 引擎层新增「tree 对 index」模式，而非在本命令内另建 diff。
+- 必须继续复用 `command::diff` 引擎；`--cached` 已走引擎的 index 比较，不要在本命令内另建 diff。

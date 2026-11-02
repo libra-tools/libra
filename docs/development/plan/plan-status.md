@@ -1149,7 +1149,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；intent-to-add WT-05..WT-07 已 `done/complete`（WT-06/07 于 2026-10-18 落地）；WT-03 `done/complete`（2026-10-18） |
 | [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495；2026-10-07：477b 后续（#522/#523/#525/#526/#527/#533/#536，HW-01..HW-07 全部 `pending`，未启动）并入该文件「后续计划：#477b 新缺陷跟进」一节，原 `issues/477b.md` 已删除 |
 | [`issues/478.md`](issues/478.md) | log/show/diff/grep/blame/notes/reflog 命令族 | 未启动 | LG-01..LG-25（25 卡） |
-| [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | **实施中（九卡实现已落地；2026-11-01 修正 TC-0044、`-z` 与 update-ref 事务协议；ER-05 R1..R5 `FAIL`，C/D 未发布）** | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
+| [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | **实施中（2026-11-02：九卡 `in-progress`/`locally-accepted`；Codex R3 `PASS`，P0=0/P1=0；`--quiet` JSON 与重复 `--raw` 已修；C/D 的九次 `release.yml` 尚未取得）** | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
 | [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
 | [`issues/481.md`](issues/481.md) | 维护与杂项命令族对齐 | **实施中** | MX-01、MX-02、MX-03、MX-06 `done`/`complete`（实现完成，2026-10-20；C 组 bump 与 D 组 release 证据待用户授权）；MX-04、MX-05、MX-07..MX-16 待开工 |
 | [`issues/483.md`](issues/483.md) | `count-objects` 与预览命令零对象写入 | 未启动 | CO-01..CO-04（4 卡；CO-03/04 受 DEP-CO-04 / DEP-CLI-mirror `src/cli.rs` 实际写者串行约束） |

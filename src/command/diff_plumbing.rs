@@ -160,12 +160,14 @@ fn push_output_mode(
         argv.push("--name-status".to_string());
     } else if no_patch {
         argv.push("--no-patch".to_string());
-    } else if patch {
-        // Patch is the shared engine's default; `--raw` must be absent.
+    } else if patch || raw {
+        // Patch is the shared engine's default. An explicit `--raw` is appended
+        // once below, including when it is combined with `-p`.
     } else {
         argv.push("--raw".to_string());
     }
     // An explicit `--raw` alongside `-p` appends a raw record after the patch.
+    // Do not append it again when the default branch already selected raw.
     if raw && !name_only && !name_status && !no_patch {
         argv.push("--raw".to_string());
     }
@@ -182,6 +184,7 @@ async fn run_via_diff(
     output: &OutputConfig,
     differences_exit_one: bool,
     stat_only: bool,
+    plumbing_quiet: bool,
 ) -> CliResult<()> {
     // `diff.renames` is porcelain-only in Git. Keep the shared engine's default
     // rename detection out of plumbing, and bypass invalid porcelain config.
@@ -189,17 +192,22 @@ async fn run_via_diff(
     if differences_exit_one {
         argv.insert(1, "--exit-code".to_string());
     }
+    if plumbing_quiet {
+        argv.insert(1, "--plumbing-quiet".to_string());
+    }
     if stat_only {
         argv.insert(1, "--plumbing-stat-only".to_string());
     }
-    // Plumbing keeps its historical 128 override on argv parse failures.
-    delegate_to_diff(argv, output, Some(128)).await
+    // Invalid synthetic arguments are usage errors (`LBR-CLI-002`, exit 129).
+    // Exit 128 stays reserved for "not inside a repository".
+    delegate_to_diff(argv, output, None).await
 }
 
 /// Parse a synthetic diff argv and dispatch into the diff engine — the shared
 /// delegation tail for the diff-tree plumbing wrappers and `branch diff`
-/// (lore.md 1.12). `parse_error_exit_override` preserves the plumbing
-/// convention (128); `None` keeps the usage default (129).
+/// (lore.md 1.12). `parse_error_exit_override` replaces the usage default
+/// (129) when a caller needs another code. Plumbing diff passes `None`, so a
+/// bad synthetic argv stays 129. Exit 128 is only "not inside a repository".
 pub(crate) async fn delegate_to_diff(
     argv: Vec<String>,
     output: &OutputConfig,
@@ -249,7 +257,14 @@ pub async fn execute_tree_safe(args: DiffTreeArgs, output: &OutputConfig) -> Cli
     );
     push_paths(&mut argv, &args.paths);
     // diff-tree compares two tree-ishes: no worktree side, content-based.
-    run_via_diff(argv, output, args.exit_code || args.quiet, false).await
+    run_via_diff(
+        argv,
+        output,
+        args.exit_code || args.quiet,
+        false,
+        args.quiet,
+    )
+    .await
 }
 
 pub async fn execute_index(args: DiffIndexArgs) {
@@ -274,7 +289,14 @@ pub async fn execute_index_safe(args: DiffIndexArgs, output: &OutputConfig) -> C
         args.name_status,
     );
     push_paths(&mut argv, &args.paths);
-    run_via_diff(argv, output, args.exit_code || args.quiet, !args.cached).await
+    run_via_diff(
+        argv,
+        output,
+        args.exit_code || args.quiet,
+        !args.cached,
+        args.quiet,
+    )
+    .await
 }
 
 pub async fn execute_files(args: DiffFilesArgs) {
@@ -296,5 +318,5 @@ pub async fn execute_files_safe(args: DiffFilesArgs, output: &OutputConfig) -> C
         args.name_status,
     );
     push_paths(&mut argv, &args.paths);
-    run_via_diff(argv, output, args.exit_code || args.quiet, true).await
+    run_via_diff(argv, output, args.exit_code || args.quiet, true, args.quiet).await
 }

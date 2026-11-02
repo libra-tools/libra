@@ -221,6 +221,27 @@ fn diff_plumbing_exit_code_and_quiet_matrix() {
     assert_eq!(quiet_clean.status.code(), Some(0));
     assert!(out_str(&quiet_clean).is_empty(), "--quiet prints nothing");
 
+    // Explicit `--raw` must be passed once. A duplicate makes clap reject the
+    // synthetic argv.
+    let raw_clean = run_libra_command(&["diff-files", "--raw"], repo.path());
+    assert_eq!(
+        raw_clean.status.code(),
+        Some(0),
+        "clean --raw: {}",
+        String::from_utf8_lossy(&raw_clean.stderr)
+    );
+    let raw_tree = run_libra_command(&["diff-tree", "--raw", &c1, &c2], repo.path());
+    assert_eq!(
+        raw_tree.status.code(),
+        Some(0),
+        "diff-tree --raw: {}",
+        String::from_utf8_lossy(&raw_tree.stderr)
+    );
+    assert!(
+        out_str(&raw_tree).contains("tracked.txt"),
+        "diff-tree --raw should print the raw record"
+    );
+
     // Dirty tree: --exit-code exits 1, --quiet exits 1 with no output.
     fs::write(repo.path().join("tracked.txt"), "dirty-edit\n").unwrap();
     let dirty = run_libra_command(&["diff-files", "--exit-code"], repo.path());
@@ -233,6 +254,16 @@ fn diff_plumbing_exit_code_and_quiet_matrix() {
     let quiet_dirty = run_libra_command(&["diff-files", "--quiet"], repo.path());
     assert_eq!(quiet_dirty.status.code(), Some(1));
     assert!(out_str(&quiet_dirty).is_empty(), "--quiet prints nothing");
+    let raw_dirty = run_libra_command(&["diff-files", "--raw"], repo.path());
+    assert_eq!(raw_dirty.status.code(), Some(0), "dirty --raw stays exit 0");
+    assert!(out_str(&raw_dirty).contains("tracked.txt"));
+    let raw_index = run_libra_command(&["diff-index", "--raw", "HEAD"], repo.path());
+    assert_eq!(
+        raw_index.status.code(),
+        Some(0),
+        "diff-index --raw: {}",
+        String::from_utf8_lossy(&raw_index.stderr)
+    );
 
     // diff-tree / diff-index accept both flags too.
     let tree_ec = run_libra_command(&["diff-tree", "--exit-code", &c1, &c2], repo.path());
@@ -240,6 +271,34 @@ fn diff_plumbing_exit_code_and_quiet_matrix() {
     let index_q = run_libra_command(&["diff-index", "--quiet", "HEAD"], repo.path());
     assert_eq!(index_q.status.code(), Some(1));
     assert!(out_str(&index_q).is_empty());
+
+    // `--json` still has to stay silent: plumbing `--quiet` is not the global
+    // quiet flag, and `--machine` keeps emitting JSON.
+    for args in [
+        vec!["--json", "diff-files", "--quiet"],
+        vec!["--json", "diff-index", "--quiet", "HEAD"],
+        vec!["--json", "diff-tree", "--quiet", &c1, &c2],
+    ] {
+        let quiet_json = run_libra_command(&args, repo.path());
+        assert_eq!(
+            quiet_json.status.code(),
+            Some(1),
+            "quiet json {args:?}: {}",
+            String::from_utf8_lossy(&quiet_json.stderr)
+        );
+        assert!(
+            quiet_json.stdout.is_empty(),
+            "--json --quiet must not print a diff envelope: {args:?} stdout={}",
+            String::from_utf8_lossy(&quiet_json.stdout)
+        );
+    }
+
+    let bad_flag = run_libra_command(&["diff-files", "--not-a-flag"], repo.path());
+    assert_eq!(bad_flag.status.code(), Some(129));
+    let bad_rev = run_libra_command(&["diff-index", "does-not-exist"], repo.path());
+    assert_eq!(bad_rev.status.code(), Some(129));
+    let bad_tree = run_libra_command(&["diff-tree", "does-not-exist", "HEAD"], repo.path());
+    assert_eq!(bad_tree.status.code(), Some(129));
 }
 
 /// issues/479 TC-0044 — the stat-raciness contract behind `t/t3700-add.sh#24`:

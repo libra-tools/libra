@@ -7,7 +7,7 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`diff-files [-- <path>...]`（= 裸 `diff`，index 对工作树）、`-p`/`--patch`、`-s`/`--no-patch`、`--raw`（默认）、`--name-only`、`--name-status`、`--exit-code`、`--quiet`，所有 `diff` 全局标志与 `--json`；工作树一侧为 stat-based（issues/479 DF-01：stat 漂移条目按 `M` + 全零 worktree sha 报告，不哈希；`read-tree` 零 stat 的 racy 条目同理）。ADR-PL-09 退出契约：默认有差异也 0，`--exit-code`/`--quiet` 才转 1。
+- 已支持：`diff-files [-- <path>...]`（= 裸 `diff`，index 对工作树）、`-p`/`--patch`、`-s`/`--no-patch`、`--raw`（默认）、`--name-only`、`--name-status`、`--exit-code`、`--quiet`，所有 `diff` 全局标志与 `--json`；工作树一侧为 stat-based（issues/479 DF-01：stat 漂移条目按 `M` + 全零 worktree sha 报告，不哈希；`read-tree` 零 stat 的 racy 条目同理）。状态字母按条目存在性判定：空 blob 的 stat-invalid 条目是 `M` 不是 `A`，工作树截断为空是 `M` 不是 `D`（TC-0044）。ADR-PL-09 退出契约：默认有差异也 0，`--exit-code`/`--quiet` 才转 1。
 - 未公开（延后）：`-1`/`-2`/`-3` 阶段选择。
 
 ## 设计方案

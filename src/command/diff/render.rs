@@ -223,6 +223,16 @@ pub(super) fn render_diff_output(
             Err(CliError::silent_exit(code))
         };
     }
+    // Plumbing `--quiet` promises an empty stdout, including under `--json`.
+    // The global quiet flag cannot do this: `--machine` sets quiet and still
+    // emits JSON.
+    if args.plumbing_quiet {
+        return if args.exit_code && result.files_changed > 0 {
+            Err(CliError::silent_exit(1))
+        } else {
+            Ok(())
+        };
+    }
     if output.is_json() {
         emit_json_data("diff", result, output)?;
         // `--exit-code` applies regardless of output format: emit the JSON, then

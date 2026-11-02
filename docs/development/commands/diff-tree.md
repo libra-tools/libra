@@ -7,8 +7,8 @@
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`diff-tree <tree-a> <tree-b> [-- <path>...]`（= `diff --old a --new b`），所有 `diff` 全局标志与 `--json`。
-- 未公开（延后）：单提交 `diff-tree <commit>`（对比父）、`-r`/`-t`/`--stdin`、raw 输出格式。
+- 已支持：`diff-tree <tree-a> <tree-b> [-- <path>...]`、`-r`（空操作，总是递归）、`-p`/`--patch`、`-s`/`--no-patch`、`--raw`、`--name-only`、`--name-status`、`--exit-code`、`--quiet`、`-c`/`--cc`（接受拼写）。ADR-PL-09：默认有差异也 0，`--exit-code`/`--quiet` 才转 1。
+- 未公开（延后）：单提交 `diff-tree <commit>`（对比父）、`-t`/`--stdin`。
 
 ## 设计方案
 
@@ -23,14 +23,14 @@
 ## 当前状态
 
 - 公开状态：已公开（`Commands::DiffTree`）。
-- 测试：`tests/command/diff_plumbing_test.rs`（diff-tree 两 tree、pathspec 限定、非仓库 128）。
+- 测试：`tests/command/diff_plumbing_test.rs`（名称输出、退出码、两 tree 与 pathspec）。
 - 用户文档：`docs/commands/diff-tree.md`（EN + zh-CN）。
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容差异项 | 单提交 vs 父、`-r`/`-t`/`--stdin`、raw | 延后；更多用 `libra diff`。 |
+| 兼容差异项 | 单提交 vs 父、`-t`/`--stdin` | `-r`、raw、`--name-only`/`--name-status`、`--exit-code`/`--quiet` 已公开。 |
 
 ## 维护要求
 

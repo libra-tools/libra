@@ -337,6 +337,12 @@ pub struct DiffArgs {
     #[clap(long = "exit-code")]
     pub exit_code: bool,
 
+    /// Plumbing `diff-files`/`diff-index`/`diff-tree --quiet`: print nothing,
+    /// including a `--json` envelope. Hidden because porcelain `diff` uses the
+    /// global quiet flag instead.
+    #[clap(long = "plumbing-quiet", hide = true)]
+    pub plumbing_quiet: bool,
+
     /// Suppress the patch (diff body) output. Combine with `--exit-code` for a
     /// status-only check.
     #[clap(short = 's', long = "no-patch")]
@@ -5252,6 +5258,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         pickaxe_regex: None,
         shortstat: false,
         exit_code: false,
+        plumbing_quiet: false,
         no_patch: false,
         null: false,
         check: false,

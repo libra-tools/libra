@@ -7,7 +7,7 @@ Show the differences between a tree and the working tree (or the index with
 ## Synopsis
 
 ```
-libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status]
+libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet]
                  <tree> [-- <path>...]
 ```
 
@@ -19,7 +19,10 @@ compares the tree against the index instead. Path limiters go after `--`; as Git
 plumbing it ignores porcelain `diff.renames`. Global output flags such as
 `libra --json diff-index ...` still apply.
 
-Like Git's plumbing, the **default output is raw**.
+Like Git's plumbing, the **default output is raw**. `--name-status` uses the
+same entry-presence letters as `diff-files`: an empty tracked blob whose stat
+was invalidated is `M`, not `A`, and a worktree file truncated to zero bytes is
+`M`, not `D`.
 
 ## Options
 
@@ -31,6 +34,8 @@ Like Git's plumbing, the **default output is raw**.
 | `--raw` | Force raw records (the default). | `libra diff-index --raw HEAD` |
 | `--name-only` | Print changed path names only. | `libra diff-index --name-only HEAD` |
 | `--name-status` | Print the status letter for each changed path. | `libra diff-index --name-status HEAD` |
+| `--exit-code` | Exit 1 when there are differences instead of the default 0. | `libra diff-index --exit-code HEAD` |
+| `--quiet` | Print nothing and exit 1 when there are differences. | `libra diff-index --quiet HEAD` |
 | `-s`, `--no-patch` | Suppress the diff body entirely. | `libra diff-index -s HEAD` |
 | `-- <path>...` | Limit the diff to paths. | `libra diff-index HEAD -- src/` |
 | `--json` / `--machine` | Structured diff output. | `libra --json diff-index HEAD` |
@@ -41,9 +46,10 @@ The remaining porcelain flag surface (`-m`) is not exposed.
 
 | Code | Meaning |
 |------|---------|
-| `0` | No differences. |
-| `1` | There are differences — Git plumbing exit convention. |
-| `128` | The tree-ish could not be resolved, or not inside a repository. |
+| `0` | No differences, or differences without `--exit-code`/`--quiet`. |
+| `1` | There are differences and `--exit-code`/`--quiet` was given. |
+| `128` | Not inside a repository. |
+| `129` | Invalid arguments (`LBR-CLI-002`) or an unresolved revision (`LBR-CLI-003`). |
 
 ## Examples
 
