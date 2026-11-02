@@ -11,6 +11,16 @@
   runtime packages described in `docs/installation.md`. The `gui` Cargo feature
   no longer gates compilation.
 
+### Added
+
+- `libra mega2 traces` reads scoped Mega2 history (`capabilities`, `targets`,
+  `streams`, `sessions`, `show`, `checkpoints`, `search`, `transcript`) and
+  `fetch` writes one verified archive ref at
+  `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`. Ordinary code clone
+  still refuses a `/.traces/` locator, and a Mega2 code mirror still fetches
+  branch tips only. This note records the code delivery. It is not a GitHub
+  Release, and the live HTTP/SSH audit is not claimed here.
+
 ### Changed
 
 - `libra ui` and the GPUI desktop window are now part of every standard build.

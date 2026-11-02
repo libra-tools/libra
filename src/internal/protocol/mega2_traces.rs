@@ -284,6 +284,140 @@ pub fn propagate_server_rejection(stable_code: &str) -> Result<(), String> {
     }
 }
 
+pub const PROTOCOL_ID: &str = "libra-traces/v1";
+pub const RESPONSE_BYTES_MAX: usize = 1_048_576;
+pub const METADATA_LIMIT_DEFAULT: u64 = 50;
+pub const METADATA_LIMIT_MAX: u64 = 200;
+pub const SEARCH_LIMIT_DEFAULT: u64 = 20;
+pub const SEARCH_LIMIT_MAX: u64 = 100;
+pub const TEXT_BYTES_DEFAULT: u64 = 16_384;
+pub const TEXT_BYTES_MAX: u64 = 131_072;
+pub const QUERY_BYTES_MIN: usize = 1;
+pub const QUERY_BYTES_MAX: usize = 256;
+
+pub fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// Keep `Authorization` only when a redirect stays on the same origin.
+pub fn bearer_after_redirect(
+    current: &url::Url,
+    next: &url::Url,
+    authorization: Option<&str>,
+) -> Option<String> {
+    if same_origin(current, next) {
+        authorization.map(str::to_string)
+    } else {
+        None
+    }
+}
+
+pub fn take_bounded(bytes: &[u8], limit: usize) -> Result<&[u8], String> {
+    if bytes.len() > limit {
+        Err(format!(
+            "traces response is {} bytes, over the {limit} byte limit",
+            bytes.len()
+        ))
+    } else {
+        Ok(bytes)
+    }
+}
+
+pub fn validate_search_query(query: &str) -> Result<(), String> {
+    let length = query.len();
+    if length < QUERY_BYTES_MIN {
+        Err("search query must be at least 1 UTF-8 byte; the request was not sent".to_string())
+    } else if length > QUERY_BYTES_MAX {
+        Err(format!(
+            "search query is {length} UTF-8 bytes; the maximum is {QUERY_BYTES_MAX} and the request was not sent"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn bounded_count(
+    name: &str,
+    value: Option<u64>,
+    default: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let chosen = value.unwrap_or(default);
+    if chosen == 0 || chosen > max {
+        Err(format!("{name} must be from 1 to {max}"))
+    } else {
+        Ok(chosen)
+    }
+}
+
+pub fn parse_rfc3339_unix_seconds(value: &str) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.timestamp())
+        .map_err(|_| format!("time bound {value:?} must be an RFC3339 timestamp"))
+}
+
+pub fn validate_time_window(since: Option<i64>, until: Option<i64>) -> Result<(), String> {
+    if let (Some(since), Some(until)) = (since, until)
+        && since > until
+    {
+        return Err(
+            "since must be earlier than until; the interval is half-open and the request was not sent"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Normalize an RFC3339 timestamp to UTC seconds, written with a `Z` suffix.
+pub fn normalize_rfc3339_utc(value: &str) -> Result<String, String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|_| format!("time bound {value:?} must be an RFC3339 timestamp"))?;
+    Ok(parsed
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// Accept a full 40- or 64-character hexadecimal code OID and leave the text unchanged.
+pub fn validate_code_commit(value: &str) -> Result<(), String> {
+    let hexadecimal = value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if hexadecimal && (value.len() == 40 || value.len() == 64) {
+        Ok(())
+    } else {
+        Err(format!(
+            "code commit {value:?} must be 40 or 64 hexadecimal characters; the request was not sent"
+        ))
+    }
+}
+
+/// Distinguish a missing or non-boolean readiness field from `search_ready=false`.
+pub fn search_ready_gate(
+    field: Option<&serde_json::Value>,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    match field {
+        None => Err("search_ready is missing; the readiness check was not accepted".to_string()),
+        Some(value) => match value.as_bool() {
+            Some(ready) => require_search_ready(ready, reason),
+            None => Err(
+                "search_ready must be a boolean; the readiness check was not accepted".to_string(),
+            ),
+        },
+    }
+}
+
+pub fn require_search_ready(ready: bool, reason: Option<&str>) -> Result<(), String> {
+    if ready {
+        Ok(())
+    } else {
+        Err(format!(
+            "search is not ready ({})",
+            reason.unwrap_or("search_unavailable")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +534,68 @@ mod tests {
             ssh_client::ordinary_code_transport_allows(&format!("ssh://traces@example.test{path}"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn auth_redirect_and_bounded_response_matrix() {
+        let origin = url::Url::parse("http://127.0.0.1:9/api/v1/traces/capabilities").unwrap();
+        let same = url::Url::parse("http://127.0.0.1:9/api/v1/traces/next").unwrap();
+        let cross = url::Url::parse("https://evil.example/api/v1/traces/next").unwrap();
+        assert_eq!(
+            bearer_after_redirect(&origin, &same, Some("Bearer secret")).as_deref(),
+            Some("Bearer secret")
+        );
+        assert!(bearer_after_redirect(&origin, &cross, Some("Bearer secret")).is_none());
+        assert!(take_bounded(&vec![1; RESPONSE_BYTES_MAX], RESPONSE_BYTES_MAX).is_ok());
+        assert!(take_bounded(&vec![1; RESPONSE_BYTES_MAX + 1], RESPONSE_BYTES_MAX).is_err());
+    }
+
+    #[test]
+    fn bounded_body_and_offsets() {
+        assert!(validate_search_query("a").is_ok());
+        assert!(validate_search_query(&"a".repeat(256)).is_ok());
+        assert!(validate_search_query("").is_err());
+        assert!(validate_search_query(&"a".repeat(257)).is_err());
+        assert!(validate_search_query("你").is_ok());
+        let since = parse_rfc3339_unix_seconds("2026-11-02T00:00:00Z").unwrap();
+        let until = parse_rfc3339_unix_seconds("2026-11-02T01:00:00Z").unwrap();
+        assert!(validate_time_window(Some(since), Some(until)).is_ok());
+        assert!(validate_time_window(Some(until), Some(since)).is_err());
+        assert!(
+            validate_time_window(Some(since), Some(since)).is_ok(),
+            "since equal to until is an empty interval, not a local rejection"
+        );
+        assert_eq!(
+            normalize_rfc3339_utc("2026-11-02T08:00:00+08:00").unwrap(),
+            "2026-11-02T00:00:00Z"
+        );
+        assert!(validate_code_commit(&"ab".repeat(20)).is_ok());
+        assert!(validate_code_commit(&"ab".repeat(32)).is_ok());
+        assert!(validate_code_commit("abcd").is_err());
+        assert!(
+            search_ready_gate(None, None)
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            search_ready_gate(Some(&serde_json::json!("yes")), None)
+                .unwrap_err()
+                .contains("boolean")
+        );
+        assert_eq!(
+            bounded_count("limit", None, TEXT_BYTES_DEFAULT, TEXT_BYTES_MAX).unwrap(),
+            TEXT_BYTES_DEFAULT
+        );
+        assert!(
+            bounded_count(
+                "max_bytes",
+                Some(TEXT_BYTES_MAX + 1),
+                TEXT_BYTES_DEFAULT,
+                TEXT_BYTES_MAX
+            )
+            .is_err()
+        );
+        assert!(require_search_ready(false, Some("extension_missing")).is_err());
+        assert!(require_search_ready(true, None).is_ok());
     }
 }

@@ -1,3 +1,5 @@
+> **2026-11-02 查询 / fetch / 收口本地切片：** `libra mega2 traces` 的 capabilities、targets、streams、sessions、show、checkpoints、search、transcript 与 fetch 已接上。筛选参数原样传递，时间边界发 UTC，`since=until` 是空区间。fetch 按 Git 对象头重算 OID，拒绝匿名、哈希格式转换、跨 stream 对象和指纹冲突。库测试 5 passed（run `cfc8cf90-fcaa-49df-a09e-287865000b1f`），命令契约 11 passed（run `b53bdda0-b22f-4edc-8e3e-e3c3ba9c6af0`）。SSH 只构造 by-scope locator，没有已认证 advertisement 时不发布 ref。Live fixture 仍缺席，H6 清理收据不在本仓，所以 LTR-07/09/08 不记 complete。LTR-13/19/24/14/15/20/03/04/25/05/16/17/18/06 为 `in-progress`/`locally-accepted`。这些卡改同一命令模块，记在同一次提交。
+
 > **2026-11-02 用户取消 DEFER-LTR-06。** LTR-00 不再挡住后续功能。AC-3 与原 ER-05 双 FAIL 仍在，LTR-00 保持 `blocked`/空。LTR-02 客户端已拒绝 `/.traces/` 克隆，Mega2 `/project/*.git` mirror 只取 heads；`mega2_code_clone_excludes_traces_matrix` 1 passed。Live OID 闭包未跑。
 
 > **2026-11-02 LTR-12 `in-progress`/`locally-accepted`：** `--mega2`/`--new-stream` 已接入。`mega2_scoped_push_contract` 与收据库测试各 1 passed。无 remote URL 或无 `libra-traces-v1` 广告时在网络前停止。Live discovery 未跑。`COMPATIBILITY.md` 因另有未提交 UI 改动而未并入。

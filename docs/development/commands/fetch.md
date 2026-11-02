@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra fetch` 的目标是从远端下载对象和 refs，并按 refspec、FETCH_HEAD、tag 策略、浅边界和 dry-run/porcelain 规则更新本地状态。实现需要支持 ref 更新原子回滚、prune、force、append 和远端诊断，同时避免网络/pack 流处理出现静默失败；独立的 `--atomic` 选项仍为延后 surface（`--set-upstream`/`--update-head-ok`/`--refmap` 已公开，见下文）。
+`libra fetch` 的目标是从远端下载对象和 refs，并按 refspec、FETCH_HEAD、tag 策略、浅边界和 dry-run/porcelain 规则更新本地状态。显式 traces 归档不走本命令：`libra mega2 traces fetch` 只在校验通过后写 `refs/remotes/<remote>/traces/<stream>/<hash-kind>`，不改 `refs/heads/traces`、`refs/libra/traces` 或本地 capture catalog。实现需要支持 ref 更新原子回滚、prune、force、append 和远端诊断，同时避免网络/pack 流处理出现静默失败；独立的 `--atomic` 选项仍为延后 surface（`--set-upstream`/`--update-head-ok`/`--refmap` 已公开，见下文）。
 
 ## 对比 Git 与兼容性
 

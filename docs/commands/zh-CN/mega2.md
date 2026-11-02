@@ -1,3 +1,21 @@
+# `libra mega2`
+
+`libra mega2 traces` 读取限定范围内的 Agent 历史，也可以取回一条已校验的 stream。
+
+```
+libra mega2 traces capabilities --server <BASE-URL> [--token-file <PATH>] [--require-search]
+libra mega2 traces targets --server <BASE-URL> --path </project/foo>
+libra mega2 traces streams --server <BASE-URL> --target <UUID> [--source <ID>] [--owner <UUID>] [--epoch <UUID>] [--cursor <CURSOR>] [--limit <N>]
+libra mega2 traces sessions --server <BASE-URL> --stream <UUID> [--since <RFC3339>] [--until <RFC3339>] [--agent <KIND>] [--code-commit <OID>] [--session <ID>] [--cursor <CURSOR>]
+libra mega2 traces show --server <BASE-URL> --stream <UUID> (--session <ID> | --checkpoint <ID>)
+libra mega2 traces checkpoints --server <BASE-URL> --stream <UUID> --session <ID> [--cursor <CURSOR>]
+libra mega2 traces search --server <BASE-URL> --target </project/foo> --query <TEXT> [--limit <N>] [--max-bytes <N>]
+libra mega2 traces transcript --server <BASE-URL> --stream <UUID> --checkpoint <ID> [--max-bytes <N>] [--cursor <CURSOR>]
+libra mega2 traces fetch --remote <NAME> --stream <UUID>
+```
+
+搜索文本必须是 1 到 256 个 UTF-8 字节，否则命令不会打开网络连接。客户端原样发送查询，ASCII 大小写折叠由服务端完成。未指定的列表 `limit` 是 50；未指定的搜索是 20 条和 16384 字节。超过 200 或 100 的 limit 在网络前拒绝。`--owner`、`--epoch`、`--agent`、`--session`、`--cursor` 按原值传递。`--code-commit` 必须是 40 或 64 位十六进制。`--since` / `--until` 按 RFC3339 解析后以 UTC 发送，区间是 `[since, until)`；since 晚于 until 在网络前拒绝，相等是空区间。`--session` 与 `--checkpoint` 不能同时使用。`--require-search` 只在 `search_ready` 为布尔 `true` 时成功；字段缺失或不是布尔值会拒绝，而不带该旗标的 `capabilities` 仍输出其余能力。跨源重定向不转发 `Authorization`。超过 1 MiB 的响应会被拒绝。`fetch` 需要 token，读取已认证的 `server_id`，并只在 Git 对象头哈希与链接闭包符合仓库对象格式后写入 `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`。它记录服务指纹，拒绝静默改指另一台服务，也不改 `refs/heads/traces`、`refs/libra/traces`、`HEAD`、index 或工作区。SSH remote 会定位到 `ssh://traces@<host>/.traces/by-scope/<stream>.git`；没有已认证的 git advertisement 时不发布 ref。
+
 # `libra mega2 browser`
 
 以 HTTP 浏览远端 Mega2 仓库：终端采用**左侧目录树、右侧文件内容**的双栏界面；
