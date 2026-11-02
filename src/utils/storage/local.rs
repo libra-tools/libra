@@ -1411,7 +1411,7 @@ impl LocalStorage {
         Ok(Self::read_idx_from_open_binary(&mut idx_file, version, &fanout, obj_id)?.is_some())
     }
 
-    fn read_idx_version(file: &mut fs::File) -> Result<IdxVersion, io::Error> {
+    fn read_idx_version(file: &mut (impl Read + Seek)) -> Result<IdxVersion, io::Error> {
         let mut header = [0u8; 4];
         file.read_exact(&mut header)?;
         if header == IDX_MAGIC {
@@ -1442,7 +1442,7 @@ impl LocalStorage {
     }
 
     fn read_idx_fanout_from_open(
-        idx_file: &mut fs::File,
+        idx_file: &mut (impl Read + Seek),
     ) -> Result<(IdxVersion, [u32; 256]), io::Error> {
         let version = Self::read_idx_version(idx_file)?;
         let fanout_offset = match version {
@@ -1451,92 +1451,48 @@ impl LocalStorage {
         };
         idx_file.seek(io::SeekFrom::Start(fanout_offset))?;
         let mut fanout: [u32; 256] = [0; 256];
-        let mut buf = [0; 4];
-        for slot in fanout.iter_mut() {
-            idx_file.read_exact(&mut buf)?;
-            *slot = u32::from_be_bytes(buf);
+        let mut bytes = [0; FANOUT as usize];
+        idx_file.read_exact(&mut bytes)?;
+        for (slot, chunk) in fanout.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
+            *slot = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        if fanout.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack index fanout counts are not monotonic",
+            ));
         }
         Ok((version, fanout))
     }
 
     fn read_idx(idx_file: &Path, obj_id: &ObjectHash) -> Result<Option<u64>, io::Error> {
         let mut idx_file = fs::File::open(idx_file)?;
-        let (version, fanout) = Self::read_idx_fanout_from_open(&mut idx_file)?;
-        Self::read_idx_from_open(&mut idx_file, version, &fanout, obj_id)
+        Self::read_idx_from_reader(&mut idx_file, obj_id)
     }
 
-    fn read_idx_from_open(
-        idx_file: &mut fs::File,
-        version: IdxVersion,
-        fanout: &[u32; 256],
+    fn read_idx_from_reader(
+        idx_file: &mut (impl Read + Seek),
         obj_id: &ObjectHash,
     ) -> Result<Option<u64>, io::Error> {
-        let first_byte = obj_id.as_ref()[0];
-        let start = if first_byte == 0 {
-            0
-        } else {
-            fanout[first_byte as usize - 1] as usize
-        };
-        let end = fanout[first_byte as usize] as usize;
-        let object_count = fanout[255] as u64;
+        let (version, fanout) = Self::read_idx_fanout_from_open(idx_file)?;
+        let count = u64::from(fanout[255]);
         let hash_size = git_internal::hash::get_hash_kind().size() as u64;
-
-        match version {
-            IdxVersion::V1 => {
-                if hash_size != 20 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "pack index v1 only supports sha1",
-                    ));
-                }
-                idx_file.seek(io::SeekFrom::Start(FANOUT + 24 * start as u64))?;
-                for _ in start..end {
-                    let offset = idx_file.read_u32::<BigEndian>()?;
-                    let hash = read_sha(idx_file)?;
-
-                    if &hash == obj_id {
-                        return Ok(Some(offset as u64));
-                    }
-                }
-                Ok(None)
-            }
-            IdxVersion::V2 => {
-                let names_offset = FANOUT + 8;
-                idx_file.seek(io::SeekFrom::Start(names_offset + hash_size * start as u64))?;
-                let mut found_index = None;
-                for i in start..end {
-                    let hash = read_sha(idx_file)?;
-                    if &hash == obj_id {
-                        found_index = Some(i as u64);
-                        break;
-                    }
-                }
-                let Some(index) = found_index else {
-                    return Ok(None);
-                };
-
-                let crc_offset = names_offset + object_count * hash_size;
-                let offsets_offset = crc_offset + object_count * 4;
-                idx_file.seek(io::SeekFrom::Start(offsets_offset + index * 4))?;
-                let offset = idx_file.read_u32::<BigEndian>()?;
-                if offset & 0x8000_0000 != 0 {
-                    let large_index = (offset & 0x7fff_ffff) as u64;
-                    let large_offsets_offset = offsets_offset + object_count * 4;
-                    idx_file.seek(io::SeekFrom::Start(large_offsets_offset + large_index * 8))?;
-                    let large_offset = idx_file.read_u64::<BigEndian>()?;
-                    Ok(Some(large_offset))
-                } else {
-                    Ok(Some(offset as u64))
-                }
-            }
+        let minimum_len = match version {
+            IdxVersion::V1 => FANOUT + count * 24,
+            IdxVersion::V2 => FANOUT + 8 + count * (hash_size + 8),
+        };
+        if idx_file.seek(io::SeekFrom::End(0))? < minimum_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pack index object tables are truncated",
+            ));
         }
+        Self::read_idx_from_open_binary(idx_file, version, &fanout, obj_id)
     }
 
-    /// Batch-only lookup: pack index names are sorted within each fanout
-    /// bucket, so binary search avoids rescanning a large bucket for every
-    /// advertised shallow boundary. The single-object path above is unchanged.
+    /// Pack index names are sorted within each fanout bucket.
     fn read_idx_from_open_binary(
-        idx_file: &mut fs::File,
+        idx_file: &mut (impl Read + Seek),
         version: IdxVersion,
         fanout: &[u32; 256],
         obj_id: &ObjectHash,
@@ -1594,7 +1550,15 @@ impl LocalStorage {
         if version == IdxVersion::V2 && offset & 0x8000_0000 != 0 {
             let large_index = u64::from(offset & 0x7fff_ffff);
             let large_offsets_offset = names_offset + object_count * hash_size + object_count * 8;
-            idx_file.seek(io::SeekFrom::Start(large_offsets_offset + large_index * 8))?;
+            let large_position = large_offsets_offset + large_index * 8;
+            let end = idx_file.seek(io::SeekFrom::End(0))?;
+            if large_index >= object_count || large_position + 8 + hash_size * 2 > end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pack index large offset points outside its table",
+                ));
+            }
+            idx_file.seek(io::SeekFrom::Start(large_position))?;
             Ok(Some(idx_file.read_u64::<BigEndian>()?))
         } else {
             Ok(Some(u64::from(offset)))
@@ -3483,6 +3447,10 @@ mod tests {
                     .expect("find indexed object"),
                     Some(index as u64 + 1)
                 );
+                assert_eq!(
+                    LocalStorage::read_idx(&index_path, hash).expect("single-object lookup"),
+                    Some(index as u64 + 1)
+                );
             }
             for missing in [
                 oid(kind, 0x2a, 0x40),
@@ -3500,8 +3468,279 @@ mod tests {
                     .expect("search missing object"),
                     None
                 );
+                assert_eq!(
+                    LocalStorage::read_idx(&index_path, &missing).expect("single-object miss"),
+                    None
+                );
             }
         }
+    }
+
+    pub(super) fn status_pack_lookup_rejects_truncated_and_corrupt_indexes() {
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("temporary index directory");
+        let path = dir.path().join("fixture.idx");
+        let hash = ObjectHash::Sha1([0x2a; 20]);
+        for len in [0, 4, 100, FANOUT as usize - 1] {
+            fs::write(&path, vec![0; len]).expect("write truncated index");
+            assert!(LocalStorage::read_idx(&path, &hash).is_err(), "len={len}");
+        }
+
+        let mut fanout = vec![0; FANOUT as usize];
+        fanout[0..4].copy_from_slice(&2u32.to_be_bytes());
+        fs::write(&path, &fanout).expect("write nonmonotonic fanout");
+        assert_eq!(
+            LocalStorage::read_idx(&path, &hash)
+                .expect_err("corrupt fanout must fail")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        fanout[0..4].copy_from_slice(&0u32.to_be_bytes());
+        for count in fanout.as_chunks_mut::<4>().0.iter_mut().skip(0x2a) {
+            count.copy_from_slice(&1u32.to_be_bytes());
+        }
+        fs::write(&path, &fanout).expect("write truncated object table");
+        assert_eq!(
+            LocalStorage::read_idx(&path, &hash)
+                .expect_err("missing object table must fail")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut bad_large = Vec::new();
+        bad_large.extend_from_slice(&IDX_MAGIC);
+        bad_large.extend_from_slice(&2u32.to_be_bytes());
+        bad_large.extend_from_slice(&fanout);
+        bad_large.extend_from_slice(hash.as_ref());
+        bad_large.extend_from_slice(&[0; 4]);
+        bad_large.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+        bad_large.extend_from_slice(&[0x55; 40]); // Checksums, not a large-offset table.
+        fs::write(&path, bad_large).expect("write index with missing large offset");
+        assert_eq!(
+            LocalStorage::read_idx(&path, &hash)
+                .expect_err("checksum bytes cannot be interpreted as an offset")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut replacement = vec![0; FANOUT as usize];
+        replacement.extend_from_slice(&7u32.to_be_bytes());
+        replacement.extend_from_slice(hash.as_ref());
+        fs::write(&path, &replacement).expect("replace index with empty index");
+        assert_eq!(
+            LocalStorage::read_idx(&path, &hash).expect("new index"),
+            None
+        );
+        for count in replacement[..FANOUT as usize]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .skip(0x2a)
+        {
+            count.copy_from_slice(&1u32.to_be_bytes());
+        }
+        fs::write(&path, replacement).expect("replace index with populated index");
+        assert_eq!(
+            LocalStorage::read_idx(&path, &hash).expect("new index"),
+            Some(7)
+        );
+    }
+
+    pub(super) fn status_pack_lookup_matches_v1_v2_and_hash_kinds() {
+        for (kind, version) in [
+            (HashKind::Sha1, IdxVersion::V1),
+            (HashKind::Sha1, IdxVersion::V2),
+            (HashKind::Sha256, IdxVersion::V2),
+        ] {
+            let _kind = git_internal::hash::set_hash_kind_for_test(kind);
+            let dir = tempfile::tempdir().expect("temporary index directory");
+            let path = dir.path().join("fixture.idx");
+            let hash = match kind {
+                HashKind::Sha1 => ObjectHash::Sha1([0x2a; 20]),
+                HashKind::Sha256 => ObjectHash::Sha256([0x2a; 32]),
+                HashKind::Blake3 => unreachable!("fixture kinds are fixed"),
+            };
+            let mut bytes = Vec::new();
+            if version == IdxVersion::V2 {
+                bytes.extend_from_slice(&IDX_MAGIC);
+                bytes.extend_from_slice(&2u32.to_be_bytes());
+            }
+            for bucket in 0..=u8::MAX {
+                bytes.extend_from_slice(&(u32::from(bucket >= 0x2a)).to_be_bytes());
+            }
+            if version == IdxVersion::V1 {
+                bytes.extend_from_slice(&17u32.to_be_bytes());
+            }
+            bytes.extend_from_slice(hash.as_ref());
+            if version == IdxVersion::V2 {
+                bytes.extend_from_slice(&[0; 4]);
+                bytes.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+                bytes.extend_from_slice(&0x1_0000_0001u64.to_be_bytes());
+                bytes.extend_from_slice(&vec![0; kind.size() * 2]);
+            }
+            fs::write(&path, bytes).expect("write index");
+            assert_eq!(
+                LocalStorage::read_idx(&path, &hash).expect("lookup"),
+                Some(if version == IdxVersion::V1 {
+                    17
+                } else {
+                    0x1_0000_0001
+                })
+            );
+            let missing = match kind {
+                HashKind::Sha1 => ObjectHash::Sha1([0x2b; 20]),
+                HashKind::Sha256 => ObjectHash::Sha256([0x2b; 32]),
+                HashKind::Blake3 => unreachable!("fixture kinds are fixed"),
+            };
+            assert_eq!(LocalStorage::read_idx(&path, &missing).expect("miss"), None);
+        }
+    }
+
+    pub(super) fn status_pack_lookup_reduces_reads_on_fixed_bucket() {
+        struct Counted<R> {
+            inner: R,
+            reads: usize,
+            seeks: usize,
+            end_seeks: usize,
+        }
+
+        impl<R: Read> Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buf)
+            }
+        }
+
+        impl<R: Seek> Seek for Counted<R> {
+            fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+                self.seeks += 1;
+                self.end_seeks += usize::from(matches!(pos, io::SeekFrom::End(_)));
+                self.inner.seek(pos)
+            }
+        }
+
+        // Reference the pre-SP-07 v2 query for this fixture's 32-bit offsets.
+        fn old_lookup(
+            reader: &mut (impl Read + Seek),
+            target: &ObjectHash,
+        ) -> io::Result<Option<u64>> {
+            assert_eq!(LocalStorage::read_idx_version(reader)?, IdxVersion::V2);
+            reader.seek(io::SeekFrom::Start(8))?;
+            let mut fanout = [0u32; 256];
+            for count in &mut fanout {
+                *count = reader.read_u32::<BigEndian>()?;
+            }
+            let bucket = usize::from(target.as_ref()[0]);
+            let start = if bucket == 0 { 0 } else { fanout[bucket - 1] };
+            let end = fanout[bucket];
+            let names = FANOUT + 8;
+            reader.seek(io::SeekFrom::Start(names + u64::from(start) * 20))?;
+            for index in start..end {
+                if read_sha(reader)? == *target {
+                    let offsets = names + u64::from(fanout[255]) * 24;
+                    reader.seek(io::SeekFrom::Start(offsets + u64::from(index) * 4))?;
+                    return Ok(Some(u64::from(reader.read_u32::<BigEndian>()?)));
+                }
+            }
+            Ok(None)
+        }
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&IDX_MAGIC);
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        for bucket in 0..=u8::MAX {
+            bytes.extend_from_slice(&(if bucket < 0x2a { 0u32 } else { 1024 }).to_be_bytes());
+        }
+        let mut target = ObjectHash::Sha1([0; 20]);
+        for index in 0..1024u16 {
+            let mut name = [0; 20];
+            name[0] = 0x2a;
+            name[1..3].copy_from_slice(&index.to_be_bytes());
+            bytes.extend_from_slice(&name);
+            if index == 1023 {
+                target = ObjectHash::Sha1(name);
+            }
+        }
+        bytes.extend_from_slice(&vec![0; 1024 * 4]);
+        for index in 0..1024u32 {
+            bytes.extend_from_slice(&(index + 1).to_be_bytes());
+        }
+        let dir = tempfile::tempdir().expect("temporary index directory");
+        let path = dir.path().join("fixed.idx");
+        fs::write(&path, bytes).expect("write fixed packed index fixture");
+
+        let mut binary_times = Vec::new();
+        let mut linear_times = Vec::new();
+        for _ in 0..21 {
+            let mut reader = Counted {
+                inner: fs::File::open(&path).expect("open binary fixture"),
+                reads: 0,
+                seeks: 0,
+                end_seeks: 0,
+            };
+            let start = Instant::now();
+            let offset = LocalStorage::read_idx_from_reader(&mut reader, &target)
+                .expect("complete single-object lookup");
+            binary_times.push(start.elapsed());
+            assert_eq!(offset, Some(1024));
+            assert!(reader.reads <= 15, "binary reads: {}", reader.reads);
+            assert_eq!(reader.seeks, 13);
+            assert_eq!(reader.end_seeks, 1);
+
+            let mut reader = Counted {
+                inner: fs::File::open(&path).expect("open linear fixture"),
+                reads: 0,
+                seeks: 0,
+                end_seeks: 0,
+            };
+            let start = Instant::now();
+            let offset = old_lookup(&mut reader, &target).expect("old complete lookup");
+            linear_times.push(start.elapsed());
+            assert_eq!(offset, Some(1024));
+            assert_eq!(reader.reads, 1283);
+            assert_eq!(reader.seeks, 3);
+        }
+        binary_times.sort();
+        linear_times.sort();
+        eprintln!(
+            "fixed 1024-name index, 21 complete file-backed queries (warm cache, excluding open): binary median {:?}, p95 {:?}, reads <=15, seeks 13; old linear median {:?}, p95 {:?}, reads 1283, seeks 3",
+            binary_times[10], binary_times[19], linear_times[10], linear_times[19]
+        );
+
+        let mut reader = Counted {
+            inner: fs::File::open(&path).expect("open batch fixture"),
+            reads: 0,
+            seeks: 0,
+            end_seeks: 0,
+        };
+        let (version, fanout) =
+            LocalStorage::read_idx_fanout_from_open(&mut reader).expect("batch fanout");
+        reader.seeks = 0;
+        reader.reads = 0;
+        for _ in 0..32 {
+            assert_eq!(
+                LocalStorage::read_idx_from_open_binary(&mut reader, version, &fanout, &target)
+                    .expect("batch hit"),
+                Some(1024)
+            );
+            let before = (reader.reads, reader.seeks);
+            assert_eq!(
+                LocalStorage::read_idx_from_open_binary(
+                    &mut reader,
+                    version,
+                    &fanout,
+                    &ObjectHash::Sha1([0xff; 20]),
+                )
+                .expect("empty bucket miss"),
+                None
+            );
+            assert_eq!((reader.reads, reader.seeks), before);
+        }
+        assert_eq!(reader.end_seeks, 0);
+        assert_eq!(reader.reads, 32 * 11);
+        assert_eq!(reader.seeks, 32 * 11);
     }
 
     #[tokio::test]
@@ -3688,4 +3927,22 @@ mod tests {
             "mkdir failure must name the operation: {rendered}"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn status_pack_lookup_rejects_truncated_and_corrupt_indexes() {
+    tests::status_pack_lookup_rejects_truncated_and_corrupt_indexes();
+}
+
+#[cfg(test)]
+#[test]
+fn status_pack_lookup_matches_v1_v2_and_hash_kinds() {
+    tests::status_pack_lookup_matches_v1_v2_and_hash_kinds();
+}
+
+#[cfg(test)]
+#[test]
+fn status_pack_lookup_reduces_reads_on_fixed_bucket() {
+    tests::status_pack_lookup_reduces_reads_on_fixed_bucket();
 }
