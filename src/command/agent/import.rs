@@ -6531,6 +6531,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         crate::utils::test::setup_with_new_libra_in(&root).await;
+        // The import reads repository settings through the current directory,
+        // so run it inside this repository rather than the test's own cwd.
+        let _cwd = crate::utils::test::ChangeDirGuard::new(&root);
         let real = std::env::current_exe()
             .unwrap()
             .parent()
@@ -6903,6 +6906,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         crate::utils::test::setup_with_new_libra_in(&root).await;
+        // The import reads repository settings through the current directory,
+        // so run it inside this repository rather than the test's own cwd.
+        let _cwd = crate::utils::test::ChangeDirGuard::new(&root);
         let program = std::env::current_exe()
             .unwrap()
             .parent()
