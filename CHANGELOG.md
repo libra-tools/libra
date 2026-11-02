@@ -56,6 +56,13 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.138] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 UI-01. `update-index` accepts `--index-info`,
+  `--stdin`, and `-z`. That behavior shipped before v0.30.134.
+
 ## [0.30.137] — 2026-11-03
 
 ### Changed
