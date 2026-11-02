@@ -907,6 +907,91 @@ fn json_unix_seconds(value: Option<&serde_json::Value>) -> Option<i64> {
 
 /// Official Hermes JSONL facts. A parent id is not a second session, and a
 /// non-default profile or non-cli source is refused before any turn is built.
+/// The thinking blocks of a Pi frame as stored retained data: per block, the
+/// key of the turn that holds it and its `thinking`, `thinkingSignature`, and
+/// `redacted` fields exactly as the redacted session wrote them (absent
+/// fields stay absent). Nothing is interpreted or joined to the answer.
+fn pi_retained_thinking_json(
+    thinking: &[super::observed_agents::builtin::pi::PiRetainedThinking],
+) -> Result<serde_json::Value> {
+    let raw = |value: &Option<super::observed_agents::builtin::pi::PiRawJson>| {
+        value
+            .as_ref()
+            .map(|value| serde_json::from_str::<serde_json::Value>(value.get()))
+            .transpose()
+            .map_err(|_| ImportError::SourceAuthorization)
+    };
+    let mut blocks = Vec::with_capacity(thinking.len());
+    for block in thinking {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "turn_key".to_string(),
+            serde_json::json!(block.turn_key.as_deref()),
+        );
+        for (name, value) in [
+            ("thinking", raw(&block.thinking)?),
+            ("thinkingSignature", raw(&block.thinking_signature)?),
+            ("redacted", raw(&block.redacted)?),
+        ] {
+            if let Some(value) = value {
+                entry.insert(name.to_string(), value);
+            }
+        }
+        blocks.push(serde_json::Value::Object(entry));
+    }
+    Ok(serde_json::Value::Array(blocks))
+}
+
+/// A Pi session's facts. The header, the file's first line, is the record:
+/// it gives the session id and the working directory (`cwd`). Every entry's
+/// `timestamp` gives the chronology. Pi writes no end-of-session entry, so
+/// the session stays active and its last turn incomplete.
+fn collect_pi_facts(
+    bytes: &[u8],
+    facts: &mut SourceFacts,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    let header = match lines.next().map(parse_canon_value) {
+        Some(Ok(header @ CanonValue::Object(_))) => header,
+        _ => return Err(ImportError::SourceAuthorization.into()),
+    };
+    if header.get("type").and_then(CanonValue::as_str) != Some("session") {
+        return Err(ImportError::SourceAuthorization.into());
+    }
+    let id = header
+        .get("id")
+        .and_then(CanonValue::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or(ImportError::SessionIdentityConflict)?;
+    facts.provider_session_ids.insert(id.to_string());
+    let cwd = header
+        .get("cwd")
+        .and_then(CanonValue::as_str)
+        .ok_or(ImportError::WorkingDirMissingOrAmbiguous)?;
+    facts.working_dirs.insert(PathBuf::from(cwd));
+    if let Some(timestamp) = header.get("timestamp").and_then(timestamp_seconds) {
+        facts.timestamps.push(timestamp);
+    }
+    for line in lines {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ImportError::DeadlineExceeded.into());
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        // The normalizer accounts for a line it cannot read; the chronology
+        // uses only lines that parse.
+        let Ok(entry) = parse_canon_value(line) else {
+            continue;
+        };
+        if let Some(timestamp) = entry.get("timestamp").and_then(timestamp_seconds) {
+            facts.timestamps.push(timestamp);
+        }
+    }
+    Ok(())
+}
+
 fn collect_hermes_facts(bytes: &[u8], facts: &mut SourceFacts) -> Result<()> {
     let mut lines = bytes
         .split(|byte| *byte == b'\n')
@@ -1048,6 +1133,7 @@ fn collect_facts(kind: AgentKind, bytes: &[u8], deadline: Option<Instant>) -> Re
             }
         }
         AgentKind::Hermes => collect_hermes_facts(bytes, &mut facts)?,
+        AgentKind::Pi => collect_pi_facts(bytes, &mut facts, deadline)?,
         AgentKind::OpenCode => {
             let document = parse_canon_value(bytes)
                 .context("parse OpenCode export metadata with duplicate-key rejection")?;
@@ -1816,6 +1902,7 @@ pub(crate) fn prepare_import_projection_with_reasoning(
     let transcript = transcript.ok_or_else(|| snapshot_failure_for_import(&transcript_snapshot))?;
     ensure_before_deadline(deadline)?;
     let mut hermes_handoff = None;
+    let mut pi_retained = None;
     let (mut turns, codex_slices, codex_unattributed_source) = if agent_kind == AgentKind::Codex {
         let normalized = normalize_codex_retained_rollout_until(transcript.bytes(), deadline)
             .ok_or(ImportError::DeadlineExceeded)?;
@@ -1824,6 +1911,39 @@ pub(crate) fn prepare_import_projection_with_reasoning(
             Some(normalized.retained),
             normalized.unattributed_source,
         )
+    } else if agent_kind == AgentKind::Pi {
+        // The snapshot already bounded these bytes with the Pi worker frame
+        // (PI-33); a refused frame left no transcript above. The same frame
+        // here, under the import deadline, gives the ordinary turns and,
+        // beside them, every thinking block as written in the redacted
+        // session. An explicit ordinary import authorizes no reasoning
+        // records, so the turns drop theirs and the thinking is kept as
+        // retained, unproven data, as Hermes keeps its own.
+        let frame = super::observed_agents::builtin::pi::pi_worker_frame_with_deadline(
+            transcript.bytes(),
+            &Some(deadline),
+        )
+        .map_err(|error| match error {
+            super::observed_agents::builtin::pi::PiWorkerError::Cancelled => {
+                ImportError::DeadlineExceeded
+            }
+            _ => ImportError::SourceAuthorization,
+        })?;
+        let turns = frame
+            .ordinary
+            .into_iter()
+            .map(|mut turn| {
+                turn.records.retain(|record| {
+                    !matches!(
+                        record,
+                        super::observed_agents::SemanticRecord::Reasoning { .. }
+                    )
+                });
+                turn
+            })
+            .collect();
+        pi_retained = Some(pi_retained_thinking_json(&frame.thinking)?);
+        (turns, None, false)
     } else if agent_kind == AgentKind::Hermes {
         let scope = HermesScope {
             session_id: provider_session_id.clone(),
@@ -1945,6 +2065,10 @@ pub(crate) fn prepare_import_projection_with_reasoning(
     }
     if retention_unavailable {
         super::observed_agents::codex_reasoning::mark_retention_unavailable(&mut redaction_report);
+    }
+    if let Some(retained) = pi_retained {
+        redaction_report["pi_source_state"] = serde_json::json!("unproven");
+        redaction_report["pi_retained"] = retained;
     }
     if let Some((retained, usage, _)) = hermes_handoff.as_ref() {
         redaction_report["hermes_source_state"] = serde_json::json!("unproven");
@@ -3691,6 +3815,66 @@ fn redacted_json(value: &serde_json::Value) -> Result<RedactedBytes> {
 struct PreparedImportReports {
     full: RedactedBytes,
     metadata: serde_json::Value,
+    /// Pi only: the report without its retained thinking, and the retained
+    /// blocks by the turn that holds them. Each turn's checkpoint stores only
+    /// its own blocks; a block before the first prompt goes with the first
+    /// turn. Metadata and the session-wide report keep only their count.
+    pi_turns: Option<(serde_json::Value, BTreeMap<String, Vec<serde_json::Value>>)>,
+}
+
+impl PreparedImportReports {
+    fn new(request: &ImportRequest) -> Result<Self> {
+        let mut report = request.redaction_report.clone();
+        let mut pi_turns = None;
+        if request.agent_kind == AgentKind::Pi
+            && let Some(serde_json::Value::Array(blocks)) = report
+                .as_object_mut()
+                .and_then(|report| report.remove("pi_retained"))
+        {
+            let first_turn = request
+                .turns
+                .iter()
+                .min_by_key(|turn| turn.ordinal)
+                .map(|turn| turn.logical_turn_key.clone())
+                .unwrap_or_default();
+            // One set of the turn keys, so grouping stays linear in the
+            // blocks however many turns the session has.
+            let turn_keys: BTreeSet<&str> = request
+                .turns
+                .iter()
+                .map(|turn| turn.logical_turn_key.as_str())
+                .collect();
+            let mut by_turn: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+            let count = blocks.len();
+            for block in blocks {
+                let key = block
+                    .get("turn_key")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|key| turn_keys.contains(key))
+                    .map_or_else(|| first_turn.clone(), str::to_owned);
+                by_turn.entry(key).or_default().push(block);
+            }
+            report["pi_retained_blocks"] = serde_json::json!(count);
+            pi_turns = Some((report.clone(), by_turn));
+        }
+        Ok(Self {
+            full: redacted_json(&report)?,
+            metadata: checkpoint_redaction_metadata(request.agent_kind, &report),
+            pi_turns,
+        })
+    }
+
+    /// The report a turn's checkpoint stores: for Pi, the session report plus
+    /// that turn's retained thinking blocks only.
+    fn full_for_turn(&self, logical_turn_key: &str) -> Result<RedactedBytes> {
+        let Some((report, by_turn)) = &self.pi_turns else {
+            return Ok(self.full.clone());
+        };
+        let mut report = report.clone();
+        report["pi_retained"] =
+            serde_json::Value::Array(by_turn.get(logical_turn_key).cloned().unwrap_or_default());
+        redacted_json(&report)
+    }
 }
 
 fn checkpoint_redaction_metadata(kind: AgentKind, report: &serde_json::Value) -> serde_json::Value {
@@ -3979,6 +4163,7 @@ pub const IMPORTABLE_AGENT_KINDS: &[AgentKind] = &[
     AgentKind::Codex,
     AgentKind::OpenCode,
     AgentKind::Hermes,
+    AgentKind::Pi,
 ];
 
 /// Whether a historical import may store sessions of `kind`.
@@ -3994,7 +4179,7 @@ fn refuse_unimportable_kind(kind: AgentKind) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "agent kind '{}' cannot be imported (prepared imports accept claude_code, codex, opencode, or hermes); nothing was written",
+        "agent kind '{}' cannot be imported (prepared imports accept claude_code, codex, opencode, hermes, or pi); nothing was written",
         kind.as_db_str()
     )
 }
@@ -5012,10 +5197,7 @@ async fn import_prepared_with_reasoning_identity_batches_and_coverage(
     validate_persisted_import_timestamps(&request, Utc::now().timestamp())?;
     assert_v2_durable_import_request(&request)?;
     ensure_before_deadline(monotonic_deadline)?;
-    let reports = PreparedImportReports {
-        full: redacted_json(&request.redaction_report)?,
-        metadata: checkpoint_redaction_metadata(request.agent_kind, &request.redaction_report),
-    };
+    let reports = PreparedImportReports::new(&request)?;
     ensure_before_deadline(monotonic_deadline)?;
     let import_scope = capture_scope_for_request_until(conn, &request, monotonic_deadline).await?;
     if let Some(reasoning) = reasoning_identity_plan.as_ref() {
@@ -5627,7 +5809,7 @@ async fn import_prepared_with_reasoning_identity_batches_and_coverage(
                 import_lifecycle_event_id(&request.session_id, &turn.logical_turn_key),
                 turn.completeness == Completeness::Incomplete,
             ))?;
-            let report = reports.full.clone();
+            let report = reports.full_for_turn(&turn.logical_turn_key)?;
             let source_snapshot = request
                 .transcript_snapshot
                 .clone()
@@ -7517,93 +7699,30 @@ pub(crate) mod tests {
         );
     }
 
-    /// PI-01: the identity-only `pi` kind is outside `IMPORTABLE_AGENT_KINDS`,
-    /// so every prepared-import entry refuses it (PI-29's gate) before any
-    /// lease, catalog row, checkpoint or object is written. On Unix the same
-    /// request as `codex` imports, so the refusal is the kind gate's.
+    /// PI-01 made `pi` a repository identity; PI-10 adds it to
+    /// `IMPORTABLE_AGENT_KINDS`, so the prepared-import entries no longer
+    /// refuse it at the kind gate. On Unix a `pi` request imports one
+    /// checkpoint through the descriptor helper, and a second import of the
+    /// same logical turn writes none.
     #[tokio::test]
-    async fn pi_role_prepared_import_entries_write_nothing() {
-        assert!(!is_importable_kind(AgentKind::Pi));
-        let (_tmp, conn, root, scope) = cov2_import_test_setup().await;
-        let storage = root.join(util::ROOT_DIR);
-        let pi_request = || {
-            let mut request =
-                cov2_import_test_request(&root, &scope, vec![cov2_test_turn("pi", 0)]);
-            request.agent_kind = AgentKind::Pi;
-            request.provider_session_id = "pi-refused".to_owned();
-            request.session_id = "pi__pi-refused".to_owned();
-            request
-        };
-        let tables = [
-            "agent_session",
-            "agent_import_identity",
-            "agent_checkpoint",
-            "agent_coverage_claim",
-            "object_index",
-        ];
-        let counts = |conn: DatabaseConnection| async move {
-            let mut counts = Vec::new();
-            for table in tables {
-                counts.push(cov2_count(&conn, &format!("SELECT COUNT(*) AS n FROM {table}")).await);
-            }
-            counts
-        };
-        let before = counts(conn.clone()).await;
-        let before_files = cov2_object_files(&storage);
-        let before_traces = cov2_traces_head(&conn).await;
-        let refusals = [
-            import_prepared(
-                &conn,
-                &storage,
-                pi_request(),
-                commit_deadline_after(Duration::from_secs(30)),
-            )
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-            import_prepared_with_retention(
-                &conn,
-                &storage,
-                pi_request(),
-                commit_deadline_after(Duration::from_secs(30)),
-                super::super::subagent_content::SubagentDiscovery::default(),
-                None,
-                None,
-                None,
-            )
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-            import_prepared_with_coverage_versions(
-                &conn,
-                &storage,
-                pi_request(),
-                &[2],
-                Duration::from_secs(30),
-                None,
-            )
-            .await
-            .map(|_| ())
-            .unwrap_err(),
-        ];
-        for error in refusals {
-            assert!(
-                error.to_string().contains(
-                    "agent kind 'pi' cannot be imported (prepared imports accept claude_code, codex, opencode, or hermes); nothing was written"
-                ),
-                "{error:#}"
-            );
-        }
-        assert_eq!(counts(conn.clone()).await, before);
-        assert_eq!(cov2_object_files(&storage), before_files);
-        assert_eq!(cov2_traces_head(&conn).await, before_traces);
-
+    async fn pi_role_prepared_import_entries_accept_pi() {
+        assert!(is_importable_kind(AgentKind::Pi));
         #[cfg(unix)]
         {
+            let (_tmp, conn, root, scope) = cov2_import_test_setup().await;
+            let pi_request = || {
+                let mut request =
+                    cov2_import_test_request(&root, &scope, vec![cov2_test_turn("pi", 0)]);
+                request.agent_kind = AgentKind::Pi;
+                request.provider_session_id = "pi-accepted".to_owned();
+                request.session_id = "pi__pi-accepted".to_owned();
+                request
+            };
+            let storage = root.join(util::ROOT_DIR);
             let imported = import_prepared_with_coverage_versions(
                 &conn,
                 &storage,
-                cov2_import_test_request(&root, &scope, vec![cov2_test_turn("pi", 0)]),
+                pi_request(),
                 &[2],
                 Duration::from_secs(30),
                 Some(&native_import_test_helper_program()),
@@ -7611,7 +7730,162 @@ pub(crate) mod tests {
             .await
             .unwrap();
             assert_eq!(imported.checkpoints_written, 1);
+            let replayed = import_prepared_with_coverage_versions(
+                &conn,
+                &storage,
+                pi_request(),
+                &[2],
+                Duration::from_secs(30),
+                Some(&native_import_test_helper_program()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed.checkpoints_written, 0);
+            assert_eq!(
+                cov2_count(
+                    &conn,
+                    "SELECT COUNT(*) AS n FROM agent_session WHERE agent_kind = 'pi'"
+                )
+                .await,
+                1
+            );
         }
+    }
+
+    /// PI-10 AC5: a `pi` import that crashes after binding its first turn
+    /// (the coordinator's `after_bind` injection skips every cleanup, as a
+    /// killed process would) leaves its identity `writing` and commits
+    /// nothing. Once the crashed owner's lease has lapsed, the retry takes
+    /// the identity over through the same claim store, commits each turn
+    /// exactly once, and leaves no in-flight marker; a replay commits nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_explicit_import_recovers_after_a_crash() {
+        let (_tmp, conn, root, scope) = cov2_import_test_setup().await;
+        let storage = root.join(util::ROOT_DIR);
+        let pi_request = || {
+            let mut request = cov2_import_test_request(
+                &root,
+                &scope,
+                vec![cov2_test_turn("pi-0", 0), cov2_test_turn("pi-1", 1)],
+            );
+            request.agent_kind = AgentKind::Pi;
+            request.provider_session_id = "pi-recovered".to_owned();
+            request.session_id = "pi__pi-recovered".to_owned();
+            request
+        };
+        let helper = native_import_test_helper_program();
+        let import = || {
+            import_prepared_with_coverage_versions(
+                &conn,
+                &storage,
+                pi_request(),
+                &[2, 2],
+                Duration::from_secs(30),
+                Some(&helper),
+            )
+        };
+        let crashed = with_import_failpoint("after_bind", import())
+            .await
+            .expect_err("the injected crash");
+        assert!(
+            crashed
+                .chain()
+                .any(|cause| cause.to_string().contains("after_bind")),
+            "{crashed:#}"
+        );
+        assert_eq!(
+            cov2_count(
+                &conn,
+                "SELECT COUNT(*) AS n FROM agent_import_identity WHERE state='writing'"
+            )
+            .await,
+            1,
+            "the crash keeps its ownership for recovery"
+        );
+        let checkpoints = || cov2_count(&conn, "SELECT COUNT(*) AS n FROM agent_checkpoint");
+        let committed_before = checkpoints().await;
+        // Stands in for the time a crashed owner's lease takes to lapse.
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE agent_import_identity SET lease_expires_at = 0".to_owned(),
+        ))
+        .await
+        .unwrap();
+        let recovered = import().await.unwrap();
+        assert_eq!(
+            committed_before + i64::try_from(recovered.checkpoints_written).unwrap(),
+            2,
+            "every turn is committed exactly once"
+        );
+        assert_eq!(checkpoints().await, 2);
+        assert_eq!(
+            cov2_count(
+                &conn,
+                "SELECT COUNT(*) AS n FROM agent_import_identity WHERE state='committed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            cov2_count(
+                &conn,
+                "SELECT COUNT(*) AS n FROM metadata_kv WHERE scope='agent_traces_inflight'"
+            )
+            .await,
+            0,
+            "the recovery retires the crashed owner's marker"
+        );
+        let replayed = import().await.unwrap();
+        assert_eq!(replayed.checkpoints_written, 0);
+        assert_eq!(checkpoints().await, 2);
+    }
+
+    /// PI-10: Pi's retained thinking is grouped by turn in time linear in
+    /// the blocks, so a session with tens of thousands of turns (within Pi's
+    /// 16 MiB cap) is grouped well inside its deadline. Each turn's report
+    /// holds only its own block; a block naming no stored turn goes with the
+    /// first turn.
+    #[tokio::test]
+    async fn pi_retained_thinking_groups_many_turns_in_linear_time() {
+        const TURNS: usize = 40_000;
+        let (_tmp, _conn, root, scope) = cov2_import_test_setup().await;
+        let turns = (0..TURNS)
+            .map(|ordinal| cov2_test_turn(&format!("t{ordinal}"), ordinal))
+            .collect();
+        let mut request = cov2_import_test_request(&root, &scope, turns);
+        request.agent_kind = AgentKind::Pi;
+        let mut blocks: Vec<serde_json::Value> = (0..TURNS)
+            .map(|ordinal| serde_json::json!({"turn_key": format!("t{ordinal}"), "thinking": "x"}))
+            .collect();
+        blocks.push(serde_json::json!({"turn_key": null, "thinking": "before"}));
+        request.redaction_report = serde_json::json!({"pi_retained": blocks});
+        let started = Instant::now();
+        let reports = PreparedImportReports::new(&request).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "grouping took {:?}",
+            started.elapsed()
+        );
+        // Every turn's group holds exactly its own block (t0 also the stray).
+        let (_, by_turn) = reports.pi_turns.as_ref().expect("Pi groups");
+        assert_eq!(by_turn.len(), TURNS);
+        for ordinal in 0..TURNS {
+            let key = format!("t{ordinal}");
+            let blocks = &by_turn[&key];
+            assert_eq!(blocks.len(), if ordinal == 0 { 2 } else { 1 }, "{key}");
+            assert_eq!(blocks[0]["turn_key"], key);
+        }
+        assert_eq!(by_turn["t0"][1]["thinking"], "before");
+        let report_for = |key: &str| -> serde_json::Value {
+            serde_json::from_slice(reports.full_for_turn(key).unwrap().bytes()).unwrap()
+        };
+        let last = report_for("t39999");
+        assert_eq!(last["pi_retained"].as_array().unwrap().len(), 1);
+        assert_eq!(last["pi_retained"][0]["turn_key"], "t39999");
+        assert_eq!(report_for("t0")["pi_retained"].as_array().unwrap().len(), 2);
+        assert_eq!(last["pi_retained_blocks"], TURNS + 1);
+        assert!(reports.metadata.get("pi_retained").is_none());
     }
 
     /// PI-29: every prepared-import entry refuses a kind outside
@@ -7704,7 +7978,7 @@ pub(crate) mod tests {
             for error in errors {
                 assert!(
                     error.to_string().contains(&format!(
-                        "agent kind '{}' cannot be imported (prepared imports accept claude_code, codex, opencode, or hermes); nothing was written",
+                        "agent kind '{}' cannot be imported (prepared imports accept claude_code, codex, opencode, hermes, or pi); nothing was written",
                         kind.as_db_str()
                     )),
                     "{kind:?}: {error:#}"

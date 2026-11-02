@@ -1824,3 +1824,59 @@ fn codex_ordinary_attached_and_legacy_repair_docs_stay_visible() {
         }
     }
 }
+
+/// PI-10 AC8: every agent document that describes Pi discloses the explicit
+/// import as local-only and its result as partial, and none still says the
+/// import refuses `pi`.
+#[test]
+fn pi_explicit_import_docs_disclose_local_only_and_partial() {
+    for (label, document, required) in [
+        (
+            "docs/commands/agent.md",
+            AGENT_CMD_DOC_EN,
+            &[
+                "`agent import --agent pi --path <timestamp>_<session-id>.jsonl --yes`",
+                "local-only",
+                "marked partial and unproven",
+            ][..],
+        ),
+        (
+            "docs/commands/zh-CN/agent.md",
+            AGENT_CMD_DOC_ZH,
+            &[
+                "`agent import --agent pi --path <timestamp>_<session-id>.jsonl --yes`",
+                "仅本地",
+                "标为 partial 且 unproven",
+            ][..],
+        ),
+        (
+            "COMPATIBILITY.md",
+            COMPATIBILITY_DOC,
+            &[
+                "`agent import --agent pi --path <timestamp>_<session-id>.jsonl --yes`",
+                "local-only",
+                "as partial and unproven",
+            ][..],
+        ),
+        (
+            "docs/development/commands/agent.md",
+            AGENT_DEV_DOC,
+            &["`agent import --agent pi --path <timestamp>_<id>.jsonl --yes`"][..],
+        ),
+        (
+            "docs/development/tracing/agent.md",
+            AGENT_DOC,
+            &["`agent import --agent pi --path <timestamp>_<id>.jsonl --yes`"][..],
+        ),
+    ] {
+        for text in required {
+            assert!(document.contains(text), "{label} must say {text:?}");
+        }
+        for stale in [
+            "`agent import --agent pi` is rejected",
+            "`agent import --agent pi` 被拒绝",
+        ] {
+            assert!(!document.contains(stale), "{label} still says {stale:?}");
+        }
+    }
+}

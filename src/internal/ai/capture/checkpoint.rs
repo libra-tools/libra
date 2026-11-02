@@ -1907,18 +1907,19 @@ impl CheckpointRedactedPayload {
         redaction_report_json: RedactedBytes,
         native: Option<NativeProvenReasoning>,
     ) -> Result<Self, CheckpointStoreError> {
-        let hermes_metadata = serde_json::from_slice::<serde_json::Value>(metadata_json.bytes())
+        let framed_metadata = serde_json::from_slice::<serde_json::Value>(metadata_json.bytes())
             .ok()
             .and_then(|value| {
                 value
                     .get("agent_kind")
                     .and_then(serde_json::Value::as_str)
-                    .map(|kind| kind == "hermes")
+                    .map(|kind| matches!(kind, "hermes" | "pi"))
             })
             .unwrap_or(false);
-        // Only a Hermes ordinary snapshot may keep retained bytes while partial.
-        // The reason records a missing native issuer. It is not a failed read.
-        let unproven_ordinary = hermes_metadata
+        // Only a Hermes or Pi ordinary snapshot, which its worker frame marks
+        // partial, may keep retained bytes while partial. The reason records
+        // a missing native issuer. It is not a failed read.
+        let unproven_ordinary = framed_metadata
             && source_snapshot.completeness
                 == crate::internal::ai::capture::snapshot::CaptureSnapshotCompleteness::Partial
             && source_snapshot.partial_reason

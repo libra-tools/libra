@@ -3902,7 +3902,7 @@ fn agent_import_discovery_errors_keep_actionable_messages() {
         ),
         (
             &["--all", "--agent", "gemini", "--yes"][..],
-            "agent import supports claude-code, codex, opencode, or hermes; got 'gemini'",
+            "agent import supports claude-code, codex, opencode, hermes, or pi; got 'gemini'",
             "LBR-CLI-002",
             129,
         ),
@@ -8220,4 +8220,798 @@ fn pi_session_metadata_falls_back_to_the_message_model() {
         BTreeSet::from([PiMetadataPartialReason::SkippedLine])
     );
     assert_eq!(metadata.totals.tokens(), 2);
+}
+
+// ---- PI-10: explicit Pi import ----
+
+const PI10_SESSION_ID: &str = "019a3c2e-7b10-7000-8000-0000000000b1";
+
+/// A Pi v3 session whose header places it in `cwd`: one prompt, and an
+/// answer with thinking and its signature.
+fn pi10_session(id: &str, cwd: &Path) -> Vec<u8> {
+    PiV3File::with_header(json!({
+        "type": "session",
+        "version": 3,
+        "id": id,
+        "timestamp": "2026-10-31T00:00:00.000Z",
+        "cwd": cwd.to_str().expect("utf-8 cwd"),
+    }))
+    .entry(
+        "message",
+        "u1",
+        None,
+        json!({"message": {"role": "user", "content": "pi10-prompt"}}),
+    )
+    .entry(
+        "message",
+        "a1",
+        Some("u1"),
+        json!({"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "pi10-thinking", "thinkingSignature": "pi10-signature"},
+            {"type": "text", "text": "pi10-answer"},
+        ]}}),
+    )
+    .bytes()
+}
+
+/// Write `bytes` the way Pi names a session file, `<timestamp>_<id>.jsonl`,
+/// under the fixture's own home (never the real `~/.pi`).
+fn pi10_write(fixture: &ImportRepo, id: &str, bytes: &[u8]) -> PathBuf {
+    let dir = fixture.home.join(".pi/agent/sessions/pi10");
+    std::fs::create_dir_all(&dir).expect("pi session dir");
+    let path = dir.join(format!("2026-10-31T00-00-00-000Z_{id}.jsonl"));
+    std::fs::write(&path, bytes).expect("pi session file");
+    path
+}
+
+fn pi10_import(fixture: &ImportRepo, path: &Path, extra: &[&str]) -> Output {
+    let path = path_arg(path);
+    let mut args = vec!["agent", "import", "--agent", "pi", "--path", path.as_str()];
+    args.extend_from_slice(extra);
+    fixture.run(&args)
+}
+
+/// Every blob under the checkpoint's directory in the traces tree, by path.
+fn pi10_checkpoint_blobs(
+    storage_root: &Path,
+    root_tree_oid: &str,
+    checkpoint_id: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let mut oid = root_tree_oid.to_string();
+    for component in ["checkpoint", &checkpoint_id[..2], &checkpoint_id[2..]] {
+        oid = tree_entry_oid(&read_object_payload(storage_root, &oid), component);
+    }
+    let mut blobs = Vec::new();
+    let mut pending = vec![(String::new(), oid)];
+    while let Some((prefix, oid)) = pending.pop() {
+        let tree = read_object_payload(storage_root, &oid);
+        let mut cursor = 0usize;
+        while cursor < tree.len() {
+            let mode_end = cursor
+                + tree[cursor..]
+                    .iter()
+                    .position(|byte| *byte == b' ')
+                    .expect("tree entry mode delimiter");
+            let name_start = mode_end + 1;
+            let name_end = name_start
+                + tree[name_start..]
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .expect("tree entry name delimiter");
+            let entry_oid = hex::encode(&tree[name_end + 1..name_end + 21]);
+            let name = format!(
+                "{prefix}{}",
+                String::from_utf8_lossy(&tree[name_start..name_end])
+            );
+            if &tree[cursor..mode_end] == b"40000" {
+                pending.push((format!("{name}/"), entry_oid));
+            } else {
+                blobs.push((name, read_object_payload(storage_root, &entry_oid)));
+            }
+            cursor = name_end + 21;
+        }
+    }
+    blobs.sort();
+    blobs
+}
+
+fn pi10_session_rows(fixture: &ImportRepo) -> i64 {
+    scalar(
+        fixture,
+        "SELECT COUNT(*) FROM agent_session WHERE agent_kind = 'pi'",
+    )
+}
+
+fn pi10_shown(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// PI-10 AC1: without consent the import stops before it reads the source.
+/// Neither a missing file nor one it may not read surfaces a source error;
+/// the refusal is the consent requirement, and nothing is written.
+#[test]
+fn pi_explicit_import_refused_consent_reads_no_source() {
+    let fixture = ImportRepo::init();
+    let missing = fixture
+        .home
+        .join(format!("2026-10-31T00-00-00-000Z_{PI10_SESSION_ID}.jsonl"));
+    let present = pi10_write(
+        &fixture,
+        PI10_SESSION_ID,
+        &pi10_session(PI10_SESSION_ID, &fixture.repo),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o000))
+            .expect("make the session unreadable");
+    }
+    for path in [&missing, &present] {
+        let output = pi10_import(&fixture, path, &["--json"]);
+        assert!(!output.status.success(), "{}", describe(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("LBR-CLI-002"), "{}", describe(&output));
+        assert!(stderr.contains("--yes"), "{}", describe(&output));
+        assert!(
+            !stderr.contains("source authorization") && !stderr.contains("pi10-"),
+            "the source must not be read before consent: {}",
+            describe(&output)
+        );
+    }
+    assert_eq!(pi10_session_rows(&fixture), 0);
+    assert_eq!(checkpoint_count(&fixture), 0);
+}
+
+/// PI-10 AC2-AC4 and AC8: one explicit import stores the PI-33 snapshot as
+/// one partial checkpoint through the shared coordinator and claim store
+/// (one identity, one coverage claim); its snapshot is the Pi frame's
+/// unproven partial one. A second import of the same logical turn writes
+/// nothing. Output never echoes session content, and Pi stays unsupported.
+#[test]
+fn pi_explicit_import_stores_one_partial_checkpoint_and_replays_as_noop() {
+    use libra::internal::ai::observed_agents::registration_for;
+
+    let fixture = ImportRepo::init();
+    let path = pi10_write(
+        &fixture,
+        PI10_SESSION_ID,
+        &pi10_session(PI10_SESSION_ID, &fixture.repo),
+    );
+    let first = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(first.status.success(), "{}", describe(&first));
+    let shown = pi10_shown(&first);
+    for hidden in [
+        "pi10-prompt",
+        "pi10-thinking",
+        "pi10-signature",
+        "pi10-answer",
+    ] {
+        assert!(!shown.contains(hidden), "{hidden}: {shown}");
+    }
+    assert_eq!(checkpoint_count(&fixture), 1);
+    assert_eq!(pi10_session_rows(&fixture), 1);
+    assert_eq!(identity_state(&fixture), "committed");
+    assert_eq!(
+        scalar(&fixture, "SELECT COUNT(*) FROM agent_import_identity"),
+        1
+    );
+    assert_eq!(
+        scalar(&fixture, "SELECT COUNT(*) FROM agent_coverage_claim"),
+        1
+    );
+    assert_eq!(
+        scalar_text(&fixture, "SELECT session_id FROM agent_session"),
+        format!("pi__{PI10_SESSION_ID}")
+    );
+    let checkpoint_id = scalar_text(&fixture, "SELECT checkpoint_id FROM agent_checkpoint");
+    let tree_oid = scalar_text(&fixture, "SELECT tree_oid FROM agent_checkpoint");
+    let metadata: Value = serde_json::from_slice(&read_checkpoint_blob(
+        &fixture.repo.join(".libra"),
+        &tree_oid,
+        &checkpoint_id,
+        &["metadata.json"],
+    ))
+    .expect("parse the checkpoint metadata");
+    let snapshot = &metadata["transcript_snapshot"];
+    assert_eq!(snapshot["completeness"], "partial", "{metadata}");
+    assert_eq!(
+        snapshot["partial_reason"], "unproven_ordinary",
+        "{metadata}"
+    );
+    // What the checkpoint stores: ordinary turns with no reasoning record,
+    // and every thinking block (text and signature as written) kept beside
+    // them as retained, unproven data.
+    let blobs: BTreeMap<String, Vec<u8>> =
+        pi10_checkpoint_blobs(&fixture.repo.join(".libra"), &tree_oid, &checkpoint_id)
+            .into_iter()
+            .collect();
+    let turn: Value = serde_json::from_slice(
+        blobs
+            .get("transcript/pi.jsonl")
+            .expect("the turn projection"),
+    )
+    .expect("parse the turn projection");
+    assert_eq!(
+        turn["records"],
+        json!([
+            {"text": "pi10-prompt", "type": "user"},
+            {"text": "pi10-answer", "type": "assistant"},
+        ]),
+        "{turn}"
+    );
+    assert_eq!(turn["completeness"], "incomplete", "{turn}");
+    let report: Value = serde_json::from_slice(
+        blobs
+            .get("redaction_report.json")
+            .expect("the redaction report"),
+    )
+    .expect("parse the redaction report");
+    assert_eq!(report["pi_source_state"], "unproven", "{report}");
+    let stored_metadata: Value =
+        serde_json::from_slice(blobs.get("metadata.json").expect("the checkpoint metadata"))
+            .expect("parse the checkpoint metadata");
+    assert!(
+        !String::from_utf8_lossy(blobs.get("metadata.json").expect("metadata"))
+            .contains("pi10-thinking"),
+        "metadata keeps no thinking text"
+    );
+    assert_eq!(
+        stored_metadata["redaction_report"]["pi_retained_blocks"], 1,
+        "{stored_metadata}"
+    );
+    assert_eq!(
+        report["pi_retained"],
+        json!([{
+            "turn_key": "u1",
+            "thinking": "pi10-thinking",
+            "thinkingSignature": "pi10-signature",
+        }]),
+        "{report}"
+    );
+
+    let second = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(second.status.success(), "{}", describe(&second));
+    assert_eq!(checkpoint_count(&fixture), 1, "a replay wrote a checkpoint");
+    assert_eq!(
+        scalar(&fixture, "SELECT COUNT(*) FROM agent_coverage_claim"),
+        1
+    );
+
+    let registration = registration_for(AgentKind::Pi);
+    assert!(!registration.supported);
+    assert!(!registration.hook_installable);
+    let listed = fixture.run(&["agent", "list", "--json"]);
+    assert!(listed.status.success(), "{}", describe(&listed));
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("\"pi\""),
+        "{}",
+        describe(&listed)
+    );
+    let enabled = fixture.run(&["agent", "add", "pi"]);
+    assert!(!enabled.status.success(), "{}", describe(&enabled));
+}
+
+/// PI-10 AC2: an import uses only the PI-33 snapshot. When its frame refuses
+/// the session (here a parent cycle, a bad frame), the snapshot keeps no
+/// transcript and the import stores nothing; no other path reads the file.
+#[test]
+fn pi_explicit_import_refused_frame_stores_nothing() {
+    let fixture = ImportRepo::init();
+    let bytes = PiV3File::with_header(json!({
+        "type": "session",
+        "version": 3,
+        "id": PI10_SESSION_ID,
+        "timestamp": "2026-10-31T00:00:00.000Z",
+        "cwd": fixture.repo.to_str().expect("utf-8 cwd"),
+    }))
+    .entry(
+        "message",
+        "u1",
+        Some("a1"),
+        json!({"message": {"role": "user", "content": "pi10-prompt"}}),
+    )
+    .entry(
+        "message",
+        "a1",
+        Some("u1"),
+        json!({"message": {"role": "assistant", "content": [{"type": "text", "text": "pi10-answer"}]}}),
+    )
+    .bytes();
+    let path = pi10_write(&fixture, PI10_SESSION_ID, &bytes);
+    let objects_before = loose_object_file_count(&fixture.repo.join(".libra/objects"));
+    let output = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        !pi10_shown(&output).contains("pi10-"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(pi10_session_rows(&fixture), 0);
+    assert_eq!(checkpoint_count(&fixture), 0);
+    assert_eq!(
+        loose_object_file_count(&fixture.repo.join(".libra/objects")),
+        objects_before
+    );
+}
+
+/// PI-10 AC5 and AC6: the session row commits before any trace object, index
+/// row, or ref: a session write that fails stops the import before an object
+/// exists. A checkpoint write that fails after the objects leaves nothing
+/// committed, and the retry, through the same coordinator, completes with
+/// exactly one checkpoint; a replay adds none. (The in-process crash after a
+/// durable turn is `pi_explicit_import_resumes_after_an_interrupted_attempt`
+/// in `agent_import.rs`.)
+#[tokio::test]
+async fn pi_explicit_import_commits_the_session_first_and_retries_once() {
+    let fixture = ImportRepo::init();
+    let path = pi10_write(
+        &fixture,
+        PI10_SESSION_ID,
+        &pi10_session(PI10_SESSION_ID, &fixture.repo),
+    );
+    let db_url = format!(
+        "sqlite://{}",
+        fixture.repo.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(db_url)
+        .await
+        .expect("open writable repo db");
+    let execute = |sql: &'static str| {
+        let conn = conn.clone();
+        async move {
+            conn.execute_raw(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect(sql);
+        }
+    };
+    let objects = || loose_object_file_count(&fixture.repo.join(".libra/objects"));
+
+    execute(
+        "CREATE TRIGGER pi10_reject_session BEFORE INSERT ON agent_session
+         BEGIN SELECT RAISE(ABORT, 'pi10 session write failure'); END",
+    )
+    .await;
+    let objects_before = objects();
+    let refused = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(!refused.status.success(), "{}", describe(&refused));
+    assert_eq!(pi10_session_rows(&fixture), 0);
+    assert_eq!(
+        objects(),
+        objects_before,
+        "an object was written before the session committed"
+    );
+    assert_eq!(scalar(&fixture, "SELECT COUNT(*) FROM object_index"), 0);
+    execute("DROP TRIGGER pi10_reject_session").await;
+
+    execute(
+        "CREATE TRIGGER pi10_reject_checkpoint BEFORE INSERT ON agent_checkpoint
+         BEGIN SELECT RAISE(ABORT, 'pi10 checkpoint write failure'); END",
+    )
+    .await;
+    let interrupted = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(!interrupted.status.success(), "{}", describe(&interrupted));
+    assert!(
+        !pi10_shown(&interrupted).contains("pi10-"),
+        "{}",
+        describe(&interrupted)
+    );
+    assert_eq!(checkpoint_count(&fixture), 0);
+    execute("DROP TRIGGER pi10_reject_checkpoint").await;
+    conn.close().await.expect("close repo db");
+
+    let retried = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(retried.status.success(), "{}", describe(&retried));
+    assert_eq!(checkpoint_count(&fixture), 1);
+    assert_eq!(identity_state(&fixture), "committed");
+    let replayed = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(replayed.status.success(), "{}", describe(&replayed));
+    assert_eq!(checkpoint_count(&fixture), 1, "a retry committed twice");
+}
+
+/// PI-10 AC7: a session cannot be tied to another repository or another
+/// session. A header whose `cwd` is outside the repository, or whose `id` is
+/// not the file's, is refused without a write; two sessions stay two
+/// sessions with their own identities.
+#[test]
+fn pi_explicit_import_keeps_repositories_and_sessions_apart() {
+    let fixture = ImportRepo::init();
+    let elsewhere = fixture._tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("other directory");
+    let elsewhere = elsewhere.canonicalize().expect("canonical other directory");
+    let outside = pi10_write(
+        &fixture,
+        PI10_SESSION_ID,
+        &pi10_session(PI10_SESSION_ID, &elsewhere),
+    );
+    let refused = pi10_import(&fixture, &outside, &["--yes", "--json"]);
+    assert!(!refused.status.success(), "{}", describe(&refused));
+    assert_eq!(pi10_session_rows(&fixture), 0);
+
+    let other_id = "019a3c2e-7b10-7000-8000-0000000000b2";
+    let renamed = pi10_write(
+        &fixture,
+        other_id,
+        &pi10_session(PI10_SESSION_ID, &fixture.repo),
+    );
+    let mismatched = pi10_import(&fixture, &renamed, &["--yes", "--json"]);
+    assert!(!mismatched.status.success(), "{}", describe(&mismatched));
+    assert_eq!(pi10_session_rows(&fixture), 0);
+
+    for id in [PI10_SESSION_ID, other_id] {
+        let path = pi10_write(&fixture, id, &pi10_session(id, &fixture.repo));
+        let output = pi10_import(&fixture, &path, &["--yes", "--json"]);
+        assert!(output.status.success(), "{}", describe(&output));
+    }
+    assert_eq!(pi10_session_rows(&fixture), 2);
+    assert_eq!(checkpoint_count(&fixture), 2);
+    assert_eq!(
+        scalar(
+            &fixture,
+            "SELECT COUNT(DISTINCT identity_id) FROM agent_import_identity"
+        ),
+        2
+    );
+    assert_eq!(
+        scalar(
+            &fixture,
+            "SELECT COUNT(DISTINCT session_id) FROM agent_checkpoint"
+        ),
+        2
+    );
+
+    // Another Pi profile (another agent directory) may hold a file with the
+    // same custom id for the same repository. It is a different source, so
+    // it is refused rather than joined to the session already stored.
+    let other_profile = fixture.home.join(".pi-other/agent/sessions/pi10");
+    std::fs::create_dir_all(&other_profile).expect("other profile directory");
+    let foreign = other_profile.join(format!("2026-10-31T00-00-00-000Z_{PI10_SESSION_ID}.jsonl"));
+    let mut body = pi10_session(PI10_SESSION_ID, &fixture.repo);
+    body.extend_from_slice(
+        json!({"type": "message", "id": "u9", "parentId": "a1",
+               "timestamp": "2026-10-31T00:00:02.000Z",
+               "message": {"role": "user", "content": "pi10-foreign"}})
+        .to_string()
+        .as_bytes(),
+    );
+    body.push(b'\n');
+    std::fs::write(&foreign, body).expect("other profile session");
+    let joined = pi10_import(&fixture, &foreign, &["--yes", "--json"]);
+    assert!(!joined.status.success(), "{}", describe(&joined));
+    assert!(
+        String::from_utf8_lossy(&joined.stderr).contains("LBR-AGENT-015"),
+        "the refusal is the session ownership conflict: {}",
+        describe(&joined)
+    );
+    assert!(
+        !pi10_shown(&joined).contains("pi10-"),
+        "{}",
+        describe(&joined)
+    );
+    assert_eq!(pi10_session_rows(&fixture), 2);
+    assert_eq!(
+        checkpoint_count(&fixture),
+        2,
+        "the other profile's turn was joined"
+    );
+}
+
+/// PI-10 AC8: `agent import` accepts `--agent pi` only with `--path`, its
+/// help names Pi, and the refusals for a scan or a session id say why.
+#[test]
+fn pi_explicit_import_requires_one_path_and_is_named_in_help() {
+    let fixture = ImportRepo::init();
+    let help = fixture.run(&["agent", "import", "--help"]);
+    assert!(help.status.success(), "{}", describe(&help));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("`hermes`, or `pi`"), "{help}");
+    assert!(help.contains("--agent pi"), "{help}");
+    for disclosed in [
+        "`pi` imports only one `--path` session file, locally (no scan, no upload)",
+        "stores its snapshot as partial and unproven",
+    ] {
+        let collapsed = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(collapsed.contains(disclosed), "{disclosed}: {help}");
+    }
+    for args in [
+        &["agent", "import", "--agent", "pi", "--all", "--yes"][..],
+        &[
+            "agent",
+            "import",
+            "--agent",
+            "pi",
+            "--session",
+            PI10_SESSION_ID,
+            "--yes",
+        ][..],
+    ] {
+        let output = fixture.run(args);
+        assert!(!output.status.success(), "{}", describe(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Pi import requires --path"),
+            "{}",
+            describe(&output)
+        );
+    }
+    // A `..` step is refused with the reason, before anything is opened.
+    let dotted = fixture
+        .home
+        .join(".pi/agent/sessions/pi10/..")
+        .join(format!(
+            "pi10/2026-10-31T00-00-00-000Z_{PI10_SESSION_ID}.jsonl"
+        ));
+    let output = pi10_import(&fixture, &dotted, &["--yes", "--json"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("without `..` components"),
+        "{}",
+        describe(&output)
+    );
+    // The file name must be Pi's: `<timestamp>_<id>.jsonl`.
+    let misnamed = fixture
+        .home
+        .join(format!("not-a-timestamp_{PI10_SESSION_ID}.jsonl"));
+    std::fs::write(&misnamed, pi10_session(PI10_SESSION_ID, &fixture.repo))
+        .expect("misnamed session file");
+    let output = pi10_import(&fixture, &misnamed, &["--yes", "--json"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("valid provider session id"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(pi10_session_rows(&fixture), 0);
+}
+
+/// PI-10 AC2 (stored content): each turn's checkpoint keeps only its own
+/// thinking blocks, and metadata keeps only their count, so a large valid
+/// thinking block stays with its turn and every checkpoint stays readable.
+#[test]
+fn pi_explicit_import_keeps_each_turns_thinking_with_its_checkpoint() {
+    let fixture = ImportRepo::init();
+    let large = "pi10-large ".repeat(200_000);
+    let bytes = PiV3File::with_header(json!({
+        "type": "session",
+        "version": 3,
+        "id": PI10_SESSION_ID,
+        "timestamp": "2026-10-31T00:00:00.000Z",
+        "cwd": fixture.repo.to_str().expect("utf-8 cwd"),
+    }))
+    .entry(
+        "message",
+        "u1",
+        None,
+        json!({"message": {"role": "user", "content": "pi10-first"}}),
+    )
+    .entry(
+        "message",
+        "a1",
+        Some("u1"),
+        json!({"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "pi10-first-thinking"},
+            {"type": "text", "text": "pi10-first-answer"},
+        ]}}),
+    )
+    .entry(
+        "message",
+        "u2",
+        Some("a1"),
+        json!({"message": {"role": "user", "content": "pi10-second"}}),
+    )
+    .entry(
+        "message",
+        "a2",
+        Some("u2"),
+        json!({"message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": large},
+            {"type": "text", "text": "pi10-second-answer"},
+        ]}}),
+    )
+    .bytes();
+    let path = pi10_write(&fixture, PI10_SESSION_ID, &bytes);
+    let output = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(checkpoint_count(&fixture), 2);
+    let rows = scalar_text(
+        &fixture,
+        "SELECT group_concat(checkpoint_id || ' ' || tree_oid, ';') FROM agent_checkpoint",
+    );
+    for row in rows.split(';') {
+        let mut fields = row.split(' ');
+        let (checkpoint_id, tree_oid) = (
+            fields.next().expect("checkpoint id"),
+            fields.next().expect("tree"),
+        );
+        let blobs: BTreeMap<String, Vec<u8>> =
+            pi10_checkpoint_blobs(&fixture.repo.join(".libra"), tree_oid, checkpoint_id)
+                .into_iter()
+                .collect();
+        let turn: Value =
+            serde_json::from_slice(blobs.get("transcript/pi.jsonl").expect("the turn"))
+                .expect("parse the turn");
+        let key = turn["logical_turn_key"]
+            .as_str()
+            .expect("turn key")
+            .to_string();
+        let report: Value =
+            serde_json::from_slice(blobs.get("redaction_report.json").expect("the report"))
+                .expect("parse the report");
+        let retained = report["pi_retained"].as_array().expect("retained blocks");
+        assert_eq!(retained.len(), 1, "{key}: {}", retained.len());
+        assert_eq!(retained[0]["turn_key"], key);
+        let expected = if key == "u1" {
+            json!("pi10-first-thinking")
+        } else {
+            json!(large)
+        };
+        assert!(
+            retained[0]["thinking"] == expected,
+            "{key} keeps exactly its own thinking, in full"
+        );
+        assert_eq!(report["pi_retained_blocks"], 2);
+        let metadata = blobs.get("metadata.json").expect("metadata");
+        assert!(
+            metadata.len() < 64 * 1024,
+            "{key}: metadata is {} bytes",
+            metadata.len()
+        );
+        assert!(!String::from_utf8_lossy(metadata).contains("pi10-large"));
+        let shown = fixture.run(&["agent", "checkpoint", "show", checkpoint_id, "--json"]);
+        assert!(shown.status.success(), "{key}: {}", describe(&shown));
+    }
+}
+
+/// PI-10 AC5: an import whose process is killed after its first durable
+/// turn (it is held at its next write, then SIGKILLed, so no cleanup runs)
+/// leaves the recovery state the shared coordinator owns. Once the dead
+/// owner's leases have lapsed, the retry commits every turn exactly once
+/// and leaves no in-flight marker; a replay commits nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn pi_explicit_import_recovers_after_the_process_is_killed() {
+    use sea_orm::sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+
+    // Enough turns that the import is still running when the lock is taken.
+    const TURNS: usize = 160;
+    let fixture = ImportRepo::init();
+    let mut file = PiV3File::with_header(json!({
+        "type": "session",
+        "version": 3,
+        "id": PI10_SESSION_ID,
+        "timestamp": "2026-10-31T00:00:00.000Z",
+        "cwd": fixture.repo.to_str().expect("utf-8 cwd"),
+    }));
+    let mut parent: Option<String> = None;
+    for turn in 0..TURNS {
+        let user = format!("u{turn}");
+        let answer = format!("a{turn}");
+        file = file
+            .entry(
+                "message",
+                &user,
+                parent.as_deref(),
+                json!({"message": {"role": "user", "content": format!("pi10-prompt-{turn}")}}),
+            )
+            .entry(
+                "message",
+                &answer,
+                Some(&user),
+                json!({"message": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": format!("pi10-thinking-{turn}")},
+                    {"type": "text", "text": format!("pi10-answer-{turn}")},
+                ]}}),
+            );
+        parent = Some(answer);
+    }
+    let path = pi10_write(&fixture, PI10_SESSION_ID, &file.bytes());
+    let database = fixture.repo.join(".libra/libra.db");
+    let mut lock = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&database)
+            // The import may hold the writer lock for a while under load.
+            .busy_timeout(Duration::from_secs(60)),
+    )
+    .await
+    .expect("open the repository database");
+    let path_text = path_arg(&path);
+    let mut child = fixture
+        .command()
+        .args([
+            "agent",
+            "import",
+            "--agent",
+            "pi",
+            "--path",
+            path_text.as_str(),
+            "--yes",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the import");
+    let started = Instant::now();
+    loop {
+        let committed: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_checkpoint")
+            .fetch_one(&mut lock)
+            .await
+            .expect("count checkpoints");
+        if committed >= 1 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the import committed no turn"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // Hold the writer lock so the import stops at its next write, then kill
+    // it there: a crash after a durable turn, with no cleanup.
+    sea_orm::sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut lock)
+        .await
+        .expect("take the writer lock");
+    let committed: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_checkpoint")
+        .fetch_one(&mut lock)
+        .await
+        .expect("count checkpoints");
+    assert!(
+        (1..TURNS as i64).contains(&committed),
+        "the import must be stopped mid-way, after {committed} of {TURNS} turns"
+    );
+    child.kill().expect("kill the import");
+    let status = child.wait().expect("reap the import");
+    assert!(!status.success());
+    // Stands in for the time the dead owner's leases and in-flight marker
+    // take to lapse.
+    sea_orm::sqlx::query("UPDATE agent_import_identity SET lease_expires_at = 0")
+        .execute(&mut lock)
+        .await
+        .expect("lapse the identity lease");
+    sea_orm::sqlx::query(
+        "UPDATE metadata_kv SET value = json_set(value, '$.lease_expires_at', 0)
+         WHERE scope = 'agent_import_index_repair'",
+    )
+    .execute(&mut lock)
+    .await
+    .expect("lapse the index barrier lease");
+    sea_orm::sqlx::query(
+        "UPDATE metadata_kv SET value = json_set(value, '$.started_at_ms', 0)
+         WHERE scope = 'agent_traces_inflight'",
+    )
+    .execute(&mut lock)
+    .await
+    .expect("lapse the in-flight marker");
+    sea_orm::sqlx::query("COMMIT")
+        .execute(&mut lock)
+        .await
+        .expect("release the writer lock");
+    lock.close().await.expect("close the repository database");
+
+    let retried = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(retried.status.success(), "{}", describe(&retried));
+    assert_eq!(
+        checkpoint_count(&fixture),
+        TURNS as i64,
+        "a turn was committed twice or lost"
+    );
+    assert_eq!(identity_state(&fixture), "committed");
+    assert_eq!(
+        scalar(
+            &fixture,
+            "SELECT COUNT(*) FROM metadata_kv WHERE scope = 'agent_traces_inflight'"
+        ),
+        0,
+        "the dead owner's in-flight marker is retired"
+    );
+    let replayed = pi10_import(&fixture, &path, &["--yes", "--json"]);
+    assert!(replayed.status.success(), "{}", describe(&replayed));
+    assert_eq!(checkpoint_count(&fixture), TURNS as i64);
 }

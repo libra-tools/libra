@@ -1649,7 +1649,7 @@ async fn pi_role_stub_refuses_every_read_and_install() {
     refuses_without_writes(&["agent", "remove", "pi"], &no_hooks);
     refuses_without_writes(
         &["agent", "import", "--agent", "pi", "--all"],
-        &["agent import supports claude-code, codex, opencode, or hermes; got 'pi'"],
+        &["Pi import requires --path to one <timestamp>_<session-id>.jsonl session file"],
     );
     // `pi` is a built-in slug: an external libra-agent-pi binary is never
     // trusted or invoked in its place. The opt-in itself is the one intended
@@ -1693,10 +1693,11 @@ async fn pi_role_stub_refuses_every_read_and_install() {
     assert!(!repo.root.path().join(".pi").exists());
 }
 
-/// PI-01 AC4: the public prepared-import API refuses a `pi` request before
-/// any write, so an embedding caller cannot store a session the CLI refuses.
+/// PI-01 AC4, as PI-10 changed it: the public prepared-import API refused a
+/// `pi` request until PI-10 made `pi` importable. On the migrated schema it
+/// now stores the `pi` session the CLI also stores; the CHECK accepts the row.
 #[tokio::test]
-async fn pi_role_prepared_import_writes_nothing() {
+async fn pi_role_prepared_import_stores_a_pi_session() {
     use std::collections::BTreeMap;
 
     use libra::internal::ai::{
@@ -1735,8 +1736,8 @@ async fn pi_role_prepared_import_writes_nothing() {
     let commitment = format!("source/hmac-v2/{}", "c".repeat(64));
     let request = ImportRequest {
         agent_kind: AgentKind::Pi,
-        provider_session_id: "pi-refused".to_owned(),
-        session_id: "pi__pi-refused".to_owned(),
+        provider_session_id: "pi-stored".to_owned(),
+        session_id: "pi__pi-stored".to_owned(),
         source_kind: "file".to_owned(),
         source_id: commitment.clone(),
         identity_schema_version: 2,
@@ -1774,25 +1775,38 @@ async fn pi_role_prepared_import_writes_nothing() {
         )]),
         turns: vec![turn],
     };
-    let refused = import_prepared_with_coverage_versions(
+    let storage = repo
+        .root
+        .path()
+        .canonicalize()
+        .expect("canonical repository root")
+        .join(".libra");
+    let imported = import_prepared_with_coverage_versions(
         &conn,
-        &repo.root.path().join(".libra"),
+        &storage,
         request,
         &[2],
         std::time::Duration::from_secs(30),
         Some(std::path::Path::new(env!("CARGO_BIN_EXE_libra"))),
     )
     .await
-    .expect_err("a pi import is refused");
-    conn.close().await.expect("close");
-    assert!(
-        refused.to_string().contains(
-            "agent kind 'pi' cannot be imported (prepared imports accept claude_code, codex, opencode, or hermes); nothing was written"
-        ),
-        "{refused}"
+    .expect("a pi import is stored");
+    assert_eq!(imported.checkpoints_written, 1);
+    assert_eq!(
+        pi_role_texts(
+            &conn,
+            "SELECT agent_kind FROM agent_session WHERE agent_kind = 'pi'"
+        )
+        .await,
+        vec!["pi".to_owned()]
     );
-    assert_eq!(pi_role_digest(&repo).await, before, "no row was written");
-    assert_eq!(repo.files(), files, "no file was written");
+    conn.close().await.expect("close");
+    assert_ne!(
+        pi_role_digest(&repo).await,
+        before,
+        "the pi session was written"
+    );
+    assert_ne!(repo.files(), files, "the checkpoint objects were written");
 }
 
 /// PI-01 AC6/AC7: the rebuild runs on the PI-07 dedicated connection (the

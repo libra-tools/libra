@@ -95,6 +95,13 @@ tokio::task_local! {
     static INDEX_SOURCE_READS: std::sync::Arc<std::sync::atomic::AtomicUsize>;
 }
 
+// Counts every Pi session file the import opens for reading, so a test can
+// prove that a refused consent reads no source (PI-10).
+#[cfg(test)]
+tokio::task_local! {
+    static PI_SOURCE_READS: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
 pub const AGENT_IMPORT_EXAMPLES: &str = "\
 EXAMPLES:
     libra agent import --session <id> --agent claude-code --yes
@@ -103,7 +110,7 @@ EXAMPLES:
     libra agent import --path ~/.claude/projects/<project>/<id>.jsonl --agent claude-code --yes
     libra agent import --since 2026-07-01T00:00:00Z --agent codex --limit 20 --yes
     libra agent import --all --agent claude-code --limit 20 --yes
-    libra agent import --path <session-id>.jsonl --agent hermes --yes\n    libra agent import --codex-index-backup ./closed-index.sqlite --limit 20 --yes";
+    libra agent import --path <session-id>.jsonl --agent hermes --yes\n    libra agent import --path <timestamp>_<session-id>.jsonl --agent pi --yes\n    libra agent import --codex-index-backup ./closed-index.sqlite --limit 20 --yes";
 
 const DEFAULT_IMPORT_LIMIT: usize = 20;
 const MAX_IMPORT_LIMIT: usize = 100;
@@ -362,7 +369,7 @@ pub struct ImportArgs {
     /// Backfill absent Codex sessions from an explicit closed full-history index backup.
     #[arg(long, value_name = "PATH")]
     pub codex_index_backup: Option<PathBuf>,
-    /// Provider filter (`claude-code`, `codex`, `opencode`, or `hermes`).
+    /// Provider filter (`claude-code`, `codex`, `opencode`, `hermes`, or `pi`). `pi` imports only one `--path` session file, locally (no scan, no upload), and stores its snapshot as partial and unproven.
     #[arg(long, value_name = "NAME")]
     pub agent: Option<String>,
     /// Maximum discovered sessions to process (default 20, maximum 100).
@@ -953,7 +960,7 @@ fn importable_kind_from_slug(slug: &str) -> Option<AgentKind> {
 fn importable_kind(slug: &str) -> CliResult<AgentKind> {
     importable_kind_from_slug(slug).ok_or_else(|| {
         CliError::command_usage(format!(
-            "agent import supports claude-code, codex, opencode, or hermes; got '{}'",
+            "agent import supports claude-code, codex, opencode, hermes, or pi; got '{}'",
             bounded_argv_echo(slug)
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)
@@ -1022,8 +1029,25 @@ fn session_id_is_valid_for_kind(value: &str, kind: AgentKind) -> bool {
             codex_session_id_is_safe_path_component(value)
         }
         AgentKind::ClaudeCode => claude_session_id_is_safe_path_component(value),
+        AgentKind::Pi => pi_session_id_is_valid(value),
         _ => false,
     }
+}
+
+/// Pi's session id grammar, `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`
+/// (`assertValidSessionId`, `session-manager.ts:268-274`), bounded to 128
+/// characters here. The header `id` the import reads must equal it.
+fn pi_session_id_is_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= 128
+        && first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_session_id_for_kind(value: &str, kind: AgentKind) -> CliResult<()> {
@@ -1035,6 +1059,9 @@ fn validate_session_id_for_kind(value: &str, kind: AgentKind) -> CliResult<()> {
                 "alphanumeric/dash/underscore, at most 64 characters"
             }
             AgentKind::ClaudeCode => "alphanumeric/dot/dash/underscore, at most 128 characters",
+            AgentKind::Pi => {
+                "alphanumeric/dot/dash/underscore, starting and ending alphanumeric, at most 128 characters"
+            }
             _ => "a safe provider session path component",
         };
         Err(CliError::command_usage(format!(
@@ -1056,6 +1083,31 @@ fn hermes_session_id_from_filename(path: &Path) -> Option<String> {
     session_id_is_valid_for_kind(stem, AgentKind::Hermes).then(|| stem.to_string())
 }
 
+/// Pi names a session file `<timestamp>_<id>.jsonl`
+/// (`session-manager.ts:1079-1080`); the timestamp has no underscore, so the
+/// id is everything after the first one. The header is the record: the
+/// import later requires the header `id` to equal this id.
+fn pi_session_id_from_filename(path: &Path) -> Option<String> {
+    if path.extension()? != "jsonl" {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (timestamp, id) = stem.split_once('_')?;
+    (pi_file_timestamp_is_valid(timestamp) && pi_session_id_is_valid(id)).then(|| id.to_string())
+}
+
+/// The timestamp Pi puts before the id: `new Date().toISOString()` with `:`
+/// and `.` replaced by `-`, as `2026-10-31T00-00-00-000Z`.
+fn pi_file_timestamp_is_valid(timestamp: &str) -> bool {
+    const SHAPE: &[u8; 24] = b"dddd-dd-ddTdd-dd-dd-dddZ";
+    let bytes = timestamp.as_bytes();
+    bytes.len() == SHAPE.len()
+        && bytes.iter().zip(SHAPE).all(|(byte, shape)| match shape {
+            b'd' => byte.is_ascii_digit(),
+            other => byte == other,
+        })
+}
+
 fn claude_session_id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     validate_session_id_for_kind(&stem, AgentKind::ClaudeCode)
@@ -1064,6 +1116,18 @@ fn claude_session_id_from_filename(path: &Path) -> Option<String> {
 }
 
 fn path_candidate(path: PathBuf, kind: AgentKind) -> CliResult<Candidate> {
+    if kind == AgentKind::Pi
+        && path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        // The Pi file is opened without following a symlink at any
+        // directory, so a `..` step, which may cross one, is refused up front.
+        return Err(CliError::command_usage(
+            "Pi import needs a --path without `..` components; pass the session file's absolute path or a path below the current directory",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     if kind == AgentKind::OpenCode {
         return Err(CliError::command_usage(
             "opencode has no transcript file; use --session so Libra can run the trusted export bridge",
@@ -1083,6 +1147,7 @@ fn path_candidate(path: PathBuf, kind: AgentKind) -> CliResult<Candidate> {
         AgentKind::ClaudeCode => claude_session_id_from_filename(&absolute),
         AgentKind::Codex => codex_session_id_from_filename(&absolute),
         AgentKind::Hermes => hermes_session_id_from_filename(&absolute),
+        AgentKind::Pi => pi_session_id_from_filename(&absolute),
         _ => None,
     }
     .ok_or_else(|| {
@@ -2004,6 +2069,12 @@ fn validate_discovery_selector(args: &ImportArgs) -> CliResult<DiscoverySelector
         )
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
+    if filter == Some(AgentKind::Pi) && args.path.is_none() {
+        return Err(CliError::command_usage(
+            "Pi import requires --path to one <timestamp>_<session-id>.jsonl session file and does not scan Pi's session directory",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     if let Some(session_id) = args.session.as_deref() {
         if let Some(kind) = filter {
             validate_session_id_for_kind(session_id, kind)?;
@@ -2402,6 +2473,71 @@ fn require_consent(
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         )
     }
+}
+
+/// A Pi session file the CLI opened for the preparation helper. It has no
+/// `Read` or `Seek` implementation and no accessor, so the CLI process cannot
+/// read its bytes: the one thing it can do is become the standard input of
+/// the killable helper (`into_helper_stdin`, called once, in the helper
+/// spawn itself), which reads it under the import deadline. The CLI never
+/// holds the file as a `File`.
+mod pi_held_source {
+    pub(super) struct PiHeldSource(std::fs::File);
+
+    impl PiHeldSource {
+        /// Open `name` under `parent`: the directory and the file without
+        /// following a symlink, and only a regular file. No byte is taken.
+        pub(super) fn open(parent: &std::path::Path, name: &std::ffi::OsStr) -> Option<Self> {
+            let directory = crate::utils::object::open_directory_tree_no_follow(parent).ok()?;
+            let file =
+                crate::utils::object::open_regular_file_at_no_follow(&directory, name).ok()?;
+            file.metadata().ok()?.is_file().then_some(Self(file))
+        }
+
+        /// Make the descriptor the preparation helper's standard input.
+        pub(super) fn into_helper_stdin(self) -> std::process::Stdio {
+            std::process::Stdio::from(self.0)
+        }
+    }
+}
+
+use pi_held_source::PiHeldSource;
+
+/// Open one explicitly named Pi session file, after consent: a regular file
+/// opened under its parent directory without following a symlink. Nothing
+/// is read here. The descriptor goes to the killable preparation helper,
+/// which reads it strictly bounded under the import deadline, as it reads a
+/// held Claude or Codex transcript; the snapshot, the frame, and the header
+/// checks (the session id, a `cwd` inside the repository) run there. The
+/// source identity is the file itself: another Pi profile's file with the
+/// same custom id is a different source, so the shared V2 ownership check
+/// refuses to join it to this session. Only the repository-keyed HMAC of the
+/// path is ever stored. Every failure is content-free.
+#[cfg_attr(windows, allow(dead_code))]
+fn open_pi_session_file(candidate: &Candidate) -> Result<(PiHeldSource, String)> {
+    let path = candidate
+        .path
+        .as_ref()
+        .context("Pi import requires one explicit session file path")?;
+    let source_id = path
+        .canonicalize()
+        .map_err(|_| ImportError::SourceAuthorization)?
+        .to_str()
+        .ok_or(ImportError::SourceAuthorization)?
+        .to_string();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(ImportError::SourceAuthorization)?;
+    let name = path.file_name().ok_or(ImportError::SourceAuthorization)?;
+    #[cfg(test)]
+    let _ = PI_SOURCE_READS.try_with(|count| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    // The file is opened inside `pi_held_source`, so no raw handle to it
+    // ever exists in this process outside that module.
+    let held = PiHeldSource::open(parent, name).ok_or(ImportError::SourceAuthorization)?;
+    Ok((held, source_id))
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -3171,13 +3307,45 @@ fn require_registered_import_helper_command(
 /// provider session id, repository path, storage path, or existing metadata.
 #[cfg_attr(windows, allow(unused_mut))]
 #[cfg_attr(windows, allow(dead_code))]
+/// What the preparation helper reads as its standard input: a held source
+/// file (an authorized transcript or the tempfile of export bytes), or a Pi
+/// session that stays a `PiHeldSource` until the spawn.
+enum PreparationInput {
+    Held(std::fs::File),
+    Pi(PiHeldSource),
+}
+
+impl From<std::fs::File> for PreparationInput {
+    fn from(file: std::fs::File) -> Self {
+        Self::Held(file)
+    }
+}
+
+impl From<PiHeldSource> for PreparationInput {
+    fn from(held: PiHeldSource) -> Self {
+        Self::Pi(held)
+    }
+}
+
+/// The helper's standard input, made at the spawn: a Pi source becomes it
+/// directly, so the CLI never holds the Pi file as a `File`.
+impl From<PreparationInput> for Stdio {
+    fn from(input: PreparationInput) -> Self {
+        match input {
+            PreparationInput::Held(file) => Stdio::from(file),
+            PreparationInput::Pi(held) => held.into_helper_stdin(),
+        }
+    }
+}
+
 async fn run_import_preparation_descriptor_helper_bounded(
     mut command: tokio::process::Command,
     control: PreparationDescriptorControl,
-    source: std::fs::File,
+    source: impl Into<PreparationInput>,
     output_cap: u64,
     deadline: Instant,
 ) -> Result<Vec<u8>> {
+    let source = source.into();
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (command, control, source, output_cap, deadline);
@@ -3351,8 +3519,15 @@ async fn prepare_candidate_bounded(
         )
         .await
         .context("verify capture workspace lease before opening import source")?;
-        let (source, source_kind, source_id) =
-            resolve_candidate_source(candidate, repo_root, monotonic_deadline).await?;
+        // A Pi session file is opened, never read, here; the helper reads it.
+        let (source, source_kind, source_id, pi_file) = if candidate.kind == AgentKind::Pi {
+            let (file, source_id) = open_pi_session_file(candidate)?;
+            (None, "file".to_string(), source_id, Some(file))
+        } else {
+            let (source, source_kind, source_id) =
+                resolve_candidate_source(candidate, repo_root, monotonic_deadline).await?;
+            (Some(source), source_kind, source_id, None)
+        };
         import_test_pause_after_source_open(monotonic_deadline)?;
         let source_preimage = import_source_preimage(
             candidate.kind,
@@ -3365,8 +3540,12 @@ async fn prepare_candidate_bounded(
             &candidate.provider_session_id,
         );
         let source = match source {
-            TranscriptSource::File { file, .. } => match file.into_rewound_inner() {
-                Ok(file) => file,
+            None => match pi_file {
+                Some(held) => PreparationInput::Pi(held),
+                None => return Err(ImportError::AuthorizedReaderFailed.into()),
+            },
+            Some(TranscriptSource::File { file, .. }) => match file.into_rewound_inner() {
+                Ok(file) => PreparationInput::Held(file),
                 Err(_) => {
                     return Ok(PreparedCandidateOutcome {
                         request: Err(ImportError::AuthorizedReaderFailed.into()),
@@ -3374,7 +3553,7 @@ async fn prepare_candidate_bounded(
                     });
                 }
             },
-            TranscriptSource::Bytes { bytes, auth } => {
+            Some(TranscriptSource::Bytes { bytes, auth }) => {
                 let raw_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 if !auth.matches(candidate.kind.as_db_str(), &provisional_session_id, &bytes) {
                     return Ok(PreparedCandidateOutcome {
@@ -3403,7 +3582,7 @@ async fn prepare_candidate_bounded(
                         raw_bytes,
                     });
                 }
-                file
+                PreparationInput::Held(file)
             }
         };
         let remaining_ms = u64::try_from(
@@ -3425,7 +3604,14 @@ async fn prepare_candidate_bounded(
             agent_kind: candidate.kind.as_cli_slug().to_string(),
             source_kind: source_kind.clone(),
             provider_commitment: import_provider_commitment(&candidate.provider_session_id),
-            read_cap,
+            // A Pi session past the Pi reader's cap would be refused anyway,
+            // so the helper reads no more than that.
+            read_cap: if candidate.kind == AgentKind::Pi {
+                read_cap
+                    .min(crate::internal::ai::observed_agents::builtin::pi::PI_NORMALIZE_MAX_BYTES)
+            } else {
+                read_cap
+            },
             remaining_ms,
             transport: Some(PreparationImportTransportControl {
                 version: 1,
@@ -4553,7 +4739,7 @@ mod tests {
         let message = refused.to_string();
         assert!(
             message.contains(
-                "agent import supports claude-code, codex, opencode, or hermes; got 'grok'"
+                "agent import supports claude-code, codex, opencode, hermes, or pi; got 'grok'"
             ),
             "{message}"
         );
@@ -6323,6 +6509,262 @@ mod tests {
         ));
     }
 
+    /// PI-10: the whole `agent import --agent pi --path` route. The CLI only
+    /// opens the Pi file; the preparation helper reads it. With an injected
+    /// preparation helper that stalls while reading that file (other helper
+    /// calls run the real binary), the command returns at its import
+    /// deadline, the stalled helper is reaped, and the file was opened once.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn pi_explicit_import_stalled_preparation_read_stops_the_command_at_its_deadline() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use crate::internal::{
+            ai::authorized_read,
+            worktree_scope::{RequestScope, with_request_scope},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        crate::utils::test::setup_with_new_libra_in(&root).await;
+        let real = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("libra");
+        assert!(real.is_file(), "the Libra binary must be built first");
+        let id = "019a3c2e-7b10-7000-8000-0000000000b1";
+        let path = root.join(format!("2026-10-31T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session", "version": 3, "id": id,
+                    "timestamp": "2026-10-31T00:00:00.000Z", "cwd": root.to_str().unwrap()})
+            ),
+        )
+        .unwrap();
+        let (_dir, script) = write_import_helper_script(&format!(
+            "if [ \"$1\" = '{IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG}' ]; then\n  printf '%s' \"$$\" > \"$LIBRA_IMPORT_HELPER_TEST_MARKER\"\n  head -c 1 > /dev/null\n  sleep 60\n  exit 1\nfi\nexec '{}' \"$@\"",
+            real.display()
+        ));
+        let marker = script.with_extension("pid");
+        let _reset = test_support::install(test_support::ImportTestControls {
+            total_deadline: Some(Duration::from_secs(8)),
+            ..test_support::ImportTestControls::default()
+        });
+        let reads = Arc::new(AtomicUsize::new(0));
+        let args = selector_args(|args| {
+            args.all = false;
+            args.agent = Some("pi".to_string());
+            args.path = Some(path.clone());
+            args.yes = true;
+        });
+        let output = OutputConfig {
+            quiet: true,
+            ..OutputConfig::default()
+        };
+        let started = Instant::now();
+        let result = with_request_scope(
+            Some(RequestScope::resolve(root.clone()).unwrap()),
+            PI_SOURCE_READS.scope(
+                reads.clone(),
+                authorized_read::with_test_helper_program(
+                    script.clone(),
+                    execute_safe(args, &output),
+                ),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "a stalled Pi read must not succeed");
+        assert!(
+            elapsed >= Duration::from_secs(7),
+            "the helper stalled until the deadline, not an earlier failure: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the command outlived its deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the file is opened once, in the CLI"
+        );
+        let pid = wait_for_import_helper_pid(&marker).await;
+        wait_for_import_helper_exit(pid).await;
+    }
+
+    /// PI-10: the CLI process cannot read a Pi session's bytes. The file is
+    /// opened inside the private `pi_held_source` module, so no raw handle
+    /// exists outside it; the `PiHeldSource` it returns implements neither
+    /// `Read` nor `Seek` (checked at compile time below: either impl would make
+    /// the probe call ambiguous); the module defines only `open` and
+    /// `into_helper_stdin` and takes no byte (no read, seek, or buffering call
+    /// in it); and production code converts the source only once, into the
+    /// helper's standard input (`From<PreparationInput> for Stdio`, used only
+    /// by the spawn's `.stdin(Stdio::from(source))`), so the CLI never holds
+    /// it as a `File`. A read in the CLI would need a new impl, a new accessor,
+    /// a read inside the module, or a second conversion, and this test fails
+    /// on each.
+    #[test]
+    fn pi_held_source_cannot_be_read_by_the_cli() {
+        trait NotReadable<Marker> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> NotReadable<()> for T {}
+        struct ViaRead;
+        impl<T: ?Sized + std::io::Read> NotReadable<ViaRead> for T {}
+        struct ViaSeek;
+        impl<T: ?Sized + std::io::Seek> NotReadable<ViaSeek> for T {}
+        <PiHeldSource as NotReadable<_>>::probe();
+
+        let source = include_str!("import.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            production.matches(".into_helper_stdin()").count(),
+            1,
+            "the held Pi source is converted only once"
+        );
+        let conversion = production
+            .find("impl From<PreparationInput> for Stdio {")
+            .expect("the helper-input conversion");
+        assert!(
+            production[conversion..].lines().take(8).any(
+                |line| line.trim() == "PreparationInput::Pi(held) => held.into_helper_stdin(),"
+            ),
+            "the one conversion makes the helper's standard input"
+        );
+        assert_eq!(
+            production.matches("Stdio::from(source)").count(),
+            1,
+            "a `PreparationInput` becomes a `Stdio` only in the helper spawn"
+        );
+        let spawn = production
+            .find(".stdin(Stdio::from(source))")
+            .expect("the helper spawn sets its standard input");
+        let helper = production
+            .find("async fn run_import_preparation_descriptor_helper_bounded(")
+            .expect("the preparation helper spawn function");
+        assert!(
+            helper < spawn && !production[helper..spawn].contains("\nasync fn "),
+            "the conversion is in the preparation helper spawn"
+        );
+        for raw_exit in [
+            "into_helper_input",
+            "-> std::fs::File {\n            self.0",
+        ] {
+            assert!(
+                !production.contains(raw_exit),
+                "the held source must not yield a `File`"
+            );
+        }
+        let module_start = production
+            .find("mod pi_held_source {")
+            .expect("the held-source module");
+        let module_end = production[module_start..]
+            .find("\nuse pi_held_source::PiHeldSource;")
+            .map(|end| module_start + end)
+            .expect("the held-source module end");
+        let module: String = production[module_start..module_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            module.matches("fn ").count(),
+            2,
+            "the module defines only `open` and `into_helper_stdin`"
+        );
+        assert!(module.contains("fn open(") && module.contains("fn into_helper_stdin("));
+        let words = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("word pattern");
+        for word in words.find_iter(&module).map(|found| found.as_str()) {
+            assert!(
+                ![
+                    "Read",
+                    "Seek",
+                    "BufRead",
+                    "BufReader",
+                    "read",
+                    "read_to_end",
+                    "read_to_string",
+                    "read_exact",
+                    "read_at",
+                    "read_vectored",
+                    "seek",
+                    "rewind",
+                    "stream_position",
+                    "take",
+                    "bytes",
+                    "copy",
+                    "mmap",
+                    "try_clone",
+                    "as_raw_fd",
+                    "as_fd",
+                ]
+                .contains(&word),
+                "the held-source module must take no byte, but uses `{word}`"
+            );
+        }
+    }
+
+    /// PI-10: a Pi session file is read only by the killable preparation
+    /// helper, never by the CLI process. A helper that stalls while reading
+    /// the opened Pi file is killed at the import deadline: the import stops
+    /// with `DeadlineExceeded` and the helper process is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_session_read_stalled_in_the_helper_stops_at_the_deadline() {
+        let sessions = tempfile::tempdir().unwrap();
+        let id = "019a3c2e-7b10-7000-8000-0000000000b1";
+        let path = sessions
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(format!("2026-10-31T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&path, b"{\"type\":\"session\"}\n").unwrap();
+        let candidate = Candidate {
+            kind: AgentKind::Pi,
+            provider_session_id: id.to_string(),
+            path: Some(path),
+        };
+        let (held, _) = open_pi_session_file(&candidate).unwrap();
+        let (_dir, script) = write_import_helper_script(
+            "printf '%s' \"$$\" > \"$LIBRA_IMPORT_HELPER_TEST_MARKER\"\nhead -c 1 > /dev/null\nsleep 30",
+        );
+        let marker = script.with_extension("pid");
+        let mut control = test_descriptor_control();
+        control.agent_kind = "pi".to_string();
+        let started = Instant::now();
+        let error = run_import_preparation_descriptor_helper_bounded(
+            import_helper_script_command(&script, &marker),
+            control,
+            held,
+            64,
+            started + Duration::from_millis(500),
+        )
+        .await
+        .expect_err("a stalled Pi read must stop at the deadline");
+        assert!(
+            matches!(
+                error.downcast_ref::<ImportError>(),
+                Some(ImportError::DeadlineExceeded)
+            ),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < IMPORT_HELPER_TEST_DEADLINE);
+        let pid = wait_for_import_helper_pid(&marker).await;
+        wait_for_import_helper_exit(pid).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn outer_cancellation_reaps_the_preparation_process_group() {
@@ -6440,6 +6882,74 @@ mod tests {
         ));
     }
 
+    /// PI-10 AC1: without consent, `agent import --agent pi --path` never
+    /// enters the Pi session reader, so its read count stays zero and the
+    /// refusal is the consent requirement. With `--yes` the same file is read
+    /// exactly once, which shows the count observes the reader.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd)]
+    async fn pi_explicit_import_refused_consent_counts_zero_source_reads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use crate::internal::{
+            ai::authorized_read,
+            worktree_scope::{RequestScope, with_request_scope},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        crate::utils::test::setup_with_new_libra_in(&root).await;
+        let program = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("libra");
+        assert!(program.is_file(), "the Libra binary must be built first");
+        let path = root.join("2026-10-31T00-00-00-000Z_019a3c2e-7b10-7000-8000-0000000000b1.jsonl");
+        std::fs::write(&path, b"{\"type\":\"session\"}\n").unwrap();
+        let run = |yes: bool| {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let args = selector_args(|args| {
+                args.all = false;
+                args.agent = Some("pi".to_string());
+                args.path = Some(path.clone());
+                args.yes = yes;
+            });
+            let root = root.clone();
+            let program = program.clone();
+            let counted = reads.clone();
+            async move {
+                let output = OutputConfig {
+                    quiet: true,
+                    ..OutputConfig::default()
+                };
+                let result = with_request_scope(
+                    Some(RequestScope::resolve(root).unwrap()),
+                    PI_SOURCE_READS.scope(
+                        counted,
+                        authorized_read::with_test_helper_program(
+                            program,
+                            execute_safe(args, &output),
+                        ),
+                    ),
+                )
+                .await;
+                (result, reads.load(Ordering::SeqCst))
+            }
+        };
+        let (refused, reads) = run(false).await;
+        let error = refused.expect_err("consent is required");
+        assert!(error.to_string().contains("--yes"), "{error}");
+        assert_eq!(reads, 0, "the source was read before consent");
+        let (_, reads) = run(true).await;
+        assert_eq!(reads, 1, "with consent the file is read once");
+    }
+
     fn selector_args(configure: impl FnOnce(&mut ImportArgs)) -> ImportArgs {
         let mut args = ImportArgs {
             session: None,
@@ -6473,7 +6983,7 @@ mod tests {
             ),
             (
                 selector_args(|args| args.agent = Some("gemini".to_string())),
-                "agent import supports claude-code, codex, opencode, or hermes; got 'gemini'",
+                "agent import supports claude-code, codex, opencode, hermes, or pi; got 'gemini'",
             ),
             (
                 selector_args(|args| {
@@ -6525,7 +7035,7 @@ mod tests {
         assert_eq!(
             error.message(),
             format!(
-                "agent import supports claude-code, codex, opencode, or hermes; got 'x{}…'",
+                "agent import supports claude-code, codex, opencode, hermes, or pi; got 'x{}…'",
                 "y".repeat(63)
             )
         );
@@ -6535,7 +7045,7 @@ mod tests {
         .expect_err("unsupported agent");
         assert_eq!(
             error.message(),
-            "agent import supports claude-code, codex, opencode, or hermes; got 'bad?[2Jslug'"
+            "agent import supports claude-code, codex, opencode, hermes, or pi; got 'bad?[2Jslug'"
         );
     }
 
