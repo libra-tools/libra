@@ -1087,6 +1087,7 @@ mod mega2_browser_tui_test;
 mod mega2_entry_transport_test;
 mod mega2_mutate_transport_test;
 mod mega2_tag_transport_test;
+mod mega2_traces_cli_test;
 mod mega2_traces_live_support;
 mod mega2_traces_live_test;
 mod mega2_tree_transport_test;

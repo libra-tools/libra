@@ -584,6 +584,10 @@ pub enum CloneError {
     SetupFailed { message: String },
     #[error("this clone source is no longer supported")]
     RemovedPublishRestoreSource,
+    #[error(
+        "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
+    )]
+    TracesLocatorRefused,
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +667,11 @@ impl From<CloneError> for CliError {
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
+                ),
+            CloneError::TracesLocatorRefused => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(
+                    "clone the Mega2 code repository, then use `libra mega2 traces fetch` for an explicit traces stream",
                 ),
         }
     }
@@ -1282,6 +1291,10 @@ async fn execute_clone_inner(
         local_path.join(util::ROOT_DIR)
     };
 
+    if crate::internal::protocol::mega2_traces::is_traces_locator_url(&args.remote_repo) {
+        return Err((CloneError::TracesLocatorRefused, None));
+    }
+
     // --- Step 2: Remote discovery ---
     if !output.quiet && !output.is_json() {
         eprintln!("Connecting to {} ...", args.remote_repo);
@@ -1625,7 +1638,7 @@ async fn clone_into_destination(
         .await;
         let _ = ConfigKv::add(
             &format!("remote.{remote_name}.fetch"),
-            "+refs/*:refs/*",
+            crate::internal::protocol::mega2_traces::mirror_fetch_refspec(remote_url),
             false,
         )
         .await;

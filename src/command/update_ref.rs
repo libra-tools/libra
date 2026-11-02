@@ -1075,14 +1075,16 @@ async fn apply_prepared_batch(
 
 /// True when stdout's pipe has no reader left, so the next acknowledgement
 /// would fail. Checked before a commit so a closed pipe cannot move refs and
-/// then fail to report it.
+/// then fail to report it. The probe asks for `POLLOUT`: Linux reports
+/// `POLLERR` for a reader-less pipe either way, but macOS reports its
+/// `POLLHUP` only when an event was requested.
 #[cfg(unix)]
 fn stdout_pipe_closed() -> bool {
     use std::os::fd::AsRawFd;
 
     let mut probe = libc::pollfd {
         fd: std::io::stdout().as_raw_fd(),
-        events: 0,
+        events: libc::POLLOUT,
         revents: 0,
     };
     // SAFETY: `probe` is one valid pollfd for a live descriptor and poll only

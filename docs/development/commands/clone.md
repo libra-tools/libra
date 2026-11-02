@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra clone` 的目标是从本地、SSH、HTTPS 或 Libra cloud 来源创建新仓库，并初始化对象、refs、配置和工作区。当前实现覆盖 Git 远程浅克隆（`--depth`；本地 Libra 源 fail-closed，见 P0-03）、单分支克隆（`--single-branch`）、裸仓库（`--bare`）、分支检出（`-b/--branch`）、URL 脱敏和安全边界检查，同时明确子模块与 sparse checkout 的延后决策；origin 命名 `-o`、引用仓库 `--reference`/`--shared`/`--dissociate`、镜像 `--mirror`、以及局部克隆过滤 `--filter` 与浅历史 `--shallow-since`/`--shallow-exclude`（接受式 no-op，见下）均已处理。
+`libra clone` 的目标是从本地、SSH、HTTPS 或 Libra cloud 来源创建新仓库，并初始化对象、refs、配置和工作区。Mega2 代码视图由 `is_mega2_code_view_url` 识别：只对 `http`/`https`/`ssh` 且路径含 `/project/` 与 `.git`、不含 `/.traces/` 的地址生效。这类 `--mirror` 在 fetch 前写入 `+refs/heads/*:refs/heads/*`，因此不会把 `refs/libra/traces` 放进 want。普通 Git 与本地路径镜像仍写 `+refs/*:refs/*`。`is_traces_locator_url` 在远程发现之前拒绝 `/.traces/`，错误是 `CloneError::TracesLocatorRefused`。默认非镜像 fetch 本来就只映射 `refs/heads/*` 与 `refs/mr/*`，裸克隆同样不选取 traces ref。当前实现覆盖 Git 远程浅克隆（`--depth`；本地 Libra 源 fail-closed，见 P0-03）、单分支克隆（`--single-branch`）、裸仓库（`--bare`）、分支检出（`-b/--branch`）、URL 脱敏和安全边界检查，同时明确子模块与 sparse checkout 的延后决策；origin 命名 `-o`、引用仓库 `--reference`/`--shared`/`--dissociate`、镜像 `--mirror`、以及局部克隆过滤 `--filter` 与浅历史 `--shallow-since`/`--shallow-exclude`（接受式 no-op，见下）均已处理。
 
 ## 对比 Git 与兼容性
 

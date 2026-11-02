@@ -1,3 +1,21 @@
+# `libra mega2`
+
+`libra mega2 traces` reads scoped agent history and can fetch one verified stream.
+
+```
+libra mega2 traces capabilities --server <BASE-URL> [--token-file <PATH>] [--require-search]
+libra mega2 traces targets --server <BASE-URL> --path </project/foo>
+libra mega2 traces streams --server <BASE-URL> --target <UUID> [--source <ID>] [--owner <UUID>] [--epoch <UUID>] [--cursor <CURSOR>] [--limit <N>]
+libra mega2 traces sessions --server <BASE-URL> --stream <UUID> [--since <RFC3339>] [--until <RFC3339>] [--agent <KIND>] [--code-commit <OID>] [--session <ID>] [--cursor <CURSOR>]
+libra mega2 traces show --server <BASE-URL> --stream <UUID> (--session <ID> | --checkpoint <ID>)
+libra mega2 traces checkpoints --server <BASE-URL> --stream <UUID> --session <ID> [--cursor <CURSOR>]
+libra mega2 traces search --server <BASE-URL> --target </project/foo> --query <TEXT> [--source <ID>] [--stream <UUID>] [--session <ID>] [--agent <KIND>] [--since <RFC3339>] [--until <RFC3339>] [--code-commit <OID>] [--cursor <CURSOR>] [--limit <N>] [--max-bytes <N>]
+libra mega2 traces transcript --server <BASE-URL> --stream <UUID> --checkpoint <ID> [--max-bytes <N>] [--cursor <CURSOR>]
+libra mega2 traces fetch --remote <NAME> --stream <UUID>
+```
+
+Search text must be 1 to 256 UTF-8 bytes or the command does not open a socket. The client sends the query unchanged; ASCII case-fold is the server's match. Omitted list limits are 50, and omitted search limits are 20 hits and 16384 bytes. A limit above 200 or 100 is rejected before a socket opens. `--owner`, `--epoch`, `--agent`, `--session`, and `--cursor` are passed through as written. `--code-commit` must be 40 or 64 hexadecimal characters. `--since` and `--until` are RFC3339 values sent as UTC on the half-open interval `[since, until)`; `since` later than `until` is rejected locally, and equal bounds are an empty interval. `--session` and `--checkpoint` cannot be combined. `--require-search` succeeds only when `search_ready` is boolean `true`; a missing or non-boolean field is rejected, while a plain `capabilities` call still prints the other fields. A redirect to another origin does not forward `Authorization`. Responses over 1 MiB are rejected. `fetch` requires a token, reads authenticated `server_id`, and writes `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>` only after the Git object header hashes and link closure match the repository object format. It records the server fingerprint and refuses a silent remote retarget. It does not update `refs/heads/traces`, `refs/libra/traces`, `HEAD`, the index, or the worktree. An SSH remote is located at `ssh://traces@<host>/.traces/by-scope/<stream>.git` and does not publish a ref without an authenticated git advertisement.
+
 # `libra mega2 browser`
 
 Browse a remote Mega2 repository over HTTP with a **directory tree on the left

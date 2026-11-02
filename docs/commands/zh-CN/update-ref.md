@@ -44,7 +44,7 @@ verify <ref> NUL [<oldvalue>] NUL
 - `option no-deref` —— 接受（范围内没有符号 ref，结果不变）；
 - `start` / `prepare` / `commit` / `abort` —— git 的事务协议。
 
-批内所有更新在**一个 SQLite 事务**内原子生效：CAS 不匹配、非法命令、同一 ref 被多次更新（git 规则）或范围外 ref 都会让所有 ref 与 reflog 保持字节不变。`start`/`prepare`/`commit`/`abort` 在处理到时向 stdout 输出 `<cmd>: ok`（与 git 一致）；`abort` 不产生任何效果。`-m <reason>` 作用于批内每个被更新的 ref。`--no-deref` 与 `option no-deref` 被接受且永不改变结果。
+批内所有更新在**一个 SQLite 事务**内原子生效：CAS 不匹配、非法命令、同一 ref 被多次更新（git 规则）或范围外 ref 都会让所有 ref 与 reflog 保持字节不变。`start`/`prepare`/`commit`/`abort` 在处理到时向 stdout 输出 `<cmd>: ok`（与 git 一致）；`abort` 不产生任何效果。在 Unix 上，若 `commit` 时 stdout 是已没有读端的 pipe，则在事务提交之前以退出码 `128` 失败，不移动任何 ref 或 reflog。`-m <reason>` 作用于批内每个被更新的 ref。`--no-deref` 与 `option no-deref` 被接受且永不改变结果。
 
 ## 选项
 

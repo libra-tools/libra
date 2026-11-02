@@ -3106,6 +3106,117 @@ fn test_clone_local_deep_history_completes_in_budget() {
     );
 }
 
+/// Mega2 code-view clone planning excludes traces refs. Ordinary Git mirrors
+/// keep the full advertised namespace. A traces locator never reaches discovery.
+#[test]
+fn mega2_code_clone_excludes_traces_matrix() {
+    use libra::internal::protocol::mega2_traces::{
+        code_view_keeps_ref, is_mega2_code_view_url, is_traces_locator_url, mirror_fetch_refspec,
+    };
+
+    use super::run_libra_command;
+
+    let https = "https://mega.example/project/foo.git";
+    let http = "http://127.0.0.1:8080/project/foo.git";
+    let ssh = "ssh://git@mega.example/project/foo.git";
+    let traces = "https://mega.example/.traces/by-scope/11111111-1111-4111-8111-111111111111.git";
+    let github = "ssh://git@github.com/org/repo.git";
+    let local = "/tmp/project/repo.git";
+
+    for url in [https, http, ssh] {
+        assert!(is_mega2_code_view_url(url), "{url}");
+        assert_eq!(mirror_fetch_refspec(url), "+refs/heads/*:refs/heads/*");
+    }
+    assert!(is_traces_locator_url(traces));
+    assert!(!is_mega2_code_view_url(traces));
+    assert!(!is_mega2_code_view_url(github));
+    assert!(!is_mega2_code_view_url(local));
+    assert_eq!(mirror_fetch_refspec(github), "+refs/*:refs/*");
+    assert_eq!(mirror_fetch_refspec(local), "+refs/*:refs/*");
+    assert_eq!(
+        mirror_fetch_refspec("git@github.com:org/repo.git"),
+        "+refs/*:refs/*"
+    );
+
+    assert!(code_view_keeps_ref("refs/heads/main"));
+    assert!(code_view_keeps_ref("refs/tags/v1"));
+    assert!(code_view_keeps_ref("HEAD"));
+    assert!(!code_view_keeps_ref("refs/libra/traces"));
+    assert!(!code_view_keeps_ref("refs/libra/traces/extra"));
+
+    let root = tempdir().expect("clone root");
+    let destination = root.path().join("dest");
+    let output = run_libra_command(
+        &[
+            "clone",
+            traces,
+            destination.to_str().expect("utf8 destination"),
+        ],
+        root.path(),
+    );
+    assert!(
+        !output.status.success(),
+        "a traces locator must be refused before discovery"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("traces locator"),
+        "refusal should name the traces locator: {stderr}"
+    );
+    assert!(
+        !destination.exists(),
+        "refused clone must not create {destination:?}"
+    );
+
+    let source = tempdir().expect("ordinary source");
+    assert!(run_libra_command(&["init"], source.path()).status.success());
+    assert!(
+        run_libra_command(&["config", "set", "user.name", "Clone"], source.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(
+            &["config", "set", "user.email", "clone@example.com"],
+            source.path()
+        )
+        .status
+        .success()
+    );
+    fs::write(source.path().join("code.txt"), "code\n").expect("code file");
+    assert!(
+        run_libra_command(&["add", "code.txt"], source.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "code", "--no-verify"], source.path())
+            .status
+            .success()
+    );
+    let mirror = root.path().join("ordinary-mirror");
+    let mirrored = run_libra_command(
+        &[
+            "clone",
+            "--mirror",
+            source.path().to_str().expect("source path"),
+            mirror.to_str().expect("mirror path"),
+        ],
+        root.path(),
+    );
+    assert!(
+        mirrored.status.success(),
+        "ordinary mirror failed: {}",
+        String::from_utf8_lossy(&mirrored.stderr)
+    );
+    let config = run_libra_command(&["config", "list"], &mirror);
+    let config_text = String::from_utf8_lossy(&config.stdout);
+    assert!(
+        config_text.contains("+refs/*:refs/*"),
+        "a non-Mega2 mirror keeps every advertised ref: {config_text}"
+    );
+}
+
 /// Run the Libra binary via `base_libra_command`'s isolated HOME, but poll it
 /// with a hard deadline: return `(output, timed_out)`. If the clone deadlocks
 /// (the ADR-CLH-01 regression), the child never exits, `timed_out` becomes
