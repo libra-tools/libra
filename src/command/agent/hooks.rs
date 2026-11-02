@@ -7,6 +7,8 @@
 //! redacted `agent_session` / `agent_checkpoint` projection and checkpoint
 //! commits on `refs/libra/traces`.
 
+use std::time::{Duration, Instant};
+
 use clap::Subcommand;
 
 use crate::{
@@ -202,6 +204,11 @@ pub async fn execute_safe(
             if !matches!(command, HookCommandKind::Observe) {
                 return Err(CliError::fatal("pi registers only the observe entry"));
             }
+            if let Some(deadline) = deadline {
+                arm_pi_hard_lifetime(deadline);
+            }
+            #[cfg(debug_assertions)]
+            stall_pi_hook_for_test();
             // The parsed frame selects the lifecycle kind; this one is only
             // the non-terminal placeholder the observe command carries.
             process_hook_event_with_target(
@@ -220,6 +227,43 @@ pub async fn execute_safe(
                 )
             })
         }
+    }
+}
+
+/// Extra time the Pi hook process may run past its managed capture deadline
+/// before it ends itself.
+const PI_HARD_LIFETIME_GRACE: Duration = Duration::from_millis(500);
+/// Exit status of a Pi hook process ended by its hard lifetime.
+const PI_HARD_LIFETIME_EXIT_CODE: i32 = 124;
+
+/// The Pi extension kills a child at its two-second delivery deadline, but
+/// if Pi itself is killed nothing in it runs. With a managed budget, end
+/// this process a fixed grace after the capture deadline, whatever the main
+/// thread is doing. Ending here is the same as a host kill, which capture
+/// already survives: durable writes are committed atomically or not at all.
+fn arm_pi_hard_lifetime(deadline: CaptureDeadline) {
+    let end = deadline.monotonic() + PI_HARD_LIFETIME_GRACE;
+    std::thread::spawn(move || {
+        let now = Instant::now();
+        if end > now {
+            std::thread::sleep(end - now);
+        }
+        std::process::exit(PI_HARD_LIFETIME_EXIT_CODE);
+    });
+}
+
+/// Test hook: block this thread as an operation that ignores the capture
+/// deadline would. Debug builds only, and only with `LIBRA_TEST=1`.
+#[cfg(debug_assertions)]
+fn stall_pi_hook_for_test() {
+    if std::env::var_os("LIBRA_TEST").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    if let Some(stall) = std::env::var("LIBRA_TEST_PI_HOOK_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(stall));
     }
 }
 

@@ -6542,7 +6542,14 @@ fn pi_observe_envelope_fields_match_adr_pi_06() {
             let forwarded = matching[0];
             assert_eq!(
                 forwarded["argv"],
-                json!(["agent", "hooks", "pi", "observe"])
+                json!([
+                    "agent",
+                    "hooks",
+                    "--capture-budget-ms",
+                    "1500",
+                    "pi",
+                    "observe"
+                ])
             );
             let frame = &forwarded["frame"];
             let keys: std::collections::BTreeSet<String> =
@@ -6758,4 +6765,866 @@ async fn pi_observe_receiver_records_adr_frames() {
         !verb.status.success(),
         "pi registers only the observe entry"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PI-13: the Pi extension's child-process resource contract (`pi_child_contract_*`).
+// ---------------------------------------------------------------------------
+
+/// A fake libra that logs `start`/`end` lines (pid, time, argv, own path) and
+/// then behaves as `mode` says: `exit:<code>`, `sleep:<ms>:<code>`, `hang`
+/// (ignores SIGTERM and never exits on its own), or `retry-then-hang:<ms>:<n>`
+/// (attempts before the `n`th sleep `ms` and exit 1; the `n`th hangs).
+fn pi_contract_fake(dir: &Path, node: &str, name: &str, mode: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).expect("fake libra dir");
+    let fake = dir.join(name);
+    std::fs::write(
+        &fake,
+        format!(
+            r#"#!{node}
+import {{ readFileSync, appendFileSync }} from 'node:fs';
+const log = (phase) => appendFileSync(process.env.LIBRA_TEST_PI_LOG, JSON.stringify({{ phase, pid: process.pid, t: Date.now(), argv: process.argv.slice(2), self: process.argv[1] }}) + '\n');
+readFileSync(0, 'utf8');
+log('start');
+const mode = {mode};
+const attempt = readFileSync(process.env.LIBRA_TEST_PI_LOG, 'utf8').split('\n').filter((line) => line.includes('"phase":"start"')).length;
+const hang = () => {{ process.on('SIGTERM', () => {{}}); setInterval(() => {{}}, 1000); }};
+if (mode === 'hang') {{
+  hang();
+}} else if (mode.startsWith('retry-then-hang:')) {{
+  const [, ms, n] = mode.split(':');
+  if (attempt >= Number(n)) {{
+    hang();
+  }} else {{
+    setTimeout(() => {{ log('end'); process.exit(1); }}, Number(ms));
+  }}
+}} else if (mode.startsWith('sleep:')) {{
+  const [, ms, code] = mode.split(':');
+  setTimeout(() => {{ log('end'); process.exit(Number(code)); }}, Number(ms));
+}} else {{
+  log('end');
+  process.exit(Number(mode.split(':')[1]));
+}}
+"#,
+            mode = serde_json::to_string(mode).unwrap()
+        ),
+    )
+    .expect("write fake libra");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
+        .expect("make fake libra executable");
+    fake
+}
+
+struct PiContractRun {
+    lines: Vec<Value>,
+    report: Value,
+    output: Output,
+    /// Child pids still present `grace` after the runner ended, recorded
+    /// before the runner's process group is cleaned up.
+    survivors: Vec<i64>,
+}
+
+/// Run the rendered extension for `command` and fire `count` copies of
+/// `tool_call` at once. `tail` is JavaScript run after the handlers return,
+/// with `t0` (the time before the first handler) in scope; it may finish the
+/// report early (for example by calling `process.exit`).
+fn pi_contract_run(
+    repo: &HookRepo,
+    node: &str,
+    command: &Path,
+    count: usize,
+    tail: &str,
+) -> PiContractRun {
+    pi_contract_run_with(
+        repo,
+        node,
+        command,
+        count,
+        "",
+        tail,
+        Duration::from_secs(2),
+        &[],
+    )
+}
+
+/// [`pi_contract_run`] with `head`, JavaScript run before the first handler
+/// (with `report` in scope and `t0p`, the `performance.now()` just before the
+/// first handler, readable from closures), extra environment for the runner
+/// and its children, and a `grace` to wait for children to disappear after
+/// the runner ends. Children are the fake libra pids from the log plus any
+/// pids the runner put in `report.kids`.
+#[allow(clippy::too_many_arguments)]
+fn pi_contract_run_with(
+    repo: &HookRepo,
+    node: &str,
+    command: &Path,
+    count: usize,
+    head: &str,
+    tail: &str,
+    grace: Duration,
+    env: &[(&str, &str)],
+) -> PiContractRun {
+    pi_assert_ps_works();
+    let asset = libra::internal::ai::hooks::providers::pi::settings::render_pi_asset(command)
+        .expect("render the Pi extension");
+    let work = repo
+        .home
+        .join(format!("pi-contract-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&work).expect("contract work dir");
+    std::fs::write(work.join("extension.mjs"), asset).expect("write extension module");
+    let log = work.join("children.jsonl");
+    let report = work.join("report.json");
+    let runner = format!(
+        r#"import {{ writeFileSync }} from 'node:fs';
+import {{ execFileSync, spawn as realSpawn, spawnSync }} from 'node:child_process';
+import {{ EventEmitter }} from 'node:events';
+import factory, {{ __setClockForTest, __setSpawnForTest }} from './extension.mjs';
+const handlers = new Map();
+factory({{ on(name, handler) {{ handlers.set(name, handler); }} }});
+const ctx = {{ cwd: {cwd}, isProjectTrusted: () => true, sessionManager: {{ getSessionId: () => {id}, getSessionFile: () => undefined }} }};
+const report = {{ returned: [] }};
+const save = () => writeFileSync({report}, JSON.stringify(report));
+process.on('exit', () => {{ report.elapsedAtExit = Date.now() - t0; save(); }});
+let t0p = 0;
+{head}
+const t0 = Date.now();
+t0p = performance.now();
+for (let i = 0; i < {count}; i++) {{
+  report.returned.push(handlers.get('tool_call')({{ type: 'tool_call', toolCallId: 'call-' + i, toolName: 'bash', input: {{}} }}, ctx) === undefined);
+}}
+{tail}
+"#,
+        cwd = serde_json::to_string(&repo.repo).unwrap(),
+        id = serde_json::to_string(PI_SESSION_ID).unwrap(),
+        report = serde_json::to_string(&report).unwrap(),
+    );
+    std::fs::write(work.join("runner.mjs"), runner).expect("write runner");
+    // Run Node in its own process group with a hard limit, so a regression
+    // that leaves a child running fails here instead of hanging the suite.
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(node)
+        .arg("--no-warnings")
+        .arg(work.join("runner.mjs"))
+        .current_dir(&work)
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", repo.home.join("decoy-bin").display()),
+        )
+        .env("HOME", &repo.home)
+        .env("LIBRA_TEST_PI_LOG", &log)
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("run the Pi extension");
+    // Kill whatever is left of the runner's process group when this run ends,
+    // also when a check below panics.
+    let group = PiGroupGuard(child.id() as i32);
+    let limit = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().expect("poll the Pi extension").is_none() {
+        if Instant::now() >= limit {
+            // SAFETY: signal the process group this test created.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect the Pi extension");
+    let lines: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("child log line"))
+        .collect();
+    let report = std::fs::read_to_string(&report)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    let mut pids: Vec<i64> = lines
+        .iter()
+        .filter(|line| line["phase"] == json!("start"))
+        .filter_map(|line| line["pid"].as_i64())
+        .collect();
+    if let Some(kids) = report["kids"].as_array() {
+        pids.extend(kids.iter().filter_map(|kid| {
+            kid.as_i64()
+                .or_else(|| kid.as_str().and_then(|text| text.trim().parse().ok()))
+        }));
+    }
+    let until = Instant::now() + grace;
+    let survivors = loop {
+        let alive: Vec<i64> = pids
+            .iter()
+            .copied()
+            .filter(|pid| pi_pid_exists(*pid))
+            .collect();
+        if alive.is_empty() || Instant::now() >= until {
+            break alive;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Clean up the runner's process group now that the survivors are known.
+    drop(group);
+    PiContractRun {
+        lines,
+        report,
+        output,
+        survivors,
+    }
+}
+
+fn pi_contract_phase(run: &PiContractRun, phase: &str) -> Vec<Value> {
+    run.lines
+        .iter()
+        .filter(|line| line["phase"] == json!(phase))
+        .cloned()
+        .collect()
+}
+
+/// Kills a test runner's process group when dropped, including on panic.
+struct PiGroupGuard(i32);
+
+impl Drop for PiGroupGuard {
+    fn drop(&mut self) {
+        // SAFETY: signal the process group this test created.
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+
+/// JavaScript for `head`: a virtual clock the test advances with
+/// `advance(to)`, recording every timer the extension sets.
+const PI_VIRTUAL_CLOCK: &str = r#"report.timers = [];
+const virtual = { t: 0, timers: [], next: 1 };
+__setClockForTest({
+  now: () => virtual.t,
+  setTimeout: (callback, ms) => {
+    const id = virtual.next++;
+    virtual.timers.push({ id, at: virtual.t + ms, callback });
+    report.timers.push({ at: virtual.t, ms });
+    return id;
+  },
+  clearTimeout: (id) => { virtual.timers = virtual.timers.filter((timer) => timer.id !== id); },
+});
+const advance = (to) => {
+  virtual.t = to;
+  for (;;) {
+    const due = virtual.timers.filter((timer) => timer.at <= to).sort((a, b) => a.at - b.at)[0];
+    if (!due) break;
+    virtual.timers = virtual.timers.filter((timer) => timer !== due);
+    due.callback();
+  }
+};"#;
+
+/// JavaScript for `head`: fake children that never exit on their own.
+/// `plan[i]` says whether the `i`th spawned child started (has a pid);
+/// beyond the plan, children start.
+const PI_FAKE_CHILDREN: &str = r#"report.spawnedAt = [];
+const children = [];
+const plan = globalThis.libraTestPlan ?? [];
+const fakeSpawn = () => {
+  const child = new EventEmitter();
+  const started = plan[children.length] ?? true;
+  child.pid = started ? 700000 + children.length : undefined;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.killCalls = 0;
+  child.stdin = { on() {}, end() {} };
+  child.kill = () => { child.killCalls += 1; child.killedAt = typeof virtual === 'undefined' ? null : virtual.t; return true; };
+  report.spawnedAt.push(typeof virtual === 'undefined' ? null : virtual.t);
+  children.push(child);
+  return child;
+};
+__setSpawnForTest(fakeSpawn);"#;
+
+/// JavaScript for `head`: record the argv of every spawn while still starting
+/// real children.
+const PI_RECORD_SPAWNS: &str = r#"report.spawns = [];
+__setSpawnForTest((command, args, options) => {
+  report.spawns.push(args);
+  return realSpawn(command, args, options);
+});"#;
+
+/// Whether `pid` still names a process (a zombie counts). `ps` exits 0 with
+/// the process's state when it exists and 1 with no output when it does
+/// not; anything else is a failed query, not an absent process.
+fn pi_pid_exists(pid: i64) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps");
+    let listed = !String::from_utf8_lossy(&out.stdout).trim().is_empty();
+    match out.status.code() {
+        Some(0) if listed => true,
+        Some(1) if !listed => false,
+        _ => panic!("ps could not answer for pid {pid}: {}", describe(&out)),
+    }
+}
+
+/// The process query used by these tests answers for a process that exists.
+fn pi_assert_ps_works() {
+    assert!(
+        pi_pid_exists(i64::from(std::process::id())),
+        "ps must list the test process itself"
+    );
+}
+
+/// JavaScript for `head`: record when each kill is decided, relative to the
+/// first handler, while still starting real children.
+const PI_RECORD_KILLS: &str = r#"report.kills = [];
+__setSpawnForTest((command, args, options) => {
+  const child = realSpawn(command, args, options);
+  const kill = child.kill.bind(child);
+  child.kill = (signal) => { report.kills.push(Math.round(performance.now() - t0p)); return kill(signal); };
+  return child;
+});"#;
+
+#[test]
+fn pi_child_contract_runs_the_fixed_absolute_executable() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    // A `libra` on PATH must never be the one that runs.
+    let decoy = pi_contract_fake(&repo.home.join("decoy-bin"), &node, "libra", "exit:0");
+    let fake = pi_contract_fake(&repo.home.join("fixed"), &node, "fixed-libra.mjs", "exit:0");
+    assert!(
+        libra::internal::ai::hooks::providers::pi::settings::render_pi_asset(Path::new("libra"))
+            .is_err(),
+        "a relative executable must be refused"
+    );
+    let run = pi_contract_run(&repo, &node, &fake, 1, "");
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    let starts = pi_contract_phase(&run, "start");
+    assert_eq!(starts.len(), 1, "{:?}", run.lines);
+    assert_eq!(starts[0]["self"], json!(fake.display().to_string()));
+    assert_ne!(starts[0]["self"], json!(decoy.display().to_string()));
+}
+
+#[test]
+fn pi_child_contract_passes_the_fixed_argv() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fixed = json!([
+        "agent",
+        "hooks",
+        "--capture-budget-ms",
+        "1500",
+        "pi",
+        "observe"
+    ]);
+    // A child that runs receives exactly the fixed argv.
+    let fake = pi_contract_fake(&repo.home.join("argv"), &node, "libra.mjs", "exit:0");
+    let run = pi_contract_run(&repo, &node, &fake, 1, "");
+    let starts = pi_contract_phase(&run, "start");
+    assert_eq!(starts.len(), 1, "{:?}", run.lines);
+    assert_eq!(starts[0]["argv"], fixed);
+    // Every retry of a child that never started is spawned with the same argv.
+    let missing = repo.home.join("no-such-libra");
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &missing,
+        1,
+        PI_RECORD_SPAWNS,
+        "",
+        Duration::from_secs(2),
+        &[],
+    );
+    let spawns = run.report["spawns"].as_array().cloned().unwrap_or_default();
+    assert_eq!(spawns.len(), 3, "{}", run.report);
+    for args in spawns {
+        assert_eq!(args, fixed);
+    }
+}
+
+#[test]
+fn pi_child_contract_starts_without_a_shell() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    // With a shell, these names would run `touch`; without one they are
+    // only a path.
+    let dir = repo.home.join("bin $(touch SHELL_RAN) ; touch SHELL_RAN2");
+    let fake = pi_contract_fake(&dir, &node, "libra `touch SHELL_RAN3`.mjs", "exit:0");
+    let run = pi_contract_run(&repo, &node, &fake, 1, "");
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    assert_eq!(pi_contract_phase(&run, "start").len(), 1, "{:?}", run.lines);
+    for name in ["SHELL_RAN", "SHELL_RAN2", "SHELL_RAN3"] {
+        for root in [&repo.home, &repo.repo] {
+            assert!(
+                !walkdir_contains(root, name),
+                "a shell ran: found {name} under {}",
+                root.display()
+            );
+        }
+    }
+}
+
+fn walkdir_contains(root: &Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return true;
+        }
+        if path.is_dir() && !path.is_symlink() && walkdir_contains(&path, name) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn pi_child_contract_bounds_each_delivery_to_two_seconds() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let unused = repo.home.join("never-run");
+    // On a virtual clock: attempts 1 and 2 never start and report so at 900
+    // and 1800 ms; attempt 3 starts and is still running at the deadline. One
+    // window covers all three, so the third gets only the 200 ms left. A
+    // never-started child reported at the deadline gets no further attempt.
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &unused,
+        0,
+        &format!(
+            "globalThis.libraTestPlan = [false, false, true, false];\n{PI_VIRTUAL_CLOCK}\n{PI_FAKE_CHILDREN}"
+        ),
+        r#"handlers.get('tool_call')({ type: 'tool_call', toolCallId: 'a', toolName: 'bash', input: {} }, ctx);
+advance(900); children[0].emit('error', new Error('not started'));
+advance(1800); children[1].emit('error', new Error('not started'));
+advance(1999); report.killsBeforeDeadline = children[2].killCalls;
+advance(2000); report.killsAtDeadline = children[2].killCalls; report.killedAt = children[2].killedAt;
+children[2].exitCode = 0; children[2].emit('exit', 0);
+report.spawnsAfterFirst = children.length;
+advance(2000);
+handlers.get('tool_call')({ type: 'tool_call', toolCallId: 'b', toolName: 'bash', input: {} }, ctx);
+advance(4000); children[3].emit('error', new Error('not started'));
+report.spawnsAfterSecond = children.length;
+report.inFlight = globalThis[Symbol.for('libra.pi-hooks.delivery')].running.size;"#,
+        Duration::from_secs(1),
+        &[],
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    assert_eq!(
+        run.report["spawnedAt"],
+        json!([0, 900, 1800, 2000]),
+        "{}",
+        run.report
+    );
+    // Each attempt's kill timer gets only what is left of the one window.
+    assert_eq!(
+        run.report["timers"],
+        json!([
+            { "at": 0, "ms": 2000 },
+            { "at": 900, "ms": 1100 },
+            { "at": 1800, "ms": 200 },
+            { "at": 2000, "ms": 2000 }
+        ]),
+        "{}",
+        run.report
+    );
+    assert_eq!(
+        run.report["killsBeforeDeadline"],
+        json!(0),
+        "{}",
+        run.report
+    );
+    assert_eq!(run.report["killsAtDeadline"], json!(1), "{}", run.report);
+    assert_eq!(run.report["killedAt"], json!(2000), "{}", run.report);
+    assert_eq!(run.report["spawnsAfterFirst"], json!(3), "{}", run.report);
+    // The second delivery's child reported "not started" at its deadline:
+    // no attempt follows.
+    assert_eq!(run.report["spawnsAfterSecond"], json!(4), "{}", run.report);
+    assert_eq!(run.report["inFlight"], json!(0), "{}", run.report);
+}
+
+#[test]
+fn pi_child_contract_kills_a_child_at_the_deadline_or_on_exit() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_contract_fake(&repo.home.join("hang"), &node, "libra.mjs", "hang");
+    // Timeout: the hung child is killed at the deadline, and the provider
+    // process can finish.
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &fake,
+        1,
+        PI_RECORD_KILLS,
+        "",
+        Duration::from_secs(2),
+        &[],
+    );
+    let starts = pi_contract_phase(&run, "start");
+    assert_eq!(starts.len(), 1, "{:?}", run.lines);
+    let kills = run.report["kills"].as_array().cloned().unwrap_or_default();
+    assert_eq!(kills.len(), 1, "{}", run.report);
+    let decided = kills[0].as_i64().unwrap();
+    // Exact timing is pinned on the virtual clock; here a real child only
+    // has to be killed at the deadline, give or take scheduling.
+    assert!(
+        (1_995..=2_600).contains(&decided),
+        "the hung child must be killed at the deadline: {decided} ms"
+    );
+    assert!(run.survivors.is_empty(), "{:?}", run.survivors);
+    // Cancellation: Pi exits while the child is running.
+    let run = pi_contract_run(
+        &repo,
+        &node,
+        &fake,
+        1,
+        "await new Promise((resolve) => setTimeout(resolve, 300)); process.exit(0);",
+    );
+    let starts = pi_contract_phase(&run, "start");
+    assert_eq!(starts.len(), 1, "{:?}", run.lines);
+    assert!(
+        run.survivors.is_empty(),
+        "the child outlived Pi's exit: {:?}",
+        run.survivors
+    );
+}
+
+#[test]
+fn pi_child_contract_caps_children_in_flight_across_reloads() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let unused = repo.home.join("never-run");
+    // Eight children of the first copy never exit while a reload loads a
+    // second copy that fires eight more events: together they stay at eight.
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &unused,
+        8,
+        PI_FAKE_CHILDREN,
+        r#"const second = await import('./extension.mjs?reload');
+second.__setSpawnForTest(fakeSpawn);
+const reloaded = new Map();
+second.default({ on(name, handler) { reloaded.set(name, handler); } });
+for (let i = 0; i < 8; i++) {
+  report.returned.push(reloaded.get('tool_call')({ type: 'tool_call', toolCallId: 'again-' + i, toolName: 'bash', input: {} }, ctx) === undefined);
+}
+report.spawned = children.length;
+report.inFlight = globalThis[Symbol.for('libra.pi-hooks.delivery')].running.size;
+report.exitListeners = process.listenerCount('exit');
+for (const child of children) { child.exitCode = 0; child.emit('exit', 0); }
+report.inFlightAfterExit = globalThis[Symbol.for('libra.pi-hooks.delivery')].running.size;"#,
+        Duration::from_secs(1),
+        &[],
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    assert_eq!(
+        run.report["spawned"],
+        json!(8),
+        "a reload must not get its own eight children: {}",
+        run.report
+    );
+    assert_eq!(run.report["inFlight"], json!(8), "{}", run.report);
+    assert_eq!(run.report["inFlightAfterExit"], json!(0), "{}", run.report);
+    // The runner's own exit listener plus one shared listener.
+    assert_eq!(run.report["exitListeners"], json!(2), "{}", run.report);
+}
+
+#[tokio::test]
+async fn pi_child_contract_bounds_a_child_after_pi_is_killed() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    // Hold the repository's write lock, so the real libra child would wait
+    // for it (the default busy wait is 30 seconds) if it had no budget.
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}",
+        repo.repo.join(".libra").join("libra.db").display()
+    ));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let lock = Database::connect(options)
+        .await
+        .expect("open repository database");
+    lock.execute_unprepared("BEGIN IMMEDIATE")
+        .await
+        .expect("hold the write lock");
+    let libra = std::fs::canonicalize(env!("CARGO_BIN_EXE_libra")).expect("libra binary");
+    // Pi dies at once, without running any hook, after the child started.
+    let started = Instant::now();
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &libra,
+        0,
+        "",
+        r#"handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx);
+report.kids = execFileSync('pgrep', ['-P', String(process.pid)]).toString().trim().split(/\s+/);
+save();
+process.kill(process.pid, 'SIGKILL');"#,
+        Duration::from_secs(3),
+        &[],
+    );
+    let lived = started.elapsed();
+    let kids = run.report["kids"].as_array().cloned().unwrap_or_default();
+    assert_eq!(kids.len(), 1, "{} {}", run.report, describe(&run.output));
+    assert!(
+        run.survivors.is_empty(),
+        "the libra child outlived Pi by more than its budget: {:?}",
+        run.survivors
+    );
+    assert!(
+        lived < Duration::from_secs(4),
+        "the child must end within its own budget: {lived:?}"
+    );
+    lock.execute_unprepared("ROLLBACK")
+        .await
+        .expect("release the write lock");
+}
+
+#[test]
+fn pi_child_contract_reaps_killed_children() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_contract_fake(&repo.home.join("reap"), &node, "libra.mjs", "hang");
+    // Stay alive past the deadline and look at the killed child from the
+    // provider's own process: a zombie would still be listed.
+    let run = pi_contract_run(
+        &repo,
+        &node,
+        &fake,
+        1,
+        r#"await new Promise((resolve) => setTimeout(resolve, 2600));
+const { readFileSync } = await import('node:fs');
+const pids = readFileSync(process.env.LIBRA_TEST_PI_LOG, 'utf8').trim().split('\n').map((line) => JSON.parse(line).pid);
+const query = (pid) => {
+  const out = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)]);
+  const listed = out.stdout.toString().trim();
+  if (out.status === 0 && listed !== '') return listed;
+  if (out.status === 1 && listed === '') return 'absent';
+  return 'query-failed';
+};
+report.self = query(process.pid);
+report.listed = pids.map(query);"#,
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    // The query works for a process that exists, and the killed child is
+    // gone, not a zombie.
+    assert_ne!(run.report["self"], json!("absent"), "{}", run.report);
+    assert_ne!(run.report["self"], json!("query-failed"), "{}", run.report);
+    assert_eq!(run.report["listed"], json!(["absent"]), "{}", run.report);
+}
+
+#[test]
+fn pi_child_contract_ends_a_stalled_child_after_pi_is_killed() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let libra = std::fs::canonicalize(env!("CARGO_BIN_EXE_libra")).expect("libra binary");
+    // The child blocks as an operation that ignores its capture deadline
+    // would, and Pi dies without running any hook: only the child's own hard
+    // lifetime (budget plus grace) can end it.
+    let started = Instant::now();
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &libra,
+        0,
+        "",
+        r#"handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx);
+report.kids = execFileSync('pgrep', ['-P', String(process.pid)]).toString().trim().split(/\s+/);
+save();
+process.kill(process.pid, 'SIGKILL');"#,
+        Duration::from_secs(3),
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_PI_HOOK_STALL_MS", "10000"),
+        ],
+    );
+    let lived = started.elapsed();
+    let kids = run.report["kids"].as_array().cloned().unwrap_or_default();
+    assert_eq!(kids.len(), 1, "{} {}", run.report, describe(&run.output));
+    assert!(
+        run.survivors.is_empty(),
+        "a stalled child outlived Pi by more than its hard lifetime: {:?}",
+        run.survivors
+    );
+    assert!(
+        lived < Duration::from_secs(4),
+        "the stalled child must end at its hard lifetime: {lived:?}"
+    );
+}
+
+#[test]
+fn pi_child_contract_retries_a_failed_kill_once() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let unused = repo.home.join("never-started");
+    for mode in ["throw", "error"] {
+        // A fake child that never exits and whose kill fails, either by
+        // throwing or by reporting an error event.
+        let head = format!(
+            r#"const fakes = [];
+__setSpawnForTest(() => {{
+  const child = new EventEmitter();
+  child.pid = 424242 + fakes.length;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.killCalls = 0;
+  child.stdin = {{ on() {{}}, end() {{}} }};
+  child.kill = () => {{
+    child.killCalls += 1;
+    if ({mode} === 'throw') throw new Error('kill failed');
+    setImmediate(() => child.emit('error', new Error('kill failed')));
+    return false;
+  }};
+  fakes.push(child);
+  return child;
+}});
+report.fakes = fakes;"#,
+            mode = serde_json::to_string(mode).unwrap()
+        );
+        let run = pi_contract_run_with(
+            &repo,
+            &node,
+            &unused,
+            1,
+            &head,
+            r#"await new Promise((resolve) => setTimeout(resolve, 2600));
+const shared = globalThis[Symbol.for('libra.pi-hooks.delivery')];
+report.killsAtDeadline = fakes.map((child) => child.killCalls);
+report.heldAtDeadline = shared.running.size;
+await new Promise((resolve) => setTimeout(resolve, 500));
+report.killsLater = fakes.map((child) => child.killCalls);
+for (const child of fakes) { child.exitCode = 0; child.emit('exit', 0); }
+report.heldAfterExit = shared.running.size;
+delete report.fakes;"#,
+            Duration::from_secs(1),
+            &[],
+        );
+        assert!(
+            run.output.status.success(),
+            "{mode}: {}",
+            describe(&run.output)
+        );
+        // One kill at the deadline and exactly one retry; no further retries.
+        assert_eq!(
+            run.report["killsAtDeadline"],
+            json!([2]),
+            "{mode}: {}",
+            run.report
+        );
+        assert_eq!(
+            run.report["killsLater"],
+            json!([2]),
+            "{mode}: {}",
+            run.report
+        );
+        // The slot stays taken until the child's exit event, then frees.
+        assert_eq!(
+            run.report["heldAtDeadline"],
+            json!(1),
+            "{mode}: {}",
+            run.report
+        );
+        assert_eq!(
+            run.report["heldAfterExit"],
+            json!(0),
+            "{mode}: {}",
+            run.report
+        );
+    }
+}
+
+#[test]
+fn pi_child_contract_caps_children_in_flight_at_eight() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_contract_fake(&repo.home.join("cap"), &node, "libra.mjs", "sleep:400:0");
+    let run = pi_contract_run(&repo, &node, &fake, 20, "");
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    let mut points: Vec<(i64, i32)> = run
+        .lines
+        .iter()
+        .map(|line| {
+            let delta = if line["phase"] == json!("start") {
+                1
+            } else {
+                -1
+            };
+            (line["t"].as_i64().unwrap(), delta)
+        })
+        .collect();
+    // Count an end before a start at the same millisecond.
+    points.sort();
+    let mut running = 0;
+    let mut peak = 0;
+    for (_, delta) in points {
+        running += delta;
+        peak = peak.max(running);
+    }
+    assert!(peak <= 8, "{peak} children ran at once");
+    assert_eq!(
+        pi_contract_phase(&run, "start").len(),
+        8,
+        "deliveries over the cap are dropped, not queued"
+    );
+}
+
+#[test]
+fn pi_child_contract_stops_after_three_attempts() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let unused = repo.home.join("never-run");
+    // Children that never start are retried up to three attempts in all.
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &unused,
+        1,
+        &format!("globalThis.libraTestPlan = [false, false, false, false];\n{PI_FAKE_CHILDREN}"),
+        r#"for (let i = 0; i < 4; i++) { if (children[i]) children[i].emit('error', new Error('not started')); }
+report.spawned = children.length;"#,
+        Duration::from_secs(1),
+        &[],
+    );
+    assert_eq!(run.report["spawned"], json!(3), "{}", run.report);
+    // The same with a real missing executable.
+    let missing = repo.home.join("no-such-libra");
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &missing,
+        1,
+        PI_RECORD_SPAWNS,
+        "",
+        Duration::from_secs(2),
+        &[],
+    );
+    assert_eq!(
+        run.report["spawns"].as_array().map(Vec::len),
+        Some(3),
+        "{}",
+        run.report
+    );
+}
+
+#[test]
+fn pi_child_contract_never_reruns_a_child_that_ran() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    // A child that ran and then failed may already have recorded the event;
+    // the receiver has no replay identity yet, so it is never run again.
+    // The fake logs its start (standing in for a recorded event) and then
+    // exits 1.
+    let failing = pi_contract_fake(&repo.home.join("ran"), &node, "libra.mjs", "exit:1");
+    let run = pi_contract_run(&repo, &node, &failing, 1, "");
+    assert_eq!(pi_contract_phase(&run, "start").len(), 1, "{:?}", run.lines);
+    assert_eq!(pi_contract_phase(&run, "end").len(), 1, "{:?}", run.lines);
+    // The same for a child killed at the deadline.
+    let hung = pi_contract_fake(&repo.home.join("ran-hung"), &node, "libra.mjs", "hang");
+    let run = pi_contract_run(&repo, &node, &hung, 1, "");
+    assert_eq!(pi_contract_phase(&run, "start").len(), 1, "{:?}", run.lines);
 }
