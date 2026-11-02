@@ -25,6 +25,7 @@ use crate::internal::ai::{
         AgentKind, AgentSessionCtx, ObservedAgent, RedactedBytes, RedactionReport, Redactor,
         TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptReadError, TranscriptSource,
         TranscriptSourceResolution,
+        builtin::pi::PiDeadline,
         codex_reasoning::{
             CodexAttachedProjection,
             authorize_codex_attached_fields as authorize_codex_attached_source,
@@ -737,6 +738,29 @@ impl CaptureSnapshot {
             .collect()
     }
 
+    /// Readable Pi thinking stored in this snapshot, in source order: the
+    /// readable text of each `thinking` block on the active branch, never
+    /// the assistant answer. Empty when the retained body is not a usable Pi
+    /// worker frame (PI-33).
+    pub fn pi_readable_thinking(&self) -> Vec<String> {
+        let Some(transcript) = self.transcript_redacted.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(frame) =
+            crate::internal::ai::observed_agents::builtin::pi::pi_worker_frame_authorized(
+                transcript.bytes(),
+                None,
+            )
+        else {
+            return Vec::new();
+        };
+        frame
+            .thinking
+            .iter()
+            .filter_map(|item| item.readable.as_ref().map(|text| text.as_str().to_string()))
+            .collect()
+    }
+
     /// Redacted-only metadata whose transient source checksum must be bound
     /// to a repository-keyed commitment before durable projection.
     pub fn safe_projection(&self) -> CaptureSnapshotProjection {
@@ -1291,10 +1315,29 @@ impl CaptureSnapshotService {
     /// provider file, trusted exporter response, or securely discovered child
     /// source. This consumes the source exactly once and never reopens a path.
     pub fn capture_authorized(
+        source: TranscriptSource,
+        agent_kind: &str,
+        libra_session_id: &str,
+        policy: CaptureSnapshotPolicy,
+    ) -> CaptureSnapshot {
+        Self::capture_authorized_framed(
+            source,
+            agent_kind,
+            libra_session_id,
+            policy,
+            &policy.deadline(),
+        )
+    }
+
+    /// [`Self::capture_authorized`] with the deadline the Pi worker frame
+    /// checks at each of its steps (PI-33). Every other stage keeps the
+    /// policy deadline.
+    fn capture_authorized_framed(
         mut source: TranscriptSource,
         agent_kind: &str,
         libra_session_id: &str,
         policy: CaptureSnapshotPolicy,
+        pi_frame_deadline: &dyn PiDeadline,
     ) -> CaptureSnapshot {
         let Some(kind) = AgentKind::from_db_str(agent_kind) else {
             wipe_in_memory_source(&mut source);
@@ -1303,7 +1346,7 @@ impl CaptureSnapshotService {
                 None,
             );
         };
-        Self::capture_authorized_with_reasoning_context(
+        Self::capture_authorized_with_reasoning_context_framed(
             source,
             crate::internal::ai::observed_agents::live_capture::selected_snapshot_adapter(kind),
             AuthorizedReasoningSourceContext::ordinary(
@@ -1312,14 +1355,31 @@ impl CaptureSnapshotService {
                 AuthorizedReasoningSourceOrigin::LegacyOrdinary,
             ),
             policy,
+            pi_frame_deadline,
         )
     }
 
     pub(crate) fn capture_authorized_with_reasoning_context(
+        source: TranscriptSource,
+        adapter: &dyn ObservedAgent,
+        context: AuthorizedReasoningSourceContext,
+        policy: CaptureSnapshotPolicy,
+    ) -> CaptureSnapshot {
+        Self::capture_authorized_with_reasoning_context_framed(
+            source,
+            adapter,
+            context,
+            policy,
+            &policy.deadline(),
+        )
+    }
+
+    fn capture_authorized_with_reasoning_context_framed(
         mut source: TranscriptSource,
         adapter: &dyn ObservedAgent,
         context: AuthorizedReasoningSourceContext,
         policy: CaptureSnapshotPolicy,
+        pi_frame_deadline: &dyn PiDeadline,
     ) -> CaptureSnapshot {
         let mut source_projection = source_projection(&source);
         if adapter.provider_kind().as_db_str() != context.provider {
@@ -1385,7 +1445,14 @@ impl CaptureSnapshotService {
                 );
             }
         };
-        Self::capture_authorized_bytes(bytes, source_projection, adapter, &context, policy)
+        Self::capture_authorized_bytes(
+            bytes,
+            source_projection,
+            adapter,
+            &context,
+            policy,
+            pi_frame_deadline,
+        )
     }
 
     fn capture_authorized_bytes(
@@ -1394,6 +1461,7 @@ impl CaptureSnapshotService {
         adapter: &dyn ObservedAgent,
         context: &AuthorizedReasoningSourceContext,
         policy: CaptureSnapshotPolicy,
+        pi_frame_deadline: &dyn PiDeadline,
     ) -> CaptureSnapshot {
         let mut bytes = Zeroizing::new(bytes);
         // A descriptor-pinned file may change between its metadata probe and
@@ -1557,6 +1625,11 @@ impl CaptureSnapshotService {
         {
             apply_hermes_worker_frame(&mut snapshot, policy.deadline());
         }
+        if context.provider == "pi"
+            && snapshot.completeness == CaptureSnapshotCompleteness::Complete
+        {
+            apply_pi_worker_frame(&mut snapshot, pi_frame_deadline);
+        }
         snapshot
     }
 
@@ -1637,6 +1710,71 @@ pub fn capture_authorized_hermes_bytes(bytes: Vec<u8>, session_id: &str) -> Capt
         "hermes",
         session_id,
         CaptureSnapshotPolicy::default(),
+    )
+}
+
+/// Bound the complete redacted body of a `pi` snapshot by the PI-32 worker
+/// frame (PI-33). It reads only the bytes the snapshot already holds: the
+/// source was read, and the session's lease taken, by the existing owners
+/// before this point. An accepted frame keeps the body, thinking and its
+/// associated values included, as unproven and partial; a refused frame
+/// keeps nothing derived from the transcript.
+fn apply_pi_worker_frame(snapshot: &mut CaptureSnapshot, deadline: &dyn PiDeadline) {
+    use crate::internal::ai::observed_agents::builtin::pi::{
+        PiWorkerError, pi_worker_frame_with_deadline,
+    };
+    let bytes = snapshot
+        .transcript_redacted
+        .as_ref()
+        .map(|transcript| transcript.bytes())
+        .unwrap_or(b"");
+    match pi_worker_frame_with_deadline(bytes, deadline) {
+        Ok(_) => {
+            snapshot.completeness = CaptureSnapshotCompleteness::Partial;
+            snapshot.partial_reason = Some(CaptureSnapshotPartialReason::UnprovenOrdinary);
+        }
+        Err(error) => {
+            // As for Hermes: keep the transient source digest so the import
+            // parent can still name the failure; the bytes, redaction
+            // counts, scan bytes, and coverage turns stay absent.
+            let reason = match error {
+                PiWorkerError::Budget => CaptureSnapshotPartialReason::SourceOversize,
+                PiWorkerError::Cancelled => CaptureSnapshotPartialReason::DeadlineExceeded,
+                PiWorkerError::BadFrame => CaptureSnapshotPartialReason::SourceReadError,
+            };
+            snapshot.completeness = CaptureSnapshotCompleteness::Partial;
+            snapshot.partial_reason = Some(reason);
+            snapshot.transcript_redacted = None;
+            snapshot.redaction_report = RedactionReport::default();
+            snapshot.source_scan_bytes = None;
+            snapshot.coverage_runtime.turns = None;
+        }
+    }
+}
+
+/// Capture one already-read Pi session through the ordinary snapshot owner
+/// (PI-33). The bytes are redacted, then bounded by the Pi worker frame.
+pub fn capture_authorized_pi_bytes(bytes: Vec<u8>, session_id: &str) -> CaptureSnapshot {
+    let policy = CaptureSnapshotPolicy::default();
+    capture_authorized_pi_bytes_until(bytes, session_id, &policy.deadline())
+}
+
+/// [`capture_authorized_pi_bytes`] with the deadline the worker frame
+/// checks at each of its steps. The stages before the frame run under the
+/// default policy, which has no deadline.
+pub fn capture_authorized_pi_bytes_until(
+    bytes: Vec<u8>,
+    session_id: &str,
+    deadline: &dyn PiDeadline,
+) -> CaptureSnapshot {
+    let auth =
+        crate::internal::ai::observed_agents::ExportAuthorized::issue("pi", session_id, &bytes);
+    CaptureSnapshotService::capture_authorized_framed(
+        TranscriptSource::Bytes { bytes, auth },
+        "pi",
+        session_id,
+        CaptureSnapshotPolicy::default(),
+        deadline,
     )
 }
 
@@ -1783,6 +1921,36 @@ pub(crate) async fn verified_partial_key_fixture() -> (
 
 #[cfg(test)]
 mod tests {
+
+    /// PI-33 AC4, for the fields no public accessor shows: a refused Pi
+    /// frame also drops the scan bytes and the coverage turns.
+    #[test]
+    fn pi_bounded_capture_refused_frame_clears_coverage_turns() {
+        let (transcript, report) =
+            Redactor::new_default().redact(b"not a pi session AKIAIOSFODNN7EXAMPLE");
+        assert!(report.match_count() > 0);
+        let mut snapshot = CaptureSnapshot::complete(
+            CaptureSnapshotSource {
+                kind: CaptureSnapshotSourceKind::TrustedExport,
+                identity: SOURCE_IDENTITY_NOT_RETAINED.to_string(),
+                digest_sha256: None,
+                byte_len: Some(37),
+            },
+            transcript,
+            report,
+        );
+        snapshot.source_scan_bytes = Some(37);
+        snapshot.coverage_runtime.turns = Some(Vec::new());
+        apply_pi_worker_frame(&mut snapshot, &None::<Instant>);
+        assert_eq!(
+            snapshot.partial_reason,
+            Some(CaptureSnapshotPartialReason::SourceReadError)
+        );
+        assert!(snapshot.transcript_redacted.is_none());
+        assert_eq!(snapshot.redaction_report.match_count(), 0);
+        assert!(snapshot.source_scan_bytes.is_none());
+        assert!(snapshot.coverage_runtime.turns.is_none());
+    }
 
     #[test]
     fn cov2_preview_preserves_order_and_fails_closed_on_budget() {
@@ -2173,6 +2341,7 @@ mod tests {
                 AuthorizedReasoningSourceOrigin::LegacyOrdinary,
             ),
             CaptureSnapshotPolicy::default(),
+            &None::<Instant>,
         );
 
         let projection = snapshot.safe_projection();

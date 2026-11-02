@@ -11,7 +11,8 @@
 //! entry and attributes each assistant message to `responseModel ?? model`.
 //! PI-34 turns the branch into coverage turns, and PI-32 bounds a worker
 //! frame of those turns with the branch's thinking blocks under a byte
-//! budget and a deadline. Pi stays unsupported:
+//! budget and a deadline; PI-33 runs that frame on a `pi` capture snapshot
+//! (`capture/snapshot.rs`) over bytes already read. Pi stays unsupported:
 //! nothing here imports a session, installs hooks, or reads a transcript for
 //! capture.
 //!
