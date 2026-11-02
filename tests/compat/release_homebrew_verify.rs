@@ -47,7 +47,9 @@ fn verification_script() -> String {
 #[test]
 fn homebrew_verification_requires_same_run_formula_and_success_artifact() {
     let job = verification_job();
-    assert!(job.contains("timeout-minutes: 15"));
+    // Queue time counts toward this timeout. 15 minutes cancelled
+    // v0.30.134 before a macOS runner was assigned (issues/479 EC-01).
+    assert!(job.contains("timeout-minutes: 45"));
     assert!(!job.contains("continue-on-error:"));
     assert!(job.contains("name: formula-commit-sha\n"));
     assert!(
