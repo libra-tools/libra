@@ -1,5 +1,9 @@
 # Agent Command Development
 
+## Mega2 traces live selectors (LTR-21/22/23)
+
+`tests/command/mega2_traces_live_test.rs` holds the ignored real-service selectors. Each one calls `LiveFixture::require()` before any command. A missing or empty `LIBRA_TRACES_LIVE_*` value fails that case. The tests do not skip, do not start a stub server, and do not read token bytes into assertion text. `LIBRA_TRACES_LIVE_INSTALLED_BINARY` is required only by `live_installed_binary_read_smoke`, which refuses the cargo test binary.
+
 ## Mega2 scoped push entry (LTR-12)
 
 `libra agent push --mega2` is the public entry. It calls the LTR-10 binding and then the LTR-11 transport planner. `--force-rewrite` together with `--mega2` returns before an epoch is replaced and before a socket is opened. A missing remote URL stops in the same way and prints the saved epoch so a retry can reuse it. `--new-stream` is explicit. The repository transaction around the receipt is the lease shared by linked worktrees. `confirm_push_attempt` keeps a successful tip idempotent when the acknowledgement is repeated, and a missing scope UUID records `scope_resolution_pending` without creating an epoch or flipping the push to failure. The stored code remote URL is not rewritten.

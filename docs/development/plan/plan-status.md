@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-21/22/23 与收口：** live selector 已登记。`live_peer_principal_write_denied` 实际 FAIL（run `b2ff49d4-1bf1-4266-a547-2b20ecd48958`），缺 `LIBRA_TRACES_LIVE_ENABLED`，没有 skip。LTR-07 仍 `in-progress`/空。LTR-09 仍 `blocked`/空，没有 H6 收据。LTR-08 仍 `in-progress`/空。
+
 > **2026-11-02 LTR-01 本地集成：** 最终树已含 LTR-10/11/12。`mega2_scoped_push_contract` 1 passed（run `ecd20b68-2fd6-4dea-babc-7efc4dea30b1`）。Live HTTP/SSH push、网站 cf 和 main D 未取得，本卡不记 complete。
 
 > **2026-11-02 查询 / fetch / 收口本地切片：** `libra mega2 traces` 的 capabilities、targets、streams、sessions、show、checkpoints、search、transcript 与 fetch 已接上。筛选参数原样传递，时间边界发 UTC，`since=until` 是空区间。fetch 按 Git 对象头重算 OID，拒绝匿名、哈希格式转换、跨 stream 对象和指纹冲突。库测试 5 passed（run `cfc8cf90-fcaa-49df-a09e-287865000b1f`），命令契约 11 passed（run `b53bdda0-b22f-4edc-8e3e-e3c3ba9c6af0`）。SSH 只构造 by-scope locator，没有已认证 advertisement 时不发布 ref。Live fixture 仍缺席，H6 清理收据不在本仓，所以 LTR-07/09/08 不记 complete。LTR-13/19/24/14/15/20/03/04/25/05/16/17/18/06 为 `in-progress`/`locally-accepted`。这些卡改同一命令模块，记在同一次提交。

@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-21/22/23：** 真实回归 selector 已登记并按缺 fixture 失败关闭。LTR-07/09/08 未完成。
+
 > **2026-11-02 LTR-01：** scoped push 家族的本地命令契约 1 passed。Live push 与 main D 未结清。
 
 > **2026-11-02 查询与 fetch：** traces 读命令和显式 archive fetch 的本地契约已通过（库 5、命令 11）。收口卡 LTR-07/09/08 仍等 live 与 H6 收据。SSH fetch 只定位 by-scope URL，不在没有 advertisement 时发布 ref。
