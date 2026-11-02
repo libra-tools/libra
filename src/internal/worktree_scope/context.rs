@@ -133,11 +133,10 @@ pub(crate) async fn with_request_scope<T>(
 }
 
 /// Rebind a captured value on a blocking worker without sharing mutable slots.
-///
-/// Spawned threads do not inherit a request pin. Callers that run two
-/// repositories at once capture each resolved scope and rebind it here, so
-/// one thread cannot replace the other's storage.
-pub fn with_request_scope_sync<T>(scope: Option<RequestScope>, operation: impl FnOnce() -> T) -> T {
+pub(crate) fn with_request_scope_sync<T>(
+    scope: Option<RequestScope>,
+    operation: impl FnOnce() -> T,
+) -> T {
     TASK_SCOPE.sync_scope(Arc::new(RwLock::new(scope)), operation)
 }
 

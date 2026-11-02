@@ -183,7 +183,6 @@ service_reports_identity_read_failure_as_server_error	lane:service	holds a long-
 service_restarts_over_its_own_legacy_record_in_a_linked_repository	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 service_startup_refuses_a_foreign_stale_control_file	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 spawn_clears_parent_env_and_injects_allowlist	lane:env	mutates process-wide HOME and probe variables via set_var/remove_var (composable env lane)
-status_storage_scope_concurrent_requests_are_isolated	lane:env	sets LIBRA_HOME via set_var so in-process discovery does not adopt the host home, then restores it
 status_storage_scope_unpinned_fallback_reads_cwd	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_corrupt_head_reference_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_sync_wrappers_honor_core_ignorecase_override	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

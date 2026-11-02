@@ -130,7 +130,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | done / complete |
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
 | SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | done / complete |
-| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | done / complete |
+| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | in-progress / locally-accepted |
 | SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | pending / 空 |
 | SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | pending / 空 |
 | SP-09 核心优化复测、全量收口与可选项决策 | P2 | 必选验收收口 | [#647](https://github.com/libra-tools/libra/issues/647) | pending / 空 |
@@ -788,7 +788,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / complete
+**Lifecycle / Acceptance:** in-progress / locally-accepted
 
 **Priority / Selection:** P2；本轮核心提速：第二梯队
 
@@ -802,7 +802,9 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **开工写集调整（2026-11-01T12:55:56Z）：** 实现写集把过期的 `src/command/status/scan.rs` 替换为 `src/command/status.rs`。未 pin fallback 测试使用 `ChangeDirGuard`，因此增加 `tests/SERIAL_REGISTRY.tsv` 与由 `sh tests/NEXTEST_GROUPS.sh` 生成的 `.config/nextest.toml`。调整后仍是 4 个生产文件、2 个落点，规模保持 M。DEP-SP-STORAGE 资格计划卡仍登记 in-progress，但其 storage/status 行为已发布在当前 main，工作区干净，与本卡无未提交文件重叠；配置失败不降级的回归 `storage_config_hold_cache_does_not_keep_rejection` 保留并在本卡验证中重跑。
 
-**实现写集再调整（2026-11-01 本地验收）：** 同进程并发隔离不能依赖进程全局 pin，测试线程通过 `with_request_scope_sync` 重绑定 task-local scope。因此实际生产写集增加 `src/internal/worktree_scope.rs` 与 `src/internal/worktree_scope/context.rs`，只公开既有同步绑定入口，不改变 scope 解析语义。调整后为 6 个生产文件，规模保持 M。`.config/nextest.toml` 已由 `sh tests/NEXTEST_GROUPS.sh` 生成；相对开工基线无额外 diff。
+**实现写集再调整（2026-11-01 本地验收）：** 同进程并发隔离不能依赖进程全局 pin，测试线程通过 `with_request_scope_sync` 重绑定 task-local scope。因此实际生产写集增加 `src/internal/worktree_scope.rs` 与 `src/internal/worktree_scope/context.rs`。调整后为 6 个生产文件，规模保持 M。`.config/nextest.toml` 已由 `sh tests/NEXTEST_GROUPS.sh` 生成；相对开工基线无额外 diff。
+
+**评审修复写集调整（2026-11-02 01:50:15 UTC）：** 实际复现 `LocalClient` 在源仓库 cwd 下仍消费目标 request pin，新增 `src/internal/protocol/local_client.rs` 与 `tests/command/fetch_test.rs`，在同一 storage scope 行为轴内恢复源/目标隔离。并发测试迁回 crate 内，`with_request_scope_sync` 恢复 `pub(crate)`，不保留新增公开 Rust API。调整后为 7 个生产文件、2 个落点，规模保持 M；完整 `utils::` focused 门必须重新取得通过证据。
 
 **Acceptance criteria:**
 
@@ -819,9 +821,13 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Verification:**
 
-- [x] `cargo +1.99.0 test --lib utils::client_storage::tests::storage_config_hold_cache_does_not_keep_rejection -- --nocapture` — 1/1 通过（2026-11-01）。整段 `cargo test --lib utils::` 未作为本卡通过证据：宿主全局配置使既有签名测试失败，与本卡对象读取无关。
+- [x] `cargo +1.99.0 test --lib utils::` — 隔离配置环境中 527 passed、0 failed、2 ignored，不以单用例替代。
 
-- [x] `cargo +1.99.0 test --test command_test status_test::status_storage_scope_ -- --nocapture` — `(new)` 5/5 通过，非零命中（2026-11-01）。
+- [x] `cargo +1.99.0 test --test command_test status_test::status_storage_scope_ -- --nocapture` — 4/4 通过，非零命中。
+
+- [x] `cargo +1.99.0 test --test command_test fetch_test::test_fetch_local_libra_source_reads_new_objects -- --nocapture` — `(new)` 1/1 通过，覆盖本地源新增提交。
+
+- [x] `cargo +1.99.0 test --test command_test deps_travel_test::fetch_notes_travels_from_local_libra_source_and_is_default_off -- --nocapture` — 既有源 notes 回归 1/1 通过。
 
 
 **Full-suite trigger:** T-1：共享路径与对象读取上下文
@@ -830,7 +836,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Deliverables:** 实现、同卡回归及列明文档
 
-**Implementation write set:** `src/utils/path.rs`, `src/utils/util.rs`, `src/utils/object_ext.rs`, `src/command/status.rs`, `src/internal/worktree_scope.rs`, `src/internal/worktree_scope/context.rs`, `tests/command/status_test.rs`, `tests/SERIAL_REGISTRY.tsv`, `.config/nextest.toml`
+**Implementation write set:** `src/utils/path.rs`, `src/utils/util.rs`, `src/utils/object_ext.rs`, `src/command/status.rs`, `src/internal/worktree_scope.rs`, `src/internal/worktree_scope/context.rs`, `src/internal/protocol/local_client.rs`, `tests/command/status_test.rs`, `tests/command/fetch_test.rs`, `tests/SERIAL_REGISTRY.tsv`, `tests/SRC_SERIAL_REGISTRY.tsv`, `tests/SRC_SERIAL_CENSUS.tsv`, `.config/nextest.toml`
 
 **Release write set:** Inherited
 
@@ -850,9 +856,19 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self（EX-SP-06-CLOSE-01 修复卡收口口径）。A/B、fmt、严格 Clippy、release 构建和 SP-00 16 格矩阵已验收。T-1 全量 nextest 仍 not-run；版本、提交、推送、PR 与远端 D 未执行，独立发布由 `DEFER-SP-REL-06` 跟踪，不称完整发布 C/D 通过。
+**C/D coverage from:** self（EX-SP-06-CLOSE-01 修复卡收口口径）。本轮 A/B、fmt、严格 Clippy、release 构建及 release 真实 fetch 场景均通过；原 SP-00 16 格矩阵为评审前历史证据。T-1 全量 nextest 仍 not-run；后续 review、提交、推送、PR 与远端 D 未执行，独立发布由 `DEFER-SP-REL-06` 跟踪，不称完整发布 C/D 通过。
 
-**Granularity:** type=implementation; axis=对象读取复用请求级 storage scope; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=2; prod-files=6; scope=M; deps=SP-05,DEP-SP-STORAGE; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-06-CLOSE-01
+**Granularity:** type=implementation; axis=对象读取复用请求级 storage scope; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=4/8; landing=2; prod-files=7; scope=M; deps=SP-05,DEP-SP-STORAGE; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-06-CLOSE-01
+
+**SP-06 评审修复证据（2026-11-02）：**
+
+- 修复前真实 CLI 复现：clone 后源仓库新增提交，目标 `fetch origin` 以 `LBR-NET-001` 报告源提交对象不存在；`fetch --notes` 跳过源 dependency note，目标邻居为空。根因是源操作在 cwd 已切换后仍消费目标请求 pin。
+- `LocalClient::with_repo_current_dir` 在完整源操作期间使用 `override_scope` 并在返回前恢复调用者 scope；`with_request_scope_sync` 恢复 `pub(crate)`，并发验证迁入 crate 内并使用隔离配置夹具及 `serial(cwd, env)`。
+- `fetch_test::test_fetch_local_libra_source_reads_new_objects` 1/1 通过；既有 `deps_travel_test::fetch_notes_travels_from_local_libra_source_and_is_default_off` 1/1 通过。
+- `status_test::status_storage_scope_` 4/4 通过；crate 内 `status_storage_scope_concurrent_requests_are_isolated` 1/1 通过；`compat_serial_registry` 26/26 通过；SRC 与 tests 两套 serial 分类器均 exit 0。
+- 隔离 HOME/全局与系统配置库后，完整 `cargo +1.99.0 test --lib utils::` 527 passed、0 failed、2 ignored。首轮 15 分钟超时仅发生在依赖编译阶段，未进入测试执行，未计通过或失败；最终运行使用最终源码与更长窗口。
+- `cargo +nightly fmt --all --check` 与 `libra diff --check` 通过。
+- `cargo +1.99.0 clippy --all-targets --all-features -- -D warnings` 通过；`cargo +1.99.0 build --release` 通过（14 分 54 秒）。使用所得 release 二进制重放原始失败场景：源仓库新增提交后目标 `fetch origin` 成功，`origin/main` 与源 HEAD 一致，目标可读取该 commit 对象。
 
 **SP-06 本地验收证据（2026-11-01）：**
 
