@@ -2391,6 +2391,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use super::*;
+    #[cfg(unix)]
     use crate::utils::json::normalize_json_value;
 
     #[test]

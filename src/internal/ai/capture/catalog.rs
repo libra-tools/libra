@@ -9313,6 +9313,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(unix)]
     use crate::utils::json::normalize_json_value;
 
     #[test]

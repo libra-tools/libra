@@ -633,6 +633,7 @@ async fn prepare_existing_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::utils::json::normalize_json_value;
 
     /// Actual export pending receipt replay through the shared authorized
