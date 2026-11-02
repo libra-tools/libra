@@ -1,3 +1,5 @@
+> **2026-11-02 用户取消 DEFER-LTR-06。** LTR-00 不再挡住后续功能。AC-3 与原 ER-05 双 FAIL 仍在，LTR-00 保持 `blocked`/空。LTR-02 客户端已拒绝 `/.traces/` 克隆，Mega2 `/project/*.git` mirror 只取 heads；`mega2_code_clone_excludes_traces_matrix` 1 passed。Live OID 闭包未跑。
+
 > **2026-11-02 LTR-12 `in-progress`/`locally-accepted`：** `--mega2`/`--new-stream` 已接入。`mega2_scoped_push_contract` 与收据库测试各 1 passed。无 remote URL 或无 `libra-traces-v1` 广告时在网络前停止。Live discovery 未跑。`COMPATIBILITY.md` 因另有未提交 UI 改动而未并入。
 
 > **2026-11-02 LTR-11 `in-progress`/`locally-accepted`：** typed TraceRepo URL、`traces` SSH login、能力拒绝与 force-rewrite 网络前拒绝已由 `scoped_git_transport_matrix` 1 passed 覆盖。公开入口仍未接线。Live fixture 缺席，live 门未跑。

@@ -1,3 +1,5 @@
+> **2026-11-02 DEFER-LTR-06 取消 / LTR-02：** 用户取消 LTR-00 延期。代码克隆拒绝 traces 定位符；Mega2 代码镜像 refspec 为 heads。矩阵测试 1 passed。服务端 pack 与 live OID 仍未证明。
+
 > **2026-11-02 LTR-12 长期索引：** 公开 `agent push --mega2`。force-rewrite 在网络前拒绝。epoch 重试复用。scope 解析失败记 `scope_resolution_pending` 且不新建 epoch。命令测试 1 passed。Live 未跑。
 
 > **2026-11-02 LTR-11 长期索引：** by-path/by-scope 路径、派生 `ssh://traces@`、缺 `libra-traces-v1` 拒绝、Mega2 force-rewrite 在网络前拒绝、非快进不转 force/不新建 epoch/不回退代码 push。库测试 1 passed。Live 未跑。

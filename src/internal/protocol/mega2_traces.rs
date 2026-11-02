@@ -220,6 +220,41 @@ pub fn admit_before_network(mega2_mode: bool, force_rewrite: bool) -> Result<(),
 }
 
 /// Ordinary code transports must not carry a traces locator.
+/// A Mega2 traces Git URL. Ordinary `clone` must not download it.
+pub fn is_traces_locator_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.contains("/.traces/")
+}
+
+/// Mega2 code-view endpoint: `http(s)` or `ssh` under `/project/`, not a traces locator.
+pub fn is_mega2_code_view_url(url: &str) -> bool {
+    if is_traces_locator_url(url) {
+        return false;
+    }
+    let (scheme, _) = url.split_once("://").unwrap_or(("", url));
+    if !matches!(scheme, "https" | "http" | "ssh") {
+        return false;
+    }
+    url.contains("/project/") && url.contains(".git")
+}
+
+/// Mirror refspec. Mega2 code view stores branch tips only, so `refs/libra/traces` is not fetched.
+pub fn mirror_fetch_refspec(url: &str) -> &'static str {
+    if is_mega2_code_view_url(url) {
+        "+refs/heads/*:refs/heads/*"
+    } else {
+        "+refs/*:refs/*"
+    }
+}
+
+/// Code-view fetches keep branch and tag tips and drop the traces ref.
+pub fn code_view_keeps_ref(name: &str) -> bool {
+    if name == "refs/libra/traces" || name.starts_with("refs/libra/traces/") {
+        return false;
+    }
+    name.starts_with("refs/heads/") || name.starts_with("refs/tags/") || name == "HEAD"
+}
+
 pub fn reject_traces_locator_on_code_transport(url: &str) -> Result<(), String> {
     if url.contains("/.traces/") {
         Err(format!(

@@ -2,6 +2,8 @@
 
 将仓库克隆到新目录。
 
+Mega2 代码地址（`https`、`http` 或 `ssh`，路径在 `/project/` 下且带 `.git`）是代码视图。`libra clone` 以及 `--bare`、`--mirror` 不获取 `refs/libra/traces`。Mega2 镜像记下的 fetch refspec 是 `+refs/heads/*:refs/heads/*`。其它镜像，包括普通 Git，仍是 `+refs/*:refs/*`。`/.traces/` 定位符会在发现远程之前被拒绝；该流要用 `libra mega2 traces fetch`。
+
 ## 概要
 
 ```

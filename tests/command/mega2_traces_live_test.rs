@@ -87,3 +87,10 @@ async fn live_scoped_push_cli() {
         fixture.server_id
     );
 }
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
+async fn live_code_clone_isolation() {
+    let _fixture = LiveFixture::require().expect("live fixture");
+    panic!("live code clone isolation requires the Mega2 fixture service");
+}
