@@ -64,7 +64,9 @@ Every update in the batch applies atomically inside ONE SQLite transaction:
 a CAS mismatch, an invalid command, two updates of the same ref (git's rule),
 or an out-of-scope ref leaves every ref and reflog byte-identical. The
 `start`/`prepare`/`commit`/`abort` commands print `<cmd>: ok` on stdout as
-they are processed (like git); `abort` applies nothing. An `-m <reason>`
+they are processed (like git); `abort` applies nothing. On Unix, a `commit`
+whose stdout is a pipe with no reader left fails with exit code `128` before
+the transaction commits, so no ref or reflog moves. An `-m <reason>`
 applies to every ref the batch updates. `--no-deref` and `option no-deref`
 are accepted and never change the outcome — Libra stores no symbolic refs
 inside `refs/heads/*`.
