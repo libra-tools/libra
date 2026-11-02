@@ -62,7 +62,7 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 
 - 本机 16 GiB 小于计划规定的 32 GiB nextest 硬门槛；T-1 双环境全量 nextest 保持 `not-run`。本次允许在该门未执行时先推分支；PR CI 结果取得后独立记录，不能改写本机 nextest 事实。
 - 本次允许暂缓 SP-07 独立发布的 patch bump、版本面同步、安装、tag/Release 及发布后置门，后续以 `DEFER-SP-REL-07` 跟踪；当前版本仍为 `0.30.132`。不得以本次分支推送称为发布完成。
-- **Lifecycle / Acceptance 保持 `in-progress / locally-accepted`。** 本卡 ER-05 Codex review、PR 建立与同一 head 的适用 base/CodeQL 检查仍须据实完成；分支推送本身不会触发 `.github/workflows/base.yml`（它只响应 PR、main/release 分支 push 或手动 dispatch），也不会自动创建 PR。PR 创建若未获授权则暂缓。Issue #646 不由此例外关闭。
+- **Lifecycle / Acceptance 保持 `in-progress / locally-accepted`。** ER-05 Codex review 已 PASS；PR #937 已创建，base.yml run `41473136033` 与 CodeQL run `41473136093` 当前 pending。分支 push 本身不会触发 `.github/workflows/base.yml`（它只响应 PR、main/release 分支 push 或手动 dispatch）。状态同步提交会改变 PR head，故旧 head 检查不作为最终 D，须以后续 head 的适用检查为准。Issue #646 不由此例外关闭。
 - 本例外仅适用于当前 SP-07 候选和此次分支交付，不修改模板、不扩展到其它卡、不免除最终计划全量收口门；所有暂缓事项未完成前，不得将 Acceptance 改为 `complete` 或 Lifecycle 改为 `done`。
 
 ### SP-06 修复卡收口决策（EX-SP-06-CLOSE-01）
@@ -935,7 +935,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** in-progress / locally-accepted（2026-11-02，分支 `codex/SP-07`；Issue #646 OPEN，前置 SP-06 done / complete 且 #645 CLOSED；A/B、fmt、严格 Clippy、release build 与 SP-00 完整矩阵已过；按 EX-SP-07-PUSH-01 暂缓 T-1 nextest 与独立发布门，Codex review、PR/D 仍待，不标完成）
+**Lifecycle / Acceptance:** in-progress / locally-accepted（2026-11-02，分支 `codex/SP-07`；Issue #646 OPEN，前置 SP-06 done / complete 且 #645 CLOSED；A/B、fmt、严格 Clippy、release build 与 SP-00 完整矩阵已过；按 EX-SP-07-PUSH-01 暂缓 T-1 nextest 与独立发布门；Codex review PASS，PR #937 的 base/CodeQL 检查 pending，不标完成）
 
 **Priority / Selection:** P2；本轮核心提速：第一梯队
 
