@@ -1,3 +1,5 @@
+> **2026-11-02 LTR-01：** scoped push 家族的本地命令契约 1 passed。Live push 与 main D 未结清。
+
 > **2026-11-02 查询与 fetch：** traces 读命令和显式 archive fetch 的本地契约已通过（库 5、命令 11）。收口卡 LTR-07/09/08 仍等 live 与 H6 收据。SSH fetch 只定位 by-scope URL，不在没有 advertisement 时发布 ref。
 
 > **2026-11-02 DEFER-LTR-06 取消 / LTR-02：** 用户取消 LTR-00 延期。代码克隆拒绝 traces 定位符；Mega2 代码镜像 refspec 为 heads。矩阵测试 1 passed。服务端 pack 与 live OID 仍未证明。
