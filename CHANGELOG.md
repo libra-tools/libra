@@ -56,6 +56,14 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.137] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 RV-01. `:<path>` and `:<n>:<path>` resolve
+  objects from the current index. That behavior shipped before v0.30.134.
+  v0.30.136 is the Pi observe release and is not part of this plan.
+
 ## [0.30.135] — 2026-11-02
 
 ### Fixed
