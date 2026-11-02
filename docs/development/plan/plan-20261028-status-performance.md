@@ -56,6 +56,14 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 - 默认 Docs and compatibility impact=N/A 仅适用于输出与错误完全不变的内部优化；公开行为变化卡须同卡双语与网站文档。网站路径为候选，DEP-SP-DOCS 核验后才允许开工；遵循用户 standing instruction 直接 cf，通过 Libra 提交推送，不能另建网站分支/PR/worktree。
 - 无家族合并发布；C/D coverage=self（实现卡），SP-09 继承下列具体实现卡。SP-00 按用户批准的 EX-SP-00-AUDIT-01 独立文档验收（见下）；该例外不免除评审、fmt、Clippy 或本卡 PR CI，也不授权其它卡开工。
 
+### SP-06 修复卡收口决策（EX-SP-06-CLOSE-01）
+
+2026-11-02，在实现、定向回归、fmt、严格 Clippy、release 构建及 SP-00 完整 16 格三方矩阵通过后，用户明确要求“记录本轮测试结果，另外，完成卡片”。本次按修复卡口径将 SP-06 登记为 `done / complete`。这是对本卡 ER-04/ER-08 完整发布切片及远端门顺序的具名例外，不扩展至 SP-07 及以后的任务卡。
+
+- 本机 16 GiB 资源门槛及两份测试环境文件缺失使 T-1 nextest 保持 `not-run`；不得用 focused 测试冒充全量。
+- 2026-11-02 用户随后授权提交、推送并创建 PR，明确不做 Release。版本保持不变，不建 tag。PR CI 在推送后单独观察，不在提交前预称远端通过。独立 patch 发布及后置门仍登记为 `DEFER-SP-REL-06`。Issue #645 不由本决策手动关闭。
+- 本轮性能对照只汇总已写入各卡的 Git 倍数：SP-00、SP-03 三轮、SP-06 本轮。SP-01/SP-02 没有 status 矩阵；SP-05 测了 Git，但卡片未留下 Git 倍数，原始样本亦不在，不回填。
+
 ### SP-05 修复卡收口决策（EX-SP-05-CLOSE-01）
 
 2026-11-01T01:43:25Z，在实现、定向回归、fmt、严格 Clippy、双方 release 构建及 SP-00 完整 16 格矩阵通过后，用户明确要求“关闭任务卡片，然后提交，推送，生成 PR”。本次按修复卡口径将 SP-05 登记为 `done / complete`，这是对模板 ER-04/ER-08 完整发布切片及远端门顺序的本卡具名例外，不扩展至其它任务卡。
@@ -122,7 +130,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | done / complete |
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
 | SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | done / complete |
-| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | pending / 空 |
+| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | in-progress / locally-accepted |
 | SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | pending / 空 |
 | SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | pending / 空 |
 | SP-09 核心优化复测、全量收口与可选项决策 | P2 | 必选验收收口 | [#647](https://github.com/libra-tools/libra/issues/647) | pending / 空 |
@@ -780,7 +788,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** pending / 空
+**Lifecycle / Acceptance:** in-progress / locally-accepted
 
 **Priority / Selection:** P2；本轮核心提速：第二梯队
 
@@ -790,26 +798,36 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Out of scope:** CE_VALID 永久不在本计划范围；其它行为轴按任务总览分别承接；pack 会话缓存/marker 合并/IPC 批处理登记为 DEFER-SP-01..03，未启用。
 
-**Current evidence:** src/utils/path.rs:46；src/utils/util.rs:1136,1364；src/utils/object_ext.rs:54（基线 380c262，开工刷新锚点）。
+**Current evidence:** src/utils/path.rs:46；src/utils/util.rs:1148,1385；src/utils/object_ext.rs:48,63；src/command/status.rs:1024（2026-11-01 本地验收锚点）。2026-11-01T12:55:56Z 开工核对：HEAD `9a92e42`，`path::objects`/`try_objects` 仍走 ambient discovery，`try_objects_storage` 直接 `try_get_storage_path`，`load_head_tree_snapshot` 已在 `src/command/status.rs`（SP-05 后 `status/scan.rs` 不再是展开入口）。
+
+**开工写集调整（2026-11-01T12:55:56Z）：** 实现写集把过期的 `src/command/status/scan.rs` 替换为 `src/command/status.rs`。未 pin fallback 测试使用 `ChangeDirGuard`，因此增加 `tests/SERIAL_REGISTRY.tsv` 与由 `sh tests/NEXTEST_GROUPS.sh` 生成的 `.config/nextest.toml`。调整后仍是 4 个生产文件、2 个落点，规模保持 M。DEP-SP-STORAGE 资格计划卡仍登记 in-progress，但其 storage/status 行为已发布在当前 main，工作区干净，与本卡无未提交文件重叠；配置失败不降级的回归 `storage_config_hold_cache_does_not_keep_rejection` 保留并在本卡验证中重跑。
+
+**实现写集再调整（2026-11-01 本地验收）：** 同进程并发隔离不能依赖进程全局 pin，测试线程通过 `with_request_scope_sync` 重绑定 task-local scope。因此实际生产写集增加 `src/internal/worktree_scope.rs` 与 `src/internal/worktree_scope/context.rs`。调整后为 6 个生产文件，规模保持 M。`.config/nextest.toml` 已由 `sh tests/NEXTEST_GROUPS.sh` 生成；相对开工基线无额外 diff。
+
+**评审修复写集调整（2026-11-02 01:50:15 UTC）：** 实际复现 `LocalClient` 在源仓库 cwd 下仍消费目标 request pin，新增 `src/internal/protocol/local_client.rs` 与 `tests/command/fetch_test.rs`，在同一 storage scope 行为轴内恢复源/目标隔离。并发测试迁回 crate 内，`with_request_scope_sync` 恢复 `pub(crate)`，不保留新增公开 Rust API。调整后为 7 个生产文件、2 个落点，规模保持 M；完整 `utils::` focused 门必须重新取得通过证据。
 
 **Acceptance criteria:**
 
-- [ ] 同一请求子树数量增长不再线性增加仓库发现次数。
+- [x] 同一请求子树数量增长不再线性增加仓库发现次数。`status_storage_scope_discovery_does_not_grow_with_subtrees` 通过。
 
-- [ ] linked worktree 对象读取仍指向正确 common storage。
+- [x] linked worktree 对象读取仍指向正确 common storage。`status_storage_scope_linked_worktree_uses_common_objects` 通过。
 
-- [ ] 并发不同仓库请求不串用 storage。
+- [x] 并发不同仓库请求不串用 storage。`status_storage_scope_concurrent_requests_are_isolated` 通过。
 
-- [ ] 无 pinned scope 的合法调用保留明确 fallback 行为。
+- [x] 无 pinned scope 的合法调用保留明确 fallback 行为。`status_storage_scope_unpinned_fallback_reads_cwd` 通过。
 
-- [ ] 配置/后端读取失败不被缓存成成功或静默回退。
+- [x] 配置/后端读取失败不被缓存成成功或静默回退。`status_storage_scope_config_rejection_is_not_success` 与 `storage_config_hold_cache_does_not_keep_rejection` 通过。
 
 
 **Verification:**
 
-- [ ] `cargo test --lib utils::`
+- [x] `cargo +1.99.0 test --lib utils::` — 隔离配置环境中 527 passed、0 failed、2 ignored，不以单用例替代。
 
-- [ ] `cargo test --test command_test status_test::status_storage_scope_ -- --nocapture` — `(new)` 测试前缀；须非零命中。
+- [x] `cargo +1.99.0 test --test command_test status_test::status_storage_scope_ -- --nocapture` — 4/4 通过，非零命中。
+
+- [x] `cargo +1.99.0 test --test command_test fetch_test::test_fetch_local_libra_source_reads_new_objects -- --nocapture` — `(new)` 1/1 通过，覆盖本地源新增提交。
+
+- [x] `cargo +1.99.0 test --test command_test deps_travel_test::fetch_notes_travels_from_local_libra_source_and_is_default_off -- --nocapture` — 既有源 notes 回归 1/1 通过。
 
 
 **Full-suite trigger:** T-1：共享路径与对象读取上下文
@@ -818,7 +836,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Deliverables:** 实现、同卡回归及列明文档
 
-**Implementation write set:** `src/utils/path.rs`, `src/utils/util.rs`, `src/utils/object_ext.rs`, `src/command/status/scan.rs`, `tests/command/status_test.rs`
+**Implementation write set:** `src/utils/path.rs`, `src/utils/util.rs`, `src/utils/object_ext.rs`, `src/command/status.rs`, `src/internal/worktree_scope.rs`, `src/internal/worktree_scope/context.rs`, `src/internal/protocol/local_client.rs`, `tests/command/status_test.rs`, `tests/command/fetch_test.rs`, `tests/SERIAL_REGISTRY.tsv`, `tests/SRC_SERIAL_REGISTRY.tsv`, `tests/SRC_SERIAL_CENSUS.tsv`, `.config/nextest.toml`
 
 **Release write set:** Inherited
 
@@ -838,9 +856,71 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self；尚未运行。
+**C/D coverage from:** self（EX-SP-06-CLOSE-01 修复卡收口口径）。本轮 A/B、fmt、严格 Clippy、release 构建及 release 真实 fetch 场景均通过；原 SP-00 16 格矩阵为评审前历史证据。T-1 全量 nextest 仍 not-run；后续 review、提交、推送、PR 与远端 D 未执行，独立发布由 `DEFER-SP-REL-06` 跟踪，不称完整发布 C/D 通过。
 
-**Granularity:** type=implementation; axis=对象读取复用请求级 storage scope; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=2; prod-files=4; scope=M; deps=SP-05,DEP-SP-STORAGE; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=N/A
+**Granularity:** type=implementation; axis=对象读取复用请求级 storage scope; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=4/8; landing=2; prod-files=7; scope=M; deps=SP-05,DEP-SP-STORAGE; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-06-CLOSE-01
+
+**SP-06 评审修复证据（2026-11-02）：**
+
+- 修复前真实 CLI 复现：clone 后源仓库新增提交，目标 `fetch origin` 以 `LBR-NET-001` 报告源提交对象不存在；`fetch --notes` 跳过源 dependency note，目标邻居为空。根因是源操作在 cwd 已切换后仍消费目标请求 pin。
+- `LocalClient::with_repo_current_dir` 在完整源操作期间使用 `override_scope` 并在返回前恢复调用者 scope；`with_request_scope_sync` 恢复 `pub(crate)`，并发验证迁入 crate 内并使用隔离配置夹具及 `serial(cwd, env)`。
+- `fetch_test::test_fetch_local_libra_source_reads_new_objects` 1/1 通过；既有 `deps_travel_test::fetch_notes_travels_from_local_libra_source_and_is_default_off` 1/1 通过。
+- `status_test::status_storage_scope_` 4/4 通过；crate 内 `status_storage_scope_concurrent_requests_are_isolated` 1/1 通过；`compat_serial_registry` 26/26 通过；SRC 与 tests 两套 serial 分类器均 exit 0。
+- 隔离 HOME/全局与系统配置库后，完整 `cargo +1.99.0 test --lib utils::` 527 passed、0 failed、2 ignored。首轮 15 分钟超时仅发生在依赖编译阶段，未进入测试执行，未计通过或失败；最终运行使用最终源码与更长窗口。
+- `cargo +nightly fmt --all --check` 与 `libra diff --check` 通过。
+- `cargo +1.99.0 clippy --all-targets --all-features -- -D warnings` 通过；`cargo +1.99.0 build --release` 通过（14 分 54 秒）。使用所得 release 二进制重放原始失败场景：源仓库新增提交后目标 `fetch origin` 成功，`origin/main` 与源 HEAD 一致，目标可读取该 commit 对象。
+
+**SP-06 本地验收证据（2026-11-01）：**
+
+- 分支 `codex/SP-06`，基线 HEAD `9a92e42`；实现与证据仍未提交。macOS arm64、16 GiB；`rustc 1.99.0`，fmt 使用 nightly。
+- `cargo +nightly fmt --all --check` 通过。
+- `cargo +1.99.0 clippy --all-targets --all-features -- -D warnings` 通过。
+- `status_storage_scope_` 5/5 通过；`compat_serial_registry` 26/26 通过；`storage_config_hold_cache_does_not_keep_rejection` 1/1 通过。
+- `cargo +1.99.0 build --release` 通过（19 分 39 秒）。这只是本地构建，不是版本 bump 或发布。
+- T-1 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`：**not-run**。本机内存 17179869184 字节，低于计划 32 GiB 门槛；`.env.test` 与 `.env.live-test` 不存在。未降并发，也未用 `cargo test --all` 替代。
+- SP-00 同环境性能配对复测（2026-11-02）：16/16 格通过。父版本为 HEAD `9a92e42` 的 release 二进制，候选为当前未提交 SP-06 源码的 release 二进制，对照为 Git 2.56.0。fixture `d0a5c28a6b236421c14a38339b592fe37137585e`，2125 个跟踪路径、10 个暂存重命名、10 个未暂存修改、100 个未跟踪文件。Git/父/候选按 ABC/CBA 交替，每边每格 5 次预热 + 20 次正式样本，新 CLI 进程、热页面缓存；共 1200 次调用、960 个正式样本。全部 exit 0、stderr 为空、各工具原始输出稳定、index SHA-256 不变；三方规范化记录一致。独立重算 median 与 nearest-rank p95 通过。父二进制 SHA-256 `49a4767f47a38acc4047f650f5d91c4764bf0a2aa077f6c6147263e1df0e10d1`，候选 `54ededf6ec0266efac98cac540d844a577eb0caaf6ced6aa1e5d57ae9af9b892`，Git `6210287b8021b25eea03b1866f8bbb775c02ac1185f0d69f2a70c01e73b1ab9c`。临时 `result.json` SHA-256 `e6140498507bf44b83f917112bb1ee3ce3b3511407389cb8ad9cd2dddc0f1d32`，`samples.jsonl` `c04610568118d60e76b5cce0f273c90bdfa5d7958e24980be3a23a0bf3ec3736`；临时文件不承诺保留。
+
+| 索引 | 未跟踪 | 重命名 | 输出 | Git median/p95 ms | 父 median/p95 ms | 候选 median/p95 ms | 中位数下降 | 候选更快配对 |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| default | no | default | v1 | 11.675/13.116 | 333.031/343.306 | 292.076/303.423 | 12.30% | 20/20 |
+| default | no | default | v2 | 11.859/13.429 | 336.903/357.598 | 295.943/306.591 | 12.16% | 20/20 |
+| default | no | no-renames | v1 | 12.016/14.207 | 326.035/395.877 | 287.700/337.023 | 11.76% | 18/20 |
+| default | no | no-renames | v2 | 11.904/14.352 | 332.988/388.287 | 292.609/354.413 | 12.13% | 15/20 |
+| default | normal | default | v1 | 18.569/21.084 | 634.927/660.308 | 597.657/611.255 | 5.87% | 20/20 |
+| default | normal | default | v2 | 18.752/22.441 | 641.215/668.675 | 600.857/617.174 | 6.29% | 20/20 |
+| default | normal | no-renames | v1 | 20.655/24.918 | 650.477/787.277 | 606.588/679.404 | 6.75% | 19/20 |
+| default | normal | no-renames | v2 | 20.670/25.663 | 692.349/726.996 | 639.672/682.666 | 7.61% | 19/20 |
+| refreshed | no | default | v1 | 12.957/15.448 | 380.748/399.885 | 325.133/359.849 | 14.61% | 19/20 |
+| refreshed | no | default | v2 | 12.751/15.214 | 385.073/400.538 | 333.427/368.735 | 13.41% | 20/20 |
+| refreshed | no | no-renames | v1 | 13.872/16.902 | 392.561/459.973 | 338.376/432.956 | 13.80% | 18/20 |
+| refreshed | no | no-renames | v2 | 12.628/15.771 | 385.413/467.576 | 335.766/370.399 | 12.88% | 19/20 |
+| refreshed | normal | default | v1 | 19.164/23.552 | 725.190/808.952 | 651.953/708.356 | 10.10% | 17/20 |
+| refreshed | normal | default | v2 | 18.907/23.118 | 684.441/786.849 | 629.815/733.547 | 7.98% | 17/20 |
+| refreshed | normal | no-renames | v1 | 18.745/22.640 | 626.890/647.892 | 591.097/634.989 | 5.71% | 18/20 |
+| refreshed | normal | no-renames | v2 | 18.381/22.905 | 634.655/662.405 | 591.238/612.416 | 6.84% | 20/20 |
+
+结论限于本机该 fixture：16 格中位数下降 5.71%–14.61%，候选更快配对为 15/20–20/20；输出与错误语义未退化。不把该区间外推为其它环境的绝对收益，也不把 Git 倍率设为通过目标。对象存储 ambient discovery 次数由既有 `status_storage_scope_discovery_does_not_grow_with_subtrees` 覆盖；本轮 release 计时未启用该 debug 探针。
+
+**已记录的跨卡 Git 倍数（2026-11-02）：** 只收录各卡正文实际留下的 Libra/Git 中位数倍数。SP-03 有历史、收口、复测三轮；SP-05 的 Git 倍数未记录，不回填。各列来自不同时间、工具链和负载，不能连成同一基线。
+
+| 索引 | 未跟踪 | 重命名 | 输出 | SP-00 | SP-03 历史父 | SP-03 历史候选 | SP-03 收口父 | SP-03 收口候选 | SP-03 复测父 | SP-03 复测候选 | SP-06 父 | SP-06 候选 |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| default | no | default | v1 | 68.863× | 52.753× | 30.187× | 57.615× | 32.711× | 57.185× | 32.151× | 28.525× | 25.017× |
+| default | no | default | v2 | 79.119× | 60.432× | 37.415× | 65.918× | 40.829× | 68.337× | 42.279× | 28.408× | 24.954× |
+| default | no | no-renames | v1 | 56.466× | 43.060× | 20.806× | 50.442× | 24.284× | 51.429× | 24.819× | 27.132× | 23.942× |
+| default | no | no-renames | v2 | 70.029× | 52.072× | 30.007× | 58.744× | 33.317× | 60.061× | 33.955× | 27.973× | 24.581× |
+| default | normal | default | v1 | 58.055× | 49.586× | 33.318× | 51.084× | 34.111× | 52.975× | 35.348× | 34.193× | 32.186× |
+| default | normal | default | v2 | 64.296× | 54.818× | 38.646× | 60.336× | 42.214× | 59.565× | 41.776× | 34.195× | 32.042× |
+| default | normal | no-renames | v1 | 52.113× | 43.109× | 27.009× | 48.348× | 30.317× | 47.242× | 29.529× | 31.493× | 29.368× |
+| default | normal | no-renames | v2 | 59.862× | 46.754× | 31.548× | 52.906× | 35.363× | 53.211× | 35.514× | 33.495× | 30.946× |
+| refreshed | no | default | v1 | 42.543× | 28.847× | 29.032× | 34.397× | 34.175× | 33.302× | 33.419× | 29.386× | 25.093× |
+| refreshed | no | default | v2 | 53.196× | 37.534× | 37.369× | 44.110× | 45.939× | 42.341× | 42.308× | 30.199× | 26.149× |
+| refreshed | no | no-renames | v1 | 30.672× | 19.368× | 19.421× | 27.553× | 27.233× | 24.629× | 24.580× | 28.299× | 24.393× |
+| refreshed | no | no-renames | v2 | 41.291× | 28.488× | 28.438× | 36.907× | 36.332× | 31.808× | 31.829× | 30.520× | 26.588× |
+| refreshed | normal | default | v1 | 41.802× | 33.915× | 33.697× | 38.554× | 38.588× | 36.119× | 36.255× | 37.842× | 34.020× |
+| refreshed | normal | default | v2 | 47.498× | 38.646× | 38.902× | 42.908× | 42.650× | 42.560× | 42.578× | 36.201× | 33.311× |
+| refreshed | normal | no-renames | v1 | 35.105× | 27.725× | 27.770× | 32.500× | 32.616× | 30.147× | 30.292× | 33.443× | 31.533× |
+| refreshed | normal | no-renames | v2 | 40.166× | 33.467× | 33.432× | 40.001× | 40.502× | 36.149× | 35.861× | 34.528× | 32.166× |
 
 ### Task SP-07: pack index 整块 fanout 与二分查找
 
@@ -1059,6 +1139,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | DEFER-SP-DOCS-02 | SP-02 网站 restore 文档同步、验证和部署；未执行 | 网站仓库可用且用户恢复交付时，按原 DEP-SP-DOCS 验收 | `/Volumes/Sea/libra-backend` 未挂载，用户明确批准按 DEFER-SP-DOCS-02 暂搁；不伪称与本仓库双语文档一并完成 |
 | DEFER-SP-DOCS-03 | SP-03 网站 clone/restore 文档同步、验证和部署；未执行 | 网站仓库恢复可用后，核实 `cf` 分支、冲突与路径，再按 DEP-SP-DOCS 验收 | 用户明确批准先搁置网站文档依赖以推进本地任务；不伪称网站交付完成 |
 | DEFER-SP-REL-02 | SP-02 独立 patch bump、发布构建/安装、tag/Release 及发布后置门；未执行 | 用户授权发布时确定后续版本并执行原发布门 | 用户明确要求“首先设置任务完成，然后再提交、推送、创建 PR，版本不变”；无发布成功证据 |
+| DEFER-SP-REL-06 | SP-06 独立 patch bump、tag/Release 及发布后置门；未执行 | 用户授权发布时确定后续版本并执行原发布门 | 用户已授权提交、推送和 PR，但明确不做 Release；T-1 全量仍 not-run |
 | DEFER-SP-01 | 会话级 pack 列表/句柄/fanout 缓存 | SP-09 仍显示 pack 打开/解析占显著成本，且缓存失效设计获接受，再建卡/Issue | 先验证整块读与二分收益；避免过早引入 repack/并发失效复杂性 |
 | DEFER-SP-02 | marker probe 与 read-dir 合并 | SP-09 证实 IPC 残余成本，且替换安全/嵌套仓库语义有可复现回归，再建卡/Issue | 两次 probe 时间边界不同，不能直接删出队检查 |
 | DEFER-SP-03 | tracked stat/hash 有界批处理 | SP-09 证实主要残余为该串行路径，并验证逐路径 deadline/取消/部分结果设计，再建卡/Issue | 上游重复工作减少后才有可靠收益判断 |
@@ -1073,7 +1154,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-03 | implementation | 7/8 | 15/8@EX-SP-03-VER-01 | 2/2 | M | 按依赖串行 | independent | EX-SP-03-DOCS-01,EX-SP-03-VER-01,EX-SP-03-CLOSE-01 |
 | SP-04 | implementation | 4/8 | 2/8 | 2/4 | M | 按依赖串行 | independent | none |
 | SP-05 | implementation | 5/8 | 3/8 | 2/3 | M | 按依赖串行 | independent | none |
-| SP-06 | implementation | 5/8 | 2/8 | 2/4 | M | 按依赖串行 | independent | none |
+| SP-06 | implementation | 5/8 | 2/8 | 2/6 | M | 按依赖串行 | independent | EX-SP-06-CLOSE-01 |
 | SP-07 | implementation | 5/8 | 2/8 | 1/1 | S | 按依赖串行 | independent | none |
 | SP-08 | implementation | 7/8 | 3/8 | 2/2 | M | 按依赖串行 | independent | none |
 | SP-09 | audit | 5/20 | 2/20 | 0/0 | S | 按依赖串行 | no-release | none |
@@ -1094,7 +1175,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 ### 基线与实施证据汇总
 
-SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-05（#644）已为 `done / complete`，本地实现、定向/静态验证和 SP-00 完整 16 格矩阵通过，远端 CI 与独立发布未执行；SP-04、SP-06..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
+SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-05（#644）已为 `done / complete`，本地实现、定向/静态验证和 SP-00 完整 16 格矩阵通过，远端 CI 与独立发布未执行；2026-11-02 SP-06 按 EX-SP-06-CLOSE-01 登记 `done / complete`（A/B、fmt、严格 Clippy、release 构建及 16 格矩阵已过；T-1 全量 nextest not-run，版本与远端交付由 DEFER-SP-REL-06 跟踪）；SP-04、SP-07..09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
 
 #### SP-00 冻结协议与环境
 
@@ -1220,3 +1301,5 @@ DEP-SP-DATA 按用户指定采用公开标准仓库 [`libra-tools/libra@d0a5c28`
 | 2026-10-31 02:23:54 UTC | PR #661必要的主线集成：合并98aa6be，保留双方serial登记；最终定向/静态、两release、新16格三边矩阵独立核验通过。 | 更新同一PR；最终head CI仍待验，不另建成功记账提交；历史bb8/ee598证据保留且明确版本边界 |
 
 | 2026-10-31 19:59:44 UTC | 用户授权新建 `codex/SP-03-closeout` 并直接完成 SP-03 收口；实核最终 head `dbd21ed8` 的 base run `41227810790` 与 CodeQL run `41227810789` 全部适用检查 SUCCESS，PR #661 已合并为 `b1b9c32259d5e2d972521e1cc30129e5319488d2`。 | SP-03 按 EX-SP-03-CLOSE-01 登记 done/complete；本机 nextest 历史 not-run 保留；网站与独立发布仍未执行，Issue #642 已关闭（completed） |
+
+| 2026-11-02 | 用户要求记录本轮测试结果并完成 SP-06，随后授权提交、推送和 PR，明确不做 Release。16 格三方矩阵及已有 Git 倍数对照写入本卡；按 EX-SP-06-CLOSE-01 登记 done/complete。 | T-1 nextest 仍 not-run；版本与 Release 保持 DEFER-SP-REL-06；PR CI 推送后观察，不预称通过；Issue #645 不手动关闭 |

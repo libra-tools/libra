@@ -4414,3 +4414,161 @@ fn status_head_expansion_skips_unborn_head() {
     assert_cli_success(&output, "unborn status");
     assert_eq!(head_expansion_count(&log), 0);
 }
+
+fn commit_nested_chain(repo: &Path, depth: usize) {
+    let mut dir = repo.to_path_buf();
+    for level in 0..depth {
+        dir.push(format!("d{level}"));
+        fs::create_dir_all(&dir).expect("create nested directory");
+    }
+    fs::write(dir.join("file.txt"), format!("depth {depth}\n")).expect("write nested file");
+    assert_cli_success(
+        &run_libra_command(&["add", "-A"], repo),
+        "stage nested chain",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", &format!("depth {depth}"), "--no-verify"],
+            repo,
+        ),
+        "commit nested chain",
+    );
+}
+
+fn ambient_storage_discovery_count(repo: &Path) -> usize {
+    let log = repo.join("storage-discovery.log");
+    let _ = fs::remove_file(&log);
+    let output = run_libra_command_with_env(
+        &["status", "--porcelain"],
+        repo,
+        &[(
+            "LIBRA_TEST_STORAGE_DISCOVERY_LOG",
+            log.to_str().expect("discovery log path should be UTF-8"),
+        )],
+    );
+    assert_cli_success(&output, "status with storage discovery probe");
+    fs::read_to_string(&log)
+        .map(|contents| contents.lines().filter(|line| *line == "ambient").count())
+        .unwrap_or(0)
+}
+
+/// Deeper HEAD trees must not rediscover object storage once per subtree.
+#[test]
+fn status_storage_scope_discovery_does_not_grow_with_subtrees() {
+    let shallow = tempdir().expect("shallow repo");
+    init_repo_via_cli(shallow.path());
+    configure_identity_via_cli(shallow.path());
+    commit_nested_chain(shallow.path(), 1);
+
+    let deep = tempdir().expect("deep repo");
+    init_repo_via_cli(deep.path());
+    configure_identity_via_cli(deep.path());
+    commit_nested_chain(deep.path(), 4);
+
+    let shallow_count = ambient_storage_discovery_count(shallow.path());
+    let deep_count = ambient_storage_discovery_count(deep.path());
+    assert_eq!(
+        shallow_count, deep_count,
+        "ambient object-storage discovery grew with subtree depth: shallow={shallow_count} deep={deep_count}"
+    );
+    assert_eq!(
+        deep_count, 0,
+        "a pinned status must not rediscover object storage from the cwd"
+    );
+}
+
+#[test]
+fn status_storage_scope_linked_worktree_uses_common_objects() {
+    let repo = tempdir().expect("main worktree");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    commit_nested_chain(repo.path(), 2);
+
+    let parent = tempdir().expect("linked parent");
+    let linked = parent.path().join("linked");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "add",
+                "linked",
+                "--path",
+                linked.to_str().expect("linked path is UTF-8"),
+            ],
+            repo.path(),
+        ),
+        "worktree add",
+    );
+    assert!(
+        !linked.join(".libra/objects").exists(),
+        "linked worktree must not copy the object store"
+    );
+
+    let output = run_libra_command(&["status", "--porcelain"], &linked);
+    assert_cli_success(&output, "linked status");
+    assert!(
+        output.stdout.is_empty(),
+        "clean linked worktree status should be empty: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let listed = run_libra_command(&["ls-files"], &linked);
+    assert_cli_success(&listed, "linked ls-files");
+    let files = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        files.contains("d0/d1/file.txt"),
+        "linked worktree should read the nested object from common storage: {files}"
+    );
+}
+
+#[test]
+#[serial(cwd)]
+fn status_storage_scope_unpinned_fallback_reads_cwd() {
+    let repo = tempdir().expect("unpinned repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("fallback.txt"), "fallback\n").expect("write");
+    assert_cli_success(
+        &run_libra_command(&["add", "fallback.txt"], repo.path()),
+        "stage fallback",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "fallback", "--no-verify"], repo.path()),
+        "commit fallback",
+    );
+
+    let _cwd = libra::utils::test::ChangeDirGuard::new(repo.path());
+    let head = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head, "unpinned rev-parse");
+    let oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let listed = libra::utils::util::try_objects_storage()
+        .expect("unpinned storage")
+        .get(&oid.parse().expect("head oid"));
+    assert!(listed.is_ok(), "unpinned cwd fallback should read objects");
+
+    let output = run_libra_command(&["status", "--porcelain"], repo.path());
+    assert_cli_success(&output, "unpinned status");
+    assert!(
+        output.stdout.is_empty(),
+        "unpinned fallback status should stay clean: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn status_storage_scope_config_rejection_is_not_success() {
+    let repo = tempdir().expect("rejected config repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    commit_nested_chain(repo.path(), 1);
+
+    let output = run_libra_command_with_env(
+        &["status", "--porcelain"],
+        repo.path(),
+        &[("LIBRA_STORAGE_TYPE", "gcs-canary")],
+    );
+    assert!(
+        !output.status.success(),
+        "a rejected storage configuration must not become a successful status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

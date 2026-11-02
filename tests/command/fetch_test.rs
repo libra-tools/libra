@@ -33,8 +33,9 @@ use tempfile::{TempDir, tempdir};
 use tokio::{process::Command as TokioCommand, time::timeout};
 
 use super::{
-    assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command, run_libra_command_with_env,
+    assert_cli_success, configure_identity_via_cli, create_committed_repo_via_cli,
+    init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
+    run_libra_command_with_env,
 };
 
 fn libra_command(cwd: &Path) -> Command {
@@ -2108,6 +2109,63 @@ async fn test_fetch_tags_from_libra_native_remote_serves_annotated() {
         listed.contains("v-annot"),
         "annotated tag must be served + fetched from a libra-native remote: {listed}"
     );
+}
+
+#[test]
+fn test_fetch_local_libra_source_reads_new_objects() {
+    let source = tempdir().expect("source repository");
+    init_repo_via_cli(source.path());
+    configure_identity_via_cli(source.path());
+    fs::write(source.path().join("base.txt"), "base\n").expect("write base");
+    assert_cli_success(
+        &run_libra_command(&["add", "-A"], source.path()),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], source.path()),
+        "commit base",
+    );
+
+    let work = tempdir().expect("clone parent");
+    let cloned = work.path().join("cloned");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                source.path().to_str().expect("source path"),
+                "cloned",
+            ],
+            work.path(),
+        ),
+        "clone source",
+    );
+
+    fs::write(source.path().join("new.txt"), "new\n").expect("write new file");
+    assert_cli_success(
+        &run_libra_command(&["add", "new.txt"], source.path()),
+        "add new",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "new", "--no-verify"], source.path()),
+        "commit new",
+    );
+    let source_head = run_libra_command(&["rev-parse", "HEAD"], source.path());
+    assert_cli_success(&source_head, "source HEAD");
+    let source_oid = String::from_utf8_lossy(&source_head.stdout)
+        .trim()
+        .to_string();
+
+    let fetched = run_libra_command(&["fetch", "origin"], &cloned);
+    assert_cli_success(&fetched, "fetch new source commit");
+    let fetched_head = run_libra_command(&["rev-parse", "origin/main"], &cloned);
+    assert_cli_success(&fetched_head, "fetched origin/main");
+    assert_eq!(
+        String::from_utf8_lossy(&fetched_head.stdout).trim(),
+        source_oid
+    );
+    let object = run_libra_command(&["cat-file", "-t", &source_oid], &cloned);
+    assert_cli_success(&object, "read fetched commit from destination storage");
+    assert_eq!(String::from_utf8_lossy(&object.stdout).trim(), "commit");
 }
 
 #[test]

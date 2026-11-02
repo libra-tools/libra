@@ -639,4 +639,61 @@ mod tests {
         assert_ne!(main.worktree_id(), linked.worktree_id());
         assert_ne!(main, linked);
     }
+
+    #[test]
+    #[serial_test::serial(cwd, env)]
+    fn status_storage_scope_concurrent_requests_are_isolated() {
+        use git_internal::{
+            hash::ObjectHash,
+            internal::object::{ObjectTrait, blob::Blob},
+        };
+
+        use crate::utils::{client_storage::ClientStorage, util};
+
+        let _config = crate::utils::test::ConfigDbFixture::new()
+            .expect("isolated global and system configuration");
+
+        fn fixture(content: &[u8]) -> (tempfile::TempDir, RequestScope, ObjectHash) {
+            let directory = tempfile::tempdir().expect("repository root");
+            let root = directory.path().join("repo");
+            std::fs::create_dir_all(&root).expect("create repository root");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture runtime")
+                .block_on(crate::utils::test::setup_with_new_libra_in(&root));
+            let scope = RequestScope::resolve(root).expect("resolve repository scope");
+            let blob = Blob::from_content_bytes(content.to_vec());
+            ClientStorage::try_init_local(scope.storage.join("objects"))
+                .expect("open fixture object storage")
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("write fixture blob");
+            (directory, scope, blob.id)
+        }
+
+        fn read_in_thread(
+            directory: tempfile::TempDir,
+            scope: RequestScope,
+            oid: ObjectHash,
+        ) -> Vec<u8> {
+            std::thread::spawn(move || {
+                let _directory = directory;
+                with_request_scope_sync(Some(scope), || {
+                    util::try_objects_storage()
+                        .expect("resolve pinned object storage")
+                        .get(&oid)
+                        .expect("read blob from this request's repository")
+                })
+            })
+            .join()
+            .expect("storage reader thread")
+        }
+
+        let left = fixture(b"left-marker\n");
+        let right = fixture(b"right-marker\n");
+        let left = read_in_thread(left.0, left.1, left.2);
+        let right = read_in_thread(right.0, right.1, right.2);
+        assert_eq!(left, b"left-marker\n");
+        assert_eq!(right, b"right-marker\n");
+    }
 }

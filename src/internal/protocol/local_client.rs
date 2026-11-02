@@ -279,7 +279,13 @@ impl LocalClient {
             test_cwd_lock,
         )
         .map_err(E::from)?;
+        // This operation reads the SOURCE repository. Keep object storage and
+        // other request-scoped reads on that source instead of the destination
+        // invocation's pin, then restore it before returning to the caller.
+        let request_scope =
+            crate::internal::worktree_scope::WorktreeScope::override_scope(self.repo_path.clone());
         let result = operation().await;
+        drop(request_scope);
 
         match guard.restore() {
             Ok(()) => result,

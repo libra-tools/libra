@@ -44,11 +44,11 @@ pub fn try_index() -> io::Result<PathBuf> {
 }
 
 pub fn objects() -> PathBuf {
-    util::storage_path().join("objects")
+    util::request_storage_path().join("objects")
 }
 
 pub fn try_objects() -> io::Result<PathBuf> {
-    Ok(util::try_get_storage_path(None)?.join("objects"))
+    Ok(util::try_request_storage_path()?.join("objects"))
 }
 
 /// Shared/common repository storage that owns the commit-preview quota.

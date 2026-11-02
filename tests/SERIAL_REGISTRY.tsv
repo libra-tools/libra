@@ -183,6 +183,7 @@ service_reports_identity_read_failure_as_server_error	lane:service	holds a long-
 service_restarts_over_its_own_legacy_record_in_a_linked_repository	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 service_startup_refuses_a_foreign_stale_control_file	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 spawn_clears_parent_env_and_injects_allowlist	lane:env	mutates process-wide HOME and probe variables via set_var/remove_var (composable env lane)
+status_storage_scope_unpinned_fallback_reads_cwd	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_corrupt_head_reference_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_sync_wrappers_honor_core_ignorecase_override	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 subagent_scope_row_persists_linkage_and_is_idempotent	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
