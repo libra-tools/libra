@@ -788,7 +788,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** in-progress / locally-accepted
+**Lifecycle / Acceptance:** done / complete
 
 **Priority / Selection:** P2；本轮核心提速：第二梯队
 
@@ -856,7 +856,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self（EX-SP-06-CLOSE-01 修复卡收口口径）。本轮 A/B、fmt、严格 Clippy、release 构建及 release 真实 fetch 场景均通过；原 SP-00 16 格矩阵为评审前历史证据。T-1 全量 nextest 仍 not-run；后续 review、提交、推送、PR 与远端 D 未执行，独立发布由 `DEFER-SP-REL-06` 跟踪，不称完整发布 C/D 通过。
+**C/D coverage from:** self（EX-SP-06-CLOSE-01 修复卡收口口径）。本轮 A/B、fmt、严格 Clippy、release 构建及 release 真实 fetch 场景均通过；原 SP-00 16 格矩阵为评审前历史证据。T-1 全量 nextest 仍 not-run（本机资源与环境门槛未满足）；PR #868 的远端 CI 于 2026-11-02 09:53:52 UTC 全部 11 项通过，随后按用户授权于 09:54 UTC 合并为 `dffa63a6dc317dc2f1c61523d0e14c5dd4cfd8a3`。独立发布由 `DEFER-SP-REL-06` 跟踪，不纳入本次卡片完成条件。
 
 **Granularity:** type=implementation; axis=对象读取复用请求级 storage scope; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=4/8; landing=2; prod-files=7; scope=M; deps=SP-05,DEP-SP-STORAGE; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-06-CLOSE-01
 
