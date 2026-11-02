@@ -130,7 +130,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-03 materialization 后安全写入真实 index stat | P1 | 本轮核心提速 | [#642](https://github.com/libra-tools/libra/issues/642) | done / complete |
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
 | SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | done / complete |
-| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | in-progress / locally-accepted |
+| SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | done / complete |
 | SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | pending / 空 |
 | SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | pending / 空 |
 | SP-09 核心优化复测、全量收口与可选项决策 | P2 | 必选验收收口 | [#647](https://github.com/libra-tools/libra/issues/647) | pending / 空 |
