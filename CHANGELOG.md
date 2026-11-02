@@ -8,8 +8,8 @@
   window. The `libra` binary therefore requires `libfontconfig.so.1`,
   `libxkbcommon.so.0`, and `libxkbcommon-x11.so.0` at runtime even when
   `libra ui` is never used. Minimal and headless Linux hosts must install the
-  runtime packages described in `docs/installation.md`. The `gui` Cargo feature
-  no longer gates compilation.
+  runtime packages described in `docs/installation.md`. The empty `gui`
+  Cargo feature has been removed, so `--features gui` is not accepted.
 
 ### Added
 
@@ -24,8 +24,7 @@
 ### Changed
 
 - `libra ui` and the GPUI desktop window are now part of every standard build.
-  The `gui` Cargo feature remains only as a deprecated no-op for existing build
-  scripts. Linux source builds need the fontconfig and xkbcommon development
+  Linux source builds need the fontconfig and xkbcommon development
   headers (`libfontconfig1-dev`, `libxkbcommon-dev`, and
   `libxkbcommon-x11-dev` on Debian/Ubuntu).
 
