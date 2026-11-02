@@ -56,6 +56,16 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.135] — 2026-11-02
+
+### Fixed
+
+- `verify-homebrew-formula` now has 45 minutes. Queue time counts toward
+  the job timeout, and the 15 minute limit cancelled the v0.30.134
+  verification before a macOS runner was assigned. The four platform
+  builds, install scripts, Homebrew tap update, and stable manifest
+  request for v0.30.134 had already succeeded.
+
 ## [0.30.134] — 2026-11-02
 
 ### Fixed

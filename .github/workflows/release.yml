@@ -627,7 +627,9 @@ jobs:
   verify-homebrew-formula:
     needs: update-homebrew-tap
     runs-on: macos-latest
-    timeout-minutes: 15
+    # Queue time counts toward the job timeout. 15 minutes cancelled the
+    # v0.30.134 verification before a macOS runner was assigned.
+    timeout-minutes: 45
     permissions: {}
     steps:
       - name: Download this release's formula commit
