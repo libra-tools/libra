@@ -52,7 +52,10 @@ pub struct UpdateRefArgs {
     #[clap(short = 'm', value_name = "REASON")]
     pub message: Option<String>,
 
-    /// With `--stdin`, records are NUL-terminated instead of newline-terminated.
+    /// With `--stdin`, separate the command's arguments with NUL instead of
+    /// whitespace (Git's `-z`). The command word and the ref stay in one
+    /// space-separated field — `create SP <ref> NUL <newvalue> NUL` — so a
+    /// value may contain spaces without C-style quoting.
     #[clap(short = 'z', long = "null")]
     pub nul_terminated: bool,
 
@@ -420,6 +423,195 @@ fn parse_stdin_command(line: &str) -> Result<StdinCommand, (String, i32)> {
     }
 }
 
+/// Parse `update-ref --stdin -z` input (Git's wire format, ADR-PL-07 /
+/// issues/479 UR-01).
+///
+/// Unlike `ls-files -z` and `status --porcelain -z` — where NUL terminates a
+/// RECORD — `update-ref --stdin -z` uses NUL as the separator between a
+/// command's ARGUMENTS. The command word and the ref stay in one
+/// space-separated field, so a value may contain spaces (for example the
+/// revision syntax `:/fix bug`) without C-style quoting:
+///
+/// ```text
+/// create SP <ref> NUL <newvalue> NUL
+/// update SP <ref> NUL <newvalue> NUL <oldvalue> NUL
+/// delete SP <ref> NUL [<oldvalue>] NUL
+/// verify SP <ref> NUL [<oldvalue>] NUL
+/// option no-deref NUL | start NUL | prepare NUL | commit NUL | abort NUL
+/// ```
+///
+/// Errors carry the exit class: malformed layouts and end-of-input are 128
+/// (Git's stdin fatals); `symref-*` stays the invalid-target class (129).
+/// Read one `--stdin` command, consuming only its own fields so every
+/// acknowledgement can be flushed before the client writes the next command.
+fn next_stdin_command(
+    reader: &mut dyn std::io::BufRead,
+    nul_terminated: bool,
+) -> std::io::Result<Option<Result<StdinCommand, (String, i32)>>> {
+    if nul_terminated {
+        let Some(head) = next_z_field(reader)? else {
+            return Ok(None);
+        };
+        if head.is_empty() {
+            return Ok(Some(Err((
+                "empty update-ref stdin command".to_string(),
+                128,
+            ))));
+        }
+        return Ok(Some(parse_stdin_z_command(&head, reader)));
+    }
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        return Ok(Some(parse_stdin_command(line).map_err(
+            |(message, code)| (format!("{message} (input: {})", truncate_input(line)), code),
+        )));
+    }
+}
+
+/// One NUL-terminated field of the `-z` wire format.
+fn next_z_field(reader: &mut dyn std::io::BufRead) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    if reader.read_until(0, &mut buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// The `<cmd> SP <ref>` head field of a `-z` record. A space inside the ref
+/// means the caller used a non-Git layout (Git keeps the ref in the head field
+/// and rejects it as `invalid ref format`).
+fn z_ref_field(keyword: &str, rest: Option<&str>) -> Result<(), (String, i32)> {
+    match rest {
+        None => Err((format!("{keyword}: missing ref"), 128)),
+        Some("") => Err((format!("{keyword}: missing ref"), 128)),
+        Some(ref_name) if ref_name.contains(' ') || ref_name.contains('\t') => {
+            Err((format!("invalid ref format: {ref_name}"), 128))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Read one required `-z` value field (present and non-empty).
+fn z_required_value(
+    reader: &mut dyn std::io::BufRead,
+    keyword: &str,
+    what: &str,
+) -> Result<String, (String, i32)> {
+    let value = z_read_field(reader, keyword, what)?;
+    if value.is_empty() {
+        return Err((format!("{keyword}: missing {what}"), 128));
+    }
+    Ok(value)
+}
+
+/// Read one optional `-z` value field: it must be present, and an empty field
+/// means "no value" (Git's absent-vs-empty distinction).
+fn z_optional_value(
+    reader: &mut dyn std::io::BufRead,
+    keyword: &str,
+    what: &str,
+) -> Result<Option<String>, (String, i32)> {
+    let value = z_read_field(reader, keyword, what)?;
+    Ok((!value.is_empty()).then_some(value))
+}
+
+/// Read the next `-z` field, mapping end-of-input and io failures to Git's
+/// stdin-fatal class (128).
+fn z_read_field(
+    reader: &mut dyn std::io::BufRead,
+    keyword: &str,
+    what: &str,
+) -> Result<String, (String, i32)> {
+    match next_z_field(reader) {
+        Ok(Some(field)) => Ok(field),
+        Ok(None) => Err((
+            format!("{keyword}: unexpected end of input when reading {what}"),
+            128,
+        )),
+        Err(error) => Err((format!("failed to read update-ref stdin: {error}"), 128)),
+    }
+}
+
+/// Parse one `-z` command whose head field is `<keyword>[ SP<ref>]`.
+///
+/// Git keeps the command word and the ref in one space-separated field and
+/// terminates every following argument with its own NUL, so a value may contain
+/// spaces (for example the revision syntax `:/fix bug`) without C-style
+/// quoting. An empty field means "no value"; an absent field is end-of-input,
+/// which Git treats as fatal.
+fn parse_stdin_z_command(
+    head: &str,
+    reader: &mut dyn std::io::BufRead,
+) -> Result<StdinCommand, (String, i32)> {
+    let (keyword, rest) = match head.split_once(' ') {
+        Some((keyword, rest)) => (keyword, Some(rest)),
+        None => (head, None),
+    };
+    match keyword {
+        "create" => {
+            z_ref_field(keyword, rest)?;
+            Ok(StdinCommand::Create {
+                ref_name: rest.unwrap_or_default().to_string(),
+                new_value: z_required_value(reader, keyword, "<newvalue>")?,
+            })
+        }
+        "update" => {
+            z_ref_field(keyword, rest)?;
+            Ok(StdinCommand::Update {
+                ref_name: rest.unwrap_or_default().to_string(),
+                new_value: z_required_value(reader, keyword, "<newvalue>")?,
+                old_value: z_optional_value(reader, keyword, "<oldvalue>")?,
+            })
+        }
+        "delete" => {
+            z_ref_field(keyword, rest)?;
+            Ok(StdinCommand::Delete {
+                ref_name: rest.unwrap_or_default().to_string(),
+                old_value: z_optional_value(reader, keyword, "<oldvalue>")?,
+            })
+        }
+        "verify" => {
+            z_ref_field(keyword, rest)?;
+            Ok(StdinCommand::Verify {
+                ref_name: rest.unwrap_or_default().to_string(),
+                old_value: z_optional_value(reader, keyword, "<oldvalue>")?,
+            })
+        }
+        "option" => match rest {
+            Some("no-deref") => Ok(StdinCommand::OptionNoDeref),
+            Some(other) => Err((format!("unknown option '{other}'"), 128)),
+            None => Err(("option: missing value".to_string(), 128)),
+        },
+        "start" | "prepare" | "commit" | "abort" => {
+            if rest.is_some() {
+                return Err((format!("{keyword}: too many arguments"), 128));
+            }
+            Ok(match keyword {
+                "start" => StdinCommand::Start,
+                "prepare" => StdinCommand::Prepare,
+                "commit" => StdinCommand::Commit,
+                _ => StdinCommand::Abort,
+            })
+        }
+        // DEFER-04: symbolic-ref update commands are out of scope.
+        "symref-update" | "symref-create" | "symref-delete" | "symref-verify" => Err((
+            format!("{keyword}: symbolic refs are not supported by update-ref"),
+            129,
+        )),
+        other => Err((format!("invalid update-ref stdin command '{other}'"), 128)),
+    }
+}
+
 /// A fully parsed and value-resolved batch command, ready for the transaction.
 enum PreparedKind {
     Update { new: String, old: Option<OldValue> },
@@ -437,11 +629,11 @@ struct PreparedCommand {
 /// The `--stdin` batch path: stream-parse the commands, resolve values, then
 /// apply every update in ONE SQLite write transaction. `start`/`prepare`/
 /// `commit`/`abort` drive git's transaction protocol (`<cmd>: ok` lines are
-/// printed as the commands are processed, exactly like git); an `abort`
+/// flushed as the commands are processed, exactly like git); an `abort`
 /// applies nothing. Any failure leaves refs + reflogs byte-identical
 /// (GC-PL-02).
 async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliResult<()> {
-    use std::io::{BufRead, Read, Write};
+    use std::io::Write;
 
     let stdin_fatal = |message: String, code: i32| {
         CliError::fatal(message)
@@ -453,84 +645,172 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             })
     };
 
-    // Stream the records (NUL-terminated with -z, newline otherwise).
-    let mut records: Vec<String> = Vec::new();
+    // Commands are consumed one at a time and every acknowledgement is flushed
+    // immediately: Git's protocol is interactive, so a client may wait for
+    // `start: ok` before writing `prepare`.
     let stdin = std::io::stdin();
-    if args.nul_terminated {
-        let mut buf = Vec::new();
-        stdin.lock().read_to_end(&mut buf).map_err(|error| {
-            stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
-        })?;
-        for record in buf.split(|byte| *byte == 0) {
-            if !record.is_empty() {
-                records.push(String::from_utf8_lossy(record).into_owned());
-            }
-        }
-    } else {
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|error| {
-                stdin_fatal(format!("failed to read update-ref stdin: {error}"), 128)
-            })?;
-            if !line.trim().is_empty() {
-                records.push(line);
-            }
-        }
-    }
+    let mut reader = stdin.lock();
+    let nul_terminated = args.nul_terminated;
 
-    // First pass: state machine + scope/uniqueness validation. git prints the
-    // `<cmd>: ok` lines as the commands are processed (they stay on stdout
-    // even when a later command fails), so they are written immediately.
+    let mut phase = StdinPhase::Idle;
     let mut seen_refs: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
-    let mut active = false;
-    let mut closed = false;
-    let mut aborted = false;
     let mut stdout = std::io::stdout().lock();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+    let message = args.message.clone().unwrap_or_default();
+    let mut pending: Vec<StdinCommand> = Vec::new();
+    let mut prepared: Vec<PreparedCommand> = Vec::new();
+    let mut committed_refs: Vec<String> = Vec::new();
+    let mut any_committed = false;
 
-    for record in &records {
-        let cmd = match parse_stdin_command(record) {
-            Ok(cmd) => cmd,
-            Err((message, code)) => {
+    let ack = |stdout: &mut std::io::StdoutLock<'_>, line: &str| -> CliResult<()> {
+        writeln!(stdout, "{line}")
+            .and_then(|()| stdout.flush())
+            .map_err(|error| {
+                stdin_fatal(
+                    format!("failed to write update-ref acknowledgement: {error}"),
+                    128,
+                )
+            })
+    };
+
+    loop {
+        let next = match next_stdin_command(&mut reader, nul_terminated) {
+            Ok(next) => next,
+            Err(error) => {
                 return Err(stdin_fatal(
-                    format!("{message} (input: {})", truncate_input(record)),
-                    code,
+                    format!("failed to read update-ref stdin: {error}"),
+                    128,
                 ));
             }
         };
-        match cmd {
-            StdinCommand::Start => {
-                if active {
+        let Some(parsed) = next else { break };
+        let command = match parsed {
+            Ok(command) => command,
+            Err((message, code)) => return Err(stdin_fatal(message, code)),
+        };
+        match &command {
+            StdinCommand::Start => match phase {
+                StdinPhase::Open => {
                     return Err(stdin_fatal(
                         "cannot restart ongoing transaction".to_string(),
                         128,
                     ));
                 }
-                active = true;
-                let _ = writeln!(stdout, "start: ok");
-            }
+                StdinPhase::Prepared => {
+                    return Err(stdin_fatal(
+                        "prepared transactions can only be closed".to_string(),
+                        128,
+                    ));
+                }
+                // A finished transaction may be followed by a fresh `start`.
+                StdinPhase::Idle | StdinPhase::Closed => {
+                    pending.clear();
+                    prepared.clear();
+                    seen_refs.clear();
+                    phase = StdinPhase::Open;
+                    ack(&mut stdout, "start: ok")?;
+                }
+            },
             StdinCommand::Prepare => {
-                let _ = writeln!(stdout, "prepare: ok");
+                match phase {
+                    StdinPhase::Closed => {
+                        return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                    }
+                    StdinPhase::Prepared => {
+                        return Err(stdin_fatal(
+                            "prepared transactions can only be closed".to_string(),
+                            128,
+                        ));
+                    }
+                    _ => {}
+                }
+                // Git's `prepare` locks and validates the queued updates, so a
+                // failing CAS or a `create` of an existing ref is reported here
+                // — never acknowledged with `prepare: ok`.
+                prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+                validate_prepared_batch(&prepared).await?;
+                phase = StdinPhase::Prepared;
+                ack(&mut stdout, "prepare: ok")?;
             }
             StdinCommand::Commit => {
-                closed = true;
-                let _ = writeln!(stdout, "commit: ok");
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+                if phase != StdinPhase::Prepared {
+                    prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+                }
+                // Detect a broken stdout BEFORE the transaction commits: a
+                // failure afterwards would move refs and then fail to report it.
+                stdout.flush().map_err(|error| {
+                    stdin_fatal(
+                        format!("failed to flush update-ref output before commit: {error}"),
+                        128,
+                    )
+                })?;
+                if stdout_pipe_closed() {
+                    return Err(stdin_fatal(
+                        "stdout is closed; refusing to commit the ref transaction".to_string(),
+                        128,
+                    ));
+                }
+                let ref_names =
+                    apply_prepared_batch(std::mem::take(&mut prepared), &message).await?;
+                phase = StdinPhase::Closed;
+                if writeln!(stdout, "commit: ok")
+                    .and_then(|()| stdout.flush())
+                    .is_err()
+                {
+                    return Err(stdin_fatal(
+                        "transaction committed, but the `commit: ok` acknowledgement could not be written"
+                            .to_string(),
+                        128,
+                    ));
+                }
+                committed_refs.extend(ref_names);
+                any_committed = true;
             }
             StdinCommand::Abort => {
-                closed = true;
-                aborted = true;
-                let _ = writeln!(stdout, "abort: ok");
+                // Git lets `prepare` be closed by `abort` (UR-01 T2), and also
+                // closes a plain batch.
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+                // Git prints `abort: ok` and keeps reading: a later command is
+                // rejected against the closed phase, and nothing is applied.
+                pending.clear();
+                prepared.clear();
+                phase = StdinPhase::Closed;
+                ack(&mut stdout, "abort: ok")?;
             }
-            StdinCommand::OptionNoDeref => {}
+            StdinCommand::OptionNoDeref => {
+                if phase == StdinPhase::Prepared {
+                    return Err(stdin_fatal(
+                        "prepared transactions can only be closed".to_string(),
+                        128,
+                    ));
+                }
+                if phase == StdinPhase::Closed {
+                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                }
+            }
             StdinCommand::Update { ref_name, .. }
             | StdinCommand::Create { ref_name, .. }
             | StdinCommand::Delete { ref_name, .. }
             | StdinCommand::Verify { ref_name, .. } => {
-                if closed {
-                    return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                match phase {
+                    StdinPhase::Prepared => {
+                        return Err(stdin_fatal(
+                            "prepared transactions can only be closed".to_string(),
+                            128,
+                        ));
+                    }
+                    StdinPhase::Closed => {
+                        return Err(stdin_fatal("transaction is closed".to_string(), 128));
+                    }
+                    _ => {}
                 }
-                let branch = parse_heads_ref(&ref_name)
-                    .map_err(|message| stdin_fatal(message, 129))?
-                    .to_string();
-                if !util::is_valid_refname(&ref_name) {
+                parse_heads_ref(ref_name).map_err(|message| stdin_fatal(message, 129))?;
+                if !util::is_valid_refname(ref_name) {
                     return Err(stdin_fatal(format!("invalid ref name '{ref_name}'"), 129));
                 }
                 if seen_refs.insert(ref_name.clone(), ()).is_some() {
@@ -539,47 +819,64 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                         128,
                     ));
                 }
-                let _ = branch;
+                pending.push(command);
             }
         }
     }
 
-    if aborted {
-        // git prints the `<cmd>: ok` lines and applies nothing.
-        if output.is_json() {
-            emit_json_data(
-                "update-ref",
-                &serde_json::json!({ "refs": [], "committed": false }),
-                output,
-            )?;
-        }
-        return Ok(());
+    // End of input. An explicit transaction that was never committed is
+    // dropped silently; a plain batch applies implicitly.
+    if phase == StdinPhase::Idle {
+        let prepared = resolve_stdin_batch(&pending, &zero, &stdin_fatal).await?;
+        let ref_names = apply_prepared_batch(prepared, &message).await?;
+        committed_refs.extend(ref_names);
+        any_committed = true;
     }
 
-    // Second pass: resolve the values (async) and build the prepared list.
-    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+    if output.is_json() {
+        emit_json_data(
+            "update-ref",
+            &serde_json::json!({ "refs": committed_refs, "committed": any_committed }),
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+/// Transaction phases of `update-ref --stdin` (Git's protocol).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdinPhase {
+    Idle,
+    Open,
+    Prepared,
+    Closed,
+}
+
+/// Resolve the queued `--stdin` commands into transaction-ready entries.
+async fn resolve_stdin_batch(
+    pending: &[StdinCommand],
+    zero: &str,
+    stdin_fatal: &impl Fn(String, i32) -> CliError,
+) -> CliResult<Vec<PreparedCommand>> {
     let mut prepared: Vec<PreparedCommand> = Vec::new();
-    for record in &records {
-        let Ok(cmd) = parse_stdin_command(record) else {
-            continue;
-        };
-        let resolved = match cmd {
+    for command in pending {
+        let resolved = match command {
             StdinCommand::Update {
                 ref_name,
                 new_value,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
-                    .expect("scope validated in the first pass")
+                let branch = parse_heads_ref(ref_name)
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let new = resolve_new_value(&new_value, &zero, &ref_name).await?;
+                let new = resolve_new_value(new_value, zero, ref_name).await?;
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Update {
                         new: new.to_string(),
                         old,
@@ -590,13 +887,13 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 new_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
-                    .expect("scope validated in the first pass")
+                let branch = parse_heads_ref(ref_name)
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let new = resolve_new_value(&new_value, &zero, &ref_name).await?;
+                let new = resolve_new_value(new_value, zero, ref_name).await?;
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Create {
                         new: new.to_string(),
                     },
@@ -606,16 +903,16 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
-                    .expect("scope validated in the first pass")
+                let branch = parse_heads_ref(ref_name)
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
                 let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
                     None => None,
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Delete { old },
                 }
             }
@@ -623,16 +920,20 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
                 ref_name,
                 old_value,
             } => {
-                let branch = parse_heads_ref(&ref_name)
-                    .expect("scope validated in the first pass")
+                let branch = parse_heads_ref(ref_name)
+                    .map_err(|message| stdin_fatal(message, 129))?
                     .to_string();
-                let old = match old_value {
-                    Some(value) => Some(resolve_old_value(&value, &zero, &ref_name).await?),
-                    None => None,
+                // Git: `verify` with no <oldvalue> (LF) or an empty one (`-z`)
+                // carries the all-zero id, so the ref must NOT exist — it is not
+                // "any value". An absent value therefore differs from `update`
+                // and `delete`, where it means "no CAS".
+                let old = match old_value.as_deref().filter(|value| !value.is_empty()) {
+                    Some(value) => Some(resolve_old_value(value, zero, ref_name).await?),
+                    None => Some(OldValue::MustNotExist),
                 };
                 PreparedCommand {
                     branch,
-                    full_ref: ref_name,
+                    full_ref: ref_name.to_string(),
                     kind: PreparedKind::Verify { old },
                 }
             }
@@ -640,7 +941,47 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         };
         prepared.push(resolved);
     }
+    Ok(prepared)
+}
 
+/// Validate the queued preconditions the way Git's `prepare` does (it locks
+/// the refs there): a `create` of an existing ref or a CAS mismatch is reported
+/// at `prepare`, not at `commit`. Read-only — the authoritative check still runs
+/// inside the commit transaction.
+async fn validate_prepared_batch(prepared: &[PreparedCommand]) -> CliResult<()> {
+    if prepared.is_empty() {
+        return Ok(());
+    }
+    let db = get_db_conn_instance().await;
+    for command in prepared {
+        let expected = match &command.kind {
+            PreparedKind::Update { old, .. } => old.clone(),
+            PreparedKind::Create { .. } => Some(OldValue::MustNotExist),
+            PreparedKind::Delete { old } => old.clone(),
+            PreparedKind::Verify { old } => old.clone(),
+        };
+        let Some(expected) = expected else {
+            continue;
+        };
+        verify_ref_value(&db, &command.branch, &command.full_ref, Some(&expected))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "prepare: cannot lock ref '{}': {error}",
+                    command.full_ref
+                ))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+    }
+    Ok(())
+}
+
+/// Apply a resolved batch atomically and return the refs it touched.
+async fn apply_prepared_batch(
+    prepared: Vec<PreparedCommand>,
+    message: &str,
+) -> CliResult<Vec<String>> {
     // Part C W0 (§C.11) per unique branch, fail closed.
     let mut checked: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
     for command in &prepared {
@@ -669,9 +1010,9 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
         }
     }
 
-    let message = args.message.clone().unwrap_or_default();
-    let db = get_db_conn_instance().await;
     let ref_names: Vec<String> = prepared.iter().map(|c| c.full_ref.clone()).collect();
+    let message = message.to_string();
+    let db = get_db_conn_instance().await;
     crate::internal::db::write_transaction(&db, move |txn| {
         Box::pin(async move {
             for command in &prepared {
@@ -729,15 +1070,30 @@ async fn execute_stdin_safe(args: &UpdateRefArgs, output: &OutputConfig) -> CliR
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
+    Ok(ref_names)
+}
 
-    if output.is_json() {
-        emit_json_data(
-            "update-ref",
-            &serde_json::json!({ "refs": ref_names, "committed": true }),
-            output,
-        )?;
-    }
-    Ok(())
+/// True when stdout's pipe has no reader left, so the next acknowledgement
+/// would fail. Checked before a commit so a closed pipe cannot move refs and
+/// then fail to report it.
+#[cfg(unix)]
+fn stdout_pipe_closed() -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut probe = libc::pollfd {
+        fd: std::io::stdout().as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: `probe` is one valid pollfd for a live descriptor and poll only
+    // reads/writes it.
+    let ready = unsafe { libc::poll(&mut probe, 1, 0) };
+    ready > 0 && probe.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+}
+
+#[cfg(not(unix))]
+fn stdout_pipe_closed() -> bool {
+    false
 }
 
 /// Truncate an input line for error messages (GC-PL-02: never echo long lines).
@@ -835,8 +1191,12 @@ async fn apply_ref_update<C: sea_orm::ConnectionTrait>(
         })
     } else {
         let Some(old) = current.clone() else {
-            return Err(UpdateRefTxError::DoesNotExist {
-                ref_name: full_ref.to_string(),
+            // Git treats `update-ref -d <missing>` (and a delete whose CAS value
+            // is the all-zero id) as a no-op; only an explicit non-zero CAS value
+            // makes the missing ref an error, and that is checked above.
+            return Ok(UpdateRefOutcome {
+                old: None,
+                new: None,
             });
         };
         Branch::delete_branch_result_with_conn(txn, branch_name, None)

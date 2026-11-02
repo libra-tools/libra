@@ -1947,6 +1947,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use crate::utils::json::normalize_json_value;
 
     #[test]
     fn snapshot_source_debug_redacts_transient_digest_and_identity() {
@@ -2953,7 +2954,7 @@ mod tests {
                 }
                 _ => unreachable!("closed fixture matrix"),
             }
-            let source = serde_json::to_vec(&document).unwrap();
+            let source = serde_json::to_vec(&normalize_json_value(document.clone())).unwrap();
             // The old scrubber removes these auxiliary associations without
             // demoting its Ordinary consumer. Pin those exact ordinary bytes.
             let field = match name {
@@ -2967,7 +2968,8 @@ mod tests {
                     .unwrap()
                     .remove(field);
             }
-            let legacy_source = serde_json::to_vec(&document).unwrap();
+            let legacy_source =
+                serde_json::to_vec(&normalize_json_value(document.clone())).unwrap();
             let (legacy, legacy_report) = Redactor::new_default().redact(&legacy_source);
             let mut snapshot = og26_snapshot(source, CaptureSnapshotPolicy::default());
             assert!(
@@ -3035,7 +3037,7 @@ mod tests {
                 }
                 _ => unreachable!("closed fixture matrix"),
             }
-            let source = serde_json::to_vec(&document).unwrap();
+            let source = serde_json::to_vec(&normalize_json_value(document.clone())).unwrap();
             let mut snapshot = og26_snapshot(source, CaptureSnapshotPolicy::default());
             assert!(
                 matches!(snapshot.reasoning, ReasoningSourceDisposition::Unproven),
@@ -3265,7 +3267,7 @@ mod tests {
                     {"id":if changed == "part" { secret_id } else { "r1" },"type":"reasoning","text":"safe thought"}
                 ]}
             ]});
-            let source = serde_json::to_vec(&document).unwrap();
+            let source = serde_json::to_vec(&normalize_json_value(document.clone())).unwrap();
             let (legacy, legacy_report) = Redactor::new_default().redact(&source);
             assert!(legacy_report.match_count() > 0, "{changed}");
             let preview = prepare_redacted_coverage_preview(

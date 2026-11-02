@@ -616,8 +616,15 @@ fn claude_disable_preserves_unverified_legacy_commands_and_user_hook() {
                         continue;
                     };
                     if command.contains(" hooks claude ") {
+                        // Default 30s handlers carry 29000ms; the
+                        // timeout-less SessionEnd keeps 9000ms.
+                        let budget = if command.contains(" hooks claude session-end ") {
+                            "9000"
+                        } else {
+                            "29000"
+                        };
                         let legacy = command
-                            .strip_suffix(" --capture-budget-ms 9000")
+                            .strip_suffix(&format!(" --capture-budget-ms {budget}"))
                             .unwrap_or_else(|| {
                                 panic!("expected current Claude capture budget in '{command}'")
                             });
@@ -666,6 +673,193 @@ fn claude_disable_preserves_unverified_legacy_commands_and_user_hook() {
         settings_after, seeded_settings,
         "disable must not rewrite settings containing only unverified legacy and user hooks"
     );
+}
+
+fn read_settings_json(path: &std::path::Path) -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display())),
+    )
+    .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
+}
+
+/// Libra-owned Claude entries (marked by `statusMessage`) for one event.
+fn claude_owned_entries(settings: &Value, event: &str) -> Vec<Value> {
+    settings["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+        .filter(|hook| hook["statusMessage"] == json!("libra capture"))
+        .cloned()
+        .collect()
+}
+
+/// Assert one Libra-owned entry per forwarded Claude event with the given
+/// host timeout; `SessionEnd` always stays timeout-less on 9000ms.
+fn assert_claude_hook_timing(settings: &Value, canonical: &str, timeout: u64) {
+    let budget = (timeout - 1) * 1_000;
+    for (event, verb) in CLAUDE_FORWARDED_EVENTS {
+        let owned = claude_owned_entries(settings, event);
+        assert_eq!(
+            owned.len(),
+            1,
+            "{event}: exactly one Libra entry: {settings}"
+        );
+        if *event == "SessionEnd" {
+            assert!(
+                owned[0].get("timeout").is_none(),
+                "SessionEnd must stay timeout-less: {settings}"
+            );
+            assert_eq!(
+                owned[0]["command"],
+                json!(format!(
+                    "{canonical} hooks claude {verb} --capture-budget-ms 9000"
+                ))
+            );
+        } else {
+            assert_eq!(owned[0]["timeout"], json!(timeout), "{event} timeout");
+            assert_eq!(
+                owned[0]["command"],
+                json!(format!(
+                    "{canonical} hooks claude {verb} --capture-budget-ms {budget}"
+                )),
+                "{event} command"
+            );
+        }
+    }
+}
+
+/// `agent enable --hook-timeout <s>` writes that host timeout and the
+/// derived `(s - 1) * 1000` capture budget for every Claude handler except
+/// the timeout-less `SessionEnd`; doctor keeps recognizing the entries, and
+/// a plain re-enable restores the 30-second default in place.
+#[test]
+fn claude_enable_hook_timeout_sets_timeout_and_derived_budget() {
+    let repo = HookRepo::init();
+    let canonical = canonical_binary_path();
+    let settings_path = repo.repo.join(".claude/settings.json");
+
+    let out = repo.run(&["agent", "enable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "default enable: {}", describe(&out));
+    assert_claude_hook_timing(&read_settings_json(&settings_path), &canonical, 30);
+
+    let out = repo.run(
+        &[
+            "agent",
+            "enable",
+            "--agent",
+            "claude",
+            "--hook-timeout",
+            "45",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "enable --hook-timeout: {}",
+        describe(&out)
+    );
+    assert_claude_hook_timing(&read_settings_json(&settings_path), &canonical, 45);
+
+    let doctor = repo.run(&["agent", "doctor", "--json"], None, &[]);
+    assert!(doctor.status.success(), "doctor: {}", describe(&doctor));
+    let doctor_json: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&doctor.stdout)).expect("doctor json");
+    let claude = doctor_json["data"]["provider_hooks"]
+        .as_array()
+        .expect("provider hooks")
+        .iter()
+        .find(|row| row["name"] == json!("claude-code"))
+        .expect("claude doctor row")
+        .clone();
+    assert_eq!(
+        claude["installed"],
+        json!(true),
+        "custom timeout stays Libra-owned"
+    );
+
+    let out = repo.run(&["agent", "enable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "re-enable: {}", describe(&out));
+    assert_claude_hook_timing(&read_settings_json(&settings_path), &canonical, 30);
+
+    let out = repo.run(&["agent", "disable", "--agent", "claude"], None, &[]);
+    assert!(out.status.success(), "disable: {}", describe(&out));
+    let after = read_settings_json(&settings_path);
+    for (event, _) in CLAUDE_FORWARDED_EVENTS {
+        assert!(
+            claude_owned_entries(&after, event).is_empty(),
+            "{event} must be removed: {after}"
+        );
+    }
+}
+
+/// `--hook-timeout` is refused before any side effect when a selected agent
+/// takes no host timeout (here OpenCode), and an invalid value is a usage
+/// error; neither writes a Claude settings file.
+#[test]
+fn enable_hook_timeout_refuses_unsupported_agent_before_any_install() {
+    let repo = HookRepo::init();
+    let settings_path = repo.repo.join(".claude/settings.json");
+
+    let out = repo.run(
+        &[
+            "agent",
+            "enable",
+            "--agent",
+            "claude",
+            "--agent",
+            "opencode",
+            "--hook-timeout",
+            "45",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "mixed batch must fail: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "{}", describe(&out));
+    assert!(stderr.contains("agent 'opencode'"), "{}", describe(&out));
+    assert!(stderr.contains("claude-code, codex"), "{}", describe(&out));
+    assert!(
+        !settings_path.exists(),
+        "no Claude hooks may be installed before the refusal"
+    );
+    assert!(
+        !repo.repo.join(".opencode").exists(),
+        "no OpenCode plugin may be installed before the refusal"
+    );
+
+    for invalid in ["0", "abc"] {
+        let out = repo.run(
+            &[
+                "agent",
+                "enable",
+                "--agent",
+                "claude",
+                "--hook-timeout",
+                invalid,
+            ],
+            None,
+            &[],
+        );
+        assert!(
+            !out.status.success(),
+            "--hook-timeout {invalid} must be rejected: {}",
+            describe(&out)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--hook-timeout"),
+            "{}",
+            describe(&out)
+        );
+        assert!(!settings_path.exists(), "invalid value must not install");
+    }
 }
 
 /// The exact hook command is a public surface, so it alone cannot prove

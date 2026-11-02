@@ -93,7 +93,7 @@ use crate::{
         },
         metadata::{MetadataKv, MetadataScope},
     },
-    utils::util,
+    utils::{json::normalize_json_value, util},
 };
 
 const IMPORT_IDENTITY_SCHEMA_VERSION_V1: i64 = 1;
@@ -1986,7 +1986,7 @@ pub(crate) fn prepare_import_projection_with_reasoning(
         },
         stopped_at: facts.terminal.then_some(ended_at),
         storage_commitment,
-        redaction_report,
+        redaction_report: normalize_json_value(redaction_report),
         transcript_snapshot: Some(transcript_snapshot),
         turn_boundaries,
         turns,
@@ -3681,7 +3681,8 @@ async fn abandon_import_attempt_after_error(
 }
 
 fn redacted_json(value: &serde_json::Value) -> Result<RedactedBytes> {
-    let bytes = serde_json::to_vec_pretty(value).context("serialize safe import projection")?;
+    let bytes = serde_json::to_vec_pretty(&normalize_json_value(value.clone()))
+        .context("serialize safe import projection")?;
     Ok(Redactor::new_default().redact(&bytes).0)
 }
 
@@ -3737,7 +3738,8 @@ fn checkpoint_redaction_metadata(kind: AgentKind, report: &serde_json::Value) ->
 }
 
 fn redacted_json_line(value: &serde_json::Value) -> Result<RedactedBytes> {
-    let mut bytes = serde_json::to_vec(value).context("serialize safe import JSONL record")?;
+    let mut bytes = serde_json::to_vec(&normalize_json_value(value.clone()))
+        .context("serialize safe import JSONL record")?;
     bytes.push(b'\n');
     Ok(Redactor::new_default().redact(&bytes).0)
 }

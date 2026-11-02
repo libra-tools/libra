@@ -1,5 +1,17 @@
 # Agent Command Development
 
+## Mega2 scoped push entry (LTR-12)
+
+`libra agent push --mega2` is the public entry. It calls the LTR-10 binding and then the LTR-11 transport planner. `--force-rewrite` together with `--mega2` returns before an epoch is replaced and before a socket is opened. A missing remote URL stops in the same way and prints the saved epoch so a retry can reuse it. `--new-stream` is explicit. The repository transaction around the receipt is the lease shared by linked worktrees. `confirm_push_attempt` keeps a successful tip idempotent when the acknowledgement is repeated, and a missing scope UUID records `scope_resolution_pending` without creating an epoch or flipping the push to failure. The stored code remote URL is not rewritten.
+
+## Mega2 TraceRepo transport (LTR-11)
+
+Scoped HTTP paths are `/.traces/by-path/<base64url-target>/self/<base64url-source>/<epoch>/<sha1|sha256>.git` and `/.traces/by-scope/<stream-uuid>.git`. Dynamic path segments are unpadded base64url of the original UTF-8 bytes. Spaces in a target path are preserved inside that encoding. A scoped SSH URL is derived with login `traces` and the original code remote string is left unchanged. The first SSH push does not send an HTTP registration request. A write is refused when the advertisement lacks `libra-traces-v1`. `admit_before_network(true, true)` returns before any socket exists. A non-fast-forward rejection stays a rejection: no force, no new epoch, no code-remote fallback. Ordinary `git://`, HTTPS, and SSH clients refuse a URL that contains `/.traces/`. Server rejections keep the stable traces code.
+
+## Mega2 traces source and epoch (LTR-10)
+
+`libra.repoid` is the traces source. `RepoIdentity::resolve` reads it verbatim from the repository database. An empty value or surrounding whitespace is corrupt metadata and is rejected with an error that tells the operator to run `libra init` or rewrite the stored value without padding. An existing opaque legacy value is kept byte for byte. The binding records that source in repository config key `libra.traces.mega2.source` and the epoch in `libra.traces.mega2.epoch`. The first epoch is committed before the call returns. This module does not open a network connection. A later epoch is written only when the caller passes an explicit new-stream intent; repeating the current intent reuses the stored UUID. If `libra.repoid` no longer matches the recorded source, the call stops and leaves both keys unchanged. A linked worktree follows `commondir` to the same database, so it sees the same source and epoch. An independent clone has a different repository database and therefore a different source. The binding does not read or write global or system config. `libra agent push` does not yet accept `--mega2` or `--new-stream`; those flags stay unwired until LTR-12.
+
 ## Removed dry-run prompt output (SC-03)
 
 `--show-redacted-prompt` is not a flag. The promote subcommand stays deleted (RC-11), so a dry-run cannot print a prompt body in human output or JSON. The command is rejected instead of formatting a `<len=N>` line.

@@ -66,6 +66,7 @@ use crate::{
     utils::{
         client_storage::ClientStorage,
         error::{CliError, StableErrorCode},
+        json::normalize_json_value,
         util::DATABASE,
     },
 };
@@ -922,8 +923,10 @@ fn write_view(
     refs: &serde_json::Value,
     heads: &[String],
 ) -> Result<ObjectHash, OperationError> {
-    let refs_bytes = serde_json::to_vec(&json!({"heads": heads, "references": refs}))
-        .map_err(|error| OperationError::Storage(error.to_string()))?;
+    let refs_bytes = serde_json::to_vec(&normalize_json_value(
+        json!({"heads": heads, "references": refs}),
+    ))
+    .map_err(|error| OperationError::Storage(error.to_string()))?;
     let refs_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &refs_bytes);
     store
         .write_blob(&refs_oid, &refs_bytes, ObjectType::Blob)

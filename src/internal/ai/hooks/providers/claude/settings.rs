@@ -23,7 +23,18 @@ use super::super::super::{
     },
 };
 
-const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
+/// Host handler timeout written for every Libra-owned Claude hook except
+/// `SessionEnd` when `libra agent enable` gets no `--hook-timeout`. Thirty
+/// seconds (capture budget 29000ms) matches the Codex default and leaves a
+/// `Stop` checkpoint room to finish on a heavily loaded host; an unloaded
+/// callback still returns in a few hundred milliseconds.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+/// Basis for the `SessionEnd` capture budget, which carries no host timeout
+/// (`ClaudeInstallTarget::set_host_timeout`). It stays at the historical
+/// ten-second basis (9000ms) regardless of [`DEFAULT_HOOK_TIMEOUT_SECS`] or
+/// `--hook-timeout`, so the shared SessionEnd window does not grow and an
+/// existing timeout-less `SessionEnd` entry keeps its ownership proof.
+const SESSION_END_BUDGET_BASIS_SECS: u64 = 10;
 const CLAUDE_SETTINGS_DIR: &str = ".claude";
 const CLAUDE_SETTINGS_FILE: &str = "settings.json";
 /// Read and write budget for one Claude settings file. A larger file is refused
@@ -317,7 +328,7 @@ fn upsert_claude_hooks(
 ) -> bool {
     let mut changed = false;
 
-    let session_end_budget = capture_budget_millis_for_host_timeout(DEFAULT_HOOK_TIMEOUT_SECS)
+    let session_end_budget = capture_budget_millis_for_host_timeout(SESSION_END_BUDGET_BASIS_SECS)
         .unwrap_or(capture_budget_millis);
     for target in claude_install_targets() {
         let event_name = target.event;
@@ -462,7 +473,7 @@ fn hook_matches_install_target(
     } else if hook.timeout.is_some() {
         return false;
     } else {
-        match capture_budget_millis_for_host_timeout(DEFAULT_HOOK_TIMEOUT_SECS) {
+        match capture_budget_millis_for_host_timeout(SESSION_END_BUDGET_BASIS_SECS) {
             Ok(budget) => budget,
             Err(_) => return false,
         }
@@ -475,7 +486,7 @@ fn hook_matches_session_end_without_timeout(hook: &ClaudeHookEntry) -> bool {
     {
         return false;
     }
-    let Ok(budget) = capture_budget_millis_for_host_timeout(DEFAULT_HOOK_TIMEOUT_SECS) else {
+    let Ok(budget) = capture_budget_millis_for_host_timeout(SESSION_END_BUDGET_BASIS_SECS) else {
         return false;
     };
     matches!(
@@ -560,9 +571,11 @@ fn is_current_unmarked_claude_hook(
             executable,
             capture_budget_millis,
         }) => {
+            // A timeout-less unmarked entry is the historical `SessionEnd`
+            // form, whose budget always used the ten-second basis.
             executable == binary_path
                 && capture_budget_millis_for_host_timeout(
-                    hook.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
+                    hook.timeout.unwrap_or(SESSION_END_BUDGET_BASIS_SECS),
                 )
                 .is_ok_and(|expected| expected == capture_budget_millis)
         }
@@ -902,7 +915,7 @@ mod tests {
             &mut settings,
             current_binary,
             DEFAULT_HOOK_TIMEOUT_SECS,
-            9_000
+            29_000
         ));
         assert!(all_claude_specs_installed(&settings, current_binary));
 
@@ -926,7 +939,8 @@ mod tests {
         }
         assert!(session_start.iter().any(|entry| {
             entry.status_message.as_deref() == Some(LIBRA_CLAUDE_STATUS_MESSAGE)
-                && entry.command == claude_hook_command(current_binary, "session-start", 9_000)
+                && entry.command == claude_hook_command(current_binary, "session-start", 29_000)
+                && entry.timeout == Some(DEFAULT_HOOK_TIMEOUT_SECS)
         }));
         assert!(
             !session_start
@@ -943,7 +957,7 @@ mod tests {
         assert_eq!(stop.len(), 1);
         assert_eq!(
             stop[0].command,
-            claude_hook_command(current_binary, "stop", 9_000)
+            claude_hook_command(current_binary, "stop", 29_000)
         );
         assert_eq!(
             stop[0].status_message.as_deref(),
@@ -1013,6 +1027,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Libra-owned entries for one event, regardless of matcher group.
+    fn owned_entries<'a>(settings: &'a ClaudeSettings, event: &str) -> Vec<&'a ClaudeHookEntry> {
+        settings
+            .hooks
+            .get(event)
+            .into_iter()
+            .flatten()
+            .flat_map(|matcher| matcher.hooks.iter())
+            .filter(|hook| hook.status_message.as_deref() == Some(LIBRA_CLAUDE_STATUS_MESSAGE))
+            .collect()
+    }
+
+    /// The default host timeout is 30s (29000ms budget) for every event that
+    /// carries one, while `SessionEnd` stays timeout-less on the historical
+    /// 9000ms budget.
+    #[test]
+    fn default_install_uses_thirty_second_timeout_and_keeps_session_end_budget() {
+        assert_eq!(DEFAULT_HOOK_TIMEOUT_SECS, 30);
+        let tmp = tempfile::tempdir().expect("create temporary Claude settings directory");
+        let settings_path = tmp.path().join(".claude/settings.json");
+        install_claude_hooks_at(&settings_path, "/opt/libra", DEFAULT_HOOK_TIMEOUT_SECS)
+            .expect("install Claude hooks");
+
+        let settings = load_claude_settings(&settings_path).expect("read installed settings");
+        for target in claude_install_targets() {
+            let owned = owned_entries(&settings, target.event);
+            assert_eq!(owned.len(), 1, "{}: one Libra entry", target.event);
+            let (timeout, budget) = if target.set_host_timeout {
+                (Some(30), 29_000)
+            } else {
+                (None, 9_000)
+            };
+            assert_eq!(owned[0].timeout, timeout, "{} timeout", target.event);
+            assert_eq!(
+                owned[0].command,
+                claude_hook_command("/opt/libra", target.subcommand, budget),
+                "{} command",
+                target.event
+            );
+        }
+        assert_eq!(
+            owned_entries(&settings, "Stop")[0].command,
+            "/opt/libra hooks claude stop --capture-budget-ms 29000"
+        );
+        assert_eq!(
+            owned_entries(&settings, "SessionEnd")[0].command,
+            "/opt/libra hooks claude session-end --capture-budget-ms 9000"
+        );
+    }
+
+    /// Hooks written by the former ten-second default (or any other valid
+    /// timeout) stay Libra-owned: re-enabling replaces each one in place
+    /// rather than appending a duplicate, and disable still removes them.
+    #[test]
+    fn reenable_replaces_previous_timeout_install_without_duplicates() {
+        let tmp = tempfile::tempdir().expect("create temporary Claude settings directory");
+        let settings_path = tmp.path().join(".claude/settings.json");
+        install_claude_hooks_at(&settings_path, "/opt/libra", 10).expect("install 10s hooks");
+        let previous = load_claude_settings(&settings_path).expect("read 10s settings");
+        assert!(all_claude_specs_installed(&previous, "/opt/libra"));
+        assert_eq!(
+            owned_entries(&previous, "Stop")[0].command,
+            "/opt/libra hooks claude stop --capture-budget-ms 9000"
+        );
+
+        for (timeout, budget) in [(DEFAULT_HOOK_TIMEOUT_SECS, 29_000), (45, 44_000)] {
+            install_claude_hooks_at(&settings_path, "/opt/libra", timeout)
+                .expect("re-install Claude hooks");
+            let settings = load_claude_settings(&settings_path).expect("read settings");
+            assert!(all_claude_specs_installed(&settings, "/opt/libra"));
+            for target in claude_install_targets() {
+                let owned = owned_entries(&settings, target.event);
+                assert_eq!(
+                    owned.len(),
+                    1,
+                    "{}: no duplicate after re-enable",
+                    target.event
+                );
+                if target.set_host_timeout {
+                    assert_eq!(owned[0].timeout, Some(timeout));
+                    assert_eq!(
+                        owned[0].command,
+                        claude_hook_command("/opt/libra", target.subcommand, budget)
+                    );
+                } else {
+                    assert_eq!(owned[0].timeout, None);
+                    assert_eq!(
+                        owned[0].command,
+                        claude_hook_command("/opt/libra", target.subcommand, 9_000)
+                    );
+                }
+            }
+        }
+
+        let mut settings = load_claude_settings(&settings_path).expect("read settings");
+        assert!(remove_libra_claude_hooks(&mut settings));
+        assert!(
+            claude_install_targets()
+                .iter()
+                .all(|target| owned_entries(&settings, target.event).is_empty()),
+            "disable must remove every custom-timeout entry"
+        );
     }
 
     /// Builds one `matcher: null` Libra command matcher for `event → verb`.

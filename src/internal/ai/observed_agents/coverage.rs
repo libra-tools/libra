@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::reasoning;
+use crate::utils::json::normalize_json_value;
 
 /// Wire tag for a reasoning provider (coverage-v1 canonical form).
 fn reasoning_provider_tag(provider: reasoning::ReasoningProvider) -> &'static str {
@@ -3401,7 +3402,11 @@ fn canon_to_json(value: &CanonValue) -> serde_json::Value {
 /// fields cannot enter this shape because it is rebuilt solely from the typed
 /// coverage model.
 pub fn safe_turn_projection(agent_kind: &str, turn: &NormalizedTurn) -> serde_json::Value {
-    project_turn_for_schema(agent_kind, turn, COVERAGE_SCHEMA_VERSION)
+    normalize_json_value(project_turn_for_schema(
+        agent_kind,
+        turn,
+        COVERAGE_SCHEMA_VERSION,
+    ))
 }
 
 /// Build an allowlist-only projection for an explicitly validated coverage
@@ -3421,11 +3426,11 @@ pub fn safe_turn_projection_for_schema(
     {
         return Err(CoverageCodecError::ReasoningRequiresV2);
     }
-    Ok(project_turn_for_schema(
+    Ok(normalize_json_value(project_turn_for_schema(
         agent_kind,
         turn,
         schema_version.as_i64(),
-    ))
+    )))
 }
 
 fn project_turn_for_schema(

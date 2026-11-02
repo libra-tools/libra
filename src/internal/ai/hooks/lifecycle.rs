@@ -10,7 +10,7 @@
 //! traversal in `session_id`, capping `transcript_path` length) and produce stable
 //! dedup keys so duplicate hook deliveries can be filtered out at ingestion time.
 
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -384,29 +384,12 @@ pub fn apply_lifecycle_event(
     }
 }
 
-/// Canonicalize JSON for deterministic blob generation.
+/// Recursively sort object keys in a JSON value while preserving array order.
 ///
-/// Functional scope:
-/// - Recursively sorts object keys alphabetically using a `BTreeMap` so that two
-///   semantically equal payloads always serialise to the same byte sequence.
-/// - Arrays preserve order; only object key order is normalised.
-///
-/// Boundary conditions:
-/// - Numbers, strings, booleans, and nulls are returned untouched.
-/// - The function is `O(n log n)` in total node count due to the per-object sort.
-pub fn normalize_json_value(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(normalize_json_value).collect()),
-        Value::Object(map) => {
-            let normalized = map
-                .into_iter()
-                .map(|(key, value)| (key, normalize_json_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(normalized.into_iter().collect())
-        }
-        other => other,
-    }
-}
+/// Re-exported from [`crate::utils::json`] so canonical-JSON callers share one
+/// implementation that is independent of `serde_json`'s optional
+/// `preserve_order` feature.
+pub use crate::utils::json::normalize_json_value;
 
 /// Build a [`LifecycleEvent`] from a parsed envelope of the given kind.
 ///
@@ -714,7 +697,7 @@ pub(crate) fn lifecycle_event_canonical_json_with_identity(
     // `session_ref` is deliberately excluded. It historically carried a
     // provider-supplied transcript path, which is a provenance input rather
     // than syncable lifecycle evidence.
-    Value::Object(obj)
+    normalize_json_value(Value::Object(obj))
 }
 
 /// Serialise a batch of already-redacted lifecycle events as canonical

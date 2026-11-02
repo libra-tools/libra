@@ -2754,6 +2754,8 @@ impl fmt::Debug for OpaqueEncryptedBytes {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::json::normalize_json_value;
+
     fn transport_context() -> ImportTransportContext {
         ImportTransportContext::new(
             [1; 32],
@@ -3259,13 +3261,13 @@ mod tests {
                 records: vec![reasoning_record],
             },
         );
-        let actual = serde_json::to_string_pretty(&serde_json::json!({
+        let actual = serde_json::to_string_pretty(&normalize_json_value(serde_json::json!({
             "availability": statuses,
             "records": [absent, unknown, encrypted],
             "semantic_reasoning_canonical": reasoning_canonical,
             "semantic_reasoning_projection": projected,
             "semantic_reasoning_note": "RG-04 additive freeze: canonical bytes of a synthetic Reasoning record (write_canonical) and the full safe_turn_projection output; provider_visible text is redacted before any persistence and serde serialization of the variant is fail-closed.",
-        }))
+        })))
         .expect("fixed contract types serialize");
         assert_eq!(
             actual.trim(),

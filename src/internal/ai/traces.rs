@@ -17,13 +17,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use git_internal::hash::ObjectHash;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, Value};
 
-use crate::internal::ai::{
-    capture_scope::{
-        CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
-        authorize_final_capture_commit,
+use crate::{
+    internal::ai::{
+        capture_scope::{
+            CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
+            authorize_final_capture_commit,
+        },
+        hooks::lifecycle::LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION,
+        observed_agents::{Completeness, CoverageSchemaVersion, RedactedBytes},
     },
-    hooks::lifecycle::LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION,
-    observed_agents::{Completeness, CoverageSchemaVersion, RedactedBytes},
+    utils::json::normalize_json_value,
 };
 
 /// A caller-owned absolute deadline elapsed while a standalone traces-marker
@@ -901,9 +904,11 @@ pub(crate) fn build_checkpoint_manifest_json(
                     .collect::<Vec<_>>()
             ),
         );
-        serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
+        serde_json::to_vec_pretty(&normalize_json_value(manifest))
+            .context("failed to serialize checkpoint manifest.json")
     } else {
-        serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
+        serde_json::to_vec_pretty(&normalize_json_value(manifest))
+            .context("failed to serialize checkpoint manifest.json")
     }
 }
 

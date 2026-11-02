@@ -25,9 +25,19 @@ libra update-ref --stdin [-z] [--no-deref] [-m <reason>]
 
 ### 批量事务（`--stdin`）
 
-`--stdin` 读取 git 的批量协议，每行一条命令（`-z` 为 NUL 分隔记录）：
+`--stdin` 读取 git 的批量协议，每行一条命令。使用 `-z` 时，命令的**参数**以 NUL 分隔而非空白——
+命令词与 ref 仍在同一个空格分隔的字段里，因此值可以包含空格而无需引号：
 
-- `update <ref> <newvalue> [<oldvalue>]` —— 更新，可带 CAS；
+```text
+create <ref> NUL <newvalue> NUL
+update <ref> NUL <newvalue> NUL <oldvalue> NUL
+delete <ref> NUL [<oldvalue>] NUL
+verify <ref> NUL [<oldvalue>] NUL
+```
+
+（`-z` 与 `ls-files -z` / `status --porcelain -z` 不同：后者用 NUL 终止整条记录。）
+
+- `update <ref> <newvalue> [<oldvalue>]` —— 更新，可带 CAS；`-z` 下 `<oldvalue>` 字段必填；
 - `create <ref> <newvalue>` —— 仅创建（ref 必须不存在）；
 - `delete <ref> [<oldvalue>]` —— 删除，可带 CAS；
 - `verify <ref> [<oldvalue>]` —— 只读校验当前值；
@@ -45,7 +55,7 @@ libra update-ref --stdin [-z] [--no-deref] [-m <reason>]
 | `<newvalue>` | 新提交，可写对象 id 或任意 revision 表达式（`-d` 时省略）。 | `libra update-ref refs/heads/main HEAD~1` |
 | `<oldvalue>` | 比较并交换的期望当前值，可写 id 或 revision（`0{40}` = 必须不存在）。 | `libra update-ref -d refs/heads/topic HEAD` |
 | `--stdin` | 从 stdin 读取 `update`/`create`/`delete`/`verify`/`option`/`start`/`prepare`/`commit`/`abort` 批量命令；所有更新在单个事务内原子提交。 | `printf 'create refs/heads/x <oid>\n' \| libra update-ref --stdin` |
-| `-z`, `--null` | 配合 `--stdin` 使用 NUL 分隔记录。 | `libra update-ref -z --stdin` |
+| `-z`, `--null` | 配合 `--stdin`，用 NUL 分隔命令的参数（因此值可含空格，如 `:/fix bug`）。 | `libra update-ref -z --stdin` |
 | `--no-deref` | 为 git 兼容而接受；永不改变结果（范围内无符号 ref）。 | `libra update-ref --no-deref refs/heads/x <oid>` |
 | `--json` / `--machine` | 结构化输出：`{ ref, old, new, deleted }`（stdin 为 `{ refs, committed }`）。 | `libra --json update-ref refs/heads/main <oid>` |
 

@@ -391,7 +391,7 @@ export default {
 pub(super) fn install_opencode_hooks(options: &ProviderInstallOptions) -> Result<()> {
     let binary_path = resolve_hook_binary_path(options.binary_path.as_deref())?;
     if options.timeout_secs.is_some() {
-        bail!("OpenCode hooks do not support --timeout");
+        bail!("OpenCode hooks do not support --hook-timeout");
     }
 
     let plugin_path = opencode_plugin_path()?;
@@ -1003,8 +1003,8 @@ mod tests {
         assert!(OPENCODE_PLUGIN_TEMPLATE.contains(LIBRA_COMMAND_PLACEHOLDER));
     }
 
-    /// `--timeout` has no meaning for an OpenCode JS plugin — reject it like
-    /// the Gemini installer does.
+    /// `--hook-timeout` has no meaning for an OpenCode JS plugin — reject it
+    /// like the Gemini installer does.
     #[test]
     fn install_rejects_timeout_option() {
         let options = ProviderInstallOptions {
@@ -1013,7 +1013,7 @@ mod tests {
         };
         let err = install_opencode_hooks(&options).unwrap_err();
         assert!(
-            format!("{err:#}").contains("do not support --timeout"),
+            format!("{err:#}").contains("do not support --hook-timeout"),
             "got: {err:#}",
         );
     }

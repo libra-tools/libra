@@ -17,7 +17,9 @@ use super::{
 };
 use crate::{
     internal::{sequencer, sparse, worktree_scope::RequestScope},
-    utils::{atomic_write::write_atomic, client_storage::ClientStorage},
+    utils::{
+        atomic_write::write_atomic, client_storage::ClientStorage, json::normalize_json_value,
+    },
 };
 
 const FACET_SCHEMA_VERSION: u32 = 1;
@@ -156,7 +158,7 @@ impl StateFacet for SequencerFacet {
             )
             .map_err(FacetError::Capture)?
             .map_err(FacetError::Capture)?;
-        let value = state.unwrap_or_else(|| json!({"present": false}));
+        let value = normalize_json_value(state.unwrap_or_else(|| json!({"present": false})));
         let bytes =
             serde_json::to_vec(&value).map_err(|error| FacetError::Capture(error.to_string()))?;
         let oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);

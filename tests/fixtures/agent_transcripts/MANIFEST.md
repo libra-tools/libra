@@ -75,7 +75,10 @@ The original `src/internal/ai/capture/pending_payload.rs` SHA-256 was
 the original `src/internal/ai/capture/pending.rs` SHA-256 was
 `393c9c7877c15680246a2ebcd1ce8c560ed2f61881dd0586d8f7871e7488743a`.
 The fixture SHA-256 at freeze is
-`96d71660e8b75d61cff2dccaa59a410b90b499afd63e10c9dcc2cc678312e32c`.
+`e8578fce3419fdb7a70b69242f9c3220767897e3fda9ddc1f61e6a9d014a450a`
+(updated when the frozen decoder gained explicit key canonicalization for the
+GPUI-forced `serde_json/preserve_order` feature; the canonical order matches
+the original `BTreeMap` behavior).
 The copied payload decoder/schema is production lines 1–674 (only its two
 inner doc comments became ordinary comments for `include!`). The following
 `pending.rs` source fragments from the same commit are compiled in the same

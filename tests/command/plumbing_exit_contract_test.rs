@@ -70,6 +70,11 @@ const CORE_QUADRANTS: [Quadrant; 4] = [
 /// justified here, never both and never neither.
 const NA_QUADRANTS: &[(&str, Quadrant, &str)] = &[
     (
+        "update-ref",
+        Quadrant::MissingObject,
+        "`update-ref -d <missing-ref>` is a successful no-op when no CAS value is supplied; deletion does not resolve an object",
+    ),
+    (
         "hash-object",
         Quadrant::MissingObject,
         "hash-object resolves no existing objects; it only hashes input content \
@@ -390,13 +395,12 @@ fn build_cases(valid_idx: &str) -> Vec<Case> {
             &["update-ref", "refs/heads/extra", "HEAD"],
         ),
         Case::new(
-            "update-ref -d missing ref",
+            "update-ref -d missing ref is a no-op",
             "update-ref",
-            Quadrant::MissingObject,
-            128,
+            Quadrant::Valid,
+            0,
             &["update-ref", "-d", "refs/heads/does-not-exist"],
-        )
-        .with_error_code("LBR-REPO-003"),
+        ),
         Case::new(
             "update-ref unresolvable new value",
             "update-ref",

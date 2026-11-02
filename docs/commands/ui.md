@@ -3,9 +3,9 @@
 Open the Libra desktop design preview with bundled demonstration data.
 This is a Libra extension. Git has no equivalent.
 
-The window is compiled in only when Libra is built with the `gui` feature.
-A default `cargo build` still produces the CLI, and `libra ui` on that
-binary explains how to rebuild.
+The window is part of every standard Libra build. No Cargo feature flag is
+required; a plain `cargo build` produces a binary where `libra ui` opens the
+window.
 
 ## Synopsis
 
@@ -48,12 +48,17 @@ The command does not read or write a repository.
 `libra ui --help` prints this command's usage and does not open a window.
 Any other argument is a usage error, also without opening a window.
 
-A build without `--features gui` exits 128 with `LBR-UNSUPPORTED-001`.
-The message names `cargo build --features gui`.
-
 Calling the command through the library dispatcher (`libra::exec`) does not
-open a window. The window has to start from the `libra` process entry point,
-because the UI toolkit owns the main thread.
+open a window; it returns `LBR-UNSUPPORTED-001` because the UI toolkit must own
+the process main thread. The window has to start from the `libra` process entry
+point.
+
+On Linux, a session with neither `DISPLAY` nor `WAYLAND_DISPLAY` exits 128 with
+`LBR-UNSUPPORTED-001` and a clear message before GPUI starts.
+
+Building from source links the GPUI desktop stack. Linux builds need the
+fontconfig and xkbcommon development headers (`libfontconfig1-dev`,
+`libxkbcommon-dev`, and `libxkbcommon-x11-dev` on Debian/Ubuntu).
 
 ## Options
 
@@ -64,19 +69,15 @@ subcommand (`libra --no-pager ui`) are ignored by the window.
 
 | Code | Meaning |
 |------|---------|
-| `0` | The window was opened and then closed. Requires `--features gui`. |
-| `128` | This binary has no desktop UI (`LBR-UNSUPPORTED-001`), or the window failed to open. |
+| `0` | The window was opened and then closed. |
+| `128` | The window failed to open, or Linux has no graphical display (`LBR-UNSUPPORTED-001`). |
 | `129` | Extra arguments. `libra ui --help` exits 0. |
 
 ## Examples
 
 ```bash
-# Default CLI build: explains the missing feature and exits 128.
+# Open the desktop window.
 libra ui
-
-# Build the window into the same libra binary, then open it.
-cargo build --features gui
-./target/debug/libra ui
 
 # Usage text. Does not open a window.
 libra ui --help

@@ -1,3 +1,9 @@
+> **2026-11-02 LTR-12 长期索引：** 公开 `agent push --mega2`。force-rewrite 在网络前拒绝。epoch 重试复用。scope 解析失败记 `scope_resolution_pending` 且不新建 epoch。命令测试 1 passed。Live 未跑。
+
+> **2026-11-02 LTR-11 长期索引：** by-path/by-scope 路径、派生 `ssh://traces@`、缺 `libra-traces-v1` 拒绝、Mega2 force-rewrite 在网络前拒绝、非快进不转 force/不新建 epoch/不回退代码 push。库测试 1 passed。Live 未跑。
+
+> **2026-11-02 LTR-10 长期索引：** source 取 `RepoIdentity`，首次 epoch 在返回前写入仓库配置，显式 new-stream 才轮换；linked worktree 共用、独立 clone 分开。库测试 1 passed。Live fixture 缺席，live 门未执行。公开入口仍留给 LTR-12。无 Claude/Codex。
+
 > **2026-10-31 15:28 UTC GOV C3 长期索引：** f9 同树唯一 C3 的 focused1/1 与原双 env full11083/11083、25原 ignored、0失败/FLAKY/TRY 均自然 exit0；后检源/DB/stash同一、owned survivors0，full 原件 `d52f56fb…`、terminal `09b87ad5…`。审计 v1 解析成功 Summary 假阴性 exit1 保留，v2 exit0且 ignored 逐名同一；39个既有条件跳过不计功能覆盖。七文档结果回填后的 B/VER7/fmt 已按最终字节 exit0（仓外 `governance-final-docs-c3/final-3/` 原件）；fresh upstream、签名DCO、push 和适用 main D 仍待，GOV 0/1、LTR 0/26、资格/H1/旧 D FAIL 不变；C1/P1/C2 STOP 与 R4 OAuth 无判词仍保留，用户只豁免本 GOV 后续 Claude Review。详见日期计划 GOV 卡。
 
 > **2026-10-31 14:35 UTC GOV C2 STOP 长期索引：** P2 两相完整前检 PASS、11083默认/11108扩展/25原 ignored，fmt/Clippy/build 均exit0；C2唯一claim `89ccfdb5…`，focused1/1 PASS，full仅6539/11083运行、6469 PASS/70 FAIL/1 FLAKY/25原 ignored，4544因进程扫描竞态触发的SIGTERM未运行。child umask0002 令本地 `.libra` group-writable 与 Pi UnsafeDirectory/模式断言失败；full自然退出码未知、controller exit1/STOP，源/DB/stash后检同一、owned零存活。原件 full stderr `5aede707…`、terminal `4aecb6d4…` 见日期计划；C1/P1/C2原失败与已耗窗口保留。C3候选仅修子进程0022和`/proc`消失竞态，原完整覆盖/重试/超时不改，未claim。用户仅本GOV本轮免Claude，旧R4无PASS；GOV 0/1、LTR 0/26、资格/H1/旧D FAIL、未签推/D不变。

@@ -61,7 +61,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         &["Field", "Value"],
                         &[
                             vec!["version", env!("CARGO_PKG_VERSION")],
-                            vec!["features", "gui"],
+                            vec!["desktop window", "always built"],
                             vec!["UI toolkit", "gpui-pre 0.3.10 · Ely dd727f4"],
                             vec!["platform", std::env::consts::OS],
                             vec!["architecture", std::env::consts::ARCH],

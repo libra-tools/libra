@@ -33,6 +33,7 @@
 ## 实现历史
 
 - 2026-06-30（GGT-06 part 2，`grit-gap.md` 阶段 2）：与 `update-index` 同属 GGT-06；本命令第二个发布；新增 `ReflogAction::UpdateRef`。
+- 2026-11-01（issues/479 UR-01 B4 修正）：`--stdin -z` 改为 Git 的**字段**分隔语义（`create <ref> NUL <newvalue> NUL`），此前实现把 NUL 当记录终止符、字段仍按空白切分，因此 Git 格式输入必然 128，且带空格的值（如 `:/fix bug`）两种模式都无法表达。`update` 在 `-z` 下要求 `<oldvalue>` 字段（与 Git 一致），旧的私方言被拒绝（`invalid ref format`）。
 
 ## 当前状态
 

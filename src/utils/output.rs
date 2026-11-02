@@ -16,7 +16,10 @@ use std::{
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
-use crate::utils::error::{CliError, CliResult, StableErrorCode};
+use crate::utils::{
+    error::{CliError, CliResult, StableErrorCode},
+    json::normalize_json_value,
+};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -102,11 +105,12 @@ fn write_json_command_envelope<W: Write, T: Serialize>(
     data: &T,
     format: JsonFormat,
 ) -> io::Result<()> {
-    let envelope = serde_json::json!({
+    let data = serde_json::to_value(data).map_err(io::Error::other)?;
+    let envelope = normalize_json_value(serde_json::json!({
         "ok": true,
         "command": command,
         "data": data,
-    });
+    }));
     match format {
         JsonFormat::Pretty => serde_json::to_writer_pretty(&mut *writer, &envelope)?,
         JsonFormat::Compact | JsonFormat::Ndjson => serde_json::to_writer(&mut *writer, &envelope)?,
@@ -382,13 +386,19 @@ pub fn emit<T: CommandOutput>(value: &T, config: &OutputConfig) -> CliResult<()>
     let mut w = stdout.lock();
     match config.json_format {
         Some(JsonFormat::Pretty) => {
-            let envelope = serde_json::json!({"ok": true, "data": value});
+            let data = serde_json::to_value(value)
+                .map(normalize_json_value)
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            let envelope = normalize_json_value(serde_json::json!({"ok": true, "data": data}));
             serde_json::to_writer_pretty(&mut w, &envelope)
                 .map_err(|e| stdout_json_error("serialize JSON output", e))?;
             writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Compact) => {
-            let envelope = serde_json::json!({"ok": true, "data": value});
+            let data = serde_json::to_value(value)
+                .map(normalize_json_value)
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            let envelope = normalize_json_value(serde_json::json!({"ok": true, "data": data}));
             serde_json::to_writer(&mut w, &envelope)
                 .map_err(|e| stdout_json_error("serialize JSON output", e))?;
             writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
@@ -430,13 +440,19 @@ pub fn emit_list<T: CommandOutput>(items: &[T], config: &OutputConfig) -> CliRes
     let mut w = stdout.lock();
     match config.json_format {
         Some(JsonFormat::Pretty) => {
-            let envelope = serde_json::json!({"ok": true, "data": items});
+            let data = serde_json::to_value(items)
+                .map(normalize_json_value)
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            let envelope = normalize_json_value(serde_json::json!({"ok": true, "data": data}));
             serde_json::to_writer_pretty(&mut w, &envelope)
                 .map_err(|e| stdout_json_error("serialize JSON output", e))?;
             writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;
         }
         Some(JsonFormat::Compact) => {
-            let envelope = serde_json::json!({"ok": true, "data": items});
+            let data = serde_json::to_value(items)
+                .map(normalize_json_value)
+                .map_err(|e| stdout_json_error("serialize JSON output", e))?;
+            let envelope = normalize_json_value(serde_json::json!({"ok": true, "data": data}));
             serde_json::to_writer(&mut w, &envelope)
                 .map_err(|e| stdout_json_error("serialize JSON output", e))?;
             writeln!(w).map_err(|e| stdout_write_error("write JSON output", e))?;

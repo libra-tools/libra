@@ -52,9 +52,12 @@ The installer appends a hidden, bounded `--capture-budget-ms` argument to
 each managed command: it derives the value from the provider handler timeout
 while retaining up to 1000ms for terminal pending-finalizer cleanup (a
 one-second legacy handler retains a usable `500ms` capture slice; the defaults
-are Claude `10s → 9000` and Codex ordinary events `30s → 29000`). Codex
+are `30s → 29000` for Claude and for Codex ordinary events, while the Claude
+`SessionEnd` entry carries no host timeout and keeps `9000`). Codex
 `SessionEnd` is capped by its host at `3s → 2000`, even when another requested
-Codex timeout is longer. It is not a public tuning flag. Re-run `libra agent
+Codex timeout is longer. The budget itself is not a public tuning flag; choose
+the handler timeout it derives from with `libra agent enable --agent <provider>
+--hook-timeout <seconds>` (Claude Code and Codex only). Re-run `libra agent
 enable --agent <provider>` to refresh an older hook configuration; the runtime
 converts the value to one dual-clock deadline before reading hook stdin,
 bounds its database waits, and never re-anchors a terminal receipt's original
@@ -372,12 +375,12 @@ claude` looks roughly like:
 ```json
 {
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-start --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude prompt --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "PreToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude stop --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-end --capture-budget-ms 9000", "timeout": 10, "statusMessage": "libra capture"}]}]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-start --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude prompt --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude stop --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-end --capture-budget-ms 9000", "statusMessage": "libra capture"}]}]
   }
 }
 ```

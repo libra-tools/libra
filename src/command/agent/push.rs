@@ -30,6 +30,17 @@ const DEFAULT_TRACES_REMOTE: &str = "origin";
 const TRACES_REMOTE_REF: &str = "refs/libra/traces";
 
 pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()> {
+    if let Err(message) = crate::internal::protocol::mega2_traces::admit_before_network(
+        args.mega2,
+        args.force_rewrite,
+    ) {
+        return Err(CliError::conflict(message).with_hint(
+            "Mega2 traces mode does not turn a rejected update into a force or a new epoch",
+        ));
+    }
+    if args.mega2 {
+        return execute_mega2(args, output).await;
+    }
     let remote = args
         .remote
         .unwrap_or_else(|| DEFAULT_TRACES_REMOTE.to_string());
@@ -118,4 +129,69 @@ pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()
         }
         Err(err) => Err(err),
     }
+}
+
+async fn execute_mega2(args: PushArgs, _output: &OutputConfig) -> CliResult<()> {
+    let workdir = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve the working directory for the Mega2 traces push: {error}"
+        ))
+    })?;
+    let intent = if args.new_stream {
+        super::mega2_stream::EpochIntent::NewStream
+    } else {
+        super::mega2_stream::EpochIntent::Current
+    };
+    let remote = args
+        .remote
+        .unwrap_or_else(|| DEFAULT_TRACES_REMOTE.to_string());
+    let binding = super::mega2_stream::bind_source_epoch_at(&workdir, intent)
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    let url_key = format!("remote.{remote}.url");
+    let url = super::mega2_stream::repository_config_at(&workdir, &url_key)
+        .await
+        .map_err(|error| CliError::fatal(error.to_string()))?;
+    let Some(url) = url.filter(|value| !value.is_empty()) else {
+        return Err(CliError::fatal(format!(
+            "remote '{remote}' has no URL; the Mega2 traces push stopped before any network attempt. Saved epoch {} will be reused on retry",
+            binding.epoch
+        ))
+        .with_hint("set the remote URL, then retry without --new-stream unless you mean to open another epoch"));
+    };
+    let ssh = url.starts_with("ssh://");
+    let derived = if ssh {
+        crate::internal::protocol::mega2_traces::derive_scoped_ssh_uri(&url).map_err(|message| {
+            CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?
+    } else {
+        url.clone()
+    };
+    if ssh && derived == url {
+        return Err(CliError::fatal(
+            "refusing to reuse an SSH URL whose login was already rewritten in the stored remote"
+                .to_string(),
+        ));
+    }
+    let path = crate::internal::protocol::mega2_traces::by_path_git_path(
+        &crate::internal::protocol::mega2_traces::ByPathLocator {
+            target_path: "/".to_string(),
+            source_id: binding.source,
+            epoch: binding.epoch,
+            hash_kind: crate::internal::protocol::mega2_traces::HashKind::Sha1,
+        },
+    )
+    .map_err(CliError::fatal)?;
+    // Capability discovery is a network read. This entry refuses to open it
+    // until the remote advertisement is supplied by the live transport.
+    // The typed URL is planned and the stored code remote is left unchanged.
+    let _ = (derived, path);
+    Err(CliError::conflict(
+        "Mega2 traces push has a saved epoch and a typed TraceRepo URL, and it stopped before network admission because the remote has not advertised libra-traces-v1 to this command",
+    )
+    .with_hint(format!(
+        "the stored remote '{remote}' URL was not modified"
+    )))
 }

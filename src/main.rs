@@ -512,30 +512,46 @@ fn run_capture_scope_binding_helper_if_requested() -> Option<i32> {
     Some(0)
 }
 
-/// Open the desktop window, or explain how to build it.
+/// Whether the process can reach a graphical display.
 ///
-/// Feature `gui` runs GPUI on this thread. Without it, the process exits
-/// with `LBR-UNSUPPORTED-001` and the rebuild command.
+/// GPUI needs Wayland or X11 on Linux. macOS and Windows always have a window
+/// server, so the check is a no-op there.
+#[cfg(target_os = "linux")]
+fn desktop_display_available() -> bool {
+    let non_empty = |name: &str| {
+        std::env::var_os(name)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    };
+    non_empty("WAYLAND_DISPLAY") || non_empty("DISPLAY")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn desktop_display_available() -> bool {
+    true
+}
+
+/// Open the desktop window on the process main thread.
+///
+/// GPUI owns the main thread, so this runs before the CLI worker thread
+/// starts. A window failure exits with code `128` and the standard
+/// internal-error report hint.
 fn run_desktop_ui() -> i32 {
-    #[cfg(feature = "gui")]
-    {
-        match libra::gui::run() {
-            Ok(()) => 0,
-            Err(error) => {
-                eprintln!("fatal: {error:#}\n\nHint: {INTERNAL_ERROR_REPORT_HINT}");
-                128
-            }
-        }
-    }
-    #[cfg(not(feature = "gui"))]
-    {
-        let err = libra::command::ui::unavailable_error();
+    if !desktop_display_available() {
+        let err = libra::command::ui::display_unavailable_error();
         let argv: Vec<String> = std::env::args_os()
             .filter_map(|arg| arg.into_string().ok())
             .collect();
         let output = OutputConfig::resolve_from_argv(&argv);
         err.print_for_output(&output);
-        err.exit_code()
+        return err.exit_code();
+    }
+    match libra::gui::run() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("fatal: {error:#}\n\nHint: {INTERNAL_ERROR_REPORT_HINT}");
+            128
+        }
     }
 }
 

@@ -44,7 +44,10 @@ use std::{
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use crate::utils::output::{JsonFormat, OutputConfig, record_warning};
+use crate::utils::{
+    json::normalize_json_value,
+    output::{JsonFormat, OutputConfig, record_warning},
+};
 
 /// Shared CLI result type used by every command handler and dispatcher.
 pub type CliResult<T = ()> = Result<T, CliError>;
@@ -1114,6 +1117,7 @@ impl CliError {
                 JsonFormat::Pretty => {
                     // Re-parse and pretty-print the JSON.
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                        let value = normalize_json_value(value);
                         let _ = serde_json::to_writer_pretty(&mut writer, &value);
                         let _ = writeln!(writer);
                     } else {
@@ -1170,7 +1174,11 @@ impl CliError {
             message: self.message.clone(),
             usage: self.usage.clone(),
             hints: self.effective_hints(),
-            details: self.details.clone(),
+            details: self
+                .details
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_json_value(value.clone())))
+                .collect(),
         }
     }
 

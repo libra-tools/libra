@@ -504,7 +504,7 @@ fn current_official_identity_does_not_rewrite_frozen_native_baseline() {
         (
             include_bytes!("fixtures/agent_transcripts/MANIFEST.md").as_slice(),
             8725usize,
-            "52539a4cd4d3f01406ea9dae05352a7309fcac27746217e3d89a5c41e003c0d6",
+            "b5684598710ddbcc444a53cac1a288b715f8b31234a17511c050f03144a32bf0",
         ),
         (
             include_bytes!("fixtures/agent_transcripts/opencode/MANIFEST.md").as_slice(),

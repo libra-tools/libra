@@ -405,6 +405,27 @@ check_dependencies() {
     else
         error_exit "neither curl nor wget found" "detect" "install one of them, then re-run"
     fi
+
+    # The binary links the GPUI desktop window, so these runtime libraries are
+    # required even when `libra ui` is never used. Warn (never abort): minimal
+    # and non-glibc hosts may resolve them through a non-ldconfig path.
+    if [ "$OS" = "linux" ]; then
+        ldconfig_bin=$(command -v ldconfig 2>/dev/null || true)
+        if [ -z "$ldconfig_bin" ] && [ -x /sbin/ldconfig ]; then
+            ldconfig_bin=/sbin/ldconfig
+        fi
+        if [ -n "$ldconfig_bin" ]; then
+            missing_libs=
+            for lib in libfontconfig.so.1 libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+                if ! "$ldconfig_bin" -p 2>/dev/null | awk -v lib="$lib" '$1 == lib { found = 1 } END { exit found ? 0 : 1 }'; then
+                    missing_libs="${missing_libs} ${lib}"
+                fi
+            done
+            if [ -n "$missing_libs" ]; then
+                warn_fact "runtime libraries" "missing:${missing_libs} — install fontconfig and xkbcommon (see docs/installation.md)"
+            fi
+        fi
+    fi
 }
 
 download_file() {

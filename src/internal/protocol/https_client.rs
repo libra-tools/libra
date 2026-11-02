@@ -21,6 +21,11 @@ use crate::{
     },
 };
 
+/// Ordinary HTTPS transports do not carry a Mega2 traces locator.
+pub(crate) fn ordinary_code_transport_allows(url: &str) -> Result<(), String> {
+    super::mega2_traces::reject_traces_locator_on_code_transport(url)
+}
+
 /// A Git protocol client that communicates with a Git server over HTTPS.
 /// Only support `SmartProtocol` now, see [http-protocol](https://www.git-scm.com/docs/http-protocol) for protocol details.
 pub struct HttpsClient {

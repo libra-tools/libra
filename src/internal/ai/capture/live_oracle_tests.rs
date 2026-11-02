@@ -23,15 +23,18 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use tempfile::TempDir;
 
-use crate::internal::ai::{
-    capture::{
-        ingress::lower_in_process_capture_frame_for_test,
-        test_support::ingest_agent_traces_ingress_outcome_for_test,
+use crate::{
+    internal::ai::{
+        capture::{
+            ingress::lower_in_process_capture_frame_for_test,
+            test_support::ingest_agent_traces_ingress_outcome_for_test,
+        },
+        hooks::{
+            HookProvider, LifecycleEventKind, ProviderHookCommand,
+            providers::{claude_provider, codex_provider, opencode_provider},
+        },
     },
-    hooks::{
-        HookProvider, LifecycleEventKind, ProviderHookCommand,
-        providers::{claude_provider, codex_provider, opencode_provider},
-    },
+    utils::json::normalize_json_value,
 };
 
 const ORACLE_BOOTSTRAP_SQL: &str = include_str!("../../../../sql/sqlite_20260309_init.sql");
@@ -386,6 +389,7 @@ async fn live_checkpoint_metadata_shape_is_stable() {
                 let mut document: Value = serde_json::from_slice(&bytes)
                     .unwrap_or_else(|error| panic!("{label} {file} is not JSON: {error}"));
                 oracle_normalize(&mut document, &repo.to_string_lossy());
+                document = normalize_json_value(document);
                 observed.push(format!("{label} {index} {scope} {file} {document}"));
             }
         }
@@ -491,6 +495,7 @@ async fn live_checkpoint_metadata_shape_claude_codex_ci() {
                 let mut document: Value = serde_json::from_slice(&bytes)
                     .unwrap_or_else(|error| panic!("{label} {file} is not JSON: {error}"));
                 oracle_normalize(&mut document, &repo.to_string_lossy());
+                document = normalize_json_value(document);
                 observed.push(format!("{label} {index} {scope} {file} {document}"));
             }
         }

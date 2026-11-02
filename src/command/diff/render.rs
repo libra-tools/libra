@@ -647,10 +647,54 @@ pub(super) fn rename_display(old: &str, new: &str) -> String {
     }
 }
 
+/// A plumbing stat-invalid entry with unchanged content has no patch to show.
+///
+/// `--raw` and `--name-status` still report it (`M` with an all-zero worktree
+/// id, Git's pessimistic plumbing contract), but Git emits **no** `-p` body for
+/// it because the two sides are byte-identical. `read-tree` makes every entry
+/// stat-invalid, so without this filter `diff-index -p` would print a bogus
+/// `--- /dev/null` header for an empty tracked file (issues/479 DF-01, TC-0044).
+pub(super) fn patch_has_no_content_change(file: &DiffFileStat) -> bool {
+    if file.status != "modified" {
+        return false;
+    }
+    let (Some(old), Some(new)) = (file.old_mode, file.new_mode) else {
+        return false;
+    };
+    if old != new || file.binary.is_some() || file.raw_diff.starts_with("diff --cc ") {
+        return false;
+    }
+    if file.raw_diff.contains("Binary files ") || file.raw_diff.contains("GIT binary patch") {
+        return false;
+    }
+    if file.raw_diff.contains("\n@@ ") {
+        return false;
+    }
+    // Only the plumbing stat-only shape qualifies: the engine renders the
+    // unhashed worktree side as an all-zero object id (`index <old>..<zeros>`).
+    // A header-only patch WITHOUT that marker (a `<LargeFile>` marker, a
+    // stripped whitespace-only body, a gitlink change) is real output and must
+    // keep flowing.
+    let Some(index_line) = file
+        .raw_diff
+        .lines()
+        .find(|line| line.starts_with("index "))
+    else {
+        return false;
+    };
+    let ids = index_line.trim_start_matches("index ");
+    let Some((_, new_id)) = ids.split_once("..") else {
+        return false;
+    };
+    let new_id = new_id.split_whitespace().next().unwrap_or_default();
+    !new_id.is_empty() && new_id.chars().all(|c| c == '0')
+}
+
 pub(super) fn format_unified_diff(result: &DiffOutput) -> String {
     result
         .files
         .iter()
+        .filter(|file| !patch_has_no_content_change(file))
         .map(|file| file.raw_diff.trim_end_matches('\n'))
         .collect::<Vec<_>>()
         .join("\n")

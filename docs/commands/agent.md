@@ -4,6 +4,8 @@
 
 Manage external-agent capture for Claude Code, Codex, OpenCode, and Grok.
 
+`libra agent push --mega2 [--remote <name>] [--new-stream]` sends `refs/libra/traces` to a Mega2 TraceRepo. The repository source is `libra.repoid`. The first epoch is stored before any network attempt and reused on retry. `--new-stream` is the only way to replace that epoch. `--mega2 --force-rewrite` is refused before a connection is opened; a non-fast-forward rejection is not turned into a force, a new epoch, or a push of the ordinary code remote. SSH uses a derived `traces@` login and does not rewrite the stored remote URL. If the remote has no URL, the command stops locally and prints the saved epoch. A successful push whose scope UUID cannot be read back stays successful and records `scope_resolution_pending`.
+
 Grok is supported and hook-installable with `support_wave=grok`, not `first_batch`, and is not a `review` or `investigate` launcher. **Automatic Thinking capture is paused.** Hook lifecycle events are recorded through the shared pipeline; decoding does not read session logs or write `GROK_HOME/libra-capture`. Existing readers for local `updates.jsonl` and `chat_history.jsonl` are not yet connected to the authorized snapshot/checkpoint writer. Offline observer JSON is scratch state, not a Libra checkpoint. The intended transcript retains Thinking text and unproven `encrypted_content`; Libra does not decrypt it. Current synthetic reader tests do not prove that live checkpoints contain it. Default `checkpoint show` does not print Thinking plaintext; an explicit transcript path returns only content actually stored.
 
 Hermes is supported and hook-installable with `support_wave=hermes`, not `first_batch`, and is not a `review` or `investigate` launcher. Migration `2026103001` accepts `agent_kind=hermes` and keeps every previously accepted kind, including `grok` and `opencode`; it does not add `pi` (see the next paragraph). The internal reader accepts the official JSONL export: rows with both `active` and `compacted` false stay out, and a non-empty `reasoning` or `reasoning_content` string is kept. `reasoning_details`, `codex_reasoning_items`, and `codex_message_items` stay raw strings. When that export is unavailable, Libra reads a read-only SQLite view and does not migrate the provider database. `libra agent list` includes `hermes`. Install writes `HERMES_HOME/plugins/libra-hermes-capture` only when the file contains the `libra capture` marker and its sha256 matches the recorded hash. An unmanaged or drifted file is left unchanged. A bare `libra agent enable` skips Hermes when `hermes` on `PATH` is missing or is not v0.22.5 `bf0203a`, and an explicit enable in that case changes no files. Review and investigate launch stay closed. `cloud sync` still refuses `hermes` before any remote write (`LBR-CONFLICT-002`, also with `--force`): while such local-only capture sessions exist the refusal persists until a release adds cloud support for the kind, and the hint points to an external backup of the whole repository meanwhile (see [`cloud`](cloud.md)). `libra agent import --path <session-id>.jsonl --agent hermes --yes` imports one official export into the local repository and does not scan a Hermes home. Messages are ordered by id. Thinking strings stay attached and unproven, and are not copied into the assistant answer. Absent usage is unknown, not zero. A non-default profile, a non-cli source, and an unproven parent are refused. Repeating the import does not write another checkpoint. The bounded snapshot keeps that thinking as unproven and partial, and refuses retained thinking text above 8 MiB. It is not the assistant answer, and a synthetic export does not pass the real-session acquisition gate. The live bridge runs `hermes sessions export --format jsonl --session-id <id> <output-file>` only while it holds the export-job lease, with a 2 second deadline. `libra agent rpc trust hermes` pins that executable and does not accept OpenCode trust. A timeout is partial and can be retried. `libra agent doctor` reports the bridge as source-qualified and does not claim native origin. `libra agent hooks hermes observe` accepts the proven observers. `on_session_end` records a turn and does not close the session. `on_session_finalize` is the teardown and uses the shared capture finalizer. Control hooks and subagent events are not registered. The installed plugin forwards only identity fields and does not read the Hermes database. A local CLI export may use `source=cli` or Hermes's `source=local` together with `created_source=cli`, and may carry `user_id` of the form `uid:<current-euid>`. Every other source or non-empty user id stays refused. CI uses fake exports. The real acquisition check uses an isolated Hermes profile and does not read the operator's `~/.hermes` state. Coverage still does not include cloud sync: `cloud sync` keeps refusing `hermes`. Recovery is forward-only: a drifted capture file is not overwritten or deleted.
@@ -216,7 +218,7 @@ libra agent status
 libra agent list [--schema-version <1|2>] [--json]
 libra agent import (--session <id> | --path <path> | --since <rfc3339> | --all) [--agent <name>] [--limit <n>] [--cursor <n>] --yes
 libra --json agent graph <session> [--repo <path>]
-libra agent enable [--agent <name>]...
+libra agent enable [--agent <name>]... [--hook-timeout <seconds>]
 libra agent add [<name>...]
 libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
@@ -459,6 +461,7 @@ Tool results are redacted before they are written. The server redacts `structure
 | Flag | Subcommand | Description |
 |------|------------|-------------|
 | `--agent <name>` | `enable`, `disable` | Select agent names; omit to target the supported roster (`add`/`remove` take the names positionally) |
+| `--hook-timeout <seconds>` | `enable` | Host handler timeout written into the installed Claude Code and Codex hooks (default 30). The hidden `--capture-budget-ms` is derived as the timeout minus up to 1000ms of cleanup margin (`30 → 29000`, `60 → 59000`). Claude `SessionEnd` keeps no timeout and a `9000` budget; Codex `SessionEnd` and `Interrupt` stay capped at `3s → 2000`. Every selected agent must take a host timeout: combining it with OpenCode, Grok, or Hermes fails with `LBR-CLI-002` before any hook is written. `0` or a non-number is rejected. Re-running `enable` without the flag restores the default |
 | `--schema-version <1\|2>` | `list` | Select the machine schema. Version 1 is the frozen legacy row; version 2 adds `methods[]` entries for `transcript_discoverable`, `importable`, and `export_bridge` availability |
 | `--session <id>` / `--path <path>` / `--since <rfc3339>` / `--all` | `import` | Select exactly one historical-import scope. `--path` also requires `--agent`; OpenCode supports explicit `--session` through its export bridge |
 | `--yes` | `import` | Required for JSON/non-TTY imports; confirms that Libra may read private provider session content, redact it, and write typed projections to this repository |
@@ -1164,6 +1167,9 @@ libra agent add claude-code
 # Enable Claude Code capture and install its hooks
 libra agent enable --agent claude
 
+# Install Claude Code hooks with a 60-second host timeout (capture budget 59000ms)
+libra agent enable --agent claude --hook-timeout 60
+
 # Enable every supported agent at once
 libra agent enable
 
@@ -1290,10 +1296,14 @@ on them:
 - Hook configs that `libra agent enable` installs for Claude Code and Codex
   invoke the top-level `libra hooks claude|codex <verb>` commands with an installer-owned bounded
   `--capture-budget-ms` argument derived from the handler timeout (default
-  Claude `10s → 9000`, Codex ordinary events `30s → 29000`, and Codex
+  Claude and Codex ordinary events `30s → 29000`; Claude `SessionEnd` has no
+  host timeout and keeps `9000`; Codex
   `SessionEnd` and `Interrupt` `3s → 2000` because that host event has a three-second
   maximum; a one-second legacy handler keeps a usable `500ms` capture slice
-  and up to 1000ms remains for terminal finalizer cleanup). Re-running enable refreshes older configs; the hidden
+  and up to 1000ms remains for terminal finalizer cleanup). Choose another
+  handler timeout with `libra agent enable --hook-timeout <seconds>`; hooks
+  written by the previous Claude default (`10s → 9000`) or another timeout
+  stay Libra-owned and are replaced in place. Re-running enable refreshes older configs; the hidden
   alias accepts the same argument for legacy installed commands. The installed
   OpenCode plugin (`.opencode/plugin/libra-hooks.js`) instead forwards every
   event through the hidden `libra agent hooks opencode <verb>` entry, without an

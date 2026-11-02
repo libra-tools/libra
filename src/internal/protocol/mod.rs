@@ -29,6 +29,7 @@ pub mod mega2_diag; // plan-20261001 MN-01: machine-readable details for mega2 H
 pub mod mega2_entry; // plan-20260912 MB-04: bounded POST /api/v1/create-entry directory client
 pub mod mega2_mutate; // plan-20260912 MB-07: bounded delete-entry / move-entry client
 pub mod mega2_tag; // plan-20260912 MB-10: tag_router list/create/get/delete client
+pub mod mega2_traces; // plan-20261015 LTR-11: typed TraceRepo transport
 pub mod mega2_tree; // plan-20260912: bounded mega2 /api/v1/tree listing client
 pub mod repository_arg; // issues/480 HP-06: shared fetch/pull/push repository-arg parsing
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)

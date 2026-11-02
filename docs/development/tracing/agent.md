@@ -157,8 +157,8 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude session-start --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude session-start --capture-budget-ms 29000",
+               "timeout": 30
              }
            ]
          }
@@ -169,8 +169,8 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude prompt --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude prompt --capture-budget-ms 29000",
+               "timeout": 30
              }
            ]
          }
@@ -181,8 +181,8 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 29000",
+               "timeout": 30
              }
            ]
          }
@@ -193,8 +193,8 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude tool-use --capture-budget-ms 29000",
+               "timeout": 30
              }
            ]
          }
@@ -205,8 +205,8 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude stop --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude stop --capture-budget-ms 29000",
+               "timeout": 30
              }
            ]
          }
@@ -217,8 +217,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
            "hooks": [
              {
                "type": "command",
-               "command": "<canonicalized-libra-abs-path> hooks claude session-end --capture-budget-ms 9000",
-               "timeout": 10
+               "command": "<canonicalized-libra-abs-path> hooks claude session-end --capture-budget-ms 9000"
              }
            ]
          }
@@ -227,7 +226,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
    }
    ```
 
-   示例中 `<canonicalized-libra-abs-path>` 为占位符：实际写入值是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径。绝对路径是**必须形态**——schema/snapshot test 断言 command 以绝对路径开头、由 `hooks claude <verb>` 与 installer-owned `--capture-budget-ms <N>` 组成，不允许裸 `libra` PATH 查找（与 plan.md §0.3.3/A6.5 安装断言互引）。当前 handler 同时写入 provider 支持的 `statusMessage: "libra capture"`；只有该标记、直接绝对 command-path grammar、verb 与 timeout/budget 对均精确匹配才属于 Libra。无标记 command（包括 `libra`/`libra.exe`、标准绝对路径或重命名路径）在 disable 时必须保留；仅 explicit enable 可把 matcher-less、executable 与本次选择 binary path 完全相同的直接绝对 legacy/canonical command 迁移为带标记形态。`N` 从 handler `timeout` 推导，保留最多 1000ms 给 terminal finalization（默认 `10s → 9000`；历史 `1s → 500`，以保留可用的 capture slice），不是用户应手动调节的公开 flag；重跑 `libra agent enable --agent claude-code` 会把旧配置原位刷新为当前命令。
+   示例中 `<canonicalized-libra-abs-path>` 为占位符：实际写入值是 `resolve_hook_binary_path` 产出的 canonicalize 绝对路径。绝对路径是**必须形态**——schema/snapshot test 断言 command 以绝对路径开头、由 `hooks claude <verb>` 与 installer-owned `--capture-budget-ms <N>` 组成，不允许裸 `libra` PATH 查找（与 plan.md §0.3.3/A6.5 安装断言互引）。当前 handler 同时写入 provider 支持的 `statusMessage: "libra capture"`；只有该标记、直接绝对 command-path grammar、verb 与 timeout/budget 对均精确匹配才属于 Libra。无标记 command（包括 `libra`/`libra.exe`、标准绝对路径或重命名路径）在 disable 时必须保留；仅 explicit enable 可把 matcher-less、executable 与本次选择 binary path 完全相同的直接绝对 legacy/canonical command 迁移为带标记形态。`N` 从 handler `timeout` 推导，保留最多 1000ms 给 terminal finalization（默认 `30s → 29000`；`SessionEnd` 不写 timeout，固定沿用十秒基准 `9000`；此前默认 `10s → 9000`；历史 `1s → 500`，以保留可用的 capture slice）。`N` 本身不是公开 flag，handler timeout 可通过 `libra agent enable --hook-timeout <seconds>` 选择（仅 Claude Code 与 Codex 的 `HookProvider::supports_host_timeout` 为 true；其余 provider 在任何写入前以 `LBR-CLI-002` 拒绝）；重跑 `libra agent enable --agent claude-code` 会把旧配置（包括任何一致的 timeout/budget 对）原位刷新为当前命令。
 
    `ModelUpdate`、`Compaction` 等 parser 能力可以存在，但当前 Claude Code 安装器只写入上表 6 个 forward events（DR-00 起 `PreToolUse` 与 `PostToolUse` 一并转发到 `hooks claude tool-use`，二者都映射 `LifecycleEventKind::ToolUse`）；`ToolUse` 事件走 AgentTraces 采集路径，只更新 `agent_session` 活跃状态（`last_event_at` / `sync_revision`），**不**物化 checkpoint（committed checkpoint 仅在 `Stop`/`SessionEnd` 落盘）。若未来增删安装事件，必须同步本节、`docs/development/commands/hooks.md`、schema tests 和 uninstall 规则。
 

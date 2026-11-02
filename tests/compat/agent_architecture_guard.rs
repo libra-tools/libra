@@ -9340,7 +9340,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn oracle_tree_blob",
                 "struct OracleEnvGuard",
             ],
-            "11d5c090d7a88e731de4f9316dc662f4273fbc2fb6bd1e30099e39ae13095019",
+            "aeb03f6f38cd063cf7f5250cb24d1ff6ac2fa3abf4711b1ca484d108866e41e7",
         ),
     ];
     const CI_ORACLES: [(&str, &str, &[&str], &str); 3] = [
@@ -9407,7 +9407,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn oracle_tree_blob",
                 "struct OracleEnvGuard",
             ],
-            "888a03ddc146e0271421ab09a080e298ef42c0354d7a1c7594b2b554a2b167fe",
+            "99d4e8c9ebe9a1fbf7cd1c7dcaa04ca6acd897eccde04b46eb22e0a2a0587f10",
         ),
     ];
     const FROZEN_HARNESS_SIGNATURE: &str =
@@ -10626,7 +10626,7 @@ fn reasoning_pending_dto_cannot_construct_raw_opaque() {
 fn reasoning_pending_pre_v2_reader_oracle_is_immutable() {
     use sha2::{Digest, Sha256};
 
-    const EXPECTED: &str = "96d71660e8b75d61cff2dccaa59a410b90b499afd63e10c9dcc2cc678312e32c";
+    const EXPECTED: &str = "e8578fce3419fdb7a70b69242f9c3220767897e3fda9ddc1f61e6a9d014a450a";
     let fixture = fs::read(
         repo_root().join("tests/fixtures/agent_transcripts/reasoning/pending_v1_decoder.rs"),
     )

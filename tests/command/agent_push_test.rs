@@ -692,3 +692,66 @@ async fn agent_push_seed_readiness_accepts_missing_or_empty_marker_dir() {
         .await
         .expect("an empty marker directory is ready");
 }
+
+/// LTR-12 wires `--mega2` and proves the force-rewrite guard never admits
+/// a network attempt. The epoch is stored on the local attempt and reused.
+#[cfg(unix)]
+#[test]
+fn mega2_scoped_push_contract() {
+    let root = tempfile::tempdir().expect("repo");
+    let repo = root.path();
+    let output = libra_command(repo).args(["init"]).output().expect("init");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let blocked = libra_command(repo)
+        .args(["agent", "push", "--mega2", "--force-rewrite"])
+        .output()
+        .expect("guard");
+    assert!(
+        !blocked.status.success(),
+        "force-rewrite must fail before network"
+    );
+    let blocked_text = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_text.contains("before any network"),
+        "guard text missing: {blocked_text}"
+    );
+
+    let first = libra_command(repo)
+        .args(["agent", "push", "--mega2", "--new-stream"])
+        .output()
+        .expect("first epoch");
+    assert!(!first.status.success());
+    let first_text = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_text.contains("before any network attempt"),
+        "first attempt must stop before the network: {first_text}"
+    );
+    let epoch = libra_command(repo)
+        .args(["config", "get", "libra.traces.mega2.epoch"])
+        .output()
+        .expect("read epoch");
+    assert!(
+        epoch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&epoch.stderr)
+    );
+    let epoch_value = String::from_utf8_lossy(&epoch.stdout).trim().to_string();
+    assert_eq!(epoch_value.len(), 36, "epoch must be a UUID: {epoch_value}");
+
+    let retry = libra_command(repo)
+        .args(["agent", "push", "--mega2"])
+        .output()
+        .expect("retry");
+    assert!(!retry.status.success());
+    let retry_text = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        retry_text.contains(&epoch_value),
+        "retry must reuse {epoch_value}: {retry_text}"
+    );
+    assert!(retry_text.contains("before any network attempt"));
+}

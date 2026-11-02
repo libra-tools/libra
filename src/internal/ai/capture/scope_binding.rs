@@ -1438,8 +1438,10 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&frame).expect("decode helper request as JSON");
         let object = value.as_object().expect("helper request is a JSON object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
         assert_eq!(
-            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            keys,
             vec![
                 "deadline_millis",
                 "dedup_preimage",

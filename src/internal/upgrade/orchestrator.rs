@@ -143,9 +143,12 @@ pub async fn startup_recovery_gate() -> CliResult<()> {
 
     match outcome {
         Ok(TxnOutcome::RolledBack) => {
-            crate::utils::error::emit_advisory_warning(
-                "a previous auto-upgrade failed its self-check and was rolled back to the prior version",
-            );
+            let warning = if cfg!(target_os = "linux") {
+                "a previous auto-upgrade failed its self-check and was rolled back to the prior version; install libfontconfig1, libxkbcommon0 and libxkbcommon-x11-0, then retry"
+            } else {
+                "a previous auto-upgrade failed its self-check and was rolled back to the prior version"
+            };
+            crate::utils::error::emit_advisory_warning(warning);
             Ok(())
         }
         Ok(_) => Ok(()),

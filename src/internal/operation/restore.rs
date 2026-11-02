@@ -44,7 +44,7 @@ use crate::{
         operation::{PointerError, facets::registry_for_scope},
         worktree_scope::WorktreeScope,
     },
-    utils::client_storage::ClientStorage,
+    utils::{client_storage::ClientStorage, json::normalize_json_value},
 };
 
 /// Return `true` for the Libra-owned AI capture and history branches whose
@@ -887,10 +887,10 @@ impl RestoreEngine {
             return Err(RestoreError::IncompleteView);
         }
         let refs = self.capture_reference_state().await?;
-        let refs_bytes = serde_json::to_vec(&serde_json::json!({
+        let refs_bytes = serde_json::to_vec(&normalize_json_value(serde_json::json!({
             "schema_version": 1,
             "references": refs,
-        }))
+        })))
         .map_err(|error| RestoreError::Storage(error.to_string()))?;
         let refs_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &refs_bytes);
         self.store

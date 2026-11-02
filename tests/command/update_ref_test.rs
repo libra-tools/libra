@@ -145,10 +145,38 @@ fn delete_with_mismatched_old_fails() {
 }
 
 #[test]
-fn deleting_a_missing_ref_fails() {
+fn deleting_a_missing_ref_is_a_noop() {
     let (repo, _c1, _c2) = repo_with_two_commits();
+    // Git exits 0 for `update-ref -d <missing>`: nothing to delete, no CAS value.
     let del = run_libra_command(&["update-ref", "-d", "refs/heads/ghost"], repo.path());
-    assert_eq!(del.status.code(), Some(128));
+    assert_eq!(
+        del.status.code(),
+        Some(0),
+        "deleting an absent ref is a no-op: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+
+    // A non-zero CAS value on a missing ref is still a mismatch.
+    let cas = run_libra_command(
+        &[
+            "update-ref",
+            "-d",
+            "refs/heads/ghost",
+            "1111111111111111111111111111111111111111",
+        ],
+        repo.path(),
+    );
+    assert_ne!(
+        cas.status.code(),
+        Some(0),
+        "a CAS delete of an absent ref reports a mismatch: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&cas.stderr).contains("cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
 }
 
 #[test]
@@ -1104,11 +1132,12 @@ fn update_ref_stdin_rejects_multiple_updates_of_one_ref() {
     assert!(!ref_exists(&repo, "refs/heads/x"));
 }
 
-/// UR-01 B4: `-z` NUL-terminated input applies exactly like the LF form.
+/// UR-01 B4: `-z` separates a command's ARGUMENTS with NUL (Git's wire
+/// format: `create SP <ref> NUL <newvalue> NUL`), not the records.
 #[test]
 fn update_ref_stdin_z_nul_records() {
     let (repo, c1, _c2) = repo_with_two_commits();
-    let body = format!("create refs/heads/z1 {c1}\0");
+    let body = format!("create refs/heads/z1\0{c1}\0");
     let out = stdin_batch(&repo, &["-z"], &body);
     assert!(
         out.status.success(),
@@ -1118,16 +1147,542 @@ fn update_ref_stdin_z_nul_records() {
     assert!(ref_exists(&repo, "refs/heads/z1"));
 }
 
+/// The pre-fix Libra dialect (`create <ref> <newvalue>` NUL) is NOT Git's
+/// format: Git keeps `<newvalue>` in its own NUL-separated field and rejects a
+/// ref containing a space as `invalid ref format`, so Libra must reject it too.
+#[test]
+fn update_ref_stdin_z_rejects_space_separated_ref_field() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let body = format!("create refs/heads/z1 {c1}\0");
+    let out = stdin_batch(&repo, &["-z"], &body);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "non-Git -z layout must be fatal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid ref format"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ref_exists(&repo, "refs/heads/z1"),
+        "nothing may be applied"
+    );
+}
+
+/// `-z` is the only mode that can carry a value containing spaces (Git applies
+/// no C-style quoting there). The revision syntax `:/fix bug` from RV-02 is the
+/// concrete case, and `update` requires the <oldvalue> field in `-z` mode.
+#[test]
+fn update_ref_stdin_z_value_with_spaces() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    fs::write(repo.path().join("spaced.txt"), "spaced\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "spaced.txt"], repo.path())
+            .status
+            .success()
+    );
+    let commit = run_libra_command(&["commit", "-m", "fix bug", "--no-verify"], repo.path());
+    assert!(
+        commit.status.success(),
+        "commit with a spaced message failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("create refs/heads/sp1\0{c1}\0update refs/heads/sp2\0:/fix bug\0{ZERO_SHA1}\0"),
+    );
+    assert!(
+        out.status.success(),
+        "-z spaced-value batch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(ref_exists(&repo, "refs/heads/sp1"));
+    assert!(
+        ref_exists(&repo, "refs/heads/sp2"),
+        "`:/fix bug` should resolve in -z mode"
+    );
+    assert_eq!(
+        stdout_trimmed(&rev_parse(&repo, "refs/heads/sp2")),
+        stdout_trimmed(&rev_parse(&repo, "HEAD")),
+        "the spaced message search must select the matching commit"
+    );
+}
+
+/// Git distinguishes an ABSENT field (end of input: fatal) from an EMPTY field
+/// (meaning "no value"): `update <ref> NUL <new> NUL NUL` is an unconditional
+/// update, and an empty `<oldvalue>` must not swallow the next command.
+#[test]
+fn update_ref_stdin_z_empty_oldvalue_field() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    // Empty trailing field -> no CAS at all. (One command per ref per batch:
+    // Git rejects a second update of the same ref in one batch.)
+    let created = stdin_batch(&repo, &["-z"], &format!("create refs/heads/e1\0{c1}\0"));
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let out = stdin_batch(&repo, &["-z"], &format!("update refs/heads/e1\0{c2}\0\0"));
+    assert!(
+        out.status.success(),
+        "empty <oldvalue> must mean \"no CAS\": {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&rev_parse(&repo, "refs/heads/e1")), c2);
+
+    // An empty <oldvalue> must not consume the following command.
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("delete refs/heads/e1\0\0create refs/heads/e2\0{c1}\0"),
+    );
+    assert!(
+        out.status.success(),
+        "empty <oldvalue> before another command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/e1"), "e1 must be deleted");
+    assert!(ref_exists(&repo, "refs/heads/e2"), "e2 must be created");
+}
+
+/// An ABSENT field is end-of-input, which Git treats as fatal.
+#[test]
+fn update_ref_stdin_z_missing_field_is_fatal() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("create refs/heads/m1\0{c1}\0delete refs/heads/m1\0"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "absent <oldvalue> is fatal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unexpected end of input"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ref_exists(&repo, "refs/heads/m1"),
+        "the whole batch must apply nothing"
+    );
+
+    let empty_new = stdin_batch(&repo, &["-z"], "create refs/heads/m2\0\0");
+    assert_eq!(empty_new.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&empty_new.stderr).contains("missing <newvalue>"),
+        "stderr: {}",
+        String::from_utf8_lossy(&empty_new.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/m2"));
+}
+
+/// Git: `verify` with NO `<oldvalue>` (LF) or an EMPTY one (`-z`) asserts the
+/// ref does NOT exist — the empty value is the all-zero id, not "any value".
+#[test]
+fn update_ref_verify_without_value_requires_absence() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    assert!(
+        stdin_batch(&repo, &[], "verify refs/heads/main\n")
+            .status
+            .code()
+            .is_some_and(|code| code != 0),
+        "LF `verify <ref>` on an existing ref must fail"
+    );
+    assert!(
+        stdin_batch(&repo, &[], "verify refs/heads/absent\n")
+            .status
+            .success(),
+        "LF `verify <ref>` on an absent ref must succeed"
+    );
+
+    assert_eq!(
+        stdin_batch(&repo, &["-z"], "verify refs/heads/main\0\0")
+            .status
+            .code(),
+        Some(128),
+        "-z `verify <ref> NUL NUL` on an existing ref must fail"
+    );
+    assert!(
+        stdin_batch(&repo, &["-z"], "verify refs/heads/absent\0\0")
+            .status
+            .success(),
+        "-z `verify <ref> NUL NUL` on an absent ref must succeed"
+    );
+
+    // A matching value still verifies the ref's current commit.
+    assert!(
+        stdin_batch(&repo, &["-z"], &format!("verify refs/heads/main\0{c2}\0"))
+            .status
+            .success(),
+        "-z: an explicit matching <oldvalue> verifies"
+    );
+    // The stated matrix needs both modes: LF matching and mismatching values.
+    assert!(
+        stdin_batch(&repo, &[], &format!("verify refs/heads/main {c2}\n"))
+            .status
+            .success(),
+        "LF: an explicit matching <oldvalue> verifies"
+    );
+    assert_eq!(
+        stdin_batch(&repo, &[], &format!("verify refs/heads/main {c1}\n"))
+            .status
+            .code(),
+        Some(128),
+        "LF: a mismatching <oldvalue> fails"
+    );
+}
+
+/// Git acknowledges commands as it reads them, so a later malformed command must
+/// not swallow the earlier `<cmd>: ok` lines.
+#[test]
+fn update_ref_stdin_keeps_earlier_acknowledgements_on_late_error() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/late {c1}\nbogus\n"),
+    );
+    assert_eq!(out.status.code(), Some(128), "malformed command is fatal");
+    assert!(
+        stdout_trimmed(&out).contains("start: ok"),
+        "earlier acknowledgements must survive: {}",
+        stdout_trimmed(&out)
+    );
+
+    let z = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("start\0create refs/heads/late2\0{c1}\0bogus\0"),
+    );
+    assert_eq!(z.status.code(), Some(128));
+    assert!(
+        stdout_trimmed(&z).contains("start: ok"),
+        "-z acknowledgements must survive: {}",
+        stdout_trimmed(&z)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/late"), "nothing is applied");
+    assert!(!ref_exists(&repo, "refs/heads/late2"), "nothing is applied");
+
+    // Both acknowledgements (`start: ok` AND `prepare: ok`) must survive a
+    // malformed command that follows the prepare, in BOTH input modes.
+    let lf_prepared = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/late3 {c1}\nprepare\nbogus\n"),
+    );
+    assert_eq!(lf_prepared.status.code(), Some(128));
+    assert_eq!(
+        stdout_trimmed(&lf_prepared),
+        "start: ok\nprepare: ok",
+        "LF acknowledgements: {}",
+        stdout_trimmed(&lf_prepared)
+    );
+
+    let z_prepared = stdin_batch(
+        &repo,
+        &["-z"],
+        &format!("start\0create refs/heads/late4\0{c1}\0prepare\0bogus\0"),
+    );
+    assert_eq!(z_prepared.status.code(), Some(128));
+    assert_eq!(
+        stdout_trimmed(&z_prepared),
+        "start: ok\nprepare: ok",
+        "-z acknowledgements: {}",
+        stdout_trimmed(&z_prepared)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/late3"), "nothing is applied");
+    assert!(!ref_exists(&repo, "refs/heads/late4"), "nothing is applied");
+}
+
+/// Git validates the queued updates during `prepare` (it locks the refs there),
+/// so a `create` of an existing ref must fail at `prepare` without `prepare: ok`.
+#[test]
+fn update_ref_stdin_prepare_validates_preconditions() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/main {c1}\nprepare\ncommit\n"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "prepare must validate the create"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("prepare: cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&out),
+        "start: ok",
+        "`prepare: ok` must not be printed for a failing prepare"
+    );
+
+    // A CAS mismatch is also reported at prepare.
+    let cas = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nupdate refs/heads/main {c1} {ZERO_SHA1}\nprepare\ncommit\n"),
+    );
+    assert_eq!(cas.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&cas.stderr).contains("prepare: cannot lock ref"),
+        "stderr: {}",
+        String::from_utf8_lossy(&cas.stderr)
+    );
+    assert!(!stdout_trimmed(&cas).contains("prepare: ok"));
+}
+
+/// Git allows a fresh `start` after a finished transaction; per-transaction
+/// state must be reset. Commands after `commit`/`abort` (including
+/// `option no-deref`) are refused.
+#[test]
+fn update_ref_stdin_reopens_transaction_and_checks_closed_phase() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+
+    let reopened = stdin_batch(
+        &repo,
+        &[],
+        &format!(
+            "start\ncreate refs/heads/r1 {c1}\ncommit\nstart\ncreate refs/heads/r2 {c1}\ncommit\n"
+        ),
+    );
+    assert!(
+        reopened.status.success(),
+        "two transactions in one batch: {}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&reopened),
+        "start: ok\ncommit: ok\nstart: ok\ncommit: ok"
+    );
+    assert!(ref_exists(&repo, "refs/heads/r1"));
+    assert!(ref_exists(&repo, "refs/heads/r2"));
+
+    let after_abort = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nabort\ncreate refs/heads/r3 {c1}\n"),
+    );
+    assert_eq!(after_abort.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&after_abort.stderr).contains("transaction is closed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&after_abort.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/r3"));
+
+    let option_after_commit = stdin_batch(&repo, &[], "start\ncommit\noption no-deref\n");
+    assert_eq!(option_after_commit.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&option_after_commit.stderr).contains("transaction is closed"));
+}
+
+/// The protocol is interactive: `start: ok` must reach the caller while stdin is
+/// still open, or a client that waits for it would deadlock.
+#[test]
+fn update_ref_stdin_ack_is_streamed_before_stdin_closes() {
+    use std::{
+        io::{BufRead, BufReader, Read as _, Write as _},
+        process::Stdio,
+        time::Duration,
+    };
+
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    let mut child = super::base_libra_command(&["update-ref", "--stdin"], repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libra update-ref --stdin");
+
+    let mut stdin = child.child.stdin.take().expect("child stdin");
+    let stdout = child.child.stdout.take().expect("child stdout");
+    stdin.write_all(b"start\n").expect("write start");
+    stdin.flush().expect("flush start");
+
+    // The reader keeps stdout open until EOF: closing it after the first line
+    // would make the child's next acknowledgement fail with EPIPE (which the
+    // command reports as a fatal output error after committing).
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first = String::new();
+        let _ = reader.read_line(&mut first);
+        let _ = sender.send(first);
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        rest
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("`start: ok` must arrive before stdin is closed");
+    assert_eq!(line.trim(), "start: ok");
+
+    stdin.write_all(b"commit\n").expect("write commit");
+    drop(stdin);
+    let status = child.child.wait().expect("wait for child");
+    let rest = reader_thread.join().expect("reader thread");
+    let output = child
+        .wait_with_output()
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        status.success(),
+        "streamed transaction exits 0 (rest of stdout: {rest:?}, wait error: {output})"
+    );
+    assert!(rest.contains("commit: ok"), "rest of stdout: {rest:?}");
+}
+
+/// Git lets `prepare` be closed by `abort` (UR-01 T2), and a `delete` of an
+/// absent ref is a no-op even inside a prepared transaction.
+#[test]
+fn update_ref_stdin_abort_after_prepare_and_delete_missing() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+
+    let out = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/pa1 {c1}\nprepare\nabort\n"),
+    );
+    assert!(
+        out.status.success(),
+        "abort must close a prepared transaction: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&out), "start: ok\nprepare: ok\nabort: ok");
+    assert!(
+        !ref_exists(&repo, "refs/heads/pa1"),
+        "abort applies nothing"
+    );
+
+    let missing = stdin_batch(
+        &repo,
+        &[],
+        "start\ndelete refs/heads/absent\nprepare\ncommit\n",
+    );
+    assert!(
+        missing.status.success(),
+        "deleting an absent ref is a no-op: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    assert_eq!(
+        stdout_trimmed(&missing),
+        "start: ok\nprepare: ok\ncommit: ok"
+    );
+}
+
+/// `--json` accumulates every transaction committed in the batch, even when a
+/// later transaction is aborted.
+#[test]
+fn update_ref_stdin_json_reports_all_committed_transactions() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = stdin_batch(
+        &repo,
+        &["--json"],
+        &format!("start\ncreate refs/heads/js1 {c1}\ncommit\nstart\nabort\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Protocol acknowledgements share stdout with the JSON envelope, so match
+    // the envelope fields instead of parsing the whole stream.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"committed\": true"),
+        "an earlier commit must still be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("refs/heads/js1"),
+        "the committed ref must be listed: {stdout}"
+    );
+}
+
+/// A closed stdout must be detected BEFORE the commit, so the refs never move.
+#[test]
+fn update_ref_stdin_refuses_commit_when_stdout_is_closed() {
+    use std::{io::Write as _, process::Stdio};
+
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let mut child = super::base_libra_command(&["update-ref", "--stdin"], repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn libra update-ref --stdin");
+
+    let mut stdin = child.child.stdin.take().expect("child stdin");
+    // Close the read end before the transaction commits: a plain batch prints
+    // nothing before `commit: ok`, so only the pre-commit probe can catch this.
+    drop(child.child.stdout.take());
+    let _ = stdin.write_all(format!("create refs/heads/closed1 {c1}\ncommit\n").as_bytes());
+    let _ = stdin.flush();
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait for child");
+    assert!(
+        !output.status.success(),
+        "a closed stdout must fail the batch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !ref_exists(&repo, "refs/heads/closed1"),
+        "no ref may be written when the acknowledgement channel is gone"
+    );
+}
+
+/// `-z` handles a multi-command batch and the transaction commands.
+#[test]
+fn update_ref_stdin_z_multi_command_batch() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    let body = format!(
+        "create refs/heads/m1\0{c1}\0create refs/heads/m2\0{c2}\0verify refs/heads/main\0{c2}\0"
+    );
+    let out = stdin_batch(&repo, &["-z"], &body);
+    assert!(
+        out.status.success(),
+        "-z multi batch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Plain (non-transaction) batches are silent, like Git.
+    assert_eq!(stdout_trimmed(&out), "");
+    assert!(ref_exists(&repo, "refs/heads/m1"));
+    assert!(ref_exists(&repo, "refs/heads/m2"));
+
+    let txn = format!("start\0create refs/heads/m3\0{c1}\0prepare\0commit\0");
+    let out = stdin_batch(&repo, &["-z"], &txn);
+    assert!(
+        out.status.success(),
+        "-z transaction failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_trimmed(&out), "start: ok\nprepare: ok\ncommit: ok");
+    assert!(ref_exists(&repo, "refs/heads/m3"));
+}
+
 /// UR-01 T1/T2/T3: the start/prepare/commit/abort state machine prints
 /// `<cmd>: ok` and commit/abort control whether anything is applied.
 #[test]
 fn update_ref_stdin_transaction_matrix() {
     let (repo, c1, _c2) = repo_with_two_commits();
 
+    // Git's order: queue the commands, prepare, then commit.
     let committed = stdin_batch(
         &repo,
         &[],
-        &format!("start\nprepare\ncreate refs/heads/t1 {c1}\ncommit\n"),
+        &format!("start\ncreate refs/heads/t1 {c1}\nprepare\ncommit\n"),
     );
     assert!(
         committed.status.success(),
@@ -1175,6 +1730,66 @@ fn update_ref_stdin_transaction_matrix() {
         String::from_utf8_lossy(&nested.stderr).contains("cannot restart ongoing transaction"),
         "nested start message: {}",
         String::from_utf8_lossy(&nested.stderr)
+    );
+
+    // After `prepare` only commit/abort may follow (Git: "prepared transactions
+    // can only be closed") — a queued update in that window is refused and
+    // nothing is applied.
+    let late = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nprepare\ncreate refs/heads/t4 {c1}\ncommit\n"),
+    );
+    assert_eq!(late.status.code(), Some(128), "post-prepare update");
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("prepared transactions can only be closed"),
+        "prepared message: {}",
+        String::from_utf8_lossy(&late.stderr)
+    );
+    assert!(!ref_exists(&repo, "refs/heads/t4"), "nothing is applied");
+
+    // A second `prepare` after a successful one is refused the same way.
+    let double_prepare = stdin_batch(&repo, &[], "start\nprepare\nprepare\n");
+    assert_eq!(double_prepare.status.code(), Some(128));
+
+    // An explicit transaction left uncommitted at end of input applies nothing
+    // but still exits 0, like Git.
+    let dangling = stdin_batch(&repo, &[], &format!("start\ncreate refs/heads/t5 {c1}\n"));
+    assert!(
+        dangling.status.success(),
+        "an uncommitted transaction exits 0: {}",
+        String::from_utf8_lossy(&dangling.stderr)
+    );
+    assert_eq!(stdout_trimmed(&dangling), "start: ok");
+    assert!(
+        !ref_exists(&repo, "refs/heads/t5"),
+        "an uncommitted transaction applies nothing"
+    );
+    let prepared_only = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\ncreate refs/heads/t6 {c1}\nprepare\n"),
+    );
+    assert!(prepared_only.status.success());
+    assert!(!ref_exists(&repo, "refs/heads/t6"));
+
+    // A plain batch with no `start` still commits on its `commit` line.
+    let implicit = stdin_batch(&repo, &[], &format!("create refs/heads/t7 {c1}\ncommit\n"));
+    assert!(implicit.status.success());
+    assert_eq!(stdout_trimmed(&implicit), "commit: ok");
+    assert!(ref_exists(&repo, "refs/heads/t7"));
+
+    // `commit: ok` must not be printed when the commit itself fails.
+    let failing = stdin_batch(
+        &repo,
+        &[],
+        &format!("start\nupdate refs/heads/main {c1} {ZERO_SHA1}\ncommit\n"),
+    );
+    assert_eq!(failing.status.code(), Some(128), "CAS failure is fatal");
+    assert!(
+        !stdout_trimmed(&failing).contains("commit: ok"),
+        "a failed commit must not acknowledge success: {}",
+        stdout_trimmed(&failing)
     );
 }
 

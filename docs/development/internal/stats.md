@@ -4,6 +4,8 @@
 
 This document preserves the original design notes for the unpublished `stats` implementation. It is not a user-visible command contract and is not tracked in `COMPATIBILITY.md`.
 
+> **统计展示交付路径（2026-11-01）：** Issue [#500](https://github.com/libra-tools/libra/issues/500)（团队统计数据集中存储）已于 2026-11-01 **放弃**，`docs/development/plan/issues/500.md` 同步标为已放弃；统计数据改由 **`libra ui`**（`src/command/ui.rs` + `src/gui/`，`gui` feature，**正在开发中**）以桌面界面形式呈现。本文件的 `libra stats` 按扩展名计数设计与该决策无直接关系，但仍为 `declined / historical`，`DEFER-CS-06`（接入该计数器）随 #500 计划一并放弃。
+
 ## 命令实现目标
 
 `libra stats` 的目标是汇总仓库统计信息，为维护和诊断提供对象、引用或工作区级别的只读概览。当前实现资料存在但顶层 CLI 尚未公开接入，后续需要决定是否把它作为稳定用户命令。

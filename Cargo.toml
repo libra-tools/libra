@@ -20,7 +20,7 @@ test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
 test-upgrade   = []   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
 fastcdc        = ["dep:fastcdc"]   # default-OFF FastCDC LFS transport (fastcdc crate; SHA-256 digests)
-gui            = ["dep:gpui", "dep:gpui_platform", "dep:ely-gpui-component"]  # default-OFF desktop window (`libra ui`)
+gui            = []                # Deprecated no-op: the desktop window (`libra ui`) is always compiled.
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
 keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
@@ -106,11 +106,11 @@ axum = "0.8.9"
 mime_guess = "2.0.5"
 tempfile = "3.27.0"
 fastcdc = { version = "=3.2.1", optional = true }
-# Desktop window (`libra ui`). Ely pins this GPUI snapshot; the feature stays
-# out of `default` so ordinary CLI builds do not link a GPU UI.
-gpui = { package = "gpui-pre", version = "=0.3.10", optional = true }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", optional = true, features = ["font-kit", "wayland", "x11"] }
-ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "dd727f4dc3ff26c5aa0b233ac23cac7b5f41d6f6", optional = true }
+# Desktop window (`libra ui`). Ely pins this GPUI snapshot; the window is part
+# of every ordinary build, so these dependencies are not feature-gated.
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit", "wayland", "x11"] }
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "dd727f4dc3ff26c5aa0b233ac23cac7b5f41d6f6" }
 
 # Async stream helpers
 tokio-stream = { version = "0.1.18", features = ["sync"] }

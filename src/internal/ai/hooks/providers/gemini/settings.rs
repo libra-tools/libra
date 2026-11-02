@@ -116,7 +116,7 @@ struct GeminiHookEntry {
 pub(super) fn install_gemini_hooks(options: &ProviderInstallOptions) -> Result<()> {
     let binary_path = resolve_hook_binary_path(options.binary_path.as_deref())?;
     if options.timeout_secs.is_some() {
-        bail!("Gemini hooks do not support --timeout");
+        bail!("Gemini hooks do not support --hook-timeout");
     }
 
     let settings_path = gemini_settings_path()?;
