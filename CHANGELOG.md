@@ -56,6 +56,15 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.134] — 2026-11-02
+
+### Fixed
+
+- Plumbing `diff-files`, `diff-index`, and `diff-tree --quiet` stay silent
+  under `--json`, and an explicit `--raw` is no longer rejected. Invalid
+  arguments and unresolved revisions exit 129. This release records EC-01
+  from issues/479.
+
 ## [0.30.85] — 2026-10-22
 
 ### Integrated upstream changes
