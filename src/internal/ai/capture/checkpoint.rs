@@ -3014,6 +3014,30 @@ impl<'a> ImportedCheckpointWriter<'a> {
         session_id: &str,
         checkpoint_id: &str,
     ) -> Result<(), CheckpointStoreError> {
+        // A killed import binds the marker, and may record object ids, before
+        // the checkpoint row commits. Promoting that row to cleanup_pending
+        // leaves an in-flight marker after the retry has committed every turn.
+        // Nothing references those objects, so drop the marker. A checkpoint
+        // that did commit keeps the shared cleanup-pending rule.
+        let committed = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 FROM agent_checkpoint \
+                 WHERE checkpoint_id = ? AND session_id = ? AND scope = 'committed'",
+                [checkpoint_id.into(), session_id.into()],
+            ))
+            .await
+            .map_err(|_| CheckpointStoreError::StoreFailure {
+                stage: CheckpointStoreStage::Cleanup,
+            })?;
+        if committed.is_none() {
+            traces::clear_traces_inflight_marker(txn, session_id, checkpoint_id)
+                .await
+                .map_err(|_| CheckpointStoreError::StoreFailure {
+                    stage: CheckpointStoreStage::Cleanup,
+                })?;
+            return Ok(());
+        }
         traces::retire_stale_traces_inflight_marker(txn, session_id, checkpoint_id)
             .await
             .map_err(|_| CheckpointStoreError::StoreFailure {
