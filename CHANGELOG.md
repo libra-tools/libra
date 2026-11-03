@@ -56,6 +56,13 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.143] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 UI-03. `update-index` accepts `--chmod`,
+  `--info-only`, and `--verbose`. That behavior shipped before v0.30.134.
+
 ## [0.30.142] — 2026-11-03
 
 ### Changed
