@@ -56,6 +56,14 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.144] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 SR-01. `symbolic-ref -d` and `--delete`
+  delete a symbolic ref, and refuse `HEAD` and a non-symbolic ref. That
+  behavior shipped before v0.30.134.
+
 ## [0.30.143] — 2026-11-03
 
 ### Changed
