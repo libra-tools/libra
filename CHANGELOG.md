@@ -56,6 +56,16 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.140] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 DF-01. `diff-files`, `diff-index`, and
+  `diff-tree` exit 0 when there are differences, and `--exit-code` or
+  `--quiet` exits 1. A stat-invalid empty blob is `M`. That behavior
+  shipped before v0.30.134. v0.30.139 is the Pi extension release and is
+  not part of this plan.
+
 ## [0.30.138] — 2026-11-03
 
 ### Changed
