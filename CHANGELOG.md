@@ -56,6 +56,13 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.141] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 RV-02. `:/<text>` and `^{/<text>}` search
+  commit messages. That behavior shipped before v0.30.134.
+
 ## [0.30.140] — 2026-11-03
 
 ### Changed
