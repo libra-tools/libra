@@ -8877,8 +8877,10 @@ fn pi_explicit_import_keeps_each_turns_thinking_with_its_checkpoint() {
 async fn pi_explicit_import_recovers_after_the_process_is_killed() {
     use sea_orm::sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 
-    // Enough turns that the import is still running when the lock is taken.
-    const TURNS: usize = 160;
+    // Enough turns that the import is still running when the lock is taken,
+    // and few enough that the retry finishes inside the 120s import deadline
+    // while the rest of the suite is holding the SQLite writer.
+    const TURNS: usize = 40;
     let fixture = ImportRepo::init();
     let mut file = PiV3File::with_header(json!({
         "type": "session",
