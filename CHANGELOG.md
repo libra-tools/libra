@@ -56,6 +56,15 @@
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
 
+## [0.30.146] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 UR-01. `update-ref --stdin -z` separates
+  fields with NUL, so `create <ref> NUL <oid> NUL` succeeds and a value
+  may contain spaces. That behavior shipped before v0.30.134.
+  v0.30.145 is the Pi live-event release and is not part of this plan.
+
 ## [0.30.144] — 2026-11-03
 
 ### Changed
