@@ -200,6 +200,16 @@ pub trait HookProviderIdentity {
     fn agent_kind(&self) -> AgentKind;
 }
 
+/// The envelope fields of a tool event that identify the call and its
+/// parent call, named by a provider for [`HookProvider::tool_link_keys`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLinkKeys {
+    /// The field holding this call's ID.
+    pub tool: &'static str,
+    /// The field holding the ID of the call that made this one, if any.
+    pub parent: &'static str,
+}
+
 /// A statically registered provider that can parse lifecycle payloads and manage hook setup.
 ///
 /// Implementations are expected to be cheap to construct (typically zero-sized
@@ -293,6 +303,14 @@ pub trait HookProvider: HookProviderIdentity + Sync {
         } else {
             self.dedup_identity_keys()
         }
+    }
+    /// Envelope fields that name one tool call and the call that made it, for
+    /// a durable, content-free link between live tool events (PI-37).
+    /// Ingress commits to their values with the repository key and stores
+    /// only the opaque identities; the raw values never leave ingress.
+    /// `None`, the default, records no link.
+    fn tool_link_keys(&self, _hook_event_name: &str) -> Option<ToolLinkKeys> {
+        None
     }
     /// Optional command-level output payload (e.g. JSON the provider expects in
     /// stdout) — defaults to `None` for providers that signal purely via exit code.

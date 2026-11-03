@@ -106,6 +106,10 @@ const UNBOUND_FINALIZER_MARKER_PREFIX: &str = "capture-finalizer-unbound-v1:";
 /// `metadata_json` without limit. Pending entries are never evicted: losing
 /// one would make a failed checkpoint unrecoverable.
 pub(crate) const MAX_CAPTURE_RECEIPTS: usize = 128;
+/// `metadata_json` member holding a session's live tool links (PI-37).
+const TOOL_LINK_FIELD: &str = "capture_tool_links_v1";
+/// Links kept per session; the earliest written is dropped first.
+pub(crate) const MAX_CAPTURE_TOOL_LINKS: usize = 128;
 
 /// v1 is retained solely to read receipts written by the pre-ACF helper
 /// protocol. New ingress always writes v2, whose HMAC input is the fixed
@@ -441,6 +445,7 @@ impl CaptureCatalogSession {
 pub(crate) struct CaptureCatalogMetadataPatch {
     concurrent_active: bool,
     redaction_report: Option<CaptureCatalogRedactionReport>,
+    tool_link: Option<CaptureCatalogToolLink>,
 }
 
 impl CaptureCatalogMetadataPatch {
@@ -451,8 +456,92 @@ impl CaptureCatalogMetadataPatch {
         Self {
             concurrent_active,
             redaction_report,
+            tool_link: None,
         }
     }
+
+    /// Record this action's tool link with its receipt (PI-37).
+    pub(crate) fn with_tool_link(mut self, tool_link: Option<CaptureCatalogToolLink>) -> Self {
+        self.tool_link = tool_link;
+        self
+    }
+}
+
+/// Opaque identities of a live tool event's call and parent call (PI-37).
+/// Only keyed commitments of the fixed `capture-tool-link-v1:` shape are
+/// accepted, so this cannot become a provider payload channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureCatalogToolLink {
+    tool: String,
+    parent: Option<String>,
+}
+
+impl CaptureCatalogToolLink {
+    pub(crate) fn new(tool: String, parent: Option<String>) -> Result<Self, CaptureCatalogError> {
+        use crate::internal::ai::capture::ingress::is_tool_link_identity;
+        if !is_tool_link_identity(&tool)
+            || parent
+                .as_deref()
+                .is_some_and(|parent| !is_tool_link_identity(parent))
+        {
+            return Err(CaptureCatalogError::InvalidRequest);
+        }
+        Ok(Self { tool, parent })
+    }
+}
+
+/// Append one action's link to the session's bounded link list. A list of
+/// an unexpected shape is replaced, since links are content-free metadata
+/// and must not block capture.
+fn record_tool_link(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    action_key: &str,
+    link: &CaptureCatalogToolLink,
+) {
+    use crate::internal::ai::capture::ingress::is_tool_link_identity;
+    let valid_entry = |entry: &serde_json::Value| {
+        entry.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "action" | "tool" | "parent"))
+                && object
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_canonical_lifecycle_action_key)
+                && object
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_tool_link_identity)
+                && object
+                    .get("parent")
+                    .is_none_or(|parent| parent.as_str().is_some_and(is_tool_link_identity))
+        })
+    };
+    let mut links = match metadata.remove(TOOL_LINK_FIELD) {
+        Some(serde_json::Value::Array(items)) if items.iter().all(valid_entry) => items,
+        _ => Vec::new(),
+    };
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "action".to_string(),
+        serde_json::Value::String(action_key.to_string()),
+    );
+    entry.insert(
+        "tool".to_string(),
+        serde_json::Value::String(link.tool.clone()),
+    );
+    if let Some(parent) = &link.parent {
+        entry.insert(
+            "parent".to_string(),
+            serde_json::Value::String(parent.clone()),
+        );
+    }
+    links.push(serde_json::Value::Object(entry));
+    if links.len() > MAX_CAPTURE_TOOL_LINKS {
+        let excess = links.len() - MAX_CAPTURE_TOOL_LINKS;
+        links.drain(..excess);
+    }
+    metadata.insert(TOOL_LINK_FIELD.to_string(), serde_json::Value::Array(links));
 }
 
 /// Typed, redaction-only catalog report. The retained rule identifiers and
@@ -5141,6 +5230,13 @@ impl CaptureCatalogStore {
             CaptureReceiptDisposition::NotTracked
         };
 
+        // A closed V2 import record admits no member beyond its schema, so a
+        // session adopted by an import records no live tool links.
+        if let Some(link) = request.metadata.tool_link.as_ref()
+            && !existing_v2_import
+        {
+            record_tool_link(&mut metadata, request.action.action_key(), link);
+        }
         if existing.is_none() {
             let (_, incarnation) = initial.ok_or(CaptureCatalogError::InvalidRequest)?;
             if let Some(incarnation) = incarnation {

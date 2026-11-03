@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 
 use super::super::{
     lifecycle::{LifecycleEvent, LifecycleEventKind, SessionHookEnvelope},
-    provider::{HookProvider, ProviderHookCommand, ProviderInstallOptions},
+    provider::{HookProvider, ProviderHookCommand, ProviderInstallOptions, ToolLinkKeys},
 };
 
 pub static PI_PROVIDER: PiProvider = PiProvider;
@@ -74,6 +74,16 @@ impl HookProvider for PiProvider {
         _event_kind: LifecycleEventKind,
     ) -> &'static [&'static str] {
         parser::pi_replay_identity_keys(hook_event_name)
+    }
+
+    /// A tool event's `toolCallId` and `parentToolCallId` (PI-37). A nested
+    /// call's parent identity is built from the parent's own `toolCallId`,
+    /// so it equals the identity the parent call is recorded with.
+    fn tool_link_keys(&self, hook_event_name: &str) -> Option<ToolLinkKeys> {
+        matches!(hook_event_name, "tool_call" | "tool_result").then_some(ToolLinkKeys {
+            tool: "toolCallId",
+            parent: "parentToolCallId",
+        })
     }
 
     fn install_hooks(&self, _options: &ProviderInstallOptions) -> Result<()> {

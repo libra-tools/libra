@@ -36,9 +36,10 @@ use crate::internal::ai::capture::key::{
 };
 use crate::internal::ai::capture::{
     ingress::{
-        CaptureIngressBinding, CaptureRuntimeScope, CaptureScopeInput, HookEnvelopeInvalid,
-        OpaqueDedupIdentity, opaque_dedup_identity_from_preimage, opaque_event_id_from_wire_parts,
-        opaque_event_identity_from_preimage,
+        CaptureIngressBinding, CaptureRuntimeScope, CaptureScopeInput, CaptureToolLink,
+        HookEnvelopeInvalid, OpaqueDedupIdentity, ToolLinkPreimages, is_tool_link_identity,
+        opaque_dedup_identity_from_preimage, opaque_event_id_from_wire_parts,
+        opaque_event_identity_from_preimage, tool_link_from_preimages,
     },
     key::CaptureDedupUnsupportedPlatform,
     live::HookExecutionDeadline,
@@ -528,6 +529,11 @@ struct ScopeBindingHelperRequest {
     /// components. The helper must never receive their raw spellings.
     dedup_preimage:
         Option<[u8; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES]>,
+    /// Fixed commitments to a tool event's call and parent call (PI-37),
+    /// never their IDs. Absent from the frame for every other event, so
+    /// those frames stay byte-identical to the earlier wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_link_preimages: Option<ToolLinkPreimages>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -541,6 +547,10 @@ enum ScopeBindingHelperResponse {
         /// A one-way HMAC commitment, not the repository key. It is safe for
         /// the parent to persist as a receipt identity.
         opaque_dedup: Option<ScopeBindingOpaqueDedup>,
+        /// One-way HMAC identities of the event's call and parent call,
+        /// present exactly when the request carried link commitments.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opaque_tool_link: Option<ScopeBindingOpaqueToolLink>,
         storage_path: ScopeBindingWirePath,
         worktree_root: ScopeBindingWirePath,
     },
@@ -565,6 +575,15 @@ enum ScopeBindingHelperResponse {
 struct ScopeBindingOpaqueDedup {
     event_id: Uuid,
     dedup_key: String,
+}
+
+/// The helper's opaque tool link identities (PI-37): HMAC commitments
+/// produced in the child, with no key material.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopeBindingOpaqueToolLink {
+    tool: String,
+    parent: Option<String>,
 }
 
 /// The helper's opaque action identity. `event_key` is an irreversible HMAC
@@ -723,6 +742,7 @@ fn encode_scope_binding_helper_request(
         deadline_millis: deadline.absolute_millis,
         event_identity_preimage: scope_input.event_identity_preimage,
         dedup_preimage: scope_input.dedup_preimage,
+        tool_link_preimages: scope_input.tool_link_preimages,
     })
     .context("encode scope-binding helper request")?;
     if frame.len() as u64 > CAPTURE_SCOPE_BINDING_HELPER_INPUT_CAP {
@@ -731,6 +751,7 @@ fn encode_scope_binding_helper_request(
     Ok(frame)
 }
 
+#[cfg(test)]
 fn scope_binding_response_from_binding(
     binding: CaptureIngressBinding,
     event_identity_preimage: [
@@ -740,6 +761,25 @@ fn scope_binding_response_from_binding(
     dedup_preimage: Option<
         [u8; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
     >,
+) -> Result<ScopeBindingHelperResponse> {
+    scope_binding_response_from_binding_with_links(
+        binding,
+        event_identity_preimage,
+        dedup_preimage,
+        None,
+    )
+}
+
+fn scope_binding_response_from_binding_with_links(
+    binding: CaptureIngressBinding,
+    event_identity_preimage: [
+        u8;
+        crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES
+    ],
+    dedup_preimage: Option<
+        [u8; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
+    >,
+    tool_link_preimages: Option<ToolLinkPreimages>,
 ) -> Result<ScopeBindingHelperResponse> {
     let (verified_cwd, dedup_secret, runtime_scope) = binding.into_scope_binding_parts()?;
     if verified_cwd.is_empty()
@@ -770,10 +810,15 @@ fn scope_binding_response_from_binding(
             }
         }
     };
+    let opaque_tool_link = tool_link_preimages.map(|preimages| {
+        let CaptureToolLink { tool, parent } = tool_link_from_preimages(&dedup_secret, &preimages);
+        ScopeBindingOpaqueToolLink { tool, parent }
+    });
     Ok(ScopeBindingHelperResponse::Bound {
         verified_cwd,
         opaque_event,
         opaque_dedup,
+        opaque_tool_link,
         storage_path: ScopeBindingWirePath::from_path(&runtime_scope.storage_path)?,
         worktree_root: ScopeBindingWirePath::from_path(&runtime_scope.worktree_root)?,
     })
@@ -800,6 +845,7 @@ fn decode_scope_binding_helper_response(input: &[u8]) -> Result<ScopeBindingHelp
             verified_cwd,
             opaque_event,
             opaque_dedup,
+            opaque_tool_link,
             storage_path,
             worktree_root,
         } => {
@@ -822,6 +868,18 @@ fn decode_scope_binding_helper_response(input: &[u8]) -> Result<ScopeBindingHelp
             {
                 bail!("scope-binding helper returned mismatched event and receipt identities");
             }
+            let tool_link = opaque_tool_link
+                .map(|ScopeBindingOpaqueToolLink { tool, parent }| {
+                    if !is_tool_link_identity(&tool)
+                        || parent
+                            .as_deref()
+                            .is_some_and(|parent| !is_tool_link_identity(parent))
+                    {
+                        bail!("scope-binding helper returned an invalid tool link identity");
+                    }
+                    Ok(CaptureToolLink { tool, parent })
+                })
+                .transpose()?;
             let storage_path = storage_path.into_path_buf()?;
             let worktree_root = worktree_root.into_path_buf()?;
             Ok(ScopeBindingHelperOutcome::Bound(
@@ -829,6 +887,7 @@ fn decode_scope_binding_helper_response(input: &[u8]) -> Result<ScopeBindingHelp
                     verified_cwd,
                     event_id,
                     opaque_dedup,
+                    tool_link,
                     CaptureRuntimeScope::new(storage_path, worktree_root),
                 ),
             ))
@@ -876,6 +935,7 @@ pub fn run_capture_scope_binding_helper_to_writer<W: Write>(
         deadline_millis,
         event_identity_preimage,
         dedup_preimage,
+        tool_link_preimages,
     } = request;
 
     // A lexical/canonical reported-path reject remains unverified. The shared
@@ -888,6 +948,7 @@ pub fn run_capture_scope_binding_helper_to_writer<W: Write>(
         reported_cwd,
         event_identity_preimage,
         dedup_preimage: None,
+        tool_link_preimages: None,
     }) {
         Ok(verified_scope) => verified_scope,
         Err(error) if error.chain().any(|cause| cause.is::<HookEnvelopeInvalid>()) => {
@@ -917,6 +978,7 @@ pub fn run_capture_scope_binding_helper_to_writer<W: Write>(
         bind_verified_capture_scope(verified_scope, Some(deadline_millis)),
         event_identity_preimage,
         dedup_preimage,
+        tool_link_preimages,
     );
     write_scope_binding_response(output, response)
 }
@@ -933,12 +995,16 @@ fn scope_binding_response_for_binding_result(
     dedup_preimage: Option<
         [u8; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
     >,
+    tool_link_preimages: Option<ToolLinkPreimages>,
 ) -> ScopeBindingHelperResponse {
     match binding {
-        Ok(binding) => {
-            scope_binding_response_from_binding(binding, event_identity_preimage, dedup_preimage)
-                .unwrap_or(ScopeBindingHelperResponse::TrustedBindingFailure)
-        }
+        Ok(binding) => scope_binding_response_from_binding_with_links(
+            binding,
+            event_identity_preimage,
+            dedup_preimage,
+            tool_link_preimages,
+        )
+        .unwrap_or(ScopeBindingHelperResponse::TrustedBindingFailure),
         Err(error) if is_capture_unsupported_platform_error(&error) => {
             ScopeBindingHelperResponse::UnsupportedPlatform
         }
@@ -1417,6 +1483,111 @@ mod tests {
         );
     }
 
+    /// PI-37: a tool event's helper request adds only the two fixed link
+    /// digests, and its response adds only two HMAC identities; neither
+    /// carries an ID or the key, and an unknown field is refused.
+    #[test]
+    fn scope_binding_helper_tool_link_wire_carries_only_digests_and_hmacs() {
+        use crate::internal::ai::capture::ingress::{
+            CAPTURE_DEDUP_PREIMAGE_BYTES, ToolLinkPreimages, is_tool_link_identity,
+        };
+        let preimages = ToolLinkPreimages {
+            tool: [0xA1; CAPTURE_DEDUP_PREIMAGE_BYTES],
+            parent: Some([0xA2; CAPTURE_DEDUP_PREIMAGE_BYTES]),
+        };
+        let frame = encode_scope_binding_helper_request(
+            &CaptureScopeInput {
+                reported_cwd: "/safe/worktree".to_string(),
+                event_identity_preimage: [0x2C; CAPTURE_DEDUP_PREIMAGE_BYTES],
+                dedup_preimage: Some([0x3C; CAPTURE_DEDUP_PREIMAGE_BYTES]),
+                tool_link_preimages: Some(preimages),
+            },
+            HookExecutionDeadline {
+                monotonic: Instant::now() + Duration::from_secs(1),
+                absolute_millis: 1_700_000_000_000,
+            },
+        )
+        .expect("encode helper request");
+        let request: serde_json::Value = serde_json::from_slice(&frame).expect("request JSON");
+        let mut keys = request
+            .as_object()
+            .expect("request object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "deadline_millis",
+                "dedup_preimage",
+                "event_identity_preimage",
+                "reported_cwd",
+                "tool_link_preimages",
+            ]
+        );
+        let links = request["tool_link_preimages"]
+            .as_object()
+            .expect("link digests object");
+        let mut link_keys = links.keys().map(String::as_str).collect::<Vec<_>>();
+        link_keys.sort_unstable();
+        assert_eq!(link_keys, vec!["parent", "tool"]);
+        for digest in links.values() {
+            let bytes = digest.as_array().expect("a digest is a byte array");
+            assert_eq!(bytes.len(), CAPTURE_DEDUP_PREIMAGE_BYTES);
+            assert!(bytes.iter().all(serde_json::Value::is_u64), "{digest}");
+        }
+
+        let secret = [42_u8; CAPTURE_DEDUP_SECRET_BYTES];
+        let response = scope_binding_response_from_binding_with_links(
+            CaptureIngressBinding::new(
+                "/tmp/libra-verified".to_string(),
+                secret,
+                CaptureRuntimeScope::new(
+                    PathBuf::from("/tmp/libra-storage"),
+                    PathBuf::from("/tmp/libra-root"),
+                ),
+            ),
+            [6_u8; CAPTURE_DEDUP_PREIMAGE_BYTES],
+            Some([7_u8; CAPTURE_DEDUP_PREIMAGE_BYTES]),
+            Some(preimages),
+        )
+        .expect("encode helper response");
+        let wire = serde_json::to_vec(&response).expect("serialize helper response");
+        let text = String::from_utf8(wire.clone()).expect("response is UTF-8");
+        assert!(!text.contains(&hex::encode(secret)), "{text}");
+        let value: serde_json::Value = serde_json::from_slice(&wire).expect("response JSON");
+        let link = value["opaque_tool_link"]
+            .as_object()
+            .expect("the response carries the tool link");
+        let mut link_keys = link.keys().map(String::as_str).collect::<Vec<_>>();
+        link_keys.sort_unstable();
+        assert_eq!(link_keys, vec!["parent", "tool"]);
+        for identity in link.values() {
+            assert!(
+                identity.as_str().is_some_and(is_tool_link_identity),
+                "{identity}"
+            );
+        }
+        let ScopeBindingHelperOutcome::Bound(_) =
+            decode_scope_binding_helper_response(&wire).expect("decode the helper response")
+        else {
+            panic!("a valid response decodes as bound");
+        };
+        let mut extra = value.clone();
+        extra["opaque_tool_link"]["key"] = json!(hex::encode(secret));
+        assert!(
+            decode_scope_binding_helper_response(&serde_json::to_vec(&extra).unwrap()).is_err(),
+            "an unknown link field is refused"
+        );
+        let mut bad = value;
+        bad["opaque_tool_link"]["tool"] = json!("call-1");
+        assert!(
+            decode_scope_binding_helper_response(&serde_json::to_vec(&bad).unwrap()).is_err(),
+            "a raw ID in place of an identity is refused"
+        );
+    }
+
     #[test]
     fn scope_binding_helper_request_contains_only_cwd_deadline_and_fixed_preimage() {
         let deadline = HookExecutionDeadline {
@@ -1431,6 +1602,7 @@ mod tests {
                 dedup_preimage: Some(
                     [0x3C; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                 ),
+                tool_link_preimages: None,
             },
             deadline,
         )
@@ -1570,6 +1742,7 @@ mod tests {
             dedup_preimage: Some(
                 [0xD4; crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
             ),
+            tool_link_preimages: None,
         };
         let frame = serde_json::to_vec(&request).expect("encode direct helper request");
 
@@ -2019,6 +2192,7 @@ mod tests {
             event_identity_preimage: [0;
                 crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
             dedup_preimage: None,
+            tool_link_preimages: None,
         })
         .expect("encode expired scope-binding request");
         let output = run_capture_scope_binding_helper(&frame)
@@ -2071,6 +2245,7 @@ mod tests {
                     event_identity_preimage: [0;
                         crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                     dedup_preimage: None,
+                    tool_link_preimages: None,
                 },
                 Some(scope_binding_fixture_deadline()),
             ),
@@ -2558,6 +2733,7 @@ mod tests {
                         event_identity_preimage: [0;
                             crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                         dedup_preimage: None,
+                        tool_link_preimages: None,
                     },
                     Some(initial_deadline),
                 ),
@@ -2664,6 +2840,7 @@ mod tests {
                         event_identity_preimage: [0;
                             crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                         dedup_preimage: None,
+                        tool_link_preimages: None,
                     },
                     Some(initial_deadline),
                 ),
@@ -2759,6 +2936,7 @@ mod tests {
                         event_identity_preimage: [0;
                             crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                         dedup_preimage: None,
+                        tool_link_preimages: None,
                     },
                     Some(initial_deadline),
                 ),
@@ -2838,6 +3016,7 @@ mod tests {
                     event_identity_preimage: [0;
                         crate::internal::ai::capture::ingress::CAPTURE_DEDUP_PREIMAGE_BYTES],
                     dedup_preimage: None,
+                    tool_link_preimages: None,
                 },
                 Some(deadline),
             ),

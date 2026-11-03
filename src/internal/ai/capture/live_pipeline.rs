@@ -26,7 +26,7 @@ use crate::{
                 catalog::{
                     CaptureCatalogAction, CaptureCatalogApplyRequest, CaptureCatalogConflict,
                     CaptureCatalogError, CaptureCatalogMetadataPatch, CaptureCatalogMutation,
-                    CaptureCatalogRedactionReport, CaptureCatalogSession,
+                    CaptureCatalogRedactionReport, CaptureCatalogSession, CaptureCatalogToolLink,
                 },
                 checkpoint::checkpoint_id_for_capture_action,
                 coordinator::{
@@ -689,6 +689,15 @@ async fn ingest_agent_traces_payload_with_scope(
 ) -> Result<()> {
     use crate::internal::ai::observed_agents::{RedactionMatch, Redactor};
 
+    // Read the opaque tool link before the command is consumed; it carries
+    // only keyed commitments, never provider IDs.
+    let tool_link = ingress_command
+        .tool_link()
+        .map(|link| {
+            CaptureCatalogToolLink::new(link.tool.clone(), link.parent.clone())
+                .map_err(|error| anyhow!("prepare capture catalog tool link: {error}"))
+        })
+        .transpose()?;
     let crate::internal::ai::capture::ingress::CaptureIngressParts {
         child_source_hints,
         hook_command: _command,
@@ -1004,12 +1013,15 @@ async fn ingest_agent_traces_payload_with_scope(
         catalog_mutation,
     )
     .map_err(|error| anyhow!("prepare scope-fenced capture catalog request: {error}"))?
-    .with_metadata(CaptureCatalogMetadataPatch::new(
-        concurrent_active,
-        Some(CaptureCatalogRedactionReport::from_report(
-            &runtime_redaction_report,
-        )),
-    ));
+    .with_metadata(
+        CaptureCatalogMetadataPatch::new(
+            concurrent_active,
+            Some(CaptureCatalogRedactionReport::from_report(
+                &runtime_redaction_report,
+            )),
+        )
+        .with_tool_link(tool_link),
+    );
     let catalog_request =
         require_child_gate_for_terminal(catalog_request, binding, child_event_policy)?;
 

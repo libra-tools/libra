@@ -8204,3 +8204,530 @@ done();"#,
     assert_eq!(raw.len(), 2, "{} {}", run.report, describe(&run.output));
     assert_eq!(raw[0], raw[1], "a redelivered frame is the same bytes");
 }
+
+// ---------------------------------------------------------------------------
+// PI-37: durable links between Pi live tool events (`pi_tool_correlation_*`).
+// ---------------------------------------------------------------------------
+
+/// Deliver one frame through the bounded helper path a managed Pi hook uses
+/// (`--capture-budget-ms`), as opposed to [`pi_observe`]'s in-process path.
+fn pi_observe_budgeted(repo: &HookRepo, frame: &Value) {
+    let out = repo.run(
+        &[
+            "agent",
+            "hooks",
+            "--capture-budget-ms",
+            "1500",
+            "pi",
+            "observe",
+        ],
+        Some(&frame.to_string()),
+    );
+    assert!(out.status.success(), "{frame}: {}", describe(&out));
+}
+
+/// The session's persisted tool links, oldest first.
+async fn pi_links_of(repo: &HookRepo, session_id: &str) -> Vec<Value> {
+    repo.durable_session(&format!("pi__{session_id}"))
+        .await
+        .metadata
+        .get("capture_tool_links_v1")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn pi_links(repo: &HookRepo) -> Vec<Value> {
+    pi_links_of(repo, PI_SESSION_ID).await
+}
+
+fn pi_tool_frame(repo: &HookRepo, event: &str, id: &str, parent: Option<&str>) -> Value {
+    pi_frame_with(
+        repo,
+        event,
+        json!({"toolCallId": id, "parentToolCallId": parent}),
+    )
+}
+
+fn pi_link_identity(value: &Value) -> String {
+    let text = value.as_str().expect("link identity is a string");
+    let hex = text
+        .strip_prefix("capture-tool-link-v1:")
+        .expect("link identity prefix");
+    assert!(
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{text}"
+    );
+    text.to_string()
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_pairs_a_call_with_its_result() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    // The result first, through the helper path; the call later, in process.
+    pi_observe_budgeted(&repo, &pi_tool_frame(&repo, "tool_result", "call-1", None));
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-1", None));
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 2, "{links:?}");
+    assert_eq!(
+        pi_link_identity(&links[0]["tool"]),
+        pi_link_identity(&links[1]["tool"]),
+        "a call and its result share one tool identity: {links:?}"
+    );
+    assert_ne!(links[0]["action"], links[1]["action"], "{links:?}");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_gives_each_call_its_own_identity() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-1", None));
+    pi_observe_budgeted(&repo, &pi_tool_frame(&repo, "tool_call", "call-2", None));
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 2, "{links:?}");
+    assert_ne!(
+        pi_link_identity(&links[0]["tool"]),
+        pi_link_identity(&links[1]["tool"]),
+        "{links:?}"
+    );
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_attributes_a_nested_event_to_its_parent() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    // The nested call arrives before its parent call.
+    pi_observe_budgeted(
+        &repo,
+        &pi_tool_frame(&repo, "tool_call", "call-1/1", Some("call-1")),
+    );
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-1", None));
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 2, "{links:?}");
+    let (nested, parent) = (&links[0], &links[1]);
+    assert_eq!(
+        pi_link_identity(&nested["parent"]),
+        pi_link_identity(&parent["tool"]),
+        "the nested event names its parent call's identity: {links:?}"
+    );
+    assert_ne!(nested["tool"], parent["tool"], "{links:?}");
+    assert!(parent.get("parent").is_none(), "{links:?}");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_keeps_the_parent_when_it_never_arrives() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(
+        &repo,
+        &pi_tool_frame(&repo, "tool_call", "call-9/1", Some("call-9")),
+    );
+    pi_observe_budgeted(
+        &repo,
+        &pi_tool_frame(&repo, "tool_result", "call-9/1", Some("call-9")),
+    );
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 2, "{links:?}");
+    let parent = pi_link_identity(&links[0]["parent"]);
+    assert_eq!(parent, pi_link_identity(&links[1]["parent"]), "{links:?}");
+    assert_ne!(parent, pi_link_identity(&links[0]["tool"]), "{links:?}");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_stores_no_raw_ids() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(
+        &repo,
+        &pi_tool_frame(&repo, "tool_call", "PI_RAW_PARENT_ID", None),
+    );
+    pi_observe_budgeted(
+        &repo,
+        &pi_tool_frame(
+            &repo,
+            "tool_call",
+            "PI_RAW_PARENT_ID/1",
+            Some("PI_RAW_PARENT_ID"),
+        ),
+    );
+    let session = repo.durable_session(&pi_libra_session()).await;
+    let text = session.metadata.to_string();
+    assert!(!text.contains("PI_RAW_PARENT_ID"), "{text}");
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 2, "{links:?}");
+    for link in &links {
+        pi_link_identity(&link["tool"]);
+    }
+    pi_link_identity(&links[1]["parent"]);
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_differs_between_sessions() {
+    const OTHER: &str = "019a0c3e-7b1d-7c2e-9f10-5a6b7c8d9e10";
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(
+        &repo,
+        &pi_frame_with(
+            &repo,
+            "session_start",
+            json!({"sessionId": OTHER, "frameId": pi_frame_id(1)}),
+        ),
+    );
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-1", None));
+    pi_observe(
+        &repo,
+        &pi_frame_with(
+            &repo,
+            "tool_call",
+            json!({"sessionId": OTHER, "toolCallId": "call-1"}),
+        ),
+    );
+    let here = pi_links(&repo).await;
+    let there = pi_links_of(&repo, OTHER).await;
+    assert_eq!((here.len(), there.len()), (1, 1), "{here:?} {there:?}");
+    assert_ne!(
+        pi_link_identity(&here[0]["tool"]),
+        pi_link_identity(&there[0]["tool"]),
+        "the same tool call ID in two sessions gives two identities"
+    );
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_leaves_links_unchanged_on_replay() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let call = pi_tool_frame(&repo, "tool_call", "call-4/1", Some("call-4"));
+    pi_observe(&repo, &call);
+    let before = serde_json::to_string(&pi_links(&repo).await).unwrap();
+    // The same frame again, through either path.
+    pi_observe(&repo, &call);
+    pi_observe_budgeted(&repo, &call);
+    let after = serde_json::to_string(&pi_links(&repo).await).unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_evicts_the_oldest_link_at_capacity() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let conn = repo.db().await;
+    pi_ingest_tool_calls(&repo, &conn, "call-cap", 128).await;
+    let full = pi_links(&repo).await;
+    assert_eq!(full.len(), 128);
+    pi_observe(
+        &repo,
+        &pi_tool_frame(&repo, "tool_call", "call-cap-next", None),
+    );
+    let after = pi_links(&repo).await;
+    assert_eq!(after.len(), 128);
+    assert_eq!(
+        after[..127],
+        full[1..],
+        "the earliest link goes and the rest keep their order"
+    );
+    assert!(!full.contains(&after[127]), "the new link is added last");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_leaves_other_providers_unlinked() {
+    let repo = HookRepo::init();
+    let session = "sess-pi37-claude-tool";
+    let envelope = repo.envelope(
+        "PreToolUse",
+        session,
+        None,
+        json!({"event_id": "pi37-claude-tool-v1", "tool_use_id": "toolu_pi37", "tool_name": "Bash"}),
+    );
+    let out = repo.hook("claude-code", "tool-use", &envelope);
+    assert!(out.status.success(), "{}", describe(&out));
+    let state = repo.durable_session(&format!("claude__{session}")).await;
+    assert!(
+        state.metadata.get("capture_tool_links_v1").is_none(),
+        "{}",
+        state.metadata
+    );
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_reads_sessions_with_and_without_links() {
+    let repo = HookRepo::init();
+    // A session written before any link, then one with links: both read
+    // back through the CLI, and doctor finds nothing.
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    for _ in 0..2 {
+        let show = repo.run(
+            &["agent", "session", "show", &pi_libra_session(), "--json"],
+            None,
+        );
+        assert!(show.status.success(), "{}", describe(&show));
+        pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-r", None));
+    }
+    assert_eq!(pi_links(&repo).await.len(), 1);
+    let doctor = repo.run(&["--json", "agent", "doctor"], None);
+    assert!(doctor.status.success(), "{}", describe(&doctor));
+    let report: Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
+    assert_eq!(report["data"]["orphan_checkpoints"], json!(0), "{report}");
+    assert_eq!(
+        report["data"]["checkpoint_store"]["findings"],
+        json!([]),
+        "{report}"
+    );
+}
+
+/// Replace one session's `metadata_json` member (test-only fault injection).
+async fn pi_set_metadata_member(repo: &HookRepo, session_id: &str, key: &str, value: Value) {
+    let conn = repo.db().await;
+    let mut metadata = repo.durable_session(session_id).await.metadata;
+    metadata[key] = value;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET metadata_json = ? WHERE session_id = ?",
+        [metadata.to_string().into(), session_id.into()],
+    ))
+    .await
+    .expect("rewrite session metadata");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_replaces_a_malformed_link_list() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let session = pi_libra_session();
+    pi_set_metadata_member(
+        &repo,
+        &session,
+        "capture_tool_links_v1",
+        json!([{"tool": "call-raw", "action": 7}]),
+    )
+    .await;
+    let before = repo.durable_session(&session).await;
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-m", None));
+    let after = repo.durable_session(&session).await;
+    assert_eq!(
+        after.sync_revision,
+        before.sync_revision + 1,
+        "capture goes on"
+    );
+    let links = pi_links(&repo).await;
+    assert_eq!(links.len(), 1, "{links:?}");
+    pi_link_identity(&links[0]["tool"]);
+    let receipts = after.metadata["capture_catalog_receipts_v1"]["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt["action_key"] == links[0]["action"]),
+        "the link names the receipt written with it: {links:?} {receipts:?}"
+    );
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_survives_metadata_rewrites() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-w", None));
+    let links = serde_json::to_string(&pi_links(&repo).await).unwrap();
+    // Another action rewrites the session metadata.
+    pi_observe(&repo, &pi_frame(&repo, "before_agent_start"));
+    assert_eq!(
+        serde_json::to_string(&pi_links(&repo).await).unwrap(),
+        links
+    );
+    // The checkpoint and terminal paths rewrite metadata through the shared
+    // catalog for every provider: links already in a session survive them.
+    let claude = "sess-pi37-rewrite";
+    let claude_session = format!("claude__{claude}");
+    let transcript = repo.write_claude_transcript(&repo.repo, claude, "pi37 rewrite source");
+    let out = repo.hook(
+        "claude-code",
+        "session-start",
+        &repo.envelope(
+            "SessionStart",
+            claude,
+            Some(&transcript),
+            json!({"event_id": "pi37-rewrite-start-v1"}),
+        ),
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let seeded = pi_links(&repo).await;
+    pi_set_metadata_member(
+        &repo,
+        &claude_session,
+        "capture_tool_links_v1",
+        json!(seeded),
+    )
+    .await;
+    let seeded_text = serde_json::to_string(&seeded).unwrap();
+    for (verb, name, id) in [
+        ("stop", "Stop", "pi37-rewrite-stop-v1"),
+        ("session-end", "SessionEnd", "pi37-rewrite-end-v1"),
+    ] {
+        let out = repo.hook(
+            "claude-code",
+            verb,
+            &repo.envelope(name, claude, Some(&transcript), json!({"event_id": id})),
+        );
+        assert!(out.status.success(), "{verb}: {}", describe(&out));
+        let kept = repo
+            .durable_session(&claude_session)
+            .await
+            .metadata
+            .get("capture_tool_links_v1")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(serde_json::to_string(&kept).unwrap(), seeded_text, "{verb}");
+    }
+    assert!(!repo.checkpoints().is_empty(), "the checkpoint paths ran");
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_skips_sessions_adopted_by_an_import() {
+    let repo = HookRepo::init();
+    // An explicit import (PI-10) stores this Pi session as a closed V2
+    // import record.
+    let dir = repo.home.join("pi-import");
+    std::fs::create_dir_all(&dir).expect("pi session dir");
+    let file = dir.join(format!("2026-10-31T00-00-00-000Z_{PI_SESSION_ID}.jsonl"));
+    let lines = [
+        json!({"type": "session", "version": 3, "id": PI_SESSION_ID, "timestamp": "2026-10-31T00:00:00.000Z", "cwd": repo.repo.to_str().expect("utf-8 repo")}),
+        json!({"type": "message", "id": "u1", "parentId": null, "timestamp": "2026-10-31T00:00:01.000Z", "message": {"role": "user", "content": "pi37-prompt"}}),
+        json!({"type": "message", "id": "a1", "parentId": "u1", "timestamp": "2026-10-31T00:00:01.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "pi37-answer"}]}}),
+    ];
+    std::fs::write(
+        &file,
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )
+    .expect("pi session file");
+    let path = file.to_str().expect("utf-8 path");
+    let import = repo.run(
+        &["agent", "import", "--agent", "pi", "--path", path, "--yes"],
+        None,
+    );
+    assert!(import.status.success(), "{}", describe(&import));
+    let session = pi_libra_session();
+    let before = repo.durable_session(&session).await;
+    assert_eq!(
+        before.metadata["import_source_schema_version"],
+        json!(2),
+        "{}",
+        before.metadata
+    );
+    // A live tool event on that session is captured without a link.
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-v2", None));
+    let after = repo.durable_session(&session).await;
+    assert_eq!(
+        after.sync_revision,
+        before.sync_revision + 1,
+        "{}",
+        after.metadata
+    );
+    assert!(
+        after.metadata.get("capture_tool_links_v1").is_none(),
+        "{}",
+        after.metadata
+    );
+    assert_eq!(after.metadata["import_source_schema_version"], json!(2));
+    let show = repo.run(&["agent", "session", "show", &session, "--json"], None);
+    assert!(show.status.success(), "{}", describe(&show));
+}
+
+#[tokio::test]
+async fn pi_tool_correlation_survives_a_doctor_repair() {
+    use libra::internal::ai::hooks::providers::claude_provider;
+    // A real repairable fault: a terminal receipt with no checkpoint whose
+    // finalizer window has passed. `agent doctor --repair` quarantines it,
+    // rewriting the session's metadata through the shared catalog.
+    let repo = HookRepo::init();
+    let session = "sess-pi37-doctor-repair";
+    let session_id = format!("claude__{session}");
+    let transcript = repo.write_claude_transcript(&repo.repo, session, "pi37 repair source");
+    let conn = repo.db().await;
+    let start = repo.envelope("SessionStart", session, Some(&transcript), json!({}));
+    ingest_agent_traces_payload(
+        start.as_bytes(),
+        ProviderHookCommand::SessionStart,
+        LifecycleEventKind::SessionStart,
+        claude_provider(),
+        &conn,
+        None,
+    )
+    .await
+    .expect("session start without a repository binding");
+    let end = repo.envelope(
+        "SessionEnd",
+        session,
+        Some(&transcript),
+        json!({"event_id": "pi37-doctor-repair-terminal-v1"}),
+    );
+    ingest_agent_traces_payload(
+        end.as_bytes(),
+        ProviderHookCommand::SessionEnd,
+        LifecycleEventKind::SessionEnd,
+        claude_provider(),
+        &conn,
+        None,
+    )
+    .await
+    .expect("terminal capture leaves a pending finalizer receipt");
+
+    // Seed links, then age the finalizer past its 30-minute window.
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_tool_frame(&repo, "tool_call", "call-dr", None));
+    let seeded = pi_links(&repo).await;
+    assert_eq!(seeded.len(), 1);
+    pi_set_metadata_member(&repo, &session_id, "capture_tool_links_v1", json!(seeded)).await;
+    let mut metadata = repo.durable_session(&session_id).await.metadata;
+    let finalizer = metadata["capture_catalog_receipts_v1"]["entries"]
+        .as_array_mut()
+        .and_then(|entries| entries.first_mut())
+        .and_then(|entry| entry.get_mut("finalizer"))
+        .and_then(Value::as_object_mut)
+        .expect("the terminal receipt has a pending finalizer");
+    finalizer.insert(
+        "first_attempt_millis".to_string(),
+        json!(Utc::now().timestamp_millis() - 1_800_001),
+    );
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET metadata_json = ? WHERE session_id = ?",
+        [metadata.to_string().into(), session_id.clone().into()],
+    ))
+    .await
+    .expect("age the finalizer");
+    let before = repo.durable_session(&session_id).await;
+    assert_ne!(before.state, "quarantined");
+    let before_links = serde_json::to_string(&before.metadata["capture_tool_links_v1"]).unwrap();
+
+    let repair = repo.run(&["--json", "agent", "doctor", "--repair"], None);
+    assert!(repair.status.success(), "{}", describe(&repair));
+    let report: Value = serde_json::from_slice(&repair.stdout).expect("doctor json");
+    assert!(
+        report["data"]["checkpoint_store"]["findings"]
+            .as_array()
+            .is_some_and(|findings| findings
+                .iter()
+                .any(|finding| finding["inconsistency_type"] == "expired_inflight_marker")),
+        "{report}"
+    );
+    let after = repo.durable_session(&session_id).await;
+    assert_eq!(after.state, "quarantined", "doctor repaired the receipt");
+    assert_ne!(
+        after.metadata, before.metadata,
+        "the repair rewrote the metadata"
+    );
+    assert_eq!(
+        serde_json::to_string(&after.metadata["capture_tool_links_v1"]).unwrap(),
+        before_links,
+        "the links survive the repair byte for byte"
+    );
+}

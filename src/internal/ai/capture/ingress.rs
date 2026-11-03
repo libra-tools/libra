@@ -197,6 +197,65 @@ pub struct CaptureScopeInput {
     /// This is deliberately the only replay-related provider material that
     /// may cross the ingress-to-runtime helper boundary.
     pub(crate) dedup_preimage: Option<[u8; CAPTURE_DEDUP_PREIMAGE_BYTES]>,
+    /// Fixed commitments to a tool event's call and parent call (PI-37), for
+    /// providers that name them. Like the replay preimage, only these digests
+    /// cross the helper boundary.
+    pub(crate) tool_link_preimages: Option<ToolLinkPreimages>,
+}
+
+/// Fixed SHA-256 commitments to one tool call and to the call that made it.
+/// Each is built like the native replay preimage but without the event
+/// name, so a call and its result commit to the same tool. The parent
+/// commitment uses the tool field's name with the parent's ID, so it equals
+/// the commitment the parent call is recorded with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolLinkPreimages {
+    pub(crate) tool: [u8; CAPTURE_DEDUP_PREIMAGE_BYTES],
+    pub(crate) parent: Option<[u8; CAPTURE_DEDUP_PREIMAGE_BYTES]>,
+}
+
+/// Opaque, per-repository identities of one tool event's call and parent
+/// call: keyed commitments, never the provider's IDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureToolLink {
+    pub(crate) tool: String,
+    pub(crate) parent: Option<String>,
+}
+
+/// Prefix of a tool link identity: 64 lowercase hex digits follow.
+pub(crate) const TOOL_LINK_IDENTITY_PREFIX: &str = "capture-tool-link-v1:";
+
+/// Whether `value` has the exact shape of a tool link identity.
+pub(crate) fn is_tool_link_identity(value: &str) -> bool {
+    value
+        .strip_prefix(TOOL_LINK_IDENTITY_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+/// HMAC the link commitments with the repository key. Shared by the
+/// in-process path and the bounded helper, so both give the same identity.
+pub(crate) fn tool_link_from_preimages(
+    dedup_secret: &[u8; 32],
+    preimages: &ToolLinkPreimages,
+) -> CaptureToolLink {
+    let identity = |preimage: &[u8; CAPTURE_DEDUP_PREIMAGE_BYTES]| {
+        opaque_hmac_identity(
+            dedup_secret,
+            preimage,
+            b"libra-capture-tool-link-v1\0",
+            TOOL_LINK_IDENTITY_PREFIX,
+        )
+        .1
+    };
+    CaptureToolLink {
+        tool: identity(&preimages.tool),
+        parent: preimages.parent.as_ref().map(identity),
+    }
 }
 
 /// Runtime facts supplied after generic frame validation and before a trusted
@@ -221,6 +280,7 @@ enum CaptureIngressDedup {
     Opaque {
         event_id: Uuid,
         dedup: Option<OpaqueDedupIdentity>,
+        tool_link: Option<CaptureToolLink>,
     },
 }
 
@@ -244,11 +304,16 @@ impl CaptureIngressBinding {
         verified_cwd: String,
         event_id: Uuid,
         dedup: Option<OpaqueDedupIdentity>,
+        tool_link: Option<CaptureToolLink>,
         runtime_scope: CaptureRuntimeScope,
     ) -> Self {
         Self {
             verified_cwd,
-            dedup: CaptureIngressDedup::Opaque { event_id, dedup },
+            dedup: CaptureIngressDedup::Opaque {
+                event_id,
+                dedup,
+                tool_link,
+            },
             runtime_scope,
         }
     }
@@ -328,6 +393,9 @@ pub struct CaptureIngressCommand {
     /// Session-wide display-batch cap declared by the provider for this
     /// observe event. `None` for every other callback.
     display_batch_limit: Option<u32>,
+    /// Opaque identities linking a tool event to its call and parent call
+    /// (PI-37); `None` when the provider names no link.
+    tool_link: Option<CaptureToolLink>,
 }
 
 /// Ingress either yields a canonical command or an explicit safe no-op for a
@@ -438,6 +506,7 @@ impl CaptureIngressCommand {
                         &parsed.envelope,
                         parsed.event.kind,
                     ),
+                    tool_link_preimages: tool_link_preimages(provider, &parsed.envelope),
                 };
                 let binding = bind_runtime(scope_input).await?;
                 finish_capture_ingress(parsed, binding, provider, Some(hint_policy))
@@ -509,6 +578,7 @@ impl CaptureIngressCommand {
                         &parsed.envelope,
                         parsed.event.kind,
                     ),
+                    tool_link_preimages: tool_link_preimages(provider, &parsed.envelope),
                 };
                 // The runtime resolver receives only the bounded cwd claim,
                 // never the raw frame or its flattened provider fields. It
@@ -523,6 +593,11 @@ impl CaptureIngressCommand {
     /// The command that selected this provider callback.
     pub fn hook_command(&self) -> ProviderHookCommand {
         self.hook_command
+    }
+
+    /// Opaque identities linking this tool event to its call and parent call.
+    pub(crate) fn tool_link(&self) -> Option<&CaptureToolLink> {
+        self.tool_link.as_ref()
     }
 
     /// Bounded frame size for sanitized telemetry; never the frame itself.
@@ -860,8 +935,12 @@ fn finish_capture_ingress(
         bail!("capture ingress resolver returned an empty verified cwd");
     }
     let event_identity_preimage = event_identity_preimage(provider, &envelope, &event);
-    let (event_id, dedup, identity_scheme) = match binding_dedup {
+    let link_preimages = tool_link_preimages(provider, &envelope);
+    let (event_id, dedup, identity_scheme, tool_link) = match binding_dedup {
         CaptureIngressDedup::Secret(dedup_secret) => {
+            let tool_link = link_preimages
+                .as_ref()
+                .map(|preimages| tool_link_from_preimages(&dedup_secret, preimages));
             if let Some(dedup) =
                 opaque_dedup_identity(&dedup_secret, provider, &envelope, event.kind)
             {
@@ -869,6 +948,7 @@ fn finish_capture_ingress(
                     dedup.event_id,
                     Some(dedup),
                     LifecycleIdentityScheme::NativeReplayHmacV2,
+                    tool_link,
                 )
             } else {
                 let (event_id, _) =
@@ -877,16 +957,33 @@ fn finish_capture_ingress(
                     event_id,
                     None,
                     LifecycleIdentityScheme::FallbackActionHmacV1,
+                    tool_link,
                 )
             }
         }
-        CaptureIngressDedup::Opaque { event_id, dedup } => {
+        CaptureIngressDedup::Opaque {
+            event_id,
+            dedup,
+            tool_link,
+        } => {
+            // The helper derives a link exactly when ingress sent link
+            // commitments; anything else is a mismatched response.
+            if tool_link.is_some() != link_preimages.is_some()
+                || tool_link.as_ref().is_some_and(|link| {
+                    link.parent.is_some()
+                        != link_preimages
+                            .as_ref()
+                            .is_some_and(|preimages| preimages.parent.is_some())
+                })
+            {
+                bail!("capture ingress helper returned a tool link that does not match the event");
+            }
             let identity_scheme = if dedup.is_some() {
                 LifecycleIdentityScheme::NativeReplayHmacV2
             } else {
                 LifecycleIdentityScheme::FallbackActionHmacV1
             };
-            (event_id, dedup, identity_scheme)
+            (event_id, dedup, identity_scheme, tool_link)
         }
     };
     // A provider transcript pointer is an input to later provenance
@@ -916,6 +1013,7 @@ fn finish_capture_ingress(
             context,
             event,
             display_batch_limit,
+            tool_link,
         },
     )))
 }
@@ -1577,6 +1675,40 @@ fn native_dedup_preimage(
     Some(output)
 }
 
+/// Commit to a tool event's call and parent call for providers that name
+/// them (PI-37). The preimage omits the event name so a call and its result
+/// commit to the same tool; the session ID keeps identities per session.
+fn tool_link_preimages(
+    provider: &dyn HookProvider,
+    envelope: &SessionHookEnvelope,
+) -> Option<ToolLinkPreimages> {
+    let keys = provider.tool_link_keys(&envelope.hook_event_name)?;
+    let tool = envelope
+        .extra
+        .get(keys.tool)
+        .and_then(opaque_scalar_identity)?;
+    let parent = envelope
+        .extra
+        .get(keys.parent)
+        .and_then(opaque_scalar_identity);
+    let preimage = |value: &str| {
+        let mut preimage = digest::Context::new(&digest::SHA256);
+        preimage.update(b"libra-capture-tool-link-preimage-v1\0");
+        hash_dedup_preimage_component(&mut preimage, provider.provider_name().as_bytes());
+        hash_dedup_preimage_component(&mut preimage, envelope.session_id.as_bytes());
+        hash_dedup_preimage_component(&mut preimage, keys.tool.as_bytes());
+        hash_dedup_preimage_component(&mut preimage, value.as_bytes());
+        let digest = preimage.finish();
+        let mut output = [0_u8; CAPTURE_DEDUP_PREIMAGE_BYTES];
+        output.copy_from_slice(digest.as_ref());
+        output
+    };
+    Some(ToolLinkPreimages {
+        tool: preimage(&tool),
+        parent: parent.as_deref().map(preimage),
+    })
+}
+
 /// Use the repository-private key only to HMAC an ingress-produced fixed
 /// digest. This is shared by the in-process path and the killable helper, so
 /// their replay identities remain byte-for-byte identical without placing the
@@ -2110,6 +2242,7 @@ mod tests {
                     reported_cwd: "/workspace".to_string(),
                     event_identity_preimage: [0; CAPTURE_DEDUP_PREIMAGE_BYTES],
                     dedup_preimage: None,
+                    tool_link_preimages: None,
                 })
             },
         ) {
