@@ -17,7 +17,9 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, TransactionTrait,
+};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -3014,35 +3016,70 @@ impl<'a> ImportedCheckpointWriter<'a> {
         session_id: &str,
         checkpoint_id: &str,
     ) -> Result<(), CheckpointStoreError> {
-        // A killed import binds the marker, and may record object ids, before
-        // the checkpoint row commits. Promoting that row to cleanup_pending
-        // leaves an in-flight marker after the retry has committed every turn.
-        // Nothing references those objects, so drop the marker. A checkpoint
-        // that did commit keeps the shared cleanup-pending rule.
-        let committed = txn
-            .query_one_raw(Statement::from_sql_and_values(
-                txn.get_database_backend(),
-                "SELECT 1 FROM agent_checkpoint \
-                 WHERE checkpoint_id = ? AND session_id = ? AND scope = 'committed'",
-                [checkpoint_id.into(), session_id.into()],
-            ))
+        // Import takeover owns this attempt. A killed writer may already have
+        // recorded object ids, and promoting the row to cleanup_pending leaves
+        // it after the retry commits every turn. Drop it here. Unreferenced
+        // objects remain for normal GC. Live capture does not use this path.
+        traces::clear_traces_inflight_marker(txn, session_id, checkpoint_id)
             .await
             .map_err(|_| CheckpointStoreError::StoreFailure {
                 stage: CheckpointStoreStage::Cleanup,
             })?;
-        if committed.is_none() {
-            traces::clear_traces_inflight_marker(txn, session_id, checkpoint_id)
-                .await
-                .map_err(|_| CheckpointStoreError::StoreFailure {
+        Ok(())
+    }
+
+    /// Remove the in-flight marker after its checkpoint row has committed.
+    /// A contended clear during the write can report `PendingCleanup` and
+    /// leave the row; the import still counts that turn as written.
+    pub(crate) async fn clear_committed_import_marker(
+        conn: &DatabaseConnection,
+        session_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        let mut last_error = CheckpointStoreError::StoreFailure {
+            stage: CheckpointStoreStage::Cleanup,
+        };
+        for attempt in 0..5 {
+            let txn = match conn.begin().await {
+                Ok(txn) => txn,
+                Err(error) => {
+                    last_error = CheckpointStoreError::StoreFailure {
+                        stage: CheckpointStoreStage::Cleanup,
+                    };
+                    let _ = error;
+                    if attempt < 4 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) =
+                traces::clear_traces_inflight_marker(&txn, session_id, checkpoint_id).await
+            {
+                txn.rollback().await.ok();
+                last_error = CheckpointStoreError::StoreFailure {
                     stage: CheckpointStoreStage::Cleanup,
-                })?;
-            return Ok(());
+                };
+                let _ = error;
+                if attempt < 4 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                continue;
+            }
+            match txn.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = CheckpointStoreError::StoreFailure {
+                        stage: CheckpointStoreStage::Cleanup,
+                    };
+                    let _ = error;
+                    if attempt < 4 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
         }
-        traces::retire_stale_traces_inflight_marker(txn, session_id, checkpoint_id)
-            .await
-            .map_err(|_| CheckpointStoreError::StoreFailure {
-                stage: CheckpointStoreStage::Cleanup,
-            })
+        Err(last_error)
     }
 
     /// Clear an uncommitted prebound marker only under its exact generation

@@ -5906,15 +5906,23 @@ async fn import_prepared_with_reasoning_identity_batches_and_coverage(
                     );
                 }
                 CheckpointWriteOutcome::PendingCleanup { .. } => {
-                    // The ref CAS and its import/coverage companion already
-                    // committed. Preserve the historical importer contract:
-                    // account for the turn while retaining the durable marker
-                    // for doctor/GC repair instead of replaying a second
-                    // checkpoint write.
-                    tracing::warn!(
-                        reason = "import_checkpoint_cleanup_pending",
-                        "imported checkpoint committed with durable cleanup pending"
-                    );
+                    // The checkpoint row is already durable. A busy marker
+                    // clear must not leave that in-flight row behind, or a
+                    // retry that otherwise committed every turn still fails
+                    // its recovery check.
+                    if let Err(error) = ImportedCheckpointWriter::clear_committed_import_marker(
+                        conn,
+                        &request.session_id,
+                        &checkpoint_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            reason = "import_checkpoint_marker_clear_failed",
+                            error = %error,
+                            "committed import checkpoint kept its in-flight marker"
+                        );
+                    }
                 }
                 CheckpointWriteOutcome::ConflictUnchanged { reason } => {
                     bail!("imported checkpoint store left the write unchanged: {reason:?}");
