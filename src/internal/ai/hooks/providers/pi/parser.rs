@@ -6,6 +6,26 @@
 //! capture. Prompts, message bodies, tool input/output and thinking are not
 //! part of the envelope; `sessionFile` is never used as a transcript source.
 //! This module does not read files or persist state.
+//!
+//! Correlation (PI-12) needs no state either. Each recorded event names the
+//! envelope field that is its replay identity ([`pi_replay_identity_keys`]);
+//! the receiver hashes that field with the event name and session ID, so a
+//! frame delivered again after a restart is the same action:
+//!
+//! - the session key is Pi's `sessionId`;
+//! - a tool event's record key is its `toolCallId` and its phase is the
+//!   event name, so `tool_call` and `tool_result` are separate actions that
+//!   are each recorded at most once, in whichever order they arrive;
+//! - `session_start` and a user `before_agent_start` carry no Pi ID, so
+//!   they are keyed by `frameId`, a random UUID the extension gives every
+//!   frame it builds and keeps when it delivers that frame again. A resume,
+//!   a reload or a start from another Pi process is a new frame and a new
+//!   action; the same frame is not.
+//!
+//! A nested tool event (`parentToolCallId` set) is recorded under its own
+//! `toolCallId`, which Pi derives as `<parentToolCallId>/<n>`; a frame whose
+//! ID is not a direct child of the parent it names is refused. Nested calls
+//! have no transcript entry of their own, so nothing waits for one.
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -13,13 +33,15 @@ use serde_json::{Map, Value, json};
 
 use super::super::super::lifecycle::{LifecycleEvent, LifecycleEventKind, SessionHookEnvelope};
 
-/// Envelope version written by the bundled extension.
-pub const PI_ENVELOPE_SCHEMA: u64 = 1;
+/// Envelope version written by the bundled extension. Version 2 (PI-12)
+/// added `frameId`; a version 1 frame is refused.
+pub const PI_ENVELOPE_SCHEMA: u64 = 2;
 
 /// Fields every frame carries.
-pub const PI_COMMON_FIELDS: [&str; 6] = [
+pub const PI_COMMON_FIELDS: [&str; 7] = [
     "schema",
     "event",
+    "frameId",
     "sessionId",
     "sessionFile",
     "cwd",
@@ -69,10 +91,31 @@ pub fn recognizes_pi_event(name: &str) -> bool {
 
 /// Events this receiver records. The run, turn and session-end boundaries
 /// are accepted on the wire but not recorded until their mapping lands
-/// (PI-12 correlation, PI-19 run terminal).
+/// (PI-19 run terminal).
 pub fn pi_event_is_ingested(name: &str) -> bool {
-    matches!(name, "session_start" | "tool_call" | "tool_result")
+    matches!(
+        name,
+        "session_start" | "before_agent_start" | "tool_call" | "tool_result"
+    )
 }
+
+/// The envelope field that identifies one recorded event across replays.
+/// The receiver commits to the field's name and value together with the
+/// event name and session ID, so these names are part of the stable
+/// identity and must not change.
+pub fn pi_replay_identity_keys(event: &str) -> &'static [&'static str] {
+    match event {
+        "tool_call" | "tool_result" => &["toolCallId"],
+        "session_start" | "before_agent_start" => &["frameId"],
+        _ => &[],
+    }
+}
+
+/// The name a `before_agent_start` takes when its message did not come from
+/// the user, such as a `custom` message. It is not an observed event, so the
+/// receiver skips the frame without writing anything: only a user message is
+/// a prompt (ADR-PI-04).
+pub const PI_NON_USER_RUN_START: &str = "before_agent_start.non_user";
 
 /// Lower one frame to the shared envelope. Error text is fixed and never
 /// echoes frame content.
@@ -114,7 +157,12 @@ pub fn lower_pi_frame(frame: &str) -> Result<SessionHookEnvelope> {
         bail!("pi hook frame emittedAt is not an RFC 3339 time");
     }
     nullable_text(&object, "sessionFile")?;
+    let frame_id = required_text(&object, "frameId")?;
+    if !is_canonical_uuid(&frame_id) {
+        bail!("pi hook frame frameId is not a UUID");
+    }
     let mut extra = Map::new();
+    extra.insert("frameId".to_string(), Value::String(frame_id));
     for key in fields {
         let value = &object[*key];
         let valid = match *key {
@@ -134,6 +182,28 @@ pub fn lower_pi_frame(frame: &str) -> Result<SessionHookEnvelope> {
             bail!("pi hook frame has a field of the wrong type for its event");
         }
         extra.insert((*key).to_string(), value.clone());
+    }
+    // Only tool events carry these keys, and they were checked above.
+    if let Some(parent) = object.get("parentToolCallId").and_then(Value::as_str) {
+        let child = object
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix(parent))
+            .and_then(|rest| rest.strip_prefix('/'));
+        if !child.is_some_and(|segment| !segment.is_empty() && !segment.contains('/')) {
+            bail!("pi hook frame names a parent tool call it does not belong to");
+        }
+    }
+    if event == "before_agent_start"
+        && object.get("messageType").and_then(Value::as_str) != Some("user")
+    {
+        return Ok(SessionHookEnvelope {
+            hook_event_name: PI_NON_USER_RUN_START.to_string(),
+            session_id,
+            cwd,
+            transcript_path: None,
+            extra: Map::new(),
+        });
     }
     Ok(SessionHookEnvelope {
         hook_event_name: event,
@@ -157,6 +227,7 @@ pub fn parse_pi_hook_event(
     }
     let (kind, tool_name) = match hook_event_name {
         "session_start" => (LifecycleEventKind::SessionStart, None),
+        "before_agent_start" => (LifecycleEventKind::TurnStart, None),
         "tool_call" | "tool_result" => (
             LifecycleEventKind::ToolUse,
             envelope
@@ -219,6 +290,11 @@ fn unique_object(frame: &str) -> Option<Map<String, Value>> {
     serde_json::from_str::<UniqueObject>(frame)
         .ok()
         .map(|object| object.0)
+}
+
+/// A lowercase, hyphenated UUID, the form `crypto.randomUUID()` produces.
+fn is_canonical_uuid(text: &str) -> bool {
+    uuid::Uuid::try_parse(text).is_ok_and(|id| id.hyphenated().to_string() == text)
 }
 
 fn required_text(object: &Map<String, Value>, key: &str) -> Result<String> {

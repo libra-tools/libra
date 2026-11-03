@@ -6,6 +6,7 @@
 // stores lifecycle metadata only. A delivery error is ignored, and each
 // delivery is bounded in time, attempts and concurrent children.
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 const LIBRA_COMMAND = __LIBRA_COMMAND_JSON__;
 // The child carries its own capture budget, shorter than the delivery
@@ -19,7 +20,7 @@ const LIBRA_ARGS = [
   "pi",
   "observe",
 ];
-const ENVELOPE_SCHEMA = 1;
+const ENVELOPE_SCHEMA = 2;
 const OBSERVED_EVENTS = [
   "session_start",
   "session_shutdown",
@@ -40,9 +41,13 @@ function envelope(event, payload, ctx) {
   if (typeof sessionId !== "string" || sessionId === "") {
     return undefined;
   }
+  // frameId identifies this frame: the receiver keys a session start and a
+  // user run start by it, so it is new for every frame, including frames
+  // from another Pi process, and a delivery retry sends the same frame.
   const frame = {
     schema: ENVELOPE_SCHEMA,
     event,
+    frameId: randomUUID(),
     sessionId,
     sessionFile: nullableText(manager.getSessionFile()),
     cwd: ctx.cwd,
@@ -91,9 +96,9 @@ function envelope(event, payload, ctx) {
 // extension: a delivery or retry that would exceed it is dropped, never
 // queued, so Pi's loop is never held and no frame is kept.
 //
-// Only a child that never started is retried: the receiver has no replay
-// identity yet, so a child that ran, even one that exited non-zero or was
-// killed, may already have recorded the event and is never run again. A
+// Only a child that never started is retried: a child that ran, even one
+// that exited non-zero or was killed, may already have recorded the event
+// and is never run again. A
 // spawn that throws synchronously fails the same way every time and is not
 // retried either. A failed kill is retried exactly once. When Pi exits
 // normally every running child is killed; if Pi dies without running any

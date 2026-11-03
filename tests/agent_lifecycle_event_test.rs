@@ -6220,11 +6220,17 @@ fn pi_ctx(repo: &HookRepo, trusted: &str, session_file: &str) -> String {
     )
 }
 
+/// A fixed `frameId` for fixture frames; `n` tells frames apart.
+fn pi_frame_id(n: u32) -> String {
+    format!("5f0c2a7e-9b4d-4c1e-8a3f-{n:012x}")
+}
+
 /// One receiver frame per ADR-PI-06 event.
 fn pi_frame(repo: &HookRepo, event: &str) -> Value {
     let mut frame = json!({
-        "schema": 1,
+        "schema": 2,
         "event": event,
+        "frameId": pi_frame_id(0),
         "sessionId": PI_SESSION_ID,
         "sessionFile": null,
         "cwd": repo.repo.display().to_string(),
@@ -6255,6 +6261,7 @@ fn pi_expected_keys(event: &str) -> std::collections::BTreeSet<String> {
     let common = [
         "schema",
         "event",
+        "frameId",
         "sessionId",
         "sessionFile",
         "cwd",
@@ -6556,7 +6563,16 @@ fn pi_observe_envelope_fields_match_adr_pi_06() {
                 frame.as_object().unwrap().keys().cloned().collect();
             assert_eq!(keys, pi_expected_keys(event), "{event}: {frame}");
             assert_eq!(frame["event"], json!(event));
-            assert_eq!(frame["schema"], json!(1));
+            assert_eq!(frame["schema"], json!(2));
+            let frame_id = frame["frameId"].as_str().expect("frameId");
+            assert_eq!(
+                uuid::Uuid::parse_str(frame_id)
+                    .map(|id| id.hyphenated().to_string())
+                    .ok()
+                    .as_deref(),
+                Some(frame_id),
+                "{event}: {frame}"
+            );
             assert_eq!(frame["sessionId"], json!(PI_SESSION_ID));
             assert_eq!(frame["cwd"], json!(repo.repo.display().to_string()));
             if nested {
@@ -6591,6 +6607,16 @@ fn pi_observe_envelope_fields_match_adr_pi_06() {
             let out = repo.hook("pi", "observe", &frame.to_string());
             assert!(out.status.success(), "{event}: {}", describe(&out));
         }
+        let frame_ids: std::collections::BTreeSet<String> = run
+            .forwarded
+            .iter()
+            .map(|forwarded| forwarded["frame"]["frameId"].to_string())
+            .collect();
+        assert_eq!(
+            frame_ids.len(),
+            events.len(),
+            "every frame gets its own frameId"
+        );
         let text = serde_json::to_string(&run.forwarded).unwrap();
         for canary in [
             "PI_CANARY_PROMPT",
@@ -6625,9 +6651,24 @@ fn pi_observe_receiver_refuses_frames_outside_adr_pi_06() {
     let mut empty = start.clone();
     empty["reason"] = json!("");
     refused.push(("empty required field", empty));
-    let mut schema = start.clone();
-    schema["schema"] = json!(2);
-    refused.push(("unknown schema", schema));
+    for version in [1, 3] {
+        let mut schema = start.clone();
+        schema["schema"] = json!(version);
+        refused.push(("other schema", schema));
+    }
+    let mut no_frame_id = start.clone();
+    no_frame_id.as_object_mut().unwrap().remove("frameId");
+    refused.push(("missing frameId", no_frame_id));
+    for bad in [
+        json!("frame-1"),
+        json!(pi_frame_id(0).to_uppercase()),
+        json!(pi_frame_id(0).replace('-', "")),
+        json!(7),
+    ] {
+        let mut frame_id = start.clone();
+        frame_id["frameId"] = bad;
+        refused.push(("frameId not a lowercase hyphenated UUID", frame_id));
+    }
     let mut snake = start.clone();
     snake["hook_event_name"] = json!("session_start");
     refused.push(("shared envelope field", snake));
@@ -6672,6 +6713,7 @@ async fn pi_observe_receiver_records_adr_frames() {
         let provider = pi_provider();
         for (event, kind, tool) in [
             ("session_start", LifecycleEventKind::SessionStart, None),
+            ("before_agent_start", LifecycleEventKind::TurnStart, None),
             ("tool_call", LifecycleEventKind::ToolUse, Some("bash")),
             ("tool_result", LifecycleEventKind::ToolUse, Some("bash")),
         ] {
@@ -6711,12 +6753,7 @@ async fn pi_observe_receiver_records_adr_frames() {
                 "{event} must carry no content"
             );
         }
-        for event in [
-            "session_shutdown",
-            "before_agent_start",
-            "turn_end",
-            "agent_settled",
-        ] {
+        for event in ["session_shutdown", "turn_end", "agent_settled"] {
             let frame = pi_frame(&repo, event).to_string();
             assert!(
                 matches!(
@@ -7615,8 +7652,8 @@ report.spawned = children.length;"#,
 fn pi_child_contract_never_reruns_a_child_that_ran() {
     let repo = HookRepo::init();
     let node = pi_node();
-    // A child that ran and then failed may already have recorded the event;
-    // the receiver has no replay identity yet, so it is never run again.
+    // A child that ran and then failed may already have recorded the event,
+    // so it is never run again.
     // The fake logs its start (standing in for a recorded event) and then
     // exits 1.
     let failing = pi_contract_fake(&repo.home.join("ran"), &node, "libra.mjs", "exit:1");
@@ -7627,4 +7664,543 @@ fn pi_child_contract_never_reruns_a_child_that_ran() {
     let hung = pi_contract_fake(&repo.home.join("ran-hung"), &node, "libra.mjs", "hang");
     let run = pi_contract_run(&repo, &node, &hung, 1, "");
     assert_eq!(pi_contract_phase(&run, "start").len(), 1, "{:?}", run.lines);
+}
+
+// ---------------------------------------------------------------------------
+// PI-12: Pi live event correlation (`pi_event_correlation_*`).
+// ---------------------------------------------------------------------------
+
+fn pi_libra_session() -> String {
+    format!("pi__{PI_SESSION_ID}")
+}
+
+/// A receiver frame for `event` with `fields` replacing the fixture values.
+fn pi_frame_with(repo: &HookRepo, event: &str, fields: Value) -> Value {
+    let mut frame = pi_frame(repo, event);
+    for (key, value) in fields.as_object().expect("override object") {
+        frame[key] = value.clone();
+    }
+    frame
+}
+
+/// Deliver one frame through the real `agent hooks pi observe` entry, a
+/// new receiver process each time, as after a restart.
+fn pi_observe(repo: &HookRepo, frame: &Value) {
+    let out = repo.hook("pi", "observe", &frame.to_string());
+    assert!(out.status.success(), "{frame}: {}", describe(&out));
+}
+
+/// The in-process ingress outcome for one frame: the lifecycle kind it is
+/// recorded as, or `None` when the receiver skips it.
+fn pi_recorded_kind(repo: &HookRepo, frame: &Value) -> Option<LifecycleEventKind> {
+    use libra::internal::ai::{
+        capture::ingress::CaptureIngressOutcome, hooks::providers::pi_provider,
+    };
+    match lower_in_process_capture_frame_for_test(
+        frame.to_string().as_bytes(),
+        ProviderHookCommand::Observe,
+        ProviderHookCommand::Observe.lifecycle_event_kind(),
+        pi_provider(),
+        Some(&repo.repo),
+    )
+    .expect("a Pi frame never fails ingress")
+    {
+        CaptureIngressOutcome::Command(command) => Some(command.event_kind()),
+        CaptureIngressOutcome::UnknownEvent { .. } => None,
+    }
+}
+
+/// Deliver `frame` and assert how far the durable session moved: one
+/// revision for a new action, none for a replay or a skipped frame.
+async fn pi_observe_advances(repo: &HookRepo, frame: &Value, by: i64) -> DurableSessionState {
+    let session = pi_libra_session();
+    let before = repo.durable_session(&session).await;
+    pi_observe(repo, frame);
+    let after = repo.durable_session(&session).await;
+    if by == 0 {
+        assert_eq!(after, before, "{frame} must leave the session as it was");
+    } else {
+        assert_eq!(
+            after.sync_revision,
+            before.sync_revision + by,
+            "{frame} must be recorded once"
+        );
+        assert_eq!(after.state, "active", "{frame}");
+    }
+    after
+}
+
+#[tokio::test]
+async fn pi_event_correlation_replays_a_session_start_once() {
+    let repo = HookRepo::init();
+    let start = pi_frame(&repo, "session_start");
+    pi_observe(&repo, &start);
+    assert_eq!(repo.sessions().len(), 1);
+    // The same start again, from a new receiver process, is the same action.
+    pi_observe_advances(&repo, &start, 0).await;
+    // Pi restarted and resumed this session, then reloaded it: each is a new
+    // start on the same session, and each is recorded once.
+    for (n, reason, previous, at) in [
+        (
+            1,
+            "resume",
+            json!("/tmp/prev.jsonl"),
+            "2026-11-02T17:05:00.000Z",
+        ),
+        (2, "reload", Value::Null, "2026-11-02T17:06:00.000Z"),
+    ] {
+        let restart = pi_frame_with(
+            &repo,
+            "session_start",
+            json!({"frameId": pi_frame_id(n), "reason": reason, "previousSessionFile": previous, "emittedAt": at, "sessionFile": "/tmp/session.jsonl"}),
+        );
+        pi_observe_advances(&repo, &restart, 1).await;
+        pi_observe_advances(&repo, &restart, 0).await;
+    }
+    // Two Pi processes start the session in the same millisecond, or a later
+    // process starts it after the clock stepped back: the frames differ
+    // only in frameId, and both starts are recorded.
+    for n in [3, 4] {
+        let start = pi_frame_with(
+            &repo,
+            "session_start",
+            json!({"frameId": pi_frame_id(n), "reason": "resume", "emittedAt": "2026-11-02T17:07:00.000Z"}),
+        );
+        pi_observe_advances(&repo, &start, 1).await;
+        pi_observe_advances(&repo, &start, 0).await;
+    }
+    // Events after the restart land on that one session.
+    let call = pi_frame_with(
+        &repo,
+        "tool_call",
+        json!({"toolCallId": "call-after-resume"}),
+    );
+    pi_observe_advances(&repo, &call, 1).await;
+    let sessions = repo.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(
+        sessions[0]["session_id"],
+        json!(pi_libra_session()),
+        "{sessions:?}"
+    );
+    assert!(repo.checkpoints().is_empty());
+}
+
+#[tokio::test]
+async fn pi_event_correlation_replays_a_tool_record_once() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let call = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-7"}));
+    let recorded = pi_observe_advances(&repo, &call, 1).await;
+    pi_observe_advances(&repo, &call, 0).await;
+    // Pi sends the same call again after a restart: a new frame, a later
+    // emittedAt and a known session file do not make it a new record.
+    let again = pi_frame_with(
+        &repo,
+        "tool_call",
+        json!({"frameId": pi_frame_id(7), "toolCallId": "call-7", "emittedAt": "2026-11-02T18:00:00.000Z", "sessionFile": "/tmp/session.jsonl"}),
+    );
+    assert_eq!(pi_observe_advances(&repo, &again, 0).await, recorded);
+    // Another tool call is another record.
+    let other = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-8"}));
+    pi_observe_advances(&repo, &other, 1).await;
+}
+
+#[tokio::test]
+async fn pi_event_correlation_keeps_call_and_result_phases_apart() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let call = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-9"}));
+    let result = pi_frame_with(&repo, "tool_result", json!({"toolCallId": "call-9"}));
+    // One record, two phases: the result is not a replay of the call.
+    pi_observe_advances(&repo, &call, 1).await;
+    let both = pi_observe_advances(&repo, &result, 1).await;
+    // Each phase replays to itself.
+    pi_observe_advances(&repo, &call, 0).await;
+    assert_eq!(pi_observe_advances(&repo, &result, 0).await, both);
+    use libra::internal::ai::hooks::providers::pi_provider;
+    for event in ["tool_call", "tool_result"] {
+        assert_eq!(
+            pi_provider().dedup_identity_keys_for_event(event, LifecycleEventKind::ToolUse),
+            &["toolCallId"],
+            "{event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pi_event_correlation_records_a_result_before_its_call() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    // The result arrives first. It is recorded at once; nothing waits for
+    // the call, and the call is recorded when it comes.
+    let result = pi_frame_with(&repo, "tool_result", json!({"toolCallId": "call-3"}));
+    let call = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-3"}));
+    pi_observe_advances(&repo, &result, 1).await;
+    let paired = pi_observe_advances(&repo, &call, 1).await;
+    pi_observe_advances(&repo, &result, 0).await;
+    assert_eq!(pi_observe_advances(&repo, &call, 0).await, paired);
+    // A result whose call never comes leaves nothing open: later events
+    // are recorded as usual.
+    let lone = pi_frame_with(&repo, "tool_result", json!({"toolCallId": "call-4"}));
+    pi_observe_advances(&repo, &lone, 1).await;
+    let next = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-5"}));
+    pi_observe_advances(&repo, &next, 1).await;
+    assert_eq!(repo.sessions().len(), 1);
+    assert!(repo.checkpoints().is_empty());
+
+    // The extension keeps no pairing state either: it forwards a result
+    // that precedes its call as it comes, and both reach the receiver.
+    let node = pi_node();
+    let fake = pi_fake_libra(&repo, &node, 0);
+    let events = pi_event_payloads(false);
+    let tool = |name: &str| {
+        events
+            .iter()
+            .find(|(event, _)| *event == name)
+            .map(|(event, payload)| (*event, payload.clone()))
+            .expect("tool payload")
+    };
+    let run = pi_run_extension(
+        &repo,
+        &node,
+        &fake,
+        &pi_ctx(&repo, "true", "undefined"),
+        &[tool("tool_result"), tool("tool_call")],
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    let mut forwarded: Vec<String> = run
+        .forwarded
+        .iter()
+        .map(|line| {
+            line["frame"]["event"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    forwarded.sort();
+    assert_eq!(
+        forwarded,
+        ["tool_call", "tool_result"],
+        "{:?}",
+        run.forwarded
+    );
+}
+
+#[tokio::test]
+async fn pi_event_correlation_treats_a_repeated_result_as_the_first() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(
+        &repo,
+        &pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-11"})),
+    );
+    let result = pi_frame_with(&repo, "tool_result", json!({"toolCallId": "call-11"}));
+    let first = pi_observe_advances(&repo, &result, 1).await;
+    // The same bytes again, and the same result sent later with a known
+    // session file, end in the state the first result left.
+    let later = pi_frame_with(
+        &repo,
+        "tool_result",
+        json!({"frameId": pi_frame_id(11), "toolCallId": "call-11", "emittedAt": "2026-11-02T18:30:00.000Z", "sessionFile": "/tmp/session.jsonl"}),
+    );
+    for repeated in [&result, &later, &result] {
+        assert_eq!(pi_observe_advances(&repo, repeated, 0).await, first);
+    }
+}
+
+#[tokio::test]
+async fn pi_event_correlation_accepts_nested_events_only_under_their_parent() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let nested = |event: &str, id: &str, parent: &str| {
+        pi_frame_with(
+            &repo,
+            event,
+            json!({"toolCallId": id, "parentToolCallId": parent, "toolName": "read"}),
+        )
+    };
+    // The parent call and a call it made are separate records; the nested
+    // call pairs with its own result, and a call the nested tool made in
+    // turn belongs to the nested call.
+    let parent = pi_frame_with(&repo, "tool_call", json!({"toolCallId": "call-1"}));
+    pi_observe_advances(&repo, &parent, 1).await;
+    let mut recorded = Vec::new();
+    for frame in [
+        nested("tool_call", "call-1/1", "call-1"),
+        nested("tool_result", "call-1/1", "call-1"),
+        nested("tool_call", "call-1/1/1", "call-1/1"),
+        nested("tool_call", "call-1/2", "call-1"),
+    ] {
+        assert_eq!(
+            pi_recorded_kind(&repo, &frame),
+            Some(LifecycleEventKind::ToolUse),
+            "{frame}"
+        );
+        pi_observe_advances(&repo, &frame, 1).await;
+        recorded.push(frame);
+    }
+    for frame in &recorded {
+        pi_observe_advances(&repo, frame, 0).await;
+    }
+    // A frame whose ID is not a direct child of the parent it names is
+    // refused without a write.
+    for frame in [
+        nested("tool_call", "call-1/1", "call-2"),
+        nested("tool_result", "call-1/1/2", "call-1"),
+        nested("tool_call", "call-1/", "call-1"),
+        nested("tool_call", "call-1", "call-1"),
+        nested("tool_call", "call-10/1", "call-1"),
+        nested("tool_call", "other", "call-1"),
+    ] {
+        assert_eq!(pi_recorded_kind(&repo, &frame), None, "{frame}");
+        pi_observe_advances(&repo, &frame, 0).await;
+    }
+    assert_eq!(repo.sessions().len(), 1);
+}
+
+#[tokio::test]
+async fn pi_event_correlation_expects_no_transcript_entry_for_nested_events() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    // Nested events with no parent event seen, result first: each is
+    // recorded as it arrives, without a diagnostic.
+    for (event, id, parent) in [
+        ("tool_result", "call-5/1", "call-5"),
+        ("tool_call", "call-5/1", "call-5"),
+        ("tool_result", "call-5/1/1", "call-5/1"),
+    ] {
+        let frame = pi_frame_with(
+            &repo,
+            event,
+            json!({"toolCallId": id, "parentToolCallId": parent}),
+        );
+        let out = repo.hook("pi", "observe", &frame.to_string());
+        assert!(out.status.success(), "{frame}: {}", describe(&out));
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "a nested event must not print a diagnostic: {}",
+            describe(&out)
+        );
+        pi_observe_advances(&repo, &frame, 0).await;
+    }
+    let session = repo.durable_session(&pi_libra_session()).await;
+    assert_eq!(session.sync_revision, 4, "start plus three nested events");
+    // Doctor finds no orphan or missing entry.
+    let doctor = repo.run(&["--json", "agent", "doctor"], None);
+    assert!(doctor.status.success(), "{}", describe(&doctor));
+    let report: Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
+    assert_eq!(report["data"]["orphan_checkpoints"], json!(0), "{report}");
+    assert_eq!(
+        report["data"]["checkpoint_store"]["findings"],
+        json!([]),
+        "{report}"
+    );
+    assert!(repo.checkpoints().is_empty());
+}
+
+#[tokio::test]
+async fn pi_event_correlation_counts_only_user_messages_as_prompts() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    // A user message starts a turn, once.
+    let user = pi_frame(&repo, "before_agent_start");
+    assert_eq!(
+        pi_recorded_kind(&repo, &user),
+        Some(LifecycleEventKind::TurnStart)
+    );
+    pi_observe_advances(&repo, &user, 1).await;
+    pi_observe_advances(&repo, &user, 0).await;
+    // A run a custom message started is not a prompt and is not recorded.
+    for (n, at) in [
+        (20, "2026-11-02T17:10:00.000Z"),
+        (21, "2026-11-02T17:11:00.000Z"),
+    ] {
+        let custom = pi_frame_with(
+            &repo,
+            "before_agent_start",
+            json!({"frameId": pi_frame_id(n), "messageType": "custom", "emittedAt": at}),
+        );
+        assert_eq!(pi_recorded_kind(&repo, &custom), None, "{custom}");
+        pi_observe_advances(&repo, &custom, 0).await;
+    }
+    // The next user message is another turn, also when it carries the same
+    // emittedAt as the first, as from another Pi process.
+    for (n, at) in [
+        (22, "2026-11-02T17:12:00.000Z"),
+        (23, "2026-11-02T17:00:00.000Z"),
+    ] {
+        let next = pi_frame_with(
+            &repo,
+            "before_agent_start",
+            json!({"frameId": pi_frame_id(n), "emittedAt": at}),
+        );
+        pi_observe_advances(&repo, &next, 1).await;
+        pi_observe_advances(&repo, &next, 0).await;
+    }
+    assert!(
+        repo.checkpoints().is_empty(),
+        "a turn start writes no checkpoint"
+    );
+}
+
+/// Deliver `count` new tool calls in process, each its own action.
+async fn pi_ingest_tool_calls(
+    repo: &HookRepo,
+    conn: &DatabaseConnection,
+    prefix: &str,
+    count: usize,
+) {
+    use libra::internal::ai::hooks::providers::pi_provider;
+    for n in 0..count {
+        let frame = pi_frame_with(
+            repo,
+            "tool_call",
+            json!({"toolCallId": format!("{prefix}-{n}")}),
+        );
+        ingest_agent_traces_payload(
+            frame.to_string().as_bytes(),
+            ProviderHookCommand::Observe,
+            ProviderHookCommand::Observe.lifecycle_event_kind(),
+            pi_provider(),
+            conn,
+            Some(&repo.repo),
+        )
+        .await
+        .expect("a later tool call is recorded");
+    }
+}
+
+#[tokio::test]
+async fn pi_event_correlation_bounds_the_replay_window() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let first = pi_frame_with(
+        &repo,
+        "tool_call",
+        json!({"toolCallId": "call-window-first"}),
+    );
+    pi_observe_advances(&repo, &first, 1).await;
+    // The shared receipt ledger keeps at most 128 receipts per session and,
+    // when full, evicts the completed receipt with the smallest
+    // (observed second, key). Let every later action be observed in a later
+    // second than the first frame, so its receipt goes before theirs.
+    std::thread::sleep(Duration::from_millis(1100));
+    let conn = repo.db().await;
+    // 102 actions in all: no receipt is evicted, so the replay is the same
+    // action.
+    pi_ingest_tool_calls(&repo, &conn, "call-window-a", 100).await;
+    pi_observe_advances(&repo, &first, 0).await;
+    // 202 actions: the receipts of the first second are gone, so the replay
+    // is recorded once more as a new action on the same session.
+    pi_ingest_tool_calls(&repo, &conn, "call-window-b", 100).await;
+    pi_observe_advances(&repo, &first, 1).await;
+    pi_observe_advances(&repo, &first, 0).await;
+    assert_eq!(repo.sessions().len(), 1);
+    assert!(repo.checkpoints().is_empty());
+}
+
+/// JavaScript for `head`: freeze the wall clock (`Date.now()` and
+/// `new Date()`), and record the frame each
+/// spawned fake child receives. `plan[i]` says whether the `i`th child
+/// started; beyond the plan, children start. `fake` is also installed in
+/// any reloaded copy the tail imports.
+const PI_FROZEN_FRAMES: &str = r#"const frozenAt = Date.UTC(2026, 10, 3, 1, 0, 0, 0);
+const RealDate = Date;
+globalThis.Date = class extends RealDate {
+  constructor(...args) { super(...(args.length ? args : [frozenAt])); }
+  static now() { return frozenAt; }
+};
+report.frames = [];
+report.raw = [];
+const kids = [];
+const plan = globalThis.libraTestPlan ?? [];
+const fake = () => {
+  const child = new EventEmitter();
+  child.pid = (plan[kids.length] ?? true) ? 710000 + kids.length : undefined;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = () => true;
+  child.stdin = { on() {}, end(data) { report.raw.push(data); report.frames.push(JSON.parse(data)); } };
+  kids.push(child);
+  return child;
+};
+__setSpawnForTest(fake);
+const done = () => { for (const kid of kids) { if (kid.pid !== undefined) kid.emit('exit', 0, null); } save(); };"#;
+
+#[tokio::test]
+async fn pi_event_correlation_gives_every_frame_its_own_frame_id() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let unused = repo.home.join("never-run");
+    // Two Pi processes with the clock frozen at the same millisecond, the
+    // first also reloading its extension: each fires a session start and a
+    // user run start.
+    let tail = r#"handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx);
+const reloaded = await import('./extension.mjs?reload=1');
+reloaded.__setSpawnForTest(fake);
+const again = new Map();
+reloaded.default({ on(name, handler) { again.set(name, handler); } });
+again.get('before_agent_start')({ type: 'before_agent_start', messageType: 'user', prompt: 'one' }, ctx);
+done();"#;
+    let mut frames: Vec<Value> = Vec::new();
+    for _ in 0..2 {
+        let run = pi_contract_run_with(
+            &repo,
+            &node,
+            &unused,
+            0,
+            PI_FROZEN_FRAMES,
+            tail,
+            Duration::from_secs(1),
+            &[],
+        );
+        let produced = run.report["frames"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            produced.len(),
+            2,
+            "{} {}",
+            run.report,
+            describe(&run.output)
+        );
+        frames.extend(produced);
+    }
+    let stamps: std::collections::BTreeSet<String> = frames
+        .iter()
+        .map(|frame| frame["emittedAt"].to_string())
+        .collect();
+    assert_eq!(stamps.len(), 1, "the clock is frozen: {frames:?}");
+    let ids: std::collections::BTreeSet<String> = frames
+        .iter()
+        .map(|frame| frame["frameId"].to_string())
+        .collect();
+    assert_eq!(ids.len(), 4, "every frame gets its own frameId: {frames:?}");
+    // The receiver records all four starts, once each.
+    pi_observe(&repo, &frames[0]);
+    for frame in &frames[1..] {
+        pi_observe_advances(&repo, frame, 1).await;
+    }
+    for frame in &frames {
+        pi_observe_advances(&repo, frame, 0).await;
+    }
+    assert_eq!(repo.sessions().len(), 1);
+
+    // A frame delivered again, after a child that never started, is the
+    // same frame, with the same frameId.
+    let run = pi_contract_run_with(
+        &repo,
+        &node,
+        &unused,
+        0,
+        &format!("globalThis.libraTestPlan = [false, true];\n{PI_FROZEN_FRAMES}"),
+        r#"handlers.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx);
+kids[0].emit('error', new Error('not started'));
+done();"#,
+        Duration::from_secs(1),
+        &[],
+    );
+    let raw: Vec<Value> = run.report["raw"].as_array().cloned().unwrap_or_default();
+    assert_eq!(raw.len(), 2, "{} {}", run.report, describe(&run.output));
+    assert_eq!(raw[0], raw[1], "a redelivered frame is the same bytes");
 }
