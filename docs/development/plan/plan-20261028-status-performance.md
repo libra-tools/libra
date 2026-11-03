@@ -65,6 +65,15 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 - **Lifecycle / Acceptance 保持 `in-progress / locally-accepted`。** ER-05 Codex review 已 PASS；PR #937 已创建，base.yml run `41473136033` 与 CodeQL run `41473136093` 当前 pending。分支 push 本身不会触发 `.github/workflows/base.yml`（它只响应 PR、main/release 分支 push 或手动 dispatch）。状态同步提交会改变 PR head，故旧 head 检查不作为最终 D，须以后续 head 的适用检查为准。Issue #646 不由此例外关闭。
 - 本例外仅适用于当前 SP-07 候选和此次分支交付，不修改模板、不扩展到其它卡、不免除最终计划全量收口门；所有暂缓事项未完成前，不得将 Acceptance 改为 `complete` 或 Lifecycle 改为 `done`。
 
+### SP-07 CI 收口裁定（EX-SP-07-CLOSE-CI-01）
+
+2026-11-03，用户根据 PR #937 当前最终 head 的全量 CI 通过，明确裁定完结 SP-07。此裁定更新并取代 EX-SP-07-PUSH-01 中“PR CI 后仍不得 complete”及“不得关闭 Issue”的临时状态条件，范围仅限 SP-07。
+
+- T-1 以 PR #937 head `85fd8909056d4bfdf722456544d2ac7a34bfb154` 的 base.yml run `41473911251` attempt 2 全部成功作为远端全量验收：`compat-offline-core` 的 `Run tests (L1 + L2 + L3)`、OTLP、keyring、upgrade tests 均通过；fmt、Clippy、redundancy、network remotes、macOS owner liveness、Windows scoped input、Linux export sandbox 均通过。CodeQL run `41473911247` 的两项也通过。此前 attempt 1 因 runner 未分配而取消，不计为代码失败；attempt 2 为最终证据。
+- 本机 dual-env nextest 仍如实记为 `not-run`（16 GiB 主机低于 32 GiB 门槛）；远端全量 CI 满足本卡 T-1 验收目的，不回写成本机执行。实现、同卡测试、ER-05、性能证据和最终 head CI 均已完成，Lifecycle / Acceptance 改为 `done / complete`。
+- PR #937 于 `2026-11-02T21:52:33Z` squash merge，merge commit `3f78dadad612f96f48882b61987182a51fbfd393`；Issue #646 于 2026-11-03 按该合并与最终 CI 证据关闭。
+- 独立 patch bump、版本面同步及发布仍未执行，继续由 `DEFER-SP-REL-07` 跟踪；本次完结只表示代码任务验收完成，不声称版本发布完成。
+
 ### SP-06 修复卡收口决策（EX-SP-06-CLOSE-01）
 
 2026-11-02，在实现、定向回归、fmt、严格 Clippy、release 构建及 SP-00 完整 16 格三方矩阵通过后，用户明确要求“记录本轮测试结果，另外，完成卡片”。本次按修复卡口径将 SP-06 登记为 `done / complete`。这是对本卡 ER-04/ER-08 完整发布切片及远端门顺序的具名例外，不扩展至 SP-07 及以后的任务卡。
@@ -935,7 +944,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** in-progress / locally-accepted（2026-11-02，分支 `codex/SP-07`；Issue #646 OPEN，前置 SP-06 done / complete 且 #645 CLOSED；A/B、fmt、严格 Clippy、release build 与 SP-00 完整矩阵已过；按 EX-SP-07-PUSH-01 暂缓 T-1 nextest 与独立发布门；Codex review PASS，PR #937 的 base/CodeQL 检查 pending，不标完成）
+**Lifecycle / Acceptance:** done / complete（2026-11-03，依 EX-SP-07-CLOSE-CI-01；前置 SP-06 done / complete 且 #645 CLOSED；A/B、fmt、严格 Clippy、release build、SP-00 完整矩阵、Codex review 与 PR #937 最终 head base/CodeQL 全部通过；PR 已合并，Issue #646 关闭。主机 dual-env nextest 保持 not-run，由 base.yml attempt 2 全量 L1+L2+L3 CI 验收；独立 patch 发布继续由 DEFER-SP-REL-07 跟踪。）
 
 **Priority / Selection:** P2；本轮核心提速：第一梯队
 
@@ -970,9 +979,9 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **静态审查处置（2026-11-02）：** 用户提供的静态审查记录提出 P1×2/P2×2。共享二分 helper 的无条件末尾 seek 已移回普通入口；只有 v2 大 offset 的安全边界检查需要末尾 seek，新回归检查同索引 32 次普通 hit/空桶 miss 不产生末尾 seek。哈希串行问题不采纳：Cargo.toml 固定 git-internal 0.10.4，其 hash.rs 使用 thread_local!，同步测试通过 guard 恢复线程状态，并非进程全局可变状态，不新增无效 serial lane。性能对照已改为完整普通入口（含长度校验）对旧 v2 完整 reference lookup，两侧记录 read/seek，实测见下。上述处置已按最终源码复核。
 
-**ER-05 Codex review（2026-11-02）：PASS。** 复核最终 `src/utils/storage/local.rs` diff 的 v1/v2 布局、SHA-1/SHA-256 分支、fanout 单调性、完整表长度、large-offset 索引与尾部校验和边界、普通 lookup 与批量入口的 seek 行为，以及新增损坏索引/索引替换/命中与 miss 回归。未发现未关闭 P0/P1；既有审查提出的问题均有对应修复或具名不采纳依据及测试。该 review 只覆盖当前源码，不把未运行的 T-1 或远端 CI 记为通过。
+**ER-05 Codex review（2026-11-02）：PASS。** 复核最终 `src/utils/storage/local.rs` diff 的 v1/v2 布局、SHA-1/SHA-256 分支、fanout 单调性、完整表长度、large-offset 索引与尾部校验和边界、普通 lookup 与批量入口的 seek 行为，以及新增损坏索引/索引替换/命中与 miss 回归。未发现未关闭 P0/P1；既有审查提出的问题均有对应修复或具名不采纳依据及测试。T-1 后由最终 PR CI 独立验收，见 EX-SP-07-CLOSE-CI-01。
 
-**审查修正后实测（2026-11-02）：** `cargo +1.99.0 test --lib utils::storage::local:: -- --nocapture` 33/33 PASS，包含新前缀 3/3 和批量 seek 回归。固定 1024 名索引、21 次完整查询，暖缓存且不含文件打开时间；新路径读取 ≤15 次、seek 13 次（含一次长度校验），旧 reference 读取 1283 次、seek 3 次。中位墙钟 62.167 µs 对 2.042334 ms，p95 为 387.625 µs 对 3.632625 ms；不外推冷缓存或整条 status 的收益。同一已打开索引的 32 次普通 hit 加 32 次空桶 miss，末尾 seek 为 0、读取和 seek 各 352 次，空桶 miss 不增加 I/O。最终 fmt、`cargo +1.99.0 clippy --all-targets --all-features -- -D warnings` 与 `cargo +1.99.0 build --release` 均 PASS。依赖 block/proc-macro-error2 的 future-incompat 提示仍存在，定向测试链接器提示 __eh_frame 较大；不将这些提示记作本卡失败或已修复。未执行版本递增、提交、推送、PR 或 Release，最终复审与 T-1/C/D 仍待。
+**审查修正后实测（2026-11-02）：** `cargo +1.99.0 test --lib utils::storage::local:: -- --nocapture` 33/33 PASS，包含新前缀 3/3 和批量 seek 回归。固定 1024 名索引、21 次完整查询，暖缓存且不含文件打开时间；新路径读取 ≤15 次、seek 13 次（含一次长度校验），旧 reference 读取 1283 次、seek 3 次。中位墙钟 62.167 µs 对 2.042334 ms，p95 为 387.625 µs 对 3.632625 ms；不外推冷缓存或整条 status 的收益。同一已打开索引的 32 次普通 hit 加 32 次空桶 miss，末尾 seek 为 0、读取和 seek 各 352 次，空桶 miss 不增加 I/O。最终 fmt、`cargo +1.99.0 clippy --all-targets --all-features -- -D warnings` 与 `cargo +1.99.0 build --release` 均 PASS。依赖 block/proc-macro-error2 的 future-incompat 提示仍存在，定向测试链接器提示 __eh_frame 较大；不将这些提示记作本卡失败或已修复。远端验收、PR 合并与本机 nextest 事实按 EX-SP-07-CLOSE-CI-01 记录；独立 patch 发布仍 deferred。
 
 **SP-00 完整矩阵（2026-11-02）：** 使用 SP-00 fixture commit `d0a5c28a6b236421c14a38339b592fe37137585e`，比较 Git 2.56.0、父版 `f9a1c87a5bd9f3953b2ac4793210c7368c06a5cc` 与 SP-07 候选；父版/候选/Git SHA-256 分别为 `9812718c8801e4a32c22baed4f7bb19b8a2bd63f8d8048e2992c09a0ef0c7921`、`140ac66f5d03f3aee637a6c69200157c797a658e169ecb836b8350df47aebfe4`、`6210287b8021b25eea03b1866f8bbb775c02ac1185f0d69f2a70c01e73b1ab9c`。16 格全部完成，每格每工具 5 次预热 + 20 个正式样本，共 1,200 次调用、960 个计时样本；执行顺序 ABC/CBA 交替，暖 page cache、新 CLI 进程。所有调用 exit 0、stderr 为空、各自输出稳定、index SHA-256 前后相同；跨工具规范化机器可读记录语义一致，未跟踪及重命名断言通过。v2 原始字节顺序存在 Git/Libra 差异，因此保留各自 stdout hash 并以 SP-00 规定的排序记录比较语义。候选相对父版中位数每格均下降 6.23%–21.01%，配对样本胜出 307/320；逐格中位数、nearest-rank p95 和倍率如下（时间 ms，Git 倍数为候选/对应 Git 中位数）：
 
@@ -1024,7 +1033,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self（EX-SP-07-PUSH-01 仅准许先提交/推送以进入 PR CI；当前未取得 C/D 覆盖，版本化发布由 DEFER-SP-REL-07 跟踪）。
+**C/D coverage from:** self（EX-SP-07-CLOSE-CI-01：代码验收由 PR #937 最终 head 的 base.yml `41473911251` attempt 2 与 CodeQL `41473911247` 覆盖并通过；版本化发布仍由 DEFER-SP-REL-07 跟踪）。
 
 **Granularity:** type=implementation; axis=pack index 整块 fanout 与二分查找; recovery=前滚修复版; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=1; prod-files=1; scope=S; deps=SP-06; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=N/A
 
