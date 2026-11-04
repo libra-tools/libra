@@ -347,7 +347,7 @@ fn rebase_exec_failure_stops_and_continue_retries_the_command() {
 
     let libra = env!("CARGO_BIN_EXE_libra");
     let create_exec_commit = format!(
-        "printf 'exec-created\\n' > exec-created.txt && '{libra}' add exec-created.txt && '{libra}' commit -s -m exec-created"
+        "printf 'exec-created\\n' > exec-created.txt && '{libra}' add exec-created.txt && '{libra}' commit --no-gpg-sign -s -m exec-created"
     );
     let failed = fixture.run(
         &repo,
