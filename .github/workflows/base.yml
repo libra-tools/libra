@@ -432,7 +432,9 @@ jobs:
           if cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.143"; then
             echo "cargo-nextest 0.9.143 already installed"
           else
-            cargo install cargo-nextest --version 0.9.143 --locked
+            # The self-hosted runner may preinstall another version; replace it
+            # so the pinned toolchain, not the ambient binary, runs the suite.
+            cargo install cargo-nextest --version 0.9.143 --locked --force
           fi
           cargo nextest --version
 
