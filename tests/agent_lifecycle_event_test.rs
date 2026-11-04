@@ -6228,7 +6228,7 @@ fn pi_frame_id(n: u32) -> String {
 /// One receiver frame per ADR-PI-06 event.
 fn pi_frame(repo: &HookRepo, event: &str) -> Value {
     let mut frame = json!({
-        "schema": 2,
+        "schema": 3,
         "event": event,
         "frameId": pi_frame_id(0),
         "sessionId": PI_SESSION_ID,
@@ -6246,7 +6246,7 @@ fn pi_frame(repo: &HookRepo, event: &str) -> Value {
         "tool_call" | "tool_result" => {
             json!({"toolCallId": "call-1", "parentToolCallId": null, "toolName": "bash"})
         }
-        "agent_settled" => json!({"aborted": false}),
+        "agent_settled" => json!({"aborted": false, "outcome": "completed"}),
         other => panic!("no fixture for {other}"),
     };
     for (key, value) in fields.as_object().unwrap() {
@@ -6278,7 +6278,7 @@ fn pi_expected_keys(event: &str) -> std::collections::BTreeSet<String> {
             "outcome",
         ],
         "tool_call" | "tool_result" => &["toolCallId", "parentToolCallId", "toolName"],
-        "agent_settled" => &["aborted"],
+        "agent_settled" => &["aborted", "outcome"],
         other => panic!("ADR-PI-06 has no field set for {other}"),
     };
     common
@@ -6563,7 +6563,7 @@ fn pi_observe_envelope_fields_match_adr_pi_06() {
                 frame.as_object().unwrap().keys().cloned().collect();
             assert_eq!(keys, pi_expected_keys(event), "{event}: {frame}");
             assert_eq!(frame["event"], json!(event));
-            assert_eq!(frame["schema"], json!(2));
+            assert_eq!(frame["schema"], json!(3));
             let frame_id = frame["frameId"].as_str().expect("frameId");
             assert_eq!(
                 uuid::Uuid::parse_str(frame_id)
@@ -6651,11 +6651,14 @@ fn pi_observe_receiver_refuses_frames_outside_adr_pi_06() {
     let mut empty = start.clone();
     empty["reason"] = json!("");
     refused.push(("empty required field", empty));
-    for version in [1, 3] {
+    for version in [1, 2] {
         let mut schema = start.clone();
         schema["schema"] = json!(version);
         refused.push(("other schema", schema));
     }
+    let mut bad_outcome = pi_frame(&repo, "agent_settled");
+    bad_outcome["outcome"] = json!("interrupted");
+    refused.push(("agent_settled outcome outside the envelope", bad_outcome));
     let mut no_frame_id = start.clone();
     no_frame_id.as_object_mut().unwrap().remove("frameId");
     refused.push(("missing frameId", no_frame_id));
@@ -6716,6 +6719,7 @@ async fn pi_observe_receiver_records_adr_frames() {
             ("before_agent_start", LifecycleEventKind::TurnStart, None),
             ("tool_call", LifecycleEventKind::ToolUse, Some("bash")),
             ("tool_result", LifecycleEventKind::ToolUse, Some("bash")),
+            ("agent_settled", LifecycleEventKind::TurnEnd, None),
         ] {
             let frame = pi_frame(&repo, event).to_string();
             match lower_in_process_capture_frame_for_test(
@@ -6753,7 +6757,7 @@ async fn pi_observe_receiver_records_adr_frames() {
                 "{event} must carry no content"
             );
         }
-        for event in ["session_shutdown", "turn_end", "agent_settled"] {
+        for event in ["session_shutdown", "turn_end"] {
             let frame = pi_frame(&repo, event).to_string();
             assert!(
                 matches!(
@@ -8203,6 +8207,533 @@ done();"#,
     let raw: Vec<Value> = run.report["raw"].as_array().cloned().unwrap_or_default();
     assert_eq!(raw.len(), 2, "{} {}", run.report, describe(&run.output));
     assert_eq!(raw[0], raw[1], "a redelivered frame is the same bytes");
+}
+
+// ---------------------------------------------------------------------------
+// PI-19: Pi run terminal mapping (`pi_run_terminal_*`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pi_run_terminal_waits_for_agent_settled() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_frame(&repo, "before_agent_start"));
+    // A turn ending is not the run terminal: nothing is committed yet.
+    pi_observe(&repo, &pi_frame(&repo, "turn_end"));
+    assert!(
+        repo.checkpoints().is_empty(),
+        "turn_end must not commit a checkpoint"
+    );
+    // agent_end is not an observed event and writes nothing.
+    let mut agent_end = pi_frame(&repo, "session_start");
+    agent_end["event"] = json!("agent_end");
+    pi_observe(&repo, &agent_end);
+    assert!(repo.checkpoints().is_empty(), "agent_end is not a terminal");
+    // The settle commits exactly one checkpoint.
+    let settled = pi_frame(&repo, "agent_settled");
+    pi_observe(&repo, &settled);
+    assert_eq!(repo.checkpoints().len(), 1);
+    // Replaying the same frame is the same action.
+    pi_observe(&repo, &settled);
+    assert_eq!(repo.checkpoints().len(), 1);
+}
+
+#[tokio::test]
+async fn pi_run_terminal_reports_an_error_run() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_frame(&repo, "before_agent_start"));
+    let turn = pi_frame_with(&repo, "turn_end", json!({"outcome": "error"}));
+    pi_observe(&repo, &turn);
+    let settled = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"aborted": false, "outcome": "error"}),
+    );
+    let out = repo.hook("pi", "observe", &settled.to_string());
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("pi run ended with an error; its checkpoint was kept"),
+        "an error run must not look like a clean completion: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        repo.checkpoints().len(),
+        1,
+        "an error run keeps the data it captured"
+    );
+    // The recorded kind is still the checkpoint-committing turn end.
+    assert_eq!(
+        pi_recorded_kind(&repo, &settled),
+        Some(LifecycleEventKind::TurnEnd)
+    );
+    let envelope = libra::internal::ai::hooks::providers::pi_provider()
+        .lower_native_frame(&settled.to_string())
+        .expect("pi lowers its frame")
+        .expect("valid frame lowers");
+    let parsed = libra::internal::ai::hooks::providers::pi_provider()
+        .parse_hook_event("agent_settled", &envelope)
+        .expect("the terminal parses");
+    assert_eq!(parsed.kind, LifecycleEventKind::TurnEnd);
+    let source = parsed.source.expect("terminal source");
+    assert_eq!(source["outcome"], json!("error"));
+    assert_eq!(source["partial"], json!(true));
+}
+
+#[tokio::test]
+async fn pi_run_terminal_interrupts_without_a_checkpoint() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    let interrupted = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"aborted": true, "outcome": "error"}),
+    );
+    pi_observe(&repo, &interrupted);
+    assert!(
+        repo.checkpoints().is_empty(),
+        "an aborted run does not commit a checkpoint"
+    );
+    assert_eq!(
+        pi_recorded_kind(&repo, &interrupted),
+        Some(LifecycleEventKind::TurnInterrupted)
+    );
+    let session = pi_libra_session();
+    assert_eq!(repo.durable_session(&session).await.state, "active");
+}
+
+#[tokio::test]
+async fn pi_run_terminal_reports_an_unknown_outcome() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_frame(&repo, "before_agent_start"));
+    // The run produced no turn_end at all.
+    let settled = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"aborted": false, "outcome": null}),
+    );
+    let out = repo.hook("pi", "observe", &settled.to_string());
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("pi run ended without a completed turn; its checkpoint is partial"),
+        "an unknown outcome must not look like a clean completion: {}",
+        describe(&out)
+    );
+    assert_eq!(repo.checkpoints().len(), 1);
+    let envelope = libra::internal::ai::hooks::providers::pi_provider()
+        .lower_native_frame(&settled.to_string())
+        .expect("pi lowers its frame")
+        .expect("valid frame lowers");
+    let parsed = libra::internal::ai::hooks::providers::pi_provider()
+        .parse_hook_event("agent_settled", &envelope)
+        .expect("the terminal parses");
+    let source = parsed.source.expect("terminal source");
+    assert_eq!(source["outcome"], json!("unknown"));
+    assert_eq!(source["partial"], json!(true));
+}
+
+#[tokio::test]
+async fn pi_run_terminal_keeps_previously_captured_data() {
+    let repo = HookRepo::init();
+    pi_observe(&repo, &pi_frame(&repo, "session_start"));
+    pi_observe(&repo, &pi_frame(&repo, "before_agent_start"));
+    pi_observe(&repo, &pi_frame(&repo, "agent_settled"));
+    let first = repo.checkpoints();
+    assert_eq!(first.len(), 1);
+    // The next run is aborted: it must not delete or rewrite the earlier
+    // checkpoint.
+    pi_observe(
+        &repo,
+        &pi_frame_with(
+            &repo,
+            "agent_settled",
+            json!({"frameId": pi_frame_id(20), "aborted": true, "outcome": "error"}),
+        ),
+    );
+    assert_eq!(
+        repo.checkpoints(),
+        first,
+        "an aborted run keeps earlier capture data unchanged"
+    );
+}
+
+#[test]
+fn pi_run_terminal_tracks_each_run_outcome() {
+    let repo = HookRepo::init();
+    let node = pi_node();
+    let fake = pi_fake_libra(&repo, &node, 0);
+    let events = vec![
+        ("session_start", json!({"reason": "startup"})),
+        (
+            "before_agent_start",
+            json!({"messageType": "user", "prompt": "one"}),
+        ),
+        (
+            "turn_end",
+            json!({"outcome": "completed", "turnIndex": 0, "messageEntryId": "entry-1", "toolResultEntryIds": []}),
+        ),
+        ("agent_settled", json!({"aborted": false})),
+        (
+            "before_agent_start",
+            json!({"messageType": "custom", "message": "two"}),
+        ),
+        (
+            "turn_end",
+            json!({"outcome": "error", "turnIndex": 0, "messageEntryId": "entry-2", "toolResultEntryIds": []}),
+        ),
+        ("agent_settled", json!({"aborted": false})),
+        // A settle with no observed run in this process reports unknown.
+        ("agent_settled", json!({"aborted": false})),
+    ];
+    let run = pi_run_extension(
+        &repo,
+        &node,
+        &fake,
+        &pi_ctx(&repo, "true", "undefined"),
+        &events,
+    );
+    assert!(run.output.status.success(), "{}", describe(&run.output));
+    let outcomes: Vec<Value> = run
+        .forwarded
+        .iter()
+        .filter(|forwarded| forwarded["frame"]["event"] == json!("agent_settled"))
+        .map(|forwarded| forwarded["frame"]["outcome"].clone())
+        .collect();
+    // Deliveries run as independent children, so their log order is not
+    // the event order. Three runs must still yield all three distinct
+    // outcomes: completed, error and the unknown null. Reusing a previous
+    // run's outcome would repeat one value and drop another.
+    let mut labels: Vec<&str> = outcomes
+        .iter()
+        .map(|outcome| outcome.as_str().unwrap_or("null"))
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec!["completed", "error", "null"],
+        "each run reports its own outcome, never the previous run's: {outcomes:?}"
+    );
+}
+
+// Draft tests for tests/agent_lifecycle_event_test.rs (PI-14/PI-17).
+
+#[test]
+fn pi_asset_install_writes_only_a_verified_owned_asset() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiAssetOwnership, PiAssetWrite, pi_asset_ownership, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    let binary = temp.path().join("bin").join("libra");
+    assert_eq!(
+        write_owned_pi_asset(temp.path(), &binary).expect("install"),
+        PiAssetWrite::Created
+    );
+    assert_eq!(
+        pi_asset_ownership(temp.path()).expect("ownership"),
+        PiAssetOwnership::Owned
+    );
+
+    let user = tempfile::tempdir().expect("user project");
+    let slot = user
+        .path()
+        .join(".pi")
+        .join("extensions")
+        .join("libra-hooks.ts");
+    std::fs::create_dir_all(slot.parent().expect("slot parent")).expect("mkdir");
+    std::fs::write(&slot, "the user's own extension").expect("user file");
+    let error = write_owned_pi_asset(user.path(), &binary)
+        .expect_err("an unmanaged file is never replaced");
+    assert!(
+        error.to_string().contains("not a libra-managed"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&slot).expect("user bytes"),
+        "the user's own extension"
+    );
+    assert_eq!(
+        pi_asset_ownership(user.path()).expect("ownership"),
+        PiAssetOwnership::Unmanaged
+    );
+}
+
+#[test]
+fn pi_asset_install_is_idempotent() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiAssetWrite, pi_asset_path, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    let binary = temp.path().join("libra");
+    assert_eq!(
+        write_owned_pi_asset(temp.path(), &binary).expect("first install"),
+        PiAssetWrite::Created
+    );
+    let first = std::fs::read(pi_asset_path(temp.path())).expect("asset");
+    assert_eq!(
+        write_owned_pi_asset(temp.path(), &binary).expect("second install"),
+        PiAssetWrite::Unchanged
+    );
+    assert_eq!(
+        std::fs::read(pi_asset_path(temp.path())).expect("asset"),
+        first
+    );
+}
+
+#[test]
+fn pi_asset_uninstall_is_idempotent() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiAssetOwnership, PiAssetRemove, pi_asset_ownership, remove_owned_pi_asset,
+        write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    let binary = temp.path().join("libra");
+    write_owned_pi_asset(temp.path(), &binary).expect("install");
+    assert_eq!(
+        remove_owned_pi_asset(temp.path()).expect("first remove"),
+        PiAssetRemove::Removed
+    );
+    assert_eq!(
+        pi_asset_ownership(temp.path()).expect("ownership"),
+        PiAssetOwnership::Absent
+    );
+    assert_eq!(
+        remove_owned_pi_asset(temp.path()).expect("second remove"),
+        PiAssetRemove::Absent
+    );
+}
+
+#[test]
+fn pi_asset_uninstall_removes_only_the_owned_asset() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PI_ASSET_FILE, PiAssetOwnership, remove_owned_pi_asset, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    write_owned_pi_asset(temp.path(), &temp.path().join("libra")).expect("install");
+    let slot = temp
+        .path()
+        .join(".pi")
+        .join("extensions")
+        .join(PI_ASSET_FILE);
+    assert!(slot.exists());
+    remove_owned_pi_asset(temp.path()).expect("remove");
+    assert!(!slot.exists(), "the owned asset is removed");
+    assert!(
+        slot.parent().expect("parent").is_dir(),
+        "the extension directory is not removed"
+    );
+    assert_eq!(
+        libra::internal::ai::hooks::providers::pi::settings::pi_asset_ownership(temp.path())
+            .expect("ownership"),
+        PiAssetOwnership::Absent
+    );
+}
+
+#[test]
+fn pi_asset_uninstall_leaves_non_owned_or_drifted_files() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PI_ASSET_FILE, PiAssetOwnership, pi_asset_ownership, pi_asset_path, remove_owned_pi_asset,
+        write_owned_pi_asset,
+    };
+
+    let user = tempfile::tempdir().expect("user project");
+    let user_slot = pi_asset_path(user.path());
+    std::fs::create_dir_all(user_slot.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&user_slot, "the user's own extension").expect("user file");
+    let error = remove_owned_pi_asset(user.path()).expect_err("an unmanaged file is kept");
+    assert!(
+        error.to_string().contains("not a libra-managed"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&user_slot).expect("user bytes"),
+        "the user's own extension"
+    );
+
+    let drifted = tempfile::tempdir().expect("drifted project");
+    write_owned_pi_asset(drifted.path(), &drifted.path().join("libra")).expect("install");
+    let drifted_slot = drifted
+        .path()
+        .join(".pi")
+        .join("extensions")
+        .join(PI_ASSET_FILE);
+    let mut bytes = std::fs::read(&drifted_slot).expect("asset");
+    bytes.extend_from_slice(b"\n// local edit\n");
+    std::fs::write(&drifted_slot, &bytes).expect("drift");
+    let error = remove_owned_pi_asset(drifted.path()).expect_err("a drifted file is kept");
+    assert!(
+        error.to_string().contains("changed after libra wrote it"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&drifted_slot).expect("drifted bytes"), bytes);
+    assert_eq!(
+        pi_asset_ownership(drifted.path()).expect("ownership"),
+        PiAssetOwnership::Drifted
+    );
+}
+
+#[test]
+fn pi_asset_install_never_writes_pi_trust_state() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PI_ASSET_FILE, pi_asset_path, remove_owned_pi_asset, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    write_owned_pi_asset(temp.path(), &temp.path().join("libra")).expect("install");
+    let asset = std::fs::read_to_string(pi_asset_path(temp.path())).expect("asset");
+    assert!(
+        !asset.contains("trust.json") && !asset.contains("--approve"),
+        "the asset must not manage Pi trust state"
+    );
+    let trust = temp.path().join(".pi").join("agent").join("trust.json");
+    assert!(!trust.exists(), "install wrote a Pi trust file");
+    remove_owned_pi_asset(temp.path()).expect("remove");
+    assert!(!trust.exists(), "uninstall wrote a Pi trust file");
+    assert!(
+        !temp
+            .path()
+            .join(".pi")
+            .join("extensions")
+            .join(PI_ASSET_FILE)
+            .exists()
+    );
+}
+
+#[test]
+fn pi_asset_install_detects_a_missing_pi_binary() {
+    use libra::internal::ai::hooks::providers::pi::settings::pi_binary_on_path;
+
+    let empty = tempfile::tempdir().expect("empty dir");
+    assert!(
+        pi_binary_on_path(Some(empty.path().as_os_str())).is_none(),
+        "an empty PATH directory has no Pi binary"
+    );
+    assert!(pi_binary_on_path(None).is_none());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = tempfile::tempdir().expect("bin dir");
+        let pi = bin.path().join("pi");
+        std::fs::write(&pi, b"#!/bin/sh\necho 1.4.0\n").expect("fake pi");
+        let mut permissions = std::fs::metadata(&pi).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&pi, permissions).expect("chmod");
+        assert_eq!(pi_binary_on_path(Some(bin.path().as_os_str())), Some(pi));
+
+        // A plain file named `pi` is not an executable binary.
+        let plain_dir = tempfile::tempdir().expect("plain dir");
+        let plain = plain_dir.path().join("pi");
+        std::fs::write(&plain, b"not executable").expect("plain file");
+        let mut permissions = std::fs::metadata(&plain).expect("metadata").permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&plain, permissions).expect("chmod");
+        assert!(pi_binary_on_path(Some(plain_dir.path().as_os_str())).is_none());
+    }
+}
+
+#[test]
+fn pi_asset_doctor_reports_a_missing_asset() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiDiagnostic, PiProjectTrust, diagnose_pi_project,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    let diagnosis =
+        diagnose_pi_project(temp.path(), None, PiProjectTrust::Granted).expect("diagnose");
+    assert!(diagnosis.findings.contains(&PiDiagnostic::AssetMissing));
+    assert!(!diagnosis.findings.contains(&PiDiagnostic::TrustNotGranted));
+}
+
+#[test]
+fn pi_asset_doctor_reports_asset_drift() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiDiagnostic, PiProjectTrust, diagnose_pi_project, pi_asset_path, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    write_owned_pi_asset(temp.path(), &temp.path().join("libra")).expect("install");
+    let slot = pi_asset_path(temp.path());
+    let mut bytes = std::fs::read(&slot).expect("asset");
+    bytes.extend_from_slice(b"\n// local edit\n");
+    std::fs::write(&slot, bytes).expect("drift");
+    let diagnosis =
+        diagnose_pi_project(temp.path(), None, PiProjectTrust::Granted).expect("diagnose");
+    assert!(diagnosis.findings.contains(&PiDiagnostic::AssetDrifted));
+}
+
+#[test]
+fn pi_asset_doctor_reports_a_trust_coverage_gap() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiDiagnostic, PiProjectTrust, diagnose_pi_project, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    write_owned_pi_asset(temp.path(), &temp.path().join("libra")).expect("install");
+    for trust in [PiProjectTrust::Denied, PiProjectTrust::Unknown] {
+        let diagnosis = diagnose_pi_project(temp.path(), None, trust).expect("diagnose");
+        assert!(
+            diagnosis.findings.contains(&PiDiagnostic::TrustNotGranted),
+            "{trust:?}: {:?}",
+            diagnosis.findings
+        );
+    }
+    let diagnosis =
+        diagnose_pi_project(temp.path(), None, PiProjectTrust::Granted).expect("diagnose");
+    assert!(!diagnosis.findings.contains(&PiDiagnostic::TrustNotGranted));
+    assert!(
+        diagnosis
+            .findings
+            .contains(&PiDiagnostic::SubdirectoryLaunchGap),
+        "the subdirectory launch gap is always reported"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_asset_doctor_reports_a_pi_version_drift() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiDiagnostic, PiProjectTrust, diagnose_pi_project, write_owned_pi_asset,
+    };
+
+    let temp = tempfile::tempdir().expect("temp project");
+    write_owned_pi_asset(temp.path(), &temp.path().join("libra")).expect("install");
+    let bin = tempfile::tempdir().expect("bin dir");
+    let fake = bin.path().join("pi");
+    std::fs::write(&fake, b"#!/bin/sh\necho 1.5.0\n").expect("fake pi");
+    let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake, permissions).expect("chmod");
+    let diagnosis =
+        diagnose_pi_project(temp.path(), Some(&fake), PiProjectTrust::Granted).expect("diagnose");
+    assert!(
+        diagnosis.findings.iter().any(|finding| matches!(
+            finding,
+            PiDiagnostic::VersionDrift { installed, audited }
+                if installed == "1.5.0" && *audited == "1.4.0"
+        )),
+        "{:?}",
+        diagnosis.findings
+    );
+
+    std::fs::write(&fake, b"#!/bin/sh\necho 1.4.0\n").expect("fake audited pi");
+    let diagnosis =
+        diagnose_pi_project(temp.path(), Some(&fake), PiProjectTrust::Granted).expect("diagnose");
+    assert!(
+        !diagnosis
+            .findings
+            .iter()
+            .any(|finding| matches!(finding, PiDiagnostic::VersionDrift { .. }))
+    );
 }
 
 // ---------------------------------------------------------------------------

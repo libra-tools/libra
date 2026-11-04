@@ -1485,7 +1485,10 @@ mod tests {
 
     /// PI-37: a tool event's helper request adds only the two fixed link
     /// digests, and its response adds only two HMAC identities; neither
-    /// carries an ID or the key, and an unknown field is refused.
+    /// carries an ID or the key, and an unknown field is refused. Unix only:
+    /// the fixture's verified cwd is a Unix absolute path, and `json!` is
+    /// imported for Unix tests.
+    #[cfg(unix)]
     #[test]
     fn scope_binding_helper_tool_link_wire_carries_only_digests_and_hmacs() {
         use crate::internal::ai::capture::ingress::{

@@ -34,8 +34,9 @@ use serde_json::{Map, Value, json};
 use super::super::super::lifecycle::{LifecycleEvent, LifecycleEventKind, SessionHookEnvelope};
 
 /// Envelope version written by the bundled extension. Version 2 (PI-12)
-/// added `frameId`; a version 1 frame is refused.
-pub const PI_ENVELOPE_SCHEMA: u64 = 2;
+/// added `frameId`; version 3 (PI-19) added the nullable `outcome` on
+/// `agent_settled`. Frames written for another schema are refused.
+pub const PI_ENVELOPE_SCHEMA: u64 = 3;
 
 /// Fields every frame carries.
 pub const PI_COMMON_FIELDS: [&str; 7] = [
@@ -80,7 +81,7 @@ pub fn pi_event_fields(event: &str) -> Option<&'static [&'static str]> {
             "outcome",
         ]),
         "tool_call" | "tool_result" => Some(&["toolCallId", "parentToolCallId", "toolName"]),
-        "agent_settled" => Some(&["aborted"]),
+        "agent_settled" => Some(&["aborted", "outcome"]),
         _ => None,
     }
 }
@@ -89,13 +90,13 @@ pub fn recognizes_pi_event(name: &str) -> bool {
     PI_OBSERVED_EVENTS.contains(&name)
 }
 
-/// Events this receiver records. The run, turn and session-end boundaries
-/// are accepted on the wire but not recorded until their mapping lands
-/// (PI-19 run terminal).
+/// Events this receiver records. `agent_settled` is the run terminal
+/// (ADR-PI-04); `turn_end` only feeds the extension's run-outcome tracking
+/// and `session_shutdown` stays wire-only until a later card maps it.
 pub fn pi_event_is_ingested(name: &str) -> bool {
     matches!(
         name,
-        "session_start" | "before_agent_start" | "tool_call" | "tool_result"
+        "session_start" | "before_agent_start" | "tool_call" | "tool_result" | "agent_settled"
     )
 }
 
@@ -106,7 +107,7 @@ pub fn pi_event_is_ingested(name: &str) -> bool {
 pub fn pi_replay_identity_keys(event: &str) -> &'static [&'static str] {
     match event {
         "tool_call" | "tool_result" => &["toolCallId"],
-        "session_start" | "before_agent_start" => &["frameId"],
+        "session_start" | "before_agent_start" | "agent_settled" => &["frameId"],
         _ => &[],
     }
 }
@@ -176,6 +177,7 @@ pub fn lower_pi_frame(frame: &str) -> Result<SessionHookEnvelope> {
                     .all(|id| id.as_str().is_some_and(|id| !id.is_empty()))
             }),
             "aborted" => value.is_boolean(),
+            "outcome" => value.is_null() || matches!(value.as_str(), Some("completed" | "error")),
             _ => value.as_str().is_some_and(|text| !text.is_empty()),
         };
         if !valid {
@@ -225,9 +227,9 @@ pub fn parse_pi_hook_event(
     if envelope.transcript_path.is_some() {
         bail!("pi hook does not accept a transcript path");
     }
-    let (kind, tool_name) = match hook_event_name {
-        "session_start" => (LifecycleEventKind::SessionStart, None),
-        "before_agent_start" => (LifecycleEventKind::TurnStart, None),
+    let (kind, tool_name, partial, outcome) = match hook_event_name {
+        "session_start" => (LifecycleEventKind::SessionStart, None, false, None),
+        "before_agent_start" => (LifecycleEventKind::TurnStart, None, false, None),
         "tool_call" | "tool_result" => (
             LifecycleEventKind::ToolUse,
             envelope
@@ -235,7 +237,46 @@ pub fn parse_pi_hook_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            false,
+            None,
         ),
+        // ADR-PI-04: only `agent_settled` ends a run. An aborted run is an
+        // interruption, never a normal completion. A non-aborted run keeps
+        // its checkpoint even when its last turn ended in an error, or when
+        // the run produced no `turn_end` at all (outcome unknown), but both
+        // are reported as partial rather than as a clean completion.
+        "agent_settled" => {
+            let aborted = envelope
+                .extra
+                .get("aborted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let outcome = envelope.extra.get("outcome").and_then(Value::as_str);
+            if aborted {
+                (
+                    LifecycleEventKind::TurnInterrupted,
+                    None,
+                    false,
+                    Some("aborted"),
+                )
+            } else {
+                match outcome {
+                    Some("completed") => {
+                        (LifecycleEventKind::TurnEnd, None, false, Some("completed"))
+                    }
+                    Some("error") => {
+                        eprintln!("libra: pi run ended with an error; its checkpoint was kept");
+                        (LifecycleEventKind::TurnEnd, None, true, Some("error"))
+                    }
+                    _ => {
+                        eprintln!(
+                            "libra: pi run ended without a completed turn; its checkpoint is partial"
+                        );
+                        (LifecycleEventKind::TurnEnd, None, true, Some("unknown"))
+                    }
+                }
+            }
+        }
         _ => bail!("pi hook event is not recorded by this receiver"),
     };
     Ok(LifecycleEvent {
@@ -244,7 +285,15 @@ pub fn parse_pi_hook_event(
         session_ref: None,
         prompt: None,
         model: None,
-        source: Some(json!({ "provider": "pi", "event": hook_event_name })),
+        source: Some(match outcome {
+            Some(outcome) => json!({
+                "provider": "pi",
+                "event": hook_event_name,
+                "outcome": outcome,
+                "partial": partial,
+            }),
+            None => json!({ "provider": "pi", "event": hook_event_name }),
+        }),
         tool_name,
         tool_input: None,
         tool_response: None,

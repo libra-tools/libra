@@ -160,6 +160,208 @@ fn write_owned_pi_asset_inner(
     }
 }
 
+// Draft additions to src/internal/ai/hooks/providers/pi/settings.rs for PI-14/PI-17.
+// (Applied manually after the running full gate finishes.)
+
+/// What [`remove_owned_pi_asset`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiAssetRemove {
+    /// The Libra-owned asset was removed.
+    Removed,
+    /// Nothing was in the asset slot.
+    Absent,
+}
+
+/// Remove the Libra-owned asset under `project_root`. Removing twice is a
+/// no-op. A user file, a drifted file, a link or a non-regular entry is left
+/// unchanged and reported as an error: removal never proves ownership by
+/// path alone. On Unix the file is opened and removed through pinned
+/// directory handles without following links; other platforms refuse.
+pub fn remove_owned_pi_asset(project_root: &Path) -> Result<PiAssetRemove> {
+    #[cfg(unix)]
+    {
+        unix_slot::remove(project_root)
+    }
+    #[cfg(not(unix))]
+    {
+        path_slot::remove(project_root)
+    }
+}
+
+/// The Pi release this plan audited (PI-00). A different installed version is
+/// a diagnostic gap, not a supported baseline.
+pub const PI_AUDITED_VERSION: &str = "1.4.0";
+
+/// Whether a `pi` executable is on this process's `PATH`.
+pub fn pi_runtime_is_installed() -> bool {
+    pi_binary_on_path(std::env::var_os("PATH").as_deref()).is_some()
+}
+
+/// Find `pi` in `path`, purely so tests can supply a fixture `PATH`. Only an
+/// executable regular file counts.
+pub fn pi_binary_on_path(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    for directory in std::env::split_paths(path) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let name = if cfg!(windows) { "pi.exe" } else { "pi" };
+        let candidate = directory.join(name);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Whether the project trust Pi would use is known to Libra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiProjectTrust {
+    /// The project is trusted (`ctx.isProjectTrusted() === true`).
+    Granted,
+    /// The project is explicitly untrusted.
+    Denied,
+    /// No saved decision and no interactive prompt: Pi treats `ask` as
+    /// untrusted in print/JSON/RPC mode.
+    Unknown,
+}
+
+/// One gap the Pi asset diagnostic reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PiDiagnostic {
+    /// No file is in the asset slot.
+    AssetMissing,
+    /// The marker is present but the recorded digest no longer matches.
+    AssetDrifted,
+    /// The slot holds the user's file or a non-regular entry.
+    AssetUnmanaged,
+    /// The asset is intact but the project would not load it.
+    TrustNotGranted,
+    /// Pi only loads `<project>/.pi/extensions`, not ancestor directories.
+    SubdirectoryLaunchGap,
+    /// The installed Pi release is not the audited one.
+    VersionDrift {
+        installed: String,
+        audited: &'static str,
+    },
+}
+
+/// The asset state and every gap found by [`diagnose_pi_project`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiProjectDiagnosis {
+    pub ownership: PiAssetOwnership,
+    pub findings: Vec<PiDiagnostic>,
+}
+
+/// Diagnose the Pi project asset without writing anything. A missing or
+/// drifted asset, an unowned slot, an unproven trust decision, the
+/// subdirectory launch gap and a release different from
+/// [`PI_AUDITED_VERSION`] are reported separately; only an intact asset with
+/// granted trust and the audited version has no asset-related gap.
+pub fn diagnose_pi_project(
+    project_root: &Path,
+    pi_binary: Option<&Path>,
+    trust: PiProjectTrust,
+) -> Result<PiProjectDiagnosis> {
+    let ownership = pi_asset_ownership(project_root)?;
+    let mut findings = Vec::new();
+    match ownership {
+        PiAssetOwnership::Absent => findings.push(PiDiagnostic::AssetMissing),
+        PiAssetOwnership::Drifted => findings.push(PiDiagnostic::AssetDrifted),
+        PiAssetOwnership::Unmanaged => findings.push(PiDiagnostic::AssetUnmanaged),
+        PiAssetOwnership::Owned => {}
+    }
+    if ownership == PiAssetOwnership::Owned && trust != PiProjectTrust::Granted {
+        findings.push(PiDiagnostic::TrustNotGranted);
+    }
+    findings.push(PiDiagnostic::SubdirectoryLaunchGap);
+    if let Some(binary) = pi_binary
+        && let Some(installed) = pi_binary_version(binary)?
+        && installed != PI_AUDITED_VERSION
+    {
+        findings.push(PiDiagnostic::VersionDrift {
+            installed,
+            audited: PI_AUDITED_VERSION,
+        });
+    }
+    Ok(PiProjectDiagnosis {
+        ownership,
+        findings,
+    })
+}
+
+/// Run `<binary> --version` under a fixed two-second bound and return its
+/// first line as the bare version. A binary that cannot start or does not
+/// answer in time reports `None` rather than blocking the diagnostic.
+fn pi_binary_version(binary: &Path) -> Result<Option<String>> {
+    use std::{
+        io::Read,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    let mut child = std::process::Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to run {} --version", binary.display()))?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(output) = stdout {
+            let _ = output.take(4096).read_to_string(&mut text);
+        }
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Ok(None);
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error)
+                    .with_context(|| format!("failed to wait for {} --version", binary.display()));
+            }
+        }
+    }
+    let text = reader.join().unwrap_or_default();
+    Ok(text
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        }))
+}
+
 /// Refuse every occupied slot except the same unmodified asset.
 #[cfg(unix)]
 fn refuse_occupied(
@@ -210,8 +412,8 @@ mod unix_slot {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        MAX_ASSET_BYTES, PI_ASSET_DIR, PI_ASSET_FILE, PiAssetOwnership, PiAssetWrite,
-        classify_slot, pi_asset_path, refuse_occupied,
+        MAX_ASSET_BYTES, PI_ASSET_DIR, PI_ASSET_FILE, PiAssetOwnership, PiAssetRemove,
+        PiAssetWrite, classify_slot, pi_asset_path, refuse_occupied,
     };
 
     /// What the slot holds, read through the pinned extensions directory.
@@ -316,6 +518,51 @@ mod unix_slot {
         Ok(ownership_of(&read_slot(&directory)?))
     }
 
+    pub(super) fn remove(project_root: &Path) -> Result<PiAssetRemove> {
+        let path = pi_asset_path(project_root);
+        let Some(directory) = open_dirs(project_root, false)? else {
+            return Ok(PiAssetRemove::Absent);
+        };
+        let slot = read_slot(&directory)?;
+        let current = match &slot {
+            Slot::File(bytes) => Some(bytes.as_slice()),
+            Slot::Absent => return Ok(PiAssetRemove::Absent),
+            Slot::Foreign => None,
+        };
+        match (ownership_of(&slot), current) {
+            (PiAssetOwnership::Owned, _) => {}
+            (PiAssetOwnership::Drifted, _) => bail!(
+                "{} was changed after libra wrote it; libra leaves it as it is and nothing was removed",
+                path.display()
+            ),
+            _ => bail!(
+                "{} is not a libra-managed Pi extension; libra leaves it as it is and nothing was removed",
+                path.display()
+            ),
+        }
+        let name = CString::new(PI_ASSET_FILE).context("invalid Pi extension file name")?;
+        // SAFETY: `directory` owns a live descriptor and `name` is
+        // NUL-terminated. The file was read through the same pinned directory
+        // and no link is followed; the directory is owned by the user running
+        // libra, so a concurrent swap can only be made by that same user.
+        let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        if removed != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to remove the Pi extension {}; it may have been replaced after it was checked",
+                    path.display()
+                )
+            });
+        }
+        directory.sync_all().with_context(|| {
+            format!(
+                "failed to persist the removal of the Pi extension {}",
+                path.display()
+            )
+        })?;
+        Ok(PiAssetRemove::Removed)
+    }
+
     pub(super) fn create(
         project_root: &Path,
         rendered: &str,
@@ -411,7 +658,8 @@ mod path_slot {
     use anyhow::{Context, Result, bail};
 
     use super::{
-        MAX_ASSET_BYTES, PI_ASSET_DIR, PiAssetOwnership, PiAssetWrite, classify_slot, pi_asset_path,
+        MAX_ASSET_BYTES, PI_ASSET_DIR, PiAssetOwnership, PiAssetRemove, PiAssetWrite,
+        classify_slot, pi_asset_path,
     };
 
     /// `Ok(false)` when a directory is missing; an entry that is not a plain
@@ -474,6 +722,22 @@ mod path_slot {
             "libra cannot create the Pi extension under {} on this platform: it writes the file only through directory handles pinned against links, which are available on Unix-like systems only. Nothing was written",
             project_root.display()
         )
+    }
+
+    /// Removal is refused for the same reason creation is: without a pinned
+    /// directory handle a swapped junction could redirect the unlink outside
+    /// the project. Nothing is removed.
+    pub(super) fn remove(project_root: &Path) -> Result<PiAssetRemove> {
+        let path = pi_asset_path(project_root);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(PiAssetRemove::Absent),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to inspect the Pi extension {}", path.display())),
+            Ok(_) => bail!(
+                "libra cannot remove the Pi extension under {} on this platform: it removes the file only through directory handles pinned against links, which are available on Unix-like systems only. Nothing was removed",
+                project_root.display()
+            ),
+        }
     }
 }
 
