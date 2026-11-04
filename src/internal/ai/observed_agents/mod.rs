@@ -46,6 +46,7 @@ pub(crate) mod live_capture;
 pub mod native_origin;
 pub mod opencode_export;
 pub(crate) mod opencode_reasoning;
+pub mod pi_live;
 pub mod preview;
 pub mod reasoning;
 pub mod redaction;
@@ -240,6 +241,7 @@ pub(crate) fn live_capture_for(
     static OPENCODE_POLICY: live_capture::OpenCodeLiveCapture = live_capture::OpenCodeLiveCapture;
     static GROK_POLICY: live_capture::GrokLiveCapture = live_capture::GrokLiveCapture;
     static HERMES_POLICY: live_capture::HermesLiveCapture = live_capture::HermesLiveCapture;
+    static PI_POLICY: live_capture::PiLiveCapture = live_capture::PiLiveCapture;
     static CLAUDE_CODE_LIVE: LiveCaptureRegistration<dyn LiveCaptureProvider> =
         LiveCaptureRegistration {
             policy: &CLAUDE_POLICY,
@@ -263,17 +265,18 @@ pub(crate) fn live_capture_for(
             policy: &HERMES_POLICY,
             locator: None,
         };
+    static PI_LIVE: LiveCaptureRegistration<dyn LiveCaptureProvider> = LiveCaptureRegistration {
+        policy: &PI_POLICY,
+        locator: None,
+    };
     match kind {
         AgentKind::ClaudeCode => Some(&CLAUDE_CODE_LIVE),
         AgentKind::Codex => Some(&CODEX_LIVE),
         AgentKind::OpenCode => Some(&OPENCODE_LIVE),
-        AgentKind::Cursor
-        | AgentKind::Gemini
-        | AgentKind::Copilot
-        | AgentKind::FactoryAi
-        | AgentKind::Pi => None,
+        AgentKind::Cursor | AgentKind::Gemini | AgentKind::Copilot | AgentKind::FactoryAi => None,
         AgentKind::Grok => Some(&GROK_LIVE),
         AgentKind::Hermes => Some(&HERMES_LIVE),
+        AgentKind::Pi => Some(&PI_LIVE),
     }
 }
 
@@ -281,7 +284,10 @@ pub(crate) fn live_capture_for(
 /// kind is hook-installable. Integration tests call this instead of the
 /// crate-private lookup.
 pub fn live_capture_matches_hook_installable(kind: AgentKind) -> bool {
-    live_capture_for(kind).is_some() == registration_for(kind).hook_installable
+    // PI-36 registers Pi before it becomes supported; PI-06 removes the
+    // pre-support exception and returns to plain equality.
+    live_capture_for(kind).is_some()
+        == (registration_for(kind).hook_installable || kind == AgentKind::Pi)
 }
 
 struct GrokObservedAgent;

@@ -1107,6 +1107,13 @@ fn codex_header_matches(source: &[u8], control: &CodexSourceControl) -> bool {
 /// bytes are read solely from the held stdin descriptor; controls cannot name
 /// a transcript to reopen. The locator returns only a bounded relative path.
 pub fn run_codex_capture_helper_if_requested(cap: u64, mode: &str) -> Option<i32> {
+    if let Some(code) =
+        crate::internal::ai::observed_agents::pi_live::run_pi_session_source_helper_if_requested(
+            cap, mode,
+        )
+    {
+        return Some(code);
+    }
     if mode == crate::internal::ai::observed_agents::codex_index::LOCATE_MODE {
         return Some(crate::internal::ai::observed_agents::codex_index::run_locator_helper(cap));
     }
