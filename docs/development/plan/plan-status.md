@@ -1,3 +1,15 @@
+> **2026-11-04 14:23:13 UTC SP-09 用户指令收口：** 用户明确要求“设置卡片状态为已完成，然后提交，推送”，随后追加创建PR授权；按 EX-SP-09-CLOSE-01 登记 `done / complete`，仅本次审计记录交付。矩阵/独立复算/补充语义与计数整改已有实证，fmt/严格Clippy exit0；定向仍在首次编译，补充status-errors、最终评审、最终PR全量与原发布继承缺口均未记通过，原未满足AC保留。授权精确提交两计划文档、推送 `codex/SP-09` 并创建PR，不合并/关闭Issue/发布，不宣称整轮最终验收完成。Review.md已按用户后续指令删除，不纳入提交。
+
+> **2026-11-04 14:15:50 UTC SP-09 Review 整改：** 用户 Review 的2P1/2P2已核实：原trace重计，撤回pack211→206结论（对象库两边均206），ignore含.gitignore/.libraignore/exclude后normal为437→415，旧原件保留，热点AC撤勾待复核。新增48份未计时输出匹配原样本SHA、3份精确refresh回执及51缺记录负例均PASS，独立复算再验通过；原性能样本未变。采样器已补断言；定向worker补充status_error_test过滤器需待旧worker结束另跑，尚未算通过；总览SP07/08与SP08 C/D已对齐，旧汇总标历史。fmt和严格Clippy实际exit0，定向/最终review/远端全量仍待，`in-progress / 空`。Review.md当时为用户未跟踪文件，随后已按用户明确指令删除，不纳入写集。
+
+> **2026-11-04 12:44:51 UTC SP-09 矩阵通过：** 完整16格/1200调用/960正式样本，独立复算 PASS；default 中位数下降62.81%–72.83%，refreshed下降31.86%–63.27%，320/320候选配对更快，候选/Git仍32.11×–44.32×。clean预检、跨工具/索引语义及原始输出/index稳定性通过；独立文件调用profiling只用于次数，SP-04与三个DEFER维持defer并记录依据。原件在外接盘，摘要与SHA入日期计划。Clippy/定向回归已启动但未取得终态，ignore/错误/安全、评审和最终PR全量仍待；保持 `in-progress / 空`，不提交推送。
+
+> **2026-11-04 12:12:31 UTC SP-09 构建完成：** stable 1.99.1、独立 target、`--release --locked`、并发 2；基线 `8abdcf7` exit0/2798.163s/SHA `d295395780d436275abc2346f2319fe457c57e3d70a8f3d3f325ef07751b3e1f`，候选 `016ce4a` exit0/3800.075s/SHA `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`。二进制已冻结，完整矩阵已启动；不并行编译干扰计时。矩阵、Clippy、定向回归、评审和最终 PR CI 尚未通过，保持 `in-progress / 空`。
+
+> **2026-11-04 10:30:32 UTC SP-09 准备进展：** 公开 fixture mirror 已下载并确认 2,125 tracked paths；前置 SP-01/02/03/05/06/07/08 的 PR 与 Issue 已核，SP-02/03/05/06/07/08 对应最终 PR 均 11 项成功，SP-01 既有 offline-core FAIL/例外与 #656 OPEN 保留。用户授权的 32 项原生构建依赖已安装，物料缓存仍在外接盘；nightly fmt 准备检查通过。基线 `8abdcf7` 与候选 `016ce4a` 独立构建进行中，矩阵未运行。候选 main run 41804426064 因已有 nextest 二进制而安装失败，全量及特性测试未执行，macOS cancelled；不计 PASS，不扩大本卡写集修 CI。保持 `in-progress / 空`，最终 PR 全量与评审待。
+
+> **2026-11-04 10:19:32 UTC SP-09 开工：** `codex/SP-09`，`in-progress / 空`，源码起点 `016ce4a86b988d668fda7b2bf7e446c9ab491555`。用户授权审计与本地执行，锁定 status 性能计划及本文件两路径。前置 SP-08 PR #1023 已合并、最终 PR 11 项检查成功，#648 已关闭；main 构建 cancelled 仍不计 PASS。物料统一放 `/data/libra-performance/`（`/dev/sda` ext4）；本机约 14.86 GiB，不安装/运行 nextest。用户批准 EX-SP-09-CI-01，由最终 PR CI 承担全量验收；未通过或覆盖不足不得 complete。矩阵、本地质量门、评审与远端交付均待，不提交/推送/发布。
+
 > **2026-11-02 LTR-21/22/23 与收口：** live selector 已登记。`live_peer_principal_write_denied` 实际 FAIL（run `b2ff49d4-1bf1-4266-a547-2b20ecd48958`），缺 `LIBRA_TRACES_LIVE_ENABLED`，没有 skip。LTR-07 仍 `in-progress`/空。LTR-09 仍 `blocked`/空，没有 H6 收据。LTR-08 仍 `in-progress`/空。
 
 > **2026-11-02 LTR-01 本地集成：** 最终树已含 LTR-10/11/12。`mega2_scoped_push_contract` 1 passed（run `ecd20b68-2fd6-4dea-babc-7efc4dea30b1`）。Live HTTP/SSH push、网站 cf 和 main D 未取得，本卡不记 complete。
