@@ -1,3 +1,5 @@
+> **2026-11-04 UTC 资格证据更新：** FIX-LTR-09 已推送并合入上游；`c426de6977678a60bef0d89f032c162a90686bbf` A9 六阶段本地 exit0、base 8/8 与 CodeQL/Code Quality success，具体收据及 47 项运行时跳过、旧 FAIL/STOP、F2 unknown 见 [来源资格计划](plan-20261025-qualification.md)。本记录自身 D 和原工作区受控整合仍待，`DEP-TR-QUAL-REPAIRS` 不提前解除；用户免交叉 Review，未声称 Review PASS。
+
 > **2026-11-02 LTR-21/22/23 与收口：** live selector 已登记。`live_peer_principal_write_denied` 实际 FAIL（run `b2ff49d4-1bf1-4266-a547-2b20ecd48958`），缺 `LIBRA_TRACES_LIVE_ENABLED`，没有 skip。LTR-07 仍 `in-progress`/空。LTR-09 仍 `blocked`/空，没有 H6 收据。LTR-08 仍 `in-progress`/空。
 
 > **2026-11-02 LTR-01 本地集成：** 最终树已含 LTR-10/11/12。`mega2_scoped_push_contract` 1 passed（run `ecd20b68-2fd6-4dea-babc-7efc4dea30b1`）。Live HTTP/SSH push、网站 cf 和 main D 未取得，本卡不记 complete。
