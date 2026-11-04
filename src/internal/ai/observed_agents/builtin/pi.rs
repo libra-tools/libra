@@ -410,6 +410,7 @@ fn attribute_candidate(
 /// PI-35: open one Pi session directory through the same provider-root and
 /// no-follow rules as PI-02 discovery. `Ok(None)` means the path is not
 /// inside the configured Pi provider root.
+#[cfg(unix)]
 pub(crate) fn open_pi_provider_directory_for_source(path: &Path) -> Result<Option<std::fs::File>> {
     super::super::transcript_source::open_provider_directory_for_discovery(
         super::super::agent_for(AgentKind::Pi),

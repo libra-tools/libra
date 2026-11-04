@@ -12,14 +12,17 @@
 //! consulted here; an explicit Pi session directory is not granted a root and
 //! yields no source (the caller degrades to a metadata-only checkpoint).
 
+#[cfg(unix)]
+use std::{io::Write, time::Duration};
 use std::{
-    io::Write,
     path::{Component, Path},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use super::builtin::pi::open_pi_provider_directory_for_source;
 #[cfg(unix)]
 use super::transcript_source::{
     PinnedEntryType, open_file_beneath_pinned_provider_directory,
@@ -27,10 +30,9 @@ use super::transcript_source::{
 };
 use super::{
     AgentKind,
-    builtin::pi::{
-        PiDiscoveryLimits, open_pi_provider_directory_for_source, pi_session_id_is_valid,
-    },
+    builtin::pi::{PiDiscoveryLimits, pi_session_id_is_valid},
 };
+#[cfg(unix)]
 use crate::internal::ai::authorized_read::{
     AUTHORIZED_READ_HELPER_ARG, AUTHORIZED_READ_HELPER_CAP_ENV, AUTHORIZED_READ_HELPER_MAX_CAP,
     AUTHORIZED_READ_HELPER_MODE_ENV, RegisteredHelperOutput, StrictBoundedRead,
