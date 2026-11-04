@@ -1837,8 +1837,10 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "only while Pi reports the project as trusted",
-                "stores only lifecycle metadata",
+                "stores lifecycle metadata",
                 "each run started by a user message",
+                "the run terminal",
+                "a non-aborted settle commits one metadata-only checkpoint",
                 "no Pi content",
                 "`agent enable` does not install that extension yet",
             ][..],
@@ -1849,7 +1851,8 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "只在 Pi 报告项目受信时",
-                "只为会话开始、由用户消息发起的 run 与 tool 事件保存生命周期元数据",
+                "为会话开始、由用户消息发起的 run、tool 事件与 run 终态保存生命周期元数据",
+                "未中止的 settle 提交一个仅含元数据的 checkpoint",
                 "不保存任何 Pi 内容",
                 "`agent enable` 暂不安装该 extension",
             ][..],
@@ -1869,6 +1872,8 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`HookProvider::lower_native_frame`",
                 "`write_owned_pi_asset`",
+                "`remove_owned_pi_asset`",
+                "`diagnose_pi_project`",
             ][..],
         ),
         (

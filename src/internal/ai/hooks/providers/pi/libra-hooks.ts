@@ -20,7 +20,7 @@ const LIBRA_ARGS = [
   "pi",
   "observe",
 ];
-const ENVELOPE_SCHEMA = 2;
+const ENVELOPE_SCHEMA = 3;
 const OBSERVED_EVENTS = [
   "session_start",
   "session_shutdown",
@@ -35,7 +35,36 @@ function nullableText(value) {
   return typeof value === "string" && value !== "" ? value : null;
 }
 
-function envelope(event, payload, ctx) {
+// The run outcome is tracked here, not by the receiver: every frame is a new
+// `libra agent hooks` process, so only the extension sees the whole run. A
+// run starts at `before_agent_start`, each `turn_end` updates its outcome,
+// and `agent_settled` reports it once and clears it. Sharing the map on
+// globalThis keeps one view across reloaded copies in the same Pi process.
+const RUN_STATE = Symbol.for("libra.pi-hooks.runs");
+const runState = (globalThis[RUN_STATE] ??= new Map());
+
+function trackRunOutcome(event, payload, sessionId) {
+  if (event === "before_agent_start") {
+    runState.set(sessionId, null);
+    return null;
+  }
+  if (event === "turn_end") {
+    const outcome = payload?.outcome;
+    runState.set(
+      sessionId,
+      outcome === "completed" || outcome === "error" ? outcome : null,
+    );
+    return null;
+  }
+  if (event === "agent_settled") {
+    const outcome = runState.get(sessionId) ?? null;
+    runState.delete(sessionId);
+    return outcome;
+  }
+  return null;
+}
+
+function envelope(event, payload, ctx, runOutcome) {
   const manager = ctx.sessionManager;
   const sessionId = manager.getSessionId();
   if (typeof sessionId !== "string" || sessionId === "") {
@@ -81,6 +110,7 @@ function envelope(event, payload, ctx) {
       break;
     case "agent_settled":
       frame.aborted = payload.aborted === true;
+      frame.outcome = runOutcome ?? null;
       break;
     default:
       return undefined;
@@ -231,7 +261,12 @@ function observe(event, payload, ctx) {
     if (typeof ctx?.isProjectTrusted !== "function" || ctx.isProjectTrusted() !== true) {
       return;
     }
-    const frame = envelope(event, payload, ctx);
+    const sessionId = ctx?.sessionManager?.getSessionId();
+    const runOutcome =
+      typeof sessionId === "string" && sessionId !== ""
+        ? trackRunOutcome(event, payload, sessionId)
+        : null;
+    const frame = envelope(event, payload, ctx, runOutcome);
     if (frame !== undefined) {
       deliver(frame);
     }
