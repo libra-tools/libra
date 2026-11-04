@@ -17,6 +17,184 @@ use libra::{
 
 use super::*;
 
+#[test]
+fn status_ignore_context_nested_rules_and_tracked_files() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("deep/inner")).unwrap();
+    fs::write(repo.path().join("deep/inner/tracked.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "deep/inner/tracked.txt"], repo.path()),
+        "stage tracked ignore fixture",
+    );
+    fs::write(repo.path().join("deep/inner/tracked.txt"), "changed\n").unwrap();
+    fs::write(repo.path().join(".gitignore"), "*.tmp\n").unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "!keep.tmp\n").unwrap();
+    fs::write(
+        repo.path().join("deep/inner/.libraignore"),
+        "tracked.txt\nhidden.txt\n",
+    )
+    .unwrap();
+    for name in ["keep.tmp", "drop.tmp", "hidden.txt", "visible.txt"] {
+        fs::write(repo.path().join("deep/inner").join(name), "payload\n").unwrap();
+    }
+    let output = run_libra_command(
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "-uall",
+            "--no-renames",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "nested ignore context");
+    let text = String::from_utf8(output.stdout).unwrap();
+    for row in [
+        "AM deep/inner/tracked.txt",
+        "?? deep/inner/keep.tmp",
+        "?? deep/inner/visible.txt",
+        "!! deep/inner/drop.tmp",
+        "!! deep/inner/hidden.txt",
+    ] {
+        assert!(
+            text.lines().any(|line| line == row),
+            "missing {row}: {text}"
+        );
+    }
+    assert!(!text.contains("!! deep/inner/tracked.txt"), "{text}");
+}
+
+#[test]
+fn status_ignore_context_invalid_source_in_empty_directory_is_reported() {
+    // A FIFO is not necessary to make an ignore source unreadable: a directory
+    // in its place fails the beneath regular-file check on every supported OS.
+    // No regular file is present to trigger a per-file ignore lookup.
+    for relative in [".gitignore", "deep/.gitignore"] {
+        let repo = tempdir().unwrap();
+        init_repo_via_cli(repo.path());
+        fs::create_dir_all(repo.path().join(relative)).unwrap();
+        let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+        assert_cli_success(&output, "status with an unreadable directory ignore source");
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            doc["data"]["base_scan_complete"], false,
+            "{relative}: {doc}"
+        );
+        assert!(
+            doc["data"]["io_blocked"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty()),
+            "{relative}: ignore failure must survive without regular children: {doc}"
+        );
+        if relative.starts_with("deep/") {
+            let output = run_libra_command(&["--json", "status", "--no-renames"], repo.path());
+            assert_cli_success(&output, "normal visibility preserves ignore error taxonomy");
+            let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                doc["data"]["io_blocked"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|event| {
+                        event["path"]["display"] == "deep" && event["reason"] == "io_timeout"
+                    })),
+                "normal mode must retain the parent version's io_timeout: {doc}"
+            );
+        }
+    }
+}
+
+#[test]
+fn status_ignore_context_global_info_and_directory_precedence() {
+    let repo = tempdir().unwrap();
+    let config = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    let excludes = config.path().join("excludes");
+    fs::write(&excludes, "*.tmp\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+            repo.path(),
+        ),
+        "configure isolated global excludes file",
+    );
+    fs::write(repo.path().join(".libra/info/exclude"), "!info.tmp\n").unwrap();
+    fs::create_dir(repo.path().join("deep")).unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "!keep.tmp\ninfo.tmp\n").unwrap();
+    fs::write(repo.path().join("deep/.libraignore"), "!info.tmp\n").unwrap();
+    for path in [
+        "info.tmp",
+        "drop.tmp",
+        "deep/info.tmp",
+        "deep/keep.tmp",
+        "deep/drop.tmp",
+    ] {
+        fs::write(repo.path().join(path), "payload\n").unwrap();
+    }
+    let output = run_libra_command(
+        &["status", "--porcelain", "--ignored", "-uall"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "ignore source precedence");
+    let text = String::from_utf8(output.stdout).unwrap();
+    for row in [
+        "?? info.tmp",
+        "!! drop.tmp",
+        "?? deep/info.tmp",
+        "?? deep/keep.tmp",
+        "!! deep/drop.tmp",
+    ] {
+        assert!(
+            text.lines().any(|line| line == row),
+            "missing {row}: {text}"
+        );
+    }
+}
+
+#[test]
+fn status_ignore_context_tracked_only_directory_still_validates_sources() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    fs::create_dir(repo.path().join("deep")).unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "# valid\n").unwrap();
+    fs::write(repo.path().join("deep/tracked.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "deep"], repo.path()),
+        "stage every file in the directory",
+    );
+    fs::write(repo.path().join("deep/.gitignore"), [0xff]).unwrap();
+    let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+    assert_cli_success(&output, "tracked short circuit preserves ignore errors");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["base_scan_complete"], false, "{doc}");
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()),
+        "{doc}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_ignore_context_symlink_source_cannot_escape() {
+    let repo = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("deep")).unwrap();
+    fs::write(outside.path().join("rules"), "visible.txt\n").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("rules"),
+        repo.path().join("deep/.gitignore"),
+    )
+    .unwrap();
+    fs::write(repo.path().join("deep/visible.txt"), "visible\n").unwrap();
+    let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+    assert_cli_success(&output, "status rejects an escaping ignore source");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["base_scan_complete"], false, "{doc}");
+}
+
 async fn status_execute(args: StatusArgs, writer: &mut impl Write) {
     status_execute_inner(args, writer)
         .await

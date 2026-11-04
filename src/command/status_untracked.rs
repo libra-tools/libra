@@ -42,6 +42,12 @@ struct WorkdirScan {
     io_blocked: Vec<crate::command::status_probe::IoBlockedEvent>,
 }
 
+#[derive(Clone, Copy)]
+struct ScanEntry<'a> {
+    absolute: &'a Path,
+    relative: &'a Path,
+}
+
 /// A path whose inspection exceeded the per-operation deadline (§B.3.3).
 /// Distinct from a plain I/O error so consumers can tell "the mount is
 /// hung" apart from "the read failed".
@@ -436,6 +442,15 @@ fn scan_workdir(
             let source = crate::command::status_io_worker::io_from_wire(kind, raw_os);
             scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
         }
+        // Validate the directory's own rules before tracked files can bypass
+        // matching. A context is shared by all children, so pure matching never
+        // submits another filesystem task or rediscovers ancestor/config paths.
+        let ignore = util::directory_ignore_context_bounded(workdir, &dir);
+        if listing.entries.is_empty()
+            && let Err(source) = &ignore
+        {
+            scan.io_blocked.push(io_blocked_event(&dir_rel, source));
+        }
         for dirent in listing.entries {
             let name = crate::command::status_io_worker::dirent_os(&dirent.name);
             if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
@@ -467,26 +482,10 @@ fn scan_workdir(
                 // non-ignored decision, revalidate through the repo-root fd
                 // before descending so a post-listing escape cannot poison
                 // the walk.
-                util::prewarm_ignore_config(workdir);
-                let ignore_target = (workdir.to_path_buf(), path.clone());
-                let walk_epoch = util::secure_ignore_walk_epoch();
-                let ignored = match crate::command::status_probe::with_io_deadline(move || {
-                    let (workdir, path) = ignore_target;
-                    util::check_gitignore_as_dir_for_walk(&workdir, &path, true, walk_epoch)
-                }) {
-                    Ok(value) => {
-                        if util::ignore_read_failed() {
-                            scan.io_blocked.push(io_blocked_event(
-                                &entry_rel,
-                                &io::Error::other("ignore source unreadable"),
-                            ));
-                            true
-                        } else {
-                            value
-                        }
-                    }
-                    Err(()) => {
-                        scan.io_blocked.push(io_timeout_event(&entry_rel));
+                let ignored = match &ignore {
+                    Ok(context) => context.is_ignored(&path, true),
+                    Err(source) => {
+                        scan.io_blocked.push(io_blocked_event(&entry_rel, source));
                         true
                     }
                 };
@@ -565,9 +564,12 @@ fn scan_workdir(
                     workdir,
                     index,
                     tracked,
-                    &path,
-                    &relative,
+                    ScanEntry {
+                        absolute: &path,
+                        relative: &relative,
+                    },
                     include_ignored,
+                    ignore.as_ref().ok(),
                 )?;
             }
         }
@@ -581,26 +583,27 @@ fn scan_file(
     workdir: &Path,
     index: &Index,
     tracked_paths: &TrackedPaths,
-    path: &Path,
-    relative: &Path,
+    entry: ScanEntry<'_>,
     include_ignored: bool,
+    ignore: Option<&util::DirectoryIgnoreContext>,
 ) -> Result<(), StatusError> {
     // §B.6.1: a non-UTF-8 name can never be an index entry (index paths are
     // UTF-8 strings), so it is untracked by construction — base `??`/ignored
     // classification proceeds on the raw path and the whole status must NOT
     // fail (rename candidacy is skipped separately with a warning).
+    let relative = entry.relative;
     let tracked = match relative.to_str() {
         Some(file_str) => {
             index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative)
         }
         None => false,
     };
-    // An undecidable ignore state must not silently classify the entry.
-    // Report it and keep the conservative untracked reading (a path the scan
-    // could not classify is visible, not invisible).
-    let ignored = match util::check_gitignore_bounded(workdir, path) {
-        Some(value) => value,
+    let ignored = match ignore {
+        Some(_) if tracked => return Ok(()),
+        Some(context) => context.is_ignored(entry.absolute, false),
         None => {
+            // Preserve partial results and the existing per-file timeout
+            // taxonomy when a directory's ignore state is undecidable.
             scan.io_blocked.push(io_timeout_event(relative));
             false
         }
@@ -660,6 +663,17 @@ fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
                 kind, raw_os,
             ));
         }
+        let ignore = match util::directory_ignore_context_bounded(workdir, &current) {
+            Ok(context) => context,
+            Err(_) => {
+                // The bounded visibility probe historically maps undecidable
+                // ignore state (read failure or deadline) to io_timeout.
+                return DirVisibility::Blocked(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ignore lookup exceeded the status I/O deadline",
+                ));
+            }
+        };
         for dirent in listing.entries {
             let name = crate::command::status_io_worker::dirent_os(&dirent.name);
             if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
@@ -678,15 +692,8 @@ fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
                     Ok(Ok(kind)) => kind,
                 };
             if file_type.is_dir() {
-                match util::check_gitignore_bounded_as_dir(workdir, &path, true) {
-                    Some(true) => continue,
-                    Some(false) => {}
-                    None => {
-                        return DirVisibility::Blocked(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "ignore lookup exceeded the status I/O deadline",
-                        ));
-                    }
+                if ignore.is_ignored(&path, true) {
+                    continue;
                 }
                 // Revalidate eligible directories through the repo-root fd before
                 // descending; ignored paths were already pruned above.
@@ -704,15 +711,8 @@ fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
                 pending.push(path);
                 continue;
             }
-            match util::check_gitignore_bounded_as_dir(workdir, &path, false) {
-                Some(true) => continue,
-                Some(false) => {}
-                None => {
-                    return DirVisibility::Blocked(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "ignore lookup exceeded the status I/O deadline",
-                    ));
-                }
+            if ignore.is_ignored(&path, false) {
+                continue;
             }
             if file_type.is_file() || file_type.is_symlink() {
                 return DirVisibility::HasVisibleFile;
