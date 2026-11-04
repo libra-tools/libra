@@ -203,6 +203,7 @@ fn source_control(
 
 /// The built libra binary for integration tests. Production resolves the
 /// helper through `registered_helper_command` or the running executable.
+#[cfg(unix)]
 fn pi_helper_program() -> Option<std::path::PathBuf> {
     std::env::var_os("LIBRA_TEST")?;
     std::env::var_os("LIBRA_TEST_PI_SOURCE_HELPER").map(std::path::PathBuf::from)
@@ -215,6 +216,7 @@ fn safe_absolute(path: &Path) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
+#[cfg(unix)]
 fn decode_source_frame(frame: &[u8], cap: u64) -> PiSessionSourceRead {
     if frame.len() < 9 {
         return PiSessionSourceRead::Failed;
@@ -415,6 +417,7 @@ pub mod pi_source_status {
 }
 
 /// First parsed line must be Pi's session header for this id and cwd.
+#[cfg(unix)]
 fn header_matches(bytes: &[u8], session_id: &str, cwd: &str) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -430,6 +433,7 @@ fn header_matches(bytes: &[u8], session_id: &str, cwd: &str) -> bool {
         && value.get("cwd").and_then(serde_json::Value::as_str) == Some(cwd)
 }
 
+#[cfg(unix)]
 fn write_source_frame(status: u8, bytes: &[u8]) -> bool {
     let mut out = std::io::stdout().lock();
     out.write_all(&[status]).is_ok()
@@ -438,6 +442,7 @@ fn write_source_frame(status: u8, bytes: &[u8]) -> bool {
         && out.flush().is_ok()
 }
 
+#[cfg(unix)]
 fn test_stall(stage: &str) {
     if std::env::var_os("LIBRA_TEST").is_none() {
         return;
