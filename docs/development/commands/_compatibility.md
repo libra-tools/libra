@@ -279,6 +279,15 @@ D15 拒绝诊断（HF-14）
 D16 拒绝诊断（HF-14）
 D-empty-message 已由 HF-06 实现
 
+## Issue #479 notes（plumbing 延后项）
+
+以下四项来自 [`docs/development/plan/issues/479.md`](../plan/issues/479.md) 的「非目标与延后项」表，逐项与 [`update-index`](update-index.md)、[`update-ref`](update-ref.md)、[`symbolic-ref`](symbolic-ref.md)、[`diff-files`](diff-files.md) 的未实现表一致；本节的 `DEFER-*` 编号是 #479 计划内的编号，不与 D 系列共用序列。
+
+- **DEFER-01** `update-index --unresolve` / `--again`：解析层不公开这两个 flag（`LBR-CLI-002`，129，零写入）。原因：需要 merge 源树与 `HEAD` 差异的额外状态读取，使用频率低。重启条件：外部用例移植需要时另立 issue，并按 `_general.md` 同步 `COMPATIBILITY.md`、`update-index` 开发文档与测试证据。
+- **DEFER-02** `update-index --assume-unchanged` / `--no-assume-unchanged` 及其在 `status` / `diff` / `add` / `refresh` 中的生效面：index v2 已有 `assume_valid` 位，但生效面横跨多个命令，属独立行为轴。重启条件：用户需求或用例移植，另立计划后再开放。
+- **DEFER-03**（已撤销，2026-11-01 起生效）`update-index --skip-worktree` / `--no-skip-worktree`：原判断为需要 index v3 扩展标志位，实测已生效——`ls-files -v` 输出 `S`、`status --porcelain` 与 `diff-files` 忽略该路径、`--no-skip-worktree` 可清除。保留本条只作历史判断更正，不再是延后项。
+- **DEFER-04** `update-ref` 的 `HEAD` / 非 `refs/heads/*` 命名空间与 `symref-*`，以及 `symbolic-ref` 对非 `HEAD` 符号引用的支持：refs 存于 SQLite，当前范围限定为既有设计（`symbolic-ref -d HEAD` 与删除非符号 ref 均按 Git 文案 fail-closed）。重启条件：ref 存储支持通用符号引用时另立 ADR 并同步两个命令的开发文档与测试。
+
 ## D25: `init` 的 Git 布局与引用存储选项（issue #473）
 
 - 拒绝项：`--separate-git-dir`、Libra 旧版 `--separate-libra-dir`、`--ref-format=files|reftable`、`--recurse-submodules`。
