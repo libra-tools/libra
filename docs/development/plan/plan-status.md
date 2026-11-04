@@ -1,3 +1,5 @@
+> **2026-11-03 03:20:36 UTC benchmark 计划登记：** 新增 plan-20261103.md，全部任务 pending；其它计划保留各自历史状态，不据此重核。
+
 > **2026-11-02 LTR-21/22/23 与收口：** live selector 已登记。`live_peer_principal_write_denied` 实际 FAIL（run `b2ff49d4-1bf1-4266-a547-2b20ecd48958`），缺 `LIBRA_TRACES_LIVE_ENABLED`，没有 skip。LTR-07 仍 `in-progress`/空。LTR-09 仍 `blocked`/空，没有 H6 收据。LTR-08 仍 `in-progress`/空。
 
 > **2026-11-02 LTR-01 本地集成：** 最终树已含 LTR-10/11/12。`mega2_scoped_push_contract` 1 passed（run `ecd20b68-2fd6-4dea-babc-7efc4dea30b1`）。Live HTTP/SSH push、网站 cf 和 main D 未取得，本卡不记 complete。
@@ -1088,6 +1090,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
+| [plan-20261103.md](plan-20261103.md) | benchmark / 平台接入验证 | 已排期 | 2026-11-03 03:20:36 UTC：BM-00..07 全部 pending；[#983](https://github.com/libra-tools/libra/issues/983)，Astra high R2 计划评审 PASS；先单样例无模型验证 Harbor、隔离、私有判分与四臂批次。严格任务/agent 质量仍为 0；不改 Memory 产品 owner，真实 pilot 另受 B2/consumer/任务/预算门约束 |
 <!-- Current override: SP-07 is done / complete under user-approved EX-SP-07-CLOSE-CI-01 (2026-11-03); PR #937 final head 85fd8909056d4bfdf722456544d2ac7a34bfb154 passed all applicable base.yml and CodeQL checks and squash-merged as 3f78dadad612f96f48882b61987182a51fbfd393 at 2026-11-02T21:52:33Z; Issue #646 closed. base.yml 41473911251 attempt 2 passed all jobs, including full L1+L2+L3 and OTLP/keyring/upgrade tests; CodeQL 41473911247 passed. Local dual-env nextest remains not-run on the 16 GiB host (<32 GiB threshold), with remote CI accepted for T-1; independent patch bump/versioned release remains deferred under DEFER-SP-REL-07. Implementation write set src/utils/storage/local.rs. Local focused suite 33/33, new prefix 3/3, fmt, strict Clippy, release build, complete SP-00 16-cell matrix (1,200 calls/960 timed samples; candidate median improved 6.23%–21.01%, 307/320 paired wins), and Codex ER-05 review all passed. SP-06 is done / complete. PR #868 passed all 11 remote checks and merged at 2026-11-02 09:54 UTC as dffa63a6dc317dc2f1c61523d0e14c5dd4cfd8a3. SP-06 T-1 nextest remains not-run and independent release remains deferred under DEFER-SP-REL-06. -->
 <!-- SP-08 current override (2026-11-03 08:21:54 UTC): done / complete under user-authorized EX-SP-08-CLOSE-01 on codex/SP-08, denoting local fix/review acceptance only. Final aa271746 passed focused suites, strict Clippy/fmt/release, corrected 16-cell matrix (1,200 calls / 960 samples), workload audit and final Codex PASS (01a1a068-7f4a-7dd0-ac07-9dacca294756). Commit/push/PR are authorized to obtain actual remote checks; base.yml/CodeQL are not yet claimed. Independent patch bump/version surfaces/install/tag/Release/post-release gates remain DEFER-SP-REL-08; Issue #648 is not manually closed. Upstream main advanced 7e39a8e→53d3588→4005a58 (Pi/version/plan surfaces; no SP-08 production overlap). Direct current-branch rebase completed; stash apply refused atomically on plan-status, so four files were restored byte-exactly from delivery backup and only SP-08 current status was inserted into the upstream table. Production/test hashes were rechecked against candidate manifest and pre-rebase backup; delivery review R2 session 01a1a0bf-aaad-7af2-b03d-4f06a419f1ec returned PASS with no P0/P1/P2. Final 4005a58 checks are running; prior 53d3588 checks passed: util 72/72, exact status 74/74, Wave-0 175/175, check-ignore 12/12, new prefix 5/5, upstream agent lifecycle 84 passed / 7 existing ignored, agent docs 37/37, strict Clippy/fmt and release build. Exact signed+DCO commit, push and PR wait for this final rerun. Local dual-env nextest remains not-run; SP-09 final full-suite gate unchanged. -->
 <!-- The detailed progress text in the row below is historical; current SP-06 state is done / complete as recorded above. -->
@@ -1173,6 +1176,8 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 ---
 
 ## 二、未启动的计划与卡
+
+[Memory benchmark 平台接入计划](plan-20261103.md)为新增设计项，BM-00..07 全部 pending；本轮只写计划，不表示已部署平台、接入模型或完成质量评测。
 
 以下计划中，`plan-20260921` 已于 2026-09-24 完成并发布为 `v0.23.65`（15/15 卡 `done`/`complete`，见下表本行注）；其余计划均未进入实施/发布阶段（多数为设计态、全部 `pending`；`plan-20260919` 已全部 `done`/`complete`，GCX-01..04 含 GCX-02/03/04 的 v0.30.32/33/34 交付见下表本行注）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
 
