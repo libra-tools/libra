@@ -1,6 +1,24 @@
 test_fn	lane	reason
 agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+agent_kind_check_rebuild_discards_a_cancelled_connection	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
+agent_kind_check_rebuild_discards_a_failed_in_memory_connection	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
+agent_kind_check_rebuild_finishes_an_in_memory_run_its_caller_abandoned	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
+agent_kind_check_rebuild_holds_the_in_memory_connection_until_restored	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
+agent_kind_check_rebuild_ignores_failpoints_outside_tests	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_keeps_every_row_and_dependent	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_never_falls_back_when_the_file_lookup_fails	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_rechecks_a_lost_claim_with_foreign_keys_on	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_rechecks_with_foreign_keys_on_after_the_commit	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_records_an_expanded_check_only_when_clean	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_refuses_an_unreviewed_check	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_reports_a_failed_check_after_the_commit	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_reports_a_foreign_keys_restore_failure	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_reports_a_foreign_keys_setup_failure	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_reports_an_unknown_outcome_when_commit_or_rollback_fails	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_rolls_back_every_failed_step	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_runs_once_under_concurrent_upgrades	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
+agent_kind_check_rebuild_survives_a_crash_at_every_step	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
 agent_object_gc_findings_reachability	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 agent_push_after_prune_requires_force_rewrite_and_lease_protects	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 agent_push_seed_drains_object_index_queue	lane:hash_kind	checkpoint seed uses the shared hash-kind state while asserting its direct-library index queue drains
@@ -49,24 +67,6 @@ config_bare_read_protected_key_interactive_pty	lane:cwd+env+hash_kind	fail-close
 config_cascade_uses_explicit_role	lane:cwd+env	uses isolated global/system configuration paths and cwd to prove read-only role routing
 config_db_fixture_creates_sqlite_only_beneath_its_root	lane:env	mutates config-path environment through the shared scoped fixture
 config_db_fixture_restores_caller_values_after_drop_and_early_return	lane:env	mutates config-path environment through the shared scoped fixture
-agent_kind_check_rebuild_finishes_an_in_memory_run_its_caller_abandoned	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
-agent_kind_check_rebuild_discards_a_cancelled_connection	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
-agent_kind_check_rebuild_holds_the_in_memory_connection_until_restored	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
-agent_kind_check_rebuild_discards_a_failed_in_memory_connection	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
-agent_kind_check_rebuild_keeps_every_row_and_dependent	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_rolls_back_every_failed_step	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_survives_a_crash_at_every_step	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_runs_once_under_concurrent_upgrades	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_refuses_an_unreviewed_check	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_records_an_expanded_check_only_when_clean	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_reports_a_failed_check_after_the_commit	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_rechecks_with_foreign_keys_on_after_the_commit	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_never_falls_back_when_the_file_lookup_fails	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_reports_an_unknown_outcome_when_commit_or_rollback_fails	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_reports_a_foreign_keys_setup_failure	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_reports_a_foreign_keys_restore_failure	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_ignores_failpoints_outside_tests	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
-agent_kind_check_rebuild_rechecks_a_lost_claim_with_foreign_keys_on	lane:env	PI-07: spawns libra children whose environment derives from the process environment, which env-lane tests of this binary change
 config_db_fixture_restores_caller_values_after_panic	lane:env	mutates config-path environment through the shared scoped fixture
 config_generate_gpg_key_after_import_resumes_idempotently	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14 resume)
 config_generate_gpg_key_migrates_imported_key_into_history	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-14)
@@ -87,6 +87,10 @@ dirty_mark_rejected_in_multi_worktree_repo	lane:cwd+env+hash_kind+service	fail-c
 discovery_reference_restores_current_dir_after_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 discovery_skips_builtin_slug_impersonation	lane:env	mutates process-wide PATH via set_var/remove_var (composable env lane)
 doctor_repair_never_rebinds_an_expired_terminal_marker_to_changed_source	lane:env	installs and restores the in-process Claude provider-root fixture through an RAII environment guard
+every_tool_error_example_is_error	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the error example runs
+every_tool_error_matches_error_schema	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the error schema runs
+every_tool_success_example_is_success	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success example runs
+every_tool_success_matches_success_branch	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success schema runs
 fetch_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 fetch reject; serial(cwd) while spawning CLI subprocesses
 fsck_heal_restores_object_from_durable_tier	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 fuse_repair_failure_closes_the_shared_audit_row_failed	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -152,6 +156,11 @@ pi_discovery_refuses_non_regular_files	lane:env	PI-02 AC4: sets LIBRA_TEST_HOME 
 pi_discovery_refuses_relative_and_parent_roots	lane:env	PI-02 AC1: sets LIBRA_TEST_HOME in-process (ScopedEnvVar) so the Pi provider root is an isolated temporary home
 pi_discovery_refuses_symlinks	lane:env	PI-02 AC3: sets LIBRA_TEST_HOME in-process (ScopedEnvVar) so the Pi provider root is an isolated temporary home
 pi_discovery_reports_partial_past_any_limit	lane:env	PI-02 AC7: sets LIBRA_TEST_HOME in-process (ScopedEnvVar) so the Pi provider root is an isolated temporary home
+pi_session_source_encodes_the_default_directory	lane:env	points LIBRA_TEST_HOME at a temp provider home
+pi_session_source_reads_only_the_named_candidate	lane:env	points LIBRA_TEST_HOME at a temp provider home
+pi_session_source_refuses_unusable_candidates	lane:env	points LIBRA_TEST_HOME at a temp provider home
+pi_session_source_selects_the_matching_session	lane:env	points LIBRA_TEST_HOME at a temp provider home
+pi_session_source_stops_at_the_deadline	lane:env	sets LIBRA_TEST_HOME and a test-only Pi source stall hook
 porcelain_v2_unmerged_row_from_subdirectory_keeps_real_worktree_mode	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 porcelain_v2_unmerged_u_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 prior_chunk_cli_upload_consumes_cached_layout_and_rejects_source_change	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -183,9 +192,15 @@ service_reports_identity_read_failure_as_server_error	lane:service	holds a long-
 service_restarts_over_its_own_legacy_record_in_a_linked_repository	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 service_startup_refuses_a_foreign_stale_control_file	lane:service	holds a long-lived service child under the process-local CLI spawn limiter while issuing follow-up CLI calls
 spawn_clears_parent_env_and_injects_allowlist	lane:env	mutates process-wide HOME and probe variables via set_var/remove_var (composable env lane)
-status_storage_scope_unpinned_fallback_reads_cwd	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_corrupt_head_reference_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+status_storage_scope_unpinned_fallback_reads_cwd	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 status_sync_wrappers_honor_core_ignorecase_override	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+storage_config_failure_hides_values_clone	lane:cwd+env	sets LIBRA_STORAGE_* and runs clone in a temporary repository
+storage_config_failure_hides_values_fetch	lane:cwd+env	sets LIBRA_STORAGE_* and runs fetch in a temporary repository
+storage_config_failure_hides_values_pull	lane:cwd+env	sets LIBRA_STORAGE_* and runs pull in a temporary repository
+storage_config_unresolved_fetch_stays_local_clone	lane:cwd+env	points clone at a missing global config database from a temporary repository
+storage_config_unresolved_fetch_stays_local_fetch	lane:cwd+env	points fetch at a missing global config database from a temporary repository
+storage_config_unresolved_fetch_stays_local_pull	lane:cwd+env	points pull at a missing global config database from a temporary repository
 subagent_scope_row_persists_linkage_and_is_idempotent	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 successful_ingest_clears_its_inflight_marker	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 system_config_create_uses_system_role	lane:env+cwd	fixture temporarily points system config at a future-schema database while in-process init may read it
@@ -955,6 +970,7 @@ test_worktree_remove_with_delete_dir_dirty_path_is_rejected	lane:cwd	changes the
 test_worktree_repair_deduplicates_entries	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_repair_json_reports_changed_state	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_repair_persists_main_flag_fix_without_duplicates	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+tools_call_span_has_tool_name	lane:env	sets LIBRA_TEST so the MCP request span can name the debug echo tool
 trusted_dirs_env_allowlist_extra	lane:env	mutates process-wide environment variables via set_var/remove_var (composable env lane)
 undo_restores_current_symbolic_branch_tip_and_preserves_other_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unmerged_path_never_pairs_as_a_staged_rename_source	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -978,14 +994,3 @@ worktree_doctor_reports_scope_diagnostics	lane:cwd+env+hash_kind	fail-closed bod
 worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-every_tool_error_example_is_error	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the error example runs
-every_tool_error_matches_error_schema	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the error schema runs
-every_tool_success_example_is_success	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success example runs
-tools_call_span_has_tool_name	lane:env	sets LIBRA_TEST so the MCP request span can name the debug echo tool
-every_tool_success_matches_success_branch	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success schema runs
-storage_config_failure_hides_values_clone	lane:cwd+env	sets LIBRA_STORAGE_* and runs clone in a temporary repository
-storage_config_failure_hides_values_fetch	lane:cwd+env	sets LIBRA_STORAGE_* and runs fetch in a temporary repository
-storage_config_failure_hides_values_pull	lane:cwd+env	sets LIBRA_STORAGE_* and runs pull in a temporary repository
-storage_config_unresolved_fetch_stays_local_clone	lane:cwd+env	points clone at a missing global config database from a temporary repository
-storage_config_unresolved_fetch_stays_local_fetch	lane:cwd+env	points fetch at a missing global config database from a temporary repository
-storage_config_unresolved_fetch_stays_local_pull	lane:cwd+env	points pull at a missing global config database from a temporary repository

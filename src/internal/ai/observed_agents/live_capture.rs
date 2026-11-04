@@ -29,10 +29,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::{
-    AgentKind, NormalizedTurn, ObservedAgent, RedactedBytes, TRANSCRIPT_READ_HARD_CAP_BYTES,
-    TranscriptSource, agent_for, claude_jsonl_session_matches, claude_session_file_candidate,
-    live_capture_for, normalize_claude_transcript, normalize_codex_rollout,
-    normalize_opencode_export,
+    AgentKind, ExportAuthorized, NormalizedTurn, ObservedAgent, RedactedBytes,
+    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, agent_for, claude_jsonl_session_matches,
+    claude_session_file_candidate, live_capture_for, normalize_claude_transcript,
+    normalize_codex_rollout, normalize_opencode_export,
     opencode_export::{ExportLimits, authorized_trusted_sandboxed_export_until},
     reasoning::note_claude_attached_duplicates,
 };
@@ -765,6 +765,65 @@ pub(super) struct GrokLiveCapture;
 
 impl LiveCaptureProvider for GrokLiveCapture {}
 
+/// PI-36: Pi is not hook-installable yet, but its observe path already needs
+/// a bounded session source for automatic checkpoints before PI-06 promotes
+/// it. The exporter returns the selected session bytes as an authorized
+/// in-memory source, so the snapshot runs the PI-33 worker frame.
+pub(super) struct PiLiveCapture;
+
+impl LiveCaptureProvider for PiLiveCapture {
+    fn missing_host_capture_budget(&self) -> Option<Duration> {
+        // The extension passes a 1500 ms host budget. The same fixed value
+        // keeps a directly invoked hook bounded: the source read or the
+        // checkpoint write finishes (or fails closed) before PI-13's delivery
+        // window can kill the child.
+        Some(Duration::from_millis(1500))
+    }
+
+    fn transcript_exporter(&self) -> Option<&dyn LiveTranscriptExporter> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl LiveTranscriptExporter for PiLiveCapture {
+    async fn export(
+        &self,
+        context: &LiveCaptureContext<'_>,
+        deadline: Instant,
+    ) -> Result<TranscriptSource> {
+        let Some(directory) = super::pi_live::default_pi_session_directory(context.verified_cwd)
+        else {
+            anyhow::bail!("pi default session directory is unavailable");
+        };
+        let read = super::pi_live::read_pi_session_source_until(
+            &directory,
+            context.provider_session_id,
+            context.verified_cwd,
+            super::builtin::pi::PiDiscoveryLimits::default(),
+            deadline,
+        )
+        .await;
+        let Some(bytes) = read.bytes() else {
+            anyhow::bail!("pi session source is unavailable");
+        };
+        let auth = ExportAuthorized::issue("pi", context.libra_session_id, &bytes);
+        Ok(TranscriptSource::Bytes { bytes, auth })
+    }
+
+    fn export_coverage_normalizer(&self) -> LiveCoverageNormalizer {
+        pi_export_coverage
+    }
+}
+
+fn pi_export_coverage(transcript: &RedactedBytes) -> Vec<NormalizedTurn> {
+    super::builtin::pi::normalize_pi_turns(
+        transcript.bytes(),
+        super::builtin::pi::PiNormalizeLimits::default(),
+    )
+    .unwrap_or_default()
+}
+
 /// Hermes is hook-installable, so the live lookup must be `Some`. Thinking
 /// text arrives through the JSONL export reader on the live snapshot path.
 pub(super) struct HermesLiveCapture;
@@ -1302,13 +1361,14 @@ mod tests {
             let db = kind.as_db_str();
             assert_eq!(
                 live_capture_for(kind).is_some(),
-                registration_for(kind).hook_installable,
+                registration_for(kind).hook_installable || kind == AgentKind::Pi,
                 "{db}: live capture must exist exactly for hook-installable kinds"
             );
             let binding = LiveCaptureBinding::for_kind(db, kind);
 
             let legacy_budget = match db {
                 "opencode" | "hermes" => Some(ExportLimits::default().deadline),
+                "pi" => Some(Duration::from_millis(1500)),
                 _ => None,
             };
             assert_eq!(binding.missing_host_capture_budget(), legacy_budget, "{db}");
@@ -1370,11 +1430,15 @@ mod tests {
             match binding.transcript_exporter() {
                 Some(exporter) => {
                     assert!(
-                        matches!(db, "opencode" | "hermes"),
+                        matches!(db, "opencode" | "hermes" | "pi"),
                         "{db}: unexpected transcript exporter"
                     );
                     let normalize = exporter.export_coverage_normalizer();
-                    if db == "opencode" {
+                    if db == "pi" {
+                        let fixture = RedactedBytes::new_unchecked(Vec::new());
+                        assert!(normalize(&fixture).is_empty(), "{db}");
+                        assert!(!exporter.manages_export_lease(), "{db}");
+                    } else if db == "opencode" {
                         let fixture =
                             RedactedBytes::new_unchecked(OPENCODE_FIXTURE.as_bytes().to_vec());
                         assert_eq!(normalize(&fixture).len(), 1, "{db}");
@@ -1393,7 +1457,7 @@ mod tests {
                     }
                 }
                 None => assert!(
-                    !matches!(db, "opencode" | "hermes"),
+                    !matches!(db, "opencode" | "hermes" | "pi"),
                     "{db}: missing transcript exporter"
                 ),
             }

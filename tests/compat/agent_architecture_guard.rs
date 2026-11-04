@@ -2682,7 +2682,7 @@ fn live_capture_port_and_store_boundaries() {
     }
     let installable: BTreeSet<String> = AgentKind::all()
         .iter()
-        .filter(|kind| registration_for(**kind).hook_installable)
+        .filter(|kind| registration_for(**kind).hook_installable || **kind == AgentKind::Pi)
         .map(|kind| format!("AgentKind::{kind:?}"))
         .collect();
     let every_kind: BTreeSet<String> = AgentKind::all()
@@ -2691,7 +2691,7 @@ fn live_capture_port_and_store_boundaries() {
         .collect();
     assert_eq!(
         live_variants, installable,
-        "live_capture_for must return Some exactly for the hook-installable kinds"
+        "live_capture_for must return Some for the hook-installable kinds plus the pre-support Pi observer"
     );
     assert_eq!(
         live_variants

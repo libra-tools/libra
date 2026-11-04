@@ -49,6 +49,7 @@ use libra::internal::{
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use serde_json::{Value, json};
+use serial_test::serial;
 
 async fn ingest_agent_traces_payload(
     payload: &[u8],
@@ -8734,6 +8735,533 @@ fn pi_asset_doctor_reports_a_pi_version_drift() {
             .iter()
             .any(|finding| matches!(finding, PiDiagnostic::VersionDrift { .. }))
     );
+}
+
+// ---------------------------------------------------------------------------
+// PI-35: bounded Pi session source selection (`pi_session_source_*`).
+// ---------------------------------------------------------------------------
+
+// PI-35: bounded Pi session source selection (`pi_session_source_*`).
+
+struct PiSourceFixture {
+    _temp: tempfile::TempDir,
+    home: PathBuf,
+    cwd: PathBuf,
+    sessions: PathBuf,
+}
+
+impl PiSourceFixture {
+    fn create(_cwd: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let encoded = cwd
+            .to_str()
+            .expect("utf-8 cwd")
+            .trim_start_matches('/')
+            .replace(['/', '\\', ':'], "-");
+        let sessions = home
+            .join(".pi")
+            .join("agent")
+            .join("sessions")
+            .join(format!("--{encoded}--"));
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let _ = cwd;
+        Self {
+            _temp: temp,
+            home,
+            cwd,
+            sessions,
+        }
+    }
+
+    fn write_session(&self, id: &str, _cwd: &Path, bytes: &[u8]) -> PathBuf {
+        let name = format!("2026-11-04T00-00-00-000Z_{id}.jsonl");
+        let path = self.sessions.join(name);
+        std::fs::write(&path, bytes).expect("session file");
+        path
+    }
+
+    fn session_bytes(&self, id: &str, cwd: &Path) -> Vec<u8> {
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-11-04T00:00:00.000Z\",\"cwd\":\"{}\"}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-11-04T00:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n",
+            cwd.display()
+        )
+        .into_bytes()
+    }
+}
+
+fn with_pi_source_home<T>(fixture: &PiSourceFixture, run: impl FnOnce() -> T) -> T {
+    let previous = std::env::var_os("LIBRA_TEST_HOME");
+    // SAFETY: serialized tests set and restore their own environment.
+    unsafe { std::env::set_var("LIBRA_TEST_HOME", &fixture.home) };
+    let result = run();
+    match previous {
+        Some(value) => {
+            // SAFETY: serialized test restoring its own mutation.
+            unsafe { std::env::set_var("LIBRA_TEST_HOME", value) };
+        }
+        None => {
+            // SAFETY: serialized test restoring its own mutation.
+            unsafe { std::env::remove_var("LIBRA_TEST_HOME") };
+        }
+    }
+    result
+}
+
+#[test]
+#[serial(env)]
+fn pi_session_source_encodes_the_default_directory() {
+    use libra::internal::ai::observed_agents::pi_live::default_pi_session_directory;
+
+    let fixture = PiSourceFixture::create("/repo/sub");
+    with_pi_source_home(&fixture, || {
+        let directory =
+            default_pi_session_directory(&fixture.cwd).expect("default session directory");
+        let encoded = fixture
+            .cwd
+            .to_str()
+            .expect("utf-8")
+            .trim_start_matches('/')
+            .replace(['/', '\\', ':'], "-");
+        assert!(
+            directory.ends_with(format!("--{encoded}--")),
+            "{}",
+            directory.display()
+        );
+        assert_eq!(
+            directory,
+            fixture
+                .home
+                .join(".pi/agent/sessions")
+                .join(format!("--{encoded}--"))
+        );
+    });
+}
+
+#[test]
+#[serial(env)]
+fn pi_session_source_selects_the_matching_session() {
+    use libra::internal::ai::observed_agents::pi_live::{
+        pi_live_counters, pi_source_control_for_test, pi_source_status,
+        select_pi_session_source_for_test,
+    };
+
+    let fixture = PiSourceFixture::create("/repo");
+    let bytes = fixture.session_bytes("sess-1", &fixture.cwd);
+    fixture.write_session("sess-1", &fixture.cwd, &bytes);
+    with_pi_source_home(&fixture, || {
+        pi_live_counters::reset();
+        let control = pi_source_control_for_test(
+            &fixture.sessions,
+            "sess-1",
+            &fixture.cwd,
+            libra::internal::ai::observed_agents::builtin::pi::PiDiscoveryLimits::default(),
+            5_000,
+        );
+        let (status, selected) = select_pi_session_source_for_test(&control, 1024 * 1024);
+        assert_eq!(status, pi_source_status::COMPLETE);
+        assert_eq!(selected, bytes);
+        assert_eq!(pi_live_counters::opened_count(), 1);
+    });
+}
+
+#[test]
+#[serial(env)]
+fn pi_session_source_reads_only_the_named_candidate() {
+    use libra::internal::ai::observed_agents::pi_live::{
+        pi_live_counters, pi_source_control_for_test, pi_source_status,
+        select_pi_session_source_for_test,
+    };
+
+    let fixture = PiSourceFixture::create("/repo");
+    let bytes = fixture.session_bytes("sess-1", &fixture.cwd);
+    fixture.write_session("sess-1", &fixture.cwd, &bytes);
+    fixture.write_session(
+        "sess-2",
+        &fixture.cwd,
+        &fixture.session_bytes("sess-2", &fixture.cwd),
+    );
+    with_pi_source_home(&fixture, || {
+        pi_live_counters::reset();
+        let control = pi_source_control_for_test(
+            &fixture.sessions,
+            "sess-1",
+            &fixture.cwd,
+            libra::internal::ai::observed_agents::builtin::pi::PiDiscoveryLimits::default(),
+            5_000,
+        );
+        let (status, selected) = select_pi_session_source_for_test(&control, 1024 * 1024);
+        assert_eq!(status, pi_source_status::COMPLETE);
+        assert_eq!(selected, bytes);
+        assert_eq!(
+            pi_live_counters::opened_count(),
+            1,
+            "only the file name carrying the session id is opened"
+        );
+    });
+}
+
+#[test]
+#[serial(env)]
+fn pi_session_source_refuses_unusable_candidates() {
+    use libra::internal::ai::observed_agents::{
+        builtin::pi::PiDiscoveryLimits,
+        pi_live::{
+            pi_source_control_for_test, pi_source_status, select_pi_session_source_for_test,
+        },
+    };
+
+    let fixture = PiSourceFixture::create("/repo");
+    with_pi_source_home(&fixture, || {
+        let default_limits = PiDiscoveryLimits::default();
+        let control = |directory: &Path, id: &str, limits| {
+            pi_source_control_for_test(directory, id, &fixture.cwd, limits, 5_000)
+        };
+        let status = |control: String, cap: u64| select_pi_session_source_for_test(&control, cap).0;
+
+        // Missing file.
+        assert_eq!(
+            status(
+                control(&fixture.sessions, "sess-1", default_limits),
+                1024 * 1024
+            ),
+            pi_source_status::ABSENT
+        );
+        // Ambiguous: two valid files with the same id.
+        let bytes = fixture.session_bytes("sess-1", &fixture.cwd);
+        fixture.write_session("sess-1", &fixture.cwd, &bytes);
+        std::fs::write(
+            fixture
+                .sessions
+                .join("2026-11-04T00-00-01-000Z_sess-1.jsonl"),
+            &bytes,
+        )
+        .expect("second session file");
+        assert_eq!(
+            status(
+                control(&fixture.sessions, "sess-1", default_limits),
+                1024 * 1024
+            ),
+            pi_source_status::ABSENT
+        );
+        std::fs::remove_dir_all(&fixture.sessions).expect("reset sessions");
+        std::fs::create_dir_all(&fixture.sessions).expect("sessions");
+
+        // Header id mismatch.
+        fixture.write_session(
+            "sess-1",
+            &fixture.cwd,
+            &fixture.session_bytes("other", &fixture.cwd),
+        );
+        assert_eq!(
+            status(
+                control(&fixture.sessions, "sess-1", default_limits),
+                1024 * 1024
+            ),
+            pi_source_status::ABSENT
+        );
+        std::fs::remove_dir_all(&fixture.sessions).expect("reset sessions");
+        std::fs::create_dir_all(&fixture.sessions).expect("sessions");
+
+        // Header cwd mismatch.
+        fixture.write_session(
+            "sess-1",
+            &fixture.cwd,
+            &fixture.session_bytes("sess-1", Path::new("/somewhere/else")),
+        );
+        assert_eq!(
+            status(
+                control(&fixture.sessions, "sess-1", default_limits),
+                1024 * 1024
+            ),
+            pi_source_status::ABSENT
+        );
+
+        // Entry limit, header limit and source cap.
+        fixture.write_session("sess-1", &fixture.cwd, &bytes);
+        fixture.write_session(
+            "sess-2",
+            &fixture.cwd,
+            &fixture.session_bytes("sess-2", &fixture.cwd),
+        );
+        let mut one_entry = default_limits;
+        one_entry.max_entries = 1;
+        assert_eq!(
+            status(control(&fixture.sessions, "sess-1", one_entry), 1024 * 1024),
+            pi_source_status::OVERSIZE
+        );
+        let mut short_header = default_limits;
+        short_header.max_header_bytes = 8;
+        assert_eq!(
+            status(
+                control(&fixture.sessions, "sess-1", short_header),
+                1024 * 1024
+            ),
+            pi_source_status::OVERSIZE
+        );
+        assert_eq!(
+            status(control(&fixture.sessions, "sess-1", default_limits), 8),
+            pi_source_status::OVERSIZE
+        );
+
+        // A directory outside the configured provider root.
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(
+            outside.path().join("2026-11-04T00-00-00-000Z_sess-1.jsonl"),
+            &bytes,
+        )
+        .expect("outside file");
+        assert_eq!(
+            status(
+                control(outside.path(), "sess-1", default_limits),
+                1024 * 1024
+            ),
+            pi_source_status::UNTRUSTED
+        );
+    });
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn pi_session_source_stops_at_the_deadline() {
+    use std::time::{Duration, Instant};
+
+    use libra::internal::ai::observed_agents::{
+        builtin::pi::PiDiscoveryLimits,
+        pi_live::{PiSessionSourceRead, read_pi_session_source_until},
+    };
+
+    let fixture = PiSourceFixture::create("/repo");
+    let bytes = fixture.session_bytes("sess-1", &fixture.cwd);
+    fixture.write_session("sess-1", &fixture.cwd, &bytes);
+    let previous_home = std::env::var_os("LIBRA_TEST_HOME");
+    // SAFETY: serialized test; the helper child inherits these values.
+    unsafe { std::env::set_var("LIBRA_TEST_HOME", &fixture.home) };
+    // SAFETY: serialized test setting a test-only stall hook and helper.
+    unsafe { std::env::set_var("LIBRA_TEST", "1") };
+    // SAFETY: serialized test; the integration test binary is not libra.
+    unsafe { std::env::set_var("LIBRA_TEST_PI_SOURCE_HELPER", env!("CARGO_BIN_EXE_libra")) };
+    for stage in ["list", "header", "body"] {
+        // SAFETY: serialized test; the helper child inherits this value.
+        unsafe { std::env::set_var("LIBRA_TEST_PI_SOURCE_STALL", stage) };
+        let started = Instant::now();
+        let result = read_pi_session_source_until(
+            &fixture.sessions,
+            "sess-1",
+            &fixture.cwd,
+            PiDiscoveryLimits::default(),
+            Instant::now() + Duration::from_millis(400),
+        )
+        .await;
+        assert_eq!(
+            result,
+            PiSessionSourceRead::DeadlineExceeded,
+            "stage {stage}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stage {stage} exceeded the deadline by too much: {:?}",
+            started.elapsed()
+        );
+    }
+    // SAFETY: serialized test restoring its own mutation.
+    unsafe { std::env::remove_var("LIBRA_TEST_PI_SOURCE_STALL") };
+    // SAFETY: serialized test restoring its own mutation.
+    unsafe { std::env::remove_var("LIBRA_TEST") };
+    // SAFETY: serialized test restoring its own mutation.
+    unsafe { std::env::remove_var("LIBRA_TEST_PI_SOURCE_HELPER") };
+    match previous_home {
+        Some(value) => {
+            // SAFETY: serialized test restoring its own mutation.
+            unsafe { std::env::set_var("LIBRA_TEST_HOME", value) };
+        }
+        None => {
+            // SAFETY: serialized test restoring its own mutation.
+            unsafe { std::env::remove_var("LIBRA_TEST_HOME") };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PI-36: the observe checkpoint's bounded Pi session source (`pi_observe_source_*`).
+// ---------------------------------------------------------------------------
+
+fn pi_live_source_file(repo: &HookRepo, session: &str, thinking: &str, answer: &str) -> PathBuf {
+    let encoded = repo
+        .repo
+        .to_str()
+        .expect("utf-8 repo")
+        .trim_start_matches('/')
+        .replace(['/', '\\', ':'], "-");
+    let directory = repo
+        .home
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join(format!("--{encoded}--"));
+    std::fs::create_dir_all(&directory).expect("Pi session directory");
+    let cwd = serde_json::to_string(&repo.repo.display().to_string()).expect("cwd json");
+    let file = directory.join(format!("2026-11-04T00-00-00-000Z_{session}.jsonl"));
+    let bytes = format!(
+        "{{\"type\":\"session\",\"version\":3,\"id\":\"{session}\",\"timestamp\":\"2026-11-04T00:00:00.000Z\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-11-04T00:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-11-04T00:00:02.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":{thinking_json}}},{{\"type\":\"text\",\"text\":{answer_json}}}]}}}}\n",
+        thinking_json = serde_json::to_string(thinking).expect("thinking json"),
+        answer_json = serde_json::to_string(answer).expect("answer json"),
+    );
+    std::fs::write(&file, bytes).expect("Pi session file");
+    file
+}
+
+#[tokio::test]
+async fn pi_observe_source_writes_a_checkpoint_with_thinking() {
+    let repo = HookRepo::init();
+    let session = "pi-live-source";
+    pi_live_source_file(&repo, session, "PI36-THINKING-CANARY", "PI36-ANSWER-CANARY");
+    let start = pi_frame_with(
+        &repo,
+        "session_start",
+        json!({"sessionId": session, "frameId": pi_frame_id(30)}),
+    );
+    pi_observe(&repo, &start);
+    let run = pi_frame_with(
+        &repo,
+        "before_agent_start",
+        json!({"sessionId": session, "frameId": pi_frame_id(31)}),
+    );
+    pi_observe(&repo, &run);
+    let settled = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"sessionId": session, "frameId": pi_frame_id(32), "outcome": "completed"}),
+    );
+    let out = repo.hook("pi", "observe", &settled.to_string());
+    assert!(out.status.success(), "{}", describe(&out));
+    let checkpoints = repo.checkpoints();
+    assert_eq!(checkpoints.len(), 1, "{checkpoints:?}");
+    let checkpoint_id = checkpoints[0]["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id");
+    let export = repo.run(&["agent", "checkpoint", "export", checkpoint_id], None);
+    assert!(export.status.success(), "{}", describe(&export));
+    let text = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        text.contains("PI36-THINKING-CANARY"),
+        "the live checkpoint must keep the session thinking: {text}"
+    );
+    assert!(
+        text.contains("PI36-ANSWER-CANARY"),
+        "the live checkpoint must keep the assistant answer: {text}"
+    );
+    let metadata_oid = checkpoints[0]["metadata_blob_oid"]
+        .as_str()
+        .expect("metadata blob oid");
+    let metadata = repo.run(&["cat-file", "-p", metadata_oid], None);
+    assert!(metadata.status.success(), "{}", describe(&metadata));
+    let metadata_text = String::from_utf8_lossy(&metadata.stdout);
+    assert!(
+        metadata_text.contains("\"completeness\": \"partial\"")
+            && metadata_text.contains("\"partial_reason\": \"unproven_ordinary\""),
+        "the Pi snapshot must stay partial and unproven: {metadata_text}"
+    );
+    assert!(
+        repo.durable_session(&format!("pi__{session}")).await.state == "active",
+        "the observe checkpoint leaves the session active"
+    );
+}
+
+#[tokio::test]
+async fn pi_observe_source_without_a_session_file_keeps_the_metadata_checkpoint() {
+    let repo = HookRepo::init();
+    let session = "pi-live-missing";
+    let start = pi_frame_with(
+        &repo,
+        "session_start",
+        json!({"sessionId": session, "frameId": pi_frame_id(40)}),
+    );
+    pi_observe(&repo, &start);
+    let settled = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"sessionId": session, "frameId": pi_frame_id(41), "outcome": "completed"}),
+    );
+    let out = repo.hook("pi", "observe", &settled.to_string());
+    assert!(out.status.success(), "{}", describe(&out));
+    let checkpoints = repo.checkpoints();
+    assert_eq!(checkpoints.len(), 1, "{checkpoints:?}");
+    let checkpoint_id = checkpoints[0]["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id");
+    let export = repo.run(&["agent", "checkpoint", "export", checkpoint_id], None);
+    assert!(export.status.success(), "{}", describe(&export));
+    let text = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        !text.contains("PI36-"),
+        "a metadata-only checkpoint carries no transcript content: {text}"
+    );
+}
+
+#[tokio::test]
+async fn pi_observe_source_refuses_a_bad_frame() {
+    let repo = HookRepo::init();
+    let session = "pi-live-bad-frame";
+    let encoded = repo
+        .repo
+        .to_str()
+        .expect("utf-8 repo")
+        .trim_start_matches('/')
+        .replace(['/', '\\', ':'], "-");
+    let directory = repo
+        .home
+        .join(".pi")
+        .join("agent")
+        .join("sessions")
+        .join(format!("--{encoded}--"));
+    std::fs::create_dir_all(&directory).expect("Pi session directory");
+    let cwd = serde_json::to_string(&repo.repo.display().to_string()).expect("cwd json");
+    std::fs::write(
+        directory.join(format!("2026-11-04T00-00-00-000Z_{session}.jsonl")),
+        format!("{{\"type\":\"session\",\"version\":2,\"id\":\"{session}\",\"cwd\":{cwd}}}\n"),
+    )
+    .expect("v2 session file");
+    let start = pi_frame_with(
+        &repo,
+        "session_start",
+        json!({"sessionId": session, "frameId": pi_frame_id(50)}),
+    );
+    pi_observe(&repo, &start);
+    let settled = pi_frame_with(
+        &repo,
+        "agent_settled",
+        json!({"sessionId": session, "frameId": pi_frame_id(51), "outcome": "completed"}),
+    );
+    let out = repo.hook("pi", "observe", &settled.to_string());
+    assert!(
+        !out.status.success(),
+        "a Pi reader refusal fails closed: {}",
+        describe(&out)
+    );
+    assert!(
+        repo.checkpoints().is_empty(),
+        "a Pi reader refusal must not commit a checkpoint: {:?}",
+        repo.checkpoints()
+    );
+}
+
+#[test]
+fn pi_observe_source_live_capture_contract() {
+    use libra::internal::ai::observed_agents::{
+        AgentKind, live_capture_matches_hook_installable, registry::registration_for,
+    };
+
+    assert!(!registration_for(AgentKind::Pi).hook_installable);
+    assert!(live_capture_matches_hook_installable(AgentKind::Pi));
+    for kind in AgentKind::all() {
+        assert!(
+            live_capture_matches_hook_installable(*kind),
+            "{kind:?} broke the live-capture/hook-installable contract"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

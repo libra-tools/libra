@@ -5871,7 +5871,7 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             for (relative, pin) in [
                 (
                     "src/internal/ai/observed_agents/builtin/pi.rs",
-                    "078c32c31dca094c4e6eb1dfc56db505c9e0c397fc69cdb7fb97cd60bb279176",
+                    "afe49c5e24bba9c46e5a6937230d044370e6506e2501dd3823a0f94346355bfc",
                 ),
                 (
                     "src/internal/ai/capture/snapshot.rs",
