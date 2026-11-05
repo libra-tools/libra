@@ -10,7 +10,9 @@ use libra::{
 use serial_test::serial;
 use tempfile::tempdir;
 
-use super::{init_repo_via_cli, run_libra_command, run_libra_command_with_env};
+#[cfg(unix)]
+use super::run_libra_command_with_env;
+use super::{init_repo_via_cli, run_libra_command};
 
 /// `list` parses and succeeds; `add`/`remove` are strict aliases of
 /// `enable --agent` / `disable --agent`: same exit code and same
@@ -254,8 +256,10 @@ fn agent_roster_surface() {
 /// PI-17 coverage findings.
 #[test]
 fn pi_supported_enable_disable_and_bare_skip() {
+    use libra::internal::ai::hooks::providers::pi::settings::pi_asset_path;
+    #[cfg(unix)]
     use libra::internal::ai::hooks::providers::pi::settings::{
-        PI_ASSET_FILE, PiAssetOwnership, pi_asset_ownership, pi_asset_path,
+        PI_ASSET_FILE, PiAssetOwnership, pi_asset_ownership,
     };
 
     let temp = tempdir().expect("tempdir");
@@ -287,63 +291,71 @@ fn pi_supported_enable_disable_and_bare_skip() {
     );
     assert!(!pi_asset_path(&repo).exists());
 
-    let bin = temp.path().join("bin");
-    std::fs::create_dir_all(&bin).expect("fake bin");
-    let fake = bin.join("pi");
-    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("fake pi");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display());
-    let enabled = run_libra_command_with_env(
-        &["agent", "enable", "--agent", "pi"],
-        &repo,
-        &[("PATH", path.as_str())],
-    );
-    assert!(
-        enabled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
-    assert_eq!(
-        pi_asset_ownership(&repo).expect("ownership"),
-        PiAssetOwnership::Owned
-    );
-    assert!(pi_asset_path(&repo).ends_with(PI_ASSET_FILE));
+    // The fake Pi runtime is a shell script; Windows only compiles this
+    // target, so the installed-asset half stays Unix-only while the bare
+    // and explicit enable paths above run on both platforms.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    let doctor = run_libra_command(&["agent", "doctor", "--json"], &repo);
-    assert!(
-        doctor.status.success(),
-        "{}",
-        String::from_utf8_lossy(&doctor.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
-    let pi = report["data"]["provider_hooks"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["name"] == "pi"))
-        .expect("pi provider row");
-    assert_eq!(pi["installed"], true);
-    let events = pi["events"].as_array().expect("pi events");
-    assert!(
-        events.iter().any(|event| event["event"] == "trust"),
-        "doctor must report the unconfirmable Pi trust: {events:?}"
-    );
-    assert!(
-        events.iter().any(|event| event["event"] == "launch"),
-        "doctor must report the subdirectory launch gap: {events:?}"
-    );
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("fake bin");
+        let fake = bin.join("pi");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("fake pi");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display());
+        let enabled = run_libra_command_with_env(
+            &["agent", "enable", "--agent", "pi"],
+            &repo,
+            &[("PATH", path.as_str())],
+        );
+        assert!(
+            enabled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+        assert_eq!(
+            pi_asset_ownership(&repo).expect("ownership"),
+            PiAssetOwnership::Owned
+        );
+        assert!(pi_asset_path(&repo).ends_with(PI_ASSET_FILE));
 
-    let disabled = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
-    assert!(
-        disabled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&disabled.stderr)
-    );
-    assert_eq!(
-        pi_asset_ownership(&repo).expect("ownership"),
-        PiAssetOwnership::Absent
-    );
-    let again = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
-    assert!(again.status.success(), "repeated disable is idempotent");
+        let doctor = run_libra_command(&["agent", "doctor", "--json"], &repo);
+        assert!(
+            doctor.status.success(),
+            "{}",
+            String::from_utf8_lossy(&doctor.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&doctor.stdout).expect("doctor json");
+        let pi = report["data"]["provider_hooks"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "pi"))
+            .expect("pi provider row");
+        assert_eq!(pi["installed"], true);
+        let events = pi["events"].as_array().expect("pi events");
+        assert!(
+            events.iter().any(|event| event["event"] == "trust"),
+            "doctor must report the unconfirmable Pi trust: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| event["event"] == "launch"),
+            "doctor must report the subdirectory launch gap: {events:?}"
+        );
+
+        let disabled = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
+        assert!(
+            disabled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&disabled.stderr)
+        );
+        assert_eq!(
+            pi_asset_ownership(&repo).expect("ownership"),
+            PiAssetOwnership::Absent
+        );
+        let again = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
+        assert!(again.status.success(), "repeated disable is idempotent");
+    }
 }
 
 /// Enabling anything outside the supported roster is an actionable error
