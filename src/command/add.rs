@@ -1746,6 +1746,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         path: index_path.clone(),
         source,
     })?;
+    // Racily-clean anchor for the stat refresh below: the index snapshot's
+    // own mtime, read before this run rewrites the file.
+    let index_file_mtime = std::fs::metadata(&index_path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
     let current_dir = env::current_dir().map_err(|source| AddError::Workdir { source })?;
     let ignore_case = crate::utils::path_case::effective_ignore_case()
         .await
@@ -2175,6 +2180,24 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         }
     }
 
+    // Git's `add` re-records the stat of every matched tracked path whose stat
+    // changed but whose content did not (`add_to_index` / `add_files_to_cache`).
+    // The staging loop above only saw content changes, so refresh the rest
+    // silently — otherwise stat-based `diff-files`/`diff-index` keep reporting
+    // them as `M` (issues/479 TC-0044). Racily clean matched entries whose
+    // content differs are smudged so the save below cannot turn their racy
+    // uncertainty into trust. Runs before `--chmod`, which deliberately
+    // zeroes the stat of the entries it flips. The index is saved below
+    // unconditionally, so the outcome is not needed here.
+    crate::command::refresh::refresh_unchanged_tracked(
+        &mut index,
+        Some(&validated.pathspecs),
+        &files,
+        &workdir,
+        file_mode,
+        index_file_mtime,
+    );
+
     // `--chmod=(+|-)x`: force the executable bit on the matched regular files'
     // index entries, even ones with no content change (Git's `--chmod`).
     if let Some(target_mode) = chmod_mode {
@@ -2400,7 +2423,10 @@ fn render_add_output(
     let stdout = io::stdout();
     let mut w = stdout.lock();
 
-    let emit_body = dry_run || verbose || !result.refreshed.is_empty() || stdout_is_tty_for_add();
+    // Like Git, a successful non-verbose add — `--refresh` included — prints
+    // nothing to a pipe; the human summary is TTY-only (#659: a refresh used
+    // to force `refreshed N file` onto non-TTY stdout).
+    let emit_body = dry_run || verbose || stdout_is_tty_for_add();
     if emit_body {
         if dry_run {
             render_dry_run(&mut w, result)?;

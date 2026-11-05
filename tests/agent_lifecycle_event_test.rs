@@ -8830,11 +8830,13 @@ fn pi_session_source_encodes_the_default_directory() {
             "{}",
             directory.display()
         );
+        // The provider root is resolved canonically, so compare against the
+        // canonical fixture home: on macOS the temp dir `/var/...` is a
+        // symlink to `/private/var/...` (Linux CI has no such symlink).
+        let home = fixture.home.canonicalize().expect("canonical fixture home");
         assert_eq!(
             directory,
-            fixture
-                .home
-                .join(".pi/agent/sessions")
+            home.join(".pi/agent/sessions")
                 .join(format!("--{encoded}--"))
         );
     });

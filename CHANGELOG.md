@@ -36,6 +36,15 @@
   to zero bytes as `D`; both are modifications (`M`) with an all-zero worktree
   id, matching Git. The status letter now follows entry presence, never content
   emptiness (issues/479 DF-01, TC-0044).
+- `add <pathspec>`, `add -u`, `add -A` and `commit -a` now re-record the `stat`
+  of matched tracked files whose content is unchanged, as Git does. Before, a
+  file touched without a content change stayed stat-dirty after staging, so
+  `diff-files` / `diff-index` kept reporting it as `M` with an all-zero worktree
+  id right after `add` or `commit -a` (issues/479 TC-0044, upstream
+  `t3700-add.sh#24`; the `add -u` half of #660).
+- `add --refresh` no longer prints `refreshed N file(s)` when stdout is
+  redirected or piped; like every other successful `add`, the summary is
+  TTY-only (or `-v`), so scripts see Git's empty stdout (#659, TC-0021).
 - `update-ref --stdin -z` now uses Git's wire format: NUL separates a command's
   **arguments** (`create <ref> NUL <newvalue> NUL`) instead of terminating
   records, so Git-generated input parses, values may contain spaces (for example

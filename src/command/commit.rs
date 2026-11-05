@@ -3380,6 +3380,10 @@ fn auto_stage_tracked_changes(
     let index_path = path::index();
     let mut index = Index::load(&index_path)
         .map_err(|e| CommitError::IndexLoad(format!("failed to load index: {}", e)))?;
+    // Racily-clean anchor for the stat refresh below (read before any save).
+    let index_file_mtime = std::fs::metadata(&index_path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
     let workdir = util::working_dir();
     let unresolved = crate::command::merge::unresolved_conflicted_paths(&index, &[]);
     let unresolved_gitlinks: Vec<_> = unresolved
@@ -3507,7 +3511,37 @@ fn auto_stage_tracked_changes(
         }
         pending.modified.push(candidate);
     }
+    // Git's `commit -a` (`add_files_to_cache`) also re-records the stat of
+    // tracked paths whose stat changed but whose content did not; the
+    // content-based status above never lists them, so refresh them silently
+    // (issues/479 TC-0044). Racily clean entries whose content differs are
+    // smudged first, so saving the index (which advances its mtime) cannot
+    // hide a same-size edit the stat-based scan above could not see. Only a
+    // real commit writes the index; this is a stat-only rewrite and does not
+    // count as auto-staged content.
+    let stat_refreshed = persist_objects && {
+        let staged: Vec<PathBuf> = pending
+            .modified
+            .iter()
+            .chain(pending.deleted.iter())
+            .cloned()
+            .collect();
+        crate::command::refresh::refresh_unchanged_tracked(
+            &mut index,
+            None,
+            &staged,
+            &workdir,
+            file_mode,
+            index_file_mtime,
+        )
+        .index_changed
+    };
     if pending.modified.is_empty() && pending.deleted.is_empty() {
+        if stat_refreshed {
+            index
+                .save(&index_path)
+                .map_err(|e| CommitError::IndexSave(format!("failed to save index: {}", e)))?;
+        }
         return Ok(false);
     }
     let mut touched = false;
@@ -3573,7 +3607,7 @@ fn auto_stage_tracked_changes(
         }
     }
 
-    if touched {
+    if touched || stat_refreshed {
         index
             .save(&index_path)
             .map_err(|e| CommitError::IndexSave(format!("failed to save index: {}", e)))?;

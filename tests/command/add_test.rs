@@ -4742,6 +4742,12 @@ fn test_add_refresh_with_pathspec_tc0021() {
         "add --refresh bar must exit 0: {}",
         String::from_utf8_lossy(&refresh.stderr)
     );
+    // Upstream asserts `test_must_be_empty actual` on stdout (#659).
+    assert!(
+        refresh.stdout.is_empty(),
+        "add --refresh bar must print nothing on a pipe: {}",
+        String::from_utf8_lossy(&refresh.stdout)
+    );
 
     let names = run_libra_command(&["diff-files", "--name-only"], root);
     assert_eq!(

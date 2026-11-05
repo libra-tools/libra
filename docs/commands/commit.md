@@ -288,7 +288,11 @@ Automatically stage tracked files that have been modified or deleted before comm
 Equivalent to running `libra add -u` before `libra commit`. Does not add new untracked files.
 File modes follow `core.filemode`: with `true` (the Unix default) a mode-only change to a
 tracked regular file is committed too, while `false` ignores it (an invalid value fails the
-commit closed).
+commit closed). Like Git, `-a` also re-records the index stat of tracked files whose content is
+unchanged, so a file that was only touched is not reported by `diff-files`/`diff-index` after
+the commit. Unlike Git, which rolls the refresh back when the commit is refused, Libra writes
+the index before the commit runs (as it does for auto-staged content), so the refreshed stat is
+kept even when `commit -a` then stops with `nothing to commit`.
 
 Removing the LAST tracked file is still a real change to commit: even though the index
 becomes empty, `commit -a` (or `libra add -A && libra commit`) records the deletion rather

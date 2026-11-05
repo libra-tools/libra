@@ -64,6 +64,8 @@ libra add -u src/
 libra add --refresh
 ```
 
+与 Git 一致，`--refresh` 成功时若 stdout 被重定向或接入管道则不输出任何内容；`refreshed N file(s)` 摘要只在终端或加 `-v` 时显示。普通暂存同样会重新记录 stat：`add <pathspec>`、`add -u`、`add -A` 与 `commit -a` 会刷新每个命中的、内容未变的已跟踪文件的 stat，因此仅时间戳变化的文件在暂存后不会再被 `diff-files`/`diff-index` 报告为已修改。
+
 ### `-N, --intent-to-add`
 
 把命中的未跟踪路径以 *intent to add* 形式记入索引，但不暂存内容：条目携带规范空

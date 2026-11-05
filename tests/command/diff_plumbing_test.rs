@@ -450,6 +450,348 @@ fn diff_index_read_tree_empty_blob_is_modified_not_added() {
     );
 }
 
+/// A committed, tracked `foo` whose worktree copy is rewritten with the SAME
+/// bytes but an older mtime: stat-dirty, content-clean. This is the state the
+/// upstream t3700#24 sequence (TC-0044) hits — `foo` is already tracked from
+/// earlier tests when `>foo && git add foo && git commit -a` runs.
+fn repo_with_stat_dirty_tracked_file() -> TempDir {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("foo"), "").expect("create foo");
+    assert_cli_success(&run_libra_command(&["add", "foo"], root), "stage foo");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "foo", "--no-verify"], root),
+        "commit foo",
+    );
+    fs::write(root.join("foo"), "").expect("rewrite foo");
+    let file = fs::File::options()
+        .write(true)
+        .open(root.join("foo"))
+        .expect("open foo");
+    // A day back, not UNIX_EPOCH: status treats a zero time as untrusted.
+    let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    file.set_times(fs::FileTimes::new().set_modified(backdated))
+        .expect("backdate foo");
+    let dirty = run_libra_command(&["diff-files", "--", "foo"], root);
+    assert!(
+        String::from_utf8_lossy(&dirty.stdout).ends_with(" M\tfoo\n"),
+        "fixture must start stat-dirty: {}",
+        String::from_utf8_lossy(&dirty.stdout)
+    );
+    repo
+}
+
+fn assert_plumbing_clean(root: &std::path::Path, after: &str) {
+    for cmd in [
+        vec!["diff-index", "HEAD", "--", "foo"],
+        vec!["diff-files", "--", "foo"],
+    ] {
+        let out = run_libra_command(&cmd, root);
+        assert_eq!(out.status.code(), Some(0), "{cmd:?} after {after}");
+        assert!(
+            out.stdout.is_empty(),
+            "{cmd:?} must be empty after {after} (stat re-recorded like Git): {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+/// Git's `add <path>`, `add -u` and `add .` re-record the stat of a matched
+/// tracked path whose content is unchanged; Libra's staging loop only saw
+/// content changes, so the entry stayed stat-dirty (issues/479 TC-0044).
+#[test]
+fn add_rerecords_stat_of_unchanged_tracked_path() {
+    for args in [vec!["add", "foo"], vec!["add", "-u"], vec!["add", "."]] {
+        let repo = repo_with_stat_dirty_tracked_file();
+        let root = repo.path();
+        let out = run_libra_command(&args, root);
+        assert_cli_success(&out, &format!("{args:?}"));
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?} on a pipe stays silent: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_plumbing_clean(root, &format!("{args:?}"));
+    }
+}
+
+/// A pathspec that does not match the stat-dirty entry must leave it alone.
+#[test]
+fn add_leaves_unmatched_stat_dirty_entry_untouched() {
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    fs::write(root.join("other.txt"), "other\n").expect("create other");
+    assert_cli_success(
+        &run_libra_command(&["add", "other.txt"], root),
+        "add other.txt",
+    );
+    let out = run_libra_command(&["diff-files", "--", "foo"], root);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).ends_with(" M\tfoo\n"),
+        "an unmatched entry keeps its stale stat: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Git's `commit -a` (`add_files_to_cache`) refreshes the stat of unchanged
+/// tracked paths as a side effect of a successful commit (first half: Git
+/// parity). The second half pins an intentional Libra difference: Git
+/// prepares `-a` in a temporary index and rolls the refresh back when the
+/// commit is refused, while Libra's `-a` writes the index before the commit
+/// runs (as it already did for auto-staged content), so the stat refresh is
+/// kept even when the commit is then refused as "nothing to commit".
+#[test]
+fn commit_all_rerecords_stat_of_unchanged_tracked_path() {
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    fs::write(root.join("changed.txt"), "v1\n").expect("create changed");
+    assert_cli_success(
+        &run_libra_command(&["add", "changed.txt"], root),
+        "add changed",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c", "--no-verify"], root),
+        "commit changed",
+    );
+    fs::write(root.join("changed.txt"), "v2\n").expect("modify changed");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "all", "--no-verify"], root),
+        "commit -a",
+    );
+    assert_plumbing_clean(root, "commit -a");
+
+    // A stat-only refresh is not staged content: with nothing else changed,
+    // `commit -a` must still refuse as "nothing to commit". Intentional
+    // difference: unlike Git, the refreshed stat is kept after the refusal.
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    let out = run_libra_command(&["commit", "-a", "-m", "none", "--no-verify"], root);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "nothing to commit must still fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to commit"),
+        "refused as nothing to commit, not another error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_plumbing_clean(root, "commit -a with nothing to commit");
+}
+
+/// Make `name` racily clean but modified: its index entry keeps the
+/// worktree file's exact stat while pointing at the blob of different,
+/// same-size content, and the index file is backdated so the entry is not
+/// older than the index snapshot. Only a content compare can see the edit.
+fn make_racy_modified_entry(root: &std::path::Path, name: &str) {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+
+    fs::write(root.join(name), "old\n").expect("create racy file");
+    assert_cli_success(&run_libra_command(&["add", name], root), "add racy file");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "racy", "--no-verify"], root),
+        "commit racy file",
+    );
+    fs::write(root.join(name), "new\n").expect("same-size edit");
+    let index_path = root.join(".libra/index");
+    let mut index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index");
+    let (old_hash, mode) = {
+        let entry = index.get(name, 0).expect("racy file tracked");
+        (entry.hash, entry.mode)
+    };
+    let metadata = fs::symlink_metadata(root.join(name)).expect("stat racy file");
+    let mut entry = IndexEntry::new(&metadata, old_hash, name.to_string());
+    entry.mode = mode;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+    let file_mtime = metadata.modified().expect("racy mtime");
+    fs::File::options()
+        .write(true)
+        .open(&index_path)
+        .expect("open index")
+        .set_times(
+            fs::FileTimes::new().set_modified(file_mtime - std::time::Duration::from_secs(2)),
+        )
+        .expect("backdate index");
+}
+
+/// R1-P1-1 (FX-479-03 review): a stat-only refresh makes `commit -a` save the
+/// index even when there is nothing to commit, which advances the index
+/// mtime. A racily clean entry whose content differs must be smudged first,
+/// so a later `status` still content-compares it instead of trusting its stat
+/// against the newer index (Git's `ce_smudge_racily_clean_entry`).
+#[test]
+fn commit_all_stat_refresh_keeps_racy_modified_entry_visible() {
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    make_racy_modified_entry(root, "racy.txt");
+    let before = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        out_str(&before).contains(" M racy.txt"),
+        "fixture: the racy guard must report the edit before commit -a: {}",
+        out_str(&before)
+    );
+
+    // foo needs a stat-only refresh, so commit -a rewrites the index.
+    let _ = run_libra_command(&["commit", "-a", "-m", "all", "--no-verify"], root);
+
+    let committed_new = out_str(&run_libra_command(&["show", "HEAD:racy.txt"], root)) == "new\n";
+    let after = run_libra_command(&["status", "--porcelain"], root);
+    assert!(
+        committed_new || out_str(&after).contains(" M racy.txt"),
+        "the same-size edit must stay visible (or be committed), never hidden: \
+         status={:?}",
+        out_str(&after)
+    );
+    assert_plumbing_clean(root, "commit -a with a racy sibling");
+}
+
+/// R2-P1-1 (FX-479-03 review): `commit -a` with a racily clean LFS-tracked
+/// file that cannot be read must fail closed without a panic and without
+/// writing the index. The operation boundary's working-copy scan refuses it
+/// before staging (`LBR-AUTH-002`, 128); the smudge pass itself treats an
+/// unreadable racy entry as content-unknown (unit tests in
+/// `src/command/refresh.rs`), and `calc_file_blob_hash` now returns the LFS
+/// read error instead of panicking.
+#[cfg(unix)]
+#[test]
+fn commit_all_with_unreadable_racy_lfs_file_fails_closed_without_panic() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["lfs", "track", "*.bin"], root),
+        "lfs track",
+    );
+    make_racy_modified_entry(root, "big.bin");
+    let file = root.join("big.bin");
+    let index_before = fs::read(root.join(".libra/index")).expect("read index");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("make unreadable");
+    let readable = fs::read(&file).is_ok();
+
+    let out = run_libra_command(&["commit", "-a", "-m", "all", "--no-verify"], root);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("restore mode");
+    if readable {
+        // Running as root: permissions do not block the read.
+        return;
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "an unreadable LFS file must not panic commit -a: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(128), "fails closed: {stderr}");
+    assert_eq!(
+        fs::read(root.join(".libra/index")).expect("reread index"),
+        index_before,
+        "a refused commit -a must not write the index"
+    );
+}
+
+/// R1-P2-1 (FX-479-03 review): the stat-refresh pass clears a stale legacy
+/// `CE_VALID` bit (issues/637) even on a stat-clean entry; `commit -a` must
+/// persist that index change instead of depending on an unrelated stat-dirty
+/// file to trigger the save. Nothing to commit still refuses as before.
+#[test]
+fn commit_all_persists_cleared_assume_valid_bit() {
+    use git_internal::{
+        hash::HashKind,
+        internal::index::{Index, IndexEntry},
+    };
+
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("kept.txt"), "kept\n").expect("create kept");
+    assert_cli_success(&run_libra_command(&["add", "kept.txt"], root), "add kept");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "kept", "--no-verify"], root),
+        "commit kept",
+    );
+    let index_path = root.join(".libra/index");
+    let mut index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("load index");
+    let (hash, mode) = {
+        let entry = index.get("kept.txt", 0).expect("kept tracked");
+        (entry.hash, entry.mode)
+    };
+    let metadata = fs::symlink_metadata(root.join("kept.txt")).expect("stat kept");
+    let mut entry = IndexEntry::new(&metadata, hash, "kept.txt".to_string());
+    entry.mode = mode;
+    entry.flags.assume_valid = true;
+    index.update(entry);
+    index
+        .save_with_hash_kind(HashKind::Sha1, &index_path)
+        .expect("save index");
+
+    let out = run_libra_command(&["commit", "-a", "-m", "none", "--no-verify"], root);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "nothing to commit must still fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nothing to commit"),
+        "refused as nothing to commit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let index = Index::load_with_hash_kind(HashKind::Sha1, &index_path).expect("reload index");
+    assert!(
+        !index
+            .get("kept.txt", 0)
+            .expect("kept still tracked")
+            .flags
+            .assume_valid,
+        "the cleared stale CE_VALID bit must be saved"
+    );
+}
+
+/// The full upstream t3700#24 sequence (TC-0044) on an ALREADY-TRACKED foo:
+/// `>foo && add foo && commit -a` must leave `diff-index` empty BEFORE
+/// `read-tree` makes it racy; `add --refresh` then clears the racy `M`.
+#[test]
+fn t3700_24_add_refresh_sequence_on_tracked_file() {
+    let repo = repo_with_stat_dirty_tracked_file();
+    let root = repo.path();
+    fs::write(root.join("bar"), "bar\n").expect("create bar");
+    assert_cli_success(&run_libra_command(&["add", "bar"], root), "add bar");
+    assert_cli_success(&run_libra_command(&["add", "foo"], root), "add foo");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-a", "-m", "commit all", "--no-verify"], root),
+        "commit all",
+    );
+    assert_plumbing_clean(root, "add foo && commit -a");
+
+    assert_cli_success(
+        &run_libra_command(&["read-tree", "HEAD"], root),
+        "read-tree",
+    );
+    let racy = run_libra_command(&["diff-index", "HEAD", "--", "foo"], root);
+    let record = String::from_utf8_lossy(&racy.stdout);
+    assert!(
+        record.starts_with(":100644 100644 ") && record.ends_with(" M\tfoo\n"),
+        "read-tree leaves a racy M record: {record}"
+    );
+    let refresh = run_libra_command(&["add", "--refresh", "--", "foo"], root);
+    assert_cli_success(&refresh, "add --refresh");
+    assert!(
+        refresh.stdout.is_empty(),
+        "add --refresh on a pipe is silent like Git (#659): {}",
+        String::from_utf8_lossy(&refresh.stdout)
+    );
+    let after = run_libra_command(&["diff-index", "HEAD", "--", "foo"], root);
+    assert!(
+        after.stdout.is_empty(),
+        "add --refresh clears the racy entry: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}
+
 /// Git emits NO `-p` body for a stat-invalid entry whose content is unchanged,
 /// even though `--raw`/`--name-status` still report `M`. Printing a
 /// `--- /dev/null` header here would contradict the letter (issues/479 DF-01).

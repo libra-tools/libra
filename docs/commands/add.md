@@ -94,6 +94,13 @@ adding new files or removing entries. Mutually exclusive with `-A` and `-u`.
 libra add --refresh
 ```
 
+Like Git, a successful `--refresh` prints nothing when stdout is redirected or
+piped; the `refreshed N file(s)` summary appears only on a terminal or with `-v`.
+Ordinary staging also re-records stat data: `add <pathspec>`, `add -u`, `add -A`
+and `commit -a` refresh the stat of every matched tracked file whose content is
+unchanged, so a timestamp-only change no longer leaves `diff-files`/`diff-index`
+reporting the file as modified after staging.
+
 ### `-N, --intent-to-add`
 
 Record the matched untracked paths in the index as *intent to add* without staging
