@@ -72,7 +72,7 @@
 ### Task FIX-LTR-12: 限定私有 MCP read-worker 的运行时线程数
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成；本地签名子提交与家族最终 C/D 待，LEAK 观察项保留。  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成；本地 signed+DCO 子提交 `1dd29dbe9537bfd9940abbcbbb5f0549d8815126` 已核 VALIDSIG；家族最终 C/D 待，LEAK 观察项保留。  
 **Description:** Linux arm64 的两次同二进制诊断中，2/16/32 Tokio workers 成功，64 workers 在既有 2.5 GiB RLIMIT_AS 附近仅余约 692 KiB，RSS 约 45 MiB，SQLite worker 创建线程返回 `Io(EAGAIN)` 和 `LBR-AGENT-037`，与原 x64 CI 的错误签名一致。仅在私有 read-worker 创建 Tokio runtime 前固定小线程池；普通 CLI/MCP server 继续使用原策略。原 x64 机器的 CPU/进程/内存实况未捕获，不将本机诊断冒称原机器跟踪。  
 **Out of scope:** 不提高/移除 RLIMIT_AS、RSS 限制、deadline；不改 read-only/schema/对象修复拒绝、子进程回收、CI 并发或测试重试；不把全部 SQLx I/O 错误当 SQLite 锁。  
 **Acceptance criteria:**
@@ -107,7 +107,7 @@
 ### Task REL-QUAL-11: 资格恢复家族最终整合
 
 **Task type:** `release`（code-only）  
-**Lifecycle / Acceptance:** `pending` / 空。  
+**Lifecycle / Acceptance:** `in-progress` / 空；三子提交已精确签名，最终冻结树 C 尚待，main D 未触发。  
 **Description:** 唯一交付者 root 串行执行 FIX10 来源接收、FIX11 bare 修复、FIX12 MCP 修复；分别保留各卡 A/B 和精确本地 signed+DCO 子提交，再对最终合树执行一次完整 C 与真实 D。此家族解决当前共享资格来源的两个独立阻塞，避免一张卡的 D 被另一项已知失败阻塞而形成循环；不并入未交接 LTR 产品候选。  
 **Acceptance criteria:**
 - [ ] AC-1：FIX10/11/12 的具名行为和证据完成；旧 STOP、flaky、ignored、运行时 skip、LEAK 风险分别保留，源码/测试/收据身份一致。
@@ -125,6 +125,9 @@
 **Performance budget:** 旧 FIX10 窗口以失败及诊断收口，不续窗。上述新确证缺陷的家族共用一次 10800 秒本地窗口，从首个新 RED Cargo 命令起算，含全部 A/B/C 与 600 秒后检预留；Cargo jobs=4、现有 nextest 并发/重试/测试 deadline 不变，Linux 有界诊断串行计入。失败先保留/归属；无根因修正不盲重跑全量，不自动扩窗；远端 CI 等待另记，不消耗本地窗口。  
 **Rollback mode:** 集成点推送前仅撤销本家族精确本地增量；推送后 forward-only，不改原用户库。  
 **Granularity:** release；AC=3；VER=2；prod-files=0；scope=S；landing=1；self-contained=yes；deps=三具名子卡；release=唯一集成点；writeset=2；exception=用户明确免交叉 Review，不记 PASS。
+
+
+**最终 C 输入冻结（2026-11-05T04:34:11.267112+00:00）：** 隔离 main 的子提交序列为 `bc9568e85a9baaa1c85cd4bf5ce2b1f4d0a66246`（FIX10 docs）→`dfed4cbca17624daf7a9b9a2a42e15514cdc780f`（FIX11 bare）→`1dd29dbe9537bfd9940abbcbbb5f0549d8815126`（FIX12 MCP）。三个提交均精确写集、signed+DCO、本机离线GPG实际VALIDSIG，未推送；原库无写入。最新 native fetch exit0，origin/main仍292e5edf，与子链基底一致，无需重放；04:33 UTC GitHub main独立查询同SHA。当前仅本计划及plan-status本计划行收束，Rust产品/测试字节与各子卡已测输入相同。C按fmt→strictClippy→实际nextest listing→双env full→doc→原network3→release build执行；listing按当前平台实际统计，禁止沿用旧11276硬编码。所有阶段与后检计入04:06:43起的同一10800秒窗口（含600秒后检预留），没有续窗。当前文字仅登记输入和顺序，不预填结果；最终C/D及集成提交身份由仓外原件和后继具名交接写集补记。Review按用户指令免除，非PASS；本家族不bump/tag/Release，不混入LTR10七文件候选。
 
 
 > **2026-11-04 UTC FIX09 与 A9 资格证据（终态文档 D 待）：** FIX09 原测试缺陷及两次 RED 均保留；修复仅令沙箱测试内嵌套 commit 显式 `--no-gpg-sign -s`，不放宽沙箱或修改用户签名默认。签名+DCO `6819631a1d23b6110b250f8a0a1f347b2525f997` 已由上游合并，提交本机公钥实际 VALIDSIG，GitHub `unknown_key` 不称 verified。原提交自身 base run `41887408072` 部分 job cancelled，原事实不改；包含其代码的当前 `c426de6977678a60bef0d89f032c162a90686bbf` 在同树本机 A9 六阶段均 exit0：fmt、strict Clippy、双环境全量 11274/11274 passed（39 slow、0 flaky/重试/leak，50 原 ignored）、doc、network 3/3、release build；候选 binary SHA256 `cb4a08b6f90395b4ce78604dda44792d2114f8f82f3be53d6acd850d20fba26e`，terminal `8724bb2a67e1005dd5e4444c8066c4124822164c404a4eb7fd617721345fac0c`，源、用户数据、H1 后检不变。全量输出逐项审计至少 47 项测试体自行跳过，非相关功能覆盖；审计 `5ee8eca75340c4c58691069d442ce43e5e470c7524dfb55374884d8dbff43fea`，较早 v1–v3 解析错误原件保留。当前树实际 main base `41897658714` 八 job 全 success、CodeQL `41897658711` 和 Code Quality `41897658299` 均 success，收据 `6551724b02d2ffc2e2ef08912d7e8373fe9d051dfdba3325a849a283eb62b978`；历史 v0.30.92 原 base attempt1 failure 仍保留，同 SHA/ref attempt2 实际 success，F2 根因 unknown，缺失 user-decisions.json 原件未伪造。用户明确免交叉 Review，不声称审查 PASS；本段自身提交、其适用 D 与原工作区受控整合仍待，`DEP-QUAL-HANDOFF` / `DEP-TR-QUAL-REPAIRS` 尚未解除，A8 flaky 风险仍 open，H1/LTR live 不由本窗口替代。
