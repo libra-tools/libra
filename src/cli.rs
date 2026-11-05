@@ -978,8 +978,20 @@ pub enum Bisect {
 /// - Returns `CliError::fatal` if the runtime itself cannot be constructed (extremely
 ///   unlikely outside of OOM scenarios).
 pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
+    };
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if crate::internal::ai::mcp_server::exec::is_read_worker_argv(&argv) {
+        // The private worker serves one read under an address-space ceiling.
+        // A host-sized runtime can exhaust that ceiling before SQLx starts
+        // its SQLite thread. Explicit sizing also overrides the inherited
+        // TOKIO_WORKER_THREADS value; ordinary CLI/server sizing is unchanged.
+        runtime_builder.worker_threads(2);
+    }
+    let runtime = runtime_builder
         .build()
         .map_err(|e| CliError::fatal(format!("failed to create tokio runtime: {e}")))?;
 

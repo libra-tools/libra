@@ -304,6 +304,29 @@ fn slots_return_after_workers_killed() {
     assert_eq!(sleep["result"]["structuredContent"]["slept_ms"], 10);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn read_worker_runtime_is_bounded_on_large_hosts() {
+    let repo = init_repo(Some("sha256"));
+    let output = run_mcp(
+        repo.path(),
+        &session(&tool_call(2, "libra_test_hash_kind", "{}")),
+        &[("TOKIO_WORKER_THREADS", "64")],
+    );
+    assert!(
+        output.status.success(),
+        "MCP server failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let message = response_with_id(&stdout, 2);
+    assert_eq!(
+        message["result"]["structuredContent"]["hash_kind"], "sha256",
+        "MCP_WORKER_RUNTIME: high host thread count must leave room for the read-only repository connection: {message}"
+    );
+    assert_eq!(message["result"]["isError"], false);
+}
+
 #[test]
 fn read_worker_uses_repo_hash_kind() {
     let repo = init_repo(Some("sha256"));

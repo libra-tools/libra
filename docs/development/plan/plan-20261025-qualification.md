@@ -38,7 +38,7 @@
 ### Task FIX-LTR-11: bare 仓库快照排除元数据目录
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed 子提交与家族最终 C/D 待。  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed+DCO 子提交 `dfed4cbca17624daf7a9b9a2a42e15514cdc780f` 已核 VALIDSIG；家族最终 C/D 待。  
 **Description:** 已用同一 0.30.153 二进制在 16 个独立 bare 仓库实测：操作快照的 untracked manifest 收入 `libra.db`、`objects/` 和内部锁路径。bare 无工作树，扫描不得把仓库元数据当作工作区内容。按请求固定的仓库身份判定 bare，空工作区扫描仍保留已有 HEAD、引用、原始 index/facet 和操作日志流程。  
 **Out of scope:** 不改 worker wire 错误编码、不吞 I/O 错误、不放宽时间/并发、不改普通工作区 ignore/layer/gitlink/稀疏规则；原 full 的具体出错文件和时序仍 unknown。  
 **Acceptance criteria:**
@@ -72,15 +72,15 @@
 ### Task FIX-LTR-12: 限定私有 MCP read-worker 的运行时线程数
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `pending` / 空。  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成；本地签名子提交与家族最终 C/D 待，LEAK 观察项保留。  
 **Description:** Linux arm64 的两次同二进制诊断中，2/16/32 Tokio workers 成功，64 workers 在既有 2.5 GiB RLIMIT_AS 附近仅余约 692 KiB，RSS 约 45 MiB，SQLite worker 创建线程返回 `Io(EAGAIN)` 和 `LBR-AGENT-037`，与原 x64 CI 的错误签名一致。仅在私有 read-worker 创建 Tokio runtime 前固定小线程池；普通 CLI/MCP server 继续使用原策略。原 x64 机器的 CPU/进程/内存实况未捕获，不将本机诊断冒称原机器跟踪。  
 **Out of scope:** 不提高/移除 RLIMIT_AS、RSS 限制、deadline；不改 read-only/schema/对象修复拒绝、子进程回收、CI 并发或测试重试；不把全部 SQLx I/O 错误当 SQLite 锁。  
 **Acceptance criteria:**
-- [ ] AC-1：新增 Linux 实际 MCP 用例在高 `TOKIO_WORKER_THREADS` 下先失败、修复后成功返回 SHA-256 仓库身份；私有 worker 的限制不依赖宿主 CPU 数，普通 CLI/MCP server 策略不变。
-- [ ] AC-2：既有四个 MCP target 的成功、响应边界、脱敏、内存/deadline/回收与只读拒绝测试通过；不得以跳过数据库验证取得绿色结果。
+- [x] AC-1：新增 Linux 实际 MCP 用例在高 `TOKIO_WORKER_THREADS` 下先失败、修复后成功返回 SHA-256 仓库身份；私有 worker 的限制不依赖宿主 CPU 数，普通 CLI/MCP server 策略不变。
+- [x] AC-2：既有四个 MCP target 的成功、响应边界、脱敏、内存/deadline/回收与只读拒绝测试通过；不得以跳过数据库验证取得绿色结果。
 - [ ] AC-3：同一最终 Linux 二进制的受控资源诊断成功且保持原资源限制，原失败和首次后检 observer timeout 均保留；真实 Linux main D 成功。
 **Verification:**
-- [ ] VER-1：`agent_mcp_exec_test::read_worker_runtime_is_bounded_on_large_hosts`（new, Linux）RED/GREEN；原四 target：`agent_mcp_exec_test`、`agent_mcp_envelope_test`、`agent_mcp_limits_test`、`agent_mcp_conformance_test`。
+- [x] VER-1：`agent_mcp_exec_test::read_worker_runtime_is_bounded_on_large_hosts`（new, Linux）RED/GREEN；原四 target：`agent_mcp_exec_test`、`agent_mcp_envelope_test`、`agent_mcp_limits_test`、`agent_mcp_conformance_test`。
 - [ ] VER-2：受控 2/16/32/64 线程诊断、Vm/RSS/limits 与 owned container 退出收据；实际 Linux CI 的对应测试和全量终态。容器诊断不替代双 env C 或真实 x64 D。
 **Dependencies:** 当前上游 0.30.154；已保存的 Linux 失败及两次受控复现；无 FIX11 代码依赖，交付由共同集成点承载。  
 **Implementation write set:** `src/cli.rs`；`src/internal/ai/mcp_server/exec.rs`（仅纠正错误归因注释，原执行策略不变）；`tests/agent_mcp_exec_test.rs`；本计划；`plan-status.md` 本计划行。  
@@ -91,6 +91,18 @@
 **Performance budget:** 计入单一家族窗口；线程数固定，不放宽请求内任何预算。  
 **Rollback mode:** 未推送本地子提交 `revert`；集成点交付后 forward-only。  
 **Granularity:** implementation；AC=3；VER=2；prod-files=2（其中1仅注释）；scope=M；landing=1；self-contained=yes；deps=明确；release=REL-QUAL-11；writeset=5；exception=用户免 Review，非 PASS。
+
+**实际 A/B 证据（2026-11-05T04:31:52.839157+00:00）：** 新 Linux 用例在未修复产品上真实失败于 `MCP_WORKER_RUNTIME`、`LBR-AGENT-037`、SQLx Io(EAGAIN)，native101；修复后同用例1/1成功。产品仅在创建私有 read-worker runtime 前固定2个 Tokio workers，普通CLI/server仍使用默认策略；exec.rs只纠正错误归因注释，既有内存/deadline/只读/回收策略不变。
+
+- `fix12-linux-red`：native101；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `24fac1bfd00aba101827f31b07fe7ad6c59fef194a91a613c0080c7a8279f858`。
+- `fix12-linux-green`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `c91ec50c87f5f6723b4ff06372700ededce977276f85db1fa8db8d3e4d176a85`。
+- `fix12-linux-probe`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `7a5abe7f2b33abf47d6d0eed240f6d82bf5748ee55695991d900d7375b7921d9`。
+- `fix12-linux-observed`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `0ff4889c1133e1ee641a24462b26bd0caed42ee1e942da2f5ad217bc0d28ef5a`。
+- `fix12-mcp-targets`：native0；Summary [  32.440s] 31 tests run: 31 passed (1 leaky), 0 skipped；日志 SHA256 `6e89fb42c89ed46db74d2a5d4c1a630c3583aaaf4b90db93a55249392227362a`。
+- `fix12-leak-diagnostic`：native0；Summary [   1.157s] 1 test run: 1 passed, 6 skipped；日志 SHA256 `e6e4e0407c09a436c77f9960bae8e130ea67eadaca04b898a071fc45d733bbea`。
+- `fix12-clippy`：native0；严格 Clippy 成功；日志 SHA256 `4c7b3f2399b21844c8ac33ae5f4f0b9680c033434ab6d7a93bcf14b2f446e77c`。
+
+同一最终 Linux binary `fe5f58d58d26dd9e13ea8dad5bc12fe4feadec85166fc32d0c1a496d93ff57b6` 在2/16/32/64环境线程设置下的blob8请求全部成功；首次2/64瞬时进程采样缺失保留。只对同一预构建binary追加既有sleep200ms诊断后，四组均采到4总线程、VmSize377132KiB、RSS39060–39072KiB，RLIMIT_AS仍2684354560bytes；未重跑Cargo/full、未调整产品限制。Mac四target31/31 passed含1 LEAK（tools_list_matches_2025_06_18_schema），native0，source/protected后检不变，owned/unattributed=0；单例1/1定向诊断无LEAK，不能抹除原标记。该tools/list流程不调用私有read-worker，helper会wait_with_output；实际原FD持有者/原因仍unknown，登记 `RISK-LTR-NEXTEST-LEAK-MCP154`（root，open observational），按既有A9准则随最终full分别审计。真实x64 main D尚待，容器诊断不替代。用户免Review，非PASS。
 
 ### Task REL-QUAL-11: 资格恢复家族最终整合
 

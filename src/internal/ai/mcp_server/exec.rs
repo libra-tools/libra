@@ -657,12 +657,12 @@ async fn read_worker_request() -> Result<(String, Value), String> {
     Ok((name, arguments))
 }
 
-/// Open the repository database, retrying while the parent still holds it.
+/// Open the repository database with bounded retries for transient failures.
 ///
-/// `sqlite3_open` runs before the busy timeout is installed, so a lock held
-/// by the parent's preflight connection comes back as `EAGAIN` at once.
-/// The parent drops that connection before the tool runs; the drop closes
-/// the file on a later runtime poll. Retry until the file is free.
+/// SQLite lock errors and SQLx native-thread creation failures are distinct:
+/// `Io(EAGAIN)` can mean there is no address space left for a SQLite thread.
+/// The private CLI runtime is bounded to leave room for that thread. This
+/// existing retry loop neither identifies the cause nor relaxes worker limits.
 async fn open_read_worker_database(
     db_path_text: &str,
     db_path: &Path,
