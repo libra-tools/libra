@@ -1113,6 +1113,11 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             Some(claude_provider()),
         ),
         check_provider("gemini", AgentStability::Stable, Some(gemini_provider())),
+        check_provider(
+            "pi",
+            AgentStability::Stable,
+            Some(crate::internal::ai::hooks::providers::pi_provider()),
+        ),
     ];
     for spec in STABLE_PROMOTED_SPECS {
         provider_hooks.push(check_provider(
@@ -6418,6 +6423,79 @@ fn check_provider(
     tier: AgentStability,
     provider: Option<&dyn crate::internal::ai::hooks::provider::HookProvider>,
 ) -> ProviderHookStatus {
+    if name == "pi" && provider.is_some() {
+        use crate::internal::ai::hooks::providers::pi::settings::{
+            PiAssetOwnership, PiDiagnostic, PiProjectTrust, diagnose_pi_project,
+            pi_asset_ownership, pi_binary_on_path,
+        };
+        let Ok(project) = std::env::current_dir() else {
+            return ProviderHookStatus {
+                name,
+                tier,
+                installed: None,
+                error: Some(
+                    "the project directory could not be determined for the Pi extension"
+                        .to_string(),
+                ),
+                events: Vec::new(),
+            };
+        };
+        let installed = pi_asset_ownership(&project)
+            .map(|ownership| ownership == PiAssetOwnership::Owned)
+            .ok();
+        let binary = pi_binary_on_path(std::env::var_os("PATH").as_deref());
+        // Libra cannot read Pi's trust store; report an unconfirmable trust
+        // decision as a coverage gap rather than a healthy install.
+        let diagnosis = diagnose_pi_project(&project, binary.as_deref(), PiProjectTrust::Unknown);
+        let events = match diagnosis {
+            Ok(diagnosis) => diagnosis
+                .findings
+                .into_iter()
+                .map(|finding| {
+                    let (event, reason) = match finding {
+                        PiDiagnostic::AssetMissing => (
+                            "asset",
+                            "the Libra Pi extension is missing; run libra agent enable --agent pi",
+                        ),
+                        PiDiagnostic::AssetDrifted => (
+                            "asset",
+                            "the Libra Pi extension changed after installation; remove it and enable again",
+                        ),
+                        PiDiagnostic::AssetUnmanaged => (
+                            "asset",
+                            "the Pi extension slot is not libra-managed; libra leaves it unchanged",
+                        ),
+                        PiDiagnostic::TrustNotGranted => (
+                            "trust",
+                            "Pi project trust is not confirmable from Libra; verify it in Pi, non-interactive ask is not trust",
+                        ),
+                        PiDiagnostic::SubdirectoryLaunchGap => (
+                            "launch",
+                            "Pi loads project extensions only from the project root; starting in a subdirectory skips this extension",
+                        ),
+                        PiDiagnostic::VersionDrift { .. } => (
+                            "version",
+                            "the installed Pi release differs from the audited 1.4.0 baseline; re-audit the source before relying on capture",
+                        ),
+                    };
+                    ProviderHookEventStatus {
+                        event,
+                        installed: Some(false),
+                        class: Some("coverage"),
+                        reason: Some(reason),
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        return ProviderHookStatus {
+            name,
+            tier,
+            installed,
+            error: None,
+            events,
+        };
+    }
     if name == "codex" && provider.is_some() {
         return match crate::internal::ai::hooks::providers::codex::codex_hook_doctor_events() {
             Ok(rows) => {

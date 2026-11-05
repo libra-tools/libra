@@ -1837,12 +1837,12 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "only while Pi reports the project as trusted",
-                "stores lifecycle metadata",
+                "stores lifecycle metadata for the session start, each run started by a user message, and tool events",
                 "each run started by a user message",
                 "the run terminal",
-                "a non-aborted settle commits one checkpoint from the Pi session file",
+                "commits one checkpoint from the session file on a non-aborted settle",
                 "keeps the redacted prompts, answers and thinking as partial and unproven data",
-                "`agent enable` does not install that extension yet",
+                "`libra agent enable --agent pi` installs the Libra-owned project extension",
             ][..],
         ),
         (
@@ -1851,10 +1851,10 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "只在 Pi 报告项目受信时",
-                "为会话开始、由用户消息发起的 run、tool 事件与 run 终态保存生命周期元数据",
-                "未中止的 settle 从按会话 id 与仓库 cwd 选中的 Pi 会话文件提交一个 checkpoint",
+                "receiver 为会话开始与 tool 事件保存生命周期元数据",
+                "在未中止的 settle 上从会话文件提交一个 checkpoint",
                 "以 partial、unproven 数据保留脱敏后的提示、回答与 thinking",
-                "`agent enable` 暂不安装该 extension",
+                "`libra agent enable --agent pi` 安装 Libra 自有的项目 extension",
             ][..],
         ),
         (
@@ -1863,7 +1863,7 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`agent hooks pi observe`",
                 "while the project is trusted",
-                "`agent enable` does not install the extension yet",
+                "`agent enable --agent pi` installs",
             ][..],
         ),
         (

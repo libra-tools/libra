@@ -100,6 +100,307 @@ fn local_capture_smoke_opencode_macos() {
     smoke::run_slug("opencode");
 }
 
+/// PI-23: one real Pi 1.5.0 session in an isolated home and trusted
+/// fixture. The operator authorized Pi 1.5.0 and `astra/gpt-6.1-sol` (the
+/// agent-plan key is dead); the extension is installed through the PI-14
+/// function, not the closed CLI. The checkpoint must retain the session's
+/// thinking and the asset must uninstall idempotently.
+#[test]
+#[ignore = "drives a real paid Pi session; set LIBRA_RUN_LOCAL_AGENTS=1 and run with \
+            --ignored --test-threads=1 (plan-20260911 PI-23)"]
+#[serial(cwd, env, hash_kind)]
+fn local_capture_smoke_pi() {
+    use std::{
+        os::unix::{fs::PermissionsExt, process::CommandExt},
+        path::Path,
+        process::{Command, Output, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PiAssetOwnership, PiAssetRemove, PiDiagnostic, PiProjectTrust, diagnose_pi_project,
+        pi_asset_ownership, remove_owned_pi_asset, write_owned_pi_asset,
+    };
+    use serde_json::{Value, json};
+
+    fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) -> Output {
+        let mut child = command.spawn().expect("spawn smoke child");
+        let started = Instant::now();
+        loop {
+            if child.try_wait().expect("poll smoke child").is_some() {
+                return child.wait_with_output().expect("collect smoke child");
+            }
+            if started.elapsed() > timeout {
+                // SAFETY: the child was started in its own process group.
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                panic!("{label} exceeded {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn libra_command(libra: &Path, repo: &Path, home: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new(libra);
+        command
+            .args(args)
+            .current_dir(repo)
+            .env("HOME", home)
+            .env("LIBRA_TEST_HOME", home)
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_with_timeout(command, Duration::from_secs(120), "libra")
+    }
+
+    if std::env::var(smoke::GATE_ENV).as_deref() != Ok("1") {
+        eprintln!("skipped (pi): set {} = 1", smoke::GATE_ENV);
+        return;
+    }
+    let requested = std::env::var(smoke::SET_ENV).unwrap_or_default();
+    if !requested.split(',').any(|slug| slug.trim() == "pi") {
+        eprintln!("skipped (pi): {} does not contain pi", smoke::SET_ENV);
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("Pi smoke root");
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(home.join(".pi").join("agent")).expect("isolated Pi home");
+    std::fs::create_dir_all(&repo).expect("smoke repo");
+    let libra = Path::new(env!("CARGO_BIN_EXE_libra")).to_path_buf();
+    let repo = repo.canonicalize().expect("canonical repo");
+    let home = home.canonicalize().expect("canonical home");
+    let agent_dir = home.join(".pi").join("agent");
+
+    let init = libra_command(&libra, &repo, &home, &["init"]);
+    assert!(
+        init.status.success(),
+        "libra init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    write_owned_pi_asset(&repo, &libra).expect("install the Pi extension through PI-14");
+    assert_eq!(
+        pi_asset_ownership(&repo).expect("asset ownership"),
+        PiAssetOwnership::Owned
+    );
+
+    // The real models.json currently carries a dead agent-plan key (and an
+    // empty key makes Pi reject the whole file); the authorized astra
+    // provider is copied alone into the isolated home.
+    let real_models = Path::new(&std::env::var("HOME").expect("real HOME"))
+        .join(".pi")
+        .join("agent")
+        .join("models.json");
+    let mut models: Value =
+        serde_json::from_slice(&std::fs::read(&real_models).expect("read real models.json"))
+            .expect("parse models.json");
+    models["providers"]
+        .as_object_mut()
+        .expect("providers")
+        .remove("agent-plan");
+    let models_path = agent_dir.join("models.json");
+    std::fs::write(
+        &models_path,
+        serde_json::to_vec_pretty(&models).expect("models json"),
+    )
+    .expect("write isolated models.json");
+    std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600))
+        .expect("private models.json");
+    std::fs::write(
+        agent_dir.join("trust.json"),
+        serde_json::to_vec(&json!({ repo.display().to_string(): true })).expect("trust json"),
+    )
+    .expect("isolated trust");
+
+    let prompt = "Write a playable terminal Snake game to a new file named snake.py in the \
+                  current directory. Use only the Python standard library: a grid, snake \
+                  movement with WASD or arrow keys, food, score, game over, and no external \
+                  files. Do not run the game. After writing the file, reply exactly \
+                  PI23_SNAKE_DONE.";
+    let mut pi = Command::new("pi");
+    pi.args([
+        "-p",
+        "--approve",
+        "--model",
+        "astra/gpt-6.1-sol",
+        "--thinking",
+        "max",
+        prompt,
+    ])
+    .current_dir(&repo)
+    .env("HOME", &home)
+    .env("LIBRA_TEST_HOME", &home)
+    .env("PI_CODING_AGENT_DIR", &agent_dir)
+    .env("PATH", std::env::var("PATH").unwrap_or_default())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .process_group(0);
+    let session = run_with_timeout(pi, Duration::from_secs(600), "pi smoke");
+    assert!(
+        session.status.success(),
+        "pi exited {:?}: stdout={} stderr={}",
+        session.status.code(),
+        String::from_utf8_lossy(&session.stdout),
+        String::from_utf8_lossy(&session.stderr)
+    );
+    let snake = repo.join("snake.py");
+    let snake_text = std::fs::read_to_string(&snake).expect("snake.py written by the model");
+    assert!(
+        snake_text.to_ascii_lowercase().contains("snake"),
+        "snake.py does not look like the requested game"
+    );
+
+    let encoded = repo
+        .to_str()
+        .expect("utf-8 repo")
+        .trim_start_matches('/')
+        .replace(['/', '\\', ':'], "-");
+    let session_dir = agent_dir.join("sessions").join(format!("--{encoded}--"));
+    let session_file = std::fs::read_dir(&session_dir)
+        .expect("Pi session directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .expect("Pi session file");
+    let session_text = std::fs::read_to_string(&session_file).expect("read Pi session");
+    let mut thinking = Vec::new();
+    let mut session_id = None;
+    for line in session_text.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry["type"] == json!("session") {
+            session_id = entry["id"].as_str().map(str::to_string);
+        }
+        if entry["type"] != json!("message") || entry["message"]["role"] != json!("assistant") {
+            continue;
+        }
+        if let Some(blocks) = entry["message"]["content"].as_array() {
+            for block in blocks {
+                if block["type"] == json!("thinking")
+                    && let Some(text) = block["thinking"].as_str()
+                    && !text.is_empty()
+                {
+                    thinking.push(text.to_string());
+                }
+            }
+        }
+    }
+    let session_id = session_id.expect("Pi session header id");
+    assert!(
+        !thinking.is_empty(),
+        "the real Pi session produced no thinking to compare"
+    );
+
+    let sessions = libra_command(
+        &libra,
+        &repo,
+        &home,
+        &["agent", "session", "list", "--json"],
+    );
+    assert!(
+        sessions.status.success(),
+        "session list: {}",
+        String::from_utf8_lossy(&sessions.stderr)
+    );
+    let sessions: Value = serde_json::from_slice(&sessions.stdout).expect("session list json");
+    assert!(
+        sessions["data"]["sessions"]
+            .as_array()
+            .is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["session_id"] == json!(format!("pi__{session_id}")))),
+        "Libra did not record the Pi session: {sessions}"
+    );
+    let checkpoints = libra_command(
+        &libra,
+        &repo,
+        &home,
+        &["agent", "checkpoint", "list", "--json"],
+    );
+    assert!(
+        checkpoints.status.success(),
+        "checkpoint list: {}",
+        String::from_utf8_lossy(&checkpoints.stderr)
+    );
+    let checkpoints: Value =
+        serde_json::from_slice(&checkpoints.stdout).expect("checkpoint list json");
+    let row = checkpoints["data"]["checkpoints"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["session_id"] == json!(format!("pi__{session_id}")))
+        })
+        .unwrap_or_else(|| panic!("no Pi checkpoint: {checkpoints}"));
+    let checkpoint_id = row["checkpoint_id"].as_str().expect("checkpoint id");
+    let export = libra_command(
+        &libra,
+        &repo,
+        &home,
+        &["agent", "checkpoint", "export", checkpoint_id],
+    );
+    assert!(
+        export.status.success(),
+        "checkpoint export: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let exported_text = String::from_utf8_lossy(&export.stdout);
+    let exported_thinking: Vec<String> = exported_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["type"] == json!("message"))
+        .flat_map(|entry| {
+            entry["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|block| block["type"] == json!("thinking"))
+        .filter_map(|block| block["thinking"].as_str().map(str::to_string))
+        .filter(|text| !text.is_empty())
+        .collect();
+    assert_eq!(
+        exported_thinking, thinking,
+        "the checkpoint export thinking differs from the Pi source"
+    );
+
+    let diagnosis = diagnose_pi_project(&repo, Some(Path::new("pi")), PiProjectTrust::Granted)
+        .expect("PI-17 diagnosis");
+    assert_eq!(diagnosis.ownership, PiAssetOwnership::Owned);
+    assert!(
+        !diagnosis.findings.contains(&PiDiagnostic::AssetMissing)
+            && !diagnosis.findings.contains(&PiDiagnostic::AssetDrifted)
+            && !diagnosis.findings.contains(&PiDiagnostic::TrustNotGranted),
+        "diagnosis: {:?}",
+        diagnosis.findings
+    );
+    assert_eq!(
+        remove_owned_pi_asset(&repo).expect("uninstall the Pi extension"),
+        PiAssetRemove::Removed
+    );
+    assert_eq!(
+        pi_asset_ownership(&repo).expect("ownership after uninstall"),
+        PiAssetOwnership::Absent
+    );
+    assert_eq!(
+        remove_owned_pi_asset(&repo).expect("second uninstall"),
+        PiAssetRemove::Absent
+    );
+
+    eprintln!(
+        "PI-23 GO: pi 1.5.0 + astra/gpt-6.1-sol, session pi__{session_id}, {} thinking block(s) / {} bytes, checkpoint {checkpoint_id}, snake.py {} bytes, asset installed and removed",
+        thinking.len(),
+        thinking.iter().map(String::len).sum::<usize>(),
+        snake_text.len()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn opencode_project_preflight_requires_disposable_directory() {

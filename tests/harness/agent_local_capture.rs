@@ -247,6 +247,14 @@ pub const AGENTS: &[AgentSpec] = &[
         login_args: &["auth", "status"],
     },
     AgentSpec {
+        slug: "pi",
+        binary: "pi",
+        agent_kind: "pi",
+        // PI-23 smoke only: the isolated fixture drops the dead agent-plan
+        // provider and uses the operator-authorized astra/gpt-6.1-sol model.
+        login_args: &["auth", "check", "--model", "astra/gpt-6.1-sol", "--json"],
+    },
+    AgentSpec {
         slug: "opencode",
         binary: "opencode",
         agent_kind: "opencode",

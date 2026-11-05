@@ -12,7 +12,9 @@
 pub mod parser;
 pub mod settings;
 
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result};
 
 use super::super::{
     lifecycle::{LifecycleEvent, LifecycleEventKind, SessionHookEnvelope},
@@ -86,16 +88,31 @@ impl HookProvider for PiProvider {
         })
     }
 
-    fn install_hooks(&self, _options: &ProviderInstallOptions) -> Result<()> {
-        bail!("Pi hook installation is not available yet; Pi is not a supported agent")
+    fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        let binary = options
+            .binary_path
+            .as_deref()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_exe().ok())
+            .context("cannot determine the libra binary path for the Pi extension")?;
+        settings::write_owned_pi_asset(&project, &binary)?;
+        Ok(())
     }
 
     fn uninstall_hooks(&self) -> Result<()> {
-        bail!("Pi hook installation is not available yet; Pi is not a supported agent")
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        settings::remove_owned_pi_asset(&project)?;
+        Ok(())
     }
 
     fn hooks_are_installed(&self) -> Result<bool> {
-        Ok(false)
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        Ok(settings::pi_asset_ownership(&project)? == settings::PiAssetOwnership::Owned)
     }
 }
 

@@ -75,7 +75,7 @@ fn known_agent_capability_matrix_matches_current_roster() {
     // Frozen first-batch roster.
     assert_eq!(
         supported_slugs(),
-        ["claude-code", "codex", "opencode", "grok", "hermes"]
+        ["claude-code", "codex", "opencode", "grok", "hermes", "pi"]
     );
     for row in registry() {
         if row.slug == "grok" {
@@ -90,6 +90,15 @@ fn known_agent_capability_matrix_matches_current_roster() {
             assert!(row.transcript_readable, "hermes");
             assert!(!row.launchable_review, "hermes");
             assert!(!row.launchable_investigate, "hermes");
+            continue;
+        }
+        if row.slug == "pi" {
+            assert_eq!(row.support_wave, Some("pi"), "pi");
+            assert!(row.supported, "pi");
+            assert!(row.hook_installable, "pi");
+            assert!(!row.transcript_readable, "pi import is explicit");
+            assert!(!row.launchable_review, "pi");
+            assert!(!row.launchable_investigate, "pi");
             continue;
         }
         if row.supported {
@@ -177,7 +186,6 @@ fn known_agent_capability_matrix_matches_current_roster() {
         AgentKind::Cursor,
         AgentKind::Copilot,
         AgentKind::FactoryAi,
-        AgentKind::Pi,
     ] {
         let row = registration_for(kind);
         assert!(!row.supported, "{}", row.slug);
@@ -295,6 +303,18 @@ fn unsupported_external_agent_kind_is_quarantined() {
             panic!("gemini stays registered (read-only/uninstall channel)")
         }
     }
+}
+
+#[test]
+fn pi_supported_wave_is_not_first_batch() {
+    let row = registration_for(AgentKind::Pi);
+    assert!(row.supported);
+    assert!(row.hook_installable);
+    assert_eq!(row.support_wave, Some("pi"));
+    assert_ne!(row.support_wave, Some(FIRST_BATCH_WAVE));
+    assert!(!row.launchable_review);
+    assert!(!row.launchable_investigate);
+    assert!(row.capabilities.hooks);
 }
 
 #[test]

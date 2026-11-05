@@ -2691,7 +2691,7 @@ fn live_capture_port_and_store_boundaries() {
         .collect();
     assert_eq!(
         live_variants, installable,
-        "live_capture_for must return Some for the hook-installable kinds plus the pre-support Pi observer"
+        "live_capture_for must return Some exactly for the hook-installable kinds"
     );
     assert_eq!(
         live_variants
@@ -8646,7 +8646,7 @@ async fn agent_kind_enum_sql_check_and_doc_roster_stay_in_sync() {
         .collect();
     assert_eq!(
         supported,
-        ["claude-code", "codex", "opencode", "grok", "hermes"]
+        ["claude-code", "codex", "opencode", "grok", "hermes", "pi"]
     );
     let first_batch: Vec<_> = registry()
         .iter()

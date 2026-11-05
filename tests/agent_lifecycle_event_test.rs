@@ -9254,7 +9254,7 @@ fn pi_observe_source_live_capture_contract() {
         AgentKind, live_capture_matches_hook_installable, registry::registration_for,
     };
 
-    assert!(!registration_for(AgentKind::Pi).hook_installable);
+    assert!(registration_for(AgentKind::Pi).hook_installable);
     assert!(live_capture_matches_hook_installable(AgentKind::Pi));
     for kind in AgentKind::all() {
         assert!(

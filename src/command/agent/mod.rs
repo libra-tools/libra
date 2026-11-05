@@ -600,6 +600,23 @@ fn install_or_uninstall(
             }
         }
     }
+    if install
+        && resolved.contains(&AgentKind::Pi)
+        && !crate::internal::ai::hooks::providers::pi::settings::pi_runtime_is_installed()
+    {
+        if agents.is_empty() {
+            resolved.retain(|kind| *kind != AgentKind::Pi);
+            if !output.quiet {
+                eprintln!(
+                    "libra agent enable: skipping 'pi' (no `pi` executable was found on PATH; no Pi files were changed)"
+                );
+            }
+        } else {
+            return Err(CliError::fatal(
+                "agent 'pi' needs a `pi` executable on PATH before capture can be enabled; no files were changed",
+            ));
+        }
+    }
     // Fail closed before any side effect, like the roster check above: a
     // provider that takes no host timeout would otherwise reject the option
     // mid-batch, after earlier agents were already installed.
@@ -811,6 +828,7 @@ mod tests {
                 AgentKind::OpenCode,
                 AgentKind::Grok,
                 AgentKind::Hermes,
+                AgentKind::Pi,
             ]
         );
     }

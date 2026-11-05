@@ -10,7 +10,7 @@ use libra::{
 use serial_test::serial;
 use tempfile::tempdir;
 
-use super::{init_repo_via_cli, run_libra_command};
+use super::{init_repo_via_cli, run_libra_command, run_libra_command_with_env};
 
 /// `list` parses and succeeds; `add`/`remove` are strict aliases of
 /// `enable --agent` / `disable --agent`: same exit code and same
@@ -36,7 +36,7 @@ fn agent_list_add_remove_aliases_parse() {
     let enable_err = String::from_utf8_lossy(&enable.stderr);
     assert_eq!(add_err, enable_err, "add/enable diagnostics must match");
     assert!(add_err.contains("unknown agent 'bogus'"));
-    assert!(add_err.contains("claude-code, codex, opencode, grok"));
+    assert!(add_err.contains("claude-code, codex, opencode, grok, hermes, pi"));
 
     let remove = run_libra_command(&["agent", "remove", "bogus"], &repo);
     let disable = run_libra_command(&["agent", "disable", "--agent", "bogus"], &repo);
@@ -82,8 +82,8 @@ fn agent_list_json_contains_capability_fields() {
     let agents = data["agents"].as_array().expect("agents array");
     assert_eq!(
         agents.len(),
-        5,
-        "listing surfaces the supported roster, including grok and hermes"
+        6,
+        "listing surfaces the supported roster, including grok, hermes and pi"
     );
 
     let supported: Vec<&str> = agents
@@ -93,7 +93,7 @@ fn agent_list_json_contains_capability_fields() {
         .collect();
     assert_eq!(
         supported,
-        ["claude-code", "codex", "opencode", "grok", "hermes"]
+        ["claude-code", "codex", "opencode", "grok", "hermes", "pi"]
     );
 
     for row in agents {
@@ -139,6 +139,13 @@ fn agent_list_json_contains_capability_fields() {
             assert_eq!(row["transcript_readable"], true);
             assert_eq!(row["launchable_review"], false);
             assert_eq!(row["launchable_investigate"], false);
+        } else if row["slug"] == "pi" {
+            assert_eq!(row["support_wave"], "pi");
+            assert_eq!(row["supported"], true);
+            assert_eq!(row["hook_installable"], true);
+            assert_eq!(row["transcript_readable"], false);
+            assert_eq!(row["launchable_review"], false);
+            assert_eq!(row["launchable_investigate"], false);
         } else if row["supported"] == true {
             assert_eq!(row["support_wave"], "first_batch", "{}", row["slug"]);
         } else {
@@ -164,7 +171,7 @@ fn agent_list_json_contains_capability_fields() {
     // supported roster is shown. Their unsupported registry classification is
     // pinned separately against the static registry by
     // tests/compat/agent_capability_matrix_pin.rs.
-    for slug in ["gemini", "cursor", "copilot", "factory-ai", "pi"] {
+    for slug in ["gemini", "cursor", "copilot", "factory-ai"] {
         assert!(
             !agents.iter().any(|row| row["slug"] == slug),
             "{slug} must not appear in the supported-only listing"
@@ -201,8 +208,8 @@ fn agent_roster_surface() {
         .collect();
     assert_eq!(
         slugs,
-        ["claude-code", "codex", "opencode", "grok", "hermes"],
-        "listing must surface the first-batch trio plus grok and hermes"
+        ["claude-code", "codex", "opencode", "grok", "hermes", "pi"],
+        "listing must surface the first-batch trio plus grok, hermes and pi"
     );
 
     // Every listed row is supported (the unsupported agents are omitted).
@@ -218,7 +225,7 @@ fn agent_roster_surface() {
     // fully-closed unsupported classification (supported/hook_installable/
     // launchable_*/capabilities.hooks all false) stays pinned against the
     // static registry by tests/compat/agent_capability_matrix_pin.rs.
-    for slug in ["gemini", "cursor", "copilot", "factory-ai", "pi"] {
+    for slug in ["gemini", "cursor", "copilot", "factory-ai"] {
         assert!(
             !agents.iter().any(|row| row["slug"] == slug),
             "{slug} must not appear in the supported-only listing"
@@ -231,6 +238,112 @@ fn agent_roster_surface() {
     assert_eq!(grok["support_wave"], "grok");
     assert_eq!(grok["launchable_review"], false);
     assert_eq!(grok["launchable_investigate"], false);
+    let pi = agents
+        .iter()
+        .find(|row| row["slug"] == "pi")
+        .expect("pi row");
+    assert_eq!(pi["support_wave"], "pi");
+    assert_eq!(pi["supported"], true);
+    assert_eq!(pi["hook_installable"], true);
+    assert_eq!(pi["launchable_review"], false);
+    assert_eq!(pi["launchable_investigate"], false);
+    assert_eq!(pi["capabilities"]["hooks"], true);
+}
+/// PI-06: the project-local Pi extension installs and removes through the
+/// CLI, bare enable skips a missing Pi binary, and doctor reports the
+/// PI-17 coverage findings.
+#[test]
+fn pi_supported_enable_disable_and_bare_skip() {
+    use libra::internal::ai::hooks::providers::pi::settings::{
+        PI_ASSET_FILE, PiAssetOwnership, pi_asset_ownership, pi_asset_path,
+    };
+
+    let temp = tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    init_repo_via_cli(&repo);
+
+    let bare = run_libra_command(&["agent", "enable"], &repo);
+    assert!(
+        bare.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&bare.stderr).contains("skipping 'pi'"),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        !pi_asset_path(&repo).exists(),
+        "bare enable must not install a Pi asset without a binary"
+    );
+
+    let explicit = run_libra_command(&["agent", "enable", "--agent", "pi"], &repo);
+    assert!(!explicit.status.success());
+    assert!(
+        String::from_utf8_lossy(&explicit.stderr).contains("needs a `pi` executable on PATH"),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    assert!(!pi_asset_path(&repo).exists());
+
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("fake bin");
+    let fake = bin.join("pi");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("fake pi");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display());
+    let enabled = run_libra_command_with_env(
+        &["agent", "enable", "--agent", "pi"],
+        &repo,
+        &[("PATH", path.as_str())],
+    );
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert_eq!(
+        pi_asset_ownership(&repo).expect("ownership"),
+        PiAssetOwnership::Owned
+    );
+    assert!(pi_asset_path(&repo).ends_with(PI_ASSET_FILE));
+
+    let doctor = run_libra_command(&["agent", "doctor", "--json"], &repo);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor json");
+    let pi = report["data"]["provider_hooks"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["name"] == "pi"))
+        .expect("pi provider row");
+    assert_eq!(pi["installed"], true);
+    let events = pi["events"].as_array().expect("pi events");
+    assert!(
+        events.iter().any(|event| event["event"] == "trust"),
+        "doctor must report the unconfirmable Pi trust: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "launch"),
+        "doctor must report the subdirectory launch gap: {events:?}"
+    );
+
+    let disabled = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert_eq!(
+        pi_asset_ownership(&repo).expect("ownership"),
+        PiAssetOwnership::Absent
+    );
+    let again = run_libra_command(&["agent", "disable", "--agent", "pi"], &repo);
+    assert!(again.status.success(), "repeated disable is idempotent");
 }
 
 /// Enabling anything outside the supported roster is an actionable error
