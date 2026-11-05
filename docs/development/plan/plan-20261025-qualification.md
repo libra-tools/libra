@@ -1,3 +1,26 @@
+> **2026-11-04 UTC FIX09 与 A9 资格证据（终态文档 D 待）：** FIX09 原测试缺陷及两次 RED 均保留；修复仅令沙箱测试内嵌套 commit 显式 `--no-gpg-sign -s`，不放宽沙箱或修改用户签名默认。签名+DCO `6819631a1d23b6110b250f8a0a1f347b2525f997` 已由上游合并，提交本机公钥实际 VALIDSIG，GitHub `unknown_key` 不称 verified。原提交自身 base run `41887408072` 部分 job cancelled，原事实不改；包含其代码的当前 `c426de6977678a60bef0d89f032c162a90686bbf` 在同树本机 A9 六阶段均 exit0：fmt、strict Clippy、双环境全量 11274/11274 passed（39 slow、0 flaky/重试/leak，50 原 ignored）、doc、network 3/3、release build；候选 binary SHA256 `cb4a08b6f90395b4ce78604dda44792d2114f8f82f3be53d6acd850d20fba26e`，terminal `8724bb2a67e1005dd5e4444c8066c4124822164c404a4eb7fd617721345fac0c`，源、用户数据、H1 后检不变。全量输出逐项审计至少 47 项测试体自行跳过，非相关功能覆盖；审计 `5ee8eca75340c4c58691069d442ce43e5e470c7524dfb55374884d8dbff43fea`，较早 v1–v3 解析错误原件保留。当前树实际 main base `41897658714` 八 job 全 success、CodeQL `41897658711` 和 Code Quality `41897658299` 均 success，收据 `6551724b02d2ffc2e2ef08912d7e8373fe9d051dfdba3325a849a283eb62b978`；历史 v0.30.92 原 base attempt1 failure 仍保留，同 SHA/ref attempt2 实际 success，F2 根因 unknown，缺失 user-decisions.json 原件未伪造。用户明确免交叉 Review，不声称审查 PASS；本段自身提交、其适用 D 与原工作区受控整合仍待，`DEP-QUAL-HANDOFF` / `DEP-TR-QUAL-REPAIRS` 尚未解除，A8 flaky 风险仍 open，H1/LTR live 不由本窗口替代。
+
+> **2026-11-04 UTC 来源资格恢复新增 FIX-LTR-09：** 最新上游 `a0632237f596ffbcbeadb98e3c386b6dc58209a8` 的本地 A5 窗口在 nextest 10947/11274 run、10946 passed、1 failed、50 原 ignored 时 STOP，327 未运行；fmt/Clippy exit 0，后续 doc/network/build 未执行，终态 SHA256 `007d4c52ac54233dd70640459fc9986fd7b6f9826e03117a24f9f91ff599e0dd`，资源后检不变。最终失败 `rebase_exec_failure_stops_and_continue_retries_the_command` 是沙箱内嵌套 `libra commit` 请求默认签名，而 macOS sandbox 凭据读保护拒绝访问该测试 HOME 的 vault key；在安全短 `/private/tmp` 与 `/Volumes/Data` 两种独立目录复现。新增下列 test-only 修复卡，先保留原 RED，再验证明确无签名的嵌套提交不影响原 rebase 断言；不放宽沙箱或用户的签名策略。A1/A2/A3/A5 FAIL、A4 定向失败与旧 v0.30.92 D failure 均保留，新的来源窗口尚未准入；用户明确豁免交叉 Review，不冒称 PASS。
+
+### Task FIX-LTR-09: 隔离 rebase exec 回归测试的嵌套签名
+
+**Task type:** `implementation`  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（两次定向 RED 保留，修复后单例 1/1、同 target 32/32；FIX-LTR-09 签名+DCO 提交 `6819631a1d23b6110b250f8a0a1f347b2525f997` 已合入当前上游；A9 最终来源树本地六阶段 exit0，当前树 main D 成功。终态文档自身提交及其 D、原工作区受控整合仍待，不提前记 complete）。
+**Current evidence:** 两个未修改源码的单例失败收据 `f60ebeda31b53bab26e62c5c35d6f2e97e67f8ce7423971d577d0ea9fbecdcb2` / `25fee5d188c7272724d7b44cacbe92585a967168d46b995d7e9bc05501b29895`；修复后单例 1/1 `864bf8b0925a69968abb001b2f9c2bace3296acf6a7edd82d4dc67e24a35da88`、完整 target 32/32 `27313e43b0aae0c74f16c409539d0cd90ce5ef15796a1de691ff5356d506b522`；测试文件 SHA256 `8a1978974f8b60514aca6790e21d0094a245d3bf645b6cf020aa684828143e68`。仅测试命令增加 `--no-gpg-sign`，未改断言或沙箱。  
+**Description:** 在 `rebase_exec_failure_stops_and_continue_retries_the_command` 的测试命令中对嵌套测试提交显式传 `--no-gpg-sign`，使该 rebase 重试/引用更新用例不依赖沙箱禁止读取的 vault 私钥；保持 DCO、全部断言和沙箱凭据保护不变。  
+**Out of scope:** 产品源码、沙箱策略、真实用户默认签名、其它测试及既有结果。  
+**Acceptance criteria:** 原用例三次最终失败及两个单项 RED 保留；目标用例在新源码、隔离双 env 和原 sandbox 下实际通过；原 exit 23、LBR-CONFLICT-002、continue、HEAD/ref 与文件断言保持；默认签名及凭据保护不改；完成同树 fmt、strict Clippy、双 env 全量 nextest、doc、network 三例、release build、签名+DCO code-only 提交及适用 main D。  
+**Verification:** 原选择器 `cargo nextest run --test compat_noninteractive_history_controls -E 'test(=rebase_exec_failure_stops_and_continue_retries_the_command)' --no-fail-fast --retries 0`；整个相同测试 target；随后最终树资格全部原门，记录 ignored、运行时 skip 和实际环境。  
+**Dependencies:** A5 STOP/受保护资源后检、当前源码与共享写集核验、GOV-LTR-CO-01；后续 `DEP-QUAL-HANDOFF` 仍需旧版 D 归属和资格终态登记。  
+**Implementation write set:** `tests/compat/noninteractive_history_controls_test.rs`；协调写集 `docs/development/plan/plan-20261025-qualification.md`，其余计划索引由最终交接按精确前像整合。  
+**Release boundary / Version:** `code-only independent` / `N/A`，不 bump/tag/Release；提交前原生 fetch/rebase 并重新核受影响门；受控 signed+DCO 与适用 PR/main D。  
+**Full-suite trigger:** 测试逻辑变更触发 T-1/T-4；最终来源树须执行本计划双环境全量、doc、network 和 build；纯文档后补按模板 v2.16 执行文档校验及适用 D。
+**Docs and compatibility impact:** 产品行为、CLI、全局配置及网站无变更；本计划和 `plan-status.md` 仅记录真实证据与未完成边界。
+**Security and privacy:** 只改变测试用嵌套提交，不读取或输出 vault 私钥；保留真实 sandbox、受保护数据及 H1 服务。
+**Performance budget:** 不改变产品运行路径；按资格窗口 10800 秒含后检执行。
+**Estimated scope / Granularity:** `S`；一个测试命令、同测试目标与协调文档，code-only independent。
+**Rollback mode:** `revert`；不清理既有资源，不改变 H1 服务或历史结果。
+
 > **2026-10-31 15:28 UTC GOV C3 本地结果对资格入口：** GOV-LTR-CO-01 在 f9 同树的唯一 C3 focused1/1、原双 env full11083/11083（25原 ignored、0失败/FLAKY/retry）实际 exit0；原 terminal `09b87ad5…`、full `d52f56fb…`，源/全库 DB/stash 后检同一。成功 Summary 解析审计 v1 假阴性 exit1 原件保留，v2 exit0/25 ignored 逐名同一；39个既有条件性运行时跳过不计相应功能覆盖。回填后七文档 B/VER7/fmt 已按最终字节 exit0（仓外 `governance-final-docs-c3/final-3/` 原件）；fresh upstream 差异、精确签名提交/推送及适用 main D 待，故 `DEP-QUAL-CODEONLY-GOV` 仍 incoming；本资格计划来源最终窗口、H1 和旧 v0.30.92 base D FAIL 均未通过。C1/P1/C2 STOP 与 R4 OAuth 无判词保留；用户仅 GOV 后续 Claude Review 豁免，不构成资格审查 PASS。精确哈希/计数见 `plan-20261015.md` GOV 卡。
 
 > **2026-10-31 14:35 UTC GOV C2 STOP 对资格入口：** P2 两相完整前检 exit0，唯一 C2 claim 后 focused1/1 PASS，但 full 仅6539/11083运行、6469 PASS/70 FAIL/1 FLAKY/25原 ignored，4544因控制器进程扫描竞态发出的 SIGTERM 未运行；child umask0002 造成组可写 `.libra`/Pi UnsafeDirectory/模式断言失败。C2 controller exit1/STOP，原件 raw `5aede707…`、terminal `4aecb6d4…`，源/DB/stash后检同一；C3 尚属一次新恢复候选、未claim。旧 C1/P1/C2 STOP 保留，用户仅 GOV 本轮免 Claude、R4 OAuth 无 PASS，`DEP-QUAL-CODEONLY-GOV` 仍 incoming；本资格计划、H1、旧 base D FAIL 均未通过。精确收据见 `plan-20261015.md` GOV 卡。
