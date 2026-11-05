@@ -326,6 +326,120 @@ async fn init_target_repo_does_not_inherit_local_identity_from_current_repo() {
     );
 }
 
+fn snapshot_json_object(repo: &Path, oid: &str) -> serde_json::Value {
+    let output = run_libra_command(&["cat-file", "-p", oid], repo);
+    assert_cli_success(&output, "read operation snapshot object");
+    serde_json::from_slice(&output.stdout).expect("operation snapshot JSON")
+}
+
+fn snapshot_oid(value: &serde_json::Value) -> String {
+    serde_json::from_value::<git_internal::hash::ObjectHash>(value.clone())
+        .expect("snapshot object hash")
+        .to_string()
+}
+
+fn latest_snapshot(repo: &Path, bare: bool) -> serde_json::Value {
+    let gitdir = if bare {
+        repo.to_path_buf()
+    } else {
+        repo.join(".libra")
+    };
+    let pointer: serde_json::Value = serde_json::from_slice(
+        &fs::read(gitdir.join("info/operation-pointer.json")).expect("operation pointer"),
+    )
+    .expect("pointer JSON");
+    snapshot_json_object(
+        repo,
+        &snapshot_oid(&pointer["pointer"]["last_snapshot_oid"]),
+    )
+}
+
+#[test]
+fn bare_reinit_snapshot_excludes_repository_metadata() {
+    for (format, name) in [
+        ("sha1", "repo.git"),
+        ("sha256", "repo.git"),
+        ("sha1", ".libra"),
+        ("sha256", ".libra"),
+    ] {
+        let temp = tempdir().expect("tempdir");
+        let init = run_libra_command(
+            &[
+                "init",
+                "--bare",
+                name,
+                "--object-format",
+                format,
+                "--vault",
+                "false",
+            ],
+            temp.path(),
+        );
+        assert_cli_success(&init, "initial bare init");
+        let repo = temp.path().join(name);
+        let reinit = run_libra_command(&["init", "--bare", "--vault", "false"], &repo);
+        assert_cli_success(&reinit, "bare reinit");
+        let snapshot = latest_snapshot(&repo, true);
+        let untracked =
+            snapshot_json_object(&repo, &snapshot_oid(&snapshot["untracked_manifest_oid"]));
+        let files = untracked["files"].as_object().expect("untracked files");
+        assert!(
+            files.is_empty(),
+            "BARE_SNAPSHOT_METADATA: {format} has no working tree, but snapshot retained {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        let tree = run_libra_command(
+            &[
+                "cat-file",
+                "-p",
+                &snapshot_oid(&snapshot["working_copy_tree_oid"]),
+            ],
+            &repo,
+        );
+        assert_cli_success(&tree, "read bare working-copy tree");
+        assert!(
+            tree.stdout.is_empty(),
+            "bare working-copy tree must be empty"
+        );
+        assert!(
+            repo.join("libra.db").is_file(),
+            "metadata must remain on disk"
+        );
+    }
+}
+
+#[test]
+fn worktree_reinit_snapshot_keeps_visible_files() {
+    for format in ["sha1", "sha256"] {
+        let repo = tempdir().expect("tempdir");
+        let init = run_libra_command(
+            &["init", "--object-format", format, "--vault", "false"],
+            repo.path(),
+        );
+        assert_cli_success(&init, "initial worktree init");
+        fs::write(repo.path().join("visible.txt"), b"working-copy payload\n")
+            .expect("visible file");
+        let reinit = run_libra_command(&["init", "--vault", "false"], repo.path());
+        assert_cli_success(&reinit, "worktree reinit");
+        let snapshot = latest_snapshot(repo.path(), false);
+        let untracked = snapshot_json_object(
+            repo.path(),
+            &snapshot_oid(&snapshot["untracked_manifest_oid"]),
+        );
+        let files = untracked["files"].as_object().expect("untracked files");
+        assert_eq!(
+            files.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["visible.txt"]
+        );
+        let payload = run_libra_command(
+            &["cat-file", "-p", &snapshot_oid(&files["visible.txt"])],
+            repo.path(),
+        );
+        assert_cli_success(&payload, "read captured working-copy payload");
+        assert_eq!(payload.stdout, b"working-copy payload\n");
+    }
+}
+
 #[test]
 fn init_bare_reinit_tops_up_and_preserves_state() {
     let temp = tempdir().unwrap();

@@ -38,16 +38,16 @@
 ### Task FIX-LTR-11: bare 仓库快照排除元数据目录
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / 空。  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed 子提交与家族最终 C/D 待。  
 **Description:** 已用同一 0.30.153 二进制在 16 个独立 bare 仓库实测：操作快照的 untracked manifest 收入 `libra.db`、`objects/` 和内部锁路径。bare 无工作树，扫描不得把仓库元数据当作工作区内容。按请求固定的仓库身份判定 bare，空工作区扫描仍保留已有 HEAD、引用、原始 index/facet 和操作日志流程。  
 **Out of scope:** 不改 worker wire 错误编码、不吞 I/O 错误、不放宽时间/并发、不改普通工作区 ignore/layer/gitlink/稀疏规则；原 full 的具体出错文件和时序仍 unknown。  
 **Acceptance criteria:**
-- [ ] AC-1：新增真实 CLI 用例先在未修复产品上失败于 `BARE_SNAPSHOT_METADATA`；修复后 SHA-1/SHA-256、`repo.git`/`.libra` 两种 bare 名称的 untracked manifest 与 working-copy tree 为空，元数据文件留在原位。
-- [ ] AC-2：普通工作区对照仍保存可见文件及其原始内容；不会因 bare 判定而停用所有工作区快照。
-- [ ] AC-3：原 bare reinit 身份保存用例和现有 snapshot/head/ignore/gitlink 用例通过；权威元数据验证与操作记录未绕过。
+- [x] AC-1：新增真实 CLI 用例先在未修复产品上失败于 `BARE_SNAPSHOT_METADATA`；修复后 SHA-1/SHA-256、`repo.git`/`.libra` 两种 bare 名称的 untracked manifest 与 working-copy tree 为空，元数据文件留在原位。
+- [x] AC-2：普通工作区对照仍保存可见文件及其原始内容；不会因 bare 判定而停用所有工作区快照。
+- [x] AC-3：原 bare reinit 身份保存用例和现有 snapshot/head/ignore/gitlink 用例通过；权威元数据验证与操作记录未绕过。
 **Verification:**
-- [ ] VER-1：`command::init_test::bare_reinit_snapshot_excludes_repository_metadata`（new）真实 RED/GREEN；`command::init_test::worktree_reinit_snapshot_keeps_visible_files`（new）及原 `init_bare_reinit_tops_up_and_preserves_state`。
-- [ ] VER-2：完整 `command::init_test::` 和 `internal::operation::snapshot::` 选择器实际非零通过；最终全量由 REL-QUAL-11 承载。
+- [x] VER-1：`command::init_test::bare_reinit_snapshot_excludes_repository_metadata`（new）真实 RED/GREEN；`command::init_test::worktree_reinit_snapshot_keeps_visible_files`（new）及原 `init_bare_reinit_tops_up_and_preserves_state`。
+- [x] VER-2：完整 `command::init_test::` 和 `internal::operation::snapshot::` 选择器实际非零通过；最终全量由 REL-QUAL-11 承载。
 **Dependencies:** 当前上游 0.30.154；已保存的 bare 实测归属；无 FIX12 代码依赖，交付由共同集成点承载。  
 **Implementation write set:** `src/internal/operation/snapshot.rs`；`tests/command/init_test.rs`；本计划；`plan-status.md` 本计划行。  
 **Release boundary / Version:** `code-only family child of REL-QUAL-11` / N/A；精确本地 signed+DCO，不单独 push。  
@@ -57,6 +57,17 @@
 **Performance budget:** 计入下述单一家族窗口；不增加扫描遍历、未界定重试或新后台任务。  
 **Rollback mode:** 未推送本地子提交 `revert`；集成点交付后 forward-only。  
 **Granularity:** implementation；AC=3；VER=2；prod-files=1；scope=S；landing=1；self-contained=yes；deps=明确；release=REL-QUAL-11；writeset=4；exception=用户免 Review，非 PASS。
+
+**实际 A/B 证据（2026-11-05T04:23:39.737015+00:00）：** FIX10 文档子提交 `bc9568e85a9baaa1c85cd4bf5ce2b1f4d0a66246` 已精确 signed+DCO，离线 GPG VALIDSIG 核验通过；首次核验误读尚未提交前的292e上游导致NO_PUBKEY，原件保留，提交结束后按精确 child ID 重新核验成功，不改写提交。FIX11 产品改动仅 snapshot.rs：用请求固定的存储 DB 读取 core.bare、共用 Git bool 解析、保留 linked-worktree 扫描，bare 返回空文件扫描；capture 中 HEAD、原始 index 和 facet 处理保留。新增测试先 RED，再 GREEN；首轮测试 helper 错误与修正记录见 FIX10，不当产品 RED。
+
+- `fix11-red2`：native100；Summary [   8.193s] 1 test run: 0 passed, 1 failed, 4692 skipped；日志 SHA256 `a724deab1106f904c35784dcd02941e6bfd687c09e2408442922ec258661ea5a`。
+- `fix11-control-before`：native0；Summary [  13.156s] 1 test run: 1 passed, 4692 skipped；日志 SHA256 `93fc6947b5d5d67e397b81333bbca0885e8fa1315e83152ef176746fa2c73be8`。
+- `fix11-green`：native0；Summary [   4.836s] 1 test run: 1 passed, 4692 skipped；日志 SHA256 `ce91fd059e3e9b24f0117b9f730e427b79d744538e5c4ebd16762421994496e7`。
+- `fix11-init-module`：native0；Summary [  30.608s] 49 tests run: 49 passed, 4644 skipped；日志 SHA256 `b8752fc63fad7ac170e49c42f199ce5db931c40520848e436933969e0248a5d4`。
+- `fix11-snapshot-module`：native0；Summary [   9.595s] 67 tests run: 67 passed, 4782 skipped；日志 SHA256 `b9f9feeb689f4c74d00c4a823b101dba1af6023331568178cbadd1903f05676d`。
+- `fix11-clippy`：native0；strict Clippy -D warnings 成功；日志 SHA256 `27df8846d0074a811b8c0f67d5dda4e0c9fdc6a1be53bb67b4dbf874e79233f8`。
+
+所有已列本地门隔离源码/H1/DB/env/PG/容器后检不变，owned/unattributed=0；未重复失败全量，未重置家族预算。原先 bare fatal 的具体文件/时序仍 unknown；当前修复只对已证实元数据纳入缺陷负责。用户免 Review，非 PASS；未推送、非 complete。
 
 ### Task FIX-LTR-12: 限定私有 MCP read-worker 的运行时线程数
 
