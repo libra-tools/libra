@@ -23,6 +23,10 @@ pub const EPOCH_KEY: &str = "libra.traces.mega2.epoch";
 pub const RECEIPT_TIP_KEY: &str = "libra.traces.mega2.receipt.tip";
 pub const RECEIPT_SCOPE_KEY: &str = "libra.traces.mega2.receipt.scope";
 pub const RECEIPT_STATE_KEY: &str = "libra.traces.mega2.receipt.state";
+/// Target path and epoch the receipt scope belongs to. A confirmed scope is
+/// reused through the by-scope locator only for the same target and epoch.
+pub const RECEIPT_TARGET_KEY: &str = "libra.traces.mega2.receipt.target";
+pub const RECEIPT_EPOCH_KEY: &str = "libra.traces.mega2.receipt.epoch";
 pub const STATE_PENDING: &str = "pending";
 pub const STATE_CONFIRMED: &str = "confirmed";
 pub const STATE_SCOPE_PENDING: &str = "scope_resolution_pending";
@@ -322,6 +326,71 @@ where
         state: state.to_string(),
         scope,
         created_epoch: false,
+    })
+}
+
+/// Open the repository database that owns `workdir` (linked worktrees share
+/// the common database).
+pub async fn open_repository_at(workdir: &Path) -> Result<DatabaseConnection, Mega2StreamError> {
+    open_repository(workdir).await
+}
+
+/// Scope receipt that may be reused through the by-scope locator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableScope {
+    pub scope: String,
+}
+
+/// Return the confirmed scope recorded for exactly this target and epoch.
+pub async fn reusable_scope<C: ConnectionTrait>(
+    connection: &C,
+    target: &str,
+    epoch: &str,
+) -> Result<Option<ReusableScope>, Mega2StreamError> {
+    let state = config_value(connection, RECEIPT_STATE_KEY).await?;
+    let scope = config_value(connection, RECEIPT_SCOPE_KEY).await?;
+    let recorded_target = config_value(connection, RECEIPT_TARGET_KEY).await?;
+    let recorded_epoch = config_value(connection, RECEIPT_EPOCH_KEY).await?;
+    match (state.as_deref(), scope) {
+        (Some(STATE_CONFIRMED), Some(scope))
+            if recorded_target.as_deref() == Some(target)
+                && recorded_epoch.as_deref() == Some(epoch)
+                && Uuid::parse_str(&scope).is_ok() =>
+        {
+            Ok(Some(ReusableScope { scope }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Record which target and epoch the latest receipt belongs to. A pending
+/// scope clears the previous scope so it cannot be reused for this pair.
+pub async fn record_receipt_binding<C>(
+    connection: &C,
+    target: &str,
+    epoch: &str,
+    scope: Option<&str>,
+) -> Result<(), Mega2StreamError>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
+    let transaction = connection.begin().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot lock the traces receipt binding: {error}"))
+    })?;
+    for (key, value) in [(RECEIPT_TARGET_KEY, target), (RECEIPT_EPOCH_KEY, epoch)] {
+        ConfigKv::set_with_conn(&transaction, key, value, false)
+            .await
+            .map_err(|error| Mega2StreamError::Store(format!("cannot record `{key}`: {error}")))?;
+    }
+    if scope.is_none() {
+        ConfigKv::unset_with_conn(&transaction, RECEIPT_SCOPE_KEY)
+            .await
+            .map_err(|error| {
+                Mega2StreamError::Store(format!("cannot clear `{RECEIPT_SCOPE_KEY}`: {error}"))
+            })?;
+    }
+    transaction.commit().await.map_err(|error| {
+        Mega2StreamError::Store(format!("cannot commit the traces receipt binding: {error}"))
     })
 }
 

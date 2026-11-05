@@ -126,6 +126,53 @@ pub fn derive_scoped_ssh_uri(remote_url: &str) -> Result<String, String> {
     Ok(format!("ssh://traces@{host}{path}"))
 }
 
+/// HTTP(S) URL of a traces locator on the origin of `remote_url`.
+///
+/// Credentials, query and fragment of the stored remote are dropped; the
+/// stored remote itself is not modified.
+pub fn traces_http_url(remote_url: &str, locator_path: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(remote_url)
+        .map_err(|_| format!("remote URL {remote_url:?} is not an HTTP(S) Mega2 endpoint"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+        return Err(format!(
+            "remote URL {remote_url:?} is not an HTTP(S) Mega2 endpoint"
+        ));
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path(locator_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+/// SSH URL of a traces locator with the reserved `traces` login.
+pub fn traces_ssh_url(remote_url: &str, locator_path: &str) -> Result<String, String> {
+    let derived = derive_scoped_ssh_uri(remote_url)?;
+    let rest = derived
+        .strip_prefix("ssh://")
+        .ok_or_else(|| format!("derived SSH URL {derived:?} has no ssh scheme"))?;
+    let authority = rest.split_once('/').map(|(head, _)| head).unwrap_or(rest);
+    Ok(format!("ssh://{authority}{locator_path}"))
+}
+
+/// Canonical project path named by a code remote URL, such as `/project/foo`
+/// for `https://host/project/foo.git`. Returns `None` when the URL has no
+/// usable path (a bare origin, a percent-encoded path, or a traces locator);
+/// the caller then requires an explicit `--target`.
+pub fn target_from_remote_url(remote_url: &str) -> Option<String> {
+    let url = url::Url::parse(remote_url).ok()?;
+    let path = url.path().trim_end_matches('/');
+    let path = path
+        .strip_suffix(".git")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    if path.is_empty() || path.contains('%') || path.split('/').any(|part| part == ".traces") {
+        return None;
+    }
+    normalize_target_path(path).ok()
+}
+
 pub fn advertisement_has_traces_v1(advertisement: &str) -> bool {
     advertisement
         .split(|character: char| character.is_whitespace() || character == '\0')

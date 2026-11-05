@@ -14,7 +14,11 @@ libra mega2 traces transcript --server <BASE-URL> --stream <UUID> --checkpoint <
 libra mega2 traces fetch --remote <NAME> --stream <UUID>
 ```
 
-搜索文本必须是 1 到 256 个 UTF-8 字节，否则命令不会打开网络连接。客户端原样发送查询，ASCII 大小写折叠由服务端完成。未指定的列表 `limit` 是 50；未指定的搜索是 20 条和 16384 字节。超过 200 或 100 的 limit 在网络前拒绝。`--owner`、`--epoch`、`--agent`、`--session`、`--cursor` 按原值传递。`--code-commit` 必须是 40 或 64 位十六进制。`--since` / `--until` 按 RFC3339 解析后以 UTC 发送，区间是 `[since, until)`；since 晚于 until 在网络前拒绝，相等是空区间。`--session` 与 `--checkpoint` 不能同时使用。`--require-search` 只在 `search_ready` 为布尔 `true` 时成功；字段缺失或不是布尔值会拒绝，而不带该旗标的 `capabilities` 仍输出其余能力。跨源重定向不转发 `Authorization`。超过 1 MiB 的响应会被拒绝。`fetch` 需要 token，读取已认证的 `server_id`，并只在 Git 对象头哈希与链接闭包符合仓库对象格式后写入 `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`。它记录服务指纹，拒绝静默改指另一台服务，也不改 `refs/heads/traces`、`refs/libra/traces`、`HEAD`、index 或工作区。SSH remote 会定位到 `ssh://traces@<host>/.traces/by-scope/<stream>.git`；没有已认证的 git advertisement 时不发布 ref。
+搜索文本必须是 1 到 256 个 UTF-8 字节，否则命令不会打开网络连接。客户端原样发送查询，ASCII 大小写折叠由服务端完成。未指定的列表 `limit` 是 50；未指定的搜索是 20 条和 16384 字节。超过 200 或 100 的 limit 在网络前拒绝。`--owner`、`--epoch`、`--agent`、`--session`、`--cursor` 按原值传递。`--code-commit` 必须是 40 或 64 位十六进制。`--since` / `--until` 按 RFC3339 解析后以 UTC 发送，区间是 `[since, until)`；since 晚于 until 在网络前拒绝，相等是空区间。`--session` 与 `--checkpoint` 不能同时使用。`--require-search` 只在 `search_ready` 为布尔 `true` 时成功；字段缺失或不是布尔值会拒绝，而不带该旗标的 `capabilities` 仍输出其余能力。跨源重定向不转发 `Authorization`。超过 1 MiB 的响应会被拒绝。`fetch` 在 `remote.<name>.url` 的同一源上以 Git upload-pack 读取 `/.traces/by-scope/<stream>.git`：HTTP(S) 需要 token（匿名 HTTP 在打开连接前拒绝），SSH 使用 `traces@` 登录名与已配置的密钥。它从已认证的广告读取 `server_id`，校验并索引收到的 pack，只有广告的 tip 是该 pack 中的 commit 且哈希类型与仓库对象格式一致时，才写入 `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`。它记录服务指纹，拒绝静默改指另一台服务，也不改 `refs/heads/traces`、`refs/libra/traces`、`HEAD`、index 或工作区。未知或无权限的 stream 返回 `unknown_scope`，不发布任何 ref。
+
+```
+libra mega2 traces fetch --remote origin --stream 3f1d2c4b-5a6e-4f70-8a9b-0c1d2e3f4a5b --token-file ~/.mega2-token
+```
 
 # `libra mega2 browser`
 

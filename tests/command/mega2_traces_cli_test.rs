@@ -742,57 +742,205 @@ fn bounded_evidence_read_matrix() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
 }
 
-fn git_blob_sha1(payload: &str) -> String {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {}\0", payload.len()).as_bytes());
-    hasher.update(payload.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+struct GitStub {
+    port: u16,
+    discoveries: Arc<AtomicUsize>,
+    uploads: Arc<AtomicUsize>,
+}
+
+/// Loopback smart-HTTP TraceRepo stub. It serves one real PACK built by the
+/// `git` CLI. After `switch_after` discoveries it announces another server id.
+fn serve_git(stream: &'static str, tip: String, pack: Vec<u8>, switch_after: usize) -> GitStub {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let discoveries = Arc::new(AtomicUsize::new(0));
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let (seen_discovery, seen_upload) = (Arc::clone(&discoveries), Arc::clone(&uploads));
+    thread::spawn(move || {
+        for _ in 0..16 {
+            let Ok((mut socket, _)) = listener.accept() else {
+                break;
+            };
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let read = socket.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = &request[header_end..];
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let authorized = head.lines().any(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("authorization: basic ")
+                    && line.ends_with("dHJhY2VzOnRlc3QtdG9rZW4=")
+            });
+            let prefix = format!("/.traces/by-scope/{stream}.git/");
+            let (status, content_type, payload) = if !path.starts_with(&prefix) || !authorized {
+                (
+                    404,
+                    "application/json",
+                    b"{\"err_message\":\"unknown_scope\"}".to_vec(),
+                )
+            } else if path.ends_with("info/refs?service=git-upload-pack") {
+                let count = seen_discovery.fetch_add(1, Ordering::SeqCst) + 1;
+                let server = if count > switch_after {
+                    "22222222-2222-4222-8222-222222222222"
+                } else {
+                    "11111111-1111-4111-8111-111111111111"
+                };
+                let mut out = pkt("# service=git-upload-pack\n");
+                out.extend_from_slice(b"0000");
+                out.extend(pkt(&format!(
+                    "{tip} refs/libra/traces\0allow-reachable-sha1-in-want agent=mega/0.1.0 object-format=sha1 libra-traces-v1 libra-traces-server={server} libra-traces-scope={stream}\n"
+                )));
+                out.extend_from_slice(b"0000");
+                (200, "application/x-git-upload-pack-advertisement", out)
+            } else if path.ends_with("git-upload-pack") {
+                seen_upload.fetch_add(1, Ordering::SeqCst);
+                let text = String::from_utf8_lossy(body);
+                assert!(text.contains(&format!("want {tip}")), "{text}");
+                assert!(
+                    !text.contains("side-band"),
+                    "unadvertised capability: {text}"
+                );
+                assert!(text.ends_with("0009done\n"), "{text}");
+                let mut out = pkt("NAK\n");
+                out.extend_from_slice(&pack);
+                (200, "application/x-git-upload-pack-result", out)
+            } else {
+                (404, "application/json", b"{}".to_vec())
+            };
+            let reason = if status == 200 { "OK" } else { "Not Found" };
+            let mut response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&payload);
+            let _ = socket.write_all(&response);
+        }
+    });
+    GitStub {
+        port,
+        discoveries,
+        uploads,
+    }
+}
+
+fn pkt(line: &str) -> Vec<u8> {
+    format!("{:04x}{line}", line.len() + 4).into_bytes()
+}
+
+/// Build a one-commit SHA-1 history with the `git` CLI and pack its closure.
+fn evidence_pack(root: &Path) -> (String, String, Vec<u8>) {
+    let source = root.join("source");
+    let git = |args: &[&str], input: Option<&[u8]>| {
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("-C")
+            .arg(&source)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("spawn git");
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        } else {
+            drop(child.stdin.take());
+        }
+        let output = child.wait_with_output().expect("git output");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    std::fs::create_dir_all(&source).unwrap();
+    git(&["init", "-q", "--object-format=sha1"], None);
+    std::fs::write(source.join("evidence.txt"), "traces evidence sentinel\n").unwrap();
+    git(&["add", "evidence.txt"], None);
+    git(
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "evidence",
+        ],
+        None,
+    );
+    let tip = String::from_utf8(git(&["rev-parse", "HEAD"], None))
+        .unwrap()
+        .trim()
+        .to_string();
+    let blob = String::from_utf8(git(&["rev-parse", "HEAD:evidence.txt"], None))
+        .unwrap()
+        .trim()
+        .to_string();
+    let pack = git(
+        &["pack-objects", "--revs", "--stdout", "-q"],
+        Some(b"HEAD\n"),
+    );
+    (tip, blob, pack)
 }
 
 #[test]
 fn explicit_fetch_scope_and_local_invariants() {
-    let payload = "evidence";
-    let id = git_blob_sha1(payload);
-    let body = format!(
-        r#"{{"hash_kind":"sha1","stream":"44444444-4444-4444-8444-444444444444","tip":"{id}","objects":[{{"id":"{id}","kind":"blob","payload":"{payload}","links":[]}}]}}"#
-    );
-    let primary = "11111111-1111-4111-8111-111111111111";
-    let other = "22222222-2222-4222-8222-222222222222";
-    let (port, hits) = serve(move |path, seen| {
-        if path.contains("/capabilities") {
-            let server_id = if seen > 2 { other } else { primary };
-            (
-                200,
-                format!(
-                    r#"{{"protocol":"libra-traces/v1","server_id":"{server_id}","search_ready":true}}"#
-                ),
-            )
-        } else {
-            assert!(path.contains("/archive"), "{path}");
-            assert!(
-                seen <= 2,
-                "a fingerprint conflict must not download the archive"
-            );
-            (200, body.clone())
-        }
-    });
     let root = tempfile::tempdir().expect("root");
+    let (tip, blob, pack) = evidence_pack(root.path());
+    let stream = "44444444-4444-4444-8444-444444444444";
+    let stub = serve_git(stream, tip.clone(), pack, 1);
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     assert!(run_libra_command(&["init"], &repo).status.success());
     std::fs::write(repo.join("keep.txt"), "same").unwrap();
-    let remote = format!("http://127.0.0.1:{port}/project/foo.git");
+    let remote = format!("http://127.0.0.1:{}/project/foo.git", stub.port);
     assert!(
         run_libra_command(&["config", "set", "remote.origin.url", &remote], &repo)
             .status
             .success()
     );
-    let stream = "44444444-4444-4444-8444-444444444444";
+    assert!(
+        !run_libra_command(&["cat-file", "-e", &blob], &repo)
+            .status
+            .success(),
+        "the sentinel must be absent before fetch"
+    );
     let anonymous = run_libra_command(
         &[
             "mega2", "traces", "fetch", "--remote", "origin", "--stream", stream,
@@ -801,9 +949,9 @@ fn explicit_fetch_scope_and_local_invariants() {
     );
     assert!(!anonymous.status.success());
     assert!(String::from_utf8_lossy(&anonymous.stderr).contains("anonymous"));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let output = run_libra_command(
-        &[
+    assert_eq!(stub.discoveries.load(Ordering::SeqCst), 0);
+    let fetch = |extra: &[&str]| {
+        let mut args = vec![
             "--json",
             "mega2",
             "traces",
@@ -814,9 +962,11 @@ fn explicit_fetch_scope_and_local_invariants() {
             stream,
             "--token",
             "test-token",
-        ],
-        &repo,
-    );
+        ];
+        args.extend_from_slice(extra);
+        run_libra_command(&args, &repo)
+    };
+    let output = fetch(&[]);
     assert!(
         output.status.success(),
         "{}",
@@ -824,11 +974,14 @@ fn explicit_fetch_scope_and_local_invariants() {
     );
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("refs/remotes/origin/traces/"), "{text}");
-    assert!(
-        text.contains("\"hash_kind\":\"sha1\"") || text.contains("\"hash_kind\": \"sha1\""),
-        "{text}"
-    );
+    assert!(text.contains(&tip), "{text}");
     assert!(!text.contains("refs/heads/traces\""));
+    let shown = run_libra_command(&["cat-file", "-p", &blob], &repo);
+    assert!(shown.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        "traces evidence sentinel\n"
+    );
     let stored = run_libra_command(
         &[
             "config",
@@ -837,46 +990,36 @@ fn explicit_fetch_scope_and_local_invariants() {
         ],
         &repo,
     );
-    assert!(
-        stored.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stored.stderr)
-    );
     let stored_text = String::from_utf8_lossy(&stored.stdout);
     assert!(
         stored_text.contains("refs/remotes/origin/traces/"),
         "{stored_text}"
     );
     assert!(!stored_text.contains("refs/libra/traces"));
-    let fingerprint = run_libra_command(
-        &["config", "get", "libra.traces.remote.origin.fingerprint"],
-        &repo,
+    let traces = run_libra_command(&["rev-parse", "--verify", "traces"], &repo);
+    assert!(
+        !traces.status.success(),
+        "fetch must not create the local traces branch"
     );
     assert!(
-        fingerprint.status.success(),
-        "{}",
-        String::from_utf8_lossy(&fingerprint.stderr)
+        run_libra_command(
+            &["config", "get", "libra.traces.remote.origin.fingerprint"],
+            &repo
+        )
+        .status
+        .success()
     );
     assert_eq!(
         std::fs::read_to_string(repo.join("keep.txt")).unwrap(),
         "same"
     );
-    let conflict = run_libra_command(
-        &[
-            "mega2",
-            "traces",
-            "fetch",
-            "--remote",
-            "origin",
-            "--stream",
-            stream,
-            "--token",
-            "test-token",
-        ],
-        &repo,
-    );
+    let conflict = fetch(&[]);
     assert!(!conflict.status.success());
     assert!(String::from_utf8_lossy(&conflict.stderr).contains("does not match"));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
-    let _ = Path::new(&repo);
+    assert_eq!(stub.discoveries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        stub.uploads.load(Ordering::SeqCst),
+        1,
+        "a fingerprint conflict must not download the archive"
+    );
 }

@@ -58,9 +58,9 @@ use crate::{
 const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 
 /// Total timeout for push reference discovery and initial connection setup.
-const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Idle timeout for push send-pack / receive-pack operations.
-const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Push local refs and objects to a remote repository.
 ///
@@ -2272,6 +2272,18 @@ async fn collect_push_objects(
     Ok(combined)
 }
 
+/// Objects that one update to `new_oid` must send, given the server's
+/// advertisement. Used by the Mega2 traces push, which builds its own
+/// single-ref receive-pack request.
+pub(crate) async fn collect_objects_for_tip(
+    new_oid: ObjectHash,
+    advertised: &[crate::internal::protocol::DiscRef],
+) -> Result<(Vec<Entry>, Vec<String>), PushError> {
+    let haves = collect_advertised_haves(advertised).await;
+    let result = collect_objects_for_ref(new_oid, &haves).await?;
+    Ok((result.objs.into_iter().collect(), result.warnings))
+}
+
 async fn collect_objects_for_ref(
     new_oid: ObjectHash,
     advertised_haves: &AdvertisedHaves,
@@ -3183,7 +3195,7 @@ fn zero_object_hash() -> ObjectHash {
 ///
 /// Returns `true` if `ancestor` is reachable by traversing parent commits from `descendant`,
 /// or if `ancestor` and `descendant` are the same commit. Returns `false` otherwise.
-fn is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> bool {
+pub(crate) fn is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> bool {
     if ancestor == descendant {
         return true;
     }

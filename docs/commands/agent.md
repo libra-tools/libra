@@ -4,7 +4,7 @@
 
 Manage external-agent capture for Claude Code, Codex, OpenCode, and Grok.
 
-`libra agent push --mega2 [--remote <name>] [--new-stream]` sends `refs/libra/traces` to a Mega2 TraceRepo. The repository source is `libra.repoid`. The first epoch is stored before any network attempt and reused on retry. `--new-stream` is the only way to replace that epoch. `--mega2 --force-rewrite` is refused before a connection is opened; a non-fast-forward rejection is not turned into a force, a new epoch, or a push of the ordinary code remote. SSH uses a derived `traces@` login and does not rewrite the stored remote URL. If the remote has no URL, the command stops locally and prints the saved epoch. A successful push whose scope UUID cannot be read back stays successful and records `scope_resolution_pending`.
+`libra agent push --mega2 [--remote <name>] [--target <path>] [--token-file <path>] [--new-stream]` sends the local `traces` branch to `refs/libra/traces` of a Mega2 TraceRepo over HTTP(S) or SSH. The repository source is `libra.repoid`. The first epoch is stored before any network attempt and reused on retry. `--new-stream` is the only way to replace that epoch. The target project defaults to the remote URL path (`https://host/project/foo.git` is `/project/foo`); pass `--target` when the remote names only a host. HTTP authenticates with the Mega2 token from `--token-file` or `LIBRA_MEGA2_TOKEN`. SSH uses a derived `traces@` login with the key from the ordinary SSH configuration (`LIBRA_SSH_COMMAND`, the vault key, or the SSH agent) and does not rewrite the stored remote URL. A missing URL, target, checkpoint, or HTTP token stops the command locally and prints the saved epoch. The first push uses the by-path locator. Once a scope UUID is confirmed for the same target and epoch, later pushes use `/.traces/by-scope/<uuid>.git`, which only the stream owner may update. The client checks fast-forward against the advertised tip before it builds a pack. `--mega2 --force-rewrite` is refused before a connection is opened; a non-fast-forward result is not turned into a force, a new epoch, or a push of the ordinary code remote. After `libra agent clean` rewrites the chain, open a new epoch with `--new-stream`. A busy TraceRepo (`query_timeout`, HTTP 503) is retried with bounded backoff. A successful push whose scope UUID cannot be read back stays successful and records `scope_resolution_pending`; the next push confirms it without opening an epoch. `--json` prints the target, epoch, locator, old and new tip, object count, scope, and receipt state.
 
 Grok is supported and hook-installable with `support_wave=grok`, not `first_batch`, and is not a `review` or `investigate` launcher. **Automatic Thinking capture is paused.** Hook lifecycle events are recorded through the shared pipeline; decoding does not read session logs or write `GROK_HOME/libra-capture`. Existing readers for local `updates.jsonl` and `chat_history.jsonl` are not yet connected to the authorized snapshot/checkpoint writer. Offline observer JSON is scratch state, not a Libra checkpoint. The intended transcript retains Thinking text and unproven `encrypted_content`; Libra does not decrypt it. Current synthetic reader tests do not prove that live checkpoints contain it. Default `checkpoint show` does not print Thinking plaintext; an explicit transcript path returns only content actually stored.
 
@@ -479,6 +479,10 @@ Tool results are redacted before they are written. The server redacts `structure
 | `--acknowledge-commit-link-loss` | `doctor --repair --reset-commit-link-journal` | After inspecting other pages and worktrees, permit reset of a readable full journal even when their recovery evidence remains. Does not override failed repair, lease checks, or unfinished 64-link batches |
 | `--commit-page <1..100>` | `session show` | Show one page of at most 64 local commit links for a scoped Codex session; page 100 reports a limit if more links exist |
 | `--remote <name>` | `push` | Select the remote used for pushing agent trace refs |
+| `--mega2` | `push` | Push to the scoped Mega2 TraceRepo of the remote instead of its ordinary code repository |
+| `--new-stream` | `push --mega2` | Open a new traces epoch; required after `libra agent clean` rewrote a chain that was already pushed |
+| `--target <path>` | `push --mega2` | Mega2 project that owns the traces (default: the remote URL path) |
+| `--token-file <path>` | `push --mega2` | Read the Mega2 HTTP token from this file (default: `LIBRA_MEGA2_TOKEN`); SSH uses the configured key |
 | `--force-rewrite` | `push` | Allow the non-fast-forward push that follows a local `clean` prune (the traces ref is Libra-managed and rewritten as a whole chain); uses force-with-lease against the last tip this repository pushed — never an unconditional force — so a remote rewritten elsewhere still fails closed |
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--allow-raw` / `--raw` | `checkpoint export` | Authorize + request a raw (un-redacted) export; without `--allow-raw` a `--raw` request is refused (`LBR-AGENT-013`) and audited |
@@ -1224,6 +1228,12 @@ libra agent push --remote origin
 
 # Re-push after `libra agent clean` rewrote the traces chain (force-with-lease)
 libra agent push --force-rewrite
+
+# Push traces to the Mega2 project /project/foo over HTTP
+libra agent push --mega2 --target /project/foo --token-file ~/.mega2-token
+
+# Open a new Mega2 traces epoch after `libra agent clean`
+libra agent push --mega2 --new-stream
 
 # Discover libra-agent-<name> RPC binaries on PATH
 libra agent rpc list

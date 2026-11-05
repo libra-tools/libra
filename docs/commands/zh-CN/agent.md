@@ -1,6 +1,6 @@
 # `libra agent`
 
-`libra agent push --mega2 [--remote <name>] [--new-stream]` 把 `refs/libra/traces` 推到 Mega2 TraceRepo。来源是仓库的 `libra.repoid`。第一次 epoch 在任何网络尝试之前写入，失败重试会复用它。只有 `--new-stream` 会更换 epoch。`--mega2 --force-rewrite` 在打开连接之前被拒绝；非快进不会变成 force、新 epoch，也不会改推普通代码 remote。SSH 使用派生的 `traces@` 登录名，不改已保存的 remote URL。remote 没有 URL 时命令在本地停止，并打印已保存的 epoch。推送已经成功但读不回 scope UUID 时，成功结论保持不变，收据记为 `scope_resolution_pending`。
+`libra agent push --mega2 [--remote <name>] [--target <path>] [--token-file <path>] [--new-stream]` 经 HTTP(S) 或 SSH 把本地 `traces` 分支推到 Mega2 TraceRepo 的 `refs/libra/traces`。来源是仓库的 `libra.repoid`。第一次 epoch 在任何网络尝试之前写入，失败重试会复用它。只有 `--new-stream` 会更换 epoch。目标项目默认取 remote URL 的路径（`https://host/project/foo.git` 即 `/project/foo`）；remote 只给出主机时用 `--target` 指定。HTTP 用 `--token-file` 或 `LIBRA_MEGA2_TOKEN` 中的 Mega2 token 认证。SSH 使用派生的 `traces@` 登录名和普通 SSH 配置中的密钥（`LIBRA_SSH_COMMAND`、vault 密钥或 SSH agent），不改已保存的 remote URL。缺少 URL、目标、checkpoint 或 HTTP token 时命令在本地停止，并打印已保存的 epoch。首次推送用 by-path 入口；同一目标与 epoch 的 scope UUID 确认后，后续推送改用只有 stream owner 能更新的 `/.traces/by-scope/<uuid>.git`。客户端在打包前按广告的 tip 检查快进。`--mega2 --force-rewrite` 在打开连接之前被拒绝；非快进不会变成 force、新 epoch，也不会改推普通代码 remote。`libra agent clean` 改写链后，用 `--new-stream` 开新 epoch。TraceRepo 忙（`query_timeout`，HTTP 503）时按有界退避重试。推送已经成功但读不回 scope UUID 时，成功结论保持不变，收据记为 `scope_resolution_pending`，下一次推送补齐且不开新 epoch。`--json` 输出目标、epoch、入口、新旧 tip、对象数、scope 与收据状态。
 
 Grok 的 `support_wave` 是 `grok`，不是 `first_batch`，可安装生命周期 hook，不是 `review` 或 `investigate` 启动器。**自动 Thinking 采集当前暂停。** 生命周期由共享管线记录；hook 解析不读取会话日志，也不写 `GROK_HOME/libra-capture`。已有 `updates.jsonl` 与 `chat_history.jsonl` 读取器尚未接入授权 snapshot/checkpoint writer；离线 observer JSON 是临时状态，不是 Libra checkpoint。后续目标是 transcript 保留 Thinking 正文和未证明的 `encrypted_content`，不解密；当前合成读取器测试不证明真实 checkpoint 已含这些数据。默认 `checkpoint show` 不打印 Thinking 明文；显式 transcript 路径只能返回实际已保存的内容。
 
@@ -392,6 +392,10 @@ OpenCode 提取对空输入、非法 JSON 和非法 export 形状显式标记
 | `--acknowledge-commit-link-loss` | `doctor --repair --reset-commit-link-journal` | 检查其他页与 worktree 后，允许重置仍含其恢复证据的可读取满日志；不能绕过失败的修复、lease 核验或未完成的 64 关联批次 |
 | `--commit-page <1..100>` | `session show` | 每页显示最多 64 个当前作用域 Codex 会话的本地提交关联；第 100 页仍有更多时报告上限 |
 | `--remote <name>` | `push` | 选择用于推送代理 trace 引用的远程 |
+| `--mega2` | `push` | 推到该远程的 Mega2 scoped TraceRepo，而不是普通代码仓库 |
+| `--new-stream` | `push --mega2` | 开新的 traces epoch；已推送的链被 `libra agent clean` 改写后需要 |
+| `--target <path>` | `push --mega2` | 拥有这些 traces 的 Mega2 项目（默认取 remote URL 路径） |
+| `--token-file <path>` | `push --mega2` | 从该文件读取 Mega2 HTTP token（默认 `LIBRA_MEGA2_TOKEN`）；SSH 使用已配置的密钥 |
 | `--force-rewrite` | `push` | 允许本地 `clean` prune 之后的非快进推送（traces 引用由 Libra 托管，prune 即整链重写）；采用针对本仓库最近一次推送记录的 force-with-lease 语义——绝非无条件 force——远程被别处重写时仍 fail-closed 拒绝 |
 | `--dry-run` | `checkpoint rewind` | 显示影响而不修改文件；这是默认值 |
 | `--apply` | `checkpoint rewind` | 恢复所选 checkpoint 的工作树 |
@@ -867,6 +871,12 @@ libra agent push --remote origin
 
 # `libra agent clean` 重写 traces 链后重新推送（force-with-lease）
 libra agent push --force-rewrite
+
+# 经 HTTP 把 traces 推到 Mega2 项目 /project/foo
+libra agent push --mega2 --target /project/foo --token-file ~/.mega2-token
+
+# `libra agent clean` 之后开新的 Mega2 traces epoch
+libra agent push --mega2 --new-stream
 
 # 发现 PATH 上的 libra-agent-<name> RPC 二进制文件
 libra agent rpc list

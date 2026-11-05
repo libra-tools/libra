@@ -253,6 +253,17 @@ impl RemoteClient {
         }
     }
 
+    /// Send a caller-built upload-pack request (HTTP or SSH only).
+    pub(crate) async fn upload_pack_raw(&self, body: bytes::Bytes) -> Result<FetchStream, IoError> {
+        match self {
+            RemoteClient::Http(client) => client.post_upload_pack(body).await,
+            RemoteClient::Ssh(client) => client.upload_pack_raw(body).await,
+            _ => Err(IoError::other(
+                "a raw upload-pack request needs an HTTP(S) or SSH remote",
+            )),
+        }
+    }
+
     async fn fetch_objects(
         &self,
         have: &[String],
@@ -3731,6 +3742,36 @@ fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
             "existing pack index '{}' is corrupt or unreadable; repair the object store before retrying",
             path.display()
         ),
+    })
+}
+
+/// A pack installed by [`install_fetched_pack`]. Dropping it releases the
+/// `.keep` pin, so hold it until the caller has recorded the ref that roots
+/// the new objects.
+pub(crate) struct InstalledPack {
+    _keep: Option<PackKeepHold>,
+    _pin: PackPinGuard,
+    pub(crate) objects: usize,
+}
+
+/// Verify, write and index one complete pack received outside the generic
+/// fetch flow (the Mega2 traces archive fetch). No ref is written here.
+pub(crate) async fn install_fetched_pack(
+    pack_data: &[u8],
+    hash_kind: HashKind,
+) -> Result<InstalledPack, FetchError> {
+    let objects = pack_object_count(pack_data);
+    let (keep, install_lock, pack_file, pin) =
+        write_pack_and_index(pack_data, hash_kind, &[]).await?;
+    set_hash_kind(hash_kind);
+    if let Some(pack_file) = pack_file.as_deref() {
+        index_received_pack(pack_file, hash_kind, true)?;
+    }
+    drop(install_lock);
+    Ok(InstalledPack {
+        _keep: keep,
+        _pin: pin,
+        objects,
     })
 }
 

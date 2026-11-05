@@ -144,6 +144,8 @@ EXAMPLES:
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
     libra agent push --mega2 --remote origin        Push refs/libra/traces to the scoped Mega2 TraceRepo
+    libra agent push --mega2 --target /project/foo  Push traces to the Mega2 project /project/foo
+    libra agent push --mega2 --new-stream           Open a new Mega2 traces epoch after `agent clean`
     libra agent bridge --stdio                      Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)
     libra agent mcp --stdio                         Serve repository MCP tools over stdio (JSON-RPC 2.0 NDJSON)
     libra --json agent status                       Structured JSON output for agents";
@@ -401,6 +403,14 @@ pub struct PushArgs {
     /// Open a new traces epoch. Required only when replacing one that already exists.
     #[arg(long)]
     pub new_stream: bool,
+    /// Mega2 project path that owns the traces (default: the remote URL path,
+    /// such as `/project/foo` for `https://host/project/foo.git`).
+    #[arg(long, value_name = "PATH", requires = "mega2")]
+    pub target: Option<String>,
+    /// Read the Mega2 HTTP token from this file (default: `LIBRA_MEGA2_TOKEN`).
+    /// SSH authenticates with the configured key instead.
+    #[arg(long = "token-file", value_name = "PATH", requires = "mega2")]
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

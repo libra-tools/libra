@@ -754,4 +754,320 @@ fn mega2_scoped_push_contract() {
         "retry must reuse {epoch_value}: {retry_text}"
     );
     assert!(retry_text.contains("before any network attempt"));
+
+    // Every remaining local precondition also stops before a socket: the
+    // closed loopback port would turn a network attempt into another error.
+    let stop = |args: &[&str], expected: &str| {
+        let output = libra_command(repo)
+            .env_remove("LIBRA_MEGA2_TOKEN")
+            .args(args)
+            .output()
+            .expect("local stop");
+        assert!(!output.status.success());
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains(expected), "{expected}: {text}");
+        assert!(text.contains("before any network attempt"), "{text}");
+        assert!(text.contains(&epoch_value), "{text}");
+    };
+    let set_remote = |url: &str| {
+        assert!(
+            libra_command(repo)
+                .args(["config", "set", "remote.origin.url", url])
+                .output()
+                .expect("remote")
+                .status
+                .success()
+        );
+    };
+    set_remote("http://127.0.0.1:9");
+    stop(
+        &["agent", "push", "--mega2"],
+        "does not name a Mega2 project path",
+    );
+    stop(
+        &["agent", "push", "--mega2", "--target", "/project"],
+        "has no checkpoint commit",
+    );
+    set_remote("ftp://127.0.0.1/project");
+    stop(
+        &["agent", "push", "--mega2"],
+        "is not an http(s):// or ssh://",
+    );
+    let base = init_repo_base(&root.path().join("with-tip"));
+    let tipped = root.path().join("with-tip");
+    assert!(
+        libra_command(&tipped)
+            .args(["update-ref", "refs/heads/traces", &base])
+            .output()
+            .expect("update-ref")
+            .status
+            .success()
+    );
+    assert!(
+        libra_command(&tipped)
+            .args([
+                "config",
+                "set",
+                "remote.origin.url",
+                "http://127.0.0.1:9/project.git"
+            ])
+            .output()
+            .expect("remote")
+            .status
+            .success()
+    );
+    let tokenless = libra_command(&tipped)
+        .env_remove("LIBRA_MEGA2_TOKEN")
+        .args(["agent", "push", "--mega2"])
+        .output()
+        .expect("tokenless");
+    assert!(!tokenless.status.success());
+    let text = String::from_utf8_lossy(&tokenless.stderr);
+    assert!(text.contains("has no token"), "{text}");
+    assert!(text.contains("before any network attempt"), "{text}");
+}
+
+/// Loopback receive-pack stub for the Mega2 traces receipt matrix. Each
+/// request is answered from a script indexed by request order.
+#[cfg(unix)]
+type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+#[cfg(unix)]
+fn serve_traces_receive(script: Vec<(u16, &'static str, Vec<u8>)>) -> (u16, SeenRequests) {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for (status, content_type, payload) in script {
+            let Ok((mut socket, _)) = listener.accept() else {
+                break;
+            };
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let read = socket.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+            log.lock()
+                .unwrap()
+                .push((path, request[header_end..].to_vec()));
+            let mut response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&payload);
+            let _ = socket.write_all(&response);
+        }
+    });
+    (port, seen)
+}
+
+#[cfg(unix)]
+fn pkt_line(line: &str) -> Vec<u8> {
+    format!("{:04x}{line}", line.len() + 4).into_bytes()
+}
+
+#[cfg(unix)]
+fn receive_advertisement(tip: Option<&str>, caps: &str) -> (u16, &'static str, Vec<u8>) {
+    let mut body = pkt_line("# service=git-receive-pack\n");
+    body.extend_from_slice(b"0000");
+    let line = match tip {
+        Some(tip) => format!("{tip} refs/libra/traces\0{caps}\n"),
+        None => format!("{} capabilities^{{}}\0{caps}\n", "0".repeat(40)),
+    };
+    body.extend(pkt_line(&line));
+    body.extend_from_slice(b"0000");
+    (200, "application/x-git-receive-pack-advertisement", body)
+}
+
+/// LTR-12: a lost scope read keeps the push successful as
+/// `scope_resolution_pending`; the retry confirms the same tip and epoch;
+/// a confirmed scope is reused through by-scope; a remote without
+/// `libra-traces-v1` is refused after discovery.
+#[cfg(unix)]
+#[test]
+fn mega2_receipt_recovery_matrix() {
+    const SERVER: &str = "libra-traces-v1 libra-traces-server=11111111-1111-4111-8111-111111111111";
+    const SCOPE: &str = "33333333-3333-4333-8333-333333333333";
+    let temp = tempfile::tempdir().expect("root");
+    let repo = temp.path().join("repo");
+    let head = init_repo_base(&repo);
+    let tip = libra_command(&repo)
+        .args(["update-ref", "refs/heads/traces", &head])
+        .output()
+        .expect("update-ref");
+    assert!(
+        tip.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tip.stderr)
+    );
+    let token = temp.path().join("token");
+    fs::write(&token, "matrix-token\n").expect("token");
+    let caps = format!("report-status no-thin agent=mega/0.1.0 object-format=sha1 {SERVER}");
+    let scoped = format!("{caps} libra-traces-scope={SCOPE}");
+    let mut report = pkt_line("unpack ok\n");
+    report.extend(pkt_line("ok refs/libra/traces\n"));
+    report.extend_from_slice(b"0000");
+    let (port, seen) = serve_traces_receive(vec![
+        receive_advertisement(None, &caps),
+        (200, "application/x-git-receive-pack-result", report),
+        (500, "text/plain", b"scope read lost".to_vec()),
+        receive_advertisement(Some(&head), &scoped),
+        receive_advertisement(Some(&head), &scoped),
+    ]);
+    let remote = format!("http://127.0.0.1:{port}/project/foo.git");
+    assert!(
+        libra_command(&repo)
+            .args(["config", "set", "remote.origin.url", &remote])
+            .output()
+            .expect("remote")
+            .status
+            .success()
+    );
+    let push = || {
+        let output = libra_command(&repo)
+            .args([
+                "--json",
+                "agent",
+                "push",
+                "--mega2",
+                "--token-file",
+                token.to_str().unwrap(),
+            ])
+            .output()
+            .expect("push");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("json")["data"].clone()
+    };
+
+    let first = push();
+    assert_eq!(first["state"], "scope_resolution_pending");
+    assert_eq!(first["scope"], serde_json::Value::Null);
+    assert_eq!(first["target"], "/project/foo");
+    assert_eq!(first["up_to_date"], false);
+    let epoch = first["epoch"].as_str().expect("epoch").to_string();
+
+    let retry = push();
+    assert_eq!(retry["state"], "confirmed");
+    assert_eq!(retry["scope"], SCOPE);
+    assert_eq!(
+        retry["epoch"],
+        epoch.as_str(),
+        "a retry must not open an epoch"
+    );
+    assert_eq!(
+        retry["up_to_date"], true,
+        "the acknowledged tip is not re-sent"
+    );
+    assert!(
+        retry["locator"]
+            .as_str()
+            .unwrap()
+            .starts_with("/.traces/by-path/")
+    );
+
+    let reused = push();
+    assert_eq!(
+        reused["locator"],
+        format!("/.traces/by-scope/{SCOPE}.git").as_str()
+    );
+    assert_eq!(reused["epoch"], epoch.as_str());
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[1].0.ends_with("/git-receive-pack"));
+    let command = String::from_utf8_lossy(&requests[1].1);
+    assert!(
+        command.contains(&format!(
+            "{} {head} refs/libra/traces\0report-status agent=libra/",
+            "0".repeat(40)
+        )),
+        "{command}"
+    );
+    assert!(command.contains("PACK"), "the request must carry a pack");
+    assert!(
+        requests[4]
+            .0
+            .starts_with(&format!("/.traces/by-scope/{SCOPE}.git/"))
+    );
+
+    let (plain, _) = serve_traces_receive(vec![receive_advertisement(
+        None,
+        "report-status agent=git/2.43.0",
+    )]);
+    let refused_repo = temp.path().join("refused");
+    let refused_head = init_repo_base(&refused_repo);
+    assert!(
+        libra_command(&refused_repo)
+            .args(["update-ref", "refs/heads/traces", &refused_head])
+            .output()
+            .expect("update-ref")
+            .status
+            .success()
+    );
+    assert!(
+        libra_command(&refused_repo)
+            .args([
+                "config",
+                "set",
+                "remote.origin.url",
+                &format!("http://127.0.0.1:{plain}/project/foo.git"),
+            ])
+            .output()
+            .expect("remote")
+            .status
+            .success()
+    );
+    let refused = libra_command(&refused_repo)
+        .args([
+            "agent",
+            "push",
+            "--mega2",
+            "--token-file",
+            token.to_str().unwrap(),
+        ])
+        .output()
+        .expect("refused push");
+    assert!(!refused.status.success());
+    let text = String::from_utf8_lossy(&refused.stderr);
+    assert!(text.contains("libra-traces-v1"), "{text}");
+    assert!(!text.contains("stopped before"), "{text}");
 }
