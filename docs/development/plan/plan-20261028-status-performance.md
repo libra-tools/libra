@@ -58,6 +58,26 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 
 ### SP-09 审计记录交付收口（EX-SP-09-CLOSE-01）
 
+**本次构建版工具例外（2026-11-05 01:27:09 UTC）：** 用户随后明确要求“用本机 Build 的 Libra 解决冲突，然后提交推送”，本次授权取代此前暂缓提交时的工具选择，不修改仓库通用规则。仅使用已在本机验证的冻结 0.30.152 二进制 `/data/libra-performance/sp09-20261104/bin/libra-candidate`（SHA-256 `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`）完成本次冲突解决、签名+DCO提交、推送和核验；不覆盖系统安装。开始前 branch 为 `codex/SP-09`、HEAD 为 f2e7a278，三文件改动仍在；PR #1058 已与 main 冲突，需保全本卡和上游记录后重新验收新 head，旧性能证据仍绑定原冻结源码，不外推至同步后的主线。
+
+**冲突恢复与最终树验证（2026-11-05 01:41:57 UTC）：** 精确备份三文件、保存原 HEAD 归档与 stash 后，fetch 上游至 `9766c98c02abd8f7e77b4bc80d3327f95c009a80`；native merge 仅在 `plan-status.md` 首段冲突，保留 SP-09 和上游资格记录两侧内容并清除标记。合并树的 nightly fmt exit0（16.235s）与 stable 严格 all-targets/all-features Clippy exit0（273.386s）；733 个生产源码/build 路径与原冻结候选逐字节一致，变动为上游测试与文档，不新增本卡产品修改。签名+DCO合并提交 `fc1540622c3ec677d86dce7622c392da4b7c180d` 的父提交为原 `f2e7a278` 和该上游，保留原签名历史。
+
+stash apply 在合并前后均原子拒绝部分上游已变路径，原 stash 未删除。用原 HEAD、已保存工作副本和当前树生成三方回放补丁，经 Libra `apply --check` 后原生应用；仅末尾空行差异在临时比较输入规范化，上游实际内容保留，回放字节逐项核验。nextest --force 与上游相同，无需重复产品/工作流改动；剩余自有变更仅两计划记录。尚待本次最终差异只读复核、后续签名提交推送及新 head CI，未将旧失败或原矩阵记为新运行。
+
+**后续 CI 修复授权（2026-11-04 16:12:30 UTC）：** 用户随后明确要求每 30 分钟检查 PR CI，失败则修复、提交、推送，成功后合并。监控发现 PR #1058 的 offline-core job 126637807659 在安装 nextest 时 exit101（已有不同版本二进制），全量与特性步骤全部 skipped，其余检查成功。按该后续授权，将本卡维护写集扩展为两份计划文档与 `.github/workflows/base.yml`，仅回补上游 `a0632237f596ffbcbeadb98e3c386b6dc58209a8` 的 bootstrap 修复：版本不符时以 `--force` 安装固定 0.9.143，已匹配时仍跳过。此为 CI 恢复，不新增产品行为、不发布版本；本机仍不安装 nextest。原失败保留，修复 head 的全量 CI 必须重新运行，不以回补本身宣称通过。
+
+实际 workflow shell 块已在隔离假 Cargo 下复现 RED：已安装 0.9.142 时 exit101，同现网报错；固定版本存在、未安装、安装失败传播三场景符合预期。修复后须同四场景重验，并完成格式/严格 Clippy 及独立只读评审，签名+DCO提交推送后恢复每半小时监控。合并仅在最新 head 的全部适用检查成功后执行，不使用 admin 绕过、不删除分支。
+
+**修复验证前沿（2026-11-04 16:16:56 UTC）：** 同一实际 workflow shell 的四场景 GREEN 已取得：匹配版本无 install；不匹配/缺失以固定版本、locked、force 安装成功；安装失败 exit19 立即传播。RED/GREEN 原件 SHA-256 分别 `89196de110c360471f37f822a714c178c1e4ad1b2e28b201f7bb0095ec3ca0f9` / `d6731a87275e857f11328d63f9a1eae680d92b0309fba49d16ee51a789f7e917`。本机 Codex 独立只读评审 exit0、`VERDICT: PASS`、无 P0/P1/P2，报告 SHA-256 `8a58cd95cdc9662d9c722041806c117eeafcb28e3d3e30a0a09c7656a2d1746e`；reviewer 未执行测试，只核对实际 diff 与红绿回执。格式/严格 Clippy 补跑仍待终态，修复尚未提交推送，新 head CI 未取得。
+
+**提交前质量门（2026-11-04 16:29:48 UTC）：** `cargo +nightly fmt --all --check` exit0（167.496s），`cargo +stable clippy --all-targets --all-features -- -D warnings` exit0（761.276s）。原件 `ci-fix-quality.json` SHA-256 `ec1f75acd7f20a84e20dbae48ae06ad3162c98f15a209d195a09591edbb4918a`；仅保留第三方 proc-macro-error2 future-incompat 尾注，不伪称项目 lint 失败。四场景 GREEN 与独立 review PASS 均覆盖当前 bootstrap 修改，随后仅补事实记录，不改受审 workflow。现依用户授权签名提交、推送并重启监控，远端全量结果待实际新 head。
+
+**交付阻塞与本地定向终态（2026-11-05 00:08:45 UTC）：** 上述 CI 修复尚未提交或推送，HEAD 仍为 `f2e7a278cd3122d92ff6ee2a7b945889aed42d51`。系统 Libra 0.30.143 的 `add` 反复报 `hash worker returned no result`，进程跟踪见其父进程终止 worker，未确认根因；不改写为暂存成功。用户授权官方升级后，签名 0.30.152 候选的安装前 probe 触发 SIGILL，安装未应用，原系统二进制保留；本机 N5105 无 AVX/AVX2 仅是兼容性线索，不把猜测当作已证实根因。用户明确选择保留“项目构建版仅测试”的限制，故不使用已构建候选处理版本管理，保留三文件改动并暂缓提交推送，不合并失败 head。
+
+原定向 worker 已返回：util 72/72、status 74/74 通过；Wave-0 174 passed / 1 failed，唯一失败 `rename_limit_three_scope_cascade_and_invalid_winner` 在 fixture 暂存时报告 `failed to read storage configuration for LIBRA_STORAGE_TYPE`。该失败不算通过，原 worker 随 exit101 停止，check-ignore 未执行。已另启该单例精确复现及 check-ignore/status-errors 补跑，终态尚待；不将其描述为仍在编译或全绿。PR #1058 当前仍 OPEN、head 未变，offline-core 的旧失败仍在，其余检查成功。
+
+**补充定向结果（2026-11-05 00:22:46 UTC）：** 精确 `command::status_wave0::rename_limit_three_scope_cascade_and_invalid_winner -- --exact --nocapture` exit0、1/1（115.499s，测试执行81.72s）；`command::check_ignore_test::` exit0、12/12（382.452s）；`command::status_error_test::` exit0、14/14（604.919s），均非零命中。原件另存 `focused-followup-results.json`，SHA-256 `5c0838ab354d161dc4f7e48821897925ed038ebe1ab0fba0984a5b93878b2914`。原 Wave-0 全模块174/175失败记录保留；精确单例通过不等同同轮全模块175/175，失败根因尚未确定，不据此关闭最终全量门。用户更新后的 PATH Libra 连 `--version` 都 SIGILL（returncode -4），系统工具阻塞仍在；用户保留构建版仅测试限制，修复仍未提交推送，PR 与 main 的冲突也待系统工具恢复后解决。
+
 2026-11-04 14:23:13 UTC 核验后，用户在已明确获知 Review 整改和剩余验收状态的情况下，要求“设置卡片状态为已完成，然后提交，推送”，随后追加“然后提交 PR”。据此将 SP-09 登记为 `done / complete`，仅表示本次性能审计、脚本整改及现状记录的交付收口，批准精确提交两份计划文档、推送 `codex/SP-09` 并创建 PR；该指令优先于本卡此前“所有门完成才 complete”的交付顺序。
 
 - 性能矩阵、独立复算、补充语义断言及计数重解析已有实测证据；fmt 与严格 all-targets/all-features Clippy 已 exit0。
@@ -1341,7 +1361,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Deliverables:** 本计划正文与 plan-status.md；不产生新证据文件
 
-**Implementation write set:** `docs/development/plan/plan-20261028-status-performance.md`, `docs/development/plan/plan-status.md`
+**Implementation write set:** `docs/development/plan/plan-20261028-status-performance.md`, `docs/development/plan/plan-status.md`, `.github/workflows/base.yml`（仅用户后续 CI 修复授权下的 nextest bootstrap 回补；原审计提交只含前两项）
 
 **Release write set:** N/A
 

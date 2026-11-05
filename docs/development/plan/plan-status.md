@@ -1,3 +1,17 @@
+> **2026-11-05 01:41:57 UTC SP-09 冲突已恢复：** 同步上游9766c98，plan-status首段冲突两侧记录均保留；native signed+DCO merge提交fc154062（父f2e7a278与9766c98）保留历史。合并树fmt exit0/16.235s、严格all-targets/all-features Clippy exit0/273.386s，733生产/build路径与冻结候选一致。stash原子拒绝后保留原件，从三方备份生成补丁，经Libra apply --check后应用并核字节；上游nextest --force已保留，剩余自有变化仅两文档。最终差异复核、签名提交推送与新head CI待，不把旧失败改写为通过。
+
+> **2026-11-05 01:27:09 UTC SP-09 工具例外与冲突恢复：** 用户明确授权本次使用本机构建Libra解决冲突并提交推送；已核验冻结0.30.152二进制SHA为ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446，不替换系统安装。当前codex/SP-09/f2e7a278保有三文件CI修复与记录，PR1058与main冲突。先备份与精确stash，再同步上游并保全双方记录；最终验证、PGP+DCO提交、推送与新head CI待，旧矩阵不冒称覆盖新主线。
+
+> **2026-11-05 00:22:46 UTC SP-09 补充定向通过：** Wave0原失败单例精确重跑1/1、check-ignore12/12、status-errors14/14，全部exit0，原件SHA已入日期计划；保留原全模块174/175失败，不冒充同轮175/175或根因已关闭。用户更新后的系统PATH Libra --version/status均SIGILL(-4)，构建版仅测试限制保留，CI修复三文件仍未提交推送；PR1058新增main冲突，旧offline-core失败仍在。只读半小时监控继续，不合并失败或冲突head。
+
+> **2026-11-05 00:08:45 UTC SP-09 交付阻塞：** CI修复三文件未提交/推送，HEAD仍f2e7a278，PR1058 offline-core旧失败仍在。系统Libra0.30.143暂存报hash worker returned no result；用户授权的官方0.30.152升级因pre-install probe SIGILL拒绝，原安装保留。用户明确不豁免构建版仅测试限制，故保留修复、暂缓提交推送，不合并失败head。原定向终态util72/72、status74/74、Wave0 174通过/1失败（fixture暂存读取LIBRA_STORAGE_TYPE配置失败），check-ignore未跑；另启精确复现与check-ignore/status-errors，结果待，不记全绿。原done/complete仅审计记录交付口径不变。
+
+> **2026-11-04 16:29:48 UTC SP-09 CI 修复提交门通过：** nightly fmt exit0/167.496s、stable严格all-targets/all-features Clippy exit0/761.276s，原件SHA已入日期计划；加上实际workflow四场景GREEN与独立Codex PASS，本地修复门已齐。现依用户授权签名提交推送并恢复每半小时监控，新head全量CI仍待，不合并失败或缺覆盖head。
+
+> **2026-11-04 16:16:56 UTC SP-09 CI 修复验证：** workflow实际shell四场景GREEN，旧版本RED已复现；本机Codex只读独立review PASS/无P0P1P2（原件SHA入日期计划），没有冒称reviewer运行测试。fmt/严格Clippy补跑终态待，未提交推送，新head实际CI待；通过后依用户已有授权签名提交推送并恢复半小时监控，不合并失败head。
+
+> **2026-11-04 16:12:30 UTC SP-09 CI 修复跟进：** PR #1058 head f2e7a278 的其余检查成功，offline-core在nextest安装因已有不同版本二进制exit101、全量与特性测试skipped。用户已授权每半小时监控、失败修复提交推送、成功合并；本次扩写集至base.yml与两份计划文档，精确回补上游a0632237的--force bootstrap，不安装本机nextest、不发布版本。隔离假Cargo已复现不同版本RED，其余三场景符合预期；修复后验证、独立评审、新head实际CI待，不将历史失败改写为通过。原done/complete仍仅审计记录交付口径。
+
 > **2026-11-04 14:23:13 UTC SP-09 用户指令收口：** 用户明确要求“设置卡片状态为已完成，然后提交，推送”，随后追加创建PR授权；按 EX-SP-09-CLOSE-01 登记 `done / complete`，仅本次审计记录交付。矩阵/独立复算/补充语义与计数整改已有实证，fmt/严格Clippy exit0；定向仍在首次编译，补充status-errors、最终评审、最终PR全量与原发布继承缺口均未记通过，原未满足AC保留。授权精确提交两计划文档、推送 `codex/SP-09` 并创建PR，不合并/关闭Issue/发布，不宣称整轮最终验收完成。Review.md已按用户后续指令删除，不纳入提交。
 
 > **2026-11-04 14:15:50 UTC SP-09 Review 整改：** 用户 Review 的2P1/2P2已核实：原trace重计，撤回pack211→206结论（对象库两边均206），ignore含.gitignore/.libraignore/exclude后normal为437→415，旧原件保留，热点AC撤勾待复核。新增48份未计时输出匹配原样本SHA、3份精确refresh回执及51缺记录负例均PASS，独立复算再验通过；原性能样本未变。采样器已补断言；定向worker补充status_error_test过滤器需待旧worker结束另跑，尚未算通过；总览SP07/08与SP08 C/D已对齐，旧汇总标历史。fmt和严格Clippy实际exit0，定向/最终review/远端全量仍待，`in-progress / 空`。Review.md当时为用户未跟踪文件，随后已按用户明确指令删除，不纳入写集。
