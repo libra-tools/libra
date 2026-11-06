@@ -1155,6 +1155,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | **已收口（2026-11-03：九卡 `done`/`complete`。EC-01 v0.30.135 run 41505868430；RV-01 v0.30.137 run 41528688806 attempt 2；UI-01 v0.30.138 run 41545576388；DF-01 v0.30.140 run 41556490025；RV-02 v0.30.141 run 41562359692；UI-02 v0.30.142 run 41566754831；UI-03 v0.30.143 run 41572246304；SR-01 v0.30.144 run 41577360822 attempt 2；UR-01 v0.30.146 run 41583805298。均为 8/8 `success`。双环境 nextest 11252 passed、48 skipped、0 failed、exit 0。DEFER-479-PI-IMPORT 已关闭，不再豁免该门。未在 #479 发帖。）** | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
 | [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
 | [`issues/481.md`](issues/481.md) | 维护与杂项命令族对齐 | **实施中** | MX-01、MX-02、MX-03、MX-06 `done`/`complete`（实现完成，2026-10-20；C 组 bump 与 D 组 release 证据待用户授权）；MX-04、MX-05、MX-07..MX-16 待开工 |
+| [`issues/1057.md`](issues/1057.md) | `ls-tree` 目录过滤与大小格式兼容（#479 后续） | 未启动（Claude R5 计划评审 PASS；2026-11-06 15:56:27 UTC） | LS-01、LS-02 `pending` / 验收空；指定网站路径待挂载；testcase 本地副本已核实 |
 | [`issues/483.md`](issues/483.md) | `count-objects` 与预览命令零对象写入 | 未启动 | CO-01..CO-04（4 卡；CO-03/04 受 DEP-CO-04 / DEP-CLI-mirror `src/cli.rs` 实际写者串行约束） |
 | [`issues/486.md`](issues/486.md) | upstream ahead/behind 计数 | **已收口** | AB-01 `done/complete`（v0.22.31，已关闭） |
 | [`issues/487.md`](issues/487.md) | 本地 Git 转换挂死与中断恢复 | 未启动 | IG-01..IG-05（5 卡） |
