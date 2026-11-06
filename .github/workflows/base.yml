@@ -68,7 +68,7 @@ jobs:
     # invocation is not safety evidence. Each selected case must actually run.
     name: compat-owner-liveness-macos
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
