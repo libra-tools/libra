@@ -2,7 +2,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{cmp::min, fs, str::FromStr};
+use std::{cmp::min, fs, io::Write, str::FromStr};
 
 use clap::Parser;
 use git_internal::{
@@ -57,6 +57,119 @@ fn test_log_cli_empty_repository_returns_fatal_128() {
     assert_eq!(
         stderr,
         "fatal: your current branch 'main' does not have any commits yet\nError-Code: LBR-REPO-003\n\nHint: create a commit first before running 'libra log'."
+    );
+}
+
+fn lo_f1_repo() -> tempfile::TempDir {
+    lo_f1_repo_with_dates("2026-01-02T03:04:05Z", "2026-01-02T03:04:05Z")
+}
+
+fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], repo.path()),
+        "configure user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "author@example.com"], repo.path()),
+        "configure user.email",
+    );
+
+    let commits = [
+        ("initial", None),
+        ("second", Some("With * Asterisk <xyzzy@frotz.com>")),
+        ("third", None),
+        ("fourth", Some("Night Fall <nitfol@frobozz.com>")),
+    ];
+
+    for (message, author) in commits {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo.path().join("file"))
+            .expect("open file")
+            .write_all(b"a\n")
+            .expect("append file");
+        assert_cli_success(
+            &run_libra_command(&["add", "file"], repo.path()),
+            "add file",
+        );
+
+        let mut args = vec!["commit", "-m", message, "--no-verify"];
+        if let Some(author) = author {
+            args.extend(["--author", author]);
+        }
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &args,
+                repo.path(),
+                &[
+                    ("GIT_AUTHOR_DATE", author_timestamp),
+                    ("GIT_COMMITTER_DATE", committer_timestamp),
+                ],
+            ),
+            "commit with fixed date",
+        );
+    }
+
+    repo
+}
+
+#[test]
+fn lo00_date_format_committer_date() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(
+        &["log", "--format=%cd", "--date=format:%Y-%m-%d", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --date=format:%Y-%m-%d");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "2026-01-02\n");
+}
+
+#[test]
+fn lo00_date_format_with_space_both_dates() {
+    let repo = lo_f1_repo_with_dates("2026-01-02T03:04:05Z", "2026-01-03T04:05:06Z");
+    let output = run_libra_command(
+        &["log", "--format=%ad|%cd", "--date=format:%Y/%m/%d %H", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --date=format:%Y/%m/%d %H");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "2026/01/02 03|2026/01/03 04\n"
+    );
+}
+
+#[test]
+fn lo00_date_format_medium_header() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(&["log", "--date=format:%Y-%m-%d", "-1"], repo.path());
+    assert_cli_success(&output, "log --date=format:%Y-%m-%d");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "Date:   2026-01-02"),
+        "unexpected log output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn lo00_date_format_fuller_header() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(
+        &["log", "--pretty=fuller", "--date=format:%F", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --pretty=fuller --date=format:%F");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "AuthorDate: 2026-01-02"),
+        "unexpected log output: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

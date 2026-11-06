@@ -96,14 +96,16 @@ libra log --pretty=reference
 
 选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
 `iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`rfc`/`rfc2822`、`unix`
-与 `raw`。`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
+与 `raw`，以及 `format:<strftime>`（按 `strftime` 格式渲染日期）。
+`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
 优先。当前 renderer 尚未实现的合法 Git 模式（`relative`、`human`、
-`local`、`format:*`、`auto:*`）在配置中会明确报错，而不是静默忽略。
+`local`、`auto:*`）在配置中会明确报错，而不是静默忽略。
 结构化 JSON 日期继续使用 schema 规定的 RFC3339 表示。
 
 ```bash
 libra log --date=iso-strict
 libra log --pretty='format:%ad %s' --date=unix
+libra log --date='format:%Y-%m-%d'
 ```
 
 ### `-p, --patch`
