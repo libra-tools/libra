@@ -1156,6 +1156,13 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
 | [`issues/481.md`](issues/481.md) | 维护与杂项命令族对齐 | **实施中** | MX-01、MX-02、MX-03、MX-06 `done`/`complete`（实现完成，2026-10-20；C 组 bump 与 D 组 release 证据待用户授权）；MX-04、MX-05、MX-07..MX-16 待开工 |
 | [`issues/1057.md`](issues/1057.md) | `ls-tree` 目录过滤与大小格式兼容（#479 后续） | 未启动（Claude R5 计划评审 PASS；2026-11-06 15:56:27 UTC） | LS-01、LS-02 `pending` / 验收空；指定网站路径待挂载；testcase 本地副本已核实 |
+| [`issues/1050.md`](issues/1050.md) | `fast-import` 的 `from <ref>^0` | 未启动（Claude R1 FAIL 已修订，待复审） | I1050-01 `pending` / 验收空；网站未挂载；Git 控制构建未存在 |
+| [`issues/1051.md`](issues/1051.md) | `hash-object --stdin` 与路径并用 | 未启动（Claude R1 FAIL 已修订，待复审） | I1051-01 `pending` / 验收空；网站未挂载；Git 控制构建未存在 |
+| [`issues/1052.md`](issues/1052.md) | T 类缺失命令登记（不实现） | 未启动（Claude R1 FAIL 已修订，待复审） | I1052-00 `pending` / 验收空；不改产品、不关闭 #1052 |
+| [`issues/1053.md`](issues/1053.md) | `rev-parse --git-path` | 未启动（Claude R1 FAIL 已修订，待复审） | I1053-01 `pending` / 验收空；网站未挂载；与 #1054/#539 写集互斥 |
+| [`issues/1054.md`](issues/1054.md) | 无参数 `rev-parse` 不打印 HEAD | 未启动（Claude R1 FAIL 已修订，待复审） | I1054-01 `pending` / 验收空；网站未挂载；与 #1053/#539 写集互斥 |
+| [`issues/1055.md`](issues/1055.md) | `^{/<text>}` 模式内冒号切分 | 未启动（Claude R1 FAIL 已修订，待复审） | I1055-01 `pending` / 验收空；T-1；网站未挂载；与 #537 `util.rs` 互斥 |
+| [`issues/1056.md`](issues/1056.md) | `write-tree --prefix` | 未启动（Claude R1 FAIL 已修订，待复审） | I1056-01 `pending` / 验收空；TC-0142 仍受 #1052 `mktree` 与 #545 阻塞 |
 | [`issues/483.md`](issues/483.md) | `count-objects` 与预览命令零对象写入 | 未启动 | CO-01..CO-04（4 卡；CO-03/04 受 DEP-CO-04 / DEP-CLI-mirror `src/cli.rs` 实际写者串行约束） |
 | [`issues/486.md`](issues/486.md) | upstream ahead/behind 计数 | **已收口** | AB-01 `done/complete`（v0.22.31，已关闭） |
 | [`issues/487.md`](issues/487.md) | 本地 Git 转换挂死与中断恢复 | 未启动 | IG-01..IG-05（5 卡） |
