@@ -197,7 +197,15 @@ pub async fn derive_commit_episodes(
         let current_op = operation_for_created_op(conn, &current.created_op_id).await?;
         let current_status = current_op
             .as_ref()
-            .map(|op| op.status.clone())
+            .map(|op| {
+                if op.command_name.as_deref()
+                    == Some(crate::internal::change::import::IMPORT_COMMAND)
+                {
+                    "unknown".to_string()
+                } else {
+                    op.status.clone()
+                }
+            })
             .unwrap_or_else(|| "success".to_string());
 
         let mut history_statuses: Vec<String> = Vec::new();
@@ -213,11 +221,17 @@ pub async fn derive_commit_episodes(
         }
 
         let ops = committed_operations(conn, repo_id, &change_id).await?;
-        let started_at = ops.iter().map(|op| op.start_ts).min().unwrap_or(0);
+        let started_at = ops
+            .iter()
+            .map(|op| op.start_ts)
+            .min()
+            .or_else(|| current_op.as_ref().map(|op| op.start_ts))
+            .unwrap_or(0);
         let ended_at = ops
             .iter()
             .filter_map(|op| op.end_ts)
             .max()
+            .or_else(|| current_op.as_ref().and_then(|op| op.end_ts))
             .unwrap_or(started_at);
         let actor = current_op
             .and_then(|op| op.actor)
