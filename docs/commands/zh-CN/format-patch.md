@@ -12,7 +12,7 @@ libra format-patch [OPTIONS] [revision-range]
 
 `libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号），并把每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
 
-Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以错误退出；但 `--ignore-if-in-upstream` 可以成功抑制整个 series。
+Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以退出码 0 成功结束，不生成 patch。普通模式不输出内容；使用 `--json` 时，payload 中包含 `"patches": []`。仓库没有任何 commit 或 revision 无法解析时仍会报错。若所有 commit 都已在 upstream 中，`--ignore-if-in-upstream` 也会成功返回空 series。
 
 ## 选项
 
@@ -54,8 +54,8 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--histogram` | | 使用 Histogram diff algorithm 生成文本 hunks | false |
 | `--ignore-if-in-upstream` | | 抑制 stable patch-id 已出现在 range 排除侧的 commits | false |
 | `--src-prefix <PREFIX>` / `--dst-prefix <PREFIX>` | | 替换默认 `a/` 与 `b/` diff path prefixes | `a/`、`b/` |
-| `--no-stat` | | 抑制 diffstat 摘要 | false |
-| `--keep-subject` | | 保留 commit subject 中原有 `[PATCH]` prefix | false |
+| `-p`, `--no-stat` | | 抑制 diffstat 摘要 | false |
+| `--keep-subject` | `-k` | 逐字保留 commit subject，不添加 `[PATCH]` 前缀或 `n/m` 计数 | false |
 | `--suffix <SFX>` | | 生成 patch 的文件名后缀（例如 `.txt`）；`--numbered-files` 下忽略 | `.patch` |
 | `--zero-commit` | | 在每个 patch 的 `From <hash>` envelope line 中使用全零 hash | false |
 | `--signature <SIGNATURE>` | | 放在每个 patch 和 cover letter 的 `-- ` 行之后的文本 | libra version |
@@ -136,7 +136,7 @@ unified diff
 | 场景 | StableErrorCode |
 |------|-----------------|
 | 不在 Libra 仓库中 | `LBR-REPO-001` |
-| 未知 revision 或空 range | `LBR-CLI-003` |
+| 未知 revision | `LBR-CLI-003` |
 | `--base` 不是 series 的祖先 | `LBR-CLI-003`（退出 128） |
 | `--base=auto`（不支持） | `LBR-CLI-002`（退出 129） |
 | 输出文件写入失败 | `LBR-IO-002` |

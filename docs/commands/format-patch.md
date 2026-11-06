@@ -20,8 +20,10 @@ formats each as an mbox message with RFC 2822 headers, a plain-text diffstat,
 and a unified diff. The output is compatible with `git am`.
 
 Merge commits are skipped by default. When the revision range resolves to zero
-commits, the command exits with an error, except that
-`--ignore-if-in-upstream` may successfully suppress the entire series.
+commits, the command exits successfully without generating patches. Plain output
+is empty; with `--json`, the payload contains `"patches": []`. A repository
+with no commits or an unresolvable revision still fails. `--ignore-if-in-upstream`
+also succeeds with an empty series when every commit is already upstream.
 
 ## Options
 
@@ -170,7 +172,7 @@ stdout follows Libra's normal quiet BrokenPipe behavior.
 | Scenario | StableErrorCode |
 |----------|-----------------|
 | Not in a Libra repository | `LBR-REPO-001` |
-| Unknown revision or empty range | `LBR-CLI-003` |
+| Unknown revision | `LBR-CLI-003` |
 | `--base` is not an ancestor of the series | `LBR-CLI-003` (exit 128) |
 | `--base=auto` (unsupported) | `LBR-CLI-002` (exit 129) |
 | `--relative`, `--all` (unsupported) | `LBR-UNSUPPORTED-001` (exit 128) |

@@ -10,7 +10,7 @@
 
 ### P2-03 邮件输出可靠性闭环
 
-- Revision：`-1 [REV]` 精确导出一个 commit；`--root [REV]` 从指定 tip 遍历至 root；`--ignore-if-in-upstream` 用 default stable patch-id 与排除侧可达 commits 比较，全部命中时成功输出空 series。排除侧遍历错误不再被静默吞掉。
+- Revision：`-1 [REV]` 精确导出一个 commit；`--root [REV]` 从指定 tip 遍历至 root。范围解析为零个提交时退出 0，不生成 patch；启用 `--json` 时返回空的 `patches` 列表。仓库没有 commit 或 revision 无法解析时仍报错。`--ignore-if-in-upstream` 用 default stable patch-id 与排除侧可达 commits 比较，全部命中时成功输出空 series。排除侧遍历错误不再被静默吞掉。
 - Diff：`log::generate_diff_with_options` 为 format-patch 提供 `--histogram`、真实 `--full-index` 及 `--src-prefix`/`--dst-prefix`；`--minimal` 明确复用本就无 deadline、保证 shortest edit script 的 Myers backend。Histogram 通过 `diff::rewrite_unified_diff_histogram` 复用共享 hunk renderer。
 - Config：`format.subjectPrefix`、`format.signOff`、`format.outputDirectory`、`format.suffix` 使用严格 local→global→system cascade，显式 CLI 值短路无关坏默认；`--no-signoff` 覆盖 config，`--stdout` 不读取 output-directory 默认。Signoff identity 同样严格读取 cascaded `user.name`/`user.email`，不吞 config 错误。
 - Mail/thread：外部 `--in-reply-to` 与本系列生成的 Message-ID 分离；cover letter 先回复外部 parent，各 patch 再回复 cover，避免重复 Message-ID 与双尖括号。MIME attachment boundary/closing delimiter 已由真实 `git am` 消费测试固定。
@@ -41,7 +41,7 @@ flowchart TD
 ```
 
 - 底层操作对象：`Commit`（通过 `log::get_reachable_commits` 加载，读取 `id`、`tree_id`、`parent_commit_ids`、`author`、`committer`、`message`）；`Tree` / `Blob`（由 `log::generate_diff` 和 `log::compute_commit_stat` 内部加载）。
-- 输出与错误契约：`execute_safe` 支持 `--json` 输出结构化 `PatchRecord[]`；`--cover-letter` 写出封面（文件名为 `0000-cover-letter` + 后缀，后缀默认 `.patch` 由 `--suffix` 决定；`--numbered-files` 下为纯 `0`）时，该文件以 `number = 0` 的记录出现在 `PatchRecord[]` 中；`--quiet` 抑制文件路径打印；`--no-pager` 跳过分页器；失败通过 `CliError` / `CliResult` 传播，携带稳定错误码：`RepoNotFound`（`LBR-REPO-001`）、`CliInvalidTarget`（`LBR-CLI-003`，范围无提交）、`IoWriteFailed`（`LBR-IO-002`，文件写入失败）。新增失败模式要补稳定错误码、用户提示和回归测试。
+- 输出与错误契约：`execute_safe` 支持 `--json` 输出结构化 `PatchRecord[]`；空范围在 JSON 中返回空的 `patches` 列表；`--cover-letter` 写出封面（文件名为 `0000-cover-letter` + 后缀，后缀默认 `.patch` 由 `--suffix` 决定；`--numbered-files` 下为纯 `0`）时，该文件以 `number = 0` 的记录出现在 `PatchRecord[]` 中；`--quiet` 抑制文件路径打印；`--no-pager` 跳过分页器；失败通过 `CliError` / `CliResult` 传播，携带稳定错误码：`RepoNotFound`（`LBR-REPO-001`）、`CliInvalidTarget`（`LBR-CLI-003`，revision 无法解析或仓库没有指向 commit 的 `HEAD`；空范围不报错）、`IoWriteFailed`（`LBR-IO-002`，文件写入失败）。新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：该命令不应修改索引、对象库、refs/HEAD 或 reflog；唯一写入面是补丁文件（后缀默认 `.patch`，可由 `--suffix` 改变；`--numbered-files` 下为纯序号无后缀）或 stdout。
 
 ## 实现历史
