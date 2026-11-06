@@ -64,28 +64,46 @@ Do not delete or edit SQLite receipts manually. Use `--offline` or
 `LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
 these modes warn and are not authorization for remote synchronization.
 
-When `LIBRA_STORAGE_TYPE` is `s3` or `r2`, `fetch` checks the rest of the
-object-storage settings before it updates refs or installs a pack. An unreadable setting, an empty bucket, access key, or secret, or an
+On a normal fetch, when `LIBRA_STORAGE_TYPE` is `s3` or `r2`, Libra checks the
+remaining object-storage settings before it updates refs or installs a pack.
+An unreadable setting, an empty bucket, an empty access key or secret, or an
 endpoint that is not a URL fails with `LBR-IO-001` and reports only the
-setting name. An unset bucket, endpoint, region, key, secret, allow-http
-flag, threshold, or cache size keeps its existing default. The same check applies to
-`pull` and `clone`. A readable unset type, including a missing global
-configuration file, stays on the historical local path. An unread repository database, or a resolver that does not return, fails
-`fetch`, `pull`, and `clone` with `LBR-IO-001` before a pack is installed and
-reports only `LIBRA_STORAGE_TYPE`. A repository database that is merely held by another
-writer is first retried, for about 5 seconds in total per process. An unreadable global config store, after the
-repository has no type, stays on the historical local path so existing objects
-can still be read. A future global schema while reading the type stays on that
-same local path. A type other than `s3` or `r2`, including `gcs`, also fails with
-`LBR-IO-001`. `ClientStorage::init` uses the same rule and does not build a
-writable local backend for an unread type. `LIBRA_STORAGE_TYPE=local` still
-warns and stays local for `ClientStorage::init`. Fetch, pull, and clone
-already reject that exact value. In text output the unreadable-global-store degrade, the `LIBRA_STORAGE_TYPE=local`
-warning and its empty-bucket warning print a `Warning:` line on stderr and do not trip
-`--exit-code-on-warning`. Under `--json`/`--machine` they never reach stderr:
-the message joins the invocation's warning buffer and `--exit-code-on-warning`
-exits 9 (`LBR-WARN-001`); `status` lists the `local` and empty-bucket warnings
-as `repository_preflight` entries.
+setting name. An unset bucket, endpoint, region, key, secret, allow-http flag,
+threshold, or cache size keeps its existing default. The same check applies to
+`pull` and `clone`. `fetch --dry-run` returns before resolving object storage,
+so it skips these storage-setting checks; the separate global-config schema
+guard still runs before command dispatch.
+
+A readable unset type, including a missing global configuration file, stays
+on the historical local path. If the repository database cannot be read, or
+its resolver worker exits before returning the `LIBRA_STORAGE_TYPE` result,
+`fetch`, `pull`, and `clone` fail with `LBR-IO-001` before installing a pack
+and report only `LIBRA_STORAGE_TYPE`. A repository database held by another
+writer is retried for about 5 seconds in total per process. If the repository
+has no type but the global config store is unreadable, object commands that
+initialize storage stay on the historical local path so existing objects can
+still be read.
+
+An unsupported future global schema is subject to the command-level schema
+guard: `fetch`, `pull`, and `clone` fail closed before local storage fallback
+when they may need global storage configuration. They can continue with a
+warning when local-only read policy is active or process/repository settings
+prove global storage configuration is unnecessary. A type other than `s3` or
+`r2`, including `gcs`, fails with `LBR-IO-001`. `ClientStorage::init` rejects
+unsupported storage types without building writable local storage. The exact
+value `LIBRA_STORAGE_TYPE=local` remains a warning-only case for
+`ClientStorage::init`; normal `fetch`, `pull`, and `clone` reject that exact
+value.
+
+In text output, object commands using the local fallback print a `Warning:`
+line on stderr for an unreadable-global-store degrade, the
+`LIBRA_STORAGE_TYPE=local` warning, or its empty-bucket warning, without
+triggering `--exit-code-on-warning`. Under `--json`/`--machine`, those messages
+go into the invocation's warning buffer instead; the flag exits 9
+(`LBR-WARN-001`). Structured `status` preflight lists the `local` and
+empty-bucket warnings. It fails closed if its own required config lookup
+cannot read the global store, so that lookup failure is not a preflight
+warning.
 
 ### Prune config defaults (`fetch.prune`, `remote.<name>.prune`)
 

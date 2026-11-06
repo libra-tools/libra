@@ -2,7 +2,7 @@
 
 > **Coverage-v2 source version:** The coverage-v2 descriptions below refer to the Libra 0.30.50 source line and later compatible versions. This is not a stable-release announcement; check the [official releases](https://github.com/libra-tools/libra/releases) and `libra --version` for installed support. Other sections retain their own version requirements. Coverage-v2 does not prove native origin or authorize native reasoning artifacts.
 
-Manage external-agent capture for Claude Code, Codex, OpenCode, and Grok.
+Manage external-agent capture for Claude Code, Codex, OpenCode, Grok, Hermes, and Pi.
 
 `libra agent push --mega2 [--remote <name>] [--target <path>] [--token-file <path>] [--new-stream]` sends the local `traces` branch to `refs/libra/traces` of a Mega2 TraceRepo over HTTP(S) or SSH. The repository source is `libra.repoid`. The first epoch is stored before any network attempt and reused on retry. `--new-stream` is the only way to replace that epoch. The target project defaults to the remote URL path (`https://host/project/foo.git` is `/project/foo`); pass `--target` when the remote names only a host. HTTP authenticates with the Mega2 token from `--token-file` or `LIBRA_MEGA2_TOKEN`. SSH uses a derived `traces@` login with the key from the ordinary SSH configuration (`LIBRA_SSH_COMMAND`, the vault key, or the SSH agent) and does not rewrite the stored remote URL. A missing URL, target, checkpoint, or HTTP token stops the command locally and prints the saved epoch. The first push uses the by-path locator. Once a scope UUID is confirmed for the same target and epoch, later pushes use `/.traces/by-scope/<uuid>.git`, which only the stream owner may update. The client checks fast-forward against the advertised tip before it builds a pack. `--mega2 --force-rewrite` is refused before a connection is opened; a non-fast-forward result is not turned into a force, a new epoch, or a push of the ordinary code remote. After `libra agent clean` rewrites the chain, open a new epoch with `--new-stream`. A busy TraceRepo (`query_timeout`, HTTP 503) is retried with bounded backoff. A successful push whose scope UUID cannot be read back stays successful and records `scope_resolution_pending`; the next push confirms it without opening an epoch. `--json` prints the target, epoch, locator, old and new tip, object count, scope, and receipt state.
 
@@ -411,7 +411,7 @@ native-origin gates remain required.
 |------------|-------------|
 | `status` | Report captured external-agent session status |
 | `list` | List the supported agents with their capability matrix (roster, hooks, install state) |
-| `import` | Discover and import historical Claude/Codex transcript files or one trusted, sandboxed OpenCode export after explicit consent |
+| `import` | After explicit consent, discover Claude/Codex sessions; OpenCode requires `--agent opencode --session <id>` and a trusted isolated export, while Hermes/Pi require `--path` to one session file |
 | `graph <session>` | Inspect the read-only session → turn → revision → subagent capture graph; requires global `--json`/`--machine` (the interactive TUI entry was removed in the W5 breaking release) |
 | `enable` | Enable one or more external agents and install hooks |
 | `add` | Alias of `enable`: `add <name>` ≡ `enable --agent <name>` |
@@ -1278,12 +1278,11 @@ on them:
 - **External-RPC method families beyond the v2 `info` / capability gate** are not
   implemented; an agent that does not declare a capability continues to fail
   closed.
-- **The non-first-batch roster is unsupported.** Only `claude-code`, `codex` and
-  `opencode` are supported, hook-installable and launchable for
-  review/investigate, plus `grok` as described above. `gemini` (uninstall-only, see the Description above),
-  `cursor`, `copilot`, and `factory-ai` are `supported=false`, are omitted from
-  `agent list`, and `add`/`enable` returns an actionable unsupported error;
-  they are not launchable. `hermes` is supported for local capture, as described above, and is not launchable. `pi` is a registered identity with `supported=false`, as described above: the repository CHECK accepts it, but nothing writes a `pi` session yet.
+- **Review and investigate launchers are limited to `claude-code`, `codex`,
+  and `opencode`.** `grok`, `hermes`, and `pi` support local capture as
+  described above, but are not launchers. `gemini` is uninstall-only. `cursor`,
+  `copilot`, and `factory-ai` are `supported=false`, are omitted from
+  `agent list`, and `add`/`enable` returns an actionable unsupported error.
 
 ## Notes
 

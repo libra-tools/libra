@@ -8,6 +8,7 @@ built purely from objects.
 ## Synopsis
 
 ```
+libra update-index [--index-file <PATH>] [OPTIONS]
 libra update-index --add <path>...
 libra update-index --remove <path>...
 libra update-index --cacheinfo <mode>,<object>,<path>...
@@ -19,11 +20,16 @@ libra update-index --chmod=+x <path>...
 
 ## Description
 
-`update-index` applies, in order: every `--cacheinfo` entry, then the positional
-paths, and saves the index. `--add` and `--remove` are permissions rather than
-alternatives: `--remove` alone drops each named path from the index, `--add` alone
-(re)stages it from the working tree, and given together they route per path by
-whether it still exists — an existing path is staged, a missing one is dropped.
+`update-index` walks operations in command-line order: each `--cacheinfo` entry
+is applied where it appears, and each positional path is processed with the
+path-operation flags in effect at that point. It saves the index once after the
+walk. `--index-file <PATH>` selects a separate index instead of `.libra/index`;
+if that file does not exist, Libra starts with an empty index, which is useful
+for scratch index composition. `--add` and `--remove` are permissions rather
+than alternatives: `--remove` alone drops each named path from the index,
+`--add` alone (re)stages it from the working tree, and given together they
+route per path by whether it still exists — an existing path is staged, a
+missing one is dropped.
 
 - `--cacheinfo <mode>,<object>,<path>` inserts/updates an entry directly. The
   object **need not exist yet** (matching Git), so you can build an index from
@@ -43,10 +49,12 @@ whether it still exists — an existing path is staged, a missing one is dropped
   one is dropped — which is how upstream setup steps use `--add --remove` in one
   call. `--remove` on its own always drops the path, whether or not it still exists.
 - `--skip-worktree <path>...` marks tracked paths with the skip-worktree bit
-  (index v3 extended flags): `status`/`diff` then ignore the working-tree copy
-  and no command restages it, so the path can stay absent or diverge locally
-  without noise. The mark is recorded in the index only — the working tree is
-  never read and the entry content is untouched. A path that is not in the
+  (index v3 extended flags): `status`/`diff` then ignore the working-tree copy,
+  and default `add`/`update-index` path updates skip it, so the path can stay
+  absent or diverge locally without noise. To explicitly stage a changed,
+  existing sparse path, use `libra add --sparse <path>`; that preserves the
+  skip-worktree bit. The mark is recorded in the index only — the working tree
+  is never read and the entry content is untouched. A path that is not in the
   index fails with `Unable to mark file` (exit 128). Setting the bit rewrites
   the index as format v3; `--no-skip-worktree` clears it again, and the index
   returns to format v2 once no entry carries extended flags. Repositories with
@@ -74,10 +82,11 @@ agent cleanup fail closed while repair remains pending. With
 
 | Option | Description | Example |
 |--------|-------------|---------|
+| `--index-file <PATH>` | Use this index instead of `.libra/index`. A missing file starts as an empty index. | `libra update-index --index-file /tmp/draft.index --cacheinfo 100644,<oid>,a.txt` |
 | `--add` | Allow positional paths to add new (untracked) files. | `libra update-index --add a.txt` |
 | `--remove` | Remove the positional paths from the index. With `--add`, presence on disk decides per path (existing → staged, missing → removed). | `libra update-index --remove old.txt` |
 | `--force-remove` | Drop the positional paths from the index regardless of whether the working-tree file exists; paths the index does not know are a no-op, and every stage of an unmerged path is removed. Wins over `--add`/`--remove`. | `libra update-index --force-remove old.txt` |
-| `--skip-worktree` | Mark tracked paths with the skip-worktree bit (index v3): status/diff ignore the working-tree copy and it is never restaged. Untracked paths fail with exit 128. | `libra update-index --skip-worktree s.txt` |
+| `--skip-worktree` | Mark tracked paths with the skip-worktree bit (index v3): status/diff ignore the working-tree copy; default add/update-index path updates skip it. `libra add --sparse` can explicitly stage a changed, existing path while preserving the bit. Untracked paths fail with exit 128. | `libra update-index --skip-worktree s.txt` |
 | `--no-skip-worktree` | Clear the skip-worktree bit again; the index returns to v2 when no extended flags remain. | `libra update-index --no-skip-worktree s.txt` |
 | `--add --remove` | Both permissions at once: stage what exists, drop what is gone. | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | Register an entry from an object id (repeatable). | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |

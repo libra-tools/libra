@@ -21,7 +21,7 @@ redirect callback, so it requires a session on the local machine
 
 The flow times out after 15 minutes.
 
-Human output redacts credentials in the server `host` before printing it. An origin with no userinfo, including `https://libra.tools` with no trailing slash, stays byte-for-byte the same. `--json` keeps the server host unchanged.
+Human output redacts URL credentials in the server URL held in the `host` field before printing it. An origin with no userinfo, including `https://libra.tools` with no trailing slash, stays byte-for-byte the same. `--json` returns the original `host` field unchanged.
 
 ## Examples
 

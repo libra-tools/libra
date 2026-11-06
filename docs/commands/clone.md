@@ -2,7 +2,7 @@
 
 Clone a repository into a new directory.
 
-A Mega2 code URL (`https`, `http`, or `ssh`, path under `/project/`, ending in `.git`) is a code view. `libra clone`, including `--bare` and `--mirror`, does not fetch `refs/libra/traces`. A Mega2 mirror records `+refs/heads/*:refs/heads/*`. Any other mirror, including ordinary Git, still records `+refs/*:refs/*`. A `/.traces/` locator is refused before discovery; use `libra mega2 traces fetch` for that stream.
+A Mega2 code view is recognized for `https`, `http`, or `ssh` URLs containing `/project/` and `.git`, unless the URL is a `/.traces/` locator. Mega2 code-view clones filter out `refs/libra/traces`; a Mega2 mirror also uses the heads-only refspec `+refs/heads/*:refs/heads/*`. A generic mirror clone uses `+refs/*:refs/*` and may fetch an advertised `refs/libra/traces` ref. A `/.traces/` locator is refused before discovery; use `libra mega2 traces fetch` for that stream.
 
 ## Synopsis
 
@@ -12,15 +12,25 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 ## Description
 
-`libra clone` creates a local copy of a remote repository by fetching objects, configuring
-`origin`, and checking out the working tree. It initializes a vault-backed repository and
-transparently reuses `run_init()` for the local metadata setup.
+`libra clone` creates a local copy of a remote repository by fetching selected
+objects and refs, configuring a remote named `origin` by default, and checking
+out the working tree. Use `-o`/`--origin` to choose another remote name. It
+initializes a vault-backed repository and transparently reuses `run_init()` for
+the local metadata setup.
 
-Cloning fetches all objects and refs from the remote, creates a `.libra` directory with a
-SQLite-backed metadata store, sets up the `origin` remote, and checks out the default branch
-(or the branch specified with `-b`). Vault signing is always bootstrapped during clone,
-matching `libra init` defaults. For non-bare clones, any checked-out `.gitignore` files are
-copied to matching `.libraignore` files so Libra ignore rules work immediately.
+By default, cloning fetches all advertised branch and merge-request refs, plus
+all tags unless `--no-tags` is set. Selecting a branch with `-b` chooses what
+to check out but does not narrow the fetched refs. Fetch becomes single-branch
+only with `--single-branch` or the implicit single-branch mode enabled by
+`--depth`, `--shallow-since`, or `--shallow-exclude`; `--no-single-branch`
+cancels single-branch mode (the last conflicting flag wins). `--mirror` uses
+the refspec described above.
+Clone creates a `.libra` directory with a SQLite-backed metadata store, sets
+up the selected remote, and checks out the default branch (or the branch
+specified with `-b`). Vault signing is always bootstrapped during clone,
+matching `libra init` defaults. For non-bare clones, any checked-out
+`.gitignore` files are copied to matching `.libraignore` files so Libra ignore
+rules work immediately.
 For a checked-out worktree, index stat data is recorded only after each
 materialized path still matches its source blob and its metadata remains stable
 across verification; changed or racy files are left for `libra status` to
@@ -114,8 +124,11 @@ libra clone -b develop git@github.com:user/repo.git
 
 Fetch only the history leading to the tip of a single branch (HEAD, or the branch given
 by `-b`). Reduces transfer size for large repositories when only one branch is needed.
-`--depth`, `--shallow-since`, and `--shallow-exclude` imply this flag unless
-`--no-single-branch` is given (matching `git clone`). A single-branch clone writes
+This mode is enabled explicitly by `--single-branch`, or implicitly by
+`--depth`, `--shallow-since`, and `--shallow-exclude` unless
+`--no-single-branch` is given (matching `git clone`). A mirror does not enable
+single-branch mode; its ref coverage follows the mirror refspec below. A
+single-branch clone writes
 `remote.<name>.fetch=+refs/heads/<branch>:refs/remotes/<name>/<branch>`. Only Git remotes
 support this transport optimization.
 
@@ -148,11 +161,12 @@ libra clone --bare git@github.com:user/repo.git
 ### `--mirror`
 
 Set up a mirror of the source repository (like `git clone --mirror`). Implies
-`--bare`, maps advertised refs verbatim (`refs/heads/*`, `refs/tags/*`,
-`refs/notes/*`, `refs/mr/*`, and other legal `refs/*` names), keeps no
-`refs/remotes/*` tracking refs, and records `remote.<name>.mirror=true` plus
-`remote.<name>.fetch=+refs/*:refs/*`. Useful for serving or backing up a
-repository.
+`--bare` and keeps no `refs/remotes/*` tracking refs. For ordinary remotes it
+maps advertised refs verbatim and records
+`remote.<name>.fetch=+refs/*:refs/*`. For a Mega2 code-view remote it records
+`remote.<name>.fetch=+refs/heads/*:refs/heads/*` and excludes
+`refs/libra/traces`. Both modes record `remote.<name>.mirror=true`. Useful for
+serving or backing up a repository.
 
 ```bash
 libra clone --mirror git@github.com:user/repo.git repo-mirror.git
@@ -554,8 +568,10 @@ conditions.
 ### `--single-branch` flag
 
 When combined with `--branch`, `--single-branch` reduces the data transferred during clone
-by fetching only the specified branch's history. `--depth` / `--shallow-since` /
-`--shallow-exclude` imply the same narrowing unless `--no-single-branch` is given.
+by fetching only the specified branch's history; `--branch` alone still fetches
+all default refs. `--depth` / `--shallow-since` / `--shallow-exclude` imply the
+same narrowing unless `--no-single-branch` is given. Mirrors follow their
+configured mirror refspec instead.
 This is particularly useful for large
 repositories with many long-lived branches where only one branch is needed for the current
 workflow (e.g., CI building a specific release branch). Git supports this as well; jj does
@@ -574,7 +590,7 @@ not, because its operation-log model fetches all refs by design.
 | Shallow clone (depth) | `--depth <n>` | N/A | supported for Git remotes; local Libra sources fail closed (`LBR-REPO-002`) |
 | Shallow since date | `--shallow-since=<date>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |
 | Shallow exclude | `--shallow-exclude=<rev>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |
-| Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`; maps advertised `refs/*` verbatim including notes/mr, no tracking refs, sets `remote.<name>.mirror=true` and `remote.<name>.fetch=+refs/*:refs/*`) |
+| Mirror clone | `--mirror` | N/A | `--mirror` (implies `--bare`, no tracking refs; ordinary remotes use `+refs/*:refs/*`, while Mega2 code-view remotes use `+refs/heads/*:refs/heads/*` and exclude `refs/libra/traces`) |
 | Reference repository | `--reference <repo>` / `--reference-if-able <repo>` | N/A | accepted no-op (no fetch-side alternate negotiation); `--reference` warns, `--reference-if-able` silent |
 | Shared object store | `--shared` / `-s` | N/A | guarded alternate for local Libra source; v1 still copies objects; explicit use on other sources warns |
 | Dissociate from reference | `--dissociate` | N/A | disables shared alternate registration; fetched objects are already copied |

@@ -11,6 +11,7 @@ libra auth login --host <host[:port]> [--username <u>] [--with-token] [--expires
 libra auth status [--host <host>]
 libra auth logout [--host <host> | --all]
 libra auth clear
+libra auth migrate --to <file|keyring>
 ```
 
 ## Description
@@ -37,7 +38,7 @@ written into argv or shell history:
 libra auth login --host github.com --username x-access-token --expires-in 90d
 ```
 
-Human `auth status` output runs the username through URL redaction and then replaces a value that starts with `sk-`, `ghp_`, or `github_pat_` with `[REDACTED]`. A host with no userinfo is unchanged. `--json` keeps the stored username.
+Human `auth status` output applies URL credential redaction to the stored username, then replaces a value that starts with `sk-`, `ghp_`, or `github_pat_` with `[REDACTED]`. A username with no URL userinfo is unchanged unless it starts with one of those prefixes. `--json` keeps the stored username.
 
 Paste the PAT at the hidden token prompt. For scripts, feed the token on
 stdin from an environment secret, password manager, or CI secret store:
