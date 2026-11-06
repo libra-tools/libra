@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra format-patch` 将提交导出为 mbox 格式的邮件补丁文件。该命令解析 `A..B` 修订范围（空左右侧均默认 `HEAD`，单修订号按 `<spec>..HEAD` 处理），对范围内的每个非合并提交生成一个补丁文件（文件名后缀由 `--suffix` 决定，默认 `.patch`；`--numbered-files` 下改用纯序号并忽略后缀）。每个文件按 RFC 2822 标准生成 mbox 信封（`From ` 行）、邮件头（`From:`、`Date:`、`Subject:`、`Message-ID` 等）和邮件体（提交正文 + `---` 分隔 + diffstat + unified diff）。输出通过 `-o` 写入目录或通过 `--stdout` 输出到标准输出。
+`libra format-patch` 将提交导出为 mbox 格式的邮件补丁文件。该命令解析 `A..B` 修订范围（空左右侧均默认 `HEAD`，单修订号按 `<spec>..HEAD` 处理），对范围内的每个非合并提交生成一个补丁文件（文件名后缀由 `--suffix` 决定，默认 `.patch`；`--numbered-files` 下改用纯序号并忽略后缀）。除 `--numbered-files` 外，文件名始终带补零序号前缀，不受 `-n`/`-N` 影响。每个文件按 RFC 2822 标准生成 mbox 信封（`From ` 行）、邮件头（`From:`、`Date:`、`Subject:`、`Message-ID` 等）和邮件体（提交正文 + `---` 分隔 + diffstat + unified diff）。输出通过 `-o` 写入目录或通过 `--stdout` 输出到标准输出。
 
 ## 对比 Git 与兼容性
 
@@ -15,7 +15,7 @@
 - Config：`format.subjectPrefix`、`format.signOff`、`format.outputDirectory`、`format.suffix` 使用严格 local→global→system cascade，显式 CLI 值短路无关坏默认；`--no-signoff` 覆盖 config，`--stdout` 不读取 output-directory 默认。Signoff identity 同样严格读取 cascaded `user.name`/`user.email`，不吞 config 错误。
 - Mail/thread：外部 `--in-reply-to` 与本系列生成的 Message-ID 分离；cover letter 先回复外部 parent，各 patch 再回复 cover，避免重复 Message-ID 与双尖括号。MIME attachment boundary/closing delimiter 已由真实 `git am` 消费测试固定。
 - 输出：整套邮件先完整渲染，再创建任何文件；单文件通过 temp+rename atomic write，stdout 复用统一 BrokenPipe policy。
-- 互操作：`compat_format_patch_mail_roundtrip` 的 7 个 L1 场景覆盖 Libra format-patch→Git am、Git format-patch→Libra am、config/CLI precedence、cover/thread、MIME、root/algorithm/full-index/prefix、upstream patch-id suppression。
+- 互操作：`compat_format_patch_mail_roundtrip` 的 8 个 L1 场景覆盖 Libra format-patch→Git am（含 `-N` 文件名 glob）、Git format-patch→Libra am、config/CLI precedence、cover/thread、MIME、root/algorithm/full-index/prefix、upstream patch-id suppression。
 
 ## 设计方案
 
@@ -59,7 +59,8 @@ flowchart TD
 - 公开状态：已公开；模块状态：`src/command/mod.rs` 导出 `format_patch`，`src/cli.rs::Commands::FormatPatch` 负责 CLI 接入。
 - 用户文档：`docs/commands/format-patch.md`。
 - Synopsis：`libra format-patch [OPTIONS] [revision-range]`。
-- 公开参数包括：`[revision-range]`、`-1`、`--root`、`-o, --output-directory <DIR>`、`--stdout`、`-n, --numbered`、`--start-number <N>`、`--subject-prefix <PREFIX>`、`--cover-letter`、`--thread` / `--no-thread`、`--in-reply-to <MESSAGE_ID>`、`--to <ADDRESS>`、`--cc <ADDRESS>`、`--no-to`、`--no-cc`、`--from [<IDENT>]`、`-v, --reroll-count <N>`、`-s, --signoff`、`--no-signoff`、`--full-index`、`--minimal`、`--histogram`、`--ignore-if-in-upstream`、`--src-prefix`、`--dst-prefix`、`--no-stat`、`--keep-subject`、`--suffix <SFX>`、`--zero-commit`、`--signature <SIGNATURE>`、`--no-signature`、`--signature-file <FILE>`、`--encode-email-headers` / `--no-encode-email-headers`、`--numbered-files`、`--notes [<REF>]`、`--attach`、`--inline`。`--signature-file` 在 `execute_safe` 早期读文件并填入 `signature` 槽（与 `--signature` 互斥，trim 尾换行）；`--encode-email-headers` 经 `encode_email_header` 对含非 ASCII 的 `From` 名称与 `Subject` 做整值 RFC 2047 Q 编码（`=?UTF-8?q?...?=`），纯 ASCII 或未开启时原样输出。
+- 文件名语义：`-n`/`-N` 不改变文件名；`-N` 抑制 commit patch Subject 的 `[PATCH n/m]` 计数，cover letter 的 `[PATCH 0/N]` 计数保持不变。普通文件名始终带补零序号前缀；`--numbered-files` 仍使用裸序号。依赖旧版 `-N` 无前缀文件名的脚本需自行重命名。
+- 公开参数包括：`[revision-range]`、`-1`、`--root`、`-o, --output-directory <DIR>`、`--stdout`、`-n, --numbered`、`-N, --no-numbered`、`--start-number <N>`、`--subject-prefix <PREFIX>`、`--cover-letter`、`--thread` / `--no-thread`、`--in-reply-to <MESSAGE_ID>`、`--to <ADDRESS>`、`--cc <ADDRESS>`、`--no-to`、`--no-cc`、`--from [<IDENT>]`、`-v, --reroll-count <N>`、`-s, --signoff`、`--no-signoff`、`--full-index`、`--minimal`、`--histogram`、`--ignore-if-in-upstream`、`--src-prefix`、`--dst-prefix`、`--no-stat`、`--keep-subject`、`--suffix <SFX>`、`--zero-commit`、`--signature <SIGNATURE>`、`--no-signature`、`--signature-file <FILE>`、`--encode-email-headers` / `--no-encode-email-headers`、`--numbered-files`、`--notes [<REF>]`、`--attach`、`--inline`。`--signature-file` 在 `execute_safe` 早期读文件并填入 `signature` 槽（与 `--signature` 互斥，trim 尾换行）；`--encode-email-headers` 经 `encode_email_header` 对含非 ASCII 的 `From` 名称与 `Subject` 做整值 RFC 2047 Q 编码（`=?UTF-8?q?...?=`），纯 ASCII 或未开启时原样输出。
 
 ## 还未实现的功能
 

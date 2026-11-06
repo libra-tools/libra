@@ -24,6 +24,19 @@ fn repo_with_commits(num: usize) -> tempfile::TempDir {
     repo
 }
 
+fn repo_with_patch_subjects(subjects: &[&str]) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    for (index, subject) in subjects.iter().enumerate() {
+        let file = format!("patch-{index}.txt");
+        fs::write(repo.path().join(&file), format!("content {index}\n")).unwrap();
+        let add = run_libra_command(&["add", &file], repo.path());
+        assert_cli_success(&add, &format!("add {file}"));
+        let commit = run_libra_command(&["commit", "-m", subject, "--no-verify"], repo.path());
+        assert_cli_success(&commit, &format!("commit {subject}"));
+    }
+    repo
+}
+
 // ---------------------------------------------------------------------------
 // Basic functional tests
 // ---------------------------------------------------------------------------
@@ -1768,33 +1781,168 @@ fn rfc_marker_joins_the_subject_prefix() {
 }
 
 #[test]
-fn no_numbered_drops_the_sequence_prefix() {
-    let repo = repo_with_commits(2);
+fn no_numbered_keeps_sequence_filenames() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
     let out_dir = tempdir().unwrap();
     let output = run_libra_command(
         &[
             "format-patch",
-            "--no-numbered",
+            "-N",
             "-o",
             out_dir.path().to_str().unwrap(),
-            "HEAD~2..HEAD",
+            "HEAD~3",
         ],
         repo.path(),
     );
-    assert_cli_success(&output, "--no-numbered");
+    assert_cli_success(&output, "-N");
 
-    let names: Vec<String> = fs::read_dir(out_dir.path())
+    let mut names: Vec<String> = fs::read_dir(out_dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
+    names.sort();
+    assert_eq!(names, ["0001-3.patch", "0002-4.patch", "0003-rename.patch"]);
+
+    let stdout = run_libra_command(&["format-patch", "-N", "--stdout", "HEAD~3"], repo.path());
+    assert_cli_success(&stdout, "-N --stdout");
+    let stdout_text = String::from_utf8_lossy(&stdout.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH] 3", "[PATCH] 4", "[PATCH] rename"]);
+
+    let help = run_libra_command(&["format-patch", "--help"], repo.path());
+    assert_cli_success(&help, "format-patch --help");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    let numbered_help = help_text
+        .lines()
+        .find(|line| line.trim_start().starts_with("-n, --numbered"))
+        .expect("numbered help option");
     assert!(
-        names.iter().all(|n| !n.starts_with("0001")),
-        "--no-numbered drops the prefix: {names:?}"
+        numbered_help.contains("Add the [PATCH n/m] counter to commit patch Subject lines"),
+        "help should describe subject numbering: {numbered_help}"
     );
     assert!(
-        names.iter().any(|n| n == "commit-2.patch"),
-        "plain subject-derived name expected: {names:?}"
+        !numbered_help.contains("filename"),
+        "help should not describe filenames: {numbered_help}"
+    );
+    let no_numbered_help = help_text
+        .lines()
+        .find(|line| line.trim_start().starts_with("-N, --no-numbered"))
+        .expect("no-numbered help option");
+    assert!(
+        no_numbered_help
+            .contains("Do not add the [PATCH n/m] counter to commit patch Subject lines"),
+        "help should describe subject numbering: {no_numbered_help}"
+    );
+    assert!(
+        !no_numbered_help.contains("filename"),
+        "help should not describe filenames: {no_numbered_help}"
+    );
+}
+
+#[test]
+fn no_numbered_preserves_bare_numbered_files() {
+    let repo = repo_with_patch_subjects(&["3", "4"]);
+    let out_dir = tempdir().unwrap();
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "-N",
+            "--numbered-files",
+            "-o",
+            out_dir.path().to_str().unwrap(),
+            "HEAD~2",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-N --numbered-files");
+
+    let mut names: Vec<String> = fs::read_dir(out_dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["1", "2"]);
+}
+
+#[test]
+fn no_numbered_filename_limit_keeps_prefix() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let out_dir = tempdir().unwrap();
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "-N",
+            "--filename-max-length=12",
+            "-1",
+            "-o",
+            out_dir.path().to_str().unwrap(),
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-N --filename-max-length=12");
+    let names: Vec<String> = fs::read_dir(out_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["0001-.patch"]);
+}
+
+#[test]
+fn no_numbered_attach_names_match_files() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &["format-patch", "-N", "--attach", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-N --attach -1 --stdout");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains("Content-Type: text/x-patch; name=\"0001-rename.patch\""),
+        "attachment content type should retain the sequence prefix: {body}"
+    );
+    assert!(
+        body.contains("Content-Disposition: attachment; filename=\"0001-rename.patch\""),
+        "attachment disposition should retain the sequence prefix: {body}"
+    );
+}
+
+#[test]
+fn no_numbered_json_paths_match_files() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let out_dir = tempdir().unwrap();
+    let output = run_libra_command(
+        &[
+            "--json",
+            "format-patch",
+            "-N",
+            "-o",
+            out_dir.path().to_str().unwrap(),
+            "HEAD~2",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-N --json");
+
+    let value = parse_json_stdout(&output);
+    let patches = value["data"]["patches"].as_array().expect("patches array");
+    let mut reported_paths: Vec<&str> = patches
+        .iter()
+        .map(|patch| patch["path"].as_str().expect("patch path"))
+        .collect();
+    reported_paths.sort_unstable();
+    let mut written_paths: Vec<String> = fs::read_dir(out_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path().to_string_lossy().into_owned())
+        .collect();
+    written_paths.sort();
+    assert_eq!(
+        reported_paths,
+        written_paths.iter().map(String::as_str).collect::<Vec<_>>()
     );
 }
 

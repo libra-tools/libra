@@ -10,7 +10,7 @@ libra format-patch [OPTIONS] [revision-range]
 
 ## 说明
 
-`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号），并把每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
+`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
 
 Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以退出码 0 成功结束，不生成 patch。普通模式不输出内容；使用 `--json` 时，payload 中包含 `"patches": []`。仓库没有任何 commit 或 revision 无法解析时仍会报错。若所有 commit 都已在 upstream 中，`--ignore-if-in-upstream` 也会成功返回空 series。
 
@@ -23,7 +23,8 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--root` | | 包含 root commit 和所有可达的非 merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | 将 patch 文件写入 `DIR` | 当前目录 |
 | `--stdout` | | 将所有 patches 打印到 stdout | false |
-| `--no-numbered` | `-N` | 去掉文件名的 `0001-` 序号前缀以及主题中的 `n/m` 计数 | 关闭 |
+| `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | false |
+| `--no-numbered` | `-N` | 不在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | 关闭 |
 | `--rfc[=<text>]` | | 在主题前缀中加入 `RFC`（`[RFC PATCH]`）；给出值时用该文本替代（`--rfc=WIP` → `[WIP PATCH]`）。值必须用 `=` 紧跟，避免吞掉版本参数 | 关闭 |
 | `--no-rfc` | | 取消此前的 `--rfc`（后写者生效） | 关闭 |
 | `--filename-max-length <N>` | | 将输出文件名截断到最多 `N` 字节（包含 `0001-` 前缀与后缀）；必要时可只保留序号，截断点与 Git 一致 | 不限制 |
@@ -31,7 +32,6 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--relative[=<path>]`（不支持） | | 仅为明确缺口而接受：Libra 没有针对导出补丁的相对路径过滤，命令以 128 退出并返回 `LBR-UNSUPPORTED-001` | — |
 | `--all`（不支持） | | 仅为明确缺口而接受：Libra 的版本语法没有 all-refs 选择器，请显式写分支范围（如 `main..topic`） | — |
 | `--no-base` | | 不输出 `base-commit:` 尾注，覆盖 `--base`（Libra 没有 `format.useAutoBase` 配置可重置） | 关闭 |
-| `--numbered` | `-n` | 以开头序号命名文件（`0001-subject.patch`） | false |
 | `--start-number <N>` | | 从 `N` 开始编号 | 1 |
 | `--subject-prefix <PREFIX>` | | 在 Subject: 行使用 `PREFIX` 而不是 `PATCH` | `PATCH` |
 | `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false |
@@ -128,6 +128,11 @@ unified diff
 `-- ` footer 默认是 libra version；`--signature <text>` 用自定义文本替换它，`--signature-file <file>` 从文件读取 footer 文本，`--no-signature` 完全省略 footer。`--encode-email-headers` 会对包含非 ASCII 字符的 `From`/`Subject` header 值做 RFC 2047 Q-encode。Libra 默认关闭它（没有 `format.encodeEmailHeaders` config knob）；Git 的默认值来自该 config，而该 config 自身默认也是关闭，除非显式设置。
 
 带 `--json` 或 `--machine` 时，`data.patches` 列出每个生成的输出。设置 `--cover-letter` 时，列表会在 commit patch records 前包含 record number `0` 的 cover letter。其文件名为带配置 suffix 的 `0000-cover-letter`（默认 `.patch`），或在 `--numbered-files` 下为 `0`。
+
+`-N` 只取消 commit patch 的 `[PATCH n/m]` Subject 计数，文件名仍保留
+`NNNN-` 序号前缀；请求 cover letter 时，其 `[PATCH 0/N]` 计数仍保留。
+`-n` 也不会改变文件名。`--numbered-files` 是例外，会使用纯数字序号。
+较早的 Libra 版本会在 `-N` 下省略前缀；依赖旧文件名的脚本需要自行重命名。
 
 完整 series 会在创建任何输出文件前先全部渲染；每个 patch 文件再通过临时文件 + atomic rename 持久化。管道 stdout 遵循 Libra 的 quiet BrokenPipe 行为。
 

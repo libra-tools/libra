@@ -129,8 +129,7 @@ pub struct FormatPatchArgs {
     #[arg(long = "stdout")]
     pub stdout: bool,
 
-    /// Name output files in [PATCH n/m] order with a leading sequence number
-    /// (e.g. "0001-subject.patch").
+    /// Add the [PATCH n/m] counter to commit patch Subject lines.
     #[arg(short = 'n', long = "numbered")]
     pub numbered: bool,
 
@@ -148,8 +147,7 @@ pub struct FormatPatchArgs {
     #[arg(long = "no-rfc", overrides_with = "rfc")]
     pub no_rfc: bool,
 
-    /// Do not number the patch filenames (Git's `--no-numbered`/`-N`). Libra
-    /// numbers by default, so this opts out.
+    /// Do not add the [PATCH n/m] counter to commit patch Subject lines.
     #[arg(short = 'N', long = "no-numbered", overrides_with = "numbered")]
     pub no_numbered: bool,
 
@@ -927,18 +925,15 @@ async fn format_patch_body(
     if let Some(disposition) = attach_disposition {
         // MIME multipart assembly (byte-compatible with `git format-patch --attach`).
         let slug = patch_slug(commit, args);
-        let filename = patch_filename(
-            !args.no_numbered,
-            &FilenameSpec {
-                patch_num,
-                total,
-                start_num,
-                slug: &slug,
-                suffix: suffix(args),
-                numbered_files: args.numbered_files,
-                max_length: args.filename_max_length,
-            },
-        );
+        let filename = patch_filename(&FilenameSpec {
+            patch_num,
+            total,
+            start_num,
+            slug: &slug,
+            suffix: suffix(args),
+            numbered_files: args.numbered_files,
+            max_length: args.filename_max_length,
+        });
         out.push_str("This is a multi-part message in MIME format.\n");
         out.push_str(&format!("--{boundary}\n"));
         out.push_str("Content-Type: text/plain; charset=UTF-8; format=fixed\n");
@@ -1668,7 +1663,7 @@ struct FilenameSpec<'a> {
     max_length: Option<usize>,
 }
 
-fn patch_filename(numbered: bool, spec: &FilenameSpec<'_>) -> String {
+fn patch_filename(spec: &FilenameSpec<'_>) -> String {
     let FilenameSpec {
         patch_num,
         total,
@@ -1687,17 +1682,9 @@ fn patch_filename(numbered: bool, spec: &FilenameSpec<'_>) -> String {
         // Cover letter (only the cover-letter code path passes an empty slug)
         format!("0000-cover-letter{suffix}")
     } else {
-        let (prefix, number) = if numbered {
-            let width = number_width(total + start_num - 1);
-            (
-                format!("{:0width$}-", patch_num),
-                format!("{:0width$}", patch_num),
-            )
-        } else {
-            // `--no-numbered`/-N: plain `<slug>`, no sequence prefix.
-            (String::new(), String::new())
-        };
-        let stem = format!("{prefix}{slug}");
+        let width = number_width(total + start_num - 1);
+        let number = format!("{patch_num:0width$}");
+        let stem = format!("{number}-{slug}");
         // `--filename-max-length` caps the whole file name, so the stem gets
         // `limit - suffix.len() - 1` bytes (Git reserves the extra byte) and
         // may collapse to just the sequence number.
@@ -1787,21 +1774,15 @@ fn write_patch_file(
             .map_err(|error| stdout_write_error("finish format-patch output", error))?;
         Ok(PathBuf::from("<stdout>"))
     } else {
-        // `--no-numbered`/-N drops the `0001-` sequence prefix from filenames
-        // (Git's default once numbering is cancelled).
-        let numbered = !args.no_numbered;
-        let filename = patch_filename(
-            numbered,
-            &FilenameSpec {
-                patch_num,
-                total,
-                start_num,
-                slug,
-                suffix: suffix(args),
-                numbered_files: args.numbered_files,
-                max_length: args.filename_max_length,
-            },
-        );
+        let filename = patch_filename(&FilenameSpec {
+            patch_num,
+            total,
+            start_num,
+            slug,
+            suffix: suffix(args),
+            numbered_files: args.numbered_files,
+            max_length: args.filename_max_length,
+        });
         let path = out_dir.join(&filename);
         atomic_write::write_atomic(&path, body.as_bytes(), atomic_write::sync_data_enabled())
             .map_err(|error| FormatPatchError::OutputWrite {

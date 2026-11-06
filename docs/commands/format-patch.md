@@ -13,11 +13,11 @@ libra format-patch [OPTIONS] [revision-range]
 `libra format-patch` walks a revision range (`A..B` or a single commit treated
 as `<commit>..HEAD`), while `-1 [commit]` selects exactly one commit and
 `--root [commit]` includes the root and every reachable non-merge ancestor. It
-produces one patch file per non-merge commit (named with
-the `--suffix`, default `.patch`, unless `--numbered-files` is set, which uses
-bare sequence numbers), and
-formats each as an mbox message with RFC 2822 headers, a plain-text diffstat,
-and a unified diff. The output is compatible with `git am`.
+produces one patch file per non-merge commit (named with the `--suffix`,
+default `.patch`, unless `--numbered-files` is set, which uses bare sequence
+numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
+or `-N`. Each patch is formatted as an mbox message with RFC 2822 headers, a
+plain-text diffstat, and a unified diff. The output is compatible with `git am`.
 
 Merge commits are skipped by default. When the revision range resolves to zero
 commits, the command exits successfully without generating patches. Plain output
@@ -37,8 +37,8 @@ body, and series metadata.
 | `--root` | | Include the root commit and all reachable non-merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | Write patch files into `DIR` | current directory |
 | `--stdout` | | Print all patches to stdout | false |
-| `--numbered` | `-n` | Name files with a leading sequence number (`0001-subject.patch`) | false |
-| `--no-numbered` | `-N` | Drop the `0001-` sequence prefix from filenames and the `n/m` subject counter | off |
+| `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | false |
+| `--no-numbered` | `-N` | Do not add the `[PATCH n/m]` counter to commit patch Subject lines | off |
 | `--rfc[=<text>]` | | Prefix the subject with `RFC` (`[RFC PATCH]`); with a value, that text is used instead (`--rfc=WIP` → `[WIP PATCH]`). The value must be attached with `=` so a revision argument is never swallowed | off |
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
 | `--filename-max-length <N>` | | Truncate output filenames to at most `N` bytes, counting the `0001-` prefix and the suffix; the stem may collapse to just the sequence number, matching Git's cut points | unlimited |
@@ -156,6 +156,13 @@ When `--cover-letter` is set, the list includes the cover letter as record
 number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`
 under `--numbered-files`.
+
+`-N` keeps the `NNNN-` sequence prefix in filenames and suppresses the
+`[PATCH n/m]` counter on commit patch Subject lines; a requested cover letter
+retains its `[PATCH 0/N]` counter. `-n` does not change filenames either.
+`--numbered-files` is the exception and uses bare sequence numbers. Earlier
+Libra versions omitted the prefix under `-N`, so scripts that relied on those
+filenames should rename the generated files themselves.
 
 The cover letter's commit list is Git's shortlog by default: authors in
 first-appearance order, each as `Name (N):` followed by their subjects

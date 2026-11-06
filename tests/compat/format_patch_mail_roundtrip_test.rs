@@ -167,6 +167,46 @@ fn libra_last_one_stdout_applies_with_git_am() {
 }
 
 #[test]
+fn no_numbered_series_applies_with_git_am_glob() {
+    let fixture = Fixture::new();
+    let source = fixture.init_libra("libra-no-numbered-source");
+    fixture.libra_commit(&source, "base\n", "base");
+    fixture.libra_commit(&source, "base\nfirst\n", "first patch");
+    fixture.libra_commit(&source, "base\nfirst\nsecond\n", "second patch");
+
+    let target = fixture.init_git("git-no-numbered-target");
+    fixture.git_commit(&target, "base\n", "base");
+    fixture.libra_success(
+        &source,
+        &[
+            "format-patch",
+            "-N",
+            "-o",
+            target.to_str().expect("UTF-8 target path"),
+            "HEAD~2",
+        ],
+    );
+
+    let output = Command::new("sh")
+        .args(["-c", "git am 000[12]-*.patch"])
+        .current_dir(&target)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture.home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("spawn shell for Git am glob");
+    assert_success("git", &["am", "000[12]-*.patch"], &output);
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).expect("read applied file"),
+        "base\nfirst\nsecond\n"
+    );
+}
+
+#[test]
 fn git_format_patch_applies_with_libra_am() {
     let fixture = Fixture::new();
     let source = fixture.init_git("git-source");
