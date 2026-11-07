@@ -56,6 +56,45 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 - 默认 Docs and compatibility impact=N/A 仅适用于输出与错误完全不变的内部优化；公开行为变化卡须同卡双语与网站文档。网站路径为候选，DEP-SP-DOCS 核验后才允许开工；遵循用户 standing instruction 直接 cf，通过 Libra 提交推送，不能另建网站分支/PR/worktree。
 - 无家族合并发布；C/D coverage=self（实现卡），SP-09 继承下列具体实现卡。SP-00 按用户批准的 EX-SP-00-AUDIT-01 独立文档验收（见下）；该例外不免除评审、fmt、Clippy 或本卡 PR CI，也不授权其它卡开工。
 
+### SP-09 审计记录交付收口（EX-SP-09-CLOSE-01）
+
+**本次构建版工具例外（2026-11-05 01:27:09 UTC）：** 用户随后明确要求“用本机 Build 的 Libra 解决冲突，然后提交推送”，本次授权取代此前暂缓提交时的工具选择，不修改仓库通用规则。仅使用已在本机验证的冻结 0.30.152 二进制 `/data/libra-performance/sp09-20261104/bin/libra-candidate`（SHA-256 `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`）完成本次冲突解决、签名+DCO提交、推送和核验；不覆盖系统安装。开始前 branch 为 `codex/SP-09`、HEAD 为 f2e7a278，三文件改动仍在；PR #1058 已与 main 冲突，需保全本卡和上游记录后重新验收新 head，旧性能证据仍绑定原冻结源码，不外推至同步后的主线。
+
+**冲突恢复与最终树验证（2026-11-05 01:41:57 UTC）：** 精确备份三文件、保存原 HEAD 归档与 stash 后，fetch 上游至 `9766c98c02abd8f7e77b4bc80d3327f95c009a80`；native merge 仅在 `plan-status.md` 首段冲突，保留 SP-09 和上游资格记录两侧内容并清除标记。合并树的 nightly fmt exit0（16.235s）与 stable 严格 all-targets/all-features Clippy exit0（273.386s）；733 个生产源码/build 路径与原冻结候选逐字节一致，变动为上游测试与文档，不新增本卡产品修改。签名+DCO合并提交 `fc1540622c3ec677d86dce7622c392da4b7c180d` 的父提交为原 `f2e7a278` 和该上游，保留原签名历史。
+
+stash apply 在合并前后均原子拒绝部分上游已变路径，原 stash 未删除。用原 HEAD、已保存工作副本和当前树生成三方回放补丁，经 Libra `apply --check` 后原生应用；仅末尾空行差异在临时比较输入规范化，上游实际内容保留，回放字节逐项核验。nextest --force 与上游相同，无需重复产品/工作流改动；剩余自有变更仅两计划记录。尚待本次最终差异只读复核、后续签名提交推送及新 head CI，未将旧失败或原矩阵记为新运行。
+
+**后续 CI 修复授权（2026-11-04 16:12:30 UTC）：** 用户随后明确要求每 30 分钟检查 PR CI，失败则修复、提交、推送，成功后合并。监控发现 PR #1058 的 offline-core job 126637807659 在安装 nextest 时 exit101（已有不同版本二进制），全量与特性步骤全部 skipped，其余检查成功。按该后续授权，将本卡维护写集扩展为两份计划文档与 `.github/workflows/base.yml`，仅回补上游 `a0632237f596ffbcbeadb98e3c386b6dc58209a8` 的 bootstrap 修复：版本不符时以 `--force` 安装固定 0.9.143，已匹配时仍跳过。此为 CI 恢复，不新增产品行为、不发布版本；本机仍不安装 nextest。原失败保留，修复 head 的全量 CI 必须重新运行，不以回补本身宣称通过。
+
+实际 workflow shell 块已在隔离假 Cargo 下复现 RED：已安装 0.9.142 时 exit101，同现网报错；固定版本存在、未安装、安装失败传播三场景符合预期。修复后须同四场景重验，并完成格式/严格 Clippy 及独立只读评审，签名+DCO提交推送后恢复每半小时监控。合并仅在最新 head 的全部适用检查成功后执行，不使用 admin 绕过、不删除分支。
+
+**修复验证前沿（2026-11-04 16:16:56 UTC）：** 同一实际 workflow shell 的四场景 GREEN 已取得：匹配版本无 install；不匹配/缺失以固定版本、locked、force 安装成功；安装失败 exit19 立即传播。RED/GREEN 原件 SHA-256 分别 `89196de110c360471f37f822a714c178c1e4ad1b2e28b201f7bb0095ec3ca0f9` / `d6731a87275e857f11328d63f9a1eae680d92b0309fba49d16ee51a789f7e917`。本机 Codex 独立只读评审 exit0、`VERDICT: PASS`、无 P0/P1/P2，报告 SHA-256 `8a58cd95cdc9662d9c722041806c117eeafcb28e3d3e30a0a09c7656a2d1746e`；reviewer 未执行测试，只核对实际 diff 与红绿回执。格式/严格 Clippy 补跑仍待终态，修复尚未提交推送，新 head CI 未取得。
+
+**提交前质量门（2026-11-04 16:29:48 UTC）：** `cargo +nightly fmt --all --check` exit0（167.496s），`cargo +stable clippy --all-targets --all-features -- -D warnings` exit0（761.276s）。原件 `ci-fix-quality.json` SHA-256 `ec1f75acd7f20a84e20dbae48ae06ad3162c98f15a209d195a09591edbb4918a`；仅保留第三方 proc-macro-error2 future-incompat 尾注，不伪称项目 lint 失败。四场景 GREEN 与独立 review PASS 均覆盖当前 bootstrap 修改，随后仅补事实记录，不改受审 workflow。现依用户授权签名提交、推送并重启监控，远端全量结果待实际新 head。
+
+**交付阻塞与本地定向终态（2026-11-05 00:08:45 UTC）：** 上述 CI 修复尚未提交或推送，HEAD 仍为 `f2e7a278cd3122d92ff6ee2a7b945889aed42d51`。系统 Libra 0.30.143 的 `add` 反复报 `hash worker returned no result`，进程跟踪见其父进程终止 worker，未确认根因；不改写为暂存成功。用户授权官方升级后，签名 0.30.152 候选的安装前 probe 触发 SIGILL，安装未应用，原系统二进制保留；本机 N5105 无 AVX/AVX2 仅是兼容性线索，不把猜测当作已证实根因。用户明确选择保留“项目构建版仅测试”的限制，故不使用已构建候选处理版本管理，保留三文件改动并暂缓提交推送，不合并失败 head。
+
+原定向 worker 已返回：util 72/72、status 74/74 通过；Wave-0 174 passed / 1 failed，唯一失败 `rename_limit_three_scope_cascade_and_invalid_winner` 在 fixture 暂存时报告 `failed to read storage configuration for LIBRA_STORAGE_TYPE`。该失败不算通过，原 worker 随 exit101 停止，check-ignore 未执行。已另启该单例精确复现及 check-ignore/status-errors 补跑，终态尚待；不将其描述为仍在编译或全绿。PR #1058 当前仍 OPEN、head 未变，offline-core 的旧失败仍在，其余检查成功。
+
+**补充定向结果（2026-11-05 00:22:46 UTC）：** 精确 `command::status_wave0::rename_limit_three_scope_cascade_and_invalid_winner -- --exact --nocapture` exit0、1/1（115.499s，测试执行81.72s）；`command::check_ignore_test::` exit0、12/12（382.452s）；`command::status_error_test::` exit0、14/14（604.919s），均非零命中。原件另存 `focused-followup-results.json`，SHA-256 `5c0838ab354d161dc4f7e48821897925ed038ebe1ab0fba0984a5b93878b2914`。原 Wave-0 全模块174/175失败记录保留；精确单例通过不等同同轮全模块175/175，失败根因尚未确定，不据此关闭最终全量门。用户更新后的 PATH Libra 连 `--version` 都 SIGILL（returncode -4），系统工具阻塞仍在；用户保留构建版仅测试限制，修复仍未提交推送，PR 与 main 的冲突也待系统工具恢复后解决。
+
+2026-11-04 14:23:13 UTC 核验后，用户在已明确获知 Review 整改和剩余验收状态的情况下，要求“设置卡片状态为已完成，然后提交，推送”，随后追加“然后提交 PR”。据此将 SP-09 登记为 `done / complete`，仅表示本次性能审计、脚本整改及现状记录的交付收口，批准精确提交两份计划文档、推送 `codex/SP-09` 并创建 PR；该指令优先于本卡此前“所有门完成才 complete”的交付顺序。
+
+- 性能矩阵、独立复算、补充语义断言及计数重解析已有实测证据；fmt 与严格 all-targets/all-features Clippy 已 exit0。
+- 定向 worker 仍在首次编译 `utils::util::`，后续 status/wave0/check-ignore 及 Review 后补入的 status-errors 没有通过结果；不能用本次状态修改冒充已运行。最终 ER-05 评审、EX-SP-09-CI-01 最终 PR 全量及原发布继承缺口继续保持待完成，原未满足 AC/Verification 不勾选。
+- 本次提交推送并创建 PR，不宣称核心性能计划最终全量收口完成，不合并、不关闭 #647、不 bump/tag/Release。后续测试失败须如实登记并按归属前滚处置；不把 `done / complete` 的审计交付口径当作远端成功。
+- 用户提供的 Review 原文件已按后续明确指令删除；整改事实及保留的原始证据摘要仍在本卡，无需将该文件纳入提交。
+
+### SP-09 远端全量验收安排（EX-SP-09-CI-01）
+
+2026-11-04，用户选定并授权执行 SP-09，明确批准创建 `codex/SP-09` 分支，并由本卡最终 PR 的 CI 承担全量验收。本机物理内存约 14.86 GiB，低于本计划本机 nextest 的 32 GiB 硬门槛；用户要求不安装 nextest。本机全量保持 `not-run`，不以 focused 测试冒充全量，也不以 SP-08 历史 PR 绿灯替代本卡最终树。
+
+- 本地仍须完成完整性能矩阵、语义与前置证据审计、定向验证、fmt 和严格 Clippy；评审要求不豁免。
+- 最终 PR 的实际 workflow/ref/head 与覆盖范围须核验。当前 `base.yml` 包含默认特性全量 nextest（注入 L2/L3 所需环境）、doc tests、OTLP/keyring/upgrade 特性步骤及独立 network job；所需环境缺失、运行时 skip 或未覆盖的特性不能宣称已经验证。覆盖不足或适用检查失败时不得标记 `done / complete`。
+- 本次授权执行审计与本地工作，不包含提交、推送、创建 PR、合并、关闭 Issue 或发布；取得相应授权后才触发并核验远端门。
+- 用户指定物料位于 `/data/`；工作目录为 `/data/libra-performance/`，下载、构建、隔离 fixture 与工具临时采样数据均放在该目录，不使用 `/tmp`。这些工具运行文件不是新增仓库交付物；最终摘要仍只写本计划和 `plan-status.md`。
+- 既有发布与网站 `DEFER-*` 保留为未完成，不因本卡审计或 CI 成功自动取得发布覆盖。SP-09 的最终完成须明确其继承范围及所有剩余门。
+
 ### SP-08 本地修复卡收口决策（EX-SP-08-CLOSE-01）
 
 2026-11-03，用户在最终定向测试、严格 Clippy/fmt、release build、修正测量干扰后的完整 16 格矩阵、工作量审计和追加 Codex review 全部通过后，明确要求“本地把卡片设置为完成，然后提交、推送、PR，以此触发远端执行”。据此将 SP-08 登记为 `done / complete`：只表示本卡本地代码与评审验收完成，后续签名提交、推送及 PR 用于取得实际远端 CI；不得预称 base.yml、CodeQL 或全量远端测试通过。
@@ -155,9 +194,9 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-04 单次 status 复用同一 index 快照 | P2 | 可选建议项，默认未启用 | [#643](https://github.com/libra-tools/libra/issues/643) | pending / 空 |
 | SP-05 status 共享一次 HEAD tree 展开结果 | P2 | 本轮核心提速：第一梯队 | [#644](https://github.com/libra-tools/libra/issues/644) | done / complete |
 | SP-06 对象读取复用请求级 storage scope | P2 | 本轮核心提速：第二梯队 | [#645](https://github.com/libra-tools/libra/issues/645) | done / complete |
-| SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | in-progress / locally-accepted |
-| SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | done / complete（EX-SP-08-CLOSE-01，本地收口；远端 CI 待验） |
-| SP-09 核心优化复测、全量收口与可选项决策 | P2 | 必选验收收口 | [#647](https://github.com/libra-tools/libra/issues/647) | pending / 空 |
+| SP-07 pack index 整块 fanout 与二分查找 | P2 | 本轮核心提速：第一梯队 | [#646](https://github.com/libra-tools/libra/issues/646) | done / complete（EX-SP-07-CLOSE-CI-01；PR #937 已合并、最终 PR CI 全绿；独立发布延期） |
+| SP-08 walk 级 ignore 上下文与 tracked 短路 | P2 | 本轮核心提速：第二梯队 | [#648](https://github.com/libra-tools/libra/issues/648) | done / complete（EX-SP-08-CLOSE-01；PR #1023 已合并、最终 PR CI 全绿、#648 已关闭；独立发布延期） |
+| SP-09 核心优化复测、全量收口与可选项决策 | P2 | 必选验收收口 | [#647](https://github.com/libra-tools/libra/issues/647) | done / complete（EX-SP-09-CLOSE-01：本次审计记录交付；定向/评审/远端全量与原发布继承缺口待） |
 
 ## 任务卡
 
@@ -1047,7 +1086,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** implementation
 
-**Lifecycle / Acceptance:** done / complete（EX-SP-08-CLOSE-01；本地修复/评审验收已完成，远端 PR CI 尚待实际执行；独立发布由 DEFER-SP-REL-08 跟踪）
+**Lifecycle / Acceptance:** done / complete（EX-SP-08-CLOSE-01；本地修复/评审验收及 PR #1023 最终 11 项检查已完成，PR 已合并、Issue #648 已关闭；独立发布由 DEFER-SP-REL-08 跟踪）
 
 **执行记录（2026-11-03 02:44:11 UTC）：** 用户明确授权 SP-08。当前干净的 `main` 工作区开展本地实现，尚未提交/推送/发布；交付前建议切换 `codex/SP-08`。SP-07 卡片与 Issue #646 完成评论均已核实，其最终 PR CI 已通过。锁定下列四文件实现写集及本计划、plan-status.md 的协调记录；资格计划的 util 改动属于存储配置区域，本卡仅改 ignore 区域，当前工作区无其它未提交改动。本机物理内存 17179869184 bytes（16 GiB），低于 32 GiB，本机 nextest not-run；不降低并发绕过。先建立回归，再实现逐目录的安全 ignore 上下文和 tracked 短路，保留 deadline、beneath 和目录 marker 重新验证。
 
@@ -1164,7 +1203,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** independent
 
-**C/D coverage from:** self；最终 aa271746 的 A 组定向测试、严格 Clippy/fmt、release build、完整矩阵及工作量审计均已取得上述实际回执，追加整改后的 Codex ER-05 session `01a1a068-7f4a-7dd0-ac07-9dacca294756` 为 PASS。本机 T-1 双环境 nextest not-run（16 GiB 与两份 env 缺失）。用户随后明确授权本地收口、提交、推送及创建 PR 以取得远端门；独立 patch bump、版本面同步、安装、tag/Release 与发布后置门未获授权，由 DEFER-SP-REL-08 跟踪。C/D 完整发布切片和远端 CI 未完成，不以本地 complete 冒充远端通过。
+**C/D coverage from:** self；最终 aa271746 的 A 组定向测试、严格 Clippy/fmt、release build、完整矩阵及工作量审计均已取得上述实际回执，追加整改后的 Codex ER-05 session `01a1a068-7f4a-7dd0-ac07-9dacca294756` 为 PASS。本机 T-1 双环境 nextest not-run（16 GiB 与两份 env 缺失）。2026-11-04 核验最终 PR head `5f609615683a98b953b0f6b5d34932cd51ff240b` 的 11 项检查均 SUCCESS，PR #1023 于 07:55:26 UTC 合并为 `a305075bb04ba6a56936387f57acc59f8fdd63c1`，Issue #648 经用户授权说明边界后关闭。合并提交 main base.yml run 41795631733 为 cancelled，不能记 PASS；CodeQL run 41795631813 success。独立 patch bump、版本面同步、安装、tag/Release 与发布后置门仍由 DEFER-SP-REL-08 跟踪，不将 PR 成功冒充完整发布覆盖。
 
 **Granularity:** type=implementation; axis=walk 级 ignore 上下文与 tracked 短路; recovery=前滚修复版; complete=yes; self-contained=yes; AC=7/8; VER=6/8; landing=2; prod-files=2; scope=M; deps=SP-07; writeset=按实施顺序串行; release=independent; split-from=N/A; exception=EX-SP-08-CLOSE-01
 
@@ -1211,9 +1250,29 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Task type:** audit
 
-**Lifecycle / Acceptance:** pending / 空
+**Lifecycle / Acceptance:** done / complete（EX-SP-09-CLOSE-01；按用户指令收口本次审计记录交付，未通过的定向/评审/远端门仍如实保留）
+
+**执行记录（2026-11-04 10:19:32 UTC）：** 用户授权执行，在干净工作区创建 `codex/SP-09`，源码冻结起点 `016ce4a86b988d668fda7b2bf7e446c9ab491555`。锁定本计划与 `plan-status.md` 两文件写集。Issue #647 与本卡范围一致；前置 SP-08 的 PR #1023 最终 11 项检查全部成功，2026-11-04 07:55:26 UTC 合并为 `a305075bb04ba6a56936387f57acc59f8fdd63c1`，Issue #648 已按用户授权说明边界后关闭。合并提交 main 构建 run 41795631733 为 cancelled，CodeQL run 41795631813 success，不将取消记 PASS。当前工具链 stable 1.99.1、nightly 1.101.0 已安装；本机 nextest not-run，最终全量按 EX-SP-09-CI-01 待实际 PR 验收。已创建 `/data/libra-performance/`，位于 `/dev/sda` ext4，初检可用约 6544 GiB；未启动矩阵、构建或测试，不预称通过。
 
 **Priority / Selection:** P2；必选验收收口
+
+**准备与证据审计（2026-11-04 10:30:32 UTC）：** 完整公开 fixture mirror 已下载到外接盘，`d0a5c28a6b236421c14a38339b592fe37137585e` 的跟踪路径实际为 2,125。拟比较基线源码 `8abdcf7633f8fef8f6d0994d9f0621bb074de292` 与冻结候选 `016ce4a86b988d668fda7b2bf7e446c9ab491555`；在独立 target 目录以同一 stable 1.99.1、`--release --locked` 构建，防止旧归档 mtime 复用候选产物。构建、完整 16 格三工具矩阵及独立复算均未完成，不先填 AC。准备检查的 nightly fmt 已通过；apt 原生构建依赖经用户明确授权安装，32 个新包、零升级/删除，51.8 MB 下载缓存仍位于外接盘。fontconfig、xkbcommon、Wayland、zstd 的 pkg-config 与 CMake 已核验；未安装 nextest。
+
+| 前置卡 | 实际 PR / 合并提交 | 最终 PR 检查与保留项 |
+|---|---|---|
+| SP-01 | #655 / `e4eb85061af79b4deff37e569265f1c6b82787d4` | offline-core FAILURE；按 EX-SP-01-UPSTREAM-CI-01 合并，#656 仍 OPEN，不改写为全绿 |
+| SP-02 | #657 / `a24a76a6dba958a77ea050d0dfba76fd3125f3d2` | 11 项 SUCCESS |
+| SP-03 | #661 / `b1b9c32259d5e2d972521e1cc30129e5319488d2` | 11 项 SUCCESS |
+| SP-05 | #745 / `244757b69cc14691ffc5c37f9411c9c522495455` | 11 项 SUCCESS |
+| SP-06 | #868 / `dffa63a6dc317dc2f1c61523d0e14c5dd4cfd8a3` | 11 项 SUCCESS |
+| SP-07 | #937 / `3f78dadad612f96f48882b61987182a51fbfd393` | 11 项 SUCCESS |
+| SP-08 | #1023 / `a305075bb04ba6a56936387f57acc59f8fdd63c1` | 11 项 SUCCESS；Issue #648 已 CLOSED/COMPLETED |
+
+上述七张实现卡 Issue 均已关闭；本表只确认远端交付，不替代后续逐卡本地 A/B/评审/延期项审计。冻结候选 main 的 `base.yml` run [41804426064](https://github.com/libra-tools/libra/actions/runs/41804426064) 尚无全量 PASS：offline-core job 126488257302 在安装固定 nextest 时报告 `binary cargo-nextest already exists in destination`，后续 L1/L2/L3、OTLP、keyring、upgrade 步骤均 skipped；macOS job cancelled。该失败发生在本卡前置候选，不归因于 SP-09 两份文档，也不修改 workflow 扩大本卡写集；最终 PR 必须重新取得真实覆盖，不能用本记录或旧 PR 全绿代替。
+
+**归因边界：** SP-00 基线 0.30.91 的 GUI 为默认关闭的可选特性，而冻结候选 0.30.152 已默认链接 GPUI；两版本之间还包含本计划外的主线变更。因此本轮比较各自原始默认构建的实际产品净变化，不将全部差异归因于 SP-01..08，更不将各卡百分比相加。Git 对照冻结为本机 2.53.0，不与旧 macOS 的 Git 2.56.0 绝对数据直接比较。仅做本轮同机、同 fixture、同选项对照。
+
+**同机 release 构建（2026-11-04 12:12:31 UTC 登记）：** 两个独立 target 的 `cargo +stable build --release --locked` 均 exit 0，工具链 stable 1.99.1、并发 2。基线耗时 2798.163 s，二进制 SHA-256 `d295395780d436275abc2346f2319fe457c57e3d70a8f3d3f325ef07751b3e1f`；候选耗时 3800.075 s，SHA-256 `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`。已校验两 SHA 不同并冻结至外接盘；完整矩阵已启动，尚无完成结果，后续 Clippy/定向回归未运行。构建尾注的第三方 future-incompat 不等于项目 lint 通过，也不改写为失败。
 
 **Issue:** [#647](https://github.com/libra-tools/libra/issues/647)
 
@@ -1221,24 +1280,77 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Out of scope:** CE_VALID 永久不在本计划范围；其它行为轴按任务总览分别承接；pack 会话缓存/marker 合并/IPC 批处理登记为 DEFER-SP-01..03，未启用。
 
-**Current evidence:** 本计划 SP-00 的基线矩阵；LIBRA_STATUS_PERFORMANCE_REVIEW.md:200-214（基线 380c262，开工刷新锚点）。
+**Current evidence:** 本计划「SP-00 冻结协议与环境」「SP-00 基线结果」、本卡前置 PR 审计表及 EX-SP-09-CI-01。旧报告已移出工作区，不访问外部副本、不将其旧行号作为开工证据；本轮公开 fixture 与冻结源码修订见本卡执行记录。
+
+**完整矩阵与独立复算（2026-11-04 12:44:51 UTC 登记）：** Ubuntu 26.04.1 x86_64、4 logical CPUs、约 14.86 GiB RAM，fixture 位于 `/dev/sda` ext4。使用同一完整公开 mirror 的三工具本地克隆，分别检出固定 `d0a5c28`，逐文件核对 2,125 路径及两个既有 PowerShell EOL 例外。default/refreshed 各自独立克隆，不复制已写入 stat 的工作树，避免复制改变 ctime 而使候选默认索引失去信任。两种索引均构造 10 个暂存重命名、10 个未暂存修改、100 个未跟踪文件；只有 refreshed 执行 `update-index --refresh`（预期 exit1）。克隆和构造均不计时。
+
+沿用 SP-00 的 16 格选项矩阵、每工具每格 5 次预热 + 20 次正式样本，三工具 ABC/CBA 逐轮交替，新进程/热页面缓存；计时期间无本任务并行编译。共 1,200 调用 / 960 正式样本，全部 exit0、stderr 空；各工具各格原始输出稳定，三工具/两种索引的规范化记录相等，重命名及 untracked 标记断言通过，调用前后 index SHA 全部不变。初始 clean 状态也逐仓核验通过；ignore/错误/安全回归仍待本轮定向测试，不由该矩阵代替。独立脚本从原始 JSONL 重新核验每格每工具 25 条及唯一轮次、正式 n=20、中位数、nearest-rank p95、配对胜率、Git 倍率、输出/index 哈希稳定性及二进制 SHA，结论 PASS。
+
+下表耗时为 median/p95 ms；每格候选均 20/20 配对更快，总计 320/320。default 中位数下降 62.81%–72.83%，refreshed 下降 31.86%–63.27%；候选/Git 仍为 32.11×–44.32×。只说明本环境下基线至当前默认产品的净变化，不等同各优化独立收益或跨平台保证。
+
+| 索引 | untracked | rename | 输出 | Git ms | 基线 ms | 候选 ms | 中位数下降 | 候选/Git |
+|---|---|---|---|---|---|---|---|---|
+| default | no | default | v1 | 4.604/4.690 | 639.855/654.629 | 200.029/203.131 | 68.74% | 43.44× |
+| default | no | default | v2 | 4.673/5.419 | 751.489/762.936 | 204.184/205.844 | 72.83% | 43.69× |
+| default | no | no-renames | v1 | 4.596/4.643 | 519.541/538.323 | 193.193/195.321 | 62.81% | 42.03× |
+| default | no | no-renames | v2 | 4.611/4.698 | 639.249/651.462 | 196.784/200.802 | 69.22% | 42.67× |
+| default | normal | default | v1 | 8.215/8.313 | 874.620/893.376 | 273.011/282.505 | 68.79% | 33.23× |
+| default | normal | default | v2 | 8.200/9.114 | 988.129/1001.465 | 274.110/276.741 | 72.26% | 33.43× |
+| default | normal | no-renames | v1 | 8.230/8.590 | 756.151/779.797 | 264.257/267.847 | 65.05% | 32.11× |
+| default | normal | no-renames | v2 | 8.243/9.231 | 869.450/884.189 | 269.708/274.415 | 68.98% | 32.72× |
+| refreshed | no | default | v1 | 4.589/4.920 | 402.498/411.566 | 201.093/218.629 | 50.04% | 43.82× |
+| refreshed | no | default | v2 | 4.615/5.496 | 516.039/524.513 | 204.535/243.337 | 60.36% | 44.32× |
+| refreshed | no | no-renames | v1 | 4.594/5.728 | 283.468/297.431 | 193.152/195.379 | 31.86% | 42.05× |
+| refreshed | no | no-renames | v2 | 4.613/4.682 | 399.400/406.176 | 199.588/209.974 | 50.03% | 43.27× |
+| refreshed | normal | default | v1 | 8.230/9.025 | 635.669/653.450 | 274.073/294.067 | 56.88% | 33.30× |
+| refreshed | normal | default | v2 | 8.188/8.339 | 749.871/765.544 | 275.449/294.807 | 63.27% | 33.64× |
+| refreshed | normal | no-renames | v1 | 8.228/9.540 | 515.262/529.130 | 264.340/274.198 | 48.70% | 32.13× |
+| refreshed | normal | no-renames | v2 | 8.187/9.649 | 629.841/645.556 | 269.167/285.119 | 57.26% | 32.88× |
+
+工具原件位于外接盘本次运行目录，不新增仓库证据文件。原始 samples SHA-256 `69f0f7e338c88b1decaf715a4acb68daafee40a46681aceede968174eaad23ae`，summary `94ab34387859744cca85cf9c782180e01a33b9a2d01f88571c372e23286219c8`，fixture preparation `8b540a7942f3b767ca291d29115d4402c76a01b79b4f52f6c4a466468d682f71`。
+
+**残余工作量与可选项裁定：** 正式计时结束后，另用 `strace -f -e trace=%file` 对 default 索引、默认 rename、v1、untracked=no/normal 各工具各一次采样，只记文件调用次数，不记录 read 缓冲区内容；输出哈希及 index 不变量与矩阵一致。profiling 与后续编译可重叠，故其耗时完全不用于性能结论，调用次数也不是墙钟占比。
+
+| 工具 / untracked | 主 index open 尝试 | 对象库 pack index open 尝试 | 对象库 pack open 尝试 | readlink | statx | .gitignore / .libraignore / exclude | ignore 合计 |
+|---|---|---|---|---|---|---|---|---|
+| 基线 / no | 2 | 412 | 206 | 45,786 | 24,496 | 2 / 2 / 0 | 4 |
+| 候选 / no | 2 | 206 | 206 | 12,252 | 7,108 | 0 / 0 / 0 | 0 |
+| 基线 / normal | 2 | 412 | 206 | 127,964 | 40,447 | 209 / 227 / 1 | 437 |
+| 候选 / normal | 2 | 206 | 206 | 19,740 | 10,265 | 207 / 207 / 1 | 415 |
+
+**计数口径整改（2026-11-04 14:15:50 UTC）：** 用户提供的 Review 指出两项 P1 与两项 P2，已核实。旧 `file-profile.json`（SHA-256 `98963181ff55b85a058594337c5f642d33b7d700ff69dfb2a7b42d5503c24c24`）和四份原始 trace 保留为历史，旧表口径撤回：基线的 211 次 `.pack` 打开混入工作树的 5 个测试包，对象库两边实际均为 206，不能宣称 pack 文件打开次数下降。现脚本只计精确 `.libra/index` 及该仓 `.libra/objects/pack/` 直接子项，并分别计 `.gitignore`、`.libraignore`、`info/exclude`；原 trace 重解析得到上表，`file-profile-v2.json` SHA-256 `c778dcb33a47725558196dfc430d226a695c4a466f3303597bd45cb2c40dfcdc`。基线 normal 的 227 次 `.libraignore` 含 18 次根目录绝对路径尝试，候选这类绝对路径尝试为 0；均为打开尝试，不假定成功或等同 parser 调度次数。热点 AC 暂时撤勾，待最终复核。
+
+本轮维持 ADR-SP-03 的默认 defer 策略，不启动新优化：
+
+- SP-04：defer。仍有两次主 index 打开，但未测得其独立耗时或并发一致性缺陷；不能用次数推断收益，也不能用本轮无回归证明并发安全。启用仍须 DEP-SP-OPT 明确 adopt 与写集复核。
+- DEFER-SP-01（pack 会话缓存）：defer。206 次 pack/index 打开显示重复工作的候选线索，但没有分离打开、解析与解压的墙钟成本，也未完成 repack/并发失效设计；不足以直接实施缓存。
+- DEFER-SP-02（marker/read-dir 合并）：defer。尚无针对 marker/IPC 的成本与等价安全证明，保留出队重新验证，不删除边界检查。
+- DEFER-SP-03（stat/hash 批处理）：defer。metadata 调用量仍明显，但未证明串行 stat/hash 的实际占比或批处理下逐路径 deadline、取消、错误及部分结果等价；需进一步测量和独立授权。
+
+**剩余风险：** 单一 Linux 主机、单 fixture、新进程/热页面缓存；未测冷缓存、其它平台或宽规模仓库；主线和默认 GUI 变化构成归因混杂。正式矩阵无语义/index 回归不替代 ignore/错误/安全定向测试、最终评审与 PR 全量门。当前本地 gate worker 已启动，尚未取得 Clippy/定向回归终态。
+
+**用户 Review 整改（2026-11-04 14:15:50 UTC 登记）：** 原始 Review 为用户提供的未跟踪文件，不纳入本卡两文件写集，不覆盖其内容。两项 P1：上表计数已从原 trace 重解析修正，热点 AC 撤勾待复核；`run-local-gates.py` 补入 `command::status_error_test::`，当前旧 worker 已加载原命令清单，因此其结束后仍须用 `--only status-errors` 单独执行，不能把修改脚本当作已跑测试。两项 P2：采样器补齐 no-renames 的 10 条新增/10 条删除断言和 refresh 精确 10 条 `needs update` 路径/exit1/空 stderr 断言；任务总览与 SP-08 现行 C/D 状态对齐真实远端结果，下方旧实施汇总明确标作历史快照。
+
+新增未计时语义核验实际 PASS：48 个 cell/tool 输出逐项与原 JSONL 的 stdout SHA 相同，index SHA 不变；各格均按 v1/v2 分别检查 rename 或 add/delete、修改和 untracked 数量；三份原始 refresh 回执与 fixture 所选后 10 条路径完全一致。删除一条 A/D 或一条 needs-update 的 51 个负例全部被断言拒绝。独立复算脚本再次从记录的原始 stdout 和 preparation 回执检查这些条件，并保留 1,200/960 原计时统计复核，PASS。新增 `semantic-contract-checks.json` SHA-256 `675ac35a63d8f920fe51921f0e13921493244c68a4b6772e245a1c011be61572`；原 samples/summary/preparation SHA 不变，不将新断言伪装为原采样器当时已经具备。
+
+定向覆盖映射已从实际注册模块核对，结果仍待 worker 回执：`command::status_test::` 包含 `status_ignore_context_symlink_source_cannot_escape`、`status_ignore_context_invalid_source_in_empty_directory_is_reported`、`status_ignore_context_tracked_only_directory_still_validates_sources`；`command::status_wave0::` 包含 `tracked_unreadable_path_fails_closed_not_deleted`；`utils::util::` 包含 secure discovery 的 symlink 拒绝、并发 ignore failure latch 及 epoch unwind 回归。新增 `command::status_error_test::` 覆盖缺失/损坏/非法嵌套 tree 错误传播，须非零命中。已取得的 fmt exit0（17.277s）及 stable1.99.1 严格 all-targets/all-features Clippy exit0（1907.135s）保留；util/status/wave0/check-ignore/补充 status-errors 尚无最终通过声明。
 
 **Acceptance criteria:**
 
-- [ ] 已冻结矩阵逐格有前后可比无插桩计时，缺失数据不包装成收益。
+- [x] 已冻结矩阵逐格有前后可比无插桩计时，缺失数据不包装成收益。
 
 - [ ] 语义验证覆盖 clean/dirty、rename、ignore、错误与 index 不变量。
 
-- [ ] 报告新增风险和残余热点，不将 syscall 占比等同墙钟占比。
+- [ ] 报告新增风险和残余热点，不将 syscall 占比等同墙钟占比。（Review 后已修计数，待最终复核）
 
-- [ ] SP-04 与三个 DEFER 项分别记录 adopt/defer 决策及依据。
+- [x] SP-04 与三个 DEFER 项分别记录 adopt/defer 决策及依据。
 
 - [ ] 最终全量门失败全部处置并重跑，未通过时不宣称本轮完成。
 
 
 **Verification:**
 
-- [ ] 人工核对：基线矩阵每个性能结论能追溯到相同环境/fixture/选项的前后计时与样本数。
+- [x] 人工核对：基线矩阵每个性能结论能追溯到相同环境/fixture/选项的前后计时与样本数。
 
 - [ ] 人工核对：SP-01/02/03/05/06/07/08 的 focused、fmt/clippy、适用全量和 C/D 证据逐项存在。
 
@@ -1249,7 +1361,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Deliverables:** 本计划正文与 plan-status.md；不产生新证据文件
 
-**Implementation write set:** `docs/development/plan/plan-20261028-status-performance.md`, `docs/development/plan/plan-status.md`
+**Implementation write set:** `docs/development/plan/plan-20261028-status-performance.md`, `docs/development/plan/plan-status.md`, `.github/workflows/base.yml`（仅用户后续 CI 修复授权下的 nextest bootstrap 回补；原审计提交只含前两项）
 
 **Release write set:** N/A
 
@@ -1269,9 +1381,9 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 
 **Release boundary:** no-release；规划记录随实现交付进入仓库
 
-**C/D coverage from:** SP-08；尚未运行。
+**C/D coverage from:** SP-08 的代码交付（PR #1023 已合并，最终 PR 11 项检查成功）；其独立发布由 DEFER-SP-REL-08 跟踪，尚不能继承为发布覆盖。本卡最终全量与适用远端检查按 EX-SP-09-CI-01 待实际最终 PR 验收，原发布继承缺口保留，不据此提前 complete。
 
-**Granularity:** type=audit; axis=核心优化复测、全量收口与可选项决策; recovery=回退文档; complete=yes; self-contained=yes; AC=5/20; VER=2/20; landing=0; prod-files=0; scope=S; deps=SP-08; writeset=按实施顺序串行; release=no-release; split-from=N/A; exception=N/A
+**Granularity:** type=audit; axis=核心优化复测、全量收口与可选项决策; recovery=回退文档; complete=yes; self-contained=yes; AC=5/20; VER=2/20; landing=0; prod-files=0; scope=S; deps=SP-08; writeset=按实施顺序串行; release=no-release; split-from=N/A; exception=EX-SP-09-CI-01,EX-SP-09-CLOSE-01
 
 ## 延后项（不创建实施任务、不阻塞本轮）
 
@@ -1305,7 +1417,7 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-06 | implementation | 5/8 | 2/8 | 2/6 | M | 按依赖串行 | independent | EX-SP-06-CLOSE-01 |
 | SP-07 | implementation | 5/8 | 2/8 | 1/1 | S | 按依赖串行 | independent | none |
 | SP-08 | implementation | 7/8 | 3/8 | 2/2 | M | 按依赖串行 | independent | none |
-| SP-09 | audit | 5/20 | 2/20 | 0/0 | S | 按依赖串行 | no-release | none |
+| SP-09 | audit | 5/20 | 2/20 | 0/0 | S | 按依赖串行 | no-release | EX-SP-09-CI-01,EX-SP-09-CLOSE-01 |
 
 ## 测试矩阵与追溯
 
@@ -1322,6 +1434,8 @@ Phase 0 基线：SP-00；Phase 1 正确性与 stat：SP-01..03；Phase 2 核心�
 | SP-08 | Review §6 + Audit Finding 5（修正预热前提） | command_test::status_test/status_wave0_test | 深层 ignore 错误、安全路径与调度次数 |
 
 ### 基线与实施证据汇总
+
+**以下首段为历史快照：** 记录的是 SP-07 最终 CI 收口、SP-08 开工以前的阶段状态，保留原文以便追溯；其中“pending”“远端 CI 未执行”等不代表当前状态。当前 SP-07/08 均已合并并按具名例外完成，SP-09 正在 `codex/SP-09` 执行，见任务总览、各卡现行 Lifecycle 与 SP-09 前置审计表。历史 SP-00 的 audit N/A 全量判断仅适用于 SP-00，不适用于 SP-09 的 T-2 最终全量门。
 
 SP-01 已按 EX-SP-01-CLOSE-01 / EX-SP-01-UPSTREAM-CI-01 合并收口（`e4eb85061af79b4deff37e569265f1c6b82787d4`，#640 CLOSED）；SP-02 已在本仓库完成代码、双语文档、单元/集成/守卫与 fmt/严格 Clippy 验证，并按用户指令登记 EX-SP-02-CLOSE-01（`done / complete`，版本 `0.30.101` 不变；网站与独立发版由 DEFER-SP-DOCS-02 / DEFER-SP-REL-02 跟踪，PR CI 随推送建 PR 触发后单独核验）；SP-03（#642）已按 EX-SP-03-CLOSE-01 登记 `done/complete`；最终 PR head 的全量 CI/CodeQL 全绿并合并为 `b1b9c32`，网站文档仍由 DEFER-SP-DOCS-03 暂搁；SP-05（#644）已为 `done / complete`，本地实现、定向/静态验证和 SP-00 完整 16 格矩阵通过，远端 CI 与独立发布未执行；2026-11-02 SP-06 按 EX-SP-06-CLOSE-01 登记 `done / complete`（A/B、fmt、严格 Clippy、release 构建及 16 格矩阵已过；T-1 全量 nextest not-run，版本与远端交付由 DEFER-SP-REL-06 跟踪）；SP-07 已在 `codex/SP-07` 完成本地 A/B、fmt、严格 Clippy 与 release build，状态为 `in-progress / locally-accepted`，最终复审、T-1 与 C/D 仍待，详见本卡；SP-04、SP-08、SP-09 仍为 pending / not-run。SP-00 已执行 release 构建与下述基线采样，`cargo +nightly fmt --all --check` 通过；该历史采样轮未运行 Clippy 和全量测试。Clippy 仍是推送前必跑门；全量测试按 audit 卡的 N/A 触发条件不在本卡执行，当前验收归属按 EX-SP-00-AUDIT-01 调整为本卡独立文档验收；历史登记 SP-01 已被该决策取代。
 
