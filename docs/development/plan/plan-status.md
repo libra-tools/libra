@@ -1150,7 +1150,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | **已收口** | CL-01..CL-15 全 `done`/`complete`（`v0.23.47`–`v0.23.54`、`v0.23.57`–`v0.23.63`）；closeout `v0.23.64`（#569）；DEP-CL-07 完成（#474 CLOSED） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | 未启动 | CF-01..CF-15（15 卡） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；intent-to-add WT-05..WT-07 已 `done/complete`（WT-06/07 于 2026-10-18 落地）；WT-03 `done/complete`（2026-10-18） |
-| [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495；后续计划 HW-01..HW-07（#522/#523/#525/#526/#527/#536，全部 `pending`，未启动；#533 已移交 issues/533.md；原 `issues/477b.md` 已于 2026-10-07 并入并删除，`477b` 不是独立计划）见该文件「后续计划：#477 收口后新缺陷跟进（HW-01..HW-07）」 |
+| [`issues/477.md`](issues/477.md) | 历史改写命令族与 Git 对齐 | **已收口** | HF-01..HF-31（31 卡）全 `done/complete`，聚合发布 v0.22.49；子 issue #495；后续计划 HW-01..HW-07（#522/#523/#525/#526/#527/#533/#536，全部 `pending`，未启动；原 `issues/477b.md` 已于 2026-10-07 并入并删除，`477b` 不是独立计划）见该文件「后续计划：#477 收口后新缺陷跟进（HW-01..HW-07）」 |
 | [`issues/478.md`](issues/478.md) | log/show/diff/grep/blame/notes/reflog 命令族 | 未启动 | LG-01..LG-25（25 卡） |
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | **已收口（2026-11-03：九卡 `done`/`complete`。EC-01 v0.30.135 run 41505868430；RV-01 v0.30.137 run 41528688806 attempt 2；UI-01 v0.30.138 run 41545576388；DF-01 v0.30.140 run 41556490025；RV-02 v0.30.141 run 41562359692；UI-02 v0.30.142 run 41566754831；UI-03 v0.30.143 run 41572246304；SR-01 v0.30.144 run 41577360822 attempt 2；UR-01 v0.30.146 run 41583805298。均为 8/8 `success`。双环境 nextest 11252 passed、48 skipped、0 failed、exit 0。DEFER-479-PI-IMPORT 已关闭，不再豁免该门。未在 #479 发帖。）** | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
 | [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
@@ -1613,7 +1613,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 - plan-20260715：历史封存；Code 专属 `DEFER-01..08` 已由 plan-20260824 交付后拆除或由 plan-20260920 直接墓碑化，`DEFER-09/10` 已完成关闭；无现行可重启项。
 - plan-20260824：历史封存；全部 Code 专属 DEFER 已由 plan-20260920 墓碑化，无现行可重启项。
 - plan-20260825：历史封存；Code 专属 `DEFER-PS-01..04` 已墓碑化；`DEFER-PS-05` 已由 plan-20260917 关闭。仅通用测试基础设施 `DEFER-PS-06/07` 保留为另立计划候选，不得用于恢复 Code。
-- issues/498：`DEFER-TT-01..08`（tree/blob 目标、nested-tag advice、`-f` 覆盖措辞、show/log 嵌套展示、传输非 commit tag、`-n` gpgsig 标题、umask 敏感测试、`for-each-ref`/`describe` 嵌套 peel）。计划已收口；DEFER-TT-06 → issues/533 TG-03；DEFER-TT-03 → TG-14；DEFER-TT-02 → DEFER-TG-08；DEFER-TT-04 → 478；DEFER-TT-05 → 474/480；DEFER-TT-08 待新建 issue。
+- issues/498：`DEFER-TT-01..08`（tree/blob 目标、nested-tag advice、`-f` 覆盖措辞、show/log 嵌套展示、传输非 commit tag、`-n` gpgsig 标题、umask 敏感测试、`for-each-ref`/`describe` 嵌套 peel）。计划已收口；DEFER-TT-02/03/06 → `issues/477.md` 的 HW-05；DEFER-TT-04 → 478；DEFER-TT-05 → 474/480；DEFER-TT-08 待新建 issue。
 
 ---
 
