@@ -1158,7 +1158,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/1057.md`](issues/1057.md) | `ls-tree` 目录过滤与大小格式兼容（#479 后续） | 未启动（Claude R5 计划评审 PASS；2026-11-06 15:56:27 UTC） | LS-01、LS-02 `pending` / 验收空；指定网站路径待挂载；testcase 本地副本已核实 |
 | [`issues/1050.md`](issues/1050.md) | `fast-import` 的 `from <ref>^0` | 未启动（计划审 VERDICT: PASS，2026-11-06 20:25:00 UTC） | I1050-01、I1050-02 `pending` / 验收空；网站未挂载；Git 控制构建未存在 |
 | [`issues/1051.md`](issues/1051.md) | `hash-object --stdin` 与路径并用 | 未启动（计划审 VERDICT: PASS，2026-11-06 20:10:00 UTC） | I1051-01 `pending` / 验收空；网站未挂载；Git 控制构建未存在 |
-| [`issues/1052.md`](issues/1052.md) | T 类缺失命令登记（不实现） | 未启动（计划审 VERDICT: PASS，2026-11-06 19:41:52 UTC） | I1052-00、I1052-REL `pending` / 验收空；不实现命令、不关闭 #1052 |
+| [`issues/1052.md`](issues/1052.md) | T 类缺失命令登记（不实现） | 实施中（计划审 VERDICT: PASS，2026-11-06 19:41:52 UTC） | I1052-00 `locally-accepted` / 空（2026-11-07 14:50:30 UTC；15/15 系统 `libra` 缺失命令检查、源码变体扫描、B 组结构门和 ER-05 R2 PASS；I1052-REL 等待本卡完成后再开工）；I1052-REL `pending` / 验收空；不实现命令、不关闭 #1052 |
 | [`issues/1053.md`](issues/1053.md) | `rev-parse --git-path` | 未启动（计划审 VERDICT: PASS，2026-11-06 20:50:00 UTC） | I1053-01 `pending` / 验收空；网站未挂载；与 #1054/#539 写集互斥 |
 | [`issues/1054.md`](issues/1054.md) | 无参数 `rev-parse` 不打印 HEAD | 未启动（计划审 VERDICT: PASS，2026-11-06 19:55:00 UTC） | I1054-01 `pending` / 验收空；网站未挂载；与 #1053/#539 写集互斥 |
 | [`issues/1055.md`](issues/1055.md) | `^{/<text>}` 模式内冒号切分 | 未启动（计划审 VERDICT: PASS，2026-11-06 20:40:00 UTC） | I1055-01 `pending` / 验收空；T-1；网站未挂载；与 #537/#1057/#478 写集有顺序 |
