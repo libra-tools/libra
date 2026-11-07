@@ -147,7 +147,7 @@ pub struct FormatPatchArgs {
     #[arg(long = "no-rfc", overrides_with = "rfc")]
     pub no_rfc: bool,
 
-    /// Do not add the [PATCH n/m] counter to commit patch Subject lines.
+    /// Do not add [PATCH n/m] counters to commit patch or cover-letter Subject lines.
     #[arg(short = 'N', long = "no-numbered", overrides_with = "numbered")]
     pub no_numbered: bool,
 
@@ -827,8 +827,9 @@ async fn format_patch_body(
 
     let numbering_enabled = !args.no_numbered;
     let num_str = if numbering_enabled && (args.numbered || args.cover_letter) {
-        let width = number_width(total);
-        format!(" {:0width$}/{}", patch_num, total + start_num - 1)
+        let displayed_total = total + start_num - 1;
+        let width = subject_counter_width(displayed_total);
+        format!(" {:0width$}/{displayed_total}", patch_num)
     } else {
         String::new()
     };
@@ -1368,9 +1369,15 @@ fn format_cover_letter(
         None => out.push_str("From: \n"),
     }
     out.push_str(&format!("Date: {}\n", now.to_rfc2822()));
+    let counter = if args.no_numbered {
+        String::new()
+    } else {
+        let displayed_total = commits.len() + args.start_number - 1;
+        let width = subject_counter_width(displayed_total);
+        format!(" {:0width$}/{displayed_total}", 0)
+    };
     out.push_str(&format!(
-        "Subject: [{prefix} 0/{total}] *** SUBJECT HERE ***\n",
-        total = commits.len()
+        "Subject: [{prefix}{counter}] *** SUBJECT HERE ***\n"
     ));
     if let Some(threading) = threading {
         out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
@@ -1724,6 +1731,10 @@ fn number_width(n: usize) -> usize {
         (n as f64).log10().floor() as usize + 1
     }
     .max(4)
+}
+
+fn subject_counter_width(displayed_total: usize) -> usize {
+    displayed_total.to_string().len()
 }
 
 // ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ body, and series metadata.
 | `--output-directory <DIR>` | `-o` | Write patch files into `DIR` | current directory |
 | `--stdout` | | Print all patches to stdout | false |
 | `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | false |
-| `--no-numbered` | `-N` | Do not add the `[PATCH n/m]` counter to commit patch Subject lines | off |
+| `--no-numbered` | `-N` | Do not add `[PATCH n/m]` counters to commit patch or cover-letter Subject lines | off |
 | `--rfc[=<text>]` | | Prefix the subject with `RFC` (`[RFC PATCH]`); with a value, that text is used instead (`--rfc=WIP` → `[WIP PATCH]`). The value must be attached with `=` so a revision argument is never swallowed | off |
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
 | `--filename-max-length <N>` | | Truncate output filenames to at most `N` bytes, counting the `0001-` prefix and the suffix; the stem may collapse to just the sequence number, matching Git's cut points | unlimited |
@@ -157,9 +157,14 @@ number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`
 under `--numbered-files`.
 
-`-N` keeps the `NNNN-` sequence prefix in filenames and suppresses the
-`[PATCH n/m]` counter on commit patch Subject lines; a requested cover letter
-retains its `[PATCH 0/N]` counter. `-n` does not change filenames either.
+`-N` keeps the `NNNN-` sequence prefix in filenames and suppresses `[PATCH n/m]`
+counters on commit patch and cover-letter Subject lines. Without `-N`, a
+requested cover letter has a `[PATCH 0/N]` counter. Counter width follows the
+displayed final number, including `--start-number`: a single patch uses
+`[PATCH 1/1]`; two patches starting at 9 use `[PATCH 00/10]` on the cover
+letter and `[PATCH 09/10]` / `[PATCH 10/10]` on the patches. A ten-patch
+series starting at 1 also uses `[PATCH 00/10]` on the cover letter. `-n` does
+not change filenames.
 `--numbered-files` is the exception and uses bare sequence numbers. Earlier
 Libra versions omitted the prefix under `-N`, so scripts that relied on those
 filenames should rename the generated files themselves.

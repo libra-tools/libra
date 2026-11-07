@@ -59,7 +59,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：`src/command/mod.rs` 导出 `format_patch`，`src/cli.rs::Commands::FormatPatch` 负责 CLI 接入。
 - 用户文档：`docs/commands/format-patch.md`。
 - Synopsis：`libra format-patch [OPTIONS] [revision-range]`。
-- 文件名语义：`-n`/`-N` 不改变文件名；`-N` 抑制 commit patch Subject 的 `[PATCH n/m]` 计数，cover letter 的 `[PATCH 0/N]` 计数保持不变。普通文件名始终带补零序号前缀；`--numbered-files` 仍使用裸序号。依赖旧版 `-N` 无前缀文件名的脚本需自行重命名。
+- 文件名与主题计数：`-n`/`-N` 不改变文件名；`-N` 抑制 commit patch 与 cover-letter Subject 的 `[PATCH n/m]` 计数，`--cover-letter` 默认保留 `[PATCH 0/N]`。计数宽度按显示的最终编号确定，并包含 `--start-number`，例如从 9 开始的两项为 `09/10`，十项系列的 cover letter 为 `00/10`。普通文件名始终带补零序号前缀；`--numbered-files` 仍使用裸序号。依赖旧版 `-N` 无前缀文件名的脚本需自行重命名。
 - 公开参数包括：`[revision-range]`、`-1`、`--root`、`-o, --output-directory <DIR>`、`--stdout`、`-n, --numbered`、`-N, --no-numbered`、`--start-number <N>`、`--subject-prefix <PREFIX>`、`--cover-letter`、`--thread` / `--no-thread`、`--in-reply-to <MESSAGE_ID>`、`--to <ADDRESS>`、`--cc <ADDRESS>`、`--no-to`、`--no-cc`、`--from [<IDENT>]`、`-v, --reroll-count <N>`、`-s, --signoff`、`--no-signoff`、`--full-index`、`--minimal`、`--histogram`、`--ignore-if-in-upstream`、`--src-prefix`、`--dst-prefix`、`--no-stat`、`--keep-subject`、`--suffix <SFX>`、`--zero-commit`、`--signature <SIGNATURE>`、`--no-signature`、`--signature-file <FILE>`、`--encode-email-headers` / `--no-encode-email-headers`、`--numbered-files`、`--notes [<REF>]`、`--attach`、`--inline`。`--signature-file` 在 `execute_safe` 早期读文件并填入 `signature` 槽（与 `--signature` 互斥，trim 尾换行）；`--encode-email-headers` 经 `encode_email_header` 对含非 ASCII 的 `From` 名称与 `Subject` 做整值 RFC 2047 Q 编码（`=?UTF-8?q?...?=`），纯 ASCII 或未开启时原样输出。
 
 ## 还未实现的功能

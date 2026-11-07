@@ -1833,14 +1833,199 @@ fn no_numbered_keeps_sequence_filenames() {
         .find(|line| line.trim_start().starts_with("-N, --no-numbered"))
         .expect("no-numbered help option");
     assert!(
-        no_numbered_help
-            .contains("Do not add the [PATCH n/m] counter to commit patch Subject lines"),
+        no_numbered_help.contains(
+            "Do not add [PATCH n/m] counters to commit patch or cover-letter Subject lines"
+        ),
         "help should describe subject numbering: {no_numbered_help}"
     );
     assert!(
         !no_numbered_help.contains("filename"),
         "help should not describe filenames: {no_numbered_help}"
     );
+}
+
+#[test]
+fn no_numbered_suppresses_every_subject_counter() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(&["format-patch", "-N", "-2", "--stdout"], repo.path());
+    assert_cli_success(&output, "-N -2 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH] 4", "[PATCH] rename"]);
+
+    let output = run_libra_command(
+        &["format-patch", "-N", "--cover-letter", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-N --cover-letter -1 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH] *** SUBJECT HERE ***", "[PATCH] rename"]);
+}
+
+#[test]
+fn subject_counter_width_follows_displayed_total() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(&["format-patch", "-n", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "-n -1 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH 1/1] rename"]);
+
+    let output = run_libra_command(
+        &["format-patch", "-n", "--start-number=9", "-2", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "-n --start-number=9 -2 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH 09/10] 4", "[PATCH 10/10] rename"]);
+}
+
+#[test]
+fn cover_letter_counter_width_matches_displayed_total() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &["format-patch", "--cover-letter", "-2", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--cover-letter -2 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "[PATCH 0/2] *** SUBJECT HERE ***",
+            "[PATCH 1/2] 4",
+            "[PATCH 2/2] rename"
+        ]
+    );
+
+    let repo = repo_with_patch_subjects(&[
+        "patch 1", "patch 2", "patch 3", "patch 4", "patch 5", "patch 6", "patch 7", "patch 8",
+        "patch 9", "patch 10",
+    ]);
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--numbered",
+            "-10",
+            "--stdout",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--cover-letter --numbered -10 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<String> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .map(str::to_string)
+        .collect();
+    let expected: Vec<String> = std::iter::once("[PATCH 00/10] *** SUBJECT HERE ***".to_string())
+        .chain((1..=10).map(|patch_num| format!("[PATCH {patch_num:02}/10] patch {patch_num}")))
+        .collect();
+    assert_eq!(subjects, expected);
+
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "--start-number=9",
+            "--cover-letter",
+            "--numbered",
+            "-2",
+            "--stdout",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(
+        &output,
+        "--start-number=9 --cover-letter --numbered -2 --stdout",
+    );
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "[PATCH 00/10] *** SUBJECT HERE ***",
+            "[PATCH 09/10] 4",
+            "[PATCH 10/10] rename"
+        ]
+    );
+}
+
+#[test]
+fn numbered_flags_follow_last_occurrence() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(&["format-patch", "-N", "-n", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "-N -n -1 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH 1/1] rename"]);
+
+    let output = run_libra_command(&["format-patch", "-n", "-N", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "-n -N -1 --stdout");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH] rename"]);
+}
+
+#[test]
+fn start_number_counter_is_unpadded() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "--start-number",
+            "3",
+            "--numbered",
+            "--stdout",
+            "HEAD~1",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--start-number 3 --numbered --stdout HEAD~1");
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<&str> = stdout_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("Subject: "))
+        .collect();
+    assert_eq!(subjects, ["[PATCH 3/3] rename"]);
 }
 
 #[test]

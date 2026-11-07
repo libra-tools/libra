@@ -24,7 +24,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--output-directory <DIR>` | `-o` | 将 patch 文件写入 `DIR` | 当前目录 |
 | `--stdout` | | 将所有 patches 打印到 stdout | false |
 | `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | false |
-| `--no-numbered` | `-N` | 不在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | 关闭 |
+| `--no-numbered` | `-N` | 不在 commit patch 或 cover-letter 的 Subject 行中加入 `[PATCH n/m]` 计数 | 关闭 |
 | `--rfc[=<text>]` | | 在主题前缀中加入 `RFC`（`[RFC PATCH]`）；给出值时用该文本替代（`--rfc=WIP` → `[WIP PATCH]`）。值必须用 `=` 紧跟，避免吞掉版本参数 | 关闭 |
 | `--no-rfc` | | 取消此前的 `--rfc`（后写者生效） | 关闭 |
 | `--filename-max-length <N>` | | 将输出文件名截断到最多 `N` 字节（包含 `0001-` 前缀与后缀）；必要时可只保留序号，截断点与 Git 一致 | 不限制 |
@@ -129,9 +129,13 @@ unified diff
 
 带 `--json` 或 `--machine` 时，`data.patches` 列出每个生成的输出。设置 `--cover-letter` 时，列表会在 commit patch records 前包含 record number `0` 的 cover letter。其文件名为带配置 suffix 的 `0000-cover-letter`（默认 `.patch`），或在 `--numbered-files` 下为 `0`。
 
-`-N` 只取消 commit patch 的 `[PATCH n/m]` Subject 计数，文件名仍保留
-`NNNN-` 序号前缀；请求 cover letter 时，其 `[PATCH 0/N]` 计数仍保留。
-`-n` 也不会改变文件名。`--numbered-files` 是例外，会使用纯数字序号。
+`-N` 会取消 commit patch 与 cover-letter Subject 中的 `[PATCH n/m]` 计数，
+文件名仍保留 `NNNN-` 序号前缀。未指定 `-N` 时，请求的 cover letter 会带
+`[PATCH 0/N]` 计数。计数宽度跟随显示的最终编号，也包括 `--start-number`：
+单个 patch 为 `[PATCH 1/1]`；从 9 开始的两个 patch，其 cover letter 为
+`[PATCH 00/10]`，两个 patch 分别为 `[PATCH 09/10]` 和 `[PATCH 10/10]`。
+从 1 开始的十个 patch，其 cover letter 也为 `[PATCH 00/10]`。`-n` 不会改变文件名。
+`--numbered-files` 是例外，会使用纯数字序号。
 较早的 Libra 版本会在 `-N` 下省略前缀；依赖旧文件名的脚本需要自行重命名。
 
 完整 series 会在创建任何输出文件前先全部渲染；每个 patch 文件再通过临时文件 + atomic rename 持久化。管道 stdout 遵循 Libra 的 quiet BrokenPipe 行为。
