@@ -176,11 +176,14 @@ pub struct LogArgs {
     #[clap(long)]
     pub abbrev_commit: bool,
     /// Number of hex digits for abbreviated commit hash (default: dynamically computed, min 7)
-    #[clap(long, value_name = "N")]
+    #[clap(long, value_name = "N", overrides_with = "no_abbrev")]
     pub abbrev: Option<usize>,
     /// Show full hash
     #[clap(long)]
     pub no_abbrev_commit: bool,
+    /// Show full object names in formatted output
+    #[clap(long = "no-abbrev", overrides_with_all = ["abbrev", "no_abbrev"])]
+    pub no_abbrev: bool,
 
     /// Print the parent commit ids after each commit hash (Git's `--parents`).
     #[clap(long, conflicts_with = "children")]
@@ -2162,7 +2165,7 @@ async fn execute_safe_with_diff_formats(
     let pretty_requests_abbreviation =
         |pretty: Option<&String>| pretty.is_some_and(|value| value.as_str() != "medium");
     // Decide abbreviated hash length
-    let abbrev_len = if args.no_abbrev_commit {
+    let abbrev_len = if args.no_abbrev_commit || args.no_abbrev {
         full_hash_len
     } else if let Some(n) = args.abbrev {
         if n == 0 { default_abbrev } else { n }

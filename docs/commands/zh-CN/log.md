@@ -55,6 +55,20 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### `--no-abbrev`
+
+`--no-abbrev` 在人类可读输出中显示完整对象名，包括 `--oneline`、`%h`、
+`%p`、`--parents` 和范围内的 `--children` 对象名。它独立于
+`--abbrev-commit` 和 `--oneline`。与 `--abbrev=<N>` 同时使用时，后出现的
+选项生效；`--no-abbrev` 可以重复使用。JSON 的 `short_hash` 仍保持 7 个字符。
+
+```bash
+libra log --no-abbrev --oneline
+libra log --no-abbrev --abbrev=10 --oneline
+```
+
+直接给 `--no-abbrev` 传值会以 `LBR-CLI-002` 拒绝（退出码 129）。
+
 ### `--no-abbrev-commit`
 
 显示完整提交哈希。覆盖 `--abbrev-commit`。
@@ -549,7 +563,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | Oneline 格式 | `git log --oneline` | 默认格式为 oneline | `libra log --oneline` |
 | 缩写哈希 | `git log --abbrev-commit` | 默认 | `libra log --abbrev-commit` |
 | 缩写长度 | `git log --abbrev=<N>` | N/A | `libra log --abbrev <N>` |
-| 完整哈希 | `git log --no-abbrev-commit` | `jj log --no-short-hash` | `libra log --no-abbrev-commit` |
+| 完整哈希 | `git log --no-abbrev` | `jj log --no-short-hash` | `libra log --no-abbrev` / `--no-abbrev-commit` |
 | 显示 patch | `git log -p` | `jj diff -r <rev>`（单独命令） | `libra log -p` / `--patch` |
 | 仅名称 | `git log --name-only` | N/A | `libra log --name-only` |
 | 名称和状态 | `git log --name-status` | N/A | `libra log --name-status` |
@@ -588,6 +602,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 空分支或空 HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | 无效日期参数 | `LBR-CLI-002` | 129 | -- |
 | 无效 `--decorate` 选项 | `LBR-CLI-002` | 129 | -- |
+| `--no-abbrev` 传入值 | `LBR-CLI-002` | 129 | -- |
 | name 输出选项与生效中的 `-s`/`--no-patch` 冲突，或两个 name 选项仍同时生效 | `LBR-CLI-002` | 129 | -- |
 | 无效对象名 | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | 无法解析的位置 revision（拼写护栏） | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |

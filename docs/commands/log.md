@@ -66,6 +66,22 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `--no-abbrev`
+
+`--no-abbrev` shows full object names in human-readable output, including
+`--oneline`, `%h`, `%p`, `--parents`, and in-range `--children` IDs. It is
+independent of `--abbrev-commit` and `--oneline`. When combined with
+`--abbrev=<N>`, the last option wins; repeated `--no-abbrev` options are
+accepted. JSON `short_hash` remains seven characters.
+
+```bash
+libra log --no-abbrev --oneline
+libra log --no-abbrev --abbrev=10 --oneline
+```
+
+Passing a value directly to `--no-abbrev` is rejected with `LBR-CLI-002`
+(exit code 129).
+
 ### `--no-abbrev-commit`
 
 Show full commit hashes. Overrides `--abbrev-commit`.
@@ -749,7 +765,7 @@ flag only affects the human rendering layer.
 | Oneline format | `git log --oneline` | Default format is oneline | `libra log --oneline` |
 | Abbreviated hash | `git log --abbrev-commit` | Default | `libra log --abbrev-commit` |
 | Abbrev length | `git log --abbrev=<N>` | N/A | `libra log --abbrev <N>` |
-| Full hash | `git log --no-abbrev-commit` | `jj log --no-short-hash` | `libra log --no-abbrev-commit` |
+| Full hash | `git log --no-abbrev` | `jj log --no-short-hash` | `libra log --no-abbrev` / `--no-abbrev-commit` |
 | Show patch | `git log -p` | `jj diff -r <rev>` (separate cmd) | `libra log -p` / `--patch` |
 | Name only | `git log --name-only` | N/A | `libra log --name-only` |
 | Name and status | `git log --name-status` | N/A | `libra log --name-status` |
@@ -786,6 +802,7 @@ flag only affects the human rendering layer.
 | Empty branch or empty HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | Invalid date argument | `LBR-CLI-002` | 129 | -- |
 | Invalid `--decorate` option | `LBR-CLI-002` | 129 | -- |
+| `--no-abbrev` supplied with a value | `LBR-CLI-002` | 129 | -- |
 | A name output option conflicts with active `-s`/`--no-patch`, or both name options remain active | `LBR-CLI-002` | 129 | -- |
 | Invalid object name | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | Unresolvable positional revision (typo guard) | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |

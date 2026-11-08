@@ -235,6 +235,246 @@ log_refusal_gates! {
     (lo01_name_only_and_name_status__machine_json, ["log", "-1", "--format=%s", "--name-only", "--name-status"], MachineJson),
 }
 
+const LO02_REFUSAL_MESSAGE: &str =
+    "unexpected value '5' for '--no-abbrev' found; no more were expected";
+
+#[derive(Clone, Copy)]
+enum Lo02RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo02_assert_refusal_gate(args: &[&str], predicate: Lo02RefusalPredicate) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo02RefusalPredicate::Json => vec!["--json"],
+        Lo02RefusalPredicate::MachineLines | Lo02RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo02RefusalPredicate::Message => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected = format!("error: {LO02_REFUSAL_MESSAGE}");
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo02RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().nth(1), Some("Error-Code: LBR-CLI-002"));
+        }
+        Lo02RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo02RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo02RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(actual["ok"], false);
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["category"], "cli");
+            assert_eq!(actual["exit_code"], 129);
+            assert_eq!(actual["severity"], "error");
+            assert_eq!(actual["message"], LO02_REFUSAL_MESSAGE);
+            assert!(actual["usage"].as_str().is_some());
+        }
+        Lo02RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo02RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["severity"], "error");
+            assert_eq!(actual["message"], LO02_REFUSAL_MESSAGE);
+            assert!(actual["usage"].as_str().is_some());
+        }
+    }
+}
+
+macro_rules! log_no_abbrev_refusal_gates {
+    ($(($name:ident, $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo02_assert_refusal_gate(
+                    &["log", "--no-abbrev=5", "--oneline", "-1"],
+                    Lo02RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_no_abbrev_refusal_gates! {
+    (lo02_no_abbrev_with_value__msg, Message),
+    (lo02_no_abbrev_with_value__code, Code),
+    (lo02_no_abbrev_with_value__exit, Exit),
+    (lo02_no_abbrev_with_value__stdout, Stdout),
+    (lo02_no_abbrev_with_value__json, Json),
+    (lo02_no_abbrev_with_value__machine_lines, MachineLines),
+    (lo02_no_abbrev_with_value__machine_json, MachineJson),
+}
+
+fn lo02_rev_parse(repo: &tempfile::TempDir, revision: &str) -> String {
+    let output = run_libra_command(&["rev-parse", revision], repo.path());
+    assert_cli_success(&output, "rev-parse");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn lo02_log_stdout(repo: &tempfile::TempDir, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo.path());
+    assert_cli_success(&output, "log");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo02_no_abbrev_oneline_full() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(&repo, &["log", "--no-abbrev", "--oneline", "-1"]),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_abbrev_commit_then_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--abbrev-commit", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_then_abbrev_commit() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--abbrev-commit", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_abbrev_n_then_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--abbrev=10", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_then_abbrev_n() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--abbrev=10", "--oneline", "-1"]
+        ),
+        format!("{} fourth\n", &full[..10])
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_format_h_p() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    assert_eq!(
+        lo02_log_stdout(&repo, &["log", "--no-abbrev", "--format=%h %p", "-1"]),
+        format!("{full} {parent}\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_parents_oneline() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--parents", "--oneline", "-1"]
+        ),
+        format!("{full} {parent} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_children_oneline() {
+    let repo = lo_f1_repo();
+    let child = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    let output = lo02_log_stdout(
+        &repo,
+        &["log", "--no-abbrev", "--children", "--oneline", "-2"],
+    );
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with(&parent))
+        .expect("the selected parent commit should be shown");
+
+    assert_eq!(parent_line, format!("{parent} {child} third"));
+}
+
+#[test]
+fn lo02_repeated_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_json_short_hash_unchanged() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let output = run_libra_command(&["--json", "log", "--no-abbrev", "-1"], repo.path());
+    assert_cli_success(&output, "json log --no-abbrev");
+    let json = parse_json_stdout(&output);
+
+    assert_eq!(json["data"]["commits"][0]["short_hash"], &full[..7]);
+}
+
 fn lo01_log_output(args: &[&str]) -> std::process::Output {
     let repo = lo_f1_repo();
     run_libra_command(args, repo.path())
