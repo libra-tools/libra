@@ -52,7 +52,10 @@ EXAMPLES:
     libra log --pretty=fuller              Use a named format preset (short/full/fuller/reference/raw)
     libra log --author alice                Filter commits by author (case-insensitive substring)
     libra log --since 24h --until 1h       Time-window filter (relative or RFC3339)
-    libra log --grep 'fix(' -n 20          Filter commits by message substring
+    libra log --grep 'fix(' -n 20          Filter commits by message pattern
+    libra log --grep fix --grep docs       Match either message pattern
+    libra log --all-match --grep fix --grep docs
+                                         Require both message patterns
     libra log --grep fix -i                Case-insensitive message grep
     libra log --grep WIP --invert-grep     Hide commits whose message matches
     libra log --name-status src/           Show changed files under src/
@@ -284,8 +287,19 @@ pub struct LogArgs {
 
     /// Filter commits whose message matches PATTERN. The default dialect is
     /// POSIX basic regex (Git's default), so plain text matches literally.
-    #[clap(long, value_name = "PATTERN")]
-    pub grep: Option<String>,
+    /// Repeat to match any pattern unless `--all-match` is given.
+    #[clap(long, value_name = "PATTERN", action = clap::ArgAction::Append)]
+    pub grep: Vec<String>,
+
+    /// Require every `--grep` pattern to match. Repeating this flag has no
+    /// additional effect.
+    #[clap(
+        long,
+        action = clap::ArgAction::SetTrue,
+        num_args = 0,
+        overrides_with = "all_match"
+    )]
+    pub all_match: bool,
 
     /// Treat `--grep` as a literal fixed string (Git's `--fixed-strings`).
     #[clap(long = "fixed-strings", overrides_with_all = ["grep_extended", "grep_basic"])]
@@ -529,10 +543,10 @@ struct CommitFilter {
     /// `FIX-AD-01`: the same path filters as a shared-engine pathspec set
     /// (wildcards and `:(magic)` supported). `None` keeps prefix matching.
     path_specs: Option<PathspecSet>,
-    grep: Option<String>,
-    /// Compiled `--grep` matcher (dialect translated at build time).
-    grep_regex: Option<regex::Regex>,
-    /// `--invert-grep`: keep commits whose message does NOT match `--grep`.
+    grep: Vec<String>,
+    /// Compiled `--grep` matchers (dialect translated at build time).
+    grep_regex: Vec<regex::Regex>,
+    all_match: bool,
     invert_grep: bool,
     min_parents: Option<usize>,
     max_parents: Option<usize>,
@@ -679,7 +693,7 @@ impl CommitFilter {
         since: Option<i64>,
         until: Option<i64>,
         paths: Vec<PathBuf>,
-        grep: Option<String>,
+        grep: Vec<String>,
         min_parents: Option<usize>,
         max_parents: Option<usize>,
         pickaxe: Option<PickaxeKind>,
@@ -692,7 +706,8 @@ impl CommitFilter {
             paths,
             path_specs: None,
             grep,
-            grep_regex: None,
+            grep_regex: Vec::new(),
+            all_match: false,
             invert_grep: false,
             min_parents,
             max_parents,
@@ -741,29 +756,31 @@ impl CommitFilter {
         dialect: GrepDialect,
     ) -> CliResult<Self> {
         self.invert_grep = invert_grep;
-        self.grep_regex = match &self.grep {
-            // An empty `--grep` leaves message filtering disabled (Git parity).
-            Some(pattern) if !pattern.is_empty() => {
+        self.grep_regex = self
+            .grep
+            .iter()
+            .map(|pattern| {
                 let translated = match dialect {
                     GrepDialect::Fixed => regex::escape(pattern),
                     GrepDialect::Extended => pattern.clone(),
                     GrepDialect::Basic => bre_to_ere(pattern),
                 };
-                Some(
-                    regex::RegexBuilder::new(&translated)
-                        .case_insensitive(ignore_case)
-                        .build()
-                        .map_err(|error| {
-                            CliError::fatal(format!("invalid --grep pattern '{pattern}': {error}"))
-                                .with_exit_code(129)
-                                .with_stable_code(StableErrorCode::CliInvalidArguments)
-                        })?,
-                )
-            }
-            None => None,
-            _ => None,
-        };
+                regex::RegexBuilder::new(&translated)
+                    .case_insensitive(ignore_case)
+                    .build()
+                    .map_err(|error| {
+                        CliError::fatal(format!("invalid --grep pattern '{pattern}': {error}"))
+                            .with_exit_code(129)
+                            .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    })
+            })
+            .collect::<CliResult<Vec<_>>>()?;
         Ok(self)
+    }
+
+    fn with_all_match(mut self, all_match: bool) -> Self {
+        self.all_match = all_match;
+        self
     }
 
     fn passes_non_path_filters(&self, commit: &Commit) -> bool {
@@ -829,7 +846,7 @@ impl CommitFilter {
             return false;
         }
 
-        if let Some(re) = &self.grep_regex {
+        if !self.grep_regex.is_empty() {
             // Recognize the embedded signature with the shared parser, but keep
             // actual message whitespace: its display slice uses trim_start().
             let message = if let Some(signature) = parse_commit_msg(&commit.message).1 {
@@ -844,11 +861,11 @@ impl CommitFilter {
             } else {
                 commit.message.strip_prefix('\n').unwrap_or(&commit.message)
             };
-            // Git matches `--grep` against the whole message buffer; `.` never
-            // crosses a newline (no `(?s)`), so multi-line patterns still work.
-            let matches = re.is_match(message);
-            // `--invert-grep` keeps the non-matching commits: exclude exactly
-            // when `matches == invert_grep` (matches & !invert, or !matches & invert).
+            let matches = if self.all_match && !self.invert_grep {
+                self.grep_regex.iter().all(|regex| regex.is_match(message))
+            } else {
+                self.grep_regex.iter().any(|regex| regex.is_match(message))
+            };
             if matches == self.invert_grep {
                 return false;
             }
@@ -1636,7 +1653,7 @@ fn eligible_date_priority_yield(
         || path_count > 0
         || args.author.is_some()
         || args.committer.is_some()
-        || args.grep.is_some()
+        || !args.grep.is_empty()
         || args.since.is_some()
         || args.until.is_some()
         || args.pickaxe_string.is_some()
@@ -2039,6 +2056,7 @@ async fn execute_safe_with_diff_formats(
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(&args))?
+    .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
 
@@ -2447,6 +2465,7 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
         pickaxe,
     )
     .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(args))?
+    .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
 
@@ -3538,7 +3557,7 @@ mod tests {
                 ("body needle", true, false, true),
                 ("Body Needle", false, true, false),
                 ("Ticket: 42", false, false, true),
-                ("", false, true, true),
+                ("", false, true, false),
             ] {
                 let filter = CommitFilter::new(
                     None,
@@ -3546,7 +3565,7 @@ mod tests {
                     None,
                     None,
                     Vec::new(),
-                    Some(pattern.to_string()),
+                    vec![pattern.to_string()],
                     None,
                     None,
                     None,
@@ -3585,7 +3604,7 @@ mod tests {
                         None,
                         None,
                         Vec::new(),
-                        Some(body.into()),
+                        vec![body.into()],
                         None,
                         None,
                         None,
@@ -3616,7 +3635,7 @@ mod tests {
             None,
             None,
             Vec::new(),
-            Some("literal body".into()),
+            vec!["literal body".into()],
             None,
             None,
             None,
@@ -3903,7 +3922,7 @@ mod tests {
             Some(1_766_000_000),
             Some(1_766_200_000),
             Vec::new(),
-            None,
+            Vec::new(),
             None,
             None,
             None,
@@ -3933,7 +3952,7 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None,
+            Vec::new(),
             Some(2),
             None,
             None,
@@ -3945,7 +3964,7 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None,
+            Vec::new(),
             None,
             Some(1),
             None,
@@ -3959,7 +3978,7 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None,
+            Vec::new(),
             None,
             None,
             None,
@@ -3971,7 +3990,7 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None,
+            Vec::new(),
             None,
             None,
             None,
@@ -4004,11 +4023,11 @@ mod tests {
     #[test]
     fn test_log_args_grep() {
         let args = LogArgs::parse_from(["libra", "--grep", "fix"]);
-        assert_eq!(args.grep, Some("fix".to_string()));
+        assert_eq!(args.grep, vec!["fix".to_string()]);
         assert!(args.pathspec.is_empty());
 
         let args = LogArgs::parse_from(["libra"]);
-        assert_eq!(args.grep, None);
+        assert!(args.grep.is_empty());
         assert!(args.pathspec.is_empty());
     }
 
@@ -4016,17 +4035,32 @@ mod tests {
     #[test]
     fn test_grep_with_other_args() {
         let args = LogArgs::parse_from(["libra", "--grep", "feature", "--oneline", "-n", "5"]);
-        assert_eq!(args.grep, Some("feature".to_string()));
+        assert_eq!(args.grep, vec!["feature".to_string()]);
         assert!(args.oneline);
         assert_eq!(args.number, Some(5));
         assert!(args.pathspec.is_empty());
+    }
+
+    #[test]
+    fn test_repeated_grep_and_all_match_args() {
+        let args = LogArgs::parse_from([
+            "libra",
+            "--grep",
+            "feature",
+            "--grep",
+            "docs",
+            "--all-match",
+            "--all-match",
+        ]);
+        assert_eq!(args.grep, vec!["feature".to_string(), "docs".to_string()]);
+        assert!(args.all_match);
     }
 
     // Test case-sensitive matching
     #[test]
     fn test_grep_case_sensitive() {
         let args = LogArgs::parse_from(["libra", "--grep", "FIX"]);
-        assert_eq!(args.grep, Some("FIX".to_string()));
+        assert_eq!(args.grep, vec!["FIX".to_string()]);
         assert!(args.pathspec.is_empty());
     }
 
@@ -4034,7 +4068,7 @@ mod tests {
     #[test]
     fn test_grep_empty_string() {
         let args = LogArgs::parse_from(["libra", "--grep", ""]);
-        assert_eq!(args.grep, Some("".to_string()));
+        assert_eq!(args.grep, vec!["".to_string()]);
         assert!(args.pathspec.is_empty());
     }
 
@@ -4043,7 +4077,7 @@ mod tests {
     fn test_graph_with_grep() {
         let args = LogArgs::parse_from(["libra", "--graph", "--grep", "fix"]);
         assert!(args.graph);
-        assert_eq!(args.grep, Some("fix".to_string()));
+        assert_eq!(args.grep, vec!["fix".to_string()]);
         assert!(args.pathspec.is_empty());
     }
 

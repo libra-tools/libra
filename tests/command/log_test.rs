@@ -326,6 +326,281 @@ log_no_abbrev_refusal_gates! {
     (lo02_no_abbrev_with_value__machine_json, MachineJson),
 }
 
+const LO03_ALL_MATCH_WITH_VALUE_MESSAGE: &str =
+    "unexpected value '1' for '--all-match' found; no more were expected";
+const LO03_INVALID_PATTERN_MESSAGE: &str = "invalid --grep pattern 'a\\(': regex parse error:";
+
+#[derive(Clone, Copy)]
+enum Lo03RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    JsonMessage,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo03_assert_refusal_gate(
+    args: &[&str],
+    expected_message: &str,
+    predicate: Lo03RefusalPredicate,
+) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo03RefusalPredicate::Json | Lo03RefusalPredicate::JsonMessage => vec!["--json"],
+        Lo03RefusalPredicate::MachineLines | Lo03RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo03RefusalPredicate::Message => {
+            let prefix = if expected_message.starts_with("unexpected value") {
+                "error: "
+            } else {
+                "fatal: "
+            };
+            let expected = format!("{prefix}{expected_message}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo03RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("Error-Code: LBR-CLI-002"));
+        }
+        Lo03RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo03RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo03RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(actual["ok"], false);
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["exit_code"], 129);
+        }
+        Lo03RefusalPredicate::JsonMessage => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert!(
+                actual["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(expected_message))
+            );
+        }
+        Lo03RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo03RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert!(
+                actual["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(expected_message))
+            );
+        }
+    }
+}
+
+macro_rules! log_lo03_refusal_gates {
+    ($(($name:ident, $args:expr, $message:expr, $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo03_assert_refusal_gate(
+                    &$args,
+                    $message,
+                    Lo03RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_lo03_refusal_gates! {
+    (lo03_all_match_with_value__msg, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Message),
+    (lo03_all_match_with_value__code, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Code),
+    (lo03_all_match_with_value__exit, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Exit),
+    (lo03_all_match_with_value__stdout, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Stdout),
+    (lo03_all_match_with_value__json, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Json),
+    (lo03_all_match_with_value__machine_lines, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, MachineLines),
+    (lo03_all_match_with_value__machine_json, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, MachineJson),
+
+    (lo03_invalid_later_pattern__msg, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Message),
+    (lo03_invalid_later_pattern__code, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Code),
+    (lo03_invalid_later_pattern__exit, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Exit),
+    (lo03_invalid_later_pattern__stdout, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Stdout),
+    (lo03_invalid_later_pattern__json, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Json),
+    (lo03_invalid_later_pattern__json_msg, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, JsonMessage),
+    (lo03_invalid_later_pattern__machine_lines, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, MachineLines),
+    (lo03_invalid_later_pattern__machine_json, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, MachineJson),
+
+    (lo03_first_invalid_pattern_reported__msg, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Message),
+    (lo03_first_invalid_pattern_reported__code, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Code),
+    (lo03_first_invalid_pattern_reported__exit, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Exit),
+    (lo03_first_invalid_pattern_reported__stdout, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Stdout),
+    (lo03_first_invalid_pattern_reported__json, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Json),
+    (lo03_first_invalid_pattern_reported__json_msg, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, JsonMessage),
+    (lo03_first_invalid_pattern_reported__machine_lines, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, MachineLines),
+    (lo03_first_invalid_pattern_reported__machine_json, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, MachineJson),
+}
+
+fn lo03_log_subjects(filters: &[&str]) -> Vec<String> {
+    let repo = lo_f1_repo();
+    let mut args = vec!["log", "--format=%s"];
+    args.extend_from_slice(filters);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log grep filter");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn lo03_multi_grep_union() {
+    assert_eq!(
+        lo03_log_subjects(&["--grep=i", "--grep=r"]),
+        vec!["fourth", "third", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_intersection() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_all_match_three_patterns() {
+    assert!(lo03_log_subjects(&["--all-match", "--grep=i", "--grep=r", "--grep=x"]).is_empty());
+}
+
+#[test]
+fn lo03_empty_pattern_inverted() {
+    assert!(lo03_log_subjects(&["--grep=", "--invert-grep"]).is_empty());
+}
+
+#[test]
+fn lo03_empty_pattern_in_union() {
+    assert_eq!(
+        lo03_log_subjects(&["--grep=", "--grep=xyz"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_with_empty_pattern() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--grep=", "--grep=r"]),
+        vec!["fourth", "third"]
+    );
+}
+
+#[test]
+fn lo03_invert_multi_grep() {
+    assert_eq!(
+        lo03_log_subjects(&["--invert-grep", "--grep=i", "--grep=r"]),
+        vec!["second"]
+    );
+}
+
+#[test]
+fn lo03_invert_ignores_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["--invert-grep", "--all-match", "--grep=i", "--grep=r"]),
+        vec!["second"]
+    );
+}
+
+#[test]
+fn lo03_ignore_case_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["-i", "--grep=I", "--grep=R", "--all-match"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_fixed_strings_multi() {
+    assert_eq!(
+        lo03_log_subjects(&["--fixed-strings", "--grep=.", "--grep=r"]),
+        vec!["fourth", "third"]
+    );
+}
+
+#[test]
+fn lo03_all_match_without_patterns() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_invert_without_patterns() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--invert-grep"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_repeated_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--all-match", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_json_all_match() {
+    let repo = lo_f1_repo();
+    let json_output = run_libra_command(
+        &["--json", "log", "--all-match", "--grep=i", "--grep=r"],
+        repo.path(),
+    );
+    assert_cli_success(&json_output, "JSON log grep filter");
+    let machine_output = run_libra_command(
+        &["--machine", "log", "--all-match", "--grep=i", "--grep=r"],
+        repo.path(),
+    );
+    assert_cli_success(&machine_output, "machine log grep filter");
+    let json = parse_json_stdout(&json_output);
+    let machine_json = parse_json_stdout(&machine_output);
+    let subjects_from_output = |json: &serde_json::Value| {
+        json["data"]["commits"]
+            .as_array()
+            .expect("commits should be an array")
+            .iter()
+            .map(|commit| {
+                commit["subject"]
+                    .as_str()
+                    .expect("commit subject should be a string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (
+            subjects_from_output(&json),
+            subjects_from_output(&machine_json)
+        ),
+        (vec!["third".to_string()], vec!["third".to_string()])
+    );
+}
+
 fn lo02_rev_parse(repo: &tempfile::TempDir, revision: &str) -> String {
     let output = run_libra_command(&["rev-parse", revision], repo.path());
     assert_cli_success(&output, "rev-parse");
@@ -2760,17 +3035,17 @@ fn test_log_json_oneline_flag_does_not_alter_schema() {
 #[test]
 fn test_log_args_grep() {
     let args = LogArgs::parse_from(["libra", "--grep", "fix"]);
-    assert_eq!(args.grep, Some("fix".to_string()));
+    assert_eq!(args.grep, vec!["fix".to_string()]);
 
     let args = LogArgs::parse_from(["libra"]);
-    assert_eq!(args.grep, None);
+    assert!(args.grep.is_empty());
 }
 
 // Test grep combined with other arguments
 #[test]
 fn test_grep_with_other_args() {
     let args = LogArgs::parse_from(["libra", "--grep", "feature", "--oneline", "-n", "5"]);
-    assert_eq!(args.grep, Some("feature".to_string()));
+    assert_eq!(args.grep, vec!["feature".to_string()]);
     assert!(args.oneline);
     assert_eq!(args.number, Some(5));
 }
@@ -2779,14 +3054,14 @@ fn test_grep_with_other_args() {
 #[test]
 fn test_grep_case_sensitive() {
     let args = LogArgs::parse_from(["libra", "--grep", "FIX"]);
-    assert_eq!(args.grep, Some("FIX".to_string()));
+    assert_eq!(args.grep, vec!["FIX".to_string()]);
 }
 
 // Test empty string grep
 #[test]
 fn test_grep_empty_string() {
     let args = LogArgs::parse_from(["libra", "--grep", ""]);
-    assert_eq!(args.grep, Some("".to_string()));
+    assert_eq!(args.grep, vec!["".to_string()]);
 }
 
 // Test graph with grep combination
@@ -2794,7 +3069,7 @@ fn test_grep_empty_string() {
 fn test_graph_with_grep() {
     let args = LogArgs::parse_from(["libra", "--graph", "--grep", "fix"]);
     assert!(args.graph);
-    assert_eq!(args.grep, Some("fix".to_string()));
+    assert_eq!(args.grep, vec!["fix".to_string()]);
 }
 
 // Integration test: verify actual filtering behavior

@@ -210,20 +210,28 @@ libra log --author alice
 libra log --author "alice@example.com"
 ```
 
-### `--grep <PATTERN>` / `-i` / `--invert-grep`
+### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
 
-按提交消息过滤。`--grep` 保留消息包含该（大小写敏感）子串的提交；`-i` /
-`--regexp-ignore-case` 改为大小写不敏感匹配（author/committer 在 Libra 中本就大小写不敏感）；
-`--invert-grep` 保留消息**不**匹配的提交。
+按提交消息过滤。可重复指定 `--grep`，默认任一模式匹配即可；`--all-match`
+要求每个模式都匹配且不接受值；无模式时不筛选。传入
+`--all-match=<value>` 会被拒绝。默认方言为 POSIX BRE（与 Git 相同）；
+`--fixed-strings` 按字面匹配，`--extended-regexp` 使用 POSIX ERE，
+`--basic-regexp` 显式选择默认方言（最后出现的方言选项生效）。
+`-i` / `--regexp-ignore-case` 让所有模式大小写不敏感；
+`--invert-grep` 保留一个模式都未匹配的提交，并优先于 `--all-match`。
 
 搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
 `-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
-人类输出、`--json` 和 `--machine` 使用相同筛选范围。空 `--grep` 模式保持不过滤消息的既有行为。
+人类输出、`--json` 和 `--machine` 使用相同筛选范围。空模式匹配所有消息，因此与
+`--invert-grep` 组合时没有提交通过。所有模式会在筛选开始前编译；多个模式
+都无效时，报告命令行中第一个无效模式。
 实际消息开头的空格、tab 和空行仍可搜索。
 此处识别紧跟 committer 的 gpgsig/gpgsig-sha256 签名头；其他导入头顺序（例如 encoding 在 gpgsig 前）沿用既有解析行为。
 
 ```bash
 libra log --grep "fix(" -n 20
+libra log --grep fix --grep docs      # 任一模式匹配
+libra log --all-match --grep fix --grep docs
 libra log --grep fix -i              # 大小写不敏感
 libra log --grep WIP --invert-grep   # 隐藏 WIP 提交
 ```
@@ -602,6 +610,8 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 空分支或空 HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | 无效日期参数 | `LBR-CLI-002` | 129 | -- |
 | 无效 `--decorate` 选项 | `LBR-CLI-002` | 129 | -- |
+| `--all-match` 传入值 | `LBR-CLI-002` | 129（Git：128） | Libra：`error: unexpected value '1' for '--all-match' found; no more were expected`；Git：`fatal: unrecognized argument: --all-match=1` |
+| 无效 `--grep` 模式（多个无效模式时报告第一个） | `LBR-CLI-002` | 129（Git：128） | Libra：`fatal: invalid --grep pattern '<pattern>': …`；Git：`fatal: command line, '<pattern>': …` |
 | `--no-abbrev` 传入值 | `LBR-CLI-002` | 129 | -- |
 | name 输出选项与生效中的 `-s`/`--no-patch` 冲突，或两个 name 选项仍同时生效 | `LBR-CLI-002` | 129 | -- |
 | 无效对象名 | `LBR-CLI-003` | 129 | "check the revision name and try again" |
