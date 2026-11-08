@@ -150,15 +150,29 @@ libra log -p -- src/main.rs
 
 ### `-s, --no-patch`
 
-Suppress diff output (patch/stat/shortstat), countermanding an earlier `-p`.
+Suppress diff output. This option can be repeated; each occurrence clears the diff output formats given before it
+(`-p`/`--patch`, `--stat`, `--shortstat`,
+`--patch-with-stat`, `--name-only`, and `--name-status`). Formats given after the
+last `-s`/`--no-patch` remain effective. An active `--name-only` or
+`--name-status` conflicts with active `-s`/`--no-patch`; the two name options
+also conflict when both remain active after applying the option order. A later
+diff format such as `--stat` clears `-s`, so name output can follow it. These
+conflicts fail with `LBR-CLI-002` (exit code 129). A later `-s` clears earlier
+name options, so a cleared option does not conflict.
 
 ```bash
 libra log -s -1
+libra log -p -s --stat
+libra log -s --name-only                       # error
+libra log -s --stat --name-only                # accepted; shows changed paths
+libra log --name-only --name-status            # error
+libra log -s --name-only --no-patch            # accepted; --name-only is cleared
 ```
 
 ### `--name-only`
 
-Show only the names of changed files for each commit.
+Show only the names of changed files for each commit. It cannot remain active
+while `-s`/`--no-patch` is active or together with `--name-status`.
 
 ```bash
 libra log --name-only
@@ -167,6 +181,8 @@ libra log --name-only
 ### `--name-status`
 
 Show names and status (added/modified/deleted) of changed files for each commit.
+It cannot remain active while `-s`/`--no-patch` is active or together with
+`--name-only`.
 
 ```bash
 libra log --name-status
@@ -770,6 +786,7 @@ flag only affects the human rendering layer.
 | Empty branch or empty HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | Invalid date argument | `LBR-CLI-002` | 129 | -- |
 | Invalid `--decorate` option | `LBR-CLI-002` | 129 | -- |
+| A name output option conflicts with active `-s`/`--no-patch`, or both name options remain active | `LBR-CLI-002` | 129 | -- |
 | Invalid object name | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | Unresolvable positional revision (typo guard) | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |
 | Ambiguous short object name | `LBR-CLI-003` | 129 | "The candidates are: ..." (one `<abbrev> <type>` line per candidate) |

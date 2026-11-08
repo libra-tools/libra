@@ -117,6 +117,284 @@ fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> t
     repo
 }
 
+const LO01_REFUSAL_MESSAGE: &str =
+    "options '--name-only', '--name-status', '--check', and '-s' cannot be used together";
+
+#[derive(Clone, Copy)]
+enum Lo01RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo01_assert_refusal_gate(args: &[&str], predicate: Lo01RefusalPredicate) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo01RefusalPredicate::Json => vec!["--json"],
+        Lo01RefusalPredicate::MachineLines | Lo01RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo01RefusalPredicate::Message => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected = format!("fatal: {LO01_REFUSAL_MESSAGE}");
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo01RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().nth(1), Some("Error-Code: LBR-CLI-002"));
+        }
+        Lo01RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo01RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo01RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "ok": false,
+                    "error_code": "LBR-CLI-002",
+                    "category": "cli",
+                    "exit_code": 129,
+                    "severity": "fatal",
+                    "message": LO01_REFUSAL_MESSAGE,
+                })
+            );
+        }
+        Lo01RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo01RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "ok": false,
+                    "error_code": "LBR-CLI-002",
+                    "category": "cli",
+                    "exit_code": 129,
+                    "severity": "fatal",
+                    "message": LO01_REFUSAL_MESSAGE,
+                })
+            );
+        }
+    }
+}
+
+macro_rules! log_refusal_gates {
+    ($(($name:ident, [$($arg:expr),+ $(,)?], $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo01_assert_refusal_gate(
+                    &[$($arg),+],
+                    Lo01RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_refusal_gates! {
+    (lo01_s_then_name_only__msg, ["log", "-1", "--format=%s", "-s", "--name-only"], Message),
+    (lo01_s_then_name_only__code, ["log", "-1", "--format=%s", "-s", "--name-only"], Code),
+    (lo01_s_then_name_only__exit, ["log", "-1", "--format=%s", "-s", "--name-only"], Exit),
+    (lo01_s_then_name_only__stdout, ["log", "-1", "--format=%s", "-s", "--name-only"], Stdout),
+    (lo01_s_then_name_only__json, ["log", "-1", "--format=%s", "-s", "--name-only"], Json),
+    (lo01_s_then_name_only__machine_lines, ["log", "-1", "--format=%s", "-s", "--name-only"], MachineLines),
+    (lo01_s_then_name_only__machine_json, ["log", "-1", "--format=%s", "-s", "--name-only"], MachineJson),
+
+    (lo01_no_patch_then_name_status__msg, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Message),
+    (lo01_no_patch_then_name_status__code, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Code),
+    (lo01_no_patch_then_name_status__exit, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Exit),
+    (lo01_no_patch_then_name_status__stdout, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Stdout),
+    (lo01_no_patch_then_name_status__json, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Json),
+    (lo01_no_patch_then_name_status__machine_lines, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], MachineLines),
+    (lo01_no_patch_then_name_status__machine_json, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], MachineJson),
+
+    (lo01_name_only_and_name_status__msg, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Message),
+    (lo01_name_only_and_name_status__code, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Code),
+    (lo01_name_only_and_name_status__exit, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Exit),
+    (lo01_name_only_and_name_status__stdout, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Stdout),
+    (lo01_name_only_and_name_status__json, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Json),
+    (lo01_name_only_and_name_status__machine_lines, ["log", "-1", "--format=%s", "--name-only", "--name-status"], MachineLines),
+    (lo01_name_only_and_name_status__machine_json, ["log", "-1", "--format=%s", "--name-only", "--name-status"], MachineJson),
+}
+
+fn lo01_log_output(args: &[&str]) -> std::process::Output {
+    let repo = lo_f1_repo();
+    run_libra_command(args, repo.path())
+}
+
+#[test]
+fn lo01_no_patch_then_stat_shows_stat() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--no-patch", "--stat", "--stat"]);
+    assert_cli_success(&output, "log --no-patch --stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_s_then_shortstat_shows_shortstat() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--shortstat",
+        "--shortstat",
+    ]);
+    assert_cli_success(&output, "log -s --shortstat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_no_patch_then_patch_with_stat_shows_patch() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "--no-patch",
+        "--patch-with-stat",
+        "--patch-with-stat",
+    ]);
+    assert_cli_success(&output, "log --no-patch --patch-with-stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_patch_no_patch_stat_drops_patch() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "--no-patch", "--stat"]);
+    assert_cli_success(&output, "log -p --no-patch --stat");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("diff --git"))
+    );
+}
+
+#[test]
+fn lo01_name_only_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--name-only", "--no-patch"]);
+    assert_cli_success(&output, "log --name-only --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_repeated_no_patch_accepted() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-s", "-s"]);
+    assert_cli_success(&output, "log -s -s");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_stat_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--stat", "--no-patch"]);
+    assert_cli_success(&output, "log --stat --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_patch_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "--no-patch"]);
+    assert_cli_success(&output, "log -p --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_trailing_no_patch_clears_name_only() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--name-only",
+        "--no-patch",
+    ]);
+    assert_cli_success(&output, "log -s --name-only --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_combined_short_flags() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-sp"]);
+    assert_cli_success(&output, "log -sp");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_no_format_flags_is_plain() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s"]);
+    assert_cli_success(&output, "log without diff format flags");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_stat_alone_shows_stat() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--stat"]);
+    assert_cli_success(&output, "log --stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_patch_alone_shows_patch() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "-p"]);
+    assert_cli_success(&output, "log -p");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_stat_clears_no_patch_before_repeated_name_only() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--stat",
+        "--name-only",
+        "--name-only",
+    ]);
+    assert_cli_success(&output, "log -s --stat --name-only --name-only");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n\nfile\n");
+}
+
 #[test]
 fn lo00_date_format_committer_date() {
     let repo = lo_f1_repo();

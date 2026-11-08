@@ -117,9 +117,29 @@ libra log -p
 libra log -p -- src/main.rs
 ```
 
+### `-s, --no-patch`
+
+抑制 diff 输出。此选项可重复；每次出现都会清除它之前给出的 diff 输出
+格式：`-p`/`--patch`、`--stat`、`--shortstat`、`--patch-with-stat`、
+`--name-only` 和 `--name-status`。最后一次 `-s`/`--no-patch` 之后给出的
+格式仍生效。处于生效状态的 `--name-only` 或 `--name-status` 与生效中的
+`-s`/`--no-patch` 冲突；两个 name 选项按顺序处理后若仍同时生效，也会报错。
+之后的 `--stat` 等 diff 格式会清除 `-s`，此时可以输出 name 结果。冲突返回
+`LBR-CLI-002`（退出码 129）。之后出现的 `-s` 会清除之前的 name 选项。
+
+```bash
+libra log -s -1
+libra log -p -s --stat
+libra log -s --stat --name-only                # 接受；显示变更路径
+libra log --name-only --name-status            # 报错
+libra log -s --name-only --no-patch            # 接受；--name-only 已清除
+libra log -s --name-only                       # 报错
+```
+
 ### `--name-only`
 
-只显示每个提交中已更改文件的名称。
+只显示每个提交中已更改文件的名称。此选项不能在 `-s`/`--no-patch` 仍生效时
+保持生效，也不能与仍生效的 `--name-status` 同时使用。
 
 ```bash
 libra log --name-only
@@ -127,7 +147,8 @@ libra log --name-only
 
 ### `--name-status`
 
-显示每个提交中已更改文件的名称和状态（added/modified/deleted）。
+显示每个提交中已更改文件的名称和状态（added/modified/deleted）。此选项不能在
+`-s`/`--no-patch` 仍生效时保持生效，也不能与仍生效的 `--name-only` 同时使用。
 
 ```bash
 libra log --name-status
@@ -567,6 +588,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 空分支或空 HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | 无效日期参数 | `LBR-CLI-002` | 129 | -- |
 | 无效 `--decorate` 选项 | `LBR-CLI-002` | 129 | -- |
+| name 输出选项与生效中的 `-s`/`--no-patch` 冲突，或两个 name 选项仍同时生效 | `LBR-CLI-002` | 129 | -- |
 | 无效对象名 | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | 无法解析的位置 revision（拼写护栏） | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |
 | 歧义短对象名 | `LBR-CLI-003` | 129 | "The candidates are: ..."（每个候选一行 `<abbrev> <type>`） |

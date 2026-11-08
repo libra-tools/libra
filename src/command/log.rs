@@ -11,7 +11,7 @@ use std::{
     rc::Rc,
 };
 
-use clap::Parser;
+use clap::{ArgMatches, Parser, parser::ValueSource};
 use colored::Colorize;
 use git_internal::{
     Diff,
@@ -140,6 +140,28 @@ fn log_missing_history_error(error: impl std::fmt::Display) -> CliError {
         .with_hint("run 'libra fsck' to inspect missing history")
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiffFormatPositions {
+    patch: Option<usize>,
+    no_patch: Option<usize>,
+    stat: Option<usize>,
+    shortstat: Option<usize>,
+    patch_with_stat: Option<usize>,
+    name_only: Option<usize>,
+    name_status: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResolvedDiffFormats {
+    patch: bool,
+    no_patch: bool,
+    stat: bool,
+    shortstat: bool,
+    patch_with_stat: bool,
+    name_only: bool,
+    name_status: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = LOG_EXAMPLES)]
 pub struct LogArgs {
@@ -169,10 +191,10 @@ pub struct LogArgs {
     pub children: bool,
 
     /// Show diffs for each commit (like git -p)
-    #[clap(short = 'p', long = "patch", overrides_with = "no_patch")]
+    #[clap(short = 'p', long = "patch", overrides_with = "patch")]
     pub patch: bool,
-    /// Suppress diff output (`-s`/`--no-patch`), countermanding an earlier `-p`.
-    #[clap(short = 's', long = "no-patch", overrides_with = "patch")]
+    /// Suppress diff output, clearing earlier diff-format options.
+    #[clap(short = 's', long = "no-patch", overrides_with = "no_patch")]
     pub no_patch: bool,
     /// Restrict decorations to refs matching any comma-separated pattern
     /// (Git's `--decorate-refs`).
@@ -183,10 +205,10 @@ pub struct LogArgs {
     #[clap(long = "decorate-refs-exclude", value_name = "PATTERN")]
     pub decorate_refs_exclude: Option<String>,
     /// Show only names of changed files
-    #[clap(long)]
+    #[clap(long, overrides_with = "name_only")]
     pub name_only: bool,
     /// Show names and status of changed files
-    #[clap(long)]
+    #[clap(long, overrides_with = "name_status")]
     pub name_status: bool,
     /// Use NUL separators for log records and changed-path output
     #[clap(short = 'z', long = "null")]
@@ -226,17 +248,17 @@ pub struct LogArgs {
     #[clap(long)]
     pub graph: bool,
     /// Show diffstat (file change statistics) for each commit
-    #[clap(long)]
+    #[clap(long, overrides_with = "stat")]
     pub stat: bool,
 
     /// Show only the summary line of the diffstat (files changed, insertions,
     /// deletions) for each commit
-    #[clap(long)]
+    #[clap(long, overrides_with = "shortstat")]
     pub shortstat: bool,
 
     /// Show the diffstat block followed by the full patch for each commit
     /// (Git's synonym for `-p --stat`).
-    #[clap(long = "patch-with-stat")]
+    #[clap(long = "patch-with-stat", overrides_with = "patch_with_stat")]
     pub patch_with_stat: bool,
 
     /// Positional `[<revision-range>...] [<path>...]` BEFORE `--`: leading
@@ -1843,10 +1865,113 @@ async fn commit_affects_line_range(
     Ok(false)
 }
 
+fn last_command_line_position(matches: &ArgMatches, id: &str) -> Option<usize> {
+    if matches.value_source(id) != Some(ValueSource::CommandLine) {
+        return None;
+    }
+    matches.indices_of(id).and_then(|indices| indices.max())
+}
+
+pub(crate) fn diff_format_positions(matches: &ArgMatches) -> DiffFormatPositions {
+    DiffFormatPositions {
+        patch: last_command_line_position(matches, "patch"),
+        no_patch: last_command_line_position(matches, "no_patch"),
+        stat: last_command_line_position(matches, "stat"),
+        shortstat: last_command_line_position(matches, "shortstat"),
+        patch_with_stat: last_command_line_position(matches, "patch_with_stat"),
+        name_only: last_command_line_position(matches, "name_only"),
+        name_status: last_command_line_position(matches, "name_status"),
+    }
+}
+
+fn after_last_no_patch(position: Option<usize>, no_patch: Option<usize>) -> bool {
+    match (position, no_patch) {
+        (Some(position), Some(no_patch)) => position > no_patch,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn resolve_diff_formats(positions: DiffFormatPositions) -> ResolvedDiffFormats {
+    let patch = after_last_no_patch(positions.patch, positions.no_patch);
+    let stat = after_last_no_patch(positions.stat, positions.no_patch);
+    let shortstat = after_last_no_patch(positions.shortstat, positions.no_patch);
+    let patch_with_stat = after_last_no_patch(positions.patch_with_stat, positions.no_patch);
+    let name_only = after_last_no_patch(positions.name_only, positions.no_patch);
+    let name_status = after_last_no_patch(positions.name_status, positions.no_patch);
+    let no_patch = positions.no_patch.is_some() && !(patch || stat || shortstat || patch_with_stat);
+
+    ResolvedDiffFormats {
+        patch,
+        no_patch,
+        stat,
+        shortstat,
+        patch_with_stat,
+        name_only,
+        name_status,
+    }
+}
+
+fn legacy_diff_formats(args: &LogArgs) -> ResolvedDiffFormats {
+    ResolvedDiffFormats {
+        patch: args.patch,
+        no_patch: args.no_patch,
+        stat: args.stat,
+        shortstat: args.shortstat,
+        patch_with_stat: args.patch_with_stat,
+        name_only: args.name_only,
+        name_status: args.name_status,
+    }
+}
+
+fn resolved_diff_formats(
+    args: &LogArgs,
+    positions: Option<DiffFormatPositions>,
+) -> CliResult<ResolvedDiffFormats> {
+    let has_positions = positions.is_some();
+    let resolved = positions
+        .map(resolve_diff_formats)
+        .unwrap_or_else(|| legacy_diff_formats(args));
+    let name_output_conflict = (resolved.no_patch && (resolved.name_only || resolved.name_status))
+        || (resolved.name_only && resolved.name_status);
+
+    if has_positions && name_output_conflict {
+        return Err(CliError::fatal(
+            "options '--name-only', '--name-status', '--check', and '-s' cannot be used together",
+        )
+        .with_exit_code(129)
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+
+    Ok(resolved)
+}
+
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. Walks commit history applying filters (date range,
 /// author, path) and renders formatted log output.
+///
+/// `LogArgs` does not retain command-line argument order, so direct callers
+/// receive the legacy order-independent diff-format behavior. The CLI
+/// dispatcher uses parsed argument positions to apply option-order semantics.
 pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()> {
+    let diff_formats = resolved_diff_formats(&args, None)?;
+    execute_safe_with_diff_formats(args, output, diff_formats).await
+}
+
+pub(crate) async fn execute_safe_with_positions(
+    args: LogArgs,
+    output: &OutputConfig,
+    positions: DiffFormatPositions,
+) -> CliResult<()> {
+    let diff_formats = resolved_diff_formats(&args, Some(positions))?;
+    execute_safe_with_diff_formats(args, output, diff_formats).await
+}
+
+async fn execute_safe_with_diff_formats(
+    args: LogArgs,
+    output: &OutputConfig,
+    diff_formats: ResolvedDiffFormats,
+) -> CliResult<()> {
     reset_log_debug_counters();
     let _log_debug_hooks = LogDebugHookGuard;
     let log_config = resolve_log_config(&args, !output.is_json()).await?;
@@ -1857,16 +1982,18 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
         return emit_json_data("log", &result, output);
     }
 
-    let name_status = args.name_status;
+    let name_status = diff_formats.name_status;
     // Check parameter mutual exclusion: if both name flags and --patch are specified, prioritize the name display flags
-    let name_only = args.name_only && !name_status;
+    let name_only = diff_formats.name_only && !name_status;
     // `--patch-with-stat` is Git's synonym for `-p --stat`, so it enables the
     // patch view. The name flags still take precedence over any diff output.
-    let patch =
-        (args.patch || args.patch_with_stat) && !name_only && !name_status && !args.no_patch;
+    let patch = (diff_formats.patch || diff_formats.patch_with_stat)
+        && !name_only
+        && !name_status
+        && !diff_formats.no_patch;
     // Emit the diffstat block before the patch when both are requested — via
     // `--patch-with-stat` or an explicit `-p --stat` combination.
-    let stat_before_patch = patch && (args.stat || args.patch_with_stat);
+    let stat_before_patch = patch && (diff_formats.stat || diff_formats.patch_with_stat);
 
     let since = args.since.as_deref().map(parse_date_arg).transpose()?;
     let until = args.until.as_deref().map(parse_date_arg).transpose()?;
@@ -1969,7 +2096,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
             patch,
             // `--shortstat` reads the same per-commit stats as `--stat`, so it
             // must trigger the same quiet-mode validation of blob data.
-            (args.stat || args.shortstat) && !args.no_patch,
+            (diff_formats.stat || diff_formats.shortstat) && !diff_formats.no_patch,
         )
         .await;
     }
@@ -2241,7 +2368,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
                 }
                 message.push_str(&block);
             }
-        } else if args.stat && !args.no_patch {
+        } else if diff_formats.stat && !diff_formats.no_patch {
             let stats = compute_commit_stat(&commit, commit_path_filters.clone()).await?;
             let stat_output = format_stat_output(&stats);
             if !stat_output.is_empty() {
@@ -2250,7 +2377,7 @@ pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()>
                 }
                 message.push_str(&stat_output);
             }
-        } else if args.shortstat && !args.no_patch {
+        } else if diff_formats.shortstat && !diff_formats.no_patch {
             let stats = compute_commit_stat(&commit, commit_path_filters).await?;
             let shortstat_output = format_shortstat_output(&stats);
             if !shortstat_output.is_empty() {

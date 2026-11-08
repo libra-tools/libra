@@ -3381,6 +3381,23 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    let log_diff_format_positions = if matches!(&args.command, Commands::Log(_)) {
+        let parsed_matches = <Cli as clap::CommandFactory>::command()
+            .try_get_matches_from(argv.clone())
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to recover log option order after successful CLI parsing: {error}"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+            })?;
+        let log_matches = parsed_matches.subcommand_matches("log").ok_or_else(|| {
+            CliError::fatal("failed to recover parsed `log` command options")
+                .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+        })?;
+        Some(command::log::diff_format_positions(log_matches))
+    } else {
+        None
+    };
     // Managed hook callbacks run beneath their provider's short timeout.
     // Establish the dual-clock deadline immediately after argv parsing, then
     // take the deliberately narrow dispatch below before global config,
@@ -3720,7 +3737,13 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::LsFiles(cmd_args) => {
                 command::ls_files::execute_safe(cmd_args, &output).await?
             }
-            Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
+            Commands::Log(cmd_args) => {
+                let positions = log_diff_format_positions.ok_or_else(|| {
+                    CliError::fatal("failed to recover parsed `log` option order")
+                        .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+                })?;
+                command::log::execute_safe_with_positions(cmd_args, &output, positions).await?
+            }
             Commands::Logfile(cmd_args) => {
                 command::logfile::execute_safe(cmd_args, &output).await?
             }
