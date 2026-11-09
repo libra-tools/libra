@@ -2271,7 +2271,7 @@ async fn execute_safe_with_diff_formats(
         std::collections::HashMap::new()
     };
 
-    for (index, selected) in selected_commits.into_iter().enumerate() {
+    for selected in selected_commits {
         let SelectedLogCommit {
             commit,
             mut cached_changes,
@@ -2279,7 +2279,8 @@ async fn execute_safe_with_diff_formats(
         } = selected;
         let ref_msg = if decorate_option != DecorateOptions::No {
             let mut ref_msgs: Vec<String> = vec![];
-            if index == 0 {
+            // `HEAD` marks the commit HEAD points to, not the first rendered one.
+            if commit.id == current_head_commit {
                 ref_msgs.push(if let Some(b_name) = &branch_name {
                     format!(
                         "{} -> {}{}",

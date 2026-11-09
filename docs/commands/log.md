@@ -366,7 +366,7 @@ libra log --format=oneline
 ### `--decorate[=<style>]`
 
 Print ref names (branches, tags) next to commits. Styles: `short` (default), `full`, `no`.
-Human-readable decorations are listed in the reverse order of their full ref names, with `HEAD` first. The `--json` `refs` array keeps its existing order.
+Human-readable decorations are listed in the reverse order of their full ref names, with `HEAD` first. `HEAD` is shown only on the commit that HEAD points to, even when the range, `--reverse` or `--skip` starts elsewhere. The `--json` `refs` array keeps its existing order.
 
 ```bash
 libra log --decorate

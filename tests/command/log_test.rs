@@ -5816,3 +5816,69 @@ fn log_ineligible_all_multiple_tips_walk_full_history() {
     let all = rev_list_count(repo.path(), &["--all"]);
     assert_loads(repo.path(), &["log", "--all", "-n", "1"], all);
 }
+
+/// LO-06 reuses fixture F2: the `HEAD` decoration may appear only on the
+/// commit HEAD points to, whatever range, order or limit the log renders.
+fn lo06_log_stdout(repo: &tempfile::TempDir, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo.path());
+    assert_cli_success(&output, "log with decorations");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo06_head_absent_outside_range() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "-1", "HEAD~1"]
+        ),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo06_reverse_keeps_head_on_head_commit() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "--reverse"]
+        ),
+        "one\ntwo (tag: t2, tag: t1, zz, aa)\nthree (HEAD -> main, tag: reach, octopus-b, octopus-a)\n"
+    );
+}
+
+#[test]
+fn lo06_skip_does_not_move_head() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "--skip=1"]
+        ),
+        "two (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo06_other_branch_has_no_head() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(&repo, &["log", "--decorate=short", "--format=%s%d", "zz"]),
+        "two (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo06_detached_head_on_its_commit() {
+    let repo = lo_f2_repo();
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", "HEAD~1"], repo.path()),
+        "detach HEAD~1",
+    );
+    assert_eq!(
+        lo06_log_stdout(&repo, &["log", "--decorate=short", "--format=%s%d", "main"]),
+        "three (tag: reach, octopus-b, octopus-a, main)\ntwo (HEAD, tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
