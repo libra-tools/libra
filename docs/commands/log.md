@@ -243,13 +243,20 @@ libra log --reverse --oneline
 libra log --follow src/main.rs
 ```
 
-### `--author <PATTERN>`
+### `--author <PATTERN>` / `--committer <PATTERN>`
 
-Filter commits to only those whose author name or email matches the given pattern.
+Filter commits to those whose author (`--author`) or committer (`--committer`)
+name or email matches the given pattern. `--author` and `--committer` may be
+repeated. Patterns within one field are OR-matched; fields are ANDed with each
+other and with message filters. Repeating `--author` does not alter how
+`--all-match` treats `--grep` patterns. Matching is a case-insensitive substring
+against `Name <email>`.
 
 ```bash
 libra log --author alice
 libra log --author "alice@example.com"
+libra log --author alice --author bob       # either author may match
+libra log --committer alice --committer bob
 ```
 
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`

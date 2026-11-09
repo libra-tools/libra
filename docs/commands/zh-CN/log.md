@@ -201,13 +201,18 @@ libra log --reverse --oneline
 libra log --follow src/main.rs
 ```
 
-### `--author <PATTERN>`
+### `--author <PATTERN>` / `--committer <PATTERN>`
 
-只显示作者姓名或 email 匹配给定模式的提交。
+只显示作者（`--author`）或提交者（`--committer`）姓名或 email 匹配给定模式的提交。
+`--author` 和 `--committer` 可重复。同一字段内的多个模式是「或」；字段之间、
+以及字段与消息过滤之间是「且」。重复 `--author` 不改变 `--all-match` 对
+`--grep` 模式的作用。匹配仍为对 `Name <email>` 的大小写不敏感子串。
 
 ```bash
 libra log --author alice
 libra log --author "alice@example.com"
+libra log --author alice --author bob       # 任一作者模式命中即可
+libra log --committer alice --committer bob
 ```
 
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`

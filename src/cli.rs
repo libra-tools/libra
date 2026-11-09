@@ -1359,7 +1359,11 @@ fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
                 None
             };
         }
-        if matches!(arg, "--color" | "--progress") {
+        if arg == "--color" {
+            i += 1;
+            continue;
+        }
+        if matches!(arg, "--progress" | "--max-connections") {
             i = (i + 2).min(args.len());
             continue;
         }
@@ -1376,6 +1380,80 @@ fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
         i += 1;
     }
     None
+}
+
+fn normalize_log_identity_patterns(
+    args: Vec<std::ffi::OsString>,
+) -> (Vec<std::ffi::OsString>, command::log::LogIdentityFilters) {
+    let Some((command_index, _)) = find_subcommand_index(&args) else {
+        return (args, command::log::LogIdentityFilters::default());
+    };
+    if !matches!(
+        args.get(command_index).and_then(|value| value.to_str()),
+        Some("log" | "hist" | "history")
+    ) {
+        return (args, command::log::LogIdentityFilters::default());
+    }
+
+    let mut rewritten = args[..=command_index].to_vec();
+    let mut identity_filters = command::log::LogIdentityFilters::default();
+    let mut author_seen = false;
+    let mut committer_seen = false;
+    let mut index = command_index + 1;
+    while index < args.len() {
+        let Some(token) = args[index].to_str() else {
+            rewritten.push(args[index].clone());
+            index += 1;
+            continue;
+        };
+        if token == "--" {
+            rewritten.extend(args[index..].iter().cloned());
+            break;
+        }
+
+        if let Some(pattern) = token.strip_prefix("--author=") {
+            identity_filters.authors.push(pattern.to_string());
+            if !author_seen {
+                rewritten.push(args[index].clone());
+                author_seen = true;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(pattern) = token.strip_prefix("--committer=") {
+            identity_filters.committers.push(pattern.to_string());
+            if !committer_seen {
+                rewritten.push(args[index].clone());
+                committer_seen = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        let flag = match token {
+            "--author" => Some((&mut author_seen, &mut identity_filters.authors)),
+            "--committer" => Some((&mut committer_seen, &mut identity_filters.committers)),
+            _ => None,
+        };
+        if let (Some((seen, patterns)), Some(pattern)) = (flag, args.get(index + 1))
+            && let Some(pattern) = pattern.to_str()
+            && !pattern.starts_with('-')
+        {
+            patterns.push(pattern.to_string());
+            if !*seen {
+                rewritten.push(args[index].clone());
+                rewritten.push(args[index + 1].clone());
+                *seen = true;
+            }
+            index += 2;
+            continue;
+        }
+
+        rewritten.push(args[index].clone());
+        index += 1;
+    }
+
+    (rewritten, identity_filters)
 }
 
 fn is_short_number_flag(arg: &str) -> bool {
@@ -3360,6 +3438,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         &<Cli as clap::CommandFactory>::command(),
     );
     let argv = rewrite_bare_stash_args(status_resolution.argv.clone())?;
+    let (argv, log_identity_filters) = normalize_log_identity_patterns(argv);
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
     reject_unsupported_single_dash_control(&utf8_argv)?;
@@ -3742,7 +3821,13 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                     CliError::fatal("failed to recover parsed `log` option order")
                         .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
                 })?;
-                command::log::execute_safe_with_positions(cmd_args, &output, positions).await?
+                command::log::execute_safe_with_positions_and_identity_filters(
+                    cmd_args,
+                    &output,
+                    positions,
+                    log_identity_filters,
+                )
+                .await?
             }
             Commands::Logfile(cmd_args) => {
                 command::logfile::execute_safe(cmd_args, &output).await?

@@ -65,6 +65,48 @@ fn lo_f1_repo() -> tempfile::TempDir {
 }
 
 fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> tempfile::TempDir {
+    lo_f1_repo_with_dates_and_committers(author_timestamp, committer_timestamp, None)
+}
+
+fn lo_f1_repo_with_distinct_committers() -> tempfile::TempDir {
+    let repo = lo_f1_repo_with_dates_and_committers(
+        "2026-01-02T03:04:05Z",
+        "2026-01-02T03:04:05Z",
+        Some(["Xx Committer", "A U Thor", "A U Thor", "A U Thor"]),
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(repo.path().join("file"))
+        .expect("open file")
+        .write_all(b"a\n")
+        .expect("append file");
+    assert_cli_success(
+        &run_libra_command(&["add", "file"], repo.path()),
+        "add unmatched committer commit",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "unmatched", "--no-verify"],
+            repo.path(),
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z"),
+                ("GIT_COMMITTER_NAME", "Other Committer"),
+                ("GIT_COMMITTER_EMAIL", "other@example.com"),
+            ],
+        ),
+        "commit with unmatched committer",
+    );
+
+    repo
+}
+
+fn lo_f1_repo_with_dates_and_committers(
+    author_timestamp: &str,
+    committer_timestamp: &str,
+    committer_names: Option<[&str; 4]>,
+) -> tempfile::TempDir {
     let repo = tempdir().expect("tempdir");
     init_repo_via_cli(repo.path());
 
@@ -84,7 +126,7 @@ fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> t
         ("fourth", Some("Night Fall <nitfol@frobozz.com>")),
     ];
 
-    for (message, author) in commits {
+    for (index, (message, author)) in commits.into_iter().enumerate() {
         fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -101,15 +143,16 @@ fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> t
         if let Some(author) = author {
             args.extend(["--author", author]);
         }
+        let mut commit_env = vec![
+            ("GIT_AUTHOR_DATE", author_timestamp),
+            ("GIT_COMMITTER_DATE", committer_timestamp),
+        ];
+        if let Some(committer_name) = committer_names.map(|names| names[index]) {
+            commit_env.push(("GIT_COMMITTER_NAME", committer_name));
+            commit_env.push(("GIT_COMMITTER_EMAIL", "committer@example.com"));
+        }
         assert_cli_success(
-            &run_libra_command_with_env(
-                &args,
-                repo.path(),
-                &[
-                    ("GIT_AUTHOR_DATE", author_timestamp),
-                    ("GIT_COMMITTER_DATE", committer_timestamp),
-                ],
-            ),
+            &run_libra_command_with_env(&args, repo.path(), &commit_env),
             "commit with fixed date",
         );
     }
@@ -599,6 +642,160 @@ fn lo03_json_all_match() {
         ),
         (vec!["third".to_string()], vec!["third".to_string()])
     );
+}
+
+fn lo04_log_subjects(filters: &[&str]) -> Vec<String> {
+    let repo = lo_f1_repo();
+    lo04_log_subjects_in_repo(&repo, filters)
+}
+
+fn lo04_log_subjects_in_repo(repo: &tempfile::TempDir, filters: &[&str]) -> Vec<String> {
+    lo04_log_subjects_with_command(repo, "log", filters)
+}
+
+fn lo04_log_subjects_with_command(
+    repo: &tempfile::TempDir,
+    command: &str,
+    filters: &[&str],
+) -> Vec<String> {
+    let mut args = vec![command, "--format=%s"];
+    args.extend_from_slice(filters);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log identity filter");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn lo04_multi_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=Thor", "--author=Aster"]),
+        vec!["third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_multi_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=Thor", "--author=Aster"]),
+        vec!["third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_grep_and_author_intersection() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=A U Thor", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo04_grep_union_and_author() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=A U Thor", "--grep=s", "--grep=l"]),
+        vec!["initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_grep_with_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=Thor", "--author=Night", "--grep=i"]),
+        vec!["third", "initial"]
+    );
+}
+
+#[test]
+fn lo04_grep_with_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=Thor", "--author=Night", "--grep=i"]),
+        vec!["third", "initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_full_intersection() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=A U Thor", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo04_multi_committer_union() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    assert_eq!(
+        lo04_log_subjects_in_repo(&repo, &["--committer=Thor", "--committer=xx"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_author_union_and_committer() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    assert_eq!(
+        lo04_log_subjects_in_repo(
+            &repo,
+            &["--author=Night", "--author=Aster", "--committer=Thor"]
+        ),
+        vec!["fourth", "second"]
+    );
+}
+
+#[test]
+fn log_identity_patterns_support_separated_values_and_history_alias() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    let output = run_libra_command(
+        &[
+            "--max-connections",
+            "2",
+            "--color",
+            "history",
+            "--format=%s",
+            "--committer",
+            "Thor",
+            "--committer",
+            "xx",
+            "--",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "history with repeated committer patterns");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn log_identity_repeated_committer_patterns_filter_json_union() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    let output = run_libra_command(
+        &["--json", "log", "--committer=Thor", "--committer=xx"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "JSON log with repeated committer patterns");
+    let json = parse_json_stdout(&output);
+    let commits = json["data"]["commits"]
+        .as_array()
+        .expect("commits should be an array");
+    let subjects = commits
+        .iter()
+        .map(|commit| {
+            commit["subject"]
+                .as_str()
+                .expect("subject should be a string")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(subjects, ["fourth", "third", "second", "initial"]);
+    assert_eq!(json["data"]["total"], 4);
 }
 
 fn lo02_rev_parse(repo: &tempfile::TempDir, revision: &str) -> String {

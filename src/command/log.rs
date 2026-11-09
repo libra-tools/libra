@@ -219,7 +219,8 @@ pub struct LogArgs {
     /// Use NUL separators for log records and changed-path output
     #[clap(short = 'z', long = "null")]
     pub null: bool,
-    /// Filter commits by author name or email (case-insensitive substring match)
+    /// Filter commits by author name or email (case-insensitive substring match).
+    /// The CLI accepts repeated patterns as a union.
     #[clap(long, value_name = "PATTERN")]
     pub author: Option<String>,
     /// Show commits more recent than DATE (RFC3339, `YYYY-MM-DD`, or relative like `24h` / `7d`)
@@ -339,7 +340,8 @@ pub struct LogArgs {
     #[clap(long = "invert-grep")]
     pub invert_grep: bool,
 
-    /// Filter commits by committer name or email (case-insensitive substring match)
+    /// Filter commits by committer name or email (case-insensitive substring match).
+    /// The CLI accepts repeated patterns as a union.
     #[clap(long, value_name = "PATTERN")]
     pub committer: Option<String>,
 
@@ -448,6 +450,21 @@ pub struct LogArgs {
     pub ranges: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LogIdentityFilters {
+    pub(crate) authors: Vec<String>,
+    pub(crate) committers: Vec<String>,
+}
+
+impl LogIdentityFilters {
+    fn from_args(args: &LogArgs) -> Self {
+        Self {
+            authors: args.author.iter().cloned().collect(),
+            committers: args.committer.iter().cloned().collect(),
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
 enum DecorateOptions {
     No,
@@ -535,8 +552,8 @@ fn resolve_parent_bounds(
 }
 
 struct CommitFilter {
-    author: Option<String>,
-    committer: Option<String>,
+    author: Vec<String>,
+    committer: Vec<String>,
     since: Option<i64>,
     until: Option<i64>,
     paths: Vec<PathBuf>,
@@ -688,8 +705,8 @@ enum PickaxeKind {
 impl CommitFilter {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        author: Option<String>,
-        committer: Option<String>,
+        author: Vec<String>,
+        committer: Vec<String>,
         since: Option<i64>,
         until: Option<i64>,
         paths: Vec<PathBuf>,
@@ -699,8 +716,14 @@ impl CommitFilter {
         pickaxe: Option<PickaxeKind>,
     ) -> Self {
         Self {
-            author: author.map(|s| s.to_lowercase()),
-            committer: committer.map(|s| s.to_lowercase()),
+            author: author
+                .into_iter()
+                .map(|pattern| pattern.to_lowercase())
+                .collect(),
+            committer: committer
+                .into_iter()
+                .map(|pattern| pattern.to_lowercase())
+                .collect(),
             since,
             until,
             paths,
@@ -784,24 +807,32 @@ impl CommitFilter {
     }
 
     fn passes_non_path_filters(&self, commit: &Commit) -> bool {
-        if let Some(author_filter) = &self.author {
+        if !self.author.is_empty() {
             let author = format!(
                 "{} <{}>",
                 commit.author.name.to_lowercase(),
                 commit.author.email.to_lowercase()
             );
-            if !author.contains(author_filter) {
+            if !self
+                .author
+                .iter()
+                .any(|author_filter| author.contains(author_filter))
+            {
                 return false;
             }
         }
 
-        if let Some(committer_filter) = &self.committer {
+        if !self.committer.is_empty() {
             let committer = format!(
                 "{} <{}>",
                 commit.committer.name.to_lowercase(),
                 commit.committer.email.to_lowercase()
             );
-            if !committer.contains(committer_filter) {
+            if !self
+                .committer
+                .iter()
+                .any(|committer_filter| committer.contains(committer_filter))
+            {
                 return false;
             }
         }
@@ -1975,22 +2006,25 @@ fn resolved_diff_formats(
 /// dispatcher uses parsed argument positions to apply option-order semantics.
 pub async fn execute_safe(args: LogArgs, output: &OutputConfig) -> CliResult<()> {
     let diff_formats = resolved_diff_formats(&args, None)?;
-    execute_safe_with_diff_formats(args, output, diff_formats).await
+    let identity_filters = LogIdentityFilters::from_args(&args);
+    execute_safe_with_diff_formats(args, output, diff_formats, identity_filters).await
 }
 
-pub(crate) async fn execute_safe_with_positions(
+pub(crate) async fn execute_safe_with_positions_and_identity_filters(
     args: LogArgs,
     output: &OutputConfig,
     positions: DiffFormatPositions,
+    identity_filters: LogIdentityFilters,
 ) -> CliResult<()> {
     let diff_formats = resolved_diff_formats(&args, Some(positions))?;
-    execute_safe_with_diff_formats(args, output, diff_formats).await
+    execute_safe_with_diff_formats(args, output, diff_formats, identity_filters).await
 }
 
 async fn execute_safe_with_diff_formats(
     args: LogArgs,
     output: &OutputConfig,
     diff_formats: ResolvedDiffFormats,
+    identity_filters: LogIdentityFilters,
 ) -> CliResult<()> {
     reset_log_debug_counters();
     let _log_debug_hooks = LogDebugHookGuard;
@@ -1998,7 +2032,7 @@ async fn execute_safe_with_diff_formats(
     let decorate_option = resolve_decorate_option(&args).await?;
 
     if output.is_json() {
-        let result = run_log(&args, &log_config).await?;
+        let result = run_log(&args, &log_config, &identity_filters).await?;
         return emit_json_data("log", &result, output);
     }
 
@@ -2045,8 +2079,8 @@ async fn execute_safe_with_diff_formats(
     );
     let pickaxe = build_pickaxe(&args)?;
     let filter = CommitFilter::new(
-        args.author.clone(),
-        args.committer.clone(),
+        identity_filters.authors.clone(),
+        identity_filters.committers.clone(),
         since,
         until,
         selection_path_filters,
@@ -2423,7 +2457,11 @@ async fn execute_safe_with_diff_formats(
     Ok(())
 }
 
-async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<LogOutput> {
+async fn run_log(
+    args: &LogArgs,
+    log_config: &ResolvedLogConfig,
+    identity_filters: &LogIdentityFilters,
+) -> CliResult<LogOutput> {
     let since = args.since.as_deref().map(parse_date_arg).transpose()?;
     let until = args.until.as_deref().map(parse_date_arg).transpose()?;
     let (ranges, paths) = resolve_log_inputs(args).await?;
@@ -2454,8 +2492,8 @@ async fn run_log(args: &LogArgs, log_config: &ResolvedLogConfig) -> CliResult<Lo
     );
     let pickaxe = build_pickaxe(args)?;
     let filter = CommitFilter::new(
-        args.author.clone(),
-        args.committer.clone(),
+        identity_filters.authors.clone(),
+        identity_filters.committers.clone(),
         since,
         until,
         selection_path_filters,
@@ -3560,8 +3598,8 @@ mod tests {
                 ("", false, true, false),
             ] {
                 let filter = CommitFilter::new(
-                    None,
-                    None,
+                    Vec::new(),
+                    Vec::new(),
                     None,
                     None,
                     Vec::new(),
@@ -3599,8 +3637,8 @@ mod tests {
                 );
                 for invert in [false, true] {
                     let filter = CommitFilter::new(
-                        None,
-                        None,
+                        Vec::new(),
+                        Vec::new(),
                         None,
                         None,
                         Vec::new(),
@@ -3630,8 +3668,8 @@ mod tests {
             &literal,
         );
         let filter = CommitFilter::new(
-            None,
-            None,
+            Vec::new(),
+            Vec::new(),
             None,
             None,
             Vec::new(),
@@ -3917,8 +3955,8 @@ mod tests {
         commit.committer.timestamp = 1_766_102_400; // 2025-12-19 00:00:00 UTC
 
         let filter = CommitFilter::new(
-            Some("lvy".to_string()),
-            None,
+            vec!["lvy".to_string()],
+            Vec::new(),
             Some(1_766_000_000),
             Some(1_766_200_000),
             Vec::new(),
@@ -3947,8 +3985,8 @@ mod tests {
 
         // --merges (min 2 parents) keeps it; --no-merges (max 1 parent) drops it.
         let merges = CommitFilter::new(
-            None,
-            None,
+            Vec::new(),
+            Vec::new(),
             None,
             None,
             Vec::new(),
@@ -3959,8 +3997,8 @@ mod tests {
         );
         assert!(merges.matches(&merge, None).await.unwrap());
         let no_merges = CommitFilter::new(
-            None,
-            None,
+            Vec::new(),
+            Vec::new(),
             None,
             None,
             Vec::new(),
@@ -3973,8 +4011,8 @@ mod tests {
 
         // --committer matches on a case-insensitive substring of name/email.
         let by_committer = CommitFilter::new(
-            None,
-            Some("alice".to_string()),
+            Vec::new(),
+            vec!["alice".to_string()],
             None,
             None,
             Vec::new(),
@@ -3985,8 +4023,8 @@ mod tests {
         );
         assert!(by_committer.matches(&merge, None).await.unwrap());
         let by_other = CommitFilter::new(
-            None,
-            Some("zzz".to_string()),
+            Vec::new(),
+            vec!["zzz".to_string()],
             None,
             None,
             Vec::new(),
