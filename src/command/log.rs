@@ -1,6 +1,7 @@
 //! Log command rendering commit history with optional decorations, filtering, and custom formatting utilities.
 
 pub(crate) mod config;
+mod decorate_filter;
 
 use std::{
     cell::RefCell,
@@ -202,14 +203,14 @@ pub struct LogArgs {
     /// Suppress diff output, clearing earlier diff-format options.
     #[clap(short = 's', long = "no-patch", overrides_with = "no_patch")]
     pub no_patch: bool,
-    /// Restrict decorations to refs matching any comma-separated pattern
+    /// Restrict decorations to refs matching any of the given patterns
     /// (Git's `--decorate-refs`).
     #[clap(long = "decorate-refs", value_name = "PATTERN")]
-    pub decorate_refs: Option<String>,
-    /// Hide decorations for refs matching any comma-separated pattern
+    pub decorate_refs: Vec<String>,
+    /// Hide decorations for refs matching any of the given patterns
     /// (Git's `--decorate-refs-exclude`).
     #[clap(long = "decorate-refs-exclude", value_name = "PATTERN")]
-    pub decorate_refs_exclude: Option<String>,
+    pub decorate_refs_exclude: Vec<String>,
     /// Show only names of changed files
     #[clap(long, overrides_with = "name_only")]
     pub name_only: bool,
@@ -615,45 +616,26 @@ enum GrepDialect {
 }
 
 /// Whether a ref passes the `--decorate-refs` / `--decorate-refs-exclude`
-/// filters (comma-separated fnmatch patterns).
+/// filters: an implicit `refs/` prefix, wildcard or component-boundary prefix
+/// matching, and excludes win over includes.
 fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
-    let full = match reference.kind {
-        ReferenceKind::Tag => format!("refs/tags/{}", reference.name),
-        ReferenceKind::Remote => format!("refs/remotes/{}", reference.name),
-        ReferenceKind::Local => format!("refs/heads/{}", reference.name),
-    };
-    if let Some(include) = &args.decorate_refs
-        && !include.split(',').any(|pattern| {
-            ref_glob_match(pattern.trim(), &full) || ref_glob_match(pattern.trim(), &reference.name)
-        })
+    let full = format!("{}{}", reference_namespace(&reference.kind), reference.name);
+    if !args.decorate_refs.is_empty()
+        && !args
+            .decorate_refs
+            .iter()
+            .any(|pattern| decorate_filter::ref_pattern_matches(pattern, &full))
     {
         return false;
     }
-    if let Some(exclude) = &args.decorate_refs_exclude
-        && exclude.split(',').any(|pattern| {
-            ref_glob_match(pattern.trim(), &full) || ref_glob_match(pattern.trim(), &reference.name)
-        })
+    if args
+        .decorate_refs_exclude
+        .iter()
+        .any(|pattern| decorate_filter::ref_pattern_matches(pattern, &full))
     {
         return false;
     }
     true
-}
-
-fn ref_glob_match(pattern: &str, name: &str) -> bool {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new("");
-    if builder.add_line(None, pattern).is_err() {
-        return false;
-    }
-    match builder.build() {
-        Ok(gi) => {
-            gi.matched_path_or_any_parents(std::path::Path::new(name), false)
-                .is_ignore()
-                || gi
-                    .matched_path_or_any_parents(std::path::Path::new(name), false)
-                    .is_whitelist()
-        }
-        Err(_) => false,
-    }
 }
 
 /// Resolve the requested `--grep` dialect (last selector flag wins, basic is

@@ -383,13 +383,22 @@ libra log --no-decorate
 
 ### `--decorate-refs <PATTERN>` / `--decorate-refs-exclude <PATTERN>`
 
-Restrict decorations to refs matching any comma-separated fnmatch pattern, or
-hide matching refs. Both match against the full ref name and the short name.
+Restrict decorations to refs matching any of the given patterns, or hide refs
+matching any of the exclude patterns. Both options are repeatable; every value
+is one complete pattern (commas are literal) with an implicit refs/ prefix, and
+the pattern matches the full ref name only. A pattern with `*`, `?` or `[` is a
+wildcard match; otherwise it matches the exact ref name or a prefix that ends
+at a `/` component boundary. Exclude patterns win over include patterns.
 
 ```bash
-libra log --decorate --decorate-refs='refs/tags/*'
-libra log --decorate --decorate-refs-exclude='origin/*'
+libra log --decorate --decorate-refs='tags/*'
+libra log --decorate --decorate-refs='heads/aa' --decorate-refs='tags/t1'
+libra log --decorate --decorate-refs-exclude='heads/*'
 ```
+
+Migration: patterns that used the old short-name or comma-split matching must
+be rewritten. `origin/*` becomes `remotes/origin/*`, `refs/tags/v1,refs/tags/v2`
+becomes `--decorate-refs='tags/v1' --decorate-refs='tags/v2'`.
 
 ### `--graph`
 

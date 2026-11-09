@@ -299,6 +299,18 @@ libra log --decorate=full
 libra log --no-decorate
 ```
 
+### `--decorate-refs <PATTERN>` / `--decorate-refs-exclude <PATTERN>`
+
+只装饰匹配任一给定模式的 ref，或隐藏匹配任一排除模式的 ref。两个选项都可重复；每个值是一个完整模式（逗号是字面字符），带隐式的 refs/ 前缀，且只匹配完整引用名。含 `*`、`?` 或 `[` 的模式是通配匹配；否则匹配完整引用名或恰好止于 `/` 组件边界的模式前缀。排除优先于包含。
+
+```bash
+libra log --decorate --decorate-refs='tags/*'
+libra log --decorate --decorate-refs='heads/aa' --decorate-refs='tags/t1'
+libra log --decorate --decorate-refs-exclude='heads/*'
+```
+
+迁移说明：依赖旧短名或逗号拆分匹配的模式需要改写，例如 `origin/*` 改为 `remotes/origin/*`，`refs/tags/v1,refs/tags/v2` 改为重复给出两个 `--decorate-refs`。
+
 ### `--graph`
 
 绘制基于文本的提交历史图形表示，直观显示分支和合并。

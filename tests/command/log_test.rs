@@ -5882,3 +5882,222 @@ fn lo06_detached_head_on_its_commit() {
         "three (tag: reach, octopus-b, octopus-a, main)\ntwo (HEAD, tag: t2, tag: t1, zz, aa)\none\n"
     );
 }
+
+/// LO-07 decoration-filter gates: fixture F2, `log --decorate=short
+/// --format=%s%d -1 HEAD~1` plus the given options; the expected stdout is
+/// the row value plus `\n`. Options are passed literally, never through a
+/// shell.
+fn lo07_decoration_output(options: &[&str]) -> String {
+    let repo = lo_f2_repo();
+    let mut args = vec!["log", "--decorate=short", "--format=%s%d", "-1", "HEAD~1"];
+    args.extend_from_slice(options);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log with decoration filters");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo07_glob_shorthand_heads() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/a*"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_glob_full_heads() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/*"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_short_name_glob_does_not_match() {
+    assert_eq!(lo07_decoration_output(&["--decorate-refs=a*"]), "two\n");
+}
+
+#[test]
+fn lo07_star_matches_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=*"]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_shorthand_tag_exact() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=tags/t2"]),
+        "two (tag: t2)\n"
+    );
+}
+
+#[test]
+fn lo07_prefix_respects_component_boundary() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/a"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_shorthand_namespace_prefix() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_trailing_slash_stripped() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_question_mark_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=tags/t?"]),
+        "two (tag: t2, tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_star_crosses_slash() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=*t1"]),
+        "two (tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_bracket_class_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[a]a"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_repeated_include_union() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/aa", "--decorate-refs=tags/t1"]),
+        "two (tag: t1, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_comma_is_literal() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/aa,tags/t1"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_empty_include_matches_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs="]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude=heads/*"]),
+        "two (tag: t2, tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_short_name_no_match() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude=aa"]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_repeated_exclude() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs-exclude=heads/aa",
+            "--decorate-refs-exclude=tags/t1"
+        ]),
+        "two (tag: t2, zz)\n"
+    );
+}
+
+#[test]
+fn lo07_include_then_exclude() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs=heads/*",
+            "--decorate-refs-exclude=heads/z*"
+        ]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_beats_include() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs=heads/aa",
+            "--decorate-refs-exclude=heads/aa"
+        ]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_empty_exclude_drops_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude="]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_class_with_regex_set_operator() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[a&&b]a"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_posix_class() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[[:alpha:]][[:alpha:]]"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_backslash_escape_in_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/\\a*"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_backslash_without_glob_is_literal_prefix() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/\\aa"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_unterminated_class_matches_nothing() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/a["]),
+        "two\n"
+    );
+}
