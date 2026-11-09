@@ -1058,6 +1058,22 @@ struct Reference {
     name: String,
 }
 
+fn reference_namespace(kind: &ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::Tag => "refs/tags/",
+        ReferenceKind::Remote => "refs/remotes/",
+        ReferenceKind::Local => "refs/heads/",
+    }
+}
+
+fn sort_references_by_full_ref_name_descending(references: &mut [Reference]) {
+    references.sort_by(|left, right| {
+        reference_namespace(&right.kind)
+            .cmp(reference_namespace(&left.kind))
+            .then_with(|| right.name.cmp(&left.name))
+    });
+}
+
 fn parse_date_arg(value: &str) -> CliResult<i64> {
     parse_date(value).map_err(|e| {
         CliError::command_usage(e.to_string())
@@ -2282,7 +2298,7 @@ async fn execute_safe_with_diff_formats(
             };
 
             let mut refs = ref_commits.get(&commit.id).cloned().unwrap_or_default();
-            refs.sort();
+            sort_references_by_full_ref_name_descending(&mut refs);
 
             ref_msgs.append(
                 &mut refs
@@ -3731,6 +3747,43 @@ mod tests {
         );
         assert!(str_to_decorate_option("auto").is_ok());
         assert!(str_to_decorate_option("invalid").is_err());
+    }
+
+    #[test]
+    fn lo05_decoration_order_sorts_full_refname_descending() {
+        let mut references = vec![
+            Reference {
+                kind: ReferenceKind::Local,
+                name: "aa".to_string(),
+            },
+            Reference {
+                kind: ReferenceKind::Remote,
+                name: "origin/x".to_string(),
+            },
+            Reference {
+                kind: ReferenceKind::Remote,
+                name: "origin/y".to_string(),
+            },
+            Reference {
+                kind: ReferenceKind::Tag,
+                name: "t".to_string(),
+            },
+        ];
+        sort_references_by_full_ref_name_descending(&mut references);
+
+        let full_ref_names = references
+            .iter()
+            .map(|reference| format!("{}{}", reference_namespace(&reference.kind), reference.name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            full_ref_names,
+            vec![
+                "refs/tags/t",
+                "refs/remotes/origin/y",
+                "refs/remotes/origin/x",
+                "refs/heads/aa",
+            ]
+        );
     }
 
     // Test parameter combination

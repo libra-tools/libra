@@ -284,6 +284,7 @@ libra log --format=oneline
 ### `--decorate[=<style>]`
 
 在提交旁打印 ref 名称（分支、标签）。样式：`short`（默认）、`full`、`no`。
+人类可读输出中的装饰按完整引用名的逆序列出，`HEAD` 位于最前。`--json` 的 `refs` 数组保持原有顺序。
 
 ```bash
 libra log --decorate

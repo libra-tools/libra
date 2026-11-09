@@ -160,6 +160,70 @@ fn lo_f1_repo_with_dates_and_committers(
     repo
 }
 
+fn lo_f2_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], repo.path()),
+        "configure user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "author@example.com"], repo.path()),
+        "configure user.email",
+    );
+
+    for (contents, subject) in [("1", "one"), ("2", "two")] {
+        fs::write(repo.path().join("f"), contents).expect("write fixture file");
+        assert_cli_success(
+            &run_libra_command(&["add", "f"], repo.path()),
+            "stage fixture file",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", subject, "--no-verify"], repo.path()),
+            "commit fixture file",
+        );
+    }
+
+    for branch in ["aa", "zz"] {
+        assert_cli_success(
+            &run_libra_command(&["branch", branch], repo.path()),
+            "create fixture branch",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["tag", "t2"], repo.path()),
+        "create lightweight fixture tag",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "ann", "t1"], repo.path()),
+        "create annotated fixture tag",
+    );
+
+    fs::write(repo.path().join("f"), "3").expect("write fixture file");
+    assert_cli_success(
+        &run_libra_command(&["add", "f"], repo.path()),
+        "stage fixture file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "three", "--no-verify"], repo.path()),
+        "commit fixture file",
+    );
+
+    for branch in ["octopus-a", "octopus-b"] {
+        assert_cli_success(
+            &run_libra_command(&["branch", branch], repo.path()),
+            "create fixture branch",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["tag", "reach"], repo.path()),
+        "create fixture tag",
+    );
+
+    repo
+}
+
 const LO01_REFUSAL_MESSAGE: &str =
     "options '--name-only', '--name-status', '--check', and '-s' cannot be used together";
 
@@ -742,6 +806,68 @@ fn lo04_author_union_and_committer() {
             &["--author=Night", "--author=Aster", "--committer=Thor"]
         ),
         vec!["fourth", "second"]
+    );
+}
+
+#[test]
+fn lo05_short_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=short", "--format=%s%d"], repo.path());
+    assert_cli_success(&output, "log with short decorations");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (HEAD -> main, tag: reach, octopus-b, octopus-a)\ntwo (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo05_full_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=full", "--format=%s%d"], repo.path());
+    assert_cli_success(&output, "log with full decorations");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (HEAD -> refs/heads/main, tag: refs/tags/reach, refs/heads/octopus-b, refs/heads/octopus-a)\ntwo (tag: refs/tags/t2, tag: refs/tags/t1, refs/heads/zz, refs/heads/aa)\none\n"
+    );
+}
+
+#[test]
+fn lo05_oneline_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=short", "--oneline", "-2"], repo.path());
+    assert_cli_success(&output, "log oneline with decorations");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let second_line = stdout.lines().nth(1).expect("expected a second log line");
+    let (_, decoration_and_subject) = second_line
+        .split_once(' ')
+        .expect("expected a commit hash followed by a space");
+    assert_eq!(decoration_and_subject, "(tag: t2, tag: t1, zz, aa) two");
+}
+
+#[test]
+fn lo05_percent_big_d_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(
+        &["log", "--decorate=short", "--format=%s%D", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log with raw decoration placeholder");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "threeHEAD -> main, tag: reach, octopus-b, octopus-a\n"
+    );
+}
+
+#[test]
+fn lo05_json_refs_order_unchanged() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["--json", "log", "-1"], repo.path());
+    assert_cli_success(&output, "JSON log with refs");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("expected JSON log output");
+    assert_eq!(
+        json["data"]["commits"][0]["refs"],
+        serde_json::json!(["HEAD -> main", "tag: reach", "octopus-a", "octopus-b"])
     );
 }
 
