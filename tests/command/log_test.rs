@@ -6101,3 +6101,97 @@ fn lo07_unterminated_class_matches_nothing() {
         "two\n"
     );
 }
+
+/// LO-08 gates: `HEAD` passes the same decoration filters as any other
+/// decoration, and `HEAD -> <branch>` needs both `HEAD` and the branch.
+fn lo08_decoration_output(options: &[&str]) -> String {
+    let repo = lo_f2_repo();
+    let mut args = vec!["log", "--decorate=short", "--format=%s%d", "-1"];
+    args.extend_from_slice(options);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log with HEAD decoration filters");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo08_include_head_only() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=HEAD"]),
+        "three (HEAD)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=HEAD"]),
+        "three (tag: reach, octopus-b, octopus-a, main)\n"
+    );
+}
+
+#[test]
+fn lo08_include_heads_drops_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=refs/heads"]),
+        "three (octopus-b, octopus-a, main)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_current_branch_keeps_bare_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=refs/heads/main"]),
+        "three (HEAD, tag: reach, octopus-b, octopus-a)\n"
+    );
+}
+
+#[test]
+fn lo08_head_and_branch_compose_arrow() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=HEAD", "--decorate-refs=heads/main"]),
+        "three (HEAD -> main)\n"
+    );
+}
+
+#[test]
+fn lo08_include_and_exclude_without_head() {
+    assert_eq!(
+        lo08_decoration_output(&[
+            "--decorate-refs=heads/*",
+            "--decorate-refs-exclude=heads/oc*"
+        ]),
+        "three (main)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_all_refs_keeps_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=*"]),
+        "three (HEAD)\n"
+    );
+}
+
+#[test]
+fn lo08_detached_head_filtered_out() {
+    let repo = lo_f2_repo();
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", "HEAD"], repo.path()),
+        "detach HEAD",
+    );
+    let output = run_libra_command(
+        &[
+            "log",
+            "--decorate=short",
+            "--format=%s%d",
+            "-1",
+            "--decorate-refs=refs/heads",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "detached HEAD with head-only ref filter");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (octopus-b, octopus-a, main)\n"
+    );
+}

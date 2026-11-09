@@ -388,7 +388,10 @@ matching any of the exclude patterns. Both options are repeatable; every value
 is one complete pattern (commas are literal) with an implicit refs/ prefix, and
 the pattern matches the full ref name only. A pattern with `*`, `?` or `[` is a
 wildcard match; otherwise it matches the exact ref name or a prefix that ends
-at a `/` component boundary. Exclude patterns win over include patterns.
+at a `/` component boundary. Exclude patterns win over include patterns. `HEAD` is filtered by its literal
+name like any other decoration: `HEAD -> <branch>` is shown only when both HEAD and
+the branch pass the filters; otherwise `HEAD` appears alone and the branch keeps
+its own sorted position when it passes.
 
 ```bash
 libra log --decorate --decorate-refs='tags/*'

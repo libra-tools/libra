@@ -615,27 +615,34 @@ enum GrepDialect {
     Fixed,
 }
 
-/// Whether a ref passes the `--decorate-refs` / `--decorate-refs-exclude`
-/// filters: an implicit `refs/` prefix, wildcard or component-boundary prefix
-/// matching, and excludes win over includes.
-fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
-    let full = format!("{}{}", reference_namespace(&reference.kind), reference.name);
+/// Whether one decoration name passes the `--decorate-refs` /
+/// `--decorate-refs-exclude` filters: an implicit `refs/` prefix, wildcard or
+/// component-boundary prefix matching, and excludes win over includes.
+/// `HEAD` is filtered like any other decoration, by its own literal name.
+fn decorate_name_allowed(name: &str, args: &LogArgs) -> bool {
     if !args.decorate_refs.is_empty()
         && !args
             .decorate_refs
             .iter()
-            .any(|pattern| decorate_filter::ref_pattern_matches(pattern, &full))
+            .any(|pattern| decorate_filter::ref_pattern_matches(pattern, name))
     {
         return false;
     }
     if args
         .decorate_refs_exclude
         .iter()
-        .any(|pattern| decorate_filter::ref_pattern_matches(pattern, &full))
+        .any(|pattern| decorate_filter::ref_pattern_matches(pattern, name))
     {
         return false;
     }
     true
+}
+
+fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
+    decorate_name_allowed(
+        &format!("{}{}", reference_namespace(&reference.kind), reference.name),
+        args,
+    )
 }
 
 /// Resolve the requested `--grep` dialect (last selector flag wins, basic is
@@ -2261,10 +2268,17 @@ async fn execute_safe_with_diff_formats(
         } = selected;
         let ref_msg = if decorate_option != DecorateOptions::No {
             let mut ref_msgs: Vec<String> = vec![];
-            // `HEAD` marks the commit HEAD points to, not the first rendered one.
-            if commit.id == current_head_commit {
-                ref_msgs.push(if let Some(b_name) = &branch_name {
-                    format!(
+            // `HEAD` marks the commit HEAD points to, not the first rendered
+            // one, and it passes the same filters as any other decoration.
+            // The arrow needs both `HEAD` and the branch it points to.
+            let head_allowed = decorate_name_allowed("HEAD", &args);
+            let branch_allowed = branch_name
+                .as_ref()
+                .is_some_and(|name| decorate_name_allowed(&format!("refs/heads/{name}"), &args));
+            let head_arrow = head_allowed && branch_allowed;
+            if commit.id == current_head_commit && head_allowed {
+                ref_msgs.push(match (&branch_name, head_arrow) {
+                    (Some(b_name), true) => format!(
                         "{} -> {}{}",
                         "HEAD".cyan(),
                         (if decorate_option == DecorateOptions::Full {
@@ -2274,9 +2288,8 @@ async fn execute_safe_with_diff_formats(
                         })
                         .green(),
                         b_name.green()
-                    )
-                } else {
-                    "HEAD".cyan().to_string()
+                    ),
+                    _ => "HEAD".cyan().to_string(),
                 });
             };
 
@@ -2290,7 +2303,11 @@ async fn execute_safe_with_diff_formats(
                         if !decorate_ref_allowed(r, &args) {
                             return None;
                         }
-                        if r.kind == ReferenceKind::Local && Some(r.name.to_owned()) == branch_name
+                        // The branch is represented by the `HEAD -> branch`
+                        // arrow; without the arrow it is listed normally.
+                        if head_arrow
+                            && r.kind == ReferenceKind::Local
+                            && Some(r.name.as_str()) == branch_name.as_deref()
                         {
                             None
                         } else {
