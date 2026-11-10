@@ -12,7 +12,7 @@ libra status [OPTIONS] [pathspec]...
 
 ## 说明
 
-已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 局部目录不可读不会遮蔽其它可读文件的真实修改；JSON 仍返回部分结果并在 `io_blocked` 中列出受影响路径，`--scan` 与 `--check-dirty` 在检查不完整时保留原脏状态缓存。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
 
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 

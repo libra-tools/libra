@@ -424,6 +424,7 @@ fn test_pull_inherits_merge_renormalize_config() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
     // Preserve a historical CRLF base, then record a real local LF
     // normalization commit now that explicit add already performs clean.
+    fs::create_dir_all(work_dir.join(".git/info")).expect("create local attributes directory");
     fs::write(work_dir.join(".git/info/attributes"), "shared.txt -text\n").unwrap();
     fs::write(work_dir.join("shared.txt"), "top\r\nbase\r\nbottom\r\n")
         .expect("write historical base");

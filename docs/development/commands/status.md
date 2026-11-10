@@ -90,6 +90,6 @@ flowchart TD
 
 ## 显式换行比较（#1062）
 
-已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 局部目录不可读不会遮蔽其它可读文件的真实修改；JSON 仍返回部分结果并在 `io_blocked` 中列出受影响路径，`--scan` 与 `--check-dirty` 在检查不完整时保留原脏状态缓存。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
 
 `ConversionScan` 以已加载索引的完整条目摘要、根身份及全部候选属性来源版本约束 stat 快路。首次或失效时逐文件 clean 比较；完整且干净的扫描才能在当前索引目录写入一个固定 64 字节的可丢弃 `conversion-stat-v1` 记录。记录缺失、损坏、不可读或写失败只使优化失效；不更新索引、ODB、refs 或默认状态的 dirty-cache 数据表。属性读取与记录 I/O 仍经过原有有界 worker；clean hash 的长度计算和哈希最多两遍读取同一描述符。`--scan` 的 dirty-cache fingerprint 加入属性来源版本，`--check-dirty` 也保留类型与执行位差异。

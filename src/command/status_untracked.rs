@@ -233,11 +233,10 @@ fn collect_tracked_worktree_changes(
             source,
         })?;
     let (sources_before, policy_valid) = match conversion.probe(None) {
-        Ok(result) => result,
-        Err(source) => {
-            io_blocked.push(io_blocked_event(Path::new("."), &source));
-            return Ok((changes, intent_to_add));
-        }
+        Ok((sources, valid)) => (Some(sources), valid),
+        // A blocked nested source invalidates stat reuse, not the readable
+        // paths. Per-path reads below retain the partial-result contract.
+        Err(_) => (None, false),
     };
     let blocked_before = io_blocked.len();
     for file in tracked_files {
@@ -360,12 +359,17 @@ fn collect_tracked_worktree_changes(
     }
     // A source edit/removal during the scan must not mint a certificate or
     // return a clean result assembled under two different conversion rules.
-    let may_record = changes.modified.is_empty()
+    let may_record = sources_before.is_some()
+        && changes.modified.is_empty()
         && changes.deleted.is_empty()
         && intent_to_add.is_empty()
         && io_blocked.len() == blocked_before;
-    match conversion.probe(may_record.then_some(sources_before.as_str())) {
-        Ok((sources_after, _)) if sources_after == sources_before => {}
+    match conversion.probe(sources_before.as_deref().filter(|_| may_record)) {
+        Ok((sources_after, _)) if sources_before.as_deref() == Some(sources_after.as_str()) => {}
+        // Path-local failures already make the result incomplete and forbid
+        // a certificate. Do not replace those paths with a root-level error.
+        Err(_) if io_blocked.len() > blocked_before => {}
+        Ok(_) if sources_before.is_none() && io_blocked.len() > blocked_before => {}
         Ok(_) => io_blocked.push(io_blocked_event(
             Path::new("."),
             &io::Error::new(

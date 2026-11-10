@@ -141,8 +141,9 @@ async fn run_status_scan_locked_inner(
 
     use crate::internal::dirty::DirtyCache;
 
-    let fingerprint_before = conversion_index_fingerprint(index_path)
-        .map_err(|e| dirty_cache_error("fingerprint", e))?;
+    // Keep a failed attributes proof until the path-aware scan can report
+    // its partial result. It must never enable a cache write.
+    let fingerprint_before = conversion_index_fingerprint(index_path);
     let head_before = Head::current_commit().await.map(|oid| oid.to_string());
     let scan_started_at = crate::internal::dirty::now_timestamp();
 
@@ -246,6 +247,7 @@ async fn run_status_scan_locked_inner(
              the partial result with data.io_blocked[]",
         ));
     }
+    let fingerprint_before = fingerprint_before.map_err(|e| dirty_cache_error("fingerprint", e))?;
     // Fully inspectable: the cache rows come from the accumulator walk above.
     let rooted = snapshot_data.to_repo_relative();
     let (staged_raw, unstaged_raw) = (rooted.staged.clone(), rooted.unstaged.clone());
@@ -471,8 +473,7 @@ pub(super) async fn run_status_cache_mode(
 
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
-    let fingerprint = conversion_index_fingerprint(&index_path)
-        .map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let fingerprint = conversion_index_fingerprint(&index_path);
     let head_oid = Head::current_commit().await.map(|oid| oid.to_string());
     let db = crate::internal::sequencer::request_db_checked()
         .await
@@ -480,7 +481,10 @@ pub(super) async fn run_status_cache_mode(
     let meta = DirtyCache::meta_with_conn(&db)
         .await
         .map_err(|e| dirty_cache_error("read", e))?;
-    let state = DirtyCache::classify(meta.as_ref(), &fingerprint, head_oid.as_deref());
+    let state = match &fingerprint {
+        Ok(fingerprint) => DirtyCache::classify(meta.as_ref(), fingerprint, head_oid.as_deref()),
+        Err(_) => CacheState::Stale,
+    };
 
     if state != CacheState::Fresh {
         // Degrade to the full reconcile — never trust a doubtful cache.
@@ -490,6 +494,11 @@ pub(super) async fn run_status_cache_mode(
             &InvocationWarningCtx::from_process_preflight(),
         )
         .await?;
+        // A failed proof must surface either as path-local io_blocked or
+        // as its original error, never as a complete fallback result.
+        if data.io_blocked.is_empty() {
+            fingerprint.map_err(|e| dirty_cache_error("fingerprint", e))?;
+        }
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheStaleFallback,
             format!(
@@ -539,6 +548,7 @@ pub(super) async fn run_status_cache_mode(
         return Ok(());
     }
 
+    let fingerprint = fingerprint.map_err(|e| dirty_cache_error("fingerprint", e))?;
     let rows = DirtyCache::list_with_conn(&db)
         .await
         .map_err(|e| dirty_cache_error("read", e))?;
@@ -744,16 +754,22 @@ pub(super) async fn run_status_cache_mode(
     // Re-verify the epoch AFTER processing: a concurrent index/HEAD change
     // since the initial classify would make this view (and any prune) stale —
     // degrade instead of committing or rendering it as fresh.
-    let fingerprint_now = conversion_index_fingerprint(&index_path)
-        .map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let fingerprint_now = conversion_index_fingerprint(&index_path);
     let head_now = Head::current_commit().await.map(|oid| oid.to_string());
-    if fingerprint_now != fingerprint || head_now != head_oid {
+    if !fingerprint_now
+        .as_ref()
+        .is_ok_and(|current| current == &fingerprint)
+        || head_now != head_oid
+    {
         let mut data = collect_status_data(
             args,
             extras,
             &InvocationWarningCtx::from_process_preflight(),
         )
         .await?;
+        if data.io_blocked.is_empty() {
+            fingerprint_now.map_err(|e| dirty_cache_error("fingerprint", e))?;
+        }
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheConcurrentInvalidate,
             "the index or HEAD changed while reading the dirty cache; falling back to the full status",
