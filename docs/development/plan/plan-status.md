@@ -1283,11 +1283,16 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/574.md`](issues/574.md) | 只讀查詢走寫操作邊界（`branch -l` 25s）與 log／rev-list 全量遍歷 | **已收口（BRL-01..05 done/complete；DEFER-BRL-01..03）** | BRL-01/BRL-02 `done`/`complete`（v0.30.9／v0.30.10，PR #587 `22b9534`，release 36843865958 8/8）；BRL-03 `done`/`complete`（v0.30.11，PR #588 `a4121a8`，release 36866068892 8/8；网站 cf@961ea3f）；BRL-04 `done`/`complete`（v0.30.12，PR #589 `f14841c`，release 36879702000 8/8；网站 cf@83d620c）；BRL-05 `done`/`complete`（v0.30.13，PR #590 squash `ce2411d`，release 36910331385 8/8；量测 AC ~15.24/15.68/14.96s under `LIBRA_READ_POLICY=local`）；完成判據全勾選；DEFER-BRL-03 executable-bit 基线已红（branch 查詢分類 → tag/remote/reflog/notes 查詢分類 → 快照 stat 短路；log 日期優先 walker → rev-list 下推）；R1-R3 雙評審 FAIL；R4 Claude FAIL、Codex 中斷；R5 兩者 FAIL；R6 Codex FAIL＋Claude PASS；R7 Claude FAIL、Codex 中斷（模型不再支援）；R8 兩者 PASS；R9 兩者 PASS；R10 Codex FAIL（golden 快照須依 v2.12 內聯）＋Claude PASS；R11 兩者 PASS（模板升 v2.12 後合規確認）；R12 兩者 PASS（結案確認）；EX-BRL-01 覆蓋 BRL-01..05（G-03 門族豁免，一門＝一完整具名測試函式＋`-E 'test(=command::…)'` 全枚舉＋零匹配失敗保護＋可執行組內數量比較，分子 33/55/28/10/18；118 個 `command_test` 門皆有 `command::` 前綴）；`BRL-02 -> BRL-03` 跨鏈串行邊（G-10）；census `--lib` 矩陣守衛；`persist_files` 持久化短路；ADR-BRL-02/04 語義修訂；`RevListArgs` 全量歸屬表；tag `no_column` 漏檢同源修正；輸出等價以 inline 期望值對拍（依 v2.12 不另存證據檔）；網站八頁與 `_compatibility.md`／integration scenarios 補齊（評審證據內聯於計劃文件）；repair 鎖殘留經 GC-01 判定已緩解（DEFER-BRL-01）；網站文件受 DEP-BRL-02（`../libra-backend` 不在本 checkout 旁）阻塞發布 |
 | [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
 | [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | **已收口（Issue #582 CLOSED）** | HKT-00 `done/complete`（no-release 設計與 HP-17／DEFER-07 移交）；HKT-01 `done/complete`（首次 clone 的 host-key policy cascade）；HKT-02 `done/complete`（受限 human-terminal unknown-host confirmation）；聚合发布 `v0.29.1`；全量 nextest 8271/8271 绿 |
-| [`issues/1062.md`](issues/1062.md) | `eol=crlf` 属性下 `status`/`diff` 误报与 `merge`/`pull` 拒绝（#1062） | 未启动（2026-11-10 12:06:57 UTC 初稿；未评审） | I1062-01..05 `pending` / 验收空（1 audit + 2 implementation + 1 docs + 1 audit，全串行，收口点 I1062-05）；根因锚点 `git-internal 0.10.4` `src/internal/index.rs:661-678` 仅比较 stat 三元组、无内容哈希回退，实测 `install.ps1` blob 31275 B / 磁盘 31938 B、`template/pre-commit.ps1` 148/160，差值恒等于 CR 行数 663/12；两份 `.ps1` 为只读夹具，不在任何写集（用户 2026-11-10 明确禁令）；DEP-1062-01（`git-internal` 条件性跨仓）、DEP-1062-02（issues/470 FM-02/FM-04）、DEP-1062-03（`COMPATIBILITY.md`/`plan-status.md` 与 issues/529–539、1050–1057 文件级串行） |
+| [issues/1062.md](issues/1062.md) | 显式 text/eol clean、status/diff 与同步预检（#1062） | 已授权实施；待 I1062-01 开工（2026-11-10 15:34:28 UTC；EX-EOL-USER-01） | I1062-01/02/03/06/07 五活动卡 pending / 验收空；01 审计→02 转换/add→03 状态/预检→06 diff→07 唯一家族发布，之后最终全量收口。旧04文档并回行为卡，旧05审计并入07，退役不计完成。当前源码已有 hash 回退，旧“无回退”归因撤回；显式策略先交付，text=auto/TC-1324 交 I861-01。REL-I1062-EOL 子卡本地验收后继续、C/D 由07回填；DEP-EOL-WRITERS/SITE 与条件性 DEP-1062-UPSTREAM 未放行。 |
+| [issues/861.md](issues/861.md) | text=auto 自动转换与 diff --quiet / TC-1324（#861） | 已授权实施；等待 #1062（2026-11-10 15:34:28 UTC；EX-EOL-USER-01） | I861-01 pending / 验收空，独立 patch/C/D；等待 DEP-EOL-1062-861：I1062-07 及子卡 complete、#1062 最终全量和终态交接。只扩展同一 clean 策略的 auto/binary/历史 CRLF index/renormalize 语义，不重做显式转换；原始 TC 两轨完整执行为独立关闭门。DEP-861-TC、WRITERS、SITE 开工重核。 |
 
 ---
 
 ## 二、未启动的计划与卡
+
+### #1062 / #861（2026-11-10 15:34:28 UTC）
+
+2026-11-10 15:34:28 UTC 用户已授权实施两份计划：main 直接开发、每卡 signed+DCO 提交推送、不创建其它分支/PR、不追加 Review；发布在最新 patch 上加 1，上游前进先 pull 并保留双方功能，完成两计划后用 gh 关闭 Issue。历史规划自审 R3 PASS 不代表实施完成，TC-1324 仅保留用例引用。顺序为 [#1062](issues/1062.md) 的 01→02→03→06→07（家族发布及最终全量）→[#861](issues/861.md) I861-01（auto/TC-1324 独立发布及最终全量）。#1062 为 0/5，#861 为 0/1；全部 pending / 验收空。04/05 是退役编号，不计 done；开工仍须取得实际交接、写者和网站/TC 前置。
 
 以下计划中，`plan-20260921` 已于 2026-09-24 完成并发布为 `v0.23.65`（15/15 卡 `done`/`complete`，见下表本行注）；其余计划均未进入实施/发布阶段（多数为设计态、全部 `pending`；`plan-20260919` 已全部 `done`/`complete`，GCX-01..04 含 GCX-02/03/04 的 v0.30.32/33/34 交付见下表本行注）。按建议优先级排列，优先级依据为跨计划依赖（`DEP-*`）与产品路线（`plan-long.md`）：
 
@@ -1650,6 +1655,12 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 五、延后决策或实施项（DEFER-* 汇总）
 
+### #1062 / #861 的转换边界（2026-11-10 15:00:39 UTC）
+
+- DEFER-1062-01：git-internal 本体重构，条件性依赖 DEP-1062-UPSTREAM，尚未排期。
+- DEFER-1062-02 与 DEFER-861-01：无属性 autocrlf/safecrlf、encoding/ident/自定义 filter 与 checkout smudge 完整兼容为同一未排期边界，不能重复算两份交付。
+- 原 DEFER-1062-03 的 .bat/.cmd 已并入 I1062-03 同规则样本；text=auto/TC-1324 明确交给 I861-01，不再模糊挂在 #1062 范围内。
+
 ### 5.1 plan-20260920（拆 Code/Publish）
 
 | ID | 内容 | 状态 |
@@ -1719,6 +1730,11 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-EOL-1062-861 | 跨计划单向交接 | [1062](issues/1062.md) outgoing / [861](issues/861.md) incoming：I1062-01 本地审计→02→03→06→07 完整 C/D→#1062 最终全量与终态→I861-01。生产者交付显式 clean 模块/读写接线、API/策略/测试清单、版本/SHA/门；接收方仅负责 auto/TC-1324。#1062 不等待 #861 | 草稿登记 2026-11-10 15:00:39 UTC；双方产品卡 pending，尚未交付；两 Issue 分别验收和关闭 |
+| DEP-EOL-WRITERS | 文件写集互斥 | 两 EOL 计划与全部活动日期/Issue 计划逐文件扫描；status/attributes/add/diff/worker、COMPATIBILITY.md、网站页及版本窗口相交即串行，不按行豁免。候选含 issues/574 BRL-05、status 性能及资格计划；历史已完成卡不重开 | 2026-11-10 15:00:39 UTC；未完成开工时扫描，不能宣称零依赖可启动 |
+| DEP-EOL-SITE | 网站交付 | 两 EOL 计划共用指定 /Volumes/Sea/libra-backend 原生 Libra cf；十四命令同卡文档/验证、Claude PASS、串行 cf 推送与部署。现有 log.en.md 无关修改必须保留 | 2026-11-10 15:00:39 UTC；已挂载 cf，旧“未挂载”快照不再代表当前事实；产品部署待 |
+| DEP-1062-UPSTREAM | 条件性跨仓 | 仅 I1062-01 证明必须改 git-internal 时激活；先另立跨仓卡和版本交付，不夹带 =0.10.4 升版 | 2026-11-10 15:00:39 UTC；未激活 |
+| DEP-861-TC | 上游对照/测试用例 | TC-1324；固定 Git 6de20f6092dcf9bdb1c8efe03db4b70c82b423dd 对照与 Libra 两轨完整执行原始用例及全部前置，未替换 Libra add，非旧缓存/SKIP | 2026-11-10 15:07:45 UTC；本轮仅静态读取，TC-1324 未执行；实施时使用用户指定位置核验前置，DEP 尚未满足 |
 | DEP-I1050-1057-REL | 跨计划发布窗口与共享文件（issues/1050.md、issues/1051.md、issues/1052.md、issues/1053.md、issues/1054.md、issues/1055.md、issues/1056.md、issues/1057.md） | 这八份计划的实现卡共写 `COMPATIBILITY.md`（各写各的行）、网站 `cf` 分支与本文件，发布卡都对 `Cargo.toml`、`install.sh`、`install.ps1` 做 patch + 1 并由工具链刷新 `Cargo.lock`。按 G-10，实现与发布全串行：同一时刻只允许一张卡处于 `in-progress`，前一卡的终止链提交推送后，下一卡才开工。（2026-11-07 07:55:30 UTC 由「只串行发布窗口」扩为「实现与发布全串行」。）bump 前 `libra fetch origin`，以 `origin/main` 的版本面为基线；bump 后上游若前进且版本面变化，在新基线重新 bump 并重跑 C 组全部门。机械防护是 bump 前确认当前版本已有 tag（防止任何计划，包括 #481 MX 等 issues/1050–1057 以外的版本面写者，处于已 bump 未发布状态）、推送前的快进检查与 tag 404 检查。本文件只暂存本计划行，判据见各计划「生命周期与证据落点」第 3 步（issues/1052.md 已按其交付时的文本执行完毕，不含该节） | 生效（2026-11-07 06:42:42 UTC 登记；issues/1052.md 的 I1052-00 与 I1052-REL 已按该计划交付（`v0.30.159`），2026-11-07 19:05:56 UTC 由 `de5210e` 收口为 `done` / `complete`；其余卡 pending） |
 | DEP-I1040-1049-REL | 跨计划发布窗口（issues/1040.md–issues/1049.md，并与 issues/1050.md–issues/1057.md 的版本面串行） | 这十份计划的实现卡都对 `Cargo.toml`、`install.sh`、`install.ps1` 做 patch + 1，并刷新 `Cargo.lock`。它们彼此之间以及与 DEP-I1050-1057-REL 的八份计划全串行：同一时刻只允许一张实现卡处于 `in-progress`。bump 前当前版本必须已有 tag。本文件只暂存本计划自己的状态行 | 生效（2026-11-07 16:01:04 UTC 登记；全部产品卡 pending，未授权执行） |
 | DEP-I1041-WRITERS | 写集互斥（issues/1041.md ↔ plan-20261025-qualification.md FIX-LTR-05Q、DOC-LTR-01） | FIX-LTR-05Q 写 `src/command/restore.rs`，DOC-LTR-01 写 `src/command/add.rs`。任一方 `in-progress` 或未标 superseded 的 `blocked` 时，I1041 四卡保持 `pending` | 生效（2026-11-07 16:01:04 UTC；对方 in-progress，本计划未开工） |
