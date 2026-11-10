@@ -26,15 +26,18 @@ resolved from the environment:
 
 It needs no repository.
 
-When logging is enabled without `LIBRA_LOG_FILE`, tracing diagnostics go to
-stderr. Stdout remains available for the command result, including a single JSON
-response under `--json` / `--machine`; warnings do not get mixed into that response.
+In human output mode, logging enabled without `LIBRA_LOG_FILE` writes tracing
+diagnostics to stderr. Under `--json` / `--machine`, console tracing is disabled:
+stdout carries command results and stderr carries structured errors. Set
+`LIBRA_LOG_FILE` to retain tracing diagnostics in these modes; filtering and
+rotation still apply to that file. The `enabled` field reports the environment's
+filter configuration, independently of this console restriction.
 
 ### Log-file environment variables
 
 | Variable | Meaning |
 |----------|---------|
-| `LIBRA_LOG_FILE` | Path of the append/rolled tracing sink. When unset, logs go to stderr (only if a filter is set). |
+| `LIBRA_LOG_FILE` | Path of the append/rolled tracing sink. When unset, logs go to stderr in human output mode (only if a filter is set); JSON/machine mode disables console tracing. |
 | `LIBRA_LOG_ROTATION` | `never` (default), `minutely`, `hourly`, or `daily`. When rolling, each active file is written as `<file>.<date-suffix>` so no single file grows without limit. Rotation only *splits* logs by time — it does **not** delete old files, so total disk usage still needs external retention (e.g. `logrotate`, or point `LIBRA_LOG_FILE` at a dedicated directory). |
 | `LIBRA_LOG` / `RUST_LOG` | `tracing-subscriber` env filter. Falls back to `libra=debug` when only `LIBRA_LOG_FILE` is set. |
 

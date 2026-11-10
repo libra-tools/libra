@@ -753,8 +753,8 @@ fn flush_telemetry() {
 ///   back to `libra=debug` only when `LIBRA_LOG_FILE` is set (so the file is never
 ///   created with no useful content).
 /// - When `LIBRA_LOG_FILE` is set, opens that file in append mode and routes events
-///   there with ANSI escapes disabled. Otherwise emits to stderr with default
-///   formatting.
+///   there with ANSI escapes disabled. Otherwise emits to stderr in human mode;
+///   structured output reserves both streams for command results and errors.
 ///
 /// Boundary conditions:
 /// - When no env vars are set, returns silently without installing any subscriber so
@@ -768,6 +768,10 @@ fn init_tracing() {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     let config = resolve_log_config();
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
+    let structured_output = OutputConfig::resolve_from_argv(&argv).is_json();
 
     // OTLP layer (lore.md 1.7): compiled only with the feature, active only
     // when the standard OTel endpoint env vars gate it on.
@@ -782,6 +786,9 @@ fn init_tracing() {
     let fmt_layer = config
         .filter
         .as_deref()
+        // JSON success uses stdout, while JSON errors use stderr. Keep human
+        // tracing out of both streams; an explicit file sink remains available.
+        .filter(|_| config.file.is_some() || !structured_output)
         .and_then(|directive| build_fmt_layer(directive, config.file.as_deref(), config.rotation));
 
     // A Vec<Box<dyn Layer<Registry>>> implements Layer, letting the two

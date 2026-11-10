@@ -25,10 +25,15 @@
   `LIBRA_LOG`/`RUST_LOG`/`LIBRA_LOG_FILE`/`LIBRA_LOG_ROTATION`，`main.rs::init_tracing`
   与 `logfile info` 共用同一解析，保证二者对配置的理解一致。`LogRotation` 枚举
   （Never/Minutely/Hourly/Daily）+ 大小写不敏感 `parse`。
-- 未设置日志文件时，fmt layer 显式使用 stderr writer，stdout 保留给命令结果，
-  包括 `--json` / `--machine` 响应。agent push 的 scope discovery 失败回归同时
-  验证 warning 在 stderr 可见、整个 stdout 可解析为单个 JSON、pending receipt
-  及后续重试/复用语义；不通过关闭日志或过滤 stdout 绕过验证。
+- 普通模式未设置日志文件时，fmt layer 显式使用 stderr writer。启动时复用
+  `OutputConfig::resolve_from_argv` 识别 JSON/machine；这些模式没有文件 sink 时
+  不安装 console fmt layer，因为成功结果使用 stdout，结构化错误使用 stderr。
+  显式文件 sink 仍保留 tracing，原 filter/rotation/OTLP 不变。`logfile info` 的
+  enabled 继续报告环境 filter 配置，不代表当前 console sink 启用。
+- agent push 恢复矩阵分别验证无文件和文件 sink：pending receipt、整个 stdout
+  JSON、空 stderr、文件 warning 及后续重试/复用语义。LFS 403/409 在显式 warn
+  日志下验证整个 stderr JSON、空 stdout、原错误码与退出码，并覆盖 JSON aliases；
+  output_flags 验证 human console 可观测及机器模式隔离，不过滤被测输出。
 - 滚动实现（`main.rs`）：`rotation=never` 保持旧行为（`OpenOptions` 单文件追加、
   精确路径，向后兼容）；`rotation!=never` 用 `tracing_appender::rolling::RollingFileAppender`
   的 **fallible builder**（非会 panic 的 `::new`）构建，写前 `create_dir_all` 日志

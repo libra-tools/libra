@@ -20,15 +20,16 @@ libra logfile info
 
 它不需要仓库。
 
-启用日志但未设置 `LIBRA_LOG_FILE` 时，tracing 诊断写入 stderr。
-stdout 保留给命令结果，包括 `--json` / `--machine` 的单个 JSON 响应；
-警告不会混入该响应。
+普通输出模式下，启用日志但未设置 `LIBRA_LOG_FILE` 时，tracing 诊断写入 stderr。
+`--json` / `--machine` 模式禁用 console tracing，stdout 保留命令结果，stderr
+保留结构化错误。需要保留诊断时设置 `LIBRA_LOG_FILE`；文件日志仍使用原过滤器和
+轮转配置。`enabled` 字段报告环境中的 filter 配置，与这项 console 限制相互独立。
 
 ### 日志文件环境变量
 
 | 变量 | 含义 |
 |------|------|
-| `LIBRA_LOG_FILE` | append/rolled tracing sink 的路径。未设置时，日志写到 stderr（仅当设置 filter 时）。 |
+| `LIBRA_LOG_FILE` | append/rolled tracing sink 的路径。未设置时，普通模式的日志写到 stderr（仅当设置 filter 时）；JSON/machine 模式禁用 console tracing。 |
 | `LIBRA_LOG_ROTATION` | `never`（默认）、`minutely`、`hourly` 或 `daily`。rolling 时，每个活动文件写作 `<file>.<date-suffix>`，避免单个文件无限增长。Rotation 只按时间 *拆分* 日志 — 它 **不会** 删除旧文件，因此总磁盘占用仍需外部保留策略（例如 `logrotate`，或把 `LIBRA_LOG_FILE` 指向专用目录）。 |
 | `LIBRA_LOG` / `RUST_LOG` | `tracing-subscriber` env filter。仅设置 `LIBRA_LOG_FILE` 时回退为 `libra=debug`。 |
 

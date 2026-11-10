@@ -921,50 +921,171 @@ fn receive_advertisement(tip: Option<&str>, caps: &str) -> (u16, &'static str, V
 #[cfg(unix)]
 #[test]
 fn mega2_receipt_recovery_matrix() {
-    const SERVER: &str = "libra-traces-v1 libra-traces-server=11111111-1111-4111-8111-111111111111";
-    const SCOPE: &str = "33333333-3333-4333-8333-333333333333";
-    let temp = tempfile::tempdir().expect("root");
-    let repo = temp.path().join("repo");
-    let head = init_repo_base(&repo);
-    let tip = libra_command(&repo)
-        .args(["update-ref", "refs/heads/traces", &head])
-        .output()
-        .expect("update-ref");
-    assert!(
-        tip.status.success(),
-        "{}",
-        String::from_utf8_lossy(&tip.stderr)
-    );
-    let token = temp.path().join("token");
-    fs::write(&token, "matrix-token\n").expect("token");
-    let caps = format!("report-status no-thin agent=mega/0.1.0 object-format=sha1 {SERVER}");
-    let scoped = format!("{caps} libra-traces-scope={SCOPE}");
-    let mut report = pkt_line("unpack ok\n");
-    report.extend(pkt_line("ok refs/libra/traces\n"));
-    report.extend_from_slice(b"0000");
-    let (port, seen) = serve_traces_receive(vec![
-        receive_advertisement(None, &caps),
-        (200, "application/x-git-receive-pack-result", report),
-        (500, "text/plain", b"scope read lost".to_vec()),
-        receive_advertisement(Some(&head), &scoped),
-        receive_advertisement(Some(&head), &scoped),
-    ]);
-    let remote = format!("http://127.0.0.1:{port}/project/foo.git");
-    assert!(
-        libra_command(&repo)
-            .args(["config", "set", "remote.origin.url", &remote])
+    for log_to_file in [false, true] {
+        const SERVER: &str =
+            "libra-traces-v1 libra-traces-server=11111111-1111-4111-8111-111111111111";
+        const SCOPE: &str = "33333333-3333-4333-8333-333333333333";
+        let temp = tempfile::tempdir().expect("root");
+        let repo = temp.path().join("repo");
+        let head = init_repo_base(&repo);
+        let tip = libra_command(&repo)
+            .args(["update-ref", "refs/heads/traces", &head])
             .output()
-            .expect("remote")
-            .status
-            .success()
-    );
-    let push = |expect_scope_warning: bool| {
-        let output = libra_command(&repo)
-            .env("LIBRA_LOG", "warn")
-            .env_remove("RUST_LOG")
-            .env_remove("LIBRA_LOG_FILE")
+            .expect("update-ref");
+        assert!(
+            tip.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tip.stderr)
+        );
+        let token = temp.path().join("token");
+        fs::write(&token, "matrix-token\n").expect("token");
+        let caps = format!("report-status no-thin agent=mega/0.1.0 object-format=sha1 {SERVER}");
+        let scoped = format!("{caps} libra-traces-scope={SCOPE}");
+        let mut report = pkt_line("unpack ok\n");
+        report.extend(pkt_line("ok refs/libra/traces\n"));
+        report.extend_from_slice(b"0000");
+        let (port, seen) = serve_traces_receive(vec![
+            receive_advertisement(None, &caps),
+            (200, "application/x-git-receive-pack-result", report),
+            (500, "text/plain", b"scope read lost".to_vec()),
+            receive_advertisement(Some(&head), &scoped),
+            receive_advertisement(Some(&head), &scoped),
+        ]);
+        let remote = format!("http://127.0.0.1:{port}/project/foo.git");
+        assert!(
+            libra_command(&repo)
+                .args(["config", "set", "remote.origin.url", &remote])
+                .output()
+                .expect("remote")
+                .status
+                .success()
+        );
+        let log_path = temp.path().join("push.log");
+        let push = |expect_scope_warning: bool| {
+            let mut command = libra_command(&repo);
+            command
+                .env("LIBRA_LOG", "warn")
+                .env("LIBRA_LOG_ROTATION", "never")
+                .env_remove("RUST_LOG")
+                .env_remove("LIBRA_LOG_FILE");
+            if log_to_file {
+                fs::write(&log_path, "").expect("clear previous push diagnostics");
+                command.env("LIBRA_LOG_FILE", &log_path);
+            }
+            let output = command
+                .args([
+                    "--json",
+                    "agent",
+                    "push",
+                    "--mega2",
+                    "--token-file",
+                    token.to_str().unwrap(),
+                ])
+                .output()
+                .expect("push");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .expect("stdout must contain only the command's JSON response");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.is_empty(),
+                "JSON stderr must have no tracing: {stderr}"
+            );
+            if log_to_file {
+                let log = fs::read_to_string(&log_path).expect("push diagnostics");
+                assert_eq!(
+                    log.contains("traces scope discovery after push failed"),
+                    expect_scope_warning,
+                    "scope discovery diagnostics must remain observable in the log file: {log}"
+                );
+            }
+            json["data"].clone()
+        };
+
+        let first = push(true);
+        assert_eq!(first["state"], "scope_resolution_pending");
+        assert_eq!(first["scope"], serde_json::Value::Null);
+        assert_eq!(first["target"], "/project/foo");
+        assert_eq!(first["up_to_date"], false);
+        let epoch = first["epoch"].as_str().expect("epoch").to_string();
+
+        let retry = push(false);
+        assert_eq!(retry["state"], "confirmed");
+        assert_eq!(retry["scope"], SCOPE);
+        assert_eq!(
+            retry["epoch"],
+            epoch.as_str(),
+            "a retry must not open an epoch"
+        );
+        assert_eq!(
+            retry["up_to_date"], true,
+            "the acknowledged tip is not re-sent"
+        );
+        assert!(
+            retry["locator"]
+                .as_str()
+                .unwrap()
+                .starts_with("/.traces/by-path/")
+        );
+
+        let reused = push(false);
+        assert_eq!(
+            reused["locator"],
+            format!("/.traces/by-scope/{SCOPE}.git").as_str()
+        );
+        assert_eq!(reused["epoch"], epoch.as_str());
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[1].0.ends_with("/git-receive-pack"));
+        let command = String::from_utf8_lossy(&requests[1].1);
+        assert!(
+            command.contains(&format!(
+                "{} {head} refs/libra/traces\0report-status agent=libra/",
+                "0".repeat(40)
+            )),
+            "{command}"
+        );
+        assert!(command.contains("PACK"), "the request must carry a pack");
+        assert!(
+            requests[4]
+                .0
+                .starts_with(&format!("/.traces/by-scope/{SCOPE}.git/"))
+        );
+
+        let (plain, _) = serve_traces_receive(vec![receive_advertisement(
+            None,
+            "report-status agent=git/2.43.0",
+        )]);
+        let refused_repo = temp.path().join("refused");
+        let refused_head = init_repo_base(&refused_repo);
+        assert!(
+            libra_command(&refused_repo)
+                .args(["update-ref", "refs/heads/traces", &refused_head])
+                .output()
+                .expect("update-ref")
+                .status
+                .success()
+        );
+        assert!(
+            libra_command(&refused_repo)
+                .args([
+                    "config",
+                    "set",
+                    "remote.origin.url",
+                    &format!("http://127.0.0.1:{plain}/project/foo.git"),
+                ])
+                .output()
+                .expect("remote")
+                .status
+                .success()
+        );
+        let refused = libra_command(&refused_repo)
             .args([
-                "--json",
                 "agent",
                 "push",
                 "--mega2",
@@ -972,113 +1093,10 @@ fn mega2_receipt_recovery_matrix() {
                 token.to_str().unwrap(),
             ])
             .output()
-            .expect("push");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .expect("stdout must contain only the command's JSON response");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            stderr.contains("traces scope discovery after push failed"),
-            expect_scope_warning,
-            "scope discovery diagnostics must be observable on stderr: {stderr}"
-        );
-        json["data"].clone()
-    };
-
-    let first = push(true);
-    assert_eq!(first["state"], "scope_resolution_pending");
-    assert_eq!(first["scope"], serde_json::Value::Null);
-    assert_eq!(first["target"], "/project/foo");
-    assert_eq!(first["up_to_date"], false);
-    let epoch = first["epoch"].as_str().expect("epoch").to_string();
-
-    let retry = push(false);
-    assert_eq!(retry["state"], "confirmed");
-    assert_eq!(retry["scope"], SCOPE);
-    assert_eq!(
-        retry["epoch"],
-        epoch.as_str(),
-        "a retry must not open an epoch"
-    );
-    assert_eq!(
-        retry["up_to_date"], true,
-        "the acknowledged tip is not re-sent"
-    );
-    assert!(
-        retry["locator"]
-            .as_str()
-            .unwrap()
-            .starts_with("/.traces/by-path/")
-    );
-
-    let reused = push(false);
-    assert_eq!(
-        reused["locator"],
-        format!("/.traces/by-scope/{SCOPE}.git").as_str()
-    );
-    assert_eq!(reused["epoch"], epoch.as_str());
-
-    let requests = seen.lock().unwrap().clone();
-    assert_eq!(requests.len(), 5);
-    assert!(requests[1].0.ends_with("/git-receive-pack"));
-    let command = String::from_utf8_lossy(&requests[1].1);
-    assert!(
-        command.contains(&format!(
-            "{} {head} refs/libra/traces\0report-status agent=libra/",
-            "0".repeat(40)
-        )),
-        "{command}"
-    );
-    assert!(command.contains("PACK"), "the request must carry a pack");
-    assert!(
-        requests[4]
-            .0
-            .starts_with(&format!("/.traces/by-scope/{SCOPE}.git/"))
-    );
-
-    let (plain, _) = serve_traces_receive(vec![receive_advertisement(
-        None,
-        "report-status agent=git/2.43.0",
-    )]);
-    let refused_repo = temp.path().join("refused");
-    let refused_head = init_repo_base(&refused_repo);
-    assert!(
-        libra_command(&refused_repo)
-            .args(["update-ref", "refs/heads/traces", &refused_head])
-            .output()
-            .expect("update-ref")
-            .status
-            .success()
-    );
-    assert!(
-        libra_command(&refused_repo)
-            .args([
-                "config",
-                "set",
-                "remote.origin.url",
-                &format!("http://127.0.0.1:{plain}/project/foo.git"),
-            ])
-            .output()
-            .expect("remote")
-            .status
-            .success()
-    );
-    let refused = libra_command(&refused_repo)
-        .args([
-            "agent",
-            "push",
-            "--mega2",
-            "--token-file",
-            token.to_str().unwrap(),
-        ])
-        .output()
-        .expect("refused push");
-    assert!(!refused.status.success());
-    let text = String::from_utf8_lossy(&refused.stderr);
-    assert!(text.contains("libra-traces-v1"), "{text}");
-    assert!(!text.contains("stopped before"), "{text}");
+            .expect("refused push");
+        assert!(!refused.status.success());
+        let text = String::from_utf8_lossy(&refused.stderr);
+        assert!(text.contains("libra-traces-v1"), "{text}");
+        assert!(!text.contains("stopped before"), "{text}");
+    }
 }
