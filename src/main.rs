@@ -824,6 +824,7 @@ fn build_fmt_layer(
         tracing_subscriber::filter::filter_fn(|metadata| metadata.target() != "libra::telemetry");
     let Some(path) = file else {
         let layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
             .with_filter(env_filter)
             .with_filter(not_telemetry);
         return Some(Box::new(layer));

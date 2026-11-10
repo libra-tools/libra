@@ -958,8 +958,11 @@ fn mega2_receipt_recovery_matrix() {
             .status
             .success()
     );
-    let push = || {
+    let push = |expect_scope_warning: bool| {
         let output = libra_command(&repo)
+            .env("LIBRA_LOG", "warn")
+            .env_remove("RUST_LOG")
+            .env_remove("LIBRA_LOG_FILE")
             .args([
                 "--json",
                 "agent",
@@ -975,17 +978,25 @@ fn mega2_receipt_recovery_matrix() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("json")["data"].clone()
+        let json = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("stdout must contain only the command's JSON response");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("traces scope discovery after push failed"),
+            expect_scope_warning,
+            "scope discovery diagnostics must be observable on stderr: {stderr}"
+        );
+        json["data"].clone()
     };
 
-    let first = push();
+    let first = push(true);
     assert_eq!(first["state"], "scope_resolution_pending");
     assert_eq!(first["scope"], serde_json::Value::Null);
     assert_eq!(first["target"], "/project/foo");
     assert_eq!(first["up_to_date"], false);
     let epoch = first["epoch"].as_str().expect("epoch").to_string();
 
-    let retry = push();
+    let retry = push(false);
     assert_eq!(retry["state"], "confirmed");
     assert_eq!(retry["scope"], SCOPE);
     assert_eq!(
@@ -1004,7 +1015,7 @@ fn mega2_receipt_recovery_matrix() {
             .starts_with("/.traces/by-path/")
     );
 
-    let reused = push();
+    let reused = push(false);
     assert_eq!(
         reused["locator"],
         format!("/.traces/by-scope/{SCOPE}.git").as_str()

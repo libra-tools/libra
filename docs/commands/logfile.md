@@ -26,6 +26,10 @@ resolved from the environment:
 
 It needs no repository.
 
+When logging is enabled without `LIBRA_LOG_FILE`, tracing diagnostics go to
+stderr. Stdout remains available for the command result, including a single JSON
+response under `--json` / `--machine`; warnings do not get mixed into that response.
+
 ### Log-file environment variables
 
 | Variable | Meaning |

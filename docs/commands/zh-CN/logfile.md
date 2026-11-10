@@ -20,6 +20,10 @@ libra logfile info
 
 它不需要仓库。
 
+启用日志但未设置 `LIBRA_LOG_FILE` 时，tracing 诊断写入 stderr。
+stdout 保留给命令结果，包括 `--json` / `--machine` 的单个 JSON 响应；
+警告不会混入该响应。
+
 ### 日志文件环境变量
 
 | 变量 | 含义 |
