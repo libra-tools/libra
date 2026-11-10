@@ -68,10 +68,13 @@ jobs:
     # invocation is not safety evidence. Each selected case must actually run.
     name: compat-owner-liveness-macos
     runs-on: macos-latest
-    timeout-minutes: 75
+    # A cold macOS build exhausted 75 minutes before the first exact test.
+    # Keep the complete safety suite within a finite build-and-test window.
+    timeout-minutes: 150
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
