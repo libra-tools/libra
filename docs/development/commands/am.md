@@ -46,3 +46,9 @@
 - 修改 mail parser 时必须同步 public `mailinfo` 与 `am` 的测试，不能产生两套 cleanup 语义。
 - branch/ref/sequencer advance 必须继续保持单 DB transaction；任何拆分都按 P1 correctness regression 处理。
 - rollback 新增 path class 时必须加入 interruption-before-stage 测试，证明 abort 不留文件且不删 pre-existing untracked data。
+
+## 显式换行比较（#1062）
+
+干净度预检遵循显式 `text`/`eol` 规则，因此等价的 CRLF 表示不会阻止应用邮件补丁。真实未暂存修改和已有序列或冲突状态仍保留原有保护。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

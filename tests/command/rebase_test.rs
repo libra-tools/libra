@@ -7803,3 +7803,29 @@ fn rebase_signoff_appends_the_trailer_once() {
         "the trailer must not be duplicated: {text}"
     );
 }
+
+#[test]
+fn i1062_consumer_rebase_accepts_clean_representation_and_preserves_real_edits() {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_fast_forward_scripts,
+    };
+    for dirty in [false, true] {
+        let (temp, tip) = i1062_fast_forward_scripts();
+        let repo = temp.path().join("repo");
+        if dirty {
+            std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+        }
+        let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+        let bytes = std::fs::read(repo.join("probe.ps1")).unwrap();
+        let output = i1062_run(&repo, &["rebase", "upstream"]);
+        assert_eq!(output.status.success(), !dirty, "{output:?}");
+        if dirty {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(std::fs::read(repo.join("probe.ps1")).unwrap(), bytes);
+        } else {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), tip);
+            assert!(repo.join("upstream.txt").is_file());
+        }
+    }
+}

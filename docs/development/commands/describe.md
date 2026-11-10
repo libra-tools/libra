@@ -61,3 +61,9 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## 显式换行比较（#1062）
+
+`--dirty` 后缀对已跟踪普通文件使用显式 `text`/`eol` clean 比较。仅有等价的 CRLF/LF 字节差异时不附加后缀；真实内容、模式、类型或暂存变化仍会附加。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

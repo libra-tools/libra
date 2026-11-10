@@ -12,6 +12,8 @@ libra status [OPTIONS] [pathspec]...
 
 ## 说明
 
+已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 
 该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。浅克隆中 ahead/behind 将 `.libra/shallow` 中的提交视为根；损坏的 shallow 列表会隐藏计数并告警，而不是猜测。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。

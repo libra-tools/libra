@@ -250,6 +250,18 @@ pub(crate) fn deadline_file_blob_hash(
     path: &Path,
     workdir: &Path,
 ) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
+    deadline_hash_with_attributes(
+        path,
+        workdir,
+        crate::utils::attributes::ConversionAttributeContext::capture(workdir),
+    )
+}
+
+fn deadline_hash_with_attributes(
+    path: &Path,
+    workdir: &Path,
+    attributes: crate::utils::attributes::ConversionAttributeContext,
+) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
     let root = path_to_bytes(workdir);
     let relative = match request_worktree_relative(&root, path, false) {
         Ok(relative) => relative,
@@ -257,25 +269,156 @@ pub(crate) fn deadline_file_blob_hash(
     };
     let events = worktree_io()
         .submit(
-            IoRequest::FileBlobHash {
+            IoRequest::CleanFileBlobHash {
                 path: relative,
                 root,
                 hash_kind: current_hash_kind(),
                 root_session: request_worktree_session(),
+                attributes,
             },
             path_to_bytes(path),
             crate::command::status_probe::io_op_timeout(),
         )
         .map_err(|_| ())?;
     for event in events {
-        if let IoEvent::DoneHash { hex } = event {
-            return Ok(unwrap_wire(hex).and_then(|hex| {
+        if let IoEvent::DoneCleanHash { hex, detail } = event {
+            return Ok(unwrap_conversion_result(hex, detail).and_then(|hex| {
                 crate::internal::object_format::parse_repo_oid(&hex)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
             }));
         }
     }
     Err(())
+}
+
+fn unwrap_conversion_result<T>(
+    result: crate::internal::worktree_io::protocol::WireResult<T>,
+    detail: Option<String>,
+) -> io::Result<T> {
+    unwrap_wire(result).map_err(|error| match detail {
+        Some(detail) => io::Error::new(error.kind(), detail),
+        None => error,
+    })
+}
+
+pub(crate) fn clean_file_blob_hash(
+    path: &Path,
+    workdir: &Path,
+) -> io::Result<git_internal::hash::ObjectHash> {
+    deadline_file_blob_hash(path, workdir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "content comparison timed out for '{}'; retry when the file is readable",
+                path.display()
+            ),
+        )
+    })?
+}
+
+/// A scan-local proof key binds the exact loaded index and all possible
+/// attribute sources. Only a complete clean scan can enable future stat hits.
+pub(crate) struct ConversionScan {
+    root: Vec<u8>,
+    directories: Vec<Vec<u8>>,
+    attributes: crate::utils::attributes::ConversionAttributeContext,
+    cache_root: Vec<u8>,
+    index_key: String,
+}
+
+impl ConversionScan {
+    pub(crate) fn new(
+        workdir: &Path,
+        index: &git_internal::internal::index::Index,
+    ) -> io::Result<Self> {
+        let mut directories = std::collections::BTreeSet::new();
+        directories.insert(PathBuf::new());
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        for path in index.tracked_files() {
+            let Some(name) = path.to_str() else {
+                continue;
+            };
+            for stage in 0..=3 {
+                if let Some(entry) = index.get(name, stage) {
+                    // Include stat, flags and mode, not only the object ID:
+                    // another command may refresh stat without re-cleaning.
+                    let encoded = entry.to_string();
+                    hash.update(&(encoded.len() as u64).to_le_bytes());
+                    hash.update(encoded.as_bytes());
+                }
+            }
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                directories.insert(directory.to_path_buf());
+                parent = directory.parent();
+            }
+        }
+        let index_path = crate::utils::path::try_index()?;
+        let cache_root = index_path
+            .parent()
+            .ok_or_else(|| io::Error::other("index has no parent for conversion validity"))?;
+        Ok(Self {
+            root: path_to_bytes(workdir),
+            directories: directories
+                .into_iter()
+                .map(|path| path_to_bytes(&path))
+                .collect(),
+            attributes: crate::utils::attributes::ConversionAttributeContext::capture(workdir),
+            cache_root: path_to_bytes(cache_root),
+            index_key: hex::encode(hash.finish().as_ref()),
+        })
+    }
+
+    pub(crate) fn hash(&self, path: &Path) -> io::Result<git_internal::hash::ObjectHash> {
+        deadline_hash_with_attributes(path, &bytes_to_path(&self.root), self.attributes.clone())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "content comparison timed out for '{}'; retry when the file is readable",
+                        path.display()
+                    ),
+                )
+            })?
+    }
+
+    pub(crate) fn probe(&self, record: Option<&str>) -> io::Result<(String, bool)> {
+        if crate::utils::attributes::ConversionAttributeContext::capture(&bytes_to_path(&self.root))
+            != self.attributes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attribute configuration changed during comparison; retry the command",
+            ));
+        }
+        let events = worktree_io()
+            .submit(
+                IoRequest::ConversionState {
+                    root: self.root.clone(),
+                    directories: self.directories.clone(),
+                    attributes: self.attributes.clone(),
+                    cache_root: self.cache_root.clone(),
+                    index_key: self.index_key.clone(),
+                    record: record.map(str::to_owned),
+                },
+                self.root.clone(),
+                crate::command::status_probe::io_op_timeout(),
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "conversion validity check timed out; retry when the worktree is readable",
+                )
+            })?;
+        for event in events {
+            if let IoEvent::DoneConversionState { result, detail } = event {
+                return unwrap_conversion_result(result, detail);
+            }
+        }
+        Err(io::Error::other(
+            "conversion validity worker returned no result",
+        ))
+    }
 }
 
 /// Outcome of a killable local object-store read (WIO-03).

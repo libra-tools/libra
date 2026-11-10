@@ -10844,3 +10844,47 @@ fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
         );
     }
 }
+
+#[test]
+fn i1062_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_fast_forward_scripts,
+    };
+    for dirty in [false, true] {
+        let (temp, _) = i1062_fast_forward_scripts();
+        let repo = temp.path().join("repo");
+        let patch_dir = temp.path().join("patches");
+        i1062_ok(
+            &repo,
+            &[
+                "format-patch",
+                "-o",
+                patch_dir.to_str().unwrap(),
+                "main..upstream",
+            ],
+        );
+        let patch = fs::read_dir(&patch_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+            .unwrap();
+        if dirty {
+            fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+        }
+        let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+        let bytes = fs::read(repo.join("probe.ps1")).unwrap();
+        let output = i1062_run(&repo, &["am", patch.to_str().unwrap()]);
+        assert_eq!(output.status.success(), !dirty, "{output:?}");
+        if dirty {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(fs::read(repo.join("probe.ps1")).unwrap(), bytes);
+        } else {
+            assert_ne!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(fs::read(repo.join("upstream.txt")).unwrap(), b"upstream\n");
+        }
+    }
+}

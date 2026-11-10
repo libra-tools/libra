@@ -422,7 +422,11 @@ async fn test_pull_diverged_remote_creates_three_way_merge() {
 #[test]
 fn test_pull_inherits_merge_renormalize_config() {
     let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
-    fs::write(work_dir.join("shared.txt"), "top\nbase\nbottom\n").expect("write base");
+    // Preserve a historical CRLF base, then record a real local LF
+    // normalization commit now that explicit add already performs clean.
+    fs::write(work_dir.join(".git/info/attributes"), "shared.txt -text\n").unwrap();
+    fs::write(work_dir.join("shared.txt"), "top\r\nbase\r\nbottom\r\n")
+        .expect("write historical base");
     fs::write(work_dir.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
     git(&["add", "shared.txt", ".gitattributes"], &work_dir);
     git(&["commit", "-m", "add shared text"], &work_dir);
@@ -448,21 +452,18 @@ fn test_pull_inherits_merge_renormalize_config() {
         &work_dir,
     );
 
-    fs::write(
-        local_repo.path().join("shared.txt"),
-        b"top\r\nbase\r\nbottom\r\n",
-    )
-    .expect("write local CRLF edit");
+    fs::write(local_repo.path().join("shared.txt"), b"top\nbase\nbottom\n")
+        .expect("write local LF normalization");
     assert_cli_success(
         &run_libra_command(&["add", "shared.txt"], local_repo.path()),
-        "stage local CRLF edit",
+        "stage local LF normalization",
     );
     assert_cli_success(
         &run_libra_command(
             &["commit", "-m", "local line endings", "--no-verify"],
             local_repo.path(),
         ),
-        "commit local CRLF edit",
+        "commit local LF normalization",
     );
     assert_cli_success(
         &run_libra_command(&["config", "merge.renormalize", "true"], local_repo.path()),
@@ -473,7 +474,7 @@ fn test_pull_inherits_merge_renormalize_config() {
     assert_cli_success(&output, "pull with merge.renormalize");
     assert_eq!(
         fs::read(local_repo.path().join("shared.txt")).expect("read pulled text"),
-        b"top\r\nfeature\r\nbottom\r\n"
+        b"top\nfeature\nbottom\n"
     );
 }
 
@@ -2067,4 +2068,57 @@ fn storage_config_unresolved_fetch_stays_local_pull() {
         !text.contains("failed to read object storage configuration"),
         "{text}"
     );
+}
+
+#[test]
+fn i1062_pull_fast_forward_accepts_clean_representation_and_preserves_edits() {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_fast_forward_scripts,
+    };
+    for dirty in [false, true] {
+        let (temp, tip) = i1062_fast_forward_scripts();
+        let source = temp.path().join("repo");
+        let bare = temp.path().join("remote.git");
+        let local = temp.path().join("local");
+        let git = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .env("HOME", temp.path().join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        i1062_ok(
+            &source,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        i1062_ok(&source, &["push", "origin", "main"]);
+        fs::create_dir(&local).unwrap();
+        i1062_ok(&local, &["init"]);
+        i1062_ok(&local, &["config", "user.name", "EOL test"]);
+        i1062_ok(&local, &["config", "user.email", "eol@example.test"]);
+        i1062_ok(&local, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        i1062_ok(&local, &["pull", "origin", "main"]);
+        i1062_ok(&source, &["push", "origin", "upstream:main"]);
+        for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+            fs::write(local.join(name), b"one\r\ntwo\r\n").unwrap();
+        }
+        if dirty {
+            fs::write(local.join("probe.ps1"), b"real change\r\n").unwrap();
+        }
+        let before = i1062_ok(&local, &["rev-parse", "HEAD"]);
+        let index = fs::read(local.join(".libra/index")).unwrap();
+        let bytes = fs::read(local.join("probe.ps1")).unwrap();
+        let output = i1062_run(&local, &["pull", "--ff-only", "origin", "main"]);
+        assert_eq!(output.status.success(), !dirty, "{output:?}");
+        if dirty {
+            assert_eq!(i1062_ok(&local, &["rev-parse", "HEAD"]), before);
+            assert_eq!(fs::read(local.join(".libra/index")).unwrap(), index);
+            assert_eq!(fs::read(local.join("probe.ps1")).unwrap(), bytes);
+        } else {
+            assert_eq!(i1062_ok(&local, &["rev-parse", "HEAD"]), tip);
+            assert_eq!(fs::read(local.join("upstream.txt")).unwrap(), b"upstream\n");
+        }
+    }
 }

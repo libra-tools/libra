@@ -1,8 +1,9 @@
-//! Read-only worktree and object-store request handler.
+//! Capability-bound worktree comparison and object-store request handler.
 //!
 //! This module owns the actual capability-bound filesystem operations used by
 //! the bounded executor. It deliberately depends on utilities and the wire
-//! protocol only, so it can be reused by status and other read-only callers.
+//! protocol only. Conversion-state requests may maintain a disposable stat
+//! certificate; object and worktree content requests remain read-only.
 
 use std::{
     cell::RefCell,
@@ -42,6 +43,8 @@ fn seal_worktree_capability(request: &IoRequest) -> io::Result<Option<WorktreeRo
         | IoRequest::CanonicalizePair { root, .. }
         | IoRequest::ReadDir { root, .. }
         | IoRequest::FileBlobHash { root, .. }
+        | IoRequest::CleanFileBlobHash { root, .. }
+        | IoRequest::ConversionState { root, .. }
         | IoRequest::MarkerProbe { root, .. } => root,
         IoRequest::ReadObjectBlob { .. } | IoRequest::Shutdown => return Ok(None),
     };
@@ -252,6 +255,76 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
                 },
             };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
+        }
+        IoRequest::CleanFileBlobHash {
+            path,
+            hash_kind,
+            root_session,
+            attributes,
+            ..
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let capability = worktree_capability
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing conversion worktree capability"))?;
+            let relative = capability.relative(&bytes_to_path(&path))?;
+            let result = (|| {
+                apply_hash_kind(&hash_kind)?;
+                let root = crate::utils::beneath::open_root(capability.root())?;
+                crate::utils::worktree_conversion::hash_clean_blob_beneath(
+                    capability.root(),
+                    &root,
+                    &relative,
+                    &attributes,
+                    (root_session != 0).then_some(root_session),
+                )
+                .map(|hash| hash.to_string())
+            })();
+            let detail = result.as_ref().err().map(ToString::to_string);
+            write_frame(
+                stdout,
+                &IoEvent::DoneCleanHash {
+                    hex: wire_result(result),
+                    detail,
+                },
+            )?;
+        }
+        IoRequest::ConversionState {
+            directories,
+            attributes,
+            cache_root,
+            index_key,
+            record,
+            ..
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let capability = worktree_capability
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing conversion worktree capability"))?;
+            let result = (|| {
+                let root = crate::utils::beneath::open_root(capability.root())?;
+                let directories = directories
+                    .iter()
+                    .map(|bytes| bytes_to_path(bytes))
+                    .collect::<Vec<_>>();
+                crate::utils::worktree_conversion::conversion_stat_certificate(
+                    capability.root(),
+                    &root,
+                    &directories,
+                    &attributes,
+                    &bytes_to_path(&cache_root),
+                    &index_key,
+                    record.as_deref(),
+                )
+            })();
+            let detail = result.as_ref().err().map(ToString::to_string);
+            write_frame(
+                stdout,
+                &IoEvent::DoneConversionState {
+                    result: wire_result(result),
+                    detail,
+                },
+            )?;
         }
         IoRequest::ReadObjectBlob {
             oid,

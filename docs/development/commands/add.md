@@ -100,3 +100,9 @@ flowchart TD
 - 2026-09-20（plan issues/470 FM-04）：`check_file_status`/`stage_a_file` 将「仅 mode 变化」（`core.fileMode=true` 且普通文件 owner-execute 位与索引不同、内容未变）视为已修改并重写条目；`--dry-run` 预览同源。
 - 2026-09-20（plan-20260918 WT-05，`-N` 暂时隐藏）：新增 `-N/--intent-to-add`——按 pathspec 命中的未跟踪路径写入空 blob（`e69de29…`）+ 零 stat + index v3 `intent_to_add` 扩展位，已跟踪路径 no-op，未命中 pathspec 保持 128 零写入，`--dry-run` 只预览（`add: <path>`）；`AddOutput.intent_to_add` 承载 JSON 字段；真实暂存路径改用 `index_ext::update_preserving_file_mode_except_intent` 清除该位（ADR-SW-03），全部清除后索引回 v2。
 - 2026-10-18（plan-20260918 WT-06/WT-07）：公开 `-N`；补齐 intent-to-add 的展示面与写入消费面——`status` 单独返回 `intent_to_add`（不再落到 modified），porcelain v1/v2/长格式/JSON 对齐 Git；`diff` 的 index 侧跳过占位（`--cached` 为空、worktree 视图为新文件），`diff-files` 新增 `--name-status`；`write-tree`/`commit`/`utils::tree` 跳过占位，`commit -a` 用 `update_preserving_file_mode_except_intent` 清除标志；`stash push` 以 `LBR-CONFLICT-002` 拒绝；`rm --cached` 可移除、非 cached 仍按 Git 文案拒绝。
+
+## 显式换行比较（#1062）
+
+候选分类也使用 clean 表示。只修改属性、目标文件 stat 不变时，已跟踪文件仍可能需要重新暂存；单纯 CRLF/LF 表示差异不会报告为内容修改。`--renormalize` 仍强制重新处理已跟踪文件。比较过程不改写工作区文件。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

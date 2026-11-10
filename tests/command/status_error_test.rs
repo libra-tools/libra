@@ -398,3 +398,35 @@ fn status_exit_code_json_dirty_returns_json_and_exit_1() {
     );
     assert_eq!(parsed["data"]["is_clean"], false);
 }
+
+#[test]
+fn i1062_status_invalid_attribute_source_never_reports_clean() {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_committed_scripts,
+    };
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    i1062_ok(&repo, &["add", "probe.ps1", "probe.bat", "probe.cmd"]);
+    i1062_ok(&repo, &["--json", "status", "--scan"]);
+    fs::create_dir_all(repo.join(".libra/info/attributes")).unwrap();
+    for args in [
+        vec!["--json", "status"],
+        vec!["--json", "status", "--scan"],
+        vec!["--json", "status", "--check-dirty"],
+    ] {
+        let output = i1062_run(&repo, &args);
+        if output.status.success() {
+            let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                !doc["data"]["io_blocked"].as_array().unwrap().is_empty(),
+                "{args:?}: {doc}"
+            );
+        }
+    }
+    assert!(
+        !i1062_run(&repo, &["status", "--porcelain"])
+            .status
+            .success()
+    );
+}

@@ -20,6 +20,8 @@ libra rebase --edit-todo
 
 ## Description
 
+The clean-worktree preflight honors explicit `text`/`eol` clean comparison. Equivalent CRLF/LF content does not prevent starting a rebase. Real modifications and existing sequence/conflict state still follow the normal refusal and recovery rules. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+
 `libra rebase` moves a sequence of commits from the current branch onto a new base commit. It finds the common ancestor between the current branch and the specified upstream, collects all commits from that ancestor to the current HEAD, and replays each commit on top of the upstream branch. After all commits are replayed, the current branch reference is updated to point to the final rebased commit.
 
 If a conflict occurs during replay, the rebase stops and reports the conflicting files. The user resolves conflicts manually, stages the resolved files, and then runs `libra rebase --continue` to proceed. Alternatively, `--abort` restores the original branch state and `--skip` discards the current commit and moves on to the next.

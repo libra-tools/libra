@@ -1972,9 +1972,10 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             if absolute.symlink_metadata().is_err() {
                 continue;
             }
-            let changed = index.is_modified(&entry.name, 0, &workdir)
-                || crate::command::calc_file_blob_hash(&absolute)
-                    .is_ok_and(|hash| !index.verify_hash(&entry.name, 0, &hash));
+            let changed = matches!(
+                check_file_status(&candidate, &index, &workdir, file_mode)?,
+                FileStatus::Modified
+            );
             if changed {
                 files.push(candidate);
             }
@@ -2885,38 +2886,41 @@ async fn stage_a_file(
         }
         FileStatus::Modified => {
             let unmerged = path_has_conflict_stages(index, file_str);
-            let missing_stage0 = !index.tracked(file_str, 0);
-            let content_dirty = !missing_stage0 && index.is_modified(file_str, 0, workdir);
-            if unmerged || missing_stage0 || content_dirty || mode_dirty {
-                let pre_read = file_abs.symlink_metadata().ok();
-                let blob =
-                    gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                if missing_stage0 || mode_dirty || !index.verify_hash(file_str, 0, &blob.id) {
-                    blob.try_save().map_err(|source| AddError::ObjectSave {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                    let entry = crate::command::verified_index_entry(
-                        file,
-                        blob.id,
-                        workdir,
-                        pre_read.as_ref(),
-                    )
-                    .map_err(|source| AddError::CreateIndexEntry {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                    crate::utils::index_ext::update_preserving_file_mode_except_intent(
-                        index, entry, file_mode,
-                    );
-                }
-                clear_conflict_stages(index, file_str);
-                return Ok(StagedAction::Modified);
+            let pre_read = file_abs.symlink_metadata().ok();
+            let blob =
+                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
+            let needs_entry = index.get(file_str, 0).is_none_or(|entry| {
+                entry.flags.intent_to_add
+                    || entry.hash != blob.id
+                    || mode_dirty
+                    || pre_read.as_ref().is_some_and(|stat| {
+                        (entry.mode & 0o170000 == 0o120000) != stat.file_type().is_symlink()
+                    })
+            });
+            if needs_entry {
+                blob.try_save().map_err(|source| AddError::ObjectSave {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
+                let entry =
+                    crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref())
+                        .map_err(|source| AddError::CreateIndexEntry {
+                            path: file.to_path_buf(),
+                            source,
+                        })?;
+                crate::utils::index_ext::update_preserving_file_mode_except_intent(
+                    index, entry, file_mode,
+                );
             }
-            Ok(StagedAction::Unchanged)
+            clear_conflict_stages(index, file_str);
+            Ok(if needs_entry || unmerged {
+                StagedAction::Modified
+            } else {
+                StagedAction::Unchanged
+            })
         }
         FileStatus::Deleted => {
             remove_all_stages(index, file_str);
@@ -2987,9 +2991,9 @@ fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
 /// in-memory `index`.
 ///
 /// Functional scope:
-/// - Uses `index.tracked` and `index.is_modified` to discriminate the four
-///   live states; missing files are reported as `Deleted` when tracked, else
-///   `NotFound`.
+/// - Uses clean content, type and mode to classify tracked paths; an attribute
+///   change cannot be hidden by a target stat match. Missing files are reported
+///   as `Deleted` when tracked, else `NotFound`.
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::InvalidPathEncoding`] when `file` is not UTF-8.
@@ -3017,12 +3021,42 @@ fn check_file_status(
             Ok(FileStatus::New)
         }
     } else if unmerged
-        || index.is_modified(file_str, 0, workdir)
+        || index
+            .get(file_str, 0)
+            .is_some_and(|entry| entry.flags.intent_to_add)
         || mode_only_worktree_change(index, file_str, &file_abs, file_mode)
     {
         Ok(FileStatus::Modified)
     } else {
-        Ok(FileStatus::Unchanged)
+        let metadata = file_abs
+            .symlink_metadata()
+            .map_err(|source| AddError::Status {
+                source: status::StatusError::FileHash {
+                    path: file_abs.clone(),
+                    source,
+                },
+            })?;
+        let type_change = index.get(file_str, 0).is_some_and(|entry| {
+            (entry.mode & 0o170000 == 0o120000) != metadata.file_type().is_symlink()
+                || (!metadata.is_file() && !metadata.file_type().is_symlink())
+        });
+        if type_change {
+            return Ok(FileStatus::Modified);
+        }
+        // A target stat match alone says nothing about changed attributes.
+        // Classification and the subsequent write use the same clean policy.
+        let hash = crate::command::status_io_worker::clean_file_blob_hash(&file_abs, workdir)
+            .map_err(|source| AddError::Status {
+                source: status::StatusError::FileHash {
+                    path: file_abs.clone(),
+                    source,
+                },
+            })?;
+        Ok(if index.verify_hash(file_str, 0, &hash) {
+            FileStatus::Unchanged
+        } else {
+            FileStatus::Modified
+        })
     }
 }
 

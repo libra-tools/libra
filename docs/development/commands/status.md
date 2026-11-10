@@ -22,7 +22,7 @@
 
 - `src/internal/worktree_io/` 承载通用只读基础设施：`protocol` 定义 `IoRequest`/`IoEvent`、frame codec、平台路径编码、request budget 和 lexical validation；`executor` 提供 `WorktreeIo`、`IoLimits`、`CancellationToken`、typed outcome/error、稳定排序的 bounded pool，以及 helper process-group kill/reap/recycle。并发上限为 8、pending 上限为 64、frame 上限为 8 MiB；byte/frame/entry 预算仍在 request/protocol 与流式 handler 中执行。
 - `status_io_worker.rs` 仍承载 status handler、root session、deadline glue、hidden worker entry 和既有 `deadline_*`/数据类型 re-export；通用 protocol/executor 已抽取到 `src/internal/worktree_io/`。parent status session 与长寿命 helper 按 root 复用 sealed capability；wire 两端校验只做绝对 root、canonical relative path、OID/size 等词法检查，不因校验额外访问文件系统。文件/目录实际读取每次都经 `beneath::open_root` 和 no-follow beneath 操作，维持符号链接逃逸与 TOCTOU 的 fail-closed 边界。
-- object-store capability 与 worktree capability 分离。对象读取限定 local-only、no-hydration，不创建目录或写入 ODB/SQLite/refs；helper 不提供任何写操作。
+- object-store capability 与 worktree capability 分离。对象读取限定 local-only、no-hydration，不创建目录或写入 ODB/SQLite/refs；原始对象读取仍不提供写操作；#1062 的转换状态请求仅可维护上述可丢弃 stat 有效性记录。
 - 这是内部实现抽取，不改变 `status` CLI 参数、输出或调用方 API。读取中断仍产生 partial/checkpoint 结果并报告 `IoBlocked`；权限、符号链接/TOCTOU 逃逸、worker 错误、超时和取消继续走现有 fail-closed/cache protection 语义；object read 与 rename 逻辑保持不变。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
@@ -87,3 +87,9 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - 2026-09-20（plan issues/470 FM-04）：`changes_to_be_staged_split_{safe,force}_with_index` 增加 `file_mode` 参数与仅 mode 变化判定，`collect_tracked_worktree_changes` 同步；`status` 经 `core_file_mode()` 解析后传入，`changes_to_be_staged_split_*_with_ignore_case_and_file_mode` 供 add/commit 复用。
+
+## 显式换行比较（#1062）
+
+已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+
+`ConversionScan` 以已加载索引的完整条目摘要、根身份及全部候选属性来源版本约束 stat 快路。首次或失效时逐文件 clean 比较；完整且干净的扫描才能在当前索引目录写入一个固定 64 字节的可丢弃 `conversion-stat-v1` 记录。记录缺失、损坏、不可读或写失败只使优化失效；不更新索引、ODB、refs 或默认状态的 dirty-cache 数据表。属性读取与记录 I/O 仍经过原有有界 worker；clean hash 的长度计算和哈希最多两遍读取同一描述符。`--scan` 的 dirty-cache fingerprint 加入属性来源版本，`--check-dirty` 也保留类型与执行位差异。

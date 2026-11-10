@@ -20,7 +20,7 @@ use sea_orm::{ConnectionTrait, Statement};
 
 use super::*;
 
-fn i1062_command(repo: &std::path::Path, args: &[&str]) -> std::process::Command {
+pub(super) fn i1062_command(repo: &std::path::Path, args: &[&str]) -> std::process::Command {
     let home = repo.parent().unwrap().join("home");
     fs::create_dir_all(home.join(".config")).unwrap();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_libra"));
@@ -37,17 +37,17 @@ fn i1062_command(repo: &std::path::Path, args: &[&str]) -> std::process::Command
     command
 }
 
-fn i1062_run(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+pub(super) fn i1062_run(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
     i1062_command(repo, args).output().unwrap()
 }
 
-fn i1062_ok(repo: &std::path::Path, args: &[&str]) -> Vec<u8> {
+pub(super) fn i1062_ok(repo: &std::path::Path, args: &[&str]) -> Vec<u8> {
     let output = i1062_run(repo, args);
     assert!(output.status.success(), "{args:?}: {output:?}");
     output.stdout
 }
 
-fn i1062_index_oid(repo: &std::path::Path, path: &str) -> String {
+pub(super) fn i1062_index_oid(repo: &std::path::Path, path: &str) -> String {
     String::from_utf8(i1062_ok(repo, &["ls-files", "--stage", "--", path]))
         .unwrap()
         .split_whitespace()
@@ -5190,4 +5190,31 @@ fn test_t2200_n10_add_u_resolves_all_stage_combinations() {
         expected,
         "only the three resolvable paths survive, at stage 0, with the worktree content"
     );
+}
+
+#[test]
+fn i1062_classification_attributes_only_change_restages_clean_content() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    fs::write(repo.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    let before = fs::metadata(repo.join("probe.ps1"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    let oid = i1062_index_oid(&repo, "probe.ps1");
+    assert_eq!(i1062_ok(&repo, &["cat-file", "-p", &oid]), b"one\ntwo\n");
+    assert_eq!(
+        fs::metadata(repo.join("probe.ps1"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    assert_eq!(fs::read(repo.join("probe.ps1")).unwrap(), b"one\r\ntwo\r\n");
 }

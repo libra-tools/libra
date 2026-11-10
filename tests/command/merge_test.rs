@@ -3105,7 +3105,29 @@ fn create_diverged_whitespace_repo(
 ) -> tempfile::TempDir {
     let temp_repo = create_committed_repo_via_cli();
     let p = temp_repo.path();
-    std::fs::write(p.join("shared.txt"), base).expect("write whitespace base");
+    let explicit = attribute.is_some_and(|value| {
+        !value
+            .split_whitespace()
+            .any(|token| matches!(token, "-text" | "text=auto"))
+            && value
+                .split_whitespace()
+                .any(|token| token == "text" || token.starts_with("eol="))
+    });
+    let info = p.join(".libra/info/attributes");
+    if explicit {
+        // Keep a historical CRLF merge base while ordinary explicit add now
+        // writes LF. The ours commit records normalization; this preserves
+        // the old -X renormalize conflict matrix without asking add to store
+        // bytes that contradict its new clean policy.
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+        std::fs::write(&info, "shared.txt -text\n").unwrap();
+    }
+    let historical_base = if explicit {
+        base.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        base.to_owned()
+    };
+    std::fs::write(p.join("shared.txt"), historical_base).expect("write whitespace base");
     let mut paths = vec!["shared.txt"];
     if let Some(attribute) = attribute {
         std::fs::write(p.join(".gitattributes"), format!("*.txt {attribute}\n"))
@@ -3130,7 +3152,18 @@ fn create_diverged_whitespace_repo(
         &run_libra_command(&["checkout", "main"], p),
         "checkout main",
     );
-    commit_file(p, "shared.txt", ours, "ours normalization-only edit");
+    if explicit {
+        std::fs::write(&info, "shared.txt text\n").unwrap();
+        commit_file(
+            p,
+            "shared.txt",
+            &ours.replace("\r\n", "\n"),
+            "ours normalization-only edit",
+        );
+        std::fs::remove_file(&info).unwrap();
+    } else {
+        commit_file(p, "shared.txt", ours, "ours normalization-only edit");
+    }
     temp_repo
 }
 
@@ -3190,7 +3223,8 @@ fn merge_x_whitespace_options_merge_original_text_and_keep_ours_eol() {
 }
 
 /// MG-11 G5/G6/G8: config and explicit `-X renormalize` both canonicalize
-/// text/eol-attributed inputs for comparison and restore ours-side CRLF.
+/// historical text/eol-attributed inputs for comparison. Ours is now stored
+/// canonically as LF by explicit add, so the merge retains ours-side LF.
 #[test]
 fn merge_x_whitespace_renormalize_config_and_option_are_equivalent() {
     for explicit in [false, true] {
@@ -3213,7 +3247,7 @@ fn merge_x_whitespace_renormalize_config_and_option_are_equivalent() {
         assert_cli_success(&out, "renormalized merge");
         assert_eq!(
             std::fs::read(p.join("shared.txt")).expect("read renormalized merge"),
-            b"top\r\nfeature\r\nbottom\r\n",
+            b"top\nfeature\nbottom\n",
             "explicit={explicit}",
         );
     }
@@ -3347,7 +3381,7 @@ fn merge_x_whitespace_composes_with_favor_and_repeated_options() {
 
 /// MG-11: `ll_merge()` renormalizes before selecting the low-level driver, so
 /// an external driver must receive canonical LF inputs too. Its `%A` result is
-/// backfilled to ours-side CRLF under Libra's documented output contract.
+/// emitted with the canonical ours-side LF under Libra's output contract.
 #[cfg(unix)]
 #[test]
 fn merge_x_whitespace_renormalizes_external_driver_inputs() {
@@ -3364,7 +3398,7 @@ fn merge_x_whitespace_renormalizes_external_driver_inputs() {
     assert_cli_success(&out, "renormalized external-driver merge");
     assert_eq!(
         std::fs::read(p.join("shared.txt")).expect("read external merge result"),
-        b"top\r\nfeature\r\nbottom\r\n"
+        b"top\nfeature\nbottom\n"
     );
 
     let raw = create_diverged_whitespace_repo(
@@ -14562,4 +14596,35 @@ fn merge_verbose_prints_the_diffstat() {
         "--no-stat must win over -v: {}",
         String::from_utf8_lossy(&suppressed.stdout)
     );
+}
+
+#[test]
+fn i1062_merge_fast_forward_accepts_clean_representation_and_rejects_edits() {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_fast_forward_scripts,
+    };
+    for dirty in [false, true] {
+        let (temp, tip) = i1062_fast_forward_scripts();
+        let repo = temp.path().join("repo");
+        if dirty {
+            std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+        }
+        let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+        let index = std::fs::read(repo.join(".libra/index")).unwrap();
+        let bytes = std::fs::read(repo.join("probe.ps1")).unwrap();
+        let output = i1062_run(&repo, &["merge", "--ff-only", "upstream"]);
+        assert_eq!(output.status.success(), !dirty, "{output:?}");
+        if dirty {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), index);
+            assert_eq!(std::fs::read(repo.join("probe.ps1")).unwrap(), bytes);
+        } else {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), tip);
+            assert_eq!(
+                std::fs::read(repo.join("upstream.txt")).unwrap(),
+                b"upstream\n"
+            );
+        }
+    }
 }

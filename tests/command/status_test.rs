@@ -4750,3 +4750,193 @@ fn status_storage_scope_config_rejection_is_not_success() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The same committed fixture is reused by the status/consumer regressions.
+pub(super) fn i1062_committed_scripts(format: &str) -> tempfile::TempDir {
+    use super::add_test::i1062_ok;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init", "--object-format", format]);
+    i1062_ok(&repo, &["config", "user.name", "EOL test"]);
+    i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.ps1 text eol=crlf\n*.bat text eol=lf\n*.cmd eol=crlf\n",
+    )
+    .unwrap();
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\ntwo\n").unwrap();
+    }
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "scripts"]);
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\r\ntwo\r\n").unwrap();
+    }
+    temp
+}
+
+#[test]
+fn i1062_status_explicit_representation_is_clean_in_both_hash_formats() {
+    use super::add_test::i1062_ok;
+    for format in ["sha1", "sha256"] {
+        let temp = i1062_committed_scripts(format);
+        let repo = temp.path().join("repo");
+        let output = i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+        assert!(
+            output.is_empty(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        for mode in ["--scan", "--check-dirty"] {
+            let doc: serde_json::Value =
+                serde_json::from_slice(&i1062_ok(&repo, &["--json", "status", mode])).unwrap();
+            assert_eq!(doc["data"]["is_clean"], true, "{format}: {mode}: {doc}");
+        }
+        for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+            assert_eq!(fs::read(repo.join(name)).unwrap(), b"one\r\ntwo\r\n");
+        }
+    }
+}
+
+#[test]
+fn i1062_status_attribute_removal_invalidates_clean_snapshot() {
+    use super::add_test::i1062_ok;
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    i1062_ok(&repo, &["add", "probe.ps1", "probe.bat", "probe.cmd"]);
+    let before = fs::metadata(repo.join("probe.ps1"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    i1062_ok(&repo, &["--json", "status", "--scan"]);
+    fs::remove_file(repo.join(".gitattributes")).unwrap();
+    let output = String::from_utf8(i1062_ok(
+        &repo,
+        &["status", "--porcelain", "--untracked-files=no"],
+    ))
+    .unwrap();
+    assert!(
+        output.lines().any(|line| line == " M probe.ps1"),
+        "{output}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&i1062_ok(&repo, &["--json", "status", "--check-dirty"])).unwrap();
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "probe.ps1"),
+        "{doc}"
+    );
+    assert_eq!(
+        fs::metadata(repo.join("probe.ps1"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn i1062_status_real_content_type_mode_and_deletion_remain_visible() {
+    use super::add_test::i1062_ok;
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(repo.join("probe.ps1"), b"one\r\nchanged\r\n").unwrap();
+    fs::remove_file(repo.join("probe.cmd")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        i1062_ok(&repo, &["config", "core.fileMode", "true"]);
+        fs::set_permissions(repo.join("probe.bat"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output =
+        String::from_utf8(i1062_ok(&repo, &["status", "--porcelain", "--no-renames"])).unwrap();
+    assert!(
+        output.lines().any(|line| line == " M probe.ps1"),
+        "{output}"
+    );
+    assert!(
+        output.lines().any(|line| line == " D probe.cmd"),
+        "{output}"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            output.lines().any(|line| line == " M probe.bat"),
+            "{output}"
+        );
+        fs::remove_file(repo.join("probe.bat")).unwrap();
+        std::os::unix::fs::symlink("one\ntwo\n", repo.join("probe.bat")).unwrap();
+        let output =
+            String::from_utf8(i1062_ok(&repo, &["status", "--porcelain", "--no-renames"])).unwrap();
+        assert!(
+            output.lines().any(|line| line.ends_with(" probe.bat")
+                && (line.starts_with(" M") || line.starts_with(" T"))),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
+    use super::add_test::{i1062_command, i1062_ok};
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    i1062_ok(&repo, &["config", "user.name", "EOL test"]);
+    i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
+    fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "base"]);
+    i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+    let run = || {
+        i1062_command(&repo, &["status", "--porcelain", "--untracked-files=no"])
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CONVERSION_HASH_FAIL", "*")
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "stat-valid unchanged paths must not attempt content reads: {output:?}"
+    );
+    assert!(output.stdout.is_empty());
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    assert!(
+        !run().status.success(),
+        "attribute change must invalidate the old stat proof"
+    );
+    i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+    fs::write(repo.join(".libra/conversion-stat-v1"), "partial").unwrap();
+    assert!(
+        !run().status.success(),
+        "a partial proof must require content verification"
+    );
+}
+
+pub(super) fn i1062_fast_forward_scripts() -> (tempfile::TempDir, Vec<u8>) {
+    use super::add_test::i1062_ok;
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    // Branch setup uses the committed LF representation; the CRLF variant is
+    // introduced only once the source/target history is ready for the test.
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\ntwo\n").unwrap();
+    }
+    i1062_ok(&repo, &["switch", "-c", "upstream"]);
+    fs::write(repo.join("upstream.txt"), "upstream\n").unwrap();
+    i1062_ok(&repo, &["add", "upstream.txt"]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "upstream"]);
+    let tip = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+    i1062_ok(&repo, &["switch", "main"]);
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\r\ntwo\r\n").unwrap();
+    }
+    (temp, tip)
+}

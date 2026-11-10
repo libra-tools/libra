@@ -15,6 +15,8 @@ libra add -N [PATHSPEC...]
 
 ## Description
 
+Candidate classification also uses the clean representation. A change to attributes can make a tracked file stageable without any change to its stat; a CRLF/LF representation difference alone does not report a content modification. `--renormalize` still explicitly reprocesses tracked files. This comparison does not rewrite the working file.
+
 `libra add` stages file changes from the working tree into the index, preparing them
 for the next `libra commit`. It supports shared Git-style pathspec matching,
 `--dry-run` preview, and `--refresh` to re-stat already tracked entries without

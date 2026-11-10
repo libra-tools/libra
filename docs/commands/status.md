@@ -12,6 +12,8 @@ libra status [OPTIONS] [pathspec]...
 
 ## Description
 
+Tracked regular files use the same explicit `text`/`eol` clean conversion as `add`: CRLF pairs compare as LF, while lone CR bytes are preserved. This applies to default status, `--scan`, and `--check-dirty`, including porcelain and JSON output. Attribute changes invalidate earlier clean conclusions even if the target file's stat is unchanged. Mode/type changes, deletions and real content edits remain visible; unreadable attributes produce an error or `io_blocked`, never a clean conclusion. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+
 `libra status` shows the state of the working tree and staging area: which files are staged
 for the next commit, which have modifications not yet staged, and which are untracked. It also
 reports the current branch, detached HEAD state, and upstream tracking information.

@@ -649,3 +649,37 @@ fn json_status_mode_only_change_is_modified() {
         "mode-only change must be in modified: {parsed}"
     );
 }
+
+#[test]
+fn i1062_json_status_clean_representations_and_attribute_invalidation() {
+    use super::{add_test::i1062_ok, status_test::i1062_committed_scripts};
+    let temp = i1062_committed_scripts("sha256");
+    let repo = temp.path().join("repo");
+    for mode in [None, Some("--scan"), Some("--check-dirty")] {
+        let mut args = vec!["--json", "status"];
+        args.extend(mode);
+        let doc: serde_json::Value = serde_json::from_slice(&i1062_ok(&repo, &args)).unwrap();
+        assert_eq!(doc["data"]["is_clean"], true, "{args:?}: {doc}");
+        assert_eq!(
+            doc["data"]["unstaged"]["modified"],
+            serde_json::json!([]),
+            "{doc}"
+        );
+    }
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.ps1 -text\n*.bat -text\n*.cmd -text\n",
+    )
+    .unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_slice(&i1062_ok(&repo, &["--json", "status", "--check-dirty"])).unwrap();
+    assert_eq!(doc["data"]["is_clean"], false, "{doc}");
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "probe.ps1"),
+        "{doc}"
+    );
+}

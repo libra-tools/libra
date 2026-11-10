@@ -1,9 +1,10 @@
-//! Read-only wire protocol and filesystem capabilities for status I/O.
+//! Wire protocol and filesystem capabilities for bounded status I/O.
 //!
 //! This module intentionally has no dependency on `crate::command`.  The
 //! command layer owns scheduling and user-facing policy; this module owns the
-//! serializable request/event contract, framing, path encoding, and the two
-//! distinct read-only filesystem capabilities used by that contract.
+//! serializable request/event contract, framing and path encoding. Content and
+//! object capabilities are read-only; conversion-state requests may maintain
+//! only the disposable stat certificate beneath their separate metadata root.
 
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -423,6 +424,21 @@ pub(crate) enum IoRequest {
         #[serde(default)]
         root_session: u64,
     },
+    CleanFileBlobHash {
+        path: Vec<u8>,
+        root: Vec<u8>,
+        hash_kind: String,
+        root_session: u64,
+        attributes: crate::utils::attributes::ConversionAttributeContext,
+    },
+    ConversionState {
+        root: Vec<u8>,
+        directories: Vec<Vec<u8>>,
+        attributes: crate::utils::attributes::ConversionAttributeContext,
+        cache_root: Vec<u8>,
+        index_key: String,
+        record: Option<String>,
+    },
     ReadObjectBlob {
         oid: String,
         objects_root: Vec<u8>,
@@ -458,6 +474,44 @@ impl IoRequest {
             }
             Self::FileBlobHash { path, root, .. } => {
                 validate_worktree_path(root, path, false).map(|_| ())
+            }
+            Self::CleanFileBlobHash {
+                path,
+                root,
+                attributes,
+                ..
+            } => {
+                validate_worktree_path(root, path, false)?;
+                for source in attributes.configured.iter().chain(&attributes.info) {
+                    validate_absolute_root(&path_to_bytes(source), "attribute source")?;
+                }
+                Ok(())
+            }
+            Self::ConversionState {
+                root,
+                directories,
+                attributes,
+                cache_root,
+                index_key,
+                record,
+            } => {
+                validate_absolute_root(root, "worktree")?;
+                validate_absolute_root(cache_root, "conversion cache")?;
+                for directory in directories {
+                    validate_worktree_path(root, directory, true)?;
+                }
+                for source in attributes.configured.iter().chain(&attributes.info) {
+                    validate_absolute_root(&path_to_bytes(source), "attribute source")?;
+                }
+                for key in std::iter::once(index_key).chain(record.iter()) {
+                    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "conversion certificate requires a SHA-256 digest",
+                        ));
+                    }
+                }
+                Ok(())
             }
             Self::MarkerProbe { dir, root } => validate_worktree_path(root, dir, true).map(|_| ()),
             Self::ReadObjectBlob {
@@ -657,6 +711,14 @@ pub(crate) enum IoEvent {
     },
     DoneHash {
         hex: WireResult<String>,
+    },
+    DoneConversionState {
+        result: WireResult<(String, bool)>,
+        detail: Option<String>,
+    },
+    DoneCleanHash {
+        hex: WireResult<String>,
+        detail: Option<String>,
     },
     DoneObjectBlob {
         status: ObjectBlobStatus,

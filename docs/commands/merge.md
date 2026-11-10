@@ -14,6 +14,10 @@ libra merge --restart
 
 ## Description
 
+An unreadable attribute source or unsafe worktree path stops the preflight with `LBR-IO-001` and retains the underlying cause so it can be corrected before retrying.
+
+The clean-worktree preflight compares tracked regular files using explicit `text`/`eol` rules. CRLF bytes that clean to the indexed LF content do not block `merge --ff-only`. Real edits, mode/type changes and existing conflict or merge state retain their normal protection. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+
 `libra merge <branch>...` resolves one or more local branches, commit hashes, or remote-tracking refs such as `refs/remotes/origin/main`. One target keeps the single-head behavior described below; two or more targets select an octopus merge.
 
 Before starting a merge, Libra checks both merge state and the index. Existing merge state still directs you to `merge --continue`, `--abort`, or `--quit`. After conflicts are staged, a regular `libra commit` also finishes the merge (two parents, saved merge message, then clear merge state and apply a held autostash). `--quit` clears only merge bookkeeping: it leaves HEAD, index stages, and conflict-marked files untouched; a held autostash is moved into the visible stash list rather than re-applied. With no merge in progress, `--quit` returns `LBR-REPO-003` (exit 128) and tells you to start a merge; this is intentionally different from Git's silent no-op. If there is no merge state but unresolved index entries remain (for example after a conflicted squash), even an already-up-to-date merge or `--dry-run` fails with `LBR-CONFLICT-002` (exit 128), preserving HEAD, the index and working tree. Resolve the conflicts, stage the paths with `libra add`, and run a plain `libra commit` before starting another merge.

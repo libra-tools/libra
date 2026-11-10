@@ -19,6 +19,8 @@ libra switch [--guess | --no-guess] <branch>
 
 ## Description
 
+The clean-worktree preflight uses explicit `text`/`eol` clean comparison. Equivalent CRLF/LF content does not cause a false dirty rejection when switching branches. This does not add CRLF checkout/smudge conversion; real local changes retain their normal protection. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+
 `libra switch` is the primary command for changing branches. It validates that the working tree is clean before switching, updates HEAD and the index, and restores the working tree to match the target commit. Unlike `libra checkout`, which exists as a Git-compatibility surface, `switch` is the recommended command for branch operations.
 
 The command supports multiple modes: switching to an existing local branch (default), returning to the previous checkout target with `-`, creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an unborn orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.

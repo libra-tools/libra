@@ -197,7 +197,7 @@ fn captured_stat_times(
 /// (the `ctime`/`mtime`/`size` triple `Index::is_modified` compares). A path
 /// missing from the index counts as differing so the caller falls through to
 /// the content hash rather than assuming "clean".
-fn index_stat_differs(
+pub(crate) fn index_stat_differs(
     index: &Index,
     file: &str,
     metadata: &crate::command::status_io_worker::CapturedStat,
@@ -227,6 +227,19 @@ fn collect_tracked_worktree_changes(
 ) -> Result<(Changes, Vec<PathBuf>), StatusError> {
     let mut changes = Changes::default();
     let mut intent_to_add: Vec<PathBuf> = Vec::new();
+    let conversion = crate::command::status_io_worker::ConversionScan::new(workdir, index)
+        .map_err(|source| StatusError::FileHash {
+            path: workdir.to_path_buf(),
+            source,
+        })?;
+    let (sources_before, policy_valid) = match conversion.probe(None) {
+        Ok(result) => result,
+        Err(source) => {
+            io_blocked.push(io_blocked_event(Path::new("."), &source));
+            return Ok((changes, intent_to_add));
+        }
+    };
+    let blocked_before = io_blocked.len();
     for file in tracked_files {
         // §B.6.1: an index key is a UTF-8 string by construction, so this
         // only fires if a path arrives from somewhere else. Skip the KEYED
@@ -296,6 +309,12 @@ fn collect_tracked_worktree_changes(
             intent_to_add.push(file.clone());
             continue;
         }
+        if index.get(file_str, 0).is_some_and(|entry| {
+            (entry.mode & 0o170000 == 0o120000) != metadata.is_symlink || metadata.is_dir
+        }) {
+            changes.modified.push(file.clone());
+            continue;
+        }
         // ADR-FM-05: with core.fileMode=true a regular file whose owner
         // execute bit differs from the index is a mode-only modification.
         if file_mode
@@ -312,8 +331,7 @@ fn collect_tracked_worktree_changes(
             if let Some(entry) = index.get(file_str, 0)
                 && entry.mode & 0o111 != 0
                 && metadata.mode & 0o111 == 0
-                && let Ok(Ok(hash)) =
-                    crate::command::status_io_worker::deadline_file_blob_hash(&file_abs, workdir)
+                && let Ok(hash) = conversion.hash(&file_abs)
                 && index.verify_hash(file_str, 0, &hash)
             {
                 mode_fix_candidates.push(file.clone());
@@ -325,16 +343,8 @@ fn collect_tracked_worktree_changes(
         // result: a path deleted or made unreadable between the two stats
         // would panic the whole command instead of degrading to an
         // `io_blocked[]` partial. Same fields, one stat, no panic.
-        if index_stat_differs(index, file_str, &metadata, index_file_mtime) {
-            let hashed =
-                match crate::command::status_io_worker::deadline_file_blob_hash(&file_abs, workdir)
-                {
-                    Ok(result) => result,
-                    Err(()) => {
-                        io_blocked.push(io_timeout_event(file));
-                        continue;
-                    }
-                };
+        if !policy_valid || index_stat_differs(index, file_str, &metadata, index_file_mtime) {
+            let hashed = conversion.hash(&file_abs);
             match hashed {
                 Ok(file_hash) => {
                     if !index.verify_hash(file_str, 0, &file_hash) {
@@ -347,6 +357,23 @@ fn collect_tracked_worktree_changes(
                 }
             }
         }
+    }
+    // A source edit/removal during the scan must not mint a certificate or
+    // return a clean result assembled under two different conversion rules.
+    let may_record = changes.modified.is_empty()
+        && changes.deleted.is_empty()
+        && intent_to_add.is_empty()
+        && io_blocked.len() == blocked_before;
+    match conversion.probe(may_record.then_some(sources_before.as_str())) {
+        Ok((sources_after, _)) if sources_after == sources_before => {}
+        Ok(_) => io_blocked.push(io_blocked_event(
+            Path::new("."),
+            &io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attributes changed during status; retry the command",
+            ),
+        )),
+        Err(error) => io_blocked.push(io_blocked_event(Path::new("."), &error)),
     }
     intent_to_add.sort();
     intent_to_add.dedup();
