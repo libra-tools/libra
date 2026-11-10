@@ -1,6 +1,6 @@
 # Linux amd64 发行二进制恢复 x86-64 基线兼容计划（2026-11-05）
 
-> 正式计划，模板 v2.16。2026-11-05 07:51:26 UTC 在分支 `plan/20261105-linux-x86-baseline` 创建。跟踪 Issue [#1060](https://github.com/libra-tools/libra/issues/1060)。2026-11-05 08:58:07 UTC 用户授权登记该 Issue、提交并推送本计划文档、创建 PR；ISA-01 仍为 `pending` / 空，不授权实施或发布。
+> 正式计划，模板 v2.16。2026-11-05 07:51:26 UTC 在分支 `plan/20261105-linux-x86-baseline` 创建。跟踪 Issue [#1060](https://github.com/libra-tools/libra/issues/1060)。2026-11-05 08:58:07 UTC 用户授权登记该 Issue、提交并推送本计划文档、创建 PR（[#1061](https://github.com/libra-tools/libra/pull/1061)）。2026-11-10 03:07:41 UTC 用户授权实施 `ISA-01`，状态置为 `in-progress` / 空。
 
 ## 文档职责
 
@@ -49,7 +49,7 @@
 | runner 变化 | GitHub 自 2026-10-19 开始把 `ubuntu-latest` 迁移到 Ubuntu 26.04，计划 2026-11-19 完成 | `actions/runner-images#14748` |
 | 同类外部事故 | GitHub Ubuntu 26.04 x64 为 amd64v3，GCC 默认 `-march=x86-64-v3`，已导致其它项目的预编译二进制在旧 CPU 上 SIGILL | `borgbackup/borg#10342`（独立旁证，不替代本机证据） |
 | 当前锁定依赖 | `aws-lc-rs 1.18.1`、`aws-lc-sys 0.45.0` | `Cargo.lock:993-1006` |
-| 创建时源码锚点 | `Build Binary (Unix)` 仍只有 `RUSTFLAGS="-C strip=symbols"`，无 C ISA 环境变量 | `.github/workflows/release.yml:80-89`，2026-11-05 07:51:26 UTC 复核 |
+| 创建时源码锚点 | `Build Binary (Unix)` 仍只有 `RUSTFLAGS="-C strip=symbols"`，无 C ISA 环境变量 | `.github/workflows/release.yml:80-89`，2026-11-05 07:51:26 UTC 复核；2026-11-10 03:07:41 UTC 开工刷新一致 |
 | 后续发布 | GitHub Release `v0.30.155` 发布于 2026-11-05T06:30:06Z，晚于 v0.30.154 复现 | `repos/libra-tools/libra/releases`；本机未运行该产物，不假定已修复 |
 
 ### 当前缺口
@@ -64,8 +64,8 @@
 |---|---|---|
 | `plan-long.md` | 无对应 LR | 只登记日期计划索引，不新增长期能力 |
 | 既有日期计划与 `issues/` | 无同名 x86-64 / AWS-LC 修复卡 | 不把历史计划当作本问题已处理 |
-| `.github/workflows/release.yml` | 2026-11-05 07:51:26 UTC 写者刷新 | 未发现未收口卡片把该文件列入 `Implementation write set`。已收口计划只把它当作 D 组观察面，或历史上改过它。当前不补依赖边。ISA-01 真正开工前必须再刷新；出现相交写者时先补具体边 |
-| `plan-status.md` | 全仓共享状态账本 | 本次只追加本计划一行。后续修改前重读，不得覆盖其它计划未提交的状态 |
+| `.github/workflows/release.yml` | 2026-11-10 03:07:41 UTC 开工写者刷新 | 全仓及远端 `main`（`6a7727de`）未发现未收口卡片把该文件列入 `Implementation write set`。已收口计划只把它当作 D 组观察面，或历史上改过它。无相交写者，不补依赖边 |
+| `plan-status.md` | 全仓共享状态账本 | 本次只更新本计划状态行。后续修改前重读，不得覆盖其它计划未提交的状态 |
 
 本计划不采用 v2.16 具名 `code-only` 模式，按普通 `independent` 发布合同执行。
 
@@ -114,13 +114,13 @@
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| ISA-01 | implementation | Linux x86_64 GNU release C 编译基线 | 不可变产物不覆盖，以前滚 patch 修复 | yes | yes | 4/8 | 6/8 | 1/1 | S | none | no-overlap（2026-11-05 07:51:26 UTC 复核；开工再刷新） | independent | N/A | N/A |
+| ISA-01 | implementation | Linux x86_64 GNU release C 编译基线 | 不可变产物不覆盖，以前滚 patch 修复 | yes | yes | 4/8 | 6/8 | 1/1 | S | none | no-overlap（2026-11-10 03:07:41 UTC 开工复核通过） | independent | N/A | N/A |
 
 ### Task ISA-01: 固定 Linux x86_64 GNU release 的 C 编译基线并实机验收
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / 空
 
 **Issue:** [#1060](https://github.com/libra-tools/libra/issues/1060)
 
@@ -144,17 +144,17 @@
 
 **Acceptance criteria:**
 
-- [ ] `Build Binary (Unix)` 仅对 `x86_64-unknown-linux-gnu` 使用 `CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64 -mtune=generic"`，其它 target 的构建语义不变。
-- [ ] Linux x86_64 GNU 在 `cargo build` 前检查实际环境变量值；缺失或不为上述精确值时非零退出并给出可操作错误，且自检不依赖可能匹配自身的文本 grep。
+- [x] `Build Binary (Unix)` 仅对 `x86_64-unknown-linux-gnu` 使用 `CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64 -mtune=generic"`，其它 target 的构建语义不变。
+- [x] Linux x86_64 GNU 在 `cargo build` 前检查实际环境变量值；缺失或不为上述精确值时非零退出并给出可操作错误，且自检不依赖可能匹配自身的文本 grep。
 - [ ] 新 tag 的官方 `libra-linux-amd64` 经发布方 `.sha256` 核对后，在 Intel Celeron N5105 上执行 `--version` 退出 0，并输出该 tag 对应的 `libra <version>`。
-- [ ] `Docs and compatibility impact` 所列 N/A 判定仍成立；没有借机修改命令、网站、兼容矩阵、错误码或其它平台。
+- [x] `Docs and compatibility impact` 所列 N/A 判定仍成立；没有借机修改命令、网站、兼容矩阵、错误码或其它平台。
 
 **Verification:**
 
-- [ ] `actionlint -oneline .github/workflows/release.yml`
-- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_release_rclone_env_guard`
-- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_release_homebrew_verify`
-- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_keyring_feature_gate_guard`
+- [x] `actionlint -oneline .github/workflows/release.yml`（`actionlint v1.7.12` exit 0，零诊断）
+- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_release_rclone_env_guard`（本机未安装 `cargo-nextest` 且无 `.env.test`/`.env.live-test`；诊断运行 `cargo test --test compat_release_rclone_env_guard` 2/2 passed）
+- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_release_homebrew_verify`（诊断运行 `cargo test --test compat_release_homebrew_verify` 4/4 passed）
+- [ ] `source .env.test && source .env.live-test && cargo nextest run --test compat_keyring_feature_gate_guard`（诊断运行 `cargo test --test compat_keyring_feature_gate_guard` 2/2 passed）
 - [ ] 手工官方产物身份门：从 `https://download.libra.tools/libra/releases/v<VERSION>/libra-linux-amd64` 下载到仓外 `/tmp/opencode/libra-isa01/`，将实际 SHA-256 与同目录 `libra-linux-amd64.sha256` 逐字核对；不一致即 FAIL，不进入运行门。
 - [ ] 手工 N5105 实机门：在上述身份门通过的同一路径执行 `./libra-linux-amd64 --version`，记录退出码与版本输出；必须 exit 0 且为 `libra <VERSION>`。若仍 SIGILL，本卡 STOP，不得以静态扫描或其它机器结果替代。
 
@@ -191,7 +191,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=Linux x86_64 GNU release C 编译基线; recovery=不可变产物不覆盖并以前滚 patch 修复; complete=yes; self-contained=yes; AC=4/8; VER=6/8; landing=1; prod-files=1; scope=S; deps=none; writeset=no-overlap（2026-11-05 07:51:26 UTC 复核，开工再刷新）; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Linux x86_64 GNU release C 编译基线; recovery=不可变产物不覆盖并以前滚 patch 修复; complete=yes; self-contained=yes; AC=4/8; VER=6/8; landing=1; prod-files=1; scope=S; deps=none; writeset=no-overlap（2026-11-10 03:07:41 UTC 开工复核通过）; release=independent; split-from=N/A; exception=N/A`
 
 ## 测试矩阵
 
@@ -239,13 +239,13 @@
 
 ## 兼容与文档收口
 
-- [ ] `COMPATIBILITY.md`：`N/A`，无公开兼容面变化。
-- [ ] `docs/commands/<cmd>.md`：`N/A`。
-- [ ] `docs/commands/zh-CN/<cmd>.md`：`N/A`。
-- [ ] `docs/development/commands/<cmd>.md`：`N/A`。
-- [ ] `docs/error-codes.md`：`N/A`。
-- [ ] `tests/INDEX.md`：`N/A`，不新增测试 target。
-- [ ] `Cargo.toml` `[[test]]`：`N/A`。
+- [x] `COMPATIBILITY.md`：`N/A`，无公开兼容面变化。
+- [x] `docs/commands/<cmd>.md`：`N/A`。
+- [x] `docs/commands/zh-CN/<cmd>.md`：`N/A`。
+- [x] `docs/development/commands/<cmd>.md`：`N/A`。
+- [x] `docs/error-codes.md`：`N/A`。
+- [x] `tests/INDEX.md`：`N/A`，不新增测试 target。
+- [x] `Cargo.toml` `[[test]]`：`N/A`。
 - [x] `plan-long.md` 日期计划索引已登记；无 LR 状态需要更新。
 
 ## Codex review log
@@ -255,6 +255,24 @@
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
 | 未开始 | 计划创建 | 未评审 | 无 | 无 | 2026-11-05 07:51:26 UTC 正式建卡 |
+
+## 实施证据汇总
+
+- **2026-11-10 04:11:11 UTC 本地实现与诊断验证：**
+  - `.github/workflows/release.yml`：`Build Binary (Unix)` 步骤已注入 `CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64 -mtune=generic"`，并在 `cargo build` 前对 `x86_64-unknown-linux-gnu` 执行环境变量逐字精确比对，不符即输出 `::error::` 并 `exit 1`。
+  - `cargo +nightly fmt --all --check`：exit 0。
+  - `cargo test --test compat_release_rclone_env_guard`（诊断）：2/2 passed。
+  - `cargo test --test compat_release_homebrew_verify`（诊断）：4/4 passed。
+  - `cargo test --test compat_keyring_feature_gate_guard`（诊断）：2/2 passed。
+  - `cargo test --test compat_version_surface_sync`（诊断）：2/2 passed。
+  - PyYAML 语法校验及离线 Bash 四分支（精确匹配、未设置、错误值、非 x86_64 target）自检：全部通过。
+- **2026-11-10 05:44:19 UTC `actionlint` 静态门验证：**
+  - 按用户授权安装 `actionlint v1.7.12`（`go1.26.8 linux/amd64` 源码构建至 `~/.local/bin/actionlint`）。
+  - 执行 `actionlint -oneline .github/workflows/release.yml`：exit 0，零诊断输出（VER-1 通过）。
+- **2026-11-10 06:07:48 UTC 实施与同步（不涉及版本号 bump）：**
+  - 本 PR 职责为修复 CI 发布工作流，让后续所有版本发布恢复基线指令集，实现写集不包含版本文件，不修改版本号。
+  - 经复跑：`actionlint -oneline .github/workflows/release.yml` exit 0、`cargo +nightly fmt --all --check` exit 0、`compat_version_surface_sync` 2/2、`compat_release_rclone_env_guard` 2/2、`compat_release_homebrew_verify` 4/4、`compat_keyring_feature_gate_guard` 2/2 全部通过。
+  - **待闭合门禁：** 本机尚未安装 `cargo-nextest`（且宿主 RAM 为 14 GiB < 32 GiB，缺 `.env.test`/`.env.live-test`），推送 PR [#1061](https://github.com/libra-tools/libra/pull/1061) 后待远端 CI 检查、合并发布及 D 组官方产物 SHA-256 身份门 + N5105 实机 `--version` 门。
 
 ## 非目标与延后项
 
@@ -295,3 +313,7 @@
 | 2026-11-05 06:25:46 UTC | 根因核实后初稿 | 新建 ISA-01 外部草稿；选择 target-specific CFLAGS 与构建时实际环境值检查 | N/A → ISA-01 | 全文 |
 | 2026-11-05 07:51:26 UTC | 用户授权正式建卡 | 迁入仓库并登记状态索引。`release.yml` 无未收口实现写者，不补依赖边。ISA-01 仍为 `pending` / 空 | ISA-01 | 本文件、`plan-status.md`、`plan-long.md` |
 | 2026-11-05 08:58:07 UTC | 用户授权登记 Issue、提交并推送计划、创建 PR | 创建 [#1060](https://github.com/libra-tools/libra/issues/1060) 并写入本计划。不实施 `release.yml`，ISA-01 仍为 `pending` / 空 | ISA-01 | 本文件、`plan-status.md`、`plan-long.md`、Issue #1060 |
+| 2026-11-10 03:07:41 UTC | 用户授权开工实施 ISA-01（并授权临时使用 `./target/debug/libra` 执行版本管理） | 复核 ER-01/ER-02/ER-03 与 `.github/workflows/release.yml:80-89` 写者（无相交写者），将 ISA-01 置为 `in-progress` / 空，锁定实现写集 | ISA-01 | 本文件、`plan-status.md` |
+| 2026-11-10 04:11:11 UTC | 完成 `.github/workflows/release.yml` 修改与本地诊断测试 | 落地 `CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64 -mtune=generic"` 及构建前 fail-closed 自检；通过 `cargo +nightly fmt --all --check`、PyYAML、离线 Bash 四分支测试及 `compat_release_rclone_env_guard`（2/2）、`compat_release_homebrew_verify`（4/4）、`compat_keyring_feature_gate_guard`（2/2）、`compat_version_surface_sync`（2/2）诊断验证。本机缺 `actionlint`/`cargo-nextest`（14 GiB RAM），保持 `in-progress` / 空 | ISA-01 | `.github/workflows/release.yml`、本文件、`plan-status.md` |
+| 2026-11-10 05:44:19 UTC | 用户授权安装 `actionlint` 并验证 | 安装 `actionlint v1.7.12` 并执行 `actionlint -oneline .github/workflows/release.yml`（exit 0，零诊断），勾选 VER-1 | ISA-01 | 本文件、`plan-status.md` |
+| 2026-11-10 06:07:48 UTC | 实施 ISA-01、签名提交并推送 PR #1061（不修改版本面） | 在 `.github/workflows/release.yml` 落地 CFLAGS 基线与构建前自检；复跑 `actionlint`、`fmt` 与 compat 诊断测试全部通过 | ISA-01 | `.github/workflows/release.yml`、本文件、`plan-status.md` |
