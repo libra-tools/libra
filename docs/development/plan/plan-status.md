@@ -1,3 +1,5 @@
+> **2026-11-10 LTR-02 关闭：** `live_code_clone_isolation` 扩展为可证伪隔离门并通过（17.7s，nextest `236dcacb`）：无 traces ref；sentinel commit/tree/blob 在 code clone 中不可读；固定代码再增 traces checkpoint 后两次 clone 的对象集合逐 OID 相等，证明 traces 不进入 code view 闭包。
+
 > **2026-11-10 LTR-25 关闭：** search 本地准入 7 AC + 3 VER 全部取得证据。`<search_argument_bounds>`（lib，0.02s）与 `search_local_admission_contract`（0.32s）复跑 1 passed；新增 `live_search_local_admission` 真实 fixture 通过（13.9s，nextest `acebfe04`）：0/257 字节拒绝且未发请求，1/256 字节真实到达服务；文档中英双语已载明 1..256 UTF-8 bytes 契约。D 门由 `v0.30.168` 发布覆盖。
 
 > **2026-11-10 REL-LTR-PUSH 小家族与 H5 隔离门收口：** LTR-01/10/11/12/21/22/23 关闭 `done / complete`。LTR-01 的最后一项“小家族 C/D 逐卡结清”以其 main D 取得：base CI `96e386ee9`→run `42708974045` 8/8 success（沙箱 job 本次 success），release `v0.30.168`→run `42725489811` 全 success；`live_scoped_push_cli` 于真实 fixture 复跑 1 passed/0 failed（nextest run `6e3dbdf5`，15.7s，binary sha256 `f33d5eb1…`）。LTR-21/22/23 的 H5 隔离 live 证据保持原记（run `52dfc027`，13/13）。

@@ -512,27 +512,94 @@ async fn live_scoped_push_cli() {
 async fn live_code_clone_isolation() {
     let fixture = prepared();
     let root = tempfile::tempdir().expect("root");
-    let destination = root.path().join("clone");
-    let output = run(
-        root.path(),
-        &[
-            "clone",
-            "--mirror",
-            fixture.http_url.as_str(),
-            destination.to_str().expect("utf8 path"),
-        ],
-        &[],
+    let http = Transport::http(&fixture.token_file);
+    let source = init_repo(
+        &root.path().join("source"),
+        "mega2-source",
+        &http.remote_url(&fixture, &fixture.target),
     );
-    assert!(
-        output.status.success(),
-        "live code clone failed: {}",
-        stderr(&output)
-    );
-    let refs = run(&destination, &["show-ref"], &[]);
+    let first = seed(&source, "code-isolation", CheckpointScope::Committed).await;
+    let tree = {
+        let output = run(&source, &["cat-file", "-p", first.commit.as_str()], &[]);
+        assert!(
+            output.status.success(),
+            "source trace commit unreadable: {}",
+            stderr(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        text.split_whitespace()
+            .skip_while(|token| *token != "tree")
+            .nth(1)
+            .expect("trace commit tree")
+            .to_string()
+    };
+    push(&source, &http, &fixture.target, &[]);
+    let clone = |name: &str| {
+        let destination = root.path().join(name);
+        let output = run(
+            root.path(),
+            &[
+                "clone",
+                "--mirror",
+                fixture.http_url.as_str(),
+                destination.to_str().expect("utf8 path"),
+            ],
+            &[],
+        );
+        assert!(
+            output.status.success(),
+            "live code clone failed: {}",
+            stderr(&output)
+        );
+        destination
+    };
+    let first_clone = clone("clone-1");
+    let refs = run(&first_clone, &["show-ref"], &[]);
     let text = String::from_utf8_lossy(&refs.stdout);
     assert!(
         !text.contains("refs/libra/traces"),
         "code clone advertised traces refs: {text}"
+    );
+    // Traces-only objects must stay out of the code view closure.
+    for (kind, oid) in [
+        ("commit", first.commit.as_str()),
+        ("tree", tree.as_str()),
+        ("blob", first.transcript_blob.as_str()),
+    ] {
+        let probe = run(
+            &first_clone,
+            &["cat-file", "-e", &format!("{oid}^{kind}")],
+            &[],
+        );
+        assert!(
+            !probe.status.success(),
+            "code clone contains the traces-only {kind} {oid}"
+        );
+    }
+    let object_set = |repo: &Path| {
+        let output = run(repo, &["rev-list", "--objects", "--all"], &[]);
+        assert!(
+            output.status.success(),
+            "object listing failed: {}",
+            stderr(&output)
+        );
+        let mut oids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect();
+        oids.sort_unstable();
+        oids
+    };
+    let before = object_set(&first_clone);
+    // Fixing the code and adding another traces checkpoint must not grow the
+    // code view.
+    seed(&source, "code-isolation-second", CheckpointScope::Committed).await;
+    push(&source, &http, &fixture.target, &[]);
+    let second_clone = clone("clone-2");
+    let after = object_set(&second_clone);
+    assert_eq!(
+        before, after,
+        "extra traces objects leaked into the code view"
     );
 }
 
