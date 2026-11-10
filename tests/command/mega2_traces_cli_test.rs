@@ -617,14 +617,26 @@ fn session_time_filter_contract() {
 #[test]
 fn checkpoint_navigation_contract() {
     let (port, _) = serve(|path, _| {
-        if path.contains("/checkpoints/cp-1") && !path.contains("transcript") {
+        if path.ends_with("/sessions/session-1/checkpoints/cp-1") && !path.contains("transcript") {
             (
                 200,
                 r#"{"checkpoint_id":"cp-1","accepted_watermark":"a","indexed_watermark":"b","unsupported":1,"invalid":2,"code_link":"unresolved"}"#.to_string(),
             )
-        } else {
-            assert!(path.contains("cursor=page-3"), "{path}");
+        } else if path.contains("/sessions/session-1/checkpoints") {
+            // Either the listing call or the session-resolution probe.
+            if !path.contains("cursor=page-3") {
+                assert!(path.contains("limit=200"), "{path}");
+            }
             (200, r#"{"items":[{"checkpoint_id":"cp-1"}]}"#.to_string())
+        } else {
+            assert!(
+                path.ends_with("/sessions?limit=200") || path.contains("/sessions?limit=200"),
+                "{path}"
+            );
+            (
+                200,
+                r#"{"items":[{"session_id":"session-1"}],"next_cursor":null}"#.to_string(),
+            )
         }
     });
     let root = tempfile::tempdir().expect("root");
@@ -674,6 +686,30 @@ fn checkpoint_navigation_contract() {
         show.status.success(),
         "{}",
         String::from_utf8_lossy(&show.stderr)
+    );
+    let both = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "show",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--stream",
+            "stream-1",
+            "--session",
+            "session-1",
+            "--checkpoint",
+            "cp-1",
+        ],
+        root.path(),
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("not both"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
     );
     let show_text = String::from_utf8_lossy(&show.stdout);
     assert!(show_text.contains("cp-1"), "{show_text}");

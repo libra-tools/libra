@@ -1239,17 +1239,52 @@ async fn live_session_time_filter() {
 async fn live_metadata_query_cli() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let session = first_session(root.path(), &fixture, stream.as_str());
+    let listing = query(
         root.path(),
         &[
             "checkpoints",
             "--stream",
-            "00000000-0000-4000-8000-000000000000",
+            stream.as_str(),
             "--session",
-            "live",
+            session.as_str(),
+            "--limit",
+            "1",
         ],
         &fixture,
     );
+    let page: Json = serde_json::from_slice(&listing.stdout).expect("checkpoints JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "checkpoints must return one page: {page}"
+    );
+    if let Some(checkpoint) = page["data"]["body"]["items"][0]["checkpoint_id"].as_str() {
+        let detail = query(
+            root.path(),
+            &[
+                "show",
+                "--stream",
+                stream.as_str(),
+                "--checkpoint",
+                checkpoint,
+            ],
+            &fixture,
+        );
+        let body: Json = serde_json::from_slice(&detail.stdout).expect("checkpoint JSON");
+        assert_eq!(
+            body["data"]["body"]["checkpoint_id"].as_str(),
+            Some(checkpoint)
+        );
+        // Server payload fields pass through unchanged: completeness and the
+        // unresolved code link are shown as-is.
+        assert!(body["data"]["body"]["completeness"].is_object(), "{body}");
+        assert!(
+            body["data"]["body"]["code_link"].is_null()
+                || body["data"]["body"]["code_link"].is_string(),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
