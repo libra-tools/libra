@@ -1216,6 +1216,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/479.md`](issues/479.md) | plumbing 与 Git 对齐 | **已收口（2026-11-03：九卡 `done`/`complete`。EC-01 v0.30.135 run 41505868430；RV-01 v0.30.137 run 41528688806 attempt 2；UI-01 v0.30.138 run 41545576388；DF-01 v0.30.140 run 41556490025；RV-02 v0.30.141 run 41562359692；UI-02 v0.30.142 run 41566754831；UI-03 v0.30.143 run 41572246304；SR-01 v0.30.144 run 41577360822 attempt 2；UR-01 v0.30.146 run 41583805298。均为 8/8 `success`。双环境 nextest 11252 passed、48 skipped、0 failed、exit 0。DEFER-479-PI-IMPORT 已关闭，不再豁免该门。未在 #479 发帖。）** | EC-01、RV-01/02、UI-01..03、DF-01、SR-01、UR-01（9 卡） |
 | [`issues/480.md`](issues/480.md) | remote/fetch/pull/push/credential/rerere 对齐 | 未启动 | HP-01..HP-17（17 卡；HP-17 为 SSH 传输入口 host-key 校验，issue #560） |
 | [`issues/481.md`](issues/481.md) | 维护与杂项命令族对齐 | **实施中** | MX-01、MX-02、MX-03、MX-06 `done`/`complete`（实现完成，2026-10-20；C 组 bump 与 D 组 release 证据待用户授权）；MX-04、MX-05、MX-07..MX-16 待开工 |
+| [`issues/1059.md`](issues/1059.md) | `archive --format=tar` 長路徑、長 prefix 與長 symlink target | 未啟動（2026-11-10 15:49:01 UTC；僅當前 Agent 隔離自審，未調用 Claude/Codex 等外部 AI 審查） | I1059-01 `pending` / 驗收空；AC=8/8、VER=8/8、S、independent patch/C/D。以 `tar 0.4.46` Builder `append_data` / `append_link` 修復三種 tar 格式，含 parser、系統 tar 與 symlink round-trip。DEP-I1059-WRITERS 與 #545 AR writer 後續修改串行；2026-11-10 16:03:48 UTC 已核 `/mnt/data/libra-backend` 原生 Libra、乾淨 `cf`、HEAD=`origin/cf`=`894662467c6dcda358a1e73c79d84cf948f804f0`，網站本地路徑/分支前置已滿足，構建與部署仍待執行。 |
 | [`issues/1057.md`](issues/1057.md) | `ls-tree` 目录过滤与大小格式兼容（#479 后续） | 未启动（Claude R24 PASS，2026-11-07 23:51:32 UTC 收据；Claude R3、R5、R10、R15、R19、R20、R21、R23 PASS 为历史） | LS-01、LS-02 `pending` / 验收空；EX-LS-01-01（45/51）、EX-LS-02-01（26/48）待具名批准；开工门的写者扫描当前没有命中（DEP-LS-SCAN，v13 白名单规则）；指定网站路径待挂载；testcase 本地副本已核实；与 #1055 I1055-03 互斥见第六节 DEP-I1055-1057-LSTREE；与 issues/1050–1056 实现与发布全串行（第六节 DEP-I1050-1057-REL） |
 | [`issues/1050.md`](issues/1050.md) | `fast-import` 的 `from <ref>^0` 与流内尖端 | 未启动（Claude R19 PASS，2026-11-07 23:51:32 UTC 收据；R10、R13、R15、R16、R17 PASS 为历史） | I1050-01、I1050-03、I1050-02 `pending` / 验收空（I1050-03 为导出侧根提交前 `reset`，排在 I1050-02 之前）；EX-I1050-01（23/9，I1050-01 的 G-03 门族型；AC9–AC19 为前缀判定表驱动 lib 测试的 11 行，逐行计数；AC20–AC23 为 reset 与 tag 的失败路径）待具名批准，未批准时开工门拦住 I1050-01；开工门的写者扫描当前没有命中（DEP-I1050-SCAN，v13 白名单规则）；网站未挂载；Git 控制构建由 TC 前置块按固定提交构建；TC-2997 的 Libra 轨只判 t7004 #212 中 `git fast-import` 退出 0，整体 PASS 受 #757 阻塞（DEP-I1050-06，信息性）；与 #478 LG-24 互斥见第六节 DEP-I1050-LG24；与 issues/1051–1057 实现与发布全串行 |
 | [`issues/1051.md`](issues/1051.md) | `hash-object --stdin` 与路径并用 | 未启动（Claude R20 PASS，2026-11-07 23:51:32 UTC 收据；R11、R15、R18、R19 PASS 为历史） | I1051-01 `pending` / 验收空；EX-I1051-01（32/28）待具名批准；开工门的写者扫描当前没有命中（DEP-I1051-SCAN，v13 白名单规则）；网站未挂载；Git 控制构建由 TC 前置块按固定提交构建；与 issues/1050–1057 实现与发布全串行 |
@@ -1289,6 +1290,10 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 ---
 
 ## 二、未启动的计划与卡
+
+### #1059（2026-11-10 15:49:01 UTC）
+
+[issues/1059.md](issues/1059.md) 僅建立規劃，未授權產品實作。I1059-01 `pending` / 驗收空，單一 S 卡、無 waiver、independent patch/C/D。開工前置為 DEP-I1059-WRITERS 無活動相交寫者，以及 DEP-I1059-SITE 的同步/構建/部署可用；2026-11-10 16:03:48 UTC 已核 `/mnt/data/libra-backend` 原生 Libra、乾淨 `cf` 且 HEAD 與 `origin/cf` 同為 `894662467c6dcda358a1e73c79d84cf948f804f0`，路徑/分支前置已滿足。#545 AR 後續 writer 重寫必須保留本計劃長名測試與行為。
 
 ### #1062 / #861（2026-11-10 15:34:28 UTC）
 
@@ -1655,6 +1660,11 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 五、延后决策或实施项（DEFER-* 汇总）
 
+### #1059 的格式與平台邊界（2026-11-10 15:49:01 UTC）
+
+- DEFER-I1059-01：強制 pax 或與 Git 逐 byte 相同不是本 Issue 驗收；僅在維護者新增明確 wire-format 合同時另立 ADR/計劃。
+- DEFER-I1059-02：非 Unix 長 symlink target 解包實測待對應平台 CI/fixture 與編碼合同；本計劃只承諾 Unix 實測，不冒稱跨平台覆蓋。
+
 ### #1062 / #861 的转换边界（2026-11-10 15:00:39 UTC）
 
 - DEFER-1062-01：git-internal 本体重构，条件性依赖 DEP-1062-UPSTREAM，尚未排期。
@@ -1730,6 +1740,8 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-I1059-WRITERS | archive 寫集與版本窗口互斥 | [1059](issues/1059.md) I1059-01 與 [545](issues/545.md) AR 系列及其它 archive 源碼/測試/文檔、`COMPATIBILITY.md`、版本面活動寫者按實際文件串行；#545 後續重寫 tar writer 必須保留長 path/prefix/target 的四個功能回歸、writer 錯誤守衛及語義，不得回退到直接固定 header 寫入 | 2026-11-10 15:49:01 UTC 登記；#545 當前 pending，開工仍須掃描全部活動計劃，未證明可啟動 |
+| DEP-I1059-SITE | 網站交付前置 | [1059](issues/1059.md) 需在 `/mnt/data/libra-backend` 核實唯一 VCS、乾淨 `cf` 與遠端一致後，同卡同步 archive 頁、同步檢查、前端 typecheck/build、精簽提交、`cf` 推送、Cloudflare 部署及頁面內容 | 2026-11-10 16:03:48 UTC 已核原生 Libra、無 `.git`、乾淨 `cf`、HEAD=`origin/cf`=`894662467c6dcda358a1e73c79d84cf948f804f0`，archive 頁/同步腳本/pnpm 存在；路徑/分支前置已滿足，構建與部署仍待執行，未完成不得標 complete |
 | DEP-EOL-1062-861 | 跨计划单向交接 | [1062](issues/1062.md) outgoing / [861](issues/861.md) incoming：I1062-01 本地审计→02→03→06→07 完整 C/D→#1062 最终全量与终态→I861-01。生产者交付显式 clean 模块/读写接线、API/策略/测试清单、版本/SHA/门；接收方仅负责 auto/TC-1324。#1062 不等待 #861 | 草稿登记 2026-11-10 15:00:39 UTC；双方产品卡 pending，尚未交付；两 Issue 分别验收和关闭 |
 | DEP-EOL-WRITERS | 文件写集互斥 | 两 EOL 计划与全部活动日期/Issue 计划逐文件扫描；status/attributes/add/diff/worker、COMPATIBILITY.md、网站页及版本窗口相交即串行，不按行豁免。候选含 issues/574 BRL-05、status 性能及资格计划；历史已完成卡不重开 | 2026-11-10 15:00:39 UTC；未完成开工时扫描，不能宣称零依赖可启动 |
 | DEP-EOL-SITE | 网站交付 | 两 EOL 计划共用指定 /Volumes/Sea/libra-backend 原生 Libra cf；十四命令同卡文档/验证、Claude PASS、串行 cf 推送与部署。现有 log.en.md 无关修改必须保留 | 2026-11-10 15:00:39 UTC；已挂载 cf，旧“未挂载”快照不再代表当前事实；产品部署待 |
