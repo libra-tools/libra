@@ -150,8 +150,12 @@ fn search_readiness_preflight_contract() {
                 r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111"}"#
                     .to_string()
             }
-            _ => {
+            3 => {
                 r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111","search_ready":"yes"}"#
+                    .to_string()
+            }
+            _ => {
+                r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111","search_ready":true}"#
                     .to_string()
             }
         };
@@ -223,7 +227,28 @@ fn search_readiness_preflight_contract() {
         String::from_utf8_lossy(&plain.stderr)
     );
     assert!(String::from_utf8_lossy(&plain.stdout).contains("libra-traces/v1"));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    // A boolean true readiness passes the preflight.
+    let ready = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "capabilities",
+            "--require-search",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+        ],
+        root.path(),
+    );
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ready.stdout).contains("search_ready"));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
 }
 
 #[test]

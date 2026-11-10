@@ -1,3 +1,5 @@
+> **2026-11-10 LTR-19 关闭：** capabilities/`--require-search` 的 10 项检查全勾选。本地契约补布尔 `true` 成功路径并断言只访问 `/capabilities`；真实 fixture 两条 selector 2/2 通过（nextest `a736012f`）。
+
 > **2026-11-10 LTR-24 关闭：** targets resolve 的 6 AC/2 VER 全勾选。本地契约扩展（非规范路径本地拒绝、尾斜杠归一、404 fail-closed）通过；新增 `live_target_resolve_navigation` 真实 fixture 通过（12.0s，nextest `eb4412c3`），未知路径 404 且不建 scope。
 
 > **2026-11-10 LTR-02 关闭：** `live_code_clone_isolation` 扩展为可证伪隔离门并通过（17.7s，nextest `236dcacb`）：无 traces ref；sentinel commit/tree/blob 在 code clone 中不可读；固定代码再增 traces checkpoint 后两次 clone 的对象集合逐 OID 相等，证明 traces 不进入 code view 闭包。
