@@ -57,6 +57,22 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 When stdout is piped and the downstream command exits early, stdout `BrokenPipe` is treated as
 normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is printed.
 
+### Explicit line-ending attributes
+
+For repository worktree comparisons, explicit `text`, `eol=lf`, and `eol=crlf`
+attributes use the same clean bytes as `add`: CRLF pairs become LF. Thus an LF
+index blob and an equivalent CRLF worktree file produce no patch, statistics,
+or difference exit status. Real edits remain visible, including in rename
+matching. Attribute changes invalidate the stat shortcut; an unreadable file
+or attribute source is an error, not a clean result.
+
+`-text` preserves bytes. `text=auto` is not enabled by this change. Stored
+index/tree blobs are never converted: `--cached` and tree-to-tree comparisons
+retain historical content. LFS uses its pointer for the original payload;
+symlink targets, external diff/textconv inputs, and `--no-index` retain their
+existing byte contracts. Comparison does not rewrite files, index entries, or
+stored objects.
+
 ## Options
 
 | Option | Short | Long | Description |

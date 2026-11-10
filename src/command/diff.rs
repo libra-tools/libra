@@ -2352,7 +2352,7 @@ fn apply_pickaxe(
     pickaxe: Option<&DiffPickaxe>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     textconv_counts: &HashMap<String, (usize, usize)>,
 ) -> Result<(), DiffError> {
     let Some(pickaxe) = pickaxe else {
@@ -2376,7 +2376,7 @@ fn apply_pickaxe(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&path) == Some(hash) {
-            read_worktree_blob_content(&path)
+            worktree_entries.read(&path, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -2645,16 +2645,53 @@ fn append_mode_only_changes(
     files.sort_by(|left, right| left.path.cmp(&right.path));
 }
 
-/// Normalize built-in patch mode headers from the directional tree/index/worktree
-/// metadata. `git_internal` compares blob ids and can render `100644` even when
-/// the real filepair is executable; keeping that placeholder would make ordinary
-/// and `--full-index` patches disagree with `--raw` and external-diff metadata.
+/// Select the worktree representation explicitly. Raw plumbing, external
+/// drivers and textconv retain their inputs; built-in content comparison uses
+/// the same clean bytes as add. Recorded objects never pass through this view.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorktreeContents {
+    entries: HashMap<PathBuf, ObjectHash>,
+    clean: bool,
+}
+
+impl WorktreeContents {
+    fn get(&self, path: &Path) -> Option<&ObjectHash> {
+        self.entries.get(path)
+    }
+
+    fn read(&self, path: &Path, expected: &ObjectHash) -> Result<Vec<u8>, DiffError> {
+        if !self.clean {
+            return read_worktree_blob_content(&path.to_path_buf());
+        }
+        let absolute = util::workdir_to_absolute(path);
+        let bytes = crate::utils::worktree_conversion::read_clean_blob_bytes(&absolute).map_err(
+            |error| DiffError::FileRead {
+                path: absolute.display().to_string(),
+                detail: error.to_string(),
+            },
+        )?;
+        // Zero denotes a stat-only plumbing candidate, not a content hash.
+        if *expected != ObjectHash::zero_for_kind(git_internal::hash::get_hash_kind())
+            && calculate_object_hash(ObjectType::Blob, &bytes) != *expected
+        {
+            return Err(DiffError::FileRead {
+                path: absolute.display().to_string(),
+                detail: "worktree content or attributes changed during diff; retry the command"
+                    .to_string(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+type WorktreeContentCache = Rc<RefCell<HashMap<(PathBuf, ObjectHash), Vec<u8>>>>;
+
 #[derive(Debug)]
 pub(crate) struct DiffSide {
     label: String,
     blobs: Vec<(PathBuf, ObjectHash)>,
     modes: HashMap<PathBuf, u32>,
-    worktree_entries: HashMap<PathBuf, ObjectHash>,
+    worktree_entries: WorktreeContents,
     is_worktree: bool,
 }
 
@@ -2673,21 +2710,51 @@ fn get_files_blobs(
         .ok()
         .and_then(|index_path| std::fs::metadata(index_path).ok())
         .and_then(|meta| meta.modified().ok());
-    files
+    let workdir = util::working_dir();
+    let conversion = crate::command::status_io_worker::ConversionScan::new(&workdir, index)
+        .map_err(|error| DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    let (sources_before, policy_valid) =
+        conversion
+            .probe(None)
+            .map_err(|error| DiffError::FileRead {
+                path: workdir.display().to_string(),
+                detail: error.to_string(),
+            })?;
+    let blobs = files
         .iter()
         .filter(|path| !ignore::should_ignore(path, policy, index))
         .map(|p| {
-            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime) {
+            if policy_valid
+                && let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime)
+            {
                 return Ok((p.to_owned(), hash));
             }
             let path = util::workdir_to_absolute(p);
-            let data = read_worktree_blob_bytes(&path).map_err(|e| DiffError::FileRead {
-                path: path.display().to_string(),
-                detail: e.to_string(),
-            })?;
-            Ok((p.to_owned(), calculate_object_hash(ObjectType::Blob, &data)))
+            let hash = conversion
+                .hash(&path)
+                .map_err(|error| DiffError::FileRead {
+                    path: path.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            Ok((p.to_owned(), hash))
         })
-        .collect()
+        .collect::<Result<Vec<_>, DiffError>>()?;
+    let (sources_after, _) = conversion
+        .probe(None)
+        .map_err(|error| DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    if sources_after != sources_before {
+        return Err(DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: "attributes changed during diff; retry the command".to_string(),
+        });
+    }
+    Ok(blobs)
 }
 
 /// Stat-based worktree side for the plumbing `diff-files`/`diff-index`
@@ -2716,8 +2783,8 @@ fn get_files_blobs_stat_only(
                 && entry.flags.intent_to_add
             {
                 let absolute = util::workdir_to_absolute(p);
-                let data =
-                    read_worktree_blob_bytes(&absolute).map_err(|e| DiffError::FileRead {
+                let data = crate::utils::worktree_conversion::read_clean_blob_bytes(&absolute)
+                    .map_err(|e| DiffError::FileRead {
                         path: absolute.display().to_string(),
                         detail: e.to_string(),
                     })?;
@@ -3379,7 +3446,7 @@ fn apply_textconv(
     path_commands: &HashMap<String, (Option<String>, Option<String>)>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
@@ -3645,7 +3712,7 @@ fn force_text_for_bare_binary(
     files: &mut [DiffFileStat],
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     context: usize,
     diff_algorithm: &DiffAlgorithm,
 ) -> Result<(), DiffError> {
@@ -3655,7 +3722,7 @@ fn force_text_for_bare_binary(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&pb) == Some(hash) {
-            read_worktree_blob_content(&pb)
+            worktree_entries.read(&pb, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -3708,7 +3775,7 @@ fn apply_binary_detection(
     files: &mut [DiffFileStat],
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     textconv_paths: &std::collections::HashSet<String>,
     want_patch: bool,
 ) -> Result<bool, DiffError> {
@@ -3719,7 +3786,7 @@ fn apply_binary_detection(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&pb) == Some(hash) {
-            read_worktree_blob_content(&pb)
+            worktree_entries.read(&pb, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -4026,8 +4093,8 @@ fn first_trailing_blank_line(text: &str) -> Option<usize> {
 fn annotate_diff_check_trailing_blanks(
     files: &mut [DiffFileStat],
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
-    worktree_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+    worktree_entries: &WorktreeContents,
+    worktree_cache: &WorktreeContentCache,
     repo_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
 ) -> Result<(), DiffError> {
     for file in files {
@@ -4038,13 +4105,13 @@ fn annotate_diff_check_trailing_blanks(
         };
         let bytes = worktree_cache
             .borrow()
-            .get(hash)
+            .get(&(path.clone(), *hash))
             .cloned()
             .or_else(|| repo_cache.borrow().get(hash).cloned())
             .map(Ok)
             .unwrap_or_else(|| {
                 if worktree_entries.get(&path) == Some(hash) {
-                    read_worktree_blob_content(&path)
+                    worktree_entries.read(&path, hash)
                 } else {
                     load_repo_blob_content(hash)
                 }
@@ -6576,6 +6643,21 @@ mod test {
         );
         index.save(crate::utils::path::index()).unwrap();
 
+        // Stat alone cannot prove equivalence under the current attributes.
+        let paths = [PathBuf::from("tracked.txt")];
+        assert_eq!(
+            get_files_blobs(&paths, &index, IgnorePolicy::Respect).unwrap(),
+            vec![(PathBuf::from("tracked.txt"), worktree_hash)]
+        );
+        // Install the certificate normally recorded by a clean status scan.
+        // The deliberately different hash above makes reuse observable here.
+        let conversion =
+            crate::command::status_io_worker::ConversionScan::new(&util::working_dir(), &index)
+                .unwrap();
+        let (sources, _) = conversion.probe(None).unwrap();
+        conversion.probe(Some(&sources)).unwrap();
+        assert!(conversion.probe(None).unwrap().1);
+
         let blobs = get_files_blobs(
             &[PathBuf::from("tracked.txt")],
             &index,
@@ -6584,5 +6666,11 @@ mod test {
         .unwrap();
 
         assert_eq!(blobs, vec![(PathBuf::from("tracked.txt"), indexed_hash)]);
+
+        fs::write(".gitattributes", "*.txt text\n").unwrap();
+        assert_eq!(
+            get_files_blobs(&paths, &index, IgnorePolicy::Respect).unwrap(),
+            vec![(PathBuf::from("tracked.txt"), worktree_hash)]
+        );
     }
 }

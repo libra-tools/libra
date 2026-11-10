@@ -16,7 +16,7 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/diff.rs`。参数/子命令类型包括：`DiffArgs`；输出、错误或状态类型包括：`DiffOutput`；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；位置性 tree-ish 读取仅对 `AUTO_MERGE` 经 opt-in resolver 放行，其余 revision 保持默认严格解析；引用路径会读取或更新 SQLite refs、HEAD 与 reflog。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径加载并比较 `.libra/index`，不刷新或保存；对象路径解析 revision 并读取 blob/tree/commit/tag 等对象；位置性 tree-ish 读取仅对 `AUTO_MERGE` 经 opt-in resolver 放行，其余 revision 保持默认严格解析；引用路径读取 refs 与 HEAD，不更新引用或 reflog。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
@@ -27,12 +27,19 @@ flowchart TD
     C --> D["执行路径<br/>execute / execute_safe"]
     D --> E["底层对象<br/>IndexEntry / Index / .libra/index / Blob"]
     D --> F["输出与错误<br/>DiffOutput"]
-    E --> G["副作用边界<br/>写入分支需先预检"]
+    E --> G["副作用边界<br/>只读工作区、索引与对象"]
 ```
 
 - 底层操作对象：`IndexEntry`（索引条目，承载路径、mode、object id 和 stat 元数据）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Commit`（提交对象、父提交关系和提交消息载荷）；`Tree`（由索引或对象遍历生成的目录树对象）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）；`ObjectType`（blob/tree/commit/tag 类型分派）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
+
+### 显式转换内容（I1062-06）
+
+- 普通工作区 diff 的候选 OID 通过共享 `ConversionScan` 计算；仅属性源/索引指纹有效且 stat 匹配时复用索引 OID。`WorktreeContents` 让渲染、pickaxe、二进制处理和 rename 消费相同 clean 内容，非零候选 OID 不一致时报可重试读取错误。转换读取失败必须传播。
+- plumbing 仍由 `get_files_blobs_stat_only` 选择候选，raw/name/退出码保留 stat 语义。`-p` 读取 clean 内容，内容相同则清空补丁但保留候选；真实编辑的 patch index 行使用实际 clean OID。缓存按路径与 OID 联合索引，防止多个全零 OID 候选串用文件内容。intent-to-add 无有效 stat，使用共享 clean 内容计算候选哈希，避免 raw OID 与 clean 正文不一致；TC-0044 条目存在性规则保持。
+- 已存储 index/tree blob 不转换；LFS 指针来自原始载荷摘要、symlink 读取目标字节，外部 diff/textconv 与 `--no-index` 输入契约保持。比较不写源文件、索引或对象库。`text=auto` 由 #861 承接。
+- 回归位于既有 `command_test`：`diff_test::i1062_explicit_`、`diff_test::i1062_failure_`、`diff_test::i1062_content_view_` 与 `diff_plumbing_test::i1062_plumbing_explicit_conversion_matches_git_modes`。固定 Git 对照保留各模式退出码，raw OID 显示使用 Git `--abbrev=7` 对齐 Libra 既有宽度，不宣称默认宽度相同。
 
 ## 实现历史
 

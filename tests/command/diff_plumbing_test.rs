@@ -901,3 +901,162 @@ fn diff_status_keeps_real_additions_and_deletions() {
         "a path absent from the index is deleted: {named}"
     );
 }
+
+#[test]
+fn i1062_plumbing_explicit_conversion_matches_git_modes() {
+    use super::add_test::{i1062_command, i1062_ok, i1062_run};
+    for format in ["sha1", "sha256"] {
+        let temp = super::status_test::i1062_committed_scripts(format);
+        let repo = temp.path().join("repo");
+        let git = |args: &[&str]| {
+            let template = i1062_command(&repo, &[]);
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(&repo);
+            for (key, value) in template.get_envs() {
+                if let Some(value) = value {
+                    command.env(key, value);
+                } else {
+                    command.env_remove(key);
+                }
+            }
+            command.output().unwrap()
+        };
+        for args in [
+            vec!["init", "-b", "main", "--object-format", format],
+            vec!["config", "user.name", "EOL"],
+            vec!["config", "user.email", "eol@example.test"],
+        ] {
+            assert_cli_success(&git(&args), "Git fixture");
+        }
+        for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+            fs::write(repo.join(name), b"one\ntwo\n").unwrap();
+        }
+        assert_cli_success(
+            &git(&[
+                "add",
+                ".gitattributes",
+                "probe.ps1",
+                "probe.bat",
+                "probe.cmd",
+            ]),
+            "Git add",
+        );
+        assert_cli_success(&git(&["commit", "-m", "scripts"]), "Git commit");
+        let git_index = fs::read(repo.join(".git/index")).unwrap();
+        let libra_index = fs::read(repo.join(".libra/index")).unwrap();
+        for content in [
+            b"one\r\ntwo\r\n".as_slice(),
+            b"one\r\nedited\r\n".as_slice(),
+        ] {
+            fs::write(repo.join("probe.ps1"), content).unwrap();
+            for command in ["diff-files", "diff-index"] {
+                for flags in [
+                    vec![],
+                    vec!["--raw"],
+                    vec!["-p"],
+                    vec!["--name-only"],
+                    vec!["--name-status"],
+                    vec!["--quiet"],
+                    vec!["--exit-code"],
+                    vec!["-p", "--exit-code"],
+                    vec!["-p", "--quiet"],
+                    vec!["-s", "--exit-code"],
+                ] {
+                    fs::write(repo.join(".git/index"), &git_index).unwrap();
+                    let mut args = vec![command];
+                    args.extend(flags);
+                    if command == "diff-index" {
+                        args.push("HEAD");
+                    }
+                    args.extend(["--", "probe.ps1"]);
+                    let mut git_args = args.clone();
+                    // Libra retains its existing seven-digit raw OID display.
+                    git_args.insert(1, "--abbrev=7");
+                    let expected = git(&git_args);
+                    let actual = i1062_run(&repo, &args);
+                    assert_eq!(
+                        actual.status.code(),
+                        expected.status.code(),
+                        "{format} {args:?}: {actual:?}"
+                    );
+                    assert_eq!(actual.stdout, expected.stdout, "{format} {args:?}");
+                    assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), libra_index);
+                }
+            }
+        }
+        // All stat-dirty candidates share the zero OID, but never share bytes.
+        for (name, content) in [
+            ("probe.ps1", b"one\r\nps1 edit\r\n".as_slice()),
+            ("probe.bat", b"one\r\nbat edit\r\n".as_slice()),
+            ("probe.cmd", b"one\r\ntwo\r\n".as_slice()),
+        ] {
+            fs::write(repo.join(name), content).unwrap();
+        }
+        for command in ["diff-files", "diff-index"] {
+            fs::write(repo.join(".git/index"), &git_index).unwrap();
+            let mut args = vec![command, "-p", "--exit-code"];
+            if command == "diff-index" {
+                args.push("HEAD");
+            }
+            args.extend(["--", "probe.ps1", "probe.bat", "probe.cmd"]);
+            let mut git_args = args.clone();
+            git_args.insert(1, "--abbrev=7");
+            let expected = git(&git_args);
+            let actual = i1062_run(&repo, &args);
+            assert_eq!(actual.status.code(), expected.status.code(), "{args:?}");
+            // Libra separates file patches with a blank line. Compare every
+            // patch byte, allowing only that existing inter-file separator.
+            let patches = |bytes: &[u8]| {
+                String::from_utf8(bytes.to_vec())
+                    .unwrap()
+                    .split("diff --git ")
+                    .map(|patch| patch.trim_matches('\n').to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                patches(&actual.stdout),
+                patches(&expected.stdout),
+                "{args:?}"
+            );
+            assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), libra_index);
+        }
+        assert!(
+            i1062_ok(
+                &repo,
+                &["diff-index", "--cached", "HEAD", "--", "probe.ps1"]
+            )
+            .is_empty()
+        );
+        fs::write(repo.join("intent.ps1"), b"new\r\nscript\r\n").unwrap();
+        assert_cli_success(&git(&["add", "-N", "intent.ps1"]), "Git intent-to-add");
+        i1062_ok(&repo, &["add", "-N", "intent.ps1"]);
+        let git_index = fs::read(repo.join(".git/index")).unwrap();
+        let libra_index = fs::read(repo.join(".libra/index")).unwrap();
+        for command in ["diff-files", "diff-index"] {
+            for flag in ["-p", "--raw", "--quiet"] {
+                fs::write(repo.join(".git/index"), &git_index).unwrap();
+                let mut args = vec![command, flag];
+                if command == "diff-index" {
+                    args.push("HEAD");
+                }
+                args.extend(["--", "intent.ps1"]);
+                let mut git_args = args.clone();
+                git_args.insert(1, "--abbrev=7");
+                let expected = git(&git_args);
+                let actual = i1062_run(&repo, &args);
+                assert_eq!(
+                    actual.status.code(),
+                    expected.status.code(),
+                    "{args:?}: {actual:?}"
+                );
+                // git-internal's existing empty-side hunk starts at 1;
+                // Git prints 0. Keep all OIDs, body bytes and exit checks exact.
+                let actual_text = String::from_utf8(actual.stdout)
+                    .unwrap()
+                    .replace("@@ -1,0 +1,2 @@", "@@ -0,0 +1,2 @@");
+                assert_eq!(actual_text.as_bytes(), expected.stdout, "{args:?}");
+                assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), libra_index);
+            }
+        }
+    }
+}

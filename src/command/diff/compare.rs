@@ -110,7 +110,7 @@ pub(crate) async fn run_diff(
     // cf. #372). `finish()` erases the hint when the scan completes.
     let old_side =
         resolve_diff_side(&args.old, args.staged, false, &index, file_mode, false).await?;
-    let (new_side, index) = if scan_hint.enabled {
+    let (mut new_side, index) = if scan_hint.enabled {
         // `Index` is not `Clone`; move it into the blocking task through an
         // `Arc` and take it back out afterwards.
         // The hash kind lives in a git-internal THREAD-LOCAL seeded by the
@@ -167,6 +167,10 @@ pub(crate) async fn run_diff(
         (side, index)
     };
 
+    // A plumbing patch renders clean content but retains its stat candidates
+    // for raw/name output and exit status, including an empty patch with exit 1.
+    new_side.worktree_entries.clean |= args.plumbing_stat_only && patch_body_is_shown(args);
+
     let pathspecs =
         PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
             .map_err(pathspec_error_to_diff)?;
@@ -182,9 +186,8 @@ pub(crate) async fn run_diff(
     let old_is_worktree = old_side.is_worktree;
     let new_is_worktree = new_side.is_worktree;
     // `Rc` so the `-U<n>` post-pass can read the blob content the diff closure
-    // cached (keyed by hash) without re-loading it from the object store/disk.
-    let worktree_cache: Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    // cached (keyed by path and hash) without re-loading it from the object store/disk.
+    let worktree_cache: WorktreeContentCache = Rc::new(RefCell::new(HashMap::new()));
     let repo_cache: Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let worktree_cache_in = Rc::clone(&worktree_cache);
@@ -265,13 +268,19 @@ pub(crate) async fn run_diff(
     }
     let diff_output = Diff::diff(first_blobs, second_blobs, paths, move |path, hash| {
         if worktree_entries.get(path) == Some(hash) {
-            if let Some(data) = worktree_cache_in.borrow().get(hash).cloned() {
+            if let Some(data) = worktree_cache_in
+                .borrow()
+                .get(&(path.clone(), *hash))
+                .cloned()
+            {
                 return data;
             }
 
-            match read_worktree_blob_content(path) {
+            match worktree_entries.read(path, hash) {
                 Ok(data) => {
-                    worktree_cache_in.borrow_mut().insert(*hash, data.clone());
+                    worktree_cache_in
+                        .borrow_mut()
+                        .insert((path.clone(), *hash), data.clone());
                     data
                 }
                 Err(err) => {
@@ -301,6 +310,58 @@ pub(crate) async fn run_diff(
     }
 
     let mut files: Vec<DiffFileStat> = diff_output.iter().map(parse_diff_item).collect();
+    if args.plumbing_stat_only && patch_body_is_shown(args) {
+        for file in &mut files {
+            let path = PathBuf::from(&file.path);
+            let old_hash = first_map.get(&path);
+            let new_hash = second_map.get(&path);
+            let cache = worktree_cache.borrow();
+            let objects = repo_cache.borrow();
+            let content = |hash: Option<&ObjectHash>, worktree: bool| {
+                hash.and_then(|hash| {
+                    if worktree {
+                        cache.get(&(path.clone(), *hash))
+                    } else {
+                        objects.get(hash)
+                    }
+                })
+            };
+            let old = content(old_hash, first_is_worktree);
+            let new = content(new_hash, second_is_worktree);
+            if old.is_some() && old == new && first_modes.get(&path) == second_modes.get(&path) {
+                // Preserve the entry for stat-based raw output and exit status.
+                file.raw_diff.clear();
+                file.hunks.clear();
+                file.insertions = 0;
+                file.deletions = 0;
+                continue;
+            }
+            let render_hash =
+                |hash: Option<&ObjectHash>, bytes: Option<&Vec<u8>>, worktree: bool| {
+                    let hash = if worktree {
+                        bytes.map(|bytes| calculate_object_hash(ObjectType::Blob, bytes))
+                    } else {
+                        hash.copied()
+                    };
+                    hash.map(|hash| hash.to_string()[..7].to_string())
+                        .unwrap_or_else(|| "0000000".to_string())
+                };
+            let old_hex = render_hash(old_hash, old, first_is_worktree);
+            let new_hex = render_hash(new_hash, new, second_is_worktree);
+            file.raw_diff = file
+                .raw_diff
+                .lines()
+                .map(|line| {
+                    if let Some(rest) = line.strip_prefix("index ") {
+                        let suffix = rest.find(' ').map(|pos| &rest[pos..]).unwrap_or("");
+                        format!("index {old_hex}..{new_hex}{suffix}\n")
+                    } else {
+                        format!("{line}\n")
+                    }
+                })
+                .collect();
+        }
+    }
     append_mode_only_changes(
         &mut files,
         &first_map,
@@ -331,7 +392,7 @@ pub(crate) async fn run_diff(
         };
 
     // Post-pass regeneration (both reuse the blob text the diff closure cached —
-    // keyed by hash — with no re-load; the default path leaves git_internal's
+    // keyed by path/hash for worktree content — with no re-load; the default path leaves git_internal's
     // output untouched):
     //   * A whitespace-ignoring flag (`-w`/`-b`/`--ignore-space-at-eol`) re-diffs
     //     each text file through the matching line normalizer, DROPS files whose
@@ -403,7 +464,7 @@ pub(crate) async fn run_diff(
             ws_normalize,
             ignore_blank,
             diff_algorithm,
-        );
+        )?;
         if rename_skips.inexact_skipped_by_limit {
             crate::utils::error::emit_legacy_stderr(format!(
                 "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact and unique-basename renames were still detected",
@@ -565,7 +626,7 @@ pub(crate) async fn run_diff(
             // Clone out of each borrow so no reference escapes the temporary `Ref`.
             let bytes = worktree_cache
                 .borrow()
-                .get(hash)
+                .get(&(path.to_path_buf(), *hash))
                 .cloned()
                 .or_else(|| repo_cache.borrow().get(hash).cloned());
             bytes
@@ -956,7 +1017,10 @@ pub(crate) fn resolve_worktree_side(
     };
     Ok(DiffSide {
         label: "working tree".to_string(),
-        worktree_entries: blobs.iter().cloned().collect(),
+        worktree_entries: WorktreeContents {
+            entries: blobs.iter().cloned().collect(),
+            clean: !stat_only,
+        },
         blobs,
         modes,
         is_worktree: true,
@@ -977,7 +1041,7 @@ pub(crate) async fn resolve_diff_side(
             label: source.clone(),
             blobs,
             modes,
-            worktree_entries: HashMap::new(),
+            worktree_entries: WorktreeContents::default(),
             is_worktree: false,
         });
     }
@@ -989,7 +1053,7 @@ pub(crate) async fn resolve_diff_side(
                 label: "index".to_string(),
                 blobs,
                 modes,
-                worktree_entries: HashMap::new(),
+                worktree_entries: WorktreeContents::default(),
                 is_worktree: false,
             })
         } else {
@@ -1003,7 +1067,7 @@ pub(crate) async fn resolve_diff_side(
                     label: "HEAD".to_string(),
                     blobs,
                     modes,
-                    worktree_entries: HashMap::new(),
+                    worktree_entries: WorktreeContents::default(),
                     is_worktree: false,
                 })
             }
@@ -1011,7 +1075,7 @@ pub(crate) async fn resolve_diff_side(
                 label: "HEAD".to_string(),
                 blobs: Vec::new(),
                 modes: HashMap::new(),
-                worktree_entries: HashMap::new(),
+                worktree_entries: WorktreeContents::default(),
                 is_worktree: false,
             }),
         }
@@ -1021,7 +1085,7 @@ pub(crate) async fn resolve_diff_side(
             label: "index".to_string(),
             blobs,
             modes,
-            worktree_entries: HashMap::new(),
+            worktree_entries: WorktreeContents::default(),
             is_worktree: false,
         })
     }
@@ -1151,7 +1215,7 @@ pub(crate) fn apply_rename_detection(
     second_map: &HashMap<PathBuf, ObjectHash>,
     first_modes: &HashMap<PathBuf, u32>,
     second_modes: &HashMap<PathBuf, u32>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     threshold: u32,
     rename_limit: usize,
     comparison_budget: Option<u64>,
@@ -1159,7 +1223,7 @@ pub(crate) fn apply_rename_detection(
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
     diff_algorithm: &DiffAlgorithm,
-) -> RenameDetectionSkips {
+) -> Result<RenameDetectionSkips, DiffError> {
     // NOTE: file-type eligibility (same kind for exact, non-empty regular
     // files for inexact) now lives in the shared engine, which is the whole
     // point of routing through it — these rules used to be duplicated here
@@ -1173,7 +1237,7 @@ pub(crate) fn apply_rename_detection(
         .filter(|&i| files[i].status == "added")
         .collect();
     if deleted.is_empty() || added.is_empty() {
-        return RenameDetectionSkips::default();
+        return Ok(RenameDetectionSkips::default());
     }
 
     // ── Pairing is delegated to the SHARED engine ────────────────────────
@@ -1240,8 +1304,9 @@ pub(crate) fn apply_rename_detection(
     struct DiffContentSource<'a> {
         first_map: &'a HashMap<PathBuf, ObjectHash>,
         second_map: &'a HashMap<PathBuf, ObjectHash>,
-        worktree_entries: &'a HashMap<PathBuf, ObjectHash>,
+        worktree_entries: &'a WorktreeContents,
         objects: rename_detect::ObjectReadBudget,
+        worktree_error: Option<DiffError>,
     }
 
     impl DiffContentSource<'_> {
@@ -1256,12 +1321,14 @@ pub(crate) fn apply_rename_detection(
                 );
             };
             if self.worktree_entries.get(path) == Some(hash) {
-                let owned = path.to_path_buf();
-                return match read_worktree_blob_content(&owned) {
+                return match self.worktree_entries.read(path, hash) {
                     Ok(bytes) => rename_detect::ContentOutcome::Content(std::rc::Rc::new(bytes)),
-                    Err(_) => rename_detect::ContentOutcome::Skipped(
-                        rename_detect::SkipReason::ObjectUnavailable,
-                    ),
+                    Err(error) => {
+                        self.worktree_error = Some(error);
+                        rename_detect::ContentOutcome::Skipped(
+                            rename_detect::SkipReason::ObjectUnavailable,
+                        )
+                    }
                 };
             }
             // Commit dry-run preview blobs live only in scratch storage —
@@ -1324,6 +1391,7 @@ pub(crate) fn apply_rename_detection(
         first_map,
         second_map,
         worktree_entries,
+        worktree_error: None,
         // Deadline-only budget: keep the killable worker read (WIO-03) but
         // no per-object/total/object-count caps — see DiffContentSource docs.
         objects: rename_detect::ObjectReadBudget::new(
@@ -1339,35 +1407,41 @@ pub(crate) fn apply_rename_detection(
         comparison_budget,
     };
     let outcome = rename_detect::match_pairs(&snapshot, &config, &mut source);
+    if let Some(error) = source.worktree_error {
+        return Err(error);
+    }
 
     // Rendering must reuse the same killable ObjectReadBudget (WIO-03): a
     // second legacy `load_repo_blob_content` pass would stall on a hung store
     // after detection already succeeded.
     let mut objects = source.objects;
-    let mut load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
-        let pb = PathBuf::from(path);
-        let hash = map.get(&pb)?;
-        if worktree_entries.get(&pb) == Some(hash) {
-            return read_worktree_blob_content(&pb).ok();
-        }
-        if let Ok(Some(content)) = preview_object::read(hash) {
-            return Some(content);
-        }
-        match objects.read_blob_tracked(hash) {
-            (rename_detect::ContentOutcome::Content(bytes), _) => Some((*bytes).clone()),
-            // Same fallback rule as detection (see DiffContentSource): only
-            // a worker-COMPLETED skip may recover through the legacy tiered
-            // read; a transport skip stays final (WIO-03, Codex r9).
-            (
-                rename_detect::ContentOutcome::Skipped(_),
-                rename_detect::ObjectReadProvenance::Completed,
-            ) => load_repo_blob_content(hash).ok(),
-            (
-                rename_detect::ContentOutcome::Skipped(_),
-                rename_detect::ObjectReadProvenance::Transport,
-            ) => None,
-        }
-    };
+    let mut load =
+        |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Option<Vec<u8>>, DiffError> {
+            let pb = PathBuf::from(path);
+            let Some(hash) = map.get(&pb) else {
+                return Ok(None);
+            };
+            if worktree_entries.get(&pb) == Some(hash) {
+                return worktree_entries.read(&pb, hash).map(Some);
+            }
+            if let Ok(Some(content)) = preview_object::read(hash) {
+                return Ok(Some(content));
+            }
+            Ok(match objects.read_blob_tracked(hash) {
+                (rename_detect::ContentOutcome::Content(bytes), _) => Some((*bytes).clone()),
+                // Same fallback rule as detection (see DiffContentSource): only
+                // a worker-COMPLETED skip may recover through the legacy tiered
+                // read; a transport skip stays final (WIO-03, Codex r9).
+                (
+                    rename_detect::ContentOutcome::Skipped(_),
+                    rename_detect::ObjectReadProvenance::Completed,
+                ) => load_repo_blob_content(hash).ok(),
+                (
+                    rename_detect::ContentOutcome::Skipped(_),
+                    rename_detect::ObjectReadProvenance::Transport,
+                ) => None,
+            })
+        };
 
     let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
     for matched in &outcome.matches {
@@ -1385,7 +1459,7 @@ pub(crate) fn apply_rename_detection(
         inexact_discarded_by_budget: budget_discarded,
     };
     if pairs.is_empty() {
-        return skips;
+        return Ok(skips);
     }
 
     // Build the rename entries, then drop the consumed del/add entries.
@@ -1394,8 +1468,8 @@ pub(crate) fn apply_rename_detection(
         let old_path = files[*di].path.clone();
         let new_path = files[*ai].path.clone();
         let percent = score / 600;
-        let old_content = load(&old_path, first_map).unwrap_or_default();
-        let new_content = load(&new_path, second_map).unwrap_or_default();
+        let old_content = load(&old_path, first_map)?.unwrap_or_default();
+        let new_content = load(&new_path, second_map)?.unwrap_or_default();
         let entry = build_rename_entry(
             &old_path,
             &new_path,
@@ -1423,5 +1497,5 @@ pub(crate) fn apply_rename_detection(
         }
     }
     *files = rebuilt;
-    skips
+    Ok(skips)
 }

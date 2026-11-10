@@ -11,9 +11,13 @@ libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status] [--e
 
 ## 说明
 
-`diff-index <tree>` 等价于 `libra diff --old <tree> --no-renames`：把给定 tree-ish 与当前工作树做 diff。加上 `--cached` 则与 index 比较。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-index ...` 等全局输出标志仍可用。
+`diff-index <tree>` 通过共享 diff 引擎把给定 tree-ish 与当前工作树比较，工作树候选条目按 stat 判定。加上 `--cached` 则与 index 比较。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-index ...` 等全局输出标志仍可用。
 
 默认输出是 raw。`--name-status` 与 `diff-files` 一样按**条目是否存在**给字母：stat 失效的空 blob 是 `M` 而不是 `A`，工作树被截断为 0 字节是 `M` 而不是 `D`。
+
+显式 `text`、`eol=lf`、`eol=crlf` 属性使 `-p` 按 clean 工作区内容比较（CRLF 对转换为 LF）。因此补丁可以为空，而基于 stat 的 raw/名称输出仍报告 `M` 和全零工作区 OID；`--quiet`、`--exit-code` 仍按该 stat 差异返回 1，包括补丁为空的情况。按内容判断干净状态请用 [`diff`](diff.md)。`-text` 保留字节，`text=auto` 仍未启用。存储对象不转换，命令不刷新索引或改写工作区文件。生成补丁时读取内容或属性失败会返回错误，不得以空补丁成功退出。
+
+`--cached` 按已存储的 tree 和索引字节比较，不受当前工作区属性影响。
 
 ## 选项
 
@@ -37,7 +41,7 @@ libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status] [--e
 |--------|------|
 | `0` | 无差异；或有差异但未给 `--exit-code`/`--quiet`。 |
 | `1` | 有差异且给了 `--exit-code`/`--quiet`。 |
-| `128` | 不在仓库内。 |
+| `128` | 不在仓库内，或内容/属性读取失败。 |
 | `129` | 参数无效（`LBR-CLI-002`），或修订无法解析（`LBR-CLI-003`）。 |
 
 ## 示例
