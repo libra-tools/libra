@@ -371,9 +371,13 @@ async fn show(args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
         ));
     }
     let path = if let Some(checkpoint) = args.checkpoint.as_deref() {
+        // The checkpoint detail route is session-scoped; resolve the owning
+        // session when the caller did not supply one (the flags stay mutually
+        // exclusive).
+        let session = resolve_checkpoint_session(&args.endpoint, &args.stream, checkpoint).await?;
         format!(
-            "/api/v1/traces/streams/{}/checkpoints/{checkpoint}",
-            args.stream
+            "/api/v1/traces/streams/{}/sessions/{}/checkpoints/{checkpoint}",
+            args.stream, session
         )
     } else if let Some(session) = args.session.as_deref() {
         format!("/api/v1/traces/streams/{}/sessions/{session}", args.stream)

@@ -512,27 +512,94 @@ async fn live_scoped_push_cli() {
 async fn live_code_clone_isolation() {
     let fixture = prepared();
     let root = tempfile::tempdir().expect("root");
-    let destination = root.path().join("clone");
-    let output = run(
-        root.path(),
-        &[
-            "clone",
-            "--mirror",
-            fixture.http_url.as_str(),
-            destination.to_str().expect("utf8 path"),
-        ],
-        &[],
+    let http = Transport::http(&fixture.token_file);
+    let source = init_repo(
+        &root.path().join("source"),
+        "mega2-source",
+        &http.remote_url(&fixture, &fixture.target),
     );
-    assert!(
-        output.status.success(),
-        "live code clone failed: {}",
-        stderr(&output)
-    );
-    let refs = run(&destination, &["show-ref"], &[]);
+    let first = seed(&source, "code-isolation", CheckpointScope::Committed).await;
+    let tree = {
+        let output = run(&source, &["cat-file", "-p", first.commit.as_str()], &[]);
+        assert!(
+            output.status.success(),
+            "source trace commit unreadable: {}",
+            stderr(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        text.split_whitespace()
+            .skip_while(|token| *token != "tree")
+            .nth(1)
+            .expect("trace commit tree")
+            .to_string()
+    };
+    push(&source, &http, &fixture.target, &[]);
+    let clone = |name: &str| {
+        let destination = root.path().join(name);
+        let output = run(
+            root.path(),
+            &[
+                "clone",
+                "--mirror",
+                fixture.http_url.as_str(),
+                destination.to_str().expect("utf8 path"),
+            ],
+            &[],
+        );
+        assert!(
+            output.status.success(),
+            "live code clone failed: {}",
+            stderr(&output)
+        );
+        destination
+    };
+    let first_clone = clone("clone-1");
+    let refs = run(&first_clone, &["show-ref"], &[]);
     let text = String::from_utf8_lossy(&refs.stdout);
     assert!(
         !text.contains("refs/libra/traces"),
         "code clone advertised traces refs: {text}"
+    );
+    // Traces-only objects must stay out of the code view closure.
+    for (kind, oid) in [
+        ("commit", first.commit.as_str()),
+        ("tree", tree.as_str()),
+        ("blob", first.transcript_blob.as_str()),
+    ] {
+        let probe = run(
+            &first_clone,
+            &["cat-file", "-e", &format!("{oid}^{kind}")],
+            &[],
+        );
+        assert!(
+            !probe.status.success(),
+            "code clone contains the traces-only {kind} {oid}"
+        );
+    }
+    let object_set = |repo: &Path| {
+        let output = run(repo, &["rev-list", "--objects", "--all"], &[]);
+        assert!(
+            output.status.success(),
+            "object listing failed: {}",
+            stderr(&output)
+        );
+        let mut oids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect();
+        oids.sort_unstable();
+        oids
+    };
+    let before = object_set(&first_clone);
+    // Fixing the code and adding another traces checkpoint must not grow the
+    // code view.
+    seed(&source, "code-isolation-second", CheckpointScope::Committed).await;
+    push(&source, &http, &fixture.target, &[]);
+    let second_clone = clone("clone-2");
+    let after = object_set(&second_clone);
+    assert_eq!(
+        before, after,
+        "extra traces objects leaked into the code view"
     );
 }
 
@@ -1012,18 +1079,109 @@ async fn live_search_readiness_preflight() {
 
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
-async fn live_target_stream_navigation() {
+async fn live_target_resolve_navigation() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let resolved = query(
         root.path(),
         &["targets", "--path", fixture.target.as_str()],
         &fixture,
     );
-    query(
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    assert!(
+        body["data"]["body"]["target_id"].is_string(),
+        "resolve must return the existing target: {body}"
+    );
+    // Resolving an unknown path must not create a scope; the fixture answers
+    // 404 and the CLI fails.
+    let missing = run(
         root.path(),
-        &["streams", "--target", "pending-from-resolve"],
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
+            "--path",
+            "/project/target-that-does-not-exist",
+        ],
+        &[],
+    );
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("404"), "{}", stderr(&missing));
+}
+
+/// Resolve the fixture target and return its first stream, so navigation live
+/// cases do not hardcode fixture UUIDs.
+fn first_stream(root: &Path, fixture: &LiveFixture) -> String {
+    let resolved = query(
+        root,
+        &["targets", "--path", fixture.target.as_str()],
+        fixture,
+    );
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    let target = body["data"]["body"]["target_id"]
+        .as_str()
+        .expect("resolved target id")
+        .to_string();
+    let streams = query(
+        root,
+        &["streams", "--target", target.as_str(), "--limit", "1"],
+        fixture,
+    );
+    let page: Json = serde_json::from_slice(&streams.stdout).expect("streams JSON");
+    page["data"]["body"]["items"][0]["stream_id"]
+        .as_str()
+        .expect("fixture stream")
+        .to_string()
+}
+
+fn first_session(root: &Path, fixture: &LiveFixture, stream: &str) -> String {
+    let sessions = query(
+        root,
+        &["sessions", "--stream", stream, "--limit", "1"],
+        fixture,
+    );
+    let page: Json = serde_json::from_slice(&sessions.stdout).expect("sessions JSON");
+    page["data"]["body"]["items"][0]["session_id"]
+        .as_str()
+        .expect("fixture session")
+        .to_string()
+}
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
+async fn live_target_stream_navigation() {
+    let fixture = prepared();
+    let root = repo();
+    let resolved = query(
+        root.path(),
+        &["targets", "--path", fixture.target.as_str()],
         &fixture,
+    );
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    let target = body["data"]["body"]["target_id"]
+        .as_str()
+        .expect("resolved target id")
+        .to_string();
+    let streams = query(
+        root.path(),
+        &["streams", "--target", target.as_str(), "--limit", "1"],
+        &fixture,
+    );
+    let page: Json = serde_json::from_slice(&streams.stdout).expect("streams JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "streams must return one page: {page}"
+    );
+    assert!(
+        page["data"]["body"]
+            .get("next_cursor")
+            .is_some_and(|value| value.is_null() || value.is_string()),
+        "{page}"
     );
 }
 
@@ -1032,15 +1190,22 @@ async fn live_target_stream_navigation() {
 async fn live_session_navigation() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let session = first_session(root.path(), &fixture, stream.as_str());
+    let listing = query(
         root.path(),
-        &[
-            "sessions",
-            "--stream",
-            "00000000-0000-4000-8000-000000000000",
-        ],
+        &["sessions", "--stream", stream.as_str(), "--limit", "1"],
         &fixture,
     );
+    let page: Json = serde_json::from_slice(&listing.stdout).expect("sessions JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "sessions must return one page: {page}"
+    );
+    // The fixture derives sessions from metadata it has not ingested, so this
+    // listing can expose synthetic ids that the detail route does not resolve.
+    // Session detail is covered by the local navigation contract.
+    assert!(!session.is_empty());
 }
 
 #[tokio::test]
@@ -1048,18 +1213,24 @@ async fn live_session_navigation() {
 async fn live_session_time_filter() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let output = query(
         root.path(),
         &[
             "sessions",
             "--stream",
-            "00000000-0000-4000-8000-000000000000",
+            stream.as_str(),
             "--since",
-            "2026-11-02T00:00:00Z",
+            "2000-01-01T00:00:00Z",
             "--until",
-            "2026-11-03T00:00:00Z",
+            "2100-01-01T00:00:00Z",
         ],
         &fixture,
+    );
+    let page: Json = serde_json::from_slice(&output.stdout).expect("sessions JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "time filter must return a page: {page}"
     );
 }
 
@@ -1068,35 +1239,278 @@ async fn live_session_time_filter() {
 async fn live_metadata_query_cli() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let session = first_session(root.path(), &fixture, stream.as_str());
+    let listing = query(
         root.path(),
         &[
             "checkpoints",
             "--stream",
-            "00000000-0000-4000-8000-000000000000",
+            stream.as_str(),
             "--session",
-            "live",
+            session.as_str(),
+            "--limit",
+            "1",
         ],
         &fixture,
     );
+    let page: Json = serde_json::from_slice(&listing.stdout).expect("checkpoints JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "checkpoints must return one page: {page}"
+    );
+    if let Some(checkpoint) = page["data"]["body"]["items"][0]["checkpoint_id"].as_str() {
+        let detail = query(
+            root.path(),
+            &[
+                "show",
+                "--stream",
+                stream.as_str(),
+                "--checkpoint",
+                checkpoint,
+            ],
+            &fixture,
+        );
+        let body: Json = serde_json::from_slice(&detail.stdout).expect("checkpoint JSON");
+        assert_eq!(
+            body["data"]["body"]["checkpoint_id"].as_str(),
+            Some(checkpoint)
+        );
+        // Server payload fields pass through unchanged: completeness and the
+        // unresolved code link are shown as-is.
+        assert!(body["data"]["body"]["completeness"].is_object(), "{body}");
+        assert!(
+            body["data"]["body"]["code_link"].is_null()
+                || body["data"]["body"]["code_link"].is_string(),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
+async fn live_search_local_admission() {
+    let fixture = prepared();
+    let root = tempfile::tempdir().expect("root");
+    let stream = pushed_stream(root.path(), &fixture).await;
+    let search = |query: &str| {
+        run(
+            root.path(),
+            &[
+                "--json",
+                "mega2",
+                "traces",
+                "search",
+                "--server",
+                fixture.http_url.as_str(),
+                "--token-file",
+                fixture.token_file.to_str().expect("token path"),
+                "--target",
+                fixture.target.as_str(),
+                "--stream",
+                stream.scope.as_str(),
+                "--query",
+                query,
+            ],
+            &[],
+        )
+    };
+    // Invalid bounds are refused before the network. The in-process observer
+    // that counts requests lives in the local contract test; this live case
+    // proves the refusal text and exit status with the real endpoint args.
+    for query in ["", &"b".repeat(257)] {
+        let refused = search(query);
+        assert!(!refused.status.success(), "{}", query.len());
+        assert!(
+            stderr(&refused).contains("was not sent"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    // Valid bounds reach the real service.
+    for query in ["a", &"c".repeat(256)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let output = search(query);
+            if output.status.success() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "valid {} byte query never reached the service: {}",
+                query.len(),
+                stderr(&output)
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
 }
 
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
 async fn live_keyword_search_cli() {
     let fixture = prepared();
-    let root = repo();
-    query(
+    let root = tempfile::tempdir().expect("root");
+    let stream = pushed_stream(root.path(), &fixture).await;
+    // The fixture indexes asynchronously; poll the mounted search until the
+    // seeded transcript is hit (bounded).
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut hit = None;
+    while std::time::Instant::now() < deadline {
+        let output = query(
+            root.path(),
+            &[
+                "search",
+                "--target",
+                fixture.target.as_str(),
+                "--stream",
+                stream.scope.as_str(),
+                "--query",
+                "live traces sentinel",
+            ],
+            &fixture,
+        );
+        let body: Json = serde_json::from_slice(&output.stdout).expect("search JSON");
+        if let Some(items) = body
+            .get("data")
+            .and_then(|data| data.get("body"))
+            .and_then(|body| body.get("items"))
+            .and_then(Json::as_array)
+            .filter(|items| !items.is_empty())
+        {
+            let item = &items[0];
+            assert!(item.get("checkpoint_id").is_some(), "{item}");
+            assert!(
+                item.get("occurrence_count")
+                    .and_then(Json::as_u64)
+                    .is_some_and(|count| count >= 1),
+                "{item}"
+            );
+            hit = Some(body);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let body = hit.expect("the seeded transcript must be searchable");
+    let coverage = body["data"]["body"]["coverage"].clone();
+    assert!(coverage.is_object(), "{coverage}");
+    // The mounted route needs a stream; the local refusal runs before network.
+    let refused = run(
         root.path(),
         &[
+            "--json",
+            "mega2",
+            "traces",
             "search",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
             "--target",
             fixture.target.as_str(),
             "--query",
-            "timeout",
+            "live",
         ],
-        &fixture,
+        &[],
     );
+    assert!(!refused.status.success());
+    // A filter the mounted route does not implement is refused locally too.
+    let unsupported = run(
+        root.path(),
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "search",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
+            "--target",
+            fixture.target.as_str(),
+            "--stream",
+            stream.scope.as_str(),
+            "--agent",
+            "codex",
+            "--query",
+            "live",
+        ],
+        &[],
+    );
+    assert!(!unsupported.status.success());
+}
+
+/// Find any already indexed checkpoint in the fixture target. Fresh pushes
+/// register a stream tip but this fixture does not project their checkpoints
+/// into the metadata tables that the navigation routes read, so the transcript
+/// live case walks the existing indexed data instead.
+fn first_indexed_checkpoint(root: &Path, fixture: &LiveFixture) -> (String, String, String) {
+    let resolved = query(
+        root,
+        &["targets", "--path", fixture.target.as_str()],
+        fixture,
+    );
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    let target = body["data"]["body"]["target_id"]
+        .as_str()
+        .expect("resolved target id")
+        .to_string();
+    let streams = query(
+        root,
+        &["streams", "--target", target.as_str(), "--limit", "200"],
+        fixture,
+    );
+    let page: Json = serde_json::from_slice(&streams.stdout).expect("streams JSON");
+    for stream in page["data"]["body"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(stream_id) = stream["stream_id"].as_str() else {
+            continue;
+        };
+        let sessions = query(
+            root,
+            &["sessions", "--stream", stream_id, "--limit", "200"],
+            fixture,
+        );
+        let page: Json = serde_json::from_slice(&sessions.stdout).expect("sessions JSON");
+        for session in page["data"]["body"]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(session_id) = session["session_id"].as_str() else {
+                continue;
+            };
+            let checkpoints = query(
+                root,
+                &[
+                    "checkpoints",
+                    "--stream",
+                    stream_id,
+                    "--session",
+                    session_id,
+                    "--limit",
+                    "5",
+                ],
+                fixture,
+            );
+            let body: Json = serde_json::from_slice(&checkpoints.stdout).expect("checkpoints JSON");
+            if let Some(checkpoint) = body["data"]["body"]["items"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|item| item["checkpoint_id"].as_str())
+            {
+                return (
+                    stream_id.to_string(),
+                    session_id.to_string(),
+                    checkpoint.to_string(),
+                );
+            }
+        }
+    }
+    panic!("the fixture target has no indexed checkpoint");
 }
 
 #[tokio::test]
@@ -1104,17 +1518,78 @@ async fn live_keyword_search_cli() {
 async fn live_bounded_transcript_cli() {
     let fixture = prepared();
     let root = repo();
-    query(
-        root.path(),
-        &[
+    let (stream, session, checkpoint) = first_indexed_checkpoint(root.path(), &fixture);
+    let transcript = |max_bytes: &str, cursor: Option<&str>| {
+        let mut args = vec![
+            "--json",
+            "mega2",
+            "traces",
             "transcript",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
             "--stream",
-            "00000000-0000-4000-8000-000000000000",
+            stream.as_str(),
+            "--session",
+            session.as_str(),
             "--checkpoint",
-            "live",
-        ],
-        &fixture,
+            checkpoint.as_str(),
+            "--max-bytes",
+            max_bytes,
+        ];
+        if let Some(cursor) = cursor {
+            args.push("--cursor");
+            args.push(cursor);
+        }
+        run(root.path(), &args, &[])
+    };
+    let full = transcript("131072", None);
+    assert!(
+        full.status.success(),
+        "live transcript failed: {}",
+        stderr(&full)
     );
+    let body: Json = serde_json::from_slice(&full.stdout).expect("transcript JSON");
+    let text = body["data"]["body"]["text"]
+        .as_str()
+        .expect("transcript text")
+        .to_owned();
+    assert!(!text.is_empty(), "the fixture transcript is empty");
+    assert_eq!(
+        body["data"]["body"]["checkpoint_id"].as_str(),
+        Some(checkpoint.as_str())
+    );
+    let first = transcript("16", None);
+    assert!(
+        first.status.success(),
+        "bounded transcript failed: {}",
+        stderr(&first)
+    );
+    let first_body: Json = serde_json::from_slice(&first.stdout).expect("bounded JSON");
+    let first_text = first_body["data"]["body"]["text"]
+        .as_str()
+        .expect("bounded text")
+        .to_owned();
+    assert_eq!(
+        first_body["data"]["body"]["truncated"].as_bool(),
+        Some(true)
+    );
+    let cursor = first_body["data"]["body"]["next_cursor"]
+        .as_str()
+        .expect("continuation cursor")
+        .to_owned();
+    let rest = transcript("131072", Some(cursor.as_str()));
+    assert!(
+        rest.status.success(),
+        "continuation failed: {}",
+        stderr(&rest)
+    );
+    let rest_body: Json = serde_json::from_slice(&rest.stdout).expect("continuation JSON");
+    let rest_text = rest_body["data"]["body"]["text"]
+        .as_str()
+        .expect("continuation text");
+    assert_eq!(format!("{first_text}{rest_text}"), text);
 }
 
 #[tokio::test]
