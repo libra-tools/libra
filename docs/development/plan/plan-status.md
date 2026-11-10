@@ -1,3 +1,5 @@
+> **2026-11-10 main CI 复核：** `6a7727ded` 的 base run `42747183081` **8/8 job success**（`compat-rustfmt`、`opencode-export-sandbox-linux`、`compat-network-remotes`、`compat-offline-core`、`compat-redundancy`、`compat-scoped-input-windows`、`compat-owner-liveness-macos`、`compat-clippy`），覆盖 checkpoint 详情路由修复与全部新增 live selector；LTR-03 的 D 门据此登记。
+
 > **2026-11-10 LTR-04/05/07 关闭（Libra 实现卡全清）：** 15 个具名 live selector 以 `-j 1` **15/15 passed**（nextest `8a7804dc`，235.9s），含 HTTP/SSH 上传、隔离、epoch、clone 闭包、search→transcript、clean/new-stream、pin 校验；`live_bounded_transcript_cli` 证有界 16B + cursor 续读拼接等于全文；安装二进制 smoke 通过（`374b1d69`）。Libra 仅余 LTR-00（用户取消的历史卡）、LTR-08（待 LTR-09 H6 收据）、LTR-09（待 Mega2 MTR-29/H6）。
 
 > **2026-11-10 显式 fetch 家族关闭（LTR-06/16/17/18）：** lib 矩阵 2/2（`bbf3fa91`）、CLI 契约 3/3（`1ccab9ac`）、真实 fixture 3/3（`9beeeeec`，HTTP fetch、SSH by-scope、server_id/fingerprint 冲突与 pack 完整性）。Libra 计划仅余 LTR-04/05 的 live transcript 环境门。
