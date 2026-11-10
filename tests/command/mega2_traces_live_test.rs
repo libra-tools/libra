@@ -1085,23 +1085,104 @@ async fn live_metadata_query_cli() {
 #[ignore = "explicit real Mega2 fixture"]
 async fn live_keyword_search_cli() {
     let fixture = prepared();
-    let root = repo();
-    query(
+    let root = tempfile::tempdir().expect("root");
+    let stream = pushed_stream(root.path(), &fixture).await;
+    // The fixture indexes asynchronously; poll the mounted search until the
+    // seeded transcript is hit (bounded).
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut hit = None;
+    while std::time::Instant::now() < deadline {
+        let output = query(
+            root.path(),
+            &[
+                "search",
+                "--target",
+                fixture.target.as_str(),
+                "--stream",
+                stream.scope.as_str(),
+                "--query",
+                "live traces sentinel",
+            ],
+            &fixture,
+        );
+        let body: Json = serde_json::from_slice(&output.stdout).expect("search JSON");
+        if let Some(items) = body
+            .get("data")
+            .and_then(|data| data.get("body"))
+            .and_then(|body| body.get("items"))
+            .and_then(Json::as_array)
+            .filter(|items| !items.is_empty())
+        {
+            let item = &items[0];
+            assert!(item.get("checkpoint_id").is_some(), "{item}");
+            assert!(
+                item.get("occurrence_count")
+                    .and_then(Json::as_u64)
+                    .is_some_and(|count| count >= 1),
+                "{item}"
+            );
+            hit = Some(body);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let body = hit.expect("the seeded transcript must be searchable");
+    let coverage = body["data"]["body"]["coverage"].clone();
+    assert!(coverage.is_object(), "{coverage}");
+    // The mounted route needs a stream; the local refusal runs before network.
+    let refused = run(
         root.path(),
         &[
+            "--json",
+            "mega2",
+            "traces",
             "search",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
             "--target",
             fixture.target.as_str(),
             "--query",
-            "timeout",
+            "live",
         ],
-        &fixture,
+        &[],
     );
+    assert!(!refused.status.success());
+    // A filter the mounted route does not implement is refused locally too.
+    let unsupported = run(
+        root.path(),
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "search",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
+            "--target",
+            fixture.target.as_str(),
+            "--stream",
+            stream.scope.as_str(),
+            "--agent",
+            "codex",
+            "--query",
+            "live",
+        ],
+        &[],
+    );
+    assert!(!unsupported.status.success());
 }
 
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
 async fn live_bounded_transcript_cli() {
+    // Blocked on the fixture: the bounded transcript route reads the metadata
+    // projection, and this fixture does not ingest freshly pushed scopes
+    // (search indexes the object store directly, the DB projection lags).
+    // The bounded-read cursor contract is covered by the local contract tests;
+    // this selector stays ignored until a fixture with live ingestion exists.
     let fixture = prepared();
     let root = repo();
     query(
