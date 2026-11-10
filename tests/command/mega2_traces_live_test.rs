@@ -1114,20 +1114,74 @@ async fn live_target_resolve_navigation() {
     assert!(stderr(&missing).contains("404"), "{}", stderr(&missing));
 }
 
+/// Resolve the fixture target and return its first stream, so navigation live
+/// cases do not hardcode fixture UUIDs.
+fn first_stream(root: &Path, fixture: &LiveFixture) -> String {
+    let resolved = query(
+        root,
+        &["targets", "--path", fixture.target.as_str()],
+        fixture,
+    );
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    let target = body["data"]["body"]["target_id"]
+        .as_str()
+        .expect("resolved target id")
+        .to_string();
+    let streams = query(
+        root,
+        &["streams", "--target", target.as_str(), "--limit", "1"],
+        fixture,
+    );
+    let page: Json = serde_json::from_slice(&streams.stdout).expect("streams JSON");
+    page["data"]["body"]["items"][0]["stream_id"]
+        .as_str()
+        .expect("fixture stream")
+        .to_string()
+}
+
+fn first_session(root: &Path, fixture: &LiveFixture, stream: &str) -> String {
+    let sessions = query(
+        root,
+        &["sessions", "--stream", stream, "--limit", "1"],
+        fixture,
+    );
+    let page: Json = serde_json::from_slice(&sessions.stdout).expect("sessions JSON");
+    page["data"]["body"]["items"][0]["session_id"]
+        .as_str()
+        .expect("fixture session")
+        .to_string()
+}
+
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
 async fn live_target_stream_navigation() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let resolved = query(
         root.path(),
         &["targets", "--path", fixture.target.as_str()],
         &fixture,
     );
-    query(
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    let target = body["data"]["body"]["target_id"]
+        .as_str()
+        .expect("resolved target id")
+        .to_string();
+    let streams = query(
         root.path(),
-        &["streams", "--target", "pending-from-resolve"],
+        &["streams", "--target", target.as_str(), "--limit", "1"],
         &fixture,
+    );
+    let page: Json = serde_json::from_slice(&streams.stdout).expect("streams JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "streams must return one page: {page}"
+    );
+    assert!(
+        page["data"]["body"]
+            .get("next_cursor")
+            .is_some_and(|value| value.is_null() || value.is_string()),
+        "{page}"
     );
 }
 
@@ -1136,15 +1190,22 @@ async fn live_target_stream_navigation() {
 async fn live_session_navigation() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let session = first_session(root.path(), &fixture, stream.as_str());
+    let listing = query(
         root.path(),
-        &[
-            "sessions",
-            "--stream",
-            "00000000-0000-4000-8000-000000000000",
-        ],
+        &["sessions", "--stream", stream.as_str(), "--limit", "1"],
         &fixture,
     );
+    let page: Json = serde_json::from_slice(&listing.stdout).expect("sessions JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "sessions must return one page: {page}"
+    );
+    // The fixture derives sessions from metadata it has not ingested, so this
+    // listing can expose synthetic ids that the detail route does not resolve.
+    // Session detail is covered by the local navigation contract.
+    assert!(!session.is_empty());
 }
 
 #[tokio::test]
@@ -1152,18 +1213,24 @@ async fn live_session_navigation() {
 async fn live_session_time_filter() {
     let fixture = prepared();
     let root = repo();
-    query(
+    let stream = first_stream(root.path(), &fixture);
+    let output = query(
         root.path(),
         &[
             "sessions",
             "--stream",
-            "00000000-0000-4000-8000-000000000000",
+            stream.as_str(),
             "--since",
-            "2026-11-02T00:00:00Z",
+            "2000-01-01T00:00:00Z",
             "--until",
-            "2026-11-03T00:00:00Z",
+            "2100-01-01T00:00:00Z",
         ],
         &fixture,
+    );
+    let page: Json = serde_json::from_slice(&output.stdout).expect("sessions JSON");
+    assert!(
+        page["data"]["body"]["items"].is_array(),
+        "time filter must return a page: {page}"
     );
 }
 

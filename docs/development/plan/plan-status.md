@@ -1,3 +1,5 @@
+> **2026-11-10 LTR-14/15/20 关闭：** streams、sessions、session 时间筛选导航三卡全部勾选。本地 4/4 契约通过（run `dc4b1cf3`）；三条 live selector 改为真实发现（target→stream→session），`live_target_stream_navigation`（`2db194b0`）与 `live_session_navigation`/`live_session_time_filter`（`7ea3f305`）均通过。fixture 未 ingest metadata 时 session 详情 404，属已知环境边界，详情由本地契约覆盖。
+
 > **2026-11-10 LTR-19 关闭：** capabilities/`--require-search` 的 10 项检查全勾选。本地契约补布尔 `true` 成功路径并断言只访问 `/capabilities`；真实 fixture 两条 selector 2/2 通过（nextest `a736012f`）。
 
 > **2026-11-10 LTR-24 关闭：** targets resolve 的 6 AC/2 VER 全勾选。本地契约扩展（非规范路径本地拒绝、尾斜杠归一、404 fail-closed）通过；新增 `live_target_resolve_navigation` 真实 fixture 通过（12.0s，nextest `eb4412c3`），未知路径 404 且不建 scope。
