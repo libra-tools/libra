@@ -1,3 +1,5 @@
+> **2026-11-10 显式 fetch 家族关闭（LTR-06/16/17/18）：** lib 矩阵 2/2（`bbf3fa91`）、CLI 契约 3/3（`1ccab9ac`）、真实 fixture 3/3（`9beeeeec`，HTTP fetch、SSH by-scope、server_id/fingerprint 冲突与 pack 完整性）。Libra 计划仅余 LTR-04/05 的 live transcript 环境门。
+
 > **2026-11-10 LTR-03/LTR-13 关闭；checkpoint 详情路由修复：** `show --checkpoint` 原用不存在的 `/streams/{stream}/checkpoints/{id}`（真实 fixture 404），现解析所属 session 后改走 `/streams/{stream}/sessions/{session}/checkpoints/{id}`；两 flag 仍互斥。本地契约通过；`live_metadata_query_cli`（`26c1e9c0`）与 capabilities 两条 live（`a736012f`）全通过。
 
 > **2026-11-10 LTR-14/15/20 关闭：** streams、sessions、session 时间筛选导航三卡全部勾选。本地 4/4 契约通过（run `dc4b1cf3`）；三条 live selector 改为真实发现（target→stream→session），`live_target_stream_navigation`（`2db194b0`）与 `live_session_navigation`/`live_session_time_filter`（`7ea3f305`）均通过。fixture 未 ingest metadata 时 session 详情 404，属已知环境边界，详情由本地契约覆盖。
