@@ -1,3 +1,5 @@
+> **2026-11-10 LTR-24 关闭：** targets resolve 的 6 AC/2 VER 全勾选。本地契约扩展（非规范路径本地拒绝、尾斜杠归一、404 fail-closed）通过；新增 `live_target_resolve_navigation` 真实 fixture 通过（12.0s，nextest `eb4412c3`），未知路径 404 且不建 scope。
+
 > **2026-11-10 LTR-02 关闭：** `live_code_clone_isolation` 扩展为可证伪隔离门并通过（17.7s，nextest `236dcacb`）：无 traces ref；sentinel commit/tree/blob 在 code clone 中不可读；固定代码再增 traces checkpoint 后两次 clone 的对象集合逐 OID 相等，证明 traces 不进入 code view 闭包。
 
 > **2026-11-10 LTR-25 关闭：** search 本地准入 7 AC + 3 VER 全部取得证据。`<search_argument_bounds>`（lib，0.02s）与 `search_local_admission_contract`（0.32s）复跑 1 passed；新增 `live_search_local_admission` 真实 fixture 通过（13.9s，nextest `acebfe04`）：0/257 字节拒绝且未发请求，1/256 字节真实到达服务；文档中英双语已载明 1..256 UTF-8 bytes 契约。D 门由 `v0.30.168` 发布覆盖。

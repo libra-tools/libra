@@ -233,12 +233,14 @@ fn target_resolve_navigation_contract() {
             path.contains("path=%2Fproject%2Ffoo") || path.contains("path=/project/foo"),
             "{path}"
         );
+        assert!(!path.contains("%2F%2F"), "path must be canonical: {path}");
         (
             200,
             r#"{"target_id":"target-1","path":"/project/foo"}"#.to_string(),
         )
     });
     let root = tempfile::tempdir().expect("root");
+    let server = format!("http://127.0.0.1:{port}");
     let output = run_libra_command(
         &[
             "--json",
@@ -246,7 +248,7 @@ fn target_resolve_navigation_contract() {
             "traces",
             "targets",
             "--server",
-            &format!("http://127.0.0.1:{port}"),
+            &server,
             "--token",
             "test-token",
             "--path",
@@ -260,6 +262,74 @@ fn target_resolve_navigation_contract() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("target-1"));
+    // The shared normalization rule trims one trailing slash.
+    let trimmed = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--path",
+            "/project/foo/",
+        ],
+        root.path(),
+    );
+    assert!(
+        trimmed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trimmed.stderr)
+    );
+    // Non-canonical input is refused before any request.
+    let refused = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--path",
+            "/project//foo",
+        ],
+        root.path(),
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not canonical"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Unknown and unauthorized targets both surface as 404; the client must
+    // fail instead of inventing a target.
+    let (missing_port, _) = serve(|path, _| {
+        assert!(path.contains("/targets/resolve"), "{path}");
+        (404, r#"{"code":"unknown_target"}"#.to_string())
+    });
+    let missing = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &format!("http://127.0.0.1:{missing_port}"),
+            "--token",
+            "test-token",
+            "--path",
+            "/project/missing",
+        ],
+        root.path(),
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("404"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 }
 
 #[test]

@@ -1079,6 +1079,43 @@ async fn live_search_readiness_preflight() {
 
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
+async fn live_target_resolve_navigation() {
+    let fixture = prepared();
+    let root = repo();
+    let resolved = query(
+        root.path(),
+        &["targets", "--path", fixture.target.as_str()],
+        &fixture,
+    );
+    let body: Json = serde_json::from_slice(&resolved.stdout).expect("target JSON");
+    assert!(
+        body["data"]["body"]["target_id"].is_string(),
+        "resolve must return the existing target: {body}"
+    );
+    // Resolving an unknown path must not create a scope; the fixture answers
+    // 404 and the CLI fails.
+    let missing = run(
+        root.path(),
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            fixture.http_url.as_str(),
+            "--token-file",
+            fixture.token_file.to_str().expect("token path"),
+            "--path",
+            "/project/target-that-does-not-exist",
+        ],
+        &[],
+    );
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("404"), "{}", stderr(&missing));
+}
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
 async fn live_target_stream_navigation() {
     let fixture = prepared();
     let root = repo();
