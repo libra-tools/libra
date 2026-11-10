@@ -1083,6 +1083,65 @@ async fn live_metadata_query_cli() {
 
 #[tokio::test]
 #[ignore = "explicit real Mega2 fixture"]
+async fn live_search_local_admission() {
+    let fixture = prepared();
+    let root = tempfile::tempdir().expect("root");
+    let stream = pushed_stream(root.path(), &fixture).await;
+    let search = |query: &str| {
+        run(
+            root.path(),
+            &[
+                "--json",
+                "mega2",
+                "traces",
+                "search",
+                "--server",
+                fixture.http_url.as_str(),
+                "--token-file",
+                fixture.token_file.to_str().expect("token path"),
+                "--target",
+                fixture.target.as_str(),
+                "--stream",
+                stream.scope.as_str(),
+                "--query",
+                query,
+            ],
+            &[],
+        )
+    };
+    // Invalid bounds are refused before the network. The in-process observer
+    // that counts requests lives in the local contract test; this live case
+    // proves the refusal text and exit status with the real endpoint args.
+    for query in ["", &"b".repeat(257)] {
+        let refused = search(query);
+        assert!(!refused.status.success(), "{}", query.len());
+        assert!(
+            stderr(&refused).contains("was not sent"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    // Valid bounds reach the real service.
+    for query in ["a", &"c".repeat(256)] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let output = search(query);
+            if output.status.success() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "valid {} byte query never reached the service: {}",
+                query.len(),
+                stderr(&output)
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "explicit real Mega2 fixture"]
 async fn live_keyword_search_cli() {
     let fixture = prepared();
     let root = tempfile::tempdir().expect("root");
