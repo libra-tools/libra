@@ -21,6 +21,18 @@ libra add -N [PATHSPEC...]
 
 符号链接会按 Git 兼容的 symlink blob 暂存：索引 mode 为 `120000`，blob 内容为链接目标字节。暂存时不会跟随链接，因此指向工作树外部的 symlink 也只会被记录为链接本身，而不会读取目标文件内容。
 
+### 行尾转换
+
+普通文件显式设置 `text`（可搭配 `eol=lf` 或 `eol=crlf`）时，暂存到索引的内容会把
+CRLF 转成 LF。未设置 `text` 时，单独的 `eol` 也会启用该转换。例如，
+`*.ps1 text eol=crlf` 会保留工作文件中的 CRLF 字节，同时暂存 LF blob。
+孤立的 CR 和缺失的末尾换行保持原样；`add` 不改写工作文件。
+
+`-text` 禁用该转换。LFS 指针生成和符号链接目标字节保持各自语义。
+自动 `text=auto` 转换、`core.autocrlf` 配置回退、`core.safecrlf` 和自定义
+clean/smudge 过滤器仍不支持。读取文件或属性来源失败时会报告错误；未指定
+`--ignore-errors` 时，不会保存部分更新的索引。
+
 ## 选项
 
 ### `[PATHSPEC...]`
@@ -166,7 +178,8 @@ libra add --chmod=-x notes.txt
 ### `--renormalize`
 
 从头重新暂存已跟踪文件，即使内容未变也重写其 blob。隐含 `-u`：只处理已跟踪文件（绝不处理
-未跟踪文件）；从工作区删除的已跟踪文件会被暂存为删除。
+未跟踪文件）；从工作区删除的已跟踪文件会被暂存为删除。即使文件 stat 未变，也重新应用
+当前显式 `text`/`eol` 规则；已有 blob 对象和工作文件字节保持不变。
 
 ```bash
 libra add --renormalize

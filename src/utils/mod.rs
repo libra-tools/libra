@@ -49,4 +49,5 @@ pub(crate) mod windows_fs;
 pub(crate) mod windows_process;
 pub mod worktree;
 pub mod worktree_blob;
+pub(crate) mod worktree_conversion;
 pub mod worktree_layout;

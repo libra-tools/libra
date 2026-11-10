@@ -20,6 +20,275 @@ use sea_orm::{ConnectionTrait, Statement};
 
 use super::*;
 
+fn i1062_command(repo: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let home = repo.parent().unwrap().join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_libra"));
+    command
+        .args(args)
+        .current_dir(repo)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env_remove("RUST_LOG")
+        .env_remove("LIBRA_LOG");
+    command
+}
+
+fn i1062_run(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    i1062_command(repo, args).output().unwrap()
+}
+
+fn i1062_ok(repo: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let output = i1062_run(repo, args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    output.stdout
+}
+
+fn i1062_index_oid(repo: &std::path::Path, path: &str) -> String {
+    String::from_utf8(i1062_ok(repo, &["ls-files", "--stage", "--", path]))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn i1062_explicit_add_normalizes_without_rewriting_worktree() {
+    use git_internal::{hash::HashKind, internal::index::Index, utils::HashAlgorithm};
+
+    for (format, kind) in [("sha1", HashKind::Sha1), ("sha256", HashKind::Sha256)] {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        i1062_ok(&repo, &["init", "--object-format", format]);
+        fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"one\r\ntwo\r\n", b"one\ntwo\n"),
+            (b"one\r\ntwo\n", b"one\ntwo\n"),
+            (b"one\ntwo\n", b"one\ntwo\n"),
+            (b"one\rtwo\r\nend", b"one\rtwo\nend"),
+            (b"\0one\r\ntwo\r", b"\0one\ntwo\r"),
+        ];
+        for (number, (input, clean)) in cases.iter().enumerate() {
+            let path = format!("case-{number}.ps1");
+            fs::write(repo.join(&path), input).unwrap();
+            i1062_ok(&repo, &["add", &path]);
+            let oid = i1062_index_oid(&repo, &path);
+            assert_eq!(i1062_ok(&repo, &["cat-file", "-p", &oid]), *clean);
+            assert_eq!(fs::read(repo.join(&path)).unwrap(), *input);
+            let index = Index::load_with_hash_kind(kind, repo.join(".libra/index")).unwrap();
+            assert_eq!(index.get(&path, 0).unwrap().size, input.len() as u32);
+            assert_eq!(
+                String::from_utf8(i1062_ok(&repo, &["cat-file", "-s", &oid]))
+                    .unwrap()
+                    .trim(),
+                clean.len().to_string()
+            );
+            let mut hash = HashAlgorithm::new_for_kind(kind);
+            hash.update(format!("blob {}\0", clean.len()).as_bytes());
+            hash.update(clean);
+            assert_eq!(oid, hex::encode(hash.finalize()), "{format}: {path}");
+        }
+    }
+}
+
+#[test]
+fn i1062_explicit_rules_preserve_unset_auto_lfs_and_symlinks() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.ps1 text eol=crlf\nraw.ps1 -text eol=crlf\nauto.ps1 text=auto eol=lf\neol.txt eol=lf\nlfs.ps1 filter=lfs text eol=crlf\n",
+    )
+    .unwrap();
+    let input = b"one\r\ntwo\r\n";
+    for (path, expected) in [
+        ("raw.ps1", input.as_slice()),
+        ("auto.ps1", input.as_slice()),
+        ("plain.txt", input.as_slice()),
+        ("eol.txt", b"one\ntwo\n".as_slice()),
+    ] {
+        fs::write(repo.join(path), input).unwrap();
+        i1062_ok(&repo, &["add", path]);
+        let oid = i1062_index_oid(&repo, path);
+        assert_eq!(i1062_ok(&repo, &["cat-file", "-p", &oid]), expected);
+        assert_eq!(fs::read(repo.join(path)).unwrap(), input);
+    }
+    fs::write(repo.join("lfs.ps1"), input).unwrap();
+    i1062_ok(&repo, &["add", "lfs.ps1"]);
+    let oid = i1062_index_oid(&repo, "lfs.ps1");
+    let pointer = i1062_ok(&repo, &["cat-file", "-p", &oid]);
+    assert!(pointer.starts_with(b"version https://git-lfs.github.com/spec/v1\n"));
+    assert!(pointer.ends_with(b"size 10\n"));
+    assert_eq!(fs::read(repo.join("lfs.ps1")).unwrap(), input);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("target\r\n", repo.join("link.ps1")).unwrap();
+        i1062_ok(&repo, &["add", "link.ps1"]);
+        let oid = i1062_index_oid(&repo, "link.ps1");
+        assert_eq!(i1062_ok(&repo, &["cat-file", "-p", &oid]), b"target\r\n");
+    }
+}
+
+#[test]
+fn i1062_explicit_existing_index_and_renormalize_keep_historical_blob() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    let clean_oid = i1062_index_oid(&repo, "probe.ps1");
+    fs::write(repo.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    assert_eq!(i1062_index_oid(&repo, "probe.ps1"), clean_oid);
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    fs::write(repo.join("history.ps1"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "history.ps1"]);
+    let historical = i1062_index_oid(&repo, "history.ps1");
+    assert_ne!(historical, clean_oid);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    i1062_ok(&repo, &["add", "--renormalize", "history.ps1"]);
+    assert_eq!(i1062_index_oid(&repo, "history.ps1"), clean_oid);
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", &historical]),
+        b"one\r\ntwo\r\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("history.ps1")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+}
+
+#[test]
+fn i1062_explicit_patch_stages_clean_hunks_and_preserves_source() {
+    use std::process::Stdio;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    let input = b"one\r\nchanged\r\n";
+    fs::write(repo.join("probe.ps1"), input).unwrap();
+    let mut child = i1062_command(&repo, &["add", "-p", "--auto-advance", "probe.ps1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let oid = i1062_index_oid(&repo, "probe.ps1");
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", &oid]),
+        b"one\nchanged\n"
+    );
+    assert_eq!(fs::read(repo.join("probe.ps1")).unwrap(), input);
+}
+
+#[test]
+fn i1062_explicit_add_updates_git_prepared_index() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output.stdout
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    fs::write(repo.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--no-verify",
+        "-m",
+        "base",
+    ]);
+    let original = String::from_utf8(git(&["rev-parse", ":probe.ps1"])).unwrap();
+    i1062_ok(&repo, &["init", "--from-git-repository", "."]);
+    assert_eq!(i1062_index_oid(&repo, "probe.ps1"), original.trim());
+    fs::write(repo.join("probe.ps1"), b"one\r\nchanged\r\n").unwrap();
+    i1062_ok(&repo, &["add", "probe.ps1"]);
+    let oid = i1062_index_oid(&repo, "probe.ps1");
+    assert_ne!(oid, original.trim());
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", &oid]),
+        b"one\nchanged\n"
+    );
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", original.trim()]),
+        b"one\ntwo\n"
+    );
+    assert_eq!(
+        fs::read(repo.join("probe.ps1")).unwrap(),
+        b"one\r\nchanged\r\n"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn i1062_conversion_failure_preserves_index_and_names_attribute_source() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path();
+    test::setup_with_new_libra_in(repo).await;
+    let _guard = test::ChangeDirGuard::new(repo);
+    fs::write(repo.join("seed.txt"), b"seed\n").unwrap();
+    add::execute_safe(
+        AddArgs {
+            pathspec: vec!["seed.txt".to_owned()],
+            ..Default::default()
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .unwrap();
+    let before = fs::read(repo.join(".libra/index")).unwrap();
+    fs::create_dir_all(repo.join("nested/.gitattributes")).unwrap();
+    fs::write(repo.join("good.txt"), b"good\n").unwrap();
+    fs::write(repo.join("nested/bad.ps1"), b"bad\r\n").unwrap();
+    let error = add::execute_safe(
+        AddArgs {
+            pathspec: vec!["good.txt".to_owned(), "nested/bad.ps1".to_owned()],
+            ..Default::default()
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains(".gitattributes"), "{error}");
+    assert!(error.contains("not a regular attributes file"), "{error}");
+    assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), before);
+    assert_eq!(fs::read(repo.join("nested/bad.ps1")).unwrap(), b"bad\r\n");
+}
+
 /// Scenario: smoke test for the simplest staging path — create one file,
 /// run `add`, and confirm the path appears in the staged "new" set.
 #[tokio::test]

@@ -31,6 +31,20 @@ Symbolic links are staged as Git-compatible symlink blobs: the index mode is
 followed while staging, so a symlink pointing outside the worktree is recorded
 as the link itself rather than as the target file's contents.
 
+### Line endings
+
+For regular files, an explicit `text` attribute (optionally with `eol=lf` or
+`eol=crlf`) stores CRLF pairs as LF in the index. An `eol` attribute also enables
+this conversion when `text` is unspecified. For example, `*.ps1 text eol=crlf`
+keeps the working file's CRLF bytes while staging an LF blob. Lone CR bytes and
+a missing final newline are preserved; `add` does not rewrite the working file.
+
+`-text` disables this conversion. LFS pointer generation and symlink target bytes
+retain their own representation. Automatic `text=auto` conversion, configuration
+fallback through `core.autocrlf`, `core.safecrlf`, and custom clean/smudge filters
+remain unsupported. Reading a file or its attribute sources can fail; without
+`--ignore-errors`, the command does not save a partially updated index.
+
 ## Options
 
 ### `[PATHSPEC...]`
@@ -232,7 +246,9 @@ libra add --chmod=-x notes.txt
 
 Re-stage tracked files from scratch, rewriting their blobs even when the content is
 unchanged. Implies `-u`: only tracked files are processed (never untracked ones), and
-a tracked file removed from the working tree has its deletion staged.
+a tracked file removed from the working tree has its deletion staged. The current
+explicit `text`/`eol` rules are reapplied even when file stat data is unchanged.
+Existing blob objects and working file bytes are preserved.
 
 ```bash
 libra add --renormalize

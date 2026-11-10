@@ -440,6 +440,117 @@ pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeS
     states
 }
 
+/// Resolve attributes for a blob write without treating a failed source read
+/// as an absent rule. Source precedence and parsing match the ordinary reader;
+/// worktree sources are opened beneath one pinned worktree root.
+pub(crate) fn try_all_attribute_states_beneath(
+    workdir: &Path,
+    root: &fs::File,
+    relative: &Path,
+) -> io::Result<BTreeMap<String, AttributeState>> {
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attribute lookup requires a canonical relative file path",
+        ));
+    }
+    let absolute = workdir.join(relative);
+    let mut sources = Vec::new();
+    if let Some(configured) = util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir)
+    {
+        sources.push(AttributeSource {
+            path: configured,
+            base: workdir.to_path_buf(),
+        });
+    }
+    for directory in attribute_dirs(workdir, &absolute) {
+        for name in [GIT_ATTRIBUTES_FILE, LIBRA_ATTRIBUTES_FILE] {
+            sources.push(AttributeSource {
+                path: directory.join(name),
+                base: directory.clone(),
+            });
+        }
+    }
+    for path in util::worktree_info_file_paths(workdir, "attributes") {
+        sources.push(AttributeSource {
+            path,
+            base: workdir.to_path_buf(),
+        });
+    }
+    let mut states = BTreeMap::new();
+    for source in sources {
+        let contents = if let Ok(relative) = source.path.strip_prefix(workdir) {
+            read_strict_attribute_source(root, relative)
+        } else {
+            // An explicitly configured external file is its own capability;
+            // worktree attribute rules cannot choose an external source.
+            let parent = source.path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "attributes file has no parent")
+            })?;
+            let name = source.path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "attributes file has no name")
+            })?;
+            match crate::utils::beneath::open_root(parent) {
+                Ok(external_root) => read_strict_attribute_source(&external_root, Path::new(name)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "read attributes source '{}': {error}",
+                    source.path.display()
+                ),
+            )
+        })?;
+        let Some(contents) = contents else {
+            continue;
+        };
+        for rule in parse_attribute_contents(&String::from_utf8_lossy(&contents), &source.base) {
+            if !attribute_rule_matches_file(&rule, &absolute) {
+                continue;
+            }
+            for assignment in rule.assignments {
+                if assignment.state == AttributeState::Unspecified {
+                    states.remove(&assignment.name);
+                } else {
+                    states.insert(assignment.name, assignment.state);
+                }
+            }
+        }
+    }
+    Ok(states)
+}
+
+fn read_strict_attribute_source(root: &fs::File, source: &Path) -> io::Result<Option<Vec<u8>>> {
+    let stat = match crate::utils::beneath::lstat_beneath(root, source) {
+        Ok(stat) => stat,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !stat.is_file {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular attributes file; replace it with a readable regular file",
+        ));
+    }
+    read_regular_beneath_attribute_source(root, source).map(|(contents, _)| Some(contents))
+}
+
 pub fn is_lfs_tracked(path: &Path) -> bool {
     matches!(
         attribute_state_for_path("filter", path),

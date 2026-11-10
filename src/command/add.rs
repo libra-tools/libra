@@ -39,7 +39,6 @@ use serde::Serialize;
 use crate::{
     command::{
         diff::{DiffAlgorithm, compute_unified_hunks},
-        read_worktree_blob_bytes,
         status::{self, Changes},
     },
     internal::{
@@ -55,7 +54,7 @@ use crate::{
         output::{self, OutputConfig},
         path,
         pathspec::{PathspecError, PathspecSet},
-        util,
+        util, worktree_conversion,
     },
 };
 
@@ -1091,9 +1090,11 @@ fn collect_patch_candidate(
     let new_bytes = if deleted {
         Vec::new()
     } else {
-        read_worktree_blob_bytes(&abs).map_err(|source| AddError::CreateIndexEntry {
-            path: rel.to_path_buf(),
-            source,
+        worktree_conversion::read_clean_blob_bytes(&abs).map_err(|source| {
+            AddError::CreateIndexEntry {
+                path: rel.to_path_buf(),
+                source,
+            }
         })?
     };
     let new_mode = if deleted {
@@ -3028,10 +3029,10 @@ fn check_file_status(
 /// Generate a `Blob` from a file.
 ///
 /// Functional scope:
-/// - Reads the exact bytes Git would store for a worktree blob: regular file
-///   content, generated LFS pointer content, or symlink target bytes.
+/// - Reads the stored representation: explicit text/eol conversion for regular
+///   files, generated LFS pointer content, or unconverted symlink target bytes.
 fn gen_blob_from_file(path: impl AsRef<Path>) -> io::Result<Blob> {
-    read_worktree_blob_bytes(path).map(Blob::from_content_bytes)
+    worktree_conversion::read_clean_blob_bytes(path).map(Blob::from_content_bytes)
 }
 
 #[cfg(test)]

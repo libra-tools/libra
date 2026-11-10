@@ -4,6 +4,18 @@
 
 `libra add` 的目标是把工作区中的文件变化写入索引，为下一次 `libra commit` 准备快照。实现需要覆盖路径规格、忽略规则、`--dry-run` 预览、`--refresh` 重新检查已跟踪条目、`-A` 全量暂存以及 LFS 指针文件暂存，同时保证路径解析不会越过仓库根目录。
 
+### 显式 text/eol 的存储语义
+
+普通 add、交互暂存的工作区输入及 `--renormalize` 通过共享 worktree_conversion
+读取原语应用显式 `text`/`eol` 策略，仅将成对 CRLF 转为 LF，保持孤立 CR、其它字节和
+末尾换行状态。索引 stat 仍描述磁盘文件，blob OID 按转换后字节及其长度计算；历史对象
+和源文件只读。`-text`、尚未启用的 `text=auto`、无转换规则、LFS 与 symlink 各保留既有
+语义。属性来源读取失败不得当作未设置规则；默认 add 失败不发布部分 index，显式
+`--ignore-errors` 继续沿用逐文件失败语义。
+
+验证覆盖 `command_test::command::add_test::i1062_explicit_` 的真实 CLI、SHA-1/SHA-256、
+历史对象与工作区不变，以及 `i1062_conversion_failure_` 的索引原子性和错误说明。
+
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。sparse-checkout flag unsupported
