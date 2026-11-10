@@ -1202,6 +1202,8 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 `issues/` 目录每份文件通常对应一个 GitHub Issue，是独立的可执行计划；`600` 是历史合并 PR 的追溯入口，复用日期计划中的既有完成卡，不新增实现任务。`474`/`477`/`486`/`497`/`498`/`500`/`574`/`577`/`582` 已收口、放弃或关闭、`476` 执行中（用户 2026-09-20 覆盖：执行期间不调用 Codex/Claude 评审）。其余多为设计计划。状态列取值同上。
 
+#541–#576 本轮新增草稿状态快照：2026-11-08 07:35:38 UTC。计划评审与实际实施验收分开记录；新增任务卡尚无实施或发布结果。上游 main 已快进至 `07bffa6885604553babc45d2148c3fe53341e868`；审查收据仅适用于受审计划内容，后续修订须再审。
+
 | 计划 | Issue 主题 | 状态 | 任务卡 |
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
@@ -1252,6 +1254,26 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/538.md`](issues/538.md) | `rev-list` 选项拒绝、修订输入、对象遍历与 cherry 语义对齐 Git（#538：计数文法与 `--disk-usage` 文案、`--[no-]object-names`/`--header`/`-z`、修订/路径消歧、`--not`/ref 伪选项/`--exclude`/`--exclude-hidden`、非提交起点、`--indexed-objects`、`--in-commit-order`、`--filter`、cherry 的 pathspec 判等与标记、`--full-history`、`--ancestry-path`、`--use-bitmap-index`/`--unpacked` 分类） | 未启动（计划评审 Codex R9 PASS；2026-11-04 18:50:08 UTC） | RL-01..RL-20（20 卡：19 implementation 各自独立发布、1 audit RL-18；全串行，链 RL-01→RL-19→RL-02→RL-03→RL-04→RL-06→RL-05→RL-07→…→RL-17→RL-20→RL-18，收口点 CLOSE-538）；除 RL-11、RL-18 外 18 张卡受门族型 waiver EX-RL-01（待 genedna 批准）门控；`--missing` 移交 #747（DEP-RL-02），`--disk-usage` 计量归 issues/478 LG-23（DEP-RL-01） |
 | [`issues/539.md`](issues/539.md) | `rev-parse` 单修订模式解析未写入对象 ID 对齐 Git（#539 场景 1；同轴吸收 #839；场景 2 普通名字已不复现、归属其它 issue；未支持形式公开归类） | 未启动（计划评审 Codex R4 PASS、R5/R6 差异确认 PASS；2026-11-04 17:41:54 UTC） | RP-00..RP-02（3 卡：1 docs、1 implementation 独立发布且 T-1、1 audit；全串行，收口点 CLOSE-539）；RP-01 受 EX-RP-01（待 genedna 批准）门控；与 issues/537 CF-03 同写 `rev_parse.rs`/`rev-parse` 文档/`COMPATIBILITY.md:217`（DEP-RP-01） |
 | [`issues/540.md`](issues/540.md) | `update-index` 对齐 Git（#540：`--cacheinfo` 三参数旧式与参数语法、mode 规范化、`--verbose` 报告、保存前拒绝全零 oid、重新暂存清除 intent-to-add、`--again`；`--assume-unchanged`/`--unresolve` 显式延后，#540 保持 OPEN） | 未启动（计划评审 Codex R10 PASS；2026-11-04 19:11:25 UTC） | UX-01..UX-07（7 卡：6 implementation 各自独立发布且均 T-1、1 audit；全串行 UX-01→UX-06→UX-07→UX-02→UX-03→UX-04→UX-05，收口点 CLOSE-540）；EX-UX-01 门族 waiver（UX-01/02/04/06）待 genedna 批准 |
+| [`issues/541.md`](issues/541.md) | `update-ref` 剩余兼容场景 | 草稿修订中；实施未启动 | R1 Claude `FAIL`；引用事务、跨计划交接、粒度与最终测试树仍需闭合。 |
+| [`issues/542.md`](issues/542.md) | `ls-files` 兼容场景 | 草稿修订中；实施未启动 | R1 Claude `FAIL`；格式原子、复跑与路径匹配投影待修订。 |
+| [`issues/543.md`](issues/543.md) | `read-tree` 兼容场景 | 草稿修订中；实施未启动 | R1 Claude `FAIL`；覆盖数据恢复、上游案例清单与状态、测试选择及跨仓交付待修订。 |
+| [`issues/544.md`](issues/544.md) | `diff-files` 兼容场景 | 草稿修订中；实施未启动 | R1、R2、R3 Claude `FAIL`；需重计独立谓词并修订组合输出发布边界、收口承载和网站交付，原始案例及未知选项仍待交接。 |
+| [`issues/545.md`](issues/545.md) | `archive` 兼容场景 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，REL 承载和七项拟议例外（均未批准）仍须核实，上游承接与复跑证据仍缺失。 |
+| [`issues/546.md`](issues/546.md) | `apply` 兼容场景 | 草稿修订中；实施未启动 | R1、R2 Claude `FAIL`；组合参数顺序、安全边界与收口待修订。 |
+| [`issues/547.md`](issues/547.md) | `am` 兼容场景 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，retry 仍依赖未获批拟申请与上游证据。 |
+| [`issues/548.md`](issues/548.md) | `blame` 兼容场景 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，六项拟议例外均未获批，原始调用清单和双轨适配器仍待落实。 |
+| [`issues/549.md`](issues/549.md) | `config` 兼容场景 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，三项拟议例外均未获批，#557 交接及权威案例仍待确认。 |
+| [`issues/550.md`](issues/550.md) | `init` 工作区符号链接处理 | 草稿已审（Claude R3 PASS，2026-11-08 07:16:08 UTC）；实施未启动 | 当前稿 SHA-256 `ce65bd95b608b405f88a823bf1d9b40495380f21af6b81190d477543fbd1624d`；四项白名单例外均待具名批准，原始 36 项和现实跑证据仍为未来执行前置。 |
+| [`issues/551.md`](issues/551.md) | `sparse-checkout` 兼容分类 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，EX-SC-01 待具名批准，真实 28 项复跑证据仍须取得。 |
+| [`issues/552.md`](issues/552.md) | `submodule` 兼容分类 | 草稿修订中；实施未启动 | R1、R2、R3 Claude `FAIL`；测试结果归因、实际复跑证据、全局参数定位和网站部署待修订；EX-SM-01 与原始 14 项权威清单仍待取得。 |
+| [`issues/553.md`](issues/553.md) | `for-each-ref` 兼容场景 | 草稿修订中；实施未启动 | R1、R2 Claude `FAIL`；共享读取器、分页边界与收口待修订。 |
+| [`issues/554.md`](issues/554.md) | `merge-file` 兼容场景 | 草稿修订中；实施未启动 | R1、R2 Claude `FAIL`；对象卡粒度、独立恢复及收口待修订。 |
+| [`issues/555.md`](issues/555.md) | `diff-tree` 兼容场景 | 草稿修订中；实施未启动 | R1、R2 Claude `FAIL`；需修订单提交行为边界、粒度、网站交付及收口承载；与 #544 的交接待双方稳定确认，上游复跑尚未取得。 |
+| [`issues/556.md`](issues/556.md) | 非 HEAD 符号引用 | 草稿修订中；实施未启动 | R1 Claude `FAIL`；存储、迁移、粒度及与 #541 的交接待复审。 |
+| [`issues/557.md`](issues/557.md) | 全局 `-c` 配置覆盖 | 草稿评审中；实施未启动 | R1、R2 Claude `FAIL`；R3 正在审查，reader/消费者映射和 #549 拟交付用例仍须双方确认。 |
+| [`issues/560.md`](issues/560.md) | SSH 主机密钥确认 | 草稿评审中；实施未启动 | R1、R3 Claude `FAIL`；R4 正在审查，R2 PASS 仅绑定旧稿；六卡 pending，协调登记与写者互斥尚待确认。 |
+| [`issues/573.md`](issues/573.md) | 测试与审查规范一致性 | 草稿修订中；实施未启动 | R1、R2、R3、R4 Claude `FAIL`；审计语义、测试实际运行证明及 DEP-573-06 的本地证据闭环待修订。 |
+| [`issues/576.md`](issues/576.md) | OpenCode 2.x 插件兼容 | 草稿已审（Claude R4 PASS，2026-11-08 07:35:38 UTC）；实施未启动 | 当前稿 SHA-256 `e5ed1665864abbad4245145e95dac0b43016c07a300a31167b72299e42dc5e30`；真实运行时 ingress 与正常 shutdown 仍为未执行。 |
 | [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | **已收口（v0.30.28）** | CLH-01 `done`/`complete`（诊断）、CLH-02 `done`/`complete`（修复 + 回归守卫 + 文档/版本面/发布；收口二维均满足——**②** 全量 **9522/9522 全绿**（上游 #612 修复 `opencode_export` bwrap probe 与 `history::cleanup_helper_guard`）＋ **③** 后续发布 **`v0.30.28`**（release 成功，4 平台）收口 `v0.30.2` 的 ER-14 门——见 `ENV-496-01`/`EX-496-01`）；根因 ADR-CLH-01（`local_client.rs` 旧 `encode_pack_bytes` 先喂满有界输入通道再排空有界输出通道的循环等待）；已复用 `pack_writer::encode_pack_bytes`，新增 pack_writer 单元回归 + clone 集成回归；文档/`COMPATIBILITY.md` 同步，`../libra-backend`（Libra 仓库，`cf` 分支，提交 `905d7a2`）已交付（`DEP-496-03` 已满足）；版本面/CHANGELOG 标为 `0.30.1`（GitHub 实际 tag `v0.30.2`）。Codex review：R1..R14，**R13 `PASS` + R14 最终确认 `PASS`**；**计划 #496 已于 2026-10-05 正式收口（`v0.30.28`）**。 |
 | [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | **已收口** | CD-01..CD-04 全部 `done`/`complete`；`v0.27.2`（PR #581 squash merge `859d7fb`；PR head `base.yml` 7/7 + CodeQL 绿；`release.yml` 8/8 + stable manifest `0.27.2`）；ER-07 签名例外 EX-CD-01（仓库 vault 不可 unseal，操作者 2026-09-24 裁决维持未签名发布） |
 | [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | **已收口** | TT-05 `done`/`complete`（v0.30.22，PR #602 `a2f1c34`，release `37055840149` 8/8；网站 `cf@a976e4c`）；TT-02 `done`/`complete`（v0.30.23，PR #604 `52bf7d2`，release `37087459978` 8/8；网站 `cf@e908d01`）；M3 收口门 2026-10-03 06:19:24 UTC 全绿（CI 口径：8754/8754 passed / 4 skipped）；完成判据全勾选；`issues/478.md` DEFER-04 已登记由 TT-02 交付；#498 CLOSED；残留 DEFER-TT-01..08（含 DEFER-TT-08 `for-each-ref`/`describe` 嵌套 peel）；TT-01/03/04 废弃，TT-06/07 合并回 TT-02；EX-TT-01 已批准 |
