@@ -955,6 +955,7 @@ fn archive_infers_format_from_output_extension() {
     );
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug)]
 struct LogicalTarEntry {
     path: PathBuf,
@@ -1073,12 +1074,16 @@ fn archive_issue1059_long_tar_path_roundtrip() {
     }
 
     let issue_content = b"issue 1059 long path\n";
-    let mut fixtures = vec![(issue_path.clone(), issue_content.as_slice())];
+    let fixtures = vec![(issue_path.clone(), issue_content.as_slice())];
     #[cfg(unix)]
-    fixtures.push((
-        nested_path.clone(),
-        b"beyond the ustar prefix range\n".as_slice(),
-    ));
+    let fixtures = {
+        let mut fixtures = fixtures;
+        fixtures.push((
+            nested_path.clone(),
+            b"beyond the ustar prefix range\n".as_slice(),
+        ));
+        fixtures
+    };
     for (path, content) in &fixtures {
         let disk_path = repo.path().join(path);
         fs::create_dir_all(disk_path.parent().expect("long fixture has a parent"))
