@@ -36,6 +36,8 @@ an error, not an empty successful patch.
 
 `--cached` compares the stored tree and index bytes, independent of current worktree attributes.
 
+In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected. Raw output and difference exit codes keep the stat-based behavior described above.
+
 ## Options
 
 | Option | Description | Example |

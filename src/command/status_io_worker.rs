@@ -250,11 +250,11 @@ pub(crate) fn deadline_file_blob_hash(
     path: &Path,
     workdir: &Path,
 ) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
-    deadline_hash_with_attributes(
-        path,
-        workdir,
-        crate::utils::attributes::ConversionAttributeContext::capture(workdir),
-    )
+    let attributes = match crate::utils::attributes::ConversionAttributeContext::capture(workdir) {
+        Ok(attributes) => attributes,
+        Err(error) => return Ok(Err(error)),
+    };
+    deadline_hash_with_attributes(path, workdir, attributes)
 }
 
 fn deadline_hash_with_attributes(
@@ -363,7 +363,7 @@ impl ConversionScan {
                 .into_iter()
                 .map(|path| path_to_bytes(&path))
                 .collect(),
-            attributes: crate::utils::attributes::ConversionAttributeContext::capture(workdir),
+            attributes: crate::utils::attributes::ConversionAttributeContext::capture(workdir)?,
             cache_root: path_to_bytes(cache_root),
             index_key: hex::encode(hash.finish().as_ref()),
         })
@@ -383,8 +383,9 @@ impl ConversionScan {
     }
 
     pub(crate) fn probe(&self, record: Option<&str>) -> io::Result<(String, bool)> {
-        if crate::utils::attributes::ConversionAttributeContext::capture(&bytes_to_path(&self.root))
-            != self.attributes
+        if crate::utils::attributes::ConversionAttributeContext::capture(&bytes_to_path(
+            &self.root,
+        ))? != self.attributes
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,

@@ -14,6 +14,8 @@ libra status [OPTIONS] [pathspec]...
 
 Tracked regular files use the same explicit `text`/`eol` clean conversion as `add`: CRLF pairs compare as LF, while lone CR bytes are preserved. This applies to default status, `--scan`, and `--check-dirty`, including porcelain and JSON output. Attribute changes invalidate earlier clean conclusions even if the target file's stat is unchanged. Mode/type changes, deletions and real content edits remain visible; unreadable attributes produce an error or `io_blocked`, never a clean conclusion. An unreadable directory does not hide changes in other readable files. JSON retains the partial result with the affected paths in `io_blocked`; `--scan` and `--check-dirty` leave the prior dirty-cache snapshot unchanged when inspection is incomplete. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
 
+Legacy symlink worktrees support read-only `status`, using `info/attributes` from their resolved metadata directory. Repository mutations still require layout migration. An attribute file that is itself a symlink, or cannot be read, produces an error rather than being treated as absent.
+
 `libra status` shows the state of the working tree and staging area: which files are staged
 for the next commit, which have modifications not yet staged, and which are untracked. It also
 reports the current branch, detached HEAD state, and upstream tracking information.

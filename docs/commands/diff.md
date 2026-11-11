@@ -73,6 +73,8 @@ symlink targets, external diff/textconv inputs, and `--no-index` retain their
 existing byte contracts. Comparison does not rewrite files, index entries, or
 stored objects.
 
+In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected.
+
 ## Options
 
 | Option | Short | Long | Description |

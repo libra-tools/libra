@@ -39,6 +39,10 @@
 |---|---|---|
 | 兼容差异项 | `-m` 与其余 porcelain 标志面 | `--cached`、raw、`--name-only`/`--name-status`、`--exit-code`/`--quiet` 已公开。 |
 
+## 共享元数据属性（#1062）
+
+旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。 raw 输出和差异退出码仍保持上述基于 stat 的规则。
+
 ## 维护要求
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。

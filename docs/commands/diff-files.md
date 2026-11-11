@@ -35,6 +35,8 @@ are not converted, and the command does not refresh the index or rewrite
 worktree files. A failure while reading content or attributes for a patch is
 an error, not an empty successful patch.
 
+In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected. Raw output and difference exit codes keep the stat-based behavior described above.
+
 ## Options
 
 | Option | Description | Example |

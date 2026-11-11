@@ -457,7 +457,7 @@ pub(crate) fn try_all_attribute_states_beneath(
         workdir,
         root,
         relative,
-        &ConversionAttributeContext::capture(workdir),
+        &ConversionAttributeContext::capture(workdir)?,
         None,
         false,
     )
@@ -471,11 +471,43 @@ pub(crate) struct ConversionAttributeContext {
 }
 
 impl ConversionAttributeContext {
-    pub(crate) fn capture(workdir: &Path) -> Self {
-        Self {
-            configured: util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir),
-            info: util::worktree_info_file_paths(workdir, "attributes"),
+    pub(crate) fn capture(workdir: &Path) -> io::Result<Self> {
+        let mut info = util::worktree_info_file_paths(workdir, "attributes");
+        let native = workdir.join(util::ROOT_DIR).join("info/attributes");
+        let native_position = info.iter().position(|path| path == &native);
+        let gitdir = match crate::internal::worktree_scope::WorktreeScope::request_scope()
+            .filter(|scope| scope.worktree_root == workdir)
+        {
+            Some(scope) => Some(scope.gitdir),
+            None if native_position.is_some() => Some(
+                fs::canonicalize(workdir.join(util::ROOT_DIR)).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "resolve attributes metadata for '{}': {error}; check the worktree layout",
+                            workdir.display()
+                        ),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        if let Some(gitdir) = gitdir {
+            // Repository discovery accepts legacy .libra symlinks. Use that
+            // resolved gitdir; do not traverse the symlink beneath a worktree
+            // root or relax no-follow checks for attribute files themselves.
+            // The unpinned fallback resolves only this exact metadata path,
+            // never a parent repository if the marker disappears meanwhile.
+            let source = gitdir.join("info/attributes");
+            match native_position {
+                Some(position) => info[position] = source,
+                None => info.insert(0, source),
+            }
         }
+        Ok(Self {
+            configured: util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir),
+            info,
+        })
     }
 }
 
