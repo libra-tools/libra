@@ -9,6 +9,12 @@
 - 兼容级别：`partial`。基础 tree inspection、子目录相对输出、`--full-name`、`--full-tree`、`REV:path` tree-ish 语法和 `--format`（支持 `%(objectmode)`/`%(objecttype)`/`%(objectname)`/`%(objectsize)`/`%(path)` 原子与 `%x09`/`%x0a` 转义）已公开；完整 Git pathspec magic 仍未公开。
 
 
+Without -r or -d, a single directory path without a trailing slash lists the directory entry itself; with a trailing slash it lists the directory contents.
+
+末尾 `/.` 同样选择目录内容；`-t` 输出到达路径时经过的树，`-r` 递归进入选中的目录。多个参数重叠时，被其它参数穿过的目录会展开，重复条目只输出一次。
+
+兼容性限制：多路径仍按参数次序输出，不保证 Git 树序；完整 pathspec magic、子目录中的 `-t` 父树显示、缺失路径和 blob 尾斜杠行为、`-d` 加目录尾斜杠的选择尚未完全对齐 Git。
+
 ## 设计方案
 
 - 入口与分发：`src/cli.rs::Commands::LsTree` 公开顶层 CLI，`src/command/mod.rs` 导出 `ls_tree` 模块；CLI 层在 `src/cli.rs` 把解析后的参数交给 `command::ls_tree::execute_safe`，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
@@ -44,7 +50,7 @@ flowchart TD
 - Synopsis：`libra ls-tree [OPTIONS] <TREE-ISH> [PATH...]`。
 - 公开参数/子命令以用户文档和 CLI help 为准；当前未抽取到独立 Options/Subcommands 小节。
 - 参数证据：`-r` / `--recursive` 已公开并由 `command_test::command::ls_tree_test::ls_tree_recursive_lists_nested_entries_without_parent_trees` 与 `ls_tree_directory_filter_recurses_when_requested` 覆盖；集成场景 `cli.ls-tree-smoke` 也执行 `libra ls-tree -r HEAD src`。
-- 参数证据：`-t`（递归时展示 tree 条目）已公开并由 `ls_tree_recursive_t_includes_tree_entries` 覆盖。
+- 参数证据：`-t`（递归时展示 tree 条目，并展示到达各路径参数所经过的 tree）已公开并由 `ls_tree_recursive_t_includes_tree_entries`、`ls_tree_issue1057_nested_t` 与 `ls_tree_issue1057_t_slash_and_blob` 覆盖。
 - 参数证据：`-l` / `--long`（展示 blob 大小）已公开并由 `ls_tree_long_includes_blob_size_and_tree_dash` 覆盖。
 - 参数证据：`--name-only`（只输出路径）已公开并由 `ls_tree_name_only_prints_paths` 覆盖；集成场景 `cli.ls-tree-smoke` 也执行 `libra ls-tree --name-only HEAD`。
 - 参数证据：`--object-only`（只输出对象 ID）已公开并由 `ls_tree_object_only_honors_abbrev_width` 覆盖。

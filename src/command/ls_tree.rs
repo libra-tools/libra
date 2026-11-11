@@ -34,7 +34,7 @@ EXAMPLES:
     libra ls-tree HEAD:src                     List the src subtree via REV:path
     libra ls-tree -r HEAD src                  Recursively list entries under src
     libra ls-tree -l HEAD README.md            Include blob sizes
-    libra ls-tree --name-only HEAD src         Print paths only
+    libra ls-tree --name-only HEAD src/        Print paths only
     libra ls-tree --full-name HEAD             Print repository-relative paths
     libra ls-tree --full-tree HEAD             List from the repository root
     libra ls-tree --object-only --abbrev HEAD  Print abbreviated object IDs only
@@ -48,7 +48,7 @@ pub struct LsTreeArgs {
     #[arg(short = 'r', long = "recursive")]
     pub recursive: bool,
 
-    /// Show tree entries when recursing.
+    /// Show tree entries when recursing, and the trees traversed to reach a path argument.
     #[arg(short = 't')]
     pub show_trees: bool,
 
@@ -132,6 +132,12 @@ struct RawLsTreeEntry {
     mode: TreeItemMode,
     object_id: ObjectHash,
     path: String,
+}
+
+#[derive(Debug)]
+struct LsTreePathFilter {
+    path: String,
+    list_contents: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -384,10 +390,27 @@ fn normalize_workdir_prefix(path: &Path) -> CliResult<String> {
 fn normalize_path_filters(
     paths: &[String],
     path_context: &LsTreePathContext,
-) -> CliResult<Vec<String>> {
+) -> CliResult<Vec<LsTreePathFilter>> {
     let mut filters = Vec::new();
+    let mut traversed = BTreeSet::new();
     for path in paths {
-        filters.push(normalize_one_path_filter_with_context(path, path_context)?);
+        let normalized = normalize_one_path_filter_with_context(path, path_context)?;
+        // Preserve the final slash/dot before normalization removes it. A
+        // directory also expands when another argument traverses through it.
+        let list_contents = path.ends_with('/') || path.rsplit('/').next() == Some(".");
+        for (index, _) in normalized.match_indices('/') {
+            traversed.insert(normalized[..index].to_string());
+        }
+        if list_contents {
+            traversed.insert(normalized.clone());
+        }
+        filters.push(LsTreePathFilter {
+            path: normalized,
+            list_contents,
+        });
+    }
+    for filter in &mut filters {
+        filter.list_contents |= traversed.contains(&filter.path);
     }
     Ok(filters)
 }
@@ -440,7 +463,7 @@ fn normalize_relative_path_filter(path: &str) -> CliResult<String> {
 
 fn collect_matching_entries(
     root_tree: ObjectHash,
-    filters: &[String],
+    filters: &[LsTreePathFilter],
     args: &LsTreeArgs,
     path_context: &LsTreePathContext,
 ) -> CliResult<Vec<RawLsTreeEntry>> {
@@ -454,7 +477,7 @@ fn collect_matching_entries(
         )?;
     } else {
         for filter in filters {
-            collect_one_filter(root_tree, filter, args, &mut entries)?;
+            collect_one_filter(root_tree, filter, args, path_context, &mut entries)?;
         }
     }
     Ok(dedupe_entries(entries))
@@ -480,16 +503,29 @@ fn collect_current_scope_contents(
 
 fn collect_one_filter(
     root_tree: ObjectHash,
-    filter: &str,
+    filter: &LsTreePathFilter,
     args: &LsTreeArgs,
+    path_context: &LsTreePathContext,
     entries: &mut Vec<RawLsTreeEntry>,
 ) -> CliResult<()> {
-    if filter.is_empty() {
+    if filter.path.is_empty() {
         collect_tree_contents(root_tree, "", args, entries)?;
         return Ok(());
     }
 
-    let (entry, subtree) = find_tree_entry(root_tree, filter)?;
+    let mut parents = Vec::new();
+    let (entry, subtree) = find_tree_entry_with_parents(
+        root_tree,
+        &filter.path,
+        args.show_trees.then_some(&mut parents),
+    )?;
+    entries.extend(parents.into_iter().filter(|parent| {
+        path_context.current_dir_prefix.is_empty()
+            || parent
+                .path
+                .strip_prefix(&path_context.current_dir_prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }));
     match entry.mode {
         TreeItemMode::Tree => {
             if args.tree_only {
@@ -497,13 +533,13 @@ fn collect_one_filter(
                 if args.recursive {
                     collect_tree_contents(subtree, &entry.path, args, entries)?;
                 }
-            } else if args.recursive {
+            } else if args.recursive || filter.list_contents {
                 if args.show_trees {
                     entries.push(entry.clone());
                 }
                 collect_tree_contents(subtree, &entry.path, args, entries)?;
             } else {
-                collect_tree_contents(subtree, &entry.path, args, entries)?;
+                entries.push(entry);
             }
         }
         _ => {
@@ -516,6 +552,14 @@ fn collect_one_filter(
 }
 
 fn find_tree_entry(root_tree: ObjectHash, filter: &str) -> CliResult<(RawLsTreeEntry, ObjectHash)> {
+    find_tree_entry_with_parents(root_tree, filter, None)
+}
+
+fn find_tree_entry_with_parents(
+    root_tree: ObjectHash,
+    filter: &str,
+    mut parents: Option<&mut Vec<RawLsTreeEntry>>,
+) -> CliResult<(RawLsTreeEntry, ObjectHash)> {
     let mut current_tree = load_tree(root_tree)?;
     let mut current_path = String::new();
     let mut components = filter.split('/').peekable();
@@ -541,7 +585,9 @@ fn find_tree_entry(root_tree: ObjectHash, filter: &str) -> CliResult<(RawLsTreeE
         if item.mode != TreeItemMode::Tree {
             return Err(path_not_found_error(filter));
         }
-
+        if let Some(parents) = parents.as_deref_mut() {
+            parents.push(entry);
+        }
         current_tree = load_tree(item.id)?;
     }
 
