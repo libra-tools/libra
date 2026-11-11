@@ -66,7 +66,7 @@ or difference exit status. Real edits remain visible, including in rename
 matching. Attribute changes invalidate the stat shortcut; an unreadable file
 or attribute source is an error, not a clean result.
 
-`-text` preserves bytes. `text=auto` is not enabled by this change. Stored
+`-text` preserves bytes. `text=auto` also cleans text input with binary detection and historical CRLF index protection; see [add](add.md) for limits. Stored
 index/tree blobs are never converted: `--cached` and tree-to-tree comparisons
 retain historical content. LFS uses its pointer for the original payload;
 symlink targets, external diff/textconv inputs, and `--no-index` retain their

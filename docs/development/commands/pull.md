@@ -353,6 +353,6 @@ See the user-facing `pull` page for the local-path Git `objectformat=sha256` rej
 
 ## 显式换行比较（#1062）
 
-`pull` 使用的 merge 预检遵循显式 `text`/`eol` clean 比较。工作区 CRLF 转换后等于索引 LF 内容时，不会阻止 `pull --ff-only`；真实本地修改仍会拒绝不安全的整合。fetch 与 merge 策略不变。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+`pull` 使用的 merge 预检遵循显式 `text`/`eol` clean 比较。工作区 CRLF 转换后等于索引 LF 内容时，不会阻止 `pull --ff-only`；真实本地修改仍会拒绝不安全的整合。fetch 与 merge 策略不变。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

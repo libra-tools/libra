@@ -30,10 +30,11 @@ CRLF 转成 LF。未设置 `text` 时，单独的 `eol` 也会启用该转换。
 `*.ps1 text eol=crlf` 会保留工作文件中的 CRLF 字节，同时暂存 LF blob。
 孤立的 CR 和缺失的末尾换行保持原样；`add` 不改写工作文件。
 
-`-text` 禁用该转换。LFS 指针生成和符号链接目标字节保持各自语义。
-自动 `text=auto` 转换、`core.autocrlf` 配置回退、`core.safecrlf` 和自定义
-clean/smudge 过滤器仍不支持。读取文件或属性来源失败时会报告错误；未指定
-`--ignore-errors` 时，不会保存部分更新的索引。
+`text=auto` 仅转换文本输入，也可搭配 `eol=lf` 或 `eol=crlf`。探测包括 NUL、孤立 CR 和不可打印字节比例。普通 `add` 在既有索引 blob 为非二进制 CRLF 文本时保留历史表示；`add --renormalize` 绕过该历史保护，仍保留二进制探测。两种模式都不重写源文件或历史对象。status 和内置 diff 使用相同的普通模式：规范化索引下等价的混合 CRLF/LF 内容保持干净，真实编辑仍报告。
+
+需要的历史索引证据只从本地读取，受超时和单对象 32 MiB 额度限制。缺失、损坏、不可读或超额均报错，不会猜测干净。可恢复可读的本地对象；若明确要替换索引表示，可使用 `add --renormalize`。文件或属性来源读取失败同样报错；未指定 `--ignore-errors` 时，不保存部分更新的索引。
+
+`-text` 禁用转换。LFS 指针和符号链接目标保留各自语义。`core.autocrlf` 配置回退、`core.safecrlf`、自定义 clean/smudge 过滤器和 checkout 的 CRLF 写回仍不支持。
 
 ## 选项
 

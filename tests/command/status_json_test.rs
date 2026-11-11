@@ -652,8 +652,21 @@ fn json_status_mode_only_change_is_modified() {
 
 #[test]
 fn i1062_json_status_clean_representations_and_attribute_invalidation() {
+    eol_json_status_clean_representations_and_attribute_invalidation(false);
+}
+
+#[test]
+fn i861_json_status_clean_representations_and_attribute_invalidation() {
+    eol_json_status_clean_representations_and_attribute_invalidation(true);
+}
+
+fn eol_json_status_clean_representations_and_attribute_invalidation(auto: bool) {
     use super::{add_test::i1062_ok, status_test::i1062_committed_scripts};
-    let temp = i1062_committed_scripts("sha256");
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha256")
+    } else {
+        i1062_committed_scripts("sha256")
+    };
     let repo = temp.path().join("repo");
     for mode in [None, Some("--scan"), Some("--check-dirty")] {
         let mut args = vec!["--json", "status"];

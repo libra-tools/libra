@@ -12,7 +12,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 An unreadable attribute source or unsafe worktree path stops the preflight with `LBR-IO-001` and retains the underlying cause so it can be corrected before retrying.
 
-The merge preflight used by `pull` honors explicit `text`/`eol` clean comparison. A CRLF working file equal to its indexed LF content after conversion does not block `pull --ff-only`; real local changes still reject unsafe integration. Fetch and merge strategies are unchanged. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+The merge preflight used by `pull` honors explicit `text`/`eol` clean comparison. A CRLF working file equal to its indexed LF content after conversion does not block `pull --ff-only`; real local changes still reject unsafe integration. Fetch and merge strategies are unchanged. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 `libra pull` combines `fetch` and the same merge engine used by `libra merge`. It downloads new objects, updates remote-tracking refs, and then integrates the selected upstream into the current branch. A remote URL that points at a Git v2 bundle is re-read on every pull, so replacing the bundle file can fast-forward the current branch. The `<repository>` may be an anonymous local-path / `file://` URL spec, which is resolved as an unnamed remote and merges the brought-down ref (issues/480 HP-06).
 

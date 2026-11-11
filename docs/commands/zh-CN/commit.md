@@ -18,7 +18,7 @@ libra commit --no-agent-trailer -m <MESSAGE>
 
 ## 说明
 
-`commit -a` 自动暂存已跟踪文件时使用显式 `text`/`eol` clean 比较。单纯 CRLF/LF 表示差异不会产生内容修改，也不会使本应为空的提交得以创建。真实编辑通过与 `add` 相同的转换暂存。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+`commit -a` 自动暂存已跟踪文件时使用显式 `text`/`eol` clean 比较。单纯 CRLF/LF 表示差异不会产生内容修改，也不会使本应为空的提交得以创建。真实编辑通过与 `add` 相同的转换暂存。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 `libra commit` 从已暂存更改创建新提交，构建 tree 和 commit 对象，验证消息（包括可选的 conventional commit 格式，以及通过 vault 进行 GPG 签名），并更新 HEAD 和 refs。
 

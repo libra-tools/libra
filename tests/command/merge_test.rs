@@ -3113,12 +3113,16 @@ fn create_diverged_whitespace_repo(
                 .split_whitespace()
                 .any(|token| token == "text" || token.starts_with("eol="))
     });
+    let automatic =
+        attribute.is_some_and(|value| value.split_whitespace().any(|token| token == "text=auto"));
     let info = p.join(".libra/info/attributes");
-    if explicit {
+    if explicit || automatic {
         // Keep a historical CRLF merge base while ordinary explicit add now
         // writes LF. The ours commit records normalization; this preserves
         // the old -X renormalize conflict matrix without asking add to store
-        // bytes that contradict its new clean policy.
+        // bytes that contradict its new clean policy. Auto merge fixtures
+        // likewise need historical raw commits; ordinary auto staging is
+        // covered separately by the i861 add and TC-1324 tests.
         std::fs::create_dir_all(info.parent().unwrap()).unwrap();
         std::fs::write(&info, "shared.txt -text\n").unwrap();
     }
@@ -3163,6 +3167,9 @@ fn create_diverged_whitespace_repo(
         std::fs::remove_file(&info).unwrap();
     } else {
         commit_file(p, "shared.txt", ours, "ours normalization-only edit");
+        if automatic {
+            std::fs::remove_file(&info).unwrap();
+        }
     }
     temp_repo
 }
@@ -14600,12 +14607,25 @@ fn merge_verbose_prints_the_diffstat() {
 
 #[test]
 fn i1062_merge_fast_forward_accepts_clean_representation_and_rejects_edits() {
+    eol_merge_fast_forward_accepts_clean_representation_and_rejects_edits(false);
+}
+
+#[test]
+fn i861_merge_fast_forward_accepts_clean_representation_and_rejects_edits() {
+    eol_merge_fast_forward_accepts_clean_representation_and_rejects_edits(true);
+}
+
+fn eol_merge_fast_forward_accepts_clean_representation_and_rejects_edits(auto: bool) {
     use super::{
         add_test::{i1062_ok, i1062_run},
         status_test::i1062_fast_forward_scripts,
     };
     for dirty in [false, true] {
-        let (temp, tip) = i1062_fast_forward_scripts();
+        let (temp, tip) = if auto {
+            super::status_test::i861_fast_forward_scripts()
+        } else {
+            i1062_fast_forward_scripts()
+        };
         let repo = temp.path().join("repo");
         if dirty {
             std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();

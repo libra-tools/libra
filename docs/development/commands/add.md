@@ -9,12 +9,21 @@
 普通 add、交互暂存的工作区输入及 `--renormalize` 通过共享 worktree_conversion
 读取原语应用显式 `text`/`eol` 策略，仅将成对 CRLF 转为 LF，保持孤立 CR、其它字节和
 末尾换行状态。索引 stat 仍描述磁盘文件，blob OID 按转换后字节及其长度计算；历史对象
-和源文件只读。`-text`、尚未启用的 `text=auto`、无转换规则、LFS 与 symlink 各保留既有
+和源文件只读。`-text`、无转换规则、LFS 与 symlink 各保留既有
 语义。属性来源读取失败不得当作未设置规则；默认 add 失败不发布部分 index，显式
 `--ignore-errors` 继续沿用逐文件失败语义。
 
 验证覆盖 `command_test::command::add_test::i1062_explicit_` 的真实 CLI、SHA-1/SHA-256、
 历史对象与工作区不变，以及 `i1062_conversion_failure_` 的索引原子性和错误说明。
+
+
+### 自动文本转换
+
+`text=auto`（可搭配 eol）与显式策略共用 worktree_conversion；流式统计 CRLF、孤立 CR、NUL、可打印/非打印字节，跨块保留 CR，并按固定 Git 规则忽略末尾 SUB。普通模式仅在非二进制 CRLF 输入上惰性检查 index stage 0、缺失时 stage 2 的实际 blob；历史非二进制 CRLF 阻止转换。`--renormalize` 跳过历史保护，仍保留二进制探测。
+
+只读比较和暂存传递同一已加载 index 上下文；对象只在现有 killable helper 内使用 local-only typed bounded reader，单对象证据限 32 MiB，不 hydrate、不创建对象目录、不缓存正文。缺失/损坏/超额报错，不映射成工作区删除。库调用沿用调用线程后备读取，不占用不可终止 dispatcher slot。conversion-v2 属性源指纹同时使旧 stat 证书和 dirty cache 失效；有效 warm stat 路径不新增对象读取。
+
+新增 `i861_auto_` / `i861_failure_`、共享消费者与 TC-1324 两轨验证。无属性 autocrlf、safecrlf、自定义过滤器和 checkout smudge 仍不在支持范围。
 
 ## 对比 Git 与兼容性
 

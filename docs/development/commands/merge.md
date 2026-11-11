@@ -281,6 +281,6 @@ single conflict-label helper
 
 ## 显式换行比较（#1062）
 
-干净度预检按显式 `text`/`eol` 规则比较已跟踪普通文件。CRLF 转换后与索引 LF 内容相同时，不会阻止 `merge --ff-only`。真实编辑、模式或类型变化、已有冲突及 merge 状态仍保留原有保护。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+干净度预检按显式 `text`/`eol` 规则比较已跟踪普通文件。CRLF 转换后与索引 LF 内容相同时，不会阻止 `merge --ff-only`。真实编辑、模式或类型变化、已有冲突及 merge 状态仍保留原有保护。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

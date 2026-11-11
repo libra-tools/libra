@@ -15,7 +15,7 @@ libra diff-files [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [
 `--name-status` 打印 Git 的 `A`/`M`/`D`/`R` 状态字母（例如 intent-to-add 条目为
 `A\tnew.txt`）。工作树一侧是**基于 stat 的**：仅 stat 漂移而内容未变的条目按 `M` 报告、工作树 sha 全零且不哈希——与 `git diff-files` 及 `t3700-add.sh#24` 背后的契约一致。状态字母按**条目是否存在**判定，不按内容是否为空：`read-tree` 使 stat 失效的空 blob 是 `M` 而不是 `A`，工作树被截断为 0 字节是 `M` 而不是 `D`。其余 porcelain 标志面仍有意保持精简；完整补丁与状态选项请使用共享的 `libra diff`。
 
-显式 `text`、`eol=lf`、`eol=crlf` 属性使 `-p` 按 clean 工作区内容比较（CRLF 对转换为 LF）。因此补丁可以为空，而基于 stat 的 raw/名称输出仍报告 `M` 和全零工作区 OID；`--quiet`、`--exit-code` 仍按该 stat 差异返回 1，包括补丁为空的情况。按内容判断干净状态请用 [`diff`](diff.md)。`-text` 保留字节，`text=auto` 仍未启用。存储对象不转换，命令不刷新索引或改写工作区文件。生成补丁时读取内容或属性失败会返回错误，不得以空补丁成功退出。
+显式 `text`、`eol=lf`、`eol=crlf` 属性使 `-p` 按 clean 工作区内容比较（CRLF 对转换为 LF）。因此补丁可以为空，而基于 stat 的 raw/名称输出仍报告 `M` 和全零工作区 OID；`--quiet`、`--exit-code` 仍按该 stat 差异返回 1，包括补丁为空的情况。按内容判断干净状态请用 [`diff`](diff.md)。`-text` 保留字节，`text=auto` 同时支持文本转换、二进制探测和历史 CRLF 索引保护，限制见 [add](add.md)。存储对象不转换，命令不刷新索引或改写工作区文件。生成补丁时读取内容或属性失败会返回错误，不得以空补丁成功退出。
 
 旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。 raw 输出和差异退出码仍保持上述基于 stat 的规则。
 

@@ -29,7 +29,7 @@ content (CRLF pairs become LF). Its patch may therefore be empty even when
 stat-based raw/name output still reports `M` with a zero worktree OID.
 `--quiet` and `--exit-code` retain that stat-based difference result, including
 exit `1` with an empty patch. Use [`diff`](diff.md) for content-based clean
-checks. `-text` preserves bytes; `text=auto` remains deferred. Stored objects
+checks. `-text` preserves bytes; `text=auto` also converts text input while protecting binary and historical CRLF index content; see [add](add.md) for limits. Stored objects
 are not converted, and the command does not refresh the index or rewrite
 worktree files. A failure while reading content or attributes for a patch is
 an error, not an empty successful patch.

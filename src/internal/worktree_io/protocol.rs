@@ -429,6 +429,7 @@ pub(crate) enum IoRequest {
         root: Vec<u8>,
         hash_kind: String,
         root_session: u64,
+        index: Option<ConversionIndex>,
         attributes: crate::utils::attributes::ConversionAttributeContext,
     },
     ConversionState {
@@ -438,6 +439,10 @@ pub(crate) enum IoRequest {
         cache_root: Vec<u8>,
         index_key: String,
         record: Option<String>,
+    },
+    ReadConversionIndex {
+        index: ConversionIndex,
+        hash_kind: String,
     },
     ReadObjectBlob {
         oid: String,
@@ -452,6 +457,32 @@ pub(crate) enum IoRequest {
         root: Vec<u8>,
     },
     Shutdown,
+}
+
+/// Local index evidence for auto conversion; only the selected entry is sent.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConversionIndex {
+    pub oid: String,
+    pub objects_root: Vec<u8>,
+}
+
+impl ConversionIndex {
+    fn validate(&self) -> io::Result<()> {
+        validate_absolute_root(&self.objects_root, "conversion object-store")?;
+        if !matches!(self.oid.len(), 40 | 64) || !self.oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "conversion index requires a hexadecimal object ID",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ConversionStateResult {
+    Attributes { sources: String, valid: bool },
+    IndexBlob { has_text_crlf: bool },
 }
 
 impl IoRequest {
@@ -479,8 +510,12 @@ impl IoRequest {
                 path,
                 root,
                 attributes,
+                index,
                 ..
             } => {
+                if let Some(index) = index {
+                    index.validate()?;
+                }
                 validate_worktree_path(root, path, false)?;
                 for source in attributes.configured.iter().chain(&attributes.info) {
                     validate_absolute_root(&path_to_bytes(source), "attribute source")?;
@@ -514,6 +549,7 @@ impl IoRequest {
                 Ok(())
             }
             Self::MarkerProbe { dir, root } => validate_worktree_path(root, dir, true).map(|_| ()),
+            Self::ReadConversionIndex { index, .. } => index.validate(),
             Self::ReadObjectBlob {
                 oid, objects_root, ..
             } => {
@@ -713,7 +749,7 @@ pub(crate) enum IoEvent {
         hex: WireResult<String>,
     },
     DoneConversionState {
-        result: WireResult<(String, bool)>,
+        result: WireResult<ConversionStateResult>,
         detail: Option<String>,
     },
     DoneCleanHash {

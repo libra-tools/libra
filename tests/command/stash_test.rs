@@ -2767,8 +2767,21 @@ fn test_stash_push_refuses_intent_to_add_entry() {
 
 #[test]
 fn i1062_consumer_stash_does_not_save_representation_only_changes() {
+    eol_consumer_stash_does_not_save_representation_only_changes(false);
+}
+
+#[test]
+fn i861_consumer_stash_does_not_save_representation_only_changes() {
+    eol_consumer_stash_does_not_save_representation_only_changes(true);
+}
+
+fn eol_consumer_stash_does_not_save_representation_only_changes(auto: bool) {
     use super::{add_test::i1062_ok, status_test::i1062_committed_scripts};
-    let temp = i1062_committed_scripts("sha1");
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha1")
+    } else {
+        i1062_committed_scripts("sha1")
+    };
     let repo = temp.path().join("repo");
     for args in [
         vec!["stash", "push"],

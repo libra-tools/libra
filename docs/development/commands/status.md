@@ -90,7 +90,7 @@ flowchart TD
 
 ## 显式换行比较（#1062）
 
-已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 局部目录不可读不会遮蔽其它可读文件的真实修改；JSON 仍返回部分结果并在 `io_blocked` 中列出受影响路径，`--scan` 与 `--check-dirty` 在检查不完整时保留原脏状态缓存。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+已跟踪普通文件使用与 `add` 相同的显式 `text`/`eol` clean 转换：比较时 CRLF 对按 LF 处理，孤立 CR 保留。默认状态、`--scan`、`--check-dirty` 以及 porcelain/JSON 输出采用相同语义。即使目标文件 stat 未变，属性变化也会使旧的 clean 结论失效。模式、类型、删除和真实内容变化仍会显示；属性不可读时返回错误或 `io_blocked`，不会当作干净。 局部目录不可读不会遮蔽其它可读文件的真实修改；JSON 仍返回部分结果并在 `io_blocked` 中列出受影响路径，`--scan` 与 `--check-dirty` 在检查不完整时保留原脏状态缓存。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 旧版符号链接工作树仍支持只读 `status`，并使用该工作树已解析的元数据目录中的 `info/attributes`。这不会解除旧版布局的写入限制；修改仓库前仍需迁移布局。属性文件自身的符号链接或不可读属性会报错，不会被当作未设置属性。
 

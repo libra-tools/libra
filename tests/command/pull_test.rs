@@ -2073,12 +2073,25 @@ fn storage_config_unresolved_fetch_stays_local_pull() {
 
 #[test]
 fn i1062_pull_fast_forward_accepts_clean_representation_and_preserves_edits() {
+    eol_pull_fast_forward_accepts_clean_representation_and_preserves_edits(false);
+}
+
+#[test]
+fn i861_pull_fast_forward_accepts_clean_representation_and_preserves_edits() {
+    eol_pull_fast_forward_accepts_clean_representation_and_preserves_edits(true);
+}
+
+fn eol_pull_fast_forward_accepts_clean_representation_and_preserves_edits(auto: bool) {
     use super::{
         add_test::{i1062_ok, i1062_run},
         status_test::i1062_fast_forward_scripts,
     };
     for dirty in [false, true] {
-        let (temp, tip) = i1062_fast_forward_scripts();
+        let (temp, tip) = if auto {
+            super::status_test::i861_fast_forward_scripts()
+        } else {
+            i1062_fast_forward_scripts()
+        };
         let source = temp.path().join("repo");
         let bare = temp.path().join("remote.git");
         let local = temp.path().join("local");

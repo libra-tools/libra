@@ -1,6 +1,6 @@
 //! Attribute-directed conversion from worktree bytes to stored blob bytes.
 //!
-//! Explicit text/eol rules are shared by writers and content comparisons. Index
+//! Text/eol rules are shared by writers and content comparisons. Index
 //! objects are never converted, and worktree files are never rewritten here.
 
 use std::{
@@ -19,14 +19,107 @@ use super::{
 pub(crate) enum CleanPolicy {
     Preserve,
     Text,
+    Auto,
 }
 
-/// `-text` wins over `eol`. Automatic conversion is a separate policy and is
-/// deliberately not enabled by an accompanying eol value at this stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CleanMode {
+    Normal,
+    Renormalize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedPolicy {
+    Preserve,
+    Text,
+}
+
+/// Git's convert.c statistics, carried across chunks including a pending CR.
+#[derive(Default)]
+struct TextStats {
+    crlf: u64,
+    lone_cr: u64,
+    printable: u64,
+    nonprintable: u64,
+    nul: bool,
+    pending_cr: bool,
+    final_sub: bool,
+}
+
+impl TextStats {
+    fn consume(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.pending_cr {
+                if byte == b'\n' {
+                    self.crlf += 1;
+                } else {
+                    self.lone_cr += 1;
+                }
+            }
+            self.pending_cr = byte == b'\r';
+            self.final_sub = byte == 0x1a;
+            match byte {
+                b'\r' | b'\n' => {}
+                0 => {
+                    self.nul = true;
+                    self.nonprintable += 1;
+                }
+                8 | 9 | 12 | 27 => self.printable += 1,
+                1..=31 | 127 => self.nonprintable += 1,
+                _ => self.printable += 1,
+            }
+        }
+    }
+
+    fn is_binary(&self) -> bool {
+        self.nul
+            || self.lone_cr != 0
+            || self.pending_cr
+            || (self.printable >> 7) < self.nonprintable - u64::from(self.final_sub)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut stats = Self::default();
+        stats.consume(bytes);
+        stats
+    }
+}
+
+/// Index objects are inspected, never cleaned. Non-blob objects are rejected
+/// by the typed reader before reaching this predicate.
+pub(crate) fn has_text_crlf(bytes: &[u8]) -> bool {
+    let stats = TextStats::from_bytes(bytes);
+    stats.crlf != 0 && !stats.is_binary()
+}
+
+fn resolve_policy(
+    policy: CleanPolicy,
+    stats: &TextStats,
+    mode: CleanMode,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<ResolvedPolicy> {
+    Ok(match policy {
+        CleanPolicy::Preserve => ResolvedPolicy::Preserve,
+        CleanPolicy::Text => ResolvedPolicy::Text,
+        CleanPolicy::Auto => {
+            if stats.crlf == 0
+                || stats.is_binary()
+                || (mode == CleanMode::Normal && index_has_text_crlf()?)
+            {
+                ResolvedPolicy::Preserve
+            } else {
+                ResolvedPolicy::Text
+            }
+        }
+    })
+}
+
+/// `-text` wins over `eol`; `text=auto` retains binary and index protection
+/// even with an accompanying eol value.
 pub(crate) fn explicit_policy(attributes: &BTreeMap<String, AttributeState>) -> CleanPolicy {
     match attributes.get("text") {
         Some(AttributeState::Unset) => return CleanPolicy::Preserve,
-        Some(AttributeState::Value(value)) if value == "auto" => return CleanPolicy::Preserve,
+        Some(AttributeState::Value(value)) if value == "auto" => return CleanPolicy::Auto,
         Some(AttributeState::Set) => return CleanPolicy::Text,
         _ => {}
     }
@@ -40,8 +133,8 @@ pub(crate) fn explicit_policy(attributes: &BTreeMap<String, AttributeState>) -> 
 
 /// Compact in place so converting an add input does not allocate a second copy.
 /// A lone CR and the final-newline state remain unchanged.
-pub(crate) fn clean_bytes(mut bytes: Vec<u8>, policy: CleanPolicy) -> Vec<u8> {
-    if policy == CleanPolicy::Preserve {
+fn clean_bytes(mut bytes: Vec<u8>, policy: ResolvedPolicy) -> Vec<u8> {
+    if policy == ResolvedPolicy::Preserve {
         return bytes;
     }
     let mut read = 0;
@@ -61,9 +154,13 @@ pub(crate) fn clean_bytes(mut bytes: Vec<u8>, policy: CleanPolicy) -> Vec<u8> {
 /// Read the representation to stage, retaining LFS and symlink semantics.
 /// Regular content is read from one no-follow descriptor; the initial length
 /// bounds the read, and a changed file is rejected before an index can be saved.
-pub(crate) fn read_clean_blob_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+pub(crate) fn read_clean_blob_bytes(
+    path: impl AsRef<Path>,
+    mode: CleanMode,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<Vec<u8>> {
     let path = path.as_ref();
-    read_clean_blob_bytes_inner(path).map_err(|error| {
+    read_clean_blob_bytes_inner(path, mode, index_has_text_crlf).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -74,7 +171,11 @@ pub(crate) fn read_clean_blob_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8
     })
 }
 
-fn read_clean_blob_bytes_inner(path: &Path) -> io::Result<Vec<u8>> {
+fn read_clean_blob_bytes_inner(
+    path: &Path,
+    mode: CleanMode,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<Vec<u8>> {
     let workdir = util::try_working_dir()?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -137,7 +238,14 @@ fn read_clean_blob_bytes_inner(path: &Path) -> io::Result<Vec<u8>> {
         let oid = hex::encode(hash.finish().as_ref());
         return Ok(lfs::format_pointer_string(&oid, before.len).into_bytes());
     }
-    Ok(clean_bytes(bytes, explicit_policy(&attributes)))
+    let policy = explicit_policy(&attributes);
+    let stats = if policy == CleanPolicy::Auto {
+        TextStats::from_bytes(&bytes)
+    } else {
+        TextStats::default()
+    };
+    let resolved = resolve_policy(policy, &stats, mode, index_has_text_crlf)?;
+    Ok(clean_bytes(bytes, resolved))
 }
 
 pub(crate) fn same_file_snapshot(left: &RawLstat, right: &RawLstat) -> bool {
@@ -164,18 +272,23 @@ pub(crate) fn same_file_snapshot(left: &RawLstat, right: &RawLstat) -> bool {
 pub(crate) fn hash_clean_file_handle(
     mut file: std::fs::File,
     policy: CleanPolicy,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
 ) -> io::Result<git_internal::hash::ObjectHash> {
     let before = RawLstat::from_metadata(&file.metadata()?)?;
-    let length = if policy == CleanPolicy::Text {
-        let mut length = 0u64;
-        stream_clean(&mut file, before.len, policy, |bytes| {
-            length += bytes.len() as u64;
+    let mut stats = TextStats::default();
+    if policy != CleanPolicy::Preserve {
+        stream_clean(&mut file, before.len, ResolvedPolicy::Preserve, |bytes| {
+            stats.consume(bytes)
         })?;
         file.rewind()?;
-        length
-    } else {
-        before.len
-    };
+    }
+    let policy = resolve_policy(policy, &stats, CleanMode::Normal, index_has_text_crlf)?;
+    let length = before.len
+        - if policy == ResolvedPolicy::Text {
+            stats.crlf
+        } else {
+            0
+        };
     let kind = git_internal::hash::get_hash_kind();
     let mut hash = git_internal::utils::HashAlgorithm::new_for_kind(kind);
     hash.update(format!("blob {length}\0").as_bytes());
@@ -198,7 +311,7 @@ pub(crate) fn hash_clean_file_handle(
 fn stream_clean(
     file: &mut std::fs::File,
     length: u64,
-    policy: CleanPolicy,
+    policy: ResolvedPolicy,
     mut consume: impl FnMut(&[u8]),
 ) -> io::Result<()> {
     const CHUNK: usize = 64 * 1024;
@@ -222,7 +335,7 @@ fn stream_clean(
         }
         remaining -= read as u64;
         buffer.truncate(prefix + read);
-        pending_cr = policy == CleanPolicy::Text && buffer.last() == Some(&b'\r');
+        pending_cr = policy == ResolvedPolicy::Text && buffer.last() == Some(&b'\r');
         if pending_cr {
             buffer.pop();
         }
@@ -241,6 +354,7 @@ pub(crate) fn hash_clean_blob_beneath(
     relative: &Path,
     context: &attributes::ConversionAttributeContext,
     session: Option<u64>,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
 ) -> io::Result<git_internal::hash::ObjectHash> {
     let stat = beneath::lstat_beneath(root, relative).map_err(|error| {
         if error.kind() == io::ErrorKind::NotADirectory {
@@ -279,7 +393,7 @@ pub(crate) fn hash_clean_blob_beneath(
     if matches!(states.get("filter"), Some(AttributeState::Value(value)) if value == "lfs") {
         let before = RawLstat::from_metadata(&file.metadata()?)?;
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        stream_clean(&mut file, before.len, CleanPolicy::Preserve, |bytes| {
+        stream_clean(&mut file, before.len, ResolvedPolicy::Preserve, |bytes| {
             hash.update(bytes)
         })?;
         if !same_file_snapshot(&before, &RawLstat::from_metadata(&file.metadata()?)?) {
@@ -291,7 +405,7 @@ pub(crate) fn hash_clean_blob_beneath(
         let pointer = lfs::format_pointer_string(&hex::encode(hash.finish().as_ref()), before.len);
         return Ok(git_internal::internal::object::blob::Blob::from_content(&pointer).id);
     }
-    hash_clean_file_handle(file, explicit_policy(&states))
+    hash_clean_file_handle(file, explicit_policy(&states), index_has_text_crlf)
 }
 
 /// One fixed-size advisory certificate per index directory. Only a complete
@@ -340,7 +454,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_policy_matrix_preserves_auto_and_unset() {
+    fn explicit_policy_matrix_selects_auto_and_preserves_unset() {
         for (text, eol, expected) in [
             (None, None, CleanPolicy::Preserve),
             (Some(AttributeState::Set), None, CleanPolicy::Text),
@@ -355,12 +469,12 @@ mod tests {
             (
                 Some(AttributeState::Value("auto".into())),
                 Some("lf"),
-                CleanPolicy::Preserve,
+                CleanPolicy::Auto,
             ),
             (
                 Some(AttributeState::Value("auto".into())),
                 Some("crlf"),
-                CleanPolicy::Preserve,
+                CleanPolicy::Auto,
             ),
             (
                 Some(AttributeState::Unspecified),
@@ -390,8 +504,11 @@ mod tests {
             (b"\r\r\n", b"\r\n"),
         ];
         for (input, expected) in cases {
-            assert_eq!(clean_bytes(input.to_vec(), CleanPolicy::Text), *expected);
-            assert_eq!(clean_bytes(input.to_vec(), CleanPolicy::Preserve), *input);
+            assert_eq!(clean_bytes(input.to_vec(), ResolvedPolicy::Text), *expected);
+            assert_eq!(
+                clean_bytes(input.to_vec(), ResolvedPolicy::Preserve),
+                *input
+            );
         }
     }
 
@@ -399,7 +516,7 @@ mod tests {
     fn explicit_conversion_spans_read_chunk_boundaries() {
         let mut bytes = vec![b'x'; 64 * 1024 - 1];
         bytes.extend_from_slice(b"\r\nlast\r");
-        let converted = clean_bytes(bytes, CleanPolicy::Text);
+        let converted = clean_bytes(bytes, ResolvedPolicy::Text);
         assert_eq!(&converted[64 * 1024 - 1..], b"\nlast\r");
     }
 
@@ -411,7 +528,7 @@ mod tests {
             pair[end - 2..].copy_from_slice(b"\r\n");
         }
         let allocation = bytes.as_ptr();
-        let converted = clean_bytes(bytes, CleanPolicy::Text);
+        let converted = clean_bytes(bytes, ResolvedPolicy::Text);
         assert_eq!(converted.as_ptr(), allocation);
         assert_eq!(converted.len(), 64 * 1024 * 1024 - 1024);
         assert_eq!(converted.last(), Some(&b'\n'));
@@ -428,9 +545,20 @@ mod tests {
                 std::io::Write::write_all(&mut file, &bytes).unwrap();
                 for policy in [CleanPolicy::Preserve, CleanPolicy::Text] {
                     file.rewind().unwrap();
-                    let hash = hash_clean_file_handle(file.try_clone().unwrap(), policy).unwrap();
+                    let hash =
+                        hash_clean_file_handle(file.try_clone().unwrap(), policy, || Ok(false))
+                            .unwrap();
                     let expected = git_internal::internal::object::blob::Blob::from_content_bytes(
-                        clean_bytes(bytes.clone(), policy),
+                        clean_bytes(
+                            bytes.clone(),
+                            resolve_policy(
+                                policy,
+                                &TextStats::from_bytes(&bytes),
+                                CleanMode::Normal,
+                                || Ok(false),
+                            )
+                            .unwrap(),
+                        ),
                     )
                     .id;
                     assert_eq!(hash, expected, "{kind:?} length={length} {policy:?}");
@@ -454,7 +582,7 @@ mod tests {
             expected.update(b"\n");
         }
         file.rewind().unwrap();
-        let hash = hash_clean_file_handle(file, CleanPolicy::Text).unwrap();
+        let hash = hash_clean_file_handle(file, CleanPolicy::Text, || Ok(false)).unwrap();
         assert_eq!(hash.to_string(), hex::encode(expected.finalize()));
     }
 
@@ -483,8 +611,15 @@ mod tests {
             ("probe", b"inside\n".as_slice()),
             ("link", b"target\r\n".as_slice()),
         ] {
-            let hash = hash_clean_blob_beneath(&workdir, &root, Path::new(path), &context, Some(1))
-                .unwrap();
+            let hash = hash_clean_blob_beneath(
+                &workdir,
+                &root,
+                Path::new(path),
+                &context,
+                Some(1),
+                || Ok(false),
+            )
+            .unwrap();
             assert_eq!(
                 hash,
                 git_internal::internal::object::blob::Blob::from_content_bytes(expected.to_vec())
@@ -575,9 +710,15 @@ mod tests {
             ("nested/override.ps1", raw.as_slice()),
         ] {
             std::fs::write(workdir.join(path), raw).unwrap();
-            let hash =
-                hash_clean_blob_beneath(&workdir, &root, Path::new(path), &context, Some(42))
-                    .unwrap();
+            let hash = hash_clean_blob_beneath(
+                &workdir,
+                &root,
+                Path::new(path),
+                &context,
+                Some(42),
+                || Ok(false),
+            )
+            .unwrap();
             assert_eq!(
                 hash,
                 git_internal::internal::object::blob::Blob::from_content_bytes(expected.to_vec())
@@ -586,12 +727,138 @@ mod tests {
             );
         }
         std::fs::write(&global, "*.cmd -text\n").unwrap();
-        let hash =
-            hash_clean_blob_beneath(&workdir, &root, Path::new("global.cmd"), &context, Some(42))
-                .unwrap();
+        let hash = hash_clean_blob_beneath(
+            &workdir,
+            &root,
+            Path::new("global.cmd"),
+            &context,
+            Some(42),
+            || Ok(false),
+        )
+        .unwrap();
         assert_eq!(
             hash,
             git_internal::internal::object::blob::Blob::from_content_bytes(raw.to_vec()).id
         );
+    }
+    #[test]
+    fn auto_binary_heuristic_matches_fixed_git_boundaries() {
+        for (bytes, binary) in [
+            (b"text\r\n".as_slice(), false),
+            (b"\0text\r\n", true),
+            (b"text\r\nlast\r", true),
+            (b"a\rb\r\n", true),
+            (b"\x01text\r\n", true),
+            (b"\x7ftext\r\n", true),
+            (b"\x08\t\x0c\x1b\xff\r\n", false),
+            (b"text\r\n\x1a", false),
+            (b"text\x1a\r\n", true),
+            (b"\x1a\x1a\r\n\x1a", true),
+        ] {
+            assert_eq!(
+                TextStats::from_bytes(bytes).is_binary(),
+                binary,
+                "{bytes:?}"
+            );
+        }
+        for printable in [127, 128, 255, 256] {
+            let mut bytes = vec![b'a'; printable];
+            bytes.extend_from_slice(b"\x01\r\n");
+            assert_eq!(TextStats::from_bytes(&bytes).is_binary(), printable < 128);
+            bytes.extend_from_slice(b"\x02");
+            assert_eq!(TextStats::from_bytes(&bytes).is_binary(), printable < 256);
+        }
+    }
+
+    #[test]
+    fn auto_index_guard_is_lazy_and_renormalize_keeps_binary_protection() {
+        for mode in [CleanMode::Normal, CleanMode::Renormalize] {
+            for (policy, raw, expected, reads) in [
+                (
+                    CleanPolicy::Preserve,
+                    b"text\r\n".as_slice(),
+                    ResolvedPolicy::Preserve,
+                    0,
+                ),
+                (CleanPolicy::Text, b"\0text\r\n", ResolvedPolicy::Text, 0),
+                (
+                    CleanPolicy::Auto,
+                    b"\0text\r\n",
+                    ResolvedPolicy::Preserve,
+                    0,
+                ),
+                (CleanPolicy::Auto, b"text\n", ResolvedPolicy::Preserve, 0),
+                (
+                    CleanPolicy::Auto,
+                    b"text\r\n",
+                    if mode == CleanMode::Normal {
+                        ResolvedPolicy::Preserve
+                    } else {
+                        ResolvedPolicy::Text
+                    },
+                    usize::from(mode == CleanMode::Normal),
+                ),
+            ] {
+                let mut observed = 0;
+                let resolved = resolve_policy(policy, &TextStats::from_bytes(raw), mode, || {
+                    observed += 1;
+                    Ok(true)
+                })
+                .unwrap();
+                assert_eq!(resolved, expected, "{mode:?}/{policy:?}");
+                assert_eq!(observed, reads);
+            }
+        }
+        let error = resolve_policy(
+            CleanPolicy::Auto,
+            &TextStats::from_bytes(b"text\r\n"),
+            CleanMode::Normal,
+            || Err(io::Error::other("missing index evidence")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing index evidence"));
+        assert!(!has_text_crlf(b"\0text\r\n"));
+        assert!(!has_text_crlf(b"text\n"));
+        assert!(has_text_crlf(b"text\r\n"));
+    }
+
+    #[test]
+    fn auto_streaming_cross_chunk_crlf_and_final_sub_in_both_formats() {
+        use git_internal::{
+            hash::{HashKind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+        for kind in [HashKind::Sha1, HashKind::Sha256] {
+            let _kind = set_hash_kind_for_test(kind);
+            for length in [65534, 65535, 65536, 131071] {
+                let mut raw = vec![b'x'; length];
+                raw.extend_from_slice(b"\r\nlast\r\n\x1a");
+                let mut clean = vec![b'x'; length];
+                clean.extend_from_slice(b"\nlast\n\x1a");
+                for historical_crlf in [false, true] {
+                    let mut file = tempfile::tempfile().unwrap();
+                    std::io::Write::write_all(&mut file, &raw).unwrap();
+                    file.rewind().unwrap();
+                    let actual =
+                        hash_clean_file_handle(file, CleanPolicy::Auto, || Ok(historical_crlf))
+                            .unwrap();
+                    let expected = if historical_crlf { &raw } else { &clean };
+                    assert_eq!(
+                        actual,
+                        Blob::from_content_bytes(expected.clone()).id,
+                        "{kind:?}/{length}/{historical_crlf}"
+                    );
+                }
+                raw.push(b'\r');
+                let mut file = tempfile::tempfile().unwrap();
+                std::io::Write::write_all(&mut file, &raw).unwrap();
+                file.rewind().unwrap();
+                let actual = hash_clean_file_handle(file, CleanPolicy::Auto, || {
+                    panic!("binary must not read index")
+                })
+                .unwrap();
+                assert_eq!(actual, Blob::from_content_bytes(raw).id);
+            }
+        }
     }
 }

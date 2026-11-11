@@ -16,7 +16,7 @@ libra merge --restart
 
 属性来源不可读或工作区路径不安全时，预检以 `LBR-IO-001` 停止，并保留具体原因，便于修复后重试。
 
-干净度预检按显式 `text`/`eol` 规则比较已跟踪普通文件。CRLF 转换后与索引 LF 内容相同时，不会阻止 `merge --ff-only`。真实编辑、模式或类型变化、已有冲突及 merge 状态仍保留原有保护。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+干净度预检按显式 `text`/`eol` 规则比较已跟踪普通文件。CRLF 转换后与索引 LF 内容相同时，不会阻止 `merge --ff-only`。真实编辑、模式或类型变化、已有冲突及 merge 状态仍保留原有保护。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 `libra merge <branch>...` 会解析一个或多个本地分支、提交哈希，或 `refs/remotes/origin/main` 这样的远程跟踪引用。一个目标保持下述单头行为；两个及以上目标进入 octopus 合并路径。
 

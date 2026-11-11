@@ -20,7 +20,7 @@
 
 - 普通工作区 diff 的候选 OID 通过共享 `ConversionScan` 计算；仅属性源/索引指纹有效且 stat 匹配时复用索引 OID。`WorktreeContents` 让渲染、pickaxe、二进制处理和 rename 消费相同 clean 内容，非零候选 OID 不一致时报可重试读取错误。转换读取失败必须传播。
 - plumbing 仍由 `get_files_blobs_stat_only` 选择候选，raw/name/退出码保留 stat 语义。`-p` 读取 clean 内容，内容相同则清空补丁但保留候选；真实编辑的 patch index 行使用实际 clean OID。缓存按路径与 OID 联合索引，防止多个全零 OID 候选串用文件内容。intent-to-add 无有效 stat，使用共享 clean 内容计算候选哈希，避免 raw OID 与 clean 正文不一致；TC-0044 条目存在性规则保持。
-- 已存储 index/tree blob 不转换；LFS 指针来自原始载荷摘要、symlink 读取目标字节，外部 diff/textconv 与 `--no-index` 输入契约保持。比较不写源文件、索引或对象库。`text=auto` 由 #861 承接。
+- 已存储 index/tree blob 不转换；LFS 指针来自原始载荷摘要、symlink 读取目标字节，外部 diff/textconv 与 `--no-index` 输入契约保持。比较不写源文件、索引或对象库。`text=auto` 通过同一 clean 策略执行二进制探测及历史 CRLF 索引保护；normal/renormalize 模式和失败边界见 [add](add.md)。
 - 回归位于既有 `command_test`：`diff_test::i1062_explicit_`、`diff_test::i1062_failure_`、`diff_test::i1062_content_view_` 与 `diff_plumbing_test::i1062_plumbing_explicit_conversion_matches_git_modes`。固定 Git 对照保留各模式退出码，raw OID 显示使用 Git `--abbrev=7` 对齐 Libra 既有宽度，不宣称默认宽度相同。
 
 ## 实现历史

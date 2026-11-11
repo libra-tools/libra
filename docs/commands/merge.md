@@ -16,7 +16,7 @@ libra merge --restart
 
 An unreadable attribute source or unsafe worktree path stops the preflight with `LBR-IO-001` and retains the underlying cause so it can be corrected before retrying.
 
-The clean-worktree preflight compares tracked regular files using explicit `text`/`eol` rules. CRLF bytes that clean to the indexed LF content do not block `merge --ff-only`. Real edits, mode/type changes and existing conflict or merge state retain their normal protection. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+The clean-worktree preflight compares tracked regular files using explicit `text`/`eol` rules. CRLF bytes that clean to the indexed LF content do not block `merge --ff-only`. Real edits, mode/type changes and existing conflict or merge state retain their normal protection. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 `libra merge <branch>...` resolves one or more local branches, commit hashes, or remote-tracking refs such as `refs/remotes/origin/main`. One target keeps the single-head behavior described below; two or more targets select an octopus merge.
 

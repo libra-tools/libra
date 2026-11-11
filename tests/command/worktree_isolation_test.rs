@@ -10933,12 +10933,25 @@ fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
 
 #[test]
 fn i1062_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(false);
+}
+
+#[test]
+fn i861_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(true);
+}
+
+fn eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(auto: bool) {
     use super::{
         add_test::{i1062_ok, i1062_run},
         status_test::i1062_fast_forward_scripts,
     };
     for dirty in [false, true] {
-        let (temp, _) = i1062_fast_forward_scripts();
+        let (temp, _) = if auto {
+            super::status_test::i861_fast_forward_scripts()
+        } else {
+            i1062_fast_forward_scripts()
+        };
         let repo = temp.path().join("repo");
         let patch_dir = temp.path().join("patches");
         i1062_ok(
@@ -10972,5 +10985,48 @@ fn i1062_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
             assert_ne!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
             assert_eq!(fs::read(repo.join("upstream.txt")).unwrap(), b"upstream\n");
         }
+    }
+}
+
+#[test]
+fn i861_consumer_linked_worktree_uses_own_index_and_common_objects() {
+    use super::add_test::{i1062_index_oid, i1062_ok, i1062_run};
+    for format in ["sha1", "sha256"] {
+        let temp = super::status_test::i861_committed_scripts(format);
+        let main = temp.path().join("repo");
+        let linked = temp.path().join("linked");
+        i1062_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "auto-linked",
+                "--path",
+                linked.to_str().unwrap(),
+                "--detach",
+            ],
+        );
+        let main_oid = i1062_index_oid(&main, "probe.ps1");
+        std::fs::write(linked.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+        std::fs::write(linked.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+        i1062_ok(&linked, &["add", ".gitattributes", "probe.ps1"]);
+        let linked_oid = i1062_index_oid(&linked, "probe.ps1");
+        assert_ne!(main_oid, linked_oid);
+        std::fs::write(linked.join(".gitattributes"), "*.ps1 text=auto\n").unwrap();
+        i1062_ok(&linked, &["diff", "--quiet", "--", "probe.ps1"]);
+        i1062_ok(&main, &["diff", "--quiet", "--", "probe.ps1"]);
+        for repo in [&main, &linked] {
+            std::fs::write(repo.join("probe.ps1"), b"one\r\ntwo\n").unwrap();
+        }
+        i1062_ok(&main, &["diff", "--quiet", "--", "probe.ps1"]);
+        assert_eq!(
+            i1062_run(&linked, &["diff", "--quiet", "--", "probe.ps1"])
+                .status
+                .code(),
+            Some(1)
+        );
+        i1062_ok(&linked, &["add", "--renormalize", "probe.ps1"]);
+        assert_eq!(i1062_index_oid(&linked, "probe.ps1"), main_oid);
+        assert_eq!(i1062_index_oid(&main, "probe.ps1"), main_oid);
     }
 }

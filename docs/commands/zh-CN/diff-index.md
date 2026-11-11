@@ -15,7 +15,7 @@ libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status] [--e
 
 默认输出是 raw。`--name-status` 与 `diff-files` 一样按**条目是否存在**给字母：stat 失效的空 blob 是 `M` 而不是 `A`，工作树被截断为 0 字节是 `M` 而不是 `D`。
 
-显式 `text`、`eol=lf`、`eol=crlf` 属性使 `-p` 按 clean 工作区内容比较（CRLF 对转换为 LF）。因此补丁可以为空，而基于 stat 的 raw/名称输出仍报告 `M` 和全零工作区 OID；`--quiet`、`--exit-code` 仍按该 stat 差异返回 1，包括补丁为空的情况。按内容判断干净状态请用 [`diff`](diff.md)。`-text` 保留字节，`text=auto` 仍未启用。存储对象不转换，命令不刷新索引或改写工作区文件。生成补丁时读取内容或属性失败会返回错误，不得以空补丁成功退出。
+显式 `text`、`eol=lf`、`eol=crlf` 属性使 `-p` 按 clean 工作区内容比较（CRLF 对转换为 LF）。因此补丁可以为空，而基于 stat 的 raw/名称输出仍报告 `M` 和全零工作区 OID；`--quiet`、`--exit-code` 仍按该 stat 差异返回 1，包括补丁为空的情况。按内容判断干净状态请用 [`diff`](diff.md)。`-text` 保留字节，`text=auto` 同时支持文本转换、二进制探测和历史 CRLF 索引保护，限制见 [add](add.md)。存储对象不转换，命令不刷新索引或改写工作区文件。生成补丁时读取内容或属性失败会返回错误，不得以空补丁成功退出。
 
 `--cached` 按已存储的 tree 和索引字节比较，不受当前工作区属性影响。
 

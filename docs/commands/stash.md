@@ -18,7 +18,7 @@ libra stash clear [--force]
 
 ## Description
 
-The tracked-change selection for `stash push` uses explicit `text`/`eol` clean comparison. Equivalent CRLF/LF content alone does not create a stash entry. Real edits and the existing untracked, ignored and conflict policies keep their normal behavior. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+The tracked-change selection for `stash push` uses explicit `text`/`eol` clean comparison. Equivalent CRLF/LF content alone does not create a stash entry. Real edits and the existing untracked, ignored and conflict policies keep their normal behavior. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 `libra stash` with no subcommand (or with options first) is exactly
 `libra stash push`; any other first token that is not a known subcommand is a

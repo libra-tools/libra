@@ -3935,11 +3935,24 @@ fn commit_partial_commit_options_are_classified() {
 
 #[test]
 fn i1062_consumer_commit_all_does_not_create_representation_only_commit() {
+    eol_consumer_commit_all_does_not_create_representation_only_commit(false);
+}
+
+#[test]
+fn i861_consumer_commit_all_does_not_create_representation_only_commit() {
+    eol_consumer_commit_all_does_not_create_representation_only_commit(true);
+}
+
+fn eol_consumer_commit_all_does_not_create_representation_only_commit(auto: bool) {
     use super::{
         add_test::{i1062_ok, i1062_run},
         status_test::i1062_committed_scripts,
     };
-    let temp = i1062_committed_scripts("sha1");
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha1")
+    } else {
+        i1062_committed_scripts("sha1")
+    };
     let repo = temp.path().join("repo");
     let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
     let output = i1062_run(

@@ -3935,3 +3935,105 @@ fn i1062_content_view_no_index_keeps_filesystem_bytes() {
     assert_eq!(diff.status.code(), Some(1), "{diff:?}");
     assert!(!diff.stdout.is_empty());
 }
+
+#[test]
+fn i861_tc1324_own_add_then_mixed_endings_is_clean() {
+    use super::add_test::{i861_repo, i1062_index_oid, i1062_ok};
+    for format in ["sha1", "sha256"] {
+        let temp = i861_repo(format, "crlf.txt text=auto\n");
+        let repo = temp.path().join("repo");
+        std::fs::write(repo.join("crlf.txt"), b"Hello\r\nWorld\r\n").unwrap();
+        i1062_ok(&repo, &["add", ".gitattributes", "crlf.txt"]);
+        let oid = i1062_index_oid(&repo, "crlf.txt");
+        assert_eq!(
+            i1062_ok(&repo, &["cat-file", "-p", &oid]),
+            b"Hello\nWorld\n"
+        );
+        std::fs::write(repo.join("crlf.txt"), b"Hello\r\nWorld\n").unwrap();
+        let before = std::fs::read(repo.join(".libra/index")).unwrap();
+        for args in [
+            vec!["diff", "--quiet", "crlf.txt"],
+            vec!["diff", "--exit-code", "crlf.txt"],
+            vec!["diff", "crlf.txt"],
+        ] {
+            assert!(i1062_ok(&repo, &args).is_empty(), "{format}: {args:?}");
+        }
+        assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(repo.join("crlf.txt")).unwrap(),
+            b"Hello\r\nWorld\n"
+        );
+    }
+}
+
+#[test]
+fn i861_real_change_renders_clean_bytes_and_remains_dirty() {
+    use super::add_test::{i1062_ok, i1062_run};
+    let temp = super::status_test::i861_committed_scripts("sha256");
+    let repo = temp.path().join("repo");
+    std::fs::write(repo.join("probe.ps1"), b"one\r\nchanged\r\n").unwrap();
+    let patch = i1062_ok(&repo, &["diff", "--", "probe.ps1"]);
+    let text = String::from_utf8(patch).unwrap();
+    assert!(
+        text.contains("-two\n") && text.contains("+changed\n"),
+        "{text}"
+    );
+    assert!(!text.contains('\r'));
+    assert_eq!(
+        i1062_run(&repo, &["diff", "--quiet", "probe.ps1"])
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn i861_history_guard_does_not_normalize_recorded_objects() {
+    use super::add_test::{i861_repo, i1062_index_oid, i1062_ok, i1062_run};
+    let temp = i861_repo("sha1", "* -text\n");
+    let repo = temp.path().join("repo");
+    std::fs::write(repo.join("probe.txt"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "raw history"]);
+    let historical = i1062_index_oid(&repo, "probe.txt");
+    std::fs::write(repo.join(".gitattributes"), "* text=auto\n").unwrap();
+    i1062_ok(&repo, &["diff", "--quiet", "probe.txt"]);
+    std::fs::write(repo.join("probe.txt"), b"one\r\ntwo\n").unwrap();
+    assert_eq!(
+        i1062_run(&repo, &["diff", "--quiet", "probe.txt"])
+            .status
+            .code(),
+        Some(1)
+    );
+    i1062_ok(&repo, &["add", "--renormalize", "probe.txt"]);
+    assert!(!i1062_ok(&repo, &["diff", "--cached", "--", "probe.txt"]).is_empty());
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", &historical]),
+        b"one\r\ntwo\r\n"
+    );
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "normalize"]);
+    assert!(!i1062_ok(&repo, &["diff", "HEAD~1", "HEAD", "--", "probe.txt"]).is_empty());
+}
+
+#[test]
+fn i861_failure_index_read_is_not_quiet_success_or_deletion() {
+    use super::add_test::{i861_damage_index_blob, i1062_run};
+    for corrupt in [false, true] {
+        let temp = super::status_test::i861_committed_scripts("sha1");
+        let repo = temp.path().join("repo");
+        let before = std::fs::read(repo.join(".libra/index")).unwrap();
+        i861_damage_index_blob(&repo, "probe.ps1", corrupt);
+        for args in [
+            vec!["diff", "--quiet", "probe.ps1"],
+            vec!["diff", "probe.ps1"],
+        ] {
+            let output = i1062_run(&repo, &args);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("index object"),
+                "{output:?}"
+            );
+        }
+        assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), before);
+    }
+}

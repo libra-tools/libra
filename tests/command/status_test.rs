@@ -4753,6 +4753,14 @@ fn status_storage_scope_config_rejection_is_not_success() {
 
 /// The same committed fixture is reused by the status/consumer regressions.
 pub(super) fn i1062_committed_scripts(format: &str) -> tempfile::TempDir {
+    eol_committed_scripts(format, false)
+}
+
+pub(super) fn i861_committed_scripts(format: &str) -> tempfile::TempDir {
+    eol_committed_scripts(format, true)
+}
+
+fn eol_committed_scripts(format: &str, auto: bool) -> tempfile::TempDir {
     use super::add_test::i1062_ok;
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -4762,7 +4770,11 @@ pub(super) fn i1062_committed_scripts(format: &str) -> tempfile::TempDir {
     i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
     fs::write(
         repo.join(".gitattributes"),
-        "*.ps1 text eol=crlf\n*.bat text eol=lf\n*.cmd eol=crlf\n",
+        if auto {
+            "*.ps1 text=auto eol=crlf\n*.bat text=auto eol=lf\n*.cmd text=auto\n"
+        } else {
+            "*.ps1 text eol=crlf\n*.bat text eol=lf\n*.cmd eol=crlf\n"
+        },
     )
     .unwrap();
     for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
@@ -4778,9 +4790,22 @@ pub(super) fn i1062_committed_scripts(format: &str) -> tempfile::TempDir {
 
 #[test]
 fn i1062_status_explicit_representation_is_clean_in_both_hash_formats() {
+    eol_status_explicit_representation_is_clean_in_both_hash_formats(false);
+}
+
+#[test]
+fn i861_status_explicit_representation_is_clean_in_both_hash_formats() {
+    eol_status_explicit_representation_is_clean_in_both_hash_formats(true);
+}
+
+fn eol_status_explicit_representation_is_clean_in_both_hash_formats(auto: bool) {
     use super::add_test::i1062_ok;
     for format in ["sha1", "sha256"] {
-        let temp = i1062_committed_scripts(format);
+        let temp = if auto {
+            super::status_test::i861_committed_scripts(format)
+        } else {
+            i1062_committed_scripts(format)
+        };
         let repo = temp.path().join("repo");
         let output = i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
         assert!(
@@ -4882,6 +4907,15 @@ fn i1062_status_real_content_type_mode_and_deletion_remain_visible() {
 
 #[test]
 fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
+    eol_status_valid_policy_stat_hits_do_not_read_content(false);
+}
+
+#[test]
+fn i861_status_valid_policy_stat_hits_do_not_read_content() {
+    eol_status_valid_policy_stat_hits_do_not_read_content(true);
+}
+
+fn eol_status_valid_policy_stat_hits_do_not_read_content(auto: bool) {
     use super::add_test::{i1062_command, i1062_ok};
     let temp = tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -4890,7 +4924,15 @@ fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
     i1062_ok(&repo, &["config", "user.name", "EOL test"]);
     i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
     fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
-    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    fs::write(
+        repo.join(".gitattributes"),
+        if auto {
+            "*.ps1 text=auto\n"
+        } else {
+            "*.ps1 text eol=crlf\n"
+        },
+    )
+    .unwrap();
     i1062_ok(&repo, &["add", "."]);
     i1062_ok(&repo, &["commit", "--no-verify", "-m", "base"]);
     i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
@@ -4898,6 +4940,7 @@ fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
         i1062_command(&repo, &["status", "--porcelain", "--untracked-files=no"])
             .env("LIBRA_TEST", "1")
             .env("LIBRA_TEST_CONVERSION_HASH_FAIL", "*")
+            .env("LIBRA_TEST_SLOW_OBJECT_READ_MS", "20000")
             .output()
             .unwrap()
     };
@@ -4921,8 +4964,16 @@ fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
 }
 
 pub(super) fn i1062_fast_forward_scripts() -> (tempfile::TempDir, Vec<u8>) {
+    eol_fast_forward_scripts(false)
+}
+
+pub(super) fn i861_fast_forward_scripts() -> (tempfile::TempDir, Vec<u8>) {
+    eol_fast_forward_scripts(true)
+}
+
+fn eol_fast_forward_scripts(auto: bool) -> (tempfile::TempDir, Vec<u8>) {
     use super::add_test::i1062_ok;
-    let temp = i1062_committed_scripts("sha1");
+    let temp = eol_committed_scripts("sha1", auto);
     let repo = temp.path().join("repo");
     // Branch setup uses the committed LF representation; the CRLF variant is
     // introduced only once the source/target history is ready for the test.

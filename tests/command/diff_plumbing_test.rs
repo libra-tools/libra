@@ -1060,3 +1060,23 @@ fn i1062_plumbing_explicit_conversion_matches_git_modes() {
         }
     }
 }
+
+#[test]
+fn i861_auto_patch_cleaning_preserves_stat_only_exit_contract() {
+    use super::add_test::{i1062_ok, i1062_run};
+    let temp = super::status_test::i861_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    for args in [
+        vec!["diff-files", "-p", "--", "probe.ps1"],
+        vec!["diff-index", "-p", "HEAD", "--", "probe.ps1"],
+    ] {
+        assert!(i1062_ok(&repo, &args).is_empty(), "{args:?}");
+    }
+    for args in [
+        vec!["diff-files", "--quiet", "--", "probe.ps1"],
+        vec!["diff-index", "--quiet", "HEAD", "--", "probe.ps1"],
+    ] {
+        assert_eq!(i1062_run(&repo, &args).status.code(), Some(1), "{args:?}");
+    }
+    i1062_ok(&repo, &["diff", "--quiet", "--", "probe.ps1"]);
+}

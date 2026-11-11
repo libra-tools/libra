@@ -111,7 +111,7 @@ Use `--skip` to discard the current patch and continue with the next one, or
 
 ## Line-ending comparison
 
-The clean-worktree preflight honors explicit `text`/`eol` rules, so an equivalent CRLF representation does not prevent applying a mail patch. Actual unstaged changes and existing sequence/conflict state retain their normal protection. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+The clean-worktree preflight honors explicit `text`/`eol` rules, so an equivalent CRLF representation does not prevent applying a mail patch. Actual unstaged changes and existing sequence/conflict state retain their normal protection. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 ## Options
 

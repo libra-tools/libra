@@ -1646,12 +1646,25 @@ fn test_checkout_orphan_on_dirty_worktree_matches_git() {
 
 #[test]
 fn i1062_consumer_checkout_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_checkout_accepts_clean_representation_and_preserves_real_edits(false);
+}
+
+#[test]
+fn i861_consumer_checkout_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_checkout_accepts_clean_representation_and_preserves_real_edits(true);
+}
+
+fn eol_consumer_checkout_accepts_clean_representation_and_preserves_real_edits(auto: bool) {
     use super::{
         add_test::{i1062_ok, i1062_run},
         status_test::i1062_fast_forward_scripts,
     };
     for dirty in [false, true] {
-        let (temp, tip) = i1062_fast_forward_scripts();
+        let (temp, tip) = if auto {
+            super::status_test::i861_fast_forward_scripts()
+        } else {
+            i1062_fast_forward_scripts()
+        };
         let repo = temp.path().join("repo");
         if dirty {
             std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();

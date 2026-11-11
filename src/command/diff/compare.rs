@@ -1019,6 +1019,7 @@ pub(crate) fn resolve_worktree_side(
         label: "working tree".to_string(),
         worktree_entries: WorktreeContents {
             entries: blobs.iter().cloned().collect(),
+            selected_index: crate::command::status_io_worker::selected_index_oids(index),
             clean: !stat_only,
         },
         blobs,

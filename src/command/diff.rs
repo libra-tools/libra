@@ -2651,6 +2651,7 @@ fn append_mode_only_changes(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorktreeContents {
     entries: HashMap<PathBuf, ObjectHash>,
+    selected_index: HashMap<PathBuf, ObjectHash>,
     clean: bool,
 }
 
@@ -2664,12 +2665,19 @@ impl WorktreeContents {
             return read_worktree_blob_content(&path.to_path_buf());
         }
         let absolute = util::workdir_to_absolute(path);
-        let bytes = crate::utils::worktree_conversion::read_clean_blob_bytes(&absolute).map_err(
-            |error| DiffError::FileRead {
-                path: absolute.display().to_string(),
-                detail: error.to_string(),
+        let bytes = crate::utils::worktree_conversion::read_clean_blob_bytes(
+            &absolute,
+            crate::utils::worktree_conversion::CleanMode::Normal,
+            || {
+                crate::command::status_io_worker::index_has_text_crlf(
+                    self.selected_index.get(path).copied(),
+                )
             },
-        )?;
+        )
+        .map_err(|error| DiffError::FileRead {
+            path: absolute.display().to_string(),
+            detail: error.to_string(),
+        })?;
         // Zero denotes a stat-only plumbing candidate, not a content hash.
         if *expected != ObjectHash::zero_for_kind(git_internal::hash::get_hash_kind())
             && calculate_object_hash(ObjectType::Blob, &bytes) != *expected
@@ -2783,11 +2791,15 @@ fn get_files_blobs_stat_only(
                 && entry.flags.intent_to_add
             {
                 let absolute = util::workdir_to_absolute(p);
-                let data = crate::utils::worktree_conversion::read_clean_blob_bytes(&absolute)
-                    .map_err(|e| DiffError::FileRead {
-                        path: absolute.display().to_string(),
-                        detail: e.to_string(),
-                    })?;
+                let data = crate::utils::worktree_conversion::read_clean_blob_bytes(
+                    &absolute,
+                    crate::utils::worktree_conversion::CleanMode::Normal,
+                    || crate::command::status_io_worker::index_has_text_crlf(Some(entry.hash)),
+                )
+                .map_err(|e| DiffError::FileRead {
+                    path: absolute.display().to_string(),
+                    detail: e.to_string(),
+                })?;
                 return Ok((p.to_owned(), calculate_object_hash(ObjectType::Blob, &data)));
             }
             // Stat differs: report the all-zero worktree sha without hashing.

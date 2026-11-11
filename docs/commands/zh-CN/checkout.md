@@ -16,7 +16,7 @@ libra checkout [<tree-ish>] [--] <pathspec>...
 
 ## 说明
 
-分支检出的干净度预检使用显式 `text`/`eol` clean 比较，等价 CRLF/LF 内容不会造成假脏拒绝。这只改变预检的比较方式，不新增 checkout/smudge 的 CRLF 写回，也不削弱真实编辑的保护。 显式规则及转换限制见 [add](add.md)；本次不启用 `text=auto`。
+分支检出的干净度预检使用显式 `text`/`eol` clean 比较，等价 CRLF/LF 内容不会造成假脏拒绝。这只改变预检的比较方式，不新增 checkout/smudge 的 CRLF 写回，也不削弱真实编辑的保护。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 `libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-` 返回上一个 checkout 目标、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
 

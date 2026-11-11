@@ -16,7 +16,7 @@ libra checkout [<tree-ish>] [--] <pathspec>...
 
 ## Description
 
-Branch checkout uses explicit `text`/`eol` clean comparison for its clean-worktree preflight. Equivalent CRLF/LF content does not cause a false dirty rejection. This changes the preflight comparison only; it does not add CRLF checkout/smudge conversion or weaken protection of real edits. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+Branch checkout uses explicit `text`/`eol` clean comparison for its clean-worktree preflight. Equivalent CRLF/LF content does not cause a false dirty rejection. This changes the preflight comparison only; it does not add CRLF checkout/smudge conversion or weaken protection of real edits. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 `libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, returning to the previous checkout target with `-`, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, creating an unborn orphan branch with `--orphan`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
 

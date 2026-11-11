@@ -601,7 +601,7 @@ pub(crate) fn conversion_sources_fingerprint(
     context: &ConversionAttributeContext,
 ) -> io::Result<String> {
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-    hash.update(format!("conversion-v1:{:?}", beneath_root_identity(workdir, root)?).as_bytes());
+    hash.update(format!("conversion-v2:{:?}", beneath_root_identity(workdir, root)?).as_bytes());
     let mut sources = Vec::new();
     sources.extend(context.configured.iter().cloned());
     for directory in directories {

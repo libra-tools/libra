@@ -430,3 +430,38 @@ fn i1062_status_invalid_attribute_source_never_reports_clean() {
             .success()
     );
 }
+
+#[test]
+fn i861_missing_index_evidence_is_blocked_and_never_clean() {
+    use super::add_test::{i861_damage_index_blob, i1062_run};
+    let temp = super::status_test::i861_committed_scripts("sha256");
+    let repo = temp.path().join("repo");
+    i861_damage_index_blob(&repo, "probe.ps1", false);
+    let before = fs::read(repo.join(".libra/index")).unwrap();
+    for mode in [None, Some("--scan"), Some("--check-dirty")] {
+        let mut args = vec!["--json", "status"];
+        args.extend(mode);
+        let output = i1062_run(&repo, &args);
+        if output.status.success() {
+            let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                !doc["data"]["io_blocked"].as_array().unwrap().is_empty(),
+                "{doc}"
+            );
+            assert_ne!(doc["data"]["is_clean"], true, "{doc}");
+            assert!(
+                doc["data"]["unstaged"]["deleted"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{doc}"
+            );
+        }
+    }
+    assert!(
+        !i1062_run(&repo, &["status", "--porcelain"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), before);
+}

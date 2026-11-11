@@ -21,7 +21,7 @@ libra commit --no-agent-trailer -m <MESSAGE>
 
 ## Description
 
-Automatic tracked-file staging with `commit -a` uses explicit `text`/`eol` clean comparison. A CRLF/LF representation difference alone does not create a content change or permit an otherwise empty commit. Real edits are staged through the same conversion used by `add`. The explicit rules and remaining conversion limits are described under [add](add.md); `text=auto` remains outside this change.
+Automatic tracked-file staging with `commit -a` uses explicit `text`/`eol` clean comparison. A CRLF/LF representation difference alone does not create a content change or permit an otherwise empty commit. Real edits are staged through the same conversion used by `add`. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
 
 `libra commit` creates a new commit from staged changes, builds tree and commit objects,
 validates messages (including optional conventional commit format and GPG signing via vault),
