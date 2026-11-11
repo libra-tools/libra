@@ -78,7 +78,7 @@ pub struct LsTreeArgs {
 
     /// Render each entry with a custom format string. Supports the atoms
     /// `%(objectmode)`, `%(objecttype)`, `%(objectname)`, `%(objectsize)`,
-    /// `%(path)`, and the escapes `%x09` (tab) / `%x0a` (newline).
+    /// `%(objectsize:padded)`, `%(path)`, and the escapes `%x09` (tab) / `%x0a` (newline).
     #[arg(long = "format", value_name = "FORMAT", conflicts_with_all = ["name_only", "name_status", "object_only", "long"])]
     pub format: Option<String>,
 
@@ -166,7 +166,12 @@ pub async fn execute(args: LsTreeArgs) -> Result<(), String> {
 /// stdout write failures.
 pub async fn execute_safe(args: LsTreeArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    let result = resolve_ls_tree(&args).await?;
+    let include_size = args.long
+        || (!output.is_json()
+            && args.format.as_deref().is_some_and(|format| {
+                format.contains("%(objectsize)") || format.contains("%(objectsize:padded)")
+            }));
+    let result = resolve_ls_tree(&args, include_size).await?;
 
     if output.is_json() {
         emit_json_data("ls-tree", &result, output)
@@ -179,7 +184,7 @@ pub async fn execute_safe(args: LsTreeArgs, output: &OutputConfig) -> CliResult<
     }
 }
 
-async fn resolve_ls_tree(args: &LsTreeArgs) -> CliResult<LsTreeOutput> {
+async fn resolve_ls_tree(args: &LsTreeArgs, include_size: bool) -> CliResult<LsTreeOutput> {
     validate_args(args)?;
     let storage = util::objects_storage()?;
     let root_tree = resolve_treeish_to_tree(&args.treeish, &storage).await?;
@@ -188,7 +193,7 @@ async fn resolve_ls_tree(args: &LsTreeArgs) -> CliResult<LsTreeOutput> {
     let raw_entries = collect_matching_entries(root_tree, &filters, args, &path_context)?;
     let entries = raw_entries
         .into_iter()
-        .map(|entry| format_entry(entry, args.abbrev, args.long, &storage, &path_context))
+        .map(|entry| format_entry(entry, args.abbrev, include_size, &storage, &path_context))
         .collect::<CliResult<Vec<_>>>()?;
 
     Ok(LsTreeOutput {
@@ -762,6 +767,7 @@ fn render_format_entry(entry: &LsTreeEntry, format: &str) -> String {
         .replace("%(objecttype)", &entry.object_type)
         .replace("%(objectname)", &entry.object)
         .replace("%(objectsize)", &size)
+        .replace("%(objectsize:padded)", &format!("{size:>7}"))
         .replace("%(path)", &entry.path)
         .replace("%x09", "\t")
         .replace("%x0a", "\n")
@@ -922,5 +928,128 @@ mod tests {
             path: "src".to_string(),
         };
         assert_eq!(raw.clone().path, "src");
+    }
+    // These bytes come from the pinned Git control, independently of Libra.
+    const ISSUE1057_GOLDEN: &[(&str, usize, &str)] = &[
+        (
+            "size",
+            102,
+            "464f4b734a2a36eff08fcf505082d50df527900825c84143a3f42f15f4062cc3",
+        ),
+        (
+            "size-six",
+            34,
+            "ee027933988caf703904b93fa400a34024f4186d1f95fcf43570ba3e83645ee0",
+        ),
+    ];
+    fn issue1057_golden(name: &str) -> &'static [u8] {
+        use sha2::{Digest, Sha256};
+        let bytes: &'static [u8] = match name {
+"size" => b"      -|-|      -|dir\n      0|0|      0|empty\n10000000|10000000|10000000|large\n      -|-|      -|link\n",
+"size-six" => b"      6|6|      6|dir/nested/file\n",
+
+            _ => panic!("unknown issue1057 golden: {name}"),
+        };
+        let (_, len, sha) = ISSUE1057_GOLDEN
+            .iter()
+            .find(|row| row.0 == name)
+            .expect("registered golden");
+        assert_eq!(bytes.len(), *len);
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), *sha);
+        bytes
+    }
+    fn issue1057_size_line(path: &str) -> &'static str {
+        let bytes = if path == "dir/nested/file" {
+            issue1057_golden("size-six")
+        } else {
+            issue1057_golden("size")
+        };
+        std::str::from_utf8(bytes)
+            .expect("UTF-8 golden")
+            .lines()
+            .find(|line| line.rsplit('|').next() == Some(path))
+            .expect("size golden path")
+    }
+    const ISSUE1057_SIZE_FORMAT: &str =
+        "%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)";
+
+    #[test]
+    fn ls_tree_issue1057_padded_blob() {
+        let mut item = entry("dir/nested/file");
+        item.size = Some(6);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("dir/nested/file")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_empty() {
+        let mut item = entry("empty");
+        item.size = Some(0);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("empty")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_large() {
+        let mut item = entry("large");
+        item.size = Some(10_000_000);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("large")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_tree() {
+        let mut item = entry("dir");
+        item.size = None;
+        item.object_type = "tree".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("dir")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_gitlink() {
+        let mut item = entry("link");
+        item.size = None;
+        item.object_type = "commit".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("link")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_repeated() {
+        let mut item = entry("empty");
+        item.size = Some(0);
+        let columns: Vec<_> = issue1057_size_line("empty").split('|').collect();
+        assert_eq!(
+            super::render_format_entry(&item, "%(objectsize:padded)|%(objectsize:padded)"),
+            format!("{}|{}", columns[0], columns[2])
+        );
+    }
+    #[test]
+    fn ls_tree_issue1057_padded_literal_path() {
+        let path = "file-%(objectsize:padded)";
+        let mut item = entry(path);
+        item.size = Some(6);
+        let padded = issue1057_size_line("dir/nested/file")
+            .split('|')
+            .next()
+            .expect("size");
+        assert_eq!(
+            super::render_format_entry(&item, "%(path)|%(objectsize:padded)"),
+            format!("{path}|{padded}")
+        );
     }
 }

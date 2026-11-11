@@ -731,6 +731,21 @@ const ISSUE1057_GOLDEN: &[(&str, usize, &str)] = &[
         184,
         "9f90c078fe0d1542d835c897011121cd38e401ee84478fc720a0d5d3d8cb966a",
     ),
+    (
+        "size",
+        102,
+        "464f4b734a2a36eff08fcf505082d50df527900825c84143a3f42f15f4062cc3",
+    ),
+    (
+        "size-six",
+        34,
+        "ee027933988caf703904b93fa400a34024f4186d1f95fcf43570ba3e83645ee0",
+    ),
+    (
+        "capture",
+        248,
+        "b75c0853ebdc15d4e6eb0da2d18d35ae16047c2a41e36a0410242df8805ffc42",
+    ),
 ];
 
 fn issue1057_golden(name: &str) -> &'static [u8] {
@@ -765,6 +780,9 @@ fn issue1057_golden(name: &str) -> &'static [u8] {
         "recursive-slash" => b"100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
         "recursive-t-slash" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
         "t-overlap-child" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "size" => b"      -|-|      -|dir\n      0|0|      0|empty\n10000000|10000000|10000000|large\n      -|-|      -|link\n",
+        "size-six" => b"      6|6|      6|dir/nested/file\n",
+        "capture" => b"ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\x00c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\x00e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tempty\x005630165e4a6c588e6657164f014b0afc169f29e4\tlarge\x001111111111111111111111111111111111111111\tlink\x00",
         _ => panic!("unknown issue1057 golden: {name}"),
     };
     let (_, len, sha) = ISSUE1057_GOLDEN
@@ -1057,4 +1075,195 @@ fn ls_tree_issue1057_json() {
     assert_eq!(json["ok"], true);
     assert_eq!(json["command"], "ls-tree");
     assert_eq!(json["data"]["entries"], serde_json::json!(expected));
+}
+
+fn issue1057_size_column(name: &str, path: &str, column: usize) -> &'static [u8] {
+    issue1057_golden(name)
+        .split(|b| *b == b'\n')
+        .find(|line| line.rsplit(|b| *b == b'|').next() == Some(path.as_bytes()))
+        .expect("size golden path")
+        .split(|b| *b == b'|')
+        .nth(column)
+        .expect("size column")
+}
+
+fn issue1057_missing_blob(repo: &std::path::Path) {
+    let oid = blob_hash_for(repo, "dir/nested/file");
+    fs::remove_file(loose_object_path(repo, &oid)).expect("remove fixture blob");
+}
+
+#[test]
+fn ls_tree_issue1057_size_unpadded() {
+    let repo = setup_issue1057_repo();
+    let expected = [
+        issue1057_size_column("size-six", "dir/nested/file", 1),
+        b"\n",
+    ]
+    .concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        &expected,
+    );
+    // Exercise the storage request through the CLI for zero, seven-column and
+    // wider sizes as well as tree/gitlink placeholders and repeated atoms.
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)",
+            "HEAD",
+            "dir",
+            "empty",
+            "large",
+            "link",
+        ],
+        issue1057_golden("size"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        issue1057_golden("size-six"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_plain_tree() {
+    let repo = setup_issue1057_repo();
+    let expected = [issue1057_size_column("size", "dir", 1), b"\n"].concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(objectsize)", "HEAD", "dir"],
+        &expected,
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_plain_gitlink() {
+    let repo = setup_issue1057_repo();
+    let expected = [issue1057_size_column("size", "link", 1), b"\n"].concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(objectsize)", "HEAD", "link"],
+        &expected,
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_error() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    for format in [
+        "--format=%(objectsize)",
+        "--format=%(objectsize:padded)",
+        "-l",
+    ] {
+        let out = run_libra_command(&["ls-tree", format, "HEAD", "dir/nested/file"], repo.path());
+        assert_eq!(out.status.code(), Some(128), "{format}");
+        assert!(out.stdout.is_empty(), "no partial listing on size failure");
+        let (_, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-IO-001");
+    }
+    let out = run_libra_command(
+        &["--json", "ls-tree", "-l", "HEAD", "dir/nested/file"],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "JSON -l still reads sizes");
+    let (_, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-IO-001");
+}
+
+#[test]
+fn ls_tree_issue1057_size_not_requested() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(path)", "HEAD", "dir/nested/file"],
+        b"dir/nested/file\n",
+    );
+}
+
+fn assert_issue1057_json_without_size(repo: &std::path::Path) {
+    let output = run_libra_command(
+        &[
+            "--json",
+            "ls-tree",
+            "--format=%(objectsize:padded)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        repo,
+    );
+    assert_cli_success(&output, "JSON ignores size atom");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "ls-tree");
+    assert_eq!(
+        json["data"],
+        serde_json::json!({
+            "treeish": "HEAD", "root_tree": root_tree_hash(repo), "recursive": false,
+            "entries": [{"mode": "100644", "object_type": "blob",
+                "object": blob_hash_for(repo, "dir/nested/file"), "path": "dir/nested/file"}]
+        })
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_json_format() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_json_without_size(repo.path());
+    let out = run_libra_command(
+        &["--json", "ls-tree", "-l", "HEAD", "dir/nested/file"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "JSON -l includes size");
+    assert_eq!(parse_json_stdout(&out)["data"]["entries"][0]["size"], 6);
+}
+
+#[test]
+fn ls_tree_issue1057_capture_format() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--format=%(objectname)%x09%(path)",
+            "HEAD",
+        ],
+        issue1057_golden("capture"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_unknown_size_atom() {
+    let repo = setup_issue1057_repo();
+    let args = [
+        "ls-tree",
+        "--format=%(objectsize:bogus)",
+        "HEAD",
+        "dir/nested/file",
+    ];
+    assert_issue1057_listing(repo.path(), &args, b"%(objectsize:bogus)\n");
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_listing(repo.path(), &args, b"%(objectsize:bogus)\n");
+}
+
+#[test]
+fn ls_tree_issue1057_size_json_missing_blob() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_json_without_size(repo.path());
 }

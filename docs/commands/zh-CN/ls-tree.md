@@ -34,6 +34,7 @@ Without -r or -d, a single directory path without a trailing slash lists the dir
 | `--object-only` | 只打印 object IDs |
 | `--full-name` | 从子目录调用时，打印相对于仓库根的路径 |
 | `--full-tree` | 从仓库根列出，并将路径过滤解释为相对于仓库根 |
+| `--format=<FORMAT>` | 替换对象元数据与路径原子；与 `-l` 及仅名称/对象 ID 模式互斥 |
 | `--abbrev[=<N>]` | 将 object IDs 缩写为 `N` 字符，省略 `N` 时为 7 |
 | `<TREE-ISH>` | 提交、分支、标签、`HEAD` 或 tree object hash |
 | `[PATH...]` | 可选路径过滤；不带尾斜杠的目录路径选中目录条目自身（另一个路径参数指向其内部时选中其内容），带尾斜杠时选中其内容；除非设置 `--full-tree`，否则相对于当前目录 |
@@ -70,6 +71,12 @@ libra --json ls-tree HEAD
 040000 tree 5a6b7c8d9e0f1234567890abcdef1234567890        -	src
 ```
 
+%(objectsize:padded) pads blob sizes to at least seven columns.
+
+In JSON output, a format string does not add a size field.
+
+普通 `%(objectsize)` 输出十进制字节数；padded 原子右对齐到至少七列，大数不截断。tree/gitlink 使用 `-`（padded 时同样补空格）。未知原子按字面保留。人类格式仅在包含这两个完整大小原子时读取 blob；缺失对象报 `LBR-IO-001`。JSON 仅在 `-l` 时读取并输出大小，格式字符串不触发读取。
+
 ## 结构化输出
 
 带 `--json` 时，输出使用标准命令信封。带 `-l` 时，blob 条目包含 `size` 字段：
@@ -105,7 +112,7 @@ libra --json ls-tree HEAD
 | 子目录输出 | 相对于当前目录；`--full-name` 保留仓库路径 | 支持 | 不同模型 |
 | 根作用域列出 | `--full-tree` | `--full-tree` | 不同模型 |
 | 路径过滤 | 仅前缀过滤；除非设置 `--full-tree`，否则相对于当前目录 | 完整 pathspec | Revset/file patterns |
-| 自定义格式 | 延后 | `--format` | 不同模型 |
+| 自定义格式 | `--format` | `--format` | 不同模型 |
 | JSON 输出 | `--json` | 无 | 无 |
 
 ## 错误处理

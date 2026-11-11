@@ -40,6 +40,7 @@ pathspec magic is deferred.
 | `--object-only` | Print only object IDs |
 | `--full-name` | Print paths relative to the repository root when invoked from a subdirectory |
 | `--full-tree` | List from the repository root and interpret path filters relative to the repository root |
+| `--format=<FORMAT>` | Substitute object metadata and path atoms; conflicts with `-l` and the name/object-only modes |
 | `--abbrev[=<N>]` | Abbreviate object IDs to `N` characters, or 7 when `N` is omitted |
 | `<TREE-ISH>` | Commit, branch, tag, `HEAD`, or tree object hash |
 | `[PATH...]` | Optional path filters; a directory path without a trailing slash selects the directory entry itself (its contents when another path argument names a path inside it), and with a trailing slash its contents; relative to the current directory unless `--full-tree` is set |
@@ -75,6 +76,12 @@ With `-l`, blob entries include their decoded object size:
 100644 blob 4f3c2d1a7b8c9d0e1234567890abcdef12345678      128	README.md
 040000 tree 5a6b7c8d9e0f1234567890abcdef1234567890        -	src
 ```
+
+%(objectsize:padded) pads blob sizes to at least seven columns.
+
+In JSON output, a format string does not add a size field.
+
+Supported format atoms are `%(objectmode)`, `%(objecttype)`, `%(objectname)`, `%(objectsize)`, `%(objectsize:padded)` and `%(path)`, with `%x09`/`%x0a` for tab/newline. Sizes are decimal bytes; tree/gitlink sizes use `-`, padded to seven columns for the padded atom. Larger sizes are never truncated. Unknown atoms stay literal. Human formats read blobs only for either supported size atom; a missing blob then fails with `LBR-IO-001`. JSON reads sizes only with `-l`.
 
 ## Structured Output
 
@@ -112,7 +119,7 @@ entries include the `size` field:
 | Subdirectory output | Current-directory relative; `--full-name` keeps repository paths | Supported | Different model |
 | Root-scoped listing | `--full-tree` | `--full-tree` | Different model |
 | Path filters | Prefix filters only; current-directory relative unless `--full-tree` is set | Full pathspec | Revset/file patterns |
-| Custom formatting | Deferred | `--format` | Different model |
+| Custom formatting | `--format` | `--format` | Different model |
 | JSON output | `--json` | No | No |
 
 ## Error Handling
