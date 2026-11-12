@@ -1296,6 +1296,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/957.md`](issues/957.md) | log/show/shortlog 的固定日期占位符 | 未启动（2026-11-12 16:20:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I957-01（1 卡） |
 | [`issues/670.md`](issues/670.md) | unborn HEAD 的隐式 reset/reset --hard | 未启动（计划已 Codex PASS，待排期执行） | I670-01 |
 | [`issues/672.md`](issues/672.md) | am/mailinfo 支持 latin-1 并对 NUL 严格报错 | 未启动（计划已 Codex PASS，待排期执行） | I672-01 |
+| [`issues/673.md`](issues/673.md) | commit 接受无时区的 YYYY-MM-DD HH:MM[:SS] 本地时间 | 未启动（计划已 Codex PASS，待排期执行） | I673-01 |
 
 ---
 
