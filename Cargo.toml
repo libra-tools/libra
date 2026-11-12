@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.30.176"
+version = "0.30.177"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -384,6 +384,10 @@ path = "tests/compat/agent_architecture_guard.rs"
 [[test]]
 name = "compat_agent_docs_contract"
 path = "tests/compat/agent_docs_contract.rs"
+
+[[test]]
+name = "compat_shared_repo_permissions"
+path = "tests/compat/compat_shared_repo_permissions.rs"
 
 # plan-20260818 LB-01: DeepSeek Harness bridge protocol + stdio transport.
 [[test]]

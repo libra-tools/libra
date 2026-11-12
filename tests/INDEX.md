@@ -62,6 +62,7 @@ checks only; their existence grants neither native provenance nor a new model ru
 | `compat_extra_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in miscellaneous modules | `src/**` |
 | `compat_all_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in general production codebase | `src/**` |
 | `compat_diff_production_expect_guard` | 1 | Bans bare `unwrap()` and unjustified `expect()` in `src/command/diff.rs` + `diff/*.rs` | `src/command/diff.rs`, `src/command/diff/`, `src/utils/blob_similarity.rs` |
+| `compat_shared_repo_permissions` | 1 | Issue #473 IN-07 post-sequence permission sweep guard (scans .libra after fixed command sequence: dirs 2775, files 0664, no world-writable, vault owner-only) | `src/utils/shared_perm.rs` |
 | `compat_object_hash_parsing_guard` | 3 | B3-08 / GC-B3-02: production OID parsing zero-hit + width/thread-local allowlist | `src/**` |
 | `compat_agent_run_non_exhaustive_guard` | 1 | Enforces `#[non_exhaustive]` on every `pub enum` under `agent_run/` for additive evolution | `src/internal/ai/agent_run/` |
 | `compat_agent_capability_matrix_pin` | 1 | Pins the E1 8-bool `DeclaredAgentCaps` wire keys and the first-batch supported roster (`claude-code`/`codex`/`opencode`) against drift (AG-16) | `src/internal/ai/observed_agents/{capability,registry}.rs`, `docs/development/tracing/agent.md` |

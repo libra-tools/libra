@@ -427,15 +427,15 @@ pub(crate) fn conversion_stat_certificate(
     hash.update(sources.as_bytes());
     let key = hex::encode(hash.finish().as_ref());
     let cache = Path::new("conversion-stat-v1");
-    let Ok(cache_root) = beneath::open_root(cache_root) else {
+    let Ok(cache_root_fd) = beneath::open_root(cache_root) else {
         return Ok((sources, false));
     };
     let valid = (|| -> io::Result<bool> {
-        let stat = beneath::lstat_beneath(&cache_root, cache)?;
+        let stat = beneath::lstat_beneath(&cache_root_fd, cache)?;
         if !stat.is_file || stat.len != key.len() as u64 {
             return Ok(false);
         }
-        let file = beneath::open_file_beneath(&cache_root, cache)?;
+        let file = beneath::open_file_beneath(&cache_root_fd, cache)?;
         let mut bytes = Vec::with_capacity(key.len() + 1);
         file.take(key.len() as u64 + 1).read_to_end(&mut bytes)?;
         Ok(bytes == key.as_bytes())
@@ -444,7 +444,11 @@ pub(crate) fn conversion_stat_certificate(
     if record == Some(sources.as_str()) && !valid {
         // Readers require the complete digest. A partial/concurrent write is
         // a cache miss; all writers have independently validated this key.
-        let _ = beneath::write_regular_file_beneath(&cache_root, cache, key.as_bytes(), true);
+        let _ = beneath::write_regular_file_beneath(&cache_root_fd, cache, key.as_bytes(), true);
+        let cache_path = cache_root.join(cache);
+        if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(&cache_path) {
+            let _ = crate::utils::shared_perm::adjust_shared_perm(&cache_path, &shared);
+        }
     }
     Ok((sources, valid))
 }

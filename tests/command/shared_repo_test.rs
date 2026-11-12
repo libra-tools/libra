@@ -252,3 +252,84 @@ fn test_shared_repo_later_writes_matrix() {
         }
     }
 }
+
+/// IN-07 (M-SMETA X1..X4): Metadata write points (COMMIT_EDITMSG, operation pointer,
+/// locks, maintenance lock, repair directories) respect shared repository permissions.
+#[cfg(unix)]
+#[test]
+fn test_shared_repo_metadata_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    assert_cli_success(
+        &run_libra_command(&["init", "--shared=group"], &repo),
+        "init group repo with vault",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "Test"], &repo),
+        "set user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "test@example.com"], &repo),
+        "set user.email",
+    );
+
+    // X1: commit creates COMMIT_EDITMSG and info/operation-pointer.json
+    fs::write(repo.join("file.txt"), "hello\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file.txt"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "my commit"], &repo),
+        "commit",
+    );
+
+    let editmsg = repo.join(".libra/COMMIT_EDITMSG");
+    if editmsg.exists() {
+        let mode = fs::metadata(&editmsg).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o664, "COMMIT_EDITMSG must be 0664 in group repo");
+    }
+
+    let pointer = repo.join(".libra/info/operation-pointer.json");
+    if pointer.exists() {
+        let mode = fs::metadata(&pointer).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o664,
+            "operation-pointer.json must be 0664 in group repo"
+        );
+    }
+
+    let info_dir = repo.join(".libra/info");
+    if info_dir.exists() {
+        let mode = fs::metadata(&info_dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o2775, "info dir must be 2775 in group repo");
+    }
+
+    // Status command
+    assert_cli_success(&run_libra_command(&["status"], &repo), "status");
+
+    // Stash push and pop
+    fs::write(repo.join("file.txt"), "hello modified\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "wip"], &repo),
+        "stash push",
+    );
+    assert_cli_success(&run_libra_command(&["stash", "pop"], &repo), "stash pop");
+
+    // Maintenance run creates/updates maintenance.lock
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run"], &repo),
+        "maintenance run",
+    );
+    let mlock = repo.join(".libra/maintenance.lock");
+    if mlock.exists() {
+        let mode = fs::metadata(&mlock).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o664, "maintenance.lock must be 0664 in group repo");
+    }
+
+    // X4: Vault files stay owner-only (0600)
+    let vault_db = repo.join(".libra/vault.db");
+    assert!(vault_db.exists());
+    let vmode = fs::metadata(&vault_db).unwrap().permissions().mode() & 0o777;
+    assert_eq!(vmode, 0o600, "vault.db must remain 0600 in group repo");
+    assert!(libra::utils::shared_perm::is_owner_only_path(&vault_db));
+}

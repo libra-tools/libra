@@ -202,7 +202,7 @@ pub fn calc_shared_perm(mode: u32, is_dir: bool, shared: &SharedMode) -> u32 {
     match shared {
         SharedMode::Umask => return mode,
         SharedMode::Group => {
-            perm |= 0o660;
+            perm |= 0o664;
             if (perm & 0o200) == 0 {
                 perm &= !0o020;
             }
@@ -265,6 +265,20 @@ pub fn calc_shared_object_perm(shared: &SharedMode) -> u32 {
     }
 }
 
+/// Returns true if `path` is an allowlisted owner-only file that must NEVER be widened.
+pub fn is_owner_only_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "vault.db" | "vault.db-wal" | "vault.db-shm" | "vault.db-journal"
+    ) || name.starts_with(".vault")
+        || name.starts_with("credentials")
+        || name.starts_with("auth")
+}
+
 /// Adjust filesystem permissions of `path` based on `shared`.
 ///
 /// On Windows, this is an explicit no-op. On Unix, this applies `calc_shared_perm`
@@ -274,6 +288,10 @@ pub fn adjust_shared_perm(path: &Path, shared: &SharedMode) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     if matches!(shared, SharedMode::Umask) {
+        return Ok(());
+    }
+
+    if is_owner_only_path(path) {
         return Ok(());
     }
 

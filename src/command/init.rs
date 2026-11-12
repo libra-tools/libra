@@ -2458,6 +2458,17 @@ async fn init_vault_for_repo(root_dir: &Path, database_path: &Path) -> Result<()
         }
     })?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = root_dir.join(format!("vault.db{suffix}"));
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+
     if let Err(error) = vault::store_credentials(&unseal_key, &enc_token).await {
         rollback_failed_vault_init(root_dir).await;
         return Err(InitError::VaultInitializationFailed {
