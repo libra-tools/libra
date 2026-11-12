@@ -135,13 +135,12 @@ fn read_repo_shared_mode_uncached(storage_root: &Path) -> io::Result<Option<Shar
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
         rt.block_on(async move {
-            let val = crate::internal::config::read_cascaded_config_value_strict(
-                crate::internal::config::LocalIdentityTarget::ExplicitDb(&db_path_buf),
+            let val = crate::internal::config::read_local_config_value_from_db_path(
+                &db_path_buf,
                 "core.sharedRepository",
             )
-            .await
-            .map_err(|e| io::Error::other(format!("failed to read core.sharedRepository: {e}")))?;
-            Ok::<Option<String>, io::Error>(val)
+            .await;
+            Ok::<Option<String>, io::Error>(val.unwrap_or(None))
         })
     })
     .join()

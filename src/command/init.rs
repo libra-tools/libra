@@ -775,8 +775,6 @@ async fn run_init_internal(
             ));
         }
     }
-    let shared_mode = resolve_shared_mode(args.shared.as_deref(), &target_dir, args.bare).await?;
-
     // The Libra home (`$LIBRA_HOME`, default `~/.libra`) holds per-user state
     // — global config (`config.db`), vault keys, binaries. A repository whose
     // storage root IS the home would mix repo data into that state, so refuse
@@ -806,6 +804,8 @@ async fn run_init_internal(
         // vault, repo id). Never recreate config/refs here. Reached BEFORE resolving
         // `--from-git-repository` so that flag is rejected by its raw presence rather
         // than failing first on a missing source path.
+        let shared_mode =
+            resolve_shared_mode(args.shared.as_deref(), &target_dir, args.bare).await?;
         return reinitialize_existing(
             &args,
             &root_dir,
@@ -878,6 +878,8 @@ async fn run_init_internal(
     };
 
     validate_branch_name(&initial_branch_name, &ref_format)?;
+
+    let shared_mode = resolve_shared_mode(args.shared.as_deref(), &target_dir, args.bare).await?;
 
     if target_dir.exists() {
         is_writable(&target_dir)?;

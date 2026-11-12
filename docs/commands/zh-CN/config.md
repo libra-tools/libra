@@ -658,6 +658,11 @@ libra config remove-gpg-key --force
 - `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在首次访问迁移之前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
+显式指定作用域（`--system`、`--global`）时的读取错误行为：
+- 配置存储不存在时：`--get*` 以退出码 1 静默失败（无 stderr；带 `--default` 时输出默认值并退出 0），`--list` 以退出码 128 失败（`fatal: unable to read config file '<path>': No such file or directory`，`LBR-IO-001`）。
+- 配置存储不可读（如权限被拒）时：`--get*` 向 stderr 输出 `warning: unable to access '<path>': Permission denied` 并以退出码 1 结束（或输出默认值），`--list` 以退出码 128 失败（`fatal: unable to access '<path>': Permission denied`，`LBR-IO-001`）。
+- 级联读取（未传作用域 flag）时，缺失的 global/system 存储与不可读/不支持的 system 存储会被跳过。
+
 ## 历史 `code.defaultProvider` 键
 
 `code.defaultProvider` 曾为已移除的 `libra code` 命令保存 provider 选择。
@@ -789,6 +794,7 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 | `LBR-CLI-003` | key 未找到且未提供 `--default` | 用 `libra config list` 检查 key 名称 |
 | `LBR-CLI-002` | 使用了 `edit` 子命令（不支持） | 使用 `set`、`get`、`unset`、`list` 子命令 |
 | `LBR-IO-001` | 读取配置数据库失败 | 检查 `.libra/libra.db` 的文件权限 |
+| `LBR-IO-001` | 显式作用域的配置存储缺失或不可读（`--system --list`、`--global --list`） | 检查配置数据库是否存在及其文件权限 |
 | `LBR-IO-002` | 写入配置数据库失败 | 检查文件权限和磁盘空间 |
 
 ## 兼容性说明

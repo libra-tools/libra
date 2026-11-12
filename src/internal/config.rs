@@ -2766,6 +2766,16 @@ async fn read_config_entry_from_db_path(
     })
 }
 
+pub async fn read_local_config_value_from_db_path(
+    db_path: &Path,
+    key: &str,
+) -> Result<Option<String>> {
+    let entry =
+        read_config_entry_from_db_path_case_insensitive(db_path, key, DatabaseRole::Repository)
+            .await?;
+    Ok(entry.map(|e| e.value))
+}
+
 async fn read_config_entry_from_db_path_case_insensitive(
     db_path: &Path,
     key: &str,

@@ -143,6 +143,18 @@ pub struct ScopedConfig;
 impl ScopedConfig {
     /// Get a database connection for the specified scope.
     pub async fn get_connection(scope: ConfigScope) -> Result<DatabaseConnection, String> {
+        Self::get_connection_internal(scope, true).await
+    }
+
+    /// Get a database connection for read-only access (does not create the database file if missing).
+    pub async fn get_connection_for_read(scope: ConfigScope) -> Result<DatabaseConnection, String> {
+        Self::get_connection_internal(scope, false).await
+    }
+
+    async fn get_connection_internal(
+        scope: ConfigScope,
+        create_if_missing: bool,
+    ) -> Result<DatabaseConnection, String> {
         match scope {
             ConfigScope::Local => {
                 let storage = try_get_storage_path(None).map_err(|_| {
@@ -159,10 +171,22 @@ impl ScopedConfig {
                 Ok(get_db_conn_instance().await.clone())
             }
             ConfigScope::Global => {
-                Self::get_or_create_cached_connection(&GLOBAL_CONFIG_CONN, scope, "global").await
+                Self::get_or_create_cached_connection(
+                    &GLOBAL_CONFIG_CONN,
+                    scope,
+                    "global",
+                    create_if_missing,
+                )
+                .await
             }
             ConfigScope::System => {
-                Self::get_or_create_cached_connection(&SYSTEM_CONFIG_CONN, scope, "system").await
+                Self::get_or_create_cached_connection(
+                    &SYSTEM_CONFIG_CONN,
+                    scope,
+                    "system",
+                    create_if_missing,
+                )
+                .await
             }
         }
     }
@@ -171,6 +195,7 @@ impl ScopedConfig {
         cache: &Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>>,
         scope: ConfigScope,
         scope_name: &str,
+        create_if_missing: bool,
     ) -> Result<DatabaseConnection, String> {
         // plan-20260919 GCX-02: acquiring a global connection is the trigger
         // for the one-time legacy migration, so the path is resolved through
@@ -188,23 +213,66 @@ impl ScopedConfig {
         let role = scope.database_role();
         if let Some((cached_path, cached_conn)) = guard.as_ref() {
             if cached_path == &config_path {
-                ensure_configuration_schema_is_current(cached_conn, role)
-                    .await
-                    .map_err(|error| {
-                        format!("Failed to validate {scope_name} config database: {error}")
-                    })?;
-                return Ok(cached_conn.clone());
+                if !config_path.exists() {
+                    *guard = None;
+                } else {
+                    ensure_configuration_schema_is_current(cached_conn, role)
+                        .await
+                        .map_err(|error| {
+                            format!("Failed to validate {scope_name} config database: {error}")
+                        })?;
+                    return Ok(cached_conn.clone());
+                }
+            } else {
+                *guard = None;
             }
-            *guard = None;
         }
-        let exists = config_path.try_exists().map_err(|error| {
-            format!(
-                "Failed to inspect {scope_name} config database '{}': {error}",
-                config_path.display()
-            )
-        })?;
+
+        let exists = match std::fs::File::open(&config_path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(format!(
+                    "UNREADABLE:{}:Permission denied",
+                    config_path.display()
+                ));
+            }
+            Err(e) => match config_path.try_exists() {
+                Ok(true) => {
+                    return Err(format!("UNREADABLE:{}:{e}", config_path.display()));
+                }
+                Ok(false) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(format!(
+                        "UNREADABLE:{}:Permission denied",
+                        config_path.display()
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!("UNREADABLE:{}:{err}", config_path.display()));
+                }
+            },
+        };
+
+        if !exists && !create_if_missing {
+            return Err(format!("NOT_FOUND:{}", config_path.display()));
+        }
+
         let conn = if exists {
-            open_configuration_database(&config_path, role).await
+            match open_configuration_database(&config_path, role).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        return Err(format!(
+                            "UNREADABLE:{}:Permission denied",
+                            config_path.display()
+                        ));
+                    }
+                    return Err(format!(
+                        "Failed to connect to {scope_name} config database: {error}"
+                    ));
+                }
+            }
         } else {
             if let Some(parent) = config_path
                 .parent()
@@ -229,8 +297,10 @@ impl ScopedConfig {
                 }
                 result => result,
             }
-        }
-        .map_err(|error| format!("Failed to connect to {scope_name} config database: {error}"))?;
+            .map_err(|error| {
+                format!("Failed to connect to {scope_name} config database: {error}")
+            })?
+        };
         *guard = Some((config_path, conn.clone()));
         Ok(conn)
     }
@@ -265,14 +335,14 @@ impl ScopedConfig {
     }
 
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
-        let conn = Self::get_connection(scope).await?;
+        let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_with_conn(&conn, key)
             .await
             .map_err(|e| e.to_string())
     }
 
     pub async fn get_all(scope: ConfigScope, key: &str) -> Result<Vec<ConfigKvEntry>, String> {
-        let conn = Self::get_connection(scope).await?;
+        let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_all_with_conn(&conn, key)
             .await
             .map_err(|e| e.to_string())
@@ -411,7 +481,7 @@ impl ScopedConfig {
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
-        let conn = Self::get_connection(scope).await?;
+        let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::list_all_with_conn(&conn)
             .await
             .map_err(|e| e.to_string())
@@ -421,7 +491,7 @@ impl ScopedConfig {
         scope: ConfigScope,
         prefix: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
-        let conn = Self::get_connection(scope).await?;
+        let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_by_prefix_with_conn(&conn, prefix)
             .await
             .map_err(|e| e.to_string())
@@ -431,7 +501,7 @@ impl ScopedConfig {
         scope: ConfigScope,
         pattern: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
-        let conn = Self::get_connection(scope).await?;
+        let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_regexp_with_conn(&conn, pattern)
             .await
             .map_err(|e| e.to_string())
@@ -1118,9 +1188,11 @@ fn upgrade_namespace_raw_preflight(args: &ConfigArgs) -> CliResult<()> {
         ) if is_upgrade_namespace_key(key)
     );
     // With `--get-regexp`, the positional operand is a PATTERN: it reaches the
-    // reserved key when it can match it, not when it spells it literally.
-    let regexp_reserved =
-        args.get_regexp && args.key.as_deref().is_some_and(regexp_reaches_upgrade_mode);
+    // reserved key when it can match it, not when it spells it literally, and
+    // only when the command reaches the global scope where upgrade.mode lives.
+    let regexp_reserved = args.get_regexp
+        && (args.global || !has_explicit_scope(args))
+        && args.key.as_deref().is_some_and(regexp_reaches_upgrade_mode);
     // `--rename-section <old> <new>` carries its operands in the two
     // positionals; the DESTINATION (valuepattern) must be checked too, or a
     // rename INTO the reserved namespace escapes the router when combined
@@ -1264,7 +1336,11 @@ async fn route_upgrade_namespace(
         }),
         // A regexp that can match the reserved key is a spelling that reaches
         // it — fail closed instead of pretending an empty result (§A.3).
-        ResolvedCommand::Get { key, regexp, .. } if *regexp && regexp_reaches_upgrade_mode(key) => {
+        ResolvedCommand::Get { key, regexp, .. }
+            if *regexp
+                && (args.global || !has_explicit_scope(args))
+                && regexp_reaches_upgrade_mode(key) =>
+        {
             Some(Err(upgrade_namespace_usage_error(
                 "--get-regexp with a pattern matching the reserved upgrade.mode",
             )))
@@ -2500,6 +2576,48 @@ fn apply_value_type(value: String, ty: Option<ConfigValueType>) -> CliResult<Str
     }
 }
 
+fn handle_explicit_read_error(
+    err: String,
+    default: Option<&str>,
+    value_type: Option<ConfigValueType>,
+    null: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if err.starts_with("NOT_FOUND:") {
+        if let Some(d) = default {
+            let d = apply_value_type(d.to_string(), value_type)?;
+            if !output.quiet {
+                if null {
+                    print!("{d}\0");
+                } else {
+                    println!("{d}");
+                }
+            }
+            return Ok(());
+        }
+        return Err(CliError::silent_exit(1));
+    }
+    if err.starts_with("UNREADABLE:") {
+        let parts: Vec<&str> = err.splitn(3, ':').collect();
+        let path = parts.get(1).unwrap_or(&"");
+        let reason = parts.get(2).unwrap_or(&"Permission denied");
+        crate::utils::error::emit_warning(format!("unable to access '{path}': {reason}"));
+        if let Some(d) = default {
+            let d = apply_value_type(d.to_string(), value_type)?;
+            if !output.quiet {
+                if null {
+                    print!("{d}\0");
+                } else {
+                    println!("{d}");
+                }
+            }
+            return Ok(());
+        }
+        return Err(CliError::silent_exit(1));
+    }
+    Err(config_read_cli_error(err))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_get(
     key: &str,
@@ -2554,12 +2672,12 @@ async fn handle_get(
             }
             all_entries
         } else {
-            ScopedConfig::get_regexp(scope, key)
-                .await
-                .map_err(CliError::from_legacy_string)?
-                .into_iter()
-                .map(|e| (e, scope))
-                .collect()
+            match ScopedConfig::get_regexp(scope, key).await {
+                Ok(entries) => entries.into_iter().map(|e| (e, scope)).collect(),
+                Err(err) => {
+                    return handle_explicit_read_error(err, default, value_type, null, output);
+                }
+            }
         };
         // Reserved namespace: `upgrade.*` never legitimately lives in SQLite,
         // so a pattern match can only hit stale legacy rows — suppress them
@@ -2584,11 +2702,7 @@ async fn handle_get(
                 }
                 return Ok(());
             }
-            return Err(
-                CliError::failure(format!("no matching config keys for '{key}'"))
-                    .with_stable_code(StableErrorCode::CliInvalidArguments)
-                    .with_exit_code(1),
-            );
+            return Err(CliError::silent_exit(1));
         }
 
         // Build display values with decryption support
@@ -2653,12 +2767,12 @@ async fn handle_get(
         let entries: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
             get_all_cascaded(key).await.map_err(config_read_cli_error)?
         } else {
-            ScopedConfig::get_all(scope, key)
-                .await
-                .map_err(CliError::from_legacy_string)?
-                .into_iter()
-                .map(|e| (e, scope))
-                .collect()
+            match ScopedConfig::get_all(scope, key).await {
+                Ok(entries) => entries.into_iter().map(|e| (e, scope)).collect(),
+                Err(err) => {
+                    return handle_explicit_read_error(err, default, value_type, null, output);
+                }
+            }
         };
 
         let value_re = value_pattern.map(compile_config_regexp).transpose()?;
@@ -2670,30 +2784,31 @@ async fn handle_get(
             None => entries,
         };
 
-        if entries.is_empty()
-            && let Some(d) = default
-        {
-            // Canonicalize the default through `--type` like a stored value.
-            let d = apply_value_type(d.to_string(), value_type)?;
-            if output.is_json() {
-                emit_json_data(
-                    "config",
-                    &serde_json::json!({
-                        "action": "get-all",
-                        "key": key,
-                        "entries": [{"value": d, "origin": serde_json::Value::Null}],
-                        "default_applied": true,
-                    }),
-                    output,
-                )?;
-            } else if !output.quiet {
-                if null {
-                    print!("{d}\0");
-                } else {
-                    println!("{d}");
+        if entries.is_empty() {
+            if let Some(d) = default {
+                // Canonicalize the default through `--type` like a stored value.
+                let d = apply_value_type(d.to_string(), value_type)?;
+                if output.is_json() {
+                    emit_json_data(
+                        "config",
+                        &serde_json::json!({
+                            "action": "get-all",
+                            "key": key,
+                            "entries": [{"value": d, "origin": serde_json::Value::Null}],
+                            "default_applied": true,
+                        }),
+                        output,
+                    )?;
+                } else if !output.quiet {
+                    if null {
+                        print!("{d}\0");
+                    } else {
+                        println!("{d}");
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
+            return Err(CliError::silent_exit(1));
         }
 
         // Build display values with decryption support
@@ -2745,21 +2860,23 @@ async fn handle_get(
             let candidates: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
                 get_all_cascaded(key).await.map_err(config_read_cli_error)?
             } else {
-                ScopedConfig::get_all(scope, key)
-                    .await
-                    .map_err(CliError::from_legacy_string)?
-                    .into_iter()
-                    .map(|e| (e, scope))
-                    .collect()
+                match ScopedConfig::get_all(scope, key).await {
+                    Ok(entries) => entries.into_iter().map(|e| (e, scope)).collect(),
+                    Err(err) => {
+                        return handle_explicit_read_error(err, default, value_type, null, output);
+                    }
+                }
             };
             candidates.into_iter().rfind(|(e, _)| re.is_match(&e.value))
         } else if use_cascade {
             get_cascaded(key).await.map_err(config_read_cli_error)?
         } else {
-            ScopedConfig::get(scope, key)
-                .await
-                .map_err(CliError::from_legacy_string)?
-                .map(|e| (e, scope))
+            match ScopedConfig::get(scope, key).await {
+                Ok(opt) => opt.map(|e| (e, scope)),
+                Err(err) => {
+                    return handle_explicit_read_error(err, default, value_type, null, output);
+                }
+            }
         };
 
         let (display_value, default_applied, origin_scope) = match entry {
@@ -2773,6 +2890,8 @@ async fn handle_get(
             None => {
                 if let Some(d) = default {
                     (apply_value_type(d.to_string(), value_type)?, true, None)
+                } else if !use_cascade {
+                    return Err(CliError::silent_exit(1));
                 } else {
                     // Spell correction: find closest matching key
                     let all_keys = if use_cascade {
@@ -3340,7 +3459,11 @@ async fn handle_list(
         let has_db = match s {
             ConfigScope::Local => !(use_cascade && try_get_storage_path(None).is_err()),
             ConfigScope::Global | ConfigScope::System => {
-                s.get_config_path().is_some_and(|path| path.exists())
+                if use_cascade {
+                    s.get_config_path().is_some_and(|path| path.exists())
+                } else {
+                    true
+                }
             }
         };
 
@@ -3349,6 +3472,22 @@ async fn handle_list(
                 Ok(entries) => entries,
                 Err(e) if use_cascade && should_skip_config_scope_read_error(s, &e) => Vec::new(),
                 Err(_e) if use_cascade && s == ConfigScope::Local => Vec::new(),
+                Err(e) if !use_cascade && e.starts_with("NOT_FOUND:") => {
+                    let path = e.strip_prefix("NOT_FOUND:").unwrap_or(&e);
+                    return Err(CliError::fatal(format!(
+                        "unable to read config file '{path}': No such file or directory"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
+                Err(e) if !use_cascade && e.starts_with("UNREADABLE:") => {
+                    let parts: Vec<&str> = e.splitn(3, ':').collect();
+                    let path = parts.get(1).unwrap_or(&"");
+                    let reason = parts.get(2).unwrap_or(&"Permission denied");
+                    return Err(
+                        CliError::fatal(format!("unable to access '{path}': {reason}"))
+                            .with_stable_code(StableErrorCode::IoReadFailed),
+                    );
+                }
                 Err(e) => return Err(CliError::from_legacy_string(e)),
             };
             for e in scope_entries {
@@ -4896,7 +5035,10 @@ fn should_skip_config_scope_read_error(scope: ConfigScope, error: &str) -> bool 
     // read. A system config that is present but unreadable (e.g. permissions) is
     // also skipped so a stray `/etc/libra/config.db` cannot break every read.
     match scope {
-        ConfigScope::Global => error.contains("is newer than this Libra binary supports"),
+        ConfigScope::Global => {
+            error.contains("is newer than this Libra binary supports")
+                || error.starts_with("NOT_FOUND:")
+        }
         ConfigScope::System => true,
         ConfigScope::Local => false,
     }

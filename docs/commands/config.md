@@ -748,6 +748,11 @@ The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and reda
 - `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (a legacy `~/.libra/config.db` stays the active fallback until the first access migrates it)
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
+When an explicit scope (`--system`, `--global`) is requested:
+- If the configuration store does not exist: `--get*` exits with code 1 (silent, no stderr; with `--default`, outputs default and exits 0), while `--list` exits with code 128 (`fatal: unable to read config file '<path>': No such file or directory`, `LBR-IO-001`).
+- If the configuration store is unreadable (e.g. permission denied): `--get*` prints `warning: unable to access '<path>': Permission denied` to stderr and exits with code 1 (or default), while `--list` exits with code 128 (`fatal: unable to access '<path>': Permission denied`, `LBR-IO-001`).
+- During cascaded reads (when no scope flag is passed), missing global/system stores and unreadable/unsupported system stores are skipped.
+
 ## Legacy `code.defaultProvider` Key
 
 `code.defaultProvider` was the persisted provider selection for the removed
@@ -900,6 +905,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | `LBR-CLI-003` | Key not found and no `--default` provided | Check key name with `libra config list` |
 | `LBR-CLI-002` | `edit` subcommand used (not supported) | Use `set`, `get`, `unset`, `list` subcommands |
 | `LBR-IO-001` | Failed to read config database | Check file permissions on `.libra/libra.db` |
+| `LBR-IO-001` | Explicit scope config store missing or unreadable (`--system --list`, `--global --list`) | Check file existence and permissions on configuration database |
 | `LBR-IO-002` | Failed to write config database | Check file permissions and disk space |
 
 ## Compatibility Notes
