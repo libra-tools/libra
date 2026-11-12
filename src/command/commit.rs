@@ -3541,6 +3541,7 @@ fn auto_stage_tracked_changes(
             index
                 .save(&index_path)
                 .map_err(|e| CommitError::IndexSave(format!("failed to save index: {}", e)))?;
+            let _ = crate::utils::shared_perm::adjust_shared_perm_for_index(&index_path);
         }
         return Ok(false);
     }
@@ -3611,6 +3612,7 @@ fn auto_stage_tracked_changes(
         index
             .save(&index_path)
             .map_err(|e| CommitError::IndexSave(format!("failed to save index: {}", e)))?;
+        let _ = crate::utils::shared_perm::adjust_shared_perm_for_index(&index_path);
     }
     Ok(touched)
 }

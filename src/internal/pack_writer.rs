@@ -512,6 +512,11 @@ fn publish_pack_bytes(
     // bytes it names would make a name durable for data that is not.
     fsync_path(&pack_path)?;
     fsync_path(&index_path)?;
+
+    // IN-06: Adjust pack file, index, and parent pack directory permissions in shared repositories
+    if let Ok(Some(shared_mode)) = crate::utils::shared_perm::get_shared_mode_for_path(&pack_path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm_for_pack(&pack_path, &shared_mode);
+    }
     // A directory sync that cannot be PROVEN is reported, not swallowed. The
     // file data is durable either way, so creating a pack stays allowed; what
     // is not allowed is treating an unproven directory entry as licence to

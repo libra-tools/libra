@@ -259,6 +259,7 @@ such as `0400` or `0200` are rejected with `LBR-CLI-002` before any files are cr
 Permissions for files and directories are computed separately aligning with Git's `calc_shared_perm`:
 - Regular files receive shared bits overlay (`0660` for `group`, `0664` for `all`/`everybody`; numeric modes replace the lower 9 bits). Executable files copy read bits to execute bits (`mode |= (mode & 0444) >> 2`).
 - Directories copy read bits to execute bits for directory traversal and receive the setgid bit (`02000`) whenever group access is present (`group`, `all`, or numeric mode with group read/write).
+- The configured shared mode applies to all post-init writes: new loose objects (`0444`/`0440`) and their fanout directories (`2775`/`2750`), repack output (`.pack` and `.idx` files `0444`), the repository database (`libra.db`) and its SQLite sidecars (`0664`/`0640`), and the index file (`0664`/`0640`).
 - Private signing keys in `vault.db` and its SQLite sidecars are strictly excluded and remain owner-only.
 - Symlinks within the repository layout are never followed during permission sweeps.
 

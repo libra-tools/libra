@@ -1352,13 +1352,19 @@ async fn run_add_patch(
             stored_objects,
             source,
         })?;
+    save_index(&index, index_path)?;
+    Ok(add_output)
+}
+
+fn save_index(index: &Index, index_path: &Path) -> Result<(), AddError> {
     index
         .save(index_path)
         .map_err(|source| AddError::IndexSave {
             path: index_path.to_path_buf(),
             source,
         })?;
-    Ok(add_output)
+    let _ = crate::utils::shared_perm::adjust_shared_perm_for_index(index_path);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1480,12 +1486,7 @@ async fn run_add_resolved(
             source,
         })?;
 
-    index
-        .save(index_path)
-        .map_err(|source| AddError::IndexSave {
-            path: index_path.to_path_buf(),
-            source,
-        })?;
+    save_index(&index, index_path)?;
 
     Ok(add_output)
 }
@@ -1654,12 +1655,7 @@ async fn run_add_intent_to_add(
     }
 
     if wrote_entries {
-        index
-            .save(index_path)
-            .map_err(|source| AddError::IndexSave {
-                path: index_path.to_path_buf(),
-                source,
-            })?;
+        save_index(&index, index_path)?;
     }
 
     if add_output.ignored.is_empty() {
@@ -1902,12 +1898,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                     source,
                 }
             })?;
-            index
-                .save(&index_path)
-                .map_err(|source| AddError::IndexSave {
-                    path: index_path.clone(),
-                    source,
-                })?;
+            save_index(&index, &index_path)?;
         }
 
         return check_ignored_only_error(add_output);
@@ -2235,12 +2226,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             stored_objects,
             source,
         })?;
-    index
-        .save(&index_path)
-        .map_err(|source| AddError::IndexSave {
-            path: index_path.clone(),
-            source,
-        })?;
+    save_index(&index, &index_path)?;
 
     check_ignored_only_error(add_output)
 }
