@@ -32,6 +32,7 @@ EXAMPLES:
     libra revision number HEAD~3           Ordinal of a commit (reverse lookup)
     libra revision index                   Index freshness for the current branch
     libra revision index --rebuild         Force a full deterministic rebuild
+    libra revision import --manifest FILE Import frozen local legacy commit facts
     libra --json revision number HEAD      Structured output for agents
 
 NOTES:
@@ -51,6 +52,12 @@ pub struct RevisionArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RevisionCommand {
+    /// Import bounded, offline ancestor commits as durable change facts.
+    Import {
+        /// Version 1 history manifest bound to this repository and HEAD.
+        #[arg(long, value_name = "FILE")]
+        manifest: std::path::PathBuf,
+    },
     /// Find a revision by ordinal (Lore's `revision find number`).
     Find {
         /// The 1-based ordinal on the ref's first-parent chain.
@@ -141,6 +148,32 @@ pub async fn execute(args: RevisionArgs) {
 pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     match args.command {
+        RevisionCommand::Import { manifest } => {
+            let (manifest, digest) =
+                crate::internal::change::import::read_manifest(&manifest).map_err(map_import)?;
+            let op_id = crate::internal::operation::current_operation_id().ok_or_else(|| {
+                CliError::fatal(
+                    "history import requires a current operation; invoke libra revision import",
+                )
+            })?;
+            let receipt = crate::internal::change::import::import_history(
+                &get_db_conn_instance().await,
+                &manifest,
+                &digest,
+                &op_id,
+            )
+            .await
+            .map_err(map_import)?;
+            if output.is_json() {
+                emit_json_data("revision", &receipt, output)?;
+            } else if !output.quiet {
+                println!(
+                    "imported {} history sources; reused {}; historical outcomes remain unknown",
+                    receipt.imported, receipt.reused
+                );
+            }
+            Ok(())
+        }
         RevisionCommand::Find { number, r#ref } => {
             if number < 1 {
                 return Err(CliError::command_usage(format!(
@@ -311,4 +344,22 @@ fn map_db(error: sea_orm::DbErr) -> CliError {
 fn map_index(error: anyhow::Error) -> CliError {
     CliError::fatal(format!("revision index error: {error}"))
         .with_stable_code(StableErrorCode::IoWriteFailed)
+}
+
+fn map_import(error: anyhow::Error) -> CliError {
+    let message = crate::internal::ai::review::sink::render_untrusted_findings(&format!(
+        "history import failed: {error:#}"
+    ));
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+        .with_hint("verify the frozen manifest, repository identity and local object view; retry in a fresh base-specific repository")
+}
+
+#[cfg(test)]
+mod import_error_tests {
+    #[test]
+    fn rejected_manifest_does_not_render_terminal_controls() {
+        let error = super::map_import(anyhow::anyhow!("invalid\u{1b}[2J manifest"));
+        assert_eq!(error.message(), "history import failed: invalid manifest");
+    }
 }
