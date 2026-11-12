@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Local Git protocol client tests covering CWD restoration on error paths.
 //!
 //! Pins the invariant that `LocalClient::discovery_reference` always restores the

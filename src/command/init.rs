@@ -355,8 +355,14 @@ pub struct InitArgs {
     #[clap(long, short = 'q', required = false)]
     pub quiet: bool,
 
-    /// Filesystem sharing mode: false, umask, group/true, all/world/everybody, or traversable octal like 0770
-    #[clap(long, required = false, value_name = "MODE")]
+    /// Filesystem sharing mode: false, umask, group/true, all/world/everybody, or octal like 0660
+    #[clap(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "group",
+        require_equals = true,
+        value_name = "MODE"
+    )]
     pub shared: Option<String>,
 
     /// Object hash algorithm: `sha1` (default), `sha256`, or `blake3`
@@ -769,7 +775,7 @@ async fn run_init_internal(
             ));
         }
     }
-    let shared_mode = parse_shared_mode(args.shared.as_deref())?;
+    let shared_mode = resolve_shared_mode(args.shared.as_deref(), &target_dir, args.bare).await?;
 
     // The Libra home (`$LIBRA_HOME`, default `~/.libra`) holds per-user state
     // — global config (`config.db`), vault keys, binaries. A repository whose
@@ -1451,14 +1457,21 @@ async fn persist_shared_repository(
     conn: &DbConn,
     shared_mode: &SharedMode,
 ) -> Result<(), InitError> {
-    ConfigKv::set_with_conn(
-        conn,
-        "core.sharedRepository",
-        shared_mode.config_value(),
-        false,
-    )
-    .await
-    .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
+    if shared_mode.should_persist() {
+        ConfigKv::set_with_conn(
+            conn,
+            "core.sharedRepository",
+            shared_mode.config_value(),
+            false,
+        )
+        .await
+        .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
+    } else {
+        ConfigKv::unset_with_conn(conn, "core.sharedRepository")
+            .await
+            .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?;
+        Ok(())
+    }
 }
 
 fn resolve_cli_path(base: &Path, raw: &str) -> PathBuf {
@@ -1997,8 +2010,7 @@ fn copy_template(src: &Path, dst: &Path, skips: &[PathBuf]) -> io::Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SharedMode {
-    False,
+pub enum SharedMode {
     Umask,
     Group,
     All,
@@ -2006,52 +2018,69 @@ enum SharedMode {
 }
 
 impl SharedMode {
-    fn parse(raw: &str) -> Result<Self, InitError> {
-        match raw {
-            "false" => Ok(Self::False),
-            "umask" => Ok(Self::Umask),
-            "true" | "group" => Ok(Self::Group),
-            "all" | "world" | "everybody" => Ok(Self::All),
-            mode if mode.starts_with('0') && mode.len() == 4 => {
-                let bits = u32::from_str_radix(&mode[1..], 8).map_err(|_| {
-                    invalid_argument(
-                        format!("invalid shared mode '{mode}'"),
-                        Some(
-                            "supported numeric shared modes must be 4-digit octal values like 0770"
-                                .to_string(),
-                        ),
-                    )
-                })?;
-                validate_numeric_shared_mode(mode, bits)?;
-                Ok(Self::Numeric {
-                    raw: mode.to_string(),
-                    bits,
-                })
+    pub fn parse(raw: &str) -> Result<Self, InitError> {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "umask" | "false" | "no" | "off" | "0" => Ok(Self::Umask),
+            "group" | "true" | "yes" | "on" | "1" => Ok(Self::Group),
+            "all" | "world" | "everybody" | "2" => Ok(Self::All),
+            _ => {
+                if let Ok(val) = u32::from_str_radix(trimmed, 8) {
+                    if val == 0 {
+                        return Ok(Self::Umask);
+                    }
+                    if val == 1 {
+                        return Ok(Self::Group);
+                    }
+                    if val == 2 {
+                        return Ok(Self::All);
+                    }
+                    if val & 0o600 != 0o600 {
+                        return Err(invalid_argument(
+                            format!(
+                                "invalid shared mode '{raw}': file owner must have read and write permissions"
+                            ),
+                            Some(
+                                "the owner of files must always have read and write permissions (mode & 0600 == 0600)"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                    let bits = val & 0o666;
+                    return Ok(Self::Numeric {
+                        raw: format!("0{bits:o}"),
+                        bits,
+                    });
+                }
+                Err(invalid_argument(
+                    format!("invalid shared mode '{raw}'"),
+                    Some(
+                        "supported values: umask, group, all, true, false, or an octal mode such as 0660"
+                            .to_string(),
+                    ),
+                ))
             }
-            other => Err(invalid_argument(
-                format!("invalid shared mode '{other}'"),
-                Some(
-                    "supported values: umask, group, all, true, false, or a 4-digit octal mode."
-                        .to_string(),
-                ),
-            )),
         }
     }
 
-    fn config_value(&self) -> &str {
+    pub fn config_value(&self) -> &str {
         match self {
-            Self::False => "false",
-            Self::Umask => "umask",
-            Self::Group => "group",
-            Self::All => "all",
-            Self::Numeric { raw, .. } => raw,
+            Self::Umask => "0",
+            Self::Group => "1",
+            Self::All => "2",
+            Self::Numeric { raw, .. } => raw.as_str(),
         }
+    }
+
+    pub fn should_persist(&self) -> bool {
+        !matches!(self, Self::Umask)
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn permission_bits(&self) -> Option<u32> {
+    pub fn permission_bits(&self) -> Option<u32> {
         match self {
-            Self::False | Self::Umask => None,
+            Self::Umask => None,
             Self::Group => Some(0o2775),
             Self::All => Some(0o2777),
             Self::Numeric { bits, .. } => Some(*bits),
@@ -2059,35 +2088,35 @@ impl SharedMode {
     }
 }
 
-fn parse_shared_mode(shared_mode: Option<&str>) -> Result<Option<SharedMode>, InitError> {
+pub fn parse_shared_mode(shared_mode: Option<&str>) -> Result<Option<SharedMode>, InitError> {
     shared_mode.map(SharedMode::parse).transpose()
 }
 
-fn validate_numeric_shared_mode(raw: &str, bits: u32) -> Result<(), InitError> {
-    let mut invalid_classes = Vec::new();
-    if bits & 0o700 != 0o700 {
-        invalid_classes.push("owner rwx");
-    }
-    if bits & 0o060 != 0 && bits & 0o010 == 0 {
-        invalid_classes.push("group execute");
-    }
-    if bits & 0o006 != 0 && bits & 0o001 == 0 {
-        invalid_classes.push("other execute");
+async fn resolve_shared_mode(
+    cli_value: Option<&str>,
+    target_dir: &Path,
+    bare: bool,
+) -> Result<Option<SharedMode>, InitError> {
+    if let Some(raw) = cli_value {
+        return SharedMode::parse(raw).map(Some);
     }
 
-    if invalid_classes.is_empty() {
-        return Ok(());
-    }
+    let root_dir = storage_root(target_dir, bare);
+    let db_path = root_dir.join(DATABASE);
+    let local_target = if is_reinit(target_dir, bare) && db_path.is_file() {
+        LocalIdentityTarget::ExplicitDb(&db_path)
+    } else {
+        LocalIdentityTarget::None
+    };
 
-    Err(invalid_argument(
-        format!(
-            "invalid shared mode '{raw}': numeric modes must keep repository directories traversable"
-        ),
-        Some(format!(
-            "missing {}; use a directory-safe mode such as 0770 or 0755",
-            invalid_classes.join(", ")
-        )),
-    ))
+    match read_cascaded_config_value_strict(local_target, "core.sharedRepository").await {
+        Ok(Some(raw)) => SharedMode::parse(&raw).map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => Err(InitError::ConfigRead {
+            key: "core.sharedRepository".to_string(),
+            detail: format!("{error:#}"),
+        }),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2141,7 +2170,12 @@ fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
             if is_vault_artifact(path) {
                 continue;
             }
-            set_shared_path_permissions(dir, path, mode)?;
+            let path_mode = if entry.file_type().is_dir() {
+                (mode | ((mode & 0o444) >> 2)) | if mode & 0o060 != 0 { 0o2000 } else { 0 }
+            } else {
+                mode
+            };
+            set_shared_path_permissions(dir, path, path_mode)?;
         }
         Ok(())
     }
@@ -2161,7 +2195,8 @@ fn apply_shared_bare_created(
     let Some(bits) = shared_mode.permission_bits() else {
         return Ok(());
     };
-    set_shared_path_permissions(root_dir, root_dir, bits)?;
+    let dir_bits = (bits | ((bits & 0o444) >> 2)) | if bits & 0o060 != 0 { 0o2000 } else { 0 };
+    set_shared_path_permissions(root_dir, root_dir, dir_bits)?;
     for (path, _) in new_bare_layout_entries(root_dir, snapshot)? {
         apply_shared(&path, shared_mode)?;
     }
@@ -2411,7 +2446,9 @@ async fn init_config(
     ConfigKv::set_with_conn(&txn, "libra.repoid", &repo_id, false)
         .await
         .map_err(|error| DbErr::Custom(error.to_string()))?;
-    if let Some(shared_mode) = shared_mode {
+    if let Some(shared_mode) = shared_mode
+        && shared_mode.should_persist()
+    {
         ConfigKv::set_with_conn(
             &txn,
             "core.sharedRepository",
@@ -2760,5 +2797,108 @@ mod tests {
                 && !captured_stderr.contains("Generating PGP signing key ..."),
             "run_init must not render init progress to stderr for internal callers, got: {captured_stderr:?}"
         );
+    }
+
+    #[test]
+    fn test_shared_mode_parse_and_persist() {
+        use super::SharedMode;
+
+        // Group synonyms and booleans
+        for raw in ["group", "GROUP", "true", "TRUE", "yes", "on", "1"] {
+            let mode = SharedMode::parse(raw).expect(raw);
+            assert_eq!(mode, SharedMode::Group);
+            assert_eq!(mode.config_value(), "1");
+            assert!(mode.should_persist());
+        }
+
+        // Everybody / All synonyms
+        for raw in ["all", "ALL", "world", "everybody", "2"] {
+            let mode = SharedMode::parse(raw).expect(raw);
+            assert_eq!(mode, SharedMode::All);
+            assert_eq!(mode.config_value(), "2");
+            assert!(mode.should_persist());
+        }
+
+        // Umask / false / 0
+        for raw in ["umask", "UMASK", "false", "FALSE", "no", "off", "0"] {
+            let mode = SharedMode::parse(raw).expect(raw);
+            assert_eq!(mode, SharedMode::Umask);
+            assert!(!mode.should_persist());
+        }
+
+        // Octal modes
+        let mode = SharedMode::parse("0660").expect("0660");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0660".to_string(),
+                bits: 0o660
+            }
+        );
+        assert_eq!(mode.config_value(), "0660");
+
+        let mode = SharedMode::parse("660").expect("660");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0660".to_string(),
+                bits: 0o660
+            }
+        );
+
+        let mode = SharedMode::parse("0640").expect("0640");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0640".to_string(),
+                bits: 0o640
+            }
+        );
+
+        let mode = SharedMode::parse("0600").expect("0600");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0600".to_string(),
+                bits: 0o600
+            }
+        );
+
+        let mode = SharedMode::parse("0664").expect("0664");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0664".to_string(),
+                bits: 0o664
+            }
+        );
+
+        // 0775 masks to 0664
+        let mode = SharedMode::parse("0775").expect("0775");
+        assert_eq!(
+            mode,
+            SharedMode::Numeric {
+                raw: "0664".to_string(),
+                bits: 0o664
+            }
+        );
+        assert_eq!(mode.config_value(), "0664");
+
+        // Owner read & write required: 0400 (no write), 0200 (no read)
+        let err = SharedMode::parse("0400").expect_err("0400 must fail");
+        assert!(
+            err.to_string()
+                .contains("file owner must have read and write permissions")
+        );
+
+        let err = SharedMode::parse("0200").expect_err("0200 must fail");
+        assert!(
+            err.to_string()
+                .contains("file owner must have read and write permissions")
+        );
+
+        // Bogus string
+        let err = SharedMode::parse("bogus").expect_err("bogus must fail");
+        assert!(err.to_string().contains("invalid shared mode 'bogus'"));
     }
 }

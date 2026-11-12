@@ -1,3 +1,5 @@
+> **2026-11-13 UTC #473 IN-04 完成：** `--shared` 解析与持久化已对齐 Git（支持无值 `group`、`0`/`1`/`2`、布尔、带 owner 读写校验的八进制文件模式并按 `0666` 掩码持久化为 `0%o`、umask/false/0 重初始化移除、兼容读取旧版值、级联读取 `core.sharedRepository`）；M-SPARSE P1..P8 矩阵与 t1301/JSON 回归全过，版本 bump 至 `0.30.174`，网站与命令文档同步完成。IN-04 状态为 `done` / `complete`；下一卡 IN-05。
+
 > **2026-11-13 UTC #473/#475/#478/#487 实施序列启动：** 按用户指示直接在 `main` 推进四计划各任务卡（无分支/PR，每卡独立提交推送，版本 bump 仅 patch+1）。#473（IN-01..03、08..11 已完成，待执行 IN-04..07、IN-12 共 5 卡，首卡 IN-04）；#475（CF-01..03、05、06、08、09、12、14 已完成，待执行 CF-04、07、10、11、13、15 共 6 卡）；#478（LG-01..LG-25 共 25 卡待执行）；#487（IG-01..04 已完成，待执行 IG-05 1 卡）。
 
 > **2026-11-11 09:04:03 UTC EOL 两计划及 Issue 收口：** #1062 7/7、#861 1/1 均 done/complete，分别由 v0.30.170 / f0a95af 与 v0.30.171 / 33cad0f 独立交付，C/D、正式渠道、网站及各自终态全量齐全。#861 终态 78f888ac 为 11572/11572 PASS（1 flaky、1 leaky、53 skipped）。#1062 于 09:03:51 UTC、#861 于 09:04:03 UTC CLOSED。上游 0bbc7f2 文档已保留，最终登记提交 D 证据按预登记 v2.14 在下一次例行同步补记。
@@ -1211,7 +1213,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | 计划 | Issue 主题 | 状态 | 任务卡 |
 |---|---|---|---|
 | [`issues/470.md`](issues/470.md) | 工作树物化丢失可执行位与 mode 变化检测 | 未启动 | FM-01/02/05（3 卡） |
-| [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | **实施中** | IN-01..IN-03、IN-08..IN-11 已 `done`/`complete`；待执行 IN-04..IN-07、IN-12（共 12 卡，已完成 7 卡，待执行 5 卡；下一卡 IN-04） |
+| [`issues/473.md`](issues/473.md) | `init` 与 Git 对齐 | **实施中** | IN-01..IN-04、IN-08..IN-11 已 `done`/`complete`；待执行 IN-05..IN-07、IN-12（共 12 卡，已完成 8 卡，待执行 4 卡；下一卡 IN-05） |
 | [`issues/474.md`](issues/474.md) | clone 浅克隆完整性、bundle 源、bare 与 mirror 对齐 | **已收口** | CL-01..CL-15 全 `done`/`complete`（`v0.23.47`–`v0.23.54`、`v0.23.57`–`v0.23.63`）；closeout `v0.23.64`（#569）；DEP-CL-07 完成（#474 CLOSED） |
 | [`issues/475.md`](issues/475.md) | `config` Git 兼容参数层对齐 | **实施中** | CF-01..CF-03、CF-05、CF-06、CF-08、CF-09、CF-12、CF-14 已 `done`/`complete`；待执行 CF-04、CF-07、CF-10、CF-11、CF-13、CF-15（共 15 卡，已完成 9 卡，待执行 6 卡；下一卡 CF-04） |
 | [`issues/476.md`](issues/476.md) | 工作树命令族与 Git 对齐 | **实施中** | WT-02 `v0.23.29` / WT-04 `v0.23.30` / WT-08 `v0.23.31` / WT-09 `v0.23.32` / WT-10 `v0.23.33` / WT-11 `v0.23.34` / WT-01 `v0.23.35`（`done`/`remote-pending`）；intent-to-add WT-05..WT-07 已 `done/complete`（WT-06/07 于 2026-10-18 落地）；WT-03 `done/complete`（2026-10-18） |
@@ -1623,7 +1625,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20260925`](plan-20260925.md) | SCAP-01 | AgentTraces ingest 改调 `decide`。`v0.23.55` / `fa3849e` D 组全绿 | SCAP-02（登记已核对） | R9 双 `PASS` | 已收口 | `done`/`complete` |
 | [`plan-20260907`](plan-20260907.md) | B3-00 | pin `git-internal`（保持 `=0.10.2`）并引入 `object_format` 事实源 | 无 | **双评审已 PASS**（R40 Codex/Claude 双 PASS） | `v0.23.68` 已发布；focused VER 绿 | `done`/`complete` |
 | [`issues/470`](issues/470.md) | FM-01 | 共享写入原语与 `restore` 系物化 | 无 | 尚未 Codex review | 关闭依赖 plan-20260918 FM-03/04（DEP-FM-06/07） | ❌ 禁止开工 |
-| [`issues/473`](issues/473.md) | IN-04 | `--shared` 解析与持久化 | 前置 IN-02（已完成） | 按用户指令直接在 main 开发交付 | 无 | ✅ 可开工（IN-01..03、08..11 已完成，当前卡 IN-04） |
+| [`issues/473`](issues/473.md) | IN-05 | 共享权限计算 | 前置 IN-04（已完成） | 按用户指令直接在 main 开发交付 | 无 | ✅ 可开工（IN-01..04、08..11 已完成，当前卡 IN-05） |
 | [`issues/474`](issues/474.md) | — | CL-01..CL-15 + closeout + DEP-CL-07 已完成；#474 CLOSED | — | **R6 `PASS`** | 无 | ✅ **已收口** |
 | [`issues/475`](issues/475.md) | CF-04 | 列表输出的格式、顺序与默认作用域 | 前置 CF-03（已完成） | 按用户指令直接在 main 开发交付 | 串行排在 #473 之后 | ⏳ 待 #473 完成后开工（CF-01..03/05/06/08/09/12/14 已完成，待执行 CF-04/07/10/11/13/15） |
 | [`issues/500`](issues/500.md) | CS-16（upstream qualification 入口卡；其 qualified 结论受外部硬门 DEP-500-11/13/14 门控，执行本身不被阻塞；CS-00 为其下游） | upstream qualification（CS-16 → CS-19 → CS-17 → CS-20 依序执行）后由 CS-00 盘点本地统计产物并对 Mega2 artifacts 做 GO/NO-GO；CS-16 为零内部前置入口 | 无（入口 = CS-16；执行链见描述） | **R41 双评已过**（Codex full-plan PASS + Claude targeted PASS，P0/P1=0） | CS-16/CS-19/CS-17/CS-20 qualification audits 已完成并记录 deployment-bound `not-qualified` evidence；CS-00 据此 NO-GO，CS-10..13 正式延后。CS-20 aggregate 非 qualified，因此 GO 与实现卡启动硬门未满足。 | ⛔ **已放弃（Abandoned，2026-11-01；Issue #500 CLOSED）**：统计数据改由 `libra ui` 界面呈现；原 NO-GO 结论保留为历史——本地 trunk compose 实测 CS-16/19/17 `not-qualified` → CS-20 `not-qualified` → CS-00 判定 NO-GO；CS-10/11/12/13 延入 DEFER-CS-02/03/07/10（重启条件：维护者在 #500 确证数据集且新 CS-00b 为 GO）；CS-18 登记 defer+outgoing handoff |

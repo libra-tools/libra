@@ -771,7 +771,7 @@ fn init_reinit_shared_preserves_vault_permissions() {
     assert!(vault_db.exists(), "vaulted init should create vault.db");
     let mode_before = fs::metadata(&vault_db).unwrap().permissions().mode() & 0o777;
 
-    let second = run_libra_command(&["init", "--shared", "all"], &repo);
+    let second = run_libra_command(&["init", "--shared=all"], &repo);
     assert_cli_success(&second, "shared reinit should succeed");
 
     // `--shared all` must NOT widen the private vault database (it is skipped by the
@@ -1795,4 +1795,223 @@ fn count_directories_named(root: &std::path::Path, name: &str) -> usize {
         }
     }
     total
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #473 IN-04: --shared parsing and persistence (M-SPARSE P1..P8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// IN-04 (M-SPARSE P1..P8): comprehensive matrix for --shared parsing,
+/// persistence, legacy value compatibility, and cascading config.
+#[test]
+fn test_init_shared_mode_parse_matrix() {
+    let root = tempdir().unwrap();
+
+    // P1: `init --shared repo` without value -> group mode, repo directory parameter, persists "1".
+    let p1_dir = root.path().join("p1_dir");
+    fs::create_dir_all(&p1_dir).unwrap();
+    let out = run_libra_command(
+        &["init", "--vault", "false", "--shared", "repo_p1"],
+        &p1_dir,
+    );
+    assert_cli_success(&out, "init --shared repo_p1");
+    let repo_p1 = p1_dir.join("repo_p1");
+    assert!(repo_p1.join(".libra/libra.db").exists());
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &repo_p1,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "1");
+
+    // P2: --shared=umask, --shared=false, --shared=0 -> no chmod, does not persist core.sharedRepository;
+    // reinit removes existing value.
+    for val in ["umask", "false", "0"] {
+        let repo = root.path().join(format!("repo_p2_{val}"));
+        fs::create_dir_all(&repo).unwrap();
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={val}")],
+            &repo,
+        );
+        assert_cli_success(&out, &format!("init --shared={val}"));
+        let cfg = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "");
+
+        // Seed core.sharedRepository=1, then reinit with --shared={val} -> removes it.
+        let set = run_libra_command(&["config", "--local", "core.sharedRepository", "1"], &repo);
+        assert_cli_success(&set, "seed core.sharedRepository");
+        let reinit = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={val}")],
+            &repo,
+        );
+        assert_cli_success(&reinit, &format!("reinit --shared={val}"));
+        let cfg2 = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg2.stdout).trim(), "");
+    }
+
+    // P3: group / true / 1 -> persists "1"; all / world / everybody / 2 -> persists "2"
+    for val in ["group", "true", "1"] {
+        let repo = root.path().join(format!("repo_p3_{val}"));
+        fs::create_dir_all(&repo).unwrap();
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={val}")],
+            &repo,
+        );
+        assert_cli_success(&out, &format!("init --shared={val}"));
+        let cfg = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "1");
+    }
+    for val in ["all", "world", "everybody", "2"] {
+        let repo = root.path().join(format!("repo_p3_{val}"));
+        fs::create_dir_all(&repo).unwrap();
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={val}")],
+            &repo,
+        );
+        assert_cli_success(&out, &format!("init --shared={val}"));
+        let cfg = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "2");
+    }
+
+    // P4: 0660, 0640, 0600, 0664, 0775 -> saves masked 0660, 0640, 0600, 0664, 0664
+    let octal_cases = [
+        ("0660", "0660"),
+        ("0640", "0640"),
+        ("0600", "0600"),
+        ("0664", "0664"),
+        ("0775", "0664"),
+    ];
+    for (input, expected) in octal_cases {
+        let repo = root.path().join(format!("repo_p4_{input}"));
+        fs::create_dir_all(&repo).unwrap();
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={input}")],
+            &repo,
+        );
+        assert_cli_success(&out, &format!("init --shared={input}"));
+        let cfg = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), expected);
+    }
+
+    // P5: 0400, 0200 -> 129 LBR-CLI-002, file owner must have read and write permissions, zero writes
+    for input in ["0400", "0200"] {
+        let repo = root.path().join(format!("repo_p5_{input}"));
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={input}")],
+            &repo,
+        );
+        assert_eq!(out.status.code(), Some(129));
+        let (_h, report) = super::parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CLI-002");
+        assert!(
+            report
+                .message
+                .contains("file owner must have read and write permissions"),
+            "expected owner permission message: {}",
+            report.message
+        );
+        assert!(!repo.join(".libra").exists(), "zero write on refusal");
+    }
+
+    // P6: bogus -> 129 LBR-CLI-002
+    let repo_bogus = root.path().join("repo_p6_bogus");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=bogus"], &repo_bogus);
+    assert_eq!(out.status.code(), Some(129));
+    let (_h, report) = super::parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        !repo_bogus.join(".libra").exists(),
+        "zero write on bogus shared mode"
+    );
+
+    // P7: Legacy values in core.sharedRepository (group, all, 0775) rewritten on reinit
+    let legacy_cases = [("group", "1"), ("all", "2"), ("0775", "0664")];
+    for (legacy_val, rewritten_val) in legacy_cases {
+        let repo = root.path().join(format!("repo_p7_{legacy_val}"));
+        fs::create_dir_all(&repo).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["init", "--vault", "false"], &repo),
+            "initial init",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--local", "core.sharedRepository", legacy_val],
+                &repo,
+            ),
+            "seed legacy config",
+        );
+        // Reinit without explicit --shared rewrites legacy value to Git format
+        let reinit = run_libra_command(&["init", "--vault", "false"], &repo);
+        assert_cli_success(&reinit, "reinit legacy value");
+        let cfg = run_libra_command(
+            &["config", "--local", "--get", "core.sharedRepository"],
+            &repo,
+        );
+        assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), rewritten_val);
+    }
+
+    // P8: cascaded global core.sharedRepository=group when --shared is omitted
+    let p8_dir = root.path().join("p8_dir");
+    fs::create_dir_all(&p8_dir).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--global", "core.sharedRepository", "group"],
+            &p8_dir,
+        ),
+        "set global core.sharedRepository",
+    );
+    let p8_repo = p8_dir.join("repo_p8");
+    let out = run_libra_command(&["init", "--vault", "false", "repo_p8"], &p8_dir);
+    assert_cli_success(&out, "init with cascaded global sharedRepository");
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &p8_repo,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "1");
+}
+
+/// IN-04: Git t1301 test case: git init --shared=all persists 2.
+#[test]
+fn test_t1301_shared_all_persists_2() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=all"], &repo);
+    assert_cli_success(&out, "init --shared=all");
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &repo,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "2");
+}
+
+/// IN-04: Git t1301 test case: git init --shared=0400 fails because file owner must have read and write permissions.
+#[test]
+fn test_t1301_shared_0400_rejected() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=0400"], &repo);
+    assert_eq!(out.status.code(), Some(129));
+    let (_h, report) = super::parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        report
+            .message
+            .contains("file owner must have read and write permissions")
+    );
+    assert!(!repo.join(".libra").exists());
 }
