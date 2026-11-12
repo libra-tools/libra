@@ -1293,6 +1293,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [issues/1062.md](issues/1062.md) | 显式 text/eol clean、status/diff 与同步预检（#1062） | 已收口：7/7 done / complete（2026-11-11 03:59:10 UTC；EX-EOL-USER-01） | v0.30.170 / signed+DCO f0a95af；main 42943288535 8/8、CodeQL 42943288416 2/2、release 42943384170 8/8、四平台签名/摘要、Homebrew 与正式安装双格式冒烟、网站均通过。最终 core 11536/11536；计划终态 819532e6 11509/11509 PASS（71 slow、1 flaky、2 leaky、53 skipped、1793.400s），fmt/严格 Clippy 通过，八输入及两状态文件前后不变。已完成 DEP-EOL-1062-861 交接；历史失败保留。#861 已独立完成；#1062 于 2026-11-11 09:03:51 UTC CLOSED。 |
 | [issues/861.md](issues/861.md) | text=auto 自动转换与 diff --quiet / TC-1324（#861） | 已收口：1/1 done / complete（2026-11-11 08:56:13 UTC；EX-EOL-USER-01） | signed+DCO 33cad0f / v0.30.171，main 42972559100 8/8、CodeQL 42972559055 2/2、release 42972701236 8/8 success；正式签名清单 revision 263、四平台产物、Homebrew 与隔离安装双格式冒烟通过。网站 cf a60c609 已部署，28 页面核验通过。本地 C 11572/11572、远端核心 11599/11599、终态 78f888ac 11572/11572（15 slow、1 flaky、1 leaky、53 skipped、1138.945s）及 fmt/严格 Clippy 通过；1224 输入保持，已保留上游 0bbc7f2 的 #1057 文档记录。TC-1324 目标两轨 PASS，Libra 整文件另有十项既有独立失败。#861 于 2026-11-11 09:04:03 UTC CLOSED，两计划与两 Issue 均已收口。 |
 | [`issues/698.md`](issues/698.md) | `branch --column` 使用 Git 兼容的动态列宽 | 未启动（2026-11-12 15:55:00 UTC；仅规划、未授权执行） | I698-01（1 卡，AC=8/8） |
+| [`issues/957.md`](issues/957.md) | log/show/shortlog 的固定日期占位符 | 未启动（2026-11-12 16:20:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I957-01（1 卡） |
 
 ---
 
