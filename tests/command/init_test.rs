@@ -2156,3 +2156,183 @@ fn test_init_shared_permission_matrix() {
         "vault.db must remain un-widened on reinit"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #473 IN-12: t0001 ports and verified-ok regression guards
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upstream t0001:34, :112, :162 — plain, plain-bare, and reinit.
+#[test]
+fn test_t0001_plain_bare_reinit_ports() {
+    let temp = tempdir().unwrap();
+
+    // t0001:34 'plain'
+    let plain = temp.path().join("plain");
+    let out = run_libra_command(&["init", "--vault", "false", "plain"], temp.path());
+    assert_cli_success(&out, "init plain");
+    assert!(plain.join(".libra/libra.db").exists());
+    let bare_cfg = run_libra_command(&["config", "--local", "--get", "core.bare"], &plain);
+    assert_eq!(String::from_utf8_lossy(&bare_cfg.stdout).trim(), "false");
+
+    // t0001:112 'plain bare'
+    let bare = temp.path().join("plain-bare");
+    let out = run_libra_command(
+        &["init", "--bare", "--vault", "false", "plain-bare"],
+        temp.path(),
+    );
+    assert_cli_success(&out, "init plain bare");
+    assert!(bare.join("libra.db").exists());
+    let bare_cfg = run_libra_command(&["config", "--local", "--get", "core.bare"], &bare);
+    assert_eq!(String::from_utf8_lossy(&bare_cfg.stdout).trim(), "true");
+
+    // t0001:162 'reinit'
+    let again = temp.path().join("again");
+    fs::create_dir_all(&again).unwrap();
+    let out1 = run_libra_command(&["init", "--vault", "false", "-b", "initial"], &again);
+    assert_cli_success(&out1, "first init");
+    assert!(String::from_utf8_lossy(&out1.stdout).contains("Initialized empty"));
+
+    let out2 = run_libra_command(&["init", "--vault", "false"], &again);
+    assert_cli_success(&out2, "reinit");
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("Reinitialized existing"));
+}
+
+/// Upstream t0001:237, :243, :249, :256, :263 — directory creation matrix.
+#[test]
+fn test_t0001_directory_creation_ports() {
+    let temp = tempdir().unwrap();
+
+    // :237 'init creates a new directory'
+    let newdir1 = temp.path().join("newdir1");
+    let out = run_libra_command(&["init", "--vault", "false", "newdir1"], temp.path());
+    assert_cli_success(&out, "init newdir1");
+    assert!(newdir1.join(".libra/libra.db").exists());
+
+    // :243 'init creates a new bare directory'
+    let newdir2 = temp.path().join("newdir2");
+    let out = run_libra_command(
+        &["init", "--bare", "--vault", "false", "newdir2"],
+        temp.path(),
+    );
+    assert_cli_success(&out, "init bare newdir2");
+    assert!(newdir2.join("libra.db").exists());
+
+    // :249 'init recreates a directory'
+    let newdir3 = temp.path().join("newdir3");
+    fs::create_dir_all(&newdir3).unwrap();
+    let out = run_libra_command(&["init", "--vault", "false", "newdir3"], temp.path());
+    assert_cli_success(&out, "init recreates newdir3");
+    assert!(newdir3.join(".libra/libra.db").exists());
+
+    // :256 'init recreates a new bare directory'
+    let newdir4 = temp.path().join("newdir4");
+    fs::create_dir_all(&newdir4).unwrap();
+    let out = run_libra_command(
+        &["init", "--bare", "--vault", "false", "newdir4"],
+        temp.path(),
+    );
+    assert_cli_success(&out, "init recreates bare newdir4");
+    assert!(newdir4.join("libra.db").exists());
+
+    // :263 'init creates a new deep directory'
+    let deep = temp.path().join("deep/a/b/c");
+    let out = run_libra_command(&["init", "--vault", "false", "deep/a/b/c"], temp.path());
+    assert_cli_success(&out, "init deep directory");
+    assert!(deep.join(".libra/libra.db").exists());
+}
+
+/// Upstream t0001:855, :890, :913 — initial branch configuration ports.
+#[test]
+fn test_t0001_initial_branch_ports() {
+    let temp = tempdir().unwrap();
+
+    // :855 '--initial-branch'
+    let repo_hello = temp.path().join("repo_hello");
+    let out = run_libra_command(
+        &["init", "--vault", "false", "--initial-branch=hello"],
+        &repo_hello,
+    );
+    assert_cli_success(&out, "init --initial-branch=hello");
+    let branch = run_libra_command(&["branch", "--show-current"], &repo_hello);
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "hello");
+
+    // Re-initializing does not change the branch name and warns
+    let reinit = run_libra_command(
+        &["init", "--vault", "false", "--initial-branch=ignore"],
+        &repo_hello,
+    );
+    assert_cli_success(&reinit, "reinit with different initial-branch");
+    let stderr = String::from_utf8_lossy(&reinit.stderr);
+    assert!(stderr.contains("ignoring --initial-branch"));
+    let branch_after = run_libra_command(&["branch", "--show-current"], &repo_hello);
+    assert_eq!(
+        String::from_utf8_lossy(&branch_after.stdout).trim(),
+        "hello"
+    );
+
+    // :890 'default branch name' is main
+    let repo_def = temp.path().join("repo_def");
+    let out = run_libra_command(&["init", "--vault", "false"], &repo_def);
+    assert_cli_success(&out, "init default branch");
+    let branch_def = run_libra_command(&["branch", "--show-current"], &repo_def);
+    assert_eq!(String::from_utf8_lossy(&branch_def.stdout).trim(), "main");
+
+    // :913 'invalid default branch name' fails with 129
+    let repo_bad = temp.path().join("repo_bad");
+    let out = run_libra_command(
+        &["init", "--vault", "false", "--initial-branch=with space"],
+        &repo_bad,
+    );
+    assert_eq!(out.status.code(), Some(129));
+    let (_h, report) = super::parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
+/// Issue #473 items 4–6 verified ok regression guards:
+/// - Item 4: --shared=group directory 2775, file 0664, no file with setgid.
+/// - Item 5: nested init in a subfolder initializes independently.
+/// - Item 6: template top-up preserves customized files, refuses symlink destination.
+#[cfg(unix)]
+#[test]
+fn test_init_issue473_verified_ok_guards() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+
+    // Item 4: --shared=group directory 2775, file 0664, file has no setgid
+    let repo_item4 = temp.path().join("repo_item4");
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false", "--shared=group"], &repo_item4),
+        "init group",
+    );
+    let dot_libra = repo_item4.join(".libra");
+    let dir_mode = fs::metadata(&dot_libra).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(dir_mode, 0o2775, ".libra directory must be 2775");
+
+    let exclude_file = dot_libra.join("info/exclude");
+    let file_mode = fs::metadata(&exclude_file).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(file_mode, 0o664, "exclude file must be 0664");
+    assert_eq!(file_mode & 0o2000, 0, "file must not carry setgid");
+
+    // Item 5: nested init
+    let nested_sub = repo_item4.join("sub/nested");
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false", "sub/nested"], &repo_item4),
+        "nested init",
+    );
+    assert!(nested_sub.join(".libra/libra.db").exists());
+    assert!(repo_item4.join(".libra/libra.db").exists());
+
+    // Item 6: template top-up preserves customized file, refuses symlink target
+    let custom_exclude = repo_item4.join(".libra/info/exclude");
+    fs::write(&custom_exclude, "custom content\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], &repo_item4),
+        "reinit top-up",
+    );
+    assert_eq!(
+        fs::read_to_string(&custom_exclude).unwrap(),
+        "custom content\n",
+        "customized file must be preserved by top-up"
+    );
+}

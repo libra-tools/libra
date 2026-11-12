@@ -288,7 +288,7 @@ D-empty-message 已由 HF-06 实现
 - **DEFER-03**（已撤销，2026-11-01 起生效）`update-index --skip-worktree` / `--no-skip-worktree`：原判断为需要 index v3 扩展标志位，实测已生效——`ls-files -v` 输出 `S`、`status --porcelain` 与 `diff-files` 忽略该路径、`--no-skip-worktree` 可清除。保留本条只作历史判断更正，不再是延后项。
 - **DEFER-04** `update-ref` 的 `HEAD` / 非 `refs/heads/*` 命名空间与 `symref-*`，以及 `symbolic-ref` 对非 `HEAD` 符号引用的支持：refs 存于 SQLite，当前范围限定为既有设计（`symbolic-ref -d HEAD` 与删除非符号 ref 均按 Git 文案 fail-closed）。重启条件：ref 存储支持通用符号引用时另立 ADR 并同步两个命令的开发文档与测试。
 
-## D25: `init` 的 Git 布局与引用存储选项（issue #473）
+### D25: `init` 的 Git 布局与引用存储选项（issue #473）
 
 - 拒绝项：`--separate-git-dir`、Libra 旧版 `--separate-libra-dir`、`--ref-format=files|reftable`、`--recurse-submodules`。
 - 行为：解析层返回 `LBR-CLI-002`（129）并给出可执行的迁移或替代 hint，零写入。

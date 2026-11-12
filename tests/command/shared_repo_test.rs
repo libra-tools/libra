@@ -333,3 +333,85 @@ fn test_shared_repo_metadata_matrix() {
     assert_eq!(vmode, 0o600, "vault.db must remain 0600 in group repo");
     assert!(libra::utils::shared_perm::is_owner_only_path(&vault_db));
 }
+
+/// IN-12 (M-LEDGER K2): Upstream t1301-shared-repo ports.
+#[cfg(unix)]
+#[test]
+fn test_t1301_ports() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+
+    // t1301:18 'shared = 0400 (faulty permission u-w)'
+    let sub_0400 = temp.path().join("sub_0400");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=0400"], &sub_0400);
+    assert_eq!(out.status.code(), Some(129));
+    let (_h, report) = super::parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(!sub_0400.join(".libra").exists());
+
+    // t1301:28 'shared=1'
+    let sub_1 = temp.path().join("sub_1");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=1"], &sub_1);
+    assert_cli_success(&out, "init --shared=1");
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &sub_1,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "1");
+    let exclude_mode = fs::metadata(sub_1.join(".libra/info/exclude"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        exclude_mode, 0o664,
+        ".libra/info/exclude must be 0664 under shared=1"
+    );
+
+    // t1301:49 'shared=all'
+    let sub_all = temp.path().join("sub_all");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=all"], &sub_all);
+    assert_cli_success(&out, "init --shared=all");
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &sub_all,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "2");
+
+    // t1301 forced modes: 0660, 0640, 0600
+    for (mode_str, exp_dir, exp_file) in [
+        ("0660", 0o2770, 0o660),
+        ("0640", 0o2750, 0o640),
+        ("0600", 0o700, 0o600),
+    ] {
+        let repo = temp.path().join(format!("t1301_{mode_str}"));
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={mode_str}")],
+            &repo,
+        );
+        assert_cli_success(&out, &format!("init --shared={mode_str}"));
+        let dmode = fs::metadata(repo.join(".libra"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(dmode, exp_dir, "directory mode for {mode_str}");
+        let fmode = fs::metadata(repo.join(".libra/info/exclude"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(fmode, exp_file, "info/exclude mode for {mode_str}");
+    }
+
+    // unshared repo does not set shared permissions
+    let repo_unshared = temp.path().join("t1301_unshared");
+    let out = run_libra_command(&["init", "--vault", "false"], &repo_unshared);
+    assert_cli_success(&out, "init unshared");
+    let cfg = run_libra_command(
+        &["config", "--local", "--get", "core.sharedRepository"],
+        &repo_unshared,
+    );
+    assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "");
+}
