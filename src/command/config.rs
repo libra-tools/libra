@@ -590,6 +590,9 @@ pub struct ConfigArgs {
     /// Shortcut for `--type=path`.
     #[clap(long = "path", hide = true, group = "config_type_sel")]
     pub type_path: bool,
+    /// Shortcut for `--type=expiry-date`.
+    #[clap(long = "expiry-date", hide = true, group = "config_type_sel")]
+    pub type_expiry_date: bool,
 
     // ── Scope flags ──────────────────────────────────────────────────
     /// Use repository config (default)
@@ -877,6 +880,7 @@ fn validate_schema_doctor_args(args: &ConfigArgs) -> CliResult<()> {
         || args.type_bool
         || args.type_int
         || args.type_path
+        || args.type_expiry_date
         || args.key.is_some()
         || args.valuepattern.is_some()
         || args.default.is_some()
@@ -2481,6 +2485,8 @@ enum ConfigValueType {
     BoolOrInt,
     /// `--type=color`: render the Git ANSI escape sequence.
     Color,
+    /// `--type=expiry-date`: render a Unix timestamp.
+    ExpiryDate,
 }
 
 /// Resolve the requested read type from `--type=<t>` or a `--bool`/`--int`/
@@ -2496,6 +2502,9 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
     if args.type_path {
         return Ok(Some(ConfigValueType::Path));
     }
+    if args.type_expiry_date {
+        return Ok(Some(ConfigValueType::ExpiryDate));
+    }
     match args.value_type.as_deref() {
         None => Ok(None),
         Some("bool") => Ok(Some(ConfigValueType::Bool)),
@@ -2504,8 +2513,9 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
         Some("bool-or-str") => Ok(Some(ConfigValueType::BoolOrStr)),
         Some("bool-or-int") => Ok(Some(ConfigValueType::BoolOrInt)),
         Some("color") => Ok(Some(ConfigValueType::Color)),
+        Some("expiry-date") => Ok(Some(ConfigValueType::ExpiryDate)),
         Some(other) => Err(CliError::command_usage(format!(
-            "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, or color)"
+            "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, color, or expiry-date)"
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)),
     }
@@ -2583,6 +2593,12 @@ fn canonicalize_typed_value(value: &str, ty: ConfigValueType) -> CliResult<Strin
                     .with_stable_code(StableErrorCode::CliInvalidArguments)
             })
         }
+        ConfigValueType::ExpiryDate => crate::utils::approxidate::parse_expiry_date(value)
+            .map(|ts| ts.to_string())
+            .map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            }),
     }
 }
 
@@ -2596,6 +2612,13 @@ fn canonicalize_typed_value_for_store(value: &str, ty: ConfigValueType) -> CliRe
                 CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::CliInvalidArguments)
                     .with_hint(format!("cannot parse color '{value}'"))
+            })?;
+            Ok(value.to_string())
+        }
+        ConfigValueType::ExpiryDate => {
+            crate::utils::approxidate::parse_expiry_date(value).map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
             })?;
             Ok(value.to_string())
         }

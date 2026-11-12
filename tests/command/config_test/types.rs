@@ -236,3 +236,193 @@ fn test_t1300_type_color() {
 
     let _ = run_libra_command_with_env(&["config", "--local", "--list"], &repo, &[]);
 }
+
+/// CF-11 (M-EXPIRY E1..E6): `--type=expiry-date` renders timestamps,
+/// validates values, and filters `--list`.
+#[test]
+#[serial(cwd, env)]
+fn test_type_expiry_date_matrix() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], &repo),
+        "init",
+    );
+
+    // E1: relative forms produce a timestamp within 2s of Git's `now - delta`.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for (value, delta) in [
+        ("2.weeks.ago", 14 * 24 * 60 * 60),
+        ("3.days.ago", 3 * 24 * 60 * 60),
+        ("1.hour.ago", 60 * 60),
+    ] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "d.v", value], &repo),
+            "set expiry",
+        );
+        let out = run_libra_command(
+            &["config", "--local", "--type=expiry-date", "--get", "d.v"],
+            &repo,
+        );
+        assert_cli_success(&out, "get expiry");
+        let ts: i64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ts");
+        assert!(
+            ((now - delta) - ts).abs() <= 2,
+            "{value}: expected ~{}, got {ts}",
+            now - delta
+        );
+    }
+
+    // E2: special words.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "d.never", "never"], &repo),
+        "set never",
+    );
+    let never = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=expiry-date",
+            "--get",
+            "d.never",
+        ],
+        &repo,
+    );
+    assert_eq!(String::from_utf8_lossy(&never.stdout).trim(), "0");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "d.now", "now"], &repo),
+        "set now",
+    );
+    let now_out = run_libra_command(
+        &["config", "--local", "--type=expiry-date", "--get", "d.now"],
+        &repo,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&now_out.stdout).trim(),
+        i64::MAX.to_string(),
+        "now maps to the far-future sentinel"
+    );
+
+    // E3: absolute dates.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "d.iso", "2017-11-11T23:11:11"],
+            &repo,
+        ),
+        "set iso",
+    );
+    let iso = run_libra_command(
+        &["config", "--local", "--type=expiry-date", "--get", "d.iso"],
+        &repo,
+    );
+    assert_cli_success(&iso, "get iso");
+    assert!(
+        String::from_utf8_lossy(&iso.stdout)
+            .trim()
+            .parse::<i64>()
+            .unwrap()
+            > 0
+    );
+
+    // E4: invalid values fail the read with Git-shaped wording.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "d.bad", "abc"], &repo),
+        "set bad",
+    );
+    let bad = run_libra_command(
+        &["config", "--local", "--type=expiry-date", "--get", "d.bad"],
+        &repo,
+    );
+    assert_eq!(bad.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("not a valid timestamp"),
+        "invalid expiry wording: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // E5: `--list --type=expiry-date` keeps only parseable values.
+    let list = run_libra_command(
+        &["config", "--local", "--list", "--type=expiry-date"],
+        &repo,
+    );
+    assert_cli_success(&list, "list --type=expiry-date");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(listed.contains("d.never=0"), "{listed:?}");
+    assert!(
+        !listed.contains("d.bad"),
+        "invalid expiry filtered: {listed:?}"
+    );
+
+    // E6: `--expiry-date` shortcut equals `--type=expiry-date`; invalid set writes nothing.
+    let shortcut = run_libra_command(
+        &["config", "--local", "--expiry-date", "--get", "d.never"],
+        &repo,
+    );
+    assert_cli_success(&shortcut, "--expiry-date shortcut");
+    assert_eq!(String::from_utf8_lossy(&shortcut.stdout).trim(), "0");
+
+    let invalid_set = run_libra_command(
+        &["config", "--local", "--expiry-date", "d.news", "not-a-date"],
+        &repo,
+    );
+    assert_eq!(invalid_set.status.code(), Some(129), "invalid set rejected");
+    let stored = run_libra_command(&["config", "--local", "--get", "d.news"], &repo);
+    assert_eq!(stored.status.code(), Some(1), "invalid set writes nothing");
+}
+
+/// CF-11 (M-EXPIRY E4): upstream t1300 `--expiry-date` get/list ports.
+#[test]
+#[serial(cwd, env)]
+fn test_t1300_expiry_date() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], &repo),
+        "init",
+    );
+
+    // t1300:1115 — `never` → 0, and an invalid value fails.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "date.valid5", "never"], &repo),
+        "set never",
+    );
+    let valid5 = run_libra_command(
+        &["config", "--local", "--expiry-date", "date.valid5"],
+        &repo,
+    );
+    assert_cli_success(&valid5, "get never");
+    assert_eq!(String::from_utf8_lossy(&valid5.stdout).trim(), "0");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "date.invalid1", "abc"], &repo),
+        "set invalid",
+    );
+    let invalid = run_libra_command(
+        &["config", "--local", "--expiry-date", "date.invalid1"],
+        &repo,
+    );
+    assert_eq!(invalid.status.code(), Some(129), "invalid expiry fails");
+
+    // t1300:2627 — `--list --type=expiry-date` filters unparseable values.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "date.good", "yesterday"], &repo),
+        "set yesterday",
+    );
+    let list = run_libra_command(
+        &["config", "--local", "--list", "--type=expiry-date"],
+        &repo,
+    );
+    assert_cli_success(&list, "list expiry");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(listed.contains("date.good="), "{listed:?}");
+    assert!(!listed.contains("date.invalid1"), "{listed:?}");
+}

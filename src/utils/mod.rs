@@ -5,6 +5,7 @@ pub mod error;
 pub mod fuse;
 pub mod output;
 
+pub mod approxidate;
 pub(crate) mod atomic_stream;
 pub mod atomic_write;
 pub mod attributes;

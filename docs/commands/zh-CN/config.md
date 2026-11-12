@@ -495,7 +495,7 @@ libra config remove-gpg-key --force
 | `--show-scope` | 读取/列表输出 `local`/`global`/`system` 前缀（对齐 Git） |
 | `--replace-all <key> <value>` | 用单个值替换该 key 的所有既有值 |
 | `--file <path>` | 读取 Git 风格 INI 文件而非存储（只读：`--get`、`--get-all`、`--get-regexp`、`--list`） |
-| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int\|color>`、`--bool`、`--int`、`--path` | 读取（`--get`/`--get-all`/`--get-regexp`/`--list`）**与设置**时规范化值：bool 变体 → `true`/`false`；int 支持可选 k/m/g（1024 倍率）；path 展开开头的 `~`/`~/`；`color` 读取时输出 Git 的 ANSI 转义序列，写入时校验并存储原始拼写（存 `red` 而非 `\x1b[31m`），`--list --type=color` 仅保留可解析的值。设置时在存储前校验+规范化（与 git `config --type` 一致：`yes` → `true`、`1k` → `1024`），非法值报错且不写入。非 get/set/list 模式会被拒绝（exit 129）。 |
+| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int\|color>`、`--bool`、`--int`、`--path` | 读取（`--get`/`--get-all`/`--get-regexp`/`--list`）**与设置**时规范化值：bool 变体 → `true`/`false`；int 支持可选 k/m/g（1024 倍率）；path 展开开头的 `~`/`~/`；`color` 读取时输出 Git 的 ANSI 转义序列，写入时校验并存储原始拼写（存 `red` 而非 `\x1b[31m`），`--list --type=color` 仅保留可解析的值；`expiry-date` 读取时输出 Unix 时间戳（相对 `<n>.<unit>.ago`、`never`/`false` → 0、`now`/`all` → 远期哨兵值、`today`/`yesterday`/`tomorrow`/`noon`/`midnight`，以及 ISO 8601/`YYYY-MM-DD`/RFC 2822 绝对日期），写入时校验并存储原始拼写，`--list --type=expiry-date` 仅保留可解析的值。设置时在存储前校验+规范化（与 git `config --type` 一致：`yes` → `true`、`1k` → `1024`），非法值报错且不写入。非 get/set/list 模式会被拒绝（exit 129）。 |
 | `--remove-section <name>` | 在一个事务内删除 section `<name>` 的 key，采用 Git 的 section/subsection 身份（`--remove-section branch` 删 `branch.<key>` 但不动 `branch.feature.*` 子节）。section 不存在 → exit 128。 |
 | `--rename-section <old> <new>` | 把 section `<old>` 的 key 搬到 `<new>`，保留每个值及其加密标志。源不存在 → exit 128；新旧同名 → exit 2；目标 section 已存在则拒绝 → exit 128。 |
 
