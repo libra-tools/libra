@@ -32,6 +32,7 @@ pub(crate) mod preview_scratch;
 pub mod read_policy;
 pub mod redact;
 pub mod resource_limits;
+pub mod shared_perm;
 pub mod stat_diff;
 pub mod storage;
 pub mod storage_ext;

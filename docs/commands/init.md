@@ -256,6 +256,12 @@ Numeric modes are validated before any repository layout is written. The file ow
 retain read and write permissions (`mode & 0600 == 0600`). Modes missing owner read/write access
 such as `0400` or `0200` are rejected with `LBR-CLI-002` before any files are created.
 
+Permissions for files and directories are computed separately aligning with Git's `calc_shared_perm`:
+- Regular files receive shared bits overlay (`0660` for `group`, `0664` for `all`/`everybody`; numeric modes replace the lower 9 bits). Executable files copy read bits to execute bits (`mode |= (mode & 0444) >> 2`).
+- Directories copy read bits to execute bits for directory traversal and receive the setgid bit (`02000`) whenever group access is present (`group`, `all`, or numeric mode with group read/write).
+- Private signing keys in `vault.db` and its SQLite sidecars are strictly excluded and remain owner-only.
+- Symlinks within the repository layout are never followed during permission sweeps.
+
 For a Git conversion into an existing bare target, `--shared` updates the target
 directory and newly created repository entries; pre-existing user files retain
 their permissions.

@@ -789,7 +789,7 @@ fn init_reinit_shared_preserves_vault_permissions() {
         .mode()
         & 0o777;
     assert_eq!(
-        exclude_mode, 0o777,
+        exclude_mode, 0o664,
         "a non-vault file should be widened by --shared all, got {exclude_mode:o}"
     );
 }
@@ -2014,4 +2014,145 @@ fn test_t1301_shared_0400_rejected() {
             .contains("file owner must have read and write permissions")
     );
     assert!(!repo.join(".libra").exists());
+}
+
+/// IN-05 (M-SPERM Q1..Q7): permission calculation and initial application matrix.
+#[cfg(unix)]
+#[test]
+fn test_init_shared_permission_matrix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+
+    // Q1: --shared=group: directories 2775, files 0664, hooks 0775, no files with setgid
+    let repo_group = temp.path().join("repo_group");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=group"], &repo_group);
+    assert_cli_success(&out, "init --shared=group");
+    let meta_root = fs::metadata(repo_group.join(".libra")).unwrap();
+    assert_eq!(
+        meta_root.permissions().mode() & 0o7777,
+        0o2775,
+        ".libra dir mode"
+    );
+    let meta_info = fs::metadata(repo_group.join(".libra/info")).unwrap();
+    assert_eq!(
+        meta_info.permissions().mode() & 0o7777,
+        0o2775,
+        ".libra/info dir mode"
+    );
+    let meta_exclude = fs::metadata(repo_group.join(".libra/info/exclude")).unwrap();
+    assert_eq!(
+        meta_exclude.permissions().mode() & 0o7777,
+        0o664,
+        "exclude file mode"
+    );
+    assert_eq!(
+        meta_exclude.permissions().mode() & 0o2000,
+        0,
+        "file must not carry setgid"
+    );
+    if let Ok(meta_hook) = fs::metadata(repo_group.join(".libra/hooks/pre-commit.sh")) {
+        assert_eq!(
+            meta_hook.permissions().mode() & 0o7777,
+            0o775,
+            "hook script mode"
+        );
+    }
+
+    // Q2: --shared=all: directory 2775, files 0664, no world-writable path
+    let repo_all = temp.path().join("repo_all");
+    let out = run_libra_command(&["init", "--vault", "false", "--shared=all"], &repo_all);
+    assert_cli_success(&out, "init --shared=all");
+    let meta_all_root = fs::metadata(repo_all.join(".libra")).unwrap();
+    assert_eq!(
+        meta_all_root.permissions().mode() & 0o7777,
+        0o2775,
+        ".libra all mode"
+    );
+    let meta_all_exclude = fs::metadata(repo_all.join(".libra/info/exclude")).unwrap();
+    assert_eq!(
+        meta_all_exclude.permissions().mode() & 0o7777,
+        0o664,
+        "exclude file mode for all"
+    );
+    for entry in walkdir::WalkDir::new(repo_all.join(".libra")) {
+        let entry = entry.unwrap();
+        let mode = fs::symlink_metadata(entry.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o002,
+            0,
+            "path {} must not be world-writable",
+            entry.path().display()
+        );
+    }
+
+    // Q3: 0660 -> 2770/0660, 0640 -> 2750/0640, 0600 -> 0700/0600
+    let numeric_cases = [
+        ("0660", 0o2770, 0o660),
+        ("0640", 0o2750, 0o640),
+        ("0600", 0o700, 0o600),
+    ];
+    for (mode_str, expected_dir, expected_file) in numeric_cases {
+        let repo_num = temp.path().join(format!("repo_num_{mode_str}"));
+        let out = run_libra_command(
+            &["init", "--vault", "false", &format!("--shared={mode_str}")],
+            &repo_num,
+        );
+        assert_cli_success(&out, &format!("init --shared={mode_str}"));
+        let dir_mode = fs::metadata(repo_num.join(".libra"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(dir_mode, expected_dir, "directory mode for {mode_str}");
+        let file_mode = fs::metadata(repo_num.join(".libra/info/exclude"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(file_mode, expected_file, "file mode for {mode_str}");
+    }
+
+    // Q4: Vault database and sidecars stay un-widened under any shared mode
+    let repo_vault = temp.path().join("repo_vault");
+    let out = run_libra_command(&["init"], &repo_vault);
+    assert_cli_success(&out, "init with vault");
+    let vault_mode_before = fs::metadata(repo_vault.join(".libra/vault.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let out = run_libra_command(&["init", "--shared=all"], &repo_vault);
+    assert_cli_success(&out, "init --shared=all with vault");
+    let vault_mode_after = fs::metadata(repo_vault.join(".libra/vault.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        vault_mode_after, vault_mode_before,
+        "vault.db must not be widened"
+    );
+
+    // Q6: reinit recalculates permissions and does not widen vault
+    let out = run_libra_command(&["init", "--shared=0640"], &repo_vault);
+    assert_cli_success(&out, "reinit --shared=0640 with vault");
+    let dir_mode = fs::metadata(repo_vault.join(".libra"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(dir_mode, 0o2750, "reinit directory mode");
+    let vault_mode_reinit = fs::metadata(repo_vault.join(".libra/vault.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        vault_mode_reinit, vault_mode_before,
+        "vault.db must remain un-widened on reinit"
+    );
 }

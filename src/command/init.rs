@@ -2009,87 +2009,37 @@ fn copy_template(src: &Path, dst: &Path, skips: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SharedMode {
-    Umask,
-    Group,
-    All,
-    Numeric { raw: String, bits: u32 },
-}
+pub use crate::utils::shared_perm::{
+    SharedMode, SharedModeError, adjust_shared_perm, calc_shared_perm,
+};
 
-impl SharedMode {
-    pub fn parse(raw: &str) -> Result<Self, InitError> {
-        let trimmed = raw.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        match lower.as_str() {
-            "umask" | "false" | "no" | "off" | "0" => Ok(Self::Umask),
-            "group" | "true" | "yes" | "on" | "1" => Ok(Self::Group),
-            "all" | "world" | "everybody" | "2" => Ok(Self::All),
-            _ => {
-                if let Ok(val) = u32::from_str_radix(trimmed, 8) {
-                    if val == 0 {
-                        return Ok(Self::Umask);
-                    }
-                    if val == 1 {
-                        return Ok(Self::Group);
-                    }
-                    if val == 2 {
-                        return Ok(Self::All);
-                    }
-                    if val & 0o600 != 0o600 {
-                        return Err(invalid_argument(
-                            format!(
-                                "invalid shared mode '{raw}': file owner must have read and write permissions"
-                            ),
-                            Some(
-                                "the owner of files must always have read and write permissions (mode & 0600 == 0600)"
-                                    .to_string(),
-                            ),
-                        ));
-                    }
-                    let bits = val & 0o666;
-                    return Ok(Self::Numeric {
-                        raw: format!("0{bits:o}"),
-                        bits,
-                    });
-                }
-                Err(invalid_argument(
-                    format!("invalid shared mode '{raw}'"),
-                    Some(
-                        "supported values: umask, group, all, true, false, or an octal mode such as 0660"
-                            .to_string(),
-                    ),
-                ))
-            }
-        }
-    }
-
-    pub fn config_value(&self) -> &str {
-        match self {
-            Self::Umask => "0",
-            Self::Group => "1",
-            Self::All => "2",
-            Self::Numeric { raw, .. } => raw.as_str(),
-        }
-    }
-
-    pub fn should_persist(&self) -> bool {
-        !matches!(self, Self::Umask)
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    pub fn permission_bits(&self) -> Option<u32> {
-        match self {
-            Self::Umask => None,
-            Self::Group => Some(0o2775),
-            Self::All => Some(0o2777),
-            Self::Numeric { bits, .. } => Some(*bits),
+impl From<SharedModeError> for InitError {
+    fn from(err: SharedModeError) -> Self {
+        match err {
+            SharedModeError::OwnerPermissionsMissing(raw) => invalid_argument(
+                format!(
+                    "invalid shared mode '{raw}': file owner must have read and write permissions"
+                ),
+                Some(
+                    "the owner of files must always have read and write permissions (mode & 0600 == 0600)"
+                        .to_string(),
+                ),
+            ),
+            SharedModeError::Invalid(raw) => invalid_argument(
+                format!("invalid shared mode '{raw}'"),
+                Some(
+                    "supported values: umask, group, all, true, false, or an octal mode such as 0660"
+                        .to_string(),
+                ),
+            ),
         }
     }
 }
 
 pub fn parse_shared_mode(shared_mode: Option<&str>) -> Result<Option<SharedMode>, InitError> {
-    shared_mode.map(SharedMode::parse).transpose()
+    shared_mode
+        .map(|raw| SharedMode::parse(raw).map_err(InitError::from))
+        .transpose()
 }
 
 async fn resolve_shared_mode(
@@ -2098,7 +2048,7 @@ async fn resolve_shared_mode(
     bare: bool,
 ) -> Result<Option<SharedMode>, InitError> {
     if let Some(raw) = cli_value {
-        return SharedMode::parse(raw).map(Some);
+        return SharedMode::parse(raw).map(Some).map_err(InitError::from);
     }
 
     let root_dir = storage_root(target_dir, bare);
@@ -2110,7 +2060,7 @@ async fn resolve_shared_mode(
     };
 
     match read_cascaded_config_value_strict(local_target, "core.sharedRepository").await {
-        Ok(Some(raw)) => SharedMode::parse(&raw).map(Some),
+        Ok(Some(raw)) => SharedMode::parse(&raw).map(Some).map_err(InitError::from),
         Ok(None) => Ok(None),
         Err(error) => Err(InitError::ConfigRead {
             key: "core.sharedRepository".to_string(),
@@ -2119,7 +2069,7 @@ async fn resolve_shared_mode(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), test))]
 fn set_shared_path_permissions(root_dir: &Path, path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -2153,35 +2103,33 @@ fn set_shared_path_permissions(root_dir: &Path, path: &Path, mode: u32) -> io::R
 
 #[cfg(not(target_os = "windows"))]
 fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
-    fn set_recursive(dir: &Path, mode: u32) -> io::Result<()> {
-        // `WalkDir` does not follow symlinks (so it never descends through them), but
-        // `fs::set_permissions` WOULD follow a symlink and chmod its target — which a
-        // re-init on a user-populated `.libra` could exploit to touch a path outside
-        // the repository. Skip symlinks entirely.
-        for entry in walkdir::WalkDir::new(dir) {
-            let entry = entry?;
-            if entry.file_type().is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            // Never widen the private vault database or its SQLite sidecars: it holds
-            // signing material and must stay owner-only even under `--shared
-            // group/all` (this also avoids a read window during re-initialization).
-            if is_vault_artifact(path) {
-                continue;
-            }
-            let path_mode = if entry.file_type().is_dir() {
-                (mode | ((mode & 0o444) >> 2)) | if mode & 0o060 != 0 { 0o2000 } else { 0 }
-            } else {
-                mode
-            };
-            set_shared_path_permissions(dir, path, path_mode)?;
-        }
-        Ok(())
+    if matches!(shared_mode, SharedMode::Umask) {
+        return Ok(());
     }
 
-    if let Some(bits) = shared_mode.permission_bits() {
-        set_recursive(root_dir, bits)?;
+    for entry in walkdir::WalkDir::new(root_dir) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if is_vault_artifact(path) {
+            continue;
+        }
+        let is_transient = path.parent().is_some_and(|parent| {
+            parent == root_dir.join("object-index-repair")
+                || parent == root_dir.join("object-index-repair-tmp")
+                || (parent == root_dir
+                    && matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("libra.db-journal" | "libra.db-wal" | "libra.db-shm")
+                    ))
+        });
+        match adjust_shared_perm(path, shared_mode) {
+            Ok(()) => {}
+            Err(err) if is_transient && err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(())
 }
@@ -2192,11 +2140,10 @@ fn apply_shared_bare_created(
     snapshot: &BareTargetSnapshot,
     shared_mode: &SharedMode,
 ) -> io::Result<()> {
-    let Some(bits) = shared_mode.permission_bits() else {
+    if matches!(shared_mode, SharedMode::Umask) {
         return Ok(());
-    };
-    let dir_bits = (bits | ((bits & 0o444) >> 2)) | if bits & 0o060 != 0 { 0o2000 } else { 0 };
-    set_shared_path_permissions(root_dir, root_dir, dir_bits)?;
+    }
+    adjust_shared_perm(root_dir, shared_mode)?;
     for (path, _) in new_bare_layout_entries(root_dir, snapshot)? {
         apply_shared(&path, shared_mode)?;
     }
@@ -2206,7 +2153,12 @@ fn apply_shared_bare_created(
         format!("{DATABASE}-shm"),
         format!("{DATABASE}-journal"),
     ] {
-        set_shared_path_permissions(root_dir, &root_dir.join(name), bits)?;
+        let p = root_dir.join(name);
+        match adjust_shared_perm(&p, shared_mode) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(())
 }
