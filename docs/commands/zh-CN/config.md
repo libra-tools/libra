@@ -485,10 +485,10 @@ libra config remove-gpg-key --force
 | `--get-all` | `get --all <key>` |
 | `--unset` | `unset <key>` |
 | `--unset-all` | `unset --all <key>` |
-| `-l`, `--list` | `list` |
+| `-l`, `--list` | `list`——列出配置条目。未指定作用域时按 system → global → local 顺序（作用域内按插入顺序）列出全部作用域；指定作用域时（`--local`、`--global`、`--system`）仅列出该作用域。 |
 | `--add` | `set --add <key> <value>` |
 | `--import` | `import` |
-| `--get-regexp <pattern>` | `get --regexp <pattern>`——操作数是**正则**，因此 `^user` 这类不含点的模式合法；完全不匹配时退出码 1 |
+| `--get-regexp <pattern>` | `get --regexp <pattern>`——操作数是**正则**，匹配的键值对以空格分隔输出（`key value`），保持插入与作用域顺序；完全不匹配时退出码 1 |
 | `--get <key> [<value-pattern>]` | 给出 value-pattern 时按值（正则）筛选 |
 | `--unset <key> [<value-pattern>]` | 只删除匹配的值；无匹配时退出码 5 |
 | `--show-origin` | 读取/列表输出 `file:<数据库路径>` 前缀（Git 打印 `file:<配置文件路径>`；Libra 配置在 SQLite） |
@@ -504,6 +504,7 @@ libra config remove-gpg-key --force
 | 标志 | 说明 |
 |------|------|
 | `-d`, `--default <value>` | key 未找到时使用的默认值（Git 兼容位置模式） |
+| `--name-only` | 仅输出变量名，适用于 `--list` 与 `--get-regexp`（配合 `-z` 时输出 `name\0`） |
 | `-z`, `--null` | NUL 分隔输出记录（`git config -z`）：`--get`/`--get-all` 输出 `value\0`；`--get-regexp`/`--list` 输出 `key\nvalue\0`；`--name-only` 输出 `key\0`；`--show-origin` 前缀 `origin\0`。`--json` 优先。仅作用于标准 config 输出；与 `--ssh-keys`/`--gpg-keys`/`--vault` 组合会被拒绝（exit 129）。 |
 | `--json` | 输出结构化 JSON |
 | `--quiet` | 抑制人类可读输出 |
@@ -528,7 +529,7 @@ libra config path
 Jane Doe
 ```
 
-**`list`** 打印 key-value 对：
+**`list`** 打印 key-value 对（未指定作用域时默认按 system → global → local 顺序，作用域内按插入顺序）：
 
 ```
 user.name=Jane Doe
@@ -549,6 +550,13 @@ global  user.email=jane@example.com
 user.name
 user.email
 core.editor
+```
+
+**`get-regexp`** 打印匹配的键值对，以空格分隔（`key value`），保持插入与作用域顺序：
+
+```
+user.name Jane Doe
+user.email jane@example.com
 ```
 
 **`set`** 成功时不打印任何内容（退出码 0）。

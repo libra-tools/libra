@@ -110,6 +110,11 @@ impl ConfigScope {
     pub const CASCADE_ORDER: [ConfigScope; 3] =
         [ConfigScope::Local, ConfigScope::Global, ConfigScope::System];
 
+    /// Read/list order (lowest to highest precedence, outer scopes before inner scopes):
+    /// system -> global -> local. Matching Git's listing order.
+    pub const SYSTEM_TO_LOCAL_ORDER: [ConfigScope; 3] =
+        [ConfigScope::System, ConfigScope::Global, ConfigScope::Local];
+
     /// Get the config database path for this scope.
     pub fn get_config_path(&self) -> Option<PathBuf> {
         match self {
@@ -475,6 +480,9 @@ pub struct ConfigArgs {
     /// (`git config --file`). Read-only.
     #[clap(long = "file", value_name = "PATH", hide = true)]
     pub file: Option<String>,
+    /// Show only key names (`git config --name-only`)
+    #[clap(long("name-only"), hide = true)]
+    pub name_only: bool,
     /// Import from Git config
     #[clap(long, hide = true)]
     pub import: bool,
@@ -682,6 +690,8 @@ pub enum ConfigCommand {
 struct ConfigListEntry {
     key: String,
     value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -898,6 +908,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             default,
             null,
             value_type,
+            name_only,
         } => {
             handle_get(
                 &key,
@@ -912,6 +923,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 use_cascade,
                 null,
                 value_type,
+                name_only,
                 output,
             )
             .await
@@ -1424,11 +1436,17 @@ async fn handle_upgrade_unset(
 /// File-backed `upgrade.mode` entry for `list` output, or `None` when the
 /// settings file does not exist. Corrupt files are a hard error, matching
 /// `get` (§A.3).
-fn upgrade_list_entry(name_only: bool, with_origin: bool) -> CliResult<Option<ConfigListEntry>> {
+fn upgrade_list_entry(
+    name_only: bool,
+    with_origin: bool,
+    with_scope: bool,
+) -> CliResult<Option<ConfigListEntry>> {
     let Some(mode) = read_upgrade_mode().map_err(upgrade_settings_cli_error)? else {
         return Ok(None);
     };
-    let origin = if with_origin {
+    let origin = if with_scope {
+        Some("global".to_string())
+    } else if with_origin {
         Some(
             upgrade_settings_path()
                 .map(|p| format!("file:{}", p.display()))
@@ -1444,6 +1462,7 @@ fn upgrade_list_entry(name_only: bool, with_origin: bool) -> CliResult<Option<Co
         } else {
             Some(mode.as_str().to_string())
         },
+        scope: Some("global".to_string()),
         origin,
         encrypted: Some(false),
     }))
@@ -1493,6 +1512,7 @@ enum ResolvedCommand {
         null: bool,
         /// Canonicalize the read value to this type (`--type`/`--bool`/etc.).
         value_type: Option<ConfigValueType>,
+        name_only: bool,
     },
     List {
         name_only: bool,
@@ -1615,6 +1635,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 default: default.clone(),
                 null: args.null,
                 value_type,
+                name_only: args.name_only,
             },
             ConfigCommand::List {
                 name_only,
@@ -1675,7 +1696,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
     // Git-compat flag translation
     if args.list {
         return Ok(ResolvedCommand::List {
-            name_only: false,
+            name_only: args.name_only,
             show_origin: args.show_origin,
             show_scope: args.show_scope,
             vault: false,
@@ -1781,6 +1802,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             default: args.default.clone(),
             null: args.null,
             value_type,
+            name_only: args.name_only,
         });
     }
     if args.get {
@@ -1795,6 +1817,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             default: args.default.clone(),
             null: args.null,
             value_type,
+            name_only: args.name_only,
         });
     }
     if args.get_all {
@@ -1809,6 +1832,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             default: args.default.clone(),
             null: args.null,
             value_type,
+            name_only: args.name_only,
         });
     }
     if args.unset {
@@ -2076,6 +2100,7 @@ async fn handle_set(
                 use_cascade,
                 null,
                 value_type,
+                false,
                 output,
             )
             .await;
@@ -2489,6 +2514,7 @@ async fn handle_get(
     use_cascade: bool,
     null: bool,
     value_type: Option<ConfigValueType>,
+    name_only: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     // Block --reveal for vault internal keys on exact-key queries
@@ -2503,7 +2529,7 @@ async fn handle_get(
         // Regex search across all keys
         let mut entries: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
             let mut all_entries = Vec::new();
-            for s in ConfigScope::CASCADE_ORDER {
+            for s in ConfigScope::SYSTEM_TO_LOCAL_ORDER {
                 if s != ConfigScope::Local {
                     let Some(path) = s.get_config_path() else {
                         continue;
@@ -2581,9 +2607,11 @@ async fn handle_get(
                 &serde_json::json!({
                     "action": "get-regexp",
                     "pattern": key,
+                    "scope": if use_cascade { "all" } else { scope_name(scope) },
                     "entries": display_entries.iter().map(|(e, s, val)| serde_json::json!({
                         "key": e.key,
                         "value": val,
+                        "scope": scope_name(**s),
                         "origin": scope_name(**s),
                         "encrypted": e.encrypted,
                     })).collect::<Vec<_>>(),
@@ -2595,14 +2623,25 @@ async fn handle_get(
                 let prefix = read_record_prefix(**s, show_origin, show_scope);
                 if null {
                     // `git config -z --get-regexp`: [origin\0]key\nvalue\0.
+                    // If name_only: [origin\0]key\0
                     if !prefix.is_empty() {
                         print!("{prefix}\0");
                     }
-                    print!("{}\n{val}\0", e.key);
+                    if name_only {
+                        print!("{}\0", e.key);
+                    } else {
+                        print!("{}\n{val}\0", e.key);
+                    }
+                } else if name_only {
+                    if !prefix.is_empty() {
+                        println!("{prefix}\t{}", e.key);
+                    } else {
+                        println!("{}", e.key);
+                    }
                 } else if !prefix.is_empty() {
                     println!("{prefix}\t{} {val}", e.key);
                 } else {
-                    println!("{} = {val}", e.key);
+                    println!("{} {val}", e.key);
                 }
             }
         }
@@ -2838,7 +2877,7 @@ fn serve_config_file(
         String::new()
     };
 
-    let (key, all, regexp, value_pattern, default, value_type, list) = match cmd {
+    let (key, all, regexp, value_pattern, default, value_type, list, name_only, null) = match cmd {
         ResolvedCommand::Get {
             key,
             all,
@@ -2846,6 +2885,8 @@ fn serve_config_file(
             value_pattern,
             default,
             value_type,
+            name_only,
+            null,
             ..
         } => (
             key.as_str(),
@@ -2855,8 +2896,12 @@ fn serve_config_file(
             default.as_deref(),
             *value_type,
             false,
+            *name_only,
+            *null,
         ),
-        ResolvedCommand::List { .. } => ("", false, false, None, None, None, true),
+        ResolvedCommand::List {
+            name_only, null, ..
+        } => ("", false, false, None, None, None, true, *name_only, *null),
         _ => {
             return Err(CliError::command_usage(
                 "--file supports read operations only (--get/--get-all/--get-regexp/--list)",
@@ -2933,7 +2978,21 @@ fn serve_config_file(
     }
     if list {
         for (k, v) in &matches {
-            if prefix.is_empty() {
+            if null {
+                if name_only {
+                    print!("{k}\0");
+                } else if prefix.is_empty() {
+                    print!("{k}\n{v}\0");
+                } else {
+                    print!("{prefix}\0{k}\n{v}\0");
+                }
+            } else if name_only {
+                if prefix.is_empty() {
+                    println!("{k}");
+                } else {
+                    println!("{prefix}\t{k}");
+                }
+            } else if prefix.is_empty() {
                 println!("{k}={v}");
             } else {
                 println!("{prefix}\t{k}={v}");
@@ -2941,7 +3000,21 @@ fn serve_config_file(
         }
     } else if regexp {
         for (k, v) in &matches {
-            if prefix.is_empty() {
+            if null {
+                if name_only {
+                    print!("{k}\0");
+                } else if prefix.is_empty() {
+                    print!("{k}\n{v}\0");
+                } else {
+                    print!("{prefix}\0{k}\n{v}\0");
+                }
+            } else if name_only {
+                if prefix.is_empty() {
+                    println!("{k}");
+                } else {
+                    println!("{prefix}\t{k}");
+                }
+            } else if prefix.is_empty() {
                 println!("{k} {v}");
             } else {
                 println!("{prefix}\t{k} {v}");
@@ -3219,6 +3292,7 @@ async fn handle_list(
                         } else {
                             format!("{}{plaintext_warning}", e.value)
                         }),
+                        scope: Some(scope_name(s).to_string()),
                         origin: Some(scope_name(s).to_string()),
                         encrypted: Some(e.encrypted),
                     });
@@ -3255,123 +3329,48 @@ async fn handle_list(
         return Ok(());
     }
 
-    if show_origin {
-        // Show all entries with scope labels
-        let mut entries = Vec::new();
-        for s in ConfigScope::CASCADE_ORDER {
-            if s != ConfigScope::Local {
-                let Some(path) = s.get_config_path() else {
-                    continue;
-                };
-                if !path.exists() {
-                    continue;
-                }
-            }
-            if let Ok(scope_entries) = ScopedConfig::list_all(s).await {
-                for e in scope_entries {
-                    // Reserved namespace: never render `upgrade.*` rows from
-                    // SQLite — the file-backed entry below is the only source
-                    // of truth (§A.3 "不得再从 SQLite 输出第二份").
-                    if is_upgrade_namespace_key(&e.key) {
-                        continue;
-                    }
-                    let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
-                        " [PLAINTEXT]"
-                    } else {
-                        ""
-                    };
-                    entries.push(ConfigListEntry {
-                        key: e.key.clone(),
-                        value: if name_only {
-                            None
-                        } else if e.encrypted {
-                            Some("<REDACTED>".to_string())
-                        } else {
-                            Some(format!("{}{plaintext_warning}", e.value))
-                        },
-                        origin: if show_scope {
-                            Some(scope_name(s).to_string())
-                        } else if show_origin {
-                            scope_origin_path(s).map(|path| format!("file:{}", path.display()))
-                        } else {
-                            None
-                        },
-                        encrypted: Some(e.encrypted),
-                    });
-                }
-            }
-        }
-
-        // File-backed reserved entry (origin `file:{path}`, §A.3). It belongs
-        // to the global (per-user) scope, so an explicit `--local`/`--system`
-        // list must not render it.
-        if (use_cascade || scope == ConfigScope::Global)
-            && let Some(entry) = upgrade_list_entry(name_only, show_origin)?
-        {
-            entries.push(entry);
-        }
-
-        if output.is_json() {
-            emit_json_data(
-                "config",
-                &serde_json::json!({
-                    "action": "list",
-                    "scope": if show_origin { "all" } else { scope_name(scope) },
-                    "cascade": use_cascade,
-                    "entries": entries,
-                    "count": entries.len(),
-                }),
-                output,
-            )?;
-        } else if !output.quiet {
-            for e in &entries {
-                match (&e.origin, &e.value) {
-                    // `git config -z`: origin\0key\nvalue\0 (origin omitted when
-                    // not requested; value omitted with --name-only).
-                    (Some(origin), Some(val)) if null => print!("{origin}\0{}\n{val}\0", e.key),
-                    (Some(origin), None) if null => print!("{origin}\0{}\0", e.key),
-                    (None, Some(val)) if null => print!("{}\n{val}\0", e.key),
-                    (None, None) if null => print!("{}\0", e.key),
-                    // `git config --show-origin`: `file:<path>\tkey=value`.
-                    (Some(origin), Some(val)) if show_origin => {
-                        println!("{origin}\t{}={val}", e.key)
-                    }
-                    (Some(origin), None) if show_origin => println!("{origin}\t{}", e.key),
-                    (Some(origin), Some(val)) if show_scope => {
-                        println!("{origin}\t{}={val}", e.key)
-                    }
-                    (Some(origin), None) if show_scope => println!("{origin}\t{}", e.key),
-                    (Some(origin), Some(val)) => println!("  {:<8} {} = {val}", origin, e.key),
-                    (Some(origin), None) => println!("  {:<8} {}", origin, e.key),
-                    (None, Some(val)) => println!("{}={val}", e.key),
-                    (None, None) => println!("{}", e.key),
-                }
-            }
-        }
+    let scopes: &[ConfigScope] = if use_cascade {
+        &ConfigScope::SYSTEM_TO_LOCAL_ORDER
     } else {
-        // Single scope list
-        let scope_entries = ScopedConfig::list_all(scope)
-            .await
-            .map_err(CliError::from_legacy_string)?;
+        std::slice::from_ref(&scope)
+    };
 
-        let single_origin = if show_scope {
-            Some(scope_name(scope).to_string())
-        } else if show_origin {
-            scope_origin_path(scope).map(|path| format!("file:{}", path.display()))
-        } else {
-            None
+    let mut entries = Vec::new();
+    for &s in scopes {
+        let has_db = match s {
+            ConfigScope::Local => !(use_cascade && try_get_storage_path(None).is_err()),
+            ConfigScope::Global | ConfigScope::System => {
+                s.get_config_path().is_some_and(|path| path.exists())
+            }
         };
-        let mut entries: Vec<ConfigListEntry> = scope_entries
-            .into_iter()
-            // Reserved namespace: suppress any legacy SQLite `upgrade.*` rows.
-            .filter(|e| !is_upgrade_namespace_key(&e.key))
-            .map(|e| {
+
+        if has_db {
+            let scope_entries = match ScopedConfig::list_all(s).await {
+                Ok(entries) => entries,
+                Err(e) if use_cascade && should_skip_config_scope_read_error(s, &e) => Vec::new(),
+                Err(_e) if use_cascade && s == ConfigScope::Local => Vec::new(),
+                Err(e) => return Err(CliError::from_legacy_string(e)),
+            };
+            for e in scope_entries {
+                // Reserved namespace: never render `upgrade.*` rows from
+                // SQLite — the file-backed entry below is the only source
+                // of truth (§A.3 "不得再从 SQLite 输出第二份").
+                if is_upgrade_namespace_key(&e.key) {
+                    continue;
+                }
                 let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
                     " [PLAINTEXT]"
                 } else {
                     ""
                 };
-                ConfigListEntry {
+                let origin = if show_scope {
+                    Some(scope_name(s).to_string())
+                } else if show_origin {
+                    scope_origin_path(s).map(|path| format!("file:{}", path.display()))
+                } else {
+                    None
+                };
+                entries.push(ConfigListEntry {
                     key: e.key.clone(),
                     value: if name_only {
                         None
@@ -3380,50 +3379,57 @@ async fn handle_list(
                     } else {
                         Some(format!("{}{plaintext_warning}", e.value))
                     },
-                    origin: single_origin.clone(),
+                    scope: Some(scope_name(s).to_string()),
+                    origin,
                     encrypted: Some(e.encrypted),
-                }
-            })
-            .collect();
+                });
+            }
+        }
 
-        // The reserved `upgrade.mode` belongs to the global (per-user) scope.
-        if scope == ConfigScope::Global
-            && let Some(entry) = upgrade_list_entry(name_only, false)?
+        // File-backed reserved entry (origin `file:{path}`, §A.3). It belongs
+        // to the global (per-user) scope, so an explicit `--local`/`--system`
+        // list must not render it.
+        // ADR-CF-04 item 4: 保留条目：文件承载的 `upgrade.mode` 条目放在 global 作用域条目之后。
+        if s == ConfigScope::Global
+            && (use_cascade || scope == ConfigScope::Global)
+            && let Some(entry) = upgrade_list_entry(name_only, show_origin, show_scope)?
         {
             entries.push(entry);
         }
+    }
 
-        if output.is_json() {
-            emit_json_data(
-                "config",
-                &serde_json::json!({
-                    "action": "list",
-                    "scope": scope_name(scope),
-                    "entries": entries,
-                    "count": entries.len(),
-                }),
-                output,
-            )?;
-        } else if !output.quiet {
-            for e in &entries {
-                let prefix = match (&e.origin, show_scope || show_origin) {
-                    (Some(origin), true) => Some(origin.as_str()),
-                    _ => None,
-                };
-                match (&e.value, prefix) {
-                    // `git config -z --list`: [origin\0]key\nvalue\0.
-                    (Some(val), Some(prefix)) if null => {
-                        print!("{prefix}\0{}\n{val}\0", e.key)
-                    }
-                    (None, Some(prefix)) if null => print!("{prefix}\0{}\0", e.key),
-                    (Some(val), None) if null => print!("{}\n{val}\0", e.key),
-                    (None, None) if null => print!("{}\0", e.key),
-                    // `--show-origin`/`--show-scope`: prefix<TAB>key=value.
-                    (Some(val), Some(prefix)) => println!("{prefix}\t{}={val}", e.key),
-                    (None, Some(prefix)) => println!("{prefix}\t{}", e.key),
-                    (Some(val), None) => println!("{}={val}", e.key),
-                    (None, None) => println!("{}", e.key),
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({
+                "action": "list",
+                "scope": if use_cascade { "all" } else { scope_name(scope) },
+                "cascade": use_cascade,
+                "entries": entries,
+                "count": entries.len(),
+            }),
+            output,
+        )?;
+    } else if !output.quiet {
+        for e in &entries {
+            let prefix = match (&e.origin, show_scope || show_origin) {
+                (Some(origin), true) => Some(origin.as_str()),
+                _ => None,
+            };
+            match (&e.value, prefix) {
+                // `git config -z`: origin\0key\nvalue\0 (origin omitted when
+                // not requested; value omitted with --name-only).
+                (Some(val), Some(prefix)) if null => {
+                    print!("{prefix}\0{}\n{val}\0", e.key)
                 }
+                (None, Some(prefix)) if null => print!("{prefix}\0{}\0", e.key),
+                (Some(val), None) if null => print!("{}\n{val}\0", e.key),
+                (None, None) if null => print!("{}\0", e.key),
+                // `--show-origin`/`--show-scope`: prefix<TAB>key=value.
+                (Some(val), Some(prefix)) => println!("{prefix}\t{}={val}", e.key),
+                (None, Some(prefix)) => println!("{prefix}\t{}", e.key),
+                (Some(val), None) => println!("{}={val}", e.key),
+                (None, None) => println!("{}", e.key),
             }
         }
     }

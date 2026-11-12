@@ -12,6 +12,7 @@ use tempfile::tempdir;
 use super::*;
 
 mod git_import;
+mod output_format;
 
 async fn fix_npr_config_rows(
     path: &std::path::Path,
@@ -1639,7 +1640,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
 
 #[tokio::test]
 #[serial(cwd)]
-async fn test_config_list_defaults_to_local_scope_without_global_entries() {
+async fn test_config_list_defaults_to_all_scopes_and_local_restricts() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
@@ -1660,6 +1661,7 @@ async fn test_config_list_defaults_to_local_scope_without_global_entries() {
         .await
         .unwrap();
 
+    // Default list includes all scopes (global + local)
     let output = run_libra_command(&["config", "list"], temp_path.path());
     assert!(
         output.status.success(),
@@ -1672,8 +1674,25 @@ async fn test_config_list_defaults_to_local_scope_without_global_entries() {
         "local entry should be listed, stdout: {stdout}"
     );
     assert!(
-        !stdout.contains("core.editor"),
-        "default list should not include global entries, stdout: {stdout}"
+        stdout.contains("core.editor=vim"),
+        "default list should include global entries, stdout: {stdout}"
+    );
+
+    // --local restricts list to local scope only
+    let local_output = run_libra_command(&["config", "--local", "list"], temp_path.path());
+    assert!(
+        local_output.status.success(),
+        "config --local list should succeed: {}",
+        String::from_utf8_lossy(&local_output.stderr)
+    );
+    let local_stdout = String::from_utf8_lossy(&local_output.stdout);
+    assert!(
+        local_stdout.contains("user.name=local-user"),
+        "local entry should be listed, stdout: {local_stdout}"
+    );
+    assert!(
+        !local_stdout.contains("core.editor"),
+        "local list should not include global entries, stdout: {local_stdout}"
     );
 }
 

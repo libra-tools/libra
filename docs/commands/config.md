@@ -574,10 +574,10 @@ These flags provide backward compatibility with `git config` invocation patterns
 | `--get-all` | `get --all <key>` |
 | `--unset` | `unset <key>` |
 | `--unset-all` | `unset --all <key>` |
-| `-l`, `--list` | `list` |
+| `-l`, `--list` | `list` — lists configuration entries. When no scope flag is given, lists all scopes in system → global → local order (each scope in insertion order); when an explicit scope (`--local`, `--global`, `--system`) is given, lists only that scope. |
 | `--add` | `set --add <key> <value>` |
 | `--import` | `import` |
-| `--get-regexp <pattern>` | `get --regexp <pattern>` — the operand is a **regexp**, so a dotless pattern such as `^user` is valid; a pattern that matches nothing exits 1 |
+| `--get-regexp <pattern>` | `get --regexp <pattern>` — matches keys against a regular expression and outputs `key value` (space-delimited) in insertion and scope order; a pattern matching nothing exits 1 |
 | `--get <key> [<value-pattern>]` | Select by value when a pattern is given (a regexp over stored values) |
 | `--unset <key> [<value-pattern>]` | Remove only the values matching the pattern; no match exits 5 |
 | `--show-origin` | Prefix reads/lists with `file:<database path>` (Git prints `file:<config path>`; Libra stores config in SQLite) |
@@ -593,6 +593,7 @@ These flags provide backward compatibility with `git config` invocation patterns
 | Flag | Description |
 |------|-------------|
 | `-d`, `--default <value>` | Default value when key is not found (Git-compat positional mode) |
+| `--name-only` | Output only variable names for `--list` and `--get-regexp` (with `-z`, outputs `name\0`) |
 | `-z`, `--null` | NUL-terminate output records (`git config -z`): `value\0` for `--get`/`--get-all`; `key\nvalue\0` for `--get-regexp`/`--list`; `key\0` with `--name-only`; `origin\0` prefix with `--show-origin`. `--json` takes precedence. Applies to standard config output only; combining it with `--ssh-keys`/`--gpg-keys`/`--vault` is rejected (exit 129). |
 | `--json` | Emit structured JSON output |
 | `--quiet` | Suppress human-readable output |
@@ -617,7 +618,7 @@ libra config path
 Jane Doe
 ```
 
-**`list`** prints key-value pairs:
+**`list`** prints key-value pairs (by default across system → global → local scopes in insertion order):
 
 ```
 user.name=Jane Doe
@@ -638,6 +639,13 @@ With `--name-only`:
 user.name
 user.email
 core.editor
+```
+
+**`get-regexp`** prints matching key-value pairs separated by space (`key value`), preserving insertion and scope order:
+
+```
+user.name Jane Doe
+user.email jane@example.com
 ```
 
 **`set`** prints nothing on success (exit code 0).

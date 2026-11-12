@@ -480,13 +480,13 @@ impl ConfigKv {
         Ok(count)
     }
 
-    /// List all config entries, sorted by key.
+    /// List all config entries in insertion order.
     ///
     /// Useful for `libra config --list`. Encrypted values are returned as
     /// hex ciphertext; the CLI is responsible for redaction.
     pub async fn list_all_with_conn<C: ConnectionTrait>(db: &C) -> Result<Vec<ConfigKvEntry>> {
         let rows = config_kv::Entity::find()
-            .order_by_asc(config_kv::Column::Key)
+            .order_by_asc(config_kv::Column::Id)
             .all(db)
             .await
             .context("failed to list config_kv")?;
@@ -571,7 +571,7 @@ impl ConfigKv {
         let re = regex::Regex::new(pattern)
             .map_err(|e| anyhow!("invalid regex pattern '{}': {}", pattern, e))?;
         let rows = config_kv::Entity::find()
-            .order_by_asc(config_kv::Column::Key)
+            .order_by_asc(config_kv::Column::Id)
             .all(db)
             .await
             .context("failed to query config_kv for regexp")?;
@@ -4544,6 +4544,32 @@ mod tests {
             super::resolve_core_file_mode(Some("notabool")),
             Err("bad boolean config value 'notabool' for 'core.filemode'".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn config_kv_list_and_regexp_preserve_insertion_order() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let db_path = temp.path().join("config.db");
+        let db = crate::internal::db::create_database(db_path.to_str().expect("utf8 path"))
+            .await
+            .expect("create config db");
+        for key in ["zz.key", "aa.key", "mm.key"] {
+            ConfigKv::add_with_conn(&db, key, "val", false)
+                .await
+                .expect("add key");
+        }
+        let list_entries = ConfigKv::list_all_with_conn(&db)
+            .await
+            .expect("list_all_with_conn");
+        let list_keys: Vec<String> = list_entries.into_iter().map(|e| e.key).collect();
+        assert_eq!(list_keys, vec!["zz.key", "aa.key", "mm.key"]);
+
+        let re_entries = ConfigKv::get_regexp_with_conn(&db, r"\.key$")
+            .await
+            .expect("get_regexp_with_conn");
+        let re_keys: Vec<String> = re_entries.into_iter().map(|e| e.key).collect();
+        assert_eq!(re_keys, vec!["zz.key", "aa.key", "mm.key"]);
+        db.close().await.expect("close db");
     }
 }
 
