@@ -13,6 +13,7 @@ use super::*;
 
 mod git_import;
 mod output_format;
+mod types;
 mod validation;
 
 async fn fix_npr_config_rows(

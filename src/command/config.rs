@@ -1006,6 +1006,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             ssh_keys,
             gpg_keys,
             null,
+            value_type,
         } => {
             handle_list(
                 name_only,
@@ -1017,6 +1018,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 scope,
                 use_cascade,
                 null,
+                value_type,
                 output,
             )
             .await
@@ -1599,6 +1601,9 @@ enum ResolvedCommand {
         gpg_keys: bool,
         /// NUL-terminate output records (`-z`/`--null`).
         null: bool,
+        /// Canonicalize each listed value to this type (`--list --type=color`
+        /// keeps only values that parse).
+        value_type: Option<ConfigValueType>,
     },
     Unset {
         key: String,
@@ -1646,17 +1651,19 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
     let cmd = resolve_command_typed(args)?;
 
     // `--type`/`--bool`/`--int`/`--path` canonicalize a value when reading and
-    // validate/canonicalize it when setting, so they apply only to get and set
-    // operations; any other mode is rejected up front (Git silently ignores the
-    // flag there, but Libra prefers an explicit usage error).
+    // validate/canonicalize it when setting, so they apply only to get, set, and
+    // list operations; any other mode is rejected up front (Git silently ignores
+    // the flag there, but Libra prefers an explicit usage error).
     if resolve_value_type(args)?.is_some()
         && !matches!(
             cmd,
-            ResolvedCommand::Get { .. } | ResolvedCommand::Set { .. }
+            ResolvedCommand::Get { .. }
+                | ResolvedCommand::Set { .. }
+                | ResolvedCommand::List { .. }
         )
     {
         return Err(CliError::command_usage(
-            "--type/--bool/--int/--path is only valid with --get/--get-all/--get-regexp or when setting a value",
+            "--type/--bool/--int/--path is only valid with --get/--get-all/--get-regexp/--list or when setting a value",
         )
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
@@ -1727,6 +1734,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 ssh_keys: *ssh_keys,
                 gpg_keys: *gpg_keys,
                 null: args.null,
+                value_type,
             },
             ConfigCommand::Unset { key, all } => ResolvedCommand::Unset {
                 key: key.clone(),
@@ -1779,6 +1787,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             ssh_keys: false,
             gpg_keys: false,
             null: args.null,
+            value_type,
         });
     }
     if args.remove_section {
@@ -2189,7 +2198,7 @@ async fn handle_set(
     // not valid for the type. Canonicalize the logical value before any
     // encryption so the stored secret round-trips to the canonical form.
     let resolved_value = match value_type {
-        Some(value_type) => canonicalize_typed_value(&resolved_value, value_type)?,
+        Some(value_type) => canonicalize_typed_value_for_store(&resolved_value, value_type)?,
         None => resolved_value,
     };
 
@@ -2470,6 +2479,8 @@ enum ConfigValueType {
     BoolOrStr,
     /// `--type=bool-or-int`: canonicalize an integer, else a boolean.
     BoolOrInt,
+    /// `--type=color`: render the Git ANSI escape sequence.
+    Color,
 }
 
 /// Resolve the requested read type from `--type=<t>` or a `--bool`/`--int`/
@@ -2492,8 +2503,9 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
         Some("path") => Ok(Some(ConfigValueType::Path)),
         Some("bool-or-str") => Ok(Some(ConfigValueType::BoolOrStr)),
         Some("bool-or-int") => Ok(Some(ConfigValueType::BoolOrInt)),
+        Some("color") => Ok(Some(ConfigValueType::Color)),
         Some(other) => Err(CliError::command_usage(format!(
-            "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, or bool-or-int)"
+            "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, or color)"
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)),
     }
@@ -2565,6 +2577,29 @@ fn canonicalize_typed_value(value: &str, ty: ConfigValueType) -> CliResult<Strin
             }
             Ok(value.to_string())
         }
+        ConfigValueType::Color => {
+            crate::utils::config_color::parse_color_value(value).map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })
+        }
+    }
+}
+
+/// Validate a `--type` value before storing it. Color stores the original
+/// spelling (Git keeps `red`, not the escape sequence), so it only validates;
+/// the other types store their canonical form.
+fn canonicalize_typed_value_for_store(value: &str, ty: ConfigValueType) -> CliResult<String> {
+    match ty {
+        ConfigValueType::Color => {
+            crate::utils::config_color::parse_color_value(value).map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint(format!("cannot parse color '{value}'"))
+            })?;
+            Ok(value.to_string())
+        }
+        other => canonicalize_typed_value(value, other),
     }
 }
 
@@ -3288,6 +3323,7 @@ async fn handle_list(
     scope: ConfigScope,
     use_cascade: bool,
     null: bool,
+    value_type: Option<ConfigValueType>,
     output: &OutputConfig,
 ) -> CliResult<()> {
     // `-z` defines NUL records for standard config key/value output only. The
@@ -3497,6 +3533,21 @@ async fn handle_list(
                 if is_upgrade_namespace_key(&e.key) {
                     continue;
                 }
+                // `--list --type=<t>` keeps only entries whose value parses
+                // (`git config --list --type=color`). Encrypted values cannot
+                // be canonicalized, so a typed listing omits them.
+                let typed_value = match value_type {
+                    Some(ty) => {
+                        if e.encrypted {
+                            continue;
+                        }
+                        match canonicalize_typed_value(&e.value, ty) {
+                            Ok(v) => Some(v),
+                            Err(_) => continue,
+                        }
+                    }
+                    None => None,
+                };
                 let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
                     " [PLAINTEXT]"
                 } else {
@@ -3513,6 +3564,8 @@ async fn handle_list(
                     key: e.key.clone(),
                     value: if name_only {
                         None
+                    } else if let Some(v) = typed_value {
+                        Some(v)
                     } else if e.encrypted {
                         Some("<REDACTED>".to_string())
                     } else {

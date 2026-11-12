@@ -11,6 +11,7 @@ pub mod attributes;
 pub mod backoff;
 pub(crate) mod beneath;
 pub mod client_storage;
+pub mod config_color;
 pub mod convert;
 pub mod d1_client;
 pub mod ignore;
