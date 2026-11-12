@@ -913,11 +913,10 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
     // Resolve subcommand: either explicit or translated from Git-compat flags
     let cmd = resolve_command(&args)?;
 
-    // `--file <path>` reads a Git-style INI file instead of the stores
-    // (read-only; Git's one-off script form). Writes stay refused so the
-    // SQLite store never silently loses an update aimed at a file.
+    // `--file <path>` reads/writes a Git-style INI file instead of the stores
+    // (Git's one-off script form). Writes never touch the SQLite store.
     if let Some(path) = args.file.as_deref() {
-        return serve_config_file(path, &cmd, args.show_origin, args.show_scope, output);
+        return serve_config_file(path, &cmd, &args, output);
     }
 
     // Reserved `upgrade.*` namespace, step 2: route every resolved command
@@ -3037,13 +3036,166 @@ async fn handle_get(
 /// Read-only `--file <path>` support: parse a Git-style INI file and answer
 /// get/get-all/get-regexp/list from it. Writes are refused so a file target can
 /// never be silently redirected to the SQLite store.
+/// Translate a write-shaped `ResolvedCommand` into a config-file mutation.
+///
+/// Returns `Ok(None)` for read commands. Vault/encryption options are refused
+/// because a Git-style file has no place to store ciphertext.
+fn config_file_write_mutation(
+    cmd: &ResolvedCommand,
+) -> CliResult<Option<crate::internal::config_file::write::Mutation>> {
+    use crate::internal::config_file::write::Mutation;
+
+    let mutation = match cmd {
+        ResolvedCommand::Set {
+            key,
+            value,
+            add,
+            replace_all,
+            value_pattern,
+            encrypt,
+            plaintext,
+            stdin,
+            ..
+        } => {
+            if *encrypt || *plaintext {
+                return Err(CliError::command_usage(
+                    "--encrypt/--plaintext cannot be used with --file",
+                )
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+            if *stdin {
+                return Err(CliError::command_usage(
+                    "writing stdin is not supported with --file (a blob has no writable backing store)",
+                )
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+            let Some(value) = value else {
+                return Err(
+                    CliError::command_usage("missing required argument: <value>")
+                        .with_stable_code(StableErrorCode::CliInvalidArguments),
+                );
+            };
+            Mutation::Set {
+                key: key.clone(),
+                value: value.clone(),
+                value_pattern: value_pattern.clone(),
+                replace_all: *replace_all,
+                add: *add,
+            }
+        }
+        ResolvedCommand::Unset {
+            key,
+            all,
+            value_pattern,
+        } => Mutation::Unset {
+            key: key.clone(),
+            value_pattern: value_pattern.clone(),
+            all: *all,
+        },
+        ResolvedCommand::RemoveSection { name } => Mutation::RemoveSection { name: name.clone() },
+        ResolvedCommand::RenameSection { old, new } => Mutation::RenameSection {
+            old: old.clone(),
+            new: new.clone(),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(mutation))
+}
+
+/// Apply a mutation to `--file <path>` and replace the file atomically through
+/// `<path>.lock` + rename, preserving the original permissions.
+fn write_config_file(
+    path: &str,
+    mutation: &crate::internal::config_file::write::Mutation,
+    _args: &ConfigArgs,
+    _output: &OutputConfig,
+) -> CliResult<()> {
+    use std::io::Write;
+
+    if path == "-" {
+        return Err(CliError::command_usage(
+            "writing stdin is not supported with --file (a blob has no writable backing store)",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    let target = Path::new(path);
+    let existing = match std::fs::read_to_string(target) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Creating a new file is only meaningful for an assignment.
+            let is_set = matches!(
+                mutation,
+                crate::internal::config_file::write::Mutation::Set { .. }
+            );
+            if !is_set {
+                return Err(CliError::fatal(format!(
+                    "unable to read config file '{}': No such file or directory",
+                    target.display()
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed));
+            }
+            String::new()
+        }
+        Err(error) => {
+            return Err(CliError::fatal(format!(
+                "failed to read config file '{}': {error}",
+                target.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        }
+    };
+
+    let updated =
+        crate::internal::config_file::write::apply(&existing, mutation).map_err(|error| {
+            CliError::failure(error.message().to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(error.exit_code())
+        })?;
+
+    // `<file>.lock` + rename keeps concurrent writers from interleaving.
+    let lock_path = PathBuf::from(format!("{}.lock", target.display()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut lock = options.open(&lock_path).map_err(|error| {
+        CliError::fatal(format!(
+            "could not lock config file '{}': {error}",
+            target.display()
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        if let Ok(metadata) = std::fs::metadata(target) {
+            let _ = lock.set_permissions(metadata.permissions());
+        }
+        lock.write_all(updated.as_bytes())?;
+        lock.sync_all()?;
+        drop(lock);
+        std::fs::rename(&lock_path, target)
+    })();
+
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&lock_path);
+        return Err(CliError::fatal(format!(
+            "failed to write config file '{}': {error}",
+            target.display()
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed));
+    }
+    Ok(())
+}
+
 fn serve_config_file(
     path: &str,
     cmd: &ResolvedCommand,
-    show_origin: bool,
-    show_scope: bool,
+    args: &ConfigArgs,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    if let Some(mutation) = config_file_write_mutation(cmd)? {
+        return write_config_file(path, &mutation, args, output);
+    }
+    let show_origin = args.show_origin;
+    let show_scope = args.show_scope;
     let entries = read_git_config_file(Path::new(path))?;
     let origin = format!("file:{path}");
     let prefix = if show_scope {

@@ -11,6 +11,7 @@ use tempfile::tempdir;
 
 use super::*;
 
+mod file_backend;
 mod git_import;
 mod output_format;
 mod types;
