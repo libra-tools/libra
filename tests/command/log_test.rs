@@ -2858,9 +2858,9 @@ async fn test_log_graph() {
     let commit_hash = ObjectHash::from_str(&commit_id).unwrap();
     let commit = load_object::<Commit>(&commit_hash).unwrap();
 
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
-    assert!(prefix.contains('*'));
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
+    assert!(rendered.prefix.contains('*'));
 }
 
 #[tokio::test]
@@ -2954,8 +2954,8 @@ async fn test_log_graph_simple_chain() {
     let mut graph_state = libra::command::log::GraphState::new();
 
     for commit in reachable_commits.iter().take(2) {
-        let prefix = graph_state.render(commit);
-        assert!(prefix.starts_with("* ") || prefix.contains("* "));
+        let rendered = graph_state.render(commit);
+        assert!(rendered.prefix.starts_with("* ") || rendered.prefix.contains("* "));
     }
 }
 
@@ -3019,8 +3019,8 @@ async fn test_log_stat_and_graph_combined() {
     assert_eq!(stats.len(), 1);
 
     let mut graph_state = libra::command::log::GraphState::new();
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
 }
 
 fn run_log_cmd(args: &[&str], cwd: &std::path::Path) -> (std::process::ExitStatus, String, String) {
@@ -6501,5 +6501,174 @@ fn test_log_format_last_one_wins() {
     assert!(
         text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
         "--oneline after --pretty wins: {text:?}"
+    );
+}
+
+/// LG-07 (M-GRAPH R1/R3/R4): `--graph` column allocation matches Git's
+/// fixtures (fork with `|/`, two-way merge, octopus `*-.`), and `--graph`
+/// implies topological order with LIFO tie handling.
+#[test]
+#[serial(cwd)]
+fn test_log_graph_matches_git_fixtures() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    // Forked history: main (newer) and side (older) share the base commit.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "-b", "side"], p),
+        "branch",
+    );
+    commit("side1.txt", "s1\n", "side1", "2026-01-02T00:00:00Z");
+    commit("side2.txt", "s2\n", "side2", "2026-01-03T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "main"], p),
+        "checkout main",
+    );
+    commit("main1.txt", "m1\n", "main1", "2026-01-04T00:00:00Z");
+    commit("main2.txt", "m2\n", "main2", "2026-01-05T00:00:00Z");
+
+    let fork = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&fork, "fork graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&fork.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // R1/R4: main commits first, then the side branch, then the `|/` join.
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert!(
+        lines[0].starts_with("* ") && lines[0].ends_with("main2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("* ") && lines[1].ends_with("main1"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("| * ") && lines[2].ends_with("side2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[3].starts_with("| * ") && lines[3].ends_with("side1"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[4], "|/  ", "{lines:?}");
+    assert!(
+        lines[5].starts_with("* ") && lines[5].ends_with("base"),
+        "{lines:?}"
+    );
+
+    // Two-way merge: merge commit, `|\`, side, main, `|/`, base.
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["merge", "--no-ff", "side", "-m", "merge", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-06T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-06T00:00:00Z"),
+            ],
+        ),
+        "merge",
+    );
+    let merged = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&merged, "merge graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*   ") && lines[0].ends_with("merge"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\  ", "{lines:?}");
+    assert!(lines.iter().any(|line| line == "|/  "), "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with("base")), "{lines:?}");
+}
+
+/// LG-07 (M-GRAPH R3): octopus merge fixture (`t4214:39`-style).
+#[test]
+#[serial(cwd)]
+fn test_log_graph_octopus_fixture() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o1"], p), "o1");
+    commit("o1.txt", "o1\n", "oct1", "2026-01-02T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o2"], p), "o2");
+    commit("o2.txt", "o2\n", "oct2", "2026-01-03T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main2");
+    commit("main1.txt", "m\n", "main1", "2026-01-04T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "--no-ff",
+                "o1",
+                "o2",
+                "-m",
+                "octopus",
+                "--no-verify",
+            ],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-05T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-05T00:00:00Z"),
+            ],
+        ),
+        "octopus merge",
+    );
+
+    let out = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&out, "octopus graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*-.") && lines[0].ends_with("octopus"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\ \\  ", "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| | * ") && line.ends_with("oct2")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| * | ") && line.ends_with("oct1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "* / " || line.starts_with("* / ")),
+        "{lines:?}"
     );
 }

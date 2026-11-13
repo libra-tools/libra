@@ -431,12 +431,23 @@ becomes `--decorate-refs='tags/v1' --decorate-refs='tags/v2'`.
 
 ### `--graph`
 
-Draw a text-based graphical representation of the commit history, showing branching and
-merging visually.
+Draw a text-based graphical representation of the commit history using Git's
+column-allocation rules: branch forks collapse with `|/`, two-way merges print
+`|\`, and octopus merges print `*-.` plus their expansion rows. `--graph`
+implies Git's topological (graph) order, so a commit is printed only after all
+of its children; equal-date commits follow the graph-order stack (the most
+recently ready commit first). `--date-order` and `--author-date-order` are
+accepted but currently use the same graph order.
+
+`--all` seeds the walk from every ref under `refs/` (local and remote-tracking
+branches, tags, and `refs/notes/*` references) plus `HEAD`, in refname order.
+Libra's own notes backend stores notes in SQLite rather than a notes commit, so
+only imported notes refs contribute commits.
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### Revision ranges (positional or `--range <SPEC>`)

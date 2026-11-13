@@ -331,11 +331,19 @@ libra log --decorate --decorate-refs-exclude='heads/*'
 
 ### `--graph`
 
-绘制基于文本的提交历史图形表示，直观显示分支和合并。
+按 Git 的列分配规则绘制基于文本的提交历史图形：分叉以 `|/` 汇合，双亲合并输出
+`|\`，octopus 合并输出 `*-.` 及其展开行。`--graph` 隐含 Git 的拓扑（图）顺序：
+提交只在其全部子提交之后输出；时间并列时按图顺序栈（最近就绪者优先）。`--date-order`
+与 `--author-date-order` 可接受，但当前复用同一图顺序。
+
+`--all` 从 `refs/` 下的全部引用（本地与远程跟踪分支、tag、`refs/notes/*`）以及
+`HEAD` 按引用名顺序播种。Libra 自身的 notes 后端把 notes 存在 SQLite 而非 notes 提交，
+因此只有导入的 notes 引用会贡献提交。
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### 修订范围（位置参数或 `--range <SPEC>`）
