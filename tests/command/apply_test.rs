@@ -296,3 +296,119 @@ fn test_apply_check_accepts_legacy_hunk_headers() {
     let out = run_libra_command(&["apply", "--check", patch.to_str().unwrap()], repo.path());
     assert_cli_success(&out, "apply --check legacy header");
 }
+
+/// LG-11 (M-APPLY A1–A5): report modes, worktree application, reverse, and
+/// atomic failure. Ports `t4106:15` and `t4102:38`.
+#[test]
+fn test_apply_worktree_and_reports_matrix() {
+    let repo = init_repo();
+    assert!(
+        run_libra_command(&["config", "user.name", "T"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["config", "user.email", "t@e"], repo.path())
+            .status
+            .success()
+    );
+    fs::write(repo.path().join("a.txt"), "a\nb\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "a.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+
+    let patch = "\
+diff --git a/a.txt b/a.txt
+index 422c2b7..de98044 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ a
+ b
++c
+";
+    let patch_path = repo.path().join("p.patch");
+    fs::write(&patch_path, patch).unwrap();
+    let p = |args: &[&str]| run_libra_command(args, repo.path());
+
+    // A1: `--stat` reports without touching the file (t4106:15 port).
+    let stat = p(&["apply", "--stat", patch_path.to_str().unwrap()]);
+    assert_cli_success(&stat, "apply --stat");
+    assert_eq!(
+        String::from_utf8_lossy(&stat.stdout),
+        " a.txt |    1 +\n 1 file changed, 1 insertion(+)\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+
+    // A2: `--numstat` and `--summary` (new-file creation).
+    let numstat = p(&["apply", "--numstat", patch_path.to_str().unwrap()]);
+    assert_eq!(String::from_utf8_lossy(&numstat.stdout), "1\t0\ta.txt\n");
+    let new_patch = "diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..422c2b7\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+x\n";
+    let new_path = repo.path().join("new.patch");
+    fs::write(&new_path, new_patch).unwrap();
+    let summary = p(&["apply", "--summary", new_path.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&summary.stdout),
+        " create mode 100644 n.txt\n"
+    );
+    assert!(
+        !repo.path().join("n.txt").exists(),
+        "report modes never write"
+    );
+
+    // A3: default apply writes only the worktree; the index keeps HEAD's blob.
+    let applied = p(&["apply", patch_path.to_str().unwrap()]);
+    assert_cli_success(&applied, "apply");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\nc\n"
+    );
+    let status = p(&["status", "--short"]);
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(status_text.contains(" M a.txt"), "{status_text}");
+
+    // A4: `-R` reverses the same patch (t4102:38 port).
+    let reversed = p(&["apply", "-R", patch_path.to_str().unwrap()]);
+    assert_cli_success(&reversed, "apply -R");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+
+    // A5: a multi-file patch whose second file does not apply writes nothing.
+    let bad = "\
+diff --git a/a.txt b/a.txt
+index 422c2b7..de98044 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ a
+ b
++c
+diff --git a/missing.txt b/missing.txt
+--- a/missing.txt
++++ b/missing.txt
+@@ -1 +1 @@
+-nope
++yep
+";
+    let bad_path = repo.path().join("bad.patch");
+    fs::write(&bad_path, bad).unwrap();
+    let failed = p(&["apply", bad_path.to_str().unwrap()]);
+    assert!(!failed.status.success(), "non-applying patch must fail");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n",
+        "atomic failure must not write the applying file"
+    );
+}

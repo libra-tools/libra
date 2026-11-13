@@ -224,6 +224,20 @@ pub struct ApplyArgs {
     #[clap(long)]
     pub stat: bool,
 
+    /// Show a machine-readable `insertions\tdeletions\tpath` report and exit
+    /// without applying.
+    #[clap(long)]
+    pub numstat: bool,
+
+    /// Show a create/delete/mode-change summary and exit without applying.
+    #[clap(long)]
+    pub summary: bool,
+
+    /// Apply even when a report flag (`--stat`/`--numstat`/`--summary`) is
+    /// present: print the report first, then apply (Git's `--apply`).
+    #[clap(long)]
+    pub apply: bool,
+
     /// Apply the patch in reverse (swap old/new sides).
     #[clap(short = 'R', long = "reverse")]
     pub reverse: bool,
@@ -301,23 +315,37 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
         patch_text = reverse_patch_text(&patch_text, args.strip);
     }
 
-    if args.stat {
-        let stat = format_apply_stat(&patch_text, args.strip);
-        let files = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
-        if output.is_json() {
-            emit_json_data(
-                "apply",
-                &ApplyOutput {
-                    applies: true,
-                    files,
-                    applied: false,
-                },
-                output,
-            )?;
-        } else {
-            print!("{stat}");
+    if args.stat || args.numstat || args.summary {
+        let mut report = String::new();
+        if args.stat {
+            report.push_str(&format_apply_stat(&patch_text, args.strip));
         }
-        return Ok(());
+        if args.numstat {
+            report.push_str(&format_apply_numstat(&patch_text, args.strip));
+        }
+        if args.summary {
+            report.push_str(&format_apply_summary(&patch_text, args.strip));
+        }
+        let files = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
+        if !args.apply {
+            if output.is_json() {
+                emit_json_data(
+                    "apply",
+                    &ApplyOutput {
+                        applies: true,
+                        files,
+                        applied: false,
+                    },
+                    output,
+                )?;
+            } else {
+                print!("{report}");
+            }
+            return Ok(());
+        }
+        if !output.is_json() {
+            print!("{report}");
+        }
     }
 
     let resolver = resolve_local_base_blob;
@@ -539,12 +567,17 @@ impl GlobMatcher {
     }
 }
 
-/// Render a `--stat` summary for a patch without applying it.
+/// Render a `--stat` summary for a patch without applying, matching Git's
+/// padded name/count columns and its omission of zero insertion/deletion
+/// clauses in the trailing summary line.
 fn format_apply_stat(patch_text: &str, strip: u32) -> String {
-    let mut out = String::new();
-    let mut files = 0usize;
-    let mut insertions = 0usize;
-    let mut deletions = 0usize;
+    struct Entry {
+        target: String,
+        insertions: usize,
+        deletions: usize,
+        binary: bool,
+    }
+    let mut entries = Vec::new();
     for section in split_file_patches(patch_text) {
         let Ok(headers) = parse_section_headers(&section, strip) else {
             continue;
@@ -552,40 +585,139 @@ fn format_apply_stat(patch_text: &str, strip: u32) -> String {
         let target = headers
             .single_target(&section, strip)
             .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
-        let mut ins = 0usize;
-        let mut del = 0usize;
-        let mut in_hunks = false;
-        for line in section.lines() {
-            if line.starts_with("@@ ") {
-                in_hunks = true;
-                continue;
-            }
-            if in_hunks {
-                if line.starts_with('+') && !line.starts_with("+++") {
-                    ins += 1;
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    del += 1;
-                }
-            }
-        }
+        let (insertions, deletions) = count_section_changes(&section);
+        entries.push(Entry {
+            target,
+            insertions,
+            deletions,
+            binary: headers.binary.is_some() || headers.binary_marker,
+        });
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
+    let name_width = entries
+        .iter()
+        .map(|entry| entry.target.len())
+        .max()
+        .unwrap_or(0);
+    let count_width = entries
+        .iter()
+        .map(|entry| (entry.insertions + entry.deletions).to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let mut out = String::new();
+    let mut files = 0usize;
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for entry in &entries {
         files += 1;
-        insertions += ins;
-        deletions += del;
-        let total = ins + del;
+        if entry.binary {
+            out.push_str(&format!(
+                " {:<name_width$} | Bin\n",
+                entry.target,
+                name_width = name_width
+            ));
+            continue;
+        }
+        insertions += entry.insertions;
+        deletions += entry.deletions;
+        let total = entry.insertions + entry.deletions;
         out.push_str(&format!(
-            " {target} | {total} {}\n",
-            "+".repeat(ins) + &"-".repeat(del)
+            " {:<name_width$} | {:>count_width$} {}\n",
+            entry.target,
+            total,
+            "+".repeat(entry.insertions) + &"-".repeat(entry.deletions),
+            name_width = name_width,
+            count_width = count_width,
         ));
     }
-    if files > 0 {
-        out.push_str(&format!(
-            " {files} file{} changed, {insertions} insertion{}(+), {deletions} deletion{}(-)\n",
-            if files == 1 { "" } else { "s" },
-            if insertions == 1 { "" } else { "s" },
-            if deletions == 1 { "" } else { "s" },
+    let mut clauses = vec![format!(
+        "{files} file{} changed",
+        if files == 1 { "" } else { "s" }
+    )];
+    if insertions > 0 {
+        clauses.push(format!(
+            "{insertions} insertion{}(+)",
+            if insertions == 1 { "" } else { "s" }
         ));
+    }
+    if deletions > 0 {
+        clauses.push(format!(
+            "{deletions} deletion{}(-)",
+            if deletions == 1 { "" } else { "s" }
+        ));
+    }
+    out.push_str(&format!(" {}\n", clauses.join(", ")));
+    out
+}
+
+/// Render `--numstat`: `insertions\tdeletions\tpath`, with `-\t-` for binary
+/// sections and the post-image path for renames.
+fn format_apply_numstat(patch_text: &str, strip: u32) -> String {
+    let mut out = String::new();
+    for section in split_file_patches(patch_text) {
+        let Ok(headers) = parse_section_headers(&section, strip) else {
+            continue;
+        };
+        let target = headers
+            .single_target(&section, strip)
+            .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
+        let binary = headers.binary.is_some() || headers.binary_marker;
+        let (ins, del) = count_section_changes(&section);
+        if binary {
+            out.push_str(&format!("-\t-\t{target}\n"));
+        } else {
+            out.push_str(&format!("{ins}\t{del}\t{target}\n"));
+        }
     }
     out
+}
+
+/// Render `--summary`: created and deleted files plus mode changes.
+fn format_apply_summary(patch_text: &str, strip: u32) -> String {
+    let mut out = String::new();
+    for section in split_file_patches(patch_text) {
+        let Ok(headers) = parse_section_headers(&section, strip) else {
+            continue;
+        };
+        let target = headers
+            .single_target(&section, strip)
+            .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
+        if let Some(mode) = headers.new_file_mode {
+            out.push_str(&format!(" create mode {mode:06o} {target}\n"));
+        } else if let Some(mode) = headers.deleted_file_mode {
+            out.push_str(&format!(" delete mode {mode:06o} {target}\n"));
+        } else if let (Some(old), Some(new)) = (headers.old_mode, headers.new_mode)
+            && old != new
+        {
+            out.push_str(&format!(" mode change {old:06o} => {new:06o} {target}\n"));
+        }
+    }
+    out
+}
+
+/// Count `+`/`-` body lines in a section (excluding headers).
+fn count_section_changes(section: &str) -> (usize, usize) {
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    let mut in_hunks = false;
+    for line in section.lines() {
+        if line.starts_with("@@ ") {
+            in_hunks = true;
+            continue;
+        }
+        if !in_hunks {
+            continue;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            ins += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            del += 1;
+        }
+    }
+    (ins, del)
 }
 
 /// Reverse a patch: swap old/new sides, hunks, modes, rename/copy pairs and
