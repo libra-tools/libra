@@ -1,3 +1,8 @@
+> **2026-11-12 07:07–07:08 UTC DEP-TR-SITE Libra agent/clone/fetch 人工验收：** 六个 EN/zh-CN URL 均 HTTP 200、0重定向、最终 URL 精确；agent 4/4、clone 3/3，通用 fetch 正文未混入 Mega2 traces 语义。六份正文哈希经独立重算与用户报告相符；报告 SHA256 `a0384d615307c545203cdee5fd14489112e76a2064ea2d0ae1ce2fb0e95574ac`，分析收据 `/mnt/data/gitmono/libra/target/20261015-closeout/evidence/libra-tools-doc-check-2026-11-12.json` SHA256 `1b27fa055dba3231194143a6b0c7e561e5a68cc3d6b94a1bc8a4d8f1d2dc3344`。zh-CN 正文是英文镜像，不算完整翻译；未提供部署 commit/build ID，源到部署关联未证。仅三页面 HTTP/正文门通过；DEP-TR-SITE仍incoming，LTR-08/09、H6和C/D不变。
+> **2026-11-12 06:03:17 UTC LTR-08 双语源文档契约修正：** 对照 Mega2 线上文章发现 Libra 英文源文档把 `--session`/`--checkpoint` 互斥写成全局规则，已修为仅限 `show`，SHA256 `0329c7c75981554509be717aa01779ba196eee4d6a964e7ab1360481e832ae32`；中文源文档 SHA256 `d38e3cc65264b38b879901ff21b218bde05e7b991bf951eb3c6c22ae962def43`。七项英/中文契约脚本与旧 synopsis 断言通过。LTR-08 仍 in-progress/空，H6、完整 C/D、LTR-09 未闭合。
+> **2026-11-12 DEP-TR-SITE 人工验收：** Mega2 command-reference 英/中文页线上 HTTP 200、无重定向，七项功能正文检查两语全通过，正文在剔除本地导航/页脚后 37,418 字符完全一致。原收据在 `/mnt/data/gitmono/libra/target/20261015-closeout/evidence/dep-tr-site-manual-http-acceptance-20261112.json`（SHA256 `3c1b8b431ec1fa472ad40c4ceb202d18bae9f8b8be460d16184cc3dc7d128149`）。页面未提供 commit/build ID；39 个内容哈希 asset 对本地 dist 的关联仅是推断。该页 HTTP/正文门通过，LTR-08/09 仍待 H6/C/D。
+> **2026-11-12 05:22:59 UTC LTR-08 执行同步：** Libra `docs/commands/zh-CN/mega2.md` 已更新到当前 search/transcript/fetch CLI 契约，七项英/中文核对脚本通过（SHA256 `d38e3cc65264b38b879901ff21b218bde05e7b991bf951eb3c6c22ae962def43`）。该局部文档门不替代LTR-08其余focused/full、安装 smoke、H6、C/D，也不替代LTR-09。
+
 > **2026-11-02 LTR-21/22/23：** 真实回归 selector 已登记并按缺 fixture 失败关闭。LTR-07/09/08 未完成。
 
 > **2026-11-02 LTR-01：** scoped push 家族的本地命令契约 1 passed。Live push 与 main D 未结清。

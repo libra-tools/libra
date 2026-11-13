@@ -40,7 +40,8 @@ as written where the mounted route supports them.
 `--code-commit` must be 40 or 64 hexadecimal characters. `--since` and
 `--until` are RFC3339 values sent as UTC on the half-open interval
 `[since, until)`; `since` later than `until` is rejected locally, and equal
-bounds are an empty interval. `--session` and `--checkpoint` cannot be combined.
+bounds are an empty interval. For `show`, `--session` and `--checkpoint` cannot
+be combined.
 `--require-search` succeeds only when `search_ready` is boolean `true`; a
 missing or non-boolean field is rejected, while a plain `capabilities` call
 still prints the other fields. A redirect to another origin does not forward

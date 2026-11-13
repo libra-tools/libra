@@ -1,22 +1,58 @@
-# `libra mega2`
+# `libra mega2 traces`
 
 `libra mega2 traces` 读取限定范围内的 Agent 历史，也可以取回一条已校验的 stream。
 
 ```
-libra mega2 traces capabilities --server <BASE-URL> [--token-file <PATH>] [--require-search]
-libra mega2 traces targets --server <BASE-URL> --path </project/foo>
-libra mega2 traces streams --server <BASE-URL> --target <UUID> [--source <ID>] [--owner <UUID>] [--epoch <UUID>] [--cursor <CURSOR>] [--limit <N>]
-libra mega2 traces sessions --server <BASE-URL> --stream <UUID> [--since <RFC3339>] [--until <RFC3339>] [--agent <KIND>] [--code-commit <OID>] [--session <ID>] [--cursor <CURSOR>]
-libra mega2 traces show --server <BASE-URL> --stream <UUID> (--session <ID> | --checkpoint <ID>)
-libra mega2 traces checkpoints --server <BASE-URL> --stream <UUID> --session <ID> [--cursor <CURSOR>]
-libra mega2 traces search --server <BASE-URL> --target </project/foo> --query <TEXT> [--limit <N>] [--max-bytes <N>]
-libra mega2 traces transcript --server <BASE-URL> --stream <UUID> --checkpoint <ID> [--max-bytes <N>] [--cursor <CURSOR>]
-libra mega2 traces fetch --remote <NAME> --stream <UUID>
+libra mega2 traces capabilities --server <BASE-URL> [--token-file <PATH> | --token <TOKEN>] [--require-search]
+libra mega2 traces targets --server <BASE-URL> --path </project/foo> [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces streams --server <BASE-URL> --target <UUID> [--source <ID>] [--owner <UUID>] [--epoch <UUID>] [--cursor <CURSOR>] [--limit <N>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces sessions --server <BASE-URL> --stream <UUID> [--since <RFC3339>] [--until <RFC3339>] [--agent <KIND>] [--code-commit <OID>] [--session <ID>] [--cursor <CURSOR>] [--limit <N>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces show --server <BASE-URL> --stream <UUID> (--session <ID> | --checkpoint <ID>) [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces checkpoints --server <BASE-URL> --stream <UUID> --session <ID> [--cursor <CURSOR>] [--limit <N>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces search --server <BASE-URL> --target </project/foo> --stream <UUID> --query <TEXT> [--cursor <CURSOR>] [--limit <N>] [--max-bytes <BYTES>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces transcript --server <BASE-URL> --stream <UUID> [--session <ID>] --checkpoint <ID> [--max-bytes <BYTES>] [--cursor <CURSOR>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces fetch --remote <NAME> --stream <UUID> [--token-file <PATH> | --token <TOKEN>]
 ```
 
-搜索文本必须是 1 到 256 个 UTF-8 字节，否则命令不会打开网络连接。客户端原样发送查询，ASCII 大小写折叠由服务端完成。未指定的列表 `limit` 是 50；未指定的搜索是 20 条和 16384 字节。超过 200 或 100 的 limit 在网络前拒绝。`--owner`、`--epoch`、`--agent`、`--session`、`--cursor` 按原值传递。`--code-commit` 必须是 40 或 64 位十六进制。`--since` / `--until` 按 RFC3339 解析后以 UTC 发送，区间是 `[since, until)`；since 晚于 until 在网络前拒绝，相等是空区间。`--session` 与 `--checkpoint` 不能同时使用。`--require-search` 只在 `search_ready` 为布尔 `true` 时成功；字段缺失或不是布尔值会拒绝，而不带该旗标的 `capabilities` 仍输出其余能力。跨源重定向不转发 `Authorization`。超过 1 MiB 的响应会被拒绝。`fetch` 在 `remote.<name>.url` 的同一源上以 Git upload-pack 读取 `/.traces/by-scope/<stream>.git`：HTTP(S) 需要 token（匿名 HTTP 在打开连接前拒绝），SSH 使用 `traces@` 登录名与已配置的密钥。它从已认证的广告读取 `server_id`，校验并索引收到的 pack，只有广告的 tip 是该 pack 中的 commit 且哈希类型与仓库对象格式一致时，才写入 `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`。它记录服务指纹，拒绝静默改指另一台服务，也不改 `refs/heads/traces`、`refs/libra/traces`、`HEAD`、index 或工作区。未知或无权限的 stream 返回 `unknown_scope`，不发布任何 ref。
+HTTP 读取命令接受可选的 bearer token。HTTP(S) `traces fetch` 必须提供 token，
+并使用 HTTP Basic 认证，用户名为 `traces`，密码为该 token。Token 的读取顺序是：
+`--token-file <PATH>`、`LIBRA_MEGA2_TOKEN`，最后是 `--token <TOKEN>`。
+直接传入 token 会使其出现在 shell 历史和进程列表中，建议使用 `--token-file`。
+SSH `traces fetch` 使用已配置的 `traces@` 密钥认证，不发送 token。
+
+搜索文本必须是 1 到 256 个 UTF-8 字节，否则命令不会打开网络连接。
+客户端原样发送查询，ASCII 大小写折叠由服务端完成。
+搜索调用已挂载的单 stream 路由 `/api/v1/traces/streams/<UUID>/search`，
+因此必须提供 `--stream`；`--target` 仍作为兼容参数接受。
+该路由不支持 `--source`、`--session`、`--agent`、`--since`、`--until`
+或 `--code-commit`，客户端会在本地拒绝这些参数。
+搜索路由自行控制 transcript 正文预算，因此 `--max-bytes` 仅在本地校验
+（默认 16384、最大 131072 字节），不会随请求发送。
+Transcript 省略 `--session` 时，会分页读取 stream 的 sessions 和 checkpoints，
+以解析 checkpoint 所属的 session。列表 `--limit` 默认为 50、最大为 200；
+搜索 `--limit` 默认为 20 条、最大为 100。Transcript `--max-bytes`
+默认为 16384 字节、最大为 131072 字节。超过对应上限的值在打开连接前被拒绝。
+`--owner`、`--epoch`、`--agent`、`--session`、`--cursor` 在对应路由支持时
+按原值传递。
+
+`--code-commit` 必须是 40 或 64 位十六进制字符串。`--since` 和 `--until`
+按 RFC3339 解析后以 UTC 发送，区间为 `[since, until)`；since 晚于 until
+会在本地拒绝，相等表示空区间。`show` 的 `--session` 与 `--checkpoint`
+不能同时使用。`--require-search` 只在 `search_ready` 为布尔 `true` 时成功；
+字段缺失或不是布尔值会拒绝，而普通 `capabilities` 调用仍输出其余能力。
+跨源重定向不转发 `Authorization`。超过 1 MiB 的 Traces JSON API 响应会被拒绝；
+`traces fetch` 获取的 Git pack 使用独立的 512 MiB 上限。
+
+Fetch 在 `remote.<name>.url` 的同一源上以 Git upload-pack 读取
+`/.traces/by-scope/<stream>.git`。它从已认证的广告读取 `server_id`，
+校验并索引收到的 pack，只有广告的 tip 是该 pack 中的 commit，且哈希类型
+与仓库对象格式一致时，才写入 `refs/remotes/<remote>/traces/<stream>/<sha1|sha256>`。
+它记录服务指纹，拒绝静默改指另一台服务，不会修改 `refs/heads/traces`、
+`refs/libra/traces`、`HEAD`、index 或工作区。
+未知或无权限的 stream 返回 `unknown_scope`，不发布任何 ref。
 
 ```
+# 适用于 HTTP(S) remote；SSH fetch 使用已配置的 traces@ 密钥。
 libra mega2 traces fetch --remote origin --stream 3f1d2c4b-5a6e-4f70-8a9b-0c1d2e3f4a5b --token-file ~/.mega2-token
 ```
 
