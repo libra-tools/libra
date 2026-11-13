@@ -14,6 +14,7 @@ use super::*;
 mod file_backend;
 mod git_import;
 mod output_format;
+mod subcommands;
 mod types;
 mod validation;
 

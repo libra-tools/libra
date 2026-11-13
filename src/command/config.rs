@@ -562,6 +562,9 @@ pub struct ConfigArgs {
     /// Show which scope each value comes from
     #[clap(long("show-origin"), hide = true)]
     pub show_origin: bool,
+    /// Treat the value pattern as a literal byte string (`git config --fixed-value`)
+    #[clap(long("fixed-value"), hide = true)]
+    pub fixed_value: bool,
     /// Remove an entire section (`<name>`) and all of its keys
     #[clap(long("remove-section"), hide = true)]
     pub remove_section: bool,
@@ -641,8 +644,17 @@ pub enum ConfigCommand {
         /// Value to set (interactive input for sensitive keys if omitted)
         value: Option<String>,
         /// Add as additional value (allows duplicates)
-        #[clap(long)]
+        #[clap(long, visible_alias = "append")]
         add: bool,
+        /// Replace every existing value (`git config set --all`)
+        #[clap(long)]
+        all: bool,
+        /// Only replace values matching this pattern (`git config set --value`)
+        #[clap(long = "value", value_name = "PATTERN")]
+        value_pattern: Option<String>,
+        /// Treat the value pattern as a literal byte string (`--fixed-value`)
+        #[clap(long = "fixed-value")]
+        fixed_value: bool,
         /// Force vault encryption
         #[clap(long)]
         encrypt: bool,
@@ -666,6 +678,18 @@ pub enum ConfigCommand {
         /// Treat key as regex pattern
         #[clap(long)]
         regexp: bool,
+        /// Only return values matching this pattern (`git config get --value`)
+        #[clap(long = "value", value_name = "PATTERN")]
+        value_pattern: Option<String>,
+        /// Treat the value pattern as a literal byte string (`--fixed-value`)
+        #[clap(long = "fixed-value")]
+        fixed_value: bool,
+        /// Prefix each record with its origin (`--show-origin`)
+        #[clap(long = "show-origin")]
+        show_origin: bool,
+        /// Prefix each record with its scope (`--show-scope`)
+        #[clap(long = "show-scope")]
+        show_scope: bool,
         /// Default value if key not found
         #[clap(long, short = 'd')]
         default: Option<String>,
@@ -678,6 +702,9 @@ pub enum ConfigCommand {
         /// Show scope origin for each entry
         #[clap(long("show-origin"))]
         show_origin: bool,
+        /// Prefix each record with its scope (`--show-scope`)
+        #[clap(long("show-scope"))]
+        show_scope: bool,
         /// Show only vault.env.* entries
         #[clap(long)]
         vault: bool,
@@ -695,6 +722,24 @@ pub enum ConfigCommand {
         /// Remove all values for this key
         #[clap(long)]
         all: bool,
+        /// Only remove values matching this pattern (`git config unset --value`)
+        #[clap(long = "value", value_name = "PATTERN")]
+        value_pattern: Option<String>,
+        /// Treat the value pattern as a literal byte string (`--fixed-value`)
+        #[clap(long = "fixed-value")]
+        fixed_value: bool,
+    },
+    /// Move a section's keys to another section
+    RenameSection {
+        /// Existing section name
+        old: String,
+        /// New section name
+        new: String,
+    },
+    /// Remove an entire section
+    RemoveSection {
+        /// Section name to remove
+        name: String,
     },
     /// Import configuration from Git
     Import,
@@ -945,6 +990,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             add,
             replace_all,
             value_pattern,
+            fixed_value,
             encrypt,
             plaintext,
             stdin,
@@ -958,6 +1004,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 add,
                 replace_all,
                 value_pattern.as_deref(),
+                fixed_value,
                 encrypt,
                 plaintext,
                 stdin,
@@ -976,6 +1023,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             reveal,
             regexp,
             value_pattern,
+            fixed_value,
             show_origin,
             show_scope,
             default,
@@ -989,6 +1037,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 reveal,
                 regexp,
                 value_pattern.as_deref(),
+                fixed_value,
                 show_origin,
                 show_scope,
                 default.as_deref(),
@@ -1030,7 +1079,18 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             key,
             all,
             value_pattern,
-        } => handle_unset(&key, all, value_pattern.as_deref(), scope, output).await,
+            fixed_value,
+        } => {
+            handle_unset(
+                &key,
+                all,
+                value_pattern.as_deref(),
+                fixed_value,
+                scope,
+                output,
+            )
+            .await
+        }
         ResolvedCommand::RemoveSection { name } => {
             handle_remove_section(&name, scope, output).await
         }
@@ -1301,6 +1361,7 @@ async fn route_upgrade_namespace(
             null: _,
             replace_all: _,
             value_pattern: _,
+            fixed_value: _,
         } if is_upgrade_namespace_key(key) => Some(match guard_conflicts() {
             Err(err) => Err(err),
             Ok(()) => {
@@ -1564,6 +1625,8 @@ enum ResolvedCommand {
         replace_all: bool,
         /// Git's value-pattern operand for a bare set (`git config k v pattern`).
         value_pattern: Option<String>,
+        /// Match the value pattern as a literal byte string (`--fixed-value`).
+        fixed_value: bool,
         encrypt: bool,
         plaintext: bool,
         stdin: bool,
@@ -1586,6 +1649,8 @@ enum ResolvedCommand {
         regexp: bool,
         /// Git's value-pattern operand: keep only entries whose value matches.
         value_pattern: Option<String>,
+        /// Match the value pattern as a literal byte string (`--fixed-value`).
+        fixed_value: bool,
         show_origin: bool,
         show_scope: bool,
         default: Option<String>,
@@ -1613,6 +1678,8 @@ enum ResolvedCommand {
         all: bool,
         /// Git's value-pattern operand: remove only matching entries.
         value_pattern: Option<String>,
+        /// Match the value pattern as a literal byte string (`--fixed-value`).
+        fixed_value: bool,
     },
     /// Remove an entire section and every key under it.
     RemoveSection {
@@ -1688,6 +1755,9 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 key,
                 value,
                 add,
+                all,
+                value_pattern,
+                fixed_value,
                 encrypt,
                 plaintext,
                 stdin,
@@ -1695,8 +1765,9 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 key: key.clone(),
                 value: value.clone(),
                 add: *add,
-                replace_all: false,
-                value_pattern: None,
+                replace_all: *all,
+                value_pattern: value_pattern.clone(),
+                fixed_value: *fixed_value,
                 encrypt: *encrypt,
                 plaintext: *plaintext,
                 stdin: *stdin,
@@ -1709,15 +1780,20 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 all,
                 reveal,
                 regexp,
+                value_pattern,
+                fixed_value,
+                show_origin,
+                show_scope,
                 default,
             } => ResolvedCommand::Get {
                 key: key.clone(),
                 all: *all,
                 reveal: *reveal,
                 regexp: *regexp,
-                value_pattern: None,
-                show_origin: false,
-                show_scope: false,
+                value_pattern: value_pattern.clone(),
+                fixed_value: *fixed_value,
+                show_origin: *show_origin,
+                show_scope: *show_scope,
                 default: default.clone(),
                 null: args.null,
                 value_type,
@@ -1726,24 +1802,38 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             ConfigCommand::List {
                 name_only,
                 show_origin,
+                show_scope,
                 vault,
                 ssh_keys,
                 gpg_keys,
             } => ResolvedCommand::List {
                 name_only: *name_only,
                 show_origin: *show_origin,
-                show_scope: false,
+                show_scope: *show_scope,
                 vault: *vault,
                 ssh_keys: *ssh_keys,
                 gpg_keys: *gpg_keys,
                 null: args.null,
                 value_type,
             },
-            ConfigCommand::Unset { key, all } => ResolvedCommand::Unset {
+            ConfigCommand::Unset {
+                key,
+                all,
+                value_pattern,
+                fixed_value,
+            } => ResolvedCommand::Unset {
                 key: key.clone(),
                 all: *all,
-                value_pattern: None,
+                value_pattern: value_pattern.clone(),
+                fixed_value: *fixed_value,
             },
+            ConfigCommand::RenameSection { old, new } => ResolvedCommand::RenameSection {
+                old: old.clone(),
+                new: new.clone(),
+            },
+            ConfigCommand::RemoveSection { name } => {
+                ResolvedCommand::RemoveSection { name: name.clone() }
+            }
             ConfigCommand::Import => ResolvedCommand::Import,
             ConfigCommand::Path => ResolvedCommand::Path,
             ConfigCommand::Edit => ResolvedCommand::Edit,
@@ -1885,6 +1975,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: true,
             value_pattern: args.valuepattern.clone(),
+            fixed_value: args.fixed_value,
             show_origin: args.show_origin,
             show_scope: args.show_scope,
             default: args.default.clone(),
@@ -1900,6 +1991,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: false,
             value_pattern: args.valuepattern.clone(),
+            fixed_value: args.fixed_value,
             show_origin: args.show_origin,
             show_scope: args.show_scope,
             default: args.default.clone(),
@@ -1915,6 +2007,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: false,
             value_pattern: args.valuepattern.clone(),
+            fixed_value: args.fixed_value,
             show_origin: args.show_origin,
             show_scope: args.show_scope,
             default: args.default.clone(),
@@ -1928,6 +2021,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             key: key.to_string(),
             all: false,
             value_pattern: args.valuepattern.clone(),
+            fixed_value: args.fixed_value,
         });
     }
     if args.unset_all {
@@ -1935,6 +2029,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             key: key.to_string(),
             all: true,
             value_pattern: args.valuepattern.clone(),
+            fixed_value: args.fixed_value,
         });
     }
     if args.add {
@@ -1948,6 +2043,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             add: true,
             replace_all: false,
             value_pattern: None,
+            fixed_value: args.fixed_value,
             encrypt: false,
             plaintext: false,
             stdin: false,
@@ -1966,6 +2062,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         add: false,
         replace_all: args.replace_all,
         value_pattern: None,
+        fixed_value: args.fixed_value,
         encrypt: false,
         plaintext: false,
         stdin: false,
@@ -1986,6 +2083,7 @@ async fn handle_set(
     add: bool,
     replace_all: bool,
     value_pattern: Option<&str>,
+    fixed_value: bool,
     encrypt: bool,
     plaintext: bool,
     stdin: bool,
@@ -2183,6 +2281,7 @@ async fn handle_set(
                 None,
                 false,
                 false,
+                false,
                 None,
                 scope,
                 use_cascade,
@@ -2311,8 +2410,8 @@ async fn handle_set(
     } else if let Some(pattern) = value_pattern {
         // Git `config <key> <value> <value-pattern>`: replace only the entries
         // whose value matches, leaving the others alone.
-        let re = compile_config_regexp(pattern)?;
-        ScopedConfig::unset_matching(scope, key, |value| re.is_match(value))
+        let matcher = compile_value_matcher(pattern, fixed_value)?;
+        ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
             .await
             .map_err(CliError::from_legacy_string)?;
         ScopedConfig::add(scope, key, &store_value, should_encrypt)
@@ -2682,6 +2781,7 @@ async fn handle_get(
     reveal: bool,
     regexp: bool,
     value_pattern: Option<&str>,
+    fixed_value: bool,
     show_origin: bool,
     show_scope: bool,
     default: Option<&str>,
@@ -2741,9 +2841,12 @@ async fn handle_get(
         // (§A.3; exact-key reads are routed to the settings file instead).
         entries.retain(|(e, _)| !is_upgrade_namespace_key(&e.key));
         // Git's value-pattern operand filters matches by VALUE as well.
-        let value_re = value_pattern.map(compile_config_regexp).transpose()?;
-        if let Some(re) = &value_re {
-            entries.retain(|(e, _)| re.is_match(&e.value));
+        let value_matcher = match value_pattern {
+            Some(pattern) => Some(compile_value_matcher(pattern, fixed_value)?),
+            None => None,
+        };
+        if let Some(matcher) = &value_matcher {
+            entries.retain(|(e, _)| matcher.matches(&e.value));
         }
 
         // Git exits 1 when a `--get-regexp` pattern matches nothing.
@@ -2832,11 +2935,14 @@ async fn handle_get(
             }
         };
 
-        let value_re = value_pattern.map(compile_config_regexp).transpose()?;
-        let entries: Vec<(ConfigKvEntry, ConfigScope)> = match &value_re {
-            Some(re) => entries
+        let value_matcher = match value_pattern {
+            Some(pattern) => Some(compile_value_matcher(pattern, fixed_value)?),
+            None => None,
+        };
+        let entries: Vec<(ConfigKvEntry, ConfigScope)> = match &value_matcher {
+            Some(matcher) => entries
                 .into_iter()
-                .filter(|(e, _)| re.is_match(&e.value))
+                .filter(|(e, _)| matcher.matches(&e.value))
                 .collect(),
             None => entries,
         };
@@ -2913,7 +3019,7 @@ async fn handle_get(
         // Get single value (last-one-wins). With a value-pattern operand the
         // pattern selects among the stored values, like Git.
         let entry: Option<(ConfigKvEntry, ConfigScope)> = if let Some(pattern) = value_pattern {
-            let re = compile_config_regexp(pattern)?;
+            let matcher = compile_value_matcher(pattern, fixed_value)?;
             let candidates: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
                 get_all_cascaded(key).await.map_err(config_read_cli_error)?
             } else {
@@ -2924,7 +3030,9 @@ async fn handle_get(
                     }
                 }
             };
-            candidates.into_iter().rfind(|(e, _)| re.is_match(&e.value))
+            candidates
+                .into_iter()
+                .rfind(|(e, _)| matcher.matches(&e.value))
         } else if use_cascade {
             get_cascaded(key).await.map_err(config_read_cli_error)?
         } else {
@@ -3052,6 +3160,7 @@ fn config_file_write_mutation(
             add,
             replace_all,
             value_pattern,
+            fixed_value,
             encrypt,
             plaintext,
             stdin,
@@ -3079,6 +3188,7 @@ fn config_file_write_mutation(
                 key: key.clone(),
                 value: value.clone(),
                 value_pattern: value_pattern.clone(),
+                fixed_value: *fixed_value,
                 replace_all: *replace_all,
                 add: *add,
             }
@@ -3087,9 +3197,11 @@ fn config_file_write_mutation(
             key,
             all,
             value_pattern,
+            fixed_value,
         } => Mutation::Unset {
             key: key.clone(),
             value_pattern: value_pattern.clone(),
+            fixed_value: *fixed_value,
             all: *all,
         },
         ResolvedCommand::RemoveSection { name } => Mutation::RemoveSection { name: name.clone() },
@@ -3479,6 +3591,29 @@ fn scope_origin_path(scope: ConfigScope) -> Option<PathBuf> {
 
 /// Compile a value-pattern / key-pattern operand with Git's POSIX-extended
 /// regexp semantics (the `regex` crate is the closest available engine).
+/// A value-pattern matcher: Git's regexp form, or `--fixed-value` byte equality.
+enum ValueMatcher {
+    Regex(regex::Regex),
+    Fixed(String),
+}
+
+impl ValueMatcher {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(value),
+            Self::Fixed(expected) => expected == value,
+        }
+    }
+}
+
+fn compile_value_matcher(pattern: &str, fixed: bool) -> CliResult<ValueMatcher> {
+    if fixed {
+        Ok(ValueMatcher::Fixed(pattern.to_string()))
+    } else {
+        Ok(ValueMatcher::Regex(compile_config_regexp(pattern)?))
+    }
+}
+
 fn compile_config_regexp(pattern: &str) -> CliResult<regex::Regex> {
     regex::Regex::new(pattern).map_err(|error| {
         CliError::failure(format!("invalid pattern '{pattern}': {error}"))
@@ -3908,6 +4043,7 @@ async fn handle_unset(
     key: &str,
     all: bool,
     value_pattern: Option<&str>,
+    fixed_value: bool,
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
@@ -3922,8 +4058,8 @@ async fn handle_unset(
     )?;
     let count = if let Some(pattern) = value_pattern {
         // Git `--unset <key> <value-pattern>`: remove only the matching values.
-        let re = compile_config_regexp(pattern)?;
-        ScopedConfig::unset_matching(scope, key, |value| re.is_match(value))
+        let matcher = compile_value_matcher(pattern, fixed_value)?;
+        ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
             .await
             .map_err(CliError::from_legacy_string)?
     } else if all {

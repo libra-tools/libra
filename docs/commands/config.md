@@ -9,10 +9,12 @@
 
 ```
 libra config <subcommand> [options]
-libra config set [--global | --system] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
-libra config get [--global | --system] [--all] [--reveal] [--regexp] [-d <default>] <key>
-libra config list [--global | --system] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
-libra config unset [--global | --system] [--all] <key>
+libra config set [--global | --system] [--add | --append] [--all] [--value <pattern>] [--fixed-value] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
+libra config get [--global | --system] [--all] [--reveal] [--regexp] [--value <pattern>] [--fixed-value] [--show-origin] [--show-scope] [-d <default>] <key>
+libra config list [--global | --system] [--name-only] [--show-origin] [--show-scope] [--vault] [--ssh-keys] [--gpg-keys]
+libra config unset [--global | --system] [--all] [--value <pattern>] [--fixed-value] <key>
+libra config rename-section [--global | --system] <old> <new>
+libra config remove-section [--global | --system] <name>
 libra config import [--global]
 libra config path [--global | --system]
 libra config doctor --global-schema
@@ -337,6 +339,13 @@ case-equivalent replacements preserve an existing encryption flag.
 | `--encrypt` | Force vault encryption even if the key does not match sensitive-key heuristics |
 | `--plaintext` | Store a new key as plaintext even if it looks sensitive; rejects replacement of existing encrypted values and vault internal/secret keys |
 | `--stdin` | Read the value from stdin instead of a positional argument (useful for piping secrets in CI/CD) |
+| `--all` | Replace every existing value (Git `config set --all` / `--replace-all`) |
+| `--value <pattern>` | Only replace values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
+| `--append` | Git 2.46+ spelling; alias of `--add` |
+
+`rename-section <old> <new>` and `remove-section <name>` are also available as
+subcommands, matching the legacy `--rename-section` / `--remove-section` flags.
 
 When `set` replaces an ordinary encrypted key, it keeps the value encrypted using
 the vault for the selected local or global scope, including ASCII case fallback.
@@ -379,6 +388,10 @@ Retrieve a configuration value. Cascades local → global → system scope, retu
 | `--reveal` | Show the actual decrypted value for encrypted entries (blocked for internal vault credentials like `vault.roottoken_enc`) |
 | `--regexp` | Treat `<key>` as a regex pattern and return all matching entries |
 | `-d`, `--default <value>` | Return this value if the key is not found (instead of an error) |
+| `--value <pattern>` | Only return values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
+| `--show-origin` | Prefix each record with its origin (`file:<database path>`) |
+| `--show-scope` | Prefix each record with its scope (`local`, `global`, or `system`) |
 
 ```bash
 # Simple get
@@ -434,6 +447,8 @@ Remove a configuration entry.
 | Flag | Description |
 |------|-------------|
 | `--all` | Remove all values for this key (for multi-valued keys) |
+| `--value <pattern>` | Only remove values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
 
 ```bash
 # Remove a key

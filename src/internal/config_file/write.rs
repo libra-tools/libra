@@ -21,12 +21,14 @@ pub enum Mutation {
         key: String,
         value: String,
         value_pattern: Option<String>,
+        fixed_value: bool,
         replace_all: bool,
         add: bool,
     },
     Unset {
         key: String,
         value_pattern: Option<String>,
+        fixed_value: bool,
         all: bool,
     },
     RemoveSection {
@@ -201,9 +203,10 @@ fn indent_for(key: &str) -> String {
     format!("\t{variable} = ")
 }
 
-fn matches_value(line: &ParsedLine, value_pattern: Option<&str>) -> bool {
+fn matches_value(line: &ParsedLine, value_pattern: Option<&str>, fixed_value: bool) -> bool {
     match value_pattern {
         None => true,
+        Some(pattern) if fixed_value => pattern == line.value,
         Some(pattern) => match regex::Regex::new(pattern) {
             Ok(re) => re.is_match(&line.value),
             Err(_) => false,
@@ -224,6 +227,7 @@ pub fn apply(text: &str, mutation: &Mutation) -> Result<String, ConfigFileWriteE
             key,
             value,
             value_pattern,
+            fixed_value,
             replace_all,
             add,
         } => {
@@ -232,7 +236,7 @@ pub fn apply(text: &str, mutation: &Mutation) -> Result<String, ConfigFileWriteE
             let matches: Vec<&ParsedLine> = parsed.iter().filter(|p| p.key == key_lower).collect();
             let matching: Vec<&ParsedLine> = matches
                 .into_iter()
-                .filter(|p| matches_value(p, value_pattern.as_deref()))
+                .filter(|p| matches_value(p, value_pattern.as_deref(), *fixed_value))
                 .collect();
 
             if *add {
@@ -277,13 +281,16 @@ pub fn apply(text: &str, mutation: &Mutation) -> Result<String, ConfigFileWriteE
         Mutation::Unset {
             key,
             value_pattern,
+            fixed_value,
             all,
         } => {
             let parsed = parse_lines(&lines);
             let key_lower = key.to_ascii_lowercase();
             let matching: Vec<&ParsedLine> = parsed
                 .iter()
-                .filter(|p| p.key == key_lower && matches_value(p, value_pattern.as_deref()))
+                .filter(|p| {
+                    p.key == key_lower && matches_value(p, value_pattern.as_deref(), *fixed_value)
+                })
                 .collect();
             if matching.is_empty() {
                 return Err(ConfigFileWriteError::new(
@@ -400,6 +407,7 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
             value_pattern: None,
+            fixed_value: false,
             replace_all: false,
             add: false,
         }
@@ -440,6 +448,7 @@ mod tests {
             &Mutation::Unset {
                 key: "a.x".to_string(),
                 value_pattern: None,
+                fixed_value: false,
                 all: false,
             },
         )
@@ -477,6 +486,7 @@ mod tests {
                 key: "m.k".to_string(),
                 value: "3".to_string(),
                 value_pattern: None,
+                fixed_value: false,
                 replace_all: true,
                 add: false,
             },

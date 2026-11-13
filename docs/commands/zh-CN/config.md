@@ -8,10 +8,12 @@
 
 ```
 libra config <subcommand> [options]
-libra config set [--global | --system] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
-libra config get [--global | --system] [--all] [--reveal] [--regexp] [-d <default>] <key>
-libra config list [--global | --system] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
-libra config unset [--global | --system] [--all] <key>
+libra config set [--global | --system] [--add | --append] [--all] [--value <pattern>] [--fixed-value] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
+libra config get [--global | --system] [--all] [--reveal] [--regexp] [--value <pattern>] [--fixed-value] [--show-origin] [--show-scope] [-d <default>] <key>
+libra config list [--global | --system] [--name-only] [--show-origin] [--show-scope] [--vault] [--ssh-keys] [--gpg-keys]
+libra config unset [--global | --system] [--all] [--value <pattern>] [--fixed-value] <key>
+libra config rename-section [--global | --system] <old> <new>
+libra config remove-section [--global | --system] <name>
 libra config import [--global]
 libra config path [--global | --system]
 libra config generate-ssh-key --remote <name>
@@ -251,6 +253,13 @@ attestation；这也不是完整健康诊断。默认 doctor 的只读报告与 
 | `--encrypt` | 即使 key 不匹配敏感 key 启发式，也强制 vault 加密 |
 | `--plaintext` | 新键即使看起来敏感也以明文存储；拒绝替换已有加密值或 vault 内部／secret 键 |
 | `--stdin` | 从 stdin 读取值，而不是位置参数（适合在 CI/CD 中管道传 secrets） |
+| `--all` | 替换该 key 的所有既有值（Git `config set --all` / `--replace-all`） |
+| `--value <pattern>` | 只替换匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
+| `--append` | Git 2.46+ 拼写；`--add` 的别名 |
+
+`rename-section <old> <new>` 与 `remove-section <name>` 也可作为子命令使用，与 legacy
+`--rename-section` / `--remove-section` 等价。
 
 `set` 替换普通的已加密键时，会使用所选 local 或 global 作用域的 vault 保持值加密，
 包括 ASCII 大小写回退。精确键优先于其他拼写；精确键有多个值时仍需先 `unset-all`
@@ -290,6 +299,10 @@ libra config set vault.env.GEMINI_API_KEY
 | `--reveal` | 对加密条目显示实际解密值（会阻止内部 vault 凭据，如 `vault.roottoken_enc`） |
 | `--regexp` | 将 `<key>` 视为正则表达式，并返回所有匹配条目 |
 | `-d`, `--default <value>` | key 未找到时返回此值（而不是报错） |
+| `--value <pattern>` | 只返回匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
+| `--show-origin` | 为每条记录添加来源前缀（`file:<数据库路径>`） |
+| `--show-scope` | 为每条记录添加作用域前缀（`local`、`global` 或 `system`） |
 
 ```bash
 # 简单 get
@@ -345,6 +358,8 @@ libra config list --ssh-keys
 | 标志 | 说明 |
 |------|------|
 | `--all` | 移除该 key 的所有值（用于多值 key） |
+| `--value <pattern>` | 只移除匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
 
 ```bash
 # 移除一个 key
