@@ -1374,7 +1374,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/976.md`](issues/976.md) | `fetch` 命令行 refspec 写成可合并 `FETCH_HEAD` 行 | 未启动（2026-11-12 18:05:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I976-01（1 卡，AC=18/8@EX-01） |
 | [`issues/977.md`](issues/977.md) | `merge --log` 截断输出 `(N commits)` 与 `...` | Codex R2 PASS（2026-11-13 17:06:05 UTC）；计划与索引随 `27e2c4a` 签名+DCO 推送 `main`；实施未启动且未授权；EX-01 具名批准 | I977-01（1 卡，AC=18/8@EX-01） |
 | [`issues/817.md`](issues/817.md) | `libra config <key> <value>` 接受以 `-` 开头的值 | **Codex R17 PASS（2026-11-13 06:50:00 UTC）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I817-01（1 卡，AC=95/8@EX-01 VER=59/8@EX-01，scope=M） |
-| [`issues/978.md`](issues/978.md) | `branch.<name>.mergeOptions` 在 `merge` 上生效 | 未启动（2026-11-12 19:35:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I978-01（1 卡，AC=18/8@EX-01） |
+| [`issues/978.md`](issues/978.md) | `branch.<name>.mergeOptions` 在 `merge` 上生效 | Codex R5 PASS（2026-11-13 17:45:17 UTC）；R1–R4 FAIL 均已修订并保留；未启动且未授权；EX-01 已由 Eli Ma <eli@patch.sh> 批准；**开工门 DEP-I978-06（#817 未完成）未满足，不得开工** | I978-01（1 卡，scope=M，AC=18/8@EX-01，VER=9/8@EX-01） |
 | [`issues/984.md`](issues/984.md) | `merge` 接受 `--no-squash` 取反形式（last-wins） | 未启动（2026-11-12 19:25:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I984-01（1 卡，AC=16/8@EX-01） |
 | [`issues/979.md`](issues/979.md) | `--pretty=format:` 不附加终止换行（`%b` 零正文须 0 字节） | 未启动（2026-11-12 19:05:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I979-01（1 卡，AC=18/8@EX-01） |
 
@@ -1832,6 +1832,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-I978-CHAIN | 跨计划前置与写集顺序 | `issues/817.md#I817-01`、`issues/974.md#I974-01`、`issues/975.md#I975-01` → `issues/978.md#I978-01` → `issues/984.md#I984-01`；#978 同时消费 merge 参数读值和共享消息/merge 写集，#984 消费 #978 的 mergeOptions 配置 | #817 实现仍 pending；#974/#975/#978/#984 均未完成实现；#978 与 #984 按卡内 start gate 保持 blocked/pending，未满足前不得开工 |
 | DEP-I1059-WRITERS | archive 寫集與版本窗口互斥 | [1059](issues/1059.md) I1059-01 與 [545](issues/545.md) AR 系列及其它 archive 源碼/測試/文檔、`COMPATIBILITY.md`、版本面活動寫者按實際文件串行；#545 後續重寫 tar writer 必須保留長 path/prefix/target 的四個功能回歸、writer 錯誤守衛及語義，不得回退到直接固定 header 寫入 | 2026-11-10 15:49:01 UTC 登記；#545 當前 pending，開工仍須掃描全部活動計劃，未證明可啟動 |
 | DEP-I1059-SITE | 網站交付前置 | [1059](issues/1059.md) 需在 `/mnt/data/libra-backend` 核實唯一 VCS、乾淨 `cf` 與遠端一致後，同卡同步 archive 頁、同步檢查、前端 typecheck/build、精簽提交、`cf` 推送、Cloudflare 部署及頁面內容 | `fdd95f00c86041f1bebd9a200f285c3ba9b39698` 已簽推 `cf`，EN/zh-CN archive 與 troubleshooting 公開頁面已核實，網站依賴已關閉 |
 | DEP-EOL-1062-861 | 跨计划单向交接 | [1062](issues/1062.md) outgoing / [861](issues/861.md) incoming：生产者 7/7 complete，v0.30.170 / f0a95af、显式 API/策略/测试、C/D 与终态 819532e6 已交付；接收者独立完成 auto/TC-1324，v0.30.171 / 33cad0f、C/D 与终态 78f888ac 齐全 | 两计划分别 7/7、1/1 done/complete；1062→861 单向顺序完成，两 Issue 已于 2026-11-11 09:03:51/09:04:03 UTC CLOSED |
