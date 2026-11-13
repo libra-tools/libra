@@ -3,7 +3,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 use git_internal::internal::object::{commit::Commit, tree::Tree};
 use libra::{
@@ -1472,4 +1472,67 @@ fn test_show_displays_default_notes() {
     let alias = run_libra_command(&["show", "-s", "HEAD", "--show-notes"], p);
     assert_cli_success(&alias, "show --show-notes");
     assert!(String::from_utf8_lossy(&alias.stdout).contains("Notes:"));
+}
+
+/// LG-04 (M-STAT S1): `show --stat` renders the shared diffstat bars/summary.
+#[test]
+#[serial(cwd)]
+fn test_show_stat_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("tracked.txt"), "tracked\nadded line\n").unwrap();
+    fs::write(p.join("extra.txt"), "one\ntwo\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt", "extra.txt"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "stat commit", "--no-verify"], p),
+        "commit",
+    );
+
+    let out = run_libra_command(&["show", "--stat", "HEAD"], p);
+    assert_cli_success(&out, "show --stat");
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Git-style bar lines: ` path | N +++-`.
+    assert!(text.contains("tracked.txt |"), "{text}");
+    assert!(text.contains("extra.txt |"), "{text}");
+    assert!(text.contains('+'), "{text}");
+    // Shared summary line.
+    assert!(
+        text.contains("files changed") && text.contains("insertions(+)"),
+        "{text}"
+    );
+    // The old A/M/D status lines must be gone.
+    assert!(!text.contains("A  extra.txt"), "{text}");
+}
+
+/// LG-04 (M-STAT S2): `show --stat` and `log --stat -1` agree on counts.
+#[test]
+#[serial(cwd)]
+fn test_log_and_diff_stat_counts_consistent() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("tracked.txt"), "tracked\none\ntwo\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "counts", "--no-verify"], p),
+        "commit",
+    );
+
+    let summary_line = |text: &str| -> String {
+        text.lines()
+            .find(|line| line.contains("file") && line.contains("changed"))
+            .unwrap_or("")
+            .to_string()
+    };
+    let show = run_libra_command(&["show", "--stat", "HEAD"], p);
+    assert_cli_success(&show, "show --stat");
+    let log = run_libra_command(&["log", "--stat", "-1"], p);
+    assert_cli_success(&log, "log --stat");
+    assert_eq!(
+        summary_line(&String::from_utf8_lossy(&show.stdout)),
+        summary_line(&String::from_utf8_lossy(&log.stdout)),
+        "show/log summary counts must match"
+    );
 }

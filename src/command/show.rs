@@ -1144,46 +1144,15 @@ fn display_commit_info(
 
 /// Renders a simple diffstat summary.
 async fn show_diffstat(commit: &Commit, paths: Vec<PathBuf>) -> CliResult<String> {
-    let changed_files = get_changed_files_for_commit(commit, &paths).await?;
-
-    if changed_files.is_empty() {
+    // ADR-LG-04 item 4: `show --stat` shares the diffstat renderer and counts
+    // with `log --stat` / `diff --stat` (bars, path column, and the
+    // `N files changed, X insertions(+), Y deletions(-)` summary).
+    let stats = crate::command::log::compute_commit_stat(commit, paths).await?;
+    let rendered = crate::command::log::format_stat_output(&stats);
+    if rendered.is_empty() {
         return Ok(String::new());
     }
-
-    let mut output = String::from("\n");
-
-    // Count summary totals while printing each changed path.
-    let mut additions = 0;
-    let mut deletions = 0;
-
-    for change in &changed_files {
-        match change.status {
-            ChangeType::Added => additions += 1,
-            ChangeType::Deleted => deletions += 1,
-            ChangeType::Modified => {
-                additions += 1;
-                deletions += 1;
-            }
-        }
-        let status = match change.status {
-            ChangeType::Added => "A",
-            ChangeType::Modified => "M",
-            ChangeType::Deleted => "D",
-        };
-        output.push_str(&format!("{}  {}\n", status, change.path.display()));
-    }
-
-    output.push_str(&format!(
-        "\n{} file{} changed, {} insertion{}(+), {} deletion{}(-)",
-        changed_files.len(),
-        if changed_files.len() != 1 { "s" } else { "" },
-        additions,
-        if additions != 1 { "s" } else { "" },
-        deletions,
-        if deletions != 1 { "s" } else { "" }
-    ));
-    output.push('\n');
-    Ok(output)
+    Ok(format!("\n{rendered}"))
 }
 
 fn show_bad_revision_error(object_ref: &str) -> CliError {

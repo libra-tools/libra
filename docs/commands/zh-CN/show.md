@@ -31,7 +31,7 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 | `--name-only` | | 只显示已更改文件名（没有 diff hunk）。 |
 | `--name-status` | | 显示已更改文件名，并以 `A`/`M`/`D` 状态字母为前缀。 |
 | `--raw` | | 以原始 diff 格式 `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>`（对象 id 缩写 7 位）显示而非 patch，类似 `git show --raw`。 |
-| `--stat` | | 显示 diff 统计（每个文件的插入 / 删除）。 |
+| `--stat` | | 显示与 `log --stat` / `diff --stat` 相同的 Git 风格 diffstat（每文件条形行加 `N files changed, X insertions(+), Y deletions(-)`）。 |
 | `--patch-with-stat` | | 先显示 diffstat 块，再显示完整 patch（Git 对 `-p --stat` 的旧式同义词）。 |
 | `--summary` | | 显示创建/删除文件的精简摘要（mode 与路径），类似 `git show --summary`。仅含创建/删除文件，不做 rename/copy 检测。 |
 | `--no-expand-tabs` | | 不在提交消息中展开 tab。接受式 no-op：Libra 的 show 逐字打印 tab。 |

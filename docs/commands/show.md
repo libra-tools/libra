@@ -39,7 +39,7 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `--name-only` | | Show only changed file names (no diff hunks). |
 | `--name-status` | | Show changed file names prefixed by a status letter (`A`/`M`/`D`), tab-separated. |
 | `--raw` | | Show the raw diff format `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>` (object ids abbreviated to 7) instead of a patch, like `git show --raw`. |
-| `--stat` | | Show diff statistics (insertions / deletions per file). |
+| `--stat` | | Show the shared Git-style diffstat (per-file bar plus `N files changed, X insertions(+), Y deletions(-)`), identical to `log --stat` / `diff --stat`. |
 | `--patch-with-stat` | | Show the diffstat block followed by the full patch (Git's legacy synonym for `-p --stat`). |
 | `--summary` | | Show a condensed summary of created and deleted files (their mode and path), like `git show --summary`. Created/deleted files only — no rename/copy detection. |
 | `--no-expand-tabs` | | Do not expand tabs in the commit message. Accepted no-op: Libra's show prints tabs verbatim. |
