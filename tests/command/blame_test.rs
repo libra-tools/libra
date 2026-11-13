@@ -1172,3 +1172,60 @@ fn test_blame_line_range_and_boundary_matrix() {
     assert!(stdout(&multiple).contains("root1"));
     assert!(stdout(&multiple).contains("changed"));
 }
+
+/// LG-18 (M-BDATE T1–T2): `--date` reuses log's formatter.
+#[test]
+#[serial(cwd)]
+fn test_blame_date_formats_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let run = |args: &[&str]| {
+        let out = run_libra_command(args, repo.path());
+        assert_cli_success(&out, "blame --date");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let iso = run(&["blame", "--date=iso", "tracked.txt"]);
+    assert!(iso.contains("Test User"), "{iso}");
+    assert!(iso.contains(" 1) "), "{iso}");
+    let short = run(&["blame", "--date=short", "tracked.txt"]);
+    assert!(short.contains(" 1) "), "{short}");
+    assert!(!short.contains(':'), "short date has no time: {short}");
+    let format = run(&["blame", "--date=format:%Y", "tracked.txt"]);
+    assert!(format.contains(" 2026 "), "{format}");
+    let relative = run(&["blame", "--date=relative", "tracked.txt"]);
+    assert!(relative.contains(" ago"), "{relative}");
+}
+
+/// LG-18 (M-BDATE T3–T4): `--incremental` header/metadata/boundary/filename.
+#[test]
+#[serial(cwd)]
+fn test_blame_incremental_output() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(&["blame", "--incremental", "tracked.txt"], repo.path());
+    assert_cli_success(&out, "blame --incremental");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let header: Vec<&str> = lines[0].split_whitespace().collect();
+    assert_eq!(header.len(), 4, "{text}");
+    assert_eq!(header[0].len(), 40, "{text}");
+    assert_eq!(&header[1..], &["1", "1", "1"]);
+    assert!(text.contains("author Test User"), "{text}");
+    assert!(text.contains("author-mail <test@example.com>"), "{text}");
+    assert!(text.contains("author-time "), "{text}");
+    assert!(text.contains("author-tz "), "{text}");
+    assert!(text.contains("committer-time "), "{text}");
+    assert!(text.contains("summary base"), "{text}");
+    assert!(text.contains("boundary"), "{text}");
+    assert!(text.ends_with("filename tracked.txt\n"), "{text}");
+    // Incremental output carries no content lines.
+    assert!(!text.lines().any(|line| line == "tracked"), "{text}");
+
+    // T4: combining with `--porcelain` keeps the porcelain output shape.
+    let combined = run_libra_command(
+        &["blame", "--incremental", "--porcelain", "tracked.txt"],
+        repo.path(),
+    );
+    assert_cli_success(&combined, "blame --incremental --porcelain");
+    let combined_text = String::from_utf8_lossy(&combined.stdout).into_owned();
+    assert!(combined_text.contains("\ttracked"), "{combined_text}");
+}

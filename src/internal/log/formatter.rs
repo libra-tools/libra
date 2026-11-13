@@ -627,6 +627,33 @@ fn parse_timezone_offset(timezone: &str) -> Option<i32> {
     Some(if bytes[0] == b'-' { -seconds } else { seconds })
 }
 
+/// Human-relative form used by `--date=relative` (Git-style coarse units).
+fn relative_date(timestamp: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = now - timestamp;
+    let future = delta < 0;
+    let seconds = delta.unsigned_abs();
+    let (value, unit) = if seconds < 60 {
+        (seconds, "second")
+    } else if seconds < 3_600 {
+        (seconds / 60, "minute")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "hour")
+    } else if seconds < 2_592_000 {
+        (seconds / 86_400, "day")
+    } else if seconds < 31_536_000 {
+        (seconds / 2_592_000, "month")
+    } else {
+        (seconds / 31_536_000, "year")
+    };
+    let plural = if value == 1 { "" } else { "s" };
+    if future {
+        format!("in {value} {unit}{plural}")
+    } else {
+        format!("{value} {unit}{plural} ago")
+    }
+}
+
 pub fn format_timestamp(timestamp: i64) -> String {
     format_timestamp_with(timestamp, "")
 }
@@ -657,6 +684,11 @@ pub fn format_timestamp_with(timestamp: i64, mode: &str) -> String {
         "rfc" | "rfc2822" => dt.to_rfc2822(),
         "unix" => timestamp.to_string(),
         "raw" => format!("{timestamp} +0000"),
+        "local" => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S %z")
+            .to_string(),
+        "relative" => relative_date(timestamp),
         // Git's default date form does not zero-pad the day of month
         // (`Fri Jan 2 00:00:00 2026 +0000`), so `%d` would be wrong here.
         _ => dt.format("%a %b %-d %H:%M:%S %Y %z").to_string(),

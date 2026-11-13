@@ -75,3 +75,5 @@ flowchart TD
 
 - 2026-11-13（#478 LG-17，ADR-LG-10 第 1–3 条）：`-L` 结束行越界夹取、起始行越界为 `file <path> has only <n> line(s)`（fatal 128，`LBR-CLI-003`）；`-L` 改为可重复并合并范围（BTreeSet）；默认输出对根/浅边界提交加 `^`+缩短一位 hash，新增 `-b/--blank-boundary` 与 `blame.showRoot`/`blame.blankBoundary` 配置（`--root` 已有）；作者/邮箱列按本次输出最长值对齐（不再截断 15 字符）。测试：`test_blame_line_range_and_boundary_matrix`（L1–L8）、`blame_test` 21/21。
 
+- 2026-11-13（#478 LG-18，ADR-LG-10 第 4、5 条）：`--date` 复用 log `format_timestamp_with`，并补齐 `relative`（粗粒度 ago/in）与 `local`（本地时区）；`--incremental` 单独渲染 Git 格式（`<oid> <orig> <final> <count>`、author/committer 元数据、根提交 `boundary`、非根 `previous`、末尾 `filename`，无内容行），`--porcelain` 同时给出时以 porcelain 为准（T4 登记）。测试：`test_blame_date_formats_matrix`、`test_blame_incremental_output`、`blame_test` 23/23、`log_test` 296/296。
+

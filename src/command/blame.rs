@@ -323,12 +323,11 @@ pub async fn execute_safe(args: BlameArgs, out_config: &OutputConfig) -> CliResu
         return Ok(());
     }
 
-    if args.porcelain || args.line_porcelain || args.incremental {
-        return render_blame_porcelain(
-            &result,
-            &args.file,
-            args.line_porcelain || args.incremental,
-        );
+    if args.incremental && !args.porcelain && !args.line_porcelain {
+        return render_blame_incremental(&result, &args.file);
+    }
+    if args.porcelain || args.line_porcelain {
+        return render_blame_porcelain(&result, &args.file, args.line_porcelain);
     }
 
     if result.lines.is_empty() {
@@ -777,6 +776,71 @@ fn render_blame_porcelain(result: &BlameOutput, file: &str, line_porcelain: bool
             CliError::io(format!("failed to write blame porcelain output: {e}"))
                 .with_stable_code(StableErrorCode::IoWriteFailed),
         ),
+    }
+}
+
+/// Git's `--incremental` format: one header + metadata block per consecutive
+/// group, `boundary` for boundary commits, and a single trailing `filename`.
+fn render_blame_incremental(result: &BlameOutput, file: &str) -> CliResult<()> {
+    use std::{collections::HashSet, io::Write};
+
+    let lines = &result.lines;
+    let mut buf = String::new();
+    let mut emitted: HashSet<String> = HashSet::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let mut end = index + 1;
+        while end < lines.len() && lines[end].hash == lines[index].hash {
+            end += 1;
+        }
+        let line = &lines[index];
+        buf.push_str(&format!(
+            "{} {} {} {}\n",
+            line.hash,
+            line.line_number,
+            line.line_number,
+            end - index
+        ));
+        if emitted.insert(line.hash.clone()) {
+            let hash =
+                crate::internal::object_format::parse_repo_oid(&line.hash).map_err(|_| {
+                    CliError::fatal(format!("invalid blame commit hash '{}'", line.hash))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+            let commit = load_object::<Commit>(&hash).map_err(|error| {
+                CliError::fatal(format!("failed to load commit {}: {error}", line.hash))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            let (parsed_message, _) = crate::common_utils::parse_commit_msg(&commit.message);
+            let summary = parsed_message.lines().next().unwrap_or("").trim();
+            buf.push_str(&format!("author {}\n", commit.author.name));
+            buf.push_str(&format!("author-mail <{}>\n", commit.author.email));
+            buf.push_str(&format!("author-time {}\n", commit.author.timestamp));
+            buf.push_str(&format!("author-tz {}\n", commit.author.timezone));
+            buf.push_str(&format!("committer {}\n", commit.committer.name));
+            buf.push_str(&format!("committer-mail <{}>\n", commit.committer.email));
+            buf.push_str(&format!("committer-time {}\n", commit.committer.timestamp));
+            buf.push_str(&format!("committer-tz {}\n", commit.committer.timezone));
+            buf.push_str(&format!("summary {summary}\n"));
+            if line.boundary {
+                buf.push_str("boundary\n");
+            }
+            if let Some(parent) = commit.parent_commit_ids.first() {
+                buf.push_str(&format!("previous {parent} {file}\n"));
+            }
+        }
+        index = end;
+    }
+    buf.push_str(&format!("filename {file}\n"));
+
+    let stdout = std::io::stdout();
+    match stdout.lock().write_all(buf.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(CliError::io(format!(
+            "failed to write blame incremental output: {error}"
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)),
     }
 }
 
