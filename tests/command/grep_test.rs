@@ -1801,3 +1801,74 @@ async fn test_grep_pattern_types_matrix() {
     assert_cli_success(&heading, "grep --heading --break");
     assert!(!stdout(&heading).trim().is_empty(), "heading output");
 }
+
+/// LG-15 (M-GBOOL O1–O6): boolean expressions with `--and`/`--or`/`--not` and
+/// parentheses (t7810:715/:736 ports).
+#[tokio::test]
+#[serial(cwd)]
+async fn test_grep_boolean_expressions_matrix() {
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+
+    fs::write(
+        "code.c",
+        "int main(void)\n{\n  return foo.bar;\n}\nword foo\n",
+    )
+    .expect("write code.c");
+    add_and_commit("add code", vec!["code.c".to_string()]).await;
+
+    let run = |args: &[&str]| run_libra_command(args, repo.path());
+    let lines = |out: &std::process::Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // O1: `--and` requires both patterns on the same line.
+    let o1 = run(&["grep", "-e", "foo", "--and", "-e", "word"]);
+    assert_cli_success(&o1, "grep --and");
+    assert_eq!(lines(&o1), vec!["code.c:word foo"]);
+
+    // O2: `--or` unions the matches.
+    let o2 = run(&["grep", "-e", "return", "--or", "-e", "word"]);
+    assert_cli_success(&o2, "grep --or");
+    assert_eq!(
+        lines(&o2),
+        vec!["code.c:  return foo.bar;", "code.c:word foo"]
+    );
+
+    // O3: `--not` negates a pattern.
+    let o3 = run(&["grep", "--not", "-e", "foo", "--", "code.c"]);
+    assert_cli_success(&o3, "grep --not");
+    assert_eq!(
+        lines(&o3),
+        vec!["code.c:int main(void)", "code.c:{", "code.c:}"]
+    );
+
+    // O4: parentheses bind before `--and` (t7810:715 port).
+    let o4 = run(&[
+        "grep", "(", "-e", "return", "--or", "-e", "word", ")", "--and", "-e", "foo",
+    ]);
+    assert_cli_success(&o4, "grep parenthesized expression");
+    assert_eq!(
+        lines(&o4),
+        vec!["code.c:  return foo.bar;", "code.c:word foo"]
+    );
+
+    // t7810:736 port: nested NOT around a grouped OR.
+    let nested = run(&[
+        "grep", "--not", "(", "-e", "return", "--or", "-e", "word", ")",
+    ]);
+    assert_cli_success(&nested, "grep nested --not");
+    assert_eq!(
+        lines(&nested),
+        vec!["code.c:int main(void)", "code.c:{", "code.c:}"]
+    );
+
+    // O6: an operator without operands is a usage error with no output.
+    let o6 = run(&["grep", "-e", "foo", "--and"]);
+    assert!(!o6.status.success(), "--and without operand must fail");
+    assert!(o6.stdout.is_empty(), "no output on syntax error");
+}

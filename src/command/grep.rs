@@ -372,7 +372,9 @@ pub async fn execute(args: GrepArgs) {
 
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. Searches for pattern matches in tracked files.
-pub async fn execute_safe(args: GrepArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: GrepArgs, output: &OutputConfig) -> CliResult<()> {
+    // `(` and `)` are boolean-expression tokens, not pathspecs (ADR-LG-08).
+    args.pathspec.retain(|entry| entry != "(" && entry != ")");
     // `--no-index` greps the filesystem directly and does not require a repository.
     if !args.no_index {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
@@ -443,7 +445,7 @@ async fn run_grep(args: &GrepArgs) -> CliResult<GrepOutput> {
     }
 
     let dialect = resolve_grep_pattern_type(args).await?;
-    let patterns = collect_patterns(args)?;
+    let (patterns, expression) = build_pattern_expression(args)?;
     let matcher = build_matcher(&patterns, args, dialect)?;
 
     // Resolve the search context (working tree, index, specific tree, or no-index)
@@ -500,7 +502,7 @@ async fn run_grep(args: &GrepArgs) -> CliResult<GrepOutput> {
             continue;
         }
 
-        let mut file_matches = search_in_content(&content, &matcher, args)?;
+        let mut file_matches = search_in_content(&content, &matcher, Some(&expression), args)?;
         // `-m`/`--max-count`: keep only the first NUM real matches per file
         // (any trailing context up to the next match comes along).
         if let Some(max) = args.max_count {
@@ -717,27 +719,215 @@ fn build_matcher(
 
 /// Evaluate the pattern set against one line: `--and` requires every pattern,
 /// otherwise any pattern; `-v`/`--not` then negate the result.
-fn line_matches(matchers: &[GrepMatcher], args: &GrepArgs, line: &str) -> CliResult<bool> {
-    let matched = if args.and {
-        let mut all = true;
-        for matcher in matchers {
-            if !matcher.is_match(line)? {
-                all = false;
-                break;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExprToken {
+    Operand(usize),
+    And,
+    Or,
+    Not,
+    LParen,
+    RParen,
+}
+
+#[derive(Debug)]
+enum Expr {
+    Operand(usize),
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+}
+
+fn expression_error(message: impl Into<String>) -> CliError {
+    CliError::command_usage(format!("invalid boolean expression: {}", message.into()))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+}
+
+/// Rebuild `-e`/`--and`/`--or`/`--not`/`(`/`)` in command-line order. Clap
+/// stores the boolean switches separately, but Git's expression semantics
+/// depend on their positions (ADR-LG-08).
+fn build_pattern_expression(args: &GrepArgs) -> CliResult<(Vec<String>, Expr)> {
+    // `-f` pattern files are expanded by `collect_patterns`; expression
+    // operators are not applied to file-supplied patterns (a plain implicit
+    // OR over every pattern keeps Git's practical behaviour).
+    if !args.pattern_file.is_empty() {
+        let patterns = collect_patterns(args)?;
+        if patterns.is_empty() {
+            return Err(
+                CliError::command_usage("at least one search pattern is required")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments),
+            );
+        }
+        let tokens: Vec<ExprToken> = (0..patterns.len()).map(ExprToken::Operand).collect();
+        let mut position = 0;
+        let expr = parse_or_expression(&tokens, &mut position)?;
+        return Ok((patterns, expr));
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let pattern = args.pattern.clone();
+    let mut operands: Vec<String> = Vec::new();
+    let mut tokens: Vec<ExprToken> = Vec::new();
+    let mut positional_used = false;
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if arg == "grep" {
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        match arg.as_str() {
+            "--and" => tokens.push(ExprToken::And),
+            "--or" => tokens.push(ExprToken::Or),
+            "--not" => tokens.push(ExprToken::Not),
+            "(" => tokens.push(ExprToken::LParen),
+            ")" => tokens.push(ExprToken::RParen),
+            "-e" | "--regexp" => {
+                if let Some(value) = argv.get(index + 1) {
+                    operands.push(value.clone());
+                    tokens.push(ExprToken::Operand(operands.len() - 1));
+                    index += 1;
+                }
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--regexp=") {
+                    operands.push(value.to_string());
+                    tokens.push(ExprToken::Operand(operands.len() - 1));
+                } else if let Some(value) = arg.strip_prefix("-e").filter(|v| !v.is_empty()) {
+                    operands.push(value.to_string());
+                    tokens.push(ExprToken::Operand(operands.len() - 1));
+                } else if !arg.starts_with('-')
+                    && !positional_used
+                    && pattern.as_deref() == Some(arg.as_str())
+                {
+                    operands.push(arg.clone());
+                    tokens.push(ExprToken::Operand(operands.len() - 1));
+                    positional_used = true;
+                }
             }
         }
-        all
-    } else {
-        let mut any = false;
-        for matcher in matchers {
-            if matcher.is_match(line)? {
-                any = true;
-                break;
+        index += 1;
+    }
+
+    if operands.is_empty() {
+        return Err(
+            CliError::command_usage("at least one search pattern is required")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    if tokens.is_empty() {
+        tokens = (0..operands.len()).map(ExprToken::Operand).collect();
+    }
+    let mut position = 0;
+    let expr = parse_or_expression(&tokens, &mut position)?;
+    if position != tokens.len() {
+        return Err(expression_error("unexpected trailing token"));
+    }
+    Ok((operands, expr))
+}
+
+fn parse_or_expression(tokens: &[ExprToken], position: &mut usize) -> CliResult<Expr> {
+    let mut left = parse_and_expression(tokens, position)?;
+    loop {
+        match tokens.get(*position).copied() {
+            Some(ExprToken::Or) => {
+                *position += 1;
+                let right = parse_and_expression(tokens, position)?;
+                left = Expr::Or(Box::new(left), Box::new(right));
             }
+            Some(ExprToken::Operand(_) | ExprToken::LParen | ExprToken::Not) => {
+                // Adjacent operands without an explicit operator are an
+                // implicit `--or`, matching Git.
+                let right = parse_and_expression(tokens, position)?;
+                left = Expr::Or(Box::new(left), Box::new(right));
+            }
+            _ => break,
         }
-        any
+    }
+    Ok(left)
+}
+
+fn parse_and_expression(tokens: &[ExprToken], position: &mut usize) -> CliResult<Expr> {
+    let mut left = parse_not_expression(tokens, position)?;
+    while tokens.get(*position).copied() == Some(ExprToken::And) {
+        *position += 1;
+        let right = parse_not_expression(tokens, position)?;
+        left = Expr::And(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn parse_not_expression(tokens: &[ExprToken], position: &mut usize) -> CliResult<Expr> {
+    if tokens.get(*position).copied() == Some(ExprToken::Not) {
+        *position += 1;
+        let inner = parse_not_expression(tokens, position)?;
+        return Ok(Expr::Not(Box::new(inner)));
+    }
+    parse_atom(tokens, position)
+}
+
+fn parse_atom(tokens: &[ExprToken], position: &mut usize) -> CliResult<Expr> {
+    match tokens.get(*position).copied() {
+        Some(ExprToken::Operand(index)) => {
+            *position += 1;
+            Ok(Expr::Operand(index))
+        }
+        Some(ExprToken::LParen) => {
+            *position += 1;
+            let inner = parse_or_expression(tokens, position)?;
+            if tokens.get(*position).copied() != Some(ExprToken::RParen) {
+                return Err(expression_error("missing ')'"));
+            }
+            *position += 1;
+            Ok(inner)
+        }
+        Some(ExprToken::And) | Some(ExprToken::Or) => {
+            Err(expression_error("operator without a left operand"))
+        }
+        Some(ExprToken::RParen) => Err(expression_error("unexpected ')'")),
+        Some(ExprToken::Not) => Err(expression_error("unexpected --not")),
+        None => Err(expression_error("missing operand")),
+    }
+}
+
+fn eval_expression(expr: &Expr, matchers: &[GrepMatcher], line: &str) -> CliResult<bool> {
+    Ok(match expr {
+        Expr::Operand(index) => match matchers.get(*index) {
+            Some(matcher) => matcher.is_match(line)?,
+            None => false,
+        },
+        Expr::Not(inner) => !eval_expression(inner, matchers, line)?,
+        Expr::And(left, right) => {
+            eval_expression(left, matchers, line)? && eval_expression(right, matchers, line)?
+        }
+        Expr::Or(left, right) => {
+            eval_expression(left, matchers, line)? || eval_expression(right, matchers, line)?
+        }
+    })
+}
+
+fn line_matches(
+    matchers: &[GrepMatcher],
+    expr: Option<&Expr>,
+    args: &GrepArgs,
+    line: &str,
+) -> CliResult<bool> {
+    let matched = match expr {
+        Some(expr) => eval_expression(expr, matchers, line)?,
+        None => {
+            // Legacy implicit form used by unit tests and `--all-match` scans.
+            let mut any = false;
+            for matcher in matchers {
+                if matcher.is_match(line)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
     };
-    Ok(matched != (args.invert_match || args.not))
+    Ok(matched != args.invert_match)
 }
 
 /// Get the list of files to search, respecting pathspec and ignore rules.
@@ -1318,6 +1508,7 @@ fn context_window(args: &GrepArgs) -> (usize, usize) {
 fn search_in_content(
     content: &[u8],
     matchers: &[GrepMatcher],
+    expr: Option<&Expr>,
     args: &GrepArgs,
 ) -> CliResult<Vec<(usize, String, usize, bool)>> {
     let content_str = String::from_utf8_lossy(content);
@@ -1327,7 +1518,7 @@ fn search_in_content(
     // First pass: collect the 0-based indices of matching lines.
     let mut match_indices = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
-        if line_matches(matchers, args, line)? {
+        if line_matches(matchers, expr, args, line)? {
             match_indices.push(idx);
         }
     }
@@ -1697,6 +1888,73 @@ mod tests {
     }
 
     #[test]
+    fn test_boolean_expression_precedence() {
+        // `a OR b AND c` groups as `a OR (b AND c)`.
+        let tokens = [
+            ExprToken::Operand(0),
+            ExprToken::Or,
+            ExprToken::Operand(1),
+            ExprToken::And,
+            ExprToken::Operand(2),
+        ];
+        let mut position = 0;
+        let expr = parse_or_expression(&tokens, &mut position).unwrap();
+        assert_eq!(position, tokens.len());
+        match expr {
+            Expr::Or(left, right) => {
+                assert!(matches!(*left, Expr::Operand(0)));
+                assert!(matches!(*right, Expr::And(_, _)));
+            }
+            other => panic!("unexpected tree: {other:?}"),
+        }
+
+        // Parentheses override precedence.
+        let tokens = [
+            ExprToken::LParen,
+            ExprToken::Operand(0),
+            ExprToken::Or,
+            ExprToken::Operand(1),
+            ExprToken::RParen,
+            ExprToken::And,
+            ExprToken::Operand(2),
+        ];
+        let mut position = 0;
+        let expr = parse_or_expression(&tokens, &mut position).unwrap();
+        assert!(matches!(expr, Expr::And(_, _)));
+    }
+
+    #[test]
+    fn test_boolean_expression_syntax_errors() {
+        let mut position = 0;
+        assert!(parse_or_expression(&[ExprToken::And], &mut position).is_err());
+        let mut position = 0;
+        assert!(
+            parse_or_expression(&[ExprToken::LParen, ExprToken::Operand(0)], &mut position)
+                .is_err()
+        );
+        let mut position = 0;
+        assert!(parse_or_expression(&[ExprToken::RParen], &mut position).is_err());
+    }
+
+    #[test]
+    fn test_boolean_expression_evaluation() {
+        let args = GrepArgs::parse_from(["grep", "-e", "foo"]);
+        let patterns = vec!["foo".to_string(), "word".to_string()];
+        let matchers = build_matcher(&patterns, &args, GrepPatternType::Basic).unwrap();
+        let tokens = [ExprToken::Operand(0), ExprToken::And, ExprToken::Operand(1)];
+        let mut position = 0;
+        let expr = parse_or_expression(&tokens, &mut position).unwrap();
+        assert!(eval_expression(&expr, &matchers, "word foo").unwrap());
+        assert!(!eval_expression(&expr, &matchers, "word only").unwrap());
+
+        let tokens = [ExprToken::Not, ExprToken::Operand(0)];
+        let mut position = 0;
+        let expr = parse_or_expression(&tokens, &mut position).unwrap();
+        assert!(eval_expression(&expr, &matchers, "other").unwrap());
+        assert!(!eval_expression(&expr, &matchers, "foo").unwrap());
+    }
+
+    #[test]
     fn test_build_matcher_basic() {
         let args = GrepArgs::parse_from(["grep", "test"]);
         let patterns = collect_patterns(&args).unwrap();
@@ -1748,7 +2006,7 @@ mod tests {
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
 
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 2); // line number
         assert_eq!(results[0].1, "line two");
@@ -1762,7 +2020,7 @@ mod tests {
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
 
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         assert_eq!(results.len(), 2); // lines 1 and 3
         assert_eq!(results[0].0, 1);
         assert_eq!(results[1].0, 3);
@@ -1776,7 +2034,7 @@ mod tests {
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
 
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -1788,7 +2046,7 @@ mod tests {
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
 
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 2);
         assert_eq!(results[0].2, 4); // "bar" starts at byte offset 4 in "foo bar"
@@ -1801,7 +2059,7 @@ mod tests {
         let patterns = collect_patterns(&args).unwrap();
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         // line 2 (match) + line 3 (trailing context)
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 2);
@@ -1817,7 +2075,7 @@ mod tests {
         let patterns = collect_patterns(&args).unwrap();
         let dialect = grep_cli_pattern_type(&args).unwrap_or(GrepPatternType::Basic);
         let matcher = build_matcher(&patterns, &args, dialect).unwrap();
-        let results = search_in_content(content, &matcher, &args).unwrap();
+        let results = search_in_content(content, &matcher, None, &args).unwrap();
         // lines 2 (ctx), 3 (match), 4 (ctx)
         assert_eq!(results.len(), 3);
         assert_eq!(

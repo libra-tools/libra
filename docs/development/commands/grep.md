@@ -88,3 +88,5 @@ flowchart TD
 
 - 2026-11-13（#478 LG-14，ADR-LG-09）：`--fixed-strings` 为 `-F` 正式长名，单数 `--fixed-string` 保留为隐藏别名；`-P/--perl-regexp` 接入 `fancy-regex 0.16.2`（MIT，syntect 已用同版本），支持环视/反向引用，回溯上限 250k、模式长度上限 32 KiB；`\K`、递归 `(?R)`/`(?n)`、`(*VERB)` 为用法错误；grep 默认方言保持既有 ERE，`--basic-regexp` 显式 BRE。`log/rev-list --grep` 共用同一编译/匹配器。测试：`test_grep_pattern_types_matrix`、`test_log_perl_regexp_grep`、`utils::grep_pattern` 7/7。
 
+- 2026-11-13（#478 LG-15，ADR-LG-08 第 1 条）：`-e`/位置模式 + `--and`/`--or`/`--not`/`(` `)` 组成表达式（`ExprToken` 扫描 argv 保序，递归下降解析；优先级 `--not` > `--and` > `--or`，相邻操作数隐式 `--or`；`(`/`)` 从 pathspec 中剔除；`-f` 文件模式退化为隐式 OR）；每个输出行按表达式求值，`-v` 仍否定整体；语法错误为 `LBR-CLI-002` 且零输出。测试：`test_grep_boolean_expressions_matrix`（O1–O4/O6、t7810:715/:736）、`command::grep` 25/25。
+

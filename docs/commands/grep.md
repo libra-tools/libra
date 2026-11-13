@@ -27,6 +27,14 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 
 Exit codes follow Git's grep contract: matches exit 0, no selected matches exit 1 without an error diagnostic, and grep command errors (for example invalid regexes, unsupported `-P`, missing pattern files, or invalid `--tree` revisions) exit 2. Repository preflight errors such as running repository mode outside a Libra repository keep the standard Libra fatal exit code.
 
+### Boolean expressions
+
+Patterns from `-e` (and the positional pattern) form a boolean expression with
+`--and`, `--or`, `--not`, and parenthesized groups `(` `)`. Precedence is
+`--not` > `--and` > `--or`; adjacent operands without an operator are an
+implicit `--or`. A syntax error (dangling operator, unbalanced parenthesis,
+empty group) is a usage error with no output.
+
 ## Options
 
 | Flag | Short | Long | Description |
