@@ -36,8 +36,8 @@ For large files, the `-L` option restricts output to a specific line range, redu
 | Abbrev | | `--abbrev <N>` | Use N hex digits for the abbreviated commit hash (ignored with `-l`). |
 | Root | | `--root` | Do not treat root commits as boundaries. Accepted no-op: Libra's blame never prefixes boundary/root commits with `^`, so root commits already appear as normal commits. |
 | Ignore whitespace | `-w` | `--ignore-whitespace` | Ignore whitespace when comparing the parent's and child's versions of a line, so a whitespace-only change is attributed to the older commit. Matches Git's `-w` (ignore-all-whitespace) semantics. |
-| Detect moves | `-M` | | Re-attribute lines that moved from another file in a parent revision (one-step scan of parent trees; a documented narrowing of Git's recursive detection). |
-| Detect copies | `-C` | | Detect lines copied from other files. Shares the parent-tree scan with `-M`; repeatable (each extra `-C` widens nothing further today). |
+| Detect moves | `-M[<score>]` | | Re-attribute lines moved within the file from a parent revision (default score 20 alphanumeric characters). |
+| Detect copies | `-C[<score>]` | | Detect lines copied from other files (repeatable; extra levels currently share the same parent-tree scan). Porcelain `filename` points at the source file. |
 | Date mode | | `--date=<MODE>` | Date rendering mode for the author column (`default` / `short` / `iso` / `iso-strict` / `rfc` / `relative` / `local` / `unix` / `raw` / `format:<strftime>`). |
 | Incremental | | `--incremental` | Emit Git's incremental format: `<oid> <orig-line> <final-line> <count>` headers, commit metadata, `boundary`, and a trailing `filename`; no content lines. |
 | Porcelain | `-p` | `--porcelain` | Machine-readable porcelain output (commit metadata once per commit). |

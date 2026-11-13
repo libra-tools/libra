@@ -841,8 +841,8 @@ async fn blame_runs_with_sha1() {
         blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
-        detect_moves: false,
-        detect_copies: 0,
+        detect_moves: None,
+        detect_copies: Vec::new(),
         date: None,
         incremental: false,
     })
@@ -876,8 +876,8 @@ async fn blame_runs_with_sha256() {
         blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
-        detect_moves: false,
-        detect_copies: 0,
+        detect_moves: None,
+        detect_copies: Vec::new(),
         date: None,
         incremental: false,
     })
@@ -993,8 +993,8 @@ async fn blame_root_flag_is_accepted_noop() {
         blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
-        detect_moves: false,
-        detect_copies: 0,
+        detect_moves: None,
+        detect_copies: Vec::new(),
         date: None,
         incremental: false,
     })
@@ -1228,4 +1228,96 @@ fn test_blame_incremental_output() {
     assert_cli_success(&combined, "blame --incremental --porcelain");
     let combined_text = String::from_utf8_lossy(&combined.stdout).into_owned();
     assert!(combined_text.contains("\ttracked"), "{combined_text}");
+}
+
+/// LG-19 (M-BMOVE M1–M6): `-M` same-file moves, `-C` cross-file copies,
+/// score thresholds (short lines stay), and porcelain source `filename`.
+#[test]
+#[serial(cwd)]
+fn test_blame_move_copy_detection_matrix() {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let long_a = "aaaaaaaaaaaaaaaaaaaaaaaa";
+    let long_b = "bbbbbbbbbbbbbbbbbbbbbbbb";
+    let long_c = "cccccccccccccccccccccccc";
+    let long_d = "dddddddddddddddddddddddd";
+    fs::write(
+        repo.path().join("f.txt"),
+        format!("{long_b}\n{long_c}\n{long_d}\n"),
+    )
+    .unwrap();
+    fs::write(repo.path().join("src.txt"), format!("{long_a}\n")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], repo.path()), "add root");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], repo.path()),
+        "commit root",
+    );
+    let root_hash =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    let root_short: String = root_hash.chars().take(7).collect();
+
+    // M1: move the first line to the end; `-M` reattributes every line.
+    fs::write(
+        repo.path().join("f.txt"),
+        format!("{long_c}\n{long_d}\n{long_b}\n"),
+    )
+    .unwrap();
+    // M2: copy a line from another file into a new file in the same commit.
+    fs::write(repo.path().join("copy.txt"), format!("{long_a}\n")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], repo.path()), "add moved");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "moved", "--no-verify"], repo.path()),
+        "commit moved",
+    );
+
+    let moved = run_libra_command(&["blame", "-M", "-s", "f.txt"], repo.path());
+    assert_cli_success(&moved, "blame -M");
+    let moved_text = String::from_utf8_lossy(&moved.stdout).into_owned();
+    assert!(
+        moved_text
+            .lines()
+            .all(|line| line.starts_with(&format!("^{root_short}"))),
+        "{moved_text}"
+    );
+
+    let copied = run_libra_command(&["blame", "-C", "-s", "copy.txt"], repo.path());
+    assert_cli_success(&copied, "blame -C");
+    let copied_text = String::from_utf8_lossy(&copied.stdout).into_owned();
+    assert!(copied_text.contains(&root_short), "{copied_text}");
+
+    // Porcelain `filename` points at the source file for copied lines.
+    let porcelain = run_libra_command(&["blame", "-C", "--porcelain", "copy.txt"], repo.path());
+    assert_cli_success(&porcelain, "blame -C --porcelain");
+    let porcelain_text = String::from_utf8_lossy(&porcelain.stdout).into_owned();
+    assert!(
+        porcelain_text.contains("filename src.txt"),
+        "{porcelain_text}"
+    );
+
+    // M5: a moved short line (fewer than the default score) is not reattributed.
+    fs::write(repo.path().join("short.txt"), "aa\nbb\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "short.txt"], repo.path()),
+        "add short",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "short", "--no-verify"], repo.path()),
+        "commit short",
+    );
+    fs::write(repo.path().join("short.txt"), "bb\naa\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "short.txt"], repo.path()),
+        "move short",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "move short", "--no-verify"], repo.path()),
+        "commit moved short",
+    );
+    let short = run_libra_command(&["blame", "-M", "-s", "short.txt"], repo.path());
+    assert_cli_success(&short, "blame -M short");
+    let short_text = String::from_utf8_lossy(&short.stdout).into_owned();
+    assert!(!short_text.contains(&root_short), "{short_text}");
 }

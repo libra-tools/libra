@@ -106,16 +106,14 @@ pub struct BlameArgs {
     #[clap(short = 'b', long = "blank-boundary")]
     pub blank_boundary: bool,
 
-    /// Detect lines moved within the file (`-M`). Libra scans the parent
-    /// revisions' trees for identical line content in other files (a documented
-    /// one-step narrowing of Git's recursive move detection).
-    #[clap(short = 'M')]
-    pub detect_moves: bool,
+    /// Detect lines moved within the file (`-M[<score>]`; score defaults to 20
+    /// alphanumeric characters).
+    #[clap(short = 'M', value_name = "SCORE", num_args = 0..=1, default_missing_value = "")]
+    pub detect_moves: Option<String>,
 
-    /// Detect lines copied from other files (`-C`). Shares the parent-tree scan
-    /// with `-M`; repeatable for wider scans (a documented narrowing).
-    #[clap(short = 'C', action = clap::ArgAction::Count)]
-    pub detect_copies: u8,
+    /// Detect lines copied from other files (`-C[<score>]`). Repeatable.
+    #[clap(short = 'C', value_name = "SCORE", num_args = 0..=1, default_missing_value = "", action = clap::ArgAction::Append)]
+    pub detect_copies: Vec<String>,
 
     /// Date rendering mode (`default` / `short` / `iso` / `iso-strict` /
     /// `rfc` / `unix` / `raw`) for the author timestamp column.
@@ -167,6 +165,8 @@ pub struct BlameLine {
     pub content: String,
     #[serde(skip)]
     pub boundary: bool,
+    #[serde(skip)]
+    pub source_file: String,
 }
 
 /// Whole-file result of a `libra blame` invocation.
@@ -188,6 +188,7 @@ struct LineBlame {
     timestamp: i64,
     content: String,
     boundary: bool,
+    source_file: String,
 }
 
 /// Domain error for `libra blame`. Mapped to stable [`CliError`] codes by
@@ -487,6 +488,7 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
             timestamp: commit_obj.author.timestamp as i64,
             content: content.clone(),
             boundary: false,
+            source_file: args.file.clone(),
         })
         .collect();
 
@@ -588,8 +590,16 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
         }
     }
 
-    if args.detect_moves || args.detect_copies > 0 {
-        detect_moved_lines(&mut blame_lines, &commit_obj, &args.file, &shallow)?;
+    if args.detect_moves.is_some() || !args.detect_copies.is_empty() {
+        detect_moved_lines(
+            &mut blame_lines,
+            &commit_obj,
+            &args.file,
+            &shallow,
+            args.detect_moves.as_deref(),
+            &args.detect_copies,
+            args.ignore_whitespace,
+        )?;
     }
 
     let mut filtered_lines = if args.line_range.is_empty() {
@@ -655,6 +665,7 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
                     timestamp: line.timestamp,
                     content: line.content,
                     boundary: line.boundary,
+                    source_file: line.source_file,
                 }
             })
             .collect(),
@@ -708,7 +719,11 @@ fn get_file_lines(
 /// and the content). The commit metadata is read by reloading each attributing
 /// commit. NOTE: the original line number is approximated by the final line
 /// number — the blame walk does not track per-commit origin line numbers.
-fn render_blame_porcelain(result: &BlameOutput, file: &str, line_porcelain: bool) -> CliResult<()> {
+fn render_blame_porcelain(
+    result: &BlameOutput,
+    _file: &str,
+    line_porcelain: bool,
+) -> CliResult<()> {
     use std::{collections::HashSet, io::Write};
 
     let lines = &result.lines;
@@ -763,7 +778,7 @@ fn render_blame_porcelain(result: &BlameOutput, file: &str, line_porcelain: bool
             buf.push_str(&format!("committer-time {}\n", commit.committer.timestamp));
             buf.push_str(&format!("committer-tz {}\n", commit.committer.timezone));
             buf.push_str(&format!("summary {summary}\n"));
-            buf.push_str(&format!("filename {file}\n"));
+            buf.push_str(&format!("filename {}\n", line.source_file));
         }
         buf.push_str(&format!("\t{}\n", line.content));
     }
@@ -829,9 +844,9 @@ fn render_blame_incremental(result: &BlameOutput, file: &str) -> CliResult<()> {
                 buf.push_str(&format!("previous {parent} {file}\n"));
             }
         }
+        buf.push_str(&format!("filename {}\n", line.source_file));
         index = end;
     }
-    buf.push_str(&format!("filename {file}\n"));
 
     let stdout = std::io::stdout();
     match stdout.lock().write_all(buf.as_bytes()) {
@@ -854,16 +869,51 @@ fn format_blame_date(timestamp: i64, mode: Option<&str>) -> String {
 /// Re-attribute lines that were moved or copied from another file in a parent
 /// revision. One step deep; repeated `-C` widens nothing further (documented
 /// narrowing of Git's recursive detection).
+fn parse_move_score(raw: Option<&str>) -> Result<usize, BlameError> {
+    match raw {
+        None | Some("") => Ok(20),
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            BlameError::InvalidLineRange(format!("invalid move/copy score '{value}'"))
+        }),
+    }
+}
+
+fn alnum_count(line: &str) -> usize {
+    line.chars().filter(|ch| ch.is_alphanumeric()).count()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn detect_moved_lines(
     blame_lines: &mut [LineBlame],
     commit: &Commit,
     file: &str,
     shallow: &ShallowSet,
+    move_score: Option<&str>,
+    copy_scores: &[String],
+    ignore_whitespace: bool,
 ) -> Result<(), BlameError> {
     use std::collections::HashMap;
 
     let target_path = util::to_workdir_path(file);
-    let mut content_owner: HashMap<String, (ObjectHash, String, String, i64)> = HashMap::new();
+    let move_threshold = parse_move_score(move_score)?;
+    let copy_threshold = copy_scores
+        .iter()
+        .map(|score| parse_move_score(Some(score)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(20);
+    let detect_copies = !copy_scores.is_empty();
+
+    let normalize = |line: &str| -> String {
+        if ignore_whitespace {
+            normalize_for_whitespace(line)
+        } else {
+            line.to_string()
+        }
+    };
+    let mut content_owner: HashMap<String, (ObjectHash, String, String, i64, String)> =
+        HashMap::new();
     for parent_id in shallow.parents_for_walk(&commit.id, &commit.parent_commit_ids) {
         let parent = match load_object::<Commit>(parent_id) {
             Ok(parent) => parent,
@@ -876,19 +926,22 @@ fn detect_moved_lines(
                 detail: error.to_string(),
             })?;
         for (path, blob_hash) in tree.get_plain_items()? {
-            if path == target_path {
+            let same_file = path == target_path;
+            if !same_file && !detect_copies {
                 continue;
             }
             let Ok(blob) = load_object::<Blob>(&blob_hash) else {
                 continue;
             };
+            let source_file = path.display().to_string();
             for line in String::from_utf8_lossy(&blob.data).lines() {
-                content_owner.entry(line.to_string()).or_insert_with(|| {
+                content_owner.entry(normalize(line)).or_insert_with(|| {
                     (
                         *parent_id,
                         parent.author.name.clone(),
                         parent.author.email.clone(),
                         parent.author.timestamp as i64,
+                        source_file.clone(),
                     )
                 });
             }
@@ -899,11 +952,25 @@ fn detect_moved_lines(
         if blame.commit_id != commit.id {
             continue;
         }
-        if let Some((id, name, email, timestamp)) = content_owner.get(&blame.content) {
+        let threshold = if content_owner
+            .get(&normalize(&blame.content))
+            .is_some_and(|(_, _, _, _, source)| source == file)
+        {
+            move_threshold
+        } else {
+            copy_threshold
+        };
+        if alnum_count(&blame.content) < threshold {
+            continue;
+        }
+        if let Some((id, name, email, timestamp, source_file)) =
+            content_owner.get(&normalize(&blame.content))
+        {
             blame.commit_id = *id;
             blame.author = name.clone();
             blame.author_email = email.clone();
             blame.timestamp = *timestamp;
+            blame.source_file = source_file.clone();
         }
     }
     Ok(())

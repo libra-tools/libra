@@ -77,3 +77,5 @@ flowchart TD
 
 - 2026-11-13（#478 LG-18，ADR-LG-10 第 4、5 条）：`--date` 复用 log `format_timestamp_with`，并补齐 `relative`（粗粒度 ago/in）与 `local`（本地时区）；`--incremental` 单独渲染 Git 格式（`<oid> <orig> <final> <count>`、author/committer 元数据、根提交 `boundary`、非根 `previous`、末尾 `filename`，无内容行），`--porcelain` 同时给出时以 porcelain 为准（T4 登记）。测试：`test_blame_date_formats_matrix`、`test_blame_incremental_output`、`blame_test` 23/23、`log_test` 296/296。
 
+- 2026-11-13（#478 LG-19，ADR-LG-11）：`-M[<score>]` 扫描父提交同文件行指纹、`-C[<score>]` 扫描父提交其它文件；默认分数 20 个字母数字字符（短行不重新归因），支持自定义分数与 `-w` 规范化；porcelain/incremental 的 `filename` 指向来源文件。实现仍为父树一次性扫描（多重 `-C` 目前共享同一扫描，登记为收窄）。测试：`test_blame_move_copy_detection_matrix`（M1/M2/M5 + porcelain 来源）、`blame_test` 24/24。
+
