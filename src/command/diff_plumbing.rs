@@ -520,6 +520,10 @@ pub async fn execute_index_safe(args: DiffIndexArgs, output: &OutputConfig) -> C
         args.name_only,
         args.name_status,
     );
+    argv.push("--plumbing-raw".to_string());
+    if args.raw && args.patch {
+        argv.push("--plumbing-raw-with-patch".to_string());
+    }
     push_paths(&mut argv, &args.paths);
     run_via_diff(
         argv,
@@ -549,6 +553,10 @@ pub async fn execute_files_safe(args: DiffFilesArgs, output: &OutputConfig) -> C
         args.name_only,
         args.name_status,
     );
+    argv.push("--plumbing-raw".to_string());
+    if args.raw && args.patch {
+        argv.push("--plumbing-raw-with-patch".to_string());
+    }
     push_paths(&mut argv, &args.paths);
     run_via_diff(argv, output, args.exit_code || args.quiet, true, args.quiet).await
 }

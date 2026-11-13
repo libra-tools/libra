@@ -1193,3 +1193,104 @@ fn test_diff_tree_raw_and_patch_matrix() {
         "root default is id only"
     );
 }
+
+/// LG-10 (M-DIDF F1–F4): `diff-index`/`diff-files` default raw with full ids,
+/// staged (`--cached`) comparison, and patch output.
+#[test]
+#[serial(cwd)]
+fn test_diff_index_files_raw_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let index_oid = rev_parse(&repo, "HEAD:tracked.txt");
+    fs::write(p.join("tracked.txt"), "tracked\nworktree\n").unwrap();
+
+    // F1: worktree-side raw uses the index id and a full-width zero new id.
+    for command in ["diff-index", "diff-files"] {
+        let args: Vec<&str> = if command == "diff-index" {
+            vec!["diff-index", "HEAD"]
+        } else {
+            vec!["diff-files"]
+        };
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, command);
+        let text = out_str(&out);
+        let line = text.lines().next().unwrap_or("");
+        assert_eq!(
+            line,
+            format!(
+                ":100644 100644 {index_oid} 0000000000000000000000000000000000000000 M\ttracked.txt"
+            ),
+            "{command}: {text}"
+        );
+    }
+
+    // F3: `diff-files -p` renders a patch (7-char index header).
+    let patch = run_libra_command(&["diff-files", "-p"], p);
+    assert_cli_success(&patch, "diff-files -p");
+    let ptext = out_str(&patch);
+    assert!(
+        ptext.contains("diff --git a/tracked.txt b/tracked.txt"),
+        "{ptext}"
+    );
+    assert!(ptext.contains("+worktree"), "{ptext}");
+
+    // F2/F4: staged changes compare index vs tree; `--cached` works and
+    // `-p --raw` includes both the raw record and the patch.
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "stage");
+    let staged_oid = rev_parse(&repo, ":tracked.txt");
+    // Tree-vs-worktree still shows the zero new side even when the change is
+    // staged; `--cached` is the tree-vs-index comparison with both ids.
+    let worktree = run_libra_command(&["diff-index", "HEAD"], p);
+    assert_cli_success(&worktree, "diff-index HEAD staged");
+    let wtext = out_str(&worktree);
+    assert!(
+        wtext.contains(&format!(
+            "{index_oid} 0000000000000000000000000000000000000000 M\ttracked.txt"
+        )),
+        "{wtext}"
+    );
+    let cached = run_libra_command(&["diff-index", "--cached", "HEAD"], p);
+    assert_cli_success(&cached, "diff-index --cached");
+    let ctext = out_str(&cached);
+    assert!(
+        ctext.contains(&format!("{index_oid} {staged_oid} M\ttracked.txt")),
+        "{ctext}"
+    );
+    for text in [&wtext, &ctext] {
+        let metadata = text.lines().next().unwrap().split('\t').next().unwrap();
+        let fields: Vec<&str> = metadata.split_whitespace().collect();
+        assert_eq!(fields[0].len(), 1 + 6, "{text}");
+        assert_eq!(fields[1].len(), 6, "{text}");
+        assert_eq!(fields[2].len(), 40, "{text}");
+        assert_eq!(fields[3].len(), 40, "{text}");
+    }
+    // Make the worktree dirty again so `diff-files` has output for the
+    // combined raw+patch form.
+    fs::write(p.join("tracked.txt"), "tracked\nworktree2\n").unwrap();
+    let combined = run_libra_command(&["diff-files", "-p", "--raw"], p);
+    assert_cli_success(&combined, "diff-files -p --raw");
+    let ctext = out_str(&combined);
+    assert!(
+        ctext.contains("0000000000000000000000000000000000000000"),
+        "{ctext}"
+    );
+    assert!(ctext.contains("diff --git"), "{ctext}");
+}
+
+/// LG-10 (M-DIDF F2): `diff-index --cached` is silent when nothing is staged.
+#[test]
+#[serial(cwd)]
+fn test_diff_index_cached() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let clean = run_libra_command(&["diff-index", "--cached", "HEAD"], p);
+    assert_cli_success(&clean, "diff-index --cached clean");
+    assert!(out_str(&clean).is_empty(), "{}", out_str(&clean));
+
+    fs::write(p.join("tracked.txt"), "tracked\nstaged\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "stage");
+    let staged = run_libra_command(&["diff-index", "--cached", "HEAD"], p);
+    assert_cli_success(&staged, "diff-index --cached staged");
+    let text = out_str(&staged);
+    assert!(text.trim_end().ends_with("M\ttracked.txt"), "{text}");
+}

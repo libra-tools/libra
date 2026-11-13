@@ -21,6 +21,9 @@ libra diff-index [--cached] [-p] [-s] [--raw] [--name-only] [--name-status] [--e
 
 旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。 raw 输出和差异退出码仍保持上述基于 stat 的规则。
 
+
+plumbing raw 记录使用完整对象 id（SHA-1 40 位 / SHA-256 64 位），缺失侧（如 `diff-index`/`diff-files` 的工作树侧）为完整全零 id。`-p --raw` 先输出 raw 记录、空行，再输出补丁，与 Git 一致。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |

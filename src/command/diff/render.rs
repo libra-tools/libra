@@ -252,8 +252,8 @@ pub(super) fn render_diff_output(
     // when --quiet is set (quiet only suppresses stdout, not file writes).
     // `-z` NUL-terminates each record; `--name-status` then separates the
     // status and path with a NUL instead of a tab.
-    let rendered = if args.raw {
-        format_diff_raw(result, args.null)
+    let rendered = if args.raw && !args.plumbing_raw_with_patch {
+        format_diff_raw(result, args.null, args.plumbing_raw)
     } else if args.name_only {
         join_diff_records(result.files.iter().map(|file| file.path.clone()), args.null)
     } else if args.name_status {
@@ -321,6 +321,21 @@ pub(super) fn render_diff_output(
             .collect()
     } else {
         format_unified_diff(result)
+    };
+
+    // Git's `diff -p --raw` prints the raw records, a blank line, then the
+    // patch. Plumbing `-p --raw` requests the same combination.
+    let rendered = if args.raw && args.plumbing_raw_with_patch {
+        let raw = format_diff_raw(result, args.null, args.plumbing_raw);
+        if raw.is_empty() {
+            rendered
+        } else if rendered.is_empty() {
+            raw
+        } else {
+            format!("{raw}\n\n{rendered}")
+        }
+    } else {
+        rendered
     };
 
     if let Some(path) = &args.output {
@@ -485,7 +500,7 @@ pub(super) fn diff_status_code(file: &DiffFileStat) -> char {
     'M'
 }
 
-pub(super) fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
+pub(super) fn format_diff_raw(result: &DiffOutput, null: bool, full_ids: bool) -> String {
     let mut output = String::new();
     for file in &result.files {
         let status = diff_status_code(file);
@@ -498,8 +513,8 @@ pub(super) fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
             ":{} {} {} {} {status_field}",
             raw_mode(file.old_mode),
             raw_mode(file.new_mode),
-            abbreviated_raw_id(file.old_id),
-            abbreviated_raw_id(file.new_id),
+            raw_id(file.old_id, full_ids),
+            raw_id(file.new_id, full_ids),
         );
         if null {
             output.push_str(&metadata);

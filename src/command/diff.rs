@@ -331,6 +331,15 @@ pub struct DiffArgs {
     #[clap(long)]
     pub cumulative: bool,
 
+    /// Plumbing raw output: full-length object ids and full-width zero ids for
+    /// the missing side (used by `diff-index`/`diff-files`).
+    #[clap(long = "plumbing-raw", hide = true)]
+    pub plumbing_raw: bool,
+
+    /// Plumbing `-p --raw`: print the raw records before the patch.
+    #[clap(long = "plumbing-raw-with-patch", hide = true)]
+    pub plumbing_raw_with_patch: bool,
+
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
     #[clap(long)]
@@ -4231,6 +4240,16 @@ fn abbreviated_raw_id(id: Option<ObjectHash>) -> String {
     .unwrap_or_else(|| "0000000".to_string())
 }
 
+/// Raw object id: 7-char abbreviation for porcelain, or the full 40/64-hex id
+/// (zero-filled for a missing side) for plumbing raw output.
+fn raw_id(id: Option<ObjectHash>, full: bool) -> String {
+    if !full {
+        return abbreviated_raw_id(id);
+    }
+    id.map(|hash| hash.to_string())
+        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string())
+}
+
 fn raw_mode(mode: Option<u32>) -> String {
     mode.map(|mode| format!("{mode:06o}"))
         .unwrap_or_else(|| "000000".to_string())
@@ -5341,6 +5360,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         dirstat: None,
         dirstat_by_file: None,
         cumulative: false,
+        plumbing_raw: false,
+        plumbing_raw_with_patch: false,
         stat_name_width: None,
         inter_hunk_context: None,
         ignore_matching_lines: None,

@@ -37,6 +37,9 @@ an error, not an empty successful patch.
 
 In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected. Raw output and difference exit codes keep the stat-based behavior described above.
 
+
+Plumbing raw records use full-width object ids (40-hex SHA-1 / 64-hex SHA-256) and a full-width all-zero id for the missing side (e.g. the worktree side of `diff-index`/`diff-files`). `-p --raw` prints the raw records, a blank line, then the patch, matching Git.
+
 ## Options
 
 | Option | Description | Example |
