@@ -109,3 +109,6 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - 2026-09-20（plan issues/470 FM-04）：`resolve_worktree_side`/`resolve_diff_side` 增加 `file_mode`；为 `false` 时工作树侧改用索引记录的 mode，从而不 diff 仅 mode 差异（`run_diff` 解析 `core_file_mode()`，非法值以 `DiffError::InvalidConfig` 失败）。
+
+- 2026-11-13（#478 LG-16）：hunk 头函数上下文（`@@ … @@ <func>`）改为复用 `utils::funcname` 的默认/gitattributes 规则，追加在 `compute_unified_hunks` 的规范头之后；回归 `test_diff_hunk_header_function_context`。
+

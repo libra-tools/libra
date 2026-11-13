@@ -1872,3 +1872,61 @@ async fn test_grep_boolean_expressions_matrix() {
     assert!(!o6.status.success(), "--and without operand must fail");
     assert!(o6.stdout.is_empty(), "no output on syntax error");
 }
+
+/// LG-16 (M-GCTX X1–X4): function header (`-p`), function context (`-W`) and
+/// numeric context (`-<n>`).
+#[tokio::test]
+#[serial(cwd)]
+async fn test_grep_function_and_numeric_context_matrix() {
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+    fs::write(
+        "code.c",
+        "int main(void)\n{\n  return foo.bar;\n}\nword foo\n",
+    )
+    .expect("write code.c");
+    add_and_commit("add code", vec!["code.c".to_string()]).await;
+
+    let run = |args: &[&str]| run_libra_command(args, repo.path());
+    let lines = |out: &std::process::Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // X1: `-p` prints the nearest header as `<path>=<header>`.
+    let p = run(&["grep", "-p", "return", "code.c"]);
+    assert_cli_success(&p, "grep -p");
+    assert_eq!(
+        lines(&p),
+        vec!["code.c=int main(void)", "code.c:  return foo.bar;"]
+    );
+
+    // X2: `-W` prints the whole function (`=` header, `-` body, `:` match).
+    let w = run(&["grep", "-W", "return", "code.c"]);
+    assert_cli_success(&w, "grep -W");
+    assert_eq!(
+        lines(&w),
+        vec![
+            "code.c=int main(void)",
+            "code.c-{",
+            "code.c:  return foo.bar;",
+            "code.c-}",
+        ]
+    );
+
+    // X3: `-1` is `-C 1` (t7810:848 port shape).
+    let numeric = run(&["grep", "-1", "return", "code.c"]);
+    assert_cli_success(&numeric, "grep -1");
+    assert_eq!(
+        lines(&numeric),
+        vec!["code.c-{", "code.c:  return foo.bar;", "code.c-}"]
+    );
+    let explicit = run(&["grep", "-C", "1", "return", "code.c"]);
+    assert_eq!(lines(&explicit), lines(&numeric));
+
+    // `-p` with a configured userdiff regex would use that rule; the default
+    // rule is covered above.
+}

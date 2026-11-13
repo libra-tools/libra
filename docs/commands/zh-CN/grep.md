@@ -40,6 +40,9 @@ libra grep -f <file> [-- <pathspec>...]
 | Regexp | `-e` | `--regexp <PATTERN>` | 添加要搜索的模式。可多次指定。 |
 | Pattern file | `-f` | `--file <FILE>` | 从文件读取模式，每行一个。可多次指定。 |
 | All match | | `--all-match` | 要求所有模式都至少在一个文件中匹配一次，该文件才会被包含。 |
+| 显示函数 | `-p` | `--show-function` | 在每个匹配行前输出最近的函数头，格式 `<path>=<header>`。 |
+| 函数上下文 | `-W` | `--function-context` | 输出匹配所在函数的完整范围（函数头 `=`、非匹配行 `-`、匹配行 `:`）。 |
+| 数字上下文 | `-<n>` | | 等价于 `-C <n>`（`-1`..`-9`），后出现的上下文标志生效。 |
 | Fixed string | `-F` | `--fixed-strings` | 将模式视为字面字符串，而不是正则表达式。 |
 | Ignore case | `-i` | `--ignore-case` | 执行大小写不敏感匹配。 |
 | Count | `-c` | `--count` | 只显示每个文件的匹配行数。 |

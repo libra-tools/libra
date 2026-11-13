@@ -4151,3 +4151,27 @@ fn test_diff_dirstat_matrix() {
         "  50.0% dir1/sub/\n  25.0% dir1/\n  25.0% dir2/\n"
     );
 }
+
+/// LG-16 (M-GCTX X5): unified hunk headers share the default function rule.
+#[test]
+#[serial(cwd)]
+fn test_diff_hunk_header_function_context() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let mut content = String::new();
+    for number in 1..=8 {
+        content.push_str(&format!("{number}\n"));
+    }
+    content.push_str("g\nx\nz\n");
+    fs::write(p.join("f.txt"), &content).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    fs::write(p.join("f.txt"), content.replace("\nx\nz\n", "\nx\nw\n")).unwrap();
+    let out = run_libra_command(&["diff", "-U1", "f.txt"], p);
+    assert_cli_success(&out, "diff -U1");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("@@ -10,2 +10,2 @@ g"), "{text}");
+}

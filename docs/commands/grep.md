@@ -46,6 +46,9 @@ empty group) is a usage error with no output.
 | And | | `--and` | Require every pattern to match the *same line*. |
 | Or | | `--or` | Match when any pattern matches the line (the default). |
 | Not | | `--not` | Negate the whole pattern set. |
+| Show function | `-p` | `--show-function` | Print the nearest function header before each matching line as `<path>=<header>`. |
+| Function context | `-W` | `--function-context` | Print the whole function containing each match (`=` header, `-` non-matching body lines, `:` matches). |
+| Numeric context | `-<n>` | | Shorthand for `-C <n>` (`-1`..`-9`); the last context flag wins. |
 | Fixed string | `-F` | `--fixed-strings` (alias `--fixed-string`, hidden) | Treat the pattern as a literal string, not a regular expression. |
 | Ignore case | `-i` | `--ignore-case` | Perform case-insensitive matching. |
 | Count | `-c` | `--count` | Show only the number of matching lines for each file. |

@@ -134,6 +134,34 @@ pub struct GrepArgs {
     #[clap(short = 'C', long = "context", value_name = "NUM")]
     context: Option<usize>,
 
+    /// Show the nearest function header before each match (`-p`).
+    #[clap(short = 'p', long = "show-function")]
+    show_function: bool,
+
+    /// Show the whole function containing each match (`-W`).
+    #[clap(short = 'W', long = "function-context")]
+    function_context: bool,
+
+    /// Numeric context shorthands (`-1`..`-9`, equivalent to `-C <n>`).
+    #[clap(short = '1', hide = true)]
+    context_1: bool,
+    #[clap(short = '2', hide = true)]
+    context_2: bool,
+    #[clap(short = '3', hide = true)]
+    context_3: bool,
+    #[clap(short = '4', hide = true)]
+    context_4: bool,
+    #[clap(short = '5', hide = true)]
+    context_5: bool,
+    #[clap(short = '6', hide = true)]
+    context_6: bool,
+    #[clap(short = '7', hide = true)]
+    context_7: bool,
+    #[clap(short = '8', hide = true)]
+    context_8: bool,
+    #[clap(short = '9', hide = true)]
+    context_9: bool,
+
     /// Ignore case distinctions in patterns and data.
     #[clap(short = 'i', long)]
     ignore_case: bool,
@@ -299,6 +327,8 @@ pub struct GrepMatch {
     /// The 0-based byte offset of the match start, if --byte-offset was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<usize>,
+    #[serde(skip)]
+    pub line_prefix: Option<char>,
     /// True when this line is surrounding context (-A/-B/-C), not an actual match.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_context: bool,
@@ -375,6 +405,29 @@ pub async fn execute(args: GrepArgs) {
 pub async fn execute_safe(mut args: GrepArgs, output: &OutputConfig) -> CliResult<()> {
     // `(` and `)` are boolean-expression tokens, not pathspecs (ADR-LG-08).
     args.pathspec.retain(|entry| entry != "(" && entry != ")");
+    // `-<n>` is a numeric shorthand for `-C <n>`; the last context flag wins.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut numeric: Option<(usize, usize)> = None;
+    let mut explicit: Option<usize> = None;
+    for (index, arg) in argv.iter().enumerate() {
+        if let Some(rest) = arg.strip_prefix('-')
+            && rest.len() == 1
+            && rest.chars().all(|ch| ('1'..='9').contains(&ch))
+        {
+            numeric = Some((index, rest.parse().unwrap_or(1)));
+        }
+        if matches!(
+            arg.as_str(),
+            "-A" | "-B" | "-C" | "--after-context" | "--before-context" | "--context"
+        ) {
+            explicit = Some(index);
+        }
+    }
+    if let Some((position, count)) = numeric
+        && explicit.is_none_or(|explicit| position > explicit)
+    {
+        args.context = Some(count);
+    }
     // `--no-index` greps the filesystem directly and does not require a repository.
     if !args.no_index {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
@@ -425,6 +478,70 @@ const MAX_FILE_SIZE: u64 = 512 * 1024;
 fn is_binary(content: &[u8]) -> bool {
     // Git checks the first 8000 bytes for NUL
     content.iter().take(8000).any(|&b| b == 0)
+}
+
+/// One rendered grep row: line number, text, byte offset, context flag, and
+/// an optional output separator prefix (`=`/`-` for function rows).
+type GrepRow = (usize, String, usize, bool, Option<char>);
+
+/// Expand match rows for `-p` (nearest function header) or `-W` (whole
+/// function). Headers are emitted with an `=` separator; non-matching body
+/// lines of a function with `-`.
+fn apply_function_context(
+    entries: Vec<GrepRow>,
+    lines: &[&str],
+    regex: Option<&regex::Regex>,
+    args: &GrepArgs,
+) -> Vec<GrepRow> {
+    use std::collections::BTreeMap;
+
+    if args.function_context {
+        let mut rows: BTreeMap<usize, (String, Option<char>)> = BTreeMap::new();
+        for (line_number, line, byte_off, is_context, _) in &entries {
+            if *is_context {
+                rows.entry(*line_number)
+                    .or_insert((line.clone(), Some('-')));
+                continue;
+            }
+            let index = line_number.saturating_sub(1);
+            let (start, end) = crate::utils::funcname::function_range(lines, index);
+            for (offset, body) in lines[start..end].iter().enumerate() {
+                let number = start + offset + 1;
+                let prefix = if start + offset == index {
+                    None
+                } else if offset == 0 {
+                    Some('=')
+                } else {
+                    Some('-')
+                };
+                let _ = byte_off;
+                rows.entry(number).or_insert((body.to_string(), prefix));
+            }
+        }
+        return rows
+            .into_iter()
+            .map(|(number, (line, prefix))| {
+                let is_context = prefix == Some('-');
+                (number, line, 0, is_context, prefix)
+            })
+            .collect();
+    }
+
+    let mut last_header: Option<usize> = None;
+    let mut out = Vec::with_capacity(entries.len());
+    for (line_number, line, byte_off, is_context, prefix) in entries {
+        if !is_context {
+            let index = line_number.saturating_sub(1);
+            if let Some(header) = crate::utils::funcname::header_index_with(regex, lines, index)
+                && last_header != Some(header)
+            {
+                out.push((header + 1, lines[header].to_string(), 0, false, Some('=')));
+                last_header = Some(header);
+            }
+        }
+        out.push((line_number, line, byte_off, is_context, prefix));
+    }
+    out
 }
 
 async fn run_grep(args: &GrepArgs) -> CliResult<GrepOutput> {
@@ -565,7 +682,7 @@ async fn run_grep(args: &GrepArgs) -> CliResult<GrepOutput> {
             } else if args.only_matching {
                 // `-o`: emit each matched substring on its own line; context
                 // lines are dropped (they have no match to extract).
-                for (line_num, line, _byte_off, is_ctx) in file_matches {
+                for (line_num, line, _byte_off, is_ctx, _prefix) in file_matches {
                     if is_ctx {
                         continue;
                     }
@@ -587,17 +704,28 @@ async fn run_grep(args: &GrepArgs) -> CliResult<GrepOutput> {
                             // consistent with Libra's existing within-line `-b`.
                             byte_offset: args.byte_offset.then_some(start),
                             is_context: false,
+                            line_prefix: None,
                         });
                     }
                 }
             } else {
-                for (line_num, line, byte_off, is_ctx) in file_matches {
+                let file_matches = if args.show_function || args.function_context {
+                    let text = String::from_utf8_lossy(&content);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let path = search_file.path.display().to_string();
+                    let regex = crate::utils::funcname::configured_funcname_regex(&path).await;
+                    apply_function_context(file_matches, &lines, regex.as_ref(), args)
+                } else {
+                    file_matches
+                };
+                for (line_num, line, byte_off, is_ctx, prefix) in file_matches {
                     matches.push(GrepMatch {
                         path: search_file.path.display().to_string(),
                         line_number: line_num,
                         line,
                         byte_offset: (args.byte_offset && !is_ctx).then_some(byte_off),
                         is_context: is_ctx,
+                        line_prefix: prefix,
                     });
                 }
             }
@@ -1510,7 +1638,7 @@ fn search_in_content(
     matchers: &[GrepMatcher],
     expr: Option<&Expr>,
     args: &GrepArgs,
-) -> CliResult<Vec<(usize, String, usize, bool)>> {
+) -> CliResult<Vec<GrepRow>> {
     let content_str = String::from_utf8_lossy(content);
     let lines: Vec<&str> = content_str.lines().collect();
     let (before, after) = context_window(args);
@@ -1540,7 +1668,15 @@ fn search_in_content(
     if before == 0 && after == 0 {
         return Ok(match_indices
             .into_iter()
-            .map(|idx| (idx + 1, lines[idx].to_string(), byte_off_of(idx), false))
+            .map(|idx| {
+                (
+                    idx + 1,
+                    lines[idx].to_string(),
+                    byte_off_of(idx),
+                    false,
+                    None,
+                )
+            })
             .collect());
     }
 
@@ -1562,7 +1698,7 @@ fn search_in_content(
         .map(|idx| {
             let is_match = match_set.contains(&idx);
             let byte_off = if is_match { byte_off_of(idx) } else { 0 };
-            (idx + 1, lines[idx].to_string(), byte_off, !is_match)
+            (idx + 1, lines[idx].to_string(), byte_off, !is_match, None)
         })
         .collect())
 }
@@ -1682,12 +1818,14 @@ fn render_grep_output(
             // match lines use ':' and context lines use '-'.
             let sep: char = if args.null {
                 '\0'
+            } else if let Some(prefix) = match_item.line_prefix {
+                prefix
             } else if match_item.is_context {
                 '-'
             } else {
                 ':'
             };
-            let rendered = if match_item.is_context {
+            let rendered = if match_item.is_context || match_item.line_prefix.is_some() {
                 match_item.line.clone()
             } else if let Some(matcher) =
                 matcher.as_ref().filter(|_| !args.invert_match && !args.not)

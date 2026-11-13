@@ -4672,7 +4672,10 @@ pub(crate) fn compute_unified_hunks(
             let indexed =
                 anchored_indexed_changes(&old_records, &new_records, &new_records, anchors);
             let changes = materialize_indexed_changes(&indexed, &old_lines, &new_lines);
-            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+            append_function_context(
+                assemble_unified_hunks(&changes, context, old_text.len() + new_text.len()),
+                new_text,
+            )
         }
         _ => {
             let diff = TextDiff::configure()
@@ -4682,9 +4685,42 @@ pub(crate) fn compute_unified_hunks(
                 .iter_all_changes()
                 .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
                 .collect();
-            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+            append_function_context(
+                assemble_unified_hunks(&changes, context, old_text.len() + new_text.len()),
+                new_text,
+            )
         }
     }
+}
+
+/// Append Git's function-context suffix to each hunk header using the shared
+/// `utils::funcname` rule (ADR-LG-08 item 2 / M-GCTX X5).
+fn append_function_context(hunks: String, new_text: &str) -> String {
+    let lines: Vec<&str> = new_text.lines().collect();
+    let mut out = String::new();
+    for line in hunks.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        if let Some(rest) = content.strip_prefix("@@ ")
+            && let Some((spans, suffix)) = rest.split_once(" @@")
+            && suffix.trim().is_empty()
+            && let Some(start) = spans
+                .split_whitespace()
+                .find_map(|span| span.strip_prefix('+'))
+                .and_then(|span| span.split(',').next())
+                .and_then(|span| span.parse::<usize>().ok())
+            && let Some(index) = start.checked_sub(2)
+            && let Some(name) = crate::utils::funcname::function_name_for_path("", &lines, index)
+        {
+            out.push_str(&format!("@@ {spans} @@ {name}{newline}"));
+            continue;
+        }
+        out.push_str(content);
+        out.push_str(newline);
+    }
+    out
 }
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character

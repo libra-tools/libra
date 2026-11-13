@@ -2,6 +2,7 @@
 
 pub mod error;
 #[cfg(unix)]
+pub mod funcname;
 pub mod fuse;
 pub mod output;
 
