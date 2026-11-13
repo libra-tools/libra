@@ -689,13 +689,16 @@ async fn test_show_tree_output_uses_git_modes_and_types() {
         String::from_utf8_lossy(&human.stderr)
     );
     let human_stdout = String::from_utf8_lossy(&human.stdout);
+    // ADR-LG-05 item 3 / M-SHOWTREE: human `show <tree>` prints Git's short
+    // form (`tree <name>`, blank line, entry names only), while `--json`
+    // keeps the mode/type/hash schema.
     assert!(
-        human_stdout.contains("100644 blob"),
-        "expected git tree mode/type in human output, got: {human_stdout}"
+        human_stdout.contains(&format!("tree {tree_hash}\n\ntracked.txt\n")),
+        "expected Git-style tree output, got: {human_stdout}"
     );
     assert!(
-        human_stdout.contains("\ttracked.txt"),
-        "expected tracked entry in human output, got: {human_stdout}"
+        !human_stdout.contains("100644 blob"),
+        "human tree output no longer prints modes/types: {human_stdout}"
     );
 
     let output = run_libra_command(&["--json", "show", &tree_hash], repo.path());
@@ -1573,4 +1576,109 @@ fn test_show_header_blank_line() {
         text.contains(&format!("{date_line}\n\n    base")),
         "blank line between header and message: {text:?}"
     );
+}
+
+/// LG-06 (M-SHOWTREE T1/T2): `^{tree}`, `<rev>:<dir>`, and bare tree ids use
+/// Git's short tree form (name, blank line, entry names, `/` for subtrees).
+#[test]
+#[serial(cwd)]
+fn test_show_tree_objects_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::create_dir_all(p.join("dir2")).unwrap();
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    std::fs::write(p.join("dir1/b.txt"), "b\n").unwrap();
+    std::fs::write(p.join("dir1/sub/c.txt"), "c\n").unwrap();
+    std::fs::write(p.join("dir2/d.txt"), "d\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add -A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tree matrix", "--no-verify"], p),
+        "commit",
+    );
+
+    // T1: `<rev>^{tree}` keeps the user-supplied name and lists only entry
+    // names, non-recursively, with a trailing `/` for subtrees.
+    let tree = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&tree, "show HEAD^{tree}");
+    let text = String::from_utf8_lossy(&tree.stdout).into_owned();
+    assert_eq!(
+        text, "tree HEAD^{tree}\n\na.txt\ndir1/\ndir2/\ntracked.txt\n",
+        "canonical tree listing"
+    );
+
+    // T2: `<rev>:<dir>` renders the subtree, including a trailing slash form.
+    for spec in ["HEAD:dir1", "HEAD:dir1/"] {
+        let out = run_libra_command(&["show", spec], p);
+        assert_cli_success(&out, "show HEAD:dir1");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(
+            text,
+            format!("tree {spec}\n\nb.txt\nsub/\n"),
+            "subtree listing for {spec}"
+        );
+    }
+
+    // T2: a bare tree id renders `tree <oid>` plus entries (no mode columns).
+    let oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^{tree}"], p).stdout)
+        .trim()
+        .to_string();
+    let bare = run_libra_command(&["show", &oid], p);
+    assert_cli_success(&bare, "show <tree oid>");
+    let text = String::from_utf8_lossy(&bare.stdout).into_owned();
+    assert!(text.starts_with(&format!("tree {oid}\n\n")), "{text:?}");
+    assert!(text.contains("dir1/\n"), "{text:?}");
+    assert!(!text.contains("100644"), "{text:?}");
+
+    // T4 regression: `<rev>:<file>` still prints blob content, not a header.
+    let blob = run_libra_command(&["show", "HEAD:dir1/b.txt"], p);
+    assert_cli_success(&blob, "show HEAD:dir1/b.txt");
+    assert_eq!(String::from_utf8_lossy(&blob.stdout), "b\n");
+}
+
+/// LG-06 (M-SHOWTREE T3): upstream `t7007` show-tree ports.
+#[test]
+#[serial(cwd)]
+fn test_t7007_show_tree_ports() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::write(p.join("dir1/b.txt"), "b\n").unwrap();
+    std::fs::write(p.join("dir1/sub/c.txt"), "c\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add -A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "t7007", "--no-verify"], p),
+        "commit",
+    );
+
+    // t7007:41 — showing a tree prints the header and its entries.
+    let shown = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&shown, "t7007 showing a tree");
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(text.starts_with("tree HEAD^{tree}\n\n"), "{text:?}");
+    assert!(text.contains("dir1/\n"), "{text:?}");
+
+    // t7007:51 — two trees in one invocation? Git's `show` takes one object, so
+    // the port exercises the same tree through both spellings.
+    let via_rev = run_libra_command(&["show", "HEAD:dir1"], p);
+    assert_cli_success(&via_rev, "t7007 two trees");
+    let via_peel = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&via_peel, "t7007 two trees peel");
+    assert!(
+        String::from_utf8_lossy(&via_rev.stdout).contains("b.txt"),
+        "subtree entries present"
+    );
+
+    // t7007:66 — the default listing is not recursive: `dir1/sub` appears as a
+    // directory entry, never as a nested path.
+    let not_recursive = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&not_recursive, "t7007 not recursive");
+    let text = String::from_utf8_lossy(&not_recursive.stdout).into_owned();
+    assert!(!text.contains("dir1/sub/c.txt"), "{text:?}");
+    assert!(!text.contains("c.txt"), "{text:?}");
+
+    // T4 regression: peeling to a commit still renders the commit header.
+    let commit = run_libra_command(&["show", "-s", "HEAD^{commit}"], p);
+    assert_cli_success(&commit, "show HEAD^{commit}");
+    assert!(String::from_utf8_lossy(&commit.stdout).contains("t7007"));
 }

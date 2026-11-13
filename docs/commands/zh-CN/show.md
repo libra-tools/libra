@@ -21,6 +21,19 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 默认头部在 `Date:` 行与缩进的提交消息之间保留一个空行。`--oneline`、`--pretty`、
 `--format` 按命令行顺序后者生效。
 
+### 树对象
+
+`libra show <tree-ish>` 接受树 id、`<rev>^{tree}` 或 `<rev>:<dir>`，输出 Git 的简洁
+树形式：`tree <用户给出的名字>`、空行，然后按树顺序每行一个条目名；子树带尾部
+`/`（如 `dir1/`），列表不递归。`--json` 仍保留 `{mode, object_type, hash, name}`
+的完整条目结构。
+
+```bash
+libra show 'HEAD^{tree}'
+libra show HEAD:dir1
+libra show <tree-oid>
+```
+
 ## 选项
 
 | 标志 | 短选项 | 说明 |

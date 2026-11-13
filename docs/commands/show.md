@@ -30,6 +30,20 @@ The default header keeps the blank line between the `Date:` line and the
 indented commit message. `--oneline`, `--pretty`, and `--format` are
 last-one-wins.
 
+### Tree objects
+
+`libra show <tree-ish>` accepts a tree id, `<rev>^{tree}`, or `<rev>:<dir>` and
+prints Git's short tree form: `tree <name as given>`, a blank line, then one
+entry name per line in tree order. Subtrees carry a trailing `/`
+(`dir1/`); the listing is not recursive. `--json` keeps the richer
+`{mode, object_type, hash, name}` entry schema.
+
+```bash
+libra show 'HEAD^{tree}'
+libra show HEAD:dir1
+libra show <tree-oid>
+```
+
 ## Options
 
 | Flag | Short | Description |

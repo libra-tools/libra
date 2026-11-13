@@ -407,7 +407,7 @@ async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<St
         let hash = util::resolve_object_spec_typed(object_ref)
             .await
             .map_err(|_| show_bad_revision_error(object_ref))?;
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Handle `<revision>:<path>` lookups before generic revision resolution.
@@ -425,13 +425,13 @@ async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<St
         let hash = util::resolve_object_spec_typed(object_ref)
             .await
             .map_err(|_| show_bad_revision_error(object_ref))?;
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref)? {
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Resolve refs first so tags keep their custom rendering.
@@ -517,6 +517,7 @@ async fn validate_show_quiet(args: &ShowArgs) -> CliResult<()> {
 /// Shows an object by hash after resolving its object type.
 fn show_object_by_hash<'a>(
     hash: &'a ObjectHash,
+    display_name: &'a str,
     args: &'a ShowArgs,
     color_enabled: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CliResult<String>> + 'a>> {
@@ -530,7 +531,7 @@ fn show_object_by_hash<'a>(
         match obj_type {
             ObjectType::Commit => show_commit(hash, args, color_enabled).await,
             ObjectType::Tag => show_tag_by_hash(hash, args, color_enabled).await,
-            ObjectType::Tree => show_tree(hash).await,
+            ObjectType::Tree => show_tree(hash, display_name).await,
             ObjectType::Blob => show_blob(hash).await,
             _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
         }
@@ -892,7 +893,15 @@ async fn show_tag_by_hash(
             output.push_str("\n\n");
 
             // Continue with the tagged object.
-            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args, color_enabled).await?);
+            output.push_str(
+                &show_object_by_hash(
+                    &tag_obj.object_hash,
+                    &tag_obj.object_hash.to_string(),
+                    args,
+                    color_enabled,
+                )
+                .await?,
+            );
             Ok(output)
         }
         Ok(tag::TagObject::Commit(commit)) => {
@@ -915,20 +924,21 @@ async fn validate_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<(
     }
 }
 
-/// Shows a tree object.
-async fn show_tree(hash: &ObjectHash) -> CliResult<String> {
+/// Shows a tree object in Git's `show <tree>` form: `tree <name>`, a blank line,
+/// then one entry name per line with a trailing `/` for subtrees (non-recursive,
+/// tree order). ADR-LG-05 item 3 / M-SHOWTREE.
+async fn show_tree(hash: &ObjectHash, display_name: &str) -> CliResult<String> {
     let tree = load_object::<Tree>(hash).map_err(|e| show_object_load_error(hash, e))?;
 
-    let mut output = format!("{} {}\n\n", "tree".yellow(), hash);
+    let mut output = format!("{} {}\n\n", "tree".yellow(), display_name);
 
     for item in &tree.tree_items {
-        output.push_str(&format!(
-            "{:06o} {} {}\t{}\n",
-            tree_item_mode_to_u32(item.mode),
-            tree_item_mode_to_object_type(item.mode),
-            item.id,
-            item.name
-        ));
+        let suffix = if matches!(item.mode, TreeItemMode::Tree) {
+            "/"
+        } else {
+            ""
+        };
+        output.push_str(&format!("{}{}\n", item.name, suffix));
     }
     Ok(output)
 }
@@ -964,14 +974,42 @@ async fn show_commit_file(rev: &str, file_path: &str) -> CliResult<String> {
     let commit =
         load_object::<Commit>(&commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
-    // Load the tree for the resolved commit.
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| show_object_load_error(commit.tree_id, e))?;
+    // ADR-LG-05 item 3: `<rev>:<dir>` renders the subtree exactly like
+    // `<rev>^{tree}` does, so walk each path component and keep the object
+    // mode instead of only consulting the flattened blob list.
+    let normalized = file_path.trim_end_matches('/');
+    let mut tree_hash = commit.tree_id;
+    let mut tree =
+        load_object::<Tree>(&tree_hash).map_err(|e| show_object_load_error(tree_hash, e))?;
+    let mut found_tree = normalized.is_empty();
+    if !normalized.is_empty() {
+        let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
+        for (index, component) in components.iter().enumerate() {
+            let Some(item) = tree.tree_items.iter().find(|item| item.name == *component) else {
+                return Err(show_path_not_found_error(file_path, rev));
+            };
+            let last = index + 1 == components.len();
+            match item.mode {
+                TreeItemMode::Tree => {
+                    tree_hash = item.id;
+                    tree = load_object::<Tree>(&tree_hash)
+                        .map_err(|e| show_object_load_error(tree_hash, e))?;
+                    if last {
+                        found_tree = true;
+                    }
+                }
+                _ if last => return show_blob(&item.id).await,
+                _ => return Err(show_path_not_found_error(file_path, rev)),
+            }
+        }
+    }
+    if found_tree {
+        return show_tree(&tree_hash, &format!("{rev}:{file_path}")).await;
+    }
 
-    // Find the target path inside the tree.
+    // `get_plain_items` also covers the empty path (the commit's root tree).
     let items = tree.get_plain_items()?;
     let target_path = PathBuf::from(file_path);
-
     if let Some((_, blob_hash)) = items.iter().find(|(path, _)| path == &target_path) {
         show_blob(blob_hash).await
     } else {
