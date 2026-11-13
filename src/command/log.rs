@@ -3914,8 +3914,7 @@ impl GraphState {
     }
 
     fn is_mapping_correct(&self) -> bool {
-        for i in 0..self.mapping_size {
-            let target = self.mapping[i];
+        for (i, &target) in self.mapping.iter().take(self.mapping_size).enumerate() {
             if target < 0 {
                 continue;
             }
