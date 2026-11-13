@@ -1351,7 +1351,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/673.md`](issues/673.md) | commit 接受无时区的 YYYY-MM-DD HH:MM[:SS] 本地时间 | 未启动（计划已 Codex PASS，待排期执行） | I673-01 |
 | [`issues/674.md`](issues/674.md) | `repack -A/-Ad` 不可达对象安全重打包 | **重建完成（初稿规模），待重新送审**：2026-11-13 事故后由会话快照/Codex 作者日志回放重建，补齐模板强制章节并机械重算 AC/VER；与丢失的末次修订版相比范围更小，差异见文件顶部告警 | `I674-01` AC=19/8@EX-01 VER=8/8；`A674-02` AC=8/20 VER=3/20 |
 | [`issues/974.md`](issues/974.md) | 合并消息标题按目标类型装饰（branch/tag/commit/remote-tracking） | **Codex R48 PASS（2026-11-13 15:55:00）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I974-01（1 卡，AC=51/8@EX-01 VER=21/8@EX-01） |
-| [`issues/975.md`](issues/975.md) | 新增 `libra fmt-merge-msg` 管线命令 | 未启动（2026-11-12 17:45:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I975-01（1 卡，AC=24/8@EX-01） |
+| [`issues/975.md`](issues/975.md) | 新增 `libra fmt-merge-msg` 管线命令 | **Codex R28 PASS（2026-11-13 06:06:00 UTC）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I975-01（1 卡，AC=71/8@EX-01 VER=41/8@EX-01） |
 | [`issues/976.md`](issues/976.md) | `fetch` 命令行 refspec 写成可合并 `FETCH_HEAD` 行 | 未启动（2026-11-12 18:05:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I976-01（1 卡，AC=18/8@EX-01） |
 | [`issues/977.md`](issues/977.md) | `merge --log` 截断输出 `(N commits)` 与 `...` | 未启动（2026-11-12 18:25:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I977-01（1 卡，AC=18/8@EX-01） |
 | [`issues/817.md`](issues/817.md) | `libra config <key> <value>` 接受以 `-` 开头的值 | 未启动（2026-11-12 19:45:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I817-01（1 卡，AC=18/8@EX-01） |
