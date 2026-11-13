@@ -1554,7 +1554,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "a\nb\nX\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -2,0 +3,1 @@"),
+        s.contains("@@ -2,0 +3 @@"),
         "insert-middle anchors at -2,0:\n{s}"
     );
 
@@ -1563,7 +1563,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "X\na\nb\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -0,0 +1,1 @@"),
+        s.contains("@@ -0,0 +1 @@"),
         "insert-at-start anchors at -0,0:\n{s}"
     );
 
@@ -1572,7 +1572,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "a\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -2,1 +1,0 @@"),
+        s.contains("@@ -2 +1,0 @@"),
         "delete-middle anchors at +1,0:\n{s}"
     );
 
@@ -1596,11 +1596,11 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "b\nX\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -1,1 +0,0 @@"),
+        s.contains("@@ -1 +0,0 @@"),
         "first hunk deletes `a` at -1,1 +0,0:\n{s}"
     );
     assert!(
-        s.contains("@@ -2,0 +2,1 @@"),
+        s.contains("@@ -2,0 +2 @@"),
         "second hunk anchors after the separator line (-2,0 +2,1):\n{s}"
     );
 }
@@ -4036,4 +4036,61 @@ fn i861_failure_index_read_is_not_quiet_success_or_deletion() {
         }
         assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), before);
     }
+}
+
+/// LG-03 (M-HUNK H1..H5): canonical hunk headers across output surfaces.
+#[test]
+#[serial(cwd)]
+fn test_diff_hunk_headers_match_git_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // H4: single-line modification -> `@@ -1 +1 @@`.
+    fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff single-line modify");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -1 +1 @@"), "{text}");
+
+    // H3: an emptied-but-present file keeps `+++ b/<path>` and `@@ -1 +0,0 @@`.
+    fs::write(p.join("tracked.txt"), "").unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff emptied");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("+++ b/tracked.txt"), "{text}");
+    assert!(text.contains("@@ -1 +0,0 @@"), "{text}");
+    assert!(!text.contains("+++ /dev/null"), "{text}");
+    assert!(!text.contains("deleted file mode"), "{text}");
+
+    // Restore the tracked file to HEAD's content so the new-file cases start
+    // from a clean tree (no commit needed — it is already committed).
+    fs::write(p.join("tracked.txt"), "tracked\n").unwrap();
+
+    // H1: a new one-line file via intent-to-add -> `@@ -0,0 +1 @@`.
+    fs::write(p.join("new.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-N", "new.txt"], p), "add -N");
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff new one-line file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -0,0 +1 @@"), "{text}");
+
+    // H1: a new three-line file -> `@@ -0,0 +1,3 @@`.
+    fs::write(p.join("three.txt"), "a\nb\nc\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "three.txt"], p),
+        "add -N three",
+    );
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff new three-line file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -0,0 +1,3 @@"), "{text}");
+
+    // H2: a deleted file -> `deleted file mode`, `+++ /dev/null`, `@@ -1 +0,0 @@`.
+    fs::remove_file(p.join("tracked.txt")).unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff deleted file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("deleted file mode"), "{text}");
+    assert!(text.contains("+++ /dev/null"), "{text}");
+    assert!(text.contains("@@ -1 +0,0 @@"), "{text}");
 }

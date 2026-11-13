@@ -75,6 +75,18 @@ stored objects.
 
 In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected.
 
+## Canonical patch format
+
+Unified hunk headers follow Git's canonical form on every patch surface (`diff`,
+`diff --cached`, `show`, `log -p`, `format-patch`, `diff-files`/`diff-tree -p`,
+`stash show -p`): a one-line side omits `,1` (`@@ -1 +1 @@`), an empty side
+anchors at the preceding line and uses 0 at the start of a file
+(`@@ -0,0 +1,3 @@`, `@@ -1 +0,0 @@`), and otherwise the form is
+`@@ -<start>,<count> +<start>,<count> @@`. Only a truly deleted file renders
+`deleted file mode` and `+++ /dev/null`; a file emptied but still present keeps
+`+++ b/<path>`. `libra apply` and `libra am` accept both this canonical form and
+older explicit-count headers.
+
 ## Options
 
 | Option | Short | Long | Description |

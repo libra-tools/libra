@@ -6,7 +6,9 @@ use std::fs;
 
 use tempfile::{TempDir, tempdir};
 
-use super::{parse_json_stdout, run_libra_command, run_libra_command_with_stdin};
+use super::{
+    assert_cli_success, parse_json_stdout, run_libra_command, run_libra_command_with_stdin,
+};
 
 fn init_repo() -> TempDir {
     let repo = tempdir().unwrap();
@@ -254,4 +256,43 @@ fn apply_outside_repository_is_an_error() {
     fs::write(dir.path().join("p.diff"), MODIFY_PATCH).unwrap();
     let out = run_libra_command(&["apply", "--check", "p.diff"], dir.path());
     assert_eq!(out.status.code(), Some(128));
+}
+
+/// LG-03 (M-HUNK H7): `apply --check` accepts legacy non-canonical hunk headers.
+#[test]
+fn test_apply_check_accepts_legacy_hunk_headers() {
+    let repo = init_repo();
+    assert!(
+        run_libra_command(&["config", "user.name", "T"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["config", "user.email", "t@e"], repo.path())
+            .status
+            .success()
+    );
+    fs::write(repo.path().join("f.txt"), "a\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "f.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+
+    // Legacy form: explicit `,0`/`,1` counts on both sides.
+    let legacy = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1,0 +2,1 @@
++b
+";
+    let patch = repo.path().join("legacy.patch");
+    fs::write(&patch, legacy).unwrap();
+    let out = run_libra_command(&["apply", "--check", patch.to_str().unwrap()], repo.path());
+    assert_cli_success(&out, "apply --check legacy header");
 }

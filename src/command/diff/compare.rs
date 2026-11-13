@@ -489,6 +489,7 @@ pub(crate) async fn run_diff(
     );
     for file in &mut files {
         apply_mode_metadata_to_patch(file);
+        fix_empty_side_labels(file);
     }
     // issues/479 DF-01 / TC-0044: the status letter must follow ENTRY PRESENCE,
     // not the rendered patch text. `parse_diff_item` classifies from the
@@ -917,6 +918,46 @@ pub(crate) fn apply_mode_metadata_to_patch(file: &mut DiffFileStat) {
     file.raw_diff = output.join("\n");
     if trailing_newline {
         file.raw_diff.push('\n');
+    }
+}
+
+/// ADR-LG-04 item 2: only a truly deleted file renders `+++ /dev/null`.
+/// `git_internal` renders a side whose *content* is empty as `/dev/null`, so an
+/// emptied-but-present file would otherwise look deleted. Presence metadata
+/// (`old_mode`/`new_mode`) is authoritative here: rewrite the labels back to
+/// `a/<path>` / `b/<path>` when both sides exist.
+pub(crate) fn fix_empty_side_labels(file: &mut DiffFileStat) {
+    if file.raw_diff.starts_with("diff --cc ") {
+        return;
+    }
+    if !matches!((file.old_mode, file.new_mode), (Some(_), Some(_))) {
+        return;
+    }
+    let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
+    let mut changed = false;
+    let repaired: Vec<String> = file
+        .raw_diff
+        .lines()
+        .map(|line| {
+            if line == "--- /dev/null" {
+                changed = true;
+                return format!("--- a/{old_path}");
+            }
+            if line == "+++ /dev/null" {
+                changed = true;
+                return format!("+++ b/{}", file.path);
+            }
+            line.to_string()
+        })
+        .collect();
+    if changed {
+        let mut raw = repaired.join("\n");
+        if file.raw_diff.ends_with('\n') {
+            raw.push('\n');
+        }
+        file.raw_diff = raw;
+        // The header changed, so the parsed hunk boundaries must follow.
+        file.hunks = parse_diff_hunks(&file.raw_diff);
     }
 }
 

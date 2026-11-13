@@ -5038,7 +5038,10 @@ fn compute_unified_hunks_ignore_blank_inner(
         let new_start = if new_count == 0 { s2 } else { s2 + 1 };
         let _ = writeln!(
             out,
-            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+            "{}",
+            crate::utils::diff_format::format_hunk_header(
+                old_start, old_count, new_start, new_count,
+            )
         );
 
         // Emit body: context, then each group's deletions and insertions in order.
@@ -5254,7 +5257,8 @@ fn flush_unified_hunk<'a>(
     let new_start = new_first.unwrap_or(*last_new_seen);
     let _ = writeln!(
         out,
-        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        "{}",
+        crate::utils::diff_format::format_hunk_header(old_start, old_count, new_start, new_count)
     );
 
     for &e in cur_hunk.iter() {
@@ -5405,17 +5409,73 @@ fn moved_line_bodies(diff_text: &str) -> std::collections::HashSet<&str> {
 /// Render `--shortstat`: just the trailing summary line of `--stat`, omitting
 /// the insertion/deletion clause when its count is zero (matching Git, which
 /// shows e.g. ` 1 file changed, 2 insertions(+)` with no deletions clause).
+/// Rewrite `@@ -a,b +c,d @@` lines to Git's canonical form (ADR-LG-04).
+///
+/// `git_internal` always prints explicit counts. Git omits `,1` and, for an
+/// empty side at the start of the file, anchors at 0 (`+0,0`). A zero-count
+/// side is anchored at the line before the hunk; when the hunk starts at line
+/// 1 on the other side, that anchor is 0.
+pub(crate) fn canonicalize_hunk_headers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        if let Some(rebuilt) = rebuild_hunk_header(content) {
+            out.push_str(&rebuilt);
+            out.push_str(newline);
+        } else {
+            out.push_str(content);
+            out.push_str(newline);
+        }
+    }
+    out
+}
+
+fn parse_hunk_span(spec: &str, sign: char) -> Option<(usize, usize)> {
+    let spec = spec.strip_prefix(sign)?;
+    match spec.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
+    }
+}
+
+fn rebuild_hunk_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("@@ ")?;
+    let (spans, suffix) = rest.split_once(" @@")?;
+    let mut parts = spans.split_whitespace();
+    let old = parts.next()?;
+    let new = parts.next()?;
+    let (old_start, old_count) = parse_hunk_span(old, '-')?;
+    let (new_start, new_count) = parse_hunk_span(new, '+')?;
+    let anchor = |start: usize, count: usize, other_start: usize| -> usize {
+        if count == 0 && start == 1 && other_start == 1 {
+            0
+        } else {
+            start
+        }
+    };
+    let old_start = anchor(old_start, old_count, new_start);
+    let new_start = anchor(new_start, new_count, old_start);
+    Some(format!(
+        "{}{suffix}",
+        crate::utils::diff_format::format_hunk_header(old_start, old_count, new_start, new_count)
+    ))
+}
+
 fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
-    let status = parse_diff_status(&item.data);
-    let (insertions, deletions) = count_hunk_line_changes(&item.data);
+    let data = canonicalize_hunk_headers(&item.data);
+    let status = parse_diff_status(&data);
+    let (insertions, deletions) = count_hunk_line_changes(&data);
 
     DiffFileStat {
         path: item.path.clone(),
         status: status.to_string(),
         insertions,
         deletions,
-        hunks: parse_diff_hunks(&item.data),
-        raw_diff: item.data.clone(),
+        hunks: parse_diff_hunks(&data),
+        raw_diff: data,
         rename_from: None,
         similarity: None,
         binary: None,

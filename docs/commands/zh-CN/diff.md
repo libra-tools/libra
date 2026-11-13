@@ -50,6 +50,16 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 
 旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。
 
+## 规范补丁格式
+
+所有补丁输出面（`diff`、`diff --cached`、`show`、`log -p`、`format-patch`、
+`diff-files`/`diff-tree -p`、`stash show -p`）的 unified hunk 头采用 Git 规范形式：
+单行侧省略 `,1`（`@@ -1 +1 @@`），空侧锚定在前一行、文件开头为 0
+（`@@ -0,0 +1,3 @@`、`@@ -1 +0,0 @@`），其余为
+`@@ -<start>,<count> +<start>,<count> @@`。只有真正删除的文件输出
+`deleted file mode` 与 `+++ /dev/null`；内容被清空但文件仍存在时保持
+`+++ b/<path>`。`libra apply` 与 `libra am` 同时接受该规范形式与旧版显式计数头。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |
