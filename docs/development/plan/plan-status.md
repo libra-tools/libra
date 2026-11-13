@@ -1372,7 +1372,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/974.md`](issues/974.md) | 合并消息标题按目标类型装饰（branch/tag/commit/remote-tracking） | **Codex R48 PASS（2026-11-13 15:55:00）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I974-01（1 卡，AC=51/8@EX-01 VER=21/8@EX-01） |
 | [`issues/975.md`](issues/975.md) | 新增 `libra fmt-merge-msg` 管线命令 | **Codex R28 PASS（2026-11-13 06:06:00 UTC）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I975-01（1 卡，AC=71/8@EX-01 VER=41/8@EX-01） |
 | [`issues/976.md`](issues/976.md) | `fetch` 命令行 refspec 写成可合并 `FETCH_HEAD` 行 | 未启动（2026-11-12 18:05:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I976-01（1 卡，AC=18/8@EX-01） |
-| [`issues/977.md`](issues/977.md) | `merge --log` 截断输出 `(N commits)` 与 `...` | Codex R2 PASS（2026-11-13 17:06:05 UTC）；待逐份提交推送；实施未启动且未授权；EX-01 具名批准 | I977-01（1 卡，AC=18/8@EX-01） |
+| [`issues/977.md`](issues/977.md) | `merge --log` 截断输出 `(N commits)` 与 `...` | Codex R2 PASS（2026-11-13 17:06:05 UTC）；计划与索引随 `27e2c4a` 签名+DCO 推送 `main`；实施未启动且未授权；EX-01 具名批准 | I977-01（1 卡，AC=18/8@EX-01） |
 | [`issues/817.md`](issues/817.md) | `libra config <key> <value>` 接受以 `-` 开头的值 | **Codex R17 PASS（2026-11-13 06:50:00 UTC）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I817-01（1 卡，AC=95/8@EX-01 VER=59/8@EX-01，scope=M） |
 | [`issues/978.md`](issues/978.md) | `branch.<name>.mergeOptions` 在 `merge` 上生效 | 未启动（2026-11-12 19:35:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I978-01（1 卡，AC=18/8@EX-01） |
 | [`issues/984.md`](issues/984.md) | `merge` 接受 `--no-squash` 取反形式（last-wins） | 未启动（2026-11-12 19:25:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I984-01（1 卡，AC=16/8@EX-01） |
