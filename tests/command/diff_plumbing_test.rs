@@ -5,6 +5,7 @@
 
 use std::{fs, process::Output};
 
+use serial_test::serial;
 use tempfile::TempDir;
 
 use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
@@ -1079,4 +1080,116 @@ fn i861_auto_patch_cleaning_preserves_stat_only_exit_contract() {
         assert_eq!(i1062_run(&repo, &args).status.code(), Some(1), "{args:?}");
     }
     i1062_ok(&repo, &["diff", "--quiet", "--", "probe.ps1"]);
+}
+
+/// LG-09 (M-DTREE D1–D7): `diff-tree` default raw, recursion, `-t`, single
+/// commit form, `--root`, and patch output match Git.
+#[test]
+#[serial(cwd)]
+fn test_diff_tree_raw_and_patch_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    fs::create_dir_all(p.join("dir2")).unwrap();
+    fs::write(p.join("dir1/sub/x"), "a\n").unwrap();
+    fs::write(p.join("dir2/z"), "a\nb\n").unwrap();
+    fs::write(p.join("tracked.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("dir1/sub/x"), "a\nb\n").unwrap();
+    fs::write(p.join("dir2/z"), "a\nb\nc\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], p),
+        "commit change",
+    );
+
+    let head = rev_parse(&repo, "HEAD");
+    let head_parent = rev_parse(&repo, "HEAD~1");
+
+    // D1: default is non-recursive raw with full OIDs and tree entries.
+    let out = run_libra_command(&["diff-tree", "HEAD~1", "HEAD"], p);
+    assert_cli_success(&out, "diff-tree default");
+    let text = out_str(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].starts_with(":040000 040000 "), "{text}");
+    assert!(lines[0].ends_with("\tdir1"), "{text}");
+    assert!(lines[1].ends_with("\tdir2"), "{text}");
+    // Full 40-char object ids, not 7-char abbreviations.
+    let oids: Vec<&str> = lines[0].split_whitespace().skip(2).take(2).collect();
+    assert!(oids.iter().all(|oid| oid.len() == 40), "{text}");
+
+    // D2: `-r` lists blobs; `--raw -r` is identical.
+    let recursive = run_libra_command(&["diff-tree", "-r", "HEAD~1", "HEAD"], p);
+    assert_cli_success(&recursive, "diff-tree -r");
+    let rtext = out_str(&recursive);
+    assert!(rtext.contains("M\tdir1/sub/x"), "{rtext}");
+    assert!(rtext.contains("M\tdir2/z"), "{rtext}");
+    assert!(!rtext.contains(":040000"), "{rtext}");
+    let raw_r = run_libra_command(&["diff-tree", "--raw", "-r", "HEAD~1", "HEAD"], p);
+    assert_eq!(out_str(&raw_r), rtext, "--raw -r matches -r");
+
+    // D6: `-t` includes tree entries while recursing.
+    let with_trees = run_libra_command(&["diff-tree", "-r", "-t", "HEAD~1", "HEAD"], p);
+    assert_cli_success(&with_trees, "diff-tree -r -t");
+    let ttext = out_str(&with_trees);
+    assert!(ttext.contains("M\tdir1"), "{ttext}");
+    assert!(ttext.contains("M\tdir1/sub"), "{ttext}");
+    assert!(ttext.contains("M\tdir1/sub/x"), "{ttext}");
+
+    // D4: single-commit form prints the commit id line, then non-recursive raw.
+    let single = run_libra_command(&["diff-tree", "HEAD"], p);
+    assert_cli_success(&single, "diff-tree HEAD");
+    let stext = out_str(&single);
+    let mut single_lines = stext.lines();
+    assert_eq!(single_lines.next().unwrap().trim(), head, "{stext}");
+    assert!(
+        single_lines.next().unwrap().starts_with(":040000"),
+        "{stext}"
+    );
+    let no_id = run_libra_command(&["diff-tree", "--no-commit-id", "HEAD"], p);
+    assert_cli_success(&no_id, "diff-tree --no-commit-id");
+    let ntext = out_str(&no_id);
+    assert!(!ntext.starts_with(&head), "{ntext}");
+    assert!(ntext.starts_with(":040000"), "{ntext}");
+
+    // D3: `-p` renders a patch (single form keeps the id line).
+    let patch = run_libra_command(&["diff-tree", "-p", "HEAD~1", "HEAD"], p);
+    assert_cli_success(&patch, "diff-tree -p");
+    let ptext = out_str(&patch);
+    assert!(
+        ptext.contains("diff --git a/dir1/sub/x b/dir1/sub/x"),
+        "{ptext}"
+    );
+    assert!(ptext.contains("@@ -1 +1,2 @@"), "{ptext}");
+    let single_patch = run_libra_command(&["diff-tree", "-p", "HEAD"], p);
+    assert_cli_success(&single_patch, "diff-tree -p HEAD");
+    assert!(
+        out_str(&single_patch).starts_with(&format!("{head}\n")),
+        "id line first"
+    );
+
+    // D5: `-r --root` renders the root commit against the empty tree.
+    let root = rev_parse(&repo, &format!("{head_parent}~1"));
+    let root_out = run_libra_command(&["diff-tree", "-r", "--root", &root], p);
+    assert_cli_success(&root_out, "diff-tree --root");
+    let root_text = out_str(&root_out);
+    assert!(root_text.starts_with(&format!("{root}\n")), "{root_text}");
+    assert!(
+        root_text.contains(":000000 100644 0000000000000000000000000000000000000000 "),
+        "{root_text}"
+    );
+    // The helper's initial commit contains only `tracked.txt`.
+    assert!(root_text.contains("A\ttracked.txt"), "{root_text}");
+    // Without `--root`, a root commit prints only the id line.
+    let root_default = run_libra_command(&["diff-tree", &root], p);
+    assert_eq!(
+        out_str(&root_default).trim(),
+        root,
+        "root default is id only"
+    );
 }
