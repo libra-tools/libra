@@ -215,6 +215,10 @@ libra log --author alice --author bob       # 任一作者模式命中即可
 libra log --committer alice --committer bob
 ```
 
+### Notes 显示
+
+内置格式（以及默认 full 格式）默认显示提交 notes：消息后空一行、`Notes:`，正文每行缩进 4 个空格；非默认 ref 显示 `Notes (<short-ref>):`。`--notes[=<ref>]` / `--show-notes[=<ref>]` 显式选择 ref（给出 ref 时不再隐式包含默认 ref），`--no-notes` 关闭，`notes.displayRef` 追加 ref，`core.notesRef` 改变默认 ref。自定义 `--format` 仅通过 `%N` 显示 note 原文（无 note 时为空）；`--json` 增加可选 `notes` 数组且不改变既有字段。
+
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
 
 按提交消息过滤。可重复指定 `--grep`，默认任一模式匹配即可；`--all-match`

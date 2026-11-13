@@ -313,6 +313,7 @@ async fn test_show_non_quiet_uses_forced_pager() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: true,
@@ -376,6 +377,7 @@ async fn test_show_quiet_still_validates_patch_generation() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -440,6 +442,7 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -913,6 +916,7 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
         no_mailmap: false,
         object: Some("nonexistent_ref_abc123".to_string()),
         no_patch: false,
@@ -967,6 +971,7 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
         no_mailmap: false,
         object: Some("HEAD:nonexistent_file.txt".to_string()),
         no_patch: false,
@@ -1441,4 +1446,30 @@ fn show_storage_read_error_is_not_bad_revision() {
         !stderr.contains("bad revision"),
         "a storage read failure must not be a missing revision: {stderr}"
     );
+}
+
+/// LG-02 (M-NOTES N1): `show` displays default notes and honors the switches.
+#[test]
+#[serial(cwd)]
+fn test_show_displays_default_notes() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "note body"], p),
+        "add note",
+    );
+
+    let default_show = run_libra_command(&["show", "-s", "HEAD"], p);
+    assert_cli_success(&default_show, "show -s");
+    let text = String::from_utf8_lossy(&default_show.stdout);
+    assert!(text.contains("\nNotes:\n"), "{text:?}");
+    assert!(text.contains("    note body"), "{text:?}");
+
+    let hidden = run_libra_command(&["show", "-s", "HEAD", "--no-notes"], p);
+    assert_cli_success(&hidden, "show --no-notes");
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+
+    let alias = run_libra_command(&["show", "-s", "HEAD", "--show-notes"], p);
+    assert_cli_success(&alias, "show --show-notes");
+    assert!(String::from_utf8_lossy(&alias.stdout).contains("Notes:"));
 }

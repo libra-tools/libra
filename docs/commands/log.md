@@ -259,6 +259,17 @@ libra log --author alice --author bob       # either author may match
 libra log --committer alice --committer bob
 ```
 
+### Notes display
+
+Built-in formats (and the default full format) show commit notes by default:
+a blank line, then `Notes:`, then the note body indented four spaces. A
+non-default ref renders `Notes (<short-ref>):`. `--notes[=<ref>]` /
+`--show-notes[=<ref>]` select refs explicitly (giving a ref replaces the
+implicit default), `--no-notes` suppresses them, `notes.displayRef` appends a
+ref, and `core.notesRef` changes the default ref. A custom `--format` shows
+notes only through `%N` (the note text, empty when absent); `--json` adds an
+optional `notes` array without changing existing fields.
+
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
 
 Repeated --grep patterns match if any pattern matches. The default dialect is

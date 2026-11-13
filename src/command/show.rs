@@ -148,6 +148,10 @@ pub struct ShowArgs {
     #[clap(long, value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub notes: Option<String>,
 
+    /// Alias of `--notes` (Git's `--show-notes[=<ref>]`).
+    #[clap(long = "show-notes", value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub show_notes: Option<String>,
+
     /// Do not show commit notes, countermanding an earlier `--notes`.
     #[clap(long = "no-notes")]
     pub no_notes: bool,
@@ -565,8 +569,29 @@ async fn show_commit(
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
     let mut output = String::new();
-    let notes = show_note_text(&commit, args).await;
+    let note_blocks = show_note_blocks(&commit, args).await;
+    let notes = note_blocks
+        .iter()
+        .map(|(_, text)| text.trim_end_matches('\n'))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("{notes}\n")
+    };
     display_commit_info(&mut output, &commit, args, color_enabled, &notes);
+    let custom_format = args.format.is_some()
+        || args
+            .pretty
+            .as_deref()
+            .is_some_and(|pretty| pretty.starts_with("format:") || pretty.starts_with("tformat:"));
+    if !custom_format {
+        for (notes_ref, text) in &note_blocks {
+            output.push_str(&crate::command::log::notes_block_for_ref(notes_ref, text));
+        }
+    }
 
     // Render patch-style details when requested.
     if !args.no_patch {
@@ -975,32 +1000,73 @@ async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
     }
 }
 
-/// Load the note text for `commit` when `--notes` is active or the custom
-/// format expands `%N`. Returns newline-terminated text, or an empty string.
-async fn show_note_text(commit: &Commit, args: &ShowArgs) -> String {
-    let enabled = args.notes.is_some() && !args.no_notes;
-    let uses_placeholder = args
-        .pretty
-        .as_ref()
-        .or(args.format.as_ref())
-        .is_some_and(|template| template.contains("%N"));
-    if !enabled && !uses_placeholder {
-        return String::new();
+/// Resolve which notes refs `show` displays (ADR-LG-03).
+async fn show_notes_refs(args: &ShowArgs, custom_format: bool) -> Vec<String> {
+    if args.no_notes {
+        return Vec::new();
     }
-    let notes_ref = match args.notes.as_deref() {
-        Some(raw) if !raw.is_empty() => crate::internal::notes::normalize_notes_ref(raw)
-            .unwrap_or_else(|_| crate::internal::notes::DEFAULT_NOTES_REF.to_string()),
+    let explicit: Vec<String> = [args.notes.clone(), args.show_notes.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let normalize = |raw: &str| -> String {
+        if raw.is_empty() {
+            crate::internal::notes::DEFAULT_NOTES_REF.to_string()
+        } else {
+            crate::internal::notes::normalize_notes_ref(raw)
+                .unwrap_or_else(|_| crate::internal::notes::DEFAULT_NOTES_REF.to_string())
+        }
+    };
+    if !explicit.is_empty() {
+        return explicit.iter().map(|raw| normalize(raw)).collect();
+    }
+    let _ = custom_format;
+    let mut refs = Vec::new();
+    let default_ref = match read_show_config("core.notesRef").await {
+        Some(raw) if !raw.trim().is_empty() => normalize(raw.trim()),
         _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
     };
-    let text = crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
-        .await
-        .map(|(_, _, text)| text)
-        .unwrap_or_default();
-    if text.is_empty() || text.ends_with('\n') {
-        text
-    } else {
-        format!("{text}\n")
+    refs.push(default_ref);
+    if let Some(display) = read_show_config("notes.displayRef").await
+        && !display.trim().is_empty()
+    {
+        let normalized = normalize(display.trim());
+        if !refs.contains(&normalized) {
+            refs.push(normalized);
+        }
     }
+    refs
+}
+
+async fn read_show_config(key: &'static str) -> Option<String> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        key,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Load the note blocks for `commit`: `(ref, text)` for each non-empty note.
+async fn show_note_blocks(commit: &Commit, args: &ShowArgs) -> Vec<(String, String)> {
+    let custom_format = args.format.is_some()
+        || args
+            .pretty
+            .as_deref()
+            .is_some_and(|pretty| pretty.starts_with("format:") || pretty.starts_with("tformat:"));
+    let refs = show_notes_refs(args, custom_format).await;
+    let mut blocks = Vec::new();
+    for notes_ref in refs {
+        let text = crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
+            .await
+            .map(|(_, _, text)| text)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            blocks.push((notes_ref, text));
+        }
+    }
+    blocks
 }
 
 /// Renders the commit header using the selected format.
@@ -1266,8 +1332,14 @@ async fn collect_commit_output(
         subject,
         body,
         notes: {
-            let text = show_note_text(&commit, args).await;
-            (!text.is_empty()).then_some(text)
+            let blocks = show_note_blocks(&commit, args).await;
+            let text = blocks
+                .iter()
+                .map(|(_, text)| text.trim_end_matches('\n'))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then(|| format!("{text}\n"))
         },
         parents: commit
             .parent_commit_ids

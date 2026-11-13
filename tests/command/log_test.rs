@@ -6290,3 +6290,105 @@ fn test_log_grep_pattern_types_matrix() {
     assert!(stderr.contains("invalid --grep pattern"), "{stderr}");
     assert!(stderr.contains(r"a\("), "{stderr}");
 }
+
+/// LG-02 (M-NOTES N1..N9): default notes display, switches, `%N`, and JSON.
+#[test]
+#[serial(cwd)]
+fn test_log_displays_notes_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // N1: a default-ref note is displayed by the built-in format.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "note body"], p),
+        "add default note",
+    );
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&default_log, "log -1");
+    let text = String::from_utf8_lossy(&default_log.stdout);
+    assert!(text.contains("\nNotes:\n"), "{text:?}");
+    assert!(text.contains("    note body"), "{text:?}");
+
+    // N2: --no-notes suppresses the block.
+    let no_notes = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert_cli_success(&no_notes, "log --no-notes");
+    let text = String::from_utf8_lossy(&no_notes.stdout);
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N3: --notes / --show-notes re-enable it.
+    for flag in ["--notes", "--show-notes"] {
+        let out = run_libra_command(&["log", "-1", flag], p);
+        assert_cli_success(&out, "log notes flag");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // N4: another ref renders its short name and only its note.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "other body",
+            ],
+            p,
+        ),
+        "add other note",
+    );
+    let other = run_libra_command(&["log", "-1", "--notes=other"], p);
+    assert_cli_success(&other, "log --notes=other");
+    let text = String::from_utf8_lossy(&other.stdout);
+    assert!(text.contains("Notes (other):"), "{text:?}");
+    assert!(text.contains("other body"), "{text:?}");
+    assert!(!text.contains("note body"), "{text:?}");
+
+    // N5/N6: `%N` expands the note; a custom format suppresses the block.
+    let placeholder = run_libra_command(&["log", "-1", "--format=%s%n%N"], p);
+    assert_cli_success(&placeholder, "log %N");
+    let text = String::from_utf8_lossy(&placeholder.stdout);
+    assert!(text.contains("note body"), "{text:?}");
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N9: JSON gains a `notes` array without removing existing fields.
+    let json = run_libra_command(&["--machine", "log", "-1"], p);
+    assert_cli_success(&json, "machine log");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    let entry = &parsed["data"]["commits"][0];
+    assert_eq!(entry["notes"][0], "note body");
+    assert!(entry["hash"].is_string(), "existing fields preserved");
+}
+
+/// LG-02 (M-NOTES N8): `t3301` notes-display ports.
+#[test]
+#[serial(cwd)]
+fn test_t3301_notes_display_ports() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "Reviewed-by: Alice"], p),
+        "notes add",
+    );
+
+    // t3301:64 — `git log --format=%N` expands the note on HEAD.
+    let fmt = run_libra_command(&["log", "-1", "--format=%N"], p);
+    assert_cli_success(&fmt, "log %N");
+    assert!(
+        String::from_utf8_lossy(&fmt.stdout).contains("Reviewed-by: Alice"),
+        "{}",
+        String::from_utf8_lossy(&fmt.stdout)
+    );
+
+    // t3301:154 — default `log` shows the note block.
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert!(String::from_utf8_lossy(&default_log.stdout).contains("Notes:"));
+
+    // t3301:282 — `--no-notes` hides it again.
+    let hidden = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+}

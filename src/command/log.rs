@@ -431,6 +431,10 @@ pub struct LogArgs {
     #[clap(long, value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub notes: Option<String>,
 
+    /// Alias of `--notes` (Git's `--show-notes[=<ref>]`).
+    #[clap(long = "show-notes", value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub show_notes: Option<String>,
+
     /// Do not show commit notes, countermanding an earlier `--notes`.
     #[clap(long = "no-notes")]
     pub no_notes: bool,
@@ -545,6 +549,9 @@ pub struct LogCommitEntry {
     /// `body` intentionally still contains the trailer lines inline so
     /// existing consumers are unaffected — additive field, lore.md §1.9).
     pub trailers: Vec<LogTrailerEntry>,
+    /// Displayed commit notes (ADR-LG-03); omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -655,6 +662,74 @@ fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
         &format!("{}{}", reference_namespace(&reference.kind), reference.name),
         args,
     )
+}
+
+/// Resolve which notes refs the built-in formats display (ADR-LG-03).
+///
+/// - `--no-notes` clears the list.
+/// - Explicit `--notes[=<ref>]` / `--show-notes[=<ref>]` replace the implicit
+///   default ref; an empty value means `refs/notes/commits`.
+/// - A custom `--format`/`--pretty` shows notes only through `%N`.
+/// - Otherwise `core.notesRef` (default `refs/notes/commits`) plus any
+///   `notes.displayRef` value.
+async fn resolve_notes_display_refs(args: &LogArgs, custom_format: bool) -> CliResult<Vec<String>> {
+    if args.no_notes {
+        return Ok(Vec::new());
+    }
+    let explicit: Vec<String> = [args.notes.clone(), args.show_notes.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let normalize = |raw: &str| -> CliResult<String> {
+        if raw.is_empty() {
+            Ok(crate::internal::notes::DEFAULT_NOTES_REF.to_string())
+        } else {
+            crate::internal::notes::normalize_notes_ref(raw)
+                .map_err(|error| CliError::fatal(format!("invalid notes ref '{raw}': {error}")))
+        }
+    };
+    if !explicit.is_empty() {
+        return explicit.iter().map(|raw| normalize(raw)).collect();
+    }
+    let _ = custom_format;
+    let mut refs = Vec::new();
+    let default_ref = match read_log_config("core.notesRef").await? {
+        Some(raw) if !raw.trim().is_empty() => normalize(raw.trim())?,
+        _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
+    };
+    refs.push(default_ref);
+    if let Some(display) = read_log_config("notes.displayRef").await?
+        && !display.trim().is_empty()
+    {
+        let normalized = normalize(display.trim())?;
+        if !refs.contains(&normalized) {
+            refs.push(normalized);
+        }
+    }
+    Ok(refs)
+}
+
+/// Render one `Notes:` block. The default ref uses the bare header; another ref
+/// names its short form (`Notes (other):`). Each body line is indented four
+/// spaces, matching Git.
+pub(crate) fn notes_block_for_ref(notes_ref: &str, notes: &str) -> String {
+    let text = notes.trim_end_matches('\n');
+    if text.is_empty() {
+        return String::new();
+    }
+    let header = if notes_ref == crate::internal::notes::DEFAULT_NOTES_REF {
+        "Notes:".to_string()
+    } else {
+        let short = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
+        format!("Notes ({short}):")
+    };
+    let mut block = format!("\n{header}\n");
+    for line in text.lines() {
+        block.push_str("    ");
+        block.push_str(line);
+        block.push('\n');
+    }
+    block
 }
 
 /// Resolve the requested `--grep` dialect (last selector flag wins, basic is
@@ -2179,18 +2254,15 @@ async fn execute_safe_with_diff_formats(
     } else {
         FormatType::Full
     };
-    // `--notes[=<ref>]` renders note text. `%N` expands notes for any format;
-    // the `Notes:` block is only appended for non-custom formats, matching Git.
-    let notes_enabled = args.notes.is_some() && !args.no_notes;
-    let notes_ref = match args.notes.as_deref() {
-        Some(raw) if !raw.is_empty() => crate::internal::notes::normalize_notes_ref(raw)
-            .map_err(|error| CliError::fatal(format!("invalid notes ref '{raw}': {error}")))?,
-        _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
-    };
+    // ADR-LG-03: built-in formats show notes by default; `--notes[=<ref>]` /
+    // `--show-notes[=<ref>]` select refs explicitly, `--no-notes` disables, and
+    // `notes.displayRef` appends. `%N` expands notes for any format.
+    let custom_format = matches!(format_type, FormatType::Custom(_));
+    let notes_refs = resolve_notes_display_refs(&args, custom_format).await?;
     let format_uses_notes_placeholder =
         matches!(&format_type, FormatType::Custom(template) if template.contains("%N"));
-    let load_notes = notes_enabled || format_uses_notes_placeholder;
-    let append_notes_block = notes_enabled && !matches!(format_type, FormatType::Custom(_));
+    let load_notes = !notes_refs.is_empty() || format_uses_notes_placeholder;
+    let append_notes_block = !notes_refs.is_empty() && !custom_format;
     let color_enabled = match output.color {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
@@ -2384,18 +2456,26 @@ async fn execute_safe_with_diff_formats(
             String::new()
         };
 
-        let note_text = if load_notes {
-            crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
-                .await
-                .map(|(_, _, text)| text)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let mut note_blocks: Vec<(String, String)> = Vec::new();
+        if load_notes {
+            for notes_ref in &notes_refs {
+                let text = crate::internal::notes::show(notes_ref, Some(&commit.id.to_string()))
+                    .await
+                    .map(|(_, _, text)| text)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    note_blocks.push((notes_ref.clone(), text));
+                }
+            }
+        }
+        let note_text = note_blocks
+            .iter()
+            .map(|(_, text)| text.trim_end_matches('\n'))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         let note_text = if note_text.is_empty() {
             String::new()
-        } else if note_text.ends_with('\n') {
-            note_text
         } else {
             format!("{note_text}\n")
         };
@@ -2409,7 +2489,9 @@ async fn execute_safe_with_diff_formats(
         };
         let mut message = formatter.format(&commit, &ctx);
         if append_notes_block {
-            message.push_str(&crate::internal::log::formatter::notes_block(&note_text));
+            for (notes_ref, text) in &note_blocks {
+                message.push_str(&notes_block_for_ref(notes_ref, text));
+            }
         }
 
         if name_only || name_status {
@@ -2521,6 +2603,7 @@ async fn run_log(
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
 
+    let json_notes_refs = resolve_notes_display_refs(args, false).await?;
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
     if start_commits.is_empty() {
@@ -2589,6 +2672,16 @@ async fn run_log(
             .collect();
         let hash = commit.id.to_string();
         let short_hash = hash.get(..7).unwrap_or(&hash).to_string();
+        let mut notes = Vec::new();
+        for notes_ref in &json_notes_refs {
+            let text = crate::internal::notes::show(notes_ref, Some(&commit.id.to_string()))
+                .await
+                .map(|(_, _, text)| text)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                notes.push(text.trim_end_matches('\n').to_string());
+            }
+        }
 
         commits.push(LogCommitEntry {
             hash,
@@ -2613,6 +2706,7 @@ async fn run_log(
                 Some(current_head_commit),
             ),
             trailers,
+            notes,
             files: files
                 .into_iter()
                 .map(|file| LogFileChange {
