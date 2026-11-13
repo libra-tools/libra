@@ -344,9 +344,8 @@ jobs:
 
     runs-on: [self-hosted]
 
-    # Below GitHub's 360-minute default so an overrun fails as a timeout with
-    # the log intact, rather than being reaped at the platform cap.
-    timeout-minutes: 350
+    # User-approved six-hour boundary. GitHub's per-job ceiling is 360 minutes.
+    timeout-minutes: 360
 
     env:
       CARGO_TERM_COLOR: always
