@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.30.197"
+version = "0.30.198"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -52,6 +52,7 @@ lazy_static = "1.5.0"
 lru-mem = "0.3.0"
 once_cell = "1.21.4"
 openssl = { version = "0.10.78", features = ["vendored"] }
+fancy-regex = "0.16.2"
 regex = "1.12.3"
 reqwest = { version = "0.13.2", default-features = false, features = [
     "stream",

@@ -272,7 +272,7 @@ async fn test_grep_after_context_marks_context_lines() {
 
 #[tokio::test]
 #[serial(cwd)]
-async fn test_grep_perl_regexp_is_rejected() {
+async fn test_grep_perl_regexp_unsupported_syntax_is_rejected() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
     let _guard = test::ChangeDirGuard::new(repo.path());
@@ -280,11 +280,12 @@ async fn test_grep_perl_regexp_is_rejected() {
     fs::write("f.txt", "needle\n").expect("failed to write file");
     add_and_commit("add f", vec!["f.txt".to_string()]).await;
 
-    let output = run_libra_command(&["grep", "-P", "needle"], repo.path());
+    // ADR-LG-09: `\K` is an intentional unsupported-feature error.
+    let output = run_libra_command(&["grep", "-P", r"\Kneedle"], repo.path());
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("perl-regexp is not supported"),
+        stderr.contains("not supported"),
         "unexpected stderr: {stderr}"
     );
 }
@@ -1698,4 +1699,105 @@ async fn test_grep_t7810_inside_repo_with_no_index_tc1596() {
     let out = run_libra_command(&["grep", "--untracked", "o"], &repo.path().join("sub"));
     assert_cli_success(&out, "TC-1596 step 2");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "file2:world\n");
+}
+
+/// LG-14 (M-GTYPE P1–P6): fixed-string long name, Perl engine, backtrack limit,
+/// and dialect regressions.
+#[tokio::test]
+#[serial(cwd)]
+async fn test_grep_pattern_types_matrix() {
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+
+    fs::write(
+        "code.c",
+        "int main(void)\n{\n  return foo.bar;\n}\nfoobar\naa\nword foo\n",
+    )
+    .expect("write code.c");
+    fs::write("long.txt", format!("{}!\n", "ab".repeat(30))).expect("write long.txt");
+    add_and_commit(
+        "add code",
+        vec!["code.c".to_string(), "long.txt".to_string()],
+    )
+    .await;
+
+    let run = |args: &[&str]| run_libra_command(args, repo.path());
+    let stdout = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).to_string();
+
+    // P1: `--fixed-strings` and `-F` are literal.
+    for flag in ["--fixed-strings", "-F"] {
+        let out = run(&["grep", flag, "foo.bar"]);
+        assert_cli_success(&out, flag);
+        assert_eq!(stdout(&out).trim(), "code.c:  return foo.bar;");
+    }
+
+    // P2: the singular alias still works but is hidden from help.
+    let alias = run(&["grep", "--fixed-string", "foo.bar"]);
+    assert_cli_success(&alias, "--fixed-string alias");
+    assert_eq!(stdout(&alias).trim(), "code.c:  return foo.bar;");
+    let help = run(&["grep", "--help"]);
+    let help_text = stdout(&help);
+    assert!(help_text.contains("--fixed-strings"), "{help_text}");
+    assert_eq!(
+        help_text.matches("--fixed-string").count(),
+        help_text.matches("--fixed-strings").count(),
+        "the singular alias must stay hidden"
+    );
+
+    // P3: lookahead.
+    let lookahead = run(&["grep", "-P", "foo(?=bar)"]);
+    assert_cli_success(&lookahead, "grep -P lookahead");
+    assert_eq!(stdout(&lookahead).trim(), "code.c:foobar");
+
+    // P4: backreference works; unsupported `\K` is a usage error.
+    let backref = run(&["grep", "-P", r"(a)\1"]);
+    assert_cli_success(&backref, "grep -P backref");
+    assert_eq!(stdout(&backref).trim(), "code.c:aa");
+    let keepout = run(&["grep", "-P", r"\Kfoo"]);
+    assert_eq!(keepout.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&keepout.stderr).contains("not supported"),
+        "{}",
+        String::from_utf8_lossy(&keepout.stderr)
+    );
+
+    // P5: a backtracking-heavy pattern fails within the limit instead of hanging.
+    let catastrophic = run(&["grep", "-P", r"(?i)(a|b|ab)*(?>c)"]);
+    assert_eq!(catastrophic.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&catastrophic.stderr).contains("backtracking"),
+        "{}",
+        String::from_utf8_lossy(&catastrophic.stderr)
+    );
+
+    // P6: existing dialect/context/no-index/heading regressions.
+    assert_eq!(
+        stdout(&run(&["grep", "-E", "foo.bar"])).trim(),
+        "code.c:  return foo.bar;"
+    );
+    assert_eq!(
+        stdout(&run(&["grep", "-G", "foo.bar"])).trim(),
+        "code.c:  return foo.bar;"
+    );
+    let word = run(&["grep", "-w", "foo"]);
+    assert_cli_success(&word, "grep -w");
+    let word_text = stdout(&word);
+    // `foo` is a word in both `foo.bar` and `word foo`.
+    assert!(
+        word_text.contains("code.c:  return foo.bar;"),
+        "{word_text}"
+    );
+    assert!(word_text.contains("code.c:word foo"), "{word_text}");
+    let untracked = run(&["grep", "--untracked", "foo"]);
+    assert!(
+        untracked.status.success() || untracked.status.code() == Some(1),
+        "--untracked must run"
+    );
+    let no_index = run(&["grep", "--no-index", "main"]);
+    assert_cli_success(&no_index, "grep --no-index");
+    assert!(stdout(&no_index).contains("code.c:int main(void)"));
+    let heading = run(&["grep", "--heading", "--break", "return"]);
+    assert_cli_success(&heading, "grep --heading --break");
+    assert!(!stdout(&heading).trim().is_empty(), "heading output");
 }

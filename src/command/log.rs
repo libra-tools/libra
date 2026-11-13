@@ -600,7 +600,7 @@ struct CommitFilter {
     path_specs: Option<PathspecSet>,
     grep: Vec<String>,
     /// Compiled `--grep` matchers (dialect translated at build time).
-    grep_regex: Vec<regex::Regex>,
+    grep_regex: Vec<crate::utils::grep_pattern::GrepMatcher>,
     all_match: bool,
     invert_grep: bool,
     min_parents: Option<usize>,
@@ -962,9 +962,13 @@ impl CommitFilter {
                 commit.message.strip_prefix('\n').unwrap_or(&commit.message)
             };
             let matches = if self.all_match && !self.invert_grep {
-                self.grep_regex.iter().all(|regex| regex.is_match(message))
+                self.grep_regex
+                    .iter()
+                    .all(|regex| regex.is_match(message).unwrap_or(false))
             } else {
-                self.grep_regex.iter().any(|regex| regex.is_match(message))
+                self.grep_regex
+                    .iter()
+                    .any(|regex| regex.is_match(message).unwrap_or(false))
             };
             if matches == self.invert_grep {
                 return false;
@@ -3569,15 +3573,16 @@ fn graph_topo_order(commits: Vec<SelectedLogCommit>) -> Vec<SelectedLogCommit> {
         }
     }
 
+    let ordered_ids: Vec<ObjectHash> = commits.iter().map(|commit| commit.commit.id).collect();
     let mut by_id: HashMap<ObjectHash, SelectedLogCommit> = commits
         .into_iter()
         .map(|commit| (commit.commit.id, commit))
         .collect();
     // Git reverses the initial tip queue so the date-ordered tips pop in order;
-    // a Vec popped from the end reproduces that stack behavior.
-    let mut stack: Vec<ObjectHash> = by_id
-        .keys()
-        .copied()
+    // a Vec popped from the end reproduces that stack behavior. Preserve the
+    // incoming date order (not HashMap iteration order).
+    let mut stack: Vec<ObjectHash> = ordered_ids
+        .into_iter()
         .filter(|id| ids.contains(id) && indegree.get(id).copied() == Some(1))
         .collect();
     stack.reverse();

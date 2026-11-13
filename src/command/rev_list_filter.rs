@@ -8,7 +8,6 @@
 //! asymmetry vs `log`, which still walks date-priority when ineligible).
 
 use git_internal::internal::object::commit::Commit;
-use regex::Regex;
 
 use super::RevListArgs;
 use crate::{
@@ -40,7 +39,7 @@ pub(super) struct RevListTimeWindow {
 
 #[derive(Debug)]
 pub(super) struct RevListMessageFilter {
-    patterns: Vec<Regex>,
+    patterns: Vec<crate::utils::grep_pattern::GrepMatcher>,
 }
 
 pub(super) fn parent_count_filter(args: &RevListArgs) -> ParentCountFilter {
@@ -167,7 +166,7 @@ pub(super) fn commit_matches_message(
     filter
         .patterns
         .iter()
-        .any(|pattern| pattern.is_match(message))
+        .any(|pattern| pattern.is_match(message).unwrap_or(false))
 }
 
 pub(super) async fn filter_commits_by_pathspecs(

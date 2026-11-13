@@ -6271,17 +6271,14 @@ fn test_log_grep_pattern_types_matrix() {
         ]),
         vec!["c++ (fix)"]
     );
-    // G5: explicit basic dialect and the unenabled -P dialect.
+    // G5: explicit basic dialect and the Perl dialect (LG-14 engine).
     let basic = subjects(&["log", "--format=%s", "--basic-regexp", "--grep", r"a\+"]);
     assert!(basic.contains(&"foo.bar aaa".to_string()));
     assert!(basic.contains(&"fooXbar".to_string()));
-    let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "HEAD"], p);
-    assert_eq!(perl.status.code(), Some(129));
-    assert!(
-        String::from_utf8_lossy(&perl.stderr).contains("--perl-regexp"),
-        "{}",
-        String::from_utf8_lossy(&perl.stderr)
-    );
+    let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "--format=%s", "HEAD"], p);
+    assert_cli_success(&perl, "log -P --grep");
+    let perl_text = String::from_utf8_lossy(&perl.stdout);
+    assert_eq!(perl_text.trim(), "foo.bar aaa", "{perl_text}");
     // G6: `--all-match` requires every pattern; the default is any.
     assert_eq!(
         subjects(&[
@@ -6670,5 +6667,54 @@ fn test_log_graph_octopus_fixture() {
             .iter()
             .any(|line| line == "* / " || line.starts_with("* / ")),
         "{lines:?}"
+    );
+}
+
+/// LG-14 (M-GTYPE P7): `log -P --grep` uses the same Perl engine as `grep -P`.
+#[test]
+#[serial(cwd)]
+fn test_log_perl_regexp_grep() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foobar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    // Lookahead is a Perl-only feature.
+    let lookahead = run_libra_command(
+        &["log", "-P", "--grep", "foo(?=bar)", "--format=%s", "HEAD"],
+        p,
+    );
+    assert_cli_success(&lookahead, "log -P lookahead");
+    assert_eq!(
+        String::from_utf8_lossy(&lookahead.stdout).trim(),
+        "foobar aaa"
+    );
+
+    // Backreference.
+    let backref = run_libra_command(&["log", "-P", "--grep", r"(o)\1", "--format=%s", "HEAD"], p);
+    assert_cli_success(&backref, "log -P backref");
+    let backref_text = String::from_utf8_lossy(&backref.stdout);
+    // Both subjects contain a doubled `o`.
+    assert!(backref_text.contains("foobar aaa"), "{backref_text}");
+    assert!(backref_text.contains("fooXbar"), "{backref_text}");
+
+    // Unsupported PCRE syntax is a usage error naming the feature.
+    let unsupported = run_libra_command(&["log", "-P", "--grep", r"\Kfoo", "HEAD"], p);
+    assert_eq!(unsupported.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr).contains(r"\K"),
+        "{}",
+        String::from_utf8_lossy(&unsupported.stderr)
     );
 }

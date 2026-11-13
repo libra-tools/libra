@@ -290,7 +290,7 @@ match and takes no value; without any patterns it does not filter. Supplying a
 value with `--all-match=<value>` is rejected. `-F`/`--fixed-strings` treats each
 pattern as a literal, `-E`/`--extended-regexp` uses POSIX ERE, `--basic-regexp`
 selects the default dialect explicitly, and `-P`/`--perl-regexp` is accepted but
-reports an "engine not enabled" usage error in this release (last flag wins).
+uses the `fancy-regex` Perl engine (lookahead and backreferences; `\K`, recursion and `(*VERB)` are usage errors). The last flag wins.
 When no dialect flag is given, `grep.patternType` (basic/extended/fixed) and
 `grep.extendedRegexp` apply from the local→global→system cascade. `-i` /
 `--regexp-ignore-case` makes all grep matches case-insensitive

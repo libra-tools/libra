@@ -239,7 +239,7 @@ libra log --committer alice --committer bob
 
 方言：默认 POSIX BRE（`+`、`(`/`)`、`.` 按 Git BRE 语义）；`-F`/`--fixed-strings`
 为字面串，`-E`/`--extended-regexp` 为 ERE，`--basic-regexp` 显式选择 BRE，
-`-P`/`--perl-regexp` 在本版本报告「引擎未启用」用法错误（后出现的标志生效）。
+`-P`/`--perl-regexp` 使用 `fancy-regex` Perl 引擎（支持环视与反向引用；`\K`、递归与 `(*VERB)` 为用法错误）。后出现的标志生效。
 未给方言标志时按级联读取 `grep.patternType`（basic/extended/fixed）与
 `grep.extendedRegexp`。
 

@@ -12,7 +12,7 @@ libra grep -f <file> [-- <pathspec>...]
 
 ## Description
 
-`libra grep` searches for text patterns in tracked files. By default it searches the working tree, but it can also search the index (`--cached`) or a specific revision (`--tree <revision>`). Patterns are interpreted as regular expressions unless `--fixed-string` is specified.
+`libra grep` searches for text patterns in tracked files. By default it searches the working tree, but it can also search the index (`--cached`) or a specific revision (`--tree <revision>`). Patterns are interpreted as regular expressions unless `--fixed-strings` (alias `--fixed-string`) is specified.
 
 Multiple patterns can be supplied via `-e` flags or read from files via `-f`. When multiple patterns are active, a file matches if any pattern matches at least one line (OR semantics). With `--all-match`, a file is included only if every pattern matches at least one line in that file (AND semantics across patterns, not across lines).
 
@@ -38,7 +38,7 @@ Exit codes follow Git's grep contract: matches exit 0, no selected matches exit 
 | And | | `--and` | Require every pattern to match the *same line*. |
 | Or | | `--or` | Match when any pattern matches the line (the default). |
 | Not | | `--not` | Negate the whole pattern set. |
-| Fixed string | `-F` | `--fixed-string` | Treat the pattern as a literal string, not a regular expression. |
+| Fixed string | `-F` | `--fixed-strings` (alias `--fixed-string`, hidden) | Treat the pattern as a literal string, not a regular expression. |
 | Ignore case | `-i` | `--ignore-case` | Perform case-insensitive matching. |
 | Count | `-c` | `--count` | Show only the number of matching lines for each file. |
 | Files with matches | `-l` | `--files-with-matches` | Show only the names of files that contain matches. |
@@ -398,7 +398,7 @@ jj does not have a built-in grep command. Users are expected to use external too
 | Index search | `--cached` | `--cached` | N/A |
 | Context lines | `-A` / `-B` / `-C` | `-C` / `-A` / `-B` | N/A |
 | Extended regexp | `-E` / `--extended-regexp` | `-E` / `--extended-regexp` | N/A |
-| Perl regexp | Rejected (exit 2) | `-P` / `--perl-regexp` | N/A |
+| Perl regexp | `-P` / `--perl-regexp` (`fancy-regex`; lookaround and backreferences) | `-P` / `--perl-regexp` | `\K`, recursion and `(*VERB)` are usage errors (exit 2) |
 | Max count | `-m` / `--max-count` | `-m` / `--max-count` | N/A |
 | Only matching | `-o` / `--only-matching` | `-o` / `--only-matching` | N/A |
 | Show function | Not supported | `-p` / `--show-function` | N/A |

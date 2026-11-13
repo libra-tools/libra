@@ -85,3 +85,6 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-13（#478 LG-14，ADR-LG-09）：`--fixed-strings` 为 `-F` 正式长名，单数 `--fixed-string` 保留为隐藏别名；`-P/--perl-regexp` 接入 `fancy-regex 0.16.2`（MIT，syntect 已用同版本），支持环视/反向引用，回溯上限 250k、模式长度上限 32 KiB；`\K`、递归 `(?R)`/`(?n)`、`(*VERB)` 为用法错误；grep 默认方言保持既有 ERE，`--basic-regexp` 显式 BRE。`log/rev-list --grep` 共用同一编译/匹配器。测试：`test_grep_pattern_types_matrix`、`test_log_perl_regexp_grep`、`utils::grep_pattern` 7/7。
+
