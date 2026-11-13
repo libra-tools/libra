@@ -69,6 +69,15 @@ impl PreparedPatch {
         &self.conflicted
     }
 
+    /// Prepared results for index updates: `(target, new content, mode)`.
+    /// `content == None` deletes the index entry.
+    pub(crate) fn staged_entries(&self) -> Vec<(String, Option<Vec<u8>>, Option<u32>)> {
+        self.files
+            .iter()
+            .map(|file| (file.target.clone(), file.content.clone(), file.mode))
+            .collect()
+    }
+
     /// PD-09 ②: surviving targets whose git mode the patch changes.
     /// Callers that stage through the regular add path must ALSO apply
     /// these to the index — a mode-only flip has identical content, so
@@ -247,9 +256,14 @@ pub struct ApplyArgs {
     #[clap(long = "3way")]
     pub three_way: bool,
 
-    /// Update the index (stage the patched paths) after writing.
+    /// Update the index (stage the patched paths) after writing; requires the
+    /// working tree to match the index for every touched path.
     #[clap(long = "index")]
     pub index: bool,
+
+    /// Update only the index; leave the working tree untouched.
+    #[clap(long)]
+    pub cached: bool,
 
     /// Only apply sections whose target path matches one of these patterns.
     #[clap(long = "include", value_name = "PATH")]
@@ -302,14 +316,44 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
             .with_stable_code(StableErrorCode::CliInvalidArguments)
     };
 
+    if args.cached && args.index {
+        return Err(usage_error(
+            "--cached and --index are incompatible".to_string(),
+        ));
+    }
+
     let mut patch_text = read_patch(&args.patches).map_err(usage_error)?;
     let workdir = util::working_dir();
 
     if let Some(directory) = &args.directory {
         patch_text = rewrite_patch_directory(&patch_text, directory).map_err(usage_error)?;
     }
-    patch_text = filter_patch_sections(&patch_text, &args.include, &args.exclude, args.strip)
-        .map_err(usage_error)?;
+    let filter_rules = ordered_filter_rules();
+    patch_text =
+        filter_patch_sections(&patch_text, &filter_rules, args.strip).map_err(usage_error)?;
+
+    // Everything was filtered out: Git succeeds without output or writes.
+    if patch_text.trim().is_empty() {
+        if output.is_json() {
+            emit_json_data(
+                "apply",
+                &ApplyOutput {
+                    applies: true,
+                    files: Vec::new(),
+                    applied: false,
+                },
+                output,
+            )?;
+        }
+        return Ok(());
+    }
+
+    // `--index` requires the working tree to match the index for every path
+    // the patch touches (Git checks this before attempting the hunks).
+    if args.index {
+        let targets = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
+        ensure_paths_match_index(&targets).map_err(usage_error)?;
+    }
 
     if args.reverse {
         patch_text = reverse_patch_text(&patch_text, args.strip);
@@ -411,11 +455,15 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
 
     let conflicted = prepared.conflicted().to_vec();
     let mode_overrides = prepared.mode_overrides();
-    prepared.write().map_err(usage_error)?;
-
-    if args.index {
-        stage_apply_targets(&files).await?;
-        stage_apply_modes(&mode_overrides)?;
+    if args.cached {
+        // `--cached` writes the new blobs into the index only.
+        stage_prepared_index(&prepared)?;
+    } else {
+        prepared.write().map_err(usage_error)?;
+        if args.index {
+            stage_apply_targets(&files).await?;
+            stage_apply_modes(&mode_overrides)?;
+        }
     }
 
     if output.is_json() {
@@ -508,63 +556,77 @@ fn rewrite_patch_directory(patch_text: &str, directory: &str) -> Result<String, 
 /// Keep only sections matching `--include` (when any) and not matching
 /// `--exclude`. Matching uses fnmatch-style globs against the `-p`-stripped
 /// target path.
+#[derive(Clone, Copy)]
+enum FilterAction {
+    Include,
+    Exclude,
+}
+
+/// Reconstruct `--include`/`--exclude` in command-line order. Clap stores the
+/// two lists separately, but Git's rule is "the first matching pattern
+/// decides", so the interleaved order matters (`--exclude=* --include=a.txt`
+/// skips while `--include=a.txt --exclude=*` applies).
+fn ordered_filter_rules() -> Vec<(FilterAction, String)> {
+    let mut rules = Vec::new();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if let Some(value) = arg.strip_prefix("--include=") {
+            rules.push((FilterAction::Include, value.to_string()));
+        } else if arg == "--include"
+            && let Some(value) = argv.get(index + 1)
+        {
+            rules.push((FilterAction::Include, value.clone()));
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--exclude=") {
+            rules.push((FilterAction::Exclude, value.to_string()));
+        } else if arg == "--exclude"
+            && let Some(value) = argv.get(index + 1)
+        {
+            rules.push((FilterAction::Exclude, value.clone()));
+            index += 1;
+        }
+        index += 1;
+    }
+    rules
+}
+
 fn filter_patch_sections(
     patch_text: &str,
-    include: &[String],
-    exclude: &[String],
+    rules: &[(FilterAction, String)],
     strip: u32,
 ) -> Result<String, String> {
-    if include.is_empty() && exclude.is_empty() {
+    if rules.is_empty() {
         return Ok(patch_text.to_string());
     }
-    let include_matcher = GlobMatcher::new(include);
-    let exclude_matcher = GlobMatcher::new(exclude);
+    let compiled: Vec<(FilterAction, ignore::gitignore::Gitignore)> = rules
+        .iter()
+        .filter_map(|(action, pattern)| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+            builder.add_line(None, pattern).ok()?;
+            builder.build().ok().map(|gi| (*action, gi))
+        })
+        .collect();
     let mut out = String::new();
     for section in split_file_patches(patch_text) {
         let headers = parse_section_headers(&section, strip)?;
         let target = headers
             .single_target(&section, strip)
             .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
-        if !include.is_empty() && !include_matcher.matches(&target) {
-            continue;
+        let mut keep = true;
+        for (action, matcher) in &compiled {
+            let matched = matcher.matched_path_or_any_parents(Path::new(&target), false);
+            if matched.is_ignore() || matched.is_whitelist() {
+                keep = matches!(action, FilterAction::Include);
+                break;
+            }
         }
-        if exclude_matcher.matches(&target) {
-            continue;
+        if keep {
+            out.push_str(&section);
         }
-        out.push_str(&section);
     }
     Ok(out)
-}
-
-struct GlobMatcher {
-    patterns: Vec<String>,
-}
-
-impl GlobMatcher {
-    fn new(patterns: &[String]) -> Self {
-        Self {
-            patterns: patterns.to_vec(),
-        }
-    }
-
-    fn matches(&self, path: &str) -> bool {
-        self.patterns.iter().any(|pattern| {
-            let mut builder = ignore::gitignore::GitignoreBuilder::new("");
-            if builder.add_line(None, pattern).is_err() {
-                return false;
-            }
-            match builder.build() {
-                Ok(gi) => {
-                    gi.matched_path_or_any_parents(Path::new(path), false)
-                        .is_ignore()
-                        || gi
-                            .matched_path_or_any_parents(Path::new(path), false)
-                            .is_whitelist()
-                }
-                Err(_) => false,
-            }
-        })
-    }
 }
 
 /// Render a `--stat` summary for a patch without applying, matching Git's
@@ -881,6 +943,82 @@ fn reverse_hunk_header(line: &str) -> String {
 }
 
 /// Stage patched targets after a successful apply.
+/// `apply --index` precondition: every touched path's working-tree bytes must
+/// equal the index blob (Git's `<path>: does not match index`).
+fn ensure_paths_match_index(targets: &[String]) -> Result<(), String> {
+    use git_internal::internal::{index::Index, object::blob::Blob};
+
+    let index_path = crate::utils::path::index();
+    let index =
+        Index::load(&index_path).map_err(|error| format!("failed to load the index: {error}"))?;
+    let workdir = util::working_dir();
+    for target in targets {
+        let index_id = index.get(target, 0).map(|entry| entry.hash);
+        let path = workdir.join(target);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("failed to read '{target}': {error}")),
+        };
+        match (index_id, bytes) {
+            (Some(id), Some(bytes)) => {
+                if Blob::from_content_bytes(bytes).id != id {
+                    return Err(format!("{target}: does not match index"));
+                }
+            }
+            (Some(_), None) => return Err(format!("{target}: does not match index")),
+            (None, Some(_)) => {
+                return Err(format!("{target}: already exists in working directory"));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Stage prepared patch results directly into the index (`--cached`), without
+/// touching the working tree.
+fn stage_prepared_index(prepared: &PreparedPatch) -> CliResult<()> {
+    use git_internal::internal::{
+        index::{Index, IndexEntry},
+        object::blob::Blob,
+    };
+
+    use crate::utils::object_ext::BlobExt;
+
+    let index_path = crate::utils::path::index();
+    let mut index = Index::load(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to load the index: {error}")))?;
+    let storage = util::objects_storage()
+        .map_err(|error| CliError::fatal(format!("failed to open the object store: {error}")))?;
+    for (target, content, mode) in prepared.staged_entries() {
+        match content {
+            Some(bytes) => {
+                let blob = Blob::from_content_bytes(bytes);
+                blob.try_save().map_err(|error| {
+                    CliError::fatal(format!("failed to store blob for '{target}': {error}"))
+                })?;
+                let mut entry =
+                    IndexEntry::new_from_blob(target.clone(), blob.id, blob.data.len() as u32);
+                if let Some(mode) = mode {
+                    entry.mode = mode;
+                }
+                crate::utils::index_ext::update_preserving_flags(&mut index, entry);
+            }
+            None => {
+                index.remove(&target, 0);
+            }
+        }
+    }
+    storage
+        .flush_object_index_batch()
+        .map_err(|error| CliError::fatal(format!("failed to flush stored objects: {error}")))?;
+    index
+        .save(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to save the index: {error}")))?;
+    Ok(())
+}
+
 async fn stage_apply_targets(targets: &[String]) -> CliResult<()> {
     if targets.is_empty() {
         return Ok(());

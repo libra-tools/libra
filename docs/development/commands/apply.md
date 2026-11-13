@@ -49,3 +49,5 @@
 
 - 2026-11-13（#478 LG-11，ADR-LG-07 第 1–3 条）：默认应用在全部准备/检查通过后原子写出工作树（多文件补丁任一失败零写入）；新增 `--numstat`（`ins\tdel\tpath`，二进制 `-\t-`）、`--summary`（create/delete/mode change）与 `--apply`（与报告同用时先报告后应用）；`--stat` 对齐 Git 的名称/计数列宽并省略零插入/删除子句；`-R/--reverse` 回归。测试：`test_apply_worktree_and_reports_matrix`（t4106:15、t4102:38 移植）、`apply_test` 18/18、`compat_mail_am_basic` 41/41。
 
+- 2026-11-13（#478 LG-12，ADR-LG-07 第 3、4 条）：`--index` 在准备前校验每条受影响路径的工作树字节与索引 blob 一致（不一致报 `<path>: does not match index`、exit 128、零写入），成功后写工作树并暂存；`--cached` 只把补丁结果写入索引（`Blob` + `IndexEntry`，不触碰工作树），与 `--index` 互斥；`--include`/`--exclude` 改为按 argv 顺序首个匹配决定（Git wildmatch，`--exclude=* --include=a.txt` 跳过、反之应用）；过滤后空补丁 exit 0 且零输出。测试：`test_apply_index_cached_and_filters_matrix`（B1–B5）。
+

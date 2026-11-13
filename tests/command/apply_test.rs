@@ -412,3 +412,150 @@ diff --git a/missing.txt b/missing.txt
         "atomic failure must not write the applying file"
     );
 }
+
+/// LG-12 (M-AIDX B1–B5): `--index`, `--cached`, and ordered path filters.
+#[test]
+fn test_apply_index_cached_and_filters_matrix() {
+    let make_repo = || -> (tempfile::TempDir, String) {
+        let repo = init_repo();
+        let p = repo.path();
+        assert!(
+            run_libra_command(&["config", "user.name", "T"], p)
+                .status
+                .success()
+        );
+        assert!(
+            run_libra_command(&["config", "user.email", "t@e"], p)
+                .status
+                .success()
+        );
+        fs::write(p.join("a.txt"), "a\nb\n").unwrap();
+        assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+        assert!(
+            run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+                .status
+                .success()
+        );
+        let patch = p.join("p.patch");
+        fs::write(
+            &patch,
+            "diff --git a/a.txt b/a.txt\nindex 422c2b7..de98044 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n a\n b\n+c\n",
+        )
+        .unwrap();
+        (repo, patch.to_str().unwrap().to_string())
+    };
+    let p = |repo: &tempfile::TempDir, args: &[&str]| run_libra_command(args, repo.path());
+
+    // B1: `--index` stages both the index and the working tree.
+    let (repo, patch) = make_repo();
+    let out = p(&repo, &["apply", "--index", &patch]);
+    assert_cli_success(&out, "apply --index");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\nc\n"
+    );
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("M  a.txt"), "{status}");
+
+    // B2: a dirty worktree that does not match the index is refused before
+    // any write.
+    let (repo, patch) = make_repo();
+    fs::write(repo.path().join("a.txt"), "dirty\n").unwrap();
+    let mismatch = p(&repo, &["apply", "--index", &patch]);
+    assert_eq!(mismatch.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("does not match index"),
+        "{}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "dirty\n"
+    );
+
+    // B3: `--cached` updates only the index.
+    let (repo, patch) = make_repo();
+    let cached = p(&repo, &["apply", "--cached", &patch]);
+    assert_cli_success(&cached, "apply --cached");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("MM a.txt"), "{status}");
+
+    // B4: the first matching include/exclude rule decides.
+    let (repo, patch) = make_repo();
+    let excluded = p(&repo, &["apply", &patch, "--exclude=a.txt"]);
+    assert_cli_success(&excluded, "apply --exclude");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+    let included = p(&repo, &["apply", "--include=a.txt", "--exclude=*", &patch]);
+    assert_cli_success(&included, "apply --include then --exclude");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\nc\n"
+    );
+    let (repo, patch) = make_repo();
+    let skipped = p(&repo, &["apply", "--exclude=*", "--include=a.txt", &patch]);
+    assert_cli_success(&skipped, "apply --exclude then --include");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\nb\n"
+    );
+
+    // B5: new-file, delete, and mode-change patches with `--index`.
+    let (repo, _) = make_repo();
+    let new_patch = repo.path().join("new.patch");
+    fs::write(
+        &new_patch,
+        "diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..422c2b7\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+x\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &p(&repo, &["apply", "--index", new_patch.to_str().unwrap()]),
+        "apply --index new file",
+    );
+    assert!(repo.path().join("n.txt").exists());
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("A  n.txt"), "{status}");
+    // Commit the new file so its later deletion is observable against HEAD.
+    assert!(
+        run_libra_command(&["commit", "-m", "add n", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+
+    let delete_patch = repo.path().join("del.patch");
+    fs::write(
+        &delete_patch,
+        "diff --git a/n.txt b/n.txt\ndeleted file mode 100644\nindex 422c2b7..0000000\n--- a/n.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &p(&repo, &["apply", "--index", delete_patch.to_str().unwrap()]),
+        "apply --index delete",
+    );
+    assert!(!repo.path().join("n.txt").exists());
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("D  n.txt"), "{status}");
+
+    let mode_patch = repo.path().join("mode.patch");
+    fs::write(
+        &mode_patch,
+        "diff --git a/a.txt b/a.txt\nold mode 100644\nnew mode 100755\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &p(&repo, &["apply", "--index", mode_patch.to_str().unwrap()]),
+        "apply --index mode change",
+    );
+    let summary = p(&repo, &["diff", "--cached", "--summary"]);
+    assert!(
+        String::from_utf8_lossy(&summary.stdout).contains("mode change 100644 => 100755 a.txt"),
+        "{}",
+        String::from_utf8_lossy(&summary.stdout)
+    );
+}
