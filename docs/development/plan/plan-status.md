@@ -1375,7 +1375,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/977.md`](issues/977.md) | `merge --log` 截断输出 `(N commits)` 与 `...` | Codex R2 PASS（2026-11-13 17:06:05 UTC）；计划与索引随 `27e2c4a` 签名+DCO 推送 `main`；实施未启动且未授权；EX-01 具名批准 | I977-01（1 卡，AC=18/8@EX-01） |
 | [`issues/817.md`](issues/817.md) | `libra config <key> <value>` 接受以 `-` 开头的值 | **Codex R17 PASS（2026-11-13 06:50:00 UTC）**；仅规划、未授权执行；EX-01 由 Eli Ma <eli@patch.sh> 批准 | I817-01（1 卡，AC=95/8@EX-01 VER=59/8@EX-01，scope=M） |
 | [`issues/978.md`](issues/978.md) | `branch.<name>.mergeOptions` 在 `merge` 上生效 | Codex R5 PASS（2026-11-13 17:45:17 UTC）；R1–R4 FAIL 均已修订并保留；未启动且未授权；EX-01 已由 Eli Ma <eli@patch.sh> 批准；**开工门 DEP-I978-06（#817 未完成）未满足，不得开工** | I978-01（1 卡，scope=M，AC=18/8@EX-01，VER=9/8@EX-01） |
-| [`issues/984.md`](issues/984.md) | `merge` 接受 `--no-squash` 取反形式（last-wins） | 未启动（2026-11-12 19:25:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I984-01（1 卡，AC=16/8@EX-01） |
+| [`issues/984.md`](issues/984.md) | `merge` 接受 `--no-squash` 取反形式（last-wins） | Codex R1 FAIL（P1×2/P2×1，已修订）、R2 FAIL（P1×1：缺 `--dry-run`/`--restart`/`--quit` 失败用例，已补 AC18–AC20），R3 FAIL（P1×1/P2×2，已修订）、R4 FAIL（P1×1/P2×1：状态行陈旧与 review log 围栏行号已修订），R5 FAIL（P1×1：gpg-sign/no-gpg-sign/signoff 守卫未覆盖，已补 AC21–AC23；P2×1：AC1 描述已修正），R6 FAIL（P2×1：`--quit` 引用更正为 :279-288，已修订），R7 FAIL（P2×1：本行陈旧，已更新），R8 PASS（2026-11-14，P0/P1/P2=0）；未启动且未授权；EX-01 已由 Eli Ma <eli@patch.sh> 批准；**开工门 DEP-I984-03/04 未满足（#974、#978 实现仍未完成），不得开工** | I984-01（1 卡，scope=S，AC=23/8@EX-01，VER=9/8@EX-01） |
 | [`issues/979.md`](issues/979.md) | `--pretty=format:` 不附加终止换行（`%b` 零正文须 0 字节） | 未启动（2026-11-12 19:05:00 UTC；仅规划、未授权执行；EX-01 已由 Eli Ma <eli@patch.sh> 批准） | I979-01（1 卡，AC=18/8@EX-01） |
 
 ---
