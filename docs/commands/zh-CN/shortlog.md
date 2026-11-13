@@ -22,6 +22,11 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 通过 `--since` 和 `--until` 的日期过滤会基于 committer 时间戳限制包含哪些提交，支持 `YYYY-MM-DD`、`"N days ago"` 和 Unix 时间戳等格式。
 
+### 修订选择
+
+`shortlog` 接受与 `log` 相同的修订形式：单个修订、`A..B`、`A...B`、`^A` 排除，
+以及多个修订。`--all` 从 `refs/` 下全部引用加 HEAD 播种，`-- <path>` 只保留触及该路径的提交。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |

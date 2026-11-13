@@ -50,9 +50,10 @@
 //! aggregating per-author statistics in memory for predictable formatting.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     io::{self, IsTerminal, Read, Write},
+    path::PathBuf,
 };
 
 use clap::Parser;
@@ -60,9 +61,13 @@ use git_internal::internal::object::commit::Commit;
 use serde::Serialize;
 
 use crate::{
-    internal::log::{
-        date_parser::parse_date,
-        formatter::{CommitFormatter, FormatContext, FormatType},
+    internal::{
+        branch::Branch,
+        log::{
+            date_parser::parse_date,
+            formatter::{CommitFormatter, FormatContext, FormatType},
+        },
+        tag::{self, TagObject},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -158,8 +163,18 @@ pub struct ShortlogArgs {
     #[clap(long = "format", value_name = "FORMAT")]
     pub format: Option<String>,
 
-    /// Revision to summarize. Defaults to HEAD.
-    pub revision: Option<String>,
+    /// Revisions or ranges to summarize (`A..B`, `A...B`, `^A`, or multiple
+    /// revisions). Defaults to HEAD.
+    #[clap(value_name = "REVISION")]
+    pub revisions: Vec<String>,
+
+    /// Summarize every ref under `refs/` plus HEAD.
+    #[clap(long)]
+    pub all: bool,
+
+    /// Paths after `--` limiting the summarized commits.
+    #[clap(value_name = "PATH", last = true)]
+    pub paths: Vec<String>,
 }
 
 /// How commits are grouped for the summary.
@@ -414,7 +429,7 @@ async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<Sho
     // convenience over Git, which has no default revision); see the command
     // docs. Walk-only options (`--since`/`--until`/`--merges`/`--no-merges`/
     // `--format`) have no commits to act on here and are ignored, as in Git.
-    if args.revision.is_none() && !io::stdin().is_terminal() {
+    if args.revisions.is_empty() && !args.all && !io::stdin().is_terminal() {
         let mut buffer = String::new();
         io::stdin().read_to_string(&mut buffer).map_err(|err| {
             CliError::fatal(format!("failed to read standard input: {err}"))
@@ -430,9 +445,16 @@ async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<Sho
 
     let since_ts = parse_shortlog_date_arg(args.since.as_deref(), "--since")?;
     let until_ts = parse_shortlog_date_arg(args.until.as_deref(), "--until")?;
-    let revision = args.revision.clone().unwrap_or_else(|| "HEAD".to_string());
+    let revision = if args.all {
+        "--all".to_string()
+    } else if args.revisions.is_empty() {
+        "HEAD".to_string()
+    } else {
+        args.revisions.join(" ")
+    };
     let mut commits =
-        get_commits_for_shortlog(args.revision.as_deref(), since_ts, until_ts).await?;
+        get_commits_for_shortlog(&args.revisions, args.all, &args.paths, since_ts, until_ts)
+            .await?;
 
     // `--no-merges` drops merge commits (more than one parent) before
     // aggregation so the counts and totals reflect only non-merge commits.
@@ -783,94 +805,131 @@ fn render_shortlog_output(output: &ShortlogOutput, writer: &mut impl Write) -> C
 }
 
 async fn get_commits_for_shortlog(
-    revision: Option<&str>,
+    revisions: &[String],
+    all: bool,
+    paths: &[String],
     since_ts: Option<i64>,
     until_ts: Option<i64>,
 ) -> CliResult<Vec<Commit>> {
-    use crate::command::log::get_reachable_commits;
+    use crate::command::log::{get_changed_files_for_commit, walk_date_priority};
 
-    let revision = revision.unwrap_or("HEAD");
+    let mut starts: Vec<git_internal::hash::ObjectHash> = Vec::new();
+    let mut excludes: HashSet<git_internal::hash::ObjectHash> = HashSet::new();
 
-    let mut commits: Vec<Commit> = if let Some((left, right)) = revision.split_once("...") {
-        // Symmetric difference: both sides reachable, minus their merge base.
-        let left_spec = if left.is_empty() { "HEAD" } else { left };
-        let right_spec = if right.is_empty() { "HEAD" } else { right };
-        let left_hash = util::get_commit_base_typed(left_spec)
+    if all {
+        let branches = Branch::list_branches_result(None)
             .await
-            .map_err(|error| shortlog_commit_base_error(revision, error))?;
-        let right_hash = util::get_commit_base_typed(right_spec)
-            .await
-            .map_err(|error| shortlog_commit_base_error(revision, error))?;
-        let mut selected = get_reachable_commits(right_hash.to_string(), None).await?;
-        selected.extend(get_reachable_commits(left_hash.to_string(), None).await?);
-        if let Ok(Some(base)) = crate::internal::merge_base::merge_base(&left_hash, &right_hash) {
-            let excluded: std::collections::HashSet<String> =
-                get_reachable_commits(base.to_string(), None)
-                    .await?
-                    .iter()
-                    .map(|commit| commit.id.to_string())
-                    .collect();
-            selected.retain(|commit| !excluded.contains(&commit.id.to_string()));
+            .map_err(|error| log_branch_store_error_shortlog("--all", error))?;
+        for branch in branches {
+            starts.push(branch.commit);
         }
-        selected
-    } else if let Some((left, right)) = revision.split_once("..") {
-        let left_spec = if left.is_empty() { "HEAD" } else { left };
-        let right_spec = if right.is_empty() { "HEAD" } else { right };
-        let right_hash = util::get_commit_base_typed(right_spec)
+        for tag in tag::list().await.map_err(|error| {
+            CliError::fatal(format!("failed to list tags: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })? {
+            if let TagObject::Commit(commit) = tag.object {
+                starts.push(commit.id);
+            }
+        }
+        if let Some(head) = crate::internal::head::Head::current_commit_result()
             .await
-            .map_err(|error| shortlog_commit_base_error(revision, error))?;
-        let mut selected = get_reachable_commits(right_hash.to_string(), None).await?;
-        let left_hash = util::get_commit_base_typed(left_spec)
-            .await
-            .map_err(|error| shortlog_commit_base_error(revision, error))?;
-        let excluded: std::collections::HashSet<String> =
-            get_reachable_commits(left_hash.to_string(), None)
-                .await?
-                .iter()
-                .map(|commit| commit.id.to_string())
-                .collect();
-        selected.retain(|commit| !excluded.contains(&commit.id.to_string()));
-        selected
-    } else {
-        let commit_hash = util::get_commit_base_typed(revision)
-            .await
-            .map_err(|error| shortlog_commit_base_error(revision, error))?
-            .to_string();
-        get_reachable_commits(commit_hash, None).await?
-    };
+            .ok()
+            .flatten()
+        {
+            starts.push(head);
+        }
+    }
 
-    commits.retain(|commit| passes_filter(commit, since_ts, until_ts));
+    for spec in revisions {
+        let spec = spec.as_str();
+        if let Some(excluded) = spec.strip_prefix('^') {
+            let excluded = if excluded.is_empty() {
+                "HEAD"
+            } else {
+                excluded
+            };
+            excludes.insert(
+                util::get_commit_base_typed(excluded)
+                    .await
+                    .map_err(|error| shortlog_commit_base_error(spec, error))?,
+            );
+        } else if let Some((left, right)) = spec.split_once("...") {
+            let left_spec = if left.is_empty() { "HEAD" } else { left };
+            let right_spec = if right.is_empty() { "HEAD" } else { right };
+            let left_hash = util::get_commit_base_typed(left_spec)
+                .await
+                .map_err(|error| shortlog_commit_base_error(spec, error))?;
+            let right_hash = util::get_commit_base_typed(right_spec)
+                .await
+                .map_err(|error| shortlog_commit_base_error(spec, error))?;
+            starts.push(left_hash);
+            starts.push(right_hash);
+            if let Ok(Some(base)) = crate::internal::merge_base::merge_base(&left_hash, &right_hash)
+            {
+                excludes.insert(base);
+            }
+        } else if let Some((left, right)) = spec.split_once("..") {
+            let left_spec = if left.is_empty() { "HEAD" } else { left };
+            let right_spec = if right.is_empty() { "HEAD" } else { right };
+            excludes.insert(
+                util::get_commit_base_typed(left_spec)
+                    .await
+                    .map_err(|error| shortlog_commit_base_error(spec, error))?,
+            );
+            starts.push(
+                util::get_commit_base_typed(right_spec)
+                    .await
+                    .map_err(|error| shortlog_commit_base_error(spec, error))?,
+            );
+        } else {
+            starts.push(
+                util::get_commit_base_typed(spec)
+                    .await
+                    .map_err(|error| shortlog_commit_base_error(spec, error))?,
+            );
+        }
+    }
 
-    // newest first
-    commits.sort_by_key(|c| std::cmp::Reverse(c.committer.timestamp));
+    if starts.is_empty() {
+        starts.push(
+            util::get_commit_base_typed("HEAD")
+                .await
+                .map_err(|error| shortlog_commit_base_error("HEAD", error))?,
+        );
+    }
 
+    let paths: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
+    let mut commits = walk_date_priority(starts, Some(excludes), false, None)?;
+    if !paths.is_empty() {
+        let mut kept = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let changes = get_changed_files_for_commit(&commit, &paths).await?;
+            if !changes.is_empty() {
+                kept.push(commit);
+            }
+        }
+        commits = kept;
+    }
+    if let Some(since) = since_ts {
+        commits.retain(|commit| commit.committer.timestamp as i64 >= since);
+    }
+    if let Some(until) = until_ts {
+        commits.retain(|commit| commit.committer.timestamp as i64 <= until);
+    }
     Ok(commits)
 }
 
-/// Case-insensitive substring match of a `shortlog --author` pattern against an
-/// identity rendered as `name <email>`. `needle_lowercase` must already be
-/// lowercased by the caller.
+fn log_branch_store_error_shortlog(
+    action: &str,
+    error: crate::internal::branch::BranchStoreError,
+) -> CliError {
+    CliError::fatal(format!("{action}: failed to list branches: {error}"))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+}
+
 fn author_identity_matches(name: &str, email: &str, needle_lowercase: &str) -> bool {
     let identity = format!("{} <{}>", name.to_lowercase(), email.to_lowercase());
     identity.contains(needle_lowercase)
-}
-
-fn passes_filter(commit: &Commit, since_ts: Option<i64>, until_ts: Option<i64>) -> bool {
-    let commit_ts = commit.committer.timestamp as i64;
-
-    if let Some(since) = since_ts
-        && commit_ts < since
-    {
-        return false;
-    }
-
-    if let Some(until) = until_ts
-        && commit_ts > until
-    {
-        return false;
-    }
-
-    true
 }
 
 fn parse_shortlog_date_arg(value: Option<&str>, flag: &str) -> CliResult<Option<i64>> {
