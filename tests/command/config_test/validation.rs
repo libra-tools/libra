@@ -1,10 +1,14 @@
 //! CF-07 (M-SYS Y1..Y7): Explicit scope missing or unreadable store tests.
 
+#[cfg(unix)]
 use std::fs;
 
+#[cfg(unix)]
 use serial_test::serial;
+#[cfg(unix)]
 use tempfile::tempdir;
 
+#[cfg(unix)]
 use crate::command::{assert_cli_success, run_libra_command, run_libra_command_with_env};
 
 /// CF-07 (M-SYS Y1..Y7): Test that explicit scope read operations correctly handle

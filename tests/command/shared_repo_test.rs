@@ -2,10 +2,13 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
+#[cfg(unix)]
 use std::fs;
 
+#[cfg(unix)]
 use tempfile::tempdir;
 
+#[cfg(unix)]
 use super::{assert_cli_success, run_libra_command};
 
 /// IN-06 (M-SLATER L1..L7): Verify that post-init writes (loose objects, fanout dirs,
