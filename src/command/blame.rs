@@ -61,9 +61,9 @@ pub struct BlameArgs {
     pub commit: String,
 
     /// The line range to blame. `END` may be negative (count back from the last
-    /// line), e.g. `-L 1,-2` (Git's form).
-    #[clap(short = 'L', value_name = "RANGE", allow_hyphen_values = true)]
-    pub line_range: Option<String>,
+    /// line), e.g. `-L 1,-2` (Git's form). Repeatable; ranges are merged.
+    #[clap(short = 'L', value_name = "RANGE", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    pub line_range: Vec<String>,
 
     /// Emit the machine-readable porcelain format (commit metadata once per commit).
     #[clap(short = 'p', long)]
@@ -98,11 +98,13 @@ pub struct BlameArgs {
     #[clap(long, value_name = "N")]
     pub abbrev: Option<usize>,
 
-    /// Do not treat root commits as boundaries. Accepted for Git parity and is a
-    /// no-op: Libra's blame never prefixes boundary commits with `^`, so a root
-    /// commit is already shown as a normal commit.
+    /// Do not treat root commits as boundaries (no `^` prefix).
     #[clap(long)]
     pub root: bool,
+
+    /// Show blank hash columns for boundary commits (`-b`).
+    #[clap(short = 'b', long = "blank-boundary")]
+    pub blank_boundary: bool,
 
     /// Detect lines moved within the file (`-M`). Libra scans the parent
     /// revisions' trees for identical line content in other files (a documented
@@ -163,6 +165,8 @@ pub struct BlameLine {
     /// Raw author timestamp (epoch seconds); surfaced for `-t` and JSON callers.
     pub timestamp: i64,
     pub content: String,
+    #[serde(skip)]
+    pub boundary: bool,
 }
 
 /// Whole-file result of a `libra blame` invocation.
@@ -183,6 +187,7 @@ struct LineBlame {
     author_email: String,
     timestamp: i64,
     content: String,
+    boundary: bool,
 }
 
 /// Domain error for `libra blame`. Mapped to stable [`CliError`] codes by
@@ -219,6 +224,14 @@ enum BlameError {
     /// resolved numbers were out of range. Mapped to a usage error.
     #[error("invalid line range: {0}")]
     InvalidLineRange(String),
+
+    /// `-L` start is past the end of the file (Git exits 128).
+    #[error("file {path} has only {lines} line{plural}")]
+    LineRangeStartOutOfBounds {
+        path: String,
+        lines: usize,
+        plural: &'static str,
+    },
 }
 
 impl From<std::io::Error> for BlameError {
@@ -255,6 +268,11 @@ impl From<BlameError> for CliError {
                 .with_hint(
                     r#"supported formats: "10", "10,20", "10,+5", "/regex/", "/start/,/end/""#,
                 ),
+            BlameError::LineRangeStartOutOfBounds { .. } => {
+                CliError::fatal(message)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_exit_code(128)
+            }
         }
     }
 }
@@ -285,6 +303,15 @@ pub async fn execute(args: BlameArgs) {
 /// in src/command/blame.rs:367;
 /// tests::test_blame_json_output_includes_lines in
 /// tests/command/blame_test.rs:50.
+async fn blame_config_bool(key: &str) -> bool {
+    match crate::internal::config::ConfigKv::get(key).await {
+        Ok(Some(entry)) => {
+            crate::internal::config::parse_git_config_bool(&entry.value).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 pub async fn execute_safe(args: BlameArgs, out_config: &OutputConfig) -> CliResult<()> {
     let result = run_blame(&args).await.map_err(CliError::from)?;
 
@@ -309,16 +336,57 @@ pub async fn execute_safe(args: BlameArgs, out_config: &OutputConfig) -> CliResu
         return Ok(());
     }
 
+    // Boundary behaviour: defaults come from `blame.showRoot`/`blame.blankBoundary`.
+    let show_root = args.root || blame_config_bool("blame.showRoot").await;
+    let blank_boundary = args.blank_boundary || blame_config_bool("blame.blankBoundary").await;
+
+    // Author/email column width follows the longest value in this output.
+    let display_authors: Vec<String> = result
+        .lines
+        .iter()
+        .map(|blame| {
+            if args.show_email {
+                format!("<{}>", blame.author_email)
+            } else {
+                blame.author.clone()
+            }
+        })
+        .collect();
+    let author_width = display_authors
+        .iter()
+        .map(|author| author.chars().count())
+        .max()
+        .unwrap_or(0);
+
     let mut output = String::new();
-    for blame in &result.lines {
+    for (index, blame) in result.lines.iter().enumerate() {
         // Hash column: `-l` shows the full hash; `--abbrev=<n>` shows n digits;
         // otherwise the default short hash.
-        let hash_col = if args.long || args.no_abbrev {
+        let base_hash = if args.long || args.no_abbrev {
             blame.hash.clone()
         } else if let Some(n) = args.abbrev {
             blame.hash.chars().take(n).collect::<String>()
         } else {
             blame.short_hash.clone()
+        };
+        let hash_width = base_hash.chars().count();
+        let hash_col = if blame.boundary {
+            if blank_boundary {
+                " ".repeat(hash_width)
+            } else if show_root {
+                base_hash
+            } else {
+                // `^` plus a hash shortened by one keeps the column width.
+                format!(
+                    "^{}",
+                    base_hash
+                        .chars()
+                        .take(hash_width.saturating_sub(1))
+                        .collect::<String>()
+                )
+            }
+        } else {
+            base_hash
         };
 
         // `-f`/`--show-name` inserts the filename right after the hash column.
@@ -339,17 +407,8 @@ pub async fn execute_safe(args: BlameArgs, out_config: &OutputConfig) -> CliResu
         }
 
         // `-e`/`--show-email` shows `<email>` (Git's form) in the author slot.
-        let display_author = if args.show_email {
-            format!("<{}>", blame.author_email)
-        } else {
-            blame.author.clone()
-        };
-        let author_short = if display_author.chars().count() > 15 {
-            let truncated: String = display_author.chars().take(12).collect();
-            format!("{truncated}...")
-        } else {
-            format!("{display_author:15}")
-        };
+        let display_author = &display_authors[index];
+        let author_short = format!("{display_author:<author_width$}");
         // `-t` shows the raw epoch timestamp; otherwise the localized date.
         let date_col = if args.raw_timestamp {
             blame.timestamp.to_string()
@@ -366,7 +425,7 @@ pub async fn execute_safe(args: BlameArgs, out_config: &OutputConfig) -> CliResu
         };
 
         output.push_str(&format!(
-            "{}{} ({:19} {} {}) {}\n",
+            "{}{} ({} {} {}) {}\n",
             hash_col, name_col, author_short, date_col, blame.line_number, blame.content
         ));
     }
@@ -428,6 +487,7 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
             author_email: commit_obj.author.email.clone(),
             timestamp: commit_obj.author.timestamp as i64,
             content: content.clone(),
+            boundary: false,
         })
         .collect();
 
@@ -533,16 +593,51 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
         detect_moved_lines(&mut blame_lines, &commit_obj, &args.file, &shallow)?;
     }
 
-    let filtered_lines = if let Some(ref range) = args.line_range {
-        let (start, end) =
-            parse_line_range(range, &blame_lines).map_err(BlameError::InvalidLineRange)?;
+    let mut filtered_lines = if args.line_range.is_empty() {
+        blame_lines
+    } else {
+        let mut selected: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for range in &args.line_range {
+            let (start, end) =
+                parse_line_range(range, &blame_lines).map_err(|error| match error {
+                    LineRangeError::Invalid(message) => BlameError::InvalidLineRange(message),
+                    LineRangeError::StartOutOfBounds => BlameError::LineRangeStartOutOfBounds {
+                        path: args.file.clone(),
+                        lines: blame_lines.len(),
+                        plural: if blame_lines.len() == 1 { "" } else { "s" },
+                    },
+                })?;
+            selected.extend(start..=end);
+        }
         blame_lines
             .into_iter()
-            .filter(|b| b.line_number >= start && b.line_number <= end)
+            .filter(|b| selected.contains(&b.line_number))
             .collect::<Vec<_>>()
-    } else {
-        blame_lines
     };
+
+    // Boundary commits: roots of the (shallow) walk. Resolve once per commit.
+    let mut boundary_cache: std::collections::HashMap<ObjectHash, bool> =
+        std::collections::HashMap::new();
+    for line in &mut filtered_lines {
+        let is_boundary = match boundary_cache.get(&line.commit_id) {
+            Some(boundary) => *boundary,
+            None => {
+                let commit = load_object::<Commit>(&line.commit_id).map_err(|error| {
+                    BlameError::ObjectLoad {
+                        kind: "commit",
+                        object_id: line.commit_id.to_string(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                let boundary = shallow
+                    .parents_for_walk(&commit.id, &commit.parent_commit_ids)
+                    .is_empty();
+                boundary_cache.insert(line.commit_id, boundary);
+                boundary
+            }
+        };
+        line.boundary = is_boundary;
+    }
 
     Ok(BlameOutput {
         file: args.file.clone(),
@@ -560,6 +655,7 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
                     date: format_blame_date(line.timestamp, args.date.as_deref()),
                     timestamp: line.timestamp,
                     content: line.content,
+                    boundary: line.boundary,
                 }
             })
             .collect(),
@@ -764,25 +860,49 @@ fn format_blame_timestamp(timestamp: i64) -> String {
 /// - Returns `Err` for non-numeric tokens, zero indices, indices past the
 ///   file end, or `start > end`. Each error message is suitable for direct
 ///   inclusion in a [`BlameError::InvalidLineRange`].
-fn parse_line_range(range_str: &str, lines: &[LineBlame]) -> Result<(usize, usize), String> {
+enum LineRangeError {
+    Invalid(String),
+    StartOutOfBounds,
+}
+
+fn parse_line_range(
+    range_str: &str,
+    lines: &[LineBlame],
+) -> Result<(usize, usize), LineRangeError> {
     let total_lines = lines.len();
-    let (start_token, end_token) = split_line_range_tokens(range_str)?;
+    let (start_token, end_token) =
+        split_line_range_tokens(range_str).map_err(LineRangeError::Invalid)?;
 
     // Resolve the start endpoint (a number or `/regex/`, searched from the file start).
-    let start = resolve_start_endpoint(start_token, lines)?;
+    let start = resolve_start_endpoint(start_token, lines).map_err(LineRangeError::Invalid)?;
 
     // A single endpoint means "from <start> to the end of the file" (matching Git),
     // not just that one line.
-    let end = match end_token {
+    let mut end = match end_token {
         None => total_lines,
-        Some(token) => resolve_end_endpoint(token, lines, start)?,
+        Some(token) => {
+            resolve_end_endpoint(token, lines, start).map_err(LineRangeError::Invalid)?
+        }
     };
 
-    if start == 0 || start > total_lines || end == 0 || end > total_lines || start > end {
-        return Err(format!(
+    if start == 0 || start > total_lines {
+        return Err(LineRangeError::StartOutOfBounds);
+    }
+    if end == 0 {
+        return Err(LineRangeError::Invalid(format!(
             "Invalid range {},{} (total lines: {})",
             start, end, total_lines
-        ));
+        )));
+    }
+    // Git clamps an end past EOF to the last line.
+    if end > total_lines {
+        end = total_lines;
+    }
+    if start > end {
+        return Err(LineRangeError::Invalid(format!(
+            "Invalid range {},{} (total lines: {})",
+            start, end, total_lines
+        )));
     }
     Ok((start, end))
 }

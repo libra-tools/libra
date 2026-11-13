@@ -359,9 +359,11 @@ fn test_blame_human_output_handles_long_unicode_author_names() {
     assert_cli_success(&output, "blame tracked.txt");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // ADR-LG-10: the author column is sized to the longest value; it is not
+    // truncated.
     assert!(
-        stdout.contains("..."),
-        "expected truncated author marker in blame output, got: {stdout}"
+        stdout.contains("测试作者名字很长很长很长很长很长很长"),
+        "expected the full author name in blame output, got: {stdout}"
     );
 }
 
@@ -471,9 +473,8 @@ async fn test_blame_json_line_range_filters_output() {
     assert_eq!(lines[0]["content"], "line2-modified");
 }
 
-/// Scenario: an out-of-bounds `-L` range must surface as a stable CLI
-/// error tagged `LBR-CLI-002` (category `cli`) with exit code 129.
-/// Pins the structured error envelope.
+/// Scenario: an out-of-bounds `-L` start surfaces as a fatal 128 error
+/// (`file ... has only N line(s)`, ADR-LG-10). Pins the structured envelope.
 #[test]
 fn test_blame_invalid_line_range_uses_stable_cli_error() {
     let repo = create_committed_repo_via_cli();
@@ -481,8 +482,8 @@ fn test_blame_invalid_line_range_uses_stable_cli_error() {
     let output = run_libra_command(&["blame", "-L", "9,10", "tracked.txt"], repo.path());
     let (_stderr, report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert_eq!(output.status.code(), Some(128));
+    assert_eq!(report.error_code, "LBR-CLI-003");
     assert_eq!(report.category, "cli");
 }
 
@@ -827,7 +828,7 @@ async fn blame_runs_with_sha1() {
     blame::execute(BlameArgs {
         file: "foo.txt".into(),
         commit: "HEAD".into(),
-        line_range: None,
+        line_range: Vec::new(),
         porcelain: false,
         line_porcelain: false,
         show_email: false,
@@ -837,6 +838,7 @@ async fn blame_runs_with_sha1() {
         raw_timestamp: false,
         abbrev: None,
         root: false,
+        blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
         detect_moves: false,
@@ -861,7 +863,7 @@ async fn blame_runs_with_sha256() {
     blame::execute(BlameArgs {
         file: "foo.txt".into(),
         commit: "HEAD".into(),
-        line_range: None,
+        line_range: Vec::new(),
         porcelain: false,
         line_porcelain: false,
         show_email: false,
@@ -871,6 +873,7 @@ async fn blame_runs_with_sha256() {
         raw_timestamp: false,
         abbrev: None,
         root: false,
+        blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
         detect_moves: false,
@@ -977,7 +980,7 @@ async fn blame_root_flag_is_accepted_noop() {
     blame::execute(BlameArgs {
         file: "foo.txt".into(),
         commit: "HEAD".into(),
-        line_range: None,
+        line_range: Vec::new(),
         porcelain: false,
         line_porcelain: false,
         show_email: false,
@@ -987,6 +990,7 @@ async fn blame_root_flag_is_accepted_noop() {
         raw_timestamp: false,
         abbrev: None,
         root: true,
+        blank_boundary: false,
         show_name: false,
         ignore_whitespace: false,
         detect_moves: false,
@@ -1062,4 +1066,109 @@ fn test_blame_show_name_flag_prints_filename() {
         String::from_utf8_lossy(&porc_f.stdout),
         "-f does not change porcelain output"
     );
+}
+
+/// LG-17 (M-BRANGE L1–L8): `-L` clamping/overflow, boundary prefix options,
+/// email column width, and multiple `-L` ranges.
+#[test]
+#[serial(cwd)]
+fn test_blame_line_range_and_boundary_matrix() {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("single.txt"), "one\n").unwrap();
+    fs::write(repo.path().join("m.txt"), "root1\nroot2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], repo.path()), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], repo.path()),
+        "commit root",
+    );
+    fs::write(repo.path().join("m.txt"), "root1\nchanged\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "m.txt"], repo.path()),
+        "add second",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "commit second",
+    );
+
+    let run = |args: &[&str]| run_libra_command(args, repo.path());
+    let stdout = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).to_string();
+
+    // L1: an end past EOF is clamped to the last line.
+    let l1 = run(&["blame", "-L", "1,2", "single.txt"]);
+    assert_cli_success(&l1, "L1 clamp");
+    assert_eq!(stdout(&l1).lines().count(), 1);
+    assert!(stdout(&l1).contains("one"));
+
+    // L2: a start past EOF is fatal 128 with Git's wording.
+    let l2 = run(&["blame", "-L", "5,9", "single.txt"]);
+    assert_eq!(l2.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&l2.stderr).contains("file single.txt has only 1 line"),
+        "{}",
+        String::from_utf8_lossy(&l2.stderr)
+    );
+
+    // L3: syntax errors stay usage errors.
+    let l3 = run(&["blame", "-L", "abc", "single.txt"]);
+    assert_eq!(l3.status.code(), Some(129));
+
+    // L5: a root commit line is prefixed with `^` plus a 7-char hash.
+    let l5 = run(&["blame", "-s", "m.txt"]);
+    let first = stdout(&l5).lines().next().unwrap().to_string();
+    assert!(first.starts_with('^'), "{first}");
+    assert_eq!(first.split_whitespace().next().unwrap().len(), 8, "{first}");
+
+    // L6: `--root` disables the prefix; `-b` blanks the hash; config mirrors.
+    let root = run(&["blame", "--root", "-s", "m.txt"]);
+    assert!(!stdout(&root).starts_with('^'), "{}", stdout(&root));
+    let blank = run(&["blame", "-b", "-s", "m.txt"]);
+    assert!(stdout(&blank).starts_with(' '), "{}", stdout(&blank));
+    assert_cli_success(
+        &run(&["config", "blame.showRoot", "true"]),
+        "set blame.showRoot",
+    );
+    let config_root = run(&["blame", "-s", "m.txt"]);
+    assert!(
+        !stdout(&config_root).starts_with('^'),
+        "{}",
+        stdout(&config_root)
+    );
+    assert_cli_success(
+        &run(&["config", "blame.showRoot", "false"]),
+        "unset showRoot",
+    );
+    assert_cli_success(
+        &run(&["config", "blame.blankBoundary", "true"]),
+        "set blame.blankBoundary",
+    );
+    let config_blank = run(&["blame", "-s", "m.txt"]);
+    assert!(
+        stdout(&config_blank).starts_with(' '),
+        "{}",
+        stdout(&config_blank)
+    );
+    assert_cli_success(
+        &run(&["config", "blame.blankBoundary", "false"]),
+        "unset blankBoundary",
+    );
+
+    // L7: `-e` prints the email and sizes the column to its longest value.
+    let email = run(&["blame", "-e", "-L", "1,1", "m.txt"]);
+    assert_cli_success(&email, "L7 email");
+    assert!(stdout(&email).contains("(<"), "{}", stdout(&email));
+    assert!(
+        stdout(&email).contains(&format!(" {}) ", "1")),
+        "{}",
+        stdout(&email)
+    );
+
+    // L8: multiple `-L` options merge (and de-duplicate) the ranges.
+    let multiple = run(&["blame", "-L", "2,2", "-L", "1,1", "m.txt"]);
+    assert_cli_success(&multiple, "L8 multiple -L");
+    assert_eq!(stdout(&multiple).lines().count(), 2);
+    assert!(stdout(&multiple).contains("root1"));
+    assert!(stdout(&multiple).contains("changed"));
 }
