@@ -559,3 +559,92 @@ fn test_apply_index_cached_and_filters_matrix() {
         String::from_utf8_lossy(&summary.stdout)
     );
 }
+
+/// LG-13 (M-A3W C1–C4): `--3way` clean merge, conflict, missing base, cached.
+#[test]
+fn test_apply_three_way_matrix() {
+    let make_repo = || -> (tempfile::TempDir, String) {
+        let repo = init_repo();
+        let p = repo.path();
+        assert!(
+            run_libra_command(&["config", "user.name", "T"], p)
+                .status
+                .success()
+        );
+        assert!(
+            run_libra_command(&["config", "user.email", "t@e"], p)
+                .status
+                .success()
+        );
+        fs::write(p.join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+        assert!(
+            run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+                .status
+                .success()
+        );
+        fs::write(p.join("a.txt"), "1\n2\nTHREE\n4\n5\n").unwrap();
+        let out = run_libra_command(&["diff"], p);
+        let patch = p.join("p.patch");
+        fs::write(&patch, &out.stdout).unwrap();
+        fs::write(p.join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        (repo, patch.to_str().unwrap().to_string())
+    };
+    let p = |repo: &tempfile::TempDir, args: &[&str]| run_libra_command(args, repo.path());
+
+    // C1 (t4108:40 port): drift outside the changed line merges cleanly, is
+    // staged, and reports Git's message.
+    let (repo, patch) = make_repo();
+    fs::write(repo.path().join("a.txt"), "1\n2\n3\n4\nFIVE\n").unwrap();
+    let clean = p(&repo, &["apply", "--3way", &patch]);
+    assert_cli_success(&clean, "apply --3way clean");
+    assert!(
+        String::from_utf8_lossy(&clean.stderr).contains("Applied patch to 'a.txt' cleanly."),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "1\n2\nTHREE\n4\nFIVE\n"
+    );
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("M  a.txt"), "{status}");
+
+    // C2 (t4108:75 port): overlapping edits leave conflict markers and fail.
+    let (repo, patch) = make_repo();
+    fs::write(repo.path().join("a.txt"), "1\nTWO\n3\n4\n5\n").unwrap();
+    let conflict = p(&repo, &["apply", "--3way", &patch]);
+    assert!(!conflict.status.success(), "conflict must fail");
+    let content = fs::read_to_string(repo.path().join("a.txt")).unwrap();
+    assert!(content.contains("<<<<<<< ours"), "{content}");
+    assert!(content.contains(">>>>>>> theirs"), "{content}");
+
+    // C3: a patch whose recorded pre-image blob is absent fails without
+    // writing.
+    let (repo, _) = make_repo();
+    let missing = repo.path().join("missing.patch");
+    fs::write(
+        &missing,
+        "diff --git a/a.txt b/a.txt\nindex 1111111..2222222 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,5 +1,5 @@\n 1\n 2\n-THREE\n+3\n 4\n 5\n",
+    )
+    .unwrap();
+    let failed = p(&repo, &["apply", "--3way", missing.to_str().unwrap()]);
+    assert!(!failed.status.success(), "missing base must fail");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "1\n2\n3\n4\n5\n"
+    );
+
+    // C4: `--3way --cached` stages the merged result without touching the
+    // working tree.
+    let (repo, patch) = make_repo();
+    fs::write(repo.path().join("a.txt"), "1\n2\n3\n4\nFIVE\n").unwrap();
+    let cached = p(&repo, &["apply", "--3way", "--cached", &patch]);
+    assert_cli_success(&cached, "apply --3way --cached");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "1\n2\n3\n4\nFIVE\n"
+    );
+    let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
+    assert!(status.contains("MM a.txt"), "{status}");
+}

@@ -46,7 +46,7 @@ Patches larger than 64 MiB are rejected.
 | `--summary` | Print create/delete/mode-change lines and exit without applying. | `libra apply --summary fix.patch` |
 | `--apply` | Apply even with a report flag: print the report first, then apply. | `libra apply --stat --apply fix.patch` |
 | `-R`, `--reverse` | Apply the patch in reverse (swap old/new sides). | `libra apply -R fix.patch` |
-| `--3way` | Three-way fallback using the patch's `index` blobs when a hunk does not apply; conflicting merges leave markers and warn. | `libra apply --3way fix.patch` |
+| `--3way` | Three-way fallback using the patch's `index` blobs when a hunk does not apply. A clean merge prints `Applied patch to '<path>' cleanly.`, stages the result (implies `--index`), and exits 0; a conflict writes markers plus unmerged stages and exits 1; a missing pre-image blob fails without writing. | `libra apply --3way fix.patch` |
 | `--index` | Require the working tree to match the index for every touched path (`<path>: does not match index` otherwise, with no writes), then update both. | `libra apply --index fix.patch` |
 | `--cached` | Update only the index; never touch the working tree. Incompatible with `--index`. | `libra apply --cached fix.patch` |
 `--include`/`--exclude` are matched in command-line order and the first matching pattern decides (Git wildmatch).

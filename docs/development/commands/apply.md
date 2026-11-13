@@ -51,3 +51,5 @@
 
 - 2026-11-13（#478 LG-12，ADR-LG-07 第 3、4 条）：`--index` 在准备前校验每条受影响路径的工作树字节与索引 blob 一致（不一致报 `<path>: does not match index`、exit 128、零写入），成功后写工作树并暂存；`--cached` 只把补丁结果写入索引（`Blob` + `IndexEntry`，不触碰工作树），与 `--index` 互斥；`--include`/`--exclude` 改为按 argv 顺序首个匹配决定（Git wildmatch，`--exclude=* --include=a.txt` 跳过、反之应用）；过滤后空补丁 exit 0 且零输出。测试：`test_apply_index_cached_and_filters_matrix`（B1–B5）。
 
+- 2026-11-13（#478 LG-13，ADR-LG-07 第 5 条）：`--3way` 隐含 `--index`（`--cached` 除外）；前像 blob 可解析时用 `diffy::merge_bytes` 合并 recorded-base/ours/theirs——干净合并记录并在应用后向 stderr 输出 `Applied patch to '<path>' cleanly.` 且暂存结果；冲突写出 markers 并写 stage 1/2/3 未合并索引，退出 1；前像缺失仍失败零写入。`--3way --cached` 只写索引。测试：`test_apply_three_way_matrix`（C1–C4），`apply_test` 20/20、`merge_test` 314/314、`compat_mail_am_basic` 41/41。
+
