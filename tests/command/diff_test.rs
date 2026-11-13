@@ -4094,3 +4094,60 @@ fn test_diff_hunk_headers_match_git_matrix() {
     assert!(text.contains("+++ /dev/null"), "{text}");
     assert!(text.contains("@@ -1 +0,0 @@"), "{text}");
 }
+
+/// LG-08 (M-DIRSTAT R1–R4): `--dirstat` matrices match Git (`t4047` ports).
+#[test]
+#[serial(cwd)]
+fn test_diff_dirstat_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let write = |path: &str, content: &str| {
+        fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+        fs::write(p.join(path), content).unwrap();
+    };
+    write("dir1/sub/x", "a\nb\nc\n");
+    write("dir1/sub/y", "a\nb\nc\n");
+    write("dir1/new.txt", "old\n");
+    write("dir2/z", "a\nb\n");
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+
+    write("dir1/sub/x", "a\nb\nc\nd\ne\nf\n");
+    write("dir1/sub/y", "a\nb\nc\nd\ne\nf\n");
+    write("dir1/new.txt", "a\nb\n");
+    write("dir2/z", "a\nb\nc\n");
+
+    let run = |args: &[&str]| -> String {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "diff dirstat");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // R1: default `changes` uses Git's byte damage.
+    assert_eq!(
+        run(&["diff", "--dirstat"]),
+        "  54.5% dir1/sub/\n  36.3% dir1/\n   9.0% dir2/\n"
+    );
+    // R2: `files,0` counts files with a 0% threshold.
+    assert_eq!(
+        run(&["diff", "--dirstat=files,0"]),
+        "  50.0% dir1/sub/\n  25.0% dir1/\n  25.0% dir2/\n"
+    );
+    // R3: `--cumulative` keeps child counts in the parent total.
+    assert_eq!(
+        run(&["diff", "--dirstat", "--cumulative"]),
+        "  54.5% dir1/sub/\n  90.9% dir1/\n   9.0% dir2/\n"
+    );
+    // R4: `-X` is the short form; `--dirstat-by-file` is `files`.
+    assert_eq!(
+        run(&["diff", "-X"]),
+        "  54.5% dir1/sub/\n  36.3% dir1/\n   9.0% dir2/\n"
+    );
+    assert_eq!(
+        run(&["diff", "--dirstat-by-file"]),
+        "  50.0% dir1/sub/\n  25.0% dir1/\n  25.0% dir2/\n"
+    );
+}

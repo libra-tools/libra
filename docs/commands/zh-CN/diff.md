@@ -94,6 +94,7 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | 忽略行尾回车 | | `--ignore-cr-at-eol` | 忽略行尾回车：CRLF↔LF-only 的变更被丢弃；行尾空格或行中 `\r` 的变更仍显示。最弱空白标志——被 `-w`/`-b`/`--ignore-space-at-eol` 各自涵盖且组合时后者优先。（对 Git 的近似：比较前剥除全部尾部 CR，而非 Git 非传递的「允许各留一个 CR」规则——仅病态多 CR 结尾有别，日常 CRLF 场景与 Git 一致。） |
 | 忽略空白行 | | `--ignore-blank-lines` | 忽略全为空白（真正空）行的变更：仅由增删空行构成的变更不报告（若新增/删除的文件内容全为空行，仍以零计数列出该文件），而紧邻真实编辑的空行则完整显示。重新 diff 受影响文件（故 `--stat`/`--name-only`/`--numstat`/JSON 反映结果）；遵循 `-U<n>`。与空白标志（`-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`）复合：任一空白标志下全空白行即视为空行（匹配 Git `xdl_blankline`）。 |
 | 按文件目录统计 | | `--dirstat-by-file[=<param>]` | 按**文件数**（而非变更行数）统计目录分布，等价于 `--dirstat=files[,<param>]`（`<param>` 接受同样的 `cumulative`/百分比取值）。 |
+| 累积目录统计 | | `--cumulative` | 等价于 `--dirstat=cumulative`；单独给出时启用 `--dirstat`。`changes`（默认）按字节 damage 统计，`lines` 按增删行数（二进制按每 64 字节折算），`files` 按文件数；只列出非顶层目录，百分比默认阈值 3%（截断到一位小数）。 |
 | Shortstat | | `--shortstat` | 只显示 `--stat` 的汇总行（文件数/插入/删除），零项省略对应子句。 |
 | Summary | | `--summary` | 显示创建/删除、已检测重命名及 mode 变更的精简摘要（默认开启重命名检测；`diff.renames=false` 或 `--no-renames` 可关闭）。纯内容修改不产生行。 |
 | No patch | `-s` | `--no-patch` | 抑制 patch（diff 主体）。与 `--exit-code` 组合做状态检查。 |

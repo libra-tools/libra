@@ -314,6 +314,8 @@ async fn test_show_non_quiet_uses_forced_pager() {
         no_notes: false,
         notes: None,
         show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: true,
@@ -378,6 +380,8 @@ async fn test_show_quiet_still_validates_patch_generation() {
         no_notes: false,
         notes: None,
         show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -443,6 +447,8 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
         no_notes: false,
         notes: None,
         show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -920,6 +926,8 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
         no_notes: false,
         notes: None,
         show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("nonexistent_ref_abc123".to_string()),
         no_patch: false,
@@ -975,6 +983,8 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
         no_notes: false,
         notes: None,
         show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD:nonexistent_file.txt".to_string()),
         no_patch: false,
@@ -1681,4 +1691,41 @@ fn test_t7007_show_tree_ports() {
     let commit = run_libra_command(&["show", "-s", "HEAD^{commit}"], p);
     assert_cli_success(&commit, "show HEAD^{commit}");
     assert!(String::from_utf8_lossy(&commit.stdout).contains("t7007"));
+}
+
+/// LG-08 (M-DIRSTAT R5): `show --dirstat` and `log --dirstat` share the diff
+/// renderer's output.
+#[test]
+#[serial(cwd)]
+fn test_show_dirstat() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::create_dir_all(p.join("dir2")).unwrap();
+    std::fs::write(p.join("dir1/sub/x"), "a\n").unwrap();
+    std::fs::write(p.join("dir2/z"), "a\nb\nc\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    std::fs::write(p.join("dir1/sub/x"), "a\nb\n").unwrap();
+    std::fs::write(p.join("dir2/z"), "a\nb\nc\nd\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], p),
+        "commit change",
+    );
+
+    let show = run_libra_command(&["show", "--dirstat", "HEAD"], p);
+    assert_cli_success(&show, "show --dirstat");
+    let text = String::from_utf8_lossy(&show.stdout).into_owned();
+    assert!(text.contains("% dir1/sub/"), "{text}");
+    assert!(text.contains("% dir2/"), "{text}");
+
+    let log = run_libra_command(&["log", "--dirstat", "-1"], p);
+    assert_cli_success(&log, "log --dirstat");
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(text.contains("\n\n  50.0% dir1/sub/"), "{text}");
+    assert!(text.contains("% dir2/"), "{text}");
 }

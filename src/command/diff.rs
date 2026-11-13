@@ -327,6 +327,10 @@ pub struct DiffArgs {
     #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat: Option<String>,
 
+    /// Synonym for `--dirstat=cumulative` (enables `--dirstat` when given alone).
+    #[clap(long)]
+    pub cumulative: bool,
+
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
     #[clap(long)]
@@ -843,6 +847,14 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
             "files".to_string()
         } else {
             format!("files,{param}")
+        };
+        args.dirstat = Some(merged);
+    }
+    // `--cumulative` is Git's synonym for `--dirstat=cumulative`.
+    if args.cumulative {
+        let merged = match args.dirstat.take() {
+            Some(param) if !param.is_empty() => format!("{param},cumulative"),
+            _ => "cumulative".to_string(),
         };
         args.dirstat = Some(merged);
     }
@@ -5328,6 +5340,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         summary: false,
         dirstat: None,
         dirstat_by_file: None,
+        cumulative: false,
         stat_name_width: None,
         inter_hunk_context: None,
         ignore_matching_lines: None,

@@ -265,6 +265,15 @@ pub struct LogArgs {
     #[clap(long, overrides_with = "shortstat")]
     pub shortstat: bool,
 
+    /// Show a per-directory change distribution for each commit
+    /// (`--dirstat[=<param>,...]`, `-X`).
+    #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat: Option<String>,
+
+    /// `--dirstat-by-file[=<param>]`: `--dirstat=files[,<param>]`.
+    #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat_by_file: Option<String>,
+
     /// Show the diffstat block followed by the full patch for each commit
     /// (Git's synonym for `-p --stat`).
     #[clap(long = "patch-with-stat", overrides_with = "patch_with_stat")]
@@ -2161,6 +2170,15 @@ async fn execute_safe_with_diff_formats(
 ) -> CliResult<()> {
     reset_log_debug_counters();
     let _log_debug_hooks = LogDebugHookGuard;
+    let mut args = args;
+    // `--dirstat-by-file[=<param>]` is `--dirstat=files[,<param>]`.
+    if let Some(param) = args.dirstat_by_file.take() {
+        args.dirstat = Some(if param.is_empty() {
+            "files".to_string()
+        } else {
+            format!("files,{param}")
+        });
+    }
     let log_config = resolve_log_config(&args, !output.is_json()).await?;
     let decorate_option = resolve_decorate_option(&args).await?;
 
@@ -2582,6 +2600,19 @@ async fn execute_safe_with_diff_formats(
         if name_only || name_status {
             let changes = cached_changes.take().unwrap_or_default();
             append_changed_paths(&mut message, &changes, name_status, args.null);
+        } else if let Some(param) = &args.dirstat {
+            let dirstat =
+                compute_commit_dirstat(&commit, commit_path_filters.clone(), param).await?;
+            if !dirstat.is_empty() {
+                if !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                // Git separates the commit message from the dirstat block with
+                // a blank line (same as `--stat`).
+                message.push('\n');
+                message.push_str(&dirstat);
+                message.push('\n');
+            }
         } else if patch {
             // Build the optional diffstat block first (stat, blank line, then the
             // patch), reusing the existing `--stat` and `-p` renderers in Git's
@@ -3372,6 +3403,59 @@ pub async fn compute_commit_stat(
         }
     }
     Ok(stats)
+}
+
+/// Compute the `--dirstat` block for a commit's first-parent diff. Shares the
+/// Git-compatible formatter with `diff --dirstat` (ADR-LG-06 item 1).
+pub async fn compute_commit_dirstat(
+    commit: &Commit,
+    paths: Vec<PathBuf>,
+    param: &str,
+) -> Result<String, CliError> {
+    let tree = load_object::<Tree>(&commit.tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items()?;
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
+            .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
+        let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
+            .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
+        parent_tree.get_plain_items()?
+    } else {
+        Vec::new()
+    };
+    let diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    let entries: Vec<crate::utils::diff_format::DirstatEntry<'_>> = diffs
+        .iter()
+        .map(|item| {
+            let mut insertions = 0usize;
+            let mut deletions = 0usize;
+            for line in item.data.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    insertions += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    deletions += 1;
+                }
+            }
+            let binary = item
+                .data
+                .lines()
+                .any(|line| line.starts_with("Binary files "))
+                .then_some((0u64, 0u64));
+            crate::utils::diff_format::DirstatEntry {
+                name: item.path.as_str(),
+                insertions,
+                deletions,
+                raw_diff: item.data.as_str(),
+                binary,
+            }
+        })
+        .collect();
+    crate::utils::diff_format::format_dirstat(&entries, param).map_err(|message| {
+        CliError::command_usage(format!("invalid --dirstat parameter: {message}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
 }
 
 /// Formats a list of file statistics into a Git-style summary with colored bars.

@@ -127,6 +127,15 @@ pub struct ShowArgs {
     #[clap(long)]
     pub stat: bool,
 
+    /// Show a per-directory change distribution (`--dirstat[=<param>,...]`,
+    /// `-X`); shares the Git-compatible formatter with `libra diff`.
+    #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat: Option<String>,
+
+    /// `--dirstat-by-file[=<param>]`: `--dirstat=files[,<param>]`.
+    #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat_by_file: Option<String>,
+
     /// Show the diffstat block followed by the full patch (Git's legacy synonym
     /// for `-p --stat`).
     #[clap(long = "patch-with-stat")]
@@ -317,6 +326,14 @@ pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResul
         args.object = Some("HEAD".to_string());
     }
 
+    // `--dirstat-by-file[=<param>]` is `--dirstat=files[,<param>]`.
+    if let Some(param) = args.dirstat_by_file.take() {
+        args.dirstat = Some(if param.is_empty() {
+            "files".to_string()
+        } else {
+            format!("files,{param}")
+        });
+    }
     if let Some(date) = args.date.take() {
         args.date = Some(resolve_cli_date(&date)?);
     }
@@ -601,6 +618,16 @@ async fn show_commit(
         // `FIX-AD-01`: a pathspec that matches no changed path renders no
         // diff/stat block — an empty `paths` otherwise means "no filter".
         if !args.pathspec.is_empty() && paths.is_empty() {
+        } else if let Some(param) = &args.dirstat {
+            // `show --dirstat` replaces the patch with the directory-level
+            // distribution, like Git.
+            let dirstat =
+                crate::command::log::compute_commit_dirstat(&commit, paths, param).await?;
+            if !dirstat.is_empty() {
+                output.push('\n');
+                output.push_str(&dirstat);
+                output.push('\n');
+            }
         } else if args.patch_with_stat {
             // `--patch-with-stat` (Git's `-p --stat`): the diffstat block followed
             // by the full patch.
