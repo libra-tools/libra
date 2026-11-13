@@ -24,6 +24,12 @@ list their entries and blobs print their text content (or a binary summary).
 When stdout is piped and the downstream command exits early, `libra show` exits quietly without
 printing panic/backtrace or `Broken pipe` diagnostics.
 
+### Default layout
+
+The default header keeps the blank line between the `Date:` line and the
+indented commit message. `--oneline`, `--pretty`, and `--format` are
+last-one-wins.
+
 ## Options
 
 | Flag | Short | Description |
@@ -32,7 +38,7 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `--no-patch` | `-s` | Skip patch output and only show object metadata. |
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
 | `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
-| `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). Mutually exclusive with `--pretty`. |
+| `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). `--oneline`, `--pretty`, and `--format` are last-one-wins. |
 | `--date <FORMAT>` | | Select the human date mode (`default`, `short`, `iso`, `iso-strict`, `rfc`, `unix`, or `raw`). Overrides `log.date`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
 | `--no-abbrev-commit` | | Show the full (unabbreviated) commit object name, countermanding an earlier `--abbrev-commit` (last one wins). The full hash is the default, so on its own this is a no-op. |

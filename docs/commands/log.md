@@ -137,6 +137,17 @@ template using `format:`, `tformat:`, or a `%` placeholder. Empty values and
 unknown bare preset names fail before output with `LBR-CLI-002`; an explicit
 CLI format bypasses the matching config key.
 
+### Default layout
+
+The default (`medium`) and the `short`/`full`/`fuller`/`raw` presets print one
+blank line between commit records and none after the last one. The `Date:` line
+uses Git's default form with an unpadded day of month
+(`Fri Jan 2 00:00:00 2026 +0000`). `oneline`, `reference`, and custom
+`--format`/`--pretty` records are separated by a single newline and print no
+blank line. `--oneline`, `--pretty`, and `--format` are last-one-wins rather
+than mutually exclusive, and `show` keeps the blank line between its header and
+the indented message.
+
 ### `--date=<format>`
 
 Select the human-readable author/committer date mode. Supported modes are
@@ -371,7 +382,7 @@ libra log --pretty=%P -1
 ### `--format <FORMAT>`
 
 Alias for `--pretty=<FORMAT>` (Git's `--format`). Accepts the same preset names and
-`%`-placeholder templates as `--pretty`. Mutually exclusive with `--pretty`.
+`%`-placeholder templates as `--pretty`. `--oneline`, `--pretty`, and `--format` are last-one-wins (the last one on the command line selects the format).
 
 ```bash
 libra log --format="%h %s"

@@ -4017,9 +4017,22 @@ fn log_format_is_alias_for_pretty() {
         String::from_utf8_lossy(&fmt.stdout)
     );
 
-    // `--format` and `--pretty` are mutually exclusive.
-    let both = run_libra_command(&["log", "--format=%s", "--pretty=%s", "-1"], p);
-    assert!(!both.status.success(), "--format conflicts with --pretty");
+    // ADR-LG-05 item 2: `--oneline`, `--pretty`, and `--format` are
+    // last-one-wins rather than mutually exclusive.
+    let pretty_last = run_libra_command(&["log", "--format=%H", "--pretty=%s", "-1"], p);
+    assert_cli_success(&pretty_last, "log --format then --pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_last.stdout).trim(),
+        "base",
+        "--pretty after --format wins"
+    );
+    let format_last = run_libra_command(&["log", "--pretty=%s", "--format=%H", "-1"], p);
+    assert_cli_success(&format_last, "log --pretty then --format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_last.stdout).trim().len(),
+        40,
+        "--format after --pretty wins"
+    );
 }
 
 #[test]
@@ -4235,11 +4248,11 @@ fn log_no_expand_tabs_flag_is_accepted_noop() {
 }
 
 #[test]
-fn log_no_notes_flag_is_accepted_noop() {
+fn log_no_notes_flag_hides_default_notes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
-    // Attach a note; Libra's log never displays notes inline, so the flag is a
-    // no-op whether or not a note exists.
+    // ADR-LG-03: built-in formats show notes by default, so `--no-notes` is no
+    // longer a no-op — it suppresses the block that plain `log` now displays.
     assert!(
         run_libra_command(&["notes", "add", "-m", "a note", "HEAD"], p)
             .status
@@ -4248,17 +4261,19 @@ fn log_no_notes_flag_is_accepted_noop() {
 
     let plain = run_libra_command(&["log"], p);
     assert_cli_success(&plain, "log");
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("Notes:"),
+        "plain log shows the default note block"
+    );
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("    a note"),
+        "plain log shows the note body"
+    );
     let out = run_libra_command(&["log", "--no-notes"], p);
     assert_cli_success(&out, "log --no-notes");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&plain.stdout),
-        "log --no-notes matches plain log (no-op)"
-    );
-    // Sanity: the note is not shown by plain log either.
     assert!(
-        !String::from_utf8_lossy(&plain.stdout).contains("a note"),
-        "Libra log does not display notes inline"
+        !String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+        "log --no-notes suppresses the note block"
     );
 }
 
@@ -6391,4 +6406,100 @@ fn test_t3301_notes_display_ports() {
     // t3301:282 — `--no-notes` hides it again.
     let hidden = run_libra_command(&["log", "-1", "--no-notes"], p);
     assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+}
+
+/// LG-05 (M-LAYOUT L1): default log layout matches Git — unpadded day, one
+/// blank line between commits, and no blank line after the final commit.
+#[test]
+#[serial(cwd)]
+fn test_log_default_layout_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Rewrite the base commit with a single-digit day so the padding rule is
+    // observable (`Fri Jan 2 ...`, not `Fri Jan 02 ...`).
+    fs::write(p.join("tracked.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add one");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "second", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z"),
+            ],
+        ),
+        "commit with fixed date",
+    );
+
+    let out = run_libra_command(&["log", "-2"], p);
+    assert_cli_success(&out, "log -2");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("Date:   Fri Jan 2 00:00:00 2026 +0000"),
+        "unpadded day: {text:?}"
+    );
+    assert!(
+        !text.contains("Jan 02"),
+        "day must not be zero-padded: {text:?}"
+    );
+    // Exactly one blank line between the two commit records.
+    let between = text.split("commit ").nth(2).expect("second commit record");
+    assert!(
+        between.starts_with(|c: char| c.is_ascii_alphanumeric()),
+        "blank line separates records: {text:?}"
+    );
+    let separator_count = text.matches("\n\ncommit ").count();
+    assert_eq!(
+        separator_count, 1,
+        "one blank line between commits: {text:?}"
+    );
+    // No trailing blank line after the last commit.
+    assert!(text.ends_with('\n'), "newline-terminated: {text:?}");
+    assert!(
+        !text.ends_with("\n\n"),
+        "no blank line after the last commit: {text:?}"
+    );
+}
+
+/// LG-05 (M-LAYOUT L3): `--oneline` / `--pretty` / `--format` are last-wins.
+#[test]
+#[serial(cwd)]
+fn test_log_format_last_one_wins() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let full_hash = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    let format_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--format=%H"], p);
+    assert_cli_success(&format_after_oneline, "oneline then format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_after_oneline.stdout).trim(),
+        full_hash,
+        "--format after --oneline wins"
+    );
+
+    let oneline_after_format = run_libra_command(&["log", "-1", "--format=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_format, "format then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_format.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --format wins: {text:?}"
+    );
+
+    let pretty_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--pretty=%s"], p);
+    assert_cli_success(&pretty_after_oneline, "oneline then pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_after_oneline.stdout).trim(),
+        "base",
+        "--pretty after --oneline wins"
+    );
+
+    let oneline_after_pretty = run_libra_command(&["log", "-1", "--pretty=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_pretty, "pretty then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_pretty.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --pretty wins: {text:?}"
+    );
 }

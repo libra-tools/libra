@@ -1155,9 +1155,28 @@ fn show_format_aliases_pretty_and_abbrev_commit_shortens_hash() {
         "subject rendered: {}",
         String::from_utf8_lossy(&fmt.stdout)
     );
-    // --format conflicts with --pretty.
-    let both = run_libra_command(&["show", "--format=%s", "--pretty=%s", "HEAD"], p);
-    assert!(!both.status.success(), "--format conflicts with --pretty");
+    // ADR-LG-05 item 2: `--oneline`, `--pretty`, and `--format` are
+    // last-one-wins rather than mutually exclusive.
+    let pretty_last = run_libra_command(
+        &["show", "--no-patch", "--format=%H", "--pretty=%s", "HEAD"],
+        p,
+    );
+    assert_cli_success(&pretty_last, "show --format then --pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_last.stdout).trim(),
+        "base",
+        "--pretty after --format wins"
+    );
+    let format_last = run_libra_command(
+        &["show", "--no-patch", "--pretty=%s", "--format=%H", "HEAD"],
+        p,
+    );
+    assert_cli_success(&format_last, "show --pretty then --format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_last.stdout).trim(),
+        full_hash,
+        "--format after --pretty wins"
+    );
 
     // --abbrev-commit shortens the default header's commit hash.
     let abbrev = run_libra_command(&["show", "--no-patch", "--abbrev-commit", "HEAD"], p);
@@ -1534,5 +1553,24 @@ fn test_log_and_diff_stat_counts_consistent() {
         summary_line(&String::from_utf8_lossy(&show.stdout)),
         summary_line(&String::from_utf8_lossy(&log.stdout)),
         "show/log summary counts must match"
+    );
+}
+
+/// LG-05 (M-LAYOUT L2): `show` keeps the blank line between the header and the
+/// indented message.
+#[test]
+#[serial(cwd)]
+fn test_show_header_blank_line() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(&["show", "-s", "HEAD"], repo.path());
+    assert_cli_success(&out, "show -s HEAD");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let date_line = text
+        .lines()
+        .find(|line| line.starts_with("Date:"))
+        .expect("Date header");
+    assert!(
+        text.contains(&format!("{date_line}\n\n    base")),
+        "blank line between header and message: {text:?}"
     );
 }

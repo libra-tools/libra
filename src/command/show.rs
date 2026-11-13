@@ -80,17 +80,17 @@ pub struct ShowArgs {
     pub no_patch: bool,
 
     /// Shorthand for `--pretty=oneline`.
-    #[clap(long)]
+    #[clap(long, overrides_with_all = ["pretty", "format"])]
     pub oneline: bool,
 
     /// Format the commit header with a pretty format
     /// (`oneline` / `format:<tmpl>` / `tformat:<tmpl>` / custom template).
-    #[clap(long, value_name = "FORMAT")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "format"])]
     pub pretty: Option<String>,
 
     /// Alias for `--pretty=<format>` (Git's `--format`). Accepts the same preset
     /// names and `%`-placeholder templates as `--pretty`.
-    #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "pretty"])]
     pub format: Option<String>,
 
     /// Date rendering mode for author/committer dates: default / short / iso /
@@ -1122,9 +1122,10 @@ fn display_commit_info(
             commit.author.email.trim()
         ));
 
-        // Format the commit timestamp for display.
+        // Format the commit timestamp for display. ADR-LG-05 item 1: the
+        // blank line between the header and the indented message is required.
         output.push_str(&format!(
-            "Date:   {}\n",
+            "Date:   {}\n\n",
             format_timestamp_with(
                 commit.committer.timestamp as i64,
                 args.date.as_deref().unwrap_or_default(),
@@ -1136,9 +1137,8 @@ fn display_commit_info(
         for line in msg.lines() {
             output.push_str(&format!("    {}\n", line));
         }
-        if args.notes.is_some() && !args.no_notes {
-            output.push_str(&crate::internal::log::formatter::notes_block(notes));
-        }
+        // Notes blocks are appended by the caller (`show_note_blocks`), so the
+        // notes are not rendered twice here.
     }
 }
 

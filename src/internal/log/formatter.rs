@@ -657,7 +657,9 @@ pub fn format_timestamp_with(timestamp: i64, mode: &str) -> String {
         "rfc" | "rfc2822" => dt.to_rfc2822(),
         "unix" => timestamp.to_string(),
         "raw" => format!("{timestamp} +0000"),
-        _ => dt.format("%a %b %d %H:%M:%S %Y %z").to_string(),
+        // Git's default date form does not zero-pad the day of month
+        // (`Fri Jan 2 00:00:00 2026 +0000`), so `%d` would be wrong here.
+        _ => dt.format("%a %b %-d %H:%M:%S %Y %z").to_string(),
     }
 }
 

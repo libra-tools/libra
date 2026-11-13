@@ -106,6 +106,14 @@ libra log --pretty=reference
 `format:`、`tformat:`、`%` 占位符的非空自定义模板。空值与未知的裸预设名
 会在输出前以 `LBR-CLI-002` 失败；显式 CLI 格式会绕过对应配置键。
 
+### 默认布局
+
+默认 `medium` 与 `short`/`full`/`fuller`/`raw` 预设在每个提交记录之间输出一个空行，
+最后一个记录后不输出空行。`Date:` 行使用 Git 默认形式，日期不补零
+（`Fri Jan 2 00:00:00 2026 +0000`）。`oneline`、`reference` 与自定义
+`--format`/`--pretty` 记录之间仅一个换行、不插入空行。`--oneline`、`--pretty`、
+`--format` 按命令行顺序后者生效，而非互斥；`show` 保留头部与缩进消息之间的空行。
+
 ### `--date=<format>`
 
 选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
@@ -284,7 +292,7 @@ libra log --pretty=%P -1
 
 ### `--format <FORMAT>`
 
-`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。与 `--pretty` 互斥。
+`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。`--oneline`、`--pretty`、`--format` 按命令行顺序后者生效。
 
 ```bash
 libra log --format="%h %s"

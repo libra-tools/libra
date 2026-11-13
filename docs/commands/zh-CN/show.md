@@ -16,6 +16,11 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 
 当 stdout 被管道连接且下游命令提前退出时，`libra show` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
 
+### 默认布局
+
+默认头部在 `Date:` 行与缩进的提交消息之间保留一个空行。`--oneline`、`--pretty`、
+`--format` 按命令行顺序后者生效。
+
 ## 选项
 
 | 标志 | 短选项 | 说明 |
@@ -24,7 +29,7 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 | `--no-patch` | `-s` | 跳过 patch 输出，只显示对象元数据。 |
 | `--oneline` | | `--pretty=oneline` 的简写，在一行中打印哈希和主题。 |
 | `--pretty <FORMAT>` | | 以预设（`oneline`、`short`、`full`、`fuller`、`reference`、`raw`）或 `%` 占位符模板（`format:`/`tformat:`/裸模板）格式化 commit header。复用 `libra log --format` 的同一组自定义占位符，包括 `%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、`%aI`、`%cI`、`%at`、`%ct`、`%D`、`%m` 和颜色占位符。 |
-| `--format <FORMAT>` | | `--pretty=<FORMAT>` 的别名（Git 的 `--format`）。与 `--pretty` 互斥。 |
+| `--format <FORMAT>` | | `--pretty=<FORMAT>` 的别名（Git 的 `--format`）。`--oneline`、`--pretty`、`--format` 按命令行顺序后者生效。 |
 | `--date <FORMAT>` | | 选择人类日期格式（`default`、`short`、`iso`、`iso-strict`、`rfc`、`unix` 或 `raw`），覆盖 `log.date`。 |
 | `--abbrev-commit` | | 把默认 header 的 commit 对象名缩写为 7 位前缀。 |
 | `--no-abbrev-commit` | | 显示完整（未缩写）commit 对象名，撤销先前的 `--abbrev-commit`（最后出现者生效）。完整哈希是默认，故单独使用时为 no-op。 |

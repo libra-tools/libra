@@ -174,7 +174,7 @@ pub struct LogArgs {
     #[clap(short, long, visible_alias = "max-count")]
     pub number: Option<usize>,
     /// Shorthand for --pretty=oneline --abbrev-commit
-    #[clap(long)]
+    #[clap(long, overrides_with_all = ["pretty", "format"])]
     pub oneline: bool,
 
     /// Show abbreviated commit hash instead of full hash
@@ -232,11 +232,11 @@ pub struct LogArgs {
     #[clap(long, value_name = "DATE")]
     pub until: Option<String>,
     /// Custom pretty format string (e.g. `%h - %s`)
-    #[clap(long, value_name = "FORMAT")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "format"])]
     pub pretty: Option<String>,
     /// Alias for `--pretty=<format>` (Git's `--format`). Accepts the same preset
     /// names and `%`-placeholder templates as `--pretty`.
-    #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "pretty"])]
     pub format: Option<String>,
     /// Date rendering mode for author/committer dates: default / short / iso /
     /// iso-strict / rfc / unix / raw.
@@ -2268,6 +2268,17 @@ async fn execute_safe_with_diff_formats(
         ColorChoice::Never => false,
         ColorChoice::Auto => std::io::stdout().is_terminal(),
     };
+    // Git's medium/short/full/fuller/raw presets separate commit records with
+    // a blank line; `oneline`, `reference`, and custom `--format` records are
+    // separated by a single newline (ADR-LG-05 item 1).
+    let blank_line_between_commits = matches!(
+        &format_type,
+        FormatType::Full
+            | FormatType::Preset(LogPreset::Short)
+            | FormatType::Preset(LogPreset::Full)
+            | FormatType::Preset(LogPreset::Fuller)
+            | FormatType::Preset(LogPreset::Raw)
+    );
     let mut formatter = CommitFormatter::new(format_type)
         .with_date_mode(log_config.date.clone().unwrap_or_default())
         .with_color_enabled(color_enabled);
@@ -2329,6 +2340,7 @@ async fn execute_safe_with_diff_formats(
         std::collections::HashMap::new()
     };
 
+    let mut first_commit = true;
     for selected in selected_commits {
         let SelectedLogCommit {
             commit,
@@ -2544,8 +2556,18 @@ async fn execute_safe_with_diff_formats(
             }
             pager.write_str(&message)?;
         } else {
-            pager.write_line(&message)?;
+            // ADR-LG-05 item 1: the separator belongs *before* each commit
+            // after the first, so no blank line is emitted after the last
+            // commit. Only the blank-line formats get an extra newline.
+            if !first_commit && blank_line_between_commits {
+                pager.write_str("\n")?;
+            }
+            pager.write_str(&message)?;
+            if !message.ends_with('\n') {
+                pager.write_str("\n")?;
+            }
         }
+        first_commit = false;
     }
 
     pager.finish()?;
