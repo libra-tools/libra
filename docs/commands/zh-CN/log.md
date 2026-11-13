@@ -225,6 +225,12 @@ libra log --committer alice --committer bob
 `-i` / `--regexp-ignore-case` 让所有模式大小写不敏感；
 `--invert-grep` 保留一个模式都未匹配的提交，并优先于 `--all-match`。
 
+方言：默认 POSIX BRE（`+`、`(`/`)`、`.` 按 Git BRE 语义）；`-F`/`--fixed-strings`
+为字面串，`-E`/`--extended-regexp` 为 ERE，`--basic-regexp` 显式选择 BRE，
+`-P`/`--perl-regexp` 在本版本报告「引擎未启用」用法错误（后出现的标志生效）。
+未给方言标志时按级联读取 `grep.patternType`（basic/extended/fixed）与
+`grep.extendedRegexp`。
+
 搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
 `-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
 人类输出、`--json` 和 `--machine` 使用相同筛选范围。空模式匹配所有消息，因此与

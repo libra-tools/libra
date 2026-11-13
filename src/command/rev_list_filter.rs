@@ -13,9 +13,15 @@ use regex::Regex;
 use super::RevListArgs;
 use crate::{
     command::log,
-    internal::log::date_parser::parse_date,
+    internal::{
+        config::{LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict},
+        log::date_parser::parse_date,
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
+        grep_pattern::{
+            GrepPatternType, commit_message_for_grep, compile_grep_patterns, resolve_pattern_type,
+        },
         util,
     },
 };
@@ -77,44 +83,51 @@ pub(super) fn rev_list_committer_filter(args: &RevListArgs) -> Option<String> {
         .map(|pattern| pattern.to_lowercase())
 }
 
-pub(super) fn rev_list_message_filter(
+pub(super) async fn rev_list_message_filter(
     args: &RevListArgs,
 ) -> CliResult<Option<RevListMessageFilter>> {
     if args.grep.is_empty() {
         return Ok(None);
     }
 
-    let patterns = args
-        .grep
-        .iter()
-        .map(|pattern| {
-            let translated = if args.grep_fixed {
-                regex::escape(pattern)
-            } else if args.grep_extended {
-                pattern.clone()
-            } else {
-                crate::command::log::bre_to_ere(pattern)
+    let cli = if args.grep_fixed {
+        Some(GrepPatternType::Fixed)
+    } else if args.grep_extended {
+        Some(GrepPatternType::Extended)
+    } else if args.grep_perl {
+        Some(GrepPatternType::Perl)
+    } else if args.grep_basic {
+        Some(GrepPatternType::Basic)
+    } else {
+        None
+    };
+    let kind = match cli {
+        Some(kind) => kind,
+        None => {
+            let pattern_type = read_rev_list_grep_config("grep.patternType").await?;
+            let extended = match read_rev_list_grep_config("grep.extendedRegexp").await? {
+                Some(raw) => parse_git_config_bool(&raw),
+                None => None,
             };
-            Regex::new(&translated)
-                .map_err(|error| {
-                    CliError::fatal(format!("invalid --grep pattern '{pattern}': {error}"))
-                        .with_stable_code(StableErrorCode::CliInvalidArguments)
-                        .with_hint("use a valid regular expression or escape metacharacters")
-                })
-                .map(|re| {
-                    if args.grep_ignore_case {
-                        regex::RegexBuilder::new(&translated)
-                            .case_insensitive(true)
-                            .build()
-                            .unwrap_or(re)
-                    } else {
-                        re
-                    }
-                })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
+            resolve_pattern_type(None, pattern_type.as_deref(), extended)
+        }
+    };
+
+    let patterns = compile_grep_patterns(&args.grep, kind, args.grep_ignore_case)?;
 
     Ok(Some(RevListMessageFilter { patterns }))
+}
+
+async fn read_rev_list_grep_config(key: &'static str) -> CliResult<Option<String>> {
+    read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, key)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to read config '{key}': {error:#}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint(format!(
+                    "repair or unset '{key}', then retry 'libra rev-list'"
+                ))
+        })
 }
 
 pub(super) fn commit_matches_author(commit: &Commit, author_filter: Option<&str>) -> bool {
@@ -150,10 +163,11 @@ pub(super) fn commit_matches_message(
         return true;
     };
 
+    let message = commit_message_for_grep(&commit.message);
     filter
         .patterns
         .iter()
-        .any(|pattern| pattern.is_match(&commit.message))
+        .any(|pattern| pattern.is_match(message))
 }
 
 pub(super) async fn filter_commits_by_pathspecs(

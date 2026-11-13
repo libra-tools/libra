@@ -15,6 +15,7 @@ pub mod client_storage;
 pub mod config_color;
 pub mod convert;
 pub mod d1_client;
+pub mod grep_pattern;
 pub mod ignore;
 pub mod index_ext;
 pub mod json;

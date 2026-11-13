@@ -6195,3 +6195,98 @@ fn lo08_detached_head_filtered_out() {
         "three (octopus-b, octopus-a, main)\n"
     );
 }
+
+/// LG-01 (M-GREP G1..G10): `--grep` dialect, multi-pattern, and scope matrix.
+#[test]
+#[serial(cwd)]
+fn test_log_grep_pattern_types_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Four commits whose subjects exercise the matrix.
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foo.bar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    let subjects = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log grep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // G1: BRE treats `+`/`(`/`)` literally, so the whole subject matches.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "c++ (fix)"]),
+        vec!["c++ (fix)"]
+    );
+    // G2: `.` is the BRE any-char operator.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa", "fooXbar"]
+    );
+    // G3: `a+` is a literal BRE, so nothing matches; `-E` makes it ERE.
+    assert!(subjects(&["log", "--format=%s", "--grep", "a+"]).is_empty());
+    let extended = subjects(&["log", "--format=%s", "-E", "--grep", "a+"]);
+    assert!(extended.contains(&"foo.bar aaa".to_string()));
+    assert!(extended.contains(&"fooXbar".to_string()));
+    // G4: fixed strings bypass the regex engine.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "-F", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa"]
+    );
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--fixed-strings",
+            "--grep",
+            "c++ (fix)"
+        ]),
+        vec!["c++ (fix)"]
+    );
+    // G5: explicit basic dialect and the unenabled -P dialect.
+    let basic = subjects(&["log", "--format=%s", "--basic-regexp", "--grep", r"a\+"]);
+    assert!(basic.contains(&"foo.bar aaa".to_string()));
+    assert!(basic.contains(&"fooXbar".to_string()));
+    let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "HEAD"], p);
+    assert_eq!(perl.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&perl.stderr).contains("--perl-regexp"),
+        "{}",
+        String::from_utf8_lossy(&perl.stderr)
+    );
+    // G6: `--all-match` requires every pattern; the default is any.
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--all-match",
+            "--grep",
+            "foo",
+            "--grep",
+            "aaa"
+        ]),
+        vec!["foo.bar aaa"]
+    );
+    let any = subjects(&["log", "--format=%s", "--grep", "foo", "--grep", "aaa"]);
+    assert!(any.contains(&"foo.bar aaa".to_string()));
+    assert!(any.contains(&"fooXbar".to_string()));
+    // G10: an invalid BRE is a CLI usage error naming the pattern.
+    let invalid = run_libra_command(&["log", "--grep", r"a\(", "HEAD"], p);
+    assert_eq!(invalid.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("invalid --grep pattern"), "{stderr}");
+    assert!(stderr.contains(r"a\("), "{stderr}");
+}

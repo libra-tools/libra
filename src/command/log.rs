@@ -21,13 +21,13 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use self::config::{ResolvedLogConfig, resolve_log_config};
+use self::config::{ResolvedLogConfig, read_log_config, resolve_log_config};
 use crate::{
     command::{diff, load_object},
     common_utils::parse_commit_msg,
     internal::{
         branch::{Branch, BranchStoreError},
-        config::ConfigKv,
+        config::{ConfigKv, parse_git_config_bool},
         head::Head,
         log::{
             date_parser::parse_date,
@@ -38,6 +38,7 @@ use crate::{
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
+        grep_pattern::{GrepPatternType, compile_grep_patterns, resolve_pattern_type},
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
@@ -303,19 +304,39 @@ pub struct LogArgs {
     )]
     pub all_match: bool,
 
-    /// Treat `--grep` as a literal fixed string (Git's `--fixed-strings`).
-    #[clap(long = "fixed-strings", overrides_with_all = ["grep_extended", "grep_basic"])]
+    /// Treat `--grep` as a literal fixed string (Git's `-F`/`--fixed-strings`).
+    #[clap(
+        short = 'F',
+        long = "fixed-strings",
+        overrides_with_all = ["grep_extended", "grep_basic", "grep_perl"]
+    )]
     pub grep_fixed: bool,
 
     /// Use POSIX extended regular expressions for `--grep` (Git's
-    /// `--extended-regexp`).
-    #[clap(long = "extended-regexp", overrides_with_all = ["grep_fixed", "grep_basic"])]
+    /// `-E`/`--extended-regexp`).
+    #[clap(
+        short = 'E',
+        long = "extended-regexp",
+        overrides_with_all = ["grep_fixed", "grep_basic", "grep_perl"]
+    )]
     pub grep_extended: bool,
 
     /// Use POSIX basic regular expressions for `--grep` (the default dialect;
     /// accepted for Git parity).
-    #[clap(long = "basic-regexp", overrides_with_all = ["grep_fixed", "grep_extended"])]
+    #[clap(
+        long = "basic-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_perl"]
+    )]
     pub grep_basic: bool,
+
+    /// Use Perl-compatible regular expressions for `--grep` (Git's
+    /// `-P`/`--perl-regexp`; the engine lands in a later release).
+    #[clap(
+        short = 'P',
+        long = "perl-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_basic"]
+    )]
+    pub grep_perl: bool,
 
     /// Only list commits whose trailer block carries this trailer (Libra
     /// extension — Git has no such flag; nearest is a fragile
@@ -606,15 +627,6 @@ fn parse_trailer_filters(specs: &[String]) -> Result<Vec<TrailerFilter>, CliErro
         .collect()
 }
 
-/// The `--grep` pattern dialect. Git's default is POSIX basic regex; the
-/// explicit selector flags pick a different dialect (last flag wins).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrepDialect {
-    Basic,
-    Extended,
-    Fixed,
-}
-
 /// Whether one decoration name passes the `--decorate-refs` /
 /// `--decorate-refs-exclude` filters: an implicit `refs/` prefix, wildcard or
 /// component-boundary prefix matching, and excludes win over includes.
@@ -647,40 +659,42 @@ fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
 
 /// Resolve the requested `--grep` dialect (last selector flag wins, basic is
 /// the default).
-fn grep_dialect(args: &LogArgs) -> GrepDialect {
+fn grep_dialect(args: &LogArgs) -> Option<GrepPatternType> {
     if args.grep_fixed {
-        GrepDialect::Fixed
+        Some(GrepPatternType::Fixed)
     } else if args.grep_extended {
-        GrepDialect::Extended
+        Some(GrepPatternType::Extended)
+    } else if args.grep_perl {
+        Some(GrepPatternType::Perl)
+    } else if args.grep_basic {
+        Some(GrepPatternType::Basic)
     } else {
-        GrepDialect::Basic
+        None
     }
 }
 
-/// Translate POSIX basic regex to the extended dialect the `regex` crate
-/// speaks: unescaped ERE operators become escaped literals, while the BRE
-/// escaped forms (`\(`, `\+`, …) become their ERE operators.
-pub(crate) fn bre_to_ere(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => match chars.next() {
-                Some(next @ ('(' | ')' | '{' | '}' | '+' | '?' | '|')) => out.push(next),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            },
-            '(' | ')' | '{' | '}' | '+' | '?' | '|' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            other => out.push(other),
-        }
+/// Read `grep.patternType` / `grep.extendedRegexp` for the no-CLI-selector case.
+async fn configured_grep_pattern_type() -> CliResult<Option<GrepPatternType>> {
+    let pattern_type = read_log_config("grep.patternType").await?;
+    let extended = match read_log_config("grep.extendedRegexp").await? {
+        Some(raw) => parse_git_config_bool(&raw),
+        None => None,
+    };
+    Ok(Some(resolve_pattern_type(
+        None,
+        pattern_type.as_deref(),
+        extended,
+    )))
+}
+
+/// Resolve the effective dialect from CLI + config.
+async fn resolve_grep_dialect(args: &LogArgs) -> CliResult<GrepPatternType> {
+    if let Some(cli) = grep_dialect(args) {
+        return Ok(cli);
     }
-    out
+    Ok(configured_grep_pattern_type()
+        .await?
+        .unwrap_or(GrepPatternType::Basic))
 }
 
 /// The two pickaxe modes. `StringCount` matches when a commit changes the number
@@ -765,28 +779,10 @@ impl CommitFilter {
         mut self,
         ignore_case: bool,
         invert_grep: bool,
-        dialect: GrepDialect,
+        dialect: GrepPatternType,
     ) -> CliResult<Self> {
         self.invert_grep = invert_grep;
-        self.grep_regex = self
-            .grep
-            .iter()
-            .map(|pattern| {
-                let translated = match dialect {
-                    GrepDialect::Fixed => regex::escape(pattern),
-                    GrepDialect::Extended => pattern.clone(),
-                    GrepDialect::Basic => bre_to_ere(pattern),
-                };
-                regex::RegexBuilder::new(&translated)
-                    .case_insensitive(ignore_case)
-                    .build()
-                    .map_err(|error| {
-                        CliError::fatal(format!("invalid --grep pattern '{pattern}': {error}"))
-                            .with_exit_code(129)
-                            .with_stable_code(StableErrorCode::CliInvalidArguments)
-                    })
-            })
-            .collect::<CliResult<Vec<_>>>()?;
+        self.grep_regex = compile_grep_patterns(&self.grep, dialect, ignore_case)?;
         Ok(self)
     }
 
@@ -2083,6 +2079,7 @@ async fn execute_safe_with_diff_formats(
         args.max_parents,
     );
     let pickaxe = build_pickaxe(&args)?;
+    let grep_dialect = resolve_grep_dialect(&args).await?;
     let filter = CommitFilter::new(
         identity_filters.authors.clone(),
         identity_filters.committers.clone(),
@@ -2094,7 +2091,7 @@ async fn execute_safe_with_diff_formats(
         max_parents,
         pickaxe,
     )
-    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(&args))?
+    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect)?
     .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
@@ -2507,6 +2504,7 @@ async fn run_log(
         args.max_parents,
     );
     let pickaxe = build_pickaxe(args)?;
+    let grep_dialect = resolve_grep_dialect(args).await?;
     let filter = CommitFilter::new(
         identity_filters.authors.clone(),
         identity_filters.committers.clone(),
@@ -2518,7 +2516,7 @@ async fn run_log(
         max_parents,
         pickaxe,
     )
-    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(args))?
+    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect)?
     .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
@@ -3624,7 +3622,7 @@ mod tests {
                     None,
                     None,
                 )
-                .with_grep_options(ignore_case, invert, GrepDialect::Basic)
+                .with_grep_options(ignore_case, invert, GrepPatternType::Basic)
                 .unwrap();
                 assert_eq!(
                     filter.passes_non_path_filters(&commit),
@@ -3663,7 +3661,7 @@ mod tests {
                         None,
                         None,
                     )
-                    .with_grep_options(false, invert, GrepDialect::Basic)
+                    .with_grep_options(false, invert, GrepPatternType::Basic)
                     .unwrap();
                     assert_eq!(
                         filter.passes_non_path_filters(&commit),

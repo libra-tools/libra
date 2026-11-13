@@ -265,9 +265,12 @@ Repeated --grep patterns match if any pattern matches. The default dialect is
 POSIX basic regex (Git's default), so plain text matches literally and `+`,
 `(`/`)`, `.` behave as Git's BRE does. `--all-match` requires every pattern to
 match and takes no value; without any patterns it does not filter. Supplying a
-value with `--all-match=<value>` is rejected. `--fixed-strings` treats each
-pattern as a literal, `--extended-regexp` uses POSIX ERE, and `--basic-regexp`
-selects the default dialect explicitly (last flag wins). `-i` /
+value with `--all-match=<value>` is rejected. `-F`/`--fixed-strings` treats each
+pattern as a literal, `-E`/`--extended-regexp` uses POSIX ERE, `--basic-regexp`
+selects the default dialect explicitly, and `-P`/`--perl-regexp` is accepted but
+reports an "engine not enabled" usage error in this release (last flag wins).
+When no dialect flag is given, `grep.patternType` (basic/extended/fixed) and
+`grep.extendedRegexp` apply from the local→global→system cascade. `-i` /
 `--regexp-ignore-case` makes all grep matches case-insensitive
 (author/committer matching is already case-insensitive in Libra).
 `--invert-grep` keeps commits matching none of the patterns and takes
@@ -290,8 +293,9 @@ libra log --grep fix --grep docs      # any pattern may match
 libra log --all-match --grep fix --grep docs
 libra log --grep fix -i              # case-insensitive
 libra log --grep WIP --invert-grep   # hide WIP commits
-libra log --extended-regexp --grep 'fix\([0-9]+\)'   # ERE dialect
-libra log --fixed-strings --grep 'c++ (fix)'           # literal pattern
+libra log -E --grep 'fix\([0-9]+\)'   # ERE dialect
+libra log -F --grep 'c++ (fix)'        # literal pattern
+libra log --basic-regexp --grep 'a\+'  # explicit BRE
 ```
 
 ### `--trailer <KEY[=VALUE]>` / `--only-trailers` (Libra extensions)
