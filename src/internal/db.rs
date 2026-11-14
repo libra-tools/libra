@@ -561,11 +561,6 @@ pub(crate) fn schema_upgrade_allowed() -> bool {
     ALLOW_SCHEMA_UPGRADE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// A short-lived connection that never applies migrations.
-pub(crate) async fn database_connection_without_migrations(db_path: &Path) -> io::Result<DbConn> {
-    open_database_without_migrations(db_path).await
-}
-
 pub async fn get_db_conn_instance_for_path(db_path: &Path) -> io::Result<DbConn> {
     get_or_init_db_conn_instance(db_path.to_path_buf()).await
 }

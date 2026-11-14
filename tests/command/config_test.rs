@@ -7438,6 +7438,12 @@ fn test_config_file_read_only() {
     let write = run_libra_command(&["config", "--file", file, "x.y", "z"], repo.path());
     assert_cli_success(&write, "write through --file");
     let after = run_libra_command(&["config", "--file", file, "--list"], repo.path());
+    assert_cli_success(&after, "list after --file write");
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("x.y=z"),
+        "{}",
+        String::from_utf8_lossy(&after.stdout)
+    );
 }
 
 /// `--type=bool-or-str` / `bool-or-int` canonicalize like Git.

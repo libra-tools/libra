@@ -144,13 +144,11 @@ fn read_repo_shared_mode_uncached(storage_root: &Path) -> io::Result<Option<Shar
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let mut value = None;
             for key in ["core.sharedRepository", "core.sharedrepository"] {
-                if let Ok(entry) =
+                if let Ok(Some(entry)) =
                     crate::internal::config::ConfigKv::get_with_conn(&conn, key).await
                 {
-                    if let Some(entry) = entry {
-                        value = Some(entry.value);
-                        break;
-                    }
+                    value = Some(entry.value);
+                    break;
                 }
             }
             let _ = conn.close().await;
