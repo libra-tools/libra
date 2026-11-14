@@ -237,32 +237,40 @@ libra init --template /path/to/template
 libra init --template=            # no template at all
 ```
 
-### `--shared <MODE>`
+### `--shared[=<MODE>]`
 
 Specify that the repository is to be shared amongst several users (mirrors the Git
-`--shared` flag for group permissions). Supported values are `false`, `umask`,
-`true`, `group`, `all`, `world`, `everybody`, or a 4-digit octal mode such as
-`0770`.
+`--shared` flag for group permissions). Passing `--shared` without a value defaults to
+`group`. When specifying a mode, use `--shared=<MODE>`. Supported values are `false`,
+`umask`, `no`, `off`, `0`, `true`, `group`, `yes`, `on`, `1`, `all`, `world`,
+`everybody`, `2`, or an octal file mode such as `0660`, `0640`, `0600`, or `0664`.
 
-`true` is canonicalized to `group`; `world` and `everybody` are canonicalized to
-`all`. Any explicit `--shared` value is recorded in `core.sharedRepository`, so
-`libra config get core.sharedRepository` reflects the active shared mode after a
-fresh init or re-initialization.
+`group`/`true`/`1` is recorded in `core.sharedRepository` as `1`; `all`/`world`/`everybody`/`2`
+is recorded as `2`; octal modes are masked with `0666` and persisted in `0%o` format (e.g. `0660`).
+`umask`/`false`/`0` does not persist `core.sharedRepository` and removes any existing value on
+re-initialization. Legacy Libra values (`group`, `all`, `umask`, `false`, `0775`) remain fully
+readable and are rewritten to the Git format upon re-initialization. When `--shared` is omitted,
+the cascade (`local` -> `global` -> `system`) for `core.sharedRepository` is honored.
 
-Numeric modes are validated before any repository layout is written. Libra applies
-numeric modes directly to repository directories and files, so the owner must keep
-`rwx` access and any group/other class that receives read or write permission must
-also receive the matching execute bit for directory traversal. Non-traversable
-modes such as `0660` are rejected with `LBR-CLI-002` and do not leave a partial
-`.libra` directory.
+Numeric modes are validated before any repository layout is written. The file owner must always
+retain read and write permissions (`mode & 0600 == 0600`). Modes missing owner read/write access
+such as `0400` or `0200` are rejected with `LBR-CLI-002` before any files are created.
+
+Permissions for files and directories are computed separately aligning with Git's `calc_shared_perm`:
+- Regular files receive shared bits overlay (`0660` for `group`, `0664` for `all`/`everybody`; numeric modes replace the lower 9 bits). Executable files copy read bits to execute bits (`mode |= (mode & 0444) >> 2`).
+- Directories copy read bits to execute bits for directory traversal and receive the setgid bit (`02000`) whenever group access is present (`group`, `all`, or numeric mode with group read/write).
+- The configured shared mode applies to all post-init writes: new loose objects (`0444`/`0440`) and their fanout directories (`2775`/`2750`), repack output (`.pack` and `.idx` files `0444`), the repository database (`libra.db`) and its SQLite sidecars (`0664`/`0640`), and the index file (`0664`/`0640`).
+- Private signing keys in `vault.db` and its SQLite sidecars are strictly excluded and remain owner-only.
+- Symlinks within the repository layout are never followed during permission sweeps.
 
 For a Git conversion into an existing bare target, `--shared` updates the target
 directory and newly created repository entries; pre-existing user files retain
 their permissions.
 
 ```bash
-libra init --shared group shared-repo
-libra init --shared 0770 shared-repo
+libra init --shared shared-repo
+libra init --shared=group shared-repo
+libra init --shared=0660 shared-repo
 ```
 
 ### `--ref-format <FORMAT>`
@@ -437,7 +445,7 @@ rather than ongoing cohabitation.
 | Initial branch name | `git init -b <name>` / `--initial-branch` | No direct flag (uses `trunk()` revset config) | `libra init -b <name>` / `--initial-branch` |
 | Object hash format | `git init --object-format=sha256` | Inherits from Git backend | `libra init --object-format sha256` |
 | Template directory | `git init --template=<dir>` | N/A | `libra init --template <dir>` |
-| Shared permissions | `git init --shared[=<mode>]` | N/A | `libra init --shared <mode>` |
+| Shared permissions | `git init --shared[=<mode>]` | N/A | `libra init --shared[=<mode>]` |
 | Separate storage dir | `git init --separate-git-dir=<dir>` | `jj git init --colocate` | Removed |
 | Import from Git repo | N/A (use `git clone --local`) | `jj git init --git-repo <path>` | `libra init --from-git-repository <path>` |
 | Vault / signing bootstrap | N/A (manual GPG/SSH setup) | N/A | `libra init --vault <bool>` (default: true) |

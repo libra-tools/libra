@@ -30,12 +30,19 @@ pub(crate) const MAX_PATCH_BYTES: usize = 64 * 1024 * 1024;
 /// A fully validated patch result. No worktree write happens while this value
 /// is built, so a malformed or non-applicable multi-file patch fails before
 /// touching its first target.
+/// `(base, ours, theirs)` bytes for a three-way conflict.
+pub(crate) type ConflictSides = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 #[derive(Debug)]
 pub(crate) struct PreparedPatch {
     files: Vec<PreparedFile>,
     /// PD-09 ③: targets whose three-way fallback left conflict markers
     /// in the prepared content. Empty on a clean preparation.
     conflicted: Vec<String>,
+    /// Targets whose `--3way` fallback merged cleanly.
+    clean_merges: Vec<String>,
+    /// Conflict sides `(base, ours, theirs)` for unmerged index stages.
+    conflict_sides: HashMap<String, ConflictSides>,
 }
 
 #[derive(Debug)]
@@ -67,6 +74,23 @@ impl PreparedPatch {
     /// pause, or treat the patch as failed).
     pub(crate) fn conflicted(&self) -> &[String] {
         &self.conflicted
+    }
+
+    pub(crate) fn clean_merges(&self) -> &[String] {
+        &self.clean_merges
+    }
+
+    pub(crate) fn conflict_sides(&self) -> &HashMap<String, ConflictSides> {
+        &self.conflict_sides
+    }
+
+    /// Prepared results for index updates: `(target, new content, mode)`.
+    /// `content == None` deletes the index entry.
+    pub(crate) fn staged_entries(&self) -> Vec<(String, Option<Vec<u8>>, Option<u32>)> {
+        self.files
+            .iter()
+            .map(|file| (file.target.clone(), file.content.clone(), file.mode))
+            .collect()
     }
 
     /// PD-09 ②: surviving targets whose git mode the patch changes.
@@ -224,6 +248,20 @@ pub struct ApplyArgs {
     #[clap(long)]
     pub stat: bool,
 
+    /// Show a machine-readable `insertions\tdeletions\tpath` report and exit
+    /// without applying.
+    #[clap(long)]
+    pub numstat: bool,
+
+    /// Show a create/delete/mode-change summary and exit without applying.
+    #[clap(long)]
+    pub summary: bool,
+
+    /// Apply even when a report flag (`--stat`/`--numstat`/`--summary`) is
+    /// present: print the report first, then apply (Git's `--apply`).
+    #[clap(long)]
+    pub apply: bool,
+
     /// Apply the patch in reverse (swap old/new sides).
     #[clap(short = 'R', long = "reverse")]
     pub reverse: bool,
@@ -233,9 +271,14 @@ pub struct ApplyArgs {
     #[clap(long = "3way")]
     pub three_way: bool,
 
-    /// Update the index (stage the patched paths) after writing.
+    /// Update the index (stage the patched paths) after writing; requires the
+    /// working tree to match the index for every touched path.
     #[clap(long = "index")]
     pub index: bool,
+
+    /// Update only the index; leave the working tree untouched.
+    #[clap(long)]
+    pub cached: bool,
 
     /// Only apply sections whose target path matches one of these patterns.
     #[clap(long = "include", value_name = "PATH")]
@@ -288,36 +331,80 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
             .with_stable_code(StableErrorCode::CliInvalidArguments)
     };
 
+    if args.cached && args.index {
+        return Err(usage_error(
+            "--cached and --index are incompatible".to_string(),
+        ));
+    }
+
     let mut patch_text = read_patch(&args.patches).map_err(usage_error)?;
     let workdir = util::working_dir();
 
     if let Some(directory) = &args.directory {
         patch_text = rewrite_patch_directory(&patch_text, directory).map_err(usage_error)?;
     }
-    patch_text = filter_patch_sections(&patch_text, &args.include, &args.exclude, args.strip)
-        .map_err(usage_error)?;
+    let filter_rules = ordered_filter_rules();
+    patch_text =
+        filter_patch_sections(&patch_text, &filter_rules, args.strip).map_err(usage_error)?;
 
-    if args.reverse {
-        patch_text = reverse_patch_text(&patch_text, args.strip);
-    }
-
-    if args.stat {
-        let stat = format_apply_stat(&patch_text, args.strip);
-        let files = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
+    // Everything was filtered out: Git succeeds without output or writes.
+    if patch_text.trim().is_empty() {
         if output.is_json() {
             emit_json_data(
                 "apply",
                 &ApplyOutput {
                     applies: true,
-                    files,
+                    files: Vec::new(),
                     applied: false,
                 },
                 output,
             )?;
-        } else {
-            print!("{stat}");
         }
         return Ok(());
+    }
+
+    // `--index` requires the working tree to match the index for every path
+    // the patch touches (Git checks this before attempting the hunks).
+    if args.index {
+        let targets = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
+        ensure_paths_match_index(&targets).map_err(usage_error)?;
+    }
+
+    if args.reverse {
+        patch_text = reverse_patch_text(&patch_text, args.strip);
+    }
+
+    if args.stat || args.numstat || args.summary {
+        let mut report = String::new();
+        if args.stat {
+            report.push_str(&format_apply_stat(&patch_text, args.strip));
+        }
+        if args.numstat {
+            report.push_str(&format_apply_numstat(&patch_text, args.strip));
+        }
+        if args.summary {
+            report.push_str(&format_apply_summary(&patch_text, args.strip));
+        }
+        let files = patch_targets(&patch_text, args.strip).map_err(usage_error)?;
+        if !args.apply {
+            if output.is_json() {
+                emit_json_data(
+                    "apply",
+                    &ApplyOutput {
+                        applies: true,
+                        files,
+                        applied: false,
+                    },
+                    output,
+                )?;
+            } else {
+                print!("{report}");
+            }
+            return Ok(());
+        }
+        if !output.is_json() {
+            print!("{report}");
+        }
     }
 
     let resolver = resolve_local_base_blob;
@@ -383,11 +470,28 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
 
     let conflicted = prepared.conflicted().to_vec();
     let mode_overrides = prepared.mode_overrides();
-    prepared.write().map_err(usage_error)?;
-
-    if args.index {
-        stage_apply_targets(&files).await?;
-        stage_apply_modes(&mode_overrides)?;
+    let clean_merges = prepared.clean_merges().to_vec();
+    let conflict_side_map = prepared.conflict_sides().clone();
+    // `--3way` implies `--index` (Git stages the merged result), but only an
+    // explicit `--index` requires the worktree to match the index first.
+    let implied_index = args.three_way && !args.cached;
+    if args.cached {
+        // `--cached` writes the new blobs into the index only.
+        stage_prepared_index(&prepared)?;
+    } else {
+        prepared.write().map_err(usage_error)?;
+        if args.index || implied_index {
+            stage_apply_targets(&files).await?;
+            stage_apply_modes(&mode_overrides)?;
+            if !conflicted.is_empty() {
+                stage_conflict_sides(&conflict_side_map)?;
+            }
+        }
+    }
+    if args.three_way {
+        for target in &clean_merges {
+            eprintln!("Applied patch to '{target}' cleanly.");
+        }
     }
 
     if output.is_json() {
@@ -480,71 +584,90 @@ fn rewrite_patch_directory(patch_text: &str, directory: &str) -> Result<String, 
 /// Keep only sections matching `--include` (when any) and not matching
 /// `--exclude`. Matching uses fnmatch-style globs against the `-p`-stripped
 /// target path.
+#[derive(Clone, Copy)]
+enum FilterAction {
+    Include,
+    Exclude,
+}
+
+/// Reconstruct `--include`/`--exclude` in command-line order. Clap stores the
+/// two lists separately, but Git's rule is "the first matching pattern
+/// decides", so the interleaved order matters (`--exclude=* --include=a.txt`
+/// skips while `--include=a.txt --exclude=*` applies).
+fn ordered_filter_rules() -> Vec<(FilterAction, String)> {
+    let mut rules = Vec::new();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if let Some(value) = arg.strip_prefix("--include=") {
+            rules.push((FilterAction::Include, value.to_string()));
+        } else if arg == "--include"
+            && let Some(value) = argv.get(index + 1)
+        {
+            rules.push((FilterAction::Include, value.clone()));
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--exclude=") {
+            rules.push((FilterAction::Exclude, value.to_string()));
+        } else if arg == "--exclude"
+            && let Some(value) = argv.get(index + 1)
+        {
+            rules.push((FilterAction::Exclude, value.clone()));
+            index += 1;
+        }
+        index += 1;
+    }
+    rules
+}
+
 fn filter_patch_sections(
     patch_text: &str,
-    include: &[String],
-    exclude: &[String],
+    rules: &[(FilterAction, String)],
     strip: u32,
 ) -> Result<String, String> {
-    if include.is_empty() && exclude.is_empty() {
+    if rules.is_empty() {
         return Ok(patch_text.to_string());
     }
-    let include_matcher = GlobMatcher::new(include);
-    let exclude_matcher = GlobMatcher::new(exclude);
+    let compiled: Vec<(FilterAction, ignore::gitignore::Gitignore)> = rules
+        .iter()
+        .filter_map(|(action, pattern)| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+            builder.add_line(None, pattern).ok()?;
+            builder.build().ok().map(|gi| (*action, gi))
+        })
+        .collect();
     let mut out = String::new();
     for section in split_file_patches(patch_text) {
         let headers = parse_section_headers(&section, strip)?;
         let target = headers
             .single_target(&section, strip)
             .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
-        if !include.is_empty() && !include_matcher.matches(&target) {
-            continue;
+        let mut keep = true;
+        for (action, matcher) in &compiled {
+            let matched = matcher.matched_path_or_any_parents(Path::new(&target), false);
+            if matched.is_ignore() || matched.is_whitelist() {
+                keep = matches!(action, FilterAction::Include);
+                break;
+            }
         }
-        if exclude_matcher.matches(&target) {
-            continue;
+        if keep {
+            out.push_str(&section);
         }
-        out.push_str(&section);
     }
     Ok(out)
 }
 
-struct GlobMatcher {
-    patterns: Vec<String>,
-}
-
-impl GlobMatcher {
-    fn new(patterns: &[String]) -> Self {
-        Self {
-            patterns: patterns.to_vec(),
-        }
-    }
-
-    fn matches(&self, path: &str) -> bool {
-        self.patterns.iter().any(|pattern| {
-            let mut builder = ignore::gitignore::GitignoreBuilder::new("");
-            if builder.add_line(None, pattern).is_err() {
-                return false;
-            }
-            match builder.build() {
-                Ok(gi) => {
-                    gi.matched_path_or_any_parents(Path::new(path), false)
-                        .is_ignore()
-                        || gi
-                            .matched_path_or_any_parents(Path::new(path), false)
-                            .is_whitelist()
-                }
-                Err(_) => false,
-            }
-        })
-    }
-}
-
-/// Render a `--stat` summary for a patch without applying it.
+/// Render a `--stat` summary for a patch without applying, matching Git's
+/// padded name/count columns and its omission of zero insertion/deletion
+/// clauses in the trailing summary line.
 fn format_apply_stat(patch_text: &str, strip: u32) -> String {
-    let mut out = String::new();
-    let mut files = 0usize;
-    let mut insertions = 0usize;
-    let mut deletions = 0usize;
+    struct Entry {
+        target: String,
+        insertions: usize,
+        deletions: usize,
+        binary: bool,
+    }
+    let mut entries = Vec::new();
     for section in split_file_patches(patch_text) {
         let Ok(headers) = parse_section_headers(&section, strip) else {
             continue;
@@ -552,40 +675,139 @@ fn format_apply_stat(patch_text: &str, strip: u32) -> String {
         let target = headers
             .single_target(&section, strip)
             .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
-        let mut ins = 0usize;
-        let mut del = 0usize;
-        let mut in_hunks = false;
-        for line in section.lines() {
-            if line.starts_with("@@ ") {
-                in_hunks = true;
-                continue;
-            }
-            if in_hunks {
-                if line.starts_with('+') && !line.starts_with("+++") {
-                    ins += 1;
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    del += 1;
-                }
-            }
-        }
+        let (insertions, deletions) = count_section_changes(&section);
+        entries.push(Entry {
+            target,
+            insertions,
+            deletions,
+            binary: headers.binary.is_some() || headers.binary_marker,
+        });
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
+    let name_width = entries
+        .iter()
+        .map(|entry| entry.target.len())
+        .max()
+        .unwrap_or(0);
+    let count_width = entries
+        .iter()
+        .map(|entry| (entry.insertions + entry.deletions).to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let mut out = String::new();
+    let mut files = 0usize;
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for entry in &entries {
         files += 1;
-        insertions += ins;
-        deletions += del;
-        let total = ins + del;
+        if entry.binary {
+            out.push_str(&format!(
+                " {:<name_width$} | Bin\n",
+                entry.target,
+                name_width = name_width
+            ));
+            continue;
+        }
+        insertions += entry.insertions;
+        deletions += entry.deletions;
+        let total = entry.insertions + entry.deletions;
         out.push_str(&format!(
-            " {target} | {total} {}\n",
-            "+".repeat(ins) + &"-".repeat(del)
+            " {:<name_width$} | {:>count_width$} {}\n",
+            entry.target,
+            total,
+            "+".repeat(entry.insertions) + &"-".repeat(entry.deletions),
+            name_width = name_width,
+            count_width = count_width,
         ));
     }
-    if files > 0 {
-        out.push_str(&format!(
-            " {files} file{} changed, {insertions} insertion{}(+), {deletions} deletion{}(-)\n",
-            if files == 1 { "" } else { "s" },
-            if insertions == 1 { "" } else { "s" },
-            if deletions == 1 { "" } else { "s" },
+    let mut clauses = vec![format!(
+        "{files} file{} changed",
+        if files == 1 { "" } else { "s" }
+    )];
+    if insertions > 0 {
+        clauses.push(format!(
+            "{insertions} insertion{}(+)",
+            if insertions == 1 { "" } else { "s" }
         ));
+    }
+    if deletions > 0 {
+        clauses.push(format!(
+            "{deletions} deletion{}(-)",
+            if deletions == 1 { "" } else { "s" }
+        ));
+    }
+    out.push_str(&format!(" {}\n", clauses.join(", ")));
+    out
+}
+
+/// Render `--numstat`: `insertions\tdeletions\tpath`, with `-\t-` for binary
+/// sections and the post-image path for renames.
+fn format_apply_numstat(patch_text: &str, strip: u32) -> String {
+    let mut out = String::new();
+    for section in split_file_patches(patch_text) {
+        let Ok(headers) = parse_section_headers(&section, strip) else {
+            continue;
+        };
+        let target = headers
+            .single_target(&section, strip)
+            .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
+        let binary = headers.binary.is_some() || headers.binary_marker;
+        let (ins, del) = count_section_changes(&section);
+        if binary {
+            out.push_str(&format!("-\t-\t{target}\n"));
+        } else {
+            out.push_str(&format!("{ins}\t{del}\t{target}\n"));
+        }
     }
     out
+}
+
+/// Render `--summary`: created and deleted files plus mode changes.
+fn format_apply_summary(patch_text: &str, strip: u32) -> String {
+    let mut out = String::new();
+    for section in split_file_patches(patch_text) {
+        let Ok(headers) = parse_section_headers(&section, strip) else {
+            continue;
+        };
+        let target = headers
+            .single_target(&section, strip)
+            .unwrap_or_else(|_| headers.display_target().unwrap_or_default());
+        if let Some(mode) = headers.new_file_mode {
+            out.push_str(&format!(" create mode {mode:06o} {target}\n"));
+        } else if let Some(mode) = headers.deleted_file_mode {
+            out.push_str(&format!(" delete mode {mode:06o} {target}\n"));
+        } else if let (Some(old), Some(new)) = (headers.old_mode, headers.new_mode)
+            && old != new
+        {
+            out.push_str(&format!(" mode change {old:06o} => {new:06o} {target}\n"));
+        }
+    }
+    out
+}
+
+/// Count `+`/`-` body lines in a section (excluding headers).
+fn count_section_changes(section: &str) -> (usize, usize) {
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    let mut in_hunks = false;
+    for line in section.lines() {
+        if line.starts_with("@@ ") {
+            in_hunks = true;
+            continue;
+        }
+        if !in_hunks {
+            continue;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            ins += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            del += 1;
+        }
+    }
+    (ins, del)
 }
 
 /// Reverse a patch: swap old/new sides, hunks, modes, rename/copy pairs and
@@ -749,6 +971,123 @@ fn reverse_hunk_header(line: &str) -> String {
 }
 
 /// Stage patched targets after a successful apply.
+/// `apply --index` precondition: every touched path's working-tree bytes must
+/// equal the index blob (Git's `<path>: does not match index`).
+fn ensure_paths_match_index(targets: &[String]) -> Result<(), String> {
+    use git_internal::internal::{index::Index, object::blob::Blob};
+
+    let index_path = crate::utils::path::index();
+    let index =
+        Index::load(&index_path).map_err(|error| format!("failed to load the index: {error}"))?;
+    let workdir = util::working_dir();
+    for target in targets {
+        let index_id = index.get(target, 0).map(|entry| entry.hash);
+        let path = workdir.join(target);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("failed to read '{target}': {error}")),
+        };
+        match (index_id, bytes) {
+            (Some(id), Some(bytes)) => {
+                if Blob::from_content_bytes(bytes).id != id {
+                    return Err(format!("{target}: does not match index"));
+                }
+            }
+            (Some(_), None) => return Err(format!("{target}: does not match index")),
+            (None, Some(_)) => {
+                return Err(format!("{target}: already exists in working directory"));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Stage prepared patch results directly into the index (`--cached`), without
+/// touching the working tree.
+fn stage_prepared_index(prepared: &PreparedPatch) -> CliResult<()> {
+    use git_internal::internal::{
+        index::{Index, IndexEntry},
+        object::blob::Blob,
+    };
+
+    use crate::utils::object_ext::BlobExt;
+
+    let index_path = crate::utils::path::index();
+    let mut index = Index::load(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to load the index: {error}")))?;
+    let storage = util::objects_storage()
+        .map_err(|error| CliError::fatal(format!("failed to open the object store: {error}")))?;
+    for (target, content, mode) in prepared.staged_entries() {
+        match content {
+            Some(bytes) => {
+                let blob = Blob::from_content_bytes(bytes);
+                blob.try_save().map_err(|error| {
+                    CliError::fatal(format!("failed to store blob for '{target}': {error}"))
+                })?;
+                let mut entry =
+                    IndexEntry::new_from_blob(target.clone(), blob.id, blob.data.len() as u32);
+                if let Some(mode) = mode {
+                    entry.mode = mode;
+                }
+                crate::utils::index_ext::update_preserving_flags(&mut index, entry);
+            }
+            None => {
+                index.remove(&target, 0);
+            }
+        }
+    }
+    storage
+        .flush_object_index_batch()
+        .map_err(|error| CliError::fatal(format!("failed to flush stored objects: {error}")))?;
+    index
+        .save(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to save the index: {error}")))?;
+    Ok(())
+}
+
+/// Write base/ours/theirs conflict stages (1/2/3) for `--3way` conflicts.
+fn stage_conflict_sides(sides: &HashMap<String, ConflictSides>) -> CliResult<()> {
+    use git_internal::internal::{
+        index::{Index, IndexEntry},
+        object::blob::Blob,
+    };
+
+    use crate::utils::object_ext::BlobExt;
+
+    if sides.is_empty() {
+        return Ok(());
+    }
+    let index_path = crate::utils::path::index();
+    let mut index = Index::load(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to load the index: {error}")))?;
+    let storage = util::objects_storage()
+        .map_err(|error| CliError::fatal(format!("failed to open the object store: {error}")))?;
+    for (target, (base, ours, theirs)) in sides {
+        for (stage, bytes) in [(1u8, base), (2u8, ours), (3u8, theirs)] {
+            let blob = Blob::from_content_bytes(bytes.clone());
+            blob.try_save().map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to store conflict blob for '{target}': {error}"
+                ))
+            })?;
+            let mut entry =
+                IndexEntry::new_from_blob(target.clone(), blob.id, blob.data.len() as u32);
+            entry.mode = 0o100644;
+            entry.flags.stage = stage;
+            index.add(entry);
+        }
+    }
+    storage
+        .flush_object_index_batch()
+        .map_err(|error| CliError::fatal(format!("failed to flush stored objects: {error}")))?;
+    index
+        .save(&index_path)
+        .map_err(|error| CliError::fatal(format!("failed to save the index: {error}")))?;
+    Ok(())
+}
+
 async fn stage_apply_targets(targets: &[String]) -> CliResult<()> {
     if targets.is_empty() {
         return Ok(());
@@ -863,6 +1202,8 @@ pub(crate) fn prepare_patch_opts(
     let mut order: Vec<String> = Vec::new();
     let mut results: HashMap<String, SectionEntry> = HashMap::new();
     let mut conflicted: Vec<String> = Vec::new();
+    let mut clean_merges: Vec<String> = Vec::new();
+    let mut conflict_side_map: HashMap<String, ConflictSides> = HashMap::new();
 
     // Load a target's current bytes: the in-memory chain first, then disk.
     // `must_exist` distinguishes modify-style reads from new-file probes.
@@ -954,11 +1295,18 @@ pub(crate) fn prepare_patch_opts(
             let to_abs = validate_patch_target(&to, workdir).map_err(invalid)?;
             let (base, permissions) = load_base(&results, &from, &from_abs)?;
             assert_absent(&results, &to, &to_abs)?;
-            let (content, mode, section_conflicted) =
-                apply_section_content(&section, &headers, base, &to, resolve_base)
-                    .map_err(map_reason)?;
-            if section_conflicted {
+            let applied = apply_section_content(&section, &headers, base, &to, resolve_base)
+                .map_err(map_reason)?;
+            let content = applied.content;
+            let mode = applied.mode;
+            if applied.conflicted {
                 conflicted.push(to.clone());
+            }
+            if applied.clean_merge {
+                clean_merges.push(to.clone());
+            }
+            if let Some(sides) = applied.conflict_sides {
+                conflict_side_map.insert(to.clone(), sides);
             }
             if !results.contains_key(&from) {
                 order.push(from.clone());
@@ -991,11 +1339,18 @@ pub(crate) fn prepare_patch_opts(
             let to_abs = validate_patch_target(&to, workdir).map_err(invalid)?;
             let (base, permissions) = load_base(&results, &from, &from_abs)?;
             assert_absent(&results, &to, &to_abs)?;
-            let (content, mode, section_conflicted) =
-                apply_section_content(&section, &headers, base, &to, resolve_base)
-                    .map_err(map_reason)?;
-            if section_conflicted {
+            let applied = apply_section_content(&section, &headers, base, &to, resolve_base)
+                .map_err(map_reason)?;
+            let content = applied.content;
+            let mode = applied.mode;
+            if applied.conflicted {
                 conflicted.push(to.clone());
+            }
+            if applied.clean_merge {
+                clean_merges.push(to.clone());
+            }
+            if let Some(sides) = applied.conflict_sides {
+                conflict_side_map.insert(to.clone(), sides);
             }
             if !results.contains_key(&to) {
                 order.push(to.clone());
@@ -1094,11 +1449,18 @@ pub(crate) fn prepare_patch_opts(
             load_base(&results, &target, &absolute)?
         };
 
-        let (content, mode, section_conflicted) =
-            apply_section_content(&section, &headers, base, &target, resolve_base)
-                .map_err(map_reason)?;
-        if section_conflicted {
+        let applied = apply_section_content(&section, &headers, base, &target, resolve_base)
+            .map_err(map_reason)?;
+        let content = applied.content;
+        let mode = applied.mode;
+        if applied.conflicted {
             conflicted.push(target.clone());
+        }
+        if applied.clean_merge {
+            clean_merges.push(target.clone());
+        }
+        if let Some(sides) = applied.conflict_sides {
+            conflict_side_map.insert(target.clone(), sides);
         }
         if is_deletion && !content.is_empty() {
             return Err(PatchPreparationError::DoesNotApply(format!(
@@ -1135,7 +1497,12 @@ pub(crate) fn prepare_patch_opts(
             })
         })
         .collect();
-    Ok(PreparedPatch { files, conflicted })
+    Ok(PreparedPatch {
+        files,
+        conflicted,
+        clean_merges,
+        conflict_sides: conflict_side_map,
+    })
 }
 
 /// Map a section-application failure string onto the preparation error
@@ -1157,13 +1524,21 @@ pub(crate) enum SectionApplyError {
 /// diffy engine (UTF-8 required), binary sections through the literal /
 /// delta decoder. Returns the bytes, the git-mode override, and whether
 /// the three-way fallback left conflict markers in the bytes.
+pub(crate) struct SectionApplied {
+    pub content: Vec<u8>,
+    pub mode: Option<u32>,
+    pub conflicted: bool,
+    pub clean_merge: bool,
+    pub conflict_sides: Option<ConflictSides>,
+}
+
 pub(crate) fn apply_section_content(
     section: &str,
     headers: &SectionHeaders,
     base: Vec<u8>,
     target: &str,
     resolve_base: Option<BaseBlobResolver<'_>>,
-) -> Result<(Vec<u8>, Option<u32>, bool), SectionApplyError> {
+) -> Result<SectionApplied, SectionApplyError> {
     let mode = headers
         .new_mode
         .or(headers.new_file_mode)
@@ -1210,11 +1585,23 @@ pub(crate) fn apply_section_content(
                 })?
             }
         };
-        return Ok((bytes, mode, false));
+        return Ok(SectionApplied {
+            content: bytes,
+            mode,
+            conflicted: false,
+            clean_merge: false,
+            conflict_sides: None,
+        });
     }
     if !headers.has_hunks {
         // Pure rename/copy without content edits.
-        return Ok((base, mode, false));
+        return Ok(SectionApplied {
+            content: base,
+            mode,
+            conflicted: false,
+            clean_merge: false,
+            conflict_sides: None,
+        });
     }
     let base_text = String::from_utf8(base).map_err(|_| {
         SectionApplyError::DoesNotApply(format!(
@@ -1224,7 +1611,13 @@ pub(crate) fn apply_section_content(
     let patch = diffy::Patch::from_str(section)
         .map_err(|error| SectionApplyError::Invalid(format!("malformed patch: {error}")))?;
     match diffy::apply(&base_text, &patch) {
-        Ok(result) => Ok((result.into_bytes(), mode, false)),
+        Ok(result) => Ok(SectionApplied {
+            content: result.into_bytes(),
+            mode,
+            conflicted: false,
+            clean_merge: false,
+            conflict_sides: None,
+        }),
         Err(_) => {
             // PD-09 ③: three-way fallback — merge ours (current content)
             // against the patch applied to the RECORDED base blob. Only a
@@ -1249,8 +1642,24 @@ pub(crate) fn apply_section_content(
                 base_text.as_bytes(),
                 theirs.as_bytes(),
             ) {
-                Ok(merged) => Ok((merged, mode, false)),
-                Err(conflict) => Ok((conflict, mode, true)),
+                Ok(merged) => Ok(SectionApplied {
+                    content: merged,
+                    mode,
+                    conflicted: false,
+                    clean_merge: true,
+                    conflict_sides: None,
+                }),
+                Err(conflict) => Ok(SectionApplied {
+                    content: conflict,
+                    mode,
+                    conflicted: true,
+                    clean_merge: false,
+                    conflict_sides: Some((
+                        recorded_base.into_bytes(),
+                        base_text.into_bytes(),
+                        theirs.into_bytes(),
+                    )),
+                }),
             }
         }
     }

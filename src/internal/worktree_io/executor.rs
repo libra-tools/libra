@@ -1237,6 +1237,8 @@ fn drive_worker(
                 | IoEvent::DoneCanonicalize { .. }
                 | IoEvent::DoneReadDir { .. }
                 | IoEvent::DoneHash { .. }
+                | IoEvent::DoneConversionState { .. }
+                | IoEvent::DoneCleanHash { .. }
                 | IoEvent::DoneObjectBlob { .. }
                 | IoEvent::DoneMarker { .. }
                 | IoEvent::Error { .. }

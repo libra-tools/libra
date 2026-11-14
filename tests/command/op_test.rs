@@ -2345,7 +2345,8 @@ fn repository_output_reflog_matches_inline_expected() {
 fn repository_output_notes_matches_inline_expected() {
     // Note blob is `Blob::from_content("pinned")` on the deterministic commit.
     const NOTE_HASH: &str = "e5df6cee8ea5bf2847658b99ebccea657e698c61";
-    const EXPECTED_LIST_HUMAN: &str = "e5df6ce 68dd00a\n";
+    const EXPECTED_LIST_HUMAN: &str =
+        "e5df6cee8ea5bf2847658b99ebccea657e698c61 68dd00aaff58c2fb07743045a98a9828e6df6831\n";
     const EXPECTED_SHOW_HUMAN: &str = "pinned";
     const EXPECTED_GET_REF_HUMAN: &str = "refs/notes/commits\n";
     const EXPECTED_LIST_JSON: &str = "{\n  \"command\": \"notes\",\n  \"data\": {\n    \"action\": \"list\",\n    \"notes\": [\n      {\n        \"annotated_object\": \"68dd00aaff58c2fb07743045a98a9828e6df6831\",\n        \"note_hash\": \"e5df6cee8ea5bf2847658b99ebccea657e698c61\"\n      }\n    ],\n    \"ref\": \"refs/notes/commits\"\n  },\n  \"ok\": true\n}\n";

@@ -80,17 +80,17 @@ pub struct ShowArgs {
     pub no_patch: bool,
 
     /// Shorthand for `--pretty=oneline`.
-    #[clap(long)]
+    #[clap(long, overrides_with_all = ["pretty", "format"])]
     pub oneline: bool,
 
     /// Format the commit header with a pretty format
     /// (`oneline` / `format:<tmpl>` / `tformat:<tmpl>` / custom template).
-    #[clap(long, value_name = "FORMAT")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "format"])]
     pub pretty: Option<String>,
 
     /// Alias for `--pretty=<format>` (Git's `--format`). Accepts the same preset
     /// names and `%`-placeholder templates as `--pretty`.
-    #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "pretty"])]
     pub format: Option<String>,
 
     /// Date rendering mode for author/committer dates: default / short / iso /
@@ -127,6 +127,15 @@ pub struct ShowArgs {
     #[clap(long)]
     pub stat: bool,
 
+    /// Show a per-directory change distribution (`--dirstat[=<param>,...]`,
+    /// `-X`); shares the Git-compatible formatter with `libra diff`.
+    #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat: Option<String>,
+
+    /// `--dirstat-by-file[=<param>]`: `--dirstat=files[,<param>]`.
+    #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat_by_file: Option<String>,
+
     /// Show the diffstat block followed by the full patch (Git's legacy synonym
     /// for `-p --stat`).
     #[clap(long = "patch-with-stat")]
@@ -147,6 +156,10 @@ pub struct ShowArgs {
     /// notes ref; the default is `refs/notes/commits`.
     #[clap(long, value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub notes: Option<String>,
+
+    /// Alias of `--notes` (Git's `--show-notes[=<ref>]`).
+    #[clap(long = "show-notes", value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub show_notes: Option<String>,
 
     /// Do not show commit notes, countermanding an earlier `--notes`.
     #[clap(long = "no-notes")]
@@ -313,6 +326,14 @@ pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResul
         args.object = Some("HEAD".to_string());
     }
 
+    // `--dirstat-by-file[=<param>]` is `--dirstat=files[,<param>]`.
+    if let Some(param) = args.dirstat_by_file.take() {
+        args.dirstat = Some(if param.is_empty() {
+            "files".to_string()
+        } else {
+            format!("files,{param}")
+        });
+    }
     if let Some(date) = args.date.take() {
         args.date = Some(resolve_cli_date(&date)?);
     }
@@ -403,7 +424,7 @@ async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<St
         let hash = util::resolve_object_spec_typed(object_ref)
             .await
             .map_err(|_| show_bad_revision_error(object_ref))?;
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Handle `<revision>:<path>` lookups before generic revision resolution.
@@ -421,13 +442,13 @@ async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<St
         let hash = util::resolve_object_spec_typed(object_ref)
             .await
             .map_err(|_| show_bad_revision_error(object_ref))?;
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref)? {
-        return show_object_by_hash(&hash, args, color_enabled).await;
+        return show_object_by_hash(&hash, object_ref, args, color_enabled).await;
     }
 
     // Resolve refs first so tags keep their custom rendering.
@@ -513,6 +534,7 @@ async fn validate_show_quiet(args: &ShowArgs) -> CliResult<()> {
 /// Shows an object by hash after resolving its object type.
 fn show_object_by_hash<'a>(
     hash: &'a ObjectHash,
+    display_name: &'a str,
     args: &'a ShowArgs,
     color_enabled: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CliResult<String>> + 'a>> {
@@ -526,7 +548,7 @@ fn show_object_by_hash<'a>(
         match obj_type {
             ObjectType::Commit => show_commit(hash, args, color_enabled).await,
             ObjectType::Tag => show_tag_by_hash(hash, args, color_enabled).await,
-            ObjectType::Tree => show_tree(hash).await,
+            ObjectType::Tree => show_tree(hash, display_name).await,
             ObjectType::Blob => show_blob(hash).await,
             _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
         }
@@ -565,8 +587,29 @@ async fn show_commit(
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
     let mut output = String::new();
-    let notes = show_note_text(&commit, args).await;
+    let note_blocks = show_note_blocks(&commit, args).await;
+    let notes = note_blocks
+        .iter()
+        .map(|(_, text)| text.trim_end_matches('\n'))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("{notes}\n")
+    };
     display_commit_info(&mut output, &commit, args, color_enabled, &notes);
+    let custom_format = args.format.is_some()
+        || args
+            .pretty
+            .as_deref()
+            .is_some_and(|pretty| pretty.starts_with("format:") || pretty.starts_with("tformat:"));
+    if !custom_format {
+        for (notes_ref, text) in &note_blocks {
+            output.push_str(&crate::command::log::notes_block_for_ref(notes_ref, text));
+        }
+    }
 
     // Render patch-style details when requested.
     if !args.no_patch {
@@ -575,6 +618,16 @@ async fn show_commit(
         // `FIX-AD-01`: a pathspec that matches no changed path renders no
         // diff/stat block — an empty `paths` otherwise means "no filter".
         if !args.pathspec.is_empty() && paths.is_empty() {
+        } else if let Some(param) = &args.dirstat {
+            // `show --dirstat` replaces the patch with the directory-level
+            // distribution, like Git.
+            let dirstat =
+                crate::command::log::compute_commit_dirstat(&commit, paths, param).await?;
+            if !dirstat.is_empty() {
+                output.push('\n');
+                output.push_str(&dirstat);
+                output.push('\n');
+            }
         } else if args.patch_with_stat {
             // `--patch-with-stat` (Git's `-p --stat`): the diffstat block followed
             // by the full patch.
@@ -867,7 +920,15 @@ async fn show_tag_by_hash(
             output.push_str("\n\n");
 
             // Continue with the tagged object.
-            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args, color_enabled).await?);
+            output.push_str(
+                &show_object_by_hash(
+                    &tag_obj.object_hash,
+                    &tag_obj.object_hash.to_string(),
+                    args,
+                    color_enabled,
+                )
+                .await?,
+            );
             Ok(output)
         }
         Ok(tag::TagObject::Commit(commit)) => {
@@ -890,20 +951,21 @@ async fn validate_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<(
     }
 }
 
-/// Shows a tree object.
-async fn show_tree(hash: &ObjectHash) -> CliResult<String> {
+/// Shows a tree object in Git's `show <tree>` form: `tree <name>`, a blank line,
+/// then one entry name per line with a trailing `/` for subtrees (non-recursive,
+/// tree order). ADR-LG-05 item 3 / M-SHOWTREE.
+async fn show_tree(hash: &ObjectHash, display_name: &str) -> CliResult<String> {
     let tree = load_object::<Tree>(hash).map_err(|e| show_object_load_error(hash, e))?;
 
-    let mut output = format!("{} {}\n\n", "tree".yellow(), hash);
+    let mut output = format!("{} {}\n\n", "tree".yellow(), display_name);
 
     for item in &tree.tree_items {
-        output.push_str(&format!(
-            "{:06o} {} {}\t{}\n",
-            tree_item_mode_to_u32(item.mode),
-            tree_item_mode_to_object_type(item.mode),
-            item.id,
-            item.name
-        ));
+        let suffix = if matches!(item.mode, TreeItemMode::Tree) {
+            "/"
+        } else {
+            ""
+        };
+        output.push_str(&format!("{}{}\n", item.name, suffix));
     }
     Ok(output)
 }
@@ -939,14 +1001,42 @@ async fn show_commit_file(rev: &str, file_path: &str) -> CliResult<String> {
     let commit =
         load_object::<Commit>(&commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
-    // Load the tree for the resolved commit.
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| show_object_load_error(commit.tree_id, e))?;
+    // ADR-LG-05 item 3: `<rev>:<dir>` renders the subtree exactly like
+    // `<rev>^{tree}` does, so walk each path component and keep the object
+    // mode instead of only consulting the flattened blob list.
+    let normalized = file_path.trim_end_matches('/');
+    let mut tree_hash = commit.tree_id;
+    let mut tree =
+        load_object::<Tree>(&tree_hash).map_err(|e| show_object_load_error(tree_hash, e))?;
+    let mut found_tree = normalized.is_empty();
+    if !normalized.is_empty() {
+        let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
+        for (index, component) in components.iter().enumerate() {
+            let Some(item) = tree.tree_items.iter().find(|item| item.name == *component) else {
+                return Err(show_path_not_found_error(file_path, rev));
+            };
+            let last = index + 1 == components.len();
+            match item.mode {
+                TreeItemMode::Tree => {
+                    tree_hash = item.id;
+                    tree = load_object::<Tree>(&tree_hash)
+                        .map_err(|e| show_object_load_error(tree_hash, e))?;
+                    if last {
+                        found_tree = true;
+                    }
+                }
+                _ if last => return show_blob(&item.id).await,
+                _ => return Err(show_path_not_found_error(file_path, rev)),
+            }
+        }
+    }
+    if found_tree {
+        return show_tree(&tree_hash, &format!("{rev}:{file_path}")).await;
+    }
 
-    // Find the target path inside the tree.
+    // `get_plain_items` also covers the empty path (the commit's root tree).
     let items = tree.get_plain_items()?;
     let target_path = PathBuf::from(file_path);
-
     if let Some((_, blob_hash)) = items.iter().find(|(path, _)| path == &target_path) {
         show_blob(blob_hash).await
     } else {
@@ -975,32 +1065,73 @@ async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
     }
 }
 
-/// Load the note text for `commit` when `--notes` is active or the custom
-/// format expands `%N`. Returns newline-terminated text, or an empty string.
-async fn show_note_text(commit: &Commit, args: &ShowArgs) -> String {
-    let enabled = args.notes.is_some() && !args.no_notes;
-    let uses_placeholder = args
-        .pretty
-        .as_ref()
-        .or(args.format.as_ref())
-        .is_some_and(|template| template.contains("%N"));
-    if !enabled && !uses_placeholder {
-        return String::new();
+/// Resolve which notes refs `show` displays (ADR-LG-03).
+async fn show_notes_refs(args: &ShowArgs, custom_format: bool) -> Vec<String> {
+    if args.no_notes {
+        return Vec::new();
     }
-    let notes_ref = match args.notes.as_deref() {
-        Some(raw) if !raw.is_empty() => crate::internal::notes::normalize_notes_ref(raw)
-            .unwrap_or_else(|_| crate::internal::notes::DEFAULT_NOTES_REF.to_string()),
+    let explicit: Vec<String> = [args.notes.clone(), args.show_notes.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let normalize = |raw: &str| -> String {
+        if raw.is_empty() {
+            crate::internal::notes::DEFAULT_NOTES_REF.to_string()
+        } else {
+            crate::internal::notes::normalize_notes_ref(raw)
+                .unwrap_or_else(|_| crate::internal::notes::DEFAULT_NOTES_REF.to_string())
+        }
+    };
+    if !explicit.is_empty() {
+        return explicit.iter().map(|raw| normalize(raw)).collect();
+    }
+    let _ = custom_format;
+    let mut refs = Vec::new();
+    let default_ref = match read_show_config("core.notesRef").await {
+        Some(raw) if !raw.trim().is_empty() => normalize(raw.trim()),
         _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
     };
-    let text = crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
-        .await
-        .map(|(_, _, text)| text)
-        .unwrap_or_default();
-    if text.is_empty() || text.ends_with('\n') {
-        text
-    } else {
-        format!("{text}\n")
+    refs.push(default_ref);
+    if let Some(display) = read_show_config("notes.displayRef").await
+        && !display.trim().is_empty()
+    {
+        let normalized = normalize(display.trim());
+        if !refs.contains(&normalized) {
+            refs.push(normalized);
+        }
     }
+    refs
+}
+
+async fn read_show_config(key: &'static str) -> Option<String> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        key,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Load the note blocks for `commit`: `(ref, text)` for each non-empty note.
+async fn show_note_blocks(commit: &Commit, args: &ShowArgs) -> Vec<(String, String)> {
+    let custom_format = args.format.is_some()
+        || args
+            .pretty
+            .as_deref()
+            .is_some_and(|pretty| pretty.starts_with("format:") || pretty.starts_with("tformat:"));
+    let refs = show_notes_refs(args, custom_format).await;
+    let mut blocks = Vec::new();
+    for notes_ref in refs {
+        let text = crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
+            .await
+            .map(|(_, _, text)| text)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            blocks.push((notes_ref, text));
+        }
+    }
+    blocks
 }
 
 /// Renders the commit header using the selected format.
@@ -1056,9 +1187,10 @@ fn display_commit_info(
             commit.author.email.trim()
         ));
 
-        // Format the commit timestamp for display.
+        // Format the commit timestamp for display. ADR-LG-05 item 1: the
+        // blank line between the header and the indented message is required.
         output.push_str(&format!(
-            "Date:   {}\n",
+            "Date:   {}\n\n",
             format_timestamp_with(
                 commit.committer.timestamp as i64,
                 args.date.as_deref().unwrap_or_default(),
@@ -1070,54 +1202,22 @@ fn display_commit_info(
         for line in msg.lines() {
             output.push_str(&format!("    {}\n", line));
         }
-        if args.notes.is_some() && !args.no_notes {
-            output.push_str(&crate::internal::log::formatter::notes_block(notes));
-        }
+        // Notes blocks are appended by the caller (`show_note_blocks`), so the
+        // notes are not rendered twice here.
     }
 }
 
 /// Renders a simple diffstat summary.
 async fn show_diffstat(commit: &Commit, paths: Vec<PathBuf>) -> CliResult<String> {
-    let changed_files = get_changed_files_for_commit(commit, &paths).await?;
-
-    if changed_files.is_empty() {
+    // ADR-LG-04 item 4: `show --stat` shares the diffstat renderer and counts
+    // with `log --stat` / `diff --stat` (bars, path column, and the
+    // `N files changed, X insertions(+), Y deletions(-)` summary).
+    let stats = crate::command::log::compute_commit_stat(commit, paths).await?;
+    let rendered = crate::command::log::format_stat_output(&stats);
+    if rendered.is_empty() {
         return Ok(String::new());
     }
-
-    let mut output = String::from("\n");
-
-    // Count summary totals while printing each changed path.
-    let mut additions = 0;
-    let mut deletions = 0;
-
-    for change in &changed_files {
-        match change.status {
-            ChangeType::Added => additions += 1,
-            ChangeType::Deleted => deletions += 1,
-            ChangeType::Modified => {
-                additions += 1;
-                deletions += 1;
-            }
-        }
-        let status = match change.status {
-            ChangeType::Added => "A",
-            ChangeType::Modified => "M",
-            ChangeType::Deleted => "D",
-        };
-        output.push_str(&format!("{}  {}\n", status, change.path.display()));
-    }
-
-    output.push_str(&format!(
-        "\n{} file{} changed, {} insertion{}(+), {} deletion{}(-)",
-        changed_files.len(),
-        if changed_files.len() != 1 { "s" } else { "" },
-        additions,
-        if additions != 1 { "s" } else { "" },
-        deletions,
-        if deletions != 1 { "s" } else { "" }
-    ));
-    output.push('\n');
-    Ok(output)
+    Ok(format!("\n{rendered}"))
 }
 
 fn show_bad_revision_error(object_ref: &str) -> CliError {
@@ -1266,8 +1366,14 @@ async fn collect_commit_output(
         subject,
         body,
         notes: {
-            let text = show_note_text(&commit, args).await;
-            (!text.is_empty()).then_some(text)
+            let blocks = show_note_blocks(&commit, args).await;
+            let text = blocks
+                .iter()
+                .map(|(_, text)| text.trim_end_matches('\n'))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then(|| format!("{text}\n"))
         },
         parents: commit
             .parent_commit_ids

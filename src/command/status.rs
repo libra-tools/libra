@@ -26,7 +26,6 @@ use super::{
     unmerged::{self, UnmergedEntry},
 };
 use crate::{
-    command::calc_file_blob_hash,
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
@@ -1315,6 +1314,22 @@ fn changes_to_be_staged_split_force_with_index(
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
     let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
+    let conversion = crate::command::status_io_worker::ConversionScan::new(workdir, index)
+        .map_err(|source| StatusError::FileHash {
+            path: workdir.clone(),
+            source,
+        })?;
+    let (sources_before, policy_valid) =
+        conversion
+            .probe(None)
+            .map_err(|source| StatusError::FileHash {
+                path: workdir.clone(),
+                source,
+            })?;
+    let index_file_mtime = path::try_index()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|stat| stat.modified().ok());
     for file in tracked_files.iter() {
         // §B.6.1: skip the keyed comparisons for an undecodable name rather
         // than failing the whole status (see `collect_tracked_worktree_changes`).
@@ -1360,20 +1375,56 @@ fn changes_to_be_staged_split_force_with_index(
                         entry.mode & 0o100000 == 0o100000
                             && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
                     });
-                if mode_only_change {
+                let type_change = index.get(file_str, 0).is_some_and(|entry| {
+                    (entry.mode & 0o170000 == 0o120000) != metadata.file_type().is_symlink()
+                        || metadata.is_dir()
+                });
+                if mode_only_change || type_change {
                     visible.modified.push(file.clone());
-                } else if index.is_modified(file_str, 0, workdir) {
+                } else if !policy_valid
+                    || crate::command::status_untracked::index_stat_differs(
+                        index,
+                        file_str,
+                        &crate::command::status_io_worker::CapturedStat::from_raw_lstat(
+                            &crate::utils::beneath::RawLstat::from_metadata(&metadata).map_err(
+                                |source| StatusError::FileHash {
+                                    path: file_abs.clone(),
+                                    source,
+                                },
+                            )?,
+                        ),
+                        index_file_mtime,
+                    )
+                {
                     let file_hash =
-                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                            path: file_abs.clone(),
-                            source,
-                        })?;
+                        conversion
+                            .hash(&file_abs)
+                            .map_err(|source| StatusError::FileHash {
+                                path: file_abs.clone(),
+                                source,
+                            })?;
                     if !index.verify_hash(file_str, 0, &file_hash) {
                         visible.modified.push(file.clone());
                     }
                 }
             }
         }
+    }
+    let may_record = visible.modified.is_empty() && visible.deleted.is_empty();
+    let (sources_after, _) = conversion
+        .probe(may_record.then_some(sources_before.as_str()))
+        .map_err(|source| StatusError::FileHash {
+            path: workdir.clone(),
+            source,
+        })?;
+    if sources_after != sources_before {
+        return Err(StatusError::FileHash {
+            path: workdir.clone(),
+            source: io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attributes changed during status; retry the command",
+            ),
+        });
     }
     let (files, ignored_files) = list_workdir_files_split_force(workdir).map_err(|source| {
         StatusError::ListWorkdirFiles {
@@ -1417,6 +1468,22 @@ fn changes_to_be_staged_split_with_index(
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
     let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
+    let conversion = crate::command::status_io_worker::ConversionScan::new(workdir, index)
+        .map_err(|source| StatusError::FileHash {
+            path: workdir.clone(),
+            source,
+        })?;
+    let (sources_before, policy_valid) =
+        conversion
+            .probe(None)
+            .map_err(|source| StatusError::FileHash {
+                path: workdir.clone(),
+                source,
+            })?;
+    let index_file_mtime = path::try_index()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|stat| stat.modified().ok());
     for file in tracked_files.iter() {
         // §B.6.1: skip the keyed comparisons for an undecodable name rather
         // than failing the whole status (see `collect_tracked_worktree_changes`).
@@ -1479,20 +1546,56 @@ fn changes_to_be_staged_split_with_index(
                         entry.mode & 0o100000 == 0o100000
                             && (entry.mode & 0o111 != 0) != worktree_exec_bit(&metadata)
                     });
-                if mode_only_change {
+                let type_change = index.get(file_str, 0).is_some_and(|entry| {
+                    (entry.mode & 0o170000 == 0o120000) != metadata.file_type().is_symlink()
+                        || metadata.is_dir()
+                });
+                if mode_only_change || type_change {
                     visible.modified.push(file.clone());
-                } else if index.is_modified(file_str, 0, workdir) {
+                } else if !policy_valid
+                    || crate::command::status_untracked::index_stat_differs(
+                        index,
+                        file_str,
+                        &crate::command::status_io_worker::CapturedStat::from_raw_lstat(
+                            &crate::utils::beneath::RawLstat::from_metadata(&metadata).map_err(
+                                |source| StatusError::FileHash {
+                                    path: file_abs.clone(),
+                                    source,
+                                },
+                            )?,
+                        ),
+                        index_file_mtime,
+                    )
+                {
                     let file_hash =
-                        calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                            path: file_abs.clone(),
-                            source,
-                        })?;
+                        conversion
+                            .hash(&file_abs)
+                            .map_err(|source| StatusError::FileHash {
+                                path: file_abs.clone(),
+                                source,
+                            })?;
                     if !index.verify_hash(file_str, 0, &file_hash) {
                         visible.modified.push(file.clone());
                     }
                 }
             }
         }
+    }
+    let may_record = visible.modified.is_empty() && visible.deleted.is_empty();
+    let (sources_after, _) = conversion
+        .probe(may_record.then_some(sources_before.as_str()))
+        .map_err(|source| StatusError::FileHash {
+            path: workdir.clone(),
+            source,
+        })?;
+    if sources_after != sources_before {
+        return Err(StatusError::FileHash {
+            path: workdir.clone(),
+            source: io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attributes changed during status; retry the command",
+            ),
+        });
     }
     let (files, ignored_files) =
         list_workdir_files_split_safe(workdir).map_err(|source| StatusError::ListWorkdirFiles {
@@ -2207,7 +2310,7 @@ mod mode_fix_hint_test {
             let path = repo.path().join(name);
             let mut entry = IndexEntry::new_from_blob(
                 name.to_string(),
-                calc_file_blob_hash(&path).expect("hash"),
+                crate::command::calc_file_blob_hash(&path).expect("hash"),
                 0,
             );
             entry.mode = mode;

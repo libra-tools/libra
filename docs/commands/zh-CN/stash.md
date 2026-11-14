@@ -18,6 +18,8 @@ libra stash clear [--force]
 
 ## 说明
 
+`stash push` 选择已跟踪修改时使用显式 `text`/`eol` clean 比较。仅有等价 CRLF/LF 内容时不会创建 stash 条目。真实编辑及既有未跟踪、忽略、冲突策略保持原有行为。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra stash` 省略子命令时（或无参数、或首参数为选项）等同 `libra stash push`；首个 token 既非已知子命令也不以 `-` 开头时按用法错误处理（文案对齐 Git：`subcommand wasn't specified; 'push' can't be assumed due to unexpected token '<tok>'`）。`libra stash` 将本地修改保存为新的 stash 条目，并把工作目录还原到与 HEAD 一致。默认情况下，`stash push` 只记录已跟踪文件的索引/工作区修改，并保留未跟踪文件。使用 `-u` / `--include-untracked` 可以包含可见未跟踪文件；使用 `-a` / `--all` 还会包含被忽略文件。传入 `-- <pathspec>...`（文件或目录路径，`.` 表示整棵树）可只 stash 这些路径的修改，工作树中其余改动原样保留（`-u`/`-a`/`-k` 不能与 pathspec 同用，否则 `LBR-CLI-002`）。之后可以用 `libra stash pop` 或 `libra stash apply` 恢复这些修改——恢复时是三方合并到当前工作树（而非 HEAD），因此期间对无关文件所做的未提交改动（包括 pathspec push 留下的那些路径）都会被保留。默认 `apply` / `pop` 保留已跟踪路径的当前索引（已跟踪改动以未暂存工作树形式回来），并把 stash 索引相对基础提交**新增**的路径重新加入索引。`apply` / `pop --index` 把 stash 索引树三方合并到当前索引；索引冲突为 `LBR-CONFLICT-001`（`conflicts in index. Try without --index.`）且零写入。`stash branch` 按 `--index` 语义应用。没有初始提交时，`stash push` 会先于改动检查以 `128` 失败（`LBR-REPO-003`、
 `you do not have the initial commit yet`）——即使工作树干净或只有未跟踪文件也会
 报错；全局 `--quiet` 下该失败不输出人读错误、只以退出码表达（`--json` 仍输出错误

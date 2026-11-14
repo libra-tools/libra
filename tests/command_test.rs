@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Main integration test entry point that re-exports the command test modules.
 //!
 //! Cargo treats every `tests/*.rs` file as its own crate. By declaring a single `mod

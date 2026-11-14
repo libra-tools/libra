@@ -24,6 +24,13 @@ By default, authors are sorted alphabetically by name. With `-n`, they are sorte
 
 Date filtering via `--since` and `--until` restricts which commits are included based on their committer timestamp, supporting formats like `YYYY-MM-DD`, `"N days ago"`, and Unix timestamps.
 
+### Revision selection
+
+`shortlog` accepts the same revision forms as `log`: a single revision, `A..B`,
+`A...B`, `^A` exclusions, and multiple revisions. `--all` seeds every ref under
+`refs/` plus HEAD, and `-- <path>` limits the summarized commits to those that
+touch the path.
+
 ## Options
 
 | Option | Short | Long | Description |

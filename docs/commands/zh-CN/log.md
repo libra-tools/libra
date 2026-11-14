@@ -106,6 +106,14 @@ libra log --pretty=reference
 `format:`、`tformat:`、`%` 占位符的非空自定义模板。空值与未知的裸预设名
 会在输出前以 `LBR-CLI-002` 失败；显式 CLI 格式会绕过对应配置键。
 
+### 默认布局
+
+默认 `medium` 与 `short`/`full`/`fuller`/`raw` 预设在每个提交记录之间输出一个空行，
+最后一个记录后不输出空行。`Date:` 行使用 Git 默认形式，日期不补零
+（`Fri Jan 2 00:00:00 2026 +0000`）。`oneline`、`reference` 与自定义
+`--format`/`--pretty` 记录之间仅一个换行、不插入空行。`--oneline`、`--pretty`、
+`--format` 按命令行顺序后者生效，而非互斥；`show` 保留头部与缩进消息之间的空行。
+
 ### `--date=<format>`
 
 选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
@@ -215,6 +223,10 @@ libra log --author alice --author bob       # 任一作者模式命中即可
 libra log --committer alice --committer bob
 ```
 
+### Notes 显示
+
+内置格式（以及默认 full 格式）默认显示提交 notes：消息后空一行、`Notes:`，正文每行缩进 4 个空格；非默认 ref 显示 `Notes (<short-ref>):`。`--notes[=<ref>]` / `--show-notes[=<ref>]` 显式选择 ref（给出 ref 时不再隐式包含默认 ref），`--no-notes` 关闭，`notes.displayRef` 追加 ref，`core.notesRef` 改变默认 ref。自定义 `--format` 仅通过 `%N` 显示 note 原文（无 note 时为空）；`--json` 增加可选 `notes` 数组且不改变既有字段。
+
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
 
 按提交消息过滤。可重复指定 `--grep`，默认任一模式匹配即可；`--all-match`
@@ -224,6 +236,12 @@ libra log --committer alice --committer bob
 `--basic-regexp` 显式选择默认方言（最后出现的方言选项生效）。
 `-i` / `--regexp-ignore-case` 让所有模式大小写不敏感；
 `--invert-grep` 保留一个模式都未匹配的提交，并优先于 `--all-match`。
+
+方言：默认 POSIX BRE（`+`、`(`/`)`、`.` 按 Git BRE 语义）；`-F`/`--fixed-strings`
+为字面串，`-E`/`--extended-regexp` 为 ERE，`--basic-regexp` 显式选择 BRE，
+`-P`/`--perl-regexp` 使用 `fancy-regex` Perl 引擎（支持环视与反向引用；`\K`、递归与 `(*VERB)` 为用法错误）。后出现的标志生效。
+未给方言标志时按级联读取 `grep.patternType`（basic/extended/fixed）与
+`grep.extendedRegexp`。
 
 搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
 `-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
@@ -274,7 +292,7 @@ libra log --pretty=%P -1
 
 ### `--format <FORMAT>`
 
-`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。与 `--pretty` 互斥。
+`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。`--oneline`、`--pretty`、`--format` 按命令行顺序后者生效。
 
 ```bash
 libra log --format="%h %s"
@@ -313,11 +331,19 @@ libra log --decorate --decorate-refs-exclude='heads/*'
 
 ### `--graph`
 
-绘制基于文本的提交历史图形表示，直观显示分支和合并。
+按 Git 的列分配规则绘制基于文本的提交历史图形：分叉以 `|/` 汇合，双亲合并输出
+`|\`，octopus 合并输出 `*-.` 及其展开行。`--graph` 隐含 Git 的拓扑（图）顺序：
+提交只在其全部子提交之后输出；时间并列时按图顺序栈（最近就绪者优先）。`--date-order`
+与 `--author-date-order` 可接受，但当前复用同一图顺序。
+
+`--all` 从 `refs/` 下的全部引用（本地与远程跟踪分支、tag、`refs/notes/*`）以及
+`HEAD` 按引用名顺序播种。Libra 自身的 notes 后端把 notes 存在 SQLite 而非 notes 提交，
+因此只有导入的 notes 引用会贡献提交。
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### 修订范围（位置参数或 `--range <SPEC>`）

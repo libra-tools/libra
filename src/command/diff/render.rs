@@ -252,8 +252,8 @@ pub(super) fn render_diff_output(
     // when --quiet is set (quiet only suppresses stdout, not file writes).
     // `-z` NUL-terminates each record; `--name-status` then separates the
     // status and path with a NUL instead of a tab.
-    let rendered = if args.raw {
-        format_diff_raw(result, args.null)
+    let rendered = if args.raw && !args.plumbing_raw_with_patch {
+        format_diff_raw(result, args.null, args.plumbing_raw)
     } else if args.name_only {
         join_diff_records(result.files.iter().map(|file| file.path.clone()), args.null)
     } else if args.name_status {
@@ -323,6 +323,21 @@ pub(super) fn render_diff_output(
         format_unified_diff(result)
     };
 
+    // Git's `diff -p --raw` prints the raw records, a blank line, then the
+    // patch. Plumbing `-p --raw` requests the same combination.
+    let rendered = if args.raw && args.plumbing_raw_with_patch {
+        let raw = format_diff_raw(result, args.null, args.plumbing_raw);
+        if raw.is_empty() {
+            rendered
+        } else if rendered.is_empty() {
+            raw
+        } else {
+            format!("{raw}\n\n{rendered}")
+        }
+    } else {
+        rendered
+    };
+
     if let Some(path) = &args.output {
         std::fs::write(path, rendered.as_bytes())
             .map_err(|e| DiffError::OutputWrite {
@@ -389,124 +404,27 @@ pub(super) fn render_diff_output(
     diff_exit_result(args, result)
 }
 
-/// One changed file's contribution to a `--dirstat` distribution.
-struct DirstatFile<'a> {
-    name: &'a str,
-    changed: u64,
-}
-
-/// Recursive `--dirstat` gather, mirroring Git: a directory is printed only
-/// when it is not the top level and does not funnel everything through a single
-/// subdirectory, and `noncumulative` stops child counts from propagating up.
-#[allow(clippy::too_many_arguments)]
-fn gather_dirstat(
-    files: &[DirstatFile<'_>],
-    cursor: &mut usize,
-    changed_total: u64,
-    base: &str,
-    cumulative: bool,
-    threshold: u64,
-    out: &mut Vec<String>,
-) -> u64 {
-    let mut sum = 0u64;
-    let mut sources = 0u32;
-    while *cursor < files.len() {
-        let name = files[*cursor].name;
-        if !name.starts_with(base) {
-            break;
-        }
-        let rest = &name[base.len()..];
-        if let Some(slash) = rest.find('/') {
-            let new_base = &name[..base.len() + slash + 1];
-            let changes = gather_dirstat(
-                files,
-                cursor,
-                changed_total,
-                new_base,
-                cumulative,
-                threshold,
-                out,
-            );
-            sources += 1;
-            sum += changes;
-        } else {
-            sum += files[*cursor].changed;
-            *cursor += 1;
-            sources += 2;
-        }
-    }
-    if !base.is_empty() && sources != 1 && sum > 0 {
-        let permille = sum * 1000 / changed_total;
-        if permille >= threshold {
-            out.push(format!(
-                "{:4}.{:01}% {}",
-                permille / 10,
-                permille % 10,
-                base
-            ));
-        }
-        if !cumulative {
-            return 0;
-        }
-    }
-    sum
-}
-
 /// Render `--dirstat`: a per-directory distribution of changes. Parameters are
-/// `changes` (default), `lines`, `files`, `noncumulative` (default),
-/// `cumulative`, and a percentage cut-off (default 3%).
-pub(super) fn format_diff_dirstat(result: &DiffOutput, param: &str) -> CliResult<String> {
-    let mut by_line = false;
-    let mut cumulative = false;
-    let mut threshold: u64 = 30; // permille
-    for part in param.split(',').filter(|part| !part.is_empty()) {
-        match part {
-            "changes" => by_line = false,
-            "lines" => by_line = true,
-            "files" => {}
-            "noncumulative" => cumulative = false,
-            "cumulative" => cumulative = true,
-            other => {
-                let value: f64 = other.parse().map_err(|_| {
-                    CliError::command_usage(format!("invalid --dirstat parameter '{other}'"))
-                        .with_stable_code(StableErrorCode::CliInvalidArguments)
-                })?;
-                threshold = (value * 10.0).round() as u64;
-            }
-        }
-    }
-
-    let mut files: Vec<DirstatFile<'_>> = result
+/// `changes` (default; byte damage), `lines`, `files`, `noncumulative` (default),
+/// `cumulative`, and a percentage cut-off (default 3%). The shared formatter in
+/// `utils::diff_format` owns the Git-compatible thresholds and gathering so
+/// `show`/`log` render the same output.
+pub(crate) fn format_diff_dirstat(result: &DiffOutput, param: &str) -> CliResult<String> {
+    let entries: Vec<crate::utils::diff_format::DirstatEntry<'_>> = result
         .files
         .iter()
-        .map(|file| DirstatFile {
+        .map(|file| crate::utils::diff_format::DirstatEntry {
             name: file.path.as_str(),
-            changed: if by_line {
-                (file.insertions + file.deletions) as u64
-            } else {
-                1
-            },
+            insertions: file.insertions,
+            deletions: file.deletions,
+            raw_diff: file.raw_diff.as_str(),
+            binary: file.binary,
         })
         .collect();
-    files.sort_by(|a, b| a.name.cmp(b.name));
-
-    let changed_total: u64 = files.iter().map(|file| file.changed).sum();
-    if changed_total == 0 {
-        return Ok(String::new());
-    }
-
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    gather_dirstat(
-        &files,
-        &mut cursor,
-        changed_total,
-        "",
-        cumulative,
-        threshold,
-        &mut out,
-    );
-    Ok(out.join("\n"))
+    crate::utils::diff_format::format_dirstat(&entries, param).map_err(|message| {
+        CliError::command_usage(format!("invalid --dirstat parameter: {message}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
 }
 
 pub(super) fn format_diff_summary(result: &DiffOutput) -> String {
@@ -582,7 +500,7 @@ pub(super) fn diff_status_code(file: &DiffFileStat) -> char {
     'M'
 }
 
-pub(super) fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
+pub(super) fn format_diff_raw(result: &DiffOutput, null: bool, full_ids: bool) -> String {
     let mut output = String::new();
     for file in &result.files {
         let status = diff_status_code(file);
@@ -595,8 +513,8 @@ pub(super) fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
             ":{} {} {} {} {status_field}",
             raw_mode(file.old_mode),
             raw_mode(file.new_mode),
-            abbreviated_raw_id(file.old_id),
-            abbreviated_raw_id(file.new_id),
+            raw_id(file.old_id, full_ids),
+            raw_id(file.new_id, full_ids),
         );
         if null {
             output.push_str(&metadata);

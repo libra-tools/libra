@@ -80,9 +80,19 @@ jobs:
       - name: Build Binary (Unix)
         if: matrix.target.os != 'windows'
         shell: bash
+        env:
+          CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64 -mtune=generic"
         run: |
           VERSION=${GITHUB_REF_NAME}
           BINARY_NAME="${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+
+          if [[ "${{ matrix.target.rust }}" == "x86_64-unknown-linux-gnu" ]]; then
+            expected_cflags="-march=x86-64 -mtune=generic"
+            if [[ "${CFLAGS_x86_64_unknown_linux_gnu:-}" != "$expected_cflags" ]]; then
+              echo "::error::CFLAGS_x86_64_unknown_linux_gnu must equal '${expected_cflags}' for x86_64-unknown-linux-gnu (got '${CFLAGS_x86_64_unknown_linux_gnu:-<unset>}'). Restore CFLAGS_x86_64_unknown_linux_gnu in Build Binary (Unix) to preserve baseline x86-64 C compatibility." >&2
+              exit 1
+            fi
+          fi
 
           echo "Building $BINARY_NAME for target ${{ matrix.target.rust }}..."
 

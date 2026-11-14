@@ -391,7 +391,6 @@ test_config_get_with_default	lane:cwd	changes the process working directory (Cha
 test_config_import_global_from_git	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_import_local_from_git_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_list_defaults_to_local_scope_without_global_entries	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_gpg_keys_outputs_configured_key_namespaces	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_name_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_ssh_keys_outputs_configured_public_keys	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -546,7 +545,6 @@ test_grep_no_index_searches_ignored_files_inside_repo	lane:cwd	changes the proce
 test_grep_no_match_emits_no_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_null_separates_fields_with_nul_byte	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_null_with_context_uses_nul_and_literal_separator	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_grep_perl_regexp_is_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_reads_patterns_from_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_reports_total_files_as_number_of_matched_files	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_returns_nonzero_when_no_matches_found	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -995,3 +993,48 @@ worktree_doctor_reports_scope_diagnostics	lane:cwd+env+hash_kind	fail-closed bod
 worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+i1062_conversion_failure_preserves_index_and_names_attribute_source	lane:cwd	changes the process working directory (ChangeDirGuard)
+test_blame_date_formats_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_blame_incremental_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_blame_line_range_and_boundary_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_blame_move_copy_detection_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_list_defaults_to_all_scopes_and_local_restricts	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_dirstat_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_hunk_header_function_context	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_hunk_headers_match_git_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_index_cached	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_index_files_raw_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_tree_raw_and_patch_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_explicit_scope_missing_or_unreadable_store	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_file_write_bytes_match_git_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_file_write_roundtrip_through_reader	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_grep_boolean_expressions_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_function_and_numeric_context_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_perl_regexp_unsupported_syntax_is_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_legacy_and_subcommand_parity_table	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_list_and_get_regexp_order_format_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_log_and_diff_stat_counts_consistent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_default_layout_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_displays_notes_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_format_last_one_wins	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_graph_matches_git_fixtures	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_graph_octopus_fixture	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_perl_regexp_grep	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_notes_blob_reuse_and_list_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_rev_list_grep_matches_log_semantics	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_shortlog_revision_ranges_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_dirstat	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_displays_default_notes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_header_blank_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_stat_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_tree_objects_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_subcommand_spellings_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t1300_expiry_date	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t1300_get_regexp_name_only	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t1300_type_color	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t3301_notes_display_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_t7007_show_tree_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_type_color_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_type_expiry_date_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables

@@ -211,6 +211,9 @@ pub struct TranscriptArgs {
     pub endpoint: EndpointArgs,
     #[arg(long, value_name = "UUID")]
     pub stream: String,
+    /// Session UUID. When omitted it is resolved from the checkpoint.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
     #[arg(long, value_name = "ID")]
     pub checkpoint: String,
     #[arg(long, value_name = "BYTES")]
@@ -339,14 +342,14 @@ async fn sessions(args: SessionArgs, output: &OutputConfig) -> CliResult<()> {
     let since = optional_time(args.since.as_deref())?;
     let until = optional_time(args.until.as_deref())?;
     mega2_traces::validate_time_window(since, until).map_err(argument_error)?;
-    let since_wire = utc_bound(args.since.as_deref())?;
-    let until_wire = utc_bound(args.until.as_deref())?;
     let limit = count(
         "limit",
         args.limit,
         METADATA_LIMIT_DEFAULT,
         METADATA_LIMIT_MAX,
     )?;
+    let since_wire = utc_bound(args.since.as_deref())?;
+    let until_wire = utc_bound(args.until.as_deref())?;
     let mut owned = vec![("limit".to_string(), limit.to_string())];
     push_owned(&mut owned, "since", since_wire);
     push_owned(&mut owned, "until", until_wire);
@@ -368,9 +371,13 @@ async fn show(args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
         ));
     }
     let path = if let Some(checkpoint) = args.checkpoint.as_deref() {
+        // The checkpoint detail route is session-scoped; resolve the owning
+        // session when the caller did not supply one (the flags stay mutually
+        // exclusive).
+        let session = resolve_checkpoint_session(&args.endpoint, &args.stream, checkpoint).await?;
         format!(
-            "/api/v1/traces/streams/{}/checkpoints/{checkpoint}",
-            args.stream
+            "/api/v1/traces/streams/{}/sessions/{}/checkpoints/{checkpoint}",
+            args.stream, session
         )
     } else if let Some(session) = args.session.as_deref() {
         format!("/api/v1/traces/streams/{}/sessions/{session}", args.stream)
@@ -407,8 +414,6 @@ async fn search_command(args: SearchArgs, output: &OutputConfig) -> CliResult<()
     let since = optional_time(args.since.as_deref())?;
     let until = optional_time(args.until.as_deref())?;
     mega2_traces::validate_time_window(since, until).map_err(argument_error)?;
-    let since_wire = utc_bound(args.since.as_deref())?;
-    let until_wire = utc_bound(args.until.as_deref())?;
     let limit = count("limit", args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX)?;
     let max_bytes = count(
         "max_bytes",
@@ -416,37 +421,121 @@ async fn search_command(args: SearchArgs, output: &OutputConfig) -> CliResult<()
         TEXT_BYTES_DEFAULT,
         TEXT_BYTES_MAX,
     )?;
-    let resolved = get_json(
-        &args.endpoint,
-        "/api/v1/traces/targets/resolve",
-        &[("path", args.target.as_str())],
-    )
-    .await?;
-    let target_id = resolved
-        .get("target_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::fatal("target resolve response has no target_id".to_string())
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-        })?
-        .to_string();
-    let mut owned = vec![
-        ("target_id".to_string(), target_id),
+    let Some(stream) = args.stream.clone() else {
+        return Err(CliError::fatal(
+            "the mounted traces search route needs --stream <UUID>".to_string(),
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    };
+    for (name, present) in [
+        ("source", args.source.is_some()),
+        ("session", args.session.is_some()),
+        ("agent", args.agent.is_some()),
+        ("since", args.since.is_some()),
+        ("until", args.until.is_some()),
+        ("code_commit", args.code_commit.is_some()),
+    ] {
+        if present {
+            return Err(CliError::fatal(format!(
+                "--{name} is not available on the per-stream traces search route"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+    }
+    // The mounted per-stream route owns the body budget; `max_bytes` is
+    // validated locally against the same fixed limits but is not a request
+    // parameter (the route rejects unknown parameters).
+    let _ = max_bytes;
+    let mut owned: Vec<(String, String)> = vec![
         ("q".to_string(), args.query),
         ("limit".to_string(), limit.to_string()),
-        ("max_bytes".to_string(), max_bytes.to_string()),
     ];
-    push_owned(&mut owned, "source", args.source);
-    push_owned(&mut owned, "stream", args.stream);
-    push_owned(&mut owned, "session", args.session);
-    push_owned(&mut owned, "agent", args.agent);
-    push_owned(&mut owned, "since", since_wire);
-    push_owned(&mut owned, "until", until_wire);
-    push_owned(&mut owned, "code_commit", args.code_commit);
     push_owned(&mut owned, "cursor", args.cursor);
     let query = borrowed(&owned);
-    let body = get_json(&args.endpoint, "/api/v1/traces/search", &query).await?;
+    let path = format!("/api/v1/traces/streams/{stream}/search");
+    let body = get_json(&args.endpoint, &path, &query).await?;
     emit_report("search", body, output)
+}
+
+/// Resolve the session that owns `checkpoint` by paging the mounted sessions
+/// and checkpoints routes. The transcript route requires the session UUID.
+async fn resolve_checkpoint_session(
+    endpoint: &EndpointArgs,
+    stream: &str,
+    checkpoint: &str,
+) -> CliResult<String> {
+    let mut sessions_cursor: Option<String> = None;
+    loop {
+        let mut owned: Vec<(String, String)> =
+            vec![("limit".to_string(), METADATA_LIMIT_MAX.to_string())];
+        if let Some(cursor) = sessions_cursor.clone() {
+            owned.push(("cursor".to_string(), cursor));
+        }
+        let query: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let path = format!("/api/v1/traces/streams/{stream}/sessions");
+        let body = get_json(endpoint, &path, &query).await?;
+        let sessions = body
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for session in sessions {
+            let Some(session_id) = session.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if checkpoint_belongs_to_session(endpoint, stream, session_id, checkpoint).await? {
+                return Ok(session_id.to_string());
+            }
+        }
+        match body.get("next_cursor").and_then(Value::as_str) {
+            Some(cursor) if !cursor.is_empty() => sessions_cursor = Some(cursor.to_string()),
+            _ => break,
+        }
+    }
+    Err(CliError::fatal(format!(
+        "no session in stream {stream} contains checkpoint {checkpoint}"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidTarget))
+}
+
+async fn checkpoint_belongs_to_session(
+    endpoint: &EndpointArgs,
+    stream: &str,
+    session: &str,
+    checkpoint: &str,
+) -> CliResult<bool> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut owned: Vec<(String, String)> =
+            vec![("limit".to_string(), METADATA_LIMIT_MAX.to_string())];
+        if let Some(cursor) = cursor.clone() {
+            owned.push(("cursor".to_string(), cursor));
+        }
+        let query: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let path = format!("/api/v1/traces/streams/{stream}/sessions/{session}/checkpoints");
+        let body = get_json(endpoint, &path, &query).await?;
+        let items = body
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items
+            .iter()
+            .any(|item| item.get("checkpoint_id").and_then(Value::as_str) == Some(checkpoint))
+        {
+            return Ok(true);
+        }
+        match body.get("next_cursor").and_then(Value::as_str) {
+            Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+            _ => return Ok(false),
+        }
+    }
 }
 
 async fn transcript(args: TranscriptArgs, output: &OutputConfig) -> CliResult<()> {
@@ -465,9 +554,13 @@ async fn transcript(args: TranscriptArgs, output: &OutputConfig) -> CliResult<()
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
+    let session = match args.session.clone() {
+        Some(session) => session,
+        None => resolve_checkpoint_session(&args.endpoint, &args.stream, &args.checkpoint).await?,
+    };
     let path = format!(
-        "/api/v1/traces/streams/{}/checkpoints/{}/transcript",
-        args.stream, args.checkpoint
+        "/api/v1/traces/streams/{}/sessions/{}/checkpoints/{}/transcript",
+        args.stream, session, args.checkpoint
     );
     let body = get_json(&args.endpoint, &path, &query).await?;
     emit_report("transcript", body, output)

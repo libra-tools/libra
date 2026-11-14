@@ -137,6 +137,17 @@ template using `format:`, `tformat:`, or a `%` placeholder. Empty values and
 unknown bare preset names fail before output with `LBR-CLI-002`; an explicit
 CLI format bypasses the matching config key.
 
+### Default layout
+
+The default (`medium`) and the `short`/`full`/`fuller`/`raw` presets print one
+blank line between commit records and none after the last one. The `Date:` line
+uses Git's default form with an unpadded day of month
+(`Fri Jan 2 00:00:00 2026 +0000`). `oneline`, `reference`, and custom
+`--format`/`--pretty` records are separated by a single newline and print no
+blank line. `--oneline`, `--pretty`, and `--format` are last-one-wins rather
+than mutually exclusive, and `show` keeps the blank line between its header and
+the indented message.
+
 ### `--date=<format>`
 
 Select the human-readable author/committer date mode. Supported modes are
@@ -259,15 +270,29 @@ libra log --author alice --author bob       # either author may match
 libra log --committer alice --committer bob
 ```
 
+### Notes display
+
+Built-in formats (and the default full format) show commit notes by default:
+a blank line, then `Notes:`, then the note body indented four spaces. A
+non-default ref renders `Notes (<short-ref>):`. `--notes[=<ref>]` /
+`--show-notes[=<ref>]` select refs explicitly (giving a ref replaces the
+implicit default), `--no-notes` suppresses them, `notes.displayRef` appends a
+ref, and `core.notesRef` changes the default ref. A custom `--format` shows
+notes only through `%N` (the note text, empty when absent); `--json` adds an
+optional `notes` array without changing existing fields.
+
 ### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
 
 Repeated --grep patterns match if any pattern matches. The default dialect is
 POSIX basic regex (Git's default), so plain text matches literally and `+`,
 `(`/`)`, `.` behave as Git's BRE does. `--all-match` requires every pattern to
 match and takes no value; without any patterns it does not filter. Supplying a
-value with `--all-match=<value>` is rejected. `--fixed-strings` treats each
-pattern as a literal, `--extended-regexp` uses POSIX ERE, and `--basic-regexp`
-selects the default dialect explicitly (last flag wins). `-i` /
+value with `--all-match=<value>` is rejected. `-F`/`--fixed-strings` treats each
+pattern as a literal, `-E`/`--extended-regexp` uses POSIX ERE, `--basic-regexp`
+selects the default dialect explicitly, and `-P`/`--perl-regexp` is accepted but
+uses the `fancy-regex` Perl engine (lookahead and backreferences; `\K`, recursion and `(*VERB)` are usage errors). The last flag wins.
+When no dialect flag is given, `grep.patternType` (basic/extended/fixed) and
+`grep.extendedRegexp` apply from the local→global→system cascade. `-i` /
 `--regexp-ignore-case` makes all grep matches case-insensitive
 (author/committer matching is already case-insensitive in Libra).
 `--invert-grep` keeps commits matching none of the patterns and takes
@@ -290,8 +315,9 @@ libra log --grep fix --grep docs      # any pattern may match
 libra log --all-match --grep fix --grep docs
 libra log --grep fix -i              # case-insensitive
 libra log --grep WIP --invert-grep   # hide WIP commits
-libra log --extended-regexp --grep 'fix\([0-9]+\)'   # ERE dialect
-libra log --fixed-strings --grep 'c++ (fix)'           # literal pattern
+libra log -E --grep 'fix\([0-9]+\)'   # ERE dialect
+libra log -F --grep 'c++ (fix)'        # literal pattern
+libra log --basic-regexp --grep 'a\+'  # explicit BRE
 ```
 
 ### `--trailer <KEY[=VALUE]>` / `--only-trailers` (Libra extensions)
@@ -356,7 +382,7 @@ libra log --pretty=%P -1
 ### `--format <FORMAT>`
 
 Alias for `--pretty=<FORMAT>` (Git's `--format`). Accepts the same preset names and
-`%`-placeholder templates as `--pretty`. Mutually exclusive with `--pretty`.
+`%`-placeholder templates as `--pretty`. `--oneline`, `--pretty`, and `--format` are last-one-wins (the last one on the command line selects the format).
 
 ```bash
 libra log --format="%h %s"
@@ -405,12 +431,23 @@ becomes `--decorate-refs='tags/v1' --decorate-refs='tags/v2'`.
 
 ### `--graph`
 
-Draw a text-based graphical representation of the commit history, showing branching and
-merging visually.
+Draw a text-based graphical representation of the commit history using Git's
+column-allocation rules: branch forks collapse with `|/`, two-way merges print
+`|\`, and octopus merges print `*-.` plus their expansion rows. `--graph`
+implies Git's topological (graph) order, so a commit is printed only after all
+of its children; equal-date commits follow the graph-order stack (the most
+recently ready commit first). `--date-order` and `--author-date-order` are
+accepted but currently use the same graph order.
+
+`--all` seeds the walk from every ref under `refs/` (local and remote-tracking
+branches, tags, and `refs/notes/*` references) plus `HEAD`, in refname order.
+Libra's own notes backend stores notes in SQLite rather than a notes commit, so
+only imported notes refs contribute commits.
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### Revision ranges (positional or `--range <SPEC>`)

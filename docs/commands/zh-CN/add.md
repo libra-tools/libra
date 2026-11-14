@@ -15,11 +15,26 @@ libra add -N [PATHSPEC...]
 
 ## 说明
 
+候选分类也使用 clean 表示。只修改属性、目标文件 stat 不变时，已跟踪文件仍可能需要重新暂存；单纯 CRLF/LF 表示差异不会报告为内容修改。`--renormalize` 仍强制重新处理已跟踪文件。比较过程不改写工作区文件。
+
 `libra add` 将工作树中的文件更改暂存到索引中，为下一次 `libra commit` 做准备。它支持共享 Git 风格 pathspec 匹配、`--dry-run` 预览，以及用 `--refresh` 对已跟踪条目重新 stat 而不暂存新内容。
 
 该命令相对于当前工作目录解析 pathspec，验证它们位于仓库根内，并遵守 Git/Libra ignore 来源。由 LFS 跟踪的文件会自动作为指针文件暂存。`-A` 标志会暂存整个工作树中的所有更改（新增、修改、删除），而 `-u` 只更新已跟踪文件，不添加新文件。
 
 符号链接会按 Git 兼容的 symlink blob 暂存：索引 mode 为 `120000`，blob 内容为链接目标字节。暂存时不会跟随链接，因此指向工作树外部的 symlink 也只会被记录为链接本身，而不会读取目标文件内容。
+
+### 行尾转换
+
+普通文件显式设置 `text`（可搭配 `eol=lf` 或 `eol=crlf`）时，暂存到索引的内容会把
+CRLF 转成 LF。未设置 `text` 时，单独的 `eol` 也会启用该转换。例如，
+`*.ps1 text eol=crlf` 会保留工作文件中的 CRLF 字节，同时暂存 LF blob。
+孤立的 CR 和缺失的末尾换行保持原样；`add` 不改写工作文件。
+
+`text=auto` 仅转换文本输入，也可搭配 `eol=lf` 或 `eol=crlf`。探测包括 NUL、孤立 CR 和不可打印字节比例。普通 `add` 在既有索引 blob 为非二进制 CRLF 文本时保留历史表示；`add --renormalize` 绕过该历史保护，仍保留二进制探测。两种模式都不重写源文件或历史对象。status 和内置 diff 使用相同的普通模式：规范化索引下等价的混合 CRLF/LF 内容保持干净，真实编辑仍报告。
+
+需要的历史索引证据只从本地读取，受超时和单对象 32 MiB 额度限制。缺失、损坏、不可读或超额均报错，不会猜测干净。可恢复可读的本地对象；若明确要替换索引表示，可使用 `add --renormalize`。文件或属性来源读取失败同样报错；未指定 `--ignore-errors` 时，不保存部分更新的索引。
+
+`-text` 禁用转换。LFS 指针和符号链接目标保留各自语义。`core.autocrlf` 配置回退、`core.safecrlf`、自定义 clean/smudge 过滤器和 checkout 的 CRLF 写回仍不支持。
 
 ## 选项
 
@@ -166,7 +181,8 @@ libra add --chmod=-x notes.txt
 ### `--renormalize`
 
 从头重新暂存已跟踪文件，即使内容未变也重写其 blob。隐含 `-u`：只处理已跟踪文件（绝不处理
-未跟踪文件）；从工作区删除的已跟踪文件会被暂存为删除。
+未跟踪文件）；从工作区删除的已跟踪文件会被暂存为删除。即使文件 stat 未变，也重新应用
+当前显式 `text`/`eol` 规则；已有 blob 对象和工作文件字节保持不变。
 
 ```bash
 libra add --renormalize

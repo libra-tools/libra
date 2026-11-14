@@ -69,3 +69,6 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - `libra notes` 已公开接入顶层 CLI；新增子命令/参数的最小闭环是：CLI 变体、`src/command/mod.rs` 导出、dispatch、用户文档、兼容矩阵和测试一起更新。
+
+- 2026-11-13（#478 LG-21，ADR-LG-12 第 2 条）：`notes add`/`append` 新增 `-C/--reuse-message`（读取对象 blob 字节作为 note）与 `-c/--reedit-message`（blob 预填编辑器，经 `compose_note_via_editor`）；`ordered_content_parts` 识别 `-C`/`-c` 并按 argv 顺序与 `-m`/`-F` 拼接；`notes list`（含 `notes list <object>`）改为完整对象 id。测试：`test_notes_blob_reuse_and_list_output`（C1–C4）、`notes_test` 79/79。
+

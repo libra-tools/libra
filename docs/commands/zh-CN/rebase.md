@@ -19,6 +19,8 @@ libra rebase --edit-todo
 
 ## 说明
 
+干净度预检遵循显式 `text`/`eol` clean 比较，等价 CRLF/LF 内容不会阻止启动 rebase。真实修改和已有序列或冲突状态仍遵循原有拒绝及恢复规则。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra rebase` 将当前分支上的一系列提交移动到新的 base 提交之上。它会找到当前分支与指定 upstream 之间的共同祖先，收集从该祖先到当前 HEAD 的所有提交，并在 upstream 分支之上重放每个提交。所有提交重放后，当前分支引用会更新为指向最终 rebased 提交。
 
 如果重放期间发生冲突，rebase 会停止并报告冲突文件。用户手动解决冲突、暂存已解决文件，然后运行 `libra rebase --continue` 继续。或者，`--abort` 会恢复原始分支状态，`--skip` 会丢弃当前提交并继续下一个。

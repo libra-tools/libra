@@ -518,7 +518,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         .ok_or(StashError::NoInitialCommit)?;
     ensure_no_intent_to_add(&index)?;
 
-    if !has_changes().await && included_untracked_paths.is_empty() {
+    if !has_changes().await? && included_untracked_paths.is_empty() {
         return Ok(StashOutput::Noop {
             message: "No local changes to save".to_string(),
         });
@@ -649,7 +649,7 @@ pub(crate) async fn create_held_stash_commit(
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
 
-    if !has_changes().await {
+    if !has_changes().await? {
         return Ok(None);
     }
 
@@ -829,6 +829,39 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
     let matched = paths_matching_pathspec(&options.pathspec, &candidates)?;
     if matched.is_empty() {
         return Err(StashError::PathspecNoMatch(options.pathspec.join(" ")));
+    }
+
+    let staged_changes = status::changes_to_be_committed_safe()
+        .await
+        .map_err(|error| {
+            StashError::ReadObject(format!("cannot inspect selected staged changes: {error}"))
+        })?;
+    let file_mode = crate::internal::config::core_file_mode()
+        .await
+        .map_err(|error| {
+            StashError::ReadObject(format!(
+                "cannot read file-mode policy before stashing: {error}"
+            ))
+        })?;
+    let worktree_changes =
+        status::changes_to_be_staged_with_file_mode(file_mode).map_err(|error| {
+            StashError::ReadObject(format!("cannot inspect selected worktree changes: {error}"))
+        })?;
+    let selected_change = staged_changes
+        .new
+        .iter()
+        .chain(&staged_changes.modified)
+        .chain(&staged_changes.deleted)
+        .chain(&worktree_changes.modified)
+        .chain(&worktree_changes.deleted)
+        .any(|path| {
+            path.to_str()
+                .is_some_and(|name| matched.contains(&name.replace('\\', "/")))
+        });
+    if !selected_change {
+        return Ok(StashOutput::Noop {
+            message: "No local changes to save".to_string(),
+        });
     }
 
     // Stash worktree tree = HEAD overlaid with each matched path's EFFECTIVE
@@ -2431,90 +2464,31 @@ fn parse_stash_index(s: &str) -> Result<usize, StashError> {
 
 // ── Unchanged helpers ────────────────────────────────────────────────
 
-async fn has_changes() -> bool {
-    let head_tree_hash = match Head::current_commit().await {
-        Some(hash) => {
-            // Storage-backed load (loose OR packed — a HEAD that arrived via
-            // clone/pull lives in a pack). An unreadable commit reports
-            // CHANGED (fail-safe): the old silent `false` made `stash push`
-            // no-op as "No local changes to save" on a mere read failure.
-            let Ok(commit) = load_object::<Commit>(&hash) else {
-                return true;
-            };
-            commit.tree_id
-        }
-        None => ObjectHash::from_type_and_data(ObjectType::Tree, &[]),
-    };
-
-    let index_path = path::index();
-    let Ok(index) = Index::load(&index_path) else {
-        return false;
-    };
-    let Ok(index_tree) = tree::create_tree_from_index(&index) else {
-        return false;
-    };
-    let index_tree_hash = index_tree.id;
-
-    if head_tree_hash != index_tree_hash {
-        return true;
-    }
-
-    let workdir = util::request_working_dir();
-    // ADR-FM-05: a mode-only worktree change is a local modification.
+async fn has_changes() -> Result<bool, StashError> {
+    let staged = status::changes_to_be_committed_safe()
+        .await
+        .map_err(|error| {
+            StashError::ReadObject(format!(
+                "cannot inspect staged changes before stashing: {error}"
+            ))
+        })?;
     let file_mode = crate::internal::config::core_file_mode()
         .await
-        .unwrap_or(cfg!(unix));
-    for entry in index.tracked_entries(0) {
-        let file_path = workdir.join(&entry.name);
-
-        let Ok(metadata) = fs::metadata(&file_path) else {
-            return true;
-        };
-        if file_mode
-            && metadata.is_file()
-            && entry.mode & 0o100000 == 0o100000
-            && (entry.mode & 0o111 != 0) != stash_worktree_exec_bit(&metadata)
-        {
-            return true;
-        }
-
-        let mtime =
-            Time::from_system_time(metadata.modified().unwrap_or(std::time::SystemTime::now()));
-        if metadata.len() == entry.size as u64 && mtime == entry.mtime {
-            continue;
-        }
-
-        if let Ok(content) = fs::read(&file_path) {
-            let header = format!("blob {}\0", content.len());
-            let mut full_content = header.into_bytes();
-            full_content.extend_from_slice(&content);
-            let current_hash =
-                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &full_content);
-
-            if current_hash != entry.hash {
-                return true;
-            }
-        } else {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Owner-execute bit of a worktree file (false on platforms without POSIX
-/// permission bits).
-fn stash_worktree_exec_bit(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
+        .map_err(|error| {
+            StashError::ReadObject(format!(
+                "cannot read file-mode policy before stashing: {error}"
+            ))
+        })?;
+    let unstaged = status::changes_to_be_staged_with_file_mode(file_mode).map_err(|error| {
+        StashError::ReadObject(format!(
+            "cannot inspect worktree changes before stashing: {error}"
+        ))
+    })?;
+    Ok(!staged.new.is_empty()
+        || !staged.modified.is_empty()
+        || !staged.deleted.is_empty()
+        || !unstaged.modified.is_empty()
+        || !unstaged.deleted.is_empty())
 }
 
 fn has_stash() -> Result<bool, StashError> {
@@ -3633,8 +3607,8 @@ mod tests {
             .await
             .expect("detach onto bogus commit");
         assert!(
-            has_changes().await,
-            "an unreadable HEAD commit reports CHANGED (fail-safe)"
+            has_changes().await.is_err(),
+            "an unreadable HEAD commit must fail before writing a stash"
         );
     }
 

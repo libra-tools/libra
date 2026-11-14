@@ -79,3 +79,9 @@ flowchart TD
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - 2026-09-20（plan issues/470 FM-04）：`has_changes()` 在 `core.fileMode=true` 时把仅 mode 变化视为本地修改，使 `stash push` 能保存并还原该变化。
+
+## 显式换行比较（#1062）
+
+`stash push` 选择已跟踪修改时使用显式 `text`/`eol` clean 比较。仅有等价 CRLF/LF 内容时不会创建 stash 条目。真实编辑及既有未跟踪、忽略、冲突策略保持原有行为。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

@@ -5,20 +5,28 @@
 ## 用法
 
 ```
-libra diff-tree [-r] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet] [-c]
-                <tree-a> <tree-b> [-- <path>...]
+libra diff-tree [-r] [-t] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet] [-c]
+                [--root] [--no-commit-id] <tree-a> [<tree-b>] [-- <path>...]
 ```
 
 ## 说明
 
-`diff-tree` 等价于 `libra diff --old <tree-a> --new <tree-b> --no-renames`：对两个 tree-ish（commit 或 tree id）做 diff。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-tree ...` 等全局输出标志仍可用。默认输出是 raw。
+`diff-tree` 等价于 `libra diff --old <tree-a> --new <tree-b> --no-renames`：对两个 tree-ish（commit 或 tree id）做 diff。路径限定写在 `--` 之后。作为 Git plumbing，它忽略 porcelain `diff.renames`；`libra --json diff-tree ...` 等全局输出标志仍可用。默认输出是 raw 且**非递归**：双 tree 形式只比较根 tree，变更目录以单条 `040000`
+记录出现，需 `-r` 才展开。只给 `<tree-a>` 是 Git 的单提交形式：先输出提交 id 行，
+再与其第一父提交做非递归 diff；`--no-commit-id` 抑制该行。`--root` 把初始提交显示为
+对空 tree 的全量创建 diff（不给则根提交只输出 id 行）；`-t` 在递归时同时列出 tree 条目。
+raw 记录使用完整对象 id（SHA-1 40 位 / SHA-256 64 位），缺失侧为 `000000` 模式与全零 id。
+`-p` 输出补丁（隐含递归）。
 
 ## 选项
 
 | 选项 | 说明 | 示例 |
 |------|------|------|
-| `<tree-a> <tree-b>` | 要比较的两个 tree-ish。 | `libra diff-tree HEAD~1 HEAD` |
-| `-r` | 递归子树。Libra 总是递归，因此这是空操作。 | `libra diff-tree -r a b` |
+| `<tree-a> [<tree-b>]` | 要比较的两个 tree-ish，或单个提交（与其第一父提交比较）。 | `libra diff-tree HEAD~1 HEAD` |
+| `-r` | 递归子树；默认非递归。 | `libra diff-tree -r a b` |
+| `-t` | 递归时同时输出 tree 条目（隐含 `-r`）。 | `libra diff-tree -r -t a b` |
+| `--root` | 把初始提交显示为对空 tree 的全量创建 diff。 | `libra diff-tree -r --root <root>` |
+| `--no-commit-id` | 单提交形式下抑制提交 id 行。 | `libra diff-tree --no-commit-id HEAD` |
 | `-p`, `--patch` | 输出补丁而非 raw 记录。 | `libra diff-tree -p a b` |
 | `--raw` | 强制 raw 记录（默认）。 | `libra diff-tree --raw a b` |
 | `--name-only` | 只打印变更路径名。 | `libra diff-tree --name-only a b` |

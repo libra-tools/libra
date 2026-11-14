@@ -139,10 +139,11 @@ async fn run_status_scan_locked_inner(
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
-    use crate::internal::dirty::{DirtyCache, current_index_fingerprint};
+    use crate::internal::dirty::DirtyCache;
 
-    let fingerprint_before =
-        current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    // Keep a failed attributes proof until the path-aware scan can report
+    // its partial result. It must never enable a cache write.
+    let fingerprint_before = conversion_index_fingerprint(index_path);
     let head_before = Head::current_commit().await.map(|oid| oid.to_string());
     let scan_started_at = crate::internal::dirty::now_timestamp();
 
@@ -159,17 +160,6 @@ async fn run_status_scan_locked_inner(
     // ANY later failure — recheck, txn, JSON emit, render, summary — reaches
     // the wrapper fallback with the complete set.
     cache_warnings.append(&mut data.warnings);
-
-    let fingerprint_after =
-        current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
-    let head_after = Head::current_commit().await.map(|oid| oid.to_string());
-    if fingerprint_before != fingerprint_after || head_before != head_after {
-        return Err(CliError::failure(
-            "the index or HEAD changed while scanning; the dirty cache was left untouched",
-        )
-        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-        .with_hint("re-run 'libra status --scan' once the concurrent operation finishes"));
-    }
 
     // The CACHE is a whole-repository snapshot, so it is collected WITHOUT
     // the pathspec — still through the bounded, io_blocked-aware
@@ -257,6 +247,7 @@ async fn run_status_scan_locked_inner(
              the partial result with data.io_blocked[]",
         ));
     }
+    let fingerprint_before = fingerprint_before.map_err(|e| dirty_cache_error("fingerprint", e))?;
     // Fully inspectable: the cache rows come from the accumulator walk above.
     let rooted = snapshot_data.to_repo_relative();
     let (staged_raw, unstaged_raw) = (rooted.staged.clone(), rooted.unstaged.clone());
@@ -270,6 +261,17 @@ async fn run_status_scan_locked_inner(
             ),
         ));
     }
+    let fingerprint_after = conversion_index_fingerprint(index_path)
+        .map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let head_after = Head::current_commit().await.map(|oid| oid.to_string());
+    if fingerprint_before != fingerprint_after || head_before != head_after {
+        return Err(CliError::failure(
+            "the index or HEAD changed while scanning; the dirty cache was left untouched",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("re-run 'libra status --scan' once the concurrent operation finishes"));
+    }
+
     let row_count = rows.len();
     let db = crate::internal::sequencer::request_db_checked()
         .await
@@ -359,14 +361,29 @@ fn blocked_reason(error: &io::Error) -> crate::command::status_probe::IoBlockedR
 /// Hash a worktree file for cache revalidation under the §B.3.3 deadline.
 /// A reclaimed read surfaces as `TimedOut` so callers classify it as blocked
 /// rather than as a content change.
-fn hash_under_deadline(abs: &Path, workdir: &Path) -> io::Result<git_internal::hash::ObjectHash> {
-    match crate::command::status_io_worker::deadline_file_blob_hash(abs, workdir) {
-        Ok(result) => result,
-        Err(()) => Err(io::Error::new(
+fn cached_entry_modified(
+    index: &Index,
+    path: &str,
+    abs: &Path,
+    file_mode: bool,
+    conversion: &crate::command::status_io_worker::ConversionScan,
+) -> io::Result<bool> {
+    let stat = crate::command::status_io_worker::deadline_stat(abs).map_err(|_| {
+        io::Error::new(
             io::ErrorKind::TimedOut,
-            "content read exceeded the status I/O deadline",
-        )),
+            "cached file metadata read exceeded the status I/O deadline",
+        )
+    })??;
+    if index.get(path, 0).is_none_or(|entry| {
+        (entry.mode & 0o170000 == 0o120000) != stat.is_symlink
+            || stat.is_dir
+            || (file_mode && stat.is_file && (entry.mode & 0o111 != 0) != (stat.mode & 0o111 != 0))
+    }) {
+        return Ok(true);
     }
+    conversion
+        .hash(abs)
+        .map(|hash| !index.verify_hash(path, 0, &hash))
 }
 
 fn cached_path_state(abs: &Path) -> CachedPathState {
@@ -402,7 +419,13 @@ enum ManualMarkClass {
     Blocked(crate::command::status_probe::IoBlockedReason),
 }
 
-fn classify_manual_mark(index: &Index, workdir: &std::path::Path, stored: &str) -> ManualMarkClass {
+fn classify_manual_mark(
+    index: &Index,
+    workdir: &std::path::Path,
+    stored: &str,
+    file_mode: bool,
+    conversion: &crate::command::status_io_worker::ConversionScan,
+) -> ManualMarkClass {
     use crate::internal::dirty;
     let native = dirty::stored_path_to_native(stored);
     let Some(path_str) = native.to_str() else {
@@ -425,9 +448,9 @@ fn classify_manual_mark(index: &Index, workdir: &std::path::Path, stored: &str) 
         (true, true) => {
             // Content confirm (no stat shortcut: manual marks are few, and a
             // wrong stat shortcut here would silently drop a real edit).
-            match hash_under_deadline(&abs, workdir) {
-                Ok(hash) if index.verify_hash(path_str, 0, &hash) => ManualMarkClass::Clean,
-                Ok(_) => ManualMarkClass::Dirty(dirty::KIND_MODIFIED),
+            match cached_entry_modified(index, path_str, &abs, file_mode, conversion) {
+                Ok(false) => ManualMarkClass::Clean,
+                Ok(true) => ManualMarkClass::Dirty(dirty::KIND_MODIFIED),
                 // Readable metadata but an unreadable body: still "cannot
                 // inspect", so never let it confirm or prune a cache row.
                 Err(error) => ManualMarkClass::Blocked(blocked_reason(&error)),
@@ -446,12 +469,11 @@ pub(super) async fn run_status_cache_mode(
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
-    use crate::internal::dirty::{self, CacheState, DirtyCache, current_index_fingerprint};
+    use crate::internal::dirty::{self, CacheState, DirtyCache};
 
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
-    let fingerprint =
-        current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let fingerprint = conversion_index_fingerprint(&index_path);
     let head_oid = Head::current_commit().await.map(|oid| oid.to_string());
     let db = crate::internal::sequencer::request_db_checked()
         .await
@@ -459,7 +481,10 @@ pub(super) async fn run_status_cache_mode(
     let meta = DirtyCache::meta_with_conn(&db)
         .await
         .map_err(|e| dirty_cache_error("read", e))?;
-    let state = DirtyCache::classify(meta.as_ref(), &fingerprint, head_oid.as_deref());
+    let state = match &fingerprint {
+        Ok(fingerprint) => DirtyCache::classify(meta.as_ref(), fingerprint, head_oid.as_deref()),
+        Err(_) => CacheState::Stale,
+    };
 
     if state != CacheState::Fresh {
         // Degrade to the full reconcile — never trust a doubtful cache.
@@ -469,6 +494,11 @@ pub(super) async fn run_status_cache_mode(
             &InvocationWarningCtx::from_process_preflight(),
         )
         .await?;
+        // A failed proof must surface either as path-local io_blocked or
+        // as its original error, never as a complete fallback result.
+        if data.io_blocked.is_empty() {
+            fingerprint.map_err(|e| dirty_cache_error("fingerprint", e))?;
+        }
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheStaleFallback,
             format!(
@@ -518,12 +548,21 @@ pub(super) async fn run_status_cache_mode(
         return Ok(());
     }
 
+    let fingerprint = fingerprint.map_err(|e| dirty_cache_error("fingerprint", e))?;
     let rows = DirtyCache::list_with_conn(&db)
         .await
         .map_err(|e| dirty_cache_error("read", e))?;
     let workdir = util::try_working_dir()
         .map_err(|source| CliError::from(StatusError::Workdir { source }))?;
     let index = load_status_index()?;
+    let conversion = crate::command::status_io_worker::ConversionScan::new(&workdir, &index)
+        .map_err(|source| {
+            CliError::from(StatusError::FileHash {
+                path: workdir.clone(),
+                source,
+            })
+        })?;
+    let file_mode = crate::internal::config::core_file_mode().await?;
 
     // Build the raw sets from the cache (staged snapshot + unstaged rows +
     // classified manual marks), optionally re-verifying (--check-dirty).
@@ -610,8 +649,14 @@ pub(super) async fn run_status_cache_mode(
                 if verify {
                     still = index.tracked(path_str, 0)
                         && matches!(state, CachedPathState::Exists)
-                        && match hash_under_deadline(&abs, &workdir) {
-                            Ok(hash) => !index.verify_hash(path_str, 0, &hash),
+                        && match cached_entry_modified(
+                            &index,
+                            path_str,
+                            &abs,
+                            file_mode,
+                            &conversion,
+                        ) {
+                            Ok(modified) => modified,
                             Err(error) => {
                                 blocked_paths.push((native.clone(), blocked_reason(&error)));
                                 true // unreadable: keep (over-report)
@@ -670,7 +715,7 @@ pub(super) async fn run_status_cache_mode(
                     unstaged.modified.push(native);
                     continue;
                 }
-                match classify_manual_mark(&index, &workdir, &row.path) {
+                match classify_manual_mark(&index, &workdir, &row.path, file_mode, &conversion) {
                     ManualMarkClass::Dirty(dirty::KIND_NEW) => unstaged.new.push(native),
                     ManualMarkClass::Dirty(dirty::KIND_DELETED) => unstaged.deleted.push(native),
                     ManualMarkClass::Dirty(_) => unstaged.modified.push(native),
@@ -709,16 +754,22 @@ pub(super) async fn run_status_cache_mode(
     // Re-verify the epoch AFTER processing: a concurrent index/HEAD change
     // since the initial classify would make this view (and any prune) stale —
     // degrade instead of committing or rendering it as fresh.
-    let fingerprint_now =
-        current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let fingerprint_now = conversion_index_fingerprint(&index_path);
     let head_now = Head::current_commit().await.map(|oid| oid.to_string());
-    if fingerprint_now != fingerprint || head_now != head_oid {
+    if !fingerprint_now
+        .as_ref()
+        .is_ok_and(|current| current == &fingerprint)
+        || head_now != head_oid
+    {
         let mut data = collect_status_data(
             args,
             extras,
             &InvocationWarningCtx::from_process_preflight(),
         )
         .await?;
+        if data.io_blocked.is_empty() {
+            fingerprint_now.map_err(|e| dirty_cache_error("fingerprint", e))?;
+        }
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheConcurrentInvalidate,
             "the index or HEAD changed while reading the dirty cache; falling back to the full status",
@@ -998,4 +1049,15 @@ async fn render_cached_status_body(
         }
     }
     Ok(())
+}
+
+/// An attribute edit can dirty paths absent from the advisory dirty set even
+/// when neither HEAD nor the index changed. Bind that set to source versions.
+fn conversion_index_fingerprint(index_path: &std::path::Path) -> anyhow::Result<String> {
+    let fingerprint = crate::internal::dirty::current_index_fingerprint(index_path)?;
+    let workdir = util::try_working_dir()?;
+    let index = Index::load(index_path)?;
+    let conversion = crate::command::status_io_worker::ConversionScan::new(&workdir, &index)?;
+    let (sources, _) = conversion.probe(None)?;
+    Ok(format!("{fingerprint}:conversion-v1:{sources}"))
 }

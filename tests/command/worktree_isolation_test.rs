@@ -8825,6 +8825,92 @@ fn create_legacy_symlink_worktree(main: &std::path::Path, name: &str) -> std::pa
     canonical
 }
 
+#[cfg(unix)]
+#[test]
+fn i1062_legacy_info_attributes_keep_reads_clean_and_mutations_closed() {
+    for format in ["sha1", "sha256"] {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path();
+        for args in [
+            vec!["init", "--vault=false", "--object-format", format],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            assert_cli_success(&run_libra_command(&args, main), "initialize repository");
+        }
+        fs::write(main.join("a.txt"), b"a\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "stage LF");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "LF", "--no-verify"], main),
+            "commit LF",
+        );
+        fs::write(
+            main.join(".libra/info/attributes"),
+            b"a.txt text eol=crlf\n",
+        )
+        .unwrap();
+        let wt = create_legacy_symlink_worktree(main, "wt-explicit");
+        fs::write(wt.join("a.txt"), b"a\r\n").unwrap();
+        let index_before = fs::read(main.join(".libra/index")).unwrap();
+        let head_before = run_libra_command(&["rev-parse", "HEAD"], main);
+        assert_cli_success(&head_before, "read main HEAD");
+
+        for args in [vec!["status", "--porcelain"], vec!["diff", "--", "a.txt"]] {
+            let out = run_libra_command(&args, &wt);
+            assert_cli_success(&out, "legacy read uses resolved info attributes");
+            assert!(out.stdout.is_empty(), "{format} {args:?}: {out:?}");
+        }
+        assert_cli_success(
+            &run_libra_command(&["diff", "--quiet", "--", "a.txt"], &wt),
+            "representation-only diff is clean",
+        );
+        assert_eq!(fs::read(wt.join("a.txt")).unwrap(), b"a\r\n");
+
+        fs::write(wt.join("a.txt"), b"a\r\nreal edit\r\n").unwrap();
+        let status = run_libra_command(&["status", "--porcelain"], &wt);
+        assert_cli_success(&status, "real edit status");
+        assert_eq!(status.stdout, b" M a.txt\n");
+        let diff = run_libra_command(&["diff", "--quiet", "--", "a.txt"], &wt);
+        assert_eq!(diff.status.code(), Some(1), "{format}: {diff:?}");
+        let add = run_libra_command(&["add", "a.txt"], &wt);
+        assert!(!add.status.success());
+        let diagnostic = String::from_utf8_lossy(&add.stderr);
+        assert!(diagnostic.contains("LBR-REPO-003") && diagnostic.contains("--migrate-layout"));
+        assert_eq!(fs::read(wt.join("a.txt")).unwrap(), b"a\r\nreal edit\r\n");
+        assert_eq!(fs::read(main.join("a.txt")).unwrap(), b"a\n");
+        assert_eq!(fs::read(main.join(".libra/index")).unwrap(), index_before);
+        let head_after = run_libra_command(&["rev-parse", "HEAD"], main);
+        assert_cli_success(&head_after, "main HEAD remains readable");
+        assert_eq!(head_after.stdout, head_before.stdout);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn i1062_legacy_info_attribute_symlink_fails_closed() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = create_legacy_symlink_worktree(main, "wt-symlink-attributes");
+    fs::write(wt.join("a.txt"), b"a\r\n").unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let source = external.path().join("attributes");
+    fs::write(&source, b"a.txt text eol=crlf\n").unwrap();
+    std::os::unix::fs::symlink(&source, main.join(".libra/info/attributes")).unwrap();
+    let index_before = fs::read(main.join(".libra/index")).unwrap();
+    for args in [
+        vec!["status", "--porcelain"],
+        vec!["diff", "--quiet", "--", "a.txt"],
+    ] {
+        let out = run_libra_command(&args, &wt);
+        assert_eq!(out.status.code(), Some(128), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "must not emit incomplete output");
+        assert!(!out.stderr.is_empty(), "failure must be diagnosed");
+    }
+    assert_eq!(fs::read(wt.join("a.txt")).unwrap(), b"a\r\n");
+    assert_eq!(fs::read(&source).unwrap(), b"a.txt text eol=crlf\n");
+    assert_eq!(fs::read(main.join(".libra/index")).unwrap(), index_before);
+}
+
 /// §C.6.1: mutation commands refuse in a legacy-symlink worktree (they
 /// would move MAIN's HEAD/index); read-only commands keep working, and the
 /// list layout field reports `legacy-symlink`.
@@ -10842,5 +10928,105 @@ fn concurrent_identical_control_actions_in_two_worktrees_not_deduped() {
             !combined.contains("duplicate operation"),
             "and the identical abort is not deduped either: {combined}"
         );
+    }
+}
+
+#[test]
+fn i1062_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(false);
+}
+
+#[test]
+fn i861_consumer_am_accepts_clean_representation_and_preserves_real_edits() {
+    eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(true);
+}
+
+fn eol_consumer_am_accepts_clean_representation_and_preserves_real_edits(auto: bool) {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_fast_forward_scripts,
+    };
+    for dirty in [false, true] {
+        let (temp, _) = if auto {
+            super::status_test::i861_fast_forward_scripts()
+        } else {
+            i1062_fast_forward_scripts()
+        };
+        let repo = temp.path().join("repo");
+        let patch_dir = temp.path().join("patches");
+        i1062_ok(
+            &repo,
+            &[
+                "format-patch",
+                "-o",
+                patch_dir.to_str().unwrap(),
+                "main..upstream",
+            ],
+        );
+        let patch = fs::read_dir(&patch_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+            .unwrap();
+        if dirty {
+            fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+        }
+        let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+        let bytes = fs::read(repo.join("probe.ps1")).unwrap();
+        let output = i1062_run(&repo, &["am", patch.to_str().unwrap()]);
+        assert_eq!(output.status.success(), !dirty, "{output:?}");
+        if dirty {
+            assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(fs::read(repo.join("probe.ps1")).unwrap(), bytes);
+        } else {
+            assert_ne!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+            assert_eq!(fs::read(repo.join("upstream.txt")).unwrap(), b"upstream\n");
+        }
+    }
+}
+
+#[test]
+fn i861_consumer_linked_worktree_uses_own_index_and_common_objects() {
+    use super::add_test::{i1062_index_oid, i1062_ok, i1062_run};
+    for format in ["sha1", "sha256"] {
+        let temp = super::status_test::i861_committed_scripts(format);
+        let main = temp.path().join("repo");
+        let linked = temp.path().join("linked");
+        i1062_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "auto-linked",
+                "--path",
+                linked.to_str().unwrap(),
+                "--detach",
+            ],
+        );
+        let main_oid = i1062_index_oid(&main, "probe.ps1");
+        std::fs::write(linked.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+        std::fs::write(linked.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+        i1062_ok(&linked, &["add", ".gitattributes", "probe.ps1"]);
+        let linked_oid = i1062_index_oid(&linked, "probe.ps1");
+        assert_ne!(main_oid, linked_oid);
+        std::fs::write(linked.join(".gitattributes"), "*.ps1 text=auto\n").unwrap();
+        i1062_ok(&linked, &["diff", "--quiet", "--", "probe.ps1"]);
+        i1062_ok(&main, &["diff", "--quiet", "--", "probe.ps1"]);
+        for repo in [&main, &linked] {
+            std::fs::write(repo.join("probe.ps1"), b"one\r\ntwo\n").unwrap();
+        }
+        i1062_ok(&main, &["diff", "--quiet", "--", "probe.ps1"]);
+        assert_eq!(
+            i1062_run(&linked, &["diff", "--quiet", "--", "probe.ps1"])
+                .status
+                .code(),
+            Some(1)
+        );
+        i1062_ok(&linked, &["add", "--renormalize", "probe.ps1"]);
+        assert_eq!(i1062_index_oid(&linked, "probe.ps1"), main_oid);
+        assert_eq!(i1062_index_oid(&main, "probe.ps1"), main_oid);
     }
 }

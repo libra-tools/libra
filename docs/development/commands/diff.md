@@ -16,7 +16,7 @@
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/diff.rs`。参数/子命令类型包括：`DiffArgs`；输出、错误或状态类型包括：`DiffOutput`；主要执行函数包括：`execute`、`execute_safe`。
-- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；位置性 tree-ish 读取仅对 `AUTO_MERGE` 经 opt-in resolver 放行，其余 revision 保持默认严格解析；引用路径会读取或更新 SQLite refs、HEAD 与 reflog。
+- 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；索引路径加载并比较 `.libra/index`，不刷新或保存；对象路径解析 revision 并读取 blob/tree/commit/tag 等对象；位置性 tree-ish 读取仅对 `AUTO_MERGE` 经 opt-in resolver 放行，其余 revision 保持默认严格解析；引用路径读取 refs 与 HEAD，不更新引用或 reflog。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
@@ -27,12 +27,19 @@ flowchart TD
     C --> D["执行路径<br/>execute / execute_safe"]
     D --> E["底层对象<br/>IndexEntry / Index / .libra/index / Blob"]
     D --> F["输出与错误<br/>DiffOutput"]
-    E --> G["副作用边界<br/>写入分支需先预检"]
+    E --> G["副作用边界<br/>只读工作区、索引与对象"]
 ```
 
 - 底层操作对象：`IndexEntry`（索引条目，承载路径、mode、object id 和 stat 元数据）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Commit`（提交对象、父提交关系和提交消息载荷）；`Tree`（由索引或对象遍历生成的目录树对象）；`Head`（SQLite 中的 HEAD 指向、当前分支和 detached 状态）；`ObjectHash`（SHA-1/SHA-256 对象 ID 和 revision 解析结果）；`ObjectType`（blob/tree/commit/tag 类型分派）
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
+
+### 显式转换内容（I1062-06）
+
+- 普通工作区 diff 的候选 OID 通过共享 `ConversionScan` 计算；仅属性源/索引指纹有效且 stat 匹配时复用索引 OID。`WorktreeContents` 让渲染、pickaxe、二进制处理和 rename 消费相同 clean 内容，非零候选 OID 不一致时报可重试读取错误。转换读取失败必须传播。
+- plumbing 仍由 `get_files_blobs_stat_only` 选择候选，raw/name/退出码保留 stat 语义。`-p` 读取 clean 内容，内容相同则清空补丁但保留候选；真实编辑的 patch index 行使用实际 clean OID。缓存按路径与 OID 联合索引，防止多个全零 OID 候选串用文件内容。intent-to-add 无有效 stat，使用共享 clean 内容计算候选哈希，避免 raw OID 与 clean 正文不一致；TC-0044 条目存在性规则保持。
+- 已存储 index/tree blob 不转换；LFS 指针来自原始载荷摘要、symlink 读取目标字节，外部 diff/textconv 与 `--no-index` 输入契约保持。比较不写源文件、索引或对象库。`text=auto` 通过同一 clean 策略执行二进制探测及历史 CRLF 索引保护；normal/renormalize 模式和失败边界见 [add](add.md)。
+- 回归位于既有 `command_test`：`diff_test::i1062_explicit_`、`diff_test::i1062_failure_`、`diff_test::i1062_content_view_` 与 `diff_plumbing_test::i1062_plumbing_explicit_conversion_matches_git_modes`。固定 Git 对照保留各模式退出码，raw OID 显示使用 Git `--abbrev=7` 对齐 Libra 既有宽度，不宣称默认宽度相同。
 
 ## 实现历史
 
@@ -51,6 +58,7 @@ flowchart TD
 - 2026-07-11（P1-05d 三轮复审整改）：精确 rename 的输出重建从逐文件 `Vec::position + remove` 改为 added-index 键控的 `HashMap::remove`，避免大量精确目录重命名的二次方尾部。`diff_rename_limit_test::diff_large_set_warns_and_preserves_exact_renames` 通过真实 CLI 覆盖 1001 个精确 rename + 1001 对非精确候选，锁定超限 warning 与精确 rename 保留语义；plumbing 的 EN/zh 用户文档同步明确 `--no-renames` 与 `diff.renames` 免疫。
 - 2026-07-11（P1-05d 收口）：第四轮独立 Codex review PASS；fmt、全 targets/all features Clippy `-D warnings`、配置 44、plumbing 9、diff 64、大集合 1、文档 1/7 与 limit 单测全部通过，随 v0.18.57 发布。
 - 2026-07-11（plan-20260708 P1-05d，diff 片 2/2，第四轮独立 Codex review PASS，随 v0.18.58 发布）：`diff.noPrefix` / `diff.mnemonicPrefix` / `diff.srcPrefix` / `diff.dstPrefix` 接入严格级联并在进度前解析。前缀策略按 Git 优先级 `noPrefix` > mnemonic > custom > `a/ b/`，`-R` 交换两侧；逐键级联允许 src/dst 来自不同 scope。渲染在 relative 后仅于首个 hunk 前精确改写内建 `diff --git`、`---`/`+++` 与 binary 行（含增删文件的 `/dev/null`），避免 word-diff 内容碰撞；rename from/to 保持无前缀，external diff 保持 verbatim。`staged_diff_text` 用于 `commit -v`，与 Git 一致强制内建 diff、传播配置错误。前三轮 Codex review 的 11 个 P1 已整改；第三轮新增的真实未合并 `diff --cc` 与空值/边界空格 verbatim 缺口已补回归，第四轮无新增发现。fmt、全 targets/all features Clippy `-D warnings`、配置 56、diff 64、plumbing 9、commit-editor 28、文档 1/7 与 CRLF 单测全绿。回归：`diff_prefix_defaults::*`、`diff_prefix_edges::*`、`commit_editor_test`。
+- 2026-11-13（#478 LG-08，ADR-LG-06 第 1 条）：`--dirstat` 收敛到共享 `utils::diff_format::format_dirstat`（Git `gather_dirstat` 的 `sources != 1`、非顶层、permille 阈值与 `cumulative` 归并规则；`changes` 默认按补丁正文的字节 damage、`lines` 按增删行数（二进制每 64 字节折算）、`files` 每文件 1；百分比默认 3%、截断一位小数）；新增独立 `--cumulative`（等价 `--dirstat=cumulative`，单独给出即启用）与 `--dirstat-by-file`→`files[,<param>]` 合并；`show --dirstat`/`log --dirstat` 经 `log::compute_commit_dirstat` 复用同一渲染。回归：`test_diff_dirstat_matrix`、`test_show_dirstat`、`utils::diff_format::dirstat_*` 单测。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -91,9 +99,16 @@ flowchart TD
 | 部分实现 | Indent 启发式 | `--no-indent-heuristic` 作为接受式 no-op 已公开（Libra 不使用 Git 的 indent 启发式）；`--indent-heuristic` 仍不支持。 |
 | ✅ 已实现 | Textconv | `--textconv`（默认开启，`--no-textconv` 关闭）：`utils::attributes::diff_driver_for_path` 从 `core.attributesFile`、逐目录 `.gitattributes`、`.libra_attributes` 和 `.git/info/attributes` 解析 `diff=<driver>` 模式（同目录 `.libra_attributes` 覆盖 `.gitattributes`，last-match-wins，`-diff`/`!diff`/裸 `diff` 会清除先前 driver）；`ConfigKv::get("diff.<driver>.textconv")` 取转换命令；`apply_textconv` 对命中文件用 `run_textconv`（把 blob 内容写临时文件、`sh -c '<cmd> "$@"' <cmd> <tmpfile>`、stdout 为转换后文本；temp/spawn/非零退出均为 fatal 错误 `LBR-IO-001`，与 git「unable to read files to diff」一致——不静默回退原始内容）转换两侧，再以 `compute_unified_hunks`(遵循 `-U<n>`/`-w`/`-b`/`--ignore-blank-lines`) 重 diff 转换后内容、`splice_unified_body` 替换 patch body、`count_body_changes` 重算计数；转换后内容相同的修改被丢弃（含纯增/删保留），与 Git 一致。stat/numstat/name/JSON 均反映转换后内容（与 git `diff` 一致；plumbing 的默认关闭不适用，Libra `diff` 为 porcelain）。`run_diff` 中在 rename 检测之后、上下文/空白 post-pass 之前应用，记录 `textconv_paths` 让 post-pass 跳过；`-S` 激活时在转换字符串仍存活时计算 old/new literal count，`TextconvOutcome` 只保留整数 count，绝不再次执行命令或延长大文本生命周期。重命名项也被 textconv：其 old 侧按 `rename_from` 取内容、转换后重 diff 并 `splice_unified_body` 替换 body（保留 `similarity`/`rename from`/`to` 头）；转换后内容相同时保留 header（不丢弃）。blob 读取失败按错误上抛（不当作空内容）。驱动按**每侧**解析：重命名的 old 侧用 `rename_from` 路径的 driver、new 侧用 `file.path` 的 driver（与 Git 按 blob/path 解析一致），某侧无 driver 则该侧用原始内容；缺失侧（新增/删除的另一侧）保持空、不喂入 textconv（避免转换器对空输入伪造 hunk）。精确重命名（无 content hunk）若两侧转换后不同（跨 driver），合成 `index`/`---`/`+++`+hunk 接到 rename 头之后。**AI-VCS 安全**：`run_libra_vcs diff` 因 textconv 与 `diff.external` 默认开启、二者均可执行配置的 shell 命令，故仅在 `--` 之前同时带 `--no-textconv` 与 `--no-ext-diff` 时算只读，否则需人工审批（`libra_vcs.diff_default_filters`；`-S`/`-G` 的 separated/glued 形态均在 allowlist 中，但不放宽该门；`--ext-diff`/`--output` 仍 Deny）。**有意限制**：`--check` 与 `diff.external` 激活时不应用（前者扫原始新增行、后者优先）。与真实 git（`.gitattributes`+`diff.<driver>.textconv`）逐字节对照 body 与 `--stat` 一致；failing textconv、`-diff` 清除、跨 driver 重命名均经 `test_diff_textconv` 覆盖，Git/Libra attributes 来源扩展经 `compat_ignore_attributes_sources` 覆盖。 |
 
+## 共享元数据属性（#1062）
+
+旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。
+
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 - 2026-09-20（plan issues/470 FM-04）：`resolve_worktree_side`/`resolve_diff_side` 增加 `file_mode`；为 `false` 时工作树侧改用索引记录的 mode，从而不 diff 仅 mode 差异（`run_diff` 解析 `core_file_mode()`，非法值以 `DiffError::InvalidConfig` 失败）。
+
+- 2026-11-13（#478 LG-16）：hunk 头函数上下文（`@@ … @@ <func>`）改为复用 `utils::funcname` 的默认/gitattributes 规则，追加在 `compute_unified_hunks` 的规范头之后；回归 `test_diff_hunk_header_function_context`。
+

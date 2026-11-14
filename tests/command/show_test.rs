@@ -3,7 +3,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 use git_internal::internal::object::{commit::Commit, tree::Tree};
 use libra::{
@@ -313,6 +313,9 @@ async fn test_show_non_quiet_uses_forced_pager() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: true,
@@ -376,6 +379,9 @@ async fn test_show_quiet_still_validates_patch_generation() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -440,6 +446,9 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
@@ -686,13 +695,16 @@ async fn test_show_tree_output_uses_git_modes_and_types() {
         String::from_utf8_lossy(&human.stderr)
     );
     let human_stdout = String::from_utf8_lossy(&human.stdout);
+    // ADR-LG-05 item 3 / M-SHOWTREE: human `show <tree>` prints Git's short
+    // form (`tree <name>`, blank line, entry names only), while `--json`
+    // keeps the mode/type/hash schema.
     assert!(
-        human_stdout.contains("100644 blob"),
-        "expected git tree mode/type in human output, got: {human_stdout}"
+        human_stdout.contains(&format!("tree {tree_hash}\n\ntracked.txt\n")),
+        "expected Git-style tree output, got: {human_stdout}"
     );
     assert!(
-        human_stdout.contains("\ttracked.txt"),
-        "expected tracked entry in human output, got: {human_stdout}"
+        !human_stdout.contains("100644 blob"),
+        "human tree output no longer prints modes/types: {human_stdout}"
     );
 
     let output = run_libra_command(&["--json", "show", &tree_hash], repo.path());
@@ -913,6 +925,9 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("nonexistent_ref_abc123".to_string()),
         no_patch: false,
@@ -967,6 +982,9 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
         no_expand_tabs: false,
         no_notes: false,
         notes: None,
+        show_notes: None,
+        dirstat: None,
+        dirstat_by_file: None,
         no_mailmap: false,
         object: Some("HEAD:nonexistent_file.txt".to_string()),
         no_patch: false,
@@ -1150,9 +1168,28 @@ fn show_format_aliases_pretty_and_abbrev_commit_shortens_hash() {
         "subject rendered: {}",
         String::from_utf8_lossy(&fmt.stdout)
     );
-    // --format conflicts with --pretty.
-    let both = run_libra_command(&["show", "--format=%s", "--pretty=%s", "HEAD"], p);
-    assert!(!both.status.success(), "--format conflicts with --pretty");
+    // ADR-LG-05 item 2: `--oneline`, `--pretty`, and `--format` are
+    // last-one-wins rather than mutually exclusive.
+    let pretty_last = run_libra_command(
+        &["show", "--no-patch", "--format=%H", "--pretty=%s", "HEAD"],
+        p,
+    );
+    assert_cli_success(&pretty_last, "show --format then --pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_last.stdout).trim(),
+        "base",
+        "--pretty after --format wins"
+    );
+    let format_last = run_libra_command(
+        &["show", "--no-patch", "--pretty=%s", "--format=%H", "HEAD"],
+        p,
+    );
+    assert_cli_success(&format_last, "show --pretty then --format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_last.stdout).trim(),
+        full_hash,
+        "--format after --pretty wins"
+    );
 
     // --abbrev-commit shortens the default header's commit hash.
     let abbrev = run_libra_command(&["show", "--no-patch", "--abbrev-commit", "HEAD"], p);
@@ -1441,4 +1478,254 @@ fn show_storage_read_error_is_not_bad_revision() {
         !stderr.contains("bad revision"),
         "a storage read failure must not be a missing revision: {stderr}"
     );
+}
+
+/// LG-02 (M-NOTES N1): `show` displays default notes and honors the switches.
+#[test]
+#[serial(cwd)]
+fn test_show_displays_default_notes() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "note body"], p),
+        "add note",
+    );
+
+    let default_show = run_libra_command(&["show", "-s", "HEAD"], p);
+    assert_cli_success(&default_show, "show -s");
+    let text = String::from_utf8_lossy(&default_show.stdout);
+    assert!(text.contains("\nNotes:\n"), "{text:?}");
+    assert!(text.contains("    note body"), "{text:?}");
+
+    let hidden = run_libra_command(&["show", "-s", "HEAD", "--no-notes"], p);
+    assert_cli_success(&hidden, "show --no-notes");
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+
+    let alias = run_libra_command(&["show", "-s", "HEAD", "--show-notes"], p);
+    assert_cli_success(&alias, "show --show-notes");
+    assert!(String::from_utf8_lossy(&alias.stdout).contains("Notes:"));
+}
+
+/// LG-04 (M-STAT S1): `show --stat` renders the shared diffstat bars/summary.
+#[test]
+#[serial(cwd)]
+fn test_show_stat_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("tracked.txt"), "tracked\nadded line\n").unwrap();
+    fs::write(p.join("extra.txt"), "one\ntwo\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt", "extra.txt"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "stat commit", "--no-verify"], p),
+        "commit",
+    );
+
+    let out = run_libra_command(&["show", "--stat", "HEAD"], p);
+    assert_cli_success(&out, "show --stat");
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Git-style bar lines: ` path | N +++-`.
+    assert!(text.contains("tracked.txt |"), "{text}");
+    assert!(text.contains("extra.txt |"), "{text}");
+    assert!(text.contains('+'), "{text}");
+    // Shared summary line.
+    assert!(
+        text.contains("files changed") && text.contains("insertions(+)"),
+        "{text}"
+    );
+    // The old A/M/D status lines must be gone.
+    assert!(!text.contains("A  extra.txt"), "{text}");
+}
+
+/// LG-04 (M-STAT S2): `show --stat` and `log --stat -1` agree on counts.
+#[test]
+#[serial(cwd)]
+fn test_log_and_diff_stat_counts_consistent() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("tracked.txt"), "tracked\none\ntwo\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "counts", "--no-verify"], p),
+        "commit",
+    );
+
+    let summary_line = |text: &str| -> String {
+        text.lines()
+            .find(|line| line.contains("file") && line.contains("changed"))
+            .unwrap_or("")
+            .to_string()
+    };
+    let show = run_libra_command(&["show", "--stat", "HEAD"], p);
+    assert_cli_success(&show, "show --stat");
+    let log = run_libra_command(&["log", "--stat", "-1"], p);
+    assert_cli_success(&log, "log --stat");
+    assert_eq!(
+        summary_line(&String::from_utf8_lossy(&show.stdout)),
+        summary_line(&String::from_utf8_lossy(&log.stdout)),
+        "show/log summary counts must match"
+    );
+}
+
+/// LG-05 (M-LAYOUT L2): `show` keeps the blank line between the header and the
+/// indented message.
+#[test]
+#[serial(cwd)]
+fn test_show_header_blank_line() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(&["show", "-s", "HEAD"], repo.path());
+    assert_cli_success(&out, "show -s HEAD");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let date_line = text
+        .lines()
+        .find(|line| line.starts_with("Date:"))
+        .expect("Date header");
+    assert!(
+        text.contains(&format!("{date_line}\n\n    base")),
+        "blank line between header and message: {text:?}"
+    );
+}
+
+/// LG-06 (M-SHOWTREE T1/T2): `^{tree}`, `<rev>:<dir>`, and bare tree ids use
+/// Git's short tree form (name, blank line, entry names, `/` for subtrees).
+#[test]
+#[serial(cwd)]
+fn test_show_tree_objects_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::create_dir_all(p.join("dir2")).unwrap();
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    std::fs::write(p.join("dir1/b.txt"), "b\n").unwrap();
+    std::fs::write(p.join("dir1/sub/c.txt"), "c\n").unwrap();
+    std::fs::write(p.join("dir2/d.txt"), "d\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add -A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tree matrix", "--no-verify"], p),
+        "commit",
+    );
+
+    // T1: `<rev>^{tree}` keeps the user-supplied name and lists only entry
+    // names, non-recursively, with a trailing `/` for subtrees.
+    let tree = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&tree, "show HEAD^{tree}");
+    let text = String::from_utf8_lossy(&tree.stdout).into_owned();
+    assert_eq!(
+        text, "tree HEAD^{tree}\n\na.txt\ndir1/\ndir2/\ntracked.txt\n",
+        "canonical tree listing"
+    );
+
+    // T2: `<rev>:<dir>` renders the subtree, including a trailing slash form.
+    for spec in ["HEAD:dir1", "HEAD:dir1/"] {
+        let out = run_libra_command(&["show", spec], p);
+        assert_cli_success(&out, "show HEAD:dir1");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(
+            text,
+            format!("tree {spec}\n\nb.txt\nsub/\n"),
+            "subtree listing for {spec}"
+        );
+    }
+
+    // T2: a bare tree id renders `tree <oid>` plus entries (no mode columns).
+    let oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^{tree}"], p).stdout)
+        .trim()
+        .to_string();
+    let bare = run_libra_command(&["show", &oid], p);
+    assert_cli_success(&bare, "show <tree oid>");
+    let text = String::from_utf8_lossy(&bare.stdout).into_owned();
+    assert!(text.starts_with(&format!("tree {oid}\n\n")), "{text:?}");
+    assert!(text.contains("dir1/\n"), "{text:?}");
+    assert!(!text.contains("100644"), "{text:?}");
+
+    // T4 regression: `<rev>:<file>` still prints blob content, not a header.
+    let blob = run_libra_command(&["show", "HEAD:dir1/b.txt"], p);
+    assert_cli_success(&blob, "show HEAD:dir1/b.txt");
+    assert_eq!(String::from_utf8_lossy(&blob.stdout), "b\n");
+}
+
+/// LG-06 (M-SHOWTREE T3): upstream `t7007` show-tree ports.
+#[test]
+#[serial(cwd)]
+fn test_t7007_show_tree_ports() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::write(p.join("dir1/b.txt"), "b\n").unwrap();
+    std::fs::write(p.join("dir1/sub/c.txt"), "c\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add -A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "t7007", "--no-verify"], p),
+        "commit",
+    );
+
+    // t7007:41 — showing a tree prints the header and its entries.
+    let shown = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&shown, "t7007 showing a tree");
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    assert!(text.starts_with("tree HEAD^{tree}\n\n"), "{text:?}");
+    assert!(text.contains("dir1/\n"), "{text:?}");
+
+    // t7007:51 — two trees in one invocation? Git's `show` takes one object, so
+    // the port exercises the same tree through both spellings.
+    let via_rev = run_libra_command(&["show", "HEAD:dir1"], p);
+    assert_cli_success(&via_rev, "t7007 two trees");
+    let via_peel = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&via_peel, "t7007 two trees peel");
+    assert!(
+        String::from_utf8_lossy(&via_rev.stdout).contains("b.txt"),
+        "subtree entries present"
+    );
+
+    // t7007:66 — the default listing is not recursive: `dir1/sub` appears as a
+    // directory entry, never as a nested path.
+    let not_recursive = run_libra_command(&["show", "HEAD^{tree}"], p);
+    assert_cli_success(&not_recursive, "t7007 not recursive");
+    let text = String::from_utf8_lossy(&not_recursive.stdout).into_owned();
+    assert!(!text.contains("dir1/sub/c.txt"), "{text:?}");
+    assert!(!text.contains("c.txt"), "{text:?}");
+
+    // T4 regression: peeling to a commit still renders the commit header.
+    let commit = run_libra_command(&["show", "-s", "HEAD^{commit}"], p);
+    assert_cli_success(&commit, "show HEAD^{commit}");
+    assert!(String::from_utf8_lossy(&commit.stdout).contains("t7007"));
+}
+
+/// LG-08 (M-DIRSTAT R5): `show --dirstat` and `log --dirstat` share the diff
+/// renderer's output.
+#[test]
+#[serial(cwd)]
+fn test_show_dirstat() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("dir1/sub")).unwrap();
+    std::fs::create_dir_all(p.join("dir2")).unwrap();
+    std::fs::write(p.join("dir1/sub/x"), "a\n").unwrap();
+    std::fs::write(p.join("dir2/z"), "a\nb\nc\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    std::fs::write(p.join("dir1/sub/x"), "a\nb\n").unwrap();
+    std::fs::write(p.join("dir2/z"), "a\nb\nc\nd\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], p),
+        "commit change",
+    );
+
+    let show = run_libra_command(&["show", "--dirstat", "HEAD"], p);
+    assert_cli_success(&show, "show --dirstat");
+    let text = String::from_utf8_lossy(&show.stdout).into_owned();
+    assert!(text.contains("% dir1/sub/"), "{text}");
+    assert!(text.contains("% dir2/"), "{text}");
+
+    let log = run_libra_command(&["log", "--dirstat", "-1"], p);
+    assert_cli_success(&log, "log --dirstat");
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(text.contains("\n\n  50.0% dir1/sub/"), "{text}");
+    assert!(text.contains("% dir2/"), "{text}");
 }

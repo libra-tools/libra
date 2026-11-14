@@ -85,3 +85,10 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-13（#478 LG-14，ADR-LG-09）：`--fixed-strings` 为 `-F` 正式长名，单数 `--fixed-string` 保留为隐藏别名；`-P/--perl-regexp` 接入 `fancy-regex 0.16.2`（MIT，syntect 已用同版本），支持环视/反向引用，回溯上限 250k、模式长度上限 32 KiB；`\K`、递归 `(?R)`/`(?n)`、`(*VERB)` 为用法错误；grep 默认方言保持既有 ERE，`--basic-regexp` 显式 BRE。`log/rev-list --grep` 共用同一编译/匹配器。测试：`test_grep_pattern_types_matrix`、`test_log_perl_regexp_grep`、`utils::grep_pattern` 7/7。
+
+- 2026-11-13（#478 LG-15，ADR-LG-08 第 1 条）：`-e`/位置模式 + `--and`/`--or`/`--not`/`(` `)` 组成表达式（`ExprToken` 扫描 argv 保序，递归下降解析；优先级 `--not` > `--and` > `--or`，相邻操作数隐式 `--or`；`(`/`)` 从 pathspec 中剔除；`-f` 文件模式退化为隐式 OR）；每个输出行按表达式求值，`-v` 仍否定整体；语法错误为 `LBR-CLI-002` 且零输出。测试：`test_grep_boolean_expressions_matrix`（O1–O4/O6、t7810:715/:736）、`command::grep` 25/25。
+
+- 2026-11-13（#478 LG-16，ADR-LG-08 第 2–4 条）：新增 `src/utils/funcname.rs`（默认规则「以字母/`_`/`$` 开头」+ `.gitattributes` `diff=<driver>` 的 `diff.<driver>.xfuncname`/`funcname`）；`-p` 在匹配前输出最近函数头（`path=header`），`-W` 输出完整函数范围（`=`/`-`/`:` 前缀），`-<n>` 等价 `-C <n>`（按 argv 后者生效）；`diff` 的 hunk 头复用同一规则追加函数后缀。测试：`test_grep_function_and_numeric_context_matrix`（X1–X4）、`test_diff_hunk_header_function_context`（X5）、`utils::funcname` 单测。
+

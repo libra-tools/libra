@@ -39,7 +39,6 @@ use serde::Serialize;
 use crate::{
     command::{
         diff::{DiffAlgorithm, compute_unified_hunks},
-        read_worktree_blob_bytes,
         status::{self, Changes},
     },
     internal::{
@@ -55,7 +54,7 @@ use crate::{
         output::{self, OutputConfig},
         path,
         pathspec::{PathspecError, PathspecSet},
-        util,
+        util, worktree_conversion,
     },
 };
 
@@ -946,8 +945,8 @@ fn stage_resolved_path(
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(StagedAction::Unchanged),
         Ok(_) => {
             let pre_read = file_abs.symlink_metadata().ok();
-            let blob =
-                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+            let blob = gen_blob_from_file(&file_abs, index, worktree_conversion::CleanMode::Normal)
+                .map_err(|source| AddError::CreateIndexEntry {
                     path: rel.to_path_buf(),
                     source,
                 })?;
@@ -1091,7 +1090,12 @@ fn collect_patch_candidate(
     let new_bytes = if deleted {
         Vec::new()
     } else {
-        read_worktree_blob_bytes(&abs).map_err(|source| AddError::CreateIndexEntry {
+        worktree_conversion::read_clean_blob_bytes(
+            &abs,
+            worktree_conversion::CleanMode::Normal,
+            || crate::command::status_io_worker::index_has_text_crlf(Some(entry.hash)),
+        )
+        .map_err(|source| AddError::CreateIndexEntry {
             path: rel.to_path_buf(),
             source,
         })?
@@ -1348,13 +1352,19 @@ async fn run_add_patch(
             stored_objects,
             source,
         })?;
+    save_index(&index, index_path)?;
+    Ok(add_output)
+}
+
+fn save_index(index: &Index, index_path: &Path) -> Result<(), AddError> {
     index
         .save(index_path)
         .map_err(|source| AddError::IndexSave {
             path: index_path.to_path_buf(),
             source,
         })?;
-    Ok(add_output)
+    let _ = crate::utils::shared_perm::adjust_shared_perm_for_index(index_path);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1476,12 +1486,7 @@ async fn run_add_resolved(
             source,
         })?;
 
-    index
-        .save(index_path)
-        .map_err(|source| AddError::IndexSave {
-            path: index_path.to_path_buf(),
-            source,
-        })?;
+    save_index(&index, index_path)?;
 
     Ok(add_output)
 }
@@ -1650,12 +1655,7 @@ async fn run_add_intent_to_add(
     }
 
     if wrote_entries {
-        index
-            .save(index_path)
-            .map_err(|source| AddError::IndexSave {
-                path: index_path.to_path_buf(),
-                source,
-            })?;
+        save_index(&index, index_path)?;
     }
 
     if add_output.ignored.is_empty() {
@@ -1802,7 +1802,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         .await;
     }
 
-    let (mut visible_changes, mut ignored_changes) = if args.force {
+    let (mut visible_changes, mut ignored_changes) = if args.renormalize {
+        // Renormalize selects tracked paths independently of ordinary clean
+        // comparison. Replacing historical content must not require reading it.
+        (Changes::default(), Changes::default())
+    } else if args.force {
         status::changes_to_be_staged_split_force_with_ignore_case_and_file_mode(
             ignore_case,
             file_mode,
@@ -1894,12 +1898,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                     source,
                 }
             })?;
-            index
-                .save(&index_path)
-                .map_err(|source| AddError::IndexSave {
-                    path: index_path.clone(),
-                    source,
-                })?;
+            save_index(&index, &index_path)?;
         }
 
         return check_ignored_only_error(add_output);
@@ -1971,9 +1970,10 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             if absolute.symlink_metadata().is_err() {
                 continue;
             }
-            let changed = index.is_modified(&entry.name, 0, &workdir)
-                || crate::command::calc_file_blob_hash(&absolute)
-                    .is_ok_and(|hash| !index.verify_hash(&entry.name, 0, &hash));
+            let changed = matches!(
+                check_file_status(&candidate, &index, &workdir, file_mode)?,
+                FileStatus::Modified
+            );
             if changed {
                 files.push(candidate);
             }
@@ -2046,12 +2046,20 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         for file in &files {
             let path_str = file.display().to_string();
             if args.renormalize {
-                // Mirror `renormalize_entry` exactly (via `symlink_metadata`, which
-                // does not follow links): gone -> staged deletion, directory ->
-                // skipped, regular file or symlink -> force-rewritten (modified).
-                match std::fs::symlink_metadata(workdir.join(file)) {
-                    Err(_) => add_output.removed.push(path_str),
-                    Ok(meta) if meta.is_dir() => {}
+                // Use the same beneath-root, no-follow stat as the real write:
+                // gone -> deletion, directory -> skipped, file/symlink -> modified.
+                match renormalize_lstat(&workdir, file) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        add_output.removed.push(path_str);
+                    }
+                    Err(source) => {
+                        return Err(AddError::CreateIndexEntry {
+                            path: file.to_path_buf(),
+                            source,
+                        }
+                        .into());
+                    }
+                    Ok(meta) if meta.is_dir => {}
                     Ok(_) => add_output.modified.push(path_str),
                 }
                 continue;
@@ -2218,12 +2226,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             stored_objects,
             source,
         })?;
-    index
-        .save(&index_path)
-        .map_err(|source| AddError::IndexSave {
-            path: index_path.clone(),
-            source,
-        })?;
+    save_index(&index, &index_path)?;
 
     check_ignored_only_error(add_output)
 }
@@ -2310,6 +2313,11 @@ fn apply_chmod(
     Ok(())
 }
 
+fn renormalize_lstat(workdir: &Path, file: &Path) -> io::Result<crate::utils::beneath::RawLstat> {
+    let root = crate::utils::beneath::open_root(workdir)?;
+    crate::utils::beneath::lstat_beneath(&root, file)
+}
+
 /// Force-rewrite an already-tracked entry for `--renormalize`.
 ///
 /// Re-reads the working-tree file, writes a fresh blob, and updates the index
@@ -2326,23 +2334,34 @@ fn renormalize_entry(
         path: file.to_path_buf(),
     })?;
     let file_abs = workdir.join(file);
-    // `symlink_metadata` does not follow symlinks, so a dangling symlink is still
-    // detected as present (and not mistaken for a deleted file).
-    let meta = match std::fs::symlink_metadata(&file_abs) {
+    // Reject symlink ancestors; only an absent path beneath the sealed root
+    // can be staged as a deletion. A dangling leaf symlink remains present.
+    let meta = match renormalize_lstat(workdir, file) {
         Ok(meta) => meta,
-        Err(_) => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             // Tracked but truly gone from the working tree: stage the deletion.
             index.remove(file_str, 0);
             return Ok(StagedAction::Removed);
         }
+        Err(source) => {
+            return Err(AddError::CreateIndexEntry {
+                path: file.to_path_buf(),
+                source,
+            });
+        }
     };
-    if meta.is_dir() {
+    if meta.is_dir {
         return Ok(StagedAction::Unchanged);
     }
     // Stat BEFORE reading — the entry's stat must describe the hashed
     // content, or it is smudged (2026-08-06 R0-8 review).
     let pre_read = file_abs.symlink_metadata().ok();
-    let blob = gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+    let blob = gen_blob_from_file(
+        &file_abs,
+        index,
+        worktree_conversion::CleanMode::Renormalize,
+    )
+    .map_err(|source| AddError::CreateIndexEntry {
         path: file.to_path_buf(),
         source,
     })?;
@@ -2861,8 +2880,8 @@ async fn stage_a_file(
             // Stat BEFORE reading: the entry's stat must describe the
             // hashed content, or it is smudged (2026-08-06 R0-8 review).
             let pre_read = file_abs.symlink_metadata().ok();
-            let blob =
-                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+            let blob = gen_blob_from_file(&file_abs, index, worktree_conversion::CleanMode::Normal)
+                .map_err(|source| AddError::CreateIndexEntry {
                     path: file.to_path_buf(),
                     source,
                 })?;
@@ -2884,38 +2903,41 @@ async fn stage_a_file(
         }
         FileStatus::Modified => {
             let unmerged = path_has_conflict_stages(index, file_str);
-            let missing_stage0 = !index.tracked(file_str, 0);
-            let content_dirty = !missing_stage0 && index.is_modified(file_str, 0, workdir);
-            if unmerged || missing_stage0 || content_dirty || mode_dirty {
-                let pre_read = file_abs.symlink_metadata().ok();
-                let blob =
-                    gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                if missing_stage0 || mode_dirty || !index.verify_hash(file_str, 0, &blob.id) {
-                    blob.try_save().map_err(|source| AddError::ObjectSave {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                    let entry = crate::command::verified_index_entry(
-                        file,
-                        blob.id,
-                        workdir,
-                        pre_read.as_ref(),
-                    )
-                    .map_err(|source| AddError::CreateIndexEntry {
-                        path: file.to_path_buf(),
-                        source,
-                    })?;
-                    crate::utils::index_ext::update_preserving_file_mode_except_intent(
-                        index, entry, file_mode,
-                    );
-                }
-                clear_conflict_stages(index, file_str);
-                return Ok(StagedAction::Modified);
+            let pre_read = file_abs.symlink_metadata().ok();
+            let blob = gen_blob_from_file(&file_abs, index, worktree_conversion::CleanMode::Normal)
+                .map_err(|source| AddError::CreateIndexEntry {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
+            let needs_entry = index.get(file_str, 0).is_none_or(|entry| {
+                entry.flags.intent_to_add
+                    || entry.hash != blob.id
+                    || mode_dirty
+                    || pre_read.as_ref().is_some_and(|stat| {
+                        (entry.mode & 0o170000 == 0o120000) != stat.file_type().is_symlink()
+                    })
+            });
+            if needs_entry {
+                blob.try_save().map_err(|source| AddError::ObjectSave {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
+                let entry =
+                    crate::command::verified_index_entry(file, blob.id, workdir, pre_read.as_ref())
+                        .map_err(|source| AddError::CreateIndexEntry {
+                            path: file.to_path_buf(),
+                            source,
+                        })?;
+                crate::utils::index_ext::update_preserving_file_mode_except_intent(
+                    index, entry, file_mode,
+                );
             }
-            Ok(StagedAction::Unchanged)
+            clear_conflict_stages(index, file_str);
+            Ok(if needs_entry || unmerged {
+                StagedAction::Modified
+            } else {
+                StagedAction::Unchanged
+            })
         }
         FileStatus::Deleted => {
             remove_all_stages(index, file_str);
@@ -2986,9 +3008,9 @@ fn worktree_exec_bit(metadata: &std::fs::Metadata) -> bool {
 /// in-memory `index`.
 ///
 /// Functional scope:
-/// - Uses `index.tracked` and `index.is_modified` to discriminate the four
-///   live states; missing files are reported as `Deleted` when tracked, else
-///   `NotFound`.
+/// - Uses clean content, type and mode to classify tracked paths; an attribute
+///   change cannot be hidden by a target stat match. Missing files are reported
+///   as `Deleted` when tracked, else `NotFound`.
 ///
 /// Boundary conditions:
 /// - Returns [`AddError::InvalidPathEncoding`] when `file` is not UTF-8.
@@ -3016,22 +3038,64 @@ fn check_file_status(
             Ok(FileStatus::New)
         }
     } else if unmerged
-        || index.is_modified(file_str, 0, workdir)
+        || index
+            .get(file_str, 0)
+            .is_some_and(|entry| entry.flags.intent_to_add)
         || mode_only_worktree_change(index, file_str, &file_abs, file_mode)
     {
         Ok(FileStatus::Modified)
     } else {
-        Ok(FileStatus::Unchanged)
+        let metadata = file_abs
+            .symlink_metadata()
+            .map_err(|source| AddError::Status {
+                source: status::StatusError::FileHash {
+                    path: file_abs.clone(),
+                    source,
+                },
+            })?;
+        let type_change = index.get(file_str, 0).is_some_and(|entry| {
+            (entry.mode & 0o170000 == 0o120000) != metadata.file_type().is_symlink()
+                || (!metadata.is_file() && !metadata.file_type().is_symlink())
+        });
+        if type_change {
+            return Ok(FileStatus::Modified);
+        }
+        // A target stat match alone says nothing about changed attributes.
+        // Classification and the subsequent write use the same clean policy.
+        let hash =
+            crate::command::status_io_worker::clean_file_blob_hash(&file_abs, workdir, index)
+                .map_err(|source| AddError::Status {
+                    source: status::StatusError::FileHash {
+                        path: file_abs.clone(),
+                        source,
+                    },
+                })?;
+        Ok(if index.verify_hash(file_str, 0, &hash) {
+            FileStatus::Unchanged
+        } else {
+            FileStatus::Modified
+        })
     }
 }
 
 /// Generate a `Blob` from a file.
 ///
 /// Functional scope:
-/// - Reads the exact bytes Git would store for a worktree blob: regular file
-///   content, generated LFS pointer content, or symlink target bytes.
-fn gen_blob_from_file(path: impl AsRef<Path>) -> io::Result<Blob> {
-    read_worktree_blob_bytes(path).map(Blob::from_content_bytes)
+/// - Reads the stored representation: explicit text/eol conversion for regular
+///   files, generated LFS pointer content, or unconverted symlink target bytes.
+fn gen_blob_from_file(
+    path: impl AsRef<Path>,
+    index: &Index,
+    mode: worktree_conversion::CleanMode,
+) -> io::Result<Blob> {
+    let path = path.as_ref();
+    let workdir = util::try_working_dir()?;
+    let relative = path.strip_prefix(&workdir).unwrap_or(path);
+    let oid = crate::command::status_io_worker::selected_index_oid(index, relative);
+    worktree_conversion::read_clean_blob_bytes(path, mode, || {
+        crate::command::status_io_worker::index_has_text_crlf(oid)
+    })
+    .map(Blob::from_content_bytes)
 }
 
 #[cfg(test)]

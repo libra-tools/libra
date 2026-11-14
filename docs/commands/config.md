@@ -9,10 +9,12 @@
 
 ```
 libra config <subcommand> [options]
-libra config set [--global | --system] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
-libra config get [--global | --system] [--all] [--reveal] [--regexp] [-d <default>] <key>
-libra config list [--global | --system] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
-libra config unset [--global | --system] [--all] <key>
+libra config set [--global | --system] [--add | --append] [--all] [--value <pattern>] [--fixed-value] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
+libra config get [--global | --system] [--all] [--reveal] [--regexp] [--value <pattern>] [--fixed-value] [--show-origin] [--show-scope] [-d <default>] <key>
+libra config list [--global | --system] [--name-only] [--show-origin] [--show-scope] [--vault] [--ssh-keys] [--gpg-keys]
+libra config unset [--global | --system] [--all] [--value <pattern>] [--fixed-value] <key>
+libra config rename-section [--global | --system] <old> <new>
+libra config remove-section [--global | --system] <name>
 libra config import [--global]
 libra config path [--global | --system]
 libra config doctor --global-schema
@@ -337,6 +339,13 @@ case-equivalent replacements preserve an existing encryption flag.
 | `--encrypt` | Force vault encryption even if the key does not match sensitive-key heuristics |
 | `--plaintext` | Store a new key as plaintext even if it looks sensitive; rejects replacement of existing encrypted values and vault internal/secret keys |
 | `--stdin` | Read the value from stdin instead of a positional argument (useful for piping secrets in CI/CD) |
+| `--all` | Replace every existing value (Git `config set --all` / `--replace-all`) |
+| `--value <pattern>` | Only replace values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
+| `--append` | Git 2.46+ spelling; alias of `--add` |
+
+`rename-section <old> <new>` and `remove-section <name>` are also available as
+subcommands, matching the legacy `--rename-section` / `--remove-section` flags.
 
 When `set` replaces an ordinary encrypted key, it keeps the value encrypted using
 the vault for the selected local or global scope, including ASCII case fallback.
@@ -379,6 +388,10 @@ Retrieve a configuration value. Cascades local → global → system scope, retu
 | `--reveal` | Show the actual decrypted value for encrypted entries (blocked for internal vault credentials like `vault.roottoken_enc`) |
 | `--regexp` | Treat `<key>` as a regex pattern and return all matching entries |
 | `-d`, `--default <value>` | Return this value if the key is not found (instead of an error) |
+| `--value <pattern>` | Only return values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
+| `--show-origin` | Prefix each record with its origin (`file:<database path>`) |
+| `--show-scope` | Prefix each record with its scope (`local`, `global`, or `system`) |
 
 ```bash
 # Simple get
@@ -434,6 +447,8 @@ Remove a configuration entry.
 | Flag | Description |
 |------|-------------|
 | `--all` | Remove all values for this key (for multi-valued keys) |
+| `--value <pattern>` | Only remove values matching this pattern (regexp unless `--fixed-value`) |
+| `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
 
 ```bash
 # Remove a key
@@ -574,17 +589,17 @@ These flags provide backward compatibility with `git config` invocation patterns
 | `--get-all` | `get --all <key>` |
 | `--unset` | `unset <key>` |
 | `--unset-all` | `unset --all <key>` |
-| `-l`, `--list` | `list` |
+| `-l`, `--list` | `list` — lists configuration entries. When no scope flag is given, lists all scopes in system → global → local order (each scope in insertion order); when an explicit scope (`--local`, `--global`, `--system`) is given, lists only that scope. |
 | `--add` | `set --add <key> <value>` |
 | `--import` | `import` |
-| `--get-regexp <pattern>` | `get --regexp <pattern>` — the operand is a **regexp**, so a dotless pattern such as `^user` is valid; a pattern that matches nothing exits 1 |
+| `--get-regexp <pattern>` | `get --regexp <pattern>` — matches keys against a regular expression and outputs `key value` (space-delimited) in insertion and scope order; a pattern matching nothing exits 1 |
 | `--get <key> [<value-pattern>]` | Select by value when a pattern is given (a regexp over stored values) |
 | `--unset <key> [<value-pattern>]` | Remove only the values matching the pattern; no match exits 5 |
 | `--show-origin` | Prefix reads/lists with `file:<database path>` (Git prints `file:<config path>`; Libra stores config in SQLite) |
 | `--show-scope` | Prefix reads/lists with `local`/`global`/`system` (Git parity) |
 | `--replace-all <key> <value>` | Replace every existing value of `<key>` with one value |
-| `--file <path>` | Read a Git-style INI file instead of the stores (read-only: `--get`, `--get-all`, `--get-regexp`, `--list`) |
-| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int>`, `--bool`, `--int`, `--path` | Canonicalize a value when reading (`--get`/`--get-all`/`--get-regexp`) **and when setting**: bool variants → `true`/`false`; int with optional k/m/g (1024-based) multiplier; path expands a leading `~`/`~/`. On a set the value is validated/canonicalized before storage (matching `git config --type`: `yes` → `true`, `1k` → `1024`), and an invalid value errors without storing. A non-get/non-set mode is rejected (exit 129). |
+| `--file <path>` | Read or write a Git-style INI file instead of the stores. Reads: `--get`, `--get-all`, `--get-regexp`, `--list`. Writes: `set`, `--add`, value-pattern set, `--replace-all`, `--unset`, `--unset-all`, `--remove-section`, `--rename-section` (Git placement/quoting, atomic `<path>.lock` + rename preserving permissions). Writing stdin (`--file -`) and vault options (`--encrypt`/`--plaintext`/`--stdin`) are refused. |
+| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int\|color>`, `--bool`, `--int`, `--path` | Canonicalize a value when reading (`--get`/`--get-all`/`--get-regexp`/`--list`) **and when setting**: bool variants → `true`/`false`; int with optional k/m/g (1024-based) multiplier; path expands a leading `~`/`~/`; `color` renders Git's ANSI escape sequence on read and validates the value on write while storing its original spelling (`red`, not `\x1b[31m`), and `--list --type=color` keeps only values that parse; `expiry-date` renders a Unix timestamp on read (relative `<n>.<unit>.ago`, `never`/`false` → 0, `now`/`all` → the far-future sentinel, `today`/`yesterday`/`tomorrow`/`noon`/`midnight`, and ISO 8601/`YYYY-MM-DD`/RFC 2822 absolute dates), validates on write while storing the original spelling, and `--list --type=expiry-date` keeps only parseable values. On a set the value is validated/canonicalized before storage (matching `git config --type`: `yes` → `true`, `1k` → `1024`), and an invalid value errors without storing. A non-get/set/list mode is rejected (exit 129). |
 | `--remove-section <name>` | Delete the keys in section `<name>` in one transaction, using Git's section/subsection identity (so `--remove-section branch` removes `branch.<key>` but not the `branch.feature.*` subsection). Missing section → exit 128. |
 | `--rename-section <old> <new>` | Move section `<old>`'s keys to `<new>`, preserving each value and its encryption flag. Missing source → exit 128; identical names → exit 2; an already-existing destination section is refused → exit 128. |
 
@@ -593,6 +608,7 @@ These flags provide backward compatibility with `git config` invocation patterns
 | Flag | Description |
 |------|-------------|
 | `-d`, `--default <value>` | Default value when key is not found (Git-compat positional mode) |
+| `--name-only` | Output only variable names for `--list` and `--get-regexp` (with `-z`, outputs `name\0`) |
 | `-z`, `--null` | NUL-terminate output records (`git config -z`): `value\0` for `--get`/`--get-all`; `key\nvalue\0` for `--get-regexp`/`--list`; `key\0` with `--name-only`; `origin\0` prefix with `--show-origin`. `--json` takes precedence. Applies to standard config output only; combining it with `--ssh-keys`/`--gpg-keys`/`--vault` is rejected (exit 129). |
 | `--json` | Emit structured JSON output |
 | `--quiet` | Suppress human-readable output |
@@ -617,7 +633,7 @@ libra config path
 Jane Doe
 ```
 
-**`list`** prints key-value pairs:
+**`list`** prints key-value pairs (by default across system → global → local scopes in insertion order):
 
 ```
 user.name=Jane Doe
@@ -638,6 +654,13 @@ With `--name-only`:
 user.name
 user.email
 core.editor
+```
+
+**`get-regexp`** prints matching key-value pairs separated by space (`key value`), preserving insertion and scope order:
+
+```
+user.name Jane Doe
+user.email jane@example.com
 ```
 
 **`set`** prints nothing on success (exit code 0).
@@ -739,6 +762,11 @@ The imported secret key is persisted encrypted (`vault.gpg.seckey_enc`) and reda
 - Default scope is local (`.libra/libra.db`)
 - `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (a legacy `~/.libra/config.db` stays the active fallback until the first access migrates it)
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
+
+When an explicit scope (`--system`, `--global`) is requested:
+- If the configuration store does not exist: `--get*` exits with code 1 (silent, no stderr; with `--default`, outputs default and exits 0), while `--list` exits with code 128 (`fatal: unable to read config file '<path>': No such file or directory`, `LBR-IO-001`).
+- If the configuration store is unreadable (e.g. permission denied): `--get*` prints `warning: unable to access '<path>': Permission denied` to stderr and exits with code 1 (or default), while `--list` exits with code 128 (`fatal: unable to access '<path>': Permission denied`, `LBR-IO-001`).
+- During cascaded reads (when no scope flag is passed), missing global/system stores and unreadable/unsupported system stores are skipped.
 
 ## Legacy `code.defaultProvider` Key
 
@@ -892,6 +920,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | `LBR-CLI-003` | Key not found and no `--default` provided | Check key name with `libra config list` |
 | `LBR-CLI-002` | `edit` subcommand used (not supported) | Use `set`, `get`, `unset`, `list` subcommands |
 | `LBR-IO-001` | Failed to read config database | Check file permissions on `.libra/libra.db` |
+| `LBR-IO-001` | Explicit scope config store missing or unreadable (`--system --list`, `--global --list`) | Check file existence and permissions on configuration database |
 | `LBR-IO-002` | Failed to write config database | Check file permissions and disk space |
 
 ## Compatibility Notes

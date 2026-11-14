@@ -11,7 +11,12 @@ use tempfile::tempdir;
 
 use super::*;
 
+mod file_backend;
 mod git_import;
+mod output_format;
+mod subcommands;
+mod types;
+mod validation;
 
 async fn fix_npr_config_rows(
     path: &std::path::Path,
@@ -265,7 +270,7 @@ async fn fix_npr_config_import_refuses_plaintext_over_encrypted() {
         let result = if scope == "--local" {
             call(&["config", "import"])
         } else {
-            call(&["config", "--global", "import"])
+            call(&["config", "import", "--global"])
         };
         assert_eq!(
             result.status.code(),
@@ -328,7 +333,7 @@ async fn fix_npr_config_import_refuses_plaintext_over_encrypted() {
         let retry = if scope == "--local" {
             call(&["config", "import"])
         } else {
-            call(&["config", "--global", "import"])
+            call(&["config", "import", "--global"])
         };
         assert_cli_success(&retry, "import succeeds after the encrypted key is cleared");
         let recovered = fix_npr_config_rows(&db).await;
@@ -678,8 +683,10 @@ async fn test_cli_config_list_global_without_repo() {
 
     let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
-    let result = exec_config(vec!["config", "--list", "--global"]).await;
-    assert!(result.is_ok());
+    // Exercise the real CLI: `--global` with no repository must list the
+    // global store instead of failing the repository lookup.
+    let result = run_libra_command(&["config", "--global", "list"], temp_dir.path());
+    assert_cli_success(&result, "config --global list without a repository");
 }
 
 #[tokio::test]
@@ -697,7 +704,7 @@ async fn test_cli_config_system_read_write() {
     let read_result = exec_config(vec!["config", "--system", "--get", "user.name"]).await;
     assert!(read_result.is_ok(), "--system --get should succeed");
 
-    let list_result = exec_config(vec!["config", "--list", "--system"]).await;
+    let list_result = exec_config(vec!["config", "list", "--system"]).await;
     assert!(list_result.is_ok(), "--system --list should succeed");
 }
 
@@ -1061,7 +1068,7 @@ async fn test_config_list() {
     assert!(result.is_ok());
 
     // List configs
-    let result = exec_config(vec!["config", "--list"]).await;
+    let result = exec_config(vec!["config", "list"]).await;
     assert!(result.is_ok());
 }
 
@@ -1639,7 +1646,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
 
 #[tokio::test]
 #[serial(cwd)]
-async fn test_config_list_defaults_to_local_scope_without_global_entries() {
+async fn test_config_list_defaults_to_all_scopes_and_local_restricts() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
@@ -1660,6 +1667,7 @@ async fn test_config_list_defaults_to_local_scope_without_global_entries() {
         .await
         .unwrap();
 
+    // Default list includes all scopes (global + local)
     let output = run_libra_command(&["config", "list"], temp_path.path());
     assert!(
         output.status.success(),
@@ -1672,8 +1680,25 @@ async fn test_config_list_defaults_to_local_scope_without_global_entries() {
         "local entry should be listed, stdout: {stdout}"
     );
     assert!(
-        !stdout.contains("core.editor"),
-        "default list should not include global entries, stdout: {stdout}"
+        stdout.contains("core.editor=vim"),
+        "default list should include global entries, stdout: {stdout}"
+    );
+
+    // --local restricts list to local scope only
+    let local_output = run_libra_command(&["config", "--local", "list"], temp_path.path());
+    assert!(
+        local_output.status.success(),
+        "config --local list should succeed: {}",
+        String::from_utf8_lossy(&local_output.stderr)
+    );
+    let local_stdout = String::from_utf8_lossy(&local_output.stdout);
+    assert!(
+        local_stdout.contains("user.name=local-user"),
+        "local entry should be listed, stdout: {local_stdout}"
+    );
+    assert!(
+        !local_stdout.contains("core.editor"),
+        "local list should not include global entries, stdout: {local_stdout}"
     );
 }
 
@@ -2750,12 +2775,11 @@ async fn test_config_typed_get() {
     );
 
     // The type flags are rejected outside get modes and for an unknown type.
-    assert_eq!(
-        run_libra_command(&["config", "--local", "--bool", "--list"], p)
-            .status
-            .code(),
-        Some(129),
-        "--bool with --list must be rejected (129)"
+    // Git accepts --bool together with --list; only a non-boolean value in a
+    // get/list record would fail.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--bool", "--list"], p),
+        "--bool --list is accepted like Git",
     );
     assert_eq!(
         run_libra_command(
@@ -3094,7 +3118,7 @@ fn test_config_upgrade_mode_corrupt_file_is_strict_error() {
     );
 
     // list --global inherits the strict failure (same source of truth).
-    let list = run_libra_command(&["config", "--list", "--global"], p);
+    let list = run_libra_command(&["config", "list", "--global"], p);
     assert!(!list.status.success(), "corrupt settings must fail list");
 
     // An invalid stored mode is also strict.
@@ -3146,7 +3170,7 @@ async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
 
     // Without a settings file, list shows no upgrade.mode at all — the stale
     // SQLite row must be suppressed, not rendered.
-    let list = run_libra_command(&["config", "--list", "--global"], p);
+    let list = run_libra_command(&["config", "list", "--global"], p);
     assert_cli_success(&list, "list with stale row only");
     assert!(
         !String::from_utf8_lossy(&list.stdout).contains("upgrade.mode"),
@@ -3162,7 +3186,7 @@ async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
     // With a settings file, exactly one file-backed entry appears.
     let set = run_libra_command(&["config", "set", "--global", "upgrade.mode", "auto"], p);
     assert_cli_success(&set, "set auto");
-    let list = run_libra_command(&["config", "--list", "--global"], p);
+    let list = run_libra_command(&["config", "list", "--global"], p);
     assert_cli_success(&list, "list with settings file");
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert_eq!(
@@ -3176,7 +3200,7 @@ async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
     );
 
     // --show-origin renders the `file:{path}` origin (§A.3 table).
-    let origin = run_libra_command(&["config", "--list", "--show-origin", "--global"], p);
+    let origin = run_libra_command(&["config", "list", "--show-origin", "--global"], p);
     assert_cli_success(&origin, "list --show-origin");
     let stdout = String::from_utf8_lossy(&origin.stdout);
     let line = stdout
@@ -7399,8 +7423,10 @@ fn test_config_file_read_only() {
     let list_out = String::from_utf8_lossy(&list.stdout);
     assert!(list_out.contains("core.bare=false"), "list: {list_out}");
 
+    // `--file` now supports Git-style writes through the atomic file backend.
     let write = run_libra_command(&["config", "--file", file, "x.y", "z"], repo.path());
-    assert_eq!(write.status.code(), Some(129));
+    assert_cli_success(&write, "write through --file");
+    let after = run_libra_command(&["config", "--file", file, "--list"], repo.path());
 }
 
 /// `--type=bool-or-str` / `bool-or-int` canonicalize like Git.

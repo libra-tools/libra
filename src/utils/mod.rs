@@ -1,18 +1,22 @@
 //! Utilities module aggregator exposing storage, path, object, LFS, D1 client, and testing helpers.
 
 pub mod error;
-#[cfg(unix)]
+pub mod funcname;
 pub mod fuse;
 pub mod output;
 
+pub mod approxidate;
 pub(crate) mod atomic_stream;
 pub mod atomic_write;
 pub mod attributes;
 pub mod backoff;
 pub(crate) mod beneath;
 pub mod client_storage;
+pub mod config_color;
 pub mod convert;
 pub mod d1_client;
+pub mod diff_format;
+pub mod grep_pattern;
 pub mod ignore;
 pub mod index_ext;
 pub mod json;
@@ -32,6 +36,7 @@ pub(crate) mod preview_scratch;
 pub mod read_policy;
 pub mod redact;
 pub mod resource_limits;
+pub mod shared_perm;
 pub mod stat_diff;
 pub mod storage;
 pub mod storage_ext;
@@ -49,4 +54,5 @@ pub(crate) mod windows_fs;
 pub(crate) mod windows_process;
 pub mod worktree;
 pub mod worktree_blob;
+pub(crate) mod worktree_conversion;
 pub mod worktree_layout;

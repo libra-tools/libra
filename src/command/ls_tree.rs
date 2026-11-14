@@ -34,7 +34,7 @@ EXAMPLES:
     libra ls-tree HEAD:src                     List the src subtree via REV:path
     libra ls-tree -r HEAD src                  Recursively list entries under src
     libra ls-tree -l HEAD README.md            Include blob sizes
-    libra ls-tree --name-only HEAD src         Print paths only
+    libra ls-tree --name-only HEAD src/        Print paths only
     libra ls-tree --full-name HEAD             Print repository-relative paths
     libra ls-tree --full-tree HEAD             List from the repository root
     libra ls-tree --object-only --abbrev HEAD  Print abbreviated object IDs only
@@ -48,7 +48,7 @@ pub struct LsTreeArgs {
     #[arg(short = 'r', long = "recursive")]
     pub recursive: bool,
 
-    /// Show tree entries when recursing.
+    /// Show tree entries when recursing, and the trees traversed to reach a path argument.
     #[arg(short = 't')]
     pub show_trees: bool,
 
@@ -78,7 +78,7 @@ pub struct LsTreeArgs {
 
     /// Render each entry with a custom format string. Supports the atoms
     /// `%(objectmode)`, `%(objecttype)`, `%(objectname)`, `%(objectsize)`,
-    /// `%(path)`, and the escapes `%x09` (tab) / `%x0a` (newline).
+    /// `%(objectsize:padded)`, `%(path)`, and the escapes `%x09` (tab) / `%x0a` (newline).
     #[arg(long = "format", value_name = "FORMAT", conflicts_with_all = ["name_only", "name_status", "object_only", "long"])]
     pub format: Option<String>,
 
@@ -134,6 +134,12 @@ struct RawLsTreeEntry {
     path: String,
 }
 
+#[derive(Debug)]
+struct LsTreePathFilter {
+    path: String,
+    list_contents: bool,
+}
+
 #[derive(Debug, Clone)]
 struct LsTreePathContext {
     current_dir_prefix: String,
@@ -160,7 +166,12 @@ pub async fn execute(args: LsTreeArgs) -> Result<(), String> {
 /// stdout write failures.
 pub async fn execute_safe(args: LsTreeArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    let result = resolve_ls_tree(&args).await?;
+    let include_size = args.long
+        || (!output.is_json()
+            && args.format.as_deref().is_some_and(|format| {
+                format.contains("%(objectsize)") || format.contains("%(objectsize:padded)")
+            }));
+    let result = resolve_ls_tree(&args, include_size).await?;
 
     if output.is_json() {
         emit_json_data("ls-tree", &result, output)
@@ -173,7 +184,7 @@ pub async fn execute_safe(args: LsTreeArgs, output: &OutputConfig) -> CliResult<
     }
 }
 
-async fn resolve_ls_tree(args: &LsTreeArgs) -> CliResult<LsTreeOutput> {
+async fn resolve_ls_tree(args: &LsTreeArgs, include_size: bool) -> CliResult<LsTreeOutput> {
     validate_args(args)?;
     let storage = util::objects_storage()?;
     let root_tree = resolve_treeish_to_tree(&args.treeish, &storage).await?;
@@ -182,7 +193,7 @@ async fn resolve_ls_tree(args: &LsTreeArgs) -> CliResult<LsTreeOutput> {
     let raw_entries = collect_matching_entries(root_tree, &filters, args, &path_context)?;
     let entries = raw_entries
         .into_iter()
-        .map(|entry| format_entry(entry, args.abbrev, args.long, &storage, &path_context))
+        .map(|entry| format_entry(entry, args.abbrev, include_size, &storage, &path_context))
         .collect::<CliResult<Vec<_>>>()?;
 
     Ok(LsTreeOutput {
@@ -384,10 +395,27 @@ fn normalize_workdir_prefix(path: &Path) -> CliResult<String> {
 fn normalize_path_filters(
     paths: &[String],
     path_context: &LsTreePathContext,
-) -> CliResult<Vec<String>> {
+) -> CliResult<Vec<LsTreePathFilter>> {
     let mut filters = Vec::new();
+    let mut traversed = BTreeSet::new();
     for path in paths {
-        filters.push(normalize_one_path_filter_with_context(path, path_context)?);
+        let normalized = normalize_one_path_filter_with_context(path, path_context)?;
+        // Preserve the final slash/dot before normalization removes it. A
+        // directory also expands when another argument traverses through it.
+        let list_contents = path.ends_with('/') || path.rsplit('/').next() == Some(".");
+        for (index, _) in normalized.match_indices('/') {
+            traversed.insert(normalized[..index].to_string());
+        }
+        if list_contents {
+            traversed.insert(normalized.clone());
+        }
+        filters.push(LsTreePathFilter {
+            path: normalized,
+            list_contents,
+        });
+    }
+    for filter in &mut filters {
+        filter.list_contents |= traversed.contains(&filter.path);
     }
     Ok(filters)
 }
@@ -440,7 +468,7 @@ fn normalize_relative_path_filter(path: &str) -> CliResult<String> {
 
 fn collect_matching_entries(
     root_tree: ObjectHash,
-    filters: &[String],
+    filters: &[LsTreePathFilter],
     args: &LsTreeArgs,
     path_context: &LsTreePathContext,
 ) -> CliResult<Vec<RawLsTreeEntry>> {
@@ -454,7 +482,7 @@ fn collect_matching_entries(
         )?;
     } else {
         for filter in filters {
-            collect_one_filter(root_tree, filter, args, &mut entries)?;
+            collect_one_filter(root_tree, filter, args, path_context, &mut entries)?;
         }
     }
     Ok(dedupe_entries(entries))
@@ -480,16 +508,29 @@ fn collect_current_scope_contents(
 
 fn collect_one_filter(
     root_tree: ObjectHash,
-    filter: &str,
+    filter: &LsTreePathFilter,
     args: &LsTreeArgs,
+    path_context: &LsTreePathContext,
     entries: &mut Vec<RawLsTreeEntry>,
 ) -> CliResult<()> {
-    if filter.is_empty() {
+    if filter.path.is_empty() {
         collect_tree_contents(root_tree, "", args, entries)?;
         return Ok(());
     }
 
-    let (entry, subtree) = find_tree_entry(root_tree, filter)?;
+    let mut parents = Vec::new();
+    let (entry, subtree) = find_tree_entry_with_parents(
+        root_tree,
+        &filter.path,
+        args.show_trees.then_some(&mut parents),
+    )?;
+    entries.extend(parents.into_iter().filter(|parent| {
+        path_context.current_dir_prefix.is_empty()
+            || parent
+                .path
+                .strip_prefix(&path_context.current_dir_prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }));
     match entry.mode {
         TreeItemMode::Tree => {
             if args.tree_only {
@@ -497,13 +538,13 @@ fn collect_one_filter(
                 if args.recursive {
                     collect_tree_contents(subtree, &entry.path, args, entries)?;
                 }
-            } else if args.recursive {
+            } else if args.recursive || filter.list_contents {
                 if args.show_trees {
                     entries.push(entry.clone());
                 }
                 collect_tree_contents(subtree, &entry.path, args, entries)?;
             } else {
-                collect_tree_contents(subtree, &entry.path, args, entries)?;
+                entries.push(entry);
             }
         }
         _ => {
@@ -516,6 +557,14 @@ fn collect_one_filter(
 }
 
 fn find_tree_entry(root_tree: ObjectHash, filter: &str) -> CliResult<(RawLsTreeEntry, ObjectHash)> {
+    find_tree_entry_with_parents(root_tree, filter, None)
+}
+
+fn find_tree_entry_with_parents(
+    root_tree: ObjectHash,
+    filter: &str,
+    mut parents: Option<&mut Vec<RawLsTreeEntry>>,
+) -> CliResult<(RawLsTreeEntry, ObjectHash)> {
     let mut current_tree = load_tree(root_tree)?;
     let mut current_path = String::new();
     let mut components = filter.split('/').peekable();
@@ -541,7 +590,9 @@ fn find_tree_entry(root_tree: ObjectHash, filter: &str) -> CliResult<(RawLsTreeE
         if item.mode != TreeItemMode::Tree {
             return Err(path_not_found_error(filter));
         }
-
+        if let Some(parents) = parents.as_deref_mut() {
+            parents.push(entry);
+        }
         current_tree = load_tree(item.id)?;
     }
 
@@ -716,6 +767,7 @@ fn render_format_entry(entry: &LsTreeEntry, format: &str) -> String {
         .replace("%(objecttype)", &entry.object_type)
         .replace("%(objectname)", &entry.object)
         .replace("%(objectsize)", &size)
+        .replace("%(objectsize:padded)", &format!("{size:>7}"))
         .replace("%(path)", &entry.path)
         .replace("%x09", "\t")
         .replace("%x0a", "\n")
@@ -876,5 +928,128 @@ mod tests {
             path: "src".to_string(),
         };
         assert_eq!(raw.clone().path, "src");
+    }
+    // These bytes come from the pinned Git control, independently of Libra.
+    const ISSUE1057_GOLDEN: &[(&str, usize, &str)] = &[
+        (
+            "size",
+            102,
+            "464f4b734a2a36eff08fcf505082d50df527900825c84143a3f42f15f4062cc3",
+        ),
+        (
+            "size-six",
+            34,
+            "ee027933988caf703904b93fa400a34024f4186d1f95fcf43570ba3e83645ee0",
+        ),
+    ];
+    fn issue1057_golden(name: &str) -> &'static [u8] {
+        use sha2::{Digest, Sha256};
+        let bytes: &'static [u8] = match name {
+"size" => b"      -|-|      -|dir\n      0|0|      0|empty\n10000000|10000000|10000000|large\n      -|-|      -|link\n",
+"size-six" => b"      6|6|      6|dir/nested/file\n",
+
+            _ => panic!("unknown issue1057 golden: {name}"),
+        };
+        let (_, len, sha) = ISSUE1057_GOLDEN
+            .iter()
+            .find(|row| row.0 == name)
+            .expect("registered golden");
+        assert_eq!(bytes.len(), *len);
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)), *sha);
+        bytes
+    }
+    fn issue1057_size_line(path: &str) -> &'static str {
+        let bytes = if path == "dir/nested/file" {
+            issue1057_golden("size-six")
+        } else {
+            issue1057_golden("size")
+        };
+        std::str::from_utf8(bytes)
+            .expect("UTF-8 golden")
+            .lines()
+            .find(|line| line.rsplit('|').next() == Some(path))
+            .expect("size golden path")
+    }
+    const ISSUE1057_SIZE_FORMAT: &str =
+        "%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)";
+
+    #[test]
+    fn ls_tree_issue1057_padded_blob() {
+        let mut item = entry("dir/nested/file");
+        item.size = Some(6);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("dir/nested/file")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_empty() {
+        let mut item = entry("empty");
+        item.size = Some(0);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("empty")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_large() {
+        let mut item = entry("large");
+        item.size = Some(10_000_000);
+        item.object_type = "blob".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("large")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_tree() {
+        let mut item = entry("dir");
+        item.size = None;
+        item.object_type = "tree".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("dir")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_gitlink() {
+        let mut item = entry("link");
+        item.size = None;
+        item.object_type = "commit".to_string();
+        assert_eq!(
+            super::render_format_entry(&item, ISSUE1057_SIZE_FORMAT),
+            issue1057_size_line("link")
+        );
+    }
+
+    #[test]
+    fn ls_tree_issue1057_padded_repeated() {
+        let mut item = entry("empty");
+        item.size = Some(0);
+        let columns: Vec<_> = issue1057_size_line("empty").split('|').collect();
+        assert_eq!(
+            super::render_format_entry(&item, "%(objectsize:padded)|%(objectsize:padded)"),
+            format!("{}|{}", columns[0], columns[2])
+        );
+    }
+    #[test]
+    fn ls_tree_issue1057_padded_literal_path() {
+        let path = "file-%(objectsize:padded)";
+        let mut item = entry(path);
+        item.size = Some(6);
+        let padded = issue1057_size_line("dir/nested/file")
+            .split('|')
+            .next()
+            .expect("size");
+        assert_eq!(
+            super::render_format_entry(&item, "%(path)|%(objectsize:padded)"),
+            format!("{path}|{padded}")
+        );
     }
 }

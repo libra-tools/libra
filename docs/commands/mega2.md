@@ -9,8 +9,8 @@ libra mega2 traces streams --server <BASE-URL> --target <UUID> [--source <ID>] [
 libra mega2 traces sessions --server <BASE-URL> --stream <UUID> [--since <RFC3339>] [--until <RFC3339>] [--agent <KIND>] [--code-commit <OID>] [--session <ID>] [--cursor <CURSOR>] [--limit <N>] [--token-file <PATH> | --token <TOKEN>]
 libra mega2 traces show --server <BASE-URL> --stream <UUID> (--session <ID> | --checkpoint <ID>) [--token-file <PATH> | --token <TOKEN>]
 libra mega2 traces checkpoints --server <BASE-URL> --stream <UUID> --session <ID> [--cursor <CURSOR>] [--limit <N>] [--token-file <PATH> | --token <TOKEN>]
-libra mega2 traces search --server <BASE-URL> --target </project/foo> --query <TEXT> [--source <ID>] [--stream <UUID>] [--session <ID>] [--agent <KIND>] [--since <RFC3339>] [--until <RFC3339>] [--code-commit <OID>] [--cursor <CURSOR>] [--limit <N>] [--max-bytes <BYTES>] [--token-file <PATH> | --token <TOKEN>]
-libra mega2 traces transcript --server <BASE-URL> --stream <UUID> --checkpoint <ID> [--max-bytes <BYTES>] [--cursor <CURSOR>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces search --server <BASE-URL> --target </project/foo> --stream <UUID> --query <TEXT> [--cursor <CURSOR>] [--limit <N>] [--max-bytes <BYTES>] [--token-file <PATH> | --token <TOKEN>]
+libra mega2 traces transcript --server <BASE-URL> --stream <UUID> [--session <ID>] --checkpoint <ID> [--max-bytes <BYTES>] [--cursor <CURSOR>] [--token-file <PATH> | --token <TOKEN>]
 libra mega2 traces fetch --remote <NAME> --stream <UUID> [--token-file <PATH> | --token <TOKEN>]
 ```
 
@@ -24,15 +24,24 @@ token can appear in shell history and process listings; prefer
 
 Search text must be 1 to 256 UTF-8 bytes or the command does not open a socket.
 The client sends the query unchanged; ASCII case-fold is the server's match.
-List `--limit` defaults to 50 and accepts at most 200; search `--limit`
-defaults to 20 hits and accepts at most 100. Search and transcript
-`--max-bytes` defaults to 16384 and accepts at most 131072 bytes. Values above
-the relevant maximum are rejected before a socket opens. `--owner`, `--epoch`,
-`--agent`, `--session`, and `--cursor` are passed through as written.
+Search calls the mounted per-stream route
+`/api/v1/traces/streams/<UUID>/search`, so `--stream` is required; `--target`
+is still accepted for compatibility, and `--source`, `--session`, `--agent`,
+`--since`, `--until` and `--code-commit` are refused locally because that
+route does not implement them. The route owns the transcript-body budget, so
+`--max-bytes` is validated locally (default 16384, maximum 131072 bytes) but is
+not sent. Transcript resolves the owning session when `--session` is omitted by
+paging the stream's sessions and checkpoints. List `--limit` defaults to 50 and
+accepts at most 200; search `--limit` defaults to 20 hits and accepts at most
+100. Transcript `--max-bytes` defaults to 16384 and accepts at most 131072
+bytes. Values above the relevant maximum are rejected before a socket opens.
+`--owner`, `--epoch`, `--agent`, `--session`, and `--cursor` are passed through
+as written where the mounted route supports them.
 `--code-commit` must be 40 or 64 hexadecimal characters. `--since` and
 `--until` are RFC3339 values sent as UTC on the half-open interval
 `[since, until)`; `since` later than `until` is rejected locally, and equal
-bounds are an empty interval. `--session` and `--checkpoint` cannot be combined.
+bounds are an empty interval. For `show`, `--session` and `--checkpoint` cannot
+be combined.
 `--require-search` succeeds only when `search_ready` is boolean `true`; a
 missing or non-boolean field is rejected, while a plain `capabilities` call
 still prints the other fields. A redirect to another origin does not forward

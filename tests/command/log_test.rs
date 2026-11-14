@@ -2858,9 +2858,9 @@ async fn test_log_graph() {
     let commit_hash = ObjectHash::from_str(&commit_id).unwrap();
     let commit = load_object::<Commit>(&commit_hash).unwrap();
 
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
-    assert!(prefix.contains('*'));
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
+    assert!(rendered.prefix.contains('*'));
 }
 
 #[tokio::test]
@@ -2954,8 +2954,8 @@ async fn test_log_graph_simple_chain() {
     let mut graph_state = libra::command::log::GraphState::new();
 
     for commit in reachable_commits.iter().take(2) {
-        let prefix = graph_state.render(commit);
-        assert!(prefix.starts_with("* ") || prefix.contains("* "));
+        let rendered = graph_state.render(commit);
+        assert!(rendered.prefix.starts_with("* ") || rendered.prefix.contains("* "));
     }
 }
 
@@ -3019,8 +3019,8 @@ async fn test_log_stat_and_graph_combined() {
     assert_eq!(stats.len(), 1);
 
     let mut graph_state = libra::command::log::GraphState::new();
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
 }
 
 fn run_log_cmd(args: &[&str], cwd: &std::path::Path) -> (std::process::ExitStatus, String, String) {
@@ -4017,9 +4017,22 @@ fn log_format_is_alias_for_pretty() {
         String::from_utf8_lossy(&fmt.stdout)
     );
 
-    // `--format` and `--pretty` are mutually exclusive.
-    let both = run_libra_command(&["log", "--format=%s", "--pretty=%s", "-1"], p);
-    assert!(!both.status.success(), "--format conflicts with --pretty");
+    // ADR-LG-05 item 2: `--oneline`, `--pretty`, and `--format` are
+    // last-one-wins rather than mutually exclusive.
+    let pretty_last = run_libra_command(&["log", "--format=%H", "--pretty=%s", "-1"], p);
+    assert_cli_success(&pretty_last, "log --format then --pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_last.stdout).trim(),
+        "base",
+        "--pretty after --format wins"
+    );
+    let format_last = run_libra_command(&["log", "--pretty=%s", "--format=%H", "-1"], p);
+    assert_cli_success(&format_last, "log --pretty then --format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_last.stdout).trim().len(),
+        40,
+        "--format after --pretty wins"
+    );
 }
 
 #[test]
@@ -4235,11 +4248,11 @@ fn log_no_expand_tabs_flag_is_accepted_noop() {
 }
 
 #[test]
-fn log_no_notes_flag_is_accepted_noop() {
+fn log_no_notes_flag_hides_default_notes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
-    // Attach a note; Libra's log never displays notes inline, so the flag is a
-    // no-op whether or not a note exists.
+    // ADR-LG-03: built-in formats show notes by default, so `--no-notes` is no
+    // longer a no-op — it suppresses the block that plain `log` now displays.
     assert!(
         run_libra_command(&["notes", "add", "-m", "a note", "HEAD"], p)
             .status
@@ -4248,17 +4261,19 @@ fn log_no_notes_flag_is_accepted_noop() {
 
     let plain = run_libra_command(&["log"], p);
     assert_cli_success(&plain, "log");
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("Notes:"),
+        "plain log shows the default note block"
+    );
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("    a note"),
+        "plain log shows the note body"
+    );
     let out = run_libra_command(&["log", "--no-notes"], p);
     assert_cli_success(&out, "log --no-notes");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&plain.stdout),
-        "log --no-notes matches plain log (no-op)"
-    );
-    // Sanity: the note is not shown by plain log either.
     assert!(
-        !String::from_utf8_lossy(&plain.stdout).contains("a note"),
-        "Libra log does not display notes inline"
+        !String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+        "log --no-notes suppresses the note block"
     );
 }
 
@@ -6193,5 +6208,513 @@ fn lo08_detached_head_filtered_out() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "three (octopus-b, octopus-a, main)\n"
+    );
+}
+
+/// LG-01 (M-GREP G1..G10): `--grep` dialect, multi-pattern, and scope matrix.
+#[test]
+#[serial(cwd)]
+fn test_log_grep_pattern_types_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Four commits whose subjects exercise the matrix.
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foo.bar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    let subjects = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log grep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // G1: BRE treats `+`/`(`/`)` literally, so the whole subject matches.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "c++ (fix)"]),
+        vec!["c++ (fix)"]
+    );
+    // G2: `.` is the BRE any-char operator.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa", "fooXbar"]
+    );
+    // G3: `a+` is a literal BRE, so nothing matches; `-E` makes it ERE.
+    assert!(subjects(&["log", "--format=%s", "--grep", "a+"]).is_empty());
+    let extended = subjects(&["log", "--format=%s", "-E", "--grep", "a+"]);
+    assert!(extended.contains(&"foo.bar aaa".to_string()));
+    assert!(extended.contains(&"fooXbar".to_string()));
+    // G4: fixed strings bypass the regex engine.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "-F", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa"]
+    );
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--fixed-strings",
+            "--grep",
+            "c++ (fix)"
+        ]),
+        vec!["c++ (fix)"]
+    );
+    // G5: explicit basic dialect and the Perl dialect (LG-14 engine).
+    let basic = subjects(&["log", "--format=%s", "--basic-regexp", "--grep", r"a\+"]);
+    assert!(basic.contains(&"foo.bar aaa".to_string()));
+    assert!(basic.contains(&"fooXbar".to_string()));
+    let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "--format=%s", "HEAD"], p);
+    assert_cli_success(&perl, "log -P --grep");
+    let perl_text = String::from_utf8_lossy(&perl.stdout);
+    assert_eq!(perl_text.trim(), "foo.bar aaa", "{perl_text}");
+    // G6: `--all-match` requires every pattern; the default is any.
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--all-match",
+            "--grep",
+            "foo",
+            "--grep",
+            "aaa"
+        ]),
+        vec!["foo.bar aaa"]
+    );
+    let any = subjects(&["log", "--format=%s", "--grep", "foo", "--grep", "aaa"]);
+    assert!(any.contains(&"foo.bar aaa".to_string()));
+    assert!(any.contains(&"fooXbar".to_string()));
+    // G10: an invalid BRE is a CLI usage error naming the pattern.
+    let invalid = run_libra_command(&["log", "--grep", r"a\(", "HEAD"], p);
+    assert_eq!(invalid.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("invalid --grep pattern"), "{stderr}");
+    assert!(stderr.contains(r"a\("), "{stderr}");
+}
+
+/// LG-02 (M-NOTES N1..N9): default notes display, switches, `%N`, and JSON.
+#[test]
+#[serial(cwd)]
+fn test_log_displays_notes_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // N1: a default-ref note is displayed by the built-in format.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "note body"], p),
+        "add default note",
+    );
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&default_log, "log -1");
+    let text = String::from_utf8_lossy(&default_log.stdout);
+    assert!(text.contains("\nNotes:\n"), "{text:?}");
+    assert!(text.contains("    note body"), "{text:?}");
+
+    // N2: --no-notes suppresses the block.
+    let no_notes = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert_cli_success(&no_notes, "log --no-notes");
+    let text = String::from_utf8_lossy(&no_notes.stdout);
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N3: --notes / --show-notes re-enable it.
+    for flag in ["--notes", "--show-notes"] {
+        let out = run_libra_command(&["log", "-1", flag], p);
+        assert_cli_success(&out, "log notes flag");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // N4: another ref renders its short name and only its note.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "other body",
+            ],
+            p,
+        ),
+        "add other note",
+    );
+    let other = run_libra_command(&["log", "-1", "--notes=other"], p);
+    assert_cli_success(&other, "log --notes=other");
+    let text = String::from_utf8_lossy(&other.stdout);
+    assert!(text.contains("Notes (other):"), "{text:?}");
+    assert!(text.contains("other body"), "{text:?}");
+    assert!(!text.contains("note body"), "{text:?}");
+
+    // N5/N6: `%N` expands the note; a custom format suppresses the block.
+    let placeholder = run_libra_command(&["log", "-1", "--format=%s%n%N"], p);
+    assert_cli_success(&placeholder, "log %N");
+    let text = String::from_utf8_lossy(&placeholder.stdout);
+    assert!(text.contains("note body"), "{text:?}");
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N9: JSON gains a `notes` array without removing existing fields.
+    let json = run_libra_command(&["--machine", "log", "-1"], p);
+    assert_cli_success(&json, "machine log");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    let entry = &parsed["data"]["commits"][0];
+    assert_eq!(entry["notes"][0], "note body");
+    assert!(entry["hash"].is_string(), "existing fields preserved");
+}
+
+/// LG-02 (M-NOTES N8): `t3301` notes-display ports.
+#[test]
+#[serial(cwd)]
+fn test_t3301_notes_display_ports() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "Reviewed-by: Alice"], p),
+        "notes add",
+    );
+
+    // t3301:64 — `git log --format=%N` expands the note on HEAD.
+    let fmt = run_libra_command(&["log", "-1", "--format=%N"], p);
+    assert_cli_success(&fmt, "log %N");
+    assert!(
+        String::from_utf8_lossy(&fmt.stdout).contains("Reviewed-by: Alice"),
+        "{}",
+        String::from_utf8_lossy(&fmt.stdout)
+    );
+
+    // t3301:154 — default `log` shows the note block.
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert!(String::from_utf8_lossy(&default_log.stdout).contains("Notes:"));
+
+    // t3301:282 — `--no-notes` hides it again.
+    let hidden = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+}
+
+/// LG-05 (M-LAYOUT L1): default log layout matches Git — unpadded day, one
+/// blank line between commits, and no blank line after the final commit.
+#[test]
+#[serial(cwd)]
+fn test_log_default_layout_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Rewrite the base commit with a single-digit day so the padding rule is
+    // observable (`Fri Jan 2 ...`, not `Fri Jan 02 ...`).
+    fs::write(p.join("tracked.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add one");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "second", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z"),
+            ],
+        ),
+        "commit with fixed date",
+    );
+
+    let out = run_libra_command(&["log", "-2"], p);
+    assert_cli_success(&out, "log -2");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("Date:   Fri Jan 2 00:00:00 2026 +0000"),
+        "unpadded day: {text:?}"
+    );
+    assert!(
+        !text.contains("Jan 02"),
+        "day must not be zero-padded: {text:?}"
+    );
+    // Exactly one blank line between the two commit records.
+    let between = text.split("commit ").nth(2).expect("second commit record");
+    assert!(
+        between.starts_with(|c: char| c.is_ascii_alphanumeric()),
+        "blank line separates records: {text:?}"
+    );
+    let separator_count = text.matches("\n\ncommit ").count();
+    assert_eq!(
+        separator_count, 1,
+        "one blank line between commits: {text:?}"
+    );
+    // No trailing blank line after the last commit.
+    assert!(text.ends_with('\n'), "newline-terminated: {text:?}");
+    assert!(
+        !text.ends_with("\n\n"),
+        "no blank line after the last commit: {text:?}"
+    );
+}
+
+/// LG-05 (M-LAYOUT L3): `--oneline` / `--pretty` / `--format` are last-wins.
+#[test]
+#[serial(cwd)]
+fn test_log_format_last_one_wins() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let full_hash = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    let format_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--format=%H"], p);
+    assert_cli_success(&format_after_oneline, "oneline then format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_after_oneline.stdout).trim(),
+        full_hash,
+        "--format after --oneline wins"
+    );
+
+    let oneline_after_format = run_libra_command(&["log", "-1", "--format=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_format, "format then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_format.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --format wins: {text:?}"
+    );
+
+    let pretty_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--pretty=%s"], p);
+    assert_cli_success(&pretty_after_oneline, "oneline then pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_after_oneline.stdout).trim(),
+        "base",
+        "--pretty after --oneline wins"
+    );
+
+    let oneline_after_pretty = run_libra_command(&["log", "-1", "--pretty=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_pretty, "pretty then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_pretty.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --pretty wins: {text:?}"
+    );
+}
+
+/// LG-07 (M-GRAPH R1/R3/R4): `--graph` column allocation matches Git's
+/// fixtures (fork with `|/`, two-way merge, octopus `*-.`), and `--graph`
+/// implies topological order with LIFO tie handling.
+#[test]
+#[serial(cwd)]
+fn test_log_graph_matches_git_fixtures() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    // Forked history: main (newer) and side (older) share the base commit.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "-b", "side"], p),
+        "branch",
+    );
+    commit("side1.txt", "s1\n", "side1", "2026-01-02T00:00:00Z");
+    commit("side2.txt", "s2\n", "side2", "2026-01-03T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "main"], p),
+        "checkout main",
+    );
+    commit("main1.txt", "m1\n", "main1", "2026-01-04T00:00:00Z");
+    commit("main2.txt", "m2\n", "main2", "2026-01-05T00:00:00Z");
+
+    let fork = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&fork, "fork graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&fork.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // R1/R4: main commits first, then the side branch, then the `|/` join.
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert!(
+        lines[0].starts_with("* ") && lines[0].ends_with("main2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("* ") && lines[1].ends_with("main1"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("| * ") && lines[2].ends_with("side2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[3].starts_with("| * ") && lines[3].ends_with("side1"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[4], "|/  ", "{lines:?}");
+    assert!(
+        lines[5].starts_with("* ") && lines[5].ends_with("base"),
+        "{lines:?}"
+    );
+
+    // Two-way merge: merge commit, `|\`, side, main, `|/`, base.
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["merge", "--no-ff", "side", "-m", "merge", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-06T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-06T00:00:00Z"),
+            ],
+        ),
+        "merge",
+    );
+    let merged = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&merged, "merge graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*   ") && lines[0].ends_with("merge"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\  ", "{lines:?}");
+    assert!(lines.iter().any(|line| line == "|/  "), "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with("base")), "{lines:?}");
+}
+
+/// LG-07 (M-GRAPH R3): octopus merge fixture (`t4214:39`-style).
+#[test]
+#[serial(cwd)]
+fn test_log_graph_octopus_fixture() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o1"], p), "o1");
+    commit("o1.txt", "o1\n", "oct1", "2026-01-02T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o2"], p), "o2");
+    commit("o2.txt", "o2\n", "oct2", "2026-01-03T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main2");
+    commit("main1.txt", "m\n", "main1", "2026-01-04T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "--no-ff",
+                "o1",
+                "o2",
+                "-m",
+                "octopus",
+                "--no-verify",
+            ],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-05T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-05T00:00:00Z"),
+            ],
+        ),
+        "octopus merge",
+    );
+
+    let out = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&out, "octopus graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*-.") && lines[0].ends_with("octopus"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\ \\  ", "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| | * ") && line.ends_with("oct2")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| * | ") && line.ends_with("oct1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "* / " || line.starts_with("* / ")),
+        "{lines:?}"
+    );
+}
+
+/// LG-14 (M-GTYPE P7): `log -P --grep` uses the same Perl engine as `grep -P`.
+#[test]
+#[serial(cwd)]
+fn test_log_perl_regexp_grep() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foobar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    // Lookahead is a Perl-only feature.
+    let lookahead = run_libra_command(
+        &["log", "-P", "--grep", "foo(?=bar)", "--format=%s", "HEAD"],
+        p,
+    );
+    assert_cli_success(&lookahead, "log -P lookahead");
+    assert_eq!(
+        String::from_utf8_lossy(&lookahead.stdout).trim(),
+        "foobar aaa"
+    );
+
+    // Backreference.
+    let backref = run_libra_command(&["log", "-P", "--grep", r"(o)\1", "--format=%s", "HEAD"], p);
+    assert_cli_success(&backref, "log -P backref");
+    let backref_text = String::from_utf8_lossy(&backref.stdout);
+    // Both subjects contain a doubled `o`.
+    assert!(backref_text.contains("foobar aaa"), "{backref_text}");
+    assert!(backref_text.contains("fooXbar"), "{backref_text}");
+
+    // Unsupported PCRE syntax is a usage error naming the feature.
+    let unsupported = run_libra_command(&["log", "-P", "--grep", r"\Kfoo", "HEAD"], p);
+    assert_eq!(unsupported.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr).contains(r"\K"),
+        "{}",
+        String::from_utf8_lossy(&unsupported.stderr)
     );
 }

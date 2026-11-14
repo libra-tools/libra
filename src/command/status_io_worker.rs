@@ -37,8 +37,9 @@ pub(crate) use crate::internal::worktree_io::{
 pub(crate) use crate::internal::worktree_io::{
     handler::{read_object_blob_local, run_worker as run_internal_worker},
     protocol::{
-        CapturedStat, Dirent, DirentKind, IoEvent, IoRequest, ObjectBlobStatus, ReadDirListing,
-        bytes_to_path, dirent_os, io_from_wire, path_to_bytes, unwrap_wire,
+        CapturedStat, ConversionIndex, ConversionStateResult, Dirent, DirentKind, IoEvent,
+        IoRequest, ObjectBlobStatus, ReadDirListing, bytes_to_path, dirent_os, io_from_wire,
+        path_to_bytes, unwrap_wire,
     },
     session::{
         begin as begin_status_io_root_session, relative_path as request_worktree_relative,
@@ -249,33 +250,265 @@ pub(crate) fn deadline_dirent_kind(
 pub(crate) fn deadline_file_blob_hash(
     path: &Path,
     workdir: &Path,
+    index: &git_internal::internal::index::Index,
+) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
+    let attributes = match crate::utils::attributes::ConversionAttributeContext::capture(workdir) {
+        Ok(attributes) => attributes,
+        Err(error) => return Ok(Err(error)),
+    };
+    let selected = selected_index_oid(index, path.strip_prefix(workdir).unwrap_or(path));
+    let index = match conversion_index(selected) {
+        Ok(index) => index,
+        Err(error) => return Ok(Err(error)),
+    };
+    deadline_hash_with_attributes(path, workdir, attributes, index)
+}
+
+fn deadline_hash_with_attributes(
+    path: &Path,
+    workdir: &Path,
+    attributes: crate::utils::attributes::ConversionAttributeContext,
+    index: Option<ConversionIndex>,
 ) -> Result<io::Result<git_internal::hash::ObjectHash>, ()> {
     let root = path_to_bytes(workdir);
     let relative = match request_worktree_relative(&root, path, false) {
         Ok(relative) => relative,
         Err(error) => return Ok(Err(error)),
     };
-    let events = worktree_io()
-        .submit(
-            IoRequest::FileBlobHash {
-                path: relative,
-                root,
-                hash_kind: current_hash_kind(),
-                root_session: request_worktree_session(),
-            },
-            path_to_bytes(path),
-            crate::command::status_probe::io_op_timeout(),
-        )
-        .map_err(|_| ())?;
+    let request = IoRequest::CleanFileBlobHash {
+        path: relative,
+        root,
+        hash_kind: current_hash_kind(),
+        root_session: request_worktree_session(),
+        attributes,
+        index,
+    };
+    let executor = worktree_io();
+    let path_key = path_to_bytes(path);
+    let timeout = crate::command::status_probe::io_op_timeout();
+    // Library hosts cannot kill a blocked helper. Keep their index evidence
+    // read on the caller thread instead of stranding a dispatcher slot.
+    let events = if executor.helper_available() {
+        executor.submit(request, path_key, timeout)
+    } else {
+        executor.submit_in_process(request, path_key, timeout)
+    }
+    .map_err(|_| ())?;
     for event in events {
-        if let IoEvent::DoneHash { hex } = event {
-            return Ok(unwrap_wire(hex).and_then(|hex| {
+        if let IoEvent::DoneCleanHash { hex, detail } = event {
+            return Ok(unwrap_conversion_result(hex, detail).and_then(|hex| {
                 crate::internal::object_format::parse_repo_oid(&hex)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
             }));
         }
     }
     Err(())
+}
+
+fn unwrap_conversion_result<T>(
+    result: crate::internal::worktree_io::protocol::WireResult<T>,
+    detail: Option<String>,
+) -> io::Result<T> {
+    unwrap_wire(result).map_err(|error| match detail {
+        Some(detail) => io::Error::new(error.kind(), detail),
+        None => error,
+    })
+}
+
+pub(crate) fn clean_file_blob_hash(
+    path: &Path,
+    workdir: &Path,
+    index: &git_internal::internal::index::Index,
+) -> io::Result<git_internal::hash::ObjectHash> {
+    deadline_file_blob_hash(path, workdir, index).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "content comparison timed out for '{}'; retry when the file is readable",
+                path.display()
+            ),
+        )
+    })?
+}
+
+pub(crate) fn selected_index_oid(
+    index: &git_internal::internal::index::Index,
+    relative: &Path,
+) -> Option<git_internal::hash::ObjectHash> {
+    let name = relative.to_str()?;
+    index
+        .get(name, 0)
+        .or_else(|| index.get(name, 2))
+        .map(|entry| entry.hash)
+}
+
+pub(crate) fn selected_index_oids(
+    index: &git_internal::internal::index::Index,
+) -> std::collections::HashMap<PathBuf, git_internal::hash::ObjectHash> {
+    index
+        .tracked_files()
+        .into_iter()
+        .filter_map(|path| selected_index_oid(index, &path).map(|oid| (path, oid)))
+        .collect()
+}
+
+fn conversion_index(
+    oid: Option<git_internal::hash::ObjectHash>,
+) -> io::Result<Option<ConversionIndex>> {
+    oid.map(|oid| {
+        Ok(ConversionIndex {
+            oid: oid.to_string(),
+            objects_root: path_to_bytes(&crate::utils::path::try_objects()?),
+        })
+    })
+    .transpose()
+}
+
+/// Used by staging and patch rendering only when the shared auto policy needs
+/// historical evidence. CLI callers use the same killable worker as status.
+pub(crate) fn index_has_text_crlf(oid: Option<git_internal::hash::ObjectHash>) -> io::Result<bool> {
+    let Some(index) = conversion_index(oid)? else {
+        return Ok(false);
+    };
+    if !worktree_io().helper_available() {
+        return crate::internal::worktree_io::handler::read_conversion_index_local(Some(&index));
+    }
+    let key = index.oid.as_bytes().to_vec();
+    let events = worktree_io().submit_absolute(
+        IoRequest::ReadConversionIndex { index, hash_kind: current_hash_kind() },
+        key,
+        crate::command::status_probe::io_op_timeout(),
+    ).map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "index evidence read timed out during automatic line-ending conversion; retry when local objects are readable"))?;
+    for event in events {
+        if let IoEvent::DoneConversionState { result, detail } = event {
+            if let ConversionStateResult::IndexBlob { has_text_crlf } =
+                unwrap_conversion_result(result, detail)?
+            {
+                return Ok(has_text_crlf);
+            }
+            break;
+        }
+    }
+    Err(io::Error::other(
+        "index conversion worker returned no evidence; retry the command",
+    ))
+}
+
+/// A scan-local proof key binds the exact loaded index and all possible
+/// attribute sources. Only a complete clean scan can enable future stat hits.
+pub(crate) struct ConversionScan {
+    root: Vec<u8>,
+    directories: Vec<Vec<u8>>,
+    attributes: crate::utils::attributes::ConversionAttributeContext,
+    cache_root: Vec<u8>,
+    index_key: String,
+    selected_index: std::collections::HashMap<PathBuf, git_internal::hash::ObjectHash>,
+}
+
+impl ConversionScan {
+    pub(crate) fn new(
+        workdir: &Path,
+        index: &git_internal::internal::index::Index,
+    ) -> io::Result<Self> {
+        let mut directories = std::collections::BTreeSet::new();
+        directories.insert(PathBuf::new());
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        for path in index.tracked_files() {
+            let Some(name) = path.to_str() else {
+                continue;
+            };
+            for stage in 0..=3 {
+                if let Some(entry) = index.get(name, stage) {
+                    // Include stat, flags and mode, not only the object ID:
+                    // another command may refresh stat without re-cleaning.
+                    let encoded = entry.to_string();
+                    hash.update(&(encoded.len() as u64).to_le_bytes());
+                    hash.update(encoded.as_bytes());
+                }
+            }
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                directories.insert(directory.to_path_buf());
+                parent = directory.parent();
+            }
+        }
+        let index_path = crate::utils::path::try_index()?;
+        let cache_root = index_path
+            .parent()
+            .ok_or_else(|| io::Error::other("index has no parent for conversion validity"))?;
+        Ok(Self {
+            root: path_to_bytes(workdir),
+            directories: directories
+                .into_iter()
+                .map(|path| path_to_bytes(&path))
+                .collect(),
+            attributes: crate::utils::attributes::ConversionAttributeContext::capture(workdir)?,
+            cache_root: path_to_bytes(cache_root),
+            index_key: hex::encode(hash.finish().as_ref()),
+            selected_index: selected_index_oids(index),
+        })
+    }
+
+    pub(crate) fn hash(&self, path: &Path) -> io::Result<git_internal::hash::ObjectHash> {
+        let workdir = bytes_to_path(&self.root);
+        let relative = path.strip_prefix(&workdir).unwrap_or(path);
+        let index = conversion_index(self.selected_index.get(relative).copied())?;
+        deadline_hash_with_attributes(path, &workdir, self.attributes.clone(), index).map_err(
+            |_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "content comparison timed out for '{}'; retry when the file is readable",
+                        path.display()
+                    ),
+                )
+            },
+        )?
+    }
+
+    pub(crate) fn probe(&self, record: Option<&str>) -> io::Result<(String, bool)> {
+        if crate::utils::attributes::ConversionAttributeContext::capture(&bytes_to_path(
+            &self.root,
+        ))? != self.attributes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attribute configuration changed during comparison; retry the command",
+            ));
+        }
+        let events = worktree_io()
+            .submit(
+                IoRequest::ConversionState {
+                    root: self.root.clone(),
+                    directories: self.directories.clone(),
+                    attributes: self.attributes.clone(),
+                    cache_root: self.cache_root.clone(),
+                    index_key: self.index_key.clone(),
+                    record: record.map(str::to_owned),
+                },
+                self.root.clone(),
+                crate::command::status_probe::io_op_timeout(),
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "conversion validity check timed out; retry when the worktree is readable",
+                )
+            })?;
+        for event in events {
+            if let IoEvent::DoneConversionState { result, detail } = event {
+                return match unwrap_conversion_result(result, detail)? {
+                    ConversionStateResult::Attributes { sources, valid } => Ok((sources, valid)),
+                    ConversionStateResult::IndexBlob { .. } => Err(io::Error::other(
+                        "unexpected index evidence in attribute validation",
+                    )),
+                };
+            }
+        }
+        Err(io::Error::other(
+            "conversion validity worker returned no result",
+        ))
+    }
 }
 
 /// Outcome of a killable local object-store read (WIO-03).
@@ -822,5 +1055,66 @@ mod tests {
             hash, expected,
             "LFS decision and bytes must use pinned root"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn i861_library_index_evidence_does_not_occupy_a_dispatcher_slot() {
+        use std::io::Write;
+
+        use git_internal::{
+            hash::{HashKind, set_hash_kind_for_test},
+            internal::object::blob::Blob,
+        };
+
+        use crate::utils::test::ScopedEnvVar;
+
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        assert!(
+            !super::worktree_io().helper_available(),
+            "library tests have no CLI entrypoint"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("repo");
+        let objects = temp.path().join("objects");
+        std::fs::create_dir(&workdir).unwrap();
+        std::fs::write(workdir.join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(workdir.join("probe.txt"), b"library evidence\r\n").unwrap();
+        let content = b"library evidence\n";
+        let blob = Blob::from_content_bytes(content.to_vec());
+        let oid = blob.id.to_string();
+        let directory = objects.join(&oid[..2]);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = std::fs::File::create(directory.join(&oid[2..])).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+        encoder
+            .write_all(format!("blob {}\0", content.len()).as_bytes())
+            .unwrap();
+        encoder.write_all(content).unwrap();
+        encoder.finish().unwrap();
+        let _env = [
+            ScopedEnvVar::set("LIBRA_TEST", "1"),
+            ScopedEnvVar::set("LIBRA_TEST_STATUS_IO_TIMEOUT_MS", "1"),
+            ScopedEnvVar::set("LIBRA_TEST_SLOW_OBJECT_READ_MS", "30"),
+            ScopedEnvVar::set("LIBRA_TEST_SLOW_OBJECT_READ_OID", &oid),
+        ];
+        // A dispatcher would time out after 1 ms and strand its in-process
+        // object read. Library fallback instead completes on the caller;
+        // only the CLI's separate helper promises killable mid-read deadlines.
+        let result = super::deadline_hash_with_attributes(
+            &workdir.join("probe.txt"),
+            &workdir,
+            crate::utils::attributes::ConversionAttributeContext {
+                configured: None,
+                info: vec![],
+            },
+            Some(super::ConversionIndex {
+                oid,
+                objects_root: super::path_to_bytes(&objects),
+            }),
+        )
+        .expect("caller-thread fallback must not consume a timed dispatcher slot")
+        .expect("local index evidence is readable");
+        assert_eq!(result, blob.id);
     }
 }

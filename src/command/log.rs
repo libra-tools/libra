@@ -21,13 +21,13 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use self::config::{ResolvedLogConfig, resolve_log_config};
+use self::config::{ResolvedLogConfig, read_log_config, resolve_log_config};
 use crate::{
     command::{diff, load_object},
     common_utils::parse_commit_msg,
     internal::{
         branch::{Branch, BranchStoreError},
-        config::ConfigKv,
+        config::{ConfigKv, parse_git_config_bool},
         head::Head,
         log::{
             date_parser::parse_date,
@@ -38,6 +38,7 @@ use crate::{
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
+        grep_pattern::{GrepPatternType, compile_grep_patterns, resolve_pattern_type},
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
@@ -173,7 +174,7 @@ pub struct LogArgs {
     #[clap(short, long, visible_alias = "max-count")]
     pub number: Option<usize>,
     /// Shorthand for --pretty=oneline --abbrev-commit
-    #[clap(long)]
+    #[clap(long, overrides_with_all = ["pretty", "format"])]
     pub oneline: bool,
 
     /// Show abbreviated commit hash instead of full hash
@@ -231,11 +232,11 @@ pub struct LogArgs {
     #[clap(long, value_name = "DATE")]
     pub until: Option<String>,
     /// Custom pretty format string (e.g. `%h - %s`)
-    #[clap(long, value_name = "FORMAT")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "format"])]
     pub pretty: Option<String>,
     /// Alias for `--pretty=<format>` (Git's `--format`). Accepts the same preset
     /// names and `%`-placeholder templates as `--pretty`.
-    #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
+    #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "pretty"])]
     pub format: Option<String>,
     /// Date rendering mode for author/committer dates: default / short / iso /
     /// iso-strict / rfc / unix / raw.
@@ -263,6 +264,15 @@ pub struct LogArgs {
     /// deletions) for each commit
     #[clap(long, overrides_with = "shortstat")]
     pub shortstat: bool,
+
+    /// Show a per-directory change distribution for each commit
+    /// (`--dirstat[=<param>,...]`, `-X`).
+    #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat: Option<String>,
+
+    /// `--dirstat-by-file[=<param>]`: `--dirstat=files[,<param>]`.
+    #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub dirstat_by_file: Option<String>,
 
     /// Show the diffstat block followed by the full patch for each commit
     /// (Git's synonym for `-p --stat`).
@@ -303,19 +313,39 @@ pub struct LogArgs {
     )]
     pub all_match: bool,
 
-    /// Treat `--grep` as a literal fixed string (Git's `--fixed-strings`).
-    #[clap(long = "fixed-strings", overrides_with_all = ["grep_extended", "grep_basic"])]
+    /// Treat `--grep` as a literal fixed string (Git's `-F`/`--fixed-strings`).
+    #[clap(
+        short = 'F',
+        long = "fixed-strings",
+        overrides_with_all = ["grep_extended", "grep_basic", "grep_perl"]
+    )]
     pub grep_fixed: bool,
 
     /// Use POSIX extended regular expressions for `--grep` (Git's
-    /// `--extended-regexp`).
-    #[clap(long = "extended-regexp", overrides_with_all = ["grep_fixed", "grep_basic"])]
+    /// `-E`/`--extended-regexp`).
+    #[clap(
+        short = 'E',
+        long = "extended-regexp",
+        overrides_with_all = ["grep_fixed", "grep_basic", "grep_perl"]
+    )]
     pub grep_extended: bool,
 
     /// Use POSIX basic regular expressions for `--grep` (the default dialect;
     /// accepted for Git parity).
-    #[clap(long = "basic-regexp", overrides_with_all = ["grep_fixed", "grep_extended"])]
+    #[clap(
+        long = "basic-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_perl"]
+    )]
     pub grep_basic: bool,
+
+    /// Use Perl-compatible regular expressions for `--grep` (Git's
+    /// `-P`/`--perl-regexp`; the engine lands in a later release).
+    #[clap(
+        short = 'P',
+        long = "perl-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_basic"]
+    )]
+    pub grep_perl: bool,
 
     /// Only list commits whose trailer block carries this trailer (Libra
     /// extension — Git has no such flag; nearest is a fragile
@@ -409,6 +439,10 @@ pub struct LogArgs {
     /// formats and expanded through `%N` in custom formats.
     #[clap(long, value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub notes: Option<String>,
+
+    /// Alias of `--notes` (Git's `--show-notes[=<ref>]`).
+    #[clap(long = "show-notes", value_name = "REF", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub show_notes: Option<String>,
 
     /// Do not show commit notes, countermanding an earlier `--notes`.
     #[clap(long = "no-notes")]
@@ -524,6 +558,9 @@ pub struct LogCommitEntry {
     /// `body` intentionally still contains the trailer lines inline so
     /// existing consumers are unaffected — additive field, lore.md §1.9).
     pub trailers: Vec<LogTrailerEntry>,
+    /// Displayed commit notes (ADR-LG-03); omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -563,7 +600,7 @@ struct CommitFilter {
     path_specs: Option<PathspecSet>,
     grep: Vec<String>,
     /// Compiled `--grep` matchers (dialect translated at build time).
-    grep_regex: Vec<regex::Regex>,
+    grep_regex: Vec<crate::utils::grep_pattern::GrepMatcher>,
     all_match: bool,
     invert_grep: bool,
     min_parents: Option<usize>,
@@ -606,15 +643,6 @@ fn parse_trailer_filters(specs: &[String]) -> Result<Vec<TrailerFilter>, CliErro
         .collect()
 }
 
-/// The `--grep` pattern dialect. Git's default is POSIX basic regex; the
-/// explicit selector flags pick a different dialect (last flag wins).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrepDialect {
-    Basic,
-    Extended,
-    Fixed,
-}
-
 /// Whether one decoration name passes the `--decorate-refs` /
 /// `--decorate-refs-exclude` filters: an implicit `refs/` prefix, wildcard or
 /// component-boundary prefix matching, and excludes win over includes.
@@ -645,42 +673,112 @@ fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
     )
 }
 
+/// Resolve which notes refs the built-in formats display (ADR-LG-03).
+///
+/// - `--no-notes` clears the list.
+/// - Explicit `--notes[=<ref>]` / `--show-notes[=<ref>]` replace the implicit
+///   default ref; an empty value means `refs/notes/commits`.
+/// - A custom `--format`/`--pretty` shows notes only through `%N`.
+/// - Otherwise `core.notesRef` (default `refs/notes/commits`) plus any
+///   `notes.displayRef` value.
+async fn resolve_notes_display_refs(args: &LogArgs, custom_format: bool) -> CliResult<Vec<String>> {
+    if args.no_notes {
+        return Ok(Vec::new());
+    }
+    let explicit: Vec<String> = [args.notes.clone(), args.show_notes.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let normalize = |raw: &str| -> CliResult<String> {
+        if raw.is_empty() {
+            Ok(crate::internal::notes::DEFAULT_NOTES_REF.to_string())
+        } else {
+            crate::internal::notes::normalize_notes_ref(raw)
+                .map_err(|error| CliError::fatal(format!("invalid notes ref '{raw}': {error}")))
+        }
+    };
+    if !explicit.is_empty() {
+        return explicit.iter().map(|raw| normalize(raw)).collect();
+    }
+    let _ = custom_format;
+    let mut refs = Vec::new();
+    let default_ref = match read_log_config("core.notesRef").await? {
+        Some(raw) if !raw.trim().is_empty() => normalize(raw.trim())?,
+        _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
+    };
+    refs.push(default_ref);
+    if let Some(display) = read_log_config("notes.displayRef").await?
+        && !display.trim().is_empty()
+    {
+        let normalized = normalize(display.trim())?;
+        if !refs.contains(&normalized) {
+            refs.push(normalized);
+        }
+    }
+    Ok(refs)
+}
+
+/// Render one `Notes:` block. The default ref uses the bare header; another ref
+/// names its short form (`Notes (other):`). Each body line is indented four
+/// spaces, matching Git.
+pub(crate) fn notes_block_for_ref(notes_ref: &str, notes: &str) -> String {
+    let text = notes.trim_end_matches('\n');
+    if text.is_empty() {
+        return String::new();
+    }
+    let header = if notes_ref == crate::internal::notes::DEFAULT_NOTES_REF {
+        "Notes:".to_string()
+    } else {
+        let short = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
+        format!("Notes ({short}):")
+    };
+    let mut block = format!("\n{header}\n");
+    for line in text.lines() {
+        block.push_str("    ");
+        block.push_str(line);
+        block.push('\n');
+    }
+    block
+}
+
 /// Resolve the requested `--grep` dialect (last selector flag wins, basic is
 /// the default).
-fn grep_dialect(args: &LogArgs) -> GrepDialect {
+fn grep_dialect(args: &LogArgs) -> Option<GrepPatternType> {
     if args.grep_fixed {
-        GrepDialect::Fixed
+        Some(GrepPatternType::Fixed)
     } else if args.grep_extended {
-        GrepDialect::Extended
+        Some(GrepPatternType::Extended)
+    } else if args.grep_perl {
+        Some(GrepPatternType::Perl)
+    } else if args.grep_basic {
+        Some(GrepPatternType::Basic)
     } else {
-        GrepDialect::Basic
+        None
     }
 }
 
-/// Translate POSIX basic regex to the extended dialect the `regex` crate
-/// speaks: unescaped ERE operators become escaped literals, while the BRE
-/// escaped forms (`\(`, `\+`, …) become their ERE operators.
-pub(crate) fn bre_to_ere(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => match chars.next() {
-                Some(next @ ('(' | ')' | '{' | '}' | '+' | '?' | '|')) => out.push(next),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            },
-            '(' | ')' | '{' | '}' | '+' | '?' | '|' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            other => out.push(other),
-        }
+/// Read `grep.patternType` / `grep.extendedRegexp` for the no-CLI-selector case.
+async fn configured_grep_pattern_type() -> CliResult<Option<GrepPatternType>> {
+    let pattern_type = read_log_config("grep.patternType").await?;
+    let extended = match read_log_config("grep.extendedRegexp").await? {
+        Some(raw) => parse_git_config_bool(&raw),
+        None => None,
+    };
+    Ok(Some(resolve_pattern_type(
+        None,
+        pattern_type.as_deref(),
+        extended,
+    )))
+}
+
+/// Resolve the effective dialect from CLI + config.
+async fn resolve_grep_dialect(args: &LogArgs) -> CliResult<GrepPatternType> {
+    if let Some(cli) = grep_dialect(args) {
+        return Ok(cli);
     }
-    out
+    Ok(configured_grep_pattern_type()
+        .await?
+        .unwrap_or(GrepPatternType::Basic))
 }
 
 /// The two pickaxe modes. `StringCount` matches when a commit changes the number
@@ -765,28 +863,10 @@ impl CommitFilter {
         mut self,
         ignore_case: bool,
         invert_grep: bool,
-        dialect: GrepDialect,
+        dialect: GrepPatternType,
     ) -> CliResult<Self> {
         self.invert_grep = invert_grep;
-        self.grep_regex = self
-            .grep
-            .iter()
-            .map(|pattern| {
-                let translated = match dialect {
-                    GrepDialect::Fixed => regex::escape(pattern),
-                    GrepDialect::Extended => pattern.clone(),
-                    GrepDialect::Basic => bre_to_ere(pattern),
-                };
-                regex::RegexBuilder::new(&translated)
-                    .case_insensitive(ignore_case)
-                    .build()
-                    .map_err(|error| {
-                        CliError::fatal(format!("invalid --grep pattern '{pattern}': {error}"))
-                            .with_exit_code(129)
-                            .with_stable_code(StableErrorCode::CliInvalidArguments)
-                    })
-            })
-            .collect::<CliResult<Vec<_>>>()?;
+        self.grep_regex = compile_grep_patterns(&self.grep, dialect, ignore_case)?;
         Ok(self)
     }
 
@@ -882,9 +962,13 @@ impl CommitFilter {
                 commit.message.strip_prefix('\n').unwrap_or(&commit.message)
             };
             let matches = if self.all_match && !self.invert_grep {
-                self.grep_regex.iter().all(|regex| regex.is_match(message))
+                self.grep_regex
+                    .iter()
+                    .all(|regex| regex.is_match(message).unwrap_or(false))
             } else {
-                self.grep_regex.iter().any(|regex| regex.is_match(message))
+                self.grep_regex
+                    .iter()
+                    .any(|regex| regex.is_match(message).unwrap_or(false))
             };
             if matches == self.invert_grep {
                 return false;
@@ -1384,27 +1468,85 @@ async fn resolve_log_start_commits(
 
 /// Collect the current tips of all local branches and tags.
 async fn collect_all_reference_tips() -> CliResult<Vec<ObjectHash>> {
-    let mut tips = Vec::new();
+    // Git seeds `--all` from every ref under `refs/` in refname order and then
+    // HEAD. Collect `(refname, oid)` first so the initial graph tips are
+    // deterministic and match Git regardless of database row order.
+    let mut refs: Vec<(String, ObjectHash)> = Vec::new();
     let branches = Branch::list_branches_result(None)
         .await
         .map_err(|e| log_branch_store_error("list branches", e))?;
     for branch in branches {
-        tips.push(branch.commit);
+        refs.push((format!("refs/heads/{}", branch.name), branch.commit));
     }
+    // Git's `--all` covers every ref under `refs/`, so remote-tracking branches
+    // and `refs/notes/*` rows (for example imported notes refs) participate too.
+    let remotes = ConfigKv::all_remote_configs().await.map_err(|e| {
+        CliError::fatal(format!("failed to list remotes: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for remote in remotes {
+        let remote_branches = Branch::list_branches_result(Some(&remote.name))
+            .await
+            .map_err(|e| log_branch_store_error("list remote branches", e))?;
+        for branch in remote_branches {
+            refs.push((
+                format!("refs/remotes/{}/{}", remote.name, branch.name),
+                branch.commit,
+            ));
+        }
+    }
+    refs.extend(collect_notes_reference_tips().await);
     let tags = tag::list().await.map_err(|e| {
         CliError::fatal(format!("failed to list tags: {e}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
     for t in tags {
-        if let TagObject::Commit(commit) = t.object {
-            tips.push(commit.id);
-        }
+        let oid = match &t.object {
+            TagObject::Commit(commit) => commit.id,
+            TagObject::Tag(tag_obj) => tag_obj.id,
+            TagObject::Tree(tree) => tree.id,
+            TagObject::Blob(blob) => blob.id,
+        };
+        refs.push((format!("refs/tags/{}", t.name), oid));
     }
+
+    refs.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut tips: Vec<ObjectHash> = refs.into_iter().map(|(_, oid)| oid).collect();
     // Also include HEAD if it points to a commit.
     if let Some(head_commit) = Head::current_commit_result().await.ok().flatten() {
         tips.push(head_commit);
     }
     Ok(tips)
+}
+
+/// Tips of any stored `refs/notes/*` references. Libra's own notes backend keeps
+/// notes in SQLite rather than a notes commit, so this only contributes refs
+/// created by import/clone paths.
+async fn collect_notes_reference_tips() -> Vec<(String, ObjectHash)> {
+    use sea_orm::EntityTrait;
+
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let rows = match crate::internal::model::reference::Entity::find()
+        .all(&db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to list references for --all");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|row| {
+            let name = row.name?;
+            if !name.starts_with("refs/notes/") {
+                return None;
+            }
+            let oid =
+                crate::internal::object_format::parse_repo_oid(row.commit.as_deref()?).ok()?;
+            Some((name, oid))
+        })
+        .collect()
 }
 
 /// Get all reachable commits from any of the starting commits, excluding the given set.
@@ -2033,6 +2175,15 @@ async fn execute_safe_with_diff_formats(
 ) -> CliResult<()> {
     reset_log_debug_counters();
     let _log_debug_hooks = LogDebugHookGuard;
+    let mut args = args;
+    // `--dirstat-by-file[=<param>]` is `--dirstat=files[,<param>]`.
+    if let Some(param) = args.dirstat_by_file.take() {
+        args.dirstat = Some(if param.is_empty() {
+            "files".to_string()
+        } else {
+            format!("files,{param}")
+        });
+    }
     let log_config = resolve_log_config(&args, !output.is_json()).await?;
     let decorate_option = resolve_decorate_option(&args).await?;
 
@@ -2083,6 +2234,7 @@ async fn execute_safe_with_diff_formats(
         args.max_parents,
     );
     let pickaxe = build_pickaxe(&args)?;
+    let grep_dialect = resolve_grep_dialect(&args).await?;
     let filter = CommitFilter::new(
         identity_filters.authors.clone(),
         identity_filters.committers.clone(),
@@ -2094,7 +2246,7 @@ async fn execute_safe_with_diff_formats(
         max_parents,
         pickaxe,
     )
-    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(&args))?
+    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect)?
     .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
@@ -2129,7 +2281,7 @@ async fn execute_safe_with_diff_formats(
 
     let max_output_number = min(args.number.unwrap_or(usize::MAX), traversed_commits.len());
     let reuse_changed_files = name_only || name_status;
-    let selected_commits = select_log_commits(
+    let mut selected_commits = select_log_commits(
         traversed_commits,
         &filter,
         &path_filters,
@@ -2138,6 +2290,15 @@ async fn execute_safe_with_diff_formats(
         reuse_changed_files,
     )
     .await?;
+    // ADR-LG-05 item 4: `--graph` implies Git's graph (topological) order.
+    // `--reverse` then flips the resulting order.
+    if args.graph && !args.author_date_order && !args.date_order {
+        let shallow = load_walk_shallow()?;
+        selected_commits = graph_topo_order(selected_commits, &shallow);
+        if args.reverse {
+            selected_commits.reverse();
+        }
+    }
     let default_abbrev = if let Some(length) = full_set_abbrev {
         length
     } else {
@@ -2182,23 +2343,31 @@ async fn execute_safe_with_diff_formats(
     } else {
         FormatType::Full
     };
-    // `--notes[=<ref>]` renders note text. `%N` expands notes for any format;
-    // the `Notes:` block is only appended for non-custom formats, matching Git.
-    let notes_enabled = args.notes.is_some() && !args.no_notes;
-    let notes_ref = match args.notes.as_deref() {
-        Some(raw) if !raw.is_empty() => crate::internal::notes::normalize_notes_ref(raw)
-            .map_err(|error| CliError::fatal(format!("invalid notes ref '{raw}': {error}")))?,
-        _ => crate::internal::notes::DEFAULT_NOTES_REF.to_string(),
-    };
+    // ADR-LG-03: built-in formats show notes by default; `--notes[=<ref>]` /
+    // `--show-notes[=<ref>]` select refs explicitly, `--no-notes` disables, and
+    // `notes.displayRef` appends. `%N` expands notes for any format.
+    let custom_format = matches!(format_type, FormatType::Custom(_));
+    let notes_refs = resolve_notes_display_refs(&args, custom_format).await?;
     let format_uses_notes_placeholder =
         matches!(&format_type, FormatType::Custom(template) if template.contains("%N"));
-    let load_notes = notes_enabled || format_uses_notes_placeholder;
-    let append_notes_block = notes_enabled && !matches!(format_type, FormatType::Custom(_));
+    let load_notes = !notes_refs.is_empty() || format_uses_notes_placeholder;
+    let append_notes_block = !notes_refs.is_empty() && !custom_format;
     let color_enabled = match output.color {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => std::io::stdout().is_terminal(),
     };
+    // Git's medium/short/full/fuller/raw presets separate commit records with
+    // a blank line; `oneline`, `reference`, and custom `--format` records are
+    // separated by a single newline (ADR-LG-05 item 1).
+    let blank_line_between_commits = matches!(
+        &format_type,
+        FormatType::Full
+            | FormatType::Preset(LogPreset::Short)
+            | FormatType::Preset(LogPreset::Full)
+            | FormatType::Preset(LogPreset::Fuller)
+            | FormatType::Preset(LogPreset::Raw)
+    );
     let mut formatter = CommitFormatter::new(format_type)
         .with_date_mode(log_config.date.clone().unwrap_or_default())
         .with_color_enabled(color_enabled);
@@ -2212,7 +2381,9 @@ async fn execute_safe_with_diff_formats(
     }
 
     let mut graph_state = if args.graph {
-        Some(GraphState::new())
+        Some(GraphState::with_visible(
+            selected_commits.iter().map(|selected| selected.commit.id),
+        ))
     } else {
         None
     };
@@ -2260,6 +2431,7 @@ async fn execute_safe_with_diff_formats(
         std::collections::HashMap::new()
     };
 
+    let mut first_commit = true;
     for selected in selected_commits {
         let SelectedLogCommit {
             commit,
@@ -2355,11 +2527,8 @@ async fn execute_safe_with_diff_formats(
             String::new()
         };
 
-        let graph_prefix = if let Some(ref mut gs) = graph_state {
-            gs.render(&commit)
-        } else {
-            String::new()
-        };
+        let graph = graph_state.as_mut().map(|gs| gs.render(&commit));
+        let graph_prefix = graph.as_ref().map(|g| g.prefix.as_str()).unwrap_or("");
 
         // `--parents`/`--children` append abbreviated ids after the commit hash;
         // children are limited to the commits in this log's rendered output (the
@@ -2387,24 +2556,32 @@ async fn execute_safe_with_diff_formats(
             String::new()
         };
 
-        let note_text = if load_notes {
-            crate::internal::notes::show(&notes_ref, Some(&commit.id.to_string()))
-                .await
-                .map(|(_, _, text)| text)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let mut note_blocks: Vec<(String, String)> = Vec::new();
+        if load_notes {
+            for notes_ref in &notes_refs {
+                let text = crate::internal::notes::show(notes_ref, Some(&commit.id.to_string()))
+                    .await
+                    .map(|(_, _, text)| text)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    note_blocks.push((notes_ref.clone(), text));
+                }
+            }
+        }
+        let note_text = note_blocks
+            .iter()
+            .map(|(_, text)| text.trim_end_matches('\n'))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         let note_text = if note_text.is_empty() {
             String::new()
-        } else if note_text.ends_with('\n') {
-            note_text
         } else {
             format!("{note_text}\n")
         };
 
         let ctx = FormatContext {
-            graph_prefix: &graph_prefix,
+            graph_prefix,
             decoration: &ref_msg,
             abbrev_len,
             extra_hashes: &extra_hashes,
@@ -2412,12 +2589,36 @@ async fn execute_safe_with_diff_formats(
         };
         let mut message = formatter.format(&commit, &ctx);
         if append_notes_block {
-            message.push_str(&crate::internal::log::formatter::notes_block(&note_text));
+            for (notes_ref, text) in &note_blocks {
+                message.push_str(&notes_block_for_ref(notes_ref, text));
+            }
+        }
+        if let Some(graph) = &graph {
+            for line in &graph.trailing {
+                if !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                message.push_str(line);
+                message.push('\n');
+            }
         }
 
         if name_only || name_status {
             let changes = cached_changes.take().unwrap_or_default();
             append_changed_paths(&mut message, &changes, name_status, args.null);
+        } else if let Some(param) = &args.dirstat {
+            let dirstat =
+                compute_commit_dirstat(&commit, commit_path_filters.clone(), param).await?;
+            if !dirstat.is_empty() {
+                if !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                // Git separates the commit message from the dirstat block with
+                // a blank line (same as `--stat`).
+                message.push('\n');
+                message.push_str(&dirstat);
+                message.push('\n');
+            }
         } else if patch {
             // Build the optional diffstat block first (stat, blank line, then the
             // patch), reusing the existing `--stat` and `-p` renderers in Git's
@@ -2465,8 +2666,18 @@ async fn execute_safe_with_diff_formats(
             }
             pager.write_str(&message)?;
         } else {
-            pager.write_line(&message)?;
+            // ADR-LG-05 item 1: the separator belongs *before* each commit
+            // after the first, so no blank line is emitted after the last
+            // commit. Only the blank-line formats get an extra newline.
+            if !first_commit && blank_line_between_commits {
+                pager.write_str("\n")?;
+            }
+            pager.write_str(&message)?;
+            if !message.ends_with('\n') {
+                pager.write_str("\n")?;
+            }
         }
+        first_commit = false;
     }
 
     pager.finish()?;
@@ -2507,6 +2718,7 @@ async fn run_log(
         args.max_parents,
     );
     let pickaxe = build_pickaxe(args)?;
+    let grep_dialect = resolve_grep_dialect(args).await?;
     let filter = CommitFilter::new(
         identity_filters.authors.clone(),
         identity_filters.committers.clone(),
@@ -2518,11 +2730,12 @@ async fn run_log(
         max_parents,
         pickaxe,
     )
-    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect(args))?
+    .with_grep_options(args.ignore_case, args.invert_grep, grep_dialect)?
     .with_all_match(args.all_match)
     .with_trailer_filters(parse_trailer_filters(&args.trailers)?)
     .with_pathspec(path_specs);
 
+    let json_notes_refs = resolve_notes_display_refs(args, false).await?;
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
     let (start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
     if start_commits.is_empty() {
@@ -2591,6 +2804,16 @@ async fn run_log(
             .collect();
         let hash = commit.id.to_string();
         let short_hash = hash.get(..7).unwrap_or(&hash).to_string();
+        let mut notes = Vec::new();
+        for notes_ref in &json_notes_refs {
+            let text = crate::internal::notes::show(notes_ref, Some(&commit.id.to_string()))
+                .await
+                .map(|(_, _, text)| text)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                notes.push(text.trim_end_matches('\n').to_string());
+            }
+        }
 
         commits.push(LogCommitEntry {
             hash,
@@ -2615,6 +2838,7 @@ async fn run_log(
                 Some(current_head_commit),
             ),
             trailers,
+            notes,
             files: files
                 .into_iter()
                 .map(|file| LogFileChange {
@@ -3187,6 +3411,59 @@ pub async fn compute_commit_stat(
     Ok(stats)
 }
 
+/// Compute the `--dirstat` block for a commit's first-parent diff. Shares the
+/// Git-compatible formatter with `diff --dirstat` (ADR-LG-06 item 1).
+pub async fn compute_commit_dirstat(
+    commit: &Commit,
+    paths: Vec<PathBuf>,
+    param: &str,
+) -> Result<String, CliError> {
+    let tree = load_object::<Tree>(&commit.tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    let new_blobs: Vec<(PathBuf, ObjectHash)> = tree.get_plain_items()?;
+    let old_blobs: Vec<(PathBuf, ObjectHash)> = if let Some(parent) = first_history_parent(commit)?
+    {
+        let parent_commit = load_object::<Commit>(&parent)
+            .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
+        let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
+            .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
+        parent_tree.get_plain_items()?
+    } else {
+        Vec::new()
+    };
+    let diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    let entries: Vec<crate::utils::diff_format::DirstatEntry<'_>> = diffs
+        .iter()
+        .map(|item| {
+            let mut insertions = 0usize;
+            let mut deletions = 0usize;
+            for line in item.data.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    insertions += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    deletions += 1;
+                }
+            }
+            let binary = item
+                .data
+                .lines()
+                .any(|line| line.starts_with("Binary files "))
+                .then_some((0u64, 0u64));
+            crate::utils::diff_format::DirstatEntry {
+                name: item.path.as_str(),
+                insertions,
+                deletions,
+                raw_diff: item.data.as_str(),
+                binary,
+            }
+        })
+        .collect();
+    crate::utils::diff_format::format_dirstat(&entries, param).map_err(|message| {
+        CliError::command_usage(format!("invalid --dirstat parameter: {message}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
+}
+
 /// Formats a list of file statistics into a Git-style summary with colored bars.
 ///
 /// Each file is displayed on its own line, showing the file path, the total number of changes,
@@ -3280,84 +3557,645 @@ pub fn format_shortstat_output(stats: &[FileStat]) -> String {
     summary
 }
 
-/// Maintains state for rendering an ASCII commit graph visualization.
+/// Reorder `commits` into Git's graph (`--topo-order`-like) order: a commit is
+/// emitted only after all of its children in the selected set, with the ready
+/// set processed LIFO (Git uses a stack for `REV_SORT_IN_GRAPH_ORDER`). The
+/// incoming order is the date-ordered walk, so it supplies the initial tip order.
+fn graph_topo_order(
+    commits: Vec<SelectedLogCommit>,
+    shallow: &ShallowSet,
+) -> Vec<SelectedLogCommit> {
+    use std::collections::HashMap;
+
+    let ids: HashSet<ObjectHash> = commits.iter().map(|commit| commit.commit.id).collect();
+    let mut indegree: HashMap<ObjectHash, usize> =
+        commits.iter().map(|commit| (commit.commit.id, 1)).collect();
+    for commit in &commits {
+        for parent in history_parents(shallow, &commit.commit) {
+            if let Some(count) = indegree.get_mut(parent) {
+                *count += 1;
+            }
+        }
+    }
+
+    let ordered_ids: Vec<ObjectHash> = commits.iter().map(|commit| commit.commit.id).collect();
+    let mut by_id: HashMap<ObjectHash, SelectedLogCommit> = commits
+        .into_iter()
+        .map(|commit| (commit.commit.id, commit))
+        .collect();
+    // Git reverses the initial tip queue so the date-ordered tips pop in order;
+    // a Vec popped from the end reproduces that stack behavior. Preserve the
+    // incoming date order (not HashMap iteration order).
+    let mut stack: Vec<ObjectHash> = ordered_ids
+        .into_iter()
+        .filter(|id| ids.contains(id) && indegree.get(id).copied() == Some(1))
+        .collect();
+    stack.reverse();
+
+    let mut ordered = Vec::new();
+    while let Some(id) = stack.pop() {
+        let Some(commit) = by_id.remove(&id) else {
+            continue;
+        };
+        for parent in history_parents(shallow, &commit.commit) {
+            if let Some(count) = indegree.get_mut(parent) {
+                *count -= 1;
+                if *count == 1 {
+                    stack.push(*parent);
+                }
+            }
+        }
+        ordered.push(commit);
+    }
+    // Cycles are impossible in commit history; keep any leftovers rather than
+    // dropping output if a corrupt object graph ever produced one.
+    ordered.extend(by_id.into_values());
+    ordered
+}
+
+/// Maintains state for rendering an ASCII commit graph (a port of Git's
+/// `graph.c`).
 ///
-/// `GraphState` tracks the columns representing active branches and parent/child relationships
-/// as the commit history is traversed. It is designed to be created once and used to render
-/// each commit in traversal order (e.g., topological or chronological), producing the correct
-/// graph prefix for each commit line. The internal algorithm updates the columns vector to
-/// reflect merges and branchings, ensuring the visual structure matches the commit graph.
-#[derive(Default)]
+/// Call [`GraphState::render`] once per commit in display order. The returned
+/// [`GraphRender`] carries the prefix for the commit's own line plus the merge /
+/// collapsing rows Git prints after the commit message.
 pub struct GraphState {
+    commit: Option<ObjectHash>,
+    parents: Vec<ObjectHash>,
+    num_parents: usize,
+    width: usize,
+    expansion_row: usize,
+    state: GraphPhase,
+    prev_state: GraphPhase,
+    commit_index: usize,
+    prev_commit_index: usize,
+    merge_layout: i32,
+    edges_added: i32,
+    prev_edges_added: i32,
+    num_columns: usize,
+    num_new_columns: usize,
+    mapping_size: usize,
     columns: Vec<Option<ObjectHash>>,
+    new_columns: Vec<Option<ObjectHash>>,
+    mapping: Vec<i32>,
+    old_mapping: Vec<i32>,
+    /// Commit ids that will actually be printed; parents outside this set get no
+    /// graph edge (Git's `graph_is_interesting`).
+    visible: Option<HashSet<ObjectHash>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphPhase {
+    Padding,
+    Skip,
+    PreCommit,
+    Commit,
+    PostMerge,
+    Collapsing,
+}
+
+/// The graph contribution for one commit: `prefix` is prepended to the commit's
+/// first output line, and `trailing` holds the rows printed after the commit
+/// message.
+pub struct GraphRender {
+    pub prefix: String,
+    pub trailing: Vec<String>,
+}
+
+#[derive(Default)]
+struct GraphLine {
+    text: String,
+    width: usize,
+}
+
+impl GraphLine {
+    fn addch(&mut self, c: char) {
+        self.text.push(c);
+        self.width += 1;
+    }
+
+    fn add_str(&mut self, value: &str) {
+        self.text.push_str(value);
+        self.width += value.len();
+    }
+
+    fn add_spaces(&mut self, count: usize) {
+        for _ in 0..count {
+            self.text.push(' ');
+        }
+        self.width += count;
+    }
+}
+
+impl Default for GraphState {
+    fn default() -> Self {
+        Self {
+            commit: None,
+            parents: Vec::new(),
+            num_parents: 0,
+            width: 0,
+            expansion_row: 0,
+            state: GraphPhase::Padding,
+            prev_state: GraphPhase::Padding,
+            commit_index: 0,
+            prev_commit_index: 0,
+            merge_layout: 0,
+            edges_added: 0,
+            prev_edges_added: 0,
+            num_columns: 0,
+            num_new_columns: 0,
+            mapping_size: 0,
+            columns: Vec::new(),
+            new_columns: Vec::new(),
+            mapping: Vec::new(),
+            old_mapping: Vec::new(),
+            visible: None,
+        }
+    }
 }
 
 impl GraphState {
-    /// Creates a new, empty `GraphState` for rendering a commit graph.
+    /// Creates a new, empty `GraphState`; every parent is treated as shown.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Renders the ASCII graph prefix for a given commit, updating internal state.
-    ///
-    /// Call this method for each commit in traversal order. It returns a string representing
-    /// the graph structure (e.g., `* | |`) for the current commit, updating the internal
-    /// columns to reflect parent/child relationships and merges.
-    ///
-    /// # Arguments
-    ///
-    /// * `commit` - The commit to render in the graph.
-    ///
-    /// # Returns
-    ///
-    /// A string containing the ASCII graph prefix for the commit.
-    pub fn render(&mut self, commit: &Commit) -> String {
-        let commit_id = commit.id;
-        let parent_ids = &commit.parent_commit_ids; // SHALLOW-DISPLAY: graph columns for shown commits
+    /// Creates a graph state that only draws edges to `commits` (the commits the
+    /// log will actually print), matching Git's "interesting parent" rule.
+    pub fn with_visible(commits: impl IntoIterator<Item = ObjectHash>) -> Self {
+        Self {
+            visible: Some(commits.into_iter().collect()),
+            ..Self::default()
+        }
+    }
 
-        let mut prefix = String::new();
+    /// Renders the graph contribution for `commit`, advancing internal state.
+    pub fn render(&mut self, commit: &Commit) -> GraphRender {
+        self.update(commit);
 
-        if let Some(pos) = self.columns.iter().position(|&c| c == Some(commit_id)) {
-            for (i, col) in self.columns.iter().enumerate() {
-                if i == pos {
-                    prefix.push_str("* ");
-                } else if col.is_some() {
-                    prefix.push_str("| ");
-                } else {
-                    prefix.push_str("  ");
-                }
+        let mut prefix_lines = Vec::new();
+        let mut commit_line = String::new();
+        // Bounded: the Git state machine always reaches the commit line, but a
+        // corrupt state must never hang the command.
+        for _ in 0..256 {
+            let (line, is_commit) = self.next_line();
+            if is_commit {
+                commit_line = line;
+                break;
             }
-
-            if parent_ids.is_empty() {
-                self.columns[pos] = None;
-            } else if parent_ids.len() == 1 {
-                self.columns[pos] = Some(parent_ids[0]);
-            } else {
-                self.columns[pos] = Some(parent_ids[0]);
-
-                for parent_id in parent_ids.iter().skip(1) {
-                    self.columns.push(Some(*parent_id));
-                }
+            prefix_lines.push(line);
+        }
+        let mut trailing = Vec::new();
+        for _ in 0..256 {
+            if self.state == GraphPhase::Padding {
+                break;
             }
+            let (line, _) = self.next_line();
+            trailing.push(line);
+        }
+
+        let mut prefix = prefix_lines.join("\n");
+        if !prefix.is_empty() {
+            prefix.push('\n');
+        }
+        prefix.push_str(&commit_line);
+        GraphRender { prefix, trailing }
+    }
+
+    fn update(&mut self, commit: &Commit) {
+        self.commit = Some(commit.id);
+        self.parents = self.interesting_parents(commit);
+        self.num_parents = self.parents.len();
+        self.prev_commit_index = self.commit_index;
+        self.update_columns(commit);
+        self.expansion_row = 0;
+        if self.state != GraphPhase::Padding {
+            self.state = GraphPhase::Skip;
+        } else if self.needs_pre_commit_line() {
+            self.state = GraphPhase::PreCommit;
         } else {
-            self.columns.insert(0, None);
-            prefix.push_str("* ");
-            for _ in 1..self.columns.len() {
-                prefix.push_str("| ");
+            self.state = GraphPhase::Commit;
+        }
+    }
+
+    /// Git's `graph_update_state`: remember the line just emitted so the next
+    /// line's rendering can depend on it.
+    fn set_state(&mut self, next: GraphPhase) {
+        self.prev_state = self.state;
+        self.state = next;
+    }
+
+    fn is_interesting(&self, id: ObjectHash) -> bool {
+        match &self.visible {
+            Some(set) => set.contains(&id),
+            None => true,
+        }
+    }
+
+    fn interesting_parents(&self, commit: &Commit) -> Vec<ObjectHash> {
+        commit
+            .parent_commit_ids // SHALLOW-DISPLAY: graph columns for shown commits
+            .iter()
+            .copied()
+            .filter(|id| self.is_interesting(*id))
+            .collect()
+    }
+
+    fn ensure_capacity(&mut self, columns: usize) {
+        if self.columns.len() < columns {
+            self.columns.resize(columns, None);
+            self.new_columns.resize(columns, None);
+        }
+        if self.mapping.len() < columns * 2 {
+            self.mapping.resize(columns * 2, -1);
+            self.old_mapping.resize(columns * 2, -1);
+        }
+    }
+
+    fn find_new_column_by_commit(&self, commit: Option<ObjectHash>) -> Option<usize> {
+        (0..self.num_new_columns).find(|&i| self.new_columns[i] == commit)
+    }
+
+    fn insert_into_new_columns(&mut self, commit: Option<ObjectHash>, parent_idx: Option<usize>) {
+        let slot = match self.find_new_column_by_commit(commit) {
+            Some(slot) => slot,
+            None => {
+                let slot = self.num_new_columns;
+                if self.new_columns.len() <= slot {
+                    self.new_columns.resize(slot + 1, None);
+                }
+                self.new_columns[slot] = commit;
+                self.num_new_columns += 1;
+                slot
             }
+        };
+        let slot_i = slot as i32;
 
-            if !parent_ids.is_empty() {
-                self.columns[0] = Some(parent_ids[0]);
+        if self.num_parents > 1 && parent_idx.is_some() && self.merge_layout == -1 {
+            let idx = parent_idx.unwrap_or(0) as i32;
+            let dist = idx - slot_i;
+            let shift = if dist > 1 { 2 * dist - 3 } else { 1 };
+            self.merge_layout = if dist > 0 { 0 } else { 1 };
+            self.edges_added = self.num_parents as i32 + self.merge_layout - 2;
+            let mapping_idx = self.width as i32 + (self.merge_layout - 1) * shift;
+            self.width = (self.width as i32 + 2 * self.merge_layout).max(0) as usize;
+            if mapping_idx >= 0 && (mapping_idx as usize) < self.mapping.len() {
+                self.mapping[mapping_idx as usize] = slot_i;
+            }
+        } else if self.edges_added > 0 && self.width >= 2 && self.mapping[self.width - 2] == slot_i
+        {
+            self.edges_added = -1;
+            self.mapping[self.width - 2] = slot_i;
+        } else {
+            let mapping_idx = self.width;
+            self.width += 2;
+            if mapping_idx < self.mapping.len() {
+                self.mapping[mapping_idx] = slot_i;
+            }
+        }
+    }
 
-                for parent_id in parent_ids.iter().skip(1) {
-                    self.columns.push(Some(*parent_id));
+    fn update_columns(&mut self, commit: &Commit) {
+        std::mem::swap(&mut self.columns, &mut self.new_columns);
+        self.num_columns = self.num_new_columns;
+        self.num_new_columns = 0;
+
+        let max_new_columns = self.num_columns + self.num_parents;
+        self.ensure_capacity(max_new_columns);
+        self.mapping_size = 2 * max_new_columns;
+        for i in 0..self.mapping_size {
+            self.mapping[i] = -1;
+        }
+        self.width = 0;
+        self.prev_edges_added = self.edges_added;
+        self.edges_added = 0;
+
+        let mut seen_this = false;
+        let mut i = 0;
+        while i <= self.num_columns {
+            let col_commit = if i == self.num_columns {
+                if seen_this {
+                    break;
+                }
+                Some(commit.id)
+            } else {
+                self.columns[i]
+            };
+            if col_commit == Some(commit.id) {
+                seen_this = true;
+                self.commit_index = i;
+                self.merge_layout = -1;
+                let parents = self.parents.clone();
+                for parent in parents {
+                    self.insert_into_new_columns(Some(parent), Some(i));
+                }
+                if self.num_parents == 0 {
+                    self.width += 2;
+                }
+            } else {
+                self.insert_into_new_columns(col_commit, None);
+            }
+            i += 1;
+        }
+
+        while self.mapping_size > 1 && self.mapping[self.mapping_size - 1] < 0 {
+            self.mapping_size -= 1;
+        }
+    }
+
+    fn num_dashed_parents(&self) -> i32 {
+        self.num_parents as i32 + self.merge_layout - 3
+    }
+
+    fn expansion_rows(&self) -> usize {
+        (self.num_dashed_parents().max(0) as usize) * 2
+    }
+
+    fn needs_pre_commit_line(&self) -> bool {
+        self.num_parents >= 3
+            && self.num_columns >= 2
+            && self.commit_index + 1 < self.num_columns
+            && self.expansion_row < self.expansion_rows()
+    }
+
+    fn is_mapping_correct(&self) -> bool {
+        for (i, &target) in self.mapping.iter().take(self.mapping_size).enumerate() {
+            if target < 0 {
+                continue;
+            }
+            if target != (i / 2) as i32 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn pad_horizontally(&self, line: &mut GraphLine) {
+        if line.width < self.width {
+            line.add_spaces(self.width - line.width);
+        }
+    }
+
+    fn next_line(&mut self) -> (String, bool) {
+        let mut line = GraphLine::default();
+        let mut shown_commit = false;
+        match self.state {
+            GraphPhase::Padding => self.output_padding_line(&mut line),
+            GraphPhase::Skip => self.output_skip_line(&mut line),
+            GraphPhase::PreCommit => self.output_pre_commit_line(&mut line),
+            GraphPhase::Commit => {
+                self.output_commit_line(&mut line);
+                shown_commit = true;
+            }
+            GraphPhase::PostMerge => self.output_post_merge_line(&mut line),
+            GraphPhase::Collapsing => self.output_collapsing_line(&mut line),
+        }
+        self.pad_horizontally(&mut line);
+        (line.text, shown_commit)
+    }
+
+    fn output_padding_line(&self, line: &mut GraphLine) {
+        for _ in 0..self.num_new_columns {
+            line.addch('|');
+            line.addch(' ');
+        }
+    }
+
+    fn output_skip_line(&mut self, line: &mut GraphLine) {
+        line.add_str("...");
+        if self.needs_pre_commit_line() {
+            self.set_state(GraphPhase::PreCommit);
+        } else {
+            self.set_state(GraphPhase::Commit);
+        }
+    }
+
+    fn output_pre_commit_line(&mut self, line: &mut GraphLine) {
+        let mut seen_this = false;
+        for i in 0..self.num_columns {
+            let col = self.columns[i];
+            if col == self.commit {
+                seen_this = true;
+                line.addch('|');
+                line.add_spaces(self.expansion_row);
+            } else if seen_this && self.expansion_row == 0 {
+                if self.prev_state == GraphPhase::PostMerge && self.prev_commit_index < i {
+                    line.addch('\\');
+                } else {
+                    line.addch('|');
+                }
+            } else if seen_this {
+                line.addch('\\');
+            } else {
+                line.addch('|');
+            }
+            line.addch(' ');
+        }
+        self.expansion_row += 1;
+        if !self.needs_pre_commit_line() {
+            self.set_state(GraphPhase::Commit);
+        }
+    }
+
+    fn draw_octopus_merge(&self, line: &mut GraphLine) {
+        let dashed = self.num_dashed_parents();
+        for i in 0..dashed.max(0) {
+            let mapping_idx = ((self.commit_index as i32 + i + 2) * 2) as usize;
+            let target = self.mapping.get(mapping_idx).copied().unwrap_or(-1);
+            if target < 0 || target as usize >= self.new_columns.len() {
+                continue;
+            }
+            line.addch('-');
+            line.addch(if i == dashed - 1 { '.' } else { '-' });
+        }
+    }
+
+    fn output_commit_line(&mut self, line: &mut GraphLine) {
+        let mut seen_this = false;
+        for i in 0..=self.num_columns {
+            let col_commit = if i == self.num_columns {
+                if seen_this {
+                    break;
+                }
+                self.commit
+            } else {
+                self.columns[i]
+            };
+            if col_commit == self.commit {
+                seen_this = true;
+                line.addch('*');
+                if self.num_parents > 2 {
+                    self.draw_octopus_merge(line);
+                }
+            } else if seen_this && self.edges_added > 1 {
+                line.addch('\\');
+            } else if seen_this && self.edges_added == 1 {
+                if self.prev_state == GraphPhase::PostMerge
+                    && self.prev_edges_added > 0
+                    && self.prev_commit_index < i
+                {
+                    line.addch('\\');
+                } else {
+                    line.addch('|');
+                }
+            } else if self.prev_state == GraphPhase::Collapsing
+                && self.old_mapping.get(2 * i + 1).copied() == Some(i as i32)
+                && self.mapping.get(2 * i).copied().unwrap_or(0) < i as i32
+            {
+                line.addch('/');
+            } else {
+                line.addch('|');
+            }
+            line.addch(' ');
+        }
+
+        if self.num_parents > 1 {
+            self.set_state(GraphPhase::PostMerge);
+        } else if self.is_mapping_correct() {
+            self.set_state(GraphPhase::Padding);
+        } else {
+            self.set_state(GraphPhase::Collapsing);
+        }
+    }
+
+    fn output_post_merge_line(&mut self, line: &mut GraphLine) {
+        let parents = self.parents.clone();
+        let first_parent = parents.first().copied();
+        let mut seen_this = false;
+        let mut parent_col: Option<usize> = None;
+        for i in 0..=self.num_columns {
+            let col_commit = if i == self.num_columns {
+                if seen_this {
+                    break;
+                }
+                self.commit
+            } else {
+                self.columns[i]
+            };
+            if col_commit == self.commit {
+                seen_this = true;
+                let mut idx = self.merge_layout;
+                for (j, parent) in parents.iter().enumerate() {
+                    let Some(par_column) = self.find_new_column_by_commit(Some(*parent)) else {
+                        continue;
+                    };
+                    let _ = par_column;
+                    line.addch(match idx {
+                        0 => '/',
+                        1 => '|',
+                        _ => '\\',
+                    });
+                    if idx == 2 {
+                        if self.edges_added > 0 || j + 1 < parents.len() {
+                            line.addch(' ');
+                        }
+                    } else {
+                        idx += 1;
+                    }
+                }
+                if self.edges_added == 0 {
+                    line.addch(' ');
+                }
+            } else if seen_this {
+                if self.edges_added > 0 {
+                    line.addch('\\');
+                } else {
+                    line.addch('|');
+                }
+                line.addch(' ');
+            } else {
+                line.addch('|');
+                if self.merge_layout != 0 || (i as i32) != self.commit_index as i32 - 1 {
+                    if parent_col.is_some() {
+                        line.addch('_');
+                    } else {
+                        line.addch(' ');
+                    }
+                }
+            }
+            if first_parent.is_some() && col_commit == first_parent {
+                parent_col = Some(i);
+            }
+        }
+
+        if self.is_mapping_correct() {
+            self.set_state(GraphPhase::Padding);
+        } else {
+            self.set_state(GraphPhase::Collapsing);
+        }
+    }
+
+    fn output_collapsing_line(&mut self, line: &mut GraphLine) {
+        std::mem::swap(&mut self.mapping, &mut self.old_mapping);
+        for i in 0..self.mapping_size {
+            self.mapping[i] = -1;
+        }
+
+        let mut used_horizontal = false;
+        let mut horizontal_edge: i32 = -1;
+        let mut horizontal_edge_target: i32 = -1;
+        for i in 0..self.mapping_size {
+            let target = self.old_mapping[i];
+            if target < 0 {
+                continue;
+            }
+            if target * 2 == i as i32 {
+                self.mapping[i] = target;
+            } else if i >= 1 && self.mapping[i - 1] < 0 {
+                self.mapping[i - 1] = target;
+                if horizontal_edge == -1 {
+                    horizontal_edge = i as i32;
+                    horizontal_edge_target = target;
+                    let mut j = (target * 2 + 3).max(0) as usize;
+                    while j + 2 < i {
+                        self.mapping[j] = target;
+                        j += 2;
+                    }
+                }
+            } else if i >= 1 && self.mapping[i - 1] == target {
+                // Already merging into the branch line to our left.
+            } else if i >= 2 {
+                self.mapping[i - 2] = target;
+                if horizontal_edge == -1 {
+                    horizontal_edge_target = target;
+                    horizontal_edge = i as i32 - 1;
+                    let mut j = (target * 2 + 3).max(0) as usize;
+                    while j + 2 < i {
+                        self.mapping[j] = target;
+                        j += 2;
+                    }
                 }
             }
         }
 
-        self.columns.retain(|c| c.is_some());
+        self.old_mapping[..self.mapping_size].copy_from_slice(&self.mapping[..self.mapping_size]);
+        if self.mapping_size > 1 && self.mapping[self.mapping_size - 1] < 0 {
+            self.mapping_size -= 1;
+        }
 
-        prefix
+        for i in 0..self.mapping_size {
+            let target = self.mapping[i];
+            if target < 0 {
+                line.addch(' ');
+            } else if target * 2 == i as i32 {
+                line.addch('|');
+            } else if target == horizontal_edge_target && i as i32 != horizontal_edge - 1 {
+                if i as i32 != target * 2 + 3 {
+                    self.mapping[i] = -1;
+                }
+                used_horizontal = true;
+                line.addch('_');
+            } else {
+                if used_horizontal && (i as i32) < horizontal_edge {
+                    self.mapping[i] = -1;
+                }
+                line.addch('/');
+            }
+        }
+
+        if self.is_mapping_correct() {
+            self.set_state(GraphPhase::Padding);
+        }
     }
 }
 
@@ -3624,7 +4462,7 @@ mod tests {
                     None,
                     None,
                 )
-                .with_grep_options(ignore_case, invert, GrepDialect::Basic)
+                .with_grep_options(ignore_case, invert, GrepPatternType::Basic)
                 .unwrap();
                 assert_eq!(
                     filter.passes_non_path_filters(&commit),
@@ -3663,7 +4501,7 @@ mod tests {
                         None,
                         None,
                     )
-                    .with_grep_options(false, invert, GrepDialect::Basic)
+                    .with_grep_options(false, invert, GrepPatternType::Basic)
                     .unwrap();
                     assert_eq!(
                         filter.passes_non_path_filters(&commit),

@@ -20,6 +20,10 @@
   still refuses a `/.traces/` locator, and a Mega2 code mirror still fetches
   branch tips only. This note records the code delivery. It is not a GitHub
   Release, and the live HTTP/SSH audit is not claimed here.
+- `traces search` and `traces transcript` now call Mega2's mounted per-stream
+  routes: `search` requires `--stream` (unsupported filters are refused
+  locally; the route owns the body budget), and `transcript` accepts an
+  optional `--session` and resolves it from the checkpoint when omitted.
 
 ### Changed
 

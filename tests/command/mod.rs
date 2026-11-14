@@ -1130,6 +1130,7 @@ mod sandbox_status_test;
 mod schema_upgrade_test;
 mod service_test;
 mod shallow_walk_test;
+mod shared_repo_test;
 mod shortlog_test;
 mod show_ref_abbrev_test;
 mod show_ref_alias_test;

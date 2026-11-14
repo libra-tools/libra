@@ -18,6 +18,8 @@ libra commit --no-agent-trailer -m <MESSAGE>
 
 ## 说明
 
+`commit -a` 自动暂存已跟踪文件时使用显式 `text`/`eol` clean 比较。单纯 CRLF/LF 表示差异不会产生内容修改，也不会使本应为空的提交得以创建。真实编辑通过与 `add` 相同的转换暂存。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra commit` 从已暂存更改创建新提交，构建 tree 和 commit 对象，验证消息（包括可选的 conventional commit 格式，以及通过 vault 进行 GPG 签名），并更新 HEAD 和 refs。
 
 该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，否则会运行 `.libra/hooks` 的 commit 生命周期。

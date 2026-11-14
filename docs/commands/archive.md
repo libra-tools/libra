@@ -81,9 +81,16 @@ On success, `libra archive` writes archive bytes to stdout or to the path passed
 with `--output <FILE>`. It does not print a separate success message.
 
 Tar archives preserve regular files, executable file modes, symlinks, nested
-paths, empty files, and Unicode filenames. Zip archives are built in memory
-first because the zip writer requires seekable output, then flushed to the
-requested destination.
+paths, empty files, and Unicode filenames. The `tar`, `tar.gz`, and `tar.bz2`
+writers use GNU LongName/LongLink extensions when an archive path (after
+applying `--prefix`) or a symlink target exceeds the fixed 100-byte header
+fields. Common tar readers can list and extract the full logical names and
+targets; this fixed header limit does not reject them. Repository, input-size,
+and host-filesystem limits still apply. This interoperable GNU encoding is not
+a promise of byte-for-byte pax header parity with `git archive`.
+
+Zip archives are built in memory first because the zip writer requires seekable
+output, then flushed to the requested destination.
 
 ## Error Handling
 

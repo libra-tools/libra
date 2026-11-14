@@ -15,6 +15,8 @@ libra add -N [PATHSPEC...]
 
 ## Description
 
+Candidate classification also uses the clean representation. A change to attributes can make a tracked file stageable without any change to its stat; a CRLF/LF representation difference alone does not report a content modification. `--renormalize` still explicitly reprocesses tracked files. This comparison does not rewrite the working file.
+
 `libra add` stages file changes from the working tree into the index, preparing them
 for the next `libra commit`. It supports shared Git-style pathspec matching,
 `--dry-run` preview, and `--refresh` to re-stat already tracked entries without
@@ -30,6 +32,34 @@ Symbolic links are staged as Git-compatible symlink blobs: the index mode is
 `120000` and the blob content is the link target bytes. The link is never
 followed while staging, so a symlink pointing outside the worktree is recorded
 as the link itself rather than as the target file's contents.
+
+### Line endings
+
+For regular files, an explicit `text` attribute (optionally with `eol=lf` or
+`eol=crlf`) stores CRLF pairs as LF in the index. An `eol` attribute also enables
+this conversion when `text` is unspecified. For example, `*.ps1 text eol=crlf`
+keeps the working file's CRLF bytes while staging an LF blob. Lone CR bytes and
+a missing final newline are preserved; `add` does not rewrite the working file.
+
+`text=auto` applies CRLF-to-LF conversion only to text input, including when
+paired with `eol=lf` or `eol=crlf`. Detection checks NUL, lone CR and the proportion
+of non-printable bytes. Ordinary `add` preserves the representation when the
+existing indexed blob contains non-binary CRLF text. `add --renormalize` bypasses
+that historical protection while retaining binary detection. Neither mode
+rewrites the source file or old objects. Status and built-in diff comparisons
+use the same ordinary policy, so equivalent mixed CRLF/LF text compares clean
+against a normalized index, while actual edits still appear.
+
+Historical index evidence is read locally with a deadline and a 32 MiB
+per-object limit. Missing, corrupt, unreadable or oversized required evidence
+returns an error, never a clean result. Restore readable local objects, or use
+`add --renormalize` when intentionally replacing the indexed representation.
+Reading files or attribute sources can also fail; without `--ignore-errors`,
+`add` does not save a partially updated index.
+
+`-text` disables conversion. LFS pointers and symlink targets retain their own
+representation. Configuration fallback through `core.autocrlf`, `core.safecrlf`,
+custom clean/smudge filters and CRLF checkout conversion remain unsupported.
 
 ## Options
 
@@ -232,7 +262,9 @@ libra add --chmod=-x notes.txt
 
 Re-stage tracked files from scratch, rewriting their blobs even when the content is
 unchanged. Implies `-u`: only tracked files are processed (never untracked ones), and
-a tracked file removed from the working tree has its deletion staged.
+a tracked file removed from the working tree has its deletion staged. The current
+explicit `text`/`eol` rules are reapplied even when file stat data is unchanged.
+Existing blob objects and working file bytes are preserved.
 
 ```bash
 libra add --renormalize

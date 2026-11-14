@@ -142,9 +142,11 @@ fn reverse_hunk(hunk: &Hunk) -> Hunk {
         old_lines: hunk.new_lines,
         new_start: hunk.old_start,
         new_lines: hunk.old_lines,
-        header: format!(
-            "@@ -{},{} +{},{} @@",
-            hunk.new_start, hunk.new_lines, hunk.old_start, hunk.old_lines
+        header: crate::utils::diff_format::format_hunk_header(
+            hunk.new_start,
+            hunk.new_lines,
+            hunk.old_start,
+            hunk.old_lines,
         ),
         lines: hunk
             .lines

@@ -1220,12 +1220,7 @@ mod tests {
 
         use crate::internal::ai::observed_agents::redaction::Redactor;
 
-        let program = std::env::current_exe()
-            .expect("locate the unit test binary")
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("locate the Cargo target directory")
-            .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+        let program = crate::utils::test::real_libra_helper_binary();
         assert!(
             program.is_file(),
             "the real Libra helper binary must be built before this unit test"

@@ -508,6 +508,7 @@ where
     match callback(&txn).await {
         Ok(value) => {
             txn.commit().await.map_err(TransactionError::Connection)?;
+            adjust_db_shared_permissions_if_shared();
             Ok(value)
         }
         Err(err) => {
@@ -881,7 +882,22 @@ fn error_chain_text(error: &anyhow::Error) -> String {
 /// - Returns `Ok(())` if the database file was created and the schema was set up successfully.
 /// - Returns an `IOError` if the database file already exists, or if there was an error creating the file or setting up the schema.
 pub async fn create_database(db_path: &str) -> io::Result<DatabaseConnection> {
-    create_database_for_role(db_path, DatabaseRole::Repository).await
+    let conn = create_database_for_role(db_path, DatabaseRole::Repository).await?;
+    let path = Path::new(db_path);
+    if let Ok(Some(shared_mode)) = crate::utils::shared_perm::get_shared_mode_for_path(path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm_for_db(path, &shared_mode);
+    }
+    Ok(conn)
+}
+
+fn adjust_db_shared_permissions_if_shared() {
+    if let Ok(storage) = crate::utils::util::try_request_storage_path() {
+        let db_path = storage.join("libra.db");
+        if let Ok(Some(shared_mode)) = crate::utils::shared_perm::get_shared_mode_for_path(&db_path)
+        {
+            let _ = crate::utils::shared_perm::adjust_shared_perm_for_db(&db_path, &shared_mode);
+        }
+    }
 }
 
 #[cfg(test)]

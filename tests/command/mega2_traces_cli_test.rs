@@ -150,8 +150,12 @@ fn search_readiness_preflight_contract() {
                 r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111"}"#
                     .to_string()
             }
-            _ => {
+            3 => {
                 r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111","search_ready":"yes"}"#
+                    .to_string()
+            }
+            _ => {
+                r#"{"protocol":"libra-traces/v1","server_id":"11111111-1111-4111-8111-111111111111","search_ready":true}"#
                     .to_string()
             }
         };
@@ -223,7 +227,28 @@ fn search_readiness_preflight_contract() {
         String::from_utf8_lossy(&plain.stderr)
     );
     assert!(String::from_utf8_lossy(&plain.stdout).contains("libra-traces/v1"));
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    // A boolean true readiness passes the preflight.
+    let ready = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "capabilities",
+            "--require-search",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+        ],
+        root.path(),
+    );
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ready.stdout).contains("search_ready"));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
 }
 
 #[test]
@@ -233,12 +258,14 @@ fn target_resolve_navigation_contract() {
             path.contains("path=%2Fproject%2Ffoo") || path.contains("path=/project/foo"),
             "{path}"
         );
+        assert!(!path.contains("%2F%2F"), "path must be canonical: {path}");
         (
             200,
             r#"{"target_id":"target-1","path":"/project/foo"}"#.to_string(),
         )
     });
     let root = tempfile::tempdir().expect("root");
+    let server = format!("http://127.0.0.1:{port}");
     let output = run_libra_command(
         &[
             "--json",
@@ -246,7 +273,7 @@ fn target_resolve_navigation_contract() {
             "traces",
             "targets",
             "--server",
-            &format!("http://127.0.0.1:{port}"),
+            &server,
             "--token",
             "test-token",
             "--path",
@@ -260,6 +287,74 @@ fn target_resolve_navigation_contract() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("target-1"));
+    // The shared normalization rule trims one trailing slash.
+    let trimmed = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--path",
+            "/project/foo/",
+        ],
+        root.path(),
+    );
+    assert!(
+        trimmed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trimmed.stderr)
+    );
+    // Non-canonical input is refused before any request.
+    let refused = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--path",
+            "/project//foo",
+        ],
+        root.path(),
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not canonical"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Unknown and unauthorized targets both surface as 404; the client must
+    // fail instead of inventing a target.
+    let (missing_port, _) = serve(|path, _| {
+        assert!(path.contains("/targets/resolve"), "{path}");
+        (404, r#"{"code":"unknown_target"}"#.to_string())
+    });
+    let missing = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "targets",
+            "--server",
+            &format!("http://127.0.0.1:{missing_port}"),
+            "--token",
+            "test-token",
+            "--path",
+            "/project/missing",
+        ],
+        root.path(),
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("404"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 }
 
 #[test]
@@ -522,14 +617,26 @@ fn session_time_filter_contract() {
 #[test]
 fn checkpoint_navigation_contract() {
     let (port, _) = serve(|path, _| {
-        if path.contains("/checkpoints/cp-1") && !path.contains("transcript") {
+        if path.ends_with("/sessions/session-1/checkpoints/cp-1") && !path.contains("transcript") {
             (
                 200,
                 r#"{"checkpoint_id":"cp-1","accepted_watermark":"a","indexed_watermark":"b","unsupported":1,"invalid":2,"code_link":"unresolved"}"#.to_string(),
             )
-        } else {
-            assert!(path.contains("cursor=page-3"), "{path}");
+        } else if path.contains("/sessions/session-1/checkpoints") {
+            // Either the listing call or the session-resolution probe.
+            if !path.contains("cursor=page-3") {
+                assert!(path.contains("limit=200"), "{path}");
+            }
             (200, r#"{"items":[{"checkpoint_id":"cp-1"}]}"#.to_string())
+        } else {
+            assert!(
+                path.ends_with("/sessions?limit=200") || path.contains("/sessions?limit=200"),
+                "{path}"
+            );
+            (
+                200,
+                r#"{"items":[{"session_id":"session-1"}],"next_cursor":null}"#.to_string(),
+            )
         }
     });
     let root = tempfile::tempdir().expect("root");
@@ -580,6 +687,30 @@ fn checkpoint_navigation_contract() {
         "{}",
         String::from_utf8_lossy(&show.stderr)
     );
+    let both = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "show",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--stream",
+            "stream-1",
+            "--session",
+            "session-1",
+            "--checkpoint",
+            "cp-1",
+        ],
+        root.path(),
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("not both"),
+        "{}",
+        String::from_utf8_lossy(&both.stderr)
+    );
     let show_text = String::from_utf8_lossy(&show.stdout);
     assert!(show_text.contains("cp-1"), "{show_text}");
     assert!(show_text.contains("unresolved"), "{show_text}");
@@ -593,13 +724,20 @@ fn checkpoint_navigation_contract() {
 fn keyword_search_contract_matrix() {
     let (port, _) = serve(|path, _| {
         if path.contains("/search") {
+            assert!(
+                path.contains("/streams/stream-1/search"),
+                "search must use the mounted per-stream route: {path}"
+            );
             assert!(path.contains("limit=20"), "{path}");
-            assert!(path.contains("max_bytes=16384"), "{path}");
+            assert!(
+                !path.contains("max_bytes"),
+                "the mounted route owns the budget: {path}"
+            );
             if path.contains("%E4%BD%A0") || path.contains("q=%E4%BD%A0") || path.contains("q=你")
             {
                 (
                     200,
-                    r#"{"items":[],"coverage_complete":false,"index_state":"pending"}"#.to_string(),
+                    r#"{"items":[],"coverage":{"coverage_complete":false}}"#.to_string(),
                 )
             } else {
                 (
@@ -608,7 +746,7 @@ fn keyword_search_contract_matrix() {
                 )
             }
         } else {
-            (200, r#"{"target_id":"target-1"}"#.to_string())
+            (404, r#"{"code":"unknown_scope"}"#.to_string())
         }
     });
     let root = tempfile::tempdir().expect("root");
@@ -625,6 +763,8 @@ fn keyword_search_contract_matrix() {
             "test-token",
             "--target",
             "/project/foo",
+            "--stream",
+            "stream-1",
             "--query",
             "你",
         ],
@@ -635,7 +775,6 @@ fn keyword_search_contract_matrix() {
         "{}",
         String::from_utf8_lossy(&found.stderr)
     );
-    assert!(String::from_utf8_lossy(&found.stdout).contains("pending"));
     let unavailable = run_libra_command(
         &[
             "mega2",
@@ -647,6 +786,8 @@ fn keyword_search_contract_matrix() {
             "test-token",
             "--target",
             "/project/foo",
+            "--stream",
+            "stream-1",
             "--query",
             "timeout",
         ],
@@ -655,11 +796,53 @@ fn keyword_search_contract_matrix() {
     assert!(!unavailable.status.success());
     let stderr = String::from_utf8_lossy(&unavailable.stderr);
     assert!(stderr.contains("search_unavailable"), "{stderr}");
+
+    // The aggregate route is gone: a search without a stream and a filter the
+    // mounted route does not support are refused before any request.
+    for args in [
+        vec![
+            "search",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--target",
+            "/project/foo",
+            "--query",
+            "x",
+        ],
+        vec![
+            "search",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--target",
+            "/project/foo",
+            "--stream",
+            "stream-1",
+            "--agent",
+            "codex",
+            "--query",
+            "x",
+        ],
+    ] {
+        let mut command = vec!["mega2", "traces"];
+        command.extend(args);
+        let refused = run_libra_command(&command, root.path());
+        assert!(!refused.status.success(), "{command:?}");
+    }
 }
 
 #[test]
 fn search_local_admission_contract() {
-    let (port, hits) = serve(|_, _| (200, r#"{"target_id":"target-1"}"#.to_string()));
+    let (port, hits) = serve(|path, _| {
+        assert!(path.contains("/streams/stream-1/search"), "{path}");
+        (
+            200,
+            r#"{"items":[],"coverage":{"coverage_complete":true}}"#.to_string(),
+        )
+    });
     let root = tempfile::tempdir().expect("root");
     let server = format!("http://127.0.0.1:{port}");
     for query in ["", &"a".repeat(257)] {
@@ -674,6 +857,8 @@ fn search_local_admission_contract() {
                 "test-token",
                 "--target",
                 "/project/foo",
+                "--stream",
+                "stream-1",
                 "--query",
                 query,
             ],
@@ -695,6 +880,8 @@ fn search_local_admission_contract() {
             "test-token",
             "--target",
             "/project/foo",
+            "--stream",
+            "stream-1",
             "--query",
             "a",
         ],
@@ -710,11 +897,24 @@ fn search_local_admission_contract() {
 #[test]
 fn bounded_evidence_read_matrix() {
     let (port, _) = serve(|path, _| {
-        assert!(path.contains("max_bytes=16384"), "{path}");
-        (
-            200,
-            r#"{"text":"hello","partial":false,"next_cursor":null}"#.to_string(),
-        )
+        if path.contains("/transcript") {
+            assert!(
+                path.contains("/sessions/session-1/checkpoints/cp-1/transcript"),
+                "{path}"
+            );
+            assert!(path.contains("max_bytes=16384"), "{path}");
+            return (
+                200,
+                r#"{"text":"hello","partial":false,"next_cursor":null}"#.to_string(),
+            );
+        }
+        if path.contains("/sessions/session-1/checkpoints") {
+            return (200, r#"{"items":[{"checkpoint_id":"cp-1"}]}"#.to_string());
+        }
+        if path.contains("/sessions") {
+            return (200, r#"{"items":[{"session_id":"session-1"}]}"#.to_string());
+        }
+        (404, r#"{"code":"unknown_scope"}"#.to_string())
     });
     let root = tempfile::tempdir().expect("root");
     let output = run_libra_command(
@@ -1022,4 +1222,124 @@ fn explicit_fetch_scope_and_local_invariants() {
         1,
         "a fingerprint conflict must not download the archive"
     );
+}
+
+#[test]
+fn transcript_resolves_the_owning_session() {
+    let (port, hits) = serve(|path, _| {
+        if path.contains("/transcript") {
+            assert!(
+                path.contains("/sessions/session-2/checkpoints/cp-1/transcript"),
+                "the transcript route must carry the resolved session: {path}"
+            );
+            return (
+                200,
+                r#"{"checkpoint_id":"cp-1","text":"hello","truncated":false,"next_cursor":null}"#
+                    .to_string(),
+            );
+        }
+        if path.contains("/sessions/session-2/checkpoints") {
+            return (200, r#"{"items":[{"checkpoint_id":"cp-1"}]}"#.to_string());
+        }
+        if path.contains("/sessions/session-1/checkpoints") {
+            return (200, r#"{"items":[{"checkpoint_id":"other"}]}"#.to_string());
+        }
+        if path.contains("/sessions") {
+            return (
+                200,
+                r#"{"items":[{"session_id":"session-1"},{"session_id":"session-2"}]}"#.to_string(),
+            );
+        }
+        (404, r#"{"code":"unknown_scope"}"#.to_string())
+    });
+    let root = tempfile::tempdir().expect("root");
+    let server = format!("http://127.0.0.1:{port}");
+    let resolved = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "transcript",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--stream",
+            "stream-1",
+            "--checkpoint",
+            "cp-1",
+        ],
+        root.path(),
+    );
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let text = String::from_utf8_lossy(&resolved.stdout);
+    assert!(text.contains("hello"), "{text}");
+
+    // An explicit session skips the discovery pages and goes straight to the
+    // mounted route.
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let explicit = run_libra_command(
+        &[
+            "--json",
+            "mega2",
+            "traces",
+            "transcript",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--stream",
+            "stream-1",
+            "--session",
+            "session-2",
+            "--checkpoint",
+            "cp-1",
+        ],
+        root.path(),
+    );
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let after = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(after - before, 1, "explicit session uses one request");
+}
+
+#[test]
+fn transcript_reports_a_missing_checkpoint() {
+    let (port, _) = serve(|path, _| {
+        if path.contains("/sessions") {
+            (200, r#"{"items":[{"session_id":"session-1"}]}"#.to_string())
+        } else if path.contains("/checkpoints") {
+            (200, r#"{"items":[{"checkpoint_id":"other"}]}"#.to_string())
+        } else {
+            (404, r#"{"code":"unknown_scope"}"#.to_string())
+        }
+    });
+    let root = tempfile::tempdir().expect("root");
+    let server = format!("http://127.0.0.1:{port}");
+    let missing = run_libra_command(
+        &[
+            "mega2",
+            "traces",
+            "transcript",
+            "--server",
+            &server,
+            "--token",
+            "test-token",
+            "--stream",
+            "stream-1",
+            "--checkpoint",
+            "cp-missing",
+        ],
+        root.path(),
+    );
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("contains checkpoint"), "{stderr}");
 }

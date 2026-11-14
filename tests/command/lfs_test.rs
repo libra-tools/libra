@@ -466,23 +466,41 @@ async fn test_lfs_locks_cli_forbidden_returns_auth_permission_denied() {
     let repo = init_repo_with_mock_remote(&format!("http://{addr}"));
     let repo_path = repo.path().to_path_buf();
 
-    let output = tokio::task::spawn_blocking(move || {
-        libra_command(&repo_path)
-            .args(["--json", "lfs", "locks"])
-            .output()
-            .expect("failed to run lfs locks")
-    })
-    .await
-    .expect("spawn_blocking join failed");
+    for flag in [
+        "--json",
+        "--json=compact",
+        "--json=ndjson",
+        "--machine",
+        "-J",
+        "-Jq",
+    ] {
+        let repo_path = repo_path.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            libra_command(&repo_path)
+                .env("LIBRA_LOG", "warn")
+                .env_remove("RUST_LOG")
+                .env_remove("LIBRA_LOG_FILE")
+                .args([flag, "lfs", "locks"])
+                .output()
+                .expect("failed to run lfs locks")
+        })
+        .await
+        .expect("spawn_blocking join failed");
 
-    assert!(
-        !output.status.success(),
-        "lfs locks should fail when server returns 403"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
-        .unwrap_or_else(|err| panic!("error envelope should be JSON: {err}; stderr={stderr}"));
-    assert_eq!(envelope["error_code"], "LBR-AUTH-002");
+        assert!(
+            !output.status.success(),
+            "lfs locks should fail when server returns 403"
+        );
+        assert_eq!(output.status.code(), Some(128));
+        assert!(
+            output.stdout.is_empty(),
+            "JSON errors must not write stdout"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|err| panic!("error envelope should be JSON: {err}; stderr={stderr}"));
+        assert_eq!(envelope["error_code"], "LBR-AUTH-002");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -541,23 +559,41 @@ async fn test_lfs_lock_cli_conflict_returns_conflict_blocked() {
     let repo_path = repo.path().to_path_buf();
     fs::write(repo_path.join("tracked.txt"), "content").expect("failed to create tracked file");
 
-    let output = tokio::task::spawn_blocking(move || {
-        libra_command(&repo_path)
-            .args(["--json", "lfs", "lock", "tracked.txt"])
-            .output()
-            .expect("failed to run lfs lock")
-    })
-    .await
-    .expect("spawn_blocking join failed");
+    for flag in [
+        "--json",
+        "--json=compact",
+        "--json=ndjson",
+        "--machine",
+        "-J",
+        "-Jq",
+    ] {
+        let repo_path = repo_path.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            libra_command(&repo_path)
+                .env("LIBRA_LOG", "warn")
+                .env_remove("RUST_LOG")
+                .env_remove("LIBRA_LOG_FILE")
+                .args([flag, "lfs", "lock", "tracked.txt"])
+                .output()
+                .expect("failed to run lfs lock")
+        })
+        .await
+        .expect("spawn_blocking join failed");
 
-    assert!(
-        !output.status.success(),
-        "lfs lock should fail when server returns 409"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
-        .unwrap_or_else(|err| panic!("error envelope should be JSON: {err}; stderr={stderr}"));
-    assert_eq!(envelope["error_code"], "LBR-CONFLICT-002");
+        assert!(
+            !output.status.success(),
+            "lfs lock should fail when server returns 409"
+        );
+        assert_eq!(output.status.code(), Some(128));
+        assert!(
+            output.stdout.is_empty(),
+            "JSON errors must not write stdout"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|err| panic!("error envelope should be JSON: {err}; stderr={stderr}"));
+        assert_eq!(envelope["error_code"], "LBR-CONFLICT-002");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

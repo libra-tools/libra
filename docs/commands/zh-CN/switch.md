@@ -19,6 +19,8 @@ libra switch [--guess | --no-guess] <branch>
 
 ## 说明
 
+干净度预检使用显式 `text`/`eol` clean 比较，等价 CRLF/LF 内容不会导致切换分支时假脏拒绝。这不新增 checkout/smudge 的 CRLF 写回；真实本地修改仍保留原有保护。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra switch` 是更改分支的主要命令。它会在切换前验证工作树干净，更新 HEAD 和索引，并恢复工作树以匹配目标提交。与作为 Git 兼容表面存在的 `libra checkout` 不同，`switch` 是分支操作的推荐命令。
 
 该命令支持多种模式：切换到已有本地分支（默认）、用 `-` 返回上一个 checkout 目标、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建 unborn 无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
