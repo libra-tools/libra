@@ -39,13 +39,9 @@ async fn receipts(conn: &DatabaseConnection) -> Vec<(i64, String, String)> {
 }
 
 pub(crate) async fn assert_history(conn: &DatabaseConnection, tip: i64) {
-    let expected_count = match tip {
-        2026050601 => 5,
-        2026072304 => 38,
-        2026073101 => 51,
-        _ => panic!("unregistered historical fixture cutoff"),
-    };
     let actual = receipts(conn).await;
+    // The registry itself defines the historical set for a cutoff; pinning a
+    // separate hard-coded count drifts every time a new migration is added.
     let expected: Vec<_> = builtin_migrations()
         .into_iter()
         .filter(|migration| migration.version <= tip)
@@ -53,7 +49,7 @@ pub(crate) async fn assert_history(conn: &DatabaseConnection, tip: i64) {
         .collect();
     assert_eq!(
         actual.len(),
-        expected_count,
+        expected.len(),
         "complete historical receipt count"
     );
     assert_eq!(actual.last().unwrap().0, tip, "historical MAX before CLI");

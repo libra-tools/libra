@@ -305,6 +305,11 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
         ));
     }
 
+    if !schema_upgrade_allowed() {
+        drop(connections);
+        return open_database_without_migrations(&db_path).await;
+    }
+
     if let Some(conn) = connections.get(&db_path) {
         let conn = conn.clone();
         drop(connections);
@@ -541,6 +546,26 @@ pub async fn get_db_conn_instance() -> DbConn {
 /// The connection is cached, so concurrent callers see the same handle.
 /// Returns `Err(IOError)` when the file is missing or the schema migrations
 /// fail.
+/// When `false`, every connection acquisition for the rest of this process
+/// opens the database WITHOUT applying pending migrations. The CLI sets this
+/// for read-only commands (e.g. `hash-object` without `--write`) so their
+/// config/filter reads never upgrade the on-disk schema.
+static ALLOW_SCHEMA_UPGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_schema_upgrade_allowed(allowed: bool) {
+    ALLOW_SCHEMA_UPGRADE.store(allowed, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn schema_upgrade_allowed() -> bool {
+    ALLOW_SCHEMA_UPGRADE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A short-lived connection that never applies migrations.
+pub(crate) async fn database_connection_without_migrations(db_path: &Path) -> io::Result<DbConn> {
+    open_database_without_migrations(db_path).await
+}
+
 pub async fn get_db_conn_instance_for_path(db_path: &Path) -> io::Result<DbConn> {
     get_or_init_db_conn_instance(db_path.to_path_buf()).await
 }

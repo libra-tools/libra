@@ -3602,6 +3602,11 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     {
         return Err(refusal);
     }
+    if preflight.storage.is_some() {
+        // Read-only commands (hash-object without --write, verify-pack) must
+        // never migrate the on-disk schema through a config/filter read.
+        crate::internal::db::set_schema_upgrade_allowed(preflight.upgrade_schema);
+    }
     if let Some(storage) = preflight.storage.as_deref() {
         if preflight.set_hash_kind {
             if preflight.upgrade_schema {
