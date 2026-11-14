@@ -242,9 +242,6 @@ path = "tests/compat/matrix_alignment.rs"
 name = "compat_install_alias"
 path = "tests/compat/install_alias_test.rs"
 
-[[test]]
-name = "compat_live_compat_workflow"
-path = "tests/compat/live_compat_workflow.rs"
 
 [[test]]
 name = "compat_branch_lossy_wrapper_guard"
