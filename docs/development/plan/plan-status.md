@@ -1318,7 +1318,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`issues/675.md`](issues/675.md) | `branch -M` 强制重命名并解锁 TC-0153 | Codex R5 PASS（2026-11-13 16:57:41 UTC）；计划与状态更新已随 `361285f` 签名+DCO 推送 `main`；实施未启动且未授权 | I675-01（1 卡，AC=21/8@EX-01） |
 | [`issues/676.md`](issues/676.md) | unborn HEAD 上等价 inherited index 的 checkout | **重建完成（初稿规模），待重新送审**：2026-11-13 事故后由会话快照/Codex 作者日志回放重建，补齐模板强制章节并机械重算 AC/VER；与丢失的末次修订版相比范围更小，差异见文件顶部告警 | `I676-01` AC=9/8@EX-01 VER=3/8 |
 | [`issues/677.md`](issues/677.md) | `branch -v --list <pattern>` 精确选择器 | 草稿修订中；实施未启动（2026-11-12 前最后一次修订；仅规划、未授权执行） | I677-01（1 卡，AC=18/8@EX-01） |
-| [`issues/997.md`](issues/997.md) | `fetch`/`pull` 的 tag source（显式 destination + 无 destination/TC-1849） | **重建完成（初稿规模），待重新送审**：2026-11-13 事故后由会话快照/Codex 作者日志回放重建，补齐模板强制章节并机械重算 AC/VER；与丢失的末次修订版相比范围更小，差异见文件顶部告警 | `I997-01` AC=7/8 VER=4/8 |
+| [`issues/997.md`](issues/997.md) | `fetch`/`pull` 的 tag source（显式 destination；无 destination tag-source 解析仍待另立计划） | **Codex R6 PASS（2026-11-14，P0/P1/P2=0）**；R1–R5 FAIL 均已修订并保留；未启动且未授权；交付合同（直推 `main` 与 template v2.16 的 PR 要求）待用户裁定，见计划文件 | `I997-01` AC=7/8 VER=4/8 |
 | [`issues/1063.md`](issues/1063.md) | cloud object-index 记账诊断、缺配置错误码与重试预算 | 未启动（计划已 Codex R15 `PASS`（2026-11-12 13:40:25 UTC，0 P0/P1/P2），已随 `559d377` 推送 `main`；仅规划、未授权执行） | I1063-01..I1063-07（7 卡，均 `pending` / 验收空） |
 | [`issues/1063.md`](issues/1063.md) | cloud object-index 记账诊断、缺配置错误码与重试预算 | 未启动（计划已 Codex R15 `PASS`（2026-11-12 13:40:25 UTC，0 P0/P1/P2），已随 `559d377` 推送 `main`；仅规划、未授权执行） | I1063-01..I1063-07（7 卡，均 `pending` / 验收空） |
 | [`issues/1063.md`](issues/1063.md) | cloud object-index 记账诊断、缺配置错误码与重试预算 | 未启动（计划已 Codex R15 `PASS`（2026-11-12 13:40:25 UTC，0 P0/P1/P2），已随 `559d377` 推送 `main`；仅规划、未授权执行） | I1063-01..I1063-07（7 卡，均 `pending` / 验收空） |
