@@ -2560,7 +2560,11 @@ fn write_commit_message_file(path: &std::path::Path, message: &str) -> Result<()
             path: path.display().to_string(),
             detail: error.to_string(),
         }
-    })
+    })?;
+    // Git creates COMMIT_EDITMSG with the normal 0644 umask baseline and then
+    // applies `core.sharedRepository`; the atomic write starts private.
+    let _ = crate::utils::shared_perm::reset_metadata_file_perm(path);
+    Ok(())
 }
 
 /// Read `commit -F -`'s message from standard input (Git semantics: the whole

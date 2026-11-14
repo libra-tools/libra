@@ -12343,35 +12343,24 @@ fn cov2_opencode_session_e2e_is_manual_only() {
             "Linux unit ignore state: {name}"
         );
     }
+    // Operator decision: the platform/live matrix no longer runs on GitHub
+    // Actions, so the sandbox dispatcher and its jobs must stay absent.
     let base = fs::read_to_string(repo_root().join(".github/workflows/base.yml")).unwrap();
-    let selected = base
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("run_gate ").map(str::to_owned))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        selected,
-        COV2_LINUX_SANDBOX_UNITS
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect::<Vec<_>>()
-    );
+    for job in [
+        "opencode-export-sandbox-linux",
+        "compat-owner-liveness-macos",
+        "compat-scoped-input-windows",
+        "compat-network-remotes",
+    ] {
+        assert!(
+            !base.contains(job),
+            "removed workflow job resurfaced: {job}"
+        );
+    }
     assert!(
-        cov2_linux_gate_body_is_exact(&base),
-        "run_gate must execute only its exact named unit with include-ignored"
-    );
-    assert!(
-        !cov2_linux_gate_body_is_exact(&base.replace(
-            "cargo test --lib \"$full\" -- --exact --include-ignored",
-            "cargo test --lib -- --include-ignored"
-        )),
-        "a broad ignored run must not hide behind the unit dispatcher"
-    );
-    assert!(
-        !cov2_workflow_session_errors(&format!(
-            "{base}\ncargo test --lib \"$full\" -- --exact --include-ignored\n"
-        ))
-        .is_empty(),
-        "the pinned dispatcher exception must not exempt commands outside its body"
+        base.lines()
+            .all(|line| !line.trim().starts_with("run_gate ")),
+        "the sandbox unit dispatcher must not be present"
     );
     for entry in fs::read_dir(repo_root().join(".github/workflows")).unwrap() {
         let path = entry.unwrap().path();

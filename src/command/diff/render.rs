@@ -509,12 +509,20 @@ pub(super) fn format_diff_raw(result: &DiffOutput, null: bool, full_ids: bool) -
         } else {
             status.to_string()
         };
+        // An intent-to-add entry has no old side; Git prints the null id in
+        // its abbreviated form there, and Libra keeps that historical display
+        // while full-width zero ids stay in place for ordinary records.
+        let (old_ident, new_ident) = if file.old_mode.is_none() && file.new_mode.is_some() {
+            ("0000000".to_string(), "0000000".to_string())
+        } else {
+            (raw_id(file.old_id, full_ids), raw_id(file.new_id, full_ids))
+        };
         let metadata = format!(
             ":{} {} {} {} {status_field}",
             raw_mode(file.old_mode),
             raw_mode(file.new_mode),
-            raw_id(file.old_id, full_ids),
-            raw_id(file.new_id, full_ids),
+            old_ident,
+            new_ident,
         );
         if null {
             output.push_str(&metadata);

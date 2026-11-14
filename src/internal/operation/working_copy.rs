@@ -100,7 +100,9 @@ impl WorkspaceStatePointer {
             pointer: self.clone(),
         };
         let bytes = serde_json::to_vec(&persisted)?;
-        write_atomic(&Self::path(scope), &bytes, true)?;
+        let path = Self::path(scope);
+        write_atomic(&path, &bytes, true)?;
+        crate::utils::shared_perm::reset_metadata_file_perm(&path)?;
         Ok(())
     }
 

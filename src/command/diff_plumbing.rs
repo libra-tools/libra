@@ -527,6 +527,9 @@ pub async fn execute_index(args: DiffIndexArgs) {
 }
 
 pub async fn execute_index_safe(args: DiffIndexArgs, output: &OutputConfig) -> CliResult<()> {
+    // Resolve the tree here so an unknown revision is the same fatal error
+    // (128) as Git, instead of a delegated argument-parsing usage error.
+    let _ = resolve_tree_id(&args.tree).await?;
     // Compare the tree to the index (`--cached`) or the working tree.
     let mut argv = vec!["diff".to_string(), "--old".to_string(), args.tree];
     if args.cached {

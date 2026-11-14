@@ -3821,7 +3821,10 @@ async fn handle_list(
                 // A missing global config file is an empty global config,
                 // exactly like Git's `git config --global --list`.
                 Err(e)
-                    if !use_cascade && s == ConfigScope::Global && e.starts_with("NOT_FOUND:") =>
+                    if !use_cascade
+                        && s == ConfigScope::Global
+                        && e.starts_with("NOT_FOUND:")
+                        && std::env::var_os("LIBRA_CONFIG_GLOBAL_DB").is_none() =>
                 {
                     Vec::new()
                 }

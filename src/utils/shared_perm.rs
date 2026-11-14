@@ -378,6 +378,24 @@ pub fn adjust_shared_perm_for_db(db_path: &Path, shared: &SharedMode) -> io::Res
     Ok(())
 }
 
+/// Restore Git's 0644 baseline for a metadata file created by an atomic
+/// write, then apply the repository's shared mode. Git creates
+/// `COMMIT_EDITMSG`, the operation pointer and similar files with the normal
+/// umask baseline, so a group-shared repository sees 0664 rather than 0660.
+pub fn reset_metadata_file_perm(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+        if let Some(shared) = get_shared_mode_for_path(path)? {
+            adjust_shared_perm(path, &shared)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Adjust permissions for the repository index file (`.libra/index`).
 pub fn adjust_shared_perm_for_index(index_path: &Path) -> io::Result<()> {
     if let Some(shared_mode) = get_shared_mode_for_path(index_path)? {
