@@ -137,12 +137,24 @@ fn read_repo_shared_mode_uncached(storage_root: &Path) -> io::Result<Option<Shar
             .build()
             .map_err(|e| io::Error::other(e.to_string()))?;
         rt.block_on(async move {
-            let val = crate::internal::config::read_local_config_value_from_db_path(
-                &db_path_buf,
-                "core.sharedRepository",
-            )
-            .await;
-            Ok::<Option<String>, io::Error>(val.unwrap_or(None))
+            // Permission reads must never migrate the schema: use a raw
+            // connection and read only the one key, tried in both spellings.
+            let conn = crate::internal::db::open_database_without_migrations(&db_path_buf)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut value = None;
+            for key in ["core.sharedRepository", "core.sharedrepository"] {
+                if let Ok(entry) =
+                    crate::internal::config::ConfigKv::get_with_conn(&conn, key).await
+                {
+                    if let Some(entry) = entry {
+                        value = Some(entry.value);
+                        break;
+                    }
+                }
+            }
+            let _ = conn.close().await;
+            Ok::<Option<String>, io::Error>(value)
         })
     })
     .join()
