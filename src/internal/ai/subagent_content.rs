@@ -13109,12 +13109,7 @@ mod tests {
         }
 
         async fn candidate_cli_helper<F: std::future::Future>(future: F) -> F::Output {
-            let executable = std::env::current_exe().unwrap();
-            let program = executable
-                .parent()
-                .and_then(Path::parent)
-                .unwrap()
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             assert!(
                 program.is_file(),
                 "build the current CLI before local deadline-bound candidate cases"
@@ -13414,12 +13409,7 @@ mod tests {
             };
             // Deadline-bound publication uses the CLI that owns private argv,
             // never the unregistered libtest executable.
-            let executable = std::env::current_exe().context("locate local test executable")?;
-            let program = executable
-                .parent()
-                .and_then(Path::parent)
-                .context("locate Cargo debug directory")?
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             anyhow::ensure!(
                 program.is_file(),
                 "build the current CLI with cargo build --features test-live-agent before running local child replay tests"
@@ -14374,11 +14364,7 @@ mod tests {
             use crate::internal::ai::observed_agents::live_capture::{
                 LiveCaptureBinding, test_support::with_subagent_discovery,
             };
-            let program = std::env::current_exe()?
-                .parent()
-                .and_then(Path::parent)
-                .context("owned debug directory")?
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             anyhow::ensure!(
                 program.is_file(),
                 "build current CLI before local recovery tests"
@@ -14956,11 +14942,7 @@ mod tests {
             discovery: &SubagentDiscovery,
             budget: Duration,
         ) -> Result<SubagentCaptureSummary> {
-            let program = std::env::current_exe()?
-                .parent()
-                .and_then(Path::parent)
-                .context("owned debug directory")?
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             anyhow::ensure!(
                 program.is_file(),
                 "build the current CLI before local prepared-child tests"

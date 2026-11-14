@@ -4956,13 +4956,7 @@ mod tests {
                 connection.close().await.unwrap();
             }
 
-            let program = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("libra");
+            let program = crate::utils::test::real_libra_helper_binary();
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("repo");
             let home = temp.path().join("home");
@@ -5165,13 +5159,7 @@ mod tests {
         #[tokio::test]
         #[ignore = "operator-local Codex acceptance; never run in CI"]
         async fn codex_summary_helper_unavailable_recovers_through_parent_and_store() {
-            let program = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("libra");
+            let program = crate::utils::test::real_libra_helper_binary();
             assert!(program.is_file());
             for fault in [1, 2] {
                 let temp = tempfile::tempdir().unwrap();
@@ -5473,13 +5461,7 @@ mod tests {
         let mut source = tempfile::tempfile().unwrap();
         source.write_all(&bytes).unwrap();
         source.seek(SeekFrom::Start(0)).unwrap();
-        let executable = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("libra");
+        let executable = crate::utils::test::real_libra_helper_binary();
         assert!(executable.is_file());
         let mut command = tokio::process::Command::new(executable);
         command.arg(IMPORT_PREPARATION_DESCRIPTOR_HELPER_ARG);
@@ -6534,12 +6516,7 @@ mod tests {
         // The import reads repository settings through the current directory,
         // so run it inside this repository rather than the test's own cwd.
         let _cwd = crate::utils::test::ChangeDirGuard::new(&root);
-        let real = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("libra");
+        let real = crate::utils::test::real_libra_helper_binary();
         assert!(real.is_file(), "the Libra binary must be built first");
         let id = "019a3c2e-7b10-7000-8000-0000000000b1";
         let path = root.join(format!("2026-10-31T00-00-00-000Z_{id}.jsonl"));
@@ -6909,12 +6886,7 @@ mod tests {
         // The import reads repository settings through the current directory,
         // so run it inside this repository rather than the test's own cwd.
         let _cwd = crate::utils::test::ChangeDirGuard::new(&root);
-        let program = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("libra");
+        let program = crate::utils::test::real_libra_helper_binary();
         assert!(program.is_file(), "the Libra binary must be built first");
         let path = root.join("2026-10-31T00-00-00-000Z_019a3c2e-7b10-7000-8000-0000000000b1.jsonl");
         std::fs::write(&path, b"{\"type\":\"session\"}\n").unwrap();

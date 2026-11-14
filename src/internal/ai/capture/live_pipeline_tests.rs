@@ -5712,12 +5712,7 @@ mod export_runner_lease {
         /// Cargo builds beside this test executable (build it first with
         /// `cargo build --bin libra`, as the live checkpoint oracle requires).
         fn libra_helper_program() -> PathBuf {
-            let program = std::env::current_exe()
-                .expect("locate the unit-test executable")
-                .parent()
-                .and_then(Path::parent)
-                .map(|profile| profile.join("libra"))
-                .expect("unit-test executable lives in a Cargo profile directory");
+            let program = crate::utils::test::real_libra_helper_binary();
             assert!(
                 program.is_file(),
                 "export-stage lease tests need the `libra` binary next to the unit-test executable; \
@@ -6299,13 +6294,7 @@ mod codex_terminal_local {
     }
 
     fn helper_program() -> PathBuf {
-        let executable = std::env::current_exe().unwrap();
-        let program = executable
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+        let program = crate::utils::test::real_libra_helper_binary();
         assert!(
             program.is_file(),
             "build the current libra binary beside the local unit-test binary first; rebuild after any source change"

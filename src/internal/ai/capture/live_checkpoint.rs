@@ -4912,12 +4912,7 @@ pub(crate) mod tests {
                 };
                 fail_once_at(CheckpointFaultPoint::MarkerCleanup);
             }
-            let helper = std::env::current_exe()
-                .expect("library test executable")
-                .parent()
-                .and_then(std::path::Path::parent)
-                .expect("Cargo debug directory")
-                .join("libra");
+            let helper = crate::utils::test::real_libra_helper_binary();
             assert!(
                 helper.is_file(),
                 "build the real Libra private-helper executable before this library test"
@@ -7141,12 +7136,7 @@ pub(crate) mod tests {
             let _native = scoped_test_snapshot_adapter(AgentKind::ClaudeCode, &fixture::NATIVE);
             let _snapshot_helper_bypass =
             crate::internal::ai::capture::live_pipeline::test_support::capture_live_without_deadline();
-            let executable = std::env::current_exe().unwrap();
-            let helper = executable
-                .parent()
-                .and_then(std::path::Path::parent)
-                .unwrap()
-                .join("libra");
+            let helper = crate::utils::test::real_libra_helper_binary();
             assert!(helper.is_file(), "built Libra helper is unavailable");
             crate::internal::ai::authorized_read::with_test_helper_program(helper, async {
             deliver(
