@@ -5258,7 +5258,13 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
     for (key, value) in &all_entries {
         if is_known_multi_value_key(key) {
             // Multi-value: use add semantics, skip exact duplicates
-            let existing = ScopedConfig::get_all(scope, key).await?;
+            let existing = match ScopedConfig::get_all(scope, key).await {
+                Ok(entries) => entries,
+                // A missing config DB means no existing values; import then
+                // creates the store on its first write.
+                Err(e) if e.starts_with("NOT_FOUND:") => Vec::new(),
+                Err(e) => return Err(e),
+            };
             if existing.iter().any(|e| &e.value == value) {
                 skipped += 1;
                 continue;
@@ -5301,7 +5307,11 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
             ));
         }
 
-        let existing = ScopedConfig::get(scope, key).await?;
+        let existing = match ScopedConfig::get(scope, key).await {
+            Ok(entry) => entry,
+            Err(e) if e.starts_with("NOT_FOUND:") => None,
+            Err(e) => return Err(e),
+        };
         if existing.as_ref().map(|e| &e.value) == Some(value) {
             skipped += 1;
             continue;
