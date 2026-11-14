@@ -682,11 +682,22 @@ async fn test_cli_config_list_global_without_repo() {
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
     let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
-
-    // Exercise the real CLI: `--global` with no repository must list the
-    // global store instead of failing the repository lookup.
+    // The global store must exist first (Git also errors on a missing file),
+    // then `--global list` works without any repository.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--global", "user.name", "cli_global_user"],
+            temp_dir.path(),
+        ),
+        "config --global write without a repository",
+    );
     let result = run_libra_command(&["config", "--global", "list"], temp_dir.path());
     assert_cli_success(&result, "config --global list without a repository");
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("user.name=cli_global_user"),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
 }
 
 #[tokio::test]
