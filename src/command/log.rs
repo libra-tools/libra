@@ -1542,7 +1542,8 @@ async fn collect_notes_reference_tips() -> Vec<(String, ObjectHash)> {
             if !name.starts_with("refs/notes/") {
                 return None;
             }
-            let oid = row.commit?.parse::<ObjectHash>().ok()?;
+            let oid =
+                crate::internal::object_format::parse_repo_oid(row.commit.as_deref()?).ok()?;
             Some((name, oid))
         })
         .collect()
@@ -2292,7 +2293,8 @@ async fn execute_safe_with_diff_formats(
     // ADR-LG-05 item 4: `--graph` implies Git's graph (topological) order.
     // `--reverse` then flips the resulting order.
     if args.graph && !args.author_date_order && !args.date_order {
-        selected_commits = graph_topo_order(selected_commits);
+        let shallow = load_walk_shallow()?;
+        selected_commits = graph_topo_order(selected_commits, &shallow);
         if args.reverse {
             selected_commits.reverse();
         }
@@ -3559,14 +3561,17 @@ pub fn format_shortstat_output(stats: &[FileStat]) -> String {
 /// emitted only after all of its children in the selected set, with the ready
 /// set processed LIFO (Git uses a stack for `REV_SORT_IN_GRAPH_ORDER`). The
 /// incoming order is the date-ordered walk, so it supplies the initial tip order.
-fn graph_topo_order(commits: Vec<SelectedLogCommit>) -> Vec<SelectedLogCommit> {
+fn graph_topo_order(
+    commits: Vec<SelectedLogCommit>,
+    shallow: &ShallowSet,
+) -> Vec<SelectedLogCommit> {
     use std::collections::HashMap;
 
     let ids: HashSet<ObjectHash> = commits.iter().map(|commit| commit.commit.id).collect();
     let mut indegree: HashMap<ObjectHash, usize> =
         commits.iter().map(|commit| (commit.commit.id, 1)).collect();
     for commit in &commits {
-        for parent in &commit.commit.parent_commit_ids {
+        for parent in history_parents(shallow, &commit.commit) {
             if let Some(count) = indegree.get_mut(parent) {
                 *count += 1;
             }
@@ -3592,7 +3597,7 @@ fn graph_topo_order(commits: Vec<SelectedLogCommit>) -> Vec<SelectedLogCommit> {
         let Some(commit) = by_id.remove(&id) else {
             continue;
         };
-        for parent in &commit.commit.parent_commit_ids {
+        for parent in history_parents(shallow, &commit.commit) {
             if let Some(count) = indegree.get_mut(parent) {
                 *count -= 1;
                 if *count == 1 {

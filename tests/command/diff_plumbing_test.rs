@@ -296,10 +296,12 @@ fn diff_plumbing_exit_code_and_quiet_matrix() {
 
     let bad_flag = run_libra_command(&["diff-files", "--not-a-flag"], repo.path());
     assert_eq!(bad_flag.status.code(), Some(129));
+    // Git reports an unknown revision as a fatal error (128); only argument
+    // parsing errors are usage errors (129).
     let bad_rev = run_libra_command(&["diff-index", "does-not-exist"], repo.path());
-    assert_eq!(bad_rev.status.code(), Some(129));
+    assert_eq!(bad_rev.status.code(), Some(128));
     let bad_tree = run_libra_command(&["diff-tree", "does-not-exist", "HEAD"], repo.path());
-    assert_eq!(bad_tree.status.code(), Some(129));
+    assert_eq!(bad_tree.status.code(), Some(128));
 }
 
 /// issues/479 TC-0044 — the stat-raciness contract behind `t/t3700-add.sh#24`:
@@ -328,7 +330,7 @@ fn diff_index_reports_read_tree_stat_raciness_with_zero_sha() {
         "raw record must report the stat-dirty entry as M: {record}"
     );
     assert!(
-        record.contains(" 0000000 M"),
+        record.contains(" 0000000000000000000000000000000000000000 M"),
         "the worktree sha must be all zeros without hashing: {record}"
     );
 
@@ -363,7 +365,7 @@ fn diff_files_reports_stat_dirty_entry_with_zero_sha() {
     assert_eq!(out.status.code(), Some(0));
     let record = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(
-        record.contains(" 0000000 M\ttracked.txt"),
+        record.contains(" 0000000000000000000000000000000000000000 M\ttracked.txt"),
         "stat-dirty entry must report M with all-zero worktree sha: {record}"
     );
 }
@@ -414,7 +416,7 @@ fn diff_index_read_tree_empty_blob_is_modified_not_added() {
         "an empty tracked file is a modification, never an addition: {record}"
     );
     assert!(
-        record.contains(" 0000000 M"),
+        record.contains(" 0000000000000000000000000000000000000000 M"),
         "the stat-invalid worktree sha is all zeros: {record}"
     );
 
@@ -819,7 +821,8 @@ fn diff_patch_omits_unchanged_stat_invalid_entry() {
     // The raw record still reports the pessimistic `M` with the zero worktree id.
     let raw = run_libra_command(&["diff-index", "HEAD", "--", "empty.txt"], root);
     assert!(
-        String::from_utf8_lossy(&raw.stdout).contains(" 0000000 M"),
+        String::from_utf8_lossy(&raw.stdout)
+            .contains(" 0000000000000000000000000000000000000000 M"),
         "raw must keep the pessimistic record: {}",
         String::from_utf8_lossy(&raw.stdout)
     );
@@ -970,9 +973,8 @@ fn i1062_plumbing_explicit_conversion_matches_git_modes() {
                         args.push("HEAD");
                     }
                     args.extend(["--", "probe.ps1"]);
-                    let mut git_args = args.clone();
-                    // Libra retains its existing seven-digit raw OID display.
-                    git_args.insert(1, "--abbrev=7");
+                    let git_args = args.clone();
+                    // Git-compatible raw output keeps the full-width zero id.
                     let expected = git(&git_args);
                     let actual = i1062_run(&repo, &args);
                     assert_eq!(

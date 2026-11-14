@@ -202,24 +202,11 @@ pub fn calc_shared_perm(mode: u32, is_dir: bool, shared: &SharedMode) -> u32 {
 
     match shared {
         SharedMode::Umask => return mode,
-        SharedMode::Group => {
-            perm |= 0o664;
-            if (perm & 0o200) == 0 {
-                perm &= !0o020;
-            }
-            if (perm & 0o100) != 0 {
-                perm |= (perm & 0o444) >> 2;
-            }
-        }
-        SharedMode::All => {
-            perm |= 0o664;
-            if (perm & 0o200) == 0 {
-                perm &= !0o020;
-            }
-            if (perm & 0o100) != 0 {
-                perm |= (perm & 0o444) >> 2;
-            }
-        }
+        // Git's PERM_GROUP adds 0660 and PERM_EVERYBODY adds 0664; the
+        // result already carries the group/other read bits, so no further
+        // execute-bit propagation is needed.
+        SharedMode::Group => perm |= 0o660,
+        SharedMode::All => perm |= 0o664,
         SharedMode::Numeric { bits, .. } => {
             let was_executable = (mode & 0o100) != 0;
             perm = (perm & !0o777) | (bits & 0o777);

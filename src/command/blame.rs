@@ -840,7 +840,9 @@ fn render_blame_incremental(result: &BlameOutput, file: &str) -> CliResult<()> {
             if line.boundary {
                 buf.push_str("boundary\n");
             }
+            // Porcelain prints the recorded parent line (SHALLOW-DISPLAY).
             if let Some(parent) = commit.parent_commit_ids.first() {
+                // SHALLOW-DISPLAY: recorded parent, not walk edge.
                 buf.push_str(&format!("previous {parent} {file}\n"));
             }
         }

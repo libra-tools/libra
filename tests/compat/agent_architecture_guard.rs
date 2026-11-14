@@ -9341,7 +9341,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn oracle_tree_blob",
                 "struct OracleEnvGuard",
             ],
-            "aeb03f6f38cd063cf7f5250cb24d1ff6ac2fa3abf4711b1ca484d108866e41e7",
+            "bfa174e81c7d3aa9bac150db132899c7d99f26764cd23a31bf74ea8a7a76b843",
         ),
     ];
     const CI_ORACLES: [(&str, &str, &[&str], &str); 3] = [

@@ -13,6 +13,8 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
+        pathspec::PathspecSet,
+        util,
     },
 };
 
@@ -420,6 +422,19 @@ async fn execute_tree_raw(
 ) -> CliResult<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
+    let path_specs = if args.paths.is_empty() {
+        None
+    } else {
+        let workdir = util::working_dir();
+        let current_dir = std::env::current_dir().map_err(|error| {
+            CliError::fatal(format!("failed to resolve current directory: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        PathspecSet::from_workdir(&args.paths, &current_dir, &workdir)
+            .map(Some)
+            .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))?
+    };
+
     let (old_tree, new_tree, commit_id, root_commit) = match &args.tree_b {
         Some(tree_b) => (
             Some(resolve_tree_id(&args.tree_a).await?),
@@ -475,6 +490,11 @@ async fn execute_tree_raw(
         }
         let names: BTreeSet<&String> = old_entries.keys().chain(new_entries.keys()).collect();
         for name in names {
+            if let Some(specs) = &path_specs
+                && !specs.matches_path(name)
+            {
+                continue;
+            }
             if let Some(record) = raw_tree_record(
                 name,
                 old_entries.get(name).copied(),
