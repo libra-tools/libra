@@ -5527,7 +5527,7 @@ mod export_runner_lease {
     /// Unix-only private helper, like the live checkpoint oracle.
     #[cfg(unix)]
     mod end_to_end {
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
 
         use super::*;
         use crate::internal::ai::{
