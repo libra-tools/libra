@@ -451,11 +451,15 @@ fn init_bare_conversion_shared_does_not_widen_existing_user_file() {
     assert_cli_success(&converted, "bare conversion with shared storage");
     let mode = fs::metadata(&user_file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "existing user file must remain private");
-    for path in [&target, &target.join("objects"), &target.join("libra.db")] {
+    for (path, expected) in [
+        (&target, 0o775),
+        (&target.join("objects"), 0o775),
+        (&target.join("libra.db"), 0o664),
+    ] {
         let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode,
-            0o777,
+            expected,
             "new repository entry must use shared mode: {}",
             path.display()
         );

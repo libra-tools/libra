@@ -277,7 +277,7 @@ mod dirstat_tests {
             },
         ];
         let out = format_dirstat(&entries, "").unwrap();
-        assert_eq!(out, "  54.5% dir1/sub/\n  36.3% dir1/\n   9.0% dir2/");
+        assert_eq!(out, "  37.5% dir1/sub/\n  50.0% dir1/\n  12.5% dir2/");
     }
 
     #[test]

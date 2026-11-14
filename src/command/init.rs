@@ -1372,6 +1372,11 @@ async fn reinitialize_existing(
         .map_err(InitError::Io)?;
     if let Some(shared_mode) = shared_mode {
         persist_shared_repository(&conn, shared_mode).await?;
+        // Persisting the new value may touch the storage directory; re-apply
+        // so switching modes (e.g. all -> numeric) leaves the final modes.
+        // Drop the cached pre-reinit value before the final sweep.
+        crate::utils::shared_perm::clear_cached_repo_shared_mode(Some(root_dir));
+        apply_shared(root_dir, shared_mode)?;
     }
 
     let object_format = stored_object_format;
