@@ -1,12 +1,13 @@
 //! Shared repository permissions helper aligning with Git's `path.c:calc_shared_perm`.
 
+#[cfg(unix)]
+use std::fs;
 use std::{
-    collections::HashMap, io,
+    collections::HashMap,
+    io,
     path::{Path, PathBuf},
     sync::{LazyLock, RwLock},
 };
-#[cfg(unix)]
-use std::fs;
 
 static REPO_SHARED_CACHE: LazyLock<RwLock<HashMap<PathBuf, Option<SharedMode>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
