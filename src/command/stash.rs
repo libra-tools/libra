@@ -2141,20 +2141,32 @@ fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), 
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| write_error(&log_path, error))?;
-    }
+    ensure_stash_directories(storage)?;
     // fsync unconditionally: this pair is recovery-critical state, like the
     // sequencer's, so it does not wait for `--sync-data`.
     crate::utils::atomic_write::write_atomic(&log_path, body.as_bytes(), true)
         .map_err(|error| write_error(&log_path, error))?;
 
-    if let Some(parent) = ref_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| write_error(&ref_path, error))?;
-    }
     let tip = format!("{}\n", entries[0].stash_id);
     crate::utils::atomic_write::write_atomic(&ref_path, tip.as_bytes(), true)
         .map_err(|error| write_error(&ref_path, error))
+}
+
+/// Create only the stash metadata directories, preserving the repository's
+/// sharing policy without walking or widening private vault paths.
+fn ensure_stash_directories(storage: &Path) -> Result<(), StashError> {
+    let shared = crate::utils::shared_perm::get_repo_shared_mode(storage)
+        .map_err(|error| StashError::WriteObject(format!("{}: {error}", storage.display())))?;
+    for relative in ["logs", "logs/refs", "refs"] {
+        let path = storage.join(relative);
+        fs::create_dir_all(&path)
+            .map_err(|error| StashError::WriteObject(format!("{}: {error}", path.display())))?;
+        if let Some(shared) = &shared {
+            crate::utils::shared_perm::adjust_shared_directory(&path, shared)
+                .map_err(|error| StashError::WriteObject(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Block at the pre-drop rendezvous when the test harness asks.
@@ -2298,10 +2310,7 @@ fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
     if recorded_tip.as_deref() == Some(expected.as_str()) {
         return Ok(false);
     }
-    if let Some(parent) = ref_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| StashError::WriteObject(format!("{}: {error}", ref_path.display())))?;
-    }
+    ensure_stash_directories(storage)?;
     crate::utils::atomic_write::write_atomic(&ref_path, format!("{expected}\n").as_bytes(), true)
         .map_err(|error| StashError::WriteObject(format!("{}: {error}", ref_path.display())))?;
     Ok(true)

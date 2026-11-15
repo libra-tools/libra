@@ -59,6 +59,12 @@ impl StreamingAtomicFile {
         self.temporary.path()
     }
 
+    /// Set the final shared-object mode on the open staging file before publication.
+    #[cfg(unix)]
+    pub(crate) fn set_permissions(&self, permissions: fs::Permissions) -> io::Result<()> {
+        self.temporary.as_file().set_permissions(permissions)
+    }
+
     /// Flush/fsync the payload, atomically replace `target`, and sync affected
     /// directories where the platform supports it.
     pub(crate) fn persist(self, target: &Path) -> io::Result<()> {

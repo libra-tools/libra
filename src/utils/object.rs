@@ -1008,6 +1008,13 @@ pub fn write_git_object(
         GitError::InvalidObjectInfo("loose-object path has no parent directory".to_string())
     })?;
     ensure_dir_exists(parent, sync_data)?;
+    #[cfg(unix)]
+    let shared_mode = crate::utils::shared_perm::get_repo_shared_mode(git_dir)?
+        .filter(|mode| !matches!(mode, crate::utils::shared_perm::SharedMode::Umask));
+    #[cfg(unix)]
+    if let Some(shared) = &shared_mode {
+        crate::utils::shared_perm::adjust_shared_directory(parent, shared)?;
+    }
     // General objects stage beside their destination and preserve the legacy
     // `File::create` permission contract (`0666 & umask`). Private atomic
     // state keeps StreamingAtomicFile's restrictive 0600 default.
@@ -1023,6 +1030,24 @@ pub fn write_git_object(
     };
     #[cfg(not(unix))]
     let temporary = crate::utils::atomic_stream::StreamingAtomicFile::new_in(parent, sync_data)?;
+    #[cfg(unix)]
+    if let Some(shared) = &shared_mode {
+        use std::os::unix::fs::PermissionsExt;
+
+        temporary
+            .set_permissions(fs::Permissions::from_mode(
+                crate::utils::shared_perm::calc_shared_object_perm(shared),
+            ))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot set shared permissions on object '{}': {error}",
+                        object_path.display()
+                    ),
+                )
+            })?;
+    }
     let mut encoder = flate2::write::ZlibEncoder::new(temporary, flate2::Compression::default());
     encoder.write_all(&content)?;
     let temporary = encoder.finish()?;
@@ -1994,6 +2019,46 @@ mod bounded_read_tests {
         let object = git_dir.join("objects").join(&oid[..2]).join(&oid[2..]);
         let actual = std::fs::metadata(object).unwrap().permissions().mode() & 0o777;
         assert_eq!(actual, expected, "loose objects must preserve 0666 & umask");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_writer_respects_shared_object_and_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::utils::shared_perm::{
+            SharedMode, clear_cached_repo_shared_mode, set_cached_repo_shared_mode,
+        };
+
+        for (raw, object_mode, directory_mode) in
+            [("group", 0o444, None), ("0640", 0o440, Some(0o2750))]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(".libra");
+            std::fs::create_dir_all(root.join("objects")).unwrap();
+            set_cached_repo_shared_mode(root.clone(), Some(SharedMode::parse(raw).unwrap()));
+            let oid = write_git_object(&root, "blob", b"shared generic writer")
+                .unwrap()
+                .to_string();
+            clear_cached_repo_shared_mode(Some(&root));
+            let shard = root.join("objects").join(&oid[..2]);
+            let object = shard.join(&oid[2..]);
+            assert_eq!(
+                std::fs::metadata(object).unwrap().permissions().mode() & 0o7777,
+                object_mode,
+                "{raw}"
+            );
+            let actual = std::fs::metadata(shard).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                actual & 0o2770,
+                0o2770 & directory_mode.unwrap_or(0o2770),
+                "{raw}: {actual:o}"
+            );
+            assert_eq!(actual & 0o002, 0, "{raw}: no world write");
+            if let Some(expected) = directory_mode {
+                assert_eq!(actual, expected, "{raw}");
+            }
+        }
     }
 
     #[test]

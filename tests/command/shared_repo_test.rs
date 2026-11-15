@@ -418,3 +418,66 @@ fn test_t1301_ports() {
     );
     assert_eq!(String::from_utf8_lossy(&cfg.stdout).trim(), "");
 }
+
+/// Stash creates metadata directories and loose objects after init's permission pass.
+#[cfg(unix)]
+#[test]
+fn test_stash_numeric_shared_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("stash-numeric");
+    for args in [
+        vec!["init", "--vault", "false", "--shared=0640"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+    ] {
+        assert_cli_success(&run_libra_command(&args, &repo), "initialize shared repo");
+    }
+    fs::write(repo.join("file"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base"], &repo),
+        "commit",
+    );
+    fs::write(repo.join("file"), "stash payload\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], &repo), "stash push");
+    for relative in ["logs", "logs/refs", "refs"] {
+        assert_eq!(
+            fs::metadata(repo.join(".libra").join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o2750,
+            "{relative}"
+        );
+    }
+    for relative in ["logs/refs/stash", "refs/stash"] {
+        assert_eq!(
+            fs::metadata(repo.join(".libra").join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640,
+            "{relative}"
+        );
+    }
+    for entry in walkdir::WalkDir::new(repo.join(".libra/objects")) {
+        let entry = entry.unwrap();
+        if entry.file_type().is_file() {
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o7777,
+                0o440,
+                "{}",
+                entry.path().display()
+            );
+        }
+    }
+    assert_cli_success(&run_libra_command(&["stash", "pop"], &repo), "stash pop");
+    assert_eq!(
+        fs::read_to_string(repo.join("file")).unwrap(),
+        "stash payload\n"
+    );
+}
