@@ -47,7 +47,7 @@ use crate::{
         head::Head,
         model::reference as ref_model,
         protocol::{
-            DiscRef, DiscoveryResult, FetchStream, ProtocolClient,
+            DiscRef, DiscoveryResult, FetchStream, ProtocolClient, ProtocolVersion,
             bundle_client::BundleClient,
             git_client::GitClient,
             https_client::HttpsClient,
@@ -264,6 +264,7 @@ impl RemoteClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_objects(
         &self,
         have: &[String],
@@ -272,6 +273,8 @@ impl RemoteClient {
         depth: Option<usize>,
         advertised_capabilities: &[String],
         expected_shallow_boundaries: &[String],
+        version: ProtocolVersion,
+        hash_kind: HashKind,
     ) -> Result<FetchStream, IoError> {
         match self {
             RemoteClient::Http(client) => {
@@ -282,6 +285,8 @@ impl RemoteClient {
                         shallow,
                         depth,
                         advertised_capabilities,
+                        version,
+                        hash_kind,
                     )
                     .await
             }
@@ -2607,6 +2612,8 @@ async fn fetch_repository_with_result_reusing(
             effective_depth,
             &discovery.capabilities,
             &discovery.shallow_boundaries,
+            discovery.version,
+            discovery.hash_kind,
         )
         .await
         .map_err(|source| FetchError::FetchObjects {

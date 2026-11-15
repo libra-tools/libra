@@ -802,6 +802,27 @@ libra config set core.filemode false
 libra config get core.filemode
 ```
 
+## The `protocol.version` Key
+
+`protocol.version` selects the Git wire protocol version Libra negotiates over
+smart HTTP. Unset it defaults to `2`: `info/refs` discovery and the
+`git-upload-pack` request both send `Git-Protocol: version=2`, and a server that
+answers with a protocol v2 capability advertisement is driven with the v2
+`ls-refs` and `fetch` commands. A server that answers with a v0/v1 reference
+advertisement is parsed by the legacy path, so mainstream v0 servers behave
+exactly as before. Set it to `0` or `1` to force the legacy path — useful when
+bisecting a protocol problem or when a proxy in front of the server mishandles
+the `Git-Protocol` header. Values other than `0`, `1` or `2` print a warning and
+keep the v2 default.
+
+Push never negotiates v2: protocol v2 defines no `receive-pack` commands, so
+`git-receive-pack` discovery and requests stay on v0/v1 regardless of this key.
+
+```bash
+libra config set protocol.version 0   # force the v0/v1 path
+libra config get protocol.version
+```
+
 ## Reserved `upgrade.*` Namespace
 
 The auto-upgrade configuration is a reserved namespace stored in
