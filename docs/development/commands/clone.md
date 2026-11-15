@@ -13,6 +13,8 @@
 
 ## 设计方案
 
+- HTTP(S) discovery 在无本地仓库时仍有效；协议版本读取使用 `ConfigKv::get_best_effort`，缺仓库按既定默认 v2 协商，不经要求本地 DB 的 panic 路径。HTTP v2/legacy fallback 测试在隔离空目录与配置夹具下运行。
+
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/clone.rs`。参数/子命令类型包括：`CloneArgs`；输出、错误或状态类型包括：`CloneOutput`、`CloudCloneSiteOutput`、`CloneError`；主要执行函数包括：`execute`、`execute_safe`。
 - 源码意图：源码模块注释说明该命令会解析 URL、通过协议客户端获取对象、检出工作树，并写入初始 refs/config；执行层生成 `CloneOutput`，渲染层按 `OutputConfig` 输出。

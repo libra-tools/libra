@@ -690,16 +690,17 @@ async fn preferred_protocol_version(service: ServiceType) -> ProtocolVersion {
     if service != ServiceType::UploadPack {
         return ProtocolVersion::V0;
     }
-    let configured = match crate::internal::config::ConfigKv::get(PROTOCOL_VERSION_CONFIG_KEY).await
-    {
-        Ok(entry) => entry.map(|entry| entry.value.trim().to_string()),
-        Err(error) => {
-            // A config read failure must not silently disable v2: log and keep
-            // the documented default so the fetch still works.
-            tracing::debug!("could not read {PROTOCOL_VERSION_CONFIG_KEY}: {error}");
-            None
-        }
-    };
+    let configured =
+        match crate::internal::config::ConfigKv::get_best_effort(PROTOCOL_VERSION_CONFIG_KEY).await
+        {
+            Ok(entry) => entry.map(|entry| entry.value.trim().to_string()),
+            Err(error) => {
+                // A config read failure must not silently disable v2: log and keep
+                // the documented default so the fetch still works.
+                tracing::debug!("could not read {PROTOCOL_VERSION_CONFIG_KEY}: {error}");
+                None
+            }
+        };
     match configured.as_deref() {
         Some(other) if protocol_version_for_value(other).is_none() => {
             emit_warning(format!(
@@ -802,7 +803,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::git_protocol::{add_delim_pkt, add_flush_pkt, add_pkt_line_string};
+    use crate::{
+        git_protocol::{add_delim_pkt, add_flush_pkt, add_pkt_line_string},
+        utils::test::{ChangeDirGuard, ConfigDbFixture},
+    };
 
     /// Records the `Git-Protocol` request header of every inbound request.
     #[derive(Clone, Default)]
@@ -981,7 +985,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn v2_discovery_sends_git_protocol_header_and_runs_ls_refs() {
+        let _config = ConfigDbFixture::new().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let _cwd = ChangeDirGuard::new(repo.path());
         let state = mock_state(Recorded::default(), v2_advertisement());
         let (url, recorded) = serve(state).await;
         let client = client(&url);
@@ -1031,7 +1039,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn v0_advertisement_falls_back_to_the_legacy_parser() {
+        let _config = ConfigDbFixture::new().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let _cwd = ChangeDirGuard::new(repo.path());
         let state = mock_state(Recorded::default(), v0_advertisement());
         let (url, recorded) = serve(state).await;
         let client = client(&url);
@@ -1059,7 +1071,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cwd, env)]
     async fn v2_fetch_posts_command_and_adapts_the_response_stream() {
+        let _config = ConfigDbFixture::new().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let _cwd = ChangeDirGuard::new(repo.path());
         let state = mock_state(Recorded::default(), v2_advertisement());
         let (url, recorded) = serve(state).await;
         let client = client(&url);
