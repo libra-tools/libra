@@ -59,6 +59,15 @@ impl FromStr for ServiceType {
 /// Flush packet (`0000`). Marks the end of a logical group of pkt-lines.
 pub const PKT_LINE_END_MARKER: &[u8; 4] = b"0000";
 
+/// Delimiter packet (`0001`). Protocol v2 uses it to separate the command and
+/// capability section of a request from its argument section, and to separate
+/// sections of a response.
+pub const PKT_LINE_DELIM_MARKER: &[u8; 4] = b"0001";
+
+/// Response-end packet (`0002`). Protocol v2 uses it to terminate a response
+/// whose last section carries a payload that cannot signal its own end.
+pub const PKT_LINE_RESPONSE_END_MARKER: &[u8; 4] = b"0002";
+
 /// String-boundary marker for typed protocol errors carried by external error types.
 pub(crate) const PKT_LINE_PROTOCOL_ERROR_PREFIX: &str = "pkt-line protocol error: ";
 
@@ -243,6 +252,107 @@ pub fn read_pkt_line(bytes: &mut Bytes) -> Result<(usize, Bytes), PktLineError> 
     Ok((declared_len as usize, bytes.copy_to_bytes(payload_len)))
 }
 
+/// One pkt-line frame, including the protocol v2 framing markers.
+///
+/// Protocol v0/v1 only ever carry [`PktFrame::Flush`] and [`PktFrame::Data`];
+/// [`PktFrame::Delim`] and [`PktFrame::ResponseEnd`] are v2-only markers that
+/// [`read_pkt_line`] deliberately rejects as invalid frame lengths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PktFrame {
+    /// `0000`: end of a logical group of pkt-lines.
+    Flush,
+    /// `0001`: section delimiter (protocol v2).
+    Delim,
+    /// `0002`: end of a protocol v2 response.
+    ResponseEnd,
+    /// A data frame carrying `payload` (may be empty for the `0004` header).
+    Data(Bytes),
+}
+
+impl PktFrame {
+    /// Payload of a data frame; `None` for the marker frames.
+    pub fn payload(&self) -> Option<&Bytes> {
+        match self {
+            Self::Data(payload) => Some(payload),
+            Self::Flush | Self::Delim | Self::ResponseEnd => None,
+        }
+    }
+}
+
+/// Declared total frame length (header included) from the first four bytes.
+///
+/// Returns `Ok(None)` when fewer than four bytes are buffered, so a streaming
+/// caller can distinguish "need more bytes" from a malformed header. Marker
+/// lengths (`0`, `1`, `2`) are reported as-is rather than rejected.
+pub fn peek_pkt_frame_len(bytes: &[u8]) -> Result<Option<u32>, PktLineError> {
+    let Some(header) = bytes.get(..4) else {
+        return Ok(None);
+    };
+    let header: &[u8; 4] = header
+        .try_into()
+        .map_err(|_| PktLineError::TruncatedHeader)?;
+    decode_pkt_line_header(header).map(Some)
+}
+
+/// Consume one completely buffered frame, reporting whether one was available.
+///
+/// Returns `Ok(None)` when the buffer does not yet hold a whole frame, leaving
+/// the buffer untouched so a streaming caller can append more bytes and retry.
+///
+/// # Errors
+///
+/// Propagates [`PktLineError`] for a malformed header or an impossible declared
+/// length (`0003` and friends).
+pub fn take_pkt_frame(bytes: &mut Bytes) -> Result<Option<PktFrame>, PktLineError> {
+    let Some(declared_len) = peek_pkt_frame_len(bytes)? else {
+        return Ok(None);
+    };
+    let frame = match declared_len {
+        0 => PktFrame::Flush,
+        1 => PktFrame::Delim,
+        2 => PktFrame::ResponseEnd,
+        _ => {
+            let payload_len = pkt_frame_payload_len(declared_len)?;
+            if bytes.len() < declared_len as usize {
+                return Ok(None);
+            }
+            bytes.advance(4);
+            return Ok(Some(PktFrame::Data(bytes.copy_to_bytes(payload_len))));
+        }
+    };
+    bytes.advance(4);
+    Ok(Some(frame))
+}
+
+/// Read exactly one frame from `bytes`, rejecting an incomplete buffer.
+///
+/// Callers must stop when `bytes` is empty; an empty buffer is reported as
+/// [`PktLineError::TruncatedHeader`] rather than a flush marker.
+pub fn read_pkt_frame(bytes: &mut Bytes) -> Result<PktFrame, PktLineError> {
+    match take_pkt_frame(bytes)? {
+        Some(frame) => Ok(frame),
+        None => match peek_pkt_frame_len(bytes)? {
+            None => Err(PktLineError::TruncatedHeader),
+            Some(_) => Err(PktLineError::TruncatedPayload),
+        },
+    }
+}
+
+/// Append a flush-pkt (`0000`).
+pub fn add_flush_pkt(pkt_line_stream: &mut BytesMut) {
+    pkt_line_stream.put(Bytes::from_static(PKT_LINE_END_MARKER));
+}
+
+/// Append a delim-pkt (`0001`), the protocol v2 section delimiter.
+pub fn add_delim_pkt(pkt_line_stream: &mut BytesMut) {
+    pkt_line_stream.put(Bytes::from_static(PKT_LINE_DELIM_MARKER));
+}
+
+/// Append a response-end-pkt (`0002`), the protocol v2 response terminator.
+pub fn add_response_end_pkt(pkt_line_stream: &mut BytesMut) {
+    pkt_line_stream.put(Bytes::from_static(PKT_LINE_RESPONSE_END_MARKER));
+}
+
 /// Preserve ordinary transport errors and classify an incomplete frame read.
 ///
 /// `truncated_frame` identifies the header or payload being read. The returned
@@ -281,8 +391,9 @@ pub fn add_pkt_line_string(pkt_line_stream: &mut BytesMut, buf_str: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bytes, PKT_LINE_PROTOCOL_ERROR_PREFIX, PktFrameError, PktLineError, pkt_frame_payload_len,
-        read_pkt_line,
+        Bytes, BytesMut, PKT_LINE_PROTOCOL_ERROR_PREFIX, PktFrame, PktFrameError, PktLineError,
+        add_delim_pkt, add_flush_pkt, add_response_end_pkt, peek_pkt_frame_len,
+        pkt_frame_payload_len, read_pkt_frame, read_pkt_line, take_pkt_frame,
     };
     use crate::utils::error::{CliError, StableErrorCode};
 
@@ -461,5 +572,80 @@ mod tests {
             "pkt-line protocol error: frame length exceeds the four-digit header limit"
         );
         assert!(message.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX));
+    }
+
+    #[test]
+    fn read_pkt_frame_classifies_protocol_v2_markers() {
+        let mut bytes = Bytes::from_static(b"0000000100020005x");
+        assert_eq!(read_pkt_frame(&mut bytes), Ok(PktFrame::Flush));
+        assert_eq!(read_pkt_frame(&mut bytes), Ok(PktFrame::Delim));
+        assert_eq!(read_pkt_frame(&mut bytes), Ok(PktFrame::ResponseEnd));
+        assert_eq!(
+            read_pkt_frame(&mut bytes),
+            Ok(PktFrame::Data(Bytes::from_static(b"x")))
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn read_pkt_frame_rejects_malformed_and_truncated_frames() {
+        for (input, expected) in [
+            (b"".as_slice(), PktLineError::TruncatedHeader),
+            (b"0", PktLineError::TruncatedHeader),
+            (b"000", PktLineError::TruncatedHeader),
+            (b"zzzz", PktLineError::InvalidHexHeader),
+            (b"\xff000", PktLineError::InvalidHeaderEncoding),
+            (b"0003".as_slice(), PktFrameError::LengthBelowHeader.into()),
+            (b"0008abc", PktLineError::TruncatedPayload),
+        ] {
+            let mut bytes = Bytes::copy_from_slice(input);
+            assert_eq!(read_pkt_frame(&mut bytes), Err(expected), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn take_pkt_frame_waits_for_complete_frames() {
+        let mut bytes = Bytes::from_static(b"000");
+        assert_eq!(take_pkt_frame(&mut bytes), Ok(None));
+        assert_eq!(bytes, b"000".as_slice());
+        bytes = Bytes::from_static(b"0008abc");
+        assert_eq!(take_pkt_frame(&mut bytes), Ok(None));
+        assert_eq!(bytes, b"0008abc".as_slice());
+        // A marker frame is complete as soon as its header arrives.
+        bytes = Bytes::from_static(b"0001");
+        assert_eq!(take_pkt_frame(&mut bytes), Ok(Some(PktFrame::Delim)));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn peek_pkt_frame_len_reports_declared_length_without_consuming() {
+        assert_eq!(peek_pkt_frame_len(b"0000rest"), Ok(Some(0)));
+        assert_eq!(peek_pkt_frame_len(b"0001"), Ok(Some(1)));
+        assert_eq!(peek_pkt_frame_len(b"000a012345"), Ok(Some(10)));
+        assert_eq!(peek_pkt_frame_len(b"000"), Ok(None));
+        assert_eq!(
+            peek_pkt_frame_len(b"zzzz"),
+            Err(PktLineError::InvalidHexHeader)
+        );
+    }
+
+    #[test]
+    fn marker_writers_emit_protocol_v2_framing() {
+        let mut stream = BytesMut::new();
+        add_delim_pkt(&mut stream);
+        add_flush_pkt(&mut stream);
+        add_response_end_pkt(&mut stream);
+        assert_eq!(stream.freeze(), Bytes::from_static(b"000100000002"));
+    }
+
+    #[test]
+    fn pkt_frame_payload_accessor_exposes_only_data_frames() {
+        assert_eq!(
+            PktFrame::Data(Bytes::from_static(b"packfile\n")).payload(),
+            Some(&Bytes::from_static(b"packfile\n"))
+        );
+        for frame in [PktFrame::Flush, PktFrame::Delim, PktFrame::ResponseEnd] {
+            assert_eq!(frame.payload(), None);
+        }
     }
 }

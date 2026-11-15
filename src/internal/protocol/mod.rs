@@ -34,6 +34,7 @@ pub mod mega2_traces_git; // plan-20261015 LTR-16/17: archive locator and pack c
 pub mod mega2_tree; // plan-20260912: bounded mega2 /api/v1/tree listing client
 pub mod repository_arg; // issues/480 HP-06: shared fetch/pull/push repository-arg parsing
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)
+pub mod v2; // issues/15: Git wire protocol v2 negotiation, ls-refs and fetch over smart HTTP
 
 pub trait ProtocolClient {
     /// create client from url
@@ -199,6 +200,27 @@ pub fn get_wire_hash_kind() -> HashKind {
     WIRE_HASH_KIND.with(|k| *k.borrow())
 }
 
+/// Wire protocol version a discovery exchange settled on.
+///
+/// Only the smart-HTTP transport negotiates v2 today; every other transport and
+/// every fallback path reports [`ProtocolVersion::V0`] and keeps the legacy
+/// advertisement parser and request builders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtocolVersion {
+    /// Git protocol v0/v1: `<oid> <ref>\0<capabilities>` advertisement.
+    #[default]
+    V0,
+    /// Git protocol v2: capability advertisement plus `ls-refs` / `fetch`.
+    V2,
+}
+
+impl ProtocolVersion {
+    /// Whether the exchange speaks protocol v2.
+    pub fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
 /// Result of reference discovery containing refs, capabilities, and hash kind.
 #[derive(Debug, Clone)]
 pub struct DiscoveryResult {
@@ -207,13 +229,15 @@ pub struct DiscoveryResult {
     /// Boundary commits advertised by a shallow upload-pack source.
     pub shallow_boundaries: Vec<String>,
     pub hash_kind: HashKind,
+    /// Negotiated wire protocol version.
+    pub version: ProtocolVersion,
 }
 
 /// Resolve wire `HashKind` from discovery capabilities (capability-first).
 ///
 /// Missing `object-format` defaults to SHA-1. Every `object-format=` entry is
 /// read; duplicates or conflicting values fail closed.
-fn wire_kind_from_capabilities(capabilities: &[String]) -> Result<HashKind, GitError> {
+pub(crate) fn wire_kind_from_capabilities(capabilities: &[String]) -> Result<HashKind, GitError> {
     let mut formats = Vec::new();
     for cap in capabilities {
         let Some(raw) = cap.strip_prefix("object-format=") else {
@@ -241,7 +265,7 @@ fn wire_kind_from_capabilities(capabilities: &[String]) -> Result<HashKind, GitE
     }
 }
 
-fn validate_discovery_oid(hash_kind: HashKind, hash: &str) -> Result<String, GitError> {
+pub(crate) fn validate_discovery_oid(hash_kind: HashKind, hash: &str) -> Result<String, GitError> {
     if hash.contains(':') {
         return Err(GitError::NetworkError(format!(
             "Tagged object id '{hash}' is not allowed on the pkt-line wire"
@@ -411,6 +435,7 @@ pub fn parse_discovered_references(
         capabilities,
         shallow_boundaries: shallow_boundaries.into_iter().collect(),
         hash_kind,
+        version: ProtocolVersion::V0,
     })
 }
 
