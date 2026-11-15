@@ -501,6 +501,7 @@ by default for maximum script friendliness.
 | SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | pkt-line discovery / transfer setup error / empty advertisement | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
+| Remote only advertises Git wire protocol v2 | `LBR-NET-002` | 128 | "use a remote whose server also serves protocol v0/v1 advertisements, or use Git for this remote" |
 | Packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | pkt-line truncation / sideband / checksum / pack protocol failure | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the fetch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |

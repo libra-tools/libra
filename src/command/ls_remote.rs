@@ -216,6 +216,13 @@ impl From<LsRemoteError> for CliError {
                         .with_stable_code(StableErrorCode::NetworkProtocol)
                         .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
                 }
+                GitError::NetworkError(detail)
+                    if crate::internal::protocol::is_protocol_v2_unsupported(detail) =>
+                {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::NetworkProtocol)
+                        .with_hint(crate::internal::protocol::PROTOCOL_V2_UNSUPPORTED_HINT)
+                }
                 GitError::IOError(source)
                     if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(source) =>
                 {
@@ -433,7 +440,10 @@ mod pkt_line_boundary_tests {
             PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType::UploadPack, add_pkt_line_string,
             read_pkt_line,
         },
-        internal::{config::ConfigKv, protocol::parse_discovered_references},
+        internal::{
+            config::ConfigKv,
+            protocol::{PROTOCOL_V2_UNSUPPORTED_MESSAGE, parse_discovered_references},
+        },
         utils::{
             error::{CliError, StableErrorCode},
             output::OutputConfig,
@@ -952,8 +962,14 @@ mod pkt_line_boundary_tests {
     #[derive(Clone, Copy)]
     enum ResponseMode {
         EmptyAdvertisement,
-        EmptyAdvertisementTail { width: usize, tail: &'static [u8] },
+        EmptyAdvertisementTail {
+            width: usize,
+            tail: &'static [u8],
+        },
         MalformedFetch,
+        /// Smart-HTTP discovery answering with a Git wire protocol v2
+        /// advertisement (`version 2` + capability list).
+        ProtocolV2Advertisement,
     }
     type Transcript = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
     #[derive(Clone)]
@@ -1018,6 +1034,23 @@ mod pkt_line_boundary_tests {
                     ),
                 );
                 add_pkt_line_string(&mut bytes, format!("{OID} refs/heads/main\n"));
+                bytes.extend_from_slice(b"0000");
+            }
+            if matches!(state.mode, ResponseMode::ProtocolV2Advertisement) {
+                // Git wire protocol v2 discovery: the service header is followed
+                // by a `version 2` line and a capability list, not by refs.
+                add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+                bytes.extend_from_slice(b"0000");
+                add_pkt_line_string(&mut bytes, "version 2\n".to_string());
+                for capability in [
+                    "agent=git/2.43.0",
+                    "ls-refs=unborn",
+                    "fetch=shallow wait-for-done",
+                    "object-format=sha1",
+                    "session-id=REMOTE_V2_SESSION_SENTINEL",
+                ] {
+                    add_pkt_line_string(&mut bytes, format!("{capability}\n"));
+                }
                 bytes.extend_from_slice(b"0000");
             }
             (
@@ -1213,6 +1246,101 @@ mod pkt_line_boundary_tests {
                     Some(&serde_json::json!("fetch"))
                 );
             }
+            let requests = server.requests();
+            assert_eq!(requests.len(), before + 1, "{command}: {requests:?}");
+            assert_eq!(
+                (&requests[before].0[..], &requests[before].1[..]),
+                ("GET", "/repo/info/refs?service=git-upload-pack")
+            );
+        }
+        server.stop().await;
+    }
+
+    /// A v2-only remote must be reported as such by every discovery command:
+    /// the `version 2` line is not a reference, so the old
+    /// `Invalid object id 'version'` diagnosis must never come back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(cwd, env)]
+    async fn pkt_line_protocol_v2_advertisement_reports_unsupported_remote() {
+        let mut server = TestServer::start(ResponseMode::ProtocolV2Advertisement).await;
+        for command in ["fetch", "clone", "ls-remote", "pull"] {
+            let repo = tempdir().unwrap();
+            setup_with_new_libra_in(repo.path()).await;
+            let _cwd = ChangeDirGuard::new(repo.path());
+            if matches!(command, "fetch" | "pull") {
+                ConfigKv::set("remote.origin.url", &server.url, false)
+                    .await
+                    .unwrap();
+            }
+            let output = OutputConfig::default();
+            let destination = repo.path().join("clone-target");
+            let before = server.requests().len();
+            let error = tokio::time::timeout(Duration::from_secs(45), async {
+                match command {
+                    "fetch" => fetch::execute_safe(
+                        FetchArgs::try_parse_from(["fetch", "origin"]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "clone" => clone::execute_safe(
+                        CloneArgs::try_parse_from([
+                            "clone",
+                            server.url.as_str(),
+                            destination.to_str().unwrap(),
+                        ])
+                        .unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "ls-remote" => super::execute_safe(
+                        LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    "pull" => pull::execute_safe(
+                        PullArgs::try_parse_from(["pull", "--ff-only", "origin", "main"]).unwrap(),
+                        &output,
+                    )
+                    .await
+                    .unwrap_err(),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect("v2 advertisement command must terminate");
+            let message = error.message();
+            assert!(
+                message.contains(PROTOCOL_V2_UNSUPPORTED_MESSAGE),
+                "{command}: {error:?}"
+            );
+            assert!(
+                !message.contains("Invalid object id"),
+                "{command} must not parse the version line as a reference: {error:?}"
+            );
+            assert!(
+                !message.contains("REMOTE_V2_SESSION_SENTINEL"),
+                "{command} must not echo remote capability text: {error:?}"
+            );
+            // A protocol mismatch must not be reported as a connectivity failure.
+            assert_eq!(
+                error.stable_code(),
+                StableErrorCode::NetworkProtocol,
+                "{command}: {error:?}"
+            );
+            assert_eq!(
+                error
+                    .hints()
+                    .iter()
+                    .map(|hint| hint.as_str())
+                    .collect::<Vec<_>>(),
+                [crate::internal::protocol::PROTOCOL_V2_UNSUPPORTED_HINT],
+                "{command}: {error:?}"
+            );
+            // Discovery fails before any v2 session request is issued: one GET,
+            // no POST to /repo/git-upload-pack.
             let requests = server.requests();
             assert_eq!(requests.len(), before + 1, "{command}: {requests:?}");
             assert_eq!(

@@ -104,6 +104,7 @@ see `docs/development/commands/_general.md` item B).
 | SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Network or transport failure | `LBR-NET-001` | 128 | Check the remote URL and network connectivity |
 | pkt-line discovery framing or protocol failure | `LBR-NET-002` | 128 | Check that the remote serves Git data and a proxy has not altered the response |
+| Remote only advertises Git wire protocol v2 (`version 2` discovery response) | `LBR-NET-002` | 128 | Use a remote whose server also serves protocol v0/v1 advertisements, or use Git for this remote |
 | Other discovery failure | `LBR-NET-002` | 128 | -- |
 | Human output write failure, including broken pipe | `LBR-IO-001` | 128 | -- |
 | JSON/machine output write failure (except broken pipe) | `LBR-IO-002` | 128 | -- |

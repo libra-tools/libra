@@ -62,6 +62,75 @@ pub type FetchStream = futures_util::stream::BoxStream<'static, Result<Bytes, st
 
 const MAX_ADVERTISED_SHALLOW_BOUNDARIES: usize = 4096;
 
+/// Upper bound on the v2 capability preview collected only for diagnostics.
+const MAX_ADVERTISED_V2_CAPABILITIES: usize = 1024;
+
+/// Diagnosis for a version line this parser does not implement.
+///
+/// Deliberately free of the remote-controlled version token: the value comes
+/// straight off the wire and must not reach the terminal unfiltered.
+const UNSUPPORTED_PROTOCOL_VERSION_MESSAGE: &str = "remote advertised a Git protocol version Libra does not implement; only the v0/v1 reference advertisement is supported";
+
+/// Leading text of [`PROTOCOL_V2_UNSUPPORTED_MESSAGE`]. Command error mapping
+/// classifies this diagnosis by the prefix instead of matching the full text.
+pub const PROTOCOL_V2_UNSUPPORTED_SIGNAL: &str = "remote only speaks protocol v2";
+
+/// Diagnosis for a remote whose discovery advertisement speaks Git wire
+/// protocol v2 only.
+///
+/// A v2 advertisement shares no grammar with the v0/v1 reference
+/// advertisement: it opens with a `version 2` pkt-line and continues with a
+/// capability list, so parsing it as `<oid> <ref>` reports the misleading
+/// `Invalid object id 'version'`. Libra implements the v0/v1 wire protocol, so
+/// name the real cause instead of the symptom.
+pub const PROTOCOL_V2_UNSUPPORTED_MESSAGE: &str = "remote only speaks protocol v2, which Libra does not support yet; use a remote whose server still answers protocol v0/v1 advertisements, or use Git for this remote";
+
+/// Guidance attached to the v2-only-remote diagnosis by every discovery
+/// command, so the fix is the same wherever the user meets it.
+pub const PROTOCOL_V2_UNSUPPORTED_HINT: &str = "use a remote whose server also serves protocol v0/v1 advertisements, or use Git for this remote";
+
+/// True when an advertisement failure carries the v2-only-remote diagnosis.
+pub fn is_protocol_v2_unsupported(detail: &str) -> bool {
+    detail.starts_with(PROTOCOL_V2_UNSUPPORTED_SIGNAL)
+}
+
+/// The protocol version announced by a discovery advertisement payload line.
+///
+/// Git may prepend a `version <n>` pkt-line to the advertisement: protocol v1
+/// reuses the v0 reference grammar behind that line, protocol v2 replaces the
+/// grammar with a capability list. A reference line can never be mistaken for
+/// a version line because it always starts with an object id.
+fn advertised_protocol_version(pkt_line: &str) -> Option<&str> {
+    let version = pkt_line.strip_prefix("version ")?;
+    let version = version.trim_end_matches(['\r', '\n']).trim();
+    (!version.is_empty()).then_some(version)
+}
+
+/// Read the capability section that follows a `version 2` line, so a v2
+/// advertisement is recognised as such instead of being parsed as references.
+///
+/// The capability text is remote-controlled, so it is only traced for
+/// diagnostics and never echoed into the returned error. Framing errors stop
+/// the preview: the leading `version 2` line already decides the diagnosis, so
+/// a corrupt capability section does not change what the caller must do.
+fn collect_v2_capability_lines(response_content: &mut Bytes) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    while !response_content.is_empty() && capabilities.len() < MAX_ADVERTISED_V2_CAPABILITIES {
+        let Ok((bytes_take, payload)) = read_pkt_line(response_content) else {
+            break;
+        };
+        if bytes_take == 0 {
+            continue;
+        }
+        let payload = String::from_utf8_lossy(&payload);
+        let payload = payload.trim_end_matches(['\r', '\n']);
+        if !payload.is_empty() {
+            capabilities.push(payload.to_string());
+        }
+    }
+    capabilities
+}
+
 /// Protocol negotiation failed before a request could be sent because the
 /// remote cannot accept shallow boundaries or a depth request.
 #[derive(Debug)]
@@ -203,6 +272,7 @@ pub fn parse_discovered_references(
     let mut shallow_boundaries = BTreeSet::new();
     let mut saw_header = false; // header seen or not
     let mut processed_first_ref = false;
+    let mut saw_version_line = false;
     let mut hash_kind = HashKind::Sha1;
 
     loop {
@@ -228,6 +298,39 @@ pub fn parse_discovered_references(
 
         let pkt_line = String::from_utf8(pkt_line.to_vec())
             .map_err(|e| GitError::NetworkError(format!("Invalid UTF-8 in response: {}", e)))?;
+        // A version line only meaningfully opens the advertisement; once a
+        // reference was accepted the v0/v1 grammar owns the rest of the stream.
+        if !processed_first_ref && let Some(version) = advertised_protocol_version(&pkt_line) {
+            if saw_version_line {
+                return Err(GitError::NetworkError(
+                    "remote advertised more than one Git protocol version line in its discovery response"
+                        .to_string(),
+                ));
+            }
+            saw_version_line = true;
+            match version {
+                // Protocol v1 is the v0 reference advertisement behind a leading
+                // `version 1` line: drop the marker and parse the rest as v0.
+                "1" => {
+                    tracing::debug!("discovery advertisement speaks protocol v1");
+                    continue;
+                }
+                "2" => {
+                    let capabilities = collect_v2_capability_lines(&mut response_content);
+                    tracing::debug!(
+                        "discovery advertisement speaks protocol v2 (capabilities: {capabilities:?}); v2 is not implemented"
+                    );
+                    return Err(GitError::NetworkError(
+                        PROTOCOL_V2_UNSUPPORTED_MESSAGE.to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(GitError::NetworkError(
+                        UNSUPPORTED_PROTOCOL_VERSION_MESSAGE.to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(oid) = pkt_line.strip_prefix("shallow ") {
             let oid = oid.trim_end_matches('\n');
             if !processed_first_ref {
@@ -461,6 +564,29 @@ mod test {
         bytes.freeze()
     }
 
+    /// Advertisement that opens with a `version <n>` line, followed by the
+    /// given payload lines (capabilities for v2, references for v1).
+    fn versioned_advertisement(version: &str, payload: &[String], header: bool) -> Bytes {
+        let mut bytes = BytesMut::new();
+        if header {
+            add_pkt_line_string(&mut bytes, "# service=git-upload-pack\n".to_string());
+            bytes.extend_from_slice(b"0000");
+        }
+        add_pkt_line_string(&mut bytes, format!("version {version}\n"));
+        for line in payload {
+            add_pkt_line_string(&mut bytes, line.clone());
+        }
+        bytes.extend_from_slice(b"0000");
+        bytes.freeze()
+    }
+
+    fn discovery_error_for(input: &[u8], service: ServiceType) -> String {
+        match parse_discovered_references(Bytes::copy_from_slice(input), service) {
+            Err(GitError::NetworkError(detail)) => detail,
+            other => panic!("expected a network error, received {other:?}"),
+        }
+    }
+
     #[test]
     fn pkt_line_discovery_propagates_pkt_line_error() {
         assert_eq!(
@@ -576,6 +702,112 @@ mod test {
                 assert_eq!(empty.hash_kind, kind);
             }
         }
+    }
+
+    #[test]
+    fn discovery_reports_protocol_v2_only_remote() {
+        // The v2 capability section as Git 2.x advertises it over smart HTTP
+        // and git://: `version 2`, then one capability per pkt-line.
+        let payload = [
+            "agent=git/2.43.0".to_string(),
+            "ls-refs=unborn".to_string(),
+            "fetch=shallow wait-for-done".to_string(),
+            "object-format=sha1".to_string(),
+            "server-option".to_string(),
+            "session-id=REMOTE_V2_SESSION_SENTINEL".to_string(),
+        ];
+        for header in [true, false] {
+            for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+                let detail =
+                    discovery_error_for(&versioned_advertisement("2", &payload, header), service);
+                assert_eq!(
+                    detail, PROTOCOL_V2_UNSUPPORTED_MESSAGE,
+                    "{service:?}/{header}"
+                );
+                // The version line and the capability list are not references.
+                assert!(!detail.contains("Invalid object id"));
+                assert!(!detail.contains("refs/heads"));
+                // Remote-controlled capability text must not reach the message.
+                assert!(!detail.contains("REMOTE_V2_SESSION_SENTINEL"));
+                assert!(!detail.contains("session-id"));
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_v2_diagnosis_prefix_drives_command_error_mapping() {
+        // Command error mapping classifies the diagnosis by this prefix; keep
+        // the message and the signal in sync.
+        assert!(PROTOCOL_V2_UNSUPPORTED_MESSAGE.starts_with(PROTOCOL_V2_UNSUPPORTED_SIGNAL));
+        assert!(is_protocol_v2_unsupported(PROTOCOL_V2_UNSUPPORTED_MESSAGE));
+        assert!(!is_protocol_v2_unsupported(
+            "network error: connection reset"
+        ));
+        assert!(!is_protocol_v2_unsupported(""));
+    }
+
+    #[test]
+    fn discovery_reports_protocol_v2_without_a_capability_section() {
+        // Some servers answer a v2 flush-only advertisement; the version line
+        // alone still identifies the protocol.
+        let detail = discovery_error(&versioned_advertisement("2", &[], true));
+        assert_eq!(detail, PROTOCOL_V2_UNSUPPORTED_MESSAGE);
+        assert!(!detail.contains("Invalid object id"));
+    }
+
+    #[test]
+    fn discovery_accepts_protocol_v1_version_line_with_v0_grammar() {
+        // Protocol v1 is the v0 advertisement behind a leading `version 1`
+        // line: the parse result must be identical to the v0 fixture.
+        let hash = "1".repeat(40);
+        let caps = "multi_ack_detailed side-band-64k ofs-delta object-format=sha1";
+        let reference = format!("{hash} refs/heads/main\0{caps}\n");
+        let v1 = versioned_advertisement("1", &[reference], true);
+        let v0 = advertisement(&hash, caps);
+
+        for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
+            let v1_result =
+                parse_discovered_references(v1.clone(), service).expect("v1 advertisement");
+            let v0_result = parse_discovered_references(v0.clone(), service).expect("v0 fixture");
+            assert_eq!(v1_result.refs, v0_result.refs, "{service:?}");
+            assert_eq!(
+                v1_result.capabilities, v0_result.capabilities,
+                "{service:?}"
+            );
+            assert_eq!(v1_result.hash_kind, v0_result.hash_kind, "{service:?}");
+            assert_eq!(v1_result.refs.len(), 1, "{service:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_unknown_protocol_version_without_echoing_it() {
+        for version in ["0", "3", "2-SENTINEL\x1b[31m"] {
+            let detail = discovery_error(&versioned_advertisement(version, &[], true));
+            assert_eq!(
+                detail, UNSUPPORTED_PROTOCOL_VERSION_MESSAGE,
+                "version={version:?}"
+            );
+            assert!(!detail.contains("SENTINEL"));
+            assert!(!detail.contains('\x1b'));
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_repeated_protocol_version_line() {
+        let hash = "1".repeat(40);
+        let mut wire = BytesMut::new();
+        add_pkt_line_string(&mut wire, "# service=git-upload-pack\n".to_string());
+        wire.extend_from_slice(b"0000");
+        add_pkt_line_string(&mut wire, "version 1\n".to_string());
+        add_pkt_line_string(&mut wire, "version 1\n".to_string());
+        add_pkt_line_string(&mut wire, format!("{hash} refs/heads/main\0multi_ack\n"));
+        wire.extend_from_slice(b"0000");
+
+        let detail = discovery_error(&wire);
+        assert!(
+            detail.contains("more than one Git protocol version line"),
+            "{detail}"
+        );
     }
 
     #[test]

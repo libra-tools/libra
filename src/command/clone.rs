@@ -716,6 +716,13 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     .with_stable_code(StableErrorCode::NetworkProtocol)
                     .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
             }
+            GitError::NetworkError(detail)
+                if crate::internal::protocol::is_protocol_v2_unsupported(detail) =>
+            {
+                CliError::fatal(format!("remote discovery failed: {source}"))
+                    .with_stable_code(StableErrorCode::NetworkProtocol)
+                    .with_hint(crate::internal::protocol::PROTOCOL_V2_UNSUPPORTED_HINT)
+            }
             GitError::IOError(error)
                 if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
             {
