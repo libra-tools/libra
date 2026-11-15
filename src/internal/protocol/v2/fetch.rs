@@ -21,9 +21,7 @@ use git_internal::hash::HashKind;
 
 use super::{super::MissingShallowCapability, Advertisement};
 use crate::{
-    git_protocol::{
-        PktFrame, add_pkt_line_string, take_pkt_frame,
-    },
+    git_protocol::{PktFrame, add_pkt_line_string, take_pkt_frame},
     internal::protocol::FetchStream,
 };
 
@@ -76,15 +74,16 @@ pub fn build_request(
     advertisement: &Advertisement,
     request: &FetchRequest,
 ) -> Result<Bytes, io::Error> {
-    let shallow_supported = advertisement
-        .features("fetch")
-        .contains(&SHALLOW_FEATURE);
+    let shallow_supported = advertisement.features("fetch").contains(&SHALLOW_FEATURE);
     if !shallow_supported && (request.depth.is_some() || !request.shallow.is_empty()) {
         return Err(io::Error::other(MissingShallowCapability));
     }
     let mut body = BytesMut::new();
     add_pkt_line_string(&mut body, "command=fetch\n".to_string());
-    add_pkt_line_string(&mut body, format!("agent=libra/{}\n", env!("CARGO_PKG_VERSION")));
+    add_pkt_line_string(
+        &mut body,
+        format!("agent=libra/{}\n", env!("CARGO_PKG_VERSION")),
+    );
     if advertisement.hash_kind != HashKind::Sha1 && advertisement.supports("object-format") {
         add_pkt_line_string(
             &mut body,
@@ -193,11 +192,13 @@ impl SectionReader {
                 if let Some(oid) = line.strip_prefix(b"shallow ") {
                     let oid = String::from_utf8_lossy(oid).trim().to_string();
                     self.response.shallow.push(oid.clone());
-                    self.emit.push(encode_frame(format!("shallow {oid}\n").as_bytes()));
+                    self.emit
+                        .push(encode_frame(format!("shallow {oid}\n").as_bytes()));
                 } else if let Some(oid) = line.strip_prefix(b"unshallow ") {
                     let oid = String::from_utf8_lossy(oid).trim().to_string();
                     self.response.unshallow.push(oid.clone());
-                    self.emit.push(encode_frame(format!("unshallow {oid}\n").as_bytes()));
+                    self.emit
+                        .push(encode_frame(format!("unshallow {oid}\n").as_bytes()));
                 }
             }
             Section::Acknowledgments => {
@@ -240,7 +241,8 @@ fn trim_newline(payload: &[u8]) -> &[u8] {
 pub fn parse_response(mut body: Bytes) -> Result<FetchResponse, io::Error> {
     let mut reader = SectionReader::default();
     while !body.is_empty() {
-        let frame = take_pkt_frame(&mut body).map_err(|error| io::Error::other(error.to_string()))?;
+        let frame =
+            take_pkt_frame(&mut body).map_err(|error| io::Error::other(error.to_string()))?;
         let Some(frame) = frame else {
             return Err(io::Error::other(
                 "protocol v2 fetch response ended inside a pkt-line frame",
@@ -354,7 +356,10 @@ mod tests {
     }
 
     fn fetch_sha1() -> Advertisement {
-        advertisement(&["fetch=shallow wait-for-done", "object-format=sha1"], HashKind::Sha1)
+        advertisement(
+            &["fetch=shallow wait-for-done", "object-format=sha1"],
+            HashKind::Sha1,
+        )
     }
 
     #[test]
@@ -371,7 +376,10 @@ mod tests {
         assert!(text.starts_with("0012command=fetch\n"), "text={text:?}");
         assert!(text.contains("ofs-delta\n"));
         assert!(text.contains("include-tag\n"));
-        assert!(!text.contains("thin-pack"), "self-contained decoder: {text}");
+        assert!(
+            !text.contains("thin-pack"),
+            "self-contained decoder: {text}"
+        );
         let delimiter = text.find("0001").expect("delim-pkt");
         let argument = text.find("ofs-delta\n").expect("argument section");
         assert!(delimiter < argument, "capabilities precede the delimiter");
@@ -382,7 +390,10 @@ mod tests {
         );
         assert!(!text.contains("deepen"));
         assert!(!text.contains("shallow "));
-        assert!(text.ends_with("0000"), "request must end with a flush: {text:?}");
+        assert!(
+            text.ends_with("0000"),
+            "request must end with a flush: {text:?}"
+        );
     }
 
     #[test]
@@ -394,8 +405,8 @@ mod tests {
             shallow: vec!["c".repeat(40)],
             depth: Some(3),
         };
-        let text = String::from_utf8_lossy(&build_request(&advertisement, &request).unwrap())
-            .to_string();
+        let text =
+            String::from_utf8_lossy(&build_request(&advertisement, &request).unwrap()).to_string();
         assert!(text.contains(&format!("shallow {}", "c".repeat(40))));
         assert!(text.contains("deepen 3\n"));
         let deepen = text.find("deepen 3\n").unwrap();
@@ -413,7 +424,9 @@ mod tests {
             depth: Some(1),
         };
         let error = build_request(&advertisement, &request).expect_err("depth needs shallow");
-        assert!(crate::internal::protocol::is_missing_shallow_capability(&error));
+        assert!(crate::internal::protocol::is_missing_shallow_capability(
+            &error
+        ));
         assert_eq!(error.to_string(), MissingShallowCapability.to_string());
 
         // Without depth or boundaries the same advertisement is fine.
@@ -431,8 +444,7 @@ mod tests {
             wants: vec!["a".repeat(64)],
             ..FetchRequest::default()
         };
-        let text =
-            String::from_utf8_lossy(&build_request(&sha256, &request).unwrap()).to_string();
+        let text = String::from_utf8_lossy(&build_request(&sha256, &request).unwrap()).to_string();
         assert!(text.contains("object-format=sha256"));
 
         let silent = advertisement(&["fetch=shallow"], HashKind::Sha256);
@@ -554,7 +566,11 @@ mod tests {
         );
         assert!(frames[1].ends_with(b"\x01PACKpayload"));
         assert!(!frames.iter().any(|frame| frame.ends_with(b"packfile\n")));
-        assert!(!frames.iter().any(|frame| frame.ends_with(b"shallow-info\n")));
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.ends_with(b"shallow-info\n"))
+        );
     }
 
     #[tokio::test]
@@ -563,7 +579,8 @@ mod tests {
             add_pkt_line_string(body, "ERR access denied\n".to_string());
             add_response_end_pkt(body);
         });
-        let adapted = adapt_response_stream(stream::iter(vec![Ok::<Bytes, io::Error>(body)]).boxed());
+        let adapted =
+            adapt_response_stream(stream::iter(vec![Ok::<Bytes, io::Error>(body)]).boxed());
         let frames = collect(adapted).await;
         assert_eq!(frames.len(), 1);
         assert!(String::from_utf8_lossy(&frames[0]).contains("ERR access denied"));
@@ -576,7 +593,11 @@ mod tests {
         );
         let mut failed = failed;
         let item = failed.next().await.expect("an error frame");
-        assert!(item.expect_err("transport error is preserved").to_string().contains("link down"));
+        assert!(
+            item.expect_err("transport error is preserved")
+                .to_string()
+                .contains("link down")
+        );
     }
 
     #[tokio::test]
@@ -585,7 +606,8 @@ mod tests {
             add_pkt_line_string(body, "packfile\n".to_string());
             add_raw_frame(body, b"\x01PACK");
         });
-        let adapted = adapt_response_stream(stream::iter(vec![Ok::<Bytes, io::Error>(body)]).boxed());
+        let adapted =
+            adapt_response_stream(stream::iter(vec![Ok::<Bytes, io::Error>(body)]).boxed());
         let frames = collect(adapted).await;
         assert_eq!(frames.len(), 1, "only the sideband frame is emitted");
     }
