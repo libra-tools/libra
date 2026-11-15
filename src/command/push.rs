@@ -377,6 +377,11 @@ fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
         GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
             PushError::Protocol { detail }
         }
+        GitError::NetworkError(detail)
+            if crate::internal::protocol::is_protocol_v2_unsupported(&detail) =>
+        {
+            PushError::Protocol { detail }
+        }
         GitError::NetworkError(detail) => {
             let lower = detail.to_lowercase();
             if lower.contains("timeout") || lower.contains("timed out") {
